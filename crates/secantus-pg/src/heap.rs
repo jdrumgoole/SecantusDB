@@ -63,6 +63,22 @@ fn layout(pg_type: &str) -> (i64, char) {
     if t.ends_with("[]") {
         return (-1, 'i');
     }
+    thread_local! {
+        /// A built-in type's layout by the name it was asked by: fixed
+        /// facts of PostgreSQL's `pg_type`, asked for every column of every
+        /// row written (RP-014). A name no built-in has is not kept -- a
+        /// user enum's answer depends on the catalog.
+        static BUILTIN: std::cell::RefCell<Vec<(String, (i64, char))>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(hit) = BUILTIN.with(|b| {
+        b.borrow()
+            .iter()
+            .find(|(name, _)| name == t)
+            .map(|(_, l)| *l)
+    }) {
+        return hit;
+    }
     let Some(oid) = secantus_pgplan::pgtypes::oid_of_name(t) else {
         return if secantus_pgplan::is_user_enum(t) {
             (4, 'i')
@@ -83,6 +99,13 @@ fn layout(pg_type: &str) -> (i64, char) {
             _ => None,
         })
         .unwrap_or('i');
+    BUILTIN.with(|b| {
+        let mut b = b.borrow_mut();
+        // Bounded: the names a server's columns use are few.
+        if b.len() < 256 {
+            b.push((t.to_string(), (len, al)));
+        }
+    });
     (len, al)
 }
 
@@ -136,8 +159,72 @@ fn numeric_bytes(text: &str) -> usize {
     2 + 2 * groups.len()
 }
 
+/// An array's datum size, its 4-byte header included (`construct_md_array`):
+/// the header (`ARR_OVERHEAD_NONULLS`, or `ARR_OVERHEAD_WITHNULLS` with a
+/// NULL element) and each element at its type's alignment -- a varlena
+/// element with its 4-byte header, never packed. `None` for an element
+/// type whose storage is not modelled (RP-254).
+pub(crate) fn array_datum_len(elem: &str, v: &Bson) -> Option<usize> {
+    let Bson::Array(top) = v else {
+        return None;
+    };
+    // Dimensions: as deep as the first elements nest.
+    let mut ndim = 0usize;
+    let mut probe: Option<&Vec<Bson>> = Some(top);
+    while let Some(a) = probe {
+        if a.is_empty() {
+            break;
+        }
+        ndim += 1;
+        probe = match &a[0] {
+            Bson::Array(inner) => Some(inner),
+            _ => None,
+        };
+    }
+    let mut items: Vec<&Bson> = Vec::new();
+    let mut stack: Vec<&Bson> = top.iter().rev().collect();
+    while let Some(x) = stack.pop() {
+        match x {
+            Bson::Array(inner) => stack.extend(inner.iter().rev()),
+            other => items.push(other),
+        }
+    }
+    let has_nulls = items.iter().any(|x| matches!(x, Bson::Null));
+    let overhead = if has_nulls {
+        maxalign(16 + 8 * ndim + items.len().div_ceil(8))
+    } else {
+        maxalign(16 + 8 * ndim)
+    };
+    let (len, al) = layout(elem);
+    let textual = matches!(
+        elem,
+        "text" | "varchar" | "character varying" | "bpchar" | "character" | "name"
+    );
+    if len <= 0 && !textual {
+        return None;
+    }
+    let mut off = overhead;
+    for x in items {
+        if matches!(x, Bson::Null) {
+            continue;
+        }
+        off = align(off, al);
+        off += if len > 0 {
+            len as usize
+        } else {
+            4 + server_len(&text_of(x))
+        };
+    }
+    Some(off)
+}
+
 /// The bytes a varlena value holds, header aside.
 fn varlena_data(pg_type: &str, typmod: i32, v: &Bson) -> usize {
+    if let Some(elem) = pg_type.strip_suffix("[]") {
+        if let Some(n) = array_datum_len(elem, v) {
+            return n - 4;
+        }
+    }
     match (pg_type, v) {
         (_, Bson::Binary(b)) => b.bytes.len(),
         ("numeric", v) => numeric_bytes(&text_of(v)),
@@ -503,7 +590,7 @@ impl PgHandler {
 
     /// A table's storage parameter, as `WITH (...)` set it.
     fn reloption(&self, table: &str, name: &str) -> Option<String> {
-        let def = self.lookup(table)?;
+        let def = self.lookup_ref(table)?;
         let opts = def.extra.get_array("reloptions").ok()?;
         opts.iter().find_map(|v| {
             let (k, val) = v.as_str()?.split_once('=')?;
@@ -518,7 +605,11 @@ impl PgHandler {
     /// committed to the store (a commit there would be another session's
     /// commit to a REPEATABLE READ snapshot). One writer at a time, as a
     /// page's buffer lock makes it.
-    fn with_heap<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
+    pub(crate) fn with_heap<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut Heap) -> T,
+    ) -> PgWireResult<T> {
         self.heap_access(table, true, f)
     }
 
@@ -542,7 +633,10 @@ impl PgHandler {
             .contains_key(&key);
         // Read before the lock is taken: deriving reads the store.
         let derived = (!known).then(|| self.derive_heap(table));
-        let (running, _) = visibility();
+        // The running xids alone: the removal horizon `visibility` also
+        // takes is not needed to forget ended inserts. Few run at once, so a
+        // list serves as well as a set.
+        let running: Vec<u64> = crate::xids::running().into_iter().map(|(_, x)| x).collect();
         let mut all = heaps().lock().unwrap_or_else(|e| e.into_inner());
         let heap = all
             .entry(key)
@@ -607,18 +701,11 @@ impl PgHandler {
         field("__sys_xmin") == Some((xid & 0xFFFF_FFFF) as i64) && field("__sys_cid") == Some(cid)
     }
 
-    /// The running command's `(xid, command id)`.
-    pub(crate) fn command_writer(&self) -> (u64, i64) {
-        self.writer()
-    }
-
     fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
-        let xid =
-            secantus_pgplan::snapshots::ask_pid(pid, secantus_pgplan::snapshots::XidOp::Assign)
-                .and_then(|x| x.parse::<u64>().ok())
-                .unwrap_or(u64::from(crate::xids::FROZEN_XID));
-        let cid = crate::xids::command_id(&self.storage, pid);
+        // The xid as the planner's hook (`xids::answer`) assigns it.
+        let (xid, cid) = crate::xids::writer(&self.storage, pid);
+        let xid = xid.unwrap_or(u64::from(crate::xids::FROZEN_XID));
         (xid, i64::from(cid))
     }
 
@@ -709,13 +796,15 @@ impl PgHandler {
         def: &TableDef,
         rows: &mut [Document],
     ) -> PgWireResult<()> {
+        // The rows are moved in and back, not copied (RP-014). Every caller
+        // drops them on an error, so what an error leaves in them is unseen.
         let mut versions: Vec<(Option<Document>, Document)> =
-            rows.iter().map(|r| (None, r.clone())).collect();
-        self.stamp_versions(table, def, &mut versions)?;
+            rows.iter_mut().map(|r| (None, std::mem::take(r))).collect();
+        let out = self.stamp_versions(table, def, &mut versions);
         for (r, (_, v)) in rows.iter_mut().zip(versions) {
             *r = v;
         }
-        Ok(())
+        out
     }
 
     /// Stamp new versions of updated rows: `(old row, new row)` each, the
@@ -826,8 +915,11 @@ impl PgHandler {
             }
             // The buffers the writes read, as `RelationGetBufferForTuple`,
             // `heap_update` and the free space map read them (RP-239).
-            self.stat_pages(&heap_table, accessed);
-            self.stat_writes(&heap_table, inserted, updated, hot);
+            // The table's oid, asked once for both (RP-014).
+            let rel = (self.tracking() && !heap_table.starts_with("__"))
+                .then(|| self.relation_oid(&heap_table));
+            self.stat_pages_of(&heap_table, rel, accessed);
+            self.stat_writes_of(&heap_table, rel, inserted, updated, hot);
             // Every version that is not heap-only takes a tuple in each of
             // the table's B-trees (RP-196).
             // With the old version, so an index can tell its key was left
@@ -845,6 +937,7 @@ impl PgHandler {
                 .collect();
             self.btree_insert_versions(&heap_table, &indexed)?;
             self.hash_insert_versions(&heap_table, &indexed)?;
+            self.am_insert_versions(&heap_table, &indexed)?;
             // The versions this transaction made, for others' conflicts
             // out: each new one, and each old one it deleted.
             for (i, ctid) in idx.iter().zip(&ctids) {
@@ -1069,6 +1162,63 @@ impl PgHandler {
                 heap.settle(block, &outcome);
             }
             heap.vacuumable_tids(horizon, &is_running)
+        })
+    }
+
+    /// [`Self::dead_index_tids`] among `roots` only -- the heap TIDs one
+    /// index key's entries hold -- settling only their pages: what a
+    /// primary-key lookup's index scan learns of the versions it passes,
+    /// without reading the whole heap for every lookup (RP-196).
+    pub(crate) fn dead_index_tids_among(
+        &self,
+        table: &str,
+        roots: &[i64],
+    ) -> PgWireResult<std::collections::HashSet<i64>> {
+        if roots.is_empty() || !self.has_heap(table) {
+            return Ok(Default::default());
+        }
+        let (running, horizon) = visibility();
+        let is_running = |x: u64| running.contains(&x);
+        let blocks: std::collections::BTreeSet<u32> = roots
+            .iter()
+            .filter_map(|t| untid(*t).map(|(b, _)| b))
+            .collect();
+        let candidates: Vec<(u32, Vec<(u16, Bson)>)> = self.with_heap(table, |heap| {
+            blocks
+                .iter()
+                .map(|&b| (b, heap.unsettled(b, horizon, &is_running)))
+                .filter(|(_, u)| !u.is_empty())
+                .collect()
+        })?;
+        let ids: Vec<Bson> = candidates
+            .iter()
+            .flat_map(|(_, u)| u.iter().map(|(_, id)| id.clone()))
+            .collect();
+        let present: std::collections::HashMap<String, i64> = if ids.is_empty() {
+            Default::default()
+        } else {
+            self.storage
+                .find_matching(self.db(), table, &bson::doc! { "_id": { "$in": ids } })
+                .map_err(|e| Self::storage_err("could not read", e))?
+                .iter()
+                .filter_map(|raw| {
+                    let d = crate::decode_doc(raw).ok()?;
+                    Some((d.get("_id")?.to_string(), ctid_of(&d)?))
+                })
+                .collect()
+        };
+        self.with_heap(table, |heap| {
+            for (block, unsettled) in candidates {
+                let outcome: Vec<(u16, bool)> = unsettled
+                    .iter()
+                    .map(|(off, id)| {
+                        let here = present.get(&id.to_string()) == Some(&tid(block, *off));
+                        (*off, !here)
+                    })
+                    .collect();
+                heap.settle(block, &outcome);
+            }
+            heap.vacuumable_among(roots, horizon, &is_running)
         })
     }
 

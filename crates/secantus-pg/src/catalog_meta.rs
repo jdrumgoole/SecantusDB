@@ -252,6 +252,16 @@ pub(crate) fn install_system_relations() {
     });
 }
 
+/// The lines of `pg_class_system.tsv`.
+pub(crate) fn system_class_lines() -> std::str::Lines<'static> {
+    CLASSES.lines()
+}
+
+/// The lines of `pg_index_system.tsv`.
+pub(crate) fn system_index_lines() -> std::str::Lines<'static> {
+    INDEXES.lines()
+}
+
 const INDEXES: &str = include_str!("pg_index_system.tsv");
 
 /// `pg_index` rows for PostgreSQL 15.19's own indexes (`pg_index_system.tsv`,
@@ -431,14 +441,17 @@ pub(crate) fn system_column_source(relation: &str, column: &str) -> Option<(i64,
 
 /// `pg_attribute` rows for PostgreSQL's own relations' columns -- tables,
 /// views, indexes and TOAST relations -- dumped from PostgreSQL 15
-/// (`pg_attribute_system.tsv`: attrelid, attname, atttypid, attnum,
-/// attnotnull, atttypmod, atthasdef). An `information_schema` column of one
-/// of that schema's domains reports the domain's base type.
+/// (`pg_attribute_system.tsv`: attrelid, attname, the column's type with an
+/// `information_schema` domain smashed to its base type (what this server
+/// computes the column as), attnum, attnotnull, atttypmod, atthasdef, then
+/// the column's declared type and its collation as PostgreSQL 15.19 records
+/// them).
 pub(crate) fn attribute_rows(def: &TableDef) -> Vec<Document> {
     let f = |name: &str| def.field_of(name);
     let mut out = Vec::new();
     for l in ATTRIBUTES.lines() {
-        let [relid, name, ty, num, notnull, typmod, hasdef] = l.split('\t').collect::<Vec<_>>()[..]
+        let [relid, name, _base, num, notnull, typmod, hasdef, ty, collation] =
+            l.split('\t').collect::<Vec<_>>()[..]
         else {
             continue;
         };
@@ -457,6 +470,7 @@ pub(crate) fn attribute_rows(def: &TableDef) -> Vec<Document> {
         put("attnotnull", Bson::Boolean(notnull == "1"));
         put("atttypmod", Bson::Int32(int(typmod) as i32));
         put("atthasdef", Bson::Boolean(hasdef == "1"));
+        put("attcollation", Bson::Int64(int(collation)));
         put("attgenerated", Bson::String(String::new()));
         out.push(d);
     }

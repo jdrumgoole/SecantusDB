@@ -81,11 +81,11 @@ impl PgHandler {
     pub(crate) fn expr_indexes(&self, def: &TableDef) -> PgWireResult<Vec<ExprIndex>> {
         let indexes = self
             .storage
-            .list_indexes(self.db(), &def.name)
+            .list_indexes_shared(self.db(), &def.name)
             .map_err(|e| Self::storage_err("could not list the indexes", e))?;
         let mut out = Vec::new();
-        for ix in indexes {
-            let Some((exprs, keys)) = Self::index_expressions(&ix) else {
+        for ix in indexes.iter() {
+            let Some((exprs, keys)) = Self::index_expressions(ix) else {
                 continue;
             };
             let name = ix.get_str("name").unwrap_or_default().to_string();
@@ -113,7 +113,7 @@ impl PgHandler {
                 field: Self::expression_index_field(&name),
                 exprs: planned,
                 predicate,
-                nulls_not_distinct: crate::nulls_not_distinct(&ix),
+                nulls_not_distinct: crate::nulls_not_distinct(ix),
             });
         }
         Ok(out)
@@ -141,7 +141,7 @@ impl PgHandler {
         table: &str,
         rows: Vec<Vec<u8>>,
     ) -> PgWireResult<Vec<Vec<u8>>> {
-        let Some(def) = self.lookup(table) else {
+        let Some(def) = self.lookup_ref(table) else {
             return Ok(rows);
         };
         let indexes = self.expr_indexes(&def)?;
@@ -156,6 +156,61 @@ impl PgHandler {
                 encode_doc(&d).map_err(|e| Self::storage_err("could not encode a row", e))
             })
             .collect()
+    }
+
+    /// [`Self::with_expr_fields`] over rows not yet encoded, giving each
+    /// stored document with its encoding: what `with_expr_fields` writes,
+    /// as storage would decode it, so the insert need not decode it again
+    /// (`Storage::insert_documents`, RP-014).
+    pub(crate) fn stored_rows(
+        &self,
+        table: &str,
+        rows: &[Document],
+    ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
+        self.stored_rows_of(table, rows.iter().map(std::borrow::Cow::Borrowed))
+    }
+
+    /// [`Self::stored_rows`] of rows the caller no longer needs: each is
+    /// moved into its stored form rather than copied (RP-014).
+    pub(crate) fn stored_rows_owned(
+        &self,
+        table: &str,
+        rows: Vec<Document>,
+    ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
+        self.stored_rows_of(table, rows.into_iter().map(std::borrow::Cow::Owned))
+    }
+
+    fn stored_rows_of<'a>(
+        &self,
+        table: &str,
+        rows: impl Iterator<Item = std::borrow::Cow<'a, Document>>,
+    ) -> PgWireResult<Vec<(Vec<u8>, Document)>> {
+        let indexes = match self.lookup_ref(table) {
+            Some(def) => self.expr_indexes(&def)?,
+            None => Vec::new(),
+        };
+        rows.map(|row| {
+            // With expression indexes, the row as `with_expr_fields`
+            // reads it back from its encoding, and fills.
+            let filled = if indexes.is_empty() {
+                None
+            } else {
+                let raw = crate::encode_doc(&row)
+                    .map_err(|e| Self::storage_err("could not encode a row", e))?;
+                let mut d =
+                    decode_doc(&raw).map_err(|e| Self::storage_err("could not read a row", e))?;
+                Self::fill_expr_fields(&indexes, &mut d)?;
+                Some(d)
+            };
+            let stored = match filled {
+                Some(d) => crate::stored_form(&d),
+                None => crate::stored_form_owned(row),
+            };
+            let bytes = bson::to_vec(&stored)
+                .map_err(|e| Self::storage_err("could not encode a row", e))?;
+            Ok((bytes, stored))
+        })
+        .collect()
     }
 
     /// Recompute the expression index fields of `table`'s rows matching

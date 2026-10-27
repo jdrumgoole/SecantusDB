@@ -11,6 +11,69 @@ use bson::Bson;
 
 const FACTS: &str = include_str!("pg_type_facts.tsv");
 
+/// `typtype`, `typdelim`, `typelem`, `typnotnull`, `typbasetype`,
+/// `typtypmod` and `typcollation` of every type `initdb` makes, dumped from
+/// PostgreSQL 15.19 (`oid < 16384`). The rows this server builds for them
+/// derived these and got 56 wrong: a fixed-length type's element (`name`'s
+/// is `char`, `point`'s `float8`), a range array's `typtype`, the
+/// collatable arrays' and statistics types' collation, the pseudo-types'
+/// NULLs.
+const IDENTITY: &str = include_str!("pg_type_identity.tsv");
+
+const IDENTITY_COLUMNS: [&str; 7] = [
+    "typtype",
+    "typdelim",
+    "typelem",
+    "typnotnull",
+    "typbasetype",
+    "typtypmod",
+    "typcollation",
+];
+
+fn identity() -> &'static HashMap<i64, Vec<&'static str>> {
+    static F: OnceLock<HashMap<i64, Vec<&'static str>>> = OnceLock::new();
+    F.get_or_init(|| {
+        IDENTITY
+            .lines()
+            .filter_map(|l| {
+                let mut it = l.split('\t');
+                let oid = it.next()?.parse().ok()?;
+                Some((oid, it.collect()))
+            })
+            .collect()
+    })
+}
+
+/// Set a built-in type's identity columns to PostgreSQL's own (`IDENTITY`).
+pub(crate) fn apply_identity(def: &secantus_pgcatalog::TableDef, rows: &mut [bson::Document]) {
+    let Some(oid_field) = def.field_of("oid") else {
+        return;
+    };
+    let fields: Vec<Option<String>> = IDENTITY_COLUMNS.iter().map(|c| def.field_of(c)).collect();
+    for row in rows {
+        let oid = match row.get(&oid_field) {
+            Some(Bson::Int64(o)) => *o,
+            Some(Bson::Int32(o)) => i64::from(*o),
+            _ => continue,
+        };
+        let Some(values) = identity().get(&oid) else {
+            continue;
+        };
+        for ((column, field), v) in IDENTITY_COLUMNS.iter().zip(&fields).zip(values) {
+            let Some(field) = field else {
+                continue;
+            };
+            let value = match *column {
+                "typtype" | "typdelim" => Bson::String((*v).to_string()),
+                "typnotnull" => Bson::Boolean(*v == "t"),
+                "typtypmod" => Bson::Int32(v.parse().unwrap_or(-1)),
+                _ => Bson::Int64(v.parse().unwrap_or(0)),
+            };
+            row.insert(field.clone(), value);
+        }
+    }
+}
+
 /// The columns, in the file's order after `oid`.
 pub(crate) const COLUMNS: [&str; 14] = [
     "typlen",

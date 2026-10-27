@@ -897,6 +897,14 @@ pub(crate) fn always_returns_set(name: &str) -> bool {
         .is_some_and(|o| !o.is_empty() && o.iter().all(|s| s.retset))
 }
 
+/// Whether every overload of the built-in `name` returns a type `plain`
+/// accepts; `false` for a name that is not a built-in.
+pub(crate) fn builtin_returns_all(name: &str, plain: &dyn Fn(&str) -> bool) -> bool {
+    sigs()
+        .get(name)
+        .is_some_and(|o| !o.is_empty() && o.iter().all(|s| plain(&s.ret)))
+}
+
 /// Is `name` a PostgreSQL built-in function (any overload)?
 pub fn is_builtin_function_name(name: &str) -> bool {
     sigs().contains_key(name)

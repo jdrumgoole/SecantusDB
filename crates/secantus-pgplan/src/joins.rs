@@ -192,11 +192,158 @@ pub struct JoinRows {
     /// Those that are an equality of two tables' columns, as joined-key
     /// pairs: each a join clause between its two tables.
     pub where_equalities: Vec<(String, String)>,
+    /// Every WHERE conjunct is evaluated at or below the join: pushed into
+    /// the scan of the one table it reads, folded into an equivalence
+    /// class, or reading two or more tables (whose join filters and
+    /// clauses the search places). Only then do the join's rows, and its
+    /// planner's estimate of them, number what the WHERE keeps, as a LIMIT
+    /// over the join counts them (`grouping_planner`'s `tuple_fraction`).
+    pub where_modelled: bool,
     /// The joined-row keys the query reads above the join -- its select
     /// list, GROUP BY, HAVING, ORDER BY and the rest, not its WHERE, whose
     /// conjuncts each read one table and run at its scan. They make the
     /// width of the rows a join passes up (`build_joinrel_tlist`).
     pub needed: Vec<String>,
+    /// Every joined-row key anything reads -- the query above the join, its
+    /// WHERE, and the join's own clauses, filters and LATERAL items: the
+    /// columns a join's rows carry, as PostgreSQL's target lists carry only
+    /// what is needed (`build_joinrel_tlist`, `attr_needed`). `None` when
+    /// that cannot be told (a `*`, a whole-row reference): every key.
+    pub project: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+}
+
+impl JoinRows {
+    /// Does a join row carry `key`? A timestamp's hidden sub-millisecond
+    /// companion goes with its column.
+    pub fn carries(project: Option<&std::collections::HashSet<String>>, key: &str) -> bool {
+        match project {
+            None => true,
+            Some(p) => {
+                p.contains(key)
+                    || key
+                        .strip_prefix(SUBMS_PREFIX)
+                        .is_some_and(|base| p.contains(base))
+            }
+        }
+    }
+}
+
+/// The keys a row expression reads, or `false` when it may read the row some
+/// other way (a column reference or subquery left in it, another variant).
+fn expr_reads(e: &ColumnExpr, keys: &mut std::collections::HashSet<String>) -> bool {
+    let ColumnExpr::Row { expr, fields, .. } = e else {
+        return false;
+    };
+    if expr_any(expr, &|n| {
+        matches!(n.node.as_ref(), Some(N::ColumnRef(_) | N::SubLink(_)))
+    }) {
+        return false;
+    }
+    keys.extend(fields.iter().map(|(_, f, _)| f.clone()));
+    true
+}
+
+/// The keys the join tree itself reads: its ON clauses, equalities, USING
+/// columns and LATERAL items' bound keys.
+fn tree_reads(node: &JoinNode, keys: &mut std::collections::HashSet<String>) -> bool {
+    match node {
+        JoinNode::Leaf { .. } => true,
+        JoinNode::Lateral { keys: bound, .. } => {
+            keys.extend(bound.iter().cloned());
+            true
+        }
+        JoinNode::Join {
+            left,
+            right,
+            on,
+            equi,
+            merged,
+            expr_keys,
+            ec,
+            ..
+        } => {
+            if let Some(on) = on {
+                if !expr_reads(on, keys) {
+                    return false;
+                }
+            }
+            for (l, r) in equi {
+                keys.insert(l.clone());
+                keys.insert(r.clone());
+            }
+            for (m, l, r) in merged {
+                keys.insert(m.clone());
+                keys.insert(l.clone());
+                keys.insert(r.clone());
+            }
+            for e in expr_keys {
+                if !expr_reads(&e.left, keys) || !expr_reads(&e.right, keys) {
+                    return false;
+                }
+                keys.extend(e.left_column.iter().cloned());
+                keys.extend(e.right_column.iter().cloned());
+            }
+            if let Some(ec) = ec {
+                for (a, b) in ec
+                    .left_restrict
+                    .iter()
+                    .chain(&ec.right_restrict)
+                    .chain(&ec.join_keys)
+                {
+                    keys.insert(a.clone());
+                    keys.insert(b.clone());
+                }
+            }
+            tree_reads(left, keys) && tree_reads(right, keys)
+        }
+    }
+}
+
+/// [`JoinRows::project`]: what the query `out` (the join's FROM aside) and
+/// the join read.
+fn projection(
+    out: &pg_query::protobuf::SelectStmt,
+    scope: &Scope,
+    tree: &JoinNode,
+    filters: &[JoinFilter],
+    equalities: &[(String, String)],
+) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    use crate::query_reads::{Reads, Use};
+    let aliases: std::collections::HashSet<&str> = scope
+        .cols
+        .iter()
+        .map(|c| c.alias.as_str())
+        .chain(scope.aliases.iter().map(String::as_str))
+        .collect();
+    let classify = |parts: &[Option<&str>]| match parts {
+        [Some(k)] if k.contains(SEP) => Use::Name((*k).to_string()),
+        // A FROM item's name alone is its whole row.
+        [Some(k)] if aliases.contains(k) => Use::All,
+        // An output column's name, or the enclosing query's: no join key.
+        [Some(_)] => Use::Ignore,
+        _ => Use::All,
+    };
+    let mut above = out.clone();
+    above.from_clause.clear();
+    let mut reads = Reads::new(&classify);
+    reads.select(&above, 0);
+    if reads.all {
+        return None;
+    }
+    let mut keys = reads.names;
+    if !tree_reads(tree, &mut keys) {
+        return None;
+    }
+    for f in filters {
+        if !expr_reads(&f.expr, &mut keys) {
+            return None;
+        }
+    }
+    for (l, r) in equalities {
+        keys.insert(l.clone());
+        keys.insert(r.clone());
+    }
+    Some(std::sync::Arc::new(keys))
 }
 
 /// One column visible in a join's scope.
@@ -326,7 +473,7 @@ pub(crate) fn plan_join_source(
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (pushdown, nonnullable, ec) = pushdown_filters(s, lookup);
+    let (pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
@@ -335,7 +482,41 @@ pub(crate) fn plan_join_source(
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
     let (tree, scope) = built?;
-    finish_join_source(s, tree, scope, params)
+    if moved.is_empty() {
+        return finish_join_source(s, tree, scope, params, &placed);
+    }
+    // The moved conjuncts ran in their leaves; the WHERE keeps the rest,
+    // and `placed` the rest's marks, in the same order.
+    let mut rest = s.clone();
+    rest.where_clause = s.where_clause.as_deref().and_then(|w| {
+        let mut conjuncts = Vec::new();
+        split_and(w, &mut conjuncts);
+        let kept: Vec<pg_query::protobuf::Node> = conjuncts
+            .into_iter()
+            .enumerate()
+            .filter(|(i, _)| !moved.contains(i))
+            .map(|(_, c)| c.clone())
+            .collect();
+        match kept.len() {
+            0 => None,
+            1 => kept.into_iter().next().map(Box::new),
+            _ => Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                    boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+                    args: kept,
+                    location: -1,
+                    ..Default::default()
+                }))),
+            })),
+        }
+    });
+    let placed: Vec<bool> = placed
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !moved.contains(i))
+        .map(|(_, p)| *p)
+        .collect();
+    finish_join_source(&rest, tree, scope, params, &placed)
 }
 
 fn build_tree(
@@ -425,6 +606,7 @@ fn finish_join_source(
     tree: JoinNode,
     scope: Scope,
     params: &[Bson],
+    placed: &[bool],
 ) -> Result<pg_query::protobuf::SelectStmt> {
     let spanning: Vec<&pg_query::protobuf::Node> = match s.where_clause.as_deref() {
         Some(w) => {
@@ -534,6 +716,20 @@ fn finish_join_source(
         }
         None => Vec::new(),
     };
+    // Each conjunct pushed or folded (`placed`, in WHERE order), or over
+    // two or more tables.
+    let where_modelled = match out.where_clause.as_deref() {
+        Some(w) => {
+            let mut conjuncts = Vec::new();
+            split_and(w, &mut conjuncts);
+            conjuncts.len() == placed.len()
+                && conjuncts
+                    .iter()
+                    .zip(placed)
+                    .all(|(c, p)| *p || key_aliases(c).len() >= 2)
+        }
+        None => true,
+    };
     let needed = {
         let mut above = out.clone();
         above.where_clause = None;
@@ -553,6 +749,7 @@ fn finish_join_source(
         }
         keys
     };
+    let project = projection(&out, &scope, &tree, &where_filters, &where_equalities);
     let name = PLANNED_JOINS.with(|j| {
         let mut j = j.borrow_mut();
         let name = format!("{SEP}join{SEP}{}", j.len());
@@ -567,7 +764,9 @@ fn finish_join_source(
                     where_span_aliases,
                     where_filters,
                     where_equalities,
+                    where_modelled,
                     needed,
+                    project,
                 }))),
                 def,
             },
@@ -1952,7 +2151,10 @@ pub(crate) const SELECT_LIST_SRFS: &[&str] = &[
 /// nullable side before the join would keep the NULL-extended rows
 /// PostgreSQL's WHERE drops. The conjunct also stays in the outer WHERE, so
 /// the answer is the same whether or not the leaf applied it -- the leaf
-/// just reads fewer rows, and can reach an index.
+/// just reads fewer rows, and can reach an index. One that calls a volatile
+/// or stable function, or a user function, is MOVED instead (its positions
+/// among the WHERE's conjuncts are the last value): it runs once a row of
+/// its table, as in PostgreSQL's scan, not again per joined row (RP-019).
 #[allow(clippy::type_complexity)]
 fn pushdown_filters(
     s: &pg_query::protobuf::SelectStmt,
@@ -1961,6 +2163,8 @@ fn pushdown_filters(
     Vec<(String, pg_query::protobuf::Node)>,
     Vec<String>,
     Option<EcPlan>,
+    Vec<bool>,
+    Vec<usize>,
 ) {
     let empty = pg_query::protobuf::Node::default();
     let w = s.where_clause.as_deref();
@@ -2002,27 +2206,68 @@ fn pushdown_filters(
     } else {
         None
     };
-    let mut pushed: Vec<(String, pg_query::protobuf::Node)> = conjuncts
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| {
-            ec.as_ref()
-                .is_none_or(|(_, absorbed, _)| !absorbed.contains(i))
-        })
-        .filter_map(|(_, c)| {
-            let alias = single_alias(c, &owner)?;
-            preserved.contains(&alias).then(|| {
-                let mut c = (*c).clone();
-                strip_qualifier(&mut c);
-                (alias, c)
-            })
-        })
-        .collect();
+    let mut filterable = Vec::new();
+    for item in &s.from_clause {
+        filtered_leaves(item, &mut filterable);
+    }
+    // Which conjuncts the scans or the classes take (in WHERE order), and
+    // which of them are moved rather than copied.
+    let mut placed = vec![false; conjuncts.len()];
+    let mut moved = Vec::new();
+    let mut pushed: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    for (i, c) in conjuncts.iter().enumerate() {
+        if ec
+            .as_ref()
+            .is_some_and(|(_, absorbed, _)| absorbed.contains(&i))
+        {
+            placed[i] = true;
+            continue;
+        }
+        let Some((alias, move_it)) = movable_alias(c, &owner) else {
+            continue;
+        };
+        // Only a stored table's leaf applies a pushed filter (`build`): a
+        // conjunct that is moved, not copied, goes nowhere else.
+        if move_it && !filterable.contains(&alias) {
+            continue;
+        }
+        if preserved.contains(&alias) {
+            placed[i] = true;
+            if move_it {
+                moved.push(i);
+            }
+            let mut c = (*c).clone();
+            strip_qualifier(&mut c);
+            pushed.push((alias, c));
+        }
+    }
     let ec = ec.map(|(plan, _, consts)| {
         pushed.extend(consts);
         plan
     });
-    (pushed, nonnullable, ec)
+    (pushed, nonnullable, ec, placed, moved)
+}
+
+/// The aliases of the FROM's table leaves that take a pushed filter: a
+/// table not renamed column by column (`build`'s `RangeVar` arm).
+fn filtered_leaves(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    match item.node.as_ref() {
+        Some(N::JoinExpr(j)) => {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                filtered_leaves(side, out);
+            }
+        }
+        Some(N::RangeVar(r)) if r.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) => {
+            out.push(
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or_else(|| r.relname.clone()),
+            );
+        }
+        _ => {}
+    }
 }
 
 /// One side of an equality atom: a table's column, or a constant.
@@ -2517,11 +2762,37 @@ fn single_alias(
     n: &pg_query::protobuf::Node,
     owner: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
+    match alias_of(n, owner, false) {
+        Some((alias, false)) => Some(alias),
+        _ => None,
+    }
+}
+
+/// `single_alias`, also taking a conjunct that calls a volatile or stable
+/// built-in or a user function over its one table: `(alias, true)` for one,
+/// which must be MOVED into the leaf rather than copied -- PostgreSQL runs
+/// a base relation's quals in its scan, once a row of that table (RP-019),
+/// and a copy left in the outer WHERE would run it again per joined row.
+fn movable_alias(
+    n: &pg_query::protobuf::Node,
+    owner: &dyn Fn(&str) -> Option<String>,
+) -> Option<(String, bool)> {
+    alias_of(n, owner, true)
+}
+
+fn alias_of(
+    n: &pg_query::protobuf::Node,
+    owner: &dyn Fn(&str) -> Option<String>,
+    movable: bool,
+) -> Option<(String, bool)> {
     fn walk(
         n: &pg_query::protobuf::Node,
         alias: &mut Option<String>,
+        moved: &std::cell::Cell<bool>,
         owner: &dyn Fn(&str) -> Option<String>,
+        movable: bool,
     ) -> bool {
+        let mut rec = |x: &pg_query::protobuf::Node| walk(x, alias, moved, owner, movable);
         match n.node.as_ref() {
             Some(N::ColumnRef(c)) => {
                 let parts: Option<Vec<&str>> = c
@@ -2549,38 +2820,59 @@ fn single_alias(
                 }
             }
             Some(N::AConst(_)) | Some(N::ParamRef(_)) => true,
-            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
+            Some(N::TypeCast(t)) => t.arg.as_deref().is_some_and(&mut rec),
             Some(N::AExpr(e)) => {
-                e.lexpr.as_deref().is_none_or(|x| walk(x, alias, owner))
-                    && e.rexpr.as_deref().is_none_or(|x| walk(x, alias, owner))
+                e.lexpr.as_deref().is_none_or(&mut rec) && e.rexpr.as_deref().is_none_or(&mut rec)
             }
-            Some(N::BoolExpr(b)) => b.args.iter().all(|a| walk(a, alias, owner)),
-            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
-            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(|a| walk(a, alias, owner)),
-            Some(N::List(l)) => l.items.iter().all(|a| walk(a, alias, owner)),
-            Some(N::AArrayExpr(a)) => a.elements.iter().all(|x| walk(x, alias, owner)),
+            Some(N::BoolExpr(b)) => b.args.iter().all(&mut rec),
+            Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(&mut rec),
+            Some(N::BooleanTest(t)) => t.arg.as_deref().is_some_and(&mut rec),
+            Some(N::List(l)) => l.items.iter().all(&mut rec),
+            Some(N::AArrayExpr(a)) => a.elements.iter().all(&mut rec),
             // An IMMUTABLE built-in: the pushed copy and the one left in the
             // outer WHERE give the same answer, so evaluating it twice is
-            // harmless. A volatile or stable one, a user function (which
-            // may shadow the built-in), and an aggregate or window call stay
-            // in the outer WHERE only.
+            // harmless. A volatile or stable one, or a user function (which
+            // may shadow the built-in), is only MOVED (`movable_alias`). An
+            // aggregate or window call, a set-returning one, and a correlated
+            // subquery's call stay in the outer WHERE only.
             Some(N::FuncCall(f)) => {
-                f.over.is_none()
+                let plain = f.over.is_none()
                     && f.agg_filter.is_none()
                     && f.agg_order.is_empty()
                     && !f.agg_star
-                    && !f.agg_distinct
-                    && func_name(f).is_some_and(|name| {
-                        crate::correlated::immutable_builtin(&name, f.args.len())
-                            && crate::correlated::user_function_for(&name, &f.args).is_none()
-                    })
-                    && f.args.iter().all(|a| walk(a, alias, owner))
+                    && !f.agg_distinct;
+                let Some(name) = func_name(f).filter(|_| plain) else {
+                    return false;
+                };
+                let user = crate::correlated::user_function_for(&name, &f.args);
+                let immutable =
+                    user.is_none() && crate::correlated::immutable_builtin(&name, f.args.len());
+                if !immutable {
+                    let callable = match &user {
+                        Some(u) => !u.returns_set,
+                        None => {
+                            crate::funcsig::is_builtin_function_name(&name)
+                                && !crate::funcsig::always_returns_set(&name)
+                                && aggregate_func(&name, false).is_none()
+                                && !crate::correlated::is_correlated_name(&name)
+                        }
+                    };
+                    if !(movable && callable) {
+                        return false;
+                    }
+                    moved.set(true);
+                }
+                f.args.iter().all(&mut rec)
             }
             _ => false,
         }
     }
     let mut alias = None;
-    (walk(n, &mut alias, owner)).then_some(alias).flatten()
+    let moved = std::cell::Cell::new(false);
+    walk(n, &mut alias, &moved, owner, movable)
+        .then_some(alias)
+        .flatten()
+        .map(|a| (a, moved.get()))
 }
 
 /// `a.x` -> `x`, for a conjunct moved into `a`'s own `SELECT * FROM t`.
@@ -2644,7 +2936,7 @@ mod tests {
             };
             Some(TableDef::new(name, cols))
         };
-        let (pushed, _, _) = pushdown_filters(s, &lookup);
+        let (pushed, _, _, _, _) = pushdown_filters(s, &lookup);
         pushed.into_iter().map(|(alias, _)| alias).collect()
     }
 
@@ -2685,17 +2977,47 @@ mod tests {
         );
     }
 
+    /// The positions among the WHERE's conjuncts of those MOVED to a leaf.
+    fn moved_in(sql: &str) -> Vec<usize> {
+        let parsed = pg_query::parse(sql).unwrap();
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().unwrap();
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("not a SELECT: {sql}");
+        };
+        let lookup = |name: &str| -> Option<TableDef> {
+            let cols = match name {
+                "a" => vec![
+                    Column::new("id", "int4", true),
+                    Column::new("v", "int4", false),
+                ],
+                "b" => vec![
+                    Column::new("id", "int4", false),
+                    Column::new("a_id", "int4", false),
+                ],
+                _ => return None,
+            };
+            Some(TableDef::new(name, cols))
+        };
+        pushdown_filters(s, &lookup).4
+    }
+
     #[test]
-    fn a_call_that_may_not_be_immutable_is_not_pushed() {
-        // Volatile: the pushed copy and the outer WHERE's would differ.
+    fn a_call_that_may_not_be_immutable_is_moved_not_copied() {
+        // Volatile: it runs in a's scan, once a row of a (RP-019), and
+        // leaves the outer WHERE, where it would run again per joined row.
+        let volatile = "select 1 from a join b on b.a_id = a.id where random() < a.v";
+        assert_eq!(pushed_to(volatile), vec!["a"]);
+        assert_eq!(moved_in(volatile), vec![0]);
+        // Stable, not immutable: moved too.
+        let stable = "select 1 from a join b on b.a_id = a.id \
+                      where b.id > 0 and a.v < extract(day from now())";
+        assert_eq!(pushed_to(stable), vec!["b", "a"]);
+        assert_eq!(moved_in(stable), vec![1]);
+        // Only into a leaf that takes a filter: a renamed table does not.
         assert!(
-            pushed_to("select 1 from a join b on b.a_id = a.id where random() < a.v").is_empty()
+            pushed_to("select 1 from a x(i, w) join b on b.a_id = x.i where random() < x.w")
+                .is_empty()
         );
-        // Stable, not immutable.
-        assert!(pushed_to(
-            "select 1 from a join b on b.a_id = a.id where a.v < extract(day from now())"
-        )
-        .is_empty());
         // An aggregate cannot appear in a WHERE, and is never pushed.
         assert!(
             pushed_to("select 1 from a join b on b.a_id = a.id where a.v = count(*)").is_empty()

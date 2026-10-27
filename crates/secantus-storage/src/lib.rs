@@ -1124,6 +1124,17 @@ fn oplog_index_spec(spec: &Document) -> Document {
     out
 }
 
+/// Can an oplog entry naming `ns` be a `local` one (`oplog_entry_is_local`)?
+/// Every namespace that function answers `true` for passes here: `false`
+/// means no entry of `ns` is local, whatever its operation and document.
+fn ns_may_hold_local_entry(ns: &str) -> bool {
+    ns == "local"
+        || ns.starts_with("local.")
+        || ns.ends_with(".system.profile")
+        || ns == "config.image_collection"
+        || ns.ends_with(".$cmd")
+}
+
 fn oplog_entry_is_local(e: &OplogEntry) -> bool {
     let (ns, target) = match e {
         OplogEntry::Doc(d) => (
@@ -2802,9 +2813,34 @@ fn decode_doc(bytes: &[u8]) -> Result<Document> {
 /// Encode a `{_id: <id>}` document — the oplog `o2` for every CRUD op (and the
 /// `o` of a `delete`, which mongod records as just the deleted doc's `_id`).
 fn encode_id_doc(id: &Bson) -> Result<Vec<u8>> {
-    let mut d = Document::new();
-    d.insert("_id", id.clone());
-    encode_doc(&d)
+    // The common `_id`s written straight into their bytes, which encoding a
+    // one-field document gives (every insert makes one, RP-014).
+    let element = |kind: u8, value: &[u8]| {
+        let len = 4 + 1 + 4 + value.len() + 1;
+        let mut b = Vec::with_capacity(len);
+        b.extend_from_slice(&(len as i32).to_le_bytes());
+        b.push(kind);
+        b.extend_from_slice(b"_id\0");
+        b.extend_from_slice(value);
+        b.push(0);
+        b
+    };
+    match id {
+        Bson::String(s) => {
+            let mut v = Vec::with_capacity(4 + s.len() + 1);
+            v.extend_from_slice(&(s.len() as i32 + 1).to_le_bytes());
+            v.extend_from_slice(s.as_bytes());
+            v.push(0);
+            Ok(element(0x02, &v))
+        }
+        Bson::Int32(n) => Ok(element(0x10, &n.to_le_bytes())),
+        Bson::Int64(n) => Ok(element(0x12, &n.to_le_bytes())),
+        _ => {
+            let mut d = Document::new();
+            d.insert("_id", id.clone());
+            encode_doc(&d)
+        }
+    }
 }
 
 /// `id_key = sortkey.encode_id_key(_id)` — the byte-sortable key for the `_id`.
@@ -4670,8 +4706,17 @@ type EntryOps = Vec<(String, Vec<u8>)>;
 /// The per-collection write locks, and the size at which the next new
 /// namespace prunes the unused ones.
 struct CollLocks {
-    map: HashMap<(String, String), Arc<Mutex<()>>>,
+    /// By database, then collection: looked up by borrowed names, with no
+    /// key built for a lock already there (every write asks, RP-014).
+    map: HashMap<String, HashMap<String, Arc<Mutex<()>>>>,
     prune_at: usize,
+}
+
+impl CollLocks {
+    /// How many locks are kept.
+    fn len(&self) -> usize {
+        self.map.values().map(HashMap::len).sum()
+    }
 }
 
 /// The fewest entries at which `coll_lock` prunes.
@@ -4827,7 +4872,7 @@ pub struct Storage {
     /// server restarted, the next insert reuses its RecordId). Kept in memory
     /// only, as mongod keeps it; forgotten when the collection is dropped, so
     /// a re-created one starts again at 1.
-    record_ids: Mutex<HashMap<(String, String), i64>>,
+    record_ids: Mutex<HashMap<String, HashMap<String, i64>>>,
     /// Per `(db, collection, index)`: which components of each key field hold
     /// an array in some document -- mongod's multikey paths, which its planner
     /// reads to decide how far an index's bounds can be narrowed. Computed by
@@ -5176,6 +5221,264 @@ pub struct Held {
     /// The store the transaction runs in (its `Storage`'s address): the
     /// shared-lock table is process-wide and keys rows by store too.
     pub store: usize,
+    /// The undo journal of the transaction's open savepoints (see
+    /// [`UndoJournal`]). Not emptied by [`Held::clear`]: a move onto a new
+    /// WiredTiger transaction keeps the savepoints, and the journal with them.
+    pub undo: UndoJournal,
+}
+
+/// A savepoint's undo journal: the first write of each document row after
+/// the savepoint records the row as it was (or that it did not exist), and
+/// the first create or drop of a collection whether it existed. Rolling back
+/// to the savepoint puts back those rows only, so a savepoint costs what is
+/// written after it -- PostgreSQL's subtransaction, whose abort makes the
+/// row versions it wrote invisible -- and never the size of the tables
+/// written. Kept only while a server has opened a frame
+/// ([`UndoJournal::open`]); the MongoDB server opens none, so it records
+/// nothing.
+///
+/// A row is recorded in the INNERMOST frame only: a row written after an
+/// inner savepoint and not after the outer one was not written between the
+/// two, so its state at the inner one is its state at the outer one too.
+/// Rolling back to a frame takes the OLDEST record of each row among it and
+/// the frames inside it; releasing one merges it down the same way.
+#[derive(Debug, Default)]
+pub struct UndoJournal {
+    frames: Vec<UndoFrame>,
+    /// While positive nothing is recorded: the writes being made are the
+    /// journal's own undo, or a move's replay of writes already recorded.
+    paused: usize,
+}
+
+/// What one savepoint's frame of the [`UndoJournal`] holds.
+#[derive(Debug, Default, Clone)]
+pub struct UndoFrame {
+    id: u64,
+    seen: HashSet<(String, String, Vec<u8>)>,
+    colls_seen: HashSet<(String, String)>,
+    /// Each row first written since the savepoint, in the order written.
+    pub rows: Vec<UndoRow>,
+    /// Each collection first created or dropped since the savepoint.
+    pub collections: Vec<UndoCollection>,
+}
+
+/// A row as it was when its savepoint was taken.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoRow {
+    pub db: String,
+    pub coll: String,
+    /// The row's `_id`.
+    pub id: Bson,
+    /// Its document then; `None` when it did not exist.
+    pub prior: Option<Vec<u8>>,
+}
+
+/// Whether a collection created or dropped since a savepoint existed then.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UndoCollection {
+    pub db: String,
+    pub coll: String,
+    pub existed: bool,
+}
+
+impl UndoFrame {
+    /// Add `other`'s records of rows and collections this frame has not got:
+    /// this frame's are the older.
+    fn absorb(&mut self, other: UndoFrame) {
+        let UndoFrame {
+            rows, collections, ..
+        } = other;
+        for row in rows {
+            let key = (row.db.clone(), row.coll.clone(), undo_id_key(&row.id));
+            if self.seen.insert(key) {
+                self.rows.push(row);
+            }
+        }
+        for c in collections {
+            if self.colls_seen.insert((c.db.clone(), c.coll.clone())) {
+                self.collections.push(c);
+            }
+        }
+    }
+}
+
+/// The key a journal frame knows a row by.
+fn undo_id_key(id: &Bson) -> Vec<u8> {
+    id_key(id).unwrap_or_else(|_| format!("{id:?}").into_bytes())
+}
+
+impl UndoJournal {
+    /// Open a frame for savepoint `id`.
+    pub fn open(&mut self, id: u64) {
+        self.frames.push(UndoFrame {
+            id,
+            ..UndoFrame::default()
+        });
+    }
+
+    /// Forget every frame (no savepoint is open).
+    pub fn reset(&mut self) {
+        self.frames.clear();
+    }
+
+    /// Is a frame open for savepoint `id`?
+    pub fn has_frame(&self, id: u64) -> bool {
+        self.frames.iter().any(|f| f.id == id)
+    }
+
+    /// RELEASE savepoint `id`: its frame and the ones inside it merge into
+    /// the frame enclosing it (whose records are the older), or are dropped
+    /// when there is none -- the writes are then the transaction's own.
+    /// `false` when no frame is open for `id`.
+    pub fn release(&mut self, id: u64) -> bool {
+        let Some(p) = self.frames.iter().position(|f| f.id == id) else {
+            return false;
+        };
+        let dropped = self.frames.split_off(p);
+        if let Some(outer) = self.frames.last_mut() {
+            for f in dropped {
+                outer.absorb(f);
+            }
+        }
+        true
+    }
+
+    /// ROLLBACK TO savepoint `id`: the records to put back -- the oldest of
+    /// each row among its frame and the ones inside it -- leaving its frame
+    /// open and empty, and the frames inside it gone. `None` when no frame
+    /// is open for `id`.
+    pub fn rollback_to(&mut self, id: u64) -> Option<UndoFrame> {
+        let p = self.frames.iter().position(|f| f.id == id)?;
+        let inner = self.frames.split_off(p + 1);
+        let mut merged = std::mem::take(&mut self.frames[p]);
+        self.frames[p].id = id;
+        for f in inner {
+            merged.absorb(f);
+        }
+        Some(merged)
+    }
+
+    /// Stop recording until the matching [`Self::resume`].
+    pub fn pause(&mut self) {
+        self.paused += 1;
+    }
+
+    /// Undo one [`Self::pause`].
+    pub fn resume(&mut self) {
+        self.paused = self.paused.saturating_sub(1);
+    }
+
+    /// Is a row write to be recorded? (A frame is open and not paused.)
+    fn recording(&self) -> bool {
+        self.paused == 0 && !self.frames.is_empty()
+    }
+}
+
+/// Record, for the user transaction running on this thread, the first write
+/// of a document row since its innermost open savepoint (see
+/// [`UndoJournal`]): `prior` is the row as the transaction saw it before the
+/// write (`None` for an insert), `id_src` a document carrying its `_id` (the
+/// new one when there is no prior).
+fn undo_note_row(
+    db: &str,
+    coll: &str,
+    id_k: &[u8],
+    prior: Option<&[u8]>,
+    id_src: &[u8],
+) -> Result<()> {
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return Ok(());
+    }
+    ACTIVE_ROWS.with(|a| -> Result<()> {
+        let Some(held) = a.borrow().as_ref().map(Arc::clone) else {
+            return Ok(());
+        };
+        let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        if !h.undo.recording() {
+            return Ok(());
+        }
+        let key = (db.to_string(), coll.to_string(), id_k.to_vec());
+        let frame = h.undo.frames.last_mut().expect("recording");
+        if frame.seen.contains(&key) {
+            return Ok(());
+        }
+        let src = prior.unwrap_or(id_src);
+        let id: Bson = bson::RawDocument::from_bytes(src)
+            .map_err(|e| StorageError::Bson(e.to_string()))?
+            .get("_id")
+            .map_err(|e| StorageError::Bson(e.to_string()))?
+            .ok_or_else(|| StorageError::Internal("a row without _id".into()))?
+            .to_raw_bson()
+            .try_into()
+            .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+        // The frame knows rows by the key `undo_id_key` gives their `_id`,
+        // which a merge recomputes: keep the two the same.
+        let key = (key.0, key.1, undo_id_key(&id));
+        if frame.seen.insert(key) {
+            frame.rows.push(UndoRow {
+                db: db.to_string(),
+                coll: coll.to_string(),
+                id,
+                prior: prior.map(<[u8]>::to_vec),
+            });
+        }
+        Ok(())
+    })
+}
+
+/// Record, for the user transaction running on this thread, the first
+/// create or drop of `(db, coll)` since its innermost open savepoint, and
+/// whether it existed before it (see [`UndoJournal`]).
+fn undo_note_collection(db: &str, coll: &str, existed: bool) {
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return;
+    }
+    ACTIVE_ROWS.with(|a| {
+        if let Some(held) = a.borrow().as_ref() {
+            let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+            if !h.undo.recording() {
+                return;
+            }
+            let frame = h.undo.frames.last_mut().expect("recording");
+            if frame.colls_seen.insert((db.to_string(), coll.to_string())) {
+                frame.collections.push(UndoCollection {
+                    db: db.to_string(),
+                    coll: coll.to_string(),
+                    existed,
+                });
+            }
+        }
+    });
+}
+
+/// The rows of the user transaction running on this thread (its undo
+/// journal among them); `None` outside one.
+pub fn active_held_rows() -> Option<HeldRows> {
+    if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+        return None;
+    }
+    ACTIVE_ROWS.with(|a| a.borrow().as_ref().map(Arc::clone))
+}
+
+/// Pauses the undo journal of `held` while it lives (see
+/// [`UndoJournal::pause`]).
+pub struct UndoPause(HeldRows);
+
+impl UndoPause {
+    pub fn new(held: &HeldRows) -> Self {
+        held.lock().unwrap_or_else(|e| e.into_inner()).undo.pause();
+        UndoPause(Arc::clone(held))
+    }
+}
+
+impl Drop for UndoPause {
+    fn drop(&mut self) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .undo
+            .resume();
+    }
 }
 
 impl Held {
@@ -5505,7 +5808,7 @@ fn note_written_entries(entries: &[OplogEntry]) {
     for e in entries {
         let (op, name) = match e {
             OplogEntry::Doc(d) => (d.get_str("op").ok(), d.get_str("ns").ok()),
-            OplogEntry::Raw(r) => (r.get_str("op").ok(), r.get_str("ns").ok()),
+            OplogEntry::Raw(r) => raw_op_ns(r),
         };
         let changed = match op {
             Some("i") => false,
@@ -5544,6 +5847,40 @@ fn note_written_entries(entries: &[OplogEntry]) {
             }
         });
     }
+}
+
+/// A raw entry's `op` and `ns` strings, as `get_str` reads them (the first
+/// field of each name, `None` when it is missing or not a string). The
+/// entries a write builds lead with the two (`oplog_entry_crud`), which are
+/// read here straight off the bytes; an entry that does not -- a non-string
+/// field before both are found -- is read field by field as before (RP-014).
+fn raw_op_ns(r: &bson::RawDocumentBuf) -> (Option<&str>, Option<&str>) {
+    fn leading(b: &[u8]) -> Option<(Option<&str>, Option<&str>)> {
+        let (mut op, mut ns) = (None, None);
+        let mut at = 4usize;
+        while op.is_none() || ns.is_none() {
+            // A string element: its type, its key, its length, its bytes.
+            if *b.get(at)? != 0x02 {
+                return None;
+            }
+            let key_start = at + 1;
+            let key_len = b.get(key_start..)?.iter().position(|c| *c == 0)?;
+            let key = &b[key_start..key_start + key_len];
+            let len_at = key_start + key_len + 1;
+            let len = i32::from_le_bytes(b.get(len_at..len_at + 4)?.try_into().ok()?);
+            let len = usize::try_from(len).ok().filter(|n| *n >= 1)?;
+            let value = b.get(len_at + 4..len_at + 4 + len - 1)?;
+            let value = std::str::from_utf8(value).ok()?;
+            match key {
+                b"op" if op.is_none() => op = Some(value),
+                b"ns" if ns.is_none() => ns = Some(value),
+                _ => {}
+            }
+            at = len_at + 4 + len;
+        }
+        Some((op, ns))
+    }
+    leading(r.as_bytes()).unwrap_or_else(|| (r.get_str("op").ok(), r.get_str("ns").ok()))
 }
 
 /// The collection a [`WrittenRow`]'s collection part names (an `_id` key's
@@ -7254,20 +7591,24 @@ impl Storage {
     /// `storage._coll_lock`.
     fn coll_lock(&self, db: &str, coll: &str) -> Arc<Mutex<()>> {
         let mut reg = self.coll_locks.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (db.to_string(), coll.to_string());
-        if let Some(lock) = reg.map.get(&key) {
+        if let Some(lock) = reg.map.get(db).and_then(|c| c.get(coll)) {
             return lock.clone();
         }
         // A new namespace: past the threshold, first let go of the locks no
         // one holds, so a server that has seen millions of collections does
         // not keep a mutex for each (RM-194). The threshold doubles past what
         // is still held, which keeps the pruning amortised.
-        if reg.map.len() >= reg.prune_at {
-            reg.map.retain(|_, lock| Arc::strong_count(lock) > 1);
-            reg.prune_at = (reg.map.len() * 2).max(COLL_LOCKS_PRUNE_FLOOR);
+        if reg.len() >= reg.prune_at {
+            for colls in reg.map.values_mut() {
+                colls.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            reg.map.retain(|_, colls| !colls.is_empty());
+            reg.prune_at = (reg.len() * 2).max(COLL_LOCKS_PRUNE_FLOOR);
         }
         reg.map
-            .entry(key)
+            .entry(db.to_string())
+            .or_default()
+            .entry(coll.to_string())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
@@ -7278,7 +7619,6 @@ impl Storage {
         self.coll_locks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .map
             .len()
     }
 
@@ -7753,26 +8093,47 @@ impl Storage {
         o: &[u8],
         o2: &[u8],
     ) -> Result<bson::RawDocumentBuf> {
-        let mut buf = bson::RawDocumentBuf::new();
-        buf.append("op", bson::RawBsonRef::String(op).to_raw_bson());
-        buf.append("ns", bson::RawBsonRef::String(ns).to_raw_bson());
-        if let Some(u) = ui {
-            buf.append(
-                "ui",
-                bson::RawBsonRef::Binary(bson::raw::RawBinaryRef {
-                    subtype: BinarySubtype::Uuid,
-                    bytes: u,
-                })
-                .to_raw_bson(),
-            );
+        bson::RawDocument::from_bytes(o).map_err(|e| StorageError::Bson(e.to_string()))?;
+        bson::RawDocument::from_bytes(o2).map_err(|e| StorageError::Bson(e.to_string()))?;
+        // The bytes `RawDocumentBuf::append` writes for these five fields,
+        // written at once into a buffer of the final size: appending field
+        // by field converted and copied each value again (RP-014).
+        let mut b = Vec::with_capacity(
+            4 + 2 * 8
+                + op.len()
+                + ns.len()
+                + ui.map_or(0, |u| 10 + u.len())
+                + 3
+                + o.len()
+                + 4
+                + o2.len()
+                + 1,
+        );
+        b.extend_from_slice(&[0; 4]);
+        for (key, value) in [(&b"op\0"[..], op), (&b"ns\0"[..], ns)] {
+            b.push(0x02);
+            b.extend_from_slice(key);
+            b.extend_from_slice(&(value.len() as i32 + 1).to_le_bytes());
+            b.extend_from_slice(value.as_bytes());
+            b.push(0);
         }
-        let o_raw =
-            bson::RawDocument::from_bytes(o).map_err(|e| StorageError::Bson(e.to_string()))?;
-        let o2_raw =
-            bson::RawDocument::from_bytes(o2).map_err(|e| StorageError::Bson(e.to_string()))?;
-        buf.append("o", bson::RawBsonRef::Document(o_raw).to_raw_bson());
-        buf.append("o2", bson::RawBsonRef::Document(o2_raw).to_raw_bson());
-        Ok(buf)
+        if let Some(u) = ui {
+            b.push(0x05);
+            b.extend_from_slice(b"ui\0");
+            b.extend_from_slice(&(u.len() as i32).to_le_bytes());
+            b.push(u8::from(BinarySubtype::Uuid));
+            b.extend_from_slice(u);
+        }
+        b.push(0x03);
+        b.extend_from_slice(b"o\0");
+        b.extend_from_slice(o);
+        b.push(0x03);
+        b.extend_from_slice(b"o2\0");
+        b.extend_from_slice(o2);
+        b.push(0);
+        let len = b.len() as i32;
+        b[..4].copy_from_slice(&len.to_le_bytes());
+        bson::RawDocumentBuf::from_bytes(b).map_err(|e| StorageError::Bson(e.to_string()))
     }
 
     /// The oplog entry for a collection's creation, with the `_id` index
@@ -7846,13 +8207,29 @@ impl Storage {
         entries: Vec<OplogEntry>,
         pre_images: Vec<Option<Vec<u8>>>,
     ) -> Result<i64> {
+        self.emit_oplog_entries_of(session, entries, pre_images, None)
+    }
+
+    /// [`Self::emit_oplog_entries`] with, when the caller knows it, whether
+    /// any entry is a `local` one (`oplog_entry_is_local`): an insert's
+    /// entries all name its own collection, so its namespace answers for
+    /// every one of them without reading each (RP-014). Everything else --
+    /// the user write block among it -- is as for any emit.
+    fn emit_oplog_entries_of(
+        &self,
+        session: &Session,
+        entries: Vec<OplogEntry>,
+        pre_images: Vec<Option<Vec<u8>>>,
+        any_local: Option<bool>,
+    ) -> Result<i64> {
         if !self.enable_oplog || entries.is_empty() {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
         // The `local` database is not replicated: mongod writes no oplog entry
         // for a write to it, so a change stream never sees one.
-        let (entries, pre_images) = if entries.iter().any(oplog_entry_is_local) {
+        let any_local = any_local.unwrap_or_else(|| entries.iter().any(oplog_entry_is_local));
+        let (entries, pre_images) = if any_local {
             let (entries, pre_images): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .zip(pre_images)
@@ -8005,15 +8382,7 @@ impl Storage {
                     d.insert("wall", wall.clone());
                     encode_doc(&d)?
                 }
-                OplogEntry::Raw(mut buf) => {
-                    buf.append("ts", bson::RawBsonRef::Timestamp(ts[i]).to_raw_bson());
-                    buf.append(
-                        "wall",
-                        bson::RawBsonRef::DateTime(bson::DateTime::from_millis(wall_millis))
-                            .to_raw_bson(),
-                    );
-                    buf.into_bytes()
-                }
+                OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
             };
             cur.reset()?;
             cur.set_key_q(seq);
@@ -8131,15 +8500,7 @@ impl Storage {
                         vec![5, 0, 0, 0, 0]
                     })
                 }
-                OplogEntry::Raw(mut buf) => {
-                    buf.append("ts", bson::RawBsonRef::Timestamp(ts[i]).to_raw_bson());
-                    buf.append(
-                        "wall",
-                        bson::RawBsonRef::DateTime(bson::DateTime::from_millis(wall_millis))
-                            .to_raw_bson(),
-                    );
-                    buf.into_bytes()
-                }
+                OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
             };
             blobs.push(blob);
             preimages.push(pre);
@@ -10471,6 +10832,9 @@ impl Storage {
         fresh.deferred_creates = handle.deferred_creates.clone();
         fresh.deferred_keys = handle.deferred_keys.clone();
         let _moving = MoveGuard::new(&handle.held);
+        // The replay rewrites what the journal already recorded (or what
+        // came before its savepoints): it records nothing.
+        let _undo_paused = UndoPause::new(&handle.held);
         self.rollback_user_transaction_inner(handle, false)?;
         // The locks taken by rewriting a row unchanged have no oplog entry:
         // they are taken again after the replay.
@@ -11288,6 +11652,7 @@ impl Storage {
                 // Doc table keyed by the (unique) RecordId.
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 note_row(db, coll, recordid)?;
+                undo_note_row(db, coll, &key, None, blob)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
@@ -11333,6 +11698,32 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
+        self.insert_with(db, coll, docs, None, ordered)
+    }
+
+    /// [`Self::insert`] of documents the caller holds decoded as well as
+    /// encoded: each pair is a document and its BSON encoding (`bson`'s, of
+    /// that very document), so the insert need not decode what the caller
+    /// just encoded (RP-014: the PostgreSQL server's rows).
+    pub fn insert_documents(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<(Vec<u8>, Document)>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>)> {
+        let (bytes, decoded): (Vec<Vec<u8>>, Vec<Document>) = docs.into_iter().unzip();
+        self.insert_with(db, coll, bytes, Some(decoded), ordered)
+    }
+
+    fn insert_with(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        decoded: Option<Vec<Document>>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>)> {
         let _admit = self.admit_write();
         // One wire message never runs as ONE statement transaction: its dirty
         // content (doc rows + full-doc oplog entries + index entries, ~2-3x
@@ -11351,7 +11742,7 @@ impl Storage {
         let mut errors: Vec<Document> = Vec::new();
         if docs.is_empty() {
             // An empty batch still lazily creates the collection.
-            let (_, _, _) = self.insert_chunk(db, coll, &[], 0, ordered)?;
+            let (_, _, _) = self.insert_chunk(db, coll, &[], None, 0, ordered)?;
             return Ok((0, errors));
         }
         // A user write block refuses each document as mongod's insert does,
@@ -11371,6 +11762,7 @@ impl Storage {
             }
         }
         let n = docs.len();
+        let mut decoded = decoded.map(Vec::into_iter);
         let mut start = 0usize;
         while start < n {
             let mut end = start + 1;
@@ -11382,8 +11774,11 @@ impl Storage {
                 chunk_bytes += docs[end].len();
                 end += 1;
             }
+            let chunk_decoded = decoded
+                .as_mut()
+                .map(|d| d.by_ref().take(end - start).collect::<Vec<_>>());
             let (chunk_inserted, chunk_errors, stopped) =
-                self.insert_chunk(db, coll, &docs[start..end], start, ordered)?;
+                self.insert_chunk(db, coll, &docs[start..end], chunk_decoded, start, ordered)?;
             inserted += chunk_inserted;
             errors.extend(chunk_errors);
             if stopped {
@@ -11403,9 +11798,35 @@ impl Storage {
         db: &str,
         coll: &str,
         docs: &[Vec<u8>],
+        decoded: Option<Vec<Document>>,
         base_index: usize,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>, bool)> {
+        // What depends only on the documents themselves -- decoding them, an
+        // `_id` minted for one with none, its `_id` key and the oplog's `o2`
+        // -- is done BEFORE the collection's write lock: every writer to the
+        // collection waits on that lock, so work done under it is work no
+        // other writer can overlap (RP-014).
+        // A caller's decoded documents are its encoded ones' (`insert_documents`).
+        debug_assert!(decoded.as_ref().is_none_or(|d| d.len() == docs.len()));
+        let mut decoded = decoded.map(Vec::into_iter);
+        let prepared: Vec<PreparedDoc> = docs
+            .iter()
+            .map(|doc_bytes| {
+                let mut doc = match decoded.as_mut().and_then(Iterator::next) {
+                    Some(doc) => doc,
+                    None => decode_doc(doc_bytes)?,
+                };
+                let assigned_id = !doc.contains_key("_id");
+                if assigned_id {
+                    doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
+                }
+                let id = doc.get("_id").expect("_id present").clone();
+                let key = id_key(&id)?;
+                let o2 = encode_id_doc(&id)?;
+                Ok((doc, assigned_id, id, key, o2))
+            })
+            .collect::<Result<_>>()?;
         self.retry_write_conflicts("insert", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -11448,26 +11869,22 @@ impl Storage {
                 for (offset, doc_bytes) in docs.iter().enumerate() {
                     let index = base_index + offset;
                     outcomes.push((doc_bytes.len(), None));
-                    let mut doc = decode_doc(doc_bytes)?;
-                    let assigned_id = !doc.contains_key("_id");
-                    if assigned_id {
-                        doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
-                    }
+                    let (doc, assigned_id, id, base_key, o2) = &prepared[offset];
+                    let (doc, assigned_id) = (doc, *assigned_id);
                     // A profile entry is stored as written, with no `_id`:
                     // mongod's `system.profile` has no `_id` index. The id
                     // minted above only keys the row. So is a time-series
                     // measurement inserted with none: mongod stores it
                     // without one (RM-089, measured 8.2.11).
                     let unkeyed = assigned_id && (coll == PROFILE_COLLECTION || timeseries);
-                    let id = doc.get("_id").expect("_id present").clone();
-                    let mut key = id_key(&id)?;
+                    let mut key = base_key.clone();
                     // Timeseries: suffix the doc-table key so duplicate `_id`s coexist.
                     if timeseries {
                         key.extend_from_slice(&self.timeseries_doc_suffix());
                     }
                     // A value a geo index cannot hold is that document's
                     // write error, as a duplicate key is.
-                    if let Some((code, errmsg)) = geo_key_problem(&doc, &descs) {
+                    if let Some((code, errmsg)) = geo_key_problem(doc, &descs) {
                         let mut e = Document::new();
                         e.insert("index", index as i32);
                         e.insert("code", code);
@@ -11483,7 +11900,7 @@ impl Storage {
                     // A document that also repeats an `_id` is reported for
                     // the `_id`, as mongod does: the write below finds it.
                     let conflict =
-                        match self.unique_conflict(&session, db, coll, &doc, &descs, None)? {
+                        match self.unique_conflict(&session, db, coll, doc, &descs, None)? {
                             Some(_)
                                 if !timeseries
                                     && self.doc_recordid(&session, db, coll, &key)?.is_some() =>
@@ -11511,7 +11928,7 @@ impl Storage {
                     }
                     // Raw-write fast path: reuse the caller's BSON verbatim when it
                     // is already in mongod's canonical storage form (`_id` first, and
-                    // no `_id` assigned here). encode_doc(&doc) would reproduce these
+                    // no `_id` assigned here). encode_doc(doc) would reproduce these
                     // exact bytes, so re-encoding is dead work; mongod likewise stores
                     // the document as the client sent it. Falls back to encode_doc when
                     // an ObjectId was assigned or `_id` is not the leading field (the
@@ -11521,7 +11938,7 @@ impl Storage {
                     let blob: &[u8] = if unkeyed || (!assigned_id && id_first) {
                         doc_bytes
                     } else {
-                        reencoded = encode_doc(&doc)?;
+                        reencoded = encode_doc(doc)?;
                         &reencoded
                     };
                     if blob.len() > MAX_BSON_OBJECT_SIZE {
@@ -11561,14 +11978,14 @@ impl Storage {
                             // `keyValue` and extra fields (RM-142, measured 8.2.11).
                             let mut id_conflict: Option<UniqueConflict> = None;
                             if let Some(claim) = self.id_claim_desc(&session, db, coll)? {
-                                let kb = claim.key_variants(&doc, false)?.into_iter().next();
+                                let kb = claim.key_variants(doc, false)?.into_iter().next();
                                 if let Some(kb) = kb {
                                     let conflict = with_bindata_order(claim.key_order, || {
                                         UniqueConflict::new(
                                             ns.clone(),
                                             &claim.name,
                                             &claim.key_spec,
-                                            &doc,
+                                            doc,
                                             &kb,
                                             claim.collation.as_ref(),
                                         )
@@ -11613,30 +12030,25 @@ impl Storage {
                     // Doc table keyed by the (unique) RecordId.
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &key, None, blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
                     self.sizes
                         .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
-                    self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
-                    self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
+                    self.write_index_entries(&session, db, coll, doc, &descs, recordid)?;
+                    self.maybe_mark_multikey(&session, db, coll, doc, &descs)?;
                     inserted += 1;
                     inserted_bytes += blob.len() as i64;
                     if oplog_on {
                         // `o` splices the stored doc bytes (`blob`) verbatim — no
                         // re-encode of the document body (the oplog hot-path win);
                         // `o2` is the tiny `{_id}`. `doc` is not used afterward.
-                        let o2 = encode_id_doc(&id)?;
                         if let Some(last) = outcomes.last_mut() {
                             last.1 = Some(oplog_entries.len());
                         }
-                        let mut entry = Self::oplog_entry_crud(
-                            "i",
-                            &ns,
-                            Some(ui.as_ref().unwrap()),
-                            blob,
-                            &o2,
-                        )?;
+                        let mut entry =
+                            Self::oplog_entry_crud("i", &ns, Some(ui.as_ref().unwrap()), blob, o2)?;
                         // A retryable write's insert names its statement:
                         // the position its document had in the command.
                         let position = INSERT_POSITIONS
@@ -11672,7 +12084,12 @@ impl Storage {
                     )?;
                 }
                 if oplog_on && !oplog_entries.is_empty() {
-                    self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
+                    // Every entry here names this collection -- its inserts,
+                    // and a capped collection's evictions -- so whether one
+                    // is a `local` entry is its namespace's answer. A
+                    // namespace that could hold one is read entry by entry.
+                    let any_local = (!ns_may_hold_local_entry(&ns)).then_some(false);
+                    self.emit_oplog_entries_of(&session, oplog_entries, pre_images, any_local)?;
                 }
                 // A retryable insert checks for interrupt before its batch
                 // commits, and a kill rolls the whole batch back: mongod
@@ -11875,6 +12292,7 @@ impl Storage {
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 note_row(db, coll, recordid)?;
+                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
@@ -11960,6 +12378,7 @@ impl Storage {
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
+                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
                 cur.remove()?;
                 self.sizes.adjust(
                     &session,
@@ -12362,6 +12781,7 @@ impl Storage {
                     match c.search() {
                         Ok(()) => {
                             c.remove()?;
+                            undo_note_collection(db, coll, true);
                             note_coll_table_write();
                         }
                         Err(e) if e.is_not_found() => {}
@@ -12639,6 +13059,7 @@ impl Storage {
                         match rc.search() {
                             Ok(()) => {
                                 rc.remove()?;
+                                undo_note_collection(db, c, true);
                                 note_coll_table_write();
                             }
                             Err(e) if e.is_not_found() => {}
@@ -13045,6 +13466,7 @@ impl Storage {
             match c.search() {
                 Ok(()) => {
                     c.remove()?;
+                    undo_note_collection(dst_db, dst_coll, true);
                     note_coll_table_write();
                 }
                 Err(e) if e.is_not_found() => {}
@@ -13124,6 +13546,7 @@ impl Storage {
         match rc.search() {
             Ok(()) => {
                 rc.remove()?;
+                undo_note_collection(src_db, src_coll, true);
                 note_coll_table_write();
             }
             Err(e) if e.is_not_found() => {}
@@ -14287,26 +14710,32 @@ impl Storage {
     /// `_id_` index first, then stored indexes), sorted by name. Empty when the
     /// collection doesn't exist. Mirrors `storage.list_indexes`.
     pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>> {
+        self.list_indexes_shared(db, coll).map(Arc::unwrap_or_clone)
+    }
+
+    /// [`Self::list_indexes`] without the copy: the cached list itself, for
+    /// a caller that only reads it (the PostgreSQL server asks on every row
+    /// it writes, and copying the list was most of the cost -- RP-014).
+    pub fn list_indexes_shared(&self, db: &str, coll: &str) -> Result<Arc<Vec<Document>>> {
         // Lock-free read outside a transaction; inside one, the transaction's own
         // session, so a DROP / CREATE earlier in it is seen (see `op_session`).
         let session = self.op_session()?;
         // Read once per catalog generation, as `index_descs_cached` is: the
         // PostgreSQL server asks on every row it writes.
         let Some(gen) = self.planner_shared_gen(&session) else {
-            return self.read_list_indexes(&session, db, coll);
+            return self.read_list_indexes(&session, db, coll).map(Arc::new);
         };
-        let key = (db.to_string(), coll.to_string());
-        if let Some((g, list)) = self
-            .list_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
+        if let Some((g, list)) = catalog_entry(
+            &self.list_cache.read().unwrap_or_else(|e| e.into_inner()),
+            db,
+            coll,
+        ) {
             if *g == gen {
-                return Ok(list.as_ref().clone());
+                return Ok(Arc::clone(list));
             }
         }
-        let list = self.read_list_indexes(&session, db, coll)?;
+        let key = (db.to_string(), coll.to_string());
+        let list = Arc::new(self.read_list_indexes(&session, db, coll)?);
         if planner_settled() == Some(gen)
             && deferred_row(&session, db, coll).is_none()
             && collection_registered(&session, db, coll)?
@@ -14315,7 +14744,7 @@ impl Storage {
             if cache.values().any(|(g, _)| *g != gen) {
                 cache.clear();
             }
-            cache.insert(key, (gen, Arc::new(list.clone())));
+            cache.insert(key, (gen, Arc::clone(&list)));
         }
         Ok(list)
     }
@@ -14849,12 +15278,17 @@ impl Storage {
     /// from 1, as mongod numbers records (`record_ids`).
     fn mint_record_id(&self, db: &str, coll: &str) -> Result<i64> {
         let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (db.to_string(), coll.to_string());
-        let next = match ids.get(&key) {
-            Some(n) => *n,
-            None => self.largest_record_id(db, coll)? + 1,
-        };
-        ids.insert(key, next + 1);
+        // By database, then collection: asked by borrowed names, with no
+        // key built for a counter already there (every insert asks, RP-014).
+        if let Some(n) = ids.get_mut(db).and_then(|c| c.get_mut(coll)) {
+            let next = *n;
+            *n = next + 1;
+            return Ok(next);
+        }
+        let next = self.largest_record_id(db, coll)? + 1;
+        ids.entry(db.to_string())
+            .or_default()
+            .insert(coll.to_string(), next + 1);
         Ok(next)
     }
 
@@ -14862,7 +15296,7 @@ impl Storage {
     /// reserving it.
     fn next_record_id(&self, db: &str, coll: &str) -> Result<i64> {
         let ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        match ids.get(&(db.to_string(), coll.to_string())) {
+        match ids.get(db).and_then(|c| c.get(coll)) {
             Some(n) => Ok(*n),
             None => Ok(self.largest_record_id(db, coll)? + 1),
         }
@@ -14872,14 +15306,18 @@ impl Storage {
     /// collection keeps its records' ids and goes on from its source's).
     fn set_next_record_id(&self, db: &str, coll: &str, next: i64) {
         let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        ids.insert((db.to_string(), coll.to_string()), next);
+        ids.entry(db.to_string())
+            .or_default()
+            .insert(coll.to_string(), next);
     }
 
     /// Forget the counter of a dropped `(db, coll)`: one created again under
     /// the name numbers its records from 1, as mongod's does.
     fn forget_record_ids(&self, db: &str, coll: &str) {
         let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        ids.remove(&(db.to_string(), coll.to_string()));
+        if let Some(c) = ids.get_mut(db) {
+            c.remove(coll);
+        }
     }
 
     /// The largest RecordId `(db, coll)` holds as committed (0 when none):
@@ -15865,17 +16303,16 @@ impl Storage {
         let Some(gen) = self.planner_shared_gen(session) else {
             return Ok(Arc::new(self.index_descs(session, db, coll)?));
         };
-        let key = (db.to_string(), coll.to_string());
-        if let Some((g, descs)) = self
-            .desc_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
+        if let Some((g, descs)) = catalog_entry(
+            &self.desc_cache.read().unwrap_or_else(|e| e.into_inner()),
+            db,
+            coll,
+        ) {
             if *g == gen {
                 return Ok(Arc::clone(descs));
             }
         }
+        let key = (db.to_string(), coll.to_string());
         let descs = Arc::new(self.index_descs(session, db, coll)?);
         // Only the committed registry row: a transaction's deferred create
         // is its own (`deferred_row`), and moves no generation.
@@ -15905,17 +16342,16 @@ impl Storage {
         let Some(gen) = self.planner_shared_gen(session) else {
             return Ok(coll_options(session, db, coll)?.map(Arc::new));
         };
-        let key = (db.to_string(), coll.to_string());
-        if let Some((g, opts)) = self
-            .options_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
+        if let Some((g, opts)) = catalog_entry(
+            &self.options_cache.read().unwrap_or_else(|e| e.into_inner()),
+            db,
+            coll,
+        ) {
             if *g == gen {
                 return Ok(Some(Arc::clone(opts)));
             }
         }
+        let key = (db.to_string(), coll.to_string());
         let Some(opts) = coll_options(session, db, coll)?.map(Arc::new) else {
             return Ok(None);
         };
@@ -17268,6 +17704,7 @@ impl Storage {
                 for (recordid, id_k, blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.remove()?;
                     self.sizes
@@ -19859,6 +20296,7 @@ impl Storage {
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
             note_row(db, coll, recordid)?;
+            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
@@ -20035,6 +20473,7 @@ impl Storage {
                         // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                         note_row(db, coll, recordid)?;
+                        undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
@@ -20267,6 +20706,7 @@ impl Storage {
                     };
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &new_id_key, None, &new_blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
@@ -20614,6 +21054,7 @@ impl Storage {
             // reader ordering rationale.
             cur.reset()?;
             note_row(db, coll, recordid)?;
+            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             self.sizes
@@ -20702,6 +21143,7 @@ impl Storage {
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
+                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.sizes
@@ -22889,6 +23331,7 @@ fn ensure_collection(
             cur.set_key_ss(db, coll);
             cur.set_value_u(&opts);
             cur.insert()?;
+            undo_note_collection(db, coll, false);
             note_coll_table_write();
             // Lazy shard creation: make the collection's documents shard on first
             // creation (not all DOC_SHARDS at open). This branch runs only when the
@@ -23010,9 +23453,35 @@ pub fn take_last_retryable_ts() -> Option<bson::Timestamp> {
     LAST_RETRYABLE_TS.with(|t| t.take())
 }
 
+/// Has any entry of this process been given an `rw` stamp? A raw entry gets
+/// one only from [`retryable_stamp`], which sets this first, on the thread
+/// that then appends it; until then no raw entry can hold one, and
+/// [`has_retryable_stamp`] need not read through each entry's fields (the
+/// whole stored document among them) to find none (RP-014).
+static RW_STAMPED: AtomicBool = AtomicBool::new(false);
+
+/// A raw entry's bytes with `ts` and `wall` appended, as
+/// `RawDocumentBuf::append` writes them, at once (RP-014).
+fn append_ts_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<u8> {
+    b.pop();
+    b.push(0x11);
+    b.extend_from_slice(b"ts\0");
+    b.extend_from_slice(&ts.increment.to_le_bytes());
+    b.extend_from_slice(&ts.time.to_le_bytes());
+    b.push(0x09);
+    b.extend_from_slice(b"wall\0");
+    b.extend_from_slice(&wall_millis.to_le_bytes());
+    b.push(0);
+    let len = b.len() as i32;
+    b[..4].copy_from_slice(&len.to_le_bytes());
+    b
+}
+
 fn has_retryable_stamp(e: &OplogEntry) -> bool {
     match e {
-        OplogEntry::Raw(buf) => buf.get("rw").ok().flatten().is_some(),
+        OplogEntry::Raw(buf) => {
+            RW_STAMPED.load(Ordering::Relaxed) && buf.get("rw").ok().flatten().is_some()
+        }
         OplogEntry::Doc(d) => d.contains_key("rw"),
     }
 }
@@ -23051,6 +23520,7 @@ fn retryable_stamp(position: usize) -> Option<bson::RawDocumentBuf> {
         let s = s.borrow();
         let (lsid, txn, ids) = s.as_ref()?;
         let id = *ids.get(position)?;
+        RW_STAMPED.store(true, Ordering::Relaxed);
         let mut rw = bson::RawDocumentBuf::new();
         rw.append("lsid", secantus_core::bsondoc::to_raw(lsid).ok()?);
         rw.append("txnNumber", *txn);
@@ -23155,9 +23625,71 @@ static COLL_TABLE_GEN: AtomicU64 = AtomicU64::new(1);
 /// field the path components that hold an array.
 pub type PlannerIndex = (Document, Vec<Vec<String>>);
 
+/// One document of an insert, prepared before the collection's lock: the
+/// decoded document, whether its `_id` was minted here, the `_id`, its
+/// `_id` key and the oplog entry's `{_id}`.
+type PreparedDoc = (Document, bool, Bson, Vec<u8>, Vec<u8>);
+
 /// A collection's catalog facts by `(db, collection)`, each with the
 /// generation it was read under (`index_descs_cached` and its siblings).
 type CatalogCache<T> = HashMap<(String, String), (u64, Arc<T>)>;
+
+/// A `(db, collection)` key a [`CatalogCache`] can be asked by without
+/// copying either name: every write asks several times (RP-014). It hashes
+/// and compares as the owned `(String, String)` tuple does.
+trait CatalogKey {
+    fn db(&self) -> &str;
+    fn coll(&self) -> &str;
+}
+
+impl CatalogKey for (String, String) {
+    fn db(&self) -> &str {
+        &self.0
+    }
+    fn coll(&self) -> &str {
+        &self.1
+    }
+}
+
+impl CatalogKey for (&str, &str) {
+    fn db(&self) -> &str {
+        self.0
+    }
+    fn coll(&self) -> &str {
+        self.1
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn CatalogKey + 'a> for (String, String) {
+    fn borrow(&self) -> &(dyn CatalogKey + 'a) {
+        self
+    }
+}
+
+impl std::hash::Hash for dyn CatalogKey + '_ {
+    // A tuple hashes its fields in turn, a `String` as its `str`.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.db().hash(state);
+        self.coll().hash(state);
+    }
+}
+
+impl PartialEq for dyn CatalogKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.db() == other.db() && self.coll() == other.coll()
+    }
+}
+
+impl Eq for dyn CatalogKey + '_ {}
+
+/// `cache`'s entry for `(db, coll)`, looked up without an owned key.
+fn catalog_entry<'c, T>(
+    cache: &'c CatalogCache<T>,
+    db: &str,
+    coll: &str,
+) -> Option<&'c (u64, Arc<T>)> {
+    cache.get(&(db, coll) as &dyn CatalogKey)
+}
 
 /// `planner_indexes` answers by `(db, collection)`, each with the generation
 /// it was read under.
@@ -26877,5 +27409,138 @@ mod tests {
             id_point_lookup_keys(&Bson::Document(doc! {"$eq": {"$gt": 1i32}})).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_key_tests {
+    use super::*;
+
+    /// A borrowed `(db, collection)` finds exactly the entry its owned key
+    /// was stored under, and no other.
+    #[test]
+    fn a_borrowed_key_finds_the_owned_entry() {
+        let keys = [
+            ("db", "coll", 1),
+            ("dbc", "oll", 2),
+            ("", "dbcoll", 3),
+            ("d", "", 4),
+        ];
+        let mut cache: CatalogCache<u32> = HashMap::new();
+        for (d, c, v) in keys {
+            cache.insert((d.to_string(), c.to_string()), (0, Arc::new(v)));
+        }
+        for (d, c, v) in keys {
+            assert_eq!(
+                catalog_entry(&cache, d, c).map(|e| *e.1),
+                Some(v),
+                "{d}.{c}"
+            );
+        }
+        assert!(catalog_entry(&cache, "db", "col").is_none());
+        assert!(catalog_entry(&cache, "dbcoll", "").is_none());
+    }
+}
+
+#[cfg(test)]
+mod oplog_entry_bytes_tests {
+    //! The insert path's raw oplog entries (RP-014): built at once, they are
+    //! the bytes field-by-field appends make, and their `op` / `ns` read off
+    //! the bytes are what `get_str` reads.
+    use super::*;
+
+    fn appended(op: &str, ns: &str, ui: Option<&[u8]>, o: &[u8], o2: &[u8]) -> Vec<u8> {
+        let mut buf = bson::RawDocumentBuf::new();
+        buf.append("op", bson::RawBsonRef::String(op).to_raw_bson());
+        buf.append("ns", bson::RawBsonRef::String(ns).to_raw_bson());
+        if let Some(u) = ui {
+            buf.append(
+                "ui",
+                bson::RawBsonRef::Binary(bson::raw::RawBinaryRef {
+                    subtype: BinarySubtype::Uuid,
+                    bytes: u,
+                })
+                .to_raw_bson(),
+            );
+        }
+        let o = bson::RawDocument::from_bytes(o).unwrap();
+        let o2 = bson::RawDocument::from_bytes(o2).unwrap();
+        buf.append("o", bson::RawBsonRef::Document(o).to_raw_bson());
+        buf.append("o2", bson::RawBsonRef::Document(o2).to_raw_bson());
+        buf.into_bytes()
+    }
+
+    #[test]
+    fn a_crud_entry_is_the_appended_bytes() {
+        let o = bson::to_vec(&bson::doc! {"_id": 7, "a": "x\u{0}y", "b": [1, 2]}).unwrap();
+        let o2 = bson::to_vec(&bson::doc! {"_id": 7}).unwrap();
+        let uuid = [9u8; 16];
+        for ui in [None, Some(&uuid[..])] {
+            for (op, ns) in [("i", "db.c"), ("d", "\u{e9}.\u{fc}"), ("u", "")] {
+                let built = Storage::oplog_entry_crud(op, ns, ui, &o, &o2).unwrap();
+                assert_eq!(built.as_bytes(), &appended(op, ns, ui, &o, &o2)[..]);
+                assert_eq!(raw_op_ns(&built), (Some(op), Some(ns)));
+            }
+        }
+        assert!(Storage::oplog_entry_crud("i", "db.c", None, b"\x05\0\0\0", &o2).is_err());
+    }
+
+    #[test]
+    fn ts_and_wall_are_the_appended_bytes() {
+        let o = bson::to_vec(&bson::doc! {"_id": "k"}).unwrap();
+        let entry = Storage::oplog_entry_crud("i", "db.c", None, &o, &o).unwrap();
+        let ts = bson::Timestamp {
+            time: 1_700_000_000,
+            increment: 7,
+        };
+        let mut appended = entry.clone();
+        appended.append("ts", bson::RawBsonRef::Timestamp(ts).to_raw_bson());
+        appended.append(
+            "wall",
+            bson::RawBsonRef::DateTime(bson::DateTime::from_millis(-5)).to_raw_bson(),
+        );
+        assert_eq!(
+            append_ts_wall(entry.into_bytes(), ts, -5),
+            appended.into_bytes()
+        );
+    }
+
+    #[test]
+    fn an_id_document_is_the_encoded_one() {
+        for id in [
+            Bson::String(String::new()),
+            Bson::String("1b4e28ba-2fa1-11d2-883f-0016d3cca427".into()),
+            Bson::String("\u{e9}t\u{e9}\u{0}x".into()),
+            Bson::Int32(-7),
+            Bson::Int32(i32::MAX),
+            Bson::Int64(i64::MIN),
+            Bson::Double(1.5),
+            Bson::Document(bson::doc! {"a": 1, "b": "x"}),
+        ] {
+            let mut d = Document::new();
+            d.insert("_id", id.clone());
+            assert_eq!(encode_id_doc(&id).unwrap(), encode_doc(&d).unwrap(), "{id}");
+        }
+    }
+
+    #[test]
+    fn op_and_ns_read_as_get_str_reads_them() {
+        let cases = [
+            bson::doc! {"op": "i", "ns": "db.c", "o": {}},
+            bson::doc! {"ns": "db.c", "op": "d"},
+            bson::doc! {"op": 1, "ns": "db.c"},
+            bson::doc! {"ts": 1, "op": "i", "ns": "db.c"},
+            bson::doc! {"op": "i"},
+            bson::doc! {"x": "y", "op": "u", "z": "w", "ns": "a.b"},
+            bson::doc! {},
+        ];
+        for d in cases {
+            let raw = bson::RawDocumentBuf::from_document(&d).unwrap();
+            assert_eq!(
+                raw_op_ns(&raw),
+                (raw.get_str("op").ok(), raw.get_str("ns").ok()),
+                "{d}"
+            );
+        }
     }
 }

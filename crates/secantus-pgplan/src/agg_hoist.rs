@@ -94,13 +94,9 @@ fn bare_output_name(item: &pg_query::protobuf::Node, out_names: &[String]) -> bo
 }
 
 pub(crate) fn contains_sublink(n: &pg_query::protobuf::Node) -> bool {
-    let mut found = false;
-    let mut n = n.clone();
-    let _ = walk_expr(&mut n, &mut |x| {
-        found |= matches!(x.node.as_ref(), Some(N::SubLink(_)));
-        Ok(())
-    });
-    found
+    // Read in place: copying the expression to walk it was 20 ms over a
+    // 200,000-item `IN` list (RP-202).
+    crate::expr_any(n, &|x| matches!(x.node.as_ref(), Some(N::SubLink(_))))
 }
 
 /// Names a subquery's own FROM exposes: an aliased table by its alias

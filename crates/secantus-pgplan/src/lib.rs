@@ -19,10 +19,13 @@ mod agg_support;
 mod cmpfn;
 pub mod colstats;
 pub mod costsize;
+mod expr_memo;
 mod expr_where;
 mod filter_sublink;
+mod functional_grouping;
 mod guc_args;
 pub mod hashagg;
+mod hashed_subplan;
 mod hashfn;
 pub mod joincost;
 mod like_match;
@@ -108,6 +111,8 @@ pub mod fts;
 mod func_cast;
 mod funcsig;
 mod named_args;
+pub mod nodetostring;
+mod query_reads;
 mod schema_functions;
 mod search_cycle;
 pub mod server_encoding;
@@ -3118,7 +3123,43 @@ pub enum ColumnExpr {
         /// Each field's `char(n)` width, when it has one: the value is
         /// padded to it before evaluation.
         widths: Vec<Option<usize>>,
+        /// The evaluator's argument list kept between rows: `params` copied
+        /// in once, the fields overwritten per row.
+        scratch: RowScratch,
     },
+}
+
+/// `params ++ fields` as `apply_row_expr` last built it for one row
+/// expression. A statement's parameter can be large (an uncorrelated
+/// subquery's rows, resolved while planning, which an `IN` reads), and
+/// copying it for every row was most of an `information_schema` view's time
+/// (RP-131). Not part of the expression: a clone starts empty, and every
+/// two compare equal.
+///
+/// It also carries the expression's [`expr_memo::ExprMemo`]: what is worked
+/// out once for the expression rather than for every row.
+#[derive(Default)]
+pub struct RowScratch(
+    std::sync::Mutex<Vec<Bson>>,
+    std::sync::Arc<expr_memo::ExprMemo>,
+);
+
+impl Clone for RowScratch {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl PartialEq for RowScratch {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl std::fmt::Debug for RowScratch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RowScratch")
+    }
 }
 
 /// One column of a FROM-less SELECT.
@@ -4164,10 +4205,27 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     const MAX_ENTRIES: usize = 4096;
     static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
         OnceLock::new();
+    thread_local! {
+        /// The tree last answered on this thread, by its text compared in
+        /// place: a statement run over and over is not hashed each time
+        /// (RP-014). A text's tree is the same whoever parsed it.
+        static LAST: std::cell::RefCell<Option<(String, Arc<pg_query::protobuf::ParseResult>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     cancel::check()?;
+    if let Some(tree) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(text, _)| text == sql)
+            .map(|(_, tree)| Arc::clone(tree))
+    }) {
+        return Ok(tree);
+    }
     if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
-        return Ok(Arc::clone(tree));
+        let tree = Arc::clone(tree);
+        LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), Arc::clone(&tree))));
+        return Ok(tree);
     }
     func_cast::check_numeric_junk(sql)?;
     let tree = Arc::new(parse_guarded(sql)?.protobuf);
@@ -4755,7 +4813,9 @@ fn plan_query_node(
     // (correlated) subquery, which the resolver has to see.
     if let Some(N::SelectStmt(s)) = node.node.as_mut() {
         if s.with_clause.is_none() {
-            **s = expand_views(s)?;
+            if let Some(expanded) = expand_views(s)? {
+                **s = expanded;
+            }
         }
     }
     cancel::check()?;
@@ -6729,6 +6789,15 @@ fn normalize_serial(ty: &str) -> String {
 /// libpg_query keeps `int[]` as the name `int4` plus a non-empty
 /// `array_bounds`, so reading only the name loses the array-ness entirely.
 fn type_name_of(t: &pg_query::protobuf::TypeName) -> String {
+    match expr_memo::type_name(t, || {
+        (type_name_of_uncached(t), declared_typmod_uncached(t))
+    }) {
+        Some((name, _)) => name,
+        None => type_name_of_uncached(t),
+    }
+}
+
+fn type_name_of_uncached(t: &pg_query::protobuf::TypeName) -> String {
     let base = type_name(&t.names);
     if t.array_bounds.is_empty() {
         base
@@ -6773,6 +6842,15 @@ pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
 }
 
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
+    match expr_memo::type_name(tn, || {
+        (type_name_of_uncached(tn), declared_typmod_uncached(tn))
+    }) {
+        Some((_, typmod)) => typmod,
+        None => declared_typmod_uncached(tn),
+    }
+}
+
+fn declared_typmod_uncached(tn: &pg_query::protobuf::TypeName) -> i32 {
     let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
     // A modifier we could not read as an integer means no faithful typmod.
     if mods.len() != tn.typmods.len() {
@@ -9999,6 +10077,11 @@ pub fn set_view_oids(oids: Vec<(String, i64)>) {
     PLAN_VIEW_OIDS.with(|v| *v.borrow_mut() = oids.into_iter().collect());
 }
 
+/// Was a FROM subquery under `alias` expanded from a view by this statement?
+pub(crate) fn is_expanded_view(alias: &str) -> bool {
+    EXPANDED_VIEWS.with(|e| e.borrow().iter().any(|(a, _)| a == alias))
+}
+
 /// The view a FROM subquery under `alias` was expanded from, and its oid.
 fn expanded_view_oid(alias: &str) -> Option<i64> {
     let view = EXPANDED_VIEWS.with(|e| {
@@ -10027,18 +10110,56 @@ pub fn is_view(name: &str) -> bool {
     view_definition(name).is_some()
 }
 
+/// Whether any node of `s`, at any depth, satisfies `pred` -- read in
+/// place, where wrapping `s` in a node to call `nodes()` on it copied the
+/// whole statement first (RP-202).
+pub(crate) fn select_any_node(
+    s: &pg_query::protobuf::SelectStmt,
+    pred: &dyn Fn(&pg_query::NodeRef<'_>) -> bool,
+) -> bool {
+    let child = |n: &pg_query::protobuf::Node| {
+        n.node
+            .as_ref()
+            .is_some_and(|e| e.nodes().iter().any(|(r, _, _, _)| pred(r)))
+    };
+    let opt = |n: &Option<Box<pg_query::protobuf::Node>>| n.as_deref().is_some_and(child);
+    s.target_list.iter().any(child)
+        || s.from_clause.iter().any(child)
+        || opt(&s.where_clause)
+        || s.group_clause.iter().any(child)
+        || opt(&s.having_clause)
+        || s.window_clause.iter().any(child)
+        || s.values_lists.iter().any(child)
+        || s.sort_clause.iter().any(child)
+        || s.distinct_clause.iter().any(child)
+        || opt(&s.limit_offset)
+        || opt(&s.limit_count)
+        || s.locking_clause.iter().any(child)
+        || s.with_clause
+            .as_ref()
+            .is_some_and(|w| w.ctes.iter().any(child))
+        || s.larg.as_deref().is_some_and(|l| select_any_node(l, pred))
+        || s.rarg.as_deref().is_some_and(|r| select_any_node(r, pred))
+}
+
 /// Replace every FROM reference to a VIEW with the subquery its definition
 /// is -- which is what PostgreSQL's rewriter does with a view, too. Only the
 /// top level of this SELECT is rewritten: a FROM-subquery, a subquery in an
 /// expression and each side of a set operation are all planned through
 /// `plan_select` in their turn, which expands their own references.
-fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf::SelectStmt> {
+///
+/// `None` when there is nothing to expand: the statement is not copied, which
+/// for a large one (a 200,000-item `IN` list) was tens of milliseconds in
+/// which no cancel was seen (RP-202).
+fn expand_views(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<Option<pg_query::protobuf::SelectStmt>> {
     if PLAN_VIEWS.with(|v| v.borrow().is_empty())
         && !rls::active()
         && !inherit::descendants_any()
         && !system_views::in_from(&s.from_clause)
     {
-        return Ok(s.clone());
+        return Ok(None);
     }
     let mut out = s.clone();
     let previous = inherit::WANT_TABLEOID.with(|w| w.replace(partitions::mentions_tableoid(s)));
@@ -10048,7 +10169,7 @@ fn expand_views(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf
         .try_for_each(|item| expand_views_in_from(item, 0));
     inherit::WANT_TABLEOID.with(|w| w.set(previous));
     result?;
-    Ok(out)
+    Ok(Some(out))
 }
 
 fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Result<()> {
@@ -12162,27 +12283,16 @@ fn has_window(s: &pg_query::protobuf::SelectStmt) -> bool {
 }
 
 fn node_has_window(node: Option<&pg_query::protobuf::Node>) -> bool {
-    let Some(node) = node.and_then(|n| n.node.as_ref()) else {
+    let Some(wrapped) = node.filter(|n| n.node.is_some()) else {
         return false;
     };
-    if let N::FuncCall(f) = node {
-        if f.over.is_some() {
-            return true;
-        }
-    }
-    // Anywhere else in the expression -- a COALESCE, a CASE, a cast --
-    // through the one walker every expression rewrite shares.
-    let mut probe = pg_query::protobuf::Node {
-        node: Some(node.clone()),
-    };
-    let mut found = false;
-    let _ = walk_expr(&mut probe, &mut |n| {
-        if let Some(N::FuncCall(f)) = n.node.as_ref() {
-            found |= f.over.is_some();
-        }
-        Ok(())
-    });
-    found
+    // Anywhere in the expression -- a COALESCE, a CASE, a cast -- over the
+    // nodes the shared walker visits, read in place (copying the expression
+    // was 20 ms over a 200,000-item `IN` list; RP-202).
+    expr_any(
+        wrapped,
+        &|n| matches!(n.node.as_ref(), Some(N::FuncCall(f)) if f.over.is_some()),
+    )
 }
 
 /// The window functions by name, with the result type PostgreSQL gives them.
@@ -15451,6 +15561,8 @@ fn row_column_expr(
 ) -> Result<ColumnExpr> {
     let mut expr = node.clone();
     rewrite_column_refs(&mut expr, fields, params.len())?;
+    let pruned = prune_row_fields(&mut expr, fields, params.len());
+    let fields: &[RowField] = pruned.as_deref().unwrap_or(fields);
     let widths = ROW_WIDTHS.with(|w| {
         let w = w.borrow();
         fields
@@ -15467,9 +15579,10 @@ fn row_column_expr(
     let mut out = ColumnExpr::Row {
         expr: Box::new(expr.clone()),
         fields: fields.to_vec(),
-        params: params.to_vec(),
+        params: params_read_by(&expr, params),
         result_type: String::new(),
         widths,
+        scratch: RowScratch::default(),
     };
     // A sample row's value types what the node alone cannot (a scalar call's
     // result); an expression that fails on the sample still gets the node's
@@ -15532,6 +15645,87 @@ fn row_column_expr(
         *t = result_type;
     }
     Ok(out)
+}
+
+/// The row fields an expression reads, its `$n` renumbered to match, when
+/// every reference to the row is a parameter: each evaluation copies its
+/// fields, and over a wide join that copy of columns the expression never
+/// reads was most of the time an `information_schema` view took (RP-131).
+/// `None` (keep them all) when a subquery or an unresolved column could
+/// read the row some other way.
+fn prune_row_fields(
+    expr: &mut pg_query::protobuf::Node,
+    fields: &[RowField],
+    n_params: usize,
+) -> Option<Vec<RowField>> {
+    let mut used = std::collections::BTreeSet::new();
+    let mut opaque = false;
+    let _ = walk_expr(expr, &mut |n| {
+        match n.node.as_ref() {
+            Some(N::SubLink(_)) | Some(N::ColumnRef(_)) => opaque = true,
+            Some(N::ParamRef(p)) if p.number as usize > n_params => {
+                used.insert(p.number as usize - n_params - 1);
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    if opaque || used.len() == fields.len() || used.iter().any(|&i| i >= fields.len()) {
+        return None;
+    }
+    let renumber: std::collections::HashMap<usize, usize> = used
+        .iter()
+        .enumerate()
+        .map(|(new, &old)| (old, new))
+        .collect();
+    walk_expr(expr, &mut |n| {
+        if let Some(N::ParamRef(p)) = n.node.as_mut() {
+            if p.number as usize > n_params {
+                let old = p.number as usize - n_params - 1;
+                p.number = (n_params + 1 + renumber[&old]) as i32;
+            }
+        }
+        Ok(())
+    })
+    .ok()?;
+    Some(used.iter().map(|&i| fields[i].clone()).collect())
+}
+
+/// The statement's parameters as a row expression keeps them: NULL in place
+/// of each one it never reads. Every evaluation copies them, and one can be
+/// large -- an uncorrelated subquery's rows, resolved while planning -- so a
+/// row's every column copied them all (RP-131). All are kept when a
+/// subquery or an unresolved column could read one some other way.
+fn params_read_by(expr: &pg_query::protobuf::Node, params: &[Bson]) -> Vec<Bson> {
+    if params.is_empty() {
+        return Vec::new();
+    }
+    let mut used = vec![false; params.len()];
+    let mut opaque = false;
+    let mut node = expr.clone();
+    let _ = walk_expr(&mut node, &mut |n| {
+        match n.node.as_ref() {
+            Some(N::SubLink(_)) | Some(N::ColumnRef(_)) => opaque = true,
+            Some(N::ParamRef(p)) => {
+                if let Some(u) = (p.number as usize)
+                    .checked_sub(1)
+                    .and_then(|i| used.get_mut(i))
+                {
+                    *u = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    });
+    if opaque {
+        return params.to_vec();
+    }
+    params
+        .iter()
+        .zip(used)
+        .map(|(p, u)| if u { p.clone() } else { Bson::Null })
+        .collect()
 }
 
 /// Replace each `ColumnRef` under `node` with `ParamRef(n_params + 1 + i)`
@@ -15597,6 +15791,7 @@ pub(crate) fn walk_expr(
     node: &mut pg_query::protobuf::Node,
     visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
 ) -> Result<()> {
+    cancel::walk_point()?;
     visit(node)?;
     let Some(inner) = node.node.as_mut() else {
         return Ok(());
@@ -15726,6 +15921,72 @@ pub(crate) fn walk_expr(
     }
 }
 
+/// Whether `pred` holds for any node `walk_expr` would visit under `node`
+/// -- the same nodes, read in place: a pass's guard asks it before copying
+/// a statement it may not change (RP-202). `nodes()` is no stand-in: it
+/// does not descend into an `A_Indirection`'s argument, among others.
+/// Keep the two in step.
+pub(crate) fn expr_any(
+    node: &pg_query::protobuf::Node,
+    pred: &dyn Fn(&pg_query::protobuf::Node) -> bool,
+) -> bool {
+    if pred(node) {
+        return true;
+    }
+    let Some(inner) = node.node.as_ref() else {
+        return false;
+    };
+    let one =
+        |n: &Option<Box<pg_query::protobuf::Node>>| n.as_deref().is_some_and(|a| expr_any(a, pred));
+    let all = |v: &[pg_query::protobuf::Node]| v.iter().any(|a| expr_any(a, pred));
+    let window =
+        |w: &pg_query::protobuf::WindowDef| all(&w.partition_clause) || all(&w.order_clause);
+    match inner {
+        N::TypeCast(tc) => one(&tc.arg),
+        N::AExpr(e) => one(&e.lexpr) || one(&e.rexpr),
+        N::FuncCall(f) => {
+            all(&f.args)
+                || all(&f.agg_order)
+                || one(&f.agg_filter)
+                || f.over.as_deref().is_some_and(window)
+        }
+        N::WindowDef(w) => window(w),
+        N::SortBy(sb) => one(&sb.node),
+        N::ResTarget(rt) => one(&rt.val),
+        N::BooleanTest(t) => one(&t.arg),
+        N::CollateClause(c) => one(&c.arg),
+        N::NamedArgExpr(a) => one(&a.arg),
+        N::GroupingSet(g) => all(&g.content),
+        N::GroupingFunc(g) => all(&g.args),
+        N::List(l) => all(&l.items),
+        N::SubLink(sl) => one(&sl.testexpr),
+        N::BoolExpr(b) => all(&b.args),
+        N::AArrayExpr(a) => all(&a.elements),
+        N::RowExpr(r) => all(&r.args),
+        N::CoalesceExpr(c) => all(&c.args),
+        N::MinMaxExpr(m) => all(&m.args),
+        N::XmlExpr(x) => all(&x.named_args) || all(&x.args),
+        N::XmlSerialize(x) => one(&x.expr),
+        N::NullTest(t) => one(&t.arg),
+        N::CaseExpr(c) => {
+            one(&c.arg)
+                || c.args.iter().any(|w| match w.node.as_ref() {
+                    Some(N::CaseWhen(cw)) => one(&cw.expr) || one(&cw.result),
+                    _ => false,
+                })
+                || one(&c.defresult)
+        }
+        N::AIndirection(a) => {
+            one(&a.arg)
+                || a.indirection.iter().any(|ind| match ind.node.as_ref() {
+                    Some(N::AIndices(idx)) => one(&idx.lidx) || one(&idx.uidx),
+                    _ => false,
+                })
+        }
+        _ => false,
+    }
+}
+
 fn walk_window_def(
     w: &mut pg_query::protobuf::WindowDef,
     visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
@@ -15743,26 +16004,54 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         fields,
         params,
         widths,
+        scratch,
         ..
     } = expr
     else {
         return Err(Error::Unsupported("not a row expression".into()));
     };
-    let mut all = params.clone();
-    all.extend(fields.iter().enumerate().map(|(i, (_, f, _))| {
+    let field_values = fields.iter().enumerate().map(|(i, (_, f, _))| {
         let v = row.get(f).cloned().unwrap_or(Bson::Null);
         // A stored timestamp keeps its sub-millisecond digits in a hidden
         // companion; an expression over the column must see them too.
-        let v = match (&v, row.get(companion_field(f))) {
-            (Bson::DateTime(_), Some(Bson::Int32(us))) if *us != 0 => {
-                Bson::Document(doc! { COMPOSITE_DATE: v.clone(), COMPOSITE_US: *us })
-            }
+        // Only a date has one, so only a date looks (the name is built).
+        let v = match &v {
+            Bson::DateTime(_) => match row.get(companion_field(f)) {
+                Some(Bson::Int32(us)) if *us != 0 => {
+                    Bson::Document(doc! { COMPOSITE_DATE: v.clone(), COMPOSITE_US: *us })
+                }
+                _ => v,
+            },
             _ => v,
         };
         pad_bpchar(v, widths.get(i).copied().flatten())
-    }));
+    });
     let previous = declare_row_fields(params.len(), fields);
-    let out = correlated::with_row_params_from(params.len(), || const_value(expr, &all));
+    let n = params.len();
+    let _memo = expr_memo::install(&scratch.1, expr);
+    let run = |all: &[Bson]| correlated::with_row_params_from(n, || const_value(expr, all));
+    // The statement's values are copied into the scratch list once; an
+    // evaluation of this expression inside its own (a recursive function)
+    // finds the list busy and builds its own.
+    let out = match scratch.0.try_lock() {
+        Ok(mut all) => {
+            if all.len() != n + fields.len() {
+                all.clear();
+                all.extend(params.iter().cloned());
+                all.extend(field_values);
+            } else {
+                for (slot, v) in all[n..].iter_mut().zip(field_values) {
+                    *slot = v;
+                }
+            }
+            run(&all)
+        }
+        Err(_) => {
+            let mut all = params.clone();
+            all.extend(field_values);
+            run(&all)
+        }
+    };
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
     out
 }
@@ -20276,10 +20565,14 @@ fn resolve_one_sublink(
                 Some(N::RowExpr(_))
             ) =>
         {
+            let types: Option<Vec<String>> = sub_plan_def(&plan, lookup)
+                .ok()
+                .map(|d| d.columns.iter().map(|c| c.pg_type.clone()).collect());
             row_subquery_comparison(
                 sl,
                 kind == SubLinkType::AnySublink,
                 rows,
+                types.as_deref(),
                 lookup,
                 params,
                 run,
@@ -20344,6 +20637,7 @@ fn row_subquery_comparison(
     sl: &pg_query::protobuf::SubLink,
     any: bool,
     rows: Vec<Vec<Bson>>,
+    types: Option<&[String]>,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -20375,6 +20669,13 @@ fn row_subquery_comparison(
             } else {
                 "subquery has too few columns".into()
             }));
+        }
+    }
+    // `IN` over hashable equalities is a hashed SubPlan, as PostgreSQL
+    // plans it when the rows fit in its hash memory (`hashed_subplan`).
+    if any && op == "=" {
+        if let Some(node) = types.and_then(|t| hashed_subplan::plan(&row.args, &rows, t, params)) {
+            return Ok(node);
         }
     }
     let boolexpr =
@@ -20821,6 +21122,15 @@ fn rewrite_tablesample(
     s: &pg_query::protobuf::SelectStmt,
     params: &[Bson],
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // Only a FROM item that samples is rewritten; with none the statement is
+    // not copied (RP-202).
+    if !s
+        .from_clause
+        .iter()
+        .any(|f| matches!(f.node.as_ref(), Some(N::RangeTableSample(_))))
+    {
+        return Ok(None);
+    }
     let mut out = s.clone();
     let mut filters: Vec<pg_query::protobuf::Node> = Vec::new();
     for item in &mut out.from_clause {
@@ -20913,6 +21223,18 @@ fn rewrite_tablesample(
 fn rewrite_xmlagg(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
+    // No `xmlagg` call where the walk below looks, nothing to rewrite, and
+    // no copy (RP-202).
+    let xmlagg = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::FuncCall(f)) if func_name(f).as_deref() == Some("xmlagg"));
+    let calls = s
+        .target_list
+        .iter()
+        .chain(s.having_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .any(|n| expr_any(n, &xmlagg));
+    if !calls {
+        return Ok(None);
+    }
     let mut out = s.clone();
     let mut changed = false;
     let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
@@ -21832,12 +22154,19 @@ fn column_alias_rewrite(
         }
         Ok(())
     }
-    let mut out = s.clone();
+    // Only the FROM list changes; the statement is copied when it does
+    // (RP-202).
+    let mut from = s.from_clause.clone();
     let mut changed = false;
-    for n in &mut out.from_clause {
+    for n in &mut from {
         item(n, lookup, &mut changed)?;
     }
-    Ok(changed.then_some(out))
+    if !changed {
+        return Ok(None);
+    }
+    let mut out = s.clone();
+    out.from_clause = from;
+    Ok(Some(out))
 }
 
 fn plan_select(
@@ -21866,11 +22195,24 @@ fn plan_select(
     if let Some(rewritten) = partitions::rewrite_tableoid(s)? {
         return plan_select(&rewritten, lookup, params);
     }
-    let expanded = expand_views(s)?;
+    // Each copies the statement only when it changes it (RP-202).
+    let views = expand_views(s)?;
     // A strict operator over a NULL constant is NULL before anything runs
     // (RP-075).
-    let expanded = strict_fold::fold_select(&expanded)?.unwrap_or(expanded);
-    let s = &expanded;
+    let folded = strict_fold::fold_select(views.as_ref().unwrap_or(s))?;
+    let expanded: std::borrow::Cow<'_, pg_query::protobuf::SelectStmt> = match (folded, views) {
+        (Some(f), _) | (None, Some(f)) => std::borrow::Cow::Owned(f),
+        (None, None) => std::borrow::Cow::Borrowed(s),
+    };
+    let s = &*expanded;
+    // The outputs of the FROM-subqueries a VIEW expanded into that nothing
+    // reads are computed as NULL: PostgreSQL's rewriter expands a view
+    // before its planner removes them (`remove_unused_subquery_outputs`),
+    // and the statement-wide pass ran before this select's views expanded
+    // (RP-131).
+    if let Some(rewritten) = prune_outputs::rewrite_from_items(s, lookup, params) {
+        return plan_select(&rewritten, lookup, params);
+    }
     // The locking clauses, checked once per top-level statement, on the
     // statement as written (views expanded): the rewrites below may move
     // the relations a clause names.
@@ -21956,6 +22298,11 @@ fn plan_select(
     }
     cancel::check()?;
     if let Some(rewritten) = expand_star_in_grouped(s, lookup) {
+        return plan_select(&rewritten, lookup, params);
+    }
+    cancel::check()?;
+    // A column of a table whose primary key is grouped by (RP-280).
+    if let Some(rewritten) = functional_grouping::rewrite(s, lookup)? {
         return plan_select(&rewritten, lookup, params);
     }
     cancel::check()?;
@@ -22207,6 +22554,16 @@ fn expand_composite_targets(
         let (_, fields) = user_composite(&composite_type(arg, column_type)?)?;
         Some((arg.clone(), fields))
     };
+    // No `(x).*` target: nothing is copied (RP-202).
+    let star_target = target_list.iter().any(|t| {
+        matches!(t.node.as_ref(), Some(N::ResTarget(rt))
+            if matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::AIndirection(ind)) if matches!(ind.indirection.as_slice(),
+                    [star] if matches!(star.node.as_ref(), Some(N::AStar(_))))))
+    });
+    if !star_target {
+        return None;
+    }
     let mut changed = false;
     let mut targets = Vec::with_capacity(target_list.len());
     for t in target_list {
@@ -23091,7 +23448,10 @@ fn plan_aggregate_direct(
         // `n % 2 = 1`) is evaluated per row by a plain SELECT; aggregate over
         // THAT: `FROM (SELECT * FROM t WHERE cond) t`.
         if let (Some(w), Some(def)) = (s.where_clause.as_deref(), lookup(&r.relname)) {
-            if matches!(lower_where(w, &def, params), Err(Error::Unsupported(_))) {
+            if matches!(
+                lower_where_nonvolatile(w, &def, params),
+                Err(Error::Unsupported(_))
+            ) {
                 let alias = r
                     .alias
                     .clone()
@@ -24854,6 +25214,11 @@ fn builtin_by_type(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Option<
 }
 
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if f.funcname.len() == 1 && func_name(f).as_deref() == Some(hashed_subplan::NAME) {
+            return "bool".to_string();
+        }
+    }
     // `x COLLATE c` is `x`'s type: a collation changes the comparison, not
     // the type, so a `bpchar` operand still ignores its trailing blanks.
     if let Some(N::CollateClause(cc)) = node.node.as_ref() {
@@ -26805,6 +27170,25 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             .as_ref()
             .and_then(|v| v.node.as_ref())
         {
+            // A hashed SubPlan (`hashed_subplan`): a boolean, named as the
+            // row comparison it stands for is.
+            Some(N::FuncCall(f))
+                if f.funcname.len() == 1
+                    && func_name(f).as_deref() == Some(hashed_subplan::NAME) =>
+            {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                columns.push((
+                    if rt.name.is_empty() {
+                        "?column?".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(const_value(node, params)?),
+                    "bool".to_string(),
+                    -1,
+                ));
+                continue;
+            }
             Some(N::FuncCall(f)) => {
                 refuse_untyped_any_args(f)?;
                 if let Some(e) = function_absent_in_reference(f, params) {
@@ -29232,6 +29616,19 @@ fn timestamp_precision(tc: &pg_query::protobuf::TypeCast, target: &str, v: Bson)
         return round_time_value(v, p);
     }
     if p >= 0 && target == "interval" {
+        // A literal reads its number by the qualifier (`interval_in`'s
+        // typmod) before the value is cut to it.
+        let literal = match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+            Some(N::AConst(c)) => match c.val.as_ref() {
+                Some(pg_query::protobuf::a_const::Val::Sval(t)) => Some(t.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
+        let v = match literal.and_then(|t| parse_interval_range(&t, p >> 16).ok()) {
+            Some(iv) => iv.to_bson(),
+            None => v,
+        };
         return adjust_interval(v, p);
     }
     if !(0..6).contains(&p) || !matches!(target, "timestamp" | "timestamptz") {
@@ -30522,7 +30919,12 @@ fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
 
 /// The user base type (not an extension's) an expression statically has.
 fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Option<String> {
-    let t = static_type(arg, value);
+    user_defined_base_source_of(&static_type(arg, value))
+}
+
+/// [`user_defined_base_source`] for an expression of static type `t`.
+fn user_defined_base_source_of(t: &str) -> Option<String> {
+    let t = t.to_string();
     let (name, _, defined) = user_base_type(&t)?;
     // citext is text to every operator and function that does not
     // define its own: it casts implicitly to text.
@@ -31678,6 +32080,23 @@ pub fn interval_value_text(v: &Bson) -> Option<String> {
 /// combined — `1 day -02:03:04` is a positive day and a negative time, which is
 /// why the components keep independent signs.
 fn parse_interval(text: &str) -> Result<Interval> {
+    parse_interval_range(text, INTERVAL_FULL_RANGE)
+}
+
+/// `INTERVAL_FULL_RANGE`: an interval with no field qualifier.
+pub(crate) const INTERVAL_FULL_RANGE: i32 = 0x7FFF;
+
+/// `interval_in` with a field qualifier: `DecodeInterval` reads a trailing
+/// number with no unit as the qualifier's last field (`interval '1' day` is
+/// one day, not one second), and, under `minute to second`, an `a:b` as
+/// minutes and seconds.
+pub(crate) fn parse_interval_range(text: &str, range: i32) -> Result<Interval> {
+    const YEAR: i32 = 1 << 2;
+    const MONTH: i32 = 1 << 1;
+    const DAY: i32 = 1 << 3;
+    const HOUR: i32 = 1 << 10;
+    const MINUTE: i32 = 1 << 11;
+    const SECOND: i32 = 1 << 12;
     let t = text.trim();
     if t.is_empty() {
         return Err(bad_interval(text));
@@ -31715,21 +32134,40 @@ fn parse_interval(text: &str) -> Result<Interval> {
                 Some(b) => (-1i64, b),
                 None => (1i64, token.strip_prefix('+').unwrap_or(token)),
             };
-            let mut it = body.split(':');
-            let h: i64 = it
-                .next()
-                .and_then(|v| v.parse().ok())
-                .ok_or_else(|| bad_interval(text))?;
-            let m: i64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
-            let secs: f64 = it
-                .next()
-                .map_or(Ok(0.0), |v| v.parse::<f64>())
-                .map_err(|_| bad_interval(text))?;
-            if it.next().is_some() {
+            let parts: Vec<&str> = body.split(':').collect();
+            if parts.len() > 3 {
                 return Err(bad_interval(text));
             }
+            let int = |v: &str| v.parse::<i64>().map_err(|_| bad_interval(text));
+            let secs_of = |v: &str| v.parse::<f64>().map_err(|_| bad_interval(text));
+            // `DecodeTimeCommon`: `a:b` is hours and minutes, but minutes
+            // and seconds under `minute to second`; `a:b.c` is always
+            // minutes and seconds.
+            let (h, m, secs) = match parts.as_slice() {
+                [a, b] if b.contains('.') => (0, int(a)?, secs_of(b)?),
+                [a, b] if range == MINUTE | SECOND => (0, int(a)?, secs_of(b)?),
+                [a, b] => (int(a)?, int(b)?, 0.0),
+                [a, b, c] => (int(a)?, int(b)?, secs_of(c)?),
+                [a] => (int(a)?, 0, 0.0),
+                _ => return Err(bad_interval(text)),
+            };
             iv.micros +=
                 sign * (h * 3_600_000_000 + m * 60_000_000 + (secs * 1_000_000.0).round() as i64);
+            saw_any = true;
+            continue;
+        }
+        // SQL's `years-months` (`1-6` is a year and six months).
+        if let Some((y, m)) = years_months(token) {
+            if pending.is_some() {
+                return Err(bad_interval(text));
+            }
+            if !(0..12).contains(&m.abs()) {
+                return Err(Error::DatetimeFieldOverflow(format!(
+                    "interval field value out of range: \"{}\"",
+                    text.trim()
+                )));
+            }
+            iv.months += y * 12 + m;
             saw_any = true;
             continue;
         }
@@ -31761,9 +32199,25 @@ fn parse_interval(text: &str) -> Result<Interval> {
             }
         }
     }
-    // A trailing bare number is seconds: `'1'::interval` is one second.
+    // A trailing bare number is seconds (`'1'::interval` is one second),
+    // or the field qualifier's last field.
     if let Some(n) = pending {
-        iv.micros += (n * 1_000_000.0).round() as i64;
+        let unit = match range {
+            YEAR => "year",
+            MONTH => "month",
+            r if r == YEAR | MONTH => "month",
+            DAY => "day",
+            HOUR => "hour",
+            r if r == DAY | HOUR => "hour",
+            MINUTE => "minute",
+            r if r == HOUR | MINUTE || r == DAY | HOUR | MINUTE => "minute",
+            _ => "",
+        };
+        if unit.is_empty() {
+            iv.micros += (n * 1_000_000.0).round() as i64;
+        } else {
+            apply_interval_unit(&mut iv, n, unit, text)?;
+        }
         saw_any = true;
     }
     if !saw_any {
@@ -31775,6 +32229,25 @@ fn parse_interval(text: &str) -> Result<Interval> {
         iv.micros = -iv.micros;
     }
     Ok(iv)
+}
+
+/// `DecodeInterval`'s SQL years-months field, `[+-]Y-M`: the years and
+/// months, both carrying the sign.
+fn years_months(token: &str) -> Option<(i32, i32)> {
+    let (neg, body) = match token.strip_prefix('-') {
+        Some(b) => (true, b),
+        None => (false, token.strip_prefix('+').unwrap_or(token)),
+    };
+    let (y, m) = body.split_once('-')?;
+    if y.is_empty()
+        || m.is_empty()
+        || !y.bytes().all(|b| b.is_ascii_digit())
+        || !m.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let (y, m): (i32, i32) = (y.parse().ok()?, m.parse().ok()?);
+    Some(if neg { (-y, -m) } else { (y, m) })
 }
 
 /// The unit spellings an interval literal may use, singular form.
@@ -32688,7 +33161,7 @@ pub(crate) fn cast_value(value: Bson, target: &str) -> Result<Bson> {
     // A domain: the base type's cast, then the domain's constraints.
     if let Some(d) = domains::user_domain(target) {
         let v = cast_value(value, &d.base)?;
-        domains::domain_check(&d.name, &v)?;
+        domains::check_domain(&d, &v)?;
         return Ok(v);
     }
     let out = cast_value_inner(value, target)?;
@@ -34123,9 +34596,36 @@ pub fn max_param_number(sql: &str) -> usize {
     const MAX_ENTRIES: usize = 4096;
     static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
         std::sync::OnceLock::new();
+    thread_local! {
+        /// The statement this thread asked about last: a client repeating
+        /// one statement (a pipeline of inserts) asks for it at every Bind
+        /// and Describe, and comparing it is cheaper than hashing it under
+        /// the shared memo's lock (RP-014).
+        static LAST: std::cell::RefCell<Option<(String, usize)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(n) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(s, _)| s == sql)
+            .map(|(_, n)| *n)
+    }) {
+        return n;
+    }
+    let remember = |n: usize| {
+        if sql.len() <= 4096 {
+            LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), n)));
+        }
+    };
     let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(n) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
-        return *n;
+    if let Some(n) = memo
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sql)
+        .copied()
+    {
+        remember(n);
+        return n;
     }
     // A large statement is scanned on a thread of its own, under the cancel
     // hook (RP-202). A cancelled scan is not remembered; the statement's
@@ -34145,6 +34645,8 @@ pub fn max_param_number(sql: &str) -> usize {
         guard.clear();
     }
     guard.insert(sql.to_string(), n);
+    drop(guard);
+    remember(n);
     n
 }
 
@@ -34630,6 +35132,83 @@ fn static_hstore_operand(n: Option<&pg_query::protobuf::Node>, value: &Bson) -> 
     static_type(n, value) == "hstore" && extension_type("hstore") == Some(ExtensionType::Hstore)
 }
 
+/// A FROM subquery's output names as its text gives them -- each target's
+/// own `AS` name or bare column reference, the leftmost arm's for a set
+/// operation, renamed by the alias's column list -- or `None` when a name
+/// needs planning to know (a star, an expression without `AS`, VALUES).
+fn syntactic_output_names(
+    sub: &pg_query::protobuf::SelectStmt,
+    alias: Option<&pg_query::protobuf::Alias>,
+) -> Option<Vec<String>> {
+    fn arm(s: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+        if let Some(l) = s.larg.as_deref() {
+            return arm(l);
+        }
+        if !s.values_lists.is_empty() {
+            return None;
+        }
+        s.target_list
+            .iter()
+            .map(|t| {
+                let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                    return None;
+                };
+                if !rt.name.is_empty() {
+                    return Some(rt.name.clone());
+                }
+                match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                    Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                        Some(N::String(sv)) => Some(sv.sval.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+    let mut names = arm(sub)?;
+    if let Some(a) = alias {
+        for (i, c) in a.colnames.iter().enumerate() {
+            match (c.node.as_ref(), names.get_mut(i)) {
+                (Some(N::String(sv)), Some(slot)) => slot.clone_from(&sv.sval),
+                _ => return None,
+            }
+        }
+    }
+    Some(names)
+}
+
+/// Whether a SELECT's clauses outside its FROM (and the subqueries inside
+/// them) name `alias` alone or as `alias.*`: the references
+/// `whole_row_rewrite` turns into the source's row or columns.
+fn names_alias(s: &pg_query::protobuf::SelectStmt, alias: &str) -> Result<bool> {
+    // Read in place (copying the clauses was the cost this check exists to
+    // save, RP-202). A subquery's body is not read here: one counts as a
+    // reference, so the rewrite runs and looks inside it as before.
+    let names = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::SubLink(_)) => true,
+        Some(N::ColumnRef(c)) => {
+            let first = matches!(
+                c.fields.first().and_then(|f| f.node.as_ref()),
+                Some(N::String(sv)) if sv.sval == alias
+            );
+            let star_or_alone = c.fields.len() == 1
+                || (c.fields.len() == 2 && matches!(c.fields[1].node.as_ref(), Some(N::AStar(_))));
+            first && star_or_alone
+        }
+        _ => false,
+    };
+    Ok(s.target_list
+        .iter()
+        .chain(s.where_clause.as_deref())
+        .chain(s.group_clause.iter())
+        .chain(s.having_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .chain(s.distinct_clause.iter())
+        .chain(s.window_clause.iter())
+        .any(|n| expr_any(n, &names)))
+}
+
 /// Rewrite whole-row references over a single FROM item into `ROW(...)`
 /// of its columns, the field NAMES kept in the RowExpr's `colnames` (which
 /// is where PostgreSQL itself keeps them for a whole-row Var).
@@ -34655,6 +35234,12 @@ fn whole_row_rewrite(
                 .alias
                 .as_ref()
                 .map_or_else(|| r.relname.clone(), |a| a.aliasname.clone());
+            // A table is never renamed below: with no reference to its
+            // name as a row there is nothing to rewrite, and the statement
+            // is not copied (RP-202).
+            if !names_alias(s, &alias)? {
+                return Ok(None);
+            }
             match lookup(&relation_name(r)) {
                 Some(def) => {
                     // A table named after a built-in type (`tid`) has the
@@ -34678,6 +35263,19 @@ fn whole_row_rewrite(
             else {
                 return Ok(None);
             };
+            // Nothing to rewrite unless the statement names the alias as a
+            // whole row or the outputs share a name. Both can often be seen
+            // without planning the subquery, which nested FROM subqueries
+            // (the information_schema views) otherwise plan again at every
+            // level (RP-131).
+            if let Some(names) = syntactic_output_names(sub, rs.alias.as_ref()) {
+                let distinct: std::collections::HashSet<&String> = names.iter().collect();
+                if distinct.len() == names.len()
+                    && (names.contains(&alias) || !names_alias(s, &alias)?)
+                {
+                    return Ok(None);
+                }
+            }
             let stmt = plan_select(sub, lookup, params)?;
             let def = sub_plan_def(&stmt, lookup)?;
             let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
@@ -38332,6 +38930,10 @@ thread_local! {
 /// so a long `a || b || c ...` cost O(n^2) -- 1,000 terms took most of a
 /// minute. `static_type`'s answers are memoised for the evaluation.
 fn const_value(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // Folding while planning is a cancellation point too (a constant `IN`
+    // list of 200,000 items is that many evaluations); never at execution
+    // (`cancel::with_walk_checks`).
+    cancel::walk_point()?;
     let depth = CONST_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
@@ -38568,6 +39170,23 @@ fn expand_between(e: &pg_query::protobuf::AExpr) -> Option<pg_query::protobuf::N
 }
 
 fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // A constant cast, folded once for the expression (`expr_memo`).
+    if let Some(N::TypeCast(_)) = node.node.as_ref() {
+        if let Some(v) = expr_memo::folded(node, || const_value_node(node, params)) {
+            return v;
+        }
+    }
+    const_value_node(node, params)
+}
+
+fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // A hashed SubPlan (`hashed_subplan`), whose arguments are not all
+    // values to evaluate.
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if f.funcname.len() == 1 && func_name(f).as_deref() == Some(hashed_subplan::NAME) {
+            return hashed_subplan::eval(f, params);
+        }
+    }
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
@@ -38577,14 +39196,16 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // The operand's type, worked out once for the cast: every check below
+        // asks it, and asking walked the operand again each time (RP-131).
+        // The value only changes below by `bpchar` trimming, which happens
+        // only when this type -- then the node's own -- is `bpchar`.
+        let arg_type = static_type(arg, &value);
         // An `int2vector` / `oidvector` as an array is subscripted from 0, as
         // the vector is (`'1 2'::int2vector::int2[]` is `[0:1]={1,2}`).
         if target.ends_with("[]")
             && value != Bson::Null
-            && matches!(
-                static_type(arg, &value).as_str(),
-                "int2vector" | "oidvector"
-            )
+            && matches!(arg_type.as_str(), "int2vector" | "oidvector")
         {
             return Ok(arrays::bounded(cast_value(value, &target)?, &[0]));
         }
@@ -38594,7 +39215,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             if value == Bson::Null {
                 return Ok(Bson::Null);
             }
-            match static_type(arg, &value).as_str() {
+            match arg_type.as_str() {
                 "bpchar" => return Ok(Bson::String(value_text(&value))),
                 // `boolout` is `t` / `f`, where the text cast spells it out.
                 "bool" => {
@@ -38617,7 +39238,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // carried as its text, but it has no cast to anything but the string
         // types and itself: `'a'::t::int` is 42846 on PostgreSQL rather than a
         // parse of the text.
-        if let Some(source) = user_defined_base_source(arg, &value) {
+        if let Some(source) = user_defined_base_source_of(&arg_type) {
             let target_base = user_base_type(&target).map(|(n, _, _)| n);
             if !(is_string_type(&target) || target_base.as_deref() == Some(source.as_str())) {
                 return Err(Error::CannotCoerce(format!(
@@ -38632,7 +39253,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         let untyped = matches!(arg.node.as_ref(), Some(N::AConst(c))
             if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) || c.isnull);
         if !untyped {
-            let source = static_type(arg, &value);
+            let source = arg_type.clone();
             if let Some(cast) = user_casts::find(&source, &target) {
                 return user_casts::apply(&cast, value);
             }
@@ -38753,13 +39374,11 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // (the instant alone cannot say it is a timestamptz, so the source cast
         // decides). PLAN_TIMEZONE is set during planning, where this evaluates.
         if matches!(target.as_str(), "text" | "varchar" | "name") {
-            if let Some(v) =
-                datetime_text_styled(&value, &static_type(arg, &value), &session_timezone())
-            {
+            if let Some(v) = datetime_text_styled(&value, &arg_type, &session_timezone()) {
                 return Ok(v);
             }
         }
-        if target == "text" && static_type(arg, &value) == "timestamptz" {
+        if target == "text" && arg_type == "timestamptz" {
             if let Some(t) = timestamptz_value_text(&value, &session_timezone()) {
                 return Ok(Bson::String(t));
             }
@@ -38767,7 +39386,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // To a zone-less type, a timestamptz is first the session zone's WALL
         // CLOCK: `now()::date` is today where the session is, not in UTC.
         if matches!(target.as_str(), "date" | "timestamp" | "time" | "timetz")
-            && static_type(arg, &value) == "timestamptz"
+            && arg_type == "timestamptz"
         {
             if let Some(v) = timestamptz_as_local(&value, &target)? {
                 return Ok(timestamp_precision(tc, &target, v));
@@ -38784,8 +39403,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // `timestamp`, not `timestamptz`.)
         let is_stored_instant = matches!(&value, Bson::DateTime(_))
             || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE));
-        if target == "timestamptz" && is_stored_instant && static_type(arg, &value) == "timestamptz"
-        {
+        if target == "timestamptz" && is_stored_instant && arg_type == "timestamptz" {
             return Ok(timestamp_precision(tc, &target, value));
         }
         // `boolean` has casts from `integer` and text only. A `smallint` or a
@@ -38795,7 +39413,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // the SOURCE type at the cast site is what decides (42846 on
         // PostgreSQL, where the text form is a 22P02 parse failure).
         if matches!(target.as_str(), "bool" | "boolean") {
-            let source = static_type(arg, &value);
+            let source = arg_type.clone();
             if matches!(
                 source.as_str(),
                 "int2"
@@ -38815,7 +39433,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         }
         // Bit strings: to `bit(n)` / `varbit(n)` from text, a bit string or an
         // integer; and from `bit` (never `varbit`) to an integer.
-        let source = static_type(arg, &value);
+        let source = arg_type.clone();
         if bits::is_bit_type(&target) && value != Bson::Null {
             let n = tc
                 .type_name
@@ -38866,7 +39484,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // citext, whose cast from bpchar is `rtrim1` (citext 1.6).
         let value = if (matches!(target.as_str(), "text" | "varchar" | "name")
             || collation::is_citext_type(&target))
-            && static_type(arg, &value) == "bpchar"
+            && arg_type == "bpchar"
         {
             trim_bpchar(value)
         } else {
@@ -38877,7 +39495,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // which are stored in UTC.
         if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name") && value != Bson::Null
         {
-            let source = static_type(arg, &value);
+            let source = arg_type.clone();
             let tz = session_timezone();
             let rendered = match (source.as_str(), &value) {
                 ("timestamptz", Bson::String(t)) => Some(wide_timestamptz_text(t, &tz)),
@@ -38914,7 +39532,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // A float4 renders as float4out does: the shortest text of the f32.
         if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name") {
             if let Bson::Double(d) = value {
-                if matches!(static_type(arg, &value).as_str(), "float4" | "real") {
+                if matches!(arg_type.as_str(), "float4" | "real") {
                     return cast_value(Bson::String(geo::float4_text(d as f32)), &target);
                 }
             }
@@ -39201,7 +39819,19 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
                 if correlated::executor_hook_installed() {
                     correlated::call_sequence("pg_sleep", &[Bson::Double(secs)])?;
                 } else {
-                    std::thread::sleep(std::time::Duration::from_secs_f64(secs.min(3600.0)));
+                    // A cancellation point every 5 ms, as `pg_sleep`'s own
+                    // loop is one (a row streamed after the statement's
+                    // hooks are gone still has the cancel hook; RP-202).
+                    let deadline = std::time::Instant::now()
+                        + std::time::Duration::from_secs_f64(secs.min(3600.0));
+                    loop {
+                        cancel::check()?;
+                        let left = deadline.saturating_duration_since(std::time::Instant::now());
+                        if left.is_zero() {
+                            break;
+                        }
+                        std::thread::sleep(left.min(std::time::Duration::from_millis(5)));
+                    }
                 }
             }
             return Ok(Bson::String(String::new()));
@@ -40215,28 +40845,33 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // anywhere makes the answer NULL.
         if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprIn) {
             let negated = in_is_negated(e);
-            let items: Vec<pg_query::protobuf::Node> =
+            let items: &[pg_query::protobuf::Node] =
                 match e.rexpr.as_deref().and_then(|n| n.node.as_ref()) {
-                    Some(N::List(l)) => l.items.clone(),
+                    Some(N::List(l)) => &l.items,
                     _ => return Err(Error::Unsupported("this IN list".into())),
                 };
             let mut saw_null = false;
-            // The comparison without its list, cloned once: cloning `e` per
+            // The comparison without its list, built once: cloning `e` per
             // item cloned the whole list each time, quadratic in its length
-            // (a 200,000-item list matching at its 780th item took 24 s).
-            let mut base = e.clone();
-            base.rexpr = None;
-            base.kind = AExprKind::AexprOp as i32;
-            base.name = vec![string_node("=")];
-            for (i, item) in items.into_iter().enumerate() {
+            // (a 200,000-item list matching at its 780th item took 24 s), and
+            // cloning it once, or the list, was 40 ms in which no cancel was
+            // seen (RP-202). Each item is copied as it is compared.
+            let base = AExpr {
+                kind: AExprKind::AexprOp as i32,
+                name: vec![string_node("=")],
+                lexpr: e.lexpr.clone(),
+                rexpr: None,
+                location: e.location,
+            };
+            for (i, item) in items.iter().enumerate() {
                 if i % 1024 == 1023 {
                     cancel::check()?;
                 }
                 let mut eq = base.clone();
-                eq.rexpr = Some(Box::new(item));
+                eq.rexpr = Some(Box::new(item.clone()));
                 match const_value(
                     &pg_query::protobuf::Node {
-                        node: Some(N::AExpr(eq)),
+                        node: Some(N::AExpr(Box::new(eq))),
                     },
                     params,
                 )? {
@@ -41822,7 +42457,7 @@ fn lower_where_or_residual(
     def: &TableDef,
     params: &[Bson],
 ) -> Result<(Document, Option<ColumnExpr>)> {
-    match lower_where(w, def, params) {
+    match lower_where_nonvolatile(w, def, params) {
         Ok(f) => Ok((f, None)),
         Err(Error::Unsupported(_)) => {
             // A top-level AND whose conjuncts partly lower: those become the
@@ -41858,6 +42493,22 @@ fn lower_where_or_residual(
     }
 }
 
+/// `lower_where`, refusing a condition that calls a VOLATILE function: a
+/// filter is built once, so lowering one folded the call into a constant
+/// while planning (`nextval` ran once, not once a row), where PostgreSQL
+/// runs it for every row the scan reads (RP-019). Refused, it is evaluated
+/// per row by the residual.
+fn lower_where_nonvolatile(
+    w: &pg_query::protobuf::Node,
+    def: &TableDef,
+    params: &[Bson],
+) -> Result<Document> {
+    if correlated::has_volatile_call(w) {
+        return Err(Error::Unsupported("a volatile function in WHERE".into()));
+    }
+    lower_where(w, def, params)
+}
+
 /// For a top-level `AND`, the conjuncts that lower to an MQL filter (ANDed)
 /// and the rest as one expression -- `None` unless both parts are non-empty
 /// and every conjunct either lowers or is merely `Unsupported` (a real error
@@ -41885,7 +42536,7 @@ fn split_lowerable_conjuncts(
     let mut filters = Vec::new();
     let mut rest = Vec::new();
     for c in conjuncts {
-        match lower_where(&c, def, params) {
+        match lower_where_nonvolatile(&c, def, params) {
             Ok(f) => filters.push(Bson::Document(f)),
             Err(Error::Unsupported(_)) => rest.push(c),
             Err(_) => return None,

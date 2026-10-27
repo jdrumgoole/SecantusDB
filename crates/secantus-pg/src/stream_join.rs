@@ -625,6 +625,11 @@ impl PgHandler {
 
     /// Hand a prepared join's rows to `sink` a batch at a time.
     fn feed_join(&self, prepared: Prepared<'_>, sink: Sink<'_>) -> PgWireResult<()> {
+        // A streamed join carries every key (`join_search::with_projection`).
+        crate::join_search::with_projection(None, || self.feed_join_inner(prepared, sink))
+    }
+
+    fn feed_join_inner(&self, prepared: Prepared<'_>, sink: Sink<'_>) -> PgWireResult<()> {
         use secantus_pgplan::joins::JoinNode;
         match prepared {
             Prepared::Leaf { sel, def, columns } => {
@@ -830,6 +835,13 @@ impl PgHandler {
 
     /// A general join (`Statement::JoinRows`) prepared to stream, or `None`.
     fn prepared_join_rows<'a>(&self, plan: &'a Statement) -> PgWireResult<Option<Prepared<'a>>> {
+        crate::join_search::with_projection(None, || self.prepared_join_rows_inner(plan))
+    }
+
+    fn prepared_join_rows_inner<'a>(
+        &self,
+        plan: &'a Statement,
+    ) -> PgWireResult<Option<Prepared<'a>>> {
         let Statement::JoinRows(join) = plan else {
             return Ok(None);
         };

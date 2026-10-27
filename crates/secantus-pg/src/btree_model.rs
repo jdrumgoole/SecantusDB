@@ -31,6 +31,10 @@ const MINUS_INFINITY: i64 = 8;
 /// `BTMaxItemSize / 2`: the largest posting list tuple deduplication
 /// makes (`BTDedupState.maxpostingsize`).
 const MAX_POSTING: i64 = 1352;
+/// CREATE INDEX's limit on a posting list tuple (`_bt_load`): a tenth of a
+/// page, MAXALIGNed down, less its line pointer -- the space a leaf filled
+/// to fillfactor 90 leaves (RP-298).
+const BUILD_MAX_POSTING: i64 = (PAGE as i64 * 10 / 100) / 8 * 8 - LP;
 /// `BTREE_NONLEAF_FILLFACTOR`.
 const NONLEAF_FILLFACTOR: i64 = 70;
 /// `BTREE_SINGLEVAL_FILLFACTOR`.
@@ -143,6 +147,10 @@ pub(crate) struct BTree {
     /// leaf each landed on, and each split `(page, its new right half)`.
     pub(crate) ssi_events: Vec<SsiEvent>,
 }
+
+/// A search's leaf, the internal pages above it (root first), and whether a
+/// search with any heap TID takes the same way (`descend_tidless`).
+pub(crate) type Descent = (u32, Vec<u32>, bool);
 
 /// An insert's report to SSI (`_bt_doinsert`, `_bt_split`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -912,6 +920,44 @@ impl BTree {
         any
     }
 
+    /// The heap TIDs of the entries between `lower` and `upper` not yet
+    /// marked dead: what an index scan of that range passes (RP-196).
+    pub(crate) fn tids_in(
+        &self,
+        shape: &dyn Shape,
+        lower: Option<(&Bson, bool)>,
+        upper: Option<(&Bson, bool)>,
+    ) -> Vec<i64> {
+        let Some(pages) = self.scan_pages(shape, lower, upper) else {
+            return Vec::new();
+        };
+        let within = |k: &Bson| {
+            let above = lower.is_none_or(|(l, inclusive)| match shape.cmp_attr(0, k, l) {
+                Ordering::Greater => true,
+                Ordering::Equal => inclusive,
+                Ordering::Less => false,
+            });
+            let below = upper.is_none_or(|(u, inclusive)| match shape.cmp_attr(0, k, u) {
+                Ordering::Less => true,
+                Ordering::Equal => inclusive,
+                Ordering::Greater => false,
+            });
+            above && below
+        };
+        let mut out = Vec::new();
+        for p in pages {
+            let Page::Leaf { items, .. } = &self.pages[p as usize] else {
+                continue;
+            };
+            for it in items {
+                if !it.dead && it.key.first().is_some_and(within) {
+                    out.extend(it.tids.iter().copied());
+                }
+            }
+        }
+        out
+    }
+
     /// The pages it occupies, the metapage and deleted pages among them.
     pub(crate) fn pages(&self) -> u32 {
         self.pages.len().max(1) as u32
@@ -962,8 +1008,8 @@ impl BTree {
             return tree;
         }
         let dedup = shape.dedup() && !shape.unique();
-        // Merge equal keys into posting lists of at most MAX_POSTING bytes
-        // (`_bt_sort_dedup_finish_pending`).
+        // Merge equal keys into posting lists of at most BUILD_MAX_POSTING
+        // bytes (`_bt_sort_dedup_finish_pending`).
         let mut items: Vec<Item> = Vec::new();
         for (key, tid) in entries {
             if dedup {
@@ -971,7 +1017,7 @@ impl BTree {
                     if keep_natts(shape, &last.key, &key) > shape.nkeyatts() {
                         let base = shape.tuple_size(&last.key);
                         let merged = maxalign(base + TID * (last.tids.len() as i64 + 1));
-                        if merged <= MAX_POSTING {
+                        if merged <= BUILD_MAX_POSTING {
                             last.tids.push(tid);
                             continue;
                         }
@@ -1036,19 +1082,162 @@ impl BTree {
         }
     }
 
+    /// [`Self::descend`] without the heap TID (`i64::MIN`, `_bt_search`
+    /// with no `scantid`, as a unique insert first searches), and whether
+    /// the TID could have taken any other way down: only a pivot whose
+    /// every key attribute equals `key` and which keeps a heap TID compares
+    /// differently for different TIDs, and such pivots sort together right
+    /// where the TID-less search stops on each page. When no page on the way
+    /// has one there, a search WITH any TID lands on the same leaf by the
+    /// same path -- what `_bt_findinsertloc` finds by stepping right from
+    /// the leaf the unique check began at, without a second descent
+    /// (RP-014).
+    fn descend_tidless(&self, shape: &dyn Shape, key: &[Bson]) -> (u32, Vec<u32>, bool) {
+        let n = shape.nkeyatts();
+        let mut path = Vec::new();
+        let mut tid_free = true;
+        let mut at = self.root.expect("a root");
+        loop {
+            match &self.pages[at as usize] {
+                Page::Internal { items, .. } => {
+                    path.push(at);
+                    let after = items[1..].partition_point(|d| {
+                        cmp_pivot(shape, key, i64::MIN, &d.pivot) != Ordering::Less
+                    });
+                    if let Some(next) = items.get(after + 1) {
+                        let p = &next.pivot;
+                        if p.tid.is_some()
+                            && p.key.len() >= n
+                            && key.len() >= n
+                            && (0..n)
+                                .all(|a| shape.cmp_attr(a, &key[a], &p.key[a]) == Ordering::Equal)
+                        {
+                            tid_free = false;
+                        }
+                    }
+                    at = items[after].child;
+                }
+                _ => return (at, path, tid_free),
+            }
+        }
+    }
+
+    /// Every heap TID inserting `key` (with heap `tid`) can ask the heap
+    /// about: the equal tuples `_bt_check_unique` passes (a unique index),
+    /// and every tuple on the leaf the insert lands on, which simple and
+    /// bottom-up deletion read. A superset of what `insert_deleting` asks,
+    /// for the heap to be read for these alone, before the tree is changed
+    /// (RP-014: reading the whole heap for each inserted row made a run of
+    /// inserts quadratic).
+    ///
+    /// The leaf's tuples are asked about only when the leaf cannot take the
+    /// new tuple (`free < need`), and `pending` -- the size of every tuple
+    /// the same command inserts, which may fill the leaf first -- is added
+    /// to the need so the set stays a superset.
+    ///
+    /// With them, for a unique index, the TID-less
+    /// descent it made (`descend_tidless`), which an insert of the same key
+    /// into the tree as it still is can take instead of descending again
+    /// ([`Self::insert_descended`]).
+    pub(crate) fn candidate_tids_descending(
+        &self,
+        shape: &dyn Shape,
+        key: &[Bson],
+        tid: i64,
+        pending: i64,
+    ) -> (Vec<i64>, Option<Descent>) {
+        let mut out = Vec::new();
+        if self.root.is_none() {
+            return (out, None);
+        }
+        // The leaf the insert lands on, when the TID-less search already
+        // found it (`descend_tidless`).
+        let mut landed = None;
+        let mut descent = None;
+        if shape.unique() {
+            let (first, path, tid_free) = self.descend_tidless(shape, key);
+            if tid_free {
+                landed = Some(first);
+            }
+            descent = Some((first, path, tid_free));
+            let mut page = first;
+            while let Page::Leaf { items, right, .. } = &self.pages[page as usize] {
+                let mut last_equal = false;
+                // The items are in key order: the equal run starts where the
+                // smaller keys end.
+                let from =
+                    items.partition_point(|it| cmp_keys(shape, &it.key, key) == Ordering::Less);
+                for it in &items[from..] {
+                    match cmp_keys(shape, &it.key, key) {
+                        Ordering::Less => continue,
+                        Ordering::Greater => {
+                            last_equal = false;
+                            break;
+                        }
+                        Ordering::Equal => {
+                            last_equal = true;
+                            out.extend(it.tids.iter().copied());
+                        }
+                    }
+                }
+                match right {
+                    Some(r) if last_equal => page = *r,
+                    _ => break,
+                }
+            }
+        }
+        let leaf = landed.unwrap_or_else(|| self.descend(shape, key, tid).0);
+        let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);
+        if let Page::Leaf { items, high, .. } = &self.pages[leaf as usize] {
+            let free = match cached {
+                Some(used) => USABLE - used - high.as_ref().map_or(0, |h| h.size + LP) - LP,
+                None => leaf_free(items, high),
+            };
+            if free < pending {
+                for it in items {
+                    out.extend(it.tids.iter().copied());
+                }
+            }
+        }
+        (out, descent)
+    }
+
+    /// The size an index tuple for `key` takes (`insertstate->itemsz`):
+    /// with one heap TID, its key's size (`item`).
+    pub(crate) fn key_tuple_size(shape: &dyn Shape, key: &[Bson]) -> i64 {
+        shape.tuple_size(key)
+    }
+
     /// `_bt_check_unique`'s pass over the key's equal tuples, from the
     /// leftmost leaf it can be on (a search without the heap TID) rightward
     /// while they go on: each whose every heap version is dead to all is
-    /// marked LP_DEAD as the check passes it.
-    fn check_unique(&mut self, shape: &dyn Shape, key: &[Bson], dead: &dyn Fn(i64) -> bool) {
-        let (mut page, _) = self.descend(shape, key, i64::MIN);
+    /// marked LP_DEAD as the check passes it. Returns that leftmost leaf:
+    /// marking changes no page's place, so it is where a search without the
+    /// heap TID still lands.
+    ///
+    /// With it, the TID-less search's path and whether a search with any
+    /// heap TID takes the same one (`descend_tidless`): marking changes no
+    /// page's place, so that leaf and path are where the insert goes.
+    fn check_unique(
+        &mut self,
+        shape: &dyn Shape,
+        key: &[Bson],
+        dead: &dyn Fn(i64) -> bool,
+        descended: Option<Descent>,
+    ) -> Descent {
+        let (first, path, tid_free) = descended.unwrap_or_else(|| self.descend_tidless(shape, key));
+        let done = (first, path, tid_free);
+        let mut page = first;
         loop {
             let Page::Leaf { items, right, .. } = &mut self.pages[page as usize] else {
-                return;
+                return done;
             };
             let mut marked = false;
             let mut last_equal = false;
-            for it in items.iter_mut() {
+            // The items are in key order: the equal run starts where the
+            // smaller keys end.
+            let from = items.partition_point(|it| cmp_keys(shape, &it.key, key) == Ordering::Less);
+            for it in items[from..].iter_mut() {
                 match cmp_keys(shape, &it.key, key) {
                     Ordering::Less => continue,
                     Ordering::Greater => {
@@ -1070,7 +1259,7 @@ impl BTree {
             }
             match next {
                 Some(r) if last_equal => page = r,
-                _ => return,
+                _ => return done,
             }
         }
     }
@@ -1108,6 +1297,22 @@ impl BTree {
         unchanged: bool,
         dead: &dyn Fn(i64) -> bool,
     ) {
+        self.insert_descended(shape, key, tid, unchanged, dead, None);
+    }
+
+    /// [`Self::insert_deleting`], given for a unique index the TID-less
+    /// descent [`Self::candidate_tids_descending`] made for `key` in the
+    /// tree as it still is -- nothing changed since -- so the unique check
+    /// starts where that search landed rather than descending again.
+    pub(crate) fn insert_descended(
+        &mut self,
+        shape: &dyn Shape,
+        key: Vec<Bson>,
+        tid: i64,
+        unchanged: bool,
+        dead: &dyn Fn(i64) -> bool,
+        descended: Option<Descent>,
+    ) {
         self.dirty = true;
         if self.root.is_none() {
             let new = item(shape, key, vec![tid]);
@@ -1121,17 +1326,21 @@ impl BTree {
             self.ssi_events.push(SsiEvent::Landed(root));
             return;
         }
-        if shape.unique() {
-            self.check_unique(shape, &key, dead);
-        }
-        let (leaf, path) = self.descend(shape, &key, tid);
-        // The page `_bt_search` lands on, which SSI checks: without the heap
-        // TID for a unique index (the first the key could be on).
-        let landed = if shape.unique() {
-            self.descend(shape, &key, i64::MIN).0
-        } else {
-            leaf
+        let (unique_first, reuse) = match shape
+            .unique()
+            .then(|| self.check_unique(shape, &key, dead, descended))
+        {
+            Some((first, path, tid_free)) => (Some(first), tid_free.then_some((first, path))),
+            None => (None, None),
         };
+        let (leaf, path) = match reuse {
+            Some(found) => found,
+            None => self.descend(shape, &key, tid),
+        };
+        // The page `_bt_search` lands on, which SSI checks: without the heap
+        // TID for a unique index (the first the key could be on) -- the
+        // leaf the unique check began at, which its marks did not move.
+        let landed = unique_first.unwrap_or(leaf);
         self.ssi_events.push(SsiEvent::Landed(landed));
         self.touched.insert(leaf);
         let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);
@@ -1575,7 +1784,20 @@ impl Builder<'_> {
         let lvl = &self.levels[0];
         // `_bt_blnewpage` reserves the high key's line pointer.
         let free = USABLE - LP - lvl.leaf_items.iter().map(|i| i.size + LP).sum::<i64>() - LP;
-        if free < it.size || (free < self.leaf_full && lvl.leaf_items.len() >= 2) {
+        // `_bt_buildadd`: room for the item and for a heap TID suffix
+        // truncation may add to the high key; and the soft fillfactor
+        // limit counts the posting list the last item's high key would
+        // shed (`btps_lastextra`, RP-298).
+        let last_extra = lvl.leaf_items.last().map_or(0, |l| {
+            if l.tids.len() > 1 {
+                l.size - shape.tuple_size(&l.key)
+            } else {
+                0
+            }
+        });
+        if free < it.size + PIVOT_TID
+            || (free + last_extra < self.leaf_full && lvl.leaf_items.len() >= 2)
+        {
             // Finish the page: its last item starts the next one, and the
             // high key between them closes it.
             let lvl = &mut self.levels[0];
@@ -1999,6 +2221,35 @@ mod tests {
             let t = BTree::build(&shape, keys((1..=n).map(|g| g % d)));
             assert_eq!(t.pages(), pages, "{n} rows of {d} values");
         }
+    }
+
+    #[test]
+    fn a_tidless_descent_knows_when_a_tid_would_go_elsewhere() {
+        // Many duplicates, so pivots keep heap TIDs; built and grown.
+        let shape = Int { unique: false };
+        let built = BTree::build(&shape, keys((0..20000).map(|i| i % 7)));
+        let grown_dups = grown(&shape, (0..6000).map(|i| (i * 7919) % 13));
+        let distinct = grown(&shape, (0..6000).map(|i| (i * 7919) % 6007));
+        let mut sensitive = 0;
+        for t in [&built, &grown_dups, &distinct] {
+            for k in -1..15 {
+                let key = [Bson::Int32(k)];
+                let (leaf, path, tid_free) = t.descend_tidless(&shape, &key);
+                assert_eq!((leaf, path.clone()), t.descend(&shape, &key, i64::MIN));
+                if !tid_free {
+                    sensitive += 1;
+                    continue;
+                }
+                for i in [0usize, 1, 500, 5000, 19999, 1_000_000] {
+                    assert_eq!(
+                        t.descend(&shape, &key, tid(i)),
+                        (leaf, path.clone()),
+                        "key {k}, tid {i}"
+                    );
+                }
+            }
+        }
+        assert!(sensitive > 0, "no descent met a TID-keeping pivot");
     }
 
     fn grown(shape: &dyn Shape, vals: impl Iterator<Item = i32>) -> BTree {

@@ -669,6 +669,20 @@ pub fn bind_with(
             if let Err(e) = handler.drop_orphan_temp_functions() {
                 eprintln!("secantusd-pg: could not drop orphaned temp functions: {e}");
             }
+            if let Err(e) = handler.ensure_catalog_collections() {
+                eprintln!("secantusd-pg: could not create the catalog collections: {e}");
+            }
+        }
+    }
+    // The built-in catalogs' rows are built once a process, by the first
+    // statement that installs the planner's catalog -- half a second in a
+    // debug build in which a cancel was not seen (RP-202). PostgreSQL has
+    // its catalogs before a backend runs a query, so they are built here,
+    // before any client connects.
+    {
+        let handler = PgHandler::new(storage.clone(), databases.clone());
+        if handler.select_database("postgres").is_ok() {
+            handler.install_user_types();
         }
     }
     let stop_flag = Arc::new(AtomicBool::new(false));

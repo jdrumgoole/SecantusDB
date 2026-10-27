@@ -19,8 +19,8 @@
 //! method's order (`reorder_join_inputs`, `hash_table_order`) and joined
 //! by `join_rows_core`, the side the plan reads first outer. Anything else
 //! -- a WHERE over more than one table, a constant on a join key, a key
-//! two clauses share, a LIMIT, a lock -- is declined, and the join runs as
-//! written.
+//! two clauses share, a lock -- is declined, and the join runs as
+//! written. A LIMIT is `join_order`'s search to plan.
 
 use super::*;
 use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
@@ -45,6 +45,36 @@ thread_local! {
     /// The joined-row keys the query reads above the join source being
     /// read (`JoinRows::needed`); `None` outside one.
     static NEEDED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    /// The keys the join source being read carries (`JoinRows::project`);
+    /// `None` outside one, and for one whose reads cannot be told.
+    static PROJECT: std::cell::RefCell<Option<std::sync::Arc<std::collections::HashSet<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The keys the join source being read carries (`JoinRows::project`), when
+/// it carries fewer than all.
+pub(crate) fn projection() -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    PROJECT.with(|p| p.borrow().clone())
+}
+
+/// Run `f` with `project` as the join projection, restoring the one before.
+/// Every way into a join's rows other than [`with_join_where`] -- the
+/// streamed join, a statement run inside a join's -- runs under `None`, so
+/// no join builds its rows by another join's projection.
+pub(crate) fn with_projection<T>(
+    project: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Option<std::sync::Arc<std::collections::HashSet<String>>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                PROJECT.with(|p| *p.borrow_mut() = previous);
+            }
+        }
+    }
+    let _restore = Restore(Some(PROJECT.with(|p| p.replace(project))));
+    f()
 }
 
 /// The keys the query reads above the join source being read, when known.
@@ -61,6 +91,65 @@ pub(crate) fn where_join_clauses() -> Option<Vec<(String, String)>> {
     (spans == equalities.len()).then_some(equalities)
 }
 
+/// A WHERE's equalities between two tables and its join filters (by index
+/// in `JoinRows::where_filters`).
+pub(crate) type WhereClauses = (
+    Vec<(String, String)>,
+    Vec<(usize, secantus_pgplan::joins::JoinFilter)>,
+);
+
+/// The join source's WHERE over more than one table, under a LIMIT's
+/// search: its equalities between two tables (join clauses) and its other
+/// conjuncts as join filters, when every one is either; `None` when one
+/// is neither, or a filter's selectivity is not estimated
+/// (`FilterKind::Other`).
+pub(crate) fn where_clauses_and_filters() -> Option<WhereClauses> {
+    use secantus_pgplan::joins::FilterKind;
+    let equalities = WHERE_EQUALITIES.with(|c| c.borrow().clone());
+    let spans = WHERE_SPAN_ALIASES.with(|c| c.borrow().len());
+    let filters: Vec<(usize, secantus_pgplan::joins::JoinFilter)> = WHERE_FILTERS
+        .with(|c| c.borrow().clone())
+        .into_iter()
+        .enumerate()
+        .collect();
+    let estimated: Vec<(usize, secantus_pgplan::joins::JoinFilter)> = filters
+        .into_iter()
+        .filter(|(_, f)| f.kind != FilterKind::Other)
+        .collect();
+    (spans == equalities.len() + estimated.len()).then_some((equalities, estimated))
+}
+
+/// The WHERE's join filter `i` (`JoinRows::where_filters`).
+pub(crate) fn where_filter(i: usize) -> Option<secantus_pgplan::joins::JoinFilter> {
+    WHERE_FILTERS.with(|c| c.borrow().get(i).cloned())
+}
+
+/// A join filter's selectivity with no statistics, as `clause_selectivity`
+/// estimates it; `nd_of` gives a joined key's distinct count.
+pub(crate) fn filter_selectivity(
+    kind: &secantus_pgplan::joins::FilterKind,
+    nd_of: &dyn Fn(&str) -> Option<f64>,
+) -> Option<f64> {
+    use secantus_pgplan::joins::FilterKind;
+    Some(match kind {
+        // `DEFAULT_INEQ_SEL`.
+        FilterKind::Inequality => 1.0 / 3.0,
+        // `neqjoinsel`: one minus `eqjoinsel`.
+        FilterKind::NotEqual(l, r) => 1.0 - 1.0 / nd_of(l)?.max(nd_of(r)?).max(1.0),
+        // `var_eq_const`: one value of the column's distinct ones.
+        FilterKind::EqualsConst(k) => 1.0 / nd_of(k)?.max(1.0),
+        FilterKind::Or(arms) => {
+            let mut s = 0.0;
+            for a in arms {
+                let x = filter_selectivity(a, nd_of)?;
+                s = s + x - s * x;
+            }
+            s
+        }
+        FilterKind::Other => return None,
+    })
+}
+
 /// Run `f` with the join source `join`'s WHERE recorded for the search.
 pub(crate) fn with_join_where<T>(
     join: &secantus_pgplan::joins::JoinRows,
@@ -71,7 +160,7 @@ pub(crate) fn with_join_where<T>(
     let outer_filters = WHERE_FILTERS.with(|c| c.replace(join.where_filters.clone()));
     let outer_equalities = WHERE_EQUALITIES.with(|c| c.replace(join.where_equalities.clone()));
     let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
-    let out = f();
+    let out = with_projection(join.project.clone(), f);
     WHERE_SPANS_EQUALITY.with(|c| c.set(outer_eq));
     WHERE_SPAN_ALIASES.with(|c| *c.borrow_mut() = outer_aliases);
     WHERE_FILTERS.with(|c| *c.borrow_mut() = outer_filters);
@@ -107,6 +196,10 @@ pub(crate) struct Step {
     /// batches and its OUTER key's type, whose hash places an outer row
     /// in its batch. `None` for one batch.
     pub(crate) batches: Option<(u64, u64, String)>,
+    /// A hash join's hashed side's columns, all of one fixed length, when
+    /// its tuples' sizes are known: a table that outgrows its buckets is
+    /// rebuilt in chunk order (`hash_grown_order`).
+    pub(crate) hash_tuple: Option<(Vec<String>, i64)>,
     /// Further clauses' keys `(a_key, b_key)`, sorted and matched on after
     /// the first (a join of two relations on several clauses).
     pub(crate) extra: Vec<(String, String)>,
@@ -335,31 +428,6 @@ impl PgHandler {
             self.join_side(&b.table, JoinKey::Column(column_of(key)?), &b.filter, 0)
                 .map(|s| s.ndistinct)
         };
-        // A filter's selectivity with no statistics, as `clause_selectivity`
-        // estimates it.
-        fn selectivity(
-            kind: &secantus_pgplan::joins::FilterKind,
-            nd_of: &dyn Fn(&str) -> Option<f64>,
-        ) -> Option<f64> {
-            use secantus_pgplan::joins::FilterKind;
-            Some(match kind {
-                // `DEFAULT_INEQ_SEL`.
-                FilterKind::Inequality => 1.0 / 3.0,
-                // `neqjoinsel`: one minus `eqjoinsel`.
-                FilterKind::NotEqual(l, r) => 1.0 - 1.0 / nd_of(l)?.max(nd_of(r)?).max(1.0),
-                // `var_eq_const`: one value of the column's distinct ones.
-                FilterKind::EqualsConst(k) => 1.0 / nd_of(k)?.max(1.0),
-                FilterKind::Or(arms) => {
-                    let mut s = 0.0;
-                    for a in arms {
-                        let x = selectivity(a, nd_of)?;
-                        s = s + x - s * x;
-                    }
-                    s
-                }
-                FilterKind::Other => return None,
-            })
-        }
         // `(filter, selectivity)` of each of the two pairs' filters.
         let mut pair_filters: [Vec<(usize, f64)>; 2] = [Vec::new(), Vec::new()];
         for (i, f) in filters.iter().enumerate() {
@@ -371,7 +439,7 @@ impl PgHandler {
                 None
             };
             let Some(place) = place else { continue };
-            pair_filters[place].push((i, selectivity(&f.kind, &nd_of)?));
+            pair_filters[place].push((i, filter_selectivity(&f.kind, &nd_of)?));
         }
         if on1.iter().any(|a| *a != x.alias && *a != y.alias)
             || on2.iter().any(|a| a != w_alias && *a != z.alias)
@@ -657,6 +725,7 @@ impl PgHandler {
                 filters: Vec::new(),
                 batches: None,
                 extra: Vec::new(),
+                hash_tuple: None,
             },
             joinrel_first: c.pair_first,
             second_step: Step {
@@ -670,6 +739,7 @@ impl PgHandler {
                 filters: rest,
                 batches: None,
                 extra: Vec::new(),
+                hash_tuple: None,
             },
         };
         Some(plan)
@@ -816,21 +886,47 @@ impl PgHandler {
         if !step.extra.is_empty() {
             return self.run_step_on_keys(step, a, b, on);
         }
+        // A hash table that outgrows the buckets its estimate sized: its
+        // rows in the rebuilt chains' order, which every arm below keeps.
+        let mut grown = false;
+        if let (None, Some((cols, typlen))) = (&step.batches, &step.hash_tuple) {
+            let (rows, key, ty, estimate, keep_nulls) = match step.method {
+                JoinMethod::HashOuterA => (&mut b.rows, &step.b_key, &b_type, step.b_rows, false),
+                JoinMethod::HashFullA => (&mut b.rows, &step.b_key, &b_type, step.b_rows, true),
+                JoinMethod::HashOuterB => (&mut a.rows, &step.a_key, &a_type, step.a_rows, false),
+                JoinMethod::HashRightB | JoinMethod::HashFullB => {
+                    (&mut a.rows, &step.a_key, &a_type, step.a_rows, true)
+                }
+                _ => (&mut a.rows, &step.a_key, &None, 0.0, false),
+            };
+            if let Some(ty) = ty {
+                if let Some(ordered) =
+                    crate::hash_grown_order(rows, key, ty, estimate, keep_nulls, cols, *typlen)
+                {
+                    *rows = ordered;
+                    grown = true;
+                }
+            }
+        }
         let (outer, inner, kind, (outer_key, inner_key)) = match step.method {
             // A FULL join: a hash full join's hashed side in its table's
             // order, which its probes' matches and the rows nothing matched
             // both keep; a merge full join's sides in key order.
             JoinMethod::HashFullA => {
-                let ordered = b_type
-                    .is_some_and(|ty| hash_table_order(&mut b.rows, &step.b_key, &ty, step.b_rows));
+                let ordered = grown
+                    || b_type.is_some_and(|ty| {
+                        hash_table_order(&mut b.rows, &step.b_key, &ty, step.b_rows)
+                    });
                 if !ordered {
                     return Ok(None);
                 }
                 (a, b, JoinKind::Full, a_first)
             }
             JoinMethod::HashFullB => {
-                let ordered = a_type
-                    .is_some_and(|ty| hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows));
+                let ordered = grown
+                    || a_type.is_some_and(|ty| {
+                        hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows)
+                    });
                 if !ordered {
                     return Ok(None);
                 }
@@ -873,15 +969,19 @@ impl PgHandler {
                 (b, a, JoinKind::Right, b_first)
             }
             JoinMethod::HashRightB => {
-                let ordered = a_type
-                    .is_some_and(|ty| hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows));
+                let ordered = grown
+                    || a_type.is_some_and(|ty| {
+                        hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows)
+                    });
                 if !ordered {
                     return Ok(None);
                 }
                 (b, a, JoinKind::Right, b_first)
             }
             method => {
-                reorder_join_inputs(method, &mut a.rows, &step.a_key, &mut b.rows, &step.b_key);
+                if !grown {
+                    reorder_join_inputs(method, &mut a.rows, &step.a_key, &mut b.rows, &step.b_key);
+                }
                 let kind = if step.left {
                     JoinKind::Left
                 } else {

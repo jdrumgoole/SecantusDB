@@ -2301,7 +2301,7 @@ def test_a_where_equality_over_two_of_three_tables_is_planned(pg: Any) -> None:
     assert got == ("ok", [(6, 6, 1), (1, 1, 1), (2, 2, 2), (3, 3, 3)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_limit_over_three_tables_is_planned(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `w0 JOIN w1 ON
     w0.b = w1.a JOIN w2 ON w1.b = w2.a LIMIT 5` is planned for its first five
@@ -2323,6 +2323,110 @@ def test_a_limit_over_three_tables_is_planned(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (6, 6, 1)])
+
+
+@pytest.mark.backlog_fixed("RP-298")
+def test_create_index_packs_posting_lists_as_postgres_builds_them(pg: Any) -> None:
+    """PostgreSQL 15.19: CREATE INDEX over many repeated keys limits a
+    posting list to a tenth of a page (`_bt_load`'s maxpostingsize, 812
+    bytes, not the 1,352 an insert's deduplication allows), and finishes a
+    leaf counting the posting list its high key sheds (`btps_lastextra`)
+    and the heap TID it may gain. 10,000 rows of five values make an index
+    of 11 pages, 30,000 of 500 values 27; the model built 12 and 29, which
+    the planner prices index scans by. (Committed: an index made in the
+    open transaction is RP-299.)"""
+    got = []
+    for rows, values in [(10000, 5), (30000, 500), (3000, 7)]:
+        name = f"rp290_{values}"
+        pg.execute(f"drop table if exists {name}")
+        pg.execute(f"create table {name} (a int, b int)")
+        try:
+            pg.execute(
+                f"insert into {name} select i, i % {values} from generate_series(1, {rows}) i"
+            )
+            pg.execute(f"create index {name}_b on {name} (b)")
+            got.append(pg_answer(pg, f"select pg_relation_size('{name}_b') / 8192"))
+        finally:
+            pg.execute(f"drop table {name}")
+    assert got == [("ok", [(11,)]), ("ok", [(27,)]), ("ok", [(5,)])]
+
+
+@pytest.mark.backlog("RP-299")
+def test_an_index_made_in_the_open_transaction_is_a_relation(pg: Any) -> None:
+    """PostgreSQL 15.19: inside the transaction that created it, an index
+    is a relation `regclass` finds, so `pg_relation_size('t_b')` answers
+    (8192 for an empty index: its metapage alone). Here the name is
+    not found until the transaction commits: 42P01."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp291_t (a int, b int)")
+        pg.execute("create index rp291_t_b on rp291_t (b)")
+        got = pg_answer(pg, "select pg_relation_size('rp291_t_b')")
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(8192,)])
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_limit_over_left_joins_reads_a_parameterized_join(pg: Any) -> None:
+    """PostgreSQL 15.19, four 300-row tables never analysed, an index on
+    v1.a: `v0 LEFT JOIN v1 ON v0.b = v1.a LEFT JOIN v2 ON v1.b = v2.a LEFT
+    JOIN v3 ON v2.b = v3.a LIMIT 5` is a Nested Loop Left Join whose inner
+    is the join of v1 and v2 parameterized by v0.b (a Hash Right Join over
+    v1's Index Scan with `a = v0.b`), so the rows come in v0's scan order.
+    A join relation parameterized by an outer table (`param_source_rels`,
+    which an outer join's SpecialJoinInfo allows) is not modelled: the
+    LIMIT's search declines, and the join runs as written."""
+    pg.execute("begin")
+    try:
+        mods = [7, 5, 3, 4, 6]
+        for t in range(4):
+            pg.execute(f"create table rp028_v{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_v{t} select i, i % {mods[t]}, i % {mods[t + 1]}"
+                " from generate_series(1, 300) i"
+            )
+        pg.execute("create index rp028_v1_a on rp028_v1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_v0.a, rp028_v1.a, rp028_v2.a, rp028_v3.a from rp028_v0"
+            " left join rp028_v1 on rp028_v0.b = rp028_v1.a"
+            " left join rp028_v2 on rp028_v1.b = rp028_v2.a"
+            " left join rp028_v3 on rp028_v2.b = rp028_v3.a limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, None), (4, 4, 4, 1), (5, 5, None, None)],
+    )
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_join_on_two_equivalence_classes_is_searched(pg: Any) -> None:
+    """PostgreSQL 15.19, five 20-row tables never analysed, s0's b joined
+    to s2 and s4 and its c to s1 and s3: two equivalence classes, {s0.b,
+    s2.a, s4.a} and {s0.c, s1.a, s3.a}. PostgreSQL's search merges s1 with
+    s3 on one class and s0, s2, s4 on the other, then the two on s0.c, and
+    returns s0's rows 11, 1, 16, 6, ... The join order search models one
+    class only and declines, so the join runs as written."""
+    pg.execute("begin")
+    try:
+        for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 6), (6, 5)]):
+            pg.execute(f"create table rp028_s{t} (a int, b int, c int)")
+            pg.execute(
+                f"insert into rp028_s{t} select i, i % {mb}, i % {mc} from generate_series(1, 20) i"
+            )
+        got = pg_answer(
+            pg,
+            "select rp028_s0.a, rp028_s1.a, rp028_s2.a, rp028_s3.a, rp028_s4.a from rp028_s0"
+            " join rp028_s1 on rp028_s0.c = rp028_s1.a join rp028_s2 on rp028_s0.b = rp028_s2.a"
+            " join rp028_s3 on rp028_s0.c = rp028_s3.a join rp028_s4 on rp028_s0.b = rp028_s4.a",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got[0] == "ok"
+    assert [r[0] for r in got[1]] == [11, 1, 16, 6, 2, 12, 17, 3, 18, 13, 8, 4, 9, 19]
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so

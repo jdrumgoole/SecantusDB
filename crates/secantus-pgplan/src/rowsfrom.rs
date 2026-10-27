@@ -14,12 +14,19 @@ use super::*;
 pub(crate) fn rewrite(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
-    let mut out = s.clone();
+    // Only the FROM list changes: the rest of the statement is copied only
+    // when it does (RP-202).
+    let mut from = s.from_clause.clone();
     let mut changed = false;
-    for (i, item) in out.from_clause.iter_mut().enumerate() {
+    for (i, item) in from.iter_mut().enumerate() {
         changed |= rewrite_item(item, i > 0)?;
     }
-    Ok(changed.then_some(out))
+    if !changed {
+        return Ok(None);
+    }
+    let mut out = s.clone();
+    out.from_clause = from;
+    Ok(Some(out))
 }
 
 /// `has_left`: a FROM item stands to this one's left, which a function in

@@ -192,6 +192,89 @@ fn enum_labels(ty: &str) -> Option<Vec<String>> {
 }
 
 /// The enum a column's declared type names, if any.
+/// A type nothing below rewrites a comparison or an ordering of: built in,
+/// and no enum, network type, range, multirange or citext. A pseudo-type
+/// (a polymorphic result) takes its arguments' types, which are checked
+/// where they are written.
+fn plain_type(t: &str) -> bool {
+    let base = t.trim().trim_end_matches("[]").trim_end();
+    if base.starts_with("any") || matches!(base, "void" | "record" | "trigger" | "internal") {
+        return true;
+    }
+    !matches!(base, "inet" | "cidr")
+        && !crate::collation::is_citext(base)
+        && !crate::range::is_range_type(base)
+        && !crate::range::is_multirange_type(base)
+        && crate::pgtypes::oid_of_name(base).is_some()
+        && enum_labels(base).is_none()
+}
+
+/// Whether this rewrite can change nothing in `s`, read in place: the
+/// statement was copied to find out, 40 ms over a 200,000-item `IN` list
+/// (RP-202). Every value in it must come from somewhere this module would
+/// look at: a plain table's plain column with no collation of its own, a
+/// literal, an operator, or a built-in call whose every overload returns a
+/// plain type. A cast, a COLLATE, a subquery, `pg_collation_for` or a user
+/// function, a WITH, VALUES, or a FROM item that is not a table, and the
+/// rewrite runs as before.
+fn over_plain_values(s: &pg_query::protobuf::SelectStmt, defs: &[(String, TableDef)]) -> bool {
+    fn from_plain(n: &pg_query::protobuf::Node, quals: &mut Vec<pg_query::protobuf::Node>) -> bool {
+        match n.node.as_ref() {
+            Some(N::RangeVar(_)) => true,
+            Some(N::JoinExpr(j)) => {
+                if let Some(q) = j.quals.as_deref() {
+                    quals.push(q.clone());
+                }
+                j.larg.as_deref().is_some_and(|l| from_plain(l, quals))
+                    && j.rarg.as_deref().is_some_and(|r| from_plain(r, quals))
+            }
+            _ => false,
+        }
+    }
+    if s.with_clause.is_some() || !s.values_lists.is_empty() {
+        return false;
+    }
+    let mut quals = Vec::new();
+    if !s.from_clause.iter().all(|f| from_plain(f, &mut quals)) {
+        return false;
+    }
+    let plain_column = |c: &Column| {
+        c.extra.get_str("enum_type").is_err()
+            && crate::collation::column_collation(c).is_none()
+            && plain_type(&c.pg_type)
+    };
+    if !defs.iter().all(|(_, d)| d.columns.iter().all(plain_column)) {
+        return false;
+    }
+    let opaque = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        // A cast to a plain type gives nothing below a type to act on.
+        Some(N::TypeCast(tc)) => !tc
+            .type_name
+            .as_ref()
+            .is_some_and(|t| plain_type(&crate::type_name_of(t))),
+        Some(N::CollateClause(_) | N::SubLink(_)) => true,
+        Some(N::FuncCall(f)) => match crate::func_name(f) {
+            Some(name) => {
+                name == "pg_collation_for"
+                    || crate::correlated::user_function_named(&name)
+                    || !crate::funcsig::builtin_returns_all(&name, &plain_type)
+            }
+            None => true,
+        },
+        _ => false,
+    };
+    !s.target_list
+        .iter()
+        .chain(s.where_clause.as_deref())
+        .chain(s.having_clause.as_deref())
+        .chain(s.group_clause.iter())
+        .chain(s.sort_clause.iter())
+        .chain(s.distinct_clause.iter())
+        .chain(s.window_clause.iter())
+        .chain(quals.iter())
+        .any(|n| crate::expr_any(n, &opaque))
+}
+
 fn column_enum(c: &Column) -> Option<(String, Vec<String>)> {
     let ty = c.extra.get_str("enum_type").unwrap_or(&c.pg_type);
     enum_labels(ty).map(|labels| (ty.to_string(), labels))
@@ -1618,6 +1701,9 @@ pub(crate) fn rewrite(
     };
     let mut defs = Vec::new();
     scope(&s.from_clause, &with_ctes, &mut defs);
+    if over_plain_values(s, &defs) {
+        return Ok(None);
+    }
     let mut out = s.clone();
     let mut r = Rewriter {
         scope: &defs,

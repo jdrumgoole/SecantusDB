@@ -88,6 +88,8 @@ pub(crate) fn save_store(
     Stats::flush_all(key);
     let d = Stats::dump(key);
     Stats::forget_store(key);
+    // The shared invalidation queue goes with the server (RP-225).
+    crate::catcache::forget_store(key);
     if !storage
         .collection_exists(STATS_NAMESPACE, STATS_COLLECTION)
         .map_err(|e| e.to_string())?
@@ -356,12 +358,17 @@ fn flush_backend(shared: &mut Shared, pid: i32, now: Instant) {
     let rels = std::mem::take(&mut b.rels);
     let funcs = std::mem::take(&mut b.funcs);
     let mut dbc = std::mem::take(&mut b.dbc);
+    // A shared catalog's counts are kept under database 0, and so are the
+    // tuples they add to a database's (`pg_stat_database`'s row for shared
+    // objects).
+    let mut shared_dbc = DbEntry::default();
     b.last_flush = Some(now);
     b.pending_since = None;
     b.idle_since = None;
     b.force_next = false;
     for (rel, c) in rels {
-        let e = shared.rels.entry((db, rel)).or_default();
+        let is_shared = crate::catalog_facts::is_shared_relation(rel);
+        let e = shared.rels.entry((rel_db(db, rel), rel)).or_default();
         e.numscans += c.numscans;
         e.tuples_returned += c.tuples_returned;
         e.tuples_fetched += c.tuples_fetched;
@@ -380,6 +387,7 @@ fn flush_backend(shared: &mut Shared, pid: i32, now: Instant) {
         e.inserts_since_vacuum += c.tuples_inserted;
         e.blocks_fetched += c.blocks_fetched;
         e.blocks_hit += c.blocks_hit;
+        let dbc = if is_shared { &mut shared_dbc } else { &mut dbc };
         dbc.tuples_returned += c.tuples_returned;
         dbc.tuples_fetched += c.tuples_fetched;
         dbc.tuples_inserted += c.tuples_inserted;
@@ -395,6 +403,19 @@ fn flush_backend(shared: &mut Shared, pid: i32, now: Instant) {
         e.self_time += c.self_time;
     }
     shared.dbs.entry(db).or_default().add(&dbc);
+    if shared_dbc != DbEntry::default() {
+        shared.dbs.entry(0).or_default().add(&shared_dbc);
+    }
+}
+
+/// The database a relation's counts are kept under: 0 for a shared
+/// catalog, which every database reads.
+fn rel_db(db: i64, rel: i64) -> i64 {
+    if crate::catalog_facts::is_shared_relation(rel) {
+        0
+    } else {
+        db
+    }
 }
 
 /// Flush every other backend that has been idle long enough with counts
@@ -846,7 +867,7 @@ impl Stats {
         self.read(
             c,
             (0, rel),
-            |s, db| Snap::Rel(s.rels.get(&(db, rel)).cloned()),
+            |s, db| Snap::Rel(s.rels.get(&(rel_db(db, rel), rel)).cloned()),
             |v| match v {
                 Snap::Rel(e) => e.clone(),
                 _ => None,
@@ -965,7 +986,7 @@ impl Stats {
             if function {
                 s.funcs.remove(&(db, oid));
             } else {
-                s.rels.remove(&(db, oid));
+                s.rels.remove(&(rel_db(db, oid), oid));
             }
             s.dbs.entry(db).or_default().stat_reset_timestamp = Some(SystemTime::now());
         });

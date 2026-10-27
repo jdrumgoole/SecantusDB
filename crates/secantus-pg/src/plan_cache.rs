@@ -578,10 +578,21 @@ fn sub_expr(e: &mut ColumnExpr, from: &[Bson], to: &[Bson], hits: &mut [bool]) {
     let ColumnExpr::Row { expr, params, .. } = e else {
         return;
     };
-    if params.len() != from.len() || !params.iter().zip(from).all(|(p, f)| same(p, f)) {
+    // A value the expression never reads is kept as NULL
+    // (`params_read_by`), so it matches any stand-in and stays NULL.
+    if params.len() != from.len()
+        || !params
+            .iter()
+            .zip(from)
+            .all(|(p, f)| same(p, f) || *p == Bson::Null)
+    {
         return;
     }
-    params.clone_from_slice(to);
+    for ((p, f), t) in params.iter_mut().zip(from).zip(to) {
+        if same(p, f) {
+            p.clone_from(t);
+        }
+    }
     let Some(root) = expr.node.as_ref() else {
         return;
     };

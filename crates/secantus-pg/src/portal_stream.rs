@@ -211,6 +211,7 @@ impl PgHandler {
         sel: &secantus_pgplan::Select,
         env: &RowEnv,
     ) -> PgWireResult<Option<Response>> {
+        let _hint = crate::am_ssi::hint_select(sel);
         let mode = self
             .stream_portal
             .swap(STREAM_NEVER, std::sync::atomic::Ordering::Relaxed);
@@ -512,7 +513,7 @@ impl PgHandler {
                         order.push(crate::heap::ctid_order_key());
                     }
                 }
-                Some(PricedScan::Index(ScanIndex::Hash(_))) | None => {}
+                Some(PricedScan::Index(ScanIndex::Hash(_)) | PricedScan::Am(..)) | None => {}
             }
         }
         if !priced && order.is_empty() && seq && self.heap_scan_disordered(&sel.table) {
