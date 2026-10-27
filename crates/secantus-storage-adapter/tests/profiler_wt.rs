@@ -396,7 +396,7 @@ fn update_and_delete_are_profiled_by_statement() {
         // cache key, locks and read concern, then its plan after `millis`
         // (RM-023, mongod 8.2.11's order). A write's flow control is
         // RM-357's.
-        let want = vec![
+        let mut want = vec![
             "op",
             "ns",
             "command",
@@ -420,6 +420,12 @@ fn update_and_delete_are_profiled_by_statement() {
             "allUsers",
             "user",
         ];
+        // A statement's own `cpuNanos`, before `millis`, on Linux (mongod
+        // 8.2.12).
+        if cfg!(target_os = "linux") {
+            let millis = want.iter().position(|k| *k == "millis").unwrap();
+            want.insert(millis, "cpuNanos");
+        }
         assert_eq!(keys(&profiled[0]), want);
         assert_eq!(
             (
