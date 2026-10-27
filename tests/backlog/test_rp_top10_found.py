@@ -79,7 +79,7 @@ def test_a_view_leaning_on_the_key_holds_its_constraint(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-281")
+@pytest.mark.backlog_fixed("RP-281")
 def test_a_deferrable_primary_key_is_deferrable(pg: Any) -> None:
     """`PRIMARY KEY (a, b) DEFERRABLE` records `condeferrable`."""
     got = _in_block(
@@ -89,6 +89,115 @@ def test_a_deferrable_primary_key_is_deferrable(pg: Any) -> None:
         " where conrelid = 'rp281_t'::regclass and contype = 'p'",
     )
     assert got == ("ok", [(True, False)])
+
+
+@pytest.mark.backlog_fixed("RP-281")
+@pytest.mark.parametrize(
+    "setup, query, want",
+    [
+        # Checked at the end of the statement, not row by row.
+        (
+            [
+                "create table rp281_s (a int primary key deferrable, b int)",
+                "insert into rp281_s values (1, 1), (2, 2)",
+                "update rp281_s set a = a + 1",
+            ],
+            "select a from rp281_s order by a",
+            ("ok", [(2,), (3,)]),
+        ),
+        (
+            [
+                "create table rp281_s (a int primary key deferrable)",
+                "insert into rp281_s values (1)",
+            ],
+            "insert into rp281_s values (1)",
+            ("err", "23505", 'duplicate key value violates unique constraint "rp281_s_pkey"'),
+        ),
+        (
+            ["create table rp281_s (a int primary key deferrable)"],
+            "insert into rp281_s values (null)",
+            (
+                "err",
+                "23502",
+                'null value in column "a" of relation "rp281_s" violates not-null constraint',
+            ),
+        ),
+        # INITIALLY DEFERRED: a duplicate stands until COMMIT.
+        (
+            [
+                "create table rp281_s (a int, b int,"
+                " primary key (a, b) deferrable initially deferred)",
+                "insert into rp281_s values (1, 1), (1, 1)",
+            ],
+            "select count(*) from rp281_s",
+            ("ok", [(2,)]),
+        ),
+        (
+            ["create table rp281_s (a int, constraint rp281_k primary key (a) deferrable)"],
+            "select c.contype, pg_get_constraintdef(c.oid), i.indisprimary, i.indimmediate"
+            " from pg_constraint c join pg_index i on i.indexrelid = c.conindid"
+            " where c.conrelid = 'rp281_s'::regclass",
+            ("ok", [("p", "PRIMARY KEY (a) DEFERRABLE", True, False)]),
+        ),
+        (
+            ["create table rp281_s (a int primary key deferrable)"],
+            "select constraint_type, is_deferrable, nulls_distinct"
+            " from information_schema.table_constraints"
+            " where table_name = 'rp281_s' and constraint_type <> 'CHECK'",
+            ("ok", [("PRIMARY KEY", "YES", None)]),
+        ),
+        (
+            ["create table rp281_s (a int primary key deferrable)"],
+            "create table rp281_r (x int references rp281_s)",
+            ("err", "55000", 'cannot use a deferrable primary key for referenced table "rp281_s"'),
+        ),
+        (
+            [
+                "create table rp281_s (a int, b int)",
+                "insert into rp281_s values (1, 1), (2, 2)",
+                "alter table rp281_s add primary key (a) deferrable initially deferred",
+                "update rp281_s set a = 1",
+            ],
+            "select pg_get_constraintdef(oid), condeferred from pg_constraint"
+            " where conrelid = 'rp281_s'::regclass and contype = 'p'",
+            ("ok", [("PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED", True)]),
+        ),
+        (
+            ["create table rp281_s (a int)", "insert into rp281_s values (1), (1)"],
+            "alter table rp281_s add primary key (a) deferrable",
+            ("err", "23505", 'could not create unique index "rp281_s_pkey"'),
+        ),
+        (
+            [
+                "create table rp281_s (a int, b int)",
+                "alter table rp281_s add primary key (a) deferrable",
+            ],
+            "alter table rp281_s add primary key (b)",
+            ("err", "42P16", 'multiple primary keys for table "rp281_s" are not allowed'),
+        ),
+    ],
+)
+def test_a_deferrable_primary_key_is_checked_as_postgres_checks_it(
+    pg: Any, setup: list[str], query: str, want: tuple
+) -> None:
+    """A DEFERRABLE primary key is judged at statement end (or COMMIT when
+    deferred), and the catalogs report it as PostgreSQL 15.19 does."""
+    assert _in_block(pg, setup, query) == want
+
+
+@pytest.mark.backlog_fixed("RP-281")
+def test_an_initially_deferred_primary_key_is_judged_at_commit(pg: Any) -> None:
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp281_c (a int primary key deferrable initially deferred)")
+        pg.execute("insert into rp281_c values (1), (1)")
+        assert pg_answer(pg, "commit") == (
+            "err",
+            "23505",
+            'duplicate key value violates unique constraint "rp281_c_pkey"',
+        )
+    finally:
+        pg.execute("rollback")
 
 
 @pytest.mark.backlog_fixed("RP-282")

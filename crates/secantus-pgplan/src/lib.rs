@@ -2309,6 +2309,10 @@ pub enum AlterTableAction {
         include: Vec<String>,
         /// Its index's storage parameters (`... PRIMARY KEY (a) WITH (...)`).
         reloptions: Vec<String>,
+        /// `DEFERRABLE [INITIALLY DEFERRED]`: kept as a unique constraint
+        /// marked `primary`, the rows keeping their `_id` (RP-281).
+        deferrable: bool,
+        initially_deferred: bool,
     },
     /// `ADD [CONSTRAINT n] FOREIGN KEY ...`: checked against the rows already
     /// there, then enforced on every write. `named` when the statement gave
@@ -7497,6 +7501,8 @@ fn plan_alter_action(
                         using_index,
                         include: string_list(&k.including),
                         reloptions: index_reloptions("btree", &k.options)?,
+                        deferrable: k.deferrable,
+                        initially_deferred: k.initdeferred,
                     });
                 }
                 Ok(CT::ConstrForeign) => {
@@ -8393,6 +8399,24 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             def.check_constraints.sort_by(|a, b| a.name.cmp(&b.name));
         }
         AlterTableAction::AddUnique(uq) => def.unique_constraints.push(uq.clone()),
+        AlterTableAction::AddPrimaryKey {
+            columns,
+            name,
+            reloptions,
+            deferrable: true,
+            initially_deferred,
+            ..
+        } => {
+            for c in def.columns.iter_mut().filter(|c| columns.contains(&c.name)) {
+                c.nullable = false;
+            }
+            let mut uq = UniqueConstraint::new(name, columns.clone());
+            uq.primary = true;
+            uq.deferrable = true;
+            uq.initially_deferred = *initially_deferred;
+            uq.reloptions = reloptions.clone();
+            def.unique_constraints.insert(0, uq);
+        }
         AlterTableAction::AddPrimaryKey {
             columns,
             name,
@@ -10527,6 +10551,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
     // `CONSTRAINT name PRIMARY KEY`: the key's name, when it was given one.
     let mut pk_name: Option<String> = None;
     let mut pk_reloptions: Vec<String> = Vec::new();
+    // `PRIMARY KEY ... DEFERRABLE [INITIALLY DEFERRED]` (RP-281).
+    let mut pk_deferrable = false;
+    let mut pk_initially_deferred = false;
     for el in &c.table_elts {
         match el.node.as_ref() {
             Some(N::ColumnDef(cd)) => {
@@ -10606,6 +10633,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                                 pk_name = Some(k.conname.clone());
                             }
                             pk_reloptions = index_reloptions("btree", &k.options)?;
+                            last_deferrable = Some(DeferTarget::PrimaryKey);
                         }
                         Ok(CT::ConstrNotnull) => column.nullable = false,
                         Ok(CT::ConstrNull) => column.nullable = !pk,
@@ -10661,6 +10689,28 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         // A column constraint's DEFERRABLE / INITIALLY
                         // DEFERRED arrive as separate attribute constraints
                         // after the constraint they qualify.
+                        Ok(CT::ConstrAttrDeferrable)
+                            if last_deferrable == Some(DeferTarget::PrimaryKey) =>
+                        {
+                            pk_deferrable = true;
+                        }
+                        Ok(CT::ConstrAttrNotDeferrable)
+                            if last_deferrable == Some(DeferTarget::PrimaryKey) =>
+                        {
+                            pk_deferrable = false;
+                            pk_initially_deferred = false;
+                        }
+                        Ok(CT::ConstrAttrDeferred)
+                            if last_deferrable == Some(DeferTarget::PrimaryKey) =>
+                        {
+                            pk_deferrable = true;
+                            pk_initially_deferred = true;
+                        }
+                        Ok(CT::ConstrAttrImmediate)
+                            if last_deferrable == Some(DeferTarget::PrimaryKey) =>
+                        {
+                            pk_initially_deferred = false;
+                        }
                         Ok(CT::ConstrAttrDeferrable) => {
                             apply_defer(&mut fks, &mut uniques, last_deferrable, true, None);
                         }
@@ -10781,6 +10831,8 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         pk_name = Some(k.conname.clone());
                     }
                     pk_reloptions = index_reloptions("btree", &k.options)?;
+                    pk_deferrable = k.deferrable;
+                    pk_initially_deferred = k.initdeferred;
                 }
                 // `EXCLUDE [USING m] (col WITH op, ...)`: each exclusion is a
                 // `[IndexElem, [op]]` pair. An all-`=` one is a UNIQUE (the
@@ -10864,6 +10916,35 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
             .ok_or_else(|| Error::UndefinedColumn(name.clone()))?;
         col.pk = true;
         col.nullable = false;
+    }
+    // A DEFERRABLE primary key cannot be the row's `_id`, whose index is
+    // unique per write: PostgreSQL checks it at the end of the statement
+    // (`update t set a = a + 1` over 1 and 2 succeeds), or at COMMIT when
+    // deferred. The rows keep a generated `_id`, and the key is a deferrable
+    // UNIQUE marked `primary`, which the catalogs report as the PRIMARY KEY.
+    if pk_deferrable {
+        let cols: Vec<String> = if table_pk.is_empty() {
+            columns
+                .iter()
+                .filter(|c| c.pk)
+                .map(|c| c.name.clone())
+                .collect()
+        } else {
+            table_pk.clone()
+        };
+        for c in columns.iter_mut().filter(|c| c.pk) {
+            c.pk = false;
+        }
+        let name = pk_name
+            .take()
+            .unwrap_or_else(|| format!("{}_pkey", schemas::split_key(&table).1));
+        let mut uq = UniqueConstraint::new(&name, cols);
+        uq.primary = true;
+        uq.deferrable = true;
+        uq.initially_deferred = pk_initially_deferred;
+        uq.reloptions = std::mem::take(&mut pk_reloptions);
+        uniques.insert(0, uq);
+        table_pk.clear();
     }
     // A COMPOSITE primary key is a subdocument `_id` whose fields are the key
     // columns, in TABLE-column order -- the Python server's layout, so the
@@ -11022,6 +11103,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
 enum DeferTarget {
     ForeignKey,
     Unique,
+    PrimaryKey,
 }
 
 /// Apply a DEFERRABLE-family attribute to whichever constraint was pushed last.
@@ -11050,7 +11132,7 @@ fn apply_defer(
                 }
             }
         }
-        None => {}
+        Some(DeferTarget::PrimaryKey) | None => {}
     }
 }
 
@@ -11072,7 +11154,7 @@ fn apply_defer_initial(
                 uq.initially_deferred = initially_deferred;
             }
         }
-        None => {}
+        Some(DeferTarget::PrimaryKey) | None => {}
     }
 }
 
@@ -11224,6 +11306,16 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
         .map(|c| c.name.clone())
         .collect();
     if fk.ref_columns.is_empty() {
+        // A DEFERRABLE primary key is kept as a unique constraint (RP-281).
+        if pk.is_empty() && target.unique_constraints.iter().any(|u| u.primary) {
+            return Err(Error::Sqlstate(
+                "55000",
+                format!(
+                    "cannot use a deferrable primary key for referenced table \"{}\"",
+                    target.name
+                ),
+            ));
+        }
         if pk.is_empty() {
             return Err(Error::InvalidForeignKey(format!(
                 "there is no primary key for referenced table \"{}\"",
