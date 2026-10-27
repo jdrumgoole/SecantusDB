@@ -4,7 +4,8 @@ RP-070's cumulative statistics -- the counters behind `pg_stat_*_tables`,
 `pg_stat_database` and `pg_statio_*` (decided by Joe, 2026-10-22: model
 the counters; 2026-10-24: model a buffer cache for the block counts), and
 the gap tests of what that model leaves: RP-224 (a LIMIT's scan), RP-225
-(the system catalogs' counters) and RP-227 (how a session ended).
+(the system catalogs' counters; fixed since, and `test_rp_catalog_reads.py`
+holds their exact counts) and RP-227 (how a session ended).
 
 A backend's counts reach the shared statistics when it goes idle, at most
 once a second, so each scenario forces the flush it reads
@@ -265,7 +266,7 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     # ------------------------------------ RP-225 the system catalogs' counts
     "a new session's catalog reads are counted": (
         "RP-225",
-        True,
+        False,
         [
             "create table rp55_c (n bigint)",
             _FLUSH,

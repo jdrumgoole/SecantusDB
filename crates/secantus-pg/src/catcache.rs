@@ -53,12 +53,8 @@ pub(crate) enum Cache {
     AuthOid,
     CastSourceTarget,
     ClaOid,
-    CollNameEncNsp,
-    CollOid,
     DatabaseOid,
     IndexRelid,
-    LangName,
-    LangOid,
     NamespaceName,
     NamespaceOid,
     OperNameNsp,
@@ -67,10 +63,8 @@ pub(crate) enum Cache {
     ProcOid,
     PublicationNamespaceMap,
     PublicationRelMap,
-    RangeType,
     RelNameNsp,
     RelOid,
-    RuleRelName,
     StatRelAttInh,
     TableSpaceOid,
     TypeNameNsp,
@@ -93,12 +87,8 @@ impl Cache {
             AuthOid => (1260, 2677),
             CastSourceTarget => (2605, 2661),
             ClaOid => (2616, 2687),
-            CollNameEncNsp => (3456, 3164),
-            CollOid => (3456, 3085),
             DatabaseOid => (1262, 2672),
             IndexRelid => (2610, 2679),
-            LangName => (2612, 2681),
-            LangOid => (2612, 2682),
             NamespaceName => (2615, 2684),
             NamespaceOid => (2615, 2685),
             OperNameNsp => (2617, 2689),
@@ -107,10 +97,8 @@ impl Cache {
             ProcOid => (1255, 2690),
             PublicationNamespaceMap => (6237, 6239),
             PublicationRelMap => (6106, 6113),
-            RangeType => (3541, 3542),
             RelNameNsp => (1259, 2663),
             RelOid => (1259, 2662),
-            RuleRelName => (2618, 2693),
             StatRelAttInh => (2619, 2696),
             TableSpaceOid => (1213, 2697),
             TypeNameNsp => (1247, 2704),
@@ -122,50 +110,7 @@ impl Cache {
     fn heap_scan(self) -> bool {
         matches!(self, Cache::AmOid)
     }
-
-    /// The caches over one catalog, for an invalidation of its rows.
-    fn over(catalog: i64) -> impl Iterator<Item = Cache> {
-        ALL.iter()
-            .copied()
-            .filter(move |c| c.relations().0 == catalog)
-    }
 }
-
-const ALL: [Cache; 33] = [
-    Cache::AggFnoid,
-    Cache::AmOid,
-    Cache::AmopOpid,
-    Cache::AmopStrategy,
-    Cache::AmprocNum,
-    Cache::AttName,
-    Cache::AttNum,
-    Cache::AuthName,
-    Cache::AuthOid,
-    Cache::CastSourceTarget,
-    Cache::ClaOid,
-    Cache::CollNameEncNsp,
-    Cache::CollOid,
-    Cache::DatabaseOid,
-    Cache::IndexRelid,
-    Cache::LangName,
-    Cache::LangOid,
-    Cache::NamespaceName,
-    Cache::NamespaceOid,
-    Cache::OperNameNsp,
-    Cache::OperOid,
-    Cache::ProcNameArgsNsp,
-    Cache::ProcOid,
-    Cache::PublicationNamespaceMap,
-    Cache::PublicationRelMap,
-    Cache::RangeType,
-    Cache::RelNameNsp,
-    Cache::RelOid,
-    Cache::RuleRelName,
-    Cache::StatRelAttInh,
-    Cache::TableSpaceOid,
-    Cache::TypeNameNsp,
-    Cache::TypeOid,
-];
 
 /// One column of a cache key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -314,6 +259,12 @@ impl Backend {
     }
 
     /// Whether `rel`'s relation cache entry is built.
+    /// Bumped by every invalidation that dropped something.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_relation(&self, rel: i64) -> bool {
         self.relcache.contains(&rel)
     }
@@ -401,16 +352,16 @@ impl Backend {
         }
         // A namespace's change makes the search path recomputed
         // (`NamespaceCallback`).
-        if matches!(msg, Inval::Cat(Cache::NamespaceName | Cache::NamespaceOid, _) | Inval::Reset)
-        {
+        if matches!(
+            msg,
+            Inval::Cat(Cache::NamespaceName | Cache::NamespaceOid, _) | Inval::Reset
+        ) {
             self.search_path = None;
         }
-        // A type's change drops its type cache entry (`TypeCacheTypCallback`);
-        // an operator-class change drops them all (`TypeCacheOpcCallback`).
-        match msg {
-            // `TypeCacheOpcCallback`: every entry's operator flags.
-            Inval::Cat(Cache::ClaOid, _) => self.typcache.clear(),
-            _ => {}
+        // An operator class's change drops every type cache entry's operator
+        // flags (`TypeCacheOpcCallback`).
+        if matches!(msg, Inval::Cat(Cache::ClaOid, _)) {
+            self.typcache.clear();
         }
         let after = (
             self.entries.len(),
@@ -492,8 +443,7 @@ fn take_dead(store: usize, index: i64, key: &Key) -> i64 {
         return 0;
     }
     let before = q.dead.len();
-    q.dead
-        .retain(|(i, k)| !(*i == index && k.starts_with(key)));
+    q.dead.retain(|(i, k)| !(*i == index && k.starts_with(key)));
     (before - q.dead.len()) as i64
 }
 
@@ -673,13 +623,33 @@ mod tests {
         b.attach(store);
         b.search(&c, Cache::RelOid, vec![K::O(16384)], 1);
         b.build_relation(16384);
-        a.local(vec![Inval::Rel(16384), Inval::Cat(Cache::RelOid, vec![K::O(16384)])]);
+        a.local(vec![
+            Inval::Rel(16384),
+            Inval::Cat(Cache::RelOid, vec![K::O(16384)]),
+        ]);
         b.accept(store, 2);
         assert!(b.has_relation(16384));
         a.end_xact(store, 1, true);
         b.accept(store, 2);
         assert!(!b.has_relation(16384));
         assert!(!b.cached(Cache::RelOid, &vec![K::O(16384)]));
+        forget_store(store);
+    }
+
+    #[test]
+    fn a_dead_entry_is_returned_once_after_commit() {
+        let store = 0xfeef;
+        let mut a = Backend::default();
+        a.attach(store);
+        let key = vec![K::O(16384), K::O(3)];
+        a.left_dead(vec![(2659, key.clone())]);
+        // Not killable while its transaction is open.
+        assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 0);
+        a.end_xact(store, 1, true);
+        // A scan of the relation's attributes meets it once.
+        assert_eq!(take_dead(store, 2659, &vec![K::O(16385)]), 0);
+        assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 1);
+        assert_eq!(take_dead(store, 2659, &vec![K::O(16384)]), 0);
         forget_store(store);
     }
 

@@ -88,6 +88,8 @@ pub(crate) fn save_store(
     Stats::flush_all(key);
     let d = Stats::dump(key);
     Stats::forget_store(key);
+    // The shared invalidation queue goes with the server (RP-225).
+    crate::catcache::forget_store(key);
     if !storage
         .collection_exists(STATS_NAMESPACE, STATS_COLLECTION)
         .map_err(|e| e.to_string())?

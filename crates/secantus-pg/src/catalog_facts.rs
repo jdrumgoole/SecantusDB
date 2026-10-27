@@ -8,16 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 pub(crate) const BOOL: i64 = 16;
-pub(crate) const NAME: i64 = 19;
 pub(crate) const INT8: i64 = 20;
-pub(crate) const INT2: i64 = 21;
 pub(crate) const INT4: i64 = 23;
 pub(crate) const TEXT: i64 = 25;
 pub(crate) const TID: i64 = 27;
-pub(crate) const OID: i64 = 26;
 pub(crate) const UNKNOWN: i64 = 705;
 pub(crate) const NUMERIC: i64 = 1700;
-pub(crate) const RECORD: i64 = 2249;
 pub(crate) const ANY: i64 = 2276;
 pub(crate) const PG_CATALOG: i64 = 11;
 pub(crate) const PUBLIC: i64 = 2200;
@@ -36,11 +32,9 @@ pub(crate) fn is_polymorphic(t: i64) -> bool {
 pub(crate) struct TypeFact {
     pub name: String,
     pub nsp: i64,
-    pub len: i64,
     pub typtype: char,
     pub category: char,
     pub preferred: bool,
-    pub relid: i64,
     pub elem: i64,
     pub array: i64,
     pub basetype: i64,
@@ -52,14 +46,11 @@ pub(crate) struct ProcFact {
     pub name: String,
     pub nsp: i64,
     pub kind: char,
-    pub retset: bool,
     pub variadic: i64,
     pub nargs: usize,
     pub ndefaults: usize,
     pub ret: i64,
     pub args: Vec<i64>,
-    pub lang: i64,
-    pub volatile: char,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -69,7 +60,6 @@ pub(crate) struct OperFact {
     pub nsp: i64,
     pub kind: char,
     pub canmerge: bool,
-    pub canhash: bool,
     pub left: i64,
     pub right: i64,
     pub result: i64,
@@ -101,7 +91,6 @@ pub(crate) struct OpclassFact {
 /// One of PostgreSQL's own relations.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CatalogRel {
-    pub oid: i64,
     pub name: String,
     pub nsp: String,
     pub kind: char,
@@ -137,7 +126,8 @@ pub(crate) struct Builtin {
     pub opers: HashMap<i64, OperFact>,
     pub opers_by_name: HashMap<String, Vec<i64>>,
     /// `pg_amop` rows by operator: `(purpose, family)`.
-    pub amop_by_opr: HashMap<i64, Vec<(char, i64)>>, /// Each operator's `pg_amop` rows, in `pg_amop_opr_fam_index` order.
+    pub amop_by_opr: HashMap<i64, Vec<(char, i64)>>,
+    /// Each operator's `pg_amop` rows, in `pg_amop_opr_fam_index` order.
     pub amop_rows: HashMap<i64, Vec<AmopFact>>,
     /// `(family, lefttype, righttype, strategy)` -> operator.
     pub amop_strategy: HashMap<(i64, i64, i64, i64), i64>,
@@ -259,11 +249,9 @@ fn load() -> Builtin {
         let t = TypeFact {
             name: text(&r, "typname"),
             nsp: int(&r, "typnamespace"),
-            len: int(&r, "typlen"),
             typtype: ch(&r, "typtype"),
             category: ch(&r, "typcategory"),
             preferred: flag(&r, "typispreferred"),
-            relid: int(&r, "typrelid"),
             elem: int(&r, "typelem"),
             array: int(&r, "typarray"),
             basetype: int(&r, "typbasetype"),
@@ -282,14 +270,11 @@ fn load() -> Builtin {
             name: text(&r, "proname"),
             nsp: int(&r, "pronamespace"),
             kind: ch(&r, "prokind"),
-            retset: flag(&r, "proretset"),
             variadic: int(&r, "provariadic"),
             nargs: int(&r, "pronargs") as usize,
             ndefaults: int(&r, "pronargdefaults") as usize,
             ret: int(&r, "prorettype"),
             args,
-            lang: int(&r, "prolang"),
-            volatile: ch(&r, "provolatile"),
         };
         b.procs_by_name.entry(p.name.clone()).or_default().push(oid);
         b.procs.insert(oid, p);
@@ -302,7 +287,6 @@ fn load() -> Builtin {
             nsp: int(&r, "oprnamespace"),
             kind: ch(&r, "oprkind"),
             canmerge: flag(&r, "oprcanmerge"),
-            canhash: flag(&r, "oprcanhash"),
             left: int(&r, "oprleft"),
             right: int(&r, "oprright"),
             result: int(&r, "oprresult"),
@@ -317,7 +301,15 @@ fn load() -> Builtin {
         b.amop_by_opr
             .entry(opr)
             .or_default()
-            .push((ch(&r, "amoppurpose"), fam)); b.amop_rows.entry(opr).or_default().push(AmopFact { purpose: ch(&r, "amoppurpose"), family: fam, method: int(&r, "amopmethod"), strategy: int(&r, "amopstrategy"), left: int(&r, "amoplefttype"), right: int(&r, "amoprighttype") });
+            .push((ch(&r, "amoppurpose"), fam));
+        b.amop_rows.entry(opr).or_default().push(AmopFact {
+            purpose: ch(&r, "amoppurpose"),
+            family: fam,
+            method: int(&r, "amopmethod"),
+            strategy: int(&r, "amopstrategy"),
+            left: int(&r, "amoplefttype"),
+            right: int(&r, "amoprighttype"),
+        });
         b.amop_strategy.insert(
             (
                 fam,
@@ -391,7 +383,6 @@ fn load() -> Builtin {
         let oid: i64 = oid.parse().unwrap_or(0);
         let analyzed = *kind == "r" && *nsp == "pg_catalog" && !EMPTY_AT_INITDB.contains(relname);
         let rel = CatalogRel {
-            oid,
             name: (*relname).to_string(),
             nsp: (*nsp).to_string(),
             kind: kind.chars().next().unwrap_or('r'),
@@ -436,12 +427,7 @@ fn load() -> Builtin {
 /// Whether `oid` is one of PostgreSQL's shared relations: their counts are
 /// kept under database 0, whichever database read them.
 pub(crate) fn is_shared_relation(oid: i64) -> bool {
-    oid > 0
-        && oid < 16384
-        && builtin()
-            .relations
-            .get(&oid)
-            .is_some_and(|r| r.shared)
+    oid > 0 && oid < 16384 && builtin().relations.get(&oid).is_some_and(|r| r.shared)
 }
 
 #[cfg(test)]
@@ -455,7 +441,7 @@ mod tests {
         assert_eq!(b.procs_by_name.get("length").map(Vec::len), Some(8));
         // btree's integer_ops for int4: four support procedures.
         assert_eq!(b.amproc_count.get(&(1976, 23, 23)), Some(&4));
-        assert_eq!(b.amproc_count.get(&(1990, 26, 26)), Some(&3));
+        assert_eq!(b.amproc_count.get(&(1989, 26, 26)), Some(&3));
         assert_eq!(b.amop_by_opr.get(&96).map(Vec::len), Some(5));
         assert_eq!(b.opclasses_by_am.get(&BTREE_AM).map(Vec::len), Some(44));
         let class = &b.relations[&1259];

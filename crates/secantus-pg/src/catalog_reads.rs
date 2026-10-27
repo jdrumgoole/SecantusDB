@@ -43,8 +43,8 @@ use pg_query::protobuf as pb;
 use pg_query::NodeEnum as N;
 
 use crate::catalog_facts::{
-    self as cf, builtin, BOOL, BTREE_AM, HEAP_AM, INT4, INT8, NUMERIC, PG_CATALOG,
-    PUBLIC, TEXT, TID, UNKNOWN,
+    self as cf, builtin, BOOL, BTREE_AM, HEAP_AM, INT4, INT8, NUMERIC, PG_CATALOG, PUBLIC, TEXT,
+    TID, UNKNOWN,
 };
 use crate::catcache::{Backend, Cache, Counter, Inval, Key, Scan, K};
 use crate::PgHandler;
@@ -109,7 +109,12 @@ pub(crate) struct TypeOps {
 
 /// The database's default tablespace (`MyDatabaseTableSpace`).
 const DEFAULT_TABLESPACE: i64 = 1663;
-const GLOBAL_TABLESPACE: i64 = 1664;
+
+/// How deep an expression is walked.
+const MAX_DEPTH: u32 = 400;
+
+/// The longest statement text walked, in bytes.
+const MAX_WALKED_TEXT: usize = 64 * 1024;
 
 /// What the statement's FROM put in scope.
 #[derive(Debug, Clone, Default)]
@@ -134,6 +139,20 @@ struct Needs {
     joins: Vec<i64>,
 }
 
+/// [`Model::facts`]' memo: `(session, catalog version, invalidation
+/// generation)` and what was read under it.
+#[derive(Default)]
+struct FactMemo {
+    key: (usize, u64, u64),
+    rels: HashMap<(i64, String), Option<Rel>>,
+    catalogs: HashMap<i64, Option<Rel>>,
+    functions: HashMap<String, Vec<cf::ProcFact>>,
+}
+
+thread_local! {
+    static FACTS: std::cell::RefCell<FactMemo> = std::cell::RefCell::new(FactMemo::default());
+}
+
 /// The walk over one statement.
 pub(crate) struct Model<'a> {
     h: &'a PgHandler,
@@ -153,6 +172,10 @@ pub(crate) struct Model<'a> {
     stored: bool,
     /// Inside a stored query's name resolution: nothing is read.
     silent: u32,
+    /// Expression nesting, and the SQL functions whose bodies are being
+    /// walked (`inline_function`'s `active_fns`).
+    depth: u32,
+    active_fns: Vec<i64>,
 }
 
 fn names_of(nodes: &[pb::Node]) -> Vec<String> {
@@ -186,6 +209,8 @@ impl<'a> Model<'a> {
             needs: HashMap::new(),
             stored: false,
             silent: 0,
+            depth: 0,
+            active_fns: Vec::new(),
         }
     }
 
@@ -197,6 +222,61 @@ impl<'a> Model<'a> {
         self.silent += 1;
         let r = f(self);
         self.silent -= 1;
+        r
+    }
+
+    // ------------------------------------------------------------- facts
+
+    /// The facts this walk reads, kept per session for as long as no
+    /// catalog changed and no invalidation reached it: a statement walked
+    /// for the first time asks for the same relations and functions as the
+    /// last, and reading them from the catalogs each time cost more than
+    /// the statement.
+    fn facts<R>(&mut self, f: impl FnOnce(&mut FactMemo) -> R) -> R {
+        let key = (
+            self.h as *const PgHandler as usize,
+            crate::catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            self.be.generation(),
+        );
+        FACTS.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.key != key {
+                *m = FactMemo {
+                    key,
+                    ..FactMemo::default()
+                };
+            }
+            f(&mut m)
+        })
+    }
+
+    fn rel_in(&mut self, nsp: i64, name: &str) -> Option<Rel> {
+        let k = (nsp, name.to_string());
+        if let Some(r) = self.facts(|m| m.rels.get(&k).cloned()) {
+            return r;
+        }
+        let r = self.h.cr_relation_in(nsp, name);
+        self.facts(|m| m.rels.insert(k, r.clone()));
+        r
+    }
+
+    fn catalog_rel(&mut self, oid: i64) -> Option<Rel> {
+        if let Some(r) = self.facts(|m| m.catalogs.get(&oid).cloned()) {
+            return r;
+        }
+        let r = self.h.cr_catalog(oid);
+        self.facts(|m| m.catalogs.insert(oid, r.clone()));
+        r
+    }
+
+    fn functions_named(&mut self, name: &str) -> Vec<cf::ProcFact> {
+        if let Some(r) = self.facts(|m| m.functions.get(name).cloned()) {
+            return r;
+        }
+        let r = self.h.cr_functions_named(name);
+        self.facts(|m| m.functions.insert(name.to_string(), r.clone()));
         r
     }
 
@@ -357,9 +437,7 @@ impl<'a> Model<'a> {
             } else {
                 vec![self.h.cr_namespace_oid(&rv.schemaname)?]
             };
-            let rel = spaces
-                .into_iter()
-                .find_map(|nsp| self.h.cr_relation_in(nsp, &name))?;
+            let rel = spaces.into_iter().find_map(|nsp| self.rel_in(nsp, &name))?;
             self.open_relation(&rel);
             return Some(rel);
         }
@@ -369,7 +447,7 @@ impl<'a> Model<'a> {
             vec![self.explicit_namespace(&rv.schemaname)?]
         };
         for nsp in spaces {
-            let rel = self.h.cr_relation_in(nsp, &name);
+            let rel = self.rel_in(nsp, &name);
             let key = vec![K::N(name.clone()), K::O(nsp)];
             self.search(Cache::RelNameNsp, key, |_| rel.is_some());
             if let Some(rel) = rel {
@@ -418,7 +496,7 @@ impl<'a> Model<'a> {
     /// A catalog's descriptor, built on its first open when no init file
     /// holds it.
     fn open_catalog(&mut self, oid: i64) {
-        if let Some(rel) = self.h.cr_catalog(oid) {
+        if let Some(rel) = self.catalog_rel(oid) {
             self.open_relation(&rel);
         }
     }
@@ -569,13 +647,8 @@ impl<'a> Model<'a> {
                 continue;
             }
             if rel.stats.contains(&lead) {
-                if let Some(o) = self.h.cr_opclass(ix.classes[0]) {
-                    let key = vec![
-                        K::O(o.family),
-                        K::O(o.intype),
-                        K::O(o.intype),
-                        K::O(1),
-                    ];
+                if let Some(o) = ix.classes.first().and_then(|c| self.h.cr_opclass(*c)) {
+                    let key = vec![K::O(o.family), K::O(o.intype), K::O(o.intype), K::O(1)];
                     let found = builtin()
                         .amop_strategy
                         .contains_key(&(o.family, o.intype, o.intype, 1));
@@ -710,9 +783,11 @@ impl<'a> Model<'a> {
             return true;
         }
         let cast = self.h.cr_cast(src, target);
-        self.search(Cache::CastSourceTarget, vec![K::O(src), K::O(target)], |_| {
-            cast.is_some()
-        });
+        self.search(
+            Cache::CastSourceTarget,
+            vec![K::O(src), K::O(target)],
+            |_| cast.is_some(),
+        );
         cast.is_some_and(|(_, ctx, m)| m == 'b' && ctx == 'i')
     }
 
@@ -867,8 +942,12 @@ impl<'a> Model<'a> {
             }
             N::InsertStmt(i) => self.insert(i),
             N::CreateStmt(c) => self.create_table(c),
-            N::UpdateStmt(u) => self.update_or_delete(u.relation.as_ref(), &u.target_list, node(&u.where_clause)),
-            N::DeleteStmt(d) => self.update_or_delete(d.relation.as_ref(), &[], node(&d.where_clause)),
+            N::UpdateStmt(u) => {
+                self.update_or_delete(u.relation.as_ref(), &u.target_list, node(&u.where_clause))
+            }
+            N::DeleteStmt(d) => {
+                self.update_or_delete(d.relation.as_ref(), &[], node(&d.where_clause))
+            }
             N::ExplainStmt(e) => {
                 if let Some(q) = node(&e.query) {
                     self.statement(q);
@@ -904,8 +983,16 @@ impl<'a> Model<'a> {
             }
         }
         let name = rv.relname.clone();
-        self.search(Cache::RelNameNsp, vec![K::N(name.clone()), K::O(nsp)], |_| false);
-        self.search(Cache::TypeNameNsp, vec![K::N(name.clone()), K::O(nsp)], |_| false);
+        self.search(
+            Cache::RelNameNsp,
+            vec![K::N(name.clone()), K::O(nsp)],
+            |_| false,
+        );
+        self.search(
+            Cache::TypeNameNsp,
+            vec![K::N(name.clone()), K::O(nsp)],
+            |_| false,
+        );
         self.search(
             Cache::TypeNameNsp,
             vec![K::N(format!("_{name}")), K::O(nsp)],
@@ -990,8 +1077,18 @@ impl<'a> Model<'a> {
             self.open_index(&ix);
         }
         if self.be.build_pubdesc(rel.oid) {
-            self.be.search_list(&self.ct, Cache::PublicationRelMap, vec![K::O(rel.oid)], Vec::new);
-            self.be.search_list(&self.ct, Cache::PublicationNamespaceMap, vec![K::O(rel.nsp)], Vec::new);
+            self.be.search_list(
+                &self.ct,
+                Cache::PublicationRelMap,
+                vec![K::O(rel.oid)],
+                Vec::new,
+            );
+            self.be.search_list(
+                &self.ct,
+                Cache::PublicationNamespaceMap,
+                vec![K::O(rel.nsp)],
+                Vec::new,
+            );
             // `GetAllTablesPublications`: a heap scan for FOR ALL TABLES.
             self.ct.seq(6104, 0);
         }
@@ -1006,7 +1103,11 @@ impl<'a> Model<'a> {
             let mut types = Vec::new();
             for row in &s.values_lists {
                 if let Some(N::List(l)) = row.node.as_ref() {
-                    types = l.items.iter().map(|i| self.expr_n(i, &Scope::default())).collect();
+                    types = l
+                        .items
+                        .iter()
+                        .map(|i| self.expr_n(i, &Scope::default()))
+                        .collect();
                 }
             }
             return types;
@@ -1023,7 +1124,7 @@ impl<'a> Model<'a> {
         }
         let mut scope = Scope::default();
         for f in &s.from_clause {
-            self.from_item(f, &mut scope);
+            self.range_item(f, &mut scope);
         }
         // The target list.
         let mut out_types = Vec::new();
@@ -1091,7 +1192,10 @@ impl<'a> Model<'a> {
             }
         }
         // `transformLimitClause`: the count and offset are int8.
-        for l in [node(&s.limit_count), node(&s.limit_offset)].into_iter().flatten() {
+        for l in [node(&s.limit_count), node(&s.limit_offset)]
+            .into_iter()
+            .flatten()
+        {
             let t = self.expr(l, &scope, true);
             self.coerce(t, INT8, false);
         }
@@ -1114,7 +1218,7 @@ impl<'a> Model<'a> {
         out_types
     }
 
-    fn from_item(&mut self, f: &pb::Node, scope: &mut Scope) {
+    fn range_item(&mut self, f: &pb::Node, scope: &mut Scope) {
         match f.node.as_ref() {
             Some(N::RangeVar(rv)) => {
                 if let Some(rel) = self.range_var(rv) {
@@ -1133,10 +1237,10 @@ impl<'a> Model<'a> {
             }
             Some(N::JoinExpr(j)) => {
                 if let Some(l) = j.larg.as_ref() {
-                    self.from_item(l, scope);
+                    self.range_item(l, scope);
                 }
                 if let Some(r) = j.rarg.as_ref() {
-                    self.from_item(r, scope);
+                    self.range_item(r, scope);
                 }
                 if let Some(q) = node(&j.quals) {
                     self.qual(q, scope);
@@ -1150,7 +1254,7 @@ impl<'a> Model<'a> {
     fn target_columns(&mut self, s: &pb::SelectStmt) -> Vec<(String, i64)> {
         let mut scope = Scope::default();
         for f in &s.from_clause {
-            self.from_item(f, &mut scope);
+            self.range_item(f, &mut scope);
         }
         let mut out = Vec::new();
         for t in &s.target_list {
@@ -1236,6 +1340,18 @@ impl<'a> Model<'a> {
     /// `transformExpr` and `assign_expr_collations`: the expression's type,
     /// looking up what PostgreSQL looks up for it.
     fn expr(&mut self, n: &N, scope: &Scope, in_target: bool) -> i64 {
+        // A nesting deeper than any statement a client writes is walked no
+        // further: what it reached is counted.
+        if self.depth > MAX_DEPTH {
+            return UNKNOWN;
+        }
+        self.depth += 1;
+        let t = self.expr_inner(n, scope, in_target);
+        self.depth -= 1;
+        t
+    }
+
+    fn expr_inner(&mut self, n: &N, scope: &Scope, in_target: bool) -> i64 {
         match n {
             N::AConst(c) => {
                 if c.isnull {
@@ -1284,7 +1400,11 @@ impl<'a> Model<'a> {
                 .unwrap_or(UNKNOWN),
             N::TypeCast(tc) => {
                 let input = node(&tc.arg).map_or(UNKNOWN, |a| self.expr(a, scope, in_target));
-                let Some(target) = tc.type_name.as_ref().and_then(|t| self.parser(|m| m.type_name(t))) else {
+                let Some(target) = tc
+                    .type_name
+                    .as_ref()
+                    .and_then(|t| self.parser(|m| m.type_name(t)))
+                else {
                     return UNKNOWN;
                 };
                 self.coerce(input, target, true);
@@ -1309,9 +1429,7 @@ impl<'a> Model<'a> {
                 BOOL
             }
             N::FuncCall(f) => self.func_call(f, scope, in_target),
-            N::CollateClause(c) => {
-                node(&c.arg).map_or(UNKNOWN, |a| self.expr(a, scope, in_target))
-            }
+            N::CollateClause(c) => node(&c.arg).map_or(UNKNOWN, |a| self.expr(a, scope, in_target)),
             _ => UNKNOWN,
         }
     }
@@ -1329,18 +1447,22 @@ impl<'a> Model<'a> {
             Some(s) => {
                 let nsp = self.explicit_namespace(&s)?;
                 let oid = self.h.cr_type_in(nsp, &name);
-                self.search(Cache::TypeNameNsp, vec![K::N(name.clone()), K::O(nsp)], |_| {
-                    oid.is_some()
-                });
+                self.search(
+                    Cache::TypeNameNsp,
+                    vec![K::N(name.clone()), K::O(nsp)],
+                    |_| oid.is_some(),
+                );
                 oid?
             }
             None => {
                 let mut found = None;
                 for nsp in self.active_path() {
                     let oid = self.h.cr_type_in(nsp, &name);
-                    self.search(Cache::TypeNameNsp, vec![K::N(name.clone()), K::O(nsp)], |_| {
-                        oid.is_some()
-                    });
+                    self.search(
+                        Cache::TypeNameNsp,
+                        vec![K::N(name.clone()), K::O(nsp)],
+                        |_| oid.is_some(),
+                    );
                     if oid.is_some() {
                         found = oid;
                         break;
@@ -1413,7 +1535,11 @@ impl<'a> Model<'a> {
         let common = if lt != UNKNOWN {
             lt
         } else {
-            types.iter().copied().find(|t| *t != UNKNOWN).unwrap_or(TEXT)
+            types
+                .iter()
+                .copied()
+                .find(|t| *t != UNKNOWN)
+                .unwrap_or(TEXT)
         };
         if types.len() < 2 {
             let rt = types.first().copied().unwrap_or(UNKNOWN);
@@ -1614,12 +1740,14 @@ impl<'a> Model<'a> {
                         ]
                     })
                     .collect();
-                if self.silent == 0 { self.be.search_list(
-                    &self.ct,
-                    Cache::OperNameNsp,
-                    vec![K::N(opname.clone())],
-                    || members,
-                ); }
+                if self.silent == 0 {
+                    self.be.search_list(
+                        &self.ct,
+                        Cache::OperNameNsp,
+                        vec![K::N(opname.clone())],
+                        || members,
+                    );
+                }
                 let cands: Vec<(i64, Vec<i64>)> = candidates
                     .iter()
                     .map(|o| (o.oid, vec![o.left, o.right]))
@@ -1661,12 +1789,14 @@ impl<'a> Model<'a> {
             .iter()
             .map(|o| vec![K::N(o.name.clone()), K::O(l), K::O(r), K::O(o.nsp)])
             .collect();
-        if self.silent == 0 { self.be.search_list(
-            &self.ct,
-            Cache::OperNameNsp,
-            vec![K::N(name.to_string()), K::O(l), K::O(r)],
-            || members,
-        ); }
+        if self.silent == 0 {
+            self.be.search_list(
+                &self.ct,
+                Cache::OperNameNsp,
+                vec![K::N(name.to_string()), K::O(l), K::O(r)],
+                || members,
+            );
+        }
         path.iter()
             .find_map(|nsp| all.iter().find(|o| o.nsp == *nsp).cloned())
     }
@@ -1677,7 +1807,11 @@ impl<'a> Model<'a> {
         let args: Vec<i64> = f
             .args
             .iter()
-            .map(|a| a.node.as_ref().map_or(UNKNOWN, |n| self.expr(n, scope, in_target)))
+            .map(|a| {
+                a.node
+                    .as_ref()
+                    .map_or(UNKNOWN, |n| self.expr(n, scope, in_target))
+            })
             .collect();
         let argv: Vec<i64> = if f.agg_star { Vec::new() } else { args.clone() };
         let best = self.parser(|m| m.resolve_function(&names, &argv));
@@ -1702,7 +1836,13 @@ impl<'a> Model<'a> {
         self.ptype(p.ret);
         // A SQL function's body is parsed when the planner inlines it, or
         // when the executor first calls it.
-        if let Some((body, params)) = self.h.cr_sql_function_body(p.oid) {
+        let body = if self.active_fns.contains(&p.oid) || self.active_fns.len() > 16 {
+            None
+        } else {
+            self.h.cr_sql_function_body(p.oid)
+        };
+        if let Some((body, params)) = body {
+            self.active_fns.push(p.oid);
             let saved = std::mem::replace(&mut self.params, params);
             if let Ok(parsed) = pg_query::parse(&body) {
                 for raw in &parsed.protobuf.stmts {
@@ -1714,6 +1854,7 @@ impl<'a> Model<'a> {
                 }
             }
             self.params = saved;
+            self.active_fns.pop();
         }
         p.ret
     }
@@ -1727,14 +1868,11 @@ impl<'a> Model<'a> {
             _ => return None,
         };
         let path = match &schema {
-            Some(s) => match self.explicit_namespace(s) {
-                Some(n) => vec![n],
-                None => return None,
-            },
+            Some(s) => vec![self.explicit_namespace(s)?],
             None => self.active_path(),
         };
         // `FuncnameGetCandidates`: every function of the name.
-        let all = self.h.cr_functions_named(&name);
+        let all = self.functions_named(&name);
         let members: Vec<Key> = all
             .iter()
             .map(|p| {
@@ -1751,12 +1889,14 @@ impl<'a> Model<'a> {
                 ]
             })
             .collect();
-        if self.silent == 0 { self.be.search_list(
-            &self.ct,
-            Cache::ProcNameArgsNsp,
-            vec![K::N(name.clone())],
-            || members,
-        ); }
+        if self.silent == 0 {
+            self.be.search_list(
+                &self.ct,
+                Cache::ProcNameArgsNsp,
+                vec![K::N(name.clone())],
+                || members,
+            );
+        }
         let nargs = argv.len();
         let candidates: Vec<cf::ProcFact> = all
             .into_iter()
@@ -1778,9 +1918,11 @@ impl<'a> Model<'a> {
                     // `FuncNameAsType`: is the name a type's?
                     for nsp in path.clone() {
                         let oid = self.h.cr_type_in(nsp, &name);
-                        self.search(Cache::TypeNameNsp, vec![K::N(name.clone()), K::O(nsp)], |_| {
-                            oid.is_some()
-                        });
+                        self.search(
+                            Cache::TypeNameNsp,
+                            vec![K::N(name.clone()), K::O(nsp)],
+                            |_| oid.is_some(),
+                        );
                         if oid.is_some() {
                             break;
                         }
@@ -1791,7 +1933,7 @@ impl<'a> Model<'a> {
                     .filter(|p| p.args.len() == argv.len())
                     .map(|p| (p.oid, p.args.clone()))
                     .collect();
-                self.select_candidate(&argv, cands)
+                self.select_candidate(argv, cands)
                     .and_then(|oid| candidates.iter().find(|p| p.oid == oid).cloned())
             }
         };
@@ -2025,7 +2167,10 @@ impl<'a> Model<'a> {
 }
 
 fn self_coercible(input: &[i64], target: &[i64]) -> bool {
-    input.iter().zip(target).all(|(i, t)| i == t || cf::is_polymorphic(*t) || *t == cf::ANY)
+    input
+        .iter()
+        .zip(target)
+        .all(|(i, t)| i == t || cf::is_polymorphic(*t) || *t == cf::ANY)
 }
 
 /// A catalog index as the model reads it.
@@ -2050,7 +2195,9 @@ impl PgHandler {
     }
 
     fn virtual_rows_for(&self, name: &str) -> Option<Vec<bson::Document>> {
-        self.virtual_rows(name, &bson::Document::new())
+        // Uncached: the statement's own read of the catalog, in its
+        // transaction, must not find rows read before it began.
+        self.virtual_rows_uncached(name, &bson::Document::new())
     }
 
     fn catalog_def(&self, name: &str) -> Option<secantus_pgcatalog::TableDef> {
@@ -2205,8 +2352,7 @@ impl PgHandler {
                     columns
                         .iter()
                         .filter(|(_, n, _)| {
-                            def.column(n)
-                                .is_some_and(|c| cols.contains_key(c.field()))
+                            def.column(n).is_some_and(|c| cols.contains_key(c.field()))
                         })
                         .map(|c| c.0)
                         .collect()
@@ -2274,7 +2420,14 @@ impl PgHandler {
             .relation_oid(key)
             .unwrap_or_else(|| self.view_relid(key));
         let mut be = Backend::default();
-        let mut m = Model::new(self, &mut be, Counter { stats: None, store: 0 });
+        let mut m = Model::new(
+            self,
+            &mut be,
+            Counter {
+                stats: None,
+                store: 0,
+            },
+        );
         m.stored = true;
         m.silent = 1;
         let parsed = pg_query::parse(sql).ok()?;
@@ -2389,8 +2542,6 @@ impl PgHandler {
                     nargs: args.len(),
                     args,
                     ret: self.cr_type_named(&f.return_type),
-                    lang: if f.language == "sql" { 14 } else { 0 },
-                    volatile: 'v',
                     ..cf::ProcFact::default()
                 });
             }
@@ -2599,18 +2750,46 @@ impl PgHandler {
         Model::new(self, &mut be, ct).backend_start(db_oid, &db, role_oid);
     }
 
-    /// The catalog reads of one statement, before it runs; the
-    /// invalidations it sends if it succeeds.
-    pub(crate) fn catalog_reads(&self, sql: &str) -> Effects {
+    /// What a statement that changes the catalogs will leave if it
+    /// succeeds, read from the catalogs as they stand before it runs.
+    pub(crate) fn catalog_effects(&self, sql: &str) -> Effects {
+        let mut effects = Effects::default();
+        if self.catcache_ids().1 == 0 || !changes_catalogs(sql) {
+            return effects;
+        }
+        let Ok(parsed) = pg_query::parse(sql) else {
+            return effects;
+        };
+        for raw in &parsed.protobuf.stmts {
+            if let Some(stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) {
+                let (invals, dead) = ddl_effects(self, stmt);
+                effects.invals.extend(invals);
+                effects.dead.extend(dead);
+            }
+        }
+        effects
+    }
+
+    /// The catalog reads of one statement. Walked once it has run: the
+    /// catalog facts are read in the session's state as the statement left
+    /// it, never ahead of what the statement itself sets up (a catalog read
+    /// before the statement ran once cached rows it then answered from).
+    pub(crate) fn catalog_reads(&self, sql: &str) {
         let (store, pid) = self.catcache_ids();
-        if pid == 0 {
-            return Effects::default();
+        // A statement this long is not parsed a second time to be walked:
+        // its catalog reads go uncounted (RP-290).
+        if pid == 0 || sql.len() > MAX_WALKED_TEXT {
+            return;
         }
         let ct = self.catcache_counter();
         let version = crate::catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let key = text_key(sql);
+        // The statement as this session would resolve it: its text, under
+        // the search path and the role (`recomputeNamespacePath`'s inputs).
+        let path = self.cr_search_path_setting();
+        let user = self.session_user_name();
+        let key = text_key(sql, &path, &user);
         let ddl = changes_catalogs(sql);
         let mut be = self.catcache.lock().unwrap_or_else(|e| e.into_inner());
         // `AcceptInvalidationMessages`, at the statement's start.
@@ -2620,23 +2799,30 @@ impl PgHandler {
                 for s in m.scans.clone() {
                     ct.scan(s);
                 }
-                return Effects::default();
+                return;
+            }
+        }
+        // The same statement with other literals of the same kinds reads
+        // what it read, unless it scans a catalog by those values.
+        let shape = if ddl {
+            None
+        } else {
+            literal_shape(sql).map(|n| text_key(&n, &path, &user))
+        };
+        if let Some(shape) = shape {
+            if be.memo(shape, version).is_some_and(|m| m.scans.is_empty()) {
+                be.remember(key, version, Vec::new());
+                return;
             }
         }
         let Ok(parsed) = pg_query::parse(sql) else {
-            return Effects::default();
+            return;
         };
-        let mut effects = Effects::default();
         let mut scans = Vec::new();
         for raw in &parsed.protobuf.stmts {
             let Some(stmt) = raw.stmt.as_ref().and_then(|s| s.node.as_ref()) else {
                 continue;
             };
-            if ddl {
-                let (invals, dead) = ddl_effects(self, stmt);
-                effects.invals.extend(invals);
-                effects.dead.extend(dead);
-            }
             let mut m = Model::new(self, &mut be, self.catcache_counter());
             m.statement(stmt);
             scans.extend(m.exec);
@@ -2645,9 +2831,11 @@ impl PgHandler {
             ct.scan(*s);
         }
         if !ddl {
+            if let (Some(shape), true) = (shape, scans.is_empty()) {
+                be.remember(shape, version, Vec::new());
+            }
             be.remember(key, version, scans);
         }
-        effects
     }
 
     /// The statement ended: a catalog change it made reaches this backend's
@@ -2680,11 +2868,89 @@ pub(crate) struct Effects {
     pub(crate) dead: Vec<(i64, Key)>,
 }
 
+/// A statement's text with each literal replaced by a representative of
+/// its kind -- a string, an int4, an int8, a numeric, a decimal -- for the
+/// memo: what the walk reads depends on a literal's type, not its value.
+/// `None` for a text whose literals this cannot place: a dollar quote, an
+/// escape or bit string, a comment, a parameter, or ORDER BY / GROUP BY,
+/// where a number names a column.
+fn literal_shape(sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    if lower.contains("order by")
+        || lower.contains("group by")
+        || sql.contains('$')
+        || sql.contains("--")
+        || sql.contains("/*")
+        || sql.contains('"')
+    {
+        return None;
+    }
+    let b = sql.as_bytes();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut changed = false;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'\'' {
+            // A string prefixed by E, B, X, U& or N is not plain.
+            if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'&' || b[i - 1] == b'_') {
+                return None;
+            }
+            let mut j = i + 1;
+            loop {
+                if j >= b.len() {
+                    return None;
+                }
+                if b[j] == b'\'' {
+                    if j + 1 < b.len() && b[j + 1] == b'\'' {
+                        j += 2;
+                        continue;
+                    }
+                    break;
+                }
+                j += 1;
+            }
+            out.push_str("'s'");
+            i = j + 1;
+            changed = true;
+        } else if c.is_ascii_digit()
+            && (i == 0
+                || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_' || b[i - 1] == b'.'))
+        {
+            let mut j = i;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < b.len() && (b[j] == b'.' || b[j] == b'e' || b[j] == b'E') {
+                return None;
+            }
+            if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
+                return None;
+            }
+            let digits = &sql[i..j];
+            let kind = match digits.parse::<i64>() {
+                Ok(v) if i32::try_from(v).is_ok() => "1",
+                Ok(_) => "4294967296",
+                Err(_) => "99999999999999999999",
+            };
+            out.push_str(kind);
+            i = j;
+            changed = true;
+        } else {
+            out.push(c as char);
+            i += 1;
+        }
+    }
+    (changed && sql.is_ascii()).then_some(out)
+}
+
 /// A statement's text, hashed, for the memo.
-pub(crate) fn text_key(sql: &str) -> u64 {
+pub(crate) fn text_key(sql: &str, path: &str, user: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sql.hash(&mut h);
+    path.hash(&mut h);
+    user.hash(&mut h);
     h.finish()
 }
 
@@ -2731,10 +2997,7 @@ pub(crate) fn ddl_effects(h: &PgHandler, stmt: &N) -> (Vec<Inval>, Vec<(i64, Key
                     ));
                 } else if cmd.subtype == pb::AlterTableType::AtDropColumn as i32 {
                     if let Some((att, _, _)) = rel.columns.iter().find(|c| c.1 == cmd.name) {
-                        out.push(Inval::Cat(
-                            Cache::AttNum,
-                            vec![K::O(rel.oid), K::O(*att)],
-                        ));
+                        out.push(Inval::Cat(Cache::AttNum, vec![K::O(rel.oid), K::O(*att)]));
                         out.push(Inval::Cat(
                             Cache::AttName,
                             vec![K::O(rel.oid), K::N(cmd.name.clone())],
@@ -2842,4 +3105,30 @@ pub(crate) fn ddl_effects(h: &PgHandler, stmt: &N) -> (Vec<Inval>, Vec<(i64, Key
         _ => {}
     }
     (out, dead)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_literal_s_kind_is_its_shape() {
+        let a = literal_shape("select v from t where id = 7 and n = 'a''b'");
+        let b = literal_shape("select v from t where id = 12 and n = 'zz'");
+        assert_eq!(a, b);
+        assert_eq!(
+            a.as_deref(),
+            Some("select v from t where id = 1 and n = 's'")
+        );
+        // int4, int8 and numeric literals are different types.
+        assert_ne!(
+            literal_shape("select 1"),
+            literal_shape("select 5000000000")
+        );
+        assert_eq!(literal_shape("select t1.a from t1"), None);
+        // A number naming a column, a decimal, an escape string: no shape.
+        assert_eq!(literal_shape("select a from t order by 1"), None);
+        assert_eq!(literal_shape("select 1.5"), None);
+        assert_eq!(literal_shape("select E'x'"), None);
+    }
 }

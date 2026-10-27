@@ -204,6 +204,49 @@ SCENARIOS: dict[str, list[str]] = {
     ],
 }
 
+# The open items' gap tests: what PostgreSQL 15.19 reads for statements
+# this model does not walk.
+GAPS: dict[str, tuple[str, list[str]]] = {
+    # ALTER TABLE's own reads: the target's descriptor and indexes, the
+    # event trigger cache, pg_depend and friends for DROP COLUMN.
+    "an ALTER TABLE's own catalog reads": (
+        "RP-290",
+        [
+            "b|",
+            "mark",
+            "b|alter table rpc_t add column w int",
+            "mark",
+            "b|alter table rpc_t drop column w",
+            "mark",
+        ],
+    ),
+    # A system view's rule: pg_stat_user_tables over pg_class, pg_index and
+    # pg_namespace, grouped.
+    "a statistics view": (
+        "RP-290",
+        [
+            "a|",
+            "mark",
+            "a|select seq_scan from pg_stat_user_tables where relname = 'rpc_p'",
+            "mark",
+        ],
+    ),
+    # psql's \d pattern query: a regular expression's fixed prefix as an
+    # index condition, pg_table_is_visible per row, the join's sort.
+    "psql's describe query": (
+        "RP-290",
+        [
+            "a|",
+            "mark",
+            "a|SELECT c.oid, n.nspname, c.relname FROM pg_catalog.pg_class c "
+            "LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE c.relname OPERATOR(pg_catalog.~) '^(rpc_t)$' COLLATE pg_catalog.default "
+            "AND pg_catalog.pg_table_is_visible(c.oid) ORDER BY 2, 3",
+            "mark",
+        ],
+    ),
+}
+
 # Segments whose reads a statement this model does not walk makes: the
 # ALTER TABLEs' own catalog reads (RP-290, open). Left out of the
 # comparison, by index.
@@ -287,7 +330,10 @@ def run_scenario(dsn: str, obs: Observer, steps: list[str]) -> list[dict[str, li
     return out
 
 
-def catalog_reads(dsn: str) -> dict[str, list[dict[str, list[int]]]]:
+def catalog_reads(
+    dsn: str, scenarios: dict[str, list[str]] | None = None
+) -> dict[str, list[dict[str, list[int]]]]:
+    scenarios = SCENARIOS if scenarios is None else scenarios
     with _connect(dsn, "setup") as c:
         for s in SETUP:
             c.execute(s)
@@ -296,7 +342,7 @@ def catalog_reads(dsn: str) -> dict[str, list[dict[str, list[int]]]]:
             c.execute(s)
     obs = Observer(dsn)
     try:
-        return {name: run_scenario(dsn, obs, steps) for name, steps in SCENARIOS.items()}
+        return {name: run_scenario(dsn, obs, steps) for name, steps in scenarios.items()}
     finally:
         obs.conn.close()
         with _connect(dsn, "teardown") as c:
@@ -1117,6 +1163,151 @@ EXPECTED: dict[str, Any] = {
 }
 
 
+EXPECTED_GAPS: dict[str, Any] = {
+    "an ALTER TABLE's own catalog reads": [
+        {
+            "pg_am": [1, 1, 0],
+            "pg_amproc_fam_proc_index": [1, 3, 3],
+            "pg_attribute_relid_attnum_index": [4, 7, 7],
+            "pg_authid_oid_index": [1, 1, 1],
+            "pg_authid_rolname_index": [1, 1, 1],
+            "pg_class_oid_index": [2, 2, 2],
+            "pg_database_datname_index": [1, 1, 1],
+            "pg_database_oid_index": [2, 2, 2],
+            "pg_db_role_setting_databaseid_rol_index": [4, 0, 0],
+            "pg_index_indexrelid_index": [1, 1, 1],
+            "pg_namespace_nspname_index": [2, 1, 1],
+            "pg_opclass_oid_index": [1, 1, 1],
+            "pg_proc_oid_index": [1, 1, 1],
+            "pg_proc_proname_args_nsp_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+        },
+        {
+            "pg_am": [1, 1, 0],
+            "pg_attribute_relid_attnam_index": [1, 0, 0],
+            "pg_attribute_relid_attnum_index": [8, 18, 18],
+            "pg_class_oid_index": [7, 7, 7],
+            "pg_class_relname_nsp_index": [2, 1, 1],
+            "pg_event_trigger_evtname_index": [1, 0, 0],
+            "pg_index_indexrelid_index": [2, 2, 2],
+            "pg_index_indrelid_index": [2, 5, 5],
+            "pg_namespace_nspname_index": [1, 1, 1],
+            "pg_namespace_oid_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+            "pg_type_typname_nsp_index": [1, 1, 1],
+        },
+        {
+            "pg_amproc_fam_proc_index": [2, 7, 7],
+            "pg_attribute_relid_attnam_index": [1, 1, 1],
+            "pg_attribute_relid_attnum_index": [33, 69, 68],
+            "pg_class_oid_index": [13, 13, 13],
+            "pg_class_relname_nsp_index": [1, 1, 1],
+            "pg_depend_depender_index": [2, 0, 0],
+            "pg_depend_reference_index": [1, 0, 0],
+            "pg_description_o_c_o_index": [1, 0, 0],
+            "pg_index_indexrelid_index": [6, 6, 6],
+            "pg_init_privs_o_c_o_index": [1, 0, 0],
+            "pg_opclass_oid_index": [2, 2, 2],
+            "pg_seclabel_object_index": [1, 0, 0],
+            "pg_shdepend_depender_index": [1, 0, 0],
+            "pg_statistic_relid_att_inh_index": [1, 0, 0],
+        },
+        {},
+    ],
+    "a statistics view": [
+        {
+            "pg_am": [1, 1, 0],
+            "pg_amproc_fam_proc_index": [1, 3, 3],
+            "pg_attribute_relid_attnum_index": [4, 7, 7],
+            "pg_authid_oid_index": [1, 1, 1],
+            "pg_authid_rolname_index": [1, 1, 1],
+            "pg_class_oid_index": [2, 2, 2],
+            "pg_database_datname_index": [1, 1, 1],
+            "pg_database_oid_index": [2, 2, 2],
+            "pg_db_role_setting_databaseid_rol_index": [4, 0, 0],
+            "pg_index_indexrelid_index": [1, 1, 1],
+            "pg_namespace_nspname_index": [2, 1, 1],
+            "pg_opclass_oid_index": [1, 1, 1],
+            "pg_proc_oid_index": [1, 1, 1],
+            "pg_proc_proname_args_nsp_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+        },
+        {
+            "pg_amop_fam_strat_index": [7, 7, 7],
+            "pg_amop_opr_fam_index": [9, 21, 21],
+            "pg_amproc_fam_proc_index": [7, 12, 12],
+            "pg_attribute_relid_attnum_index": [75, 125, 125],
+            "pg_cast_source_target_index": [49, 4, 4],
+            "pg_class_oid_index": [13, 13, 13],
+            "pg_class_relname_nsp_index": [2, 2, 2],
+            "pg_constraint_conrelid_contypid_conname_index": [1, 1, 1],
+            "pg_index_indexrelid_index": [5, 5, 5],
+            "pg_index_indrelid_index": [7, 10, 10],
+            "pg_namespace": [1, 3, 0],
+            "pg_namespace_nspname_index": [1, 1, 0],
+            "pg_namespace_oid_index": [2, 2, 0],
+            "pg_opclass_am_name_nsp_index": [4, 173, 173],
+            "pg_opclass_oid_index": [6, 6, 6],
+            "pg_operator_oid_index": [10, 10, 10],
+            "pg_operator_oprname_l_r_n_index": [1, 1, 1],
+            "pg_proc_oid_index": [27, 27, 27],
+            "pg_rewrite_rel_rulename_index": [2, 2, 2],
+            "pg_statistic_ext_relid_index": [3, 0, 0],
+            "pg_statistic_relid_att_inh_index": [8, 7, 7],
+            "pg_tablespace_oid_index": [1, 1, 1],
+            "pg_type_oid_index": [15, 15, 15],
+        },
+        {},
+    ],
+    "psql's describe query": [
+        {
+            "pg_am": [1, 1, 0],
+            "pg_amproc_fam_proc_index": [1, 3, 3],
+            "pg_attribute_relid_attnum_index": [4, 7, 7],
+            "pg_authid_oid_index": [1, 1, 1],
+            "pg_authid_rolname_index": [1, 1, 1],
+            "pg_class_oid_index": [2, 2, 2],
+            "pg_database_datname_index": [1, 1, 1],
+            "pg_database_oid_index": [2, 2, 2],
+            "pg_db_role_setting_databaseid_rol_index": [4, 0, 0],
+            "pg_index_indexrelid_index": [1, 1, 1],
+            "pg_namespace_nspname_index": [2, 1, 1],
+            "pg_opclass_oid_index": [1, 1, 1],
+            "pg_proc_oid_index": [1, 1, 1],
+            "pg_proc_proname_args_nsp_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+        },
+        {
+            "pg_amop_fam_strat_index": [8, 8, 8],
+            "pg_amop_opr_fam_index": [6, 16, 16],
+            "pg_amproc_fam_proc_index": [4, 4, 4],
+            "pg_attribute_relid_attnum_index": [7, 8, 8],
+            "pg_cast_source_target_index": [47, 4, 4],
+            "pg_class_oid_index": [6, 6, 6],
+            "pg_class_relname_nsp_index": [4, 3, 3],
+            "pg_collation_name_enc_nsp_index": [2, 1, 1],
+            "pg_collation_oid_index": [1, 1, 1],
+            "pg_index_indexrelid_index": [3, 3, 3],
+            "pg_index_indrelid_index": [2, 5, 5],
+            "pg_namespace": [1, 3, 0],
+            "pg_namespace_nspname_index": [1, 1, 1],
+            "pg_namespace_oid_index": [2, 2, 0],
+            "pg_opclass_am_name_nsp_index": [4, 170, 170],
+            "pg_opclass_oid_index": [4, 4, 4],
+            "pg_operator_oid_index": [5, 5, 5],
+            "pg_operator_oprname_l_r_n_index": [3, 11, 11],
+            "pg_proc_oid_index": [3, 3, 3],
+            "pg_proc_proname_args_nsp_index": [1, 1, 1],
+            "pg_statistic_ext_relid_index": [2, 0, 0],
+            "pg_statistic_relid_att_inh_index": [5, 5, 5],
+            "pg_tablespace_oid_index": [1, 1, 1],
+            "pg_type_oid_index": [14, 14, 14],
+        },
+        {},
+    ],
+}
+
+
 @pytest.mark.backlog_fixed("RP-225")
 def test_catalog_reads(rust_pg: Any) -> None:
     got = catalog_reads(_dsn(rust_pg))
@@ -1124,6 +1315,152 @@ def test_catalog_reads(rust_pg: Any) -> None:
         assert (name, _comparable(name, got[name])) == (name, _comparable(name, EXPECTED[name]))
 
 
+@pytest.mark.parametrize(
+    "name",
+    [pytest.param(n, marks=pytest.mark.backlog(item), id=n) for n, (item, _) in GAPS.items()],
+)
+def test_gap(name: str, rust_pg: Any) -> None:
+    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][1]})
+    assert got[name] == EXPECTED_GAPS[name]
+
+
+def catalog_blocks(dsn: str) -> list[bool]:
+    """A new session's catalog reads touch catalog pages: `pg_class`'s
+    heap and its name index each count blocks (read or hit) in
+    `pg_statio_sys_tables` / `pg_statio_sys_indexes`."""
+    with _connect(dsn, "setup") as c:
+        for s in SETUP:
+            c.execute(s)
+    obs = Observer(dsn)
+    query = (
+        "select pg_stat_get_blocks_fetched(1259), pg_stat_get_blocks_fetched(2663), "
+        "pg_stat_get_blocks_hit(1259) + pg_stat_get_blocks_hit(2663)"
+    )
+    try:
+        obs.conn.execute(query)
+        obs.conn.execute("select pg_stat_clear_snapshot()")
+        before = obs.conn.execute(query).fetchone()
+        with _connect(dsn, "a") as a:
+            a.execute("select relname from pg_class where relname = 'rpc_t'")
+            a.execute("select pg_stat_force_next_flush()")
+        time.sleep(0.3)
+        obs.conn.execute("select pg_stat_clear_snapshot()")
+        after = obs.conn.execute(query).fetchone()
+        return [after[i] > before[i] for i in range(3)]
+    finally:
+        obs.conn.close()
+        with _connect(dsn, "teardown") as c:
+            for s in TEARDOWN:
+                c.execute(s)
+
+
+@pytest.mark.backlog("RP-291")
+def test_catalog_blocks(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: all three rise."""
+    assert catalog_blocks(_dsn(rust_pg)) == [True, True, True]
+
+
+# RP-292: the first backend after the server starts finds no relation cache
+# init file and builds every critical relation's descriptor, by heap scans
+# until the critical indexes are built, and writes the files. PostgreSQL
+# 15.19's reads, a session that ran `select 1` then an observer's start,
+# measured across a restart of the private cluster (the counts survive a
+# clean shutdown, so the delta is the two sessions').
+FIRST_BACKEND: dict[str, list[int]] = {
+    "pg_am": [2, 2, 0],
+    "pg_amproc": [2, 7, 0],
+    "pg_amproc_fam_proc_index": [7, 19, 19],
+    "pg_attribute": [11, 53, 0],
+    "pg_attribute_relid_attnum_index": [249, 566, 566],
+    "pg_authid": [2, 2, 0],
+    "pg_authid_oid_index": [1, 1, 1],
+    "pg_authid_rolname_index": [1, 1, 1],
+    "pg_class": [11, 11, 0],
+    "pg_class_oid_index": [129, 129, 129],
+    "pg_database": [2, 2, 0],
+    "pg_database_datname_index": [1, 1, 1],
+    "pg_database_oid_index": [3, 3, 3],
+    "pg_db_role_setting_databaseid_rol_index": [8, 0, 0],
+    "pg_index": [7, 7, 0],
+    "pg_index_indexrelid_index": [80, 80, 80],
+    "pg_opclass": [2, 2, 0],
+    "pg_opclass_oid_index": [7, 7, 7],
+    "pg_subscription": [7, 0, 0],
+    "pg_type_oid_index": [1, 1, 1],
+}
+
+
+@pytest.mark.backlog("RP-292")
+def test_the_first_backend_after_a_start(rust_pg: Any, tmp_path: Any) -> None:
+    from tests.test_rust_pgserver_slice import _Server
+
+    # The catalogs' oids, from another server: asking the fresh one would
+    # make its observer the first backend.
+    names = Observer(_dsn(rust_pg)).names
+    query = (
+        "select o, pg_stat_get_numscans(o), pg_stat_get_tuples_returned(o), "
+        "pg_stat_get_tuples_fetched(o) from (values {}) v(o)"
+    ).format(",".join(f"({o})" for o in names))
+    with _Server(tmp_path) as server:
+        dsn = _dsn(server)
+        first = _connect(dsn, "first")
+        first.execute("select 1")
+        first.close()
+        time.sleep(0.5)
+        with _connect(dsn, "obs") as obs:
+            rows = obs.execute(query).fetchall()
+    got = {names[o]: [a, b, c] for o, a, b, c in rows if a or b or c}
+    assert got == FIRST_BACKEND
+
+
+# Found while measuring: RP-293, `pg_class.relnatts` left out a dropped
+# column's attribute; RP-294, an oidvector would not cast to regtype[].
+FOUND = {
+    "relnatts counts dropped columns": (
+        "RP-293",
+        [
+            "create table rpc_n (a int)",
+            "alter table rpc_n add column b int",
+            "alter table rpc_n drop column b",
+            "select relnatts from pg_class where relname = 'rpc_n'",
+            "drop table rpc_n",
+        ],
+    ),
+    "an oidvector casts to regtype[]": (
+        "RP-294",
+        ["select proargtypes::regtype[]::text from pg_proc where oid = 1317"],
+    ),
+}
+
+EXPECTED_FOUND: dict[str, Any] = {
+    "relnatts counts dropped columns": [None, None, None, [(2,)], None],
+    "an oidvector casts to regtype[]": [[("[0:0]={text}",)]],
+}
+
+
+def found(dsn: str, steps: list[str]) -> list[Any]:
+    out: list[Any] = []
+    with _connect(dsn, "found") as c:
+        for sql in steps:
+            cur = c.execute(sql)
+            out.append(cur.fetchall() if cur.description else None)
+    return out
+
+
+@pytest.mark.parametrize(
+    "name",
+    [pytest.param(n, marks=pytest.mark.backlog(item), id=n) for n, (item, _) in FOUND.items()],
+)
+def test_found(name: str, rust_pg: Any) -> None:
+    assert found(_dsn(rust_pg), FOUND[name][1]) == EXPECTED_FOUND[name]
+
+
 if __name__ == "__main__":
     measured = catalog_reads(sys.argv[1])
     print("EXPECTED: dict[str, Any] = " + pprint.pformat(measured, width=100, sort_dicts=False))
+    gaps = {n: catalog_reads(sys.argv[1], {n: steps})[n] for n, (_, steps) in GAPS.items()}
+    print("EXPECTED_GAPS: dict[str, Any] = " + pprint.pformat(gaps, width=100, sort_dicts=False))
+    print(
+        "EXPECTED_FOUND: dict[str, Any] = "
+        + pprint.pformat({n: found(sys.argv[1], st) for n, (_, st) in FOUND.items()}, width=100)
+    )

@@ -25683,8 +25683,10 @@ impl PgHandler {
         self.install_reload_hook();
         // A session begins (`pgstat_report_connect`).
         self.stats().connect();
-        // `InitPostgres`'s catalog reads (RP-225).
+        // `InitPostgres`'s catalog reads (RP-225), reported as the backend
+        // first goes idle, before its first ReadyForQuery.
         self.catalog_reads_start();
+        self.stats().report(false);
         // ErrorResponse / NoticeResponse fields leave in the session's
         // `client_encoding`, like every other text the server sends: a LATIN9
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
@@ -30099,12 +30101,23 @@ impl PgHandler {
                 .get_or_insert(false);
         }
         self.stats().set_state(true, !outside);
-        // The catalog reads PostgreSQL makes for the statement (RP-225).
-        let invals = self.catalog_reads(query);
+        // The catalog reads PostgreSQL makes for the statement, and what a
+        // catalog change it makes invalidates (RP-225).
+        let effects = self.catalog_effects(query);
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
-        self.catalog_reads_done(invals, result.is_ok());
+        // A statement cancelled, or refused in an aborted block, never
+        // reached parse analysis.
+        let analysed = !matches!(
+            &result,
+            Err(PgWireError::UserError(info))
+                if matches!(info.code.as_str(), "57014" | "57P01" | "25P02")
+        );
+        if analysed {
+            self.catalog_reads(query);
+        }
+        self.catalog_reads_done(effects, result.is_ok());
         if let Err(PgWireError::UserError(info)) = &result {
             if info.code == "40P01" {
                 self.stats().deadlock();
@@ -33758,7 +33771,7 @@ impl PgHandler {
                         self.commit_failed
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         self.stats().end_xact(false);
-                self.catcache_end_xact(false);
+                        self.catcache_end_xact(false);
                         return Err(e);
                     }
                     self.storage
@@ -33817,7 +33830,7 @@ impl PgHandler {
                     self.commit_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.stats().end_xact(false);
-                self.catcache_end_xact(false);
+                    self.catcache_end_xact(false);
                     return Err(e);
                 }
                 self.stats().prepare(&gid);
