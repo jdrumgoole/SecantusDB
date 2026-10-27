@@ -24094,6 +24094,40 @@ fn plan_join_select(
         }
         _ => return Err(Error::Unsupported("this subquery ORDER BY".into())),
     };
+    // An ascending ORDER BY under a LIMIT over an inner or LEFT join of two
+    // stored user tables: PostgreSQL plans the join for the rows the LIMIT takes,
+    // and runs a path already in the ORDER BY's order (a merge join on its
+    // column, an index scan) when that is cheaper than a bounded Sort of
+    // the cheapest (`create_ordered_paths`). This path joins every row and
+    // sorts them, so ties come out in another order; the general join
+    // planner's search weighs both (RP-028). The catalogs stay here.
+    let catalog = |name: &str| {
+        let base = name.rsplit('.').next().unwrap_or(name);
+        base.starts_with("pg_")
+            || name.starts_with("pg_catalog.")
+            || name.starts_with("information_schema.")
+    };
+    let nulls_last = matches!(
+        s.sort_clause.first().and_then(|n| n.node.as_ref()),
+        Some(N::SortBy(sb)) if matches!(
+            pg_query::protobuf::SortByNulls::try_from(sb.sortby_nulls),
+            Ok(pg_query::protobuf::SortByNulls::SortbyNullsDefault
+                | pg_query::protobuf::SortByNulls::SortbyNullsLast)
+        )
+    );
+    if matches!(order, Some((_, _, true)))
+        && nulls_last
+        && s.limit_count.is_some()
+        && quals.is_some()
+        && left_sub.is_none()
+        && right_sub.is_none()
+        && !catalog(&left.0)
+        && !catalog(&right.0)
+    {
+        return Err(Error::Unsupported(
+            "an ORDER BY under a LIMIT over two tables".into(),
+        ));
+    }
 
     Ok(JoinSelect {
         left,

@@ -2402,14 +2402,14 @@ def test_a_limit_over_left_joins_reads_a_parameterized_join(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_join_on_two_equivalence_classes_is_searched(pg: Any) -> None:
     """PostgreSQL 15.19, five 20-row tables never analysed, s0's b joined
     to s2 and s4 and its c to s1 and s3: two equivalence classes, {s0.b,
     s2.a, s4.a} and {s0.c, s1.a, s3.a}. PostgreSQL's search merges s1 with
     s3 on one class and s0, s2, s4 on the other, then the two on s0.c, and
-    returns s0's rows 11, 1, 16, 6, ... The join order search models one
-    class only and declines, so the join runs as written."""
+    returns s0's rows 11, 1, 16, 6, ... The join order search modelled one
+    class only and declined, so the join ran as written."""
     pg.execute("begin")
     try:
         for t, (mb, mc) in enumerate([(7, 5), (5, 3), (3, 4), (4, 6), (6, 5)]):
@@ -2427,6 +2427,131 @@ def test_a_join_on_two_equivalence_classes_is_searched(pg: Any) -> None:
         pg.execute("rollback")
     assert got[0] == "ok"
     assert [r[0] for r in got[1]] == [11, 1, 16, 6, 2, 12, 17, 3, 18, 13, 8, 4, 9, 19]
+
+
+def _rp028_tables(pg: Any, prefix: str, count: int, rows: int) -> None:
+    """`count` tables `{prefix}0..`: `(a, b, c)` holding `i, i % m, i % n`
+    for `i` in 1..`rows`, each table's two moduli the next in 7, 5, 3, 4, 6, 5."""
+    mods = [7, 5, 3, 4, 6, 5]
+    for t in range(count):
+        pg.execute(f"create table {prefix}{t} (a int, b int, c int)")
+        pg.execute(
+            f"insert into {prefix}{t} select i, i % {mods[t]}, i % {mods[t + 1]}"
+            f" from generate_series(1, {rows}) i"
+        )
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_left_join_on_a_key_an_inner_join_shares_reads_its_order(pg: Any) -> None:
+    """PostgreSQL 15.19, four 20-row tables never analysed: `t0 JOIN t1 ON
+    t0.c = t1.a JOIN t2 ON t0.b = t2.a LEFT JOIN t3 ON t0.c = t3.a`. The
+    LEFT join's key t0.c is in the class {t0.c, t1.a} the first ON makes, so
+    its Merge Right Join reads the join merged on that class unsorted. The
+    search gave the LEFT join's key a class of its own and sorted it again,
+    which left ties in another order: 16, 11, 6, 1, ..."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_e", 4, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_e0.a, rp028_e3.a from rp028_e0"
+            " join rp028_e1 on rp028_e0.c = rp028_e1.a join rp028_e2 on rp028_e0.b = rp028_e2.a"
+            " left join rp028_e3 on rp028_e0.c = rp028_e3.a",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got[0] == "ok"
+    assert [r[0] for r in got[1]] == [11, 1, 16, 6, 2, 12, 17, 3, 18, 13, 8, 4, 9, 19]
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_left_joins_on_one_preserved_key_merge_in_its_order(pg: Any) -> None:
+    """PostgreSQL 15.19, four 20-row tables never analysed: `t0 LEFT JOIN t1
+    ON t0.c = t1.a LEFT JOIN t2 ON t0.b = t2.a LEFT JOIN t3 ON t0.c = t3.a`.
+    Both LEFT joins on t0.c find the one class the first clause on it made,
+    so the Merge Left Join on t0.c = t3.a reads the one on t0.c = t1.a
+    unsorted. The search gave each clause's t0.c a class of its own."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_f", 4, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_f0.a, rp028_f1.a, rp028_f3.a from rp028_f0"
+            " left join rp028_f1 on rp028_f0.c = rp028_f1.a"
+            " left join rp028_f2 on rp028_f0.b = rp028_f2.a"
+            " left join rp028_f3 on rp028_f0.c = rp028_f3.a",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got[0] == "ok"
+    want = [15, 10, 5, 20, 1, 6, 11, 16, 7, 2, 17, 12, 13, 8, 18, 3, 19, 9, 4, 14]
+    assert [r[0] for r in got[1]] == want
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_an_order_by_under_a_limit_over_two_tables_reads_a_merge_join(pg: Any) -> None:
+    """PostgreSQL 15.19, two 300-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a ORDER BY t0.b LIMIT 5` is a Limit over a Merge Join, whose
+    rows are already in t0.b's order, ties as t0's quicksort left them
+    (`create_ordered_paths` weighs it against a bounded Sort). The narrow
+    two-table path joined every row and sorted them: 85, 127, 92, 239, 29."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_o", 2, 300)
+        got = pg_answer(
+            pg,
+            "select rp028_o0.a, rp028_o1.a from rp028_o0 join rp028_o1"
+            " on rp028_o0.b = rp028_o1.a order by rp028_o0.b limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(29, 1), (85, 1), (127, 1), (92, 1), (239, 1)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_descending_order_by_under_a_limit_over_two_tables(pg: Any) -> None:
+    """PostgreSQL 15.19, two 300-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a ORDER BY t0.b DESC LIMIT 5` is a Limit over a Merge Join
+    whose sides are sorted descending, and returns t0's rows 132, 279, 90,
+    125, 118. The join search plans an ascending ORDER BY only; this one is
+    joined whole and sorted, and returns other ties."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_d", 2, 300)
+        got = pg_answer(
+            pg,
+            "select rp028_d0.a, rp028_d1.a from rp028_d0 join rp028_d1"
+            " on rp028_d0.b = rp028_d1.a order by rp028_d0.b desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(132, 6), (279, 6), (90, 6), (125, 6), (118, 6)])
+
+
+@pytest.mark.backlog("RP-307")
+def test_an_aggregate_over_a_joined_subquery_keeps_its_limit(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables (`i, i%7, i%5` and `i, i%5,
+    i%3`): the join has 18 rows, and a FROM subquery's LIMIT 3 or OFFSET 15
+    leaves 3 for the aggregate above it. The aggregate path planned the
+    join through `plan_join_select`, whose `JoinSelect` has no limit or
+    offset, so both were parsed and dropped: 18."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp307_m0 (a int, b int, c int)")
+        pg.execute("create table rp307_m1 (a int, b int, c int)")
+        pg.execute("insert into rp307_m0 select i, i % 7, i % 5 from generate_series(1, 20) i")
+        pg.execute("insert into rp307_m1 select i, i % 5, i % 3 from generate_series(1, 20) i")
+        join = (
+            "select rp307_m0.a, rp307_m1.a as a1"
+            " from rp307_m0 join rp307_m1 on rp307_m0.b = rp307_m1.a"
+        )
+        got = [
+            pg_answer(pg, f"select count(*) from ({join} limit 3) s"),
+            pg_answer(pg, f"select count(*) from ({join} offset 15) s"),
+        ]
+    finally:
+        pg.execute("rollback")
+    assert got == [("ok", [(3,)]), ("ok", [(3,)])]
 
 
 # RP-047: the lock manager. Each test needs two sessions on one server, so

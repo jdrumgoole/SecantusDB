@@ -604,12 +604,19 @@ one beside it.
     `neqjoinsel`, IS DISTINCT FROM's, `var_eq_const`'s, an OR's -- and an
     operator a row; 117 of 117 shapes, 9 before); four or more tables
     with a WHERE over two of them; more than eight tables; an expression key with a function
-    call or a cast that costs; a join on two equivalence classes (`a JOIN
-    b ON a.b = b.a JOIN c ON a.c = c.a JOIN d ON a.b = d.a JOIN e ON a.c =
-    e.a`: 283 of 288 no-LIMIT shapes match, the 5 left all such); a LIMIT
-    with an ORDER BY over two tables, which the narrow join path plans (84
-    of 108); a join of more than 200,000 rows a side, which streams in
-    scan order.
+    call or a cast that costs; a join of more than 200,000 rows a side,
+    which streams in scan order. Joins on several equivalence classes are
+    searched since 2026-10-27 (`a JOIN b ON a.b = b.a JOIN c ON a.c = c.a
+    JOIN d ON a.b = d.a JOIN e ON a.c = e.a`): every class of three or
+    more members is kept in `eq_classes` order, two relations join on each
+    class with members on both sides, and each class has its own merge
+    order. A merge clause's key finds its class as
+    `get_eclass_for_sort_expr` does (a big class, an inner equality's
+    two-member class, or the one-member class the first outer join's
+    clause on that column made), so an outer join's merge reads a side
+    already in that order unsorted, and an open outer-join clause keeps
+    that order useful (`pathkeys_useful_for_merging`). Two classes that
+    both join one pair of relations are still declined.
   - A LIMIT over three to eight tables (and two whose WHERE holds a join
     filter) is planned for its first rows (2026-10-26): every relation
     keeps its whole pathlist with startup costs counting, base tables'
@@ -624,10 +631,24 @@ one beside it.
     (`ExecHashIncreaseNumBuckets`); the search keeps whole pathlists with
     no LIMIT too, falling back to the old search where it declines. 843 of
     843 LIMIT shapes of three to five tables at 20 to 3,000 rows (514, then
-    812 before). Declined: other ORDER BYs.
+    812 before). Since 2026-10-27 an ORDER BY under a LIMIT is planned
+    with outer joins in the search (a nullable key's order is its own, as
+    `build_join_pathkeys` gives a right or full join none), and an
+    ascending NULLS LAST ORDER BY under a LIMIT over an inner or LEFT join
+    of two stored user tables leaves the narrow path for this search,
+    which weighs presorted paths against a bounded Sort
+    (`create_ordered_paths`). On the rebuilt matrix
+    (`tools/probes/pg_join_order_matrix.py`, 1,665 shapes, private 15.19):
+    1,140 of 1,140 LIMIT shapes of three to five tables (1,031 before), 285
+    of 285 with no LIMIT (247), and 228 of 240 two-table ORDER BY + LIMIT
+    shapes (168); the 12 left are LEFT joins of 3,000-row tables with an
+    index on the nullable key, which PostgreSQL reads by an Index Only Scan
+    under a Merge Right Join. Declined: a DESC or NULLS FIRST ORDER BY, an
+    ORDER BY of several columns, and a two-table join with a subquery
+    side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_join_on_two_equivalence_classes_is_searched
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_order_by_under_a_limit_over_two_tables
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -976,6 +997,14 @@ tests regression tests:
       the CI runner's memory, so the test must first bound the server.
       Backlog-ID: RP-306
       Verify: none -- reproducing it exhausts memory; a bounded gap test is still to be written
+- [ ] **An aggregate over a joined FROM subquery drops the subquery's
+      LIMIT and OFFSET**: `select count(*) from (select ... from m0 join m1
+      on m0.b = m1.a limit 3) s` is 18 where PostgreSQL 15.19 answers 3
+      (and so with `offset 15`). The aggregate path plans the inner join
+      with `plan_join_select`, whose `JoinSelect` has no limit or offset,
+      so the clause is parsed and ignored. Found while working RP-028.
+      Backlog-ID: RP-307
+      Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_aggregate_over_a_joined_subquery_keeps_its_limit
 - [ ] **OPEN — a cancel sent during a prepared statement was lost once in
       CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
       (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
