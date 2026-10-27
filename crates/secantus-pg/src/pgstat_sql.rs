@@ -84,15 +84,16 @@ impl PgHandler {
 
     /// `track_counts`: off stops the table and index counters.
     pub(crate) fn tracking(&self) -> bool {
-        // Read in place: every write asks (RP-014).
-        !matches!(
-            self.settings
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get("track_counts")
-                .map(String::as_str),
-            Some("off" | "false" | "0" | "no")
-        )
+        // Remembered per generation: every write asks (RP-014).
+        self.settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .memo(crate::GucSlot::TrackCounts, |s| {
+                !matches!(
+                    s.get("track_counts").map(String::as_str),
+                    Some("off" | "false" | "0" | "no")
+                )
+            })
     }
 
     fn consistency(&self) -> Consistency {

@@ -512,6 +512,38 @@ impl GucMap {
         self.generation
     }
 
+    /// `read` of this map, remembered on the thread for its generation
+    /// (unique across sessions) under `slot`: the settings a statement
+    /// reads several times over (`track_counts`, the timeouts, the role
+    /// ...) are looked up once per change of the map, not each time
+    /// (RP-014).
+    pub(crate) fn memo<T: Clone + 'static>(&self, slot: GucSlot, read: impl FnOnce(&Self) -> T) -> T {
+        thread_local! {
+            static MEMO: std::cell::RefCell<Vec<Option<(u64, Box<dyn std::any::Any>)>>> =
+                const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let at = slot as usize;
+        let hit = MEMO.with(|m| {
+            m.borrow()
+                .get(at)
+                .and_then(Option::as_ref)
+                .filter(|(g, _)| *g == self.generation)
+                .and_then(|(_, v)| v.downcast_ref::<T>().cloned())
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = read(self);
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() <= at {
+                m.resize_with(at + 1, || None);
+            }
+            m[at] = Some((self.generation, Box::new(v.clone())));
+        });
+        v
+    }
+
     /// Where `name`'s value came from.
     pub(crate) fn source_of(&self, name: &str) -> GucSource {
         match (self.map.get(name), self.sources.get(name)) {
@@ -569,6 +601,20 @@ impl GucMap {
         self.generation = Self::next_generation();
         self
     }
+}
+
+/// What [`GucMap::memo`] keeps, one value each.
+#[derive(Clone, Copy)]
+pub(crate) enum GucSlot {
+    ClientEncoding,
+    TrackCounts,
+    IdleInTransaction,
+    IdleSession,
+    Role,
+    ReadOnly,
+    DefaultReadOnly,
+    StatementTimeout,
+    LockTimeout,
 }
 
 /// The parameters the server sets at each transaction's start.
@@ -3137,28 +3183,29 @@ impl PgHandler {
 
     /// The EFFECTIVE role: `SET ROLE`'s, else the session's.
     fn current_role_name(&self) -> String {
-        let role = self
-            .settings
+        match self.set_role() {
+            Some(role) => role,
+            None => self.session_user_name(),
+        }
+    }
+
+    /// The role `SET ROLE` put in effect, `None` for none (`role` unset,
+    /// empty or `none`): remembered per settings generation (RP-014).
+    fn set_role(&self) -> Option<String> {
+        self.settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get("role")
-            .cloned()
-            .unwrap_or_default();
-        if role.is_empty() || role.eq_ignore_ascii_case("none") {
-            self.session_user_name()
-        } else {
-            role
-        }
+            .memo(GucSlot::Role, |s| {
+                s.get("role")
+                    .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none"))
+                    .cloned()
+            })
     }
 
     /// [`Self::current_role_name`] for a caller holding the session user's
     /// name already.
     fn current_role_name_for(&self, session_user: &str) -> String {
-        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        match settings.get("role") {
-            Some(role) if !role.is_empty() && !role.eq_ignore_ascii_case("none") => role.clone(),
-            _ => session_user.to_string(),
-        }
+        self.set_role().unwrap_or_else(|| session_user.to_string())
     }
 
     /// A table's owner: the role that created it (or took it with `ALTER
@@ -30589,10 +30636,11 @@ impl PgHandler {
 
     fn client_encoding(&self) -> ClientEncoding {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        settings
-            .get("client_encoding")
-            .map(|v| encoding::client_encoding(v))
-            .unwrap_or(ClientEncoding::Utf8)
+        settings.memo(GucSlot::ClientEncoding, |s| {
+            s.get("client_encoding")
+                .map(|v| encoding::client_encoding(v))
+                .unwrap_or(ClientEncoding::Utf8)
+        })
     }
 
     /// Set `client_encoding` from a user-supplied name, mirroring PostgreSQL:
@@ -31061,7 +31109,12 @@ impl PgHandler {
             .load(std::sync::atomic::Ordering::Relaxed);
         let (guc, code, message) = IDLE_TIMEOUT_GUCS[if in_txn { 0 } else { 1 }];
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        let ms = settings.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0);
+        let slot = if in_txn {
+            GucSlot::IdleInTransaction
+        } else {
+            GucSlot::IdleSession
+        };
+        let ms = settings.memo(slot, |s| s.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0));
         if ms <= 0 {
             return None;
         }
@@ -31174,12 +31227,13 @@ impl PgHandler {
     /// A millisecond setting (`statement_timeout`, `lock_timeout`) as a
     /// number; 0 -- off -- when unset.
     fn ms_setting(&self, name: &str) -> i64 {
-        self.settings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .and_then(|v| parse_ms_guc(v))
-            .unwrap_or(0)
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let read = |s: &GucMap| s.get(name).and_then(|v| parse_ms_guc(v)).unwrap_or(0);
+        match name {
+            "statement_timeout" => settings.memo(GucSlot::StatementTimeout, read),
+            "lock_timeout" => settings.memo(GucSlot::LockTimeout, read),
+            _ => read(&settings),
+        }
     }
 
     /// `pg_sleep`: in slices, so a `CancelRequest` interrupts the sleep
@@ -36896,12 +36950,14 @@ impl PgHandler {
     /// what an autocommit statement's implicit transaction takes.
     fn read_only_now(&self) -> bool {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        let on = |k: &str| settings.get(k).is_some_and(|v| v == "on");
-        on("transaction_read_only")
+        let on = |slot: GucSlot, k: &'static str| {
+            settings.memo(slot, |s| s.get(k).is_some_and(|v| v == "on"))
+        };
+        on(GucSlot::ReadOnly, "transaction_read_only")
             || (!self
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && on("default_transaction_read_only"))
+                && on(GucSlot::DefaultReadOnly, "default_transaction_read_only"))
     }
 
     /// The command a READ ONLY transaction would refuse this statement as,
