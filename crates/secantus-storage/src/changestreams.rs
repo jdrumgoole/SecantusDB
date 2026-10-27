@@ -139,9 +139,11 @@ fn scope_matches(ns: &str, scope: &Scope) -> bool {
 fn ns_doc(ns: &str) -> Document {
     let (db, coll) = split_ns(ns);
     let mut out = Document::new();
-    out.insert("db", db);
+    // A name that is not UTF-8, held escaped, as the string of its bytes
+    // (RM-222).
+    out.insert("db", secantus_core::bsondoc::key_string(db));
     if !coll.is_empty() && coll != "$cmd" {
-        out.insert("coll", coll);
+        out.insert("coll", secantus_core::bsondoc::key_string(coll));
     }
     out
 }
@@ -419,6 +421,21 @@ fn project_unordered(
     let wall = oplog_entry.get("wall").cloned();
     // Periodic noop heartbeats advance cluster time but don't surface as events.
     if op == "n" {
+        return Ok((None, false));
+    }
+    // A namespace whose name is not UTF-8 (held escaped, with NULs in it)
+    // never matches mongod's namespace regex: PCRE2 refuses to match bytes
+    // that are not UTF-8, so a database or cluster stream shows no event for
+    // it (measured 8.2.11, 2026-10-27; RM-222). A stream on such a
+    // collection is refused when it opens.
+    let target = oplog_entry
+        .get_document("o")
+        .ok()
+        .filter(|_| op == "c")
+        .and_then(|o| o.values().next())
+        .and_then(Bson::as_str)
+        .unwrap_or("");
+    if ns.contains('\0') || target.contains('\0') {
         return Ok((None, false));
     }
 

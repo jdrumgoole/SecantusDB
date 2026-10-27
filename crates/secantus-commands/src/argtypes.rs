@@ -2605,6 +2605,63 @@ pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i
     }
 }
 
+/// A field a stage names by a STRING that holds a NUL: mongod refuses each
+/// when the stage parses (measured 8.2.11, 2026-10-27). Read on, a NUL and
+/// two hex digits would be taken for the escape of a field name that is not
+/// UTF-8 and write other bytes (RM-222).
+fn nul_name_in_stage(name: &str, spec: &Bson) -> Option<(i32, String)> {
+    fn nul(v: Option<&Bson>) -> Option<&str> {
+        v.and_then(Bson::as_str).filter(|s| s.contains('\0'))
+    }
+    let field = |n: &str| {
+        (
+            16411,
+            format!(
+                "Consider using $getField or $setField for a field path with '.' or '$'. :: \
+                 caused by :: FieldPath field names may not contain '{n}'."
+            ),
+        )
+    };
+    match name {
+        "$count" => {
+            nul(Some(spec)).map(|_| (40159, "the count field cannot contain a null byte".into()))
+        }
+        "$lookup" | "$graphLookup" => nul(spec.as_document()?.get("as")).map(field),
+        "$densify" => nul(spec.as_document()?.get("field")).map(field),
+        "$fill" => match spec.as_document()?.get("partitionByFields") {
+            Some(Bson::Array(fields)) => fields.iter().find_map(|f| nul(Some(f))).map(field),
+            _ => None,
+        },
+        "$unwind" => {
+            let path_refused = || {
+                Some((
+                    16419,
+                    "field path must not contain embedded null characters".into(),
+                ))
+            };
+            match spec {
+                Bson::String(p) if p.contains('\0') => path_refused(),
+                Bson::Document(d) => {
+                    if nul(d.get("path")).is_some() {
+                        return path_refused();
+                    }
+                    nul(d.get("includeArrayIndex")).map(field)
+                }
+                _ => None,
+            }
+        }
+        "$unset" => {
+            let refused = || Some((9527900, "illegal embedded NUL byte".into()));
+            match spec {
+                Bson::String(s) if s.contains('\0') => refused(),
+                Bson::Array(a) if a.iter().any(|x| nul(Some(x)).is_some()) => refused(),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// A malformed aggregation STAGE spec, named with mongod's own code.
 ///
 /// This is the `update::arith_type_error` pattern applied to the pipeline: a
@@ -2624,6 +2681,9 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
         let Some((name, spec)) = stage.iter().next() else {
             continue;
         };
+        if let Some(refused) = nul_name_in_stage(name, spec) {
+            return Some(refused);
+        }
         let err = match name.as_str() {
             "$match" if !matches!(spec, Bson::Document(_)) => Some((
                 15959,

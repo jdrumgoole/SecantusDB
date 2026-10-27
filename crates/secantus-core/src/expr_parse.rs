@@ -114,7 +114,10 @@ fn name_problem(name: &str, key: bool) -> Option<(i32, String)> {
     if name.contains('\0') && !(key && crate::bsondoc::key_bytes(name).is_some()) {
         return Some((
             16411,
-            format!("FieldPath field names may not contain '\0', given '{name}'."),
+            // mongod builds this from the C literal "'\0', given '", which
+            // ends at its NUL: the name follows the first quote (measured
+            // 8.2.11, 2026-10-27).
+            format!("FieldPath field names may not contain '{name}'."),
         ));
     }
     if name.contains('.') {
@@ -165,6 +168,12 @@ fn path_error(path: &str, key: bool) -> Option<Fallback> {
 /// `Expression::parseOperand`: any value in expression position.
 pub fn operand(v: &Bson) -> R {
     match v {
+        // A field path with a NUL in it is refused when it parses, as mongod
+        // refuses it; read on, the NUL and two hex digits after it would be
+        // taken for the escape of a name that is not UTF-8 (RM-222).
+        Bson::String(s) if s.starts_with('$') && !s.starts_with("$$") && s.contains('\0') => {
+            Err(field_name_error(&s[1..]).unwrap_or(Fallback::Defer))
+        }
         Bson::Document(d) => object(d),
         Bson::Array(items) => items.iter().try_for_each(operand),
         _ => Ok(()),

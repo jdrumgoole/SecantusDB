@@ -793,13 +793,57 @@ fn oplog_view_entries(entries: Vec<Document>) -> Vec<Document> {
             None => oplog_view_shape(&entry).unwrap_or(entry),
         };
         let shaped = with_term_and_version(shaped);
-        let shaped = match rw {
+        let mut shaped = match rw {
             Some(rw) => with_retryable_session(shaped, &rw, group.is_some(), &mut chains),
             None => shaped,
         };
+        view_names(&mut shaped);
         out.push(shaped);
     }
     out
+}
+
+/// An escaped name's value as the oplog shows it: the string of its bytes.
+/// Inside the server a database or collection name that is not UTF-8 is held
+/// escaped (`secantus_core::bsondoc::escape_key`), which is how entries are
+/// stored and how change streams and replay read them; mongod's oplog holds
+/// the bytes (measured 8.2.11, 2026-10-27; RM-222).
+fn view_name(v: &mut Bson) {
+    if let Bson::String(s) = v {
+        if s.contains('\0') {
+            *v = secantus_core::bsondoc::key_string(s.clone());
+        }
+    }
+}
+
+/// The names in an oplog entry as the oplog view shows them: `ns`, and in a
+/// command entry the collection or namespace it names and a rename's `to`,
+/// through an `applyOps`' entries too.
+fn view_names(entry: &mut Document) {
+    if let Some(v) = entry.get_mut("ns") {
+        view_name(v);
+    }
+    if entry.get_str("op") != Ok("c") {
+        return;
+    }
+    let Some(Bson::Document(o)) = entry.get_mut("o") else {
+        return;
+    };
+    if let Some(first) = o.keys().next().cloned() {
+        if let Some(v) = o.get_mut(&first) {
+            view_name(v);
+        }
+    }
+    if let Some(v) = o.get_mut("to") {
+        view_name(v);
+    }
+    if let Some(Bson::Array(ops)) = o.get_mut("applyOps") {
+        for op in ops {
+            if let Bson::Document(op) = op {
+                view_names(op);
+            }
+        }
+    }
 }
 
 /// A retryable write's entry as mongod 8.2.11 writes it: its `lsid` and
@@ -3442,6 +3486,31 @@ pub enum RouterAccess {
     Index { name: String, in_order: bool },
     /// Several indexes (an `$or`).
     Indexes,
+}
+
+/// The refusal of an index type this engine does not build: `2d`
+/// (point-only geohash) and `2dsphere` (S2 cell) geo indexes are built;
+/// other non-numeric types (text / hashed) are refused. Both the one-step
+/// `create_index` and a build over documents (`begin_index_build`) ask.
+pub(crate) fn unsupported_index_type(
+    key_spec: &Document,
+    options: &Document,
+) -> Option<StorageError> {
+    if parse_geo_2d(key_spec, options).is_some() || parse_geo_sphere(key_spec).is_some() {
+        return None;
+    }
+    for (field, v) in key_spec {
+        if direction_of(v).is_none() {
+            let ty = match v {
+                Bson::String(s) => s.clone(),
+                other => format!("{other:?}"),
+            };
+            return Some(StorageError::CreateIndexUnsupported(format!(
+                "{ty} indexes (field {field:?}) are not supported by the Rust storage engine yet"
+            )));
+        }
+    }
+    None
 }
 
 /// An index's descriptor, from its catalog `options`: what a write keys
@@ -13669,22 +13738,8 @@ impl Storage {
         if name == ID_INDEX_NAME {
             return Ok(false);
         }
-        // `2d` (point-only geohash) and `2dsphere` (S2 cell) geo indexes are
-        // supported. Other non-numeric index types (text / hashed) are rejected.
-        let geo = parse_geo_2d(key_spec, options);
-        let geo_sphere = parse_geo_sphere(key_spec);
-        if geo.is_none() && geo_sphere.is_none() {
-            for (field, v) in key_spec {
-                if direction_of(v).is_none() {
-                    let ty = match v {
-                        Bson::String(s) => s.clone(),
-                        other => format!("{other:?}"),
-                    };
-                    return Err(StorageError::CreateIndexUnsupported(format!(
-                        "{ty} indexes (field {field:?}) are not supported by the Rust storage engine yet"
-                    )));
-                }
-            }
+        if let Some(refused) = unsupported_index_type(key_spec, options) {
+            return Err(refused);
         }
 
         // `op_session` (not a fresh session) so `createIndexes` inside a
@@ -21900,13 +21955,21 @@ impl Storage {
                 Err(e) if e.is_not_found() => false,
                 Err(e) => return Err(e.into()),
             };
+            // The key columns hold a name's own bytes, which for a name that
+            // is not UTF-8 are not the escaped string's (RM-222).
+            let key_name =
+                |s: &str| secantus_wt::name_bytes(s).unwrap_or_else(|| s.as_bytes().to_vec());
+            let (db_key, coll_key, name_key) = (key_name(db), key_name(coll), key_name(name));
             while more_rows {
                 if deadline::check().is_err() {
                     return Err(StorageError::MaxTimeExpired);
                 }
                 // Read in place: this loop meets most of an index.
                 let step = cur.with_key_sssu(|d, c, n, packed| {
-                    if d != db.as_bytes() || c != coll.as_bytes() || n != name.as_bytes() {
+                    if d != db_key.as_slice()
+                        || c != coll_key.as_slice()
+                        || n != name_key.as_slice()
+                    {
                         return None;
                     }
                     let (row_esc, row_id) = unpack_entry(packed);

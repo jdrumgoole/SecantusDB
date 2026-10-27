@@ -332,6 +332,13 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
         .into_reply());
     }
 
+    // mongod filters the oplog by a regex built from the namespace it
+    // watches, and PCRE2 refuses one whose bytes are not UTF-8: the stream is
+    // 51091 with PCRE2's verdict (measured 8.2.11, 2026-10-27; RM-222).
+    if let Some(problem) = namespace_regex_problem(&ctx.db_name, on_collection) {
+        return Ok(problem.into_reply());
+    }
+
     // Scope from the aggregate target + allChangesForCluster:
     //   coll.watch()   -> aggregate: "<coll>"            -> Coll
     //   db.watch()     -> aggregate: 1                   -> Db
@@ -624,6 +631,42 @@ pub fn open_change_stream(doc: &Document, ctx: &mut CommandContext) -> HandlerRe
 }
 
 /// The `$changeStream` value of the first pipeline stage, whatever its type.
+/// mongod's `regexEscapeNsForChangeStream`: a backslash before each regex
+/// metacharacter.
+fn regex_escape(name: &[u8], out: &mut Vec<u8>) {
+    for b in name {
+        if b"*+|()^?[]./\\$".contains(b) {
+            out.push(b'\\');
+        }
+        out.push(*b);
+    }
+}
+
+/// The refusal of a change stream on a database or collection whose name is
+/// not UTF-8: mongod's namespace regex (`^<db>\.<coll>$` for a collection,
+/// `^<db>\.` and more for a database) does not compile, and the error is
+/// PCRE2's first fault in it.
+fn namespace_regex_problem(db: &str, coll: Option<&str>) -> Option<CommandError> {
+    let bytes = |s: &str| crate::bsondoc::key_bytes(s).map(|b| b.into_owned());
+    let db_bytes = bytes(db)?;
+    let mut pattern = b"^".to_vec();
+    regex_escape(&db_bytes, &mut pattern);
+    pattern.extend_from_slice(b"\\.");
+    match coll {
+        Some(c) => {
+            regex_escape(&bytes(c)?, &mut pattern);
+            pattern.push(b'$');
+        }
+        None => pattern.extend_from_slice(b"(?!(\\$|system\\.))"),
+    }
+    let fault = secantus_core::rawstr::pcre2_utf8_error(&pattern)?;
+    Some(CommandError::new(
+        51091,
+        "Location51091",
+        format!("Regular expression is invalid: {fault}"),
+    ))
+}
+
 fn first_change_stream_value(doc: &Document) -> Option<Bson> {
     let pipeline = doc.get("pipeline")?.as_array()?;
     let first = pipeline.first()?.as_document()?;
@@ -978,6 +1021,34 @@ fn cursor_batch_size(doc: &Document) -> i64 {
         .and_then(|c| c.get("batchSize"))
         .and_then(as_i64)
         .unwrap_or(DEFAULT_BATCH_SIZE as i64)
+}
+
+#[cfg(test)]
+mod namespace_regex_tests {
+    /// RM-222: mongod 8.2.11 refuses a change stream on a namespace that is
+    /// not UTF-8 with PCRE2's verdict on its namespace regex.
+    #[test]
+    fn a_namespace_that_is_not_utf8_is_refused_as_mongod_refuses_it() {
+        let msg = |db: &str, coll: Option<&str>| {
+            super::namespace_regex_problem(db, coll).map(|e| (e.code, e.errmsg))
+        };
+        let want = |fault: &str| {
+            Some((
+                51091,
+                format!("Regular expression is invalid: UTF-8 error: {fault}"),
+            ))
+        };
+        assert_eq!(
+            msg("rm222n", Some("r\u{0}fd")),
+            want("4 bytes missing at end")
+        );
+        assert_eq!(
+            msg("rm222n", Some("q\u{0}c3")),
+            want("byte 2 top bits not 0x80")
+        );
+        assert_eq!(msg("d\u{0}fe", None), want("illegal byte (0xfe or 0xff)"));
+        assert_eq!(msg("rm222n", Some("plain")), None);
+    }
 }
 
 #[cfg(test)]

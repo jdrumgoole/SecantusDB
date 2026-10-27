@@ -27,6 +27,17 @@ pub const EMPTY_ARRAY_SORT_MARKER: Bson = Bson::Undefined;
 /// Ranks are spaced by 10 so the empty-array marker can sit *between* MinKey and
 /// Null, which is where mongod puts it. Relative order is otherwise unchanged.
 fn type_rank(v: &Bson) -> u8 {
+    // A value of a text-carrying type whose text is not UTF-8 ranks as its
+    // type does (RM-222): a symbol as a string.
+    if let Some((t, _)) = crate::bsondoc::as_raw_text(v) {
+        return match t {
+            0x0B => 120,
+            0x0C => 122,
+            0x0D => 125,
+            0x0E => 40,
+            _ => 127,
+        };
+    }
     // A string whose bytes are not UTF-8 (RM-222) is a string.
     if crate::bsondoc::as_invalid_utf8(v).is_some() {
         return 40;
@@ -178,6 +189,10 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
     if let Some((x, y)) = crate::bsondoc::carrier_pair(a, b) {
         return crate::collation::active_compare_bytes(x, y);
     }
+    // A raw text-carrying value against another of its rank: by its text.
+    if let Some(o) = raw_text_cmp(a, b) {
+        return o;
+    }
     match (a, b) {
         // Two nulls / two MinKeys / two MaxKeys: Python's native `<` is False
         // both ways -> equal (stable).
@@ -229,6 +244,29 @@ pub fn cmp(a: &Bson, b: &Bson) -> Ordering {
             }
         }
     }
+}
+
+/// The text bytes of a raw text-carrying value (RM-222), or of the plain
+/// value of its type it is compared with.
+fn text_of(v: &Bson) -> Option<Vec<u8>> {
+    if let Some((t, raw)) = crate::bsondoc::as_raw_text(v) {
+        return Some(crate::bsondoc::raw_text_bytes(t, raw).to_vec());
+    }
+    match v {
+        Bson::JavaScriptCode(s) | Bson::Symbol(s) => Some(s.as_bytes().to_vec()),
+        Bson::JavaScriptCodeWithScope(c) => Some(c.code.as_bytes().to_vec()),
+        Bson::RegularExpression(r) => Some(r.pattern.as_bytes().to_vec()),
+        _ => crate::bsondoc::str_bytes(v).map(<[u8]>::to_vec),
+    }
+}
+
+/// Two values of one rank, one of them a raw text-carrying value: by their
+/// text's bytes.
+fn raw_text_cmp(a: &Bson, b: &Bson) -> Option<Ordering> {
+    if crate::bsondoc::as_raw_text(a).is_none() && crate::bsondoc::as_raw_text(b).is_none() {
+        return None;
+    }
+    Some(text_of(a)?.cmp(&text_of(b)?))
 }
 
 /// Field-by-field document comparison in insertion order (matches `_bson_lt`'s

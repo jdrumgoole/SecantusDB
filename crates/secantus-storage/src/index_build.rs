@@ -631,6 +631,14 @@ impl Storage {
         specs: &[IndexBuildSpec],
         member: &str,
     ) -> Result<()> {
+        // A type this engine does not build is refused before anything is
+        // written, as the one-step build refuses it. The build over documents
+        // (#2191) skipped the check, and a text index came back created.
+        for s in specs {
+            if let Some(refused) = crate::unsupported_index_type(&s.key, &s.options) {
+                return Err(refused);
+            }
+        }
         // The collection exists, with its UUID, before anything is logged.
         self.create_collection(db, coll)?;
         let coll_uuid = self.collection_uuid(db, coll)?;

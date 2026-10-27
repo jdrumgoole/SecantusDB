@@ -544,10 +544,11 @@ fn redact_list(values: &[Bson], spec: &Bson, vars: &Document) -> R<Vec<Bson>> {
 /// `ObjectId('…')`, and a date as ISO-8601 rather than `new Date(<ms>)`. Two
 /// renderers, both mongod's, used by different messages — probed on 8.2.11.
 pub fn render_value_compact(v: &Bson) -> String {
-    // A string that is not UTF-8 prints as the string it is, each invalid
-    // sequence replaced (mongod writes the raw bytes; RM-222).
+    // A string that is not UTF-8 prints escaped (`bsondoc::escape_key`); a
+    // reply's error message carries those bytes back out, as mongod quotes
+    // them (RM-222).
     if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
-        return format!("\"{}\"", crate::bsondoc::lossy(b));
+        return format!("\"{}\"", crate::bsondoc::message_escape(b));
     }
     match v {
         Bson::Null => "null".to_string(),
@@ -1161,6 +1162,20 @@ pub(crate) fn sort_fields(spec: &Bson) -> R<Vec<(String, bool)>> {
 
 /// The values a `$sort` on `fields` compares for `d`, one per field.
 pub(crate) fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<Bson>> {
+    // A sort on `_id` alone compares the whole value, an array as an array
+    // (after documents), where any other sort takes an array's smallest
+    // element: mongod 8.2.11 sorts a `$group`'s array keys `b, z, {x: 1},
+    // [], [5], [x, q]` by `{_id: 1}` and `[], [5], b, [x, q], z, {x: 1}` by
+    // `{t: 1}` or `{_id: 1, n: 1}` (measured 2026-10-27, RM-329).
+    if let [(path, _)] = fields {
+        if path == "_id" {
+            let v = d.get("_id").cloned().unwrap_or(Bson::Null);
+            if !order::is_sortable(&v) {
+                return Err(Fallback::Defer);
+            }
+            return Ok(vec![v]);
+        }
+    }
     let mut keys = Vec::with_capacity(fields.len());
     for (path, rev) in fields {
         // mongod refuses a sort path whose component names both an array

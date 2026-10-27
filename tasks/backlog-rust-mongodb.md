@@ -834,38 +834,34 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refuses `validateMode: "extraIndexKeysCheck"` (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **Text that is not UTF-8 outside a string value is still refused or
-      altered.** Since 2026-10-27 a string VALUE or a field NAME whose bytes
-      are not UTF-8 is kept, compared, indexed, matched and served byte for
-      byte (`bsondoc`'s carrier and escaped names;
-      `tests/mongod_live/test_invalid_utf8.py`). Left, each measured against
-      mongod 8.2.11:
-      - a collection (or database) name that is not UTF-8 is refused (73
-        "Collection name has invalid type string"); mongod creates it.
-        Storage keys its tables by a Rust `String` name;
-      - an error message that quotes such a string (`$convert`,
-        `$dateFromString`, `$toObjectId` ...) quotes it with U+FFFD for each
-        invalid sequence, where mongod writes the raw bytes; `$dateFromString`
-        then lists one "Unexpected character" per byte of each U+FFFD;
-      - JavaScript, a symbol, a regex, a DBPointer or JavaScript with a scope
-        whose text is not UTF-8 is refused (2 "invalid BSON in body");
-        mongod stores it;
-      - a NUL and two lowercase hex digits in a field name taken from a
-        string value elsewhere than `$setField`, `$rename` and a field path
-        (all three refuse it, as mongod does) would read as the escape of a
-        name that is not UTF-8. Not measured to happen: the other places a
-        string becomes a name refuse a NUL through `FieldPath`.
-      Backlog-ID: RM-222
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_collection_name_that_is_not_utf8, tests/backlog/test_rm_222_invalid_utf8.py::test_error_message_quotes_the_bytes, tests/backlog/test_rm_222_invalid_utf8.py::test_other_text_types_that_are_not_utf8
-- [ ] **A `$group` key that is an array sorts by its smallest element.**
-      `[{$group: {_id: "$s"}}, {$sort: {_id: 1}}]` over `s` values `["x",
-      "q"]`, `"b"`, `{x: 1}`, `"z"` returns `b, [x, q], z, {x: 1}`; mongod
-      8.2.11 returns `b, z, {x: 1}, [x, q]`, sorting the array as an array.
-      A find sort's rule (an array sorts by its smallest element ascending)
-      is applied to a `$sort` over a computed `_id`. Found 2026-10-27 while
+- [ ] **A `$group` after a `$match` on `_id` runs in the slot-based
+      engine.** mongod 8.2.11 runs it in its classic engine
+      (`explainVersion` 1) when the leading `$match` is on `_id` (an
+      equality or an `$in`), and in the slot-based engine after a `$match`
+      on another field; the two disagree on errors, so `{$mod: ["$n", 0]}`
+      in the `$group` is 16610 after `{$match: {_id: 1}}` on mongod and
+      4848403 here (`crates/secantus-core/src/sbe.rs` decides). Found
+      2026-10-27 while working RM-222.
+      Backlog-ID: RM-330
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_group_after_an_id_match_runs_in_the_classic_engine
+- [ ] **explain's bounds on a multikey index from two range predicates on
+      one field.** Over a multikey index mongod does not intersect `$gte`
+      and `$lte` on one field and bounds the scan by one of them: for
+      `{s: {$gte: "aé", $lte: "\U0010ffff"}}` it is the `$gte`
+      (`["aé", {})`, the `$lte` left as the filter), for `{$gte: "a",
+      $lte: "b"}` the `$lte`. This server always takes the `$lte`. Which
+      one mongod keeps is its plan ranking's choice between the two
+      single-predicate plans; measured on 8.2.11, 2026-10-27, while
       working RM-222.
-      Backlog-ID: RM-329
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_sort_of_group_ids_that_are_arrays
+      Backlog-ID: RM-331
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_multikey_bounds_from_two_range_predicates
+- [ ] **A sort on two arrays of one document is not refused.** mongod
+      8.2.11 refuses `{$sort: {a: 1, b: 1}}` over `{a: [1, 2], b: [3, 4]}`
+      with 2 "cannot sort with keys that are parallel arrays" (and a
+      `{$sort: {_id: 1, t: 1}}` over a `$group`'s array keys likewise);
+      this server sorts. Found 2026-10-27 while working RM-222/RM-329.
+      Backlog-ID: RM-332
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_sort_on_two_arrays_is_refused
 - [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
       2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
       change-stream description as `o.md`), a batch of inserts (one

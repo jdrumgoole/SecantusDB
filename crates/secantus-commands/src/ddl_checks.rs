@@ -18,10 +18,12 @@ fn invalid_namespace(message: String) -> CommandError {
 /// a collection-scoped command reports the namespace, a database-scoped one
 /// the database.
 pub(crate) fn invalid_database_name(db: &str, doc: &Document) -> Option<CommandError> {
-    if db.len() > 63 {
+    // Counted in the name's own bytes: one that is not UTF-8 is held escaped
+    // (RM-222).
+    let len = crate::bsondoc::key_bytes(db).map_or(db.len(), |b| b.len());
+    if len > 63 {
         return Some(invalid_namespace(format!(
-            "db name must be at most 63 characters, found: {}",
-            db.len()
+            "db name must be at most 63 characters, found: {len}"
         )));
     }
     if db.contains('.') {

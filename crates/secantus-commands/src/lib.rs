@@ -62,6 +62,7 @@ mod generic;
 mod hybrid;
 mod index_builds;
 mod index_filters;
+pub mod names;
 mod snapshot;
 pub use generic::db_field_problem;
 pub mod failpoints;
@@ -778,6 +779,27 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// `commands.py::dispatch` runs first. Always returns a reply document (errors
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
+    // A database or collection name that is not UTF-8 is escaped on the way
+    // in and written back as its bytes on the way out (RM-222).
+    let escaped = match names::from_bytes_named(doc) {
+        Ok(escaped) => escaped,
+        Err(e) => return e.into_reply(),
+    };
+    let (doc, carried): (&Document, &[String]) = match &escaped {
+        Some((d, carried)) => {
+            if let Ok(db) = d.get_str("$db") {
+                ctx.db_name = db.to_string();
+            }
+            (d, carried)
+        }
+        None => (doc, &[]),
+    };
+    let mut reply = dispatch_named(doc, ctx);
+    names::to_bytes(&mut reply, command_name(doc), carried);
+    reply
+}
+
+fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     handshake::process_started();
     let started = std::time::Instant::now();
     let stats = ctx.top_stats.clone();
@@ -1431,7 +1453,9 @@ fn reject_synthetic_view_write(name: &str, doc: &Document, db: &str) -> Option<C
 /// fault into a whole-server DoS. Reject it here, before it reaches storage,
 /// with the same `InvalidNamespace` error mongod returns. (#139)
 pub(crate) fn nul_in_namespace(kind: &str, value: &str) -> Option<CommandError> {
-    if value.contains('\0') {
+    // An escaped name that is not UTF-8 (`names`) holds NULs of its own; a
+    // client's NUL was refused before it was escaped.
+    if value.contains('\0') && bsondoc::key_bytes(value).is_none() {
         Some(CommandError::new(
             73,
             "InvalidNamespace",
