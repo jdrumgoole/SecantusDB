@@ -45,6 +45,36 @@ thread_local! {
     /// The joined-row keys the query reads above the join source being
     /// read (`JoinRows::needed`); `None` outside one.
     static NEEDED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+    /// The keys the join source being read carries (`JoinRows::project`);
+    /// `None` outside one, and for one whose reads cannot be told.
+    static PROJECT: std::cell::RefCell<Option<std::sync::Arc<std::collections::HashSet<String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The keys the join source being read carries (`JoinRows::project`), when
+/// it carries fewer than all.
+pub(crate) fn projection() -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    PROJECT.with(|p| p.borrow().clone())
+}
+
+/// Run `f` with `project` as the join projection, restoring the one before.
+/// Every way into a join's rows other than [`with_join_where`] -- the
+/// streamed join, a statement run inside a join's -- runs under `None`, so
+/// no join builds its rows by another join's projection.
+pub(crate) fn with_projection<T>(
+    project: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+    f: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<Option<std::sync::Arc<std::collections::HashSet<String>>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(previous) = self.0.take() {
+                PROJECT.with(|p| *p.borrow_mut() = previous);
+            }
+        }
+    }
+    let _restore = Restore(Some(PROJECT.with(|p| p.replace(project))));
+    f()
 }
 
 /// The keys the query reads above the join source being read, when known.
@@ -130,7 +160,7 @@ pub(crate) fn with_join_where<T>(
     let outer_filters = WHERE_FILTERS.with(|c| c.replace(join.where_filters.clone()));
     let outer_equalities = WHERE_EQUALITIES.with(|c| c.replace(join.where_equalities.clone()));
     let outer_needed = NEEDED.with(|n| n.replace(Some(join.needed.clone())));
-    let out = f();
+    let out = with_projection(join.project.clone(), f);
     WHERE_SPANS_EQUALITY.with(|c| c.set(outer_eq));
     WHERE_SPAN_ALIASES.with(|c| *c.borrow_mut() = outer_aliases);
     WHERE_FILTERS.with(|c| *c.borrow_mut() = outer_filters);

@@ -89,7 +89,7 @@ const TEMPLATES: &[(&str, usize, &str)] = &[
     (
         "nameconcatoid",
         2,
-        "($1::text || '_' || $2::oid::text)::name",
+        "($1::text || '_'::text || $2::oid::text)::name",
     ),
 ];
 

@@ -19,11 +19,13 @@ mod agg_support;
 mod cmpfn;
 pub mod colstats;
 pub mod costsize;
+mod expr_memo;
 mod expr_where;
 mod filter_sublink;
 mod functional_grouping;
 mod guc_args;
 pub mod hashagg;
+mod hashed_subplan;
 mod hashfn;
 pub mod joincost;
 mod like_match;
@@ -110,6 +112,7 @@ mod func_cast;
 mod funcsig;
 mod named_args;
 pub mod nodetostring;
+mod query_reads;
 mod schema_functions;
 mod search_cycle;
 pub mod server_encoding;
@@ -3132,8 +3135,14 @@ pub enum ColumnExpr {
 /// copying it for every row was most of an `information_schema` view's time
 /// (RP-131). Not part of the expression: a clone starts empty, and every
 /// two compare equal.
+///
+/// It also carries the expression's [`expr_memo::ExprMemo`]: what is worked
+/// out once for the expression rather than for every row.
 #[derive(Default)]
-pub struct RowScratch(std::sync::Mutex<Vec<Bson>>);
+pub struct RowScratch(
+    std::sync::Mutex<Vec<Bson>>,
+    std::sync::Arc<expr_memo::ExprMemo>,
+);
 
 impl Clone for RowScratch {
     fn clone(&self) -> Self {
@@ -6763,6 +6772,15 @@ fn normalize_serial(ty: &str) -> String {
 /// libpg_query keeps `int[]` as the name `int4` plus a non-empty
 /// `array_bounds`, so reading only the name loses the array-ness entirely.
 fn type_name_of(t: &pg_query::protobuf::TypeName) -> String {
+    match expr_memo::type_name(t, || {
+        (type_name_of_uncached(t), declared_typmod_uncached(t))
+    }) {
+        Some((name, _)) => name,
+        None => type_name_of_uncached(t),
+    }
+}
+
+fn type_name_of_uncached(t: &pg_query::protobuf::TypeName) -> String {
     let base = type_name(&t.names);
     if t.array_bounds.is_empty() {
         base
@@ -6807,6 +6825,15 @@ pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
 }
 
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
+    match expr_memo::type_name(tn, || {
+        (type_name_of_uncached(tn), declared_typmod_uncached(tn))
+    }) {
+        Some((_, typmod)) => typmod,
+        None => declared_typmod_uncached(tn),
+    }
+}
+
+fn declared_typmod_uncached(tn: &pg_query::protobuf::TypeName) -> i32 {
     let mods: Vec<i32> = tn.typmods.iter().filter_map(typmod_ival).collect();
     // A modifier we could not read as an integer means no faithful typmod.
     if mods.len() != tn.typmods.len() {
@@ -10031,6 +10058,11 @@ thread_local! {
 /// Install the views' relation oids beside `set_views`.
 pub fn set_view_oids(oids: Vec<(String, i64)>) {
     PLAN_VIEW_OIDS.with(|v| *v.borrow_mut() = oids.into_iter().collect());
+}
+
+/// Was a FROM subquery under `alias` expanded from a view by this statement?
+pub(crate) fn is_expanded_view(alias: &str) -> bool {
+    EXPANDED_VIEWS.with(|e| e.borrow().iter().any(|(a, _)| a == alias))
 }
 
 /// The view a FROM subquery under `alias` was expanded from, and its oid.
@@ -15979,6 +16011,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
     });
     let previous = declare_row_fields(params.len(), fields);
     let n = params.len();
+    let _memo = expr_memo::install(&scratch.1, expr);
     let run = |all: &[Bson]| correlated::with_row_params_from(n, || const_value(expr, all));
     // The statement's values are copied into the scratch list once; an
     // evaluation of this expression inside its own (a recursive function)
@@ -20515,10 +20548,14 @@ fn resolve_one_sublink(
                 Some(N::RowExpr(_))
             ) =>
         {
+            let types: Option<Vec<String>> = sub_plan_def(&plan, lookup)
+                .ok()
+                .map(|d| d.columns.iter().map(|c| c.pg_type.clone()).collect());
             row_subquery_comparison(
                 sl,
                 kind == SubLinkType::AnySublink,
                 rows,
+                types.as_deref(),
                 lookup,
                 params,
                 run,
@@ -20583,6 +20620,7 @@ fn row_subquery_comparison(
     sl: &pg_query::protobuf::SubLink,
     any: bool,
     rows: Vec<Vec<Bson>>,
+    types: Option<&[String]>,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -20614,6 +20652,13 @@ fn row_subquery_comparison(
             } else {
                 "subquery has too few columns".into()
             }));
+        }
+    }
+    // `IN` over hashable equalities is a hashed SubPlan, as PostgreSQL
+    // plans it when the rows fit in its hash memory (`hashed_subplan`).
+    if any && op == "=" {
+        if let Some(node) = types.and_then(|t| hashed_subplan::plan(&row.args, &rows, t, params)) {
+            return Ok(node);
         }
     }
     let boolexpr =
@@ -22143,6 +22188,14 @@ fn plan_select(
         (None, None) => std::borrow::Cow::Borrowed(s),
     };
     let s = &*expanded;
+    // The outputs of the FROM-subqueries a VIEW expanded into that nothing
+    // reads are computed as NULL: PostgreSQL's rewriter expands a view
+    // before its planner removes them (`remove_unused_subquery_outputs`),
+    // and the statement-wide pass ran before this select's views expanded
+    // (RP-131).
+    if let Some(rewritten) = prune_outputs::rewrite_from_items(s, lookup, params) {
+        return plan_select(&rewritten, lookup, params);
+    }
     // The locking clauses, checked once per top-level statement, on the
     // statement as written (views expanded): the rewrites below may move
     // the relations a clause names.
@@ -25144,6 +25197,11 @@ fn builtin_by_type(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Option<
 }
 
 fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if f.funcname.len() == 1 && func_name(f).as_deref() == Some(hashed_subplan::NAME) {
+            return "bool".to_string();
+        }
+    }
     // `x COLLATE c` is `x`'s type: a collation changes the comparison, not
     // the type, so a `bpchar` operand still ignores its trailing blanks.
     if let Some(N::CollateClause(cc)) = node.node.as_ref() {
@@ -27095,6 +27153,25 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             .as_ref()
             .and_then(|v| v.node.as_ref())
         {
+            // A hashed SubPlan (`hashed_subplan`): a boolean, named as the
+            // row comparison it stands for is.
+            Some(N::FuncCall(f))
+                if f.funcname.len() == 1
+                    && func_name(f).as_deref() == Some(hashed_subplan::NAME) =>
+            {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                columns.push((
+                    if rt.name.is_empty() {
+                        "?column?".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(const_value(node, params)?),
+                    "bool".to_string(),
+                    -1,
+                ));
+                continue;
+            }
             Some(N::FuncCall(f)) => {
                 refuse_untyped_any_args(f)?;
                 if let Some(e) = function_absent_in_reference(f, params) {
@@ -30825,7 +30902,12 @@ fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
 
 /// The user base type (not an extension's) an expression statically has.
 fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Option<String> {
-    let t = static_type(arg, value);
+    user_defined_base_source_of(&static_type(arg, value))
+}
+
+/// [`user_defined_base_source`] for an expression of static type `t`.
+fn user_defined_base_source_of(t: &str) -> Option<String> {
+    let t = t.to_string();
     let (name, _, defined) = user_base_type(&t)?;
     // citext is text to every operator and function that does not
     // define its own: it casts implicitly to text.
@@ -39042,6 +39124,23 @@ fn expand_between(e: &pg_query::protobuf::AExpr) -> Option<pg_query::protobuf::N
 }
 
 fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // A constant cast, folded once for the expression (`expr_memo`).
+    if let Some(N::TypeCast(_)) = node.node.as_ref() {
+        if let Some(v) = expr_memo::folded(node, || const_value_node(node, params)) {
+            return v;
+        }
+    }
+    const_value_node(node, params)
+}
+
+fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
+    // A hashed SubPlan (`hashed_subplan`), whose arguments are not all
+    // values to evaluate.
+    if let Some(N::FuncCall(f)) = node.node.as_ref() {
+        if f.funcname.len() == 1 && func_name(f).as_deref() == Some(hashed_subplan::NAME) {
+            return hashed_subplan::eval(f, params);
+        }
+    }
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
@@ -39051,14 +39150,16 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             .ok_or_else(|| Error::Parse("cast with no operand".into()))?;
         let value = const_value(arg, params)?;
         let target = tc.type_name.as_ref().map(type_name_of).unwrap_or_default();
+        // The operand's type, worked out once for the cast: every check below
+        // asks it, and asking walked the operand again each time (RP-131).
+        // The value only changes below by `bpchar` trimming, which happens
+        // only when this type -- then the node's own -- is `bpchar`.
+        let arg_type = static_type(arg, &value);
         // An `int2vector` / `oidvector` as an array is subscripted from 0, as
         // the vector is (`'1 2'::int2vector::int2[]` is `[0:1]={1,2}`).
         if target.ends_with("[]")
             && value != Bson::Null
-            && matches!(
-                static_type(arg, &value).as_str(),
-                "int2vector" | "oidvector"
-            )
+            && matches!(arg_type.as_str(), "int2vector" | "oidvector")
         {
             return Ok(arrays::bounded(cast_value(value, &target)?, &[0]));
         }
@@ -39068,7 +39169,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
             if value == Bson::Null {
                 return Ok(Bson::Null);
             }
-            match static_type(arg, &value).as_str() {
+            match arg_type.as_str() {
                 "bpchar" => return Ok(Bson::String(value_text(&value))),
                 // `boolout` is `t` / `f`, where the text cast spells it out.
                 "bool" => {
@@ -39091,7 +39192,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // carried as its text, but it has no cast to anything but the string
         // types and itself: `'a'::t::int` is 42846 on PostgreSQL rather than a
         // parse of the text.
-        if let Some(source) = user_defined_base_source(arg, &value) {
+        if let Some(source) = user_defined_base_source_of(&arg_type) {
             let target_base = user_base_type(&target).map(|(n, _, _)| n);
             if !(is_string_type(&target) || target_base.as_deref() == Some(source.as_str())) {
                 return Err(Error::CannotCoerce(format!(
@@ -39106,7 +39207,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         let untyped = matches!(arg.node.as_ref(), Some(N::AConst(c))
             if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) || c.isnull);
         if !untyped {
-            let source = static_type(arg, &value);
+            let source = arg_type.clone();
             if let Some(cast) = user_casts::find(&source, &target) {
                 return user_casts::apply(&cast, value);
             }
@@ -39227,13 +39328,11 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // (the instant alone cannot say it is a timestamptz, so the source cast
         // decides). PLAN_TIMEZONE is set during planning, where this evaluates.
         if matches!(target.as_str(), "text" | "varchar" | "name") {
-            if let Some(v) =
-                datetime_text_styled(&value, &static_type(arg, &value), &session_timezone())
-            {
+            if let Some(v) = datetime_text_styled(&value, &arg_type, &session_timezone()) {
                 return Ok(v);
             }
         }
-        if target == "text" && static_type(arg, &value) == "timestamptz" {
+        if target == "text" && arg_type == "timestamptz" {
             if let Some(t) = timestamptz_value_text(&value, &session_timezone()) {
                 return Ok(Bson::String(t));
             }
@@ -39241,7 +39340,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // To a zone-less type, a timestamptz is first the session zone's WALL
         // CLOCK: `now()::date` is today where the session is, not in UTC.
         if matches!(target.as_str(), "date" | "timestamp" | "time" | "timetz")
-            && static_type(arg, &value) == "timestamptz"
+            && arg_type == "timestamptz"
         {
             if let Some(v) = timestamptz_as_local(&value, &target)? {
                 return Ok(timestamp_precision(tc, &target, v));
@@ -39258,8 +39357,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // `timestamp`, not `timestamptz`.)
         let is_stored_instant = matches!(&value, Bson::DateTime(_))
             || matches!(&value, Bson::Document(d) if d.contains_key(COMPOSITE_DATE));
-        if target == "timestamptz" && is_stored_instant && static_type(arg, &value) == "timestamptz"
-        {
+        if target == "timestamptz" && is_stored_instant && arg_type == "timestamptz" {
             return Ok(timestamp_precision(tc, &target, value));
         }
         // `boolean` has casts from `integer` and text only. A `smallint` or a
@@ -39269,7 +39367,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // the SOURCE type at the cast site is what decides (42846 on
         // PostgreSQL, where the text form is a 22P02 parse failure).
         if matches!(target.as_str(), "bool" | "boolean") {
-            let source = static_type(arg, &value);
+            let source = arg_type.clone();
             if matches!(
                 source.as_str(),
                 "int2"
@@ -39289,7 +39387,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         }
         // Bit strings: to `bit(n)` / `varbit(n)` from text, a bit string or an
         // integer; and from `bit` (never `varbit`) to an integer.
-        let source = static_type(arg, &value);
+        let source = arg_type.clone();
         if bits::is_bit_type(&target) && value != Bson::Null {
             let n = tc
                 .type_name
@@ -39340,7 +39438,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // citext, whose cast from bpchar is `rtrim1` (citext 1.6).
         let value = if (matches!(target.as_str(), "text" | "varchar" | "name")
             || collation::is_citext_type(&target))
-            && static_type(arg, &value) == "bpchar"
+            && arg_type == "bpchar"
         {
             trim_bpchar(value)
         } else {
@@ -39351,7 +39449,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // which are stored in UTC.
         if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name") && value != Bson::Null
         {
-            let source = static_type(arg, &value);
+            let source = arg_type.clone();
             let tz = session_timezone();
             let rendered = match (source.as_str(), &value) {
                 ("timestamptz", Bson::String(t)) => Some(wide_timestamptz_text(t, &tz)),
@@ -39388,7 +39486,7 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
         // A float4 renders as float4out does: the shortest text of the f32.
         if matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name") {
             if let Bson::Double(d) = value {
-                if matches!(static_type(arg, &value).as_str(), "float4" | "real") {
+                if matches!(arg_type.as_str(), "float4" | "real") {
                     return cast_value(Bson::String(geo::float4_text(d as f32)), &target);
                 }
             }

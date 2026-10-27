@@ -37,6 +37,9 @@ thread_local! {
 /// held as `public.int4`: the bare name is the built-in, searched first
 /// (measured on 15.19), so only the qualified name reaches the domain.
 pub fn set_user_domains(mut domains: Vec<Domain>) {
+    // A constant cast to a domain is kept under the resolution epoch
+    // (`expr_memo::folded`); a domain's constraints are part of its value.
+    crate::schemas::bump_resolve_epoch();
     for d in &mut domains {
         if crate::pgtypes::shadowed_by_catalog(&d.name) {
             d.name = format!("public.{}", d.name);
