@@ -83,7 +83,7 @@ impl PgHandler {
     }
 
     /// `track_counts`: off stops the table and index counters.
-    fn tracking(&self) -> bool {
+    pub(crate) fn tracking(&self) -> bool {
         !matches!(
             self.stat_setting("track_counts").as_deref(),
             Some("off" | "false" | "0" | "no")

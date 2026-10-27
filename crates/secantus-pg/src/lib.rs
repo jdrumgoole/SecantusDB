@@ -40,10 +40,13 @@ mod binary_recv;
 mod btree;
 mod btree_model;
 mod casts;
+mod catalog_facts;
 mod catalog_fill;
 mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
+mod catalog_reads;
+mod catcache;
 mod collations;
 mod composite_alter;
 mod config_views;
@@ -3896,6 +3899,9 @@ pub struct PgHandler {
     savepoints: Mutex<Vec<Savepoint>>,
     /// The session's database oid, for the cumulative statistics (RP-070).
     stat_db_oid: std::sync::OnceLock<i64>,
+    /// The session's system caches, as PostgreSQL's backend holds them
+    /// (RP-225).
+    catcache: Mutex<catcache::Backend>,
     /// When the session began, for `pg_stat_database.session_time`.
     stat_session_start: std::time::Instant,
     /// The session's implicit transaction (a message cycle's statements
@@ -4501,6 +4507,7 @@ impl PgHandler {
             catalogs_ensured: AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
             stat_db_oid: std::sync::OnceLock::new(),
+            catcache: Mutex::new(catcache::Backend::default()),
             stat_session_start: std::time::Instant::now(),
             stat_implicit: Mutex::new(None),
             stat_ended: AtomicBool::new(false),
@@ -26097,6 +26104,10 @@ impl PgHandler {
         self.install_reload_hook();
         // A session begins (`pgstat_report_connect`).
         self.stats().connect();
+        // `InitPostgres`'s catalog reads (RP-225), reported as the backend
+        // first goes idle, before its first ReadyForQuery.
+        self.catalog_reads_start();
+        self.stats().report(false);
         // ErrorResponse / NoticeResponse fields leave in the session's
         // `client_encoding`, like every other text the server sends: a LATIN9
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
@@ -30641,9 +30652,23 @@ impl PgHandler {
                 .get_or_insert(false);
         }
         self.stats().set_state(true, !outside);
+        // The catalog reads PostgreSQL makes for the statement, and what a
+        // catalog change it makes invalidates (RP-225).
+        let effects = self.catalog_effects(query);
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
+        // A statement cancelled, or refused in an aborted block, never
+        // reached parse analysis.
+        let analysed = !matches!(
+            &result,
+            Err(PgWireError::UserError(info))
+                if matches!(info.code.as_str(), "57014" | "57P01" | "25P02")
+        );
+        if analysed {
+            self.catalog_reads(query);
+        }
+        self.catalog_reads_done(effects, result.is_ok());
         if let Err(PgWireError::UserError(info)) = &result {
             if info.code == "40P01" {
                 self.stats().deadlock();
@@ -30825,6 +30850,7 @@ impl PgHandler {
         let stats = self.stats();
         if let (Some(failed), false) = (implicit, in_block) {
             stats.end_xact(!failed);
+            self.catcache_end_xact(!failed);
         }
         stats.report(in_block);
         stats.set_state(false, in_block);
@@ -34342,6 +34368,7 @@ impl PgHandler {
                         self.commit_failed
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         self.stats().end_xact(false);
+                        self.catcache_end_xact(false);
                         return Err(e);
                     }
                     self.storage
@@ -34351,6 +34378,7 @@ impl PgHandler {
                 }
                 self.settle_notifies(true);
                 self.stats().end_xact(true);
+                self.catcache_end_xact(true);
                 ("COMMIT", chain)
             }
             TransactionControl::Rollback { chain } => {
@@ -34372,6 +34400,7 @@ impl PgHandler {
                 }
                 self.settle_notifies(false);
                 self.stats().end_xact(false);
+                self.catcache_end_xact(false);
                 ("ROLLBACK", chain)
             }
             TransactionControl::Prepare(gid) => {
@@ -34398,6 +34427,7 @@ impl PgHandler {
                     self.commit_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.stats().end_xact(false);
+                    self.catcache_end_xact(false);
                     return Err(e);
                 }
                 self.stats().prepare(&gid);
