@@ -9565,16 +9565,19 @@ impl PgHandler {
             return join_search::with_join_where(join, || self.join_rows(&join.tree));
         }
         let (_, rows) = self.rows_with_schema(stmt)?;
+        // Each column's field name, once rather than once a row.
+        let fields: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
         Ok(rows
             .into_iter()
             .map(|r| {
                 let mut d = Document::new();
-                for (i, c) in def.columns.iter().enumerate() {
+                let mut values = r.into_iter();
+                for field in &fields {
                     // A NULL cell is stored as an explicit `Bson::Null` rather
                     // than left out: the outer query's `col IS NULL` and its
                     // ORDER BY both read the field, and a missing one is not
                     // the same thing as a null one to an MQL filter.
-                    d.insert(c.field(), r.get(i).cloned().flatten().unwrap_or(Bson::Null));
+                    d.insert(field.clone(), values.next().flatten().unwrap_or(Bson::Null));
                 }
                 d
             })
@@ -9636,11 +9639,19 @@ impl PgHandler {
                     Some((sel, _)) => self.materialise_with_row_ids(sel, def)?,
                     None => self.materialise_sub(plan, def)?,
                 };
+                // Only the columns something reads (`JoinRows::project`).
+                let project = join_search::projection();
+                let columns: Vec<&(String, String)> = columns
+                    .iter()
+                    .filter(|(k, _)| {
+                        secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k)
+                    })
+                    .collect();
                 Ok(docs
                     .into_iter()
                     .map(|d| {
                         let mut out = Document::new();
-                        for (key, field) in columns {
+                        for (key, field) in &columns {
                             out.insert(key.clone(), d.get(field).cloned().unwrap_or(Bson::Null));
                         }
                         if let Some((_, key)) = &row_id_key {
@@ -9829,9 +9840,16 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         use secantus_pgplan::joins::JoinKind;
         let carry_ids = LOCK_ROW_IDS.with(|c| c.get());
+        // Only the keys something reads (`JoinRows::project`).
+        let project = join_search::projection();
+        let carries = |k: &String| secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k);
+        let merged: Vec<&(String, String, String)> =
+            merged.iter().filter(|(k, _, _)| carries(k)).collect();
+        let left_keys: Vec<&String> = left_keys.iter().filter(|k| carries(k)).collect();
+        let right_keys: Vec<&String> = right_keys.iter().filter(|k| carries(k)).collect();
         let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
             let mut d = Document::new();
-            for (key, lk, rk) in merged {
+            for (key, lk, rk) in merged.iter().copied() {
                 let lv = l
                     .and_then(|l| l.get(lk))
                     .filter(|v| !matches!(v, Bson::Null));
@@ -9845,13 +9863,13 @@ impl PgHandler {
                 };
                 d.insert(key.clone(), v.cloned().unwrap_or(Bson::Null));
             }
-            for k in left_keys {
+            for k in left_keys.iter().copied() {
                 d.insert(
                     k.clone(),
                     l.and_then(|l| l.get(k)).cloned().unwrap_or(Bson::Null),
                 );
             }
-            for k in right_keys {
+            for k in right_keys.iter().copied() {
                 d.insert(
                     k.clone(),
                     r.and_then(|r| r.get(k)).cloned().unwrap_or(Bson::Null),
@@ -10017,6 +10035,13 @@ impl PgHandler {
         right_keys: &[String],
     ) -> PgWireResult<Vec<Document>> {
         let mut out = Vec::new();
+        // Only the keys something reads (`JoinRows::project`).
+        let project = join_search::projection();
+        let carries = |k: &String| secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k);
+        let merged: Vec<&(String, String, String)> =
+            merged.iter().filter(|(k, _, _)| carries(k)).collect();
+        let left_keys: Vec<&String> = left_keys.iter().filter(|k| carries(k)).collect();
+        let right_keys: Vec<&String> = right_keys.iter().filter(|k| carries(k)).collect();
         // The statement's own parameters are the same for every left row,
         // and one may be large (an uncorrelated subquery's rows, resolved
         // while planning): only those the item's SQL reads are bound, and
@@ -10037,7 +10062,9 @@ impl PgHandler {
                     .map(|r| {
                         let mut d = Document::new();
                         for (key, i) in columns {
-                            d.insert(key.clone(), r.get(*i).cloned().unwrap_or(Bson::Null));
+                            if carries(key) {
+                                d.insert(key.clone(), r.get(*i).cloned().unwrap_or(Bson::Null));
+                            }
                         }
                         d
                     })
@@ -10048,13 +10075,13 @@ impl PgHandler {
             let mut matched = false;
             for r in rights {
                 let mut d = Document::new();
-                for (key, lk, _) in merged {
+                for (key, lk, _) in merged.iter().copied() {
                     d.insert(key.clone(), l.get(lk).cloned().unwrap_or(Bson::Null));
                 }
-                for k in left_keys {
+                for k in left_keys.iter().copied() {
                     d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
                 }
-                for k in right_keys {
+                for k in right_keys.iter().copied() {
                     d.insert(k.clone(), r.get(k).cloned().unwrap_or(Bson::Null));
                 }
                 let keep = match on {
@@ -10071,10 +10098,10 @@ impl PgHandler {
             }
             if !matched && kind == secantus_pgplan::joins::JoinKind::Left {
                 let mut d = Document::new();
-                for k in left_keys {
+                for k in left_keys.iter().copied() {
                     d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
                 }
-                for k in right_keys {
+                for &k in &right_keys {
                     d.insert(k.clone(), Bson::Null);
                 }
                 out.push(d);
@@ -36211,7 +36238,12 @@ impl PgHandler {
     /// A row-producing statement as `(schema, rows)`: what a set operation
     /// needs from each of its sides.
     fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
-        self.with_executor_hooks(|| self.rows_with_schema_inner(stmt))
+        // A statement run inside a join's rows (a leaf's subquery, a
+        // correlated subquery) builds its own joins' rows by their own
+        // projections, never the enclosing one's.
+        join_search::with_projection(None, || {
+            self.with_executor_hooks(|| self.rows_with_schema_inner(stmt))
+        })
     }
 
     fn rows_with_schema_inner(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {

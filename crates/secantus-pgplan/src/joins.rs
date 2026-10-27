@@ -204,6 +204,146 @@ pub struct JoinRows {
     /// conjuncts each read one table and run at its scan. They make the
     /// width of the rows a join passes up (`build_joinrel_tlist`).
     pub needed: Vec<String>,
+    /// Every joined-row key anything reads -- the query above the join, its
+    /// WHERE, and the join's own clauses, filters and LATERAL items: the
+    /// columns a join's rows carry, as PostgreSQL's target lists carry only
+    /// what is needed (`build_joinrel_tlist`, `attr_needed`). `None` when
+    /// that cannot be told (a `*`, a whole-row reference): every key.
+    pub project: Option<std::sync::Arc<std::collections::HashSet<String>>>,
+}
+
+impl JoinRows {
+    /// Does a join row carry `key`? A timestamp's hidden sub-millisecond
+    /// companion goes with its column.
+    pub fn carries(project: Option<&std::collections::HashSet<String>>, key: &str) -> bool {
+        match project {
+            None => true,
+            Some(p) => {
+                p.contains(key)
+                    || key
+                        .strip_prefix(SUBMS_PREFIX)
+                        .is_some_and(|base| p.contains(base))
+            }
+        }
+    }
+}
+
+/// The keys a row expression reads, or `false` when it may read the row some
+/// other way (a column reference or subquery left in it, another variant).
+fn expr_reads(e: &ColumnExpr, keys: &mut std::collections::HashSet<String>) -> bool {
+    let ColumnExpr::Row { expr, fields, .. } = e else {
+        return false;
+    };
+    if expr_any(expr, &|n| {
+        matches!(n.node.as_ref(), Some(N::ColumnRef(_) | N::SubLink(_)))
+    }) {
+        return false;
+    }
+    keys.extend(fields.iter().map(|(_, f, _)| f.clone()));
+    true
+}
+
+/// The keys the join tree itself reads: its ON clauses, equalities, USING
+/// columns and LATERAL items' bound keys.
+fn tree_reads(node: &JoinNode, keys: &mut std::collections::HashSet<String>) -> bool {
+    match node {
+        JoinNode::Leaf { .. } => true,
+        JoinNode::Lateral { keys: bound, .. } => {
+            keys.extend(bound.iter().cloned());
+            true
+        }
+        JoinNode::Join {
+            left,
+            right,
+            on,
+            equi,
+            merged,
+            expr_keys,
+            ec,
+            ..
+        } => {
+            if let Some(on) = on {
+                if !expr_reads(on, keys) {
+                    return false;
+                }
+            }
+            for (l, r) in equi {
+                keys.insert(l.clone());
+                keys.insert(r.clone());
+            }
+            for (m, l, r) in merged {
+                keys.insert(m.clone());
+                keys.insert(l.clone());
+                keys.insert(r.clone());
+            }
+            for e in expr_keys {
+                if !expr_reads(&e.left, keys) || !expr_reads(&e.right, keys) {
+                    return false;
+                }
+                keys.extend(e.left_column.iter().cloned());
+                keys.extend(e.right_column.iter().cloned());
+            }
+            if let Some(ec) = ec {
+                for (a, b) in ec
+                    .left_restrict
+                    .iter()
+                    .chain(&ec.right_restrict)
+                    .chain(&ec.join_keys)
+                {
+                    keys.insert(a.clone());
+                    keys.insert(b.clone());
+                }
+            }
+            tree_reads(left, keys) && tree_reads(right, keys)
+        }
+    }
+}
+
+/// [`JoinRows::project`]: what the query `out` (the join's FROM aside) and
+/// the join read.
+fn projection(
+    out: &pg_query::protobuf::SelectStmt,
+    scope: &Scope,
+    tree: &JoinNode,
+    filters: &[JoinFilter],
+    equalities: &[(String, String)],
+) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    use crate::query_reads::{Reads, Use};
+    let aliases: std::collections::HashSet<&str> = scope
+        .cols
+        .iter()
+        .map(|c| c.alias.as_str())
+        .chain(scope.aliases.iter().map(String::as_str))
+        .collect();
+    let classify = |parts: &[Option<&str>]| match parts {
+        [Some(k)] if k.contains(SEP) => Use::Name((*k).to_string()),
+        // A FROM item's name alone is its whole row.
+        [Some(k)] if aliases.contains(k) => Use::All,
+        // An output column's name, or the enclosing query's: no join key.
+        [Some(_)] => Use::Ignore,
+        _ => Use::All,
+    };
+    let mut above = out.clone();
+    above.from_clause.clear();
+    let mut reads = Reads::new(&classify);
+    reads.select(&above, 0);
+    if reads.all {
+        return None;
+    }
+    let mut keys = reads.names;
+    if !tree_reads(tree, &mut keys) {
+        return None;
+    }
+    for f in filters {
+        if !expr_reads(&f.expr, &mut keys) {
+            return None;
+        }
+    }
+    for (l, r) in equalities {
+        keys.insert(l.clone());
+        keys.insert(r.clone());
+    }
+    Some(std::sync::Arc::new(keys))
 }
 
 /// One column visible in a join's scope.
@@ -609,6 +749,7 @@ fn finish_join_source(
         }
         keys
     };
+    let project = projection(&out, &scope, &tree, &where_filters, &where_equalities);
     let name = PLANNED_JOINS.with(|j| {
         let mut j = j.borrow_mut();
         let name = format!("{SEP}join{SEP}{}", j.len());
@@ -625,6 +766,7 @@ fn finish_join_source(
                     where_equalities,
                     where_modelled,
                     needed,
+                    project,
                 }))),
                 def,
             },
