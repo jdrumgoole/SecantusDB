@@ -167,8 +167,47 @@ fn own_fields(command: &str) -> Option<&'static [&'static str]> {
             "bypassDocumentValidation",
         ],
         "compact" => &["force", "freeSpaceTargetMB", "dryRun"],
+        "autoCompact" => &["freeSpaceTargetMB", "runOnce"],
         _ => return None,
     })
+}
+
+/// A strict command's own field, checked where mongod's parser checks it:
+/// in the order the fields were sent, among the unknown-field checks. Only
+/// the commands whose handlers rely on this are listed; a null never gets
+/// here (it is an absent field).
+fn own_field(command: &str, key: &str, value: &Bson) -> Result<(), CommandError> {
+    match (command, key) {
+        ("compact", "force" | "dryRun") | ("autoCompact", "runOnce") => match value {
+            Bson::Boolean(_) => Ok(()),
+            v => Err(wrong_type(&format!("{command}.{key}"), v, "type 'bool'")),
+        },
+        ("compact" | "autoCompact", "freeSpaceTargetMB") => {
+            free_space_target_mb(command, value).map(|_| ())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `freeSpaceTargetMB`, a `safeInt64` of at least 1, as mongod parses it for
+/// `compact` and `autoCompact`: any number, a double truncated and NaN 0
+/// (measured 8.2.11).
+pub(crate) fn free_space_target_mb(command: &str, value: &Bson) -> Result<i64, CommandError> {
+    let Some(n) = crate::cluster_params::safe_int64(value) else {
+        return Err(wrong_type(
+            &format!("{command}.freeSpaceTargetMB"),
+            value,
+            "types '[int, decimal, double, long]'",
+        ));
+    };
+    if n < 1 {
+        return Err(CommandError::new(
+            2,
+            "BadValue",
+            format!("BSON field 'freeSpaceTargetMB' value must be >= 1, actual value '{n}'"),
+        ));
+    }
+    Ok(n)
 }
 
 /// The name mongod's parser gives a command in a message about its fields.
@@ -228,6 +267,14 @@ pub(crate) fn check(doc: &Document, command: &str) -> Result<(), CommandError> {
     let mut api_flag = false;
     for (i, (key, value)) in doc.iter().enumerate() {
         if i == 0 {
+            // `autoCompact`'s parameter is its on/off switch, parsed first.
+            if command == "autoCompact" {
+                match value {
+                    Bson::Boolean(_) => {}
+                    Bson::Null => return Err(missing("autoCompact.autoCompact")),
+                    v => return Err(wrong_type("autoCompact.autoCompact", v, "type 'bool'")),
+                }
+            }
             continue;
         }
         let path = format!("{name}.{key}");
@@ -284,10 +331,11 @@ pub(crate) fn check(doc: &Document, command: &str) -> Result<(), CommandError> {
             (key, _) if strict && key.starts_with('$') => {
                 return Err(unknown(&format!("{unknown_in}.{key}")))
             }
-            (key, _) => {
+            (key, value) => {
                 if own.is_some_and(|fields| !fields.contains(&key)) {
                     return Err(unknown(&format!("{unknown_in}.{key}")));
                 }
+                own_field(command, key, value)?;
             }
         }
     }

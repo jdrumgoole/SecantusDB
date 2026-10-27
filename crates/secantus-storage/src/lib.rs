@@ -50,8 +50,11 @@ use secantus_wt::{Connection, Cursor, Session, WtError};
 pub use secantus_core::bsondoc;
 
 pub mod admission;
+mod auto_compact;
 pub mod changestreams;
+pub mod compact;
 pub mod pitr_archive;
+pub mod repair;
 pub mod replay;
 pub mod share_locks;
 
@@ -4799,6 +4802,9 @@ pub struct Storage {
     /// checkpoint throughout. (The other checkpoints hold `lock`, which the
     /// check holds too.)
     checkpoint_gate: Arc<Mutex<()>>,
+    /// `compact`'s running claims and the `autoCompact` server
+    /// ([`compact`], [`auto_compact`]).
+    compaction: compact::Compaction,
     /// The reason user writes are blocked (`setUserWriteBlockMode`), or
     /// `None`. Persisted in `config.user_writes_critical_sections` and read
     /// back at open.
@@ -6565,6 +6571,11 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // Background compaction opens WT sessions and checkpoints: it stops
+        // before anything else is torn down (a file in hand finishes).
+        if let Err(e) = self.stop_auto_compact() {
+            fail("stopping background compaction", e);
+        }
         // Stop the background oplog pruner first: it opens WT sessions, so it
         // must be gone before the connection closes below. A parked pruner
         // wakes on the notify; a mid-sweep one finishes its bounded sweep.
@@ -6950,6 +6961,7 @@ impl Storage {
             journal_join: Mutex::new(None),
             closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
+            compaction: compact::Compaction::default(),
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
             sizes: sizes::SizeStorer::default(),
@@ -9552,6 +9564,16 @@ impl Storage {
         while cursor.next()? {
             stats.push(cursor.get_value_stat()?);
         }
+        // WiredTiger 11.3's background-compaction counters, which 11.2 does
+        // not have: kept by this store's own server (`autoCompact`), and
+        // placed where 11.3 lists them, its statistics being in description
+        // order.
+        let background = self.background_compact_statistics();
+        let at = stats
+            .iter()
+            .position(|(d, _)| d.as_str() > background[0].0.as_str())
+            .unwrap_or(stats.len());
+        stats.splice(at..at, background);
         Ok((secantus_wt::version_string(), stats))
     }
 

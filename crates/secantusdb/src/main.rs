@@ -128,6 +128,18 @@ fn main() -> ExitCode {
         log::info!("loaded config from {}", src.display());
     }
 
+    if parsed.repair {
+        return match run_repair(&cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(msg) => {
+                eprintln!("secantusd-rs: {msg}");
+                // mongod's exit code for a repair that could not finish
+                // (`EXIT_UNCAUGHT`, measured 8.2.11 on a missing --dbpath).
+                ExitCode::from(100)
+            }
+        };
+    }
+
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
@@ -194,30 +206,7 @@ fn run(cli: CliArgs) -> Result<(), String> {
     std::fs::create_dir_all(&cli.storage_path)
         .map_err(|e| format!("failed to create storage dir {}: {e}", cli.storage_path))?;
 
-    // Open with the resolved WiredTiger knobs (--cache-size / --session-max /
-    // --sync-on-commit). The daemon default is `1G` (matching the Python
-    // server); the engine/library default via `Storage::open` stays `256M`.
-    let wt = wt_config(
-        &cli.cache_size,
-        cli.session_max,
-        cli.sync_on_commit,
-        &cli.log_file_max,
-    );
-    // Storage write-path modes (--oplog-async / --oplog-nonlogged /
-    // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching
-    // SECANTUS_* env var, so env-driven runs are unchanged.
-    let opts = StorageOptions {
-        wt_config: Some(wt),
-        oplog_async: cli.oplog_async,
-        oplog_nonlogged: cli.oplog_nonlogged,
-        // mongod's split, so writes carry the timestamps a snapshot read at a
-        // past time reads by (RM-210); `--data-logged` opts out.
-        data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
-        checkpoint_seconds: cli.checkpoint_seconds,
-        write_tickets: cli.write_tickets,
-        transactions_logged_at_commit: true,
-        ..StorageOptions::default()
-    };
+    let opts = storage_options(&cli);
     let mut storage = Storage::open_with_options(&cli.storage_path, &opts)
         .map_err(|e| format!("failed to open storage at {}: {e:?}", cli.storage_path))?;
     // SECANTUS_DISABLE_OPLOG=1 turns oplog emission off entirely (no change
@@ -340,6 +329,63 @@ fn run(cli: CliArgs) -> Result<(), String> {
     storage
         .close()
         .map_err(|e| format!("failed to close storage at {}: {e:?}", cli.storage_path))?;
+    Ok(())
+}
+
+/// The store's options from the resolved run configuration: what `run`
+/// serves with and what `--repair` repairs with.
+fn storage_options(cli: &CliArgs) -> StorageOptions {
+    // Open with the resolved WiredTiger knobs (--cache-size / --session-max /
+    // --sync-on-commit). The daemon default is `1G` (matching the Python
+    // server); the engine/library default via `Storage::open` stays `256M`.
+    let wt = wt_config(
+        &cli.cache_size,
+        cli.session_max,
+        cli.sync_on_commit,
+        &cli.log_file_max,
+    );
+    // Storage write-path modes (--oplog-async / --oplog-nonlogged /
+    // --data-nonlogged / --checkpoint-seconds): `None` defers to the matching
+    // SECANTUS_* env var, so env-driven runs are unchanged.
+    StorageOptions {
+        wt_config: Some(wt),
+        oplog_async: cli.oplog_async,
+        oplog_nonlogged: cli.oplog_nonlogged,
+        // mongod's split, so writes carry the timestamps a snapshot read at a
+        // past time reads by (RM-210); `--data-logged` opts out.
+        data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
+        checkpoint_seconds: cli.checkpoint_seconds,
+        write_tickets: cli.write_tickets,
+        transactions_logged_at_commit: true,
+        ..StorageOptions::default()
+    }
+}
+
+/// `--repair`: mongod's `--repair` over this store
+/// (`secantus_storage::repair`): every table verified and a damaged one
+/// salvaged, the indexes of the collections it held rebuilt, then exit.
+/// Unlike a server start, a missing storage path is an error, as mongod's
+/// missing `--dbpath` is.
+fn run_repair(cli: &CliArgs) -> Result<(), String> {
+    log::info!("repairing the store at {}", cli.storage_path);
+    let report =
+        secantus_storage::repair::repair(&cli.storage_path, &storage_options(cli), &mut |line| {
+            log::info!("{line}")
+        })
+        .map_err(|e| format!("repair of {} failed: {e}", cli.storage_path))?;
+    println!(
+        "secantusd-rs repaired {}: {} tables verified, {} salvaged{}, {} collections' \
+         indexes rebuilt",
+        cli.storage_path,
+        report.verified.len() + report.salvaged.len(),
+        report.salvaged.len(),
+        if report.metadata_salvaged {
+            " (and WiredTiger's metadata)"
+        } else {
+            ""
+        },
+        report.rebuilt.len(),
+    );
     Ok(())
 }
 

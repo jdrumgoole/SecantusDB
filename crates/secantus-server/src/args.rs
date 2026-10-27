@@ -30,6 +30,9 @@ pub struct ParsedRun {
     pub config_path: Option<PathBuf>,
     /// The CLI flags the user actually passed (highest precedence).
     pub overrides: ConfigOverrides,
+    /// `--repair`: repair the store and exit instead of serving (mongod's
+    /// `--repair`). Command line only, as mongod's is.
+    pub repair: bool,
 }
 
 /// A fully-resolved run configuration: where to bind, the WiredTiger home, and
@@ -245,6 +248,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     let mut tls_key_file: Option<String> = None;
     let mut tls_ca_file: Option<String> = None;
     let mut tls_require_client_cert = false;
+    let mut repair = false;
 
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -334,6 +338,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             }
             "--auth" => o.auth = Some(true),
             "--standalone" => o.standalone = Some(true),
+            "--repair" => repair = true,
             "--enable-test-commands" => o.enable_test_commands = Some(true),
             "--tls-cert-file" => tls_cert_file = Some(take_value("--tls-cert-file")?),
             "--tls-key-file" => tls_key_file = Some(take_value("--tls-key-file")?),
@@ -348,6 +353,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
                 flag,
                 "--auth"
                     | "--standalone"
+                    | "--repair"
                     | "--enable-test-commands"
                     | "--sync-on-commit"
                     | "--oplog-async"
@@ -384,6 +390,7 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
     Ok(Parsed::Run(Box::new(ParsedRun {
         config_path,
         overrides: o,
+        repair,
     })))
 }
 
@@ -479,6 +486,10 @@ OPTIONS:
     --tls-ca-file PATH           PEM CA bundle to verify client certs (mTLS)
     --tls-require-client-cert    Reject clients without a valid X.509 cert;
                                  requires --tls-ca-file
+    --repair                     Repair the store at --storage-path and exit:
+                                 verify every table, salvage one that fails,
+                                 rebuild the indexes of the collections it held,
+                                 as mongod --repair does. Exits 0 when done
     --version                    Print the version and exit
     -h, --help                   Print this help and exit
 ",

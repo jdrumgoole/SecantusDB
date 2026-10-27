@@ -2,16 +2,19 @@
 //!
 //! The first two copy a collection into a capped one: its options carry
 //! over, its documents go in insertion order until the cap evicts the oldest,
-//! and only the `_id` index survives. `compact` and `reIndex` have nothing to
-//! do on this storage and answer as `mongod` does when there was nothing to
-//! free or rebuild; on a replica-set member, which is what this server says
-//! it is unless started standalone, `mongod` refuses both. Every code and
-//! message was measured against `mongod` 8.2.11, as a replica-set member and
-//! standalone.
+//! and only the `_id` index survives. `compact` gives the free space in the
+//! files a collection is kept in back to the file system, and `autoCompact`
+//! runs that in the background; `reIndex` has nothing to rebuild on this
+//! storage and answers as `mongod` does when there was nothing to rebuild.
+//! On a replica-set member, which is what this server says it is unless
+//! started standalone, `mongod` refuses `reIndex` and wants `force` for
+//! `compact`. Every code and message was measured against `mongod` 8.2.11,
+//! as a replica-set member and standalone.
 
 use bson::{doc, Bson, Document};
 
-use crate::util::{as_i64, bool_field, command_error};
+use crate::storage::{AutoCompactReply, CompactReply, CompactTarget};
+use crate::util::{as_i64, command_error};
 use crate::{CommandContext, CommandError, HandlerResult};
 
 fn invalid_namespace(message: impl Into<String>) -> CommandError {
@@ -206,10 +209,29 @@ pub fn convert_to_capped(doc: &Document, ctx: &mut CommandContext) -> HandlerRes
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `compact`. There is never anything to free here.
+/// `compact`: give the collection's free disk space back
+/// (`secantus_storage::compact`, which says what is compacted where
+/// collections share their tables).
+///
+/// The options are parsed with the command's other fields
+/// (`generic::own_field`): `force` and `dryRun` booleans,
+/// `freeSpaceTargetMB` a whole number of at least 1. Then, as mongod 8.2.11
+/// does (measured as a replica-set member and standalone): a primary needs
+/// `force: true`; the collection must exist (a view is refused by name); a
+/// time-series collection is compacted through either of its names, as are
+/// the oplog (`local.oplog.rs`, on a replica-set member) and `system.views`
+/// (when the database has a view). A second `compact` of the same
+/// collection while one runs is refused. The reply is `bytesFreed`, or
+/// `estimatedBytesFreed` for a dry run.
 pub fn compact(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = named(doc, "compact")?;
-    if ctx.replica_set_name.is_some() && !bool_field(doc, "force", false) {
+    let set = |key: &str| matches!(doc.get(key), Some(Bson::Boolean(true)));
+    let dry_run = set("dryRun");
+    let free_space_target_mb = match doc.get("freeSpaceTargetMB") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(crate::generic::free_space_target_mb("compact", v)?),
+    };
+    if ctx.replica_set_name.is_some() && !set("force") {
         return Err(CommandError::new(
             20,
             "IllegalOperation",
@@ -218,24 +240,116 @@ pub fn compact(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ));
     }
     let storage = ctx.storage()?;
-    if crate::views::is_view(storage, &ctx.db_name, &coll) {
+    let db = ctx.db_name.clone();
+    let not_found = || CommandError::new(26, "NamespaceNotFound", "collection does not exist");
+    let base = coll.strip_prefix(crate::BUCKETS_PREFIX);
+    let target = if db == "local" && coll == "oplog.rs" {
+        if ctx.replica_set_name.is_none() {
+            return Err(not_found());
+        }
+        CompactTarget::Oplog
+    } else if let Some(base) = base.filter(|b| {
+        storage
+            .get_collection_options(&db, b)
+            .is_ok_and(|o| o.contains_key("timeseries"))
+    }) {
+        CompactTarget::Collection(&db, base)
+    } else if coll == "system.views"
+        && !storage
+            .collection_exists(&db, &coll)
+            .map_err(command_error)?
+        && !crate::ts_buckets::view_definitions(storage, &db)?.is_empty()
+    {
+        CompactTarget::Catalog
+    } else if crate::views::is_view(storage, &db, &coll) {
         return Err(CommandError::new(
             166,
             "CommandNotSupportedOnView",
             "can't compact a view",
         ));
-    }
-    if !storage
-        .collection_exists(&ctx.db_name, &coll)
+    } else if storage
+        .collection_exists(&db, &coll)
         .map_err(command_error)?
     {
+        CompactTarget::Collection(&db, &coll)
+    } else {
+        return Err(not_found());
+    };
+    let freed = match storage.compact(target, dry_run, free_space_target_mb) {
+        None => 0,
+        Some(Ok(CompactReply::Freed(n))) => n,
+        Some(Ok(CompactReply::AlreadyRunning)) => {
+            return Err(CommandError::new(
+                96,
+                "OperationFailed",
+                format!("Compaction is already in progress for {db}.{coll}"),
+            ))
+        }
+        Some(Ok(CompactReply::Busy(table))) => {
+            return Err(CommandError::new(
+                11601,
+                "Interrupted",
+                format!("Compaction interrupted on {table}"),
+            ))
+        }
+        Some(Err(e)) => return Err(command_error(e)),
+    };
+    // mongod's `appendNumber`: an int when it fits, a long when not.
+    let freed = i32::try_from(freed).map_or(Bson::Int64(freed), Bson::Int32);
+    let key = if dry_run {
+        "estimatedBytesFreed"
+    } else {
+        "bytesFreed"
+    };
+    Ok(doc! { key: freed, "ok": 1.0 })
+}
+
+/// `autoCompact`: WiredTiger's background compaction on or off
+/// (`secantus_storage::auto_compact`). The switch and the options are
+/// parsed first (`generic`), then it is refused from any database but
+/// `admin`; enabling it while it runs with another `freeSpaceTargetMB` or
+/// `runOnce` is 23 AlreadyInitialized, as on mongod 8.2.11, a change sent
+/// before the server has taken up the last one is 314 ObjectIsBusy, and a
+/// store held in memory refuses it as mongod's in-memory engine does.
+pub fn auto_compact(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let enable = matches!(doc.get("autoCompact"), Some(Bson::Boolean(true)));
+    let run_once = matches!(doc.get("runOnce"), Some(Bson::Boolean(true)));
+    let free_space_target_mb = match doc.get("freeSpaceTargetMB") {
+        None | Some(Bson::Null) => None,
+        Some(v) => Some(crate::generic::free_space_target_mb("autoCompact", v)?),
+    };
+    if ctx.db_name != "admin" {
         return Err(CommandError::new(
-            26,
-            "NamespaceNotFound",
-            "collection does not exist",
+            13,
+            "Unauthorized",
+            "autoCompact may only be run against the admin database.",
         ));
     }
-    Ok(doc! { "bytesFreed": 0_i32, "ok": 1.0 })
+    let storage = ctx.storage()?;
+    match storage.auto_compact(enable, run_once, free_space_target_mb) {
+        None | Some(Ok(AutoCompactReply::InMemory)) => Err(CommandError::new(
+            20,
+            "IllegalOperation",
+            "autoCompact() cannot be executed for in-memory configurations",
+        )),
+        Some(Ok(AutoCompactReply::Done)) => Ok(doc! { "ok": 1.0 }),
+        Some(Ok(AutoCompactReply::AlreadyRunning)) => Err(CommandError::new(
+            23,
+            "AlreadyInitialized",
+            "Cannot reconfigure background compaction while it's already running.",
+        )),
+        // mongod's `wtRCToStatus` text: its prefix, the code, the C
+        // library's words for it, and WiredTiger's message.
+        Some(Ok(AutoCompactReply::Busy(text))) => Err(CommandError::new(
+            314,
+            "ObjectIsBusy",
+            format!(
+                "Failed to configure auto compact 16: {text} - Background compact is busy \
+                 processing a previous command"
+            ),
+        )),
+        Some(Err(e)) => Err(command_error(e)),
+    }
 }
 
 /// `reIndex`. The indexes are always current, so the reply lists them.

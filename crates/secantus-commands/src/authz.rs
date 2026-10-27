@@ -358,6 +358,7 @@ pub(crate) fn check(
         "setUserWriteBlockMode" => c.cluster("setUserWriteBlockMode"),
         "applyOps" => c.cluster("applyOps"),
         "rotateCertificates" => c.cluster("rotateCertificates"),
+        "autoCompact" => c.cluster("compact"),
         "dbCheck" => c.cluster("dbCheck"),
         "validateDBMetadata" => c.on_database(&["listCollections", "listIndexes", "validate"]),
         "invalidateUserCache" => c.cluster("invalidateUserCache"),

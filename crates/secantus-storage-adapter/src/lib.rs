@@ -1162,6 +1162,52 @@ impl CmdStorage for StorageAdapter {
         Some(self.inner.wt_statistics().map_err(map_err))
     }
 
+    fn compact(
+        &self,
+        target: secantus_commands::storage::CompactTarget<'_>,
+        dry_run: bool,
+        free_space_target_mb: Option<i64>,
+    ) -> Option<Result<secantus_commands::storage::CompactReply, StorageError>> {
+        use secantus_commands::storage::{CompactReply, CompactTarget as Cmd};
+        use secantus_storage::compact::{CompactOutcome, CompactTarget};
+        let target = match target {
+            Cmd::Collection(db, coll) => CompactTarget::Collection(db, coll),
+            Cmd::Oplog => CompactTarget::Oplog,
+            Cmd::Catalog => CompactTarget::Catalog,
+        };
+        Some(
+            self.inner
+                .compact(target, dry_run, free_space_target_mb)
+                .map(|outcome| match outcome {
+                    CompactOutcome::Freed(n) => CompactReply::Freed(n),
+                    CompactOutcome::AlreadyRunning => CompactReply::AlreadyRunning,
+                    CompactOutcome::Busy(table) => CompactReply::Busy(table),
+                })
+                .map_err(map_err),
+        )
+    }
+
+    fn auto_compact(
+        &self,
+        enable: bool,
+        run_once: bool,
+        free_space_target_mb: Option<i64>,
+    ) -> Option<Result<secantus_commands::storage::AutoCompactReply, StorageError>> {
+        use secantus_commands::storage::AutoCompactReply;
+        use secantus_storage::compact::AutoCompactOutcome;
+        Some(
+            self.inner
+                .auto_compact(enable, run_once, free_space_target_mb)
+                .map(|outcome| match outcome {
+                    AutoCompactOutcome::Done => AutoCompactReply::Done,
+                    AutoCompactOutcome::AlreadyRunning => AutoCompactReply::AlreadyRunning,
+                    AutoCompactOutcome::InMemory => AutoCompactReply::InMemory,
+                    AutoCompactOutcome::Busy(text) => AutoCompactReply::Busy(text),
+                })
+                .map_err(map_err),
+        )
+    }
+
     fn writes_waiting(&self) -> usize {
         self.inner.writes_waiting()
     }

@@ -765,7 +765,7 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Four commands mongod runs are 59 CommandNotFound here.**
+- [ ] **Three commands mongod runs are 59 CommandNotFound here.**
       mongod 8.2.11 (one-member replica set) answers each with success or
       an error of its own:
       - diagnostics: `getDiagnosticData` (mongod's FTDC sample);
@@ -773,12 +773,12 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         is keyed by mongod's `queryShapeHash`, which is not a plain SHA-256
         of the shape's BSON -- the debug shape, representative literals and
         likely extra fields were tried, 2026-10-20 -- so the hash needs
-        mongod's own shape serialization first), `autoCompact` (needs
-        background compaction, which RM-192 lacks).
+        mongod's own shape serialization first).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. Thirteen of the original
-      seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
+      mongod's own MD5 implementation's state. `autoCompact` landed
+      2026-10-26 (RM-192's compaction, run in the background). Thirteen of
+      the original seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
       `validateDBMetadata`, `dbCheck`,
       `invalidateUserCache`, `replSetGetRBID`,
       `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
@@ -863,20 +863,55 @@ inject (a panic, a power loss, a failing checkpoint).
       would also stop holding all its entries in memory at once.
       Backlog-ID: RM-187
       Verify: none -- a concurrency budget (writes during a long build), not an answer
-- [ ] **Disk space is never given back, and there is no repair path.**
-      `compact` answers `bytesFreed: 0` without doing anything
-      (`secantus-commands/src/capped_admin.rs`, "There is never anything to
-      free here"), and `secantus-wt` has no binding for
-      `WT_SESSION::compact`. Collections share the 16 document shards, one
-      index-entries table and the oplog shards, so a dropped or emptied
-      collection's pages are only ever reused inside those files. mongod runs
-      WiredTiger's compaction (and `autoCompact` in 8.x). The reply itself is
-      not testable from a small shape: on 40,000 documents with 95% deleted,
-      mongod 8.2.11 also reported `bytesFreed: 0`. There is no
-      `--repair` / salvage either; `secantus-pg/src/main.rs` already
-      recognises `WT_TRY_SALVAGE` and has nothing to offer.
-      Backlog-ID: RM-192
-      Verify: none -- reclaiming disk space; no small shape where mongod reports bytesFreed > 0 was found
+- **Scope decision — `compact` compacts the files a collection shares**
+  (2026-10-26, RM-192). mongod compacts a collection's own table and its
+  indexes'; here a collection's documents are rows in one of sixteen
+  document shards and its indexes rows in shared tables, so `compact`
+  compacts those files, gives back the free space in them whoever freed it
+  (a dropped neighbour's pages included), and answers `bytesFreed` as how
+  much they shrank -- mongod's measure, over the files this store keeps the
+  collection in. `freeSpaceTargetMB` is WiredTiger 11.3's check, made from
+  the block manager's free-bytes statistic before the vendored 11.2 is
+  asked (`crates/secantus-storage/src/compact.rs`).
+- [ ] **`compact`'s dry run does not estimate.** `{compact, dryRun: true}`
+      answers `estimatedBytesFreed: 0` and compacts nothing. mongod 8.2.11
+      runs WiredTiger 11.3's estimation phase and reports the statistic it
+      leaves; the vendored WiredTiger (11.2) has no estimation phase. mongod
+      answered 0 on every shape measured (2026-10-26: five collections of
+      6,000 to 200,000 documents, files of 13 to 155 MB with 12 to 103 MB
+      free, the default target and 1 MB), so no answer is known to differ.
+      Backlog-ID: RM-316
+      Verify: none -- no shape was found where mongod 8.2.11 estimates more than 0
+- [ ] **`autoCompact` cannot stop a file part-way, and judges files by the
+      bytes given back.** WiredTiger 11.3's background compaction server is
+      rebuilt over 11.2 (`crates/secantus-storage/src/auto_compact.rs`).
+      11.2 cannot interrupt a compaction, so disabling it lets the file in
+      hand finish (11.3 interrupts it and counts `background compact
+      interrupted`, never counted here), and closing the store waits for
+      that file. 11.2 does not count the bytes a compaction rewrote, so the
+      moving average that decides which files to skip for an hour -- and
+      `background compact moving average of bytes rewritten` -- is of the
+      bytes each pass gave back.
+      Backlog-ID: RM-317
+      Verify: none -- an interrupt is a timing inside WiredTiger, and the rewritten-bytes count is internal to it
+- [ ] **`--repair` leaves a resurrected duplicate where mongod moves it
+      aside.** When a salvage brings back a deleted document beside the
+      document that replaced it (same `_id`, another RecordId), the repair
+      keeps the earlier one in the `_id` index and says how many it left
+      out; mongod moves the other into `local.lost_and_found.<uuid>`, which
+      this server does not have, so the extra document stays in its
+      collection, readable by a scan and not by `_id`.
+      Backlog-ID: RM-318
+      Verify: none -- needs a salvage that brings back a deleted document beside its replacement, which no quick test can stage
+- [ ] **There is no `local.startup_log`.** mongod 8.2.11 keeps a capped
+      `local.startup_log` with one document per start (`hostname`,
+      `startTime`, `startTimeLocal`, `cmdLine`, `pid`, `buildinfo`); here
+      the collection does not exist, so `compact` of it is 26
+      NamespaceNotFound where mongod answers `bytesFreed`, and a tool that
+      reads when the server started finds nothing. Found by the RM-192 probe
+      (2026-10-26).
+      Backlog-ID: RM-319
+      Verify: tests/backlog/test_rm_192_compact.py::test_local_startup_log_records_each_start
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 

@@ -35,6 +35,43 @@ pub struct MatchedRows {
     pub via: Option<String>,
 }
 
+/// What a `compact` compacts (see `secantus_storage::compact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTarget<'a> {
+    /// A collection: the tables its documents and indexes are kept in.
+    Collection(&'a str, &'a str),
+    /// The oplog, `local.oplog.rs`.
+    Oplog,
+    /// The catalog that holds a database's view definitions
+    /// (`system.views`).
+    Catalog,
+}
+
+/// How a `compact` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactReply {
+    /// The bytes given back (for a dry run, the estimate).
+    Freed(i64),
+    /// Another `compact` of the same target is running.
+    AlreadyRunning,
+    /// The engine was too busy to compact this table.
+    Busy(String),
+}
+
+/// How an `autoCompact` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoCompactReply {
+    /// On or off, as asked.
+    Done,
+    /// On already, with another configuration.
+    AlreadyRunning,
+    /// A store held in memory, which has nothing to compact.
+    InMemory,
+    /// The previous change has not been taken up yet; carries the
+    /// platform's text for `EBUSY`.
+    Busy(String),
+}
+
 /// `(id_key, bson)` document rows, as returned by the collection scans the
 /// tailable-find producer polls (`scan_docs_after_id_key`).
 pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -945,6 +982,28 @@ pub trait Storage: Send + Sync {
     /// Set `ttlMonitorSleepSecs` and / or `ttlMonitorEnabled`; `None` leaves
     /// a setting alone. Default: nothing to set.
     fn set_ttl_monitor(&self, _sleep_secs: Option<i64>, _enabled: Option<bool>) {}
+
+    /// `compact`: compact the tables `target` is kept in. Default: `None`,
+    /// a backend with nothing to compact (answered as freeing nothing).
+    fn compact(
+        &self,
+        _target: CompactTarget<'_>,
+        _dry_run: bool,
+        _free_space_target_mb: Option<i64>,
+    ) -> Option<Result<CompactReply, StorageError>> {
+        None
+    }
+
+    /// `autoCompact`: background compaction on or off. Default: `None`, a
+    /// backend with no storage engine to compact.
+    fn auto_compact(
+        &self,
+        _enable: bool,
+        _run_once: bool,
+        _free_space_target_mb: Option<i64>,
+    ) -> Option<Result<AutoCompactReply, StorageError>> {
+        None
+    }
 
     /// The storage engine's own statistics, `(description, value)` in its
     /// order, and its version string: what `serverStatus.wiredTiger` reports.
