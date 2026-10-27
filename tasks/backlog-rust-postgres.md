@@ -783,19 +783,6 @@ one beside it.
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
 
-## Open from the 2026-09-30 batch
-
-- [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is
-      the size of what the block writes.** WiredTiger has no savepoint, so
-      one here is a set of pre-images: the first write to a table after a
-      savepoint copies that table's documents into it. Correct for any size,
-      but a savepoint taken before a write to a large table copies the whole
-      table into memory. Lazy capture is what keeps the common case free (a
-      savepoint nobody writes through costs nothing), and a per-row undo log
-      would be the fix if the cost ever bites.
-      Backlog-ID: RP-018
-      Verify: none -- savepoint memory cost design; no answer differs
-
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`
@@ -882,6 +869,24 @@ tests regression tests:
       `dense_rank(2, 'x') WITHIN GROUP (ORDER BY a, b)` is 0A000 here.
       Backlog-ID: RP-283
       Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_over_two_columns
+- [ ] **An UPDATE leaves the row's unique-key claim on its old value**
+      (shared storage), so inserting that value again fails XX000 `E11000
+      duplicate key error` where PostgreSQL 15.19 inserts it: the update
+      path (`index_entry_diff`) never moves the row's claim in `UNIQ_TABLE`;
+      only an insert writes claims and only a delete releases them. It also
+      blocks a journal ROLLBACK TO that puts back two rows which swapped a
+      unique value. The MongoDB server links the same code (not yet
+      compared with mongod). Found while closing RP-018.
+      Backlog-ID: RP-296
+      Verify: tests/backlog/test_rp018_savepoint_undo.py::test_an_updated_unique_value_can_be_used_again
+- [ ] **Pricing a key lookup reads the whole table** whenever the cached
+      heap page count is invalid (after any CREATE or DROP, and inside
+      transaction blocks): `priced_scan` -> `heap_pages` -> `heap_spaces` ->
+      `table_docs` decodes every row, so a one-row SELECT or UPDATE took
+      about 2.1 s on 200,000 rows (debug build) and about 1 s on 1,000,000
+      rows (optimised). Found while closing RP-018.
+      Backlog-ID: RP-297
+      Verify: tests/backlog/test_rp018_savepoint_undo.py::test_a_key_lookup_after_ddl_does_not_read_the_table
 
 ## Found by batch 78 (2026-10-25)
 
