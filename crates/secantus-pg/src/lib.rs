@@ -34,15 +34,19 @@ mod access_methods;
 mod advisory;
 mod aggregates;
 mod alter_system;
+mod am_ssi;
 mod autovacuum;
 mod binary_recv;
 mod btree;
 mod btree_model;
 mod casts;
+mod catalog_facts;
 mod catalog_fill;
 mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;
+mod catalog_reads;
+mod catcache;
 mod collations;
 mod composite_alter;
 mod config_views;
@@ -66,6 +70,8 @@ mod external_sort;
 mod extstats;
 mod fdw;
 mod fsm;
+mod gin_index;
+mod gist_index;
 mod grace_join;
 mod guc_values;
 mod hash_index;
@@ -101,6 +107,7 @@ mod procedures;
 mod progress;
 mod renames;
 mod row_waits;
+mod rule_trees;
 mod rules;
 mod scan_partitions;
 mod schema_rows;
@@ -339,9 +346,20 @@ thread_local! {
     /// The rows a LIMIT (and OFFSET) reads from the general join a select
     /// is over, while `select_docs` materialises it: the top join's plan is
     /// then the cheapest for that many rows (RP-028). Taken by the first
-    /// `join_rows` call, so a nested join never sees it.
-    static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<usize>> =
+    /// `join_rows` call, so a nested join never sees it. With it, the
+    /// OFFSET's rows alone, which a Limit's startup cost counts, and
+    /// whether a WHERE over two or more of the join's tables filters it,
+    /// which only the join order search places (`four_table_join`).
+    static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<(usize, usize, bool)>> =
         const { std::cell::Cell::new(None) };
+    /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY over
+    /// the join (one plain column, ascending), which only the join order
+    /// search plans for (`four_table_join`); and, once it has, whether the
+    /// plan it picked returns its rows in that order already, so that the
+    /// select runs no Sort of its own (`create_ordered_paths`).
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+    static GENERAL_JOIN_PRESORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Run `f` with FROM-subquery rows carrying their base row ids.
@@ -494,6 +512,42 @@ impl GucMap {
         self.generation
     }
 
+    /// `read` of this map, remembered on the thread for its generation
+    /// (unique across sessions) under `slot`: the settings a statement
+    /// reads several times over (`track_counts`, the timeouts, the role
+    /// ...) are looked up once per change of the map, not each time
+    /// (RP-014).
+    pub(crate) fn memo<T: Clone + 'static>(
+        &self,
+        slot: GucSlot,
+        read: impl FnOnce(&Self) -> T,
+    ) -> T {
+        type Slots = Vec<Option<(u64, Box<dyn std::any::Any>)>>;
+        thread_local! {
+            static MEMO: std::cell::RefCell<Slots> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let at = slot as usize;
+        let hit = MEMO.with(|m| {
+            m.borrow()
+                .get(at)
+                .and_then(Option::as_ref)
+                .filter(|(g, _)| *g == self.generation)
+                .and_then(|(_, v)| v.downcast_ref::<T>().cloned())
+        });
+        if let Some(v) = hit {
+            return v;
+        }
+        let v = read(self);
+        MEMO.with(|m| {
+            let mut m = m.borrow_mut();
+            if m.len() <= at {
+                m.resize_with(at + 1, || None);
+            }
+            m[at] = Some((self.generation, Box::new(v.clone())));
+        });
+        v
+    }
+
     /// Where `name`'s value came from.
     pub(crate) fn source_of(&self, name: &str) -> GucSource {
         match (self.map.get(name), self.sources.get(name)) {
@@ -553,6 +607,20 @@ impl GucMap {
     }
 }
 
+/// What [`GucMap::memo`] keeps, one value each.
+#[derive(Clone, Copy)]
+pub(crate) enum GucSlot {
+    ClientEncoding,
+    TrackCounts,
+    IdleInTransaction,
+    IdleSession,
+    Role,
+    ReadOnly,
+    DefaultReadOnly,
+    StatementTimeout,
+    LockTimeout,
+}
+
 /// The parameters the server sets at each transaction's start.
 pub(crate) const TRANSACTION_GUCS: [&str; 3] = [
     "transaction_isolation",
@@ -602,6 +670,56 @@ impl std::ops::DerefMut for GucMap {
 /// session is 0 -- shared by every connection -- unless something this
 /// session sees is its own (see `session_tables_owner`).
 type SessionTablesKey = (usize, u64, u64, String, String, String);
+
+/// What Bind decoded of a portal's parameters (`check_bound_portal`), and
+/// the state the decoding read: the session's settings (the zone, the
+/// client encoding, the DateStyle, the role) by their generation, and the
+/// catalog (user types and enums) by its version, with nothing of this
+/// session's uncommitted. While all of it stands, decoding the same
+/// portal's parameters again gives these values, so its Execute takes them
+/// instead of decoding twice (RP-014).
+struct BoundParams {
+    portal: Arc<Portal<ParsedStatement>>,
+    generation: u64,
+    catalog_version: u64,
+    param_types: Vec<Option<String>>,
+    params: Vec<Bson>,
+}
+
+/// A table's catalog entry as [`PgHandler::lookup_ref`] finds it: shared with
+/// the catalog cache when it came from there, owned otherwise.
+pub(crate) enum TableRef {
+    Owned(Box<TableDef>),
+    Shared(Arc<Option<TableDef>>),
+}
+
+impl TableRef {
+    /// A cached entry, or `None` when the cache records the table's absence.
+    fn shared(entry: Arc<Option<TableDef>>) -> Option<Self> {
+        entry.is_some().then_some(Self::Shared(entry))
+    }
+
+    fn into_owned(self) -> TableDef {
+        match self {
+            Self::Owned(def) => *def,
+            Self::Shared(entry) => Option::clone(&entry).expect("a shared entry holds a table"),
+        }
+    }
+}
+
+impl std::ops::Deref for TableRef {
+    type Target = TableDef;
+
+    fn deref(&self) -> &TableDef {
+        match self {
+            Self::Owned(def) => def,
+            Self::Shared(entry) => entry
+                .as_ref()
+                .as_ref()
+                .expect("a shared entry holds a table"),
+        }
+    }
+}
 
 thread_local! {
     static INSTALLED_SESSION_TABLES: std::cell::RefCell<Option<SessionTablesKey>> =
@@ -1064,6 +1182,18 @@ fn nest_key(d: &Document) -> Option<Document> {
     Some(out)
 }
 
+/// A document as storage holds it: a composite key nested (see `nest_key`).
+/// `encode_doc` writes exactly this document.
+fn stored_form(d: &Document) -> Document {
+    nest_key(d).unwrap_or_else(|| d.clone())
+}
+
+/// [`stored_form`] of a row that may be held or given: one given is moved,
+/// not copied, when nothing is nested (RP-014).
+fn stored_form_owned(d: std::borrow::Cow<'_, Document>) -> Document {
+    nest_key(&d).unwrap_or_else(|| d.into_owned())
+}
+
 /// Encode a document for storage, nesting a composite key (see `nest_key`).
 fn encode_doc(d: &Document) -> Result<Vec<u8>, bson::ser::Error> {
     match nest_key(d) {
@@ -1435,6 +1565,13 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
     };
     secantus_pgplan::UserFn {
         name,
+        volatile: !matches!(
+            d.get_str("volatility")
+                .unwrap_or("volatile")
+                .to_ascii_lowercase()
+                .as_str(),
+            "immutable" | "stable"
+        ),
         schema: d.get_str("schema").unwrap_or("public").to_string(),
         arg_types: strings("param_types"),
         return_type: d.get_str("return_tag").unwrap_or("text").to_string(),
@@ -1940,14 +2077,15 @@ impl plpgsql_fn::Host for PlHost<'_> {
         let stmt = self.plan(sql, params, types)?;
         let changes_catalog = PgHandler::may_change_catalog(&stmt);
         let _nested = NestedStatement::enter(self.h);
+        // The statement's own text is its source: a view or rule it creates
+        // records offsets into it, as SPI parses it alone (RP-203).
+        let outer_source = self.h.enter_statement_source(sql);
         // A nested CALL keeps the non-atomic context, and its statements
         // join the transaction themselves (holding the guard across it would
         // deadlock its COMMIT). Everything else is atomic and joins here,
         // captured first for any subtransaction open around it.
         let responses = if matches!(stmt, Statement::Call { .. }) {
-            self.h
-                .execute_statement(stmt, 0)
-                .map_err(|e| pl_error(&e))?
+            self.h.execute_statement(stmt, 0).map_err(|e| pl_error(&e))
         } else {
             self.joined(|| {
                 self.atomic(|| {
@@ -1956,8 +2094,10 @@ impl plpgsql_fn::Host for PlHost<'_> {
                         .and_then(|()| self.h.execute_statement(stmt, 0))
                         .map_err(|e| pl_error(&e))
                 })
-            })?
+            })
         };
+        self.h.restore_statement_source(outer_source);
+        let responses = responses?;
         // The planner's catalog was published for the statement around this
         // one: a DDL here republishes it, so the next statement of the same
         // body sees what this one created or dropped (a DROP VIEW, then a
@@ -3053,18 +3193,29 @@ impl PgHandler {
 
     /// The EFFECTIVE role: `SET ROLE`'s, else the session's.
     fn current_role_name(&self) -> String {
-        let role = self
-            .settings
+        match self.set_role() {
+            Some(role) => role,
+            None => self.session_user_name(),
+        }
+    }
+
+    /// The role `SET ROLE` put in effect, `None` for none (`role` unset,
+    /// empty or `none`): remembered per settings generation (RP-014).
+    fn set_role(&self) -> Option<String> {
+        self.settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get("role")
-            .cloned()
-            .unwrap_or_default();
-        if role.is_empty() || role.eq_ignore_ascii_case("none") {
-            self.session_user_name()
-        } else {
-            role
-        }
+            .memo(GucSlot::Role, |s| {
+                s.get("role")
+                    .filter(|r| !r.is_empty() && !r.eq_ignore_ascii_case("none"))
+                    .cloned()
+            })
+    }
+
+    /// [`Self::current_role_name`] for a caller holding the session user's
+    /// name already.
+    fn current_role_name_for(&self, session_user: &str) -> String {
+        self.set_role().unwrap_or_else(|| session_user.to_string())
     }
 
     /// A table's owner: the role that created it (or took it with `ALTER
@@ -3527,24 +3678,24 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let key = (
-            Arc::as_ptr(&self.storage) as usize,
-            self.db().to_string(),
-            slot,
-        );
+        let store = Arc::as_ptr(&self.storage) as usize;
         // This thread's copy first: several slots are read on every
         // statement, and the shared map's one lock was contended at 8
         // clients (batch 71). Only what the shared map holds as current
-        // reaches the front.
+        // reaches the front. Asked before the shared map's key is made,
+        // which copies the database's name (RP-014).
         let front = COMMITTED_FRONT.with(|f| {
             f.borrow()
                 .iter()
-                .find(|(s, d, sl, v, _)| *s == key.0 && *sl == slot && *v == version && *d == key.1)
+                .find(|(s, d, sl, v, _)| {
+                    *s == store && *sl == slot && *v == version && d == self.db()
+                })
                 .map(|e| Arc::clone(&e.4))
         });
         if let Some(value) = front.as_ref().and_then(|v| v.downcast_ref::<T>()) {
             return value.clone();
         }
+        let key = (store, self.db().to_string(), slot);
         let to_front = |value: &Arc<dyn std::any::Any + Send + Sync>| {
             COMMITTED_FRONT.with(|f| {
                 let mut f = f.borrow_mut();
@@ -3671,9 +3822,15 @@ impl PgHandler {
     /// Is `name` a superuser? The login user this server has no record of
     /// is trusted as one (the password-less bootstrap `postgres`).
     fn is_superuser(&self, name: &str) -> bool {
-        match self.role(name) {
-            Ok(Some(r)) => r.superuser,
-            _ => name == self.session_user_name(),
+        // Read in place: every statement's privilege check asks, and a copy
+        // of the role was most of the cost (RP-014).
+        let found = self
+            .roles_shared()
+            .ok()
+            .and_then(|roles| roles.iter().find(|r| r.name == name).map(|r| r.superuser));
+        match found {
+            Some(superuser) => superuser,
+            None => name == self.session_user_name(),
         }
     }
 }
@@ -3774,10 +3931,19 @@ pub struct PgHandler {
     /// portal) is planned once rather than twice. Valid while the catalog
     /// version, the session's settings and its role are what they were.
     describe_cache: Mutex<HashMap<DescribeKey, DescribeEntry>>,
+    /// The `describe_cache` entry last answered from, compared in place:
+    /// a pipeline describes one statement again and again, and building
+    /// and hashing its key copied the whole text each time (RP-014).
+    describe_last: Mutex<Option<(DescribeKey, DescribeEntry)>>,
     /// Plan templates by statement text, parameter types and the BSON types
     /// of the values (see `plan_cache`): an Execute whose statement has one
     /// substitutes its values instead of planning again.
     plan_cache: Mutex<HashMap<PlanKey, PlanEntry>>,
+    /// The `plan_cache` entry last used, compared in place with the next
+    /// Execute's text, types and values (RP-014): building and hashing the
+    /// key copied the whole text each time. Cleared whenever the cache
+    /// changes, so it is always one of its entries.
+    plan_last: Mutex<Option<(PlanKey, PlanEntry)>>,
     /// Hashes of the plan keys this session has planned once. A template is
     /// learned when a key comes round a SECOND time: learning plans the
     /// statement twice more, which a statement sent once never earns back --
@@ -3871,6 +4037,9 @@ pub struct PgHandler {
     savepoints: Mutex<Vec<Savepoint>>,
     /// The session's database oid, for the cumulative statistics (RP-070).
     stat_db_oid: std::sync::OnceLock<i64>,
+    /// The session's system caches, as PostgreSQL's backend holds them
+    /// (RP-225).
+    catcache: Mutex<catcache::Backend>,
     /// When the session began, for `pg_stat_database.session_time`.
     stat_session_start: std::time::Instant,
     /// The session's implicit transaction (a message cycle's statements
@@ -3972,6 +4141,10 @@ pub struct PgHandler {
     /// The results a multi-command simple query produced BEFORE the command
     /// that failed: PostgreSQL sends each of them, then the error.
     batch_partial: Mutex<Vec<Response>>,
+    /// The query string the running top-level statement came from, and
+    /// its index among the string's statements (RP-203: a rule's trees
+    /// record source offsets into that string).
+    statement_source: Mutex<Option<(String, usize)>>,
     /// Protocol-level statements a SQL `DEALLOCATE` / `DISCARD ALL` removed,
     /// to drop from the wire layer's statement store at the next message
     /// that can reach it (the executor has no handle on the store).
@@ -4020,6 +4193,9 @@ pub struct PgHandler {
     /// This transaction has registered with SSI, or found it need not
     /// (`serializable.rs`).
     ssi_registered: AtomicBool,
+    /// The parameters Bind decoded for the portal it stored, with what the
+    /// decoding read (`BoundParams`), for its Execute to take.
+    bound_params: Mutex<Option<BoundParams>>,
     /// A unique index's insert-time SSI checks, `(index, leaf)`, held to
     /// the statement's end (`ssi_flush_unique`).
     ssi_unique_pending: Mutex<Vec<(i64, u32)>>,
@@ -4121,9 +4297,10 @@ fn typed_from_text(
 /// One open savepoint and the table contents it can put back.
 struct Savepoint {
     name: String,
-    /// Table -> its documents when this savepoint was established, or `None`
-    /// when the table did not exist then (so rolling back DROPS it).
-    tables: HashMap<String, Option<Vec<Vec<u8>>>>,
+    /// This savepoint's frame in the transaction's undo journal
+    /// (`secantus_storage::UndoJournal`): the rows written since it, each as
+    /// it was then, which a ROLLBACK TO that cannot move the block puts back.
+    undo_frame: u64,
     /// Table -> its storage indexes' definitions (`list_indexes`) when this
     /// savepoint was established: what a ROLLBACK TO puts back, as the
     /// subtransaction's abort undoes an index's CREATE, DROP or ALTER.
@@ -4157,6 +4334,9 @@ struct Savepoint {
     /// drops its portals (`AtSubAbort_Portals`).
     cursor_mark: u64,
 }
+
+/// A savepoint's frame in the undo journal, unique in the process.
+static NEXT_UNDO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// A number for a cursor as it is declared, rising: a savepoint records
 /// the next one, and the cursors from it on are the subtransaction's.
@@ -4454,7 +4634,9 @@ impl PgHandler {
             session_lastval: Mutex::new(None),
             session_lastval_seq: Mutex::new(None),
             describe_cache: Mutex::new(HashMap::new()),
+            describe_last: Mutex::new(None),
             plan_cache: Mutex::new(HashMap::new()),
+            plan_last: Mutex::new(None),
             plan_seen: Mutex::new(std::collections::HashSet::new()),
             stream_request: std::sync::atomic::AtomicU8::new(0),
             cascade_capture: Mutex::new(None),
@@ -4473,6 +4655,7 @@ impl PgHandler {
             catalogs_ensured: AtomicBool::new(false),
             savepoints: Mutex::new(Vec::new()),
             stat_db_oid: std::sync::OnceLock::new(),
+            catcache: Mutex::new(catcache::Backend::default()),
             stat_session_start: std::time::Instant::now(),
             stat_implicit: Mutex::new(None),
             stat_ended: AtomicBool::new(false),
@@ -4501,6 +4684,7 @@ impl PgHandler {
             catalog_statements: std::sync::atomic::AtomicUsize::new(0),
             nested_statements: std::sync::atomic::AtomicUsize::new(0),
             batch_partial: Mutex::new(Vec::new()),
+            statement_source: Mutex::new(None),
             wire_dealloc: Mutex::new(Vec::new()),
             temp_tables: Mutex::new(Vec::new()),
             holdable_declared: AtomicBool::new(false),
@@ -4517,6 +4701,7 @@ impl PgHandler {
             sole_implicit: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
             ssi_registered: AtomicBool::new(false),
+            bound_params: Mutex::new(None),
             ssi_unique_pending: Mutex::new(Vec::new()),
             no_snapshot_stmt: AtomicBool::new(false),
             statement_depth: std::sync::atomic::AtomicUsize::new(0),
@@ -4925,14 +5110,14 @@ impl PgHandler {
     /// A session with its own temporary tables or functions, or a database
     /// with row-level security (whose tables are resolved by name), keeps a
     /// private record.
-    fn session_tables_owner(&self) -> u64 {
+    fn session_tables_owner(&self, temp_function: &std::cell::OnceCell<bool>) -> u64 {
         let private = !self
             .temp_tables
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
             || !self.rls_enabled_docs().is_empty()
-            || self.any_temp_function();
+            || *temp_function.get_or_init(|| self.any_temp_function());
         if private {
             self.session_serial
         } else {
@@ -4990,7 +5175,12 @@ impl PgHandler {
             self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
         );
         crate::xids::set_current(&self.storage);
-        secantus_pgplan::server_encoding::set_server_encoding(&self.server_encoding_name());
+        secantus_pgplan::server_encoding::set_server_encoding(
+            &self
+                .server_encoding
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         self.install_reload_hook();
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
@@ -5045,10 +5235,15 @@ impl PgHandler {
             let start = guard.as_ref().map_or(now, |h| h.opened_at_micros());
             secantus_pgplan::scalar::set_clocks(start, now);
         }
-        secantus_pgplan::set_session_user_str(
-            &self.session_user.lock().unwrap_or_else(|e| e.into_inner()),
-        );
-        let role = self.current_role_name();
+        // Read once for all three uses below: the planner's, the effective
+        // role's fallback (`current_role_name`) and the key (RP-014).
+        let session_user = self
+            .session_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        secantus_pgplan::set_session_user_str(&session_user);
+        let role = self.current_role_name_for(&session_user);
         secantus_pgplan::set_current_user_str(&role);
         // The tables below are read from the committed catalog, per role:
         // re-installed only when this thread last installed them for another
@@ -5065,12 +5260,9 @@ impl PgHandler {
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
         secantus_pgplan::schemas::set_temp_schema_serial(self.session_serial);
-        let owner = self.session_tables_owner();
-        let session_user = self
-            .session_user
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        // Whether a temporary function exists, asked at most once here.
+        let temp_function = std::cell::OnceCell::new();
+        let owner = self.session_tables_owner(&temp_function);
         // Compared in place: building the key allocated the role and the
         // database name on every statement.
         let fresh = !shareable
@@ -5149,7 +5341,10 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let serial = if overlay_empty && !self.any_temp_function() && !self.block_wrote_catalog() {
+        let serial = if overlay_empty
+            && !*temp_function.get_or_init(|| self.any_temp_function())
+            && !self.block_wrote_catalog()
+        {
             0
         } else {
             self.session_serial
@@ -6040,7 +6235,7 @@ impl PgHandler {
         &self,
         portal: &Portal<ParsedStatement>,
         result_formats: usize,
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<(Vec<Option<String>>, Vec<Bson>)> {
         self.install_user_types();
         self.check_cached_result_type(portal.statement.as_ref())?;
         let declared = self.param_type_names(portal.statement.as_ref());
@@ -6089,8 +6284,47 @@ impl PgHandler {
                 binary_recv::check(&ty, bytes, i, utf8)?;
             }
         }
-        self.portal_params(portal, &param_types)?;
-        Ok(())
+        // Installed at the top of this check, on this thread.
+        let params = self.portal_params_installed(portal, &param_types)?;
+        Ok((param_types, params))
+    }
+
+    /// The state a portal's parameters were decoded under, when it can be
+    /// told apart from any other: the settings' generation and the catalog
+    /// version, and only while this session holds no uncommitted catalog
+    /// change (which neither of them records).
+    fn param_decoding_state(&self) -> Option<(u64, u64)> {
+        if !self.pending.tables().is_empty() || !self.pending.types().is_empty() {
+            return None;
+        }
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Some((generation, version))
+    }
+
+    /// The parameters Bind decoded for `portal`, if the state they were
+    /// decoded under still stands. Taken: an Execute uses them once.
+    fn take_bound_params(
+        &self,
+        portal: &Portal<ParsedStatement>,
+    ) -> Option<(Vec<Option<String>>, Vec<Bson>)> {
+        let bound = self
+            .bound_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        if !std::ptr::eq(Arc::as_ptr(&bound.portal), portal) {
+            return None;
+        }
+        let (generation, version) = self.param_decoding_state()?;
+        (bound.generation == generation && bound.catalog_version == version)
+            .then_some((bound.param_types, bound.params))
     }
 
     /// A table this transaction block created or truncated (for COPY
@@ -6211,7 +6445,9 @@ impl PgHandler {
         // Parse is a message cycle of its own (psycopg's `prepare`), and a
         // cancel left pending when it answered was cleared as stale at the
         // next message -- the statement then ran to its end.
-        let described = self.describe_fields(sql, param_types.len(), &param_types);
+        let described = secantus_pgplan::cancel::with_walk_checks(|| {
+            self.describe_fields(sql, param_types.len(), &param_types)
+        });
         self.check_cancel()?;
         match described {
             Ok(_) => Ok(()),
@@ -6358,10 +6594,14 @@ impl PgHandler {
         // cost in an `executemany` (RP-014).
         // A FETCH (or MOVE) returns its cursor's rows, which are no cached
         // plan's: PostgreSQL describes the portal's own columns (RP-046).
-        let is_fetch = pg_query::parse(&stmt.statement.sql).is_ok_and(|p| {
+        // Through the planner's memo and under the cancel hook: a fresh
+        // parse of a 200,000-item `IN` list was 0.2 s in which no cancel was
+        // seen (RP-202). A cancel is taken before anything is recorded.
+        let parsed = self.with_cancel_hook(|| secantus_pgplan::memoised_parse(&stmt.statement.sql));
+        self.check_cancel()?;
+        let is_fetch = parsed.is_some_and(|p| {
             matches!(
-                p.protobuf
-                    .stmts
+                p.stmts
                     .first()
                     .and_then(|s| s.stmt.as_ref())
                     .and_then(|n| n.node.as_ref()),
@@ -6602,6 +6842,21 @@ impl PgHandler {
         // scan's is the TIDs its index holds, each a HOT chain's root
         // (where a scan reaches a version an update left on the page); a
         // B-tree index scan's is the index's, ties in their roots' order.
+        // A lookup of one row by a unique key: an index scan whenever the
+        // planner prices it so, which marks the dead versions of that key it
+        // passes (RP-196).
+        if rows.len() <= 1 && !filter.is_empty() && self.has_heap(table) {
+            let live: Vec<i64> = rows
+                .iter()
+                .filter_map(|b| {
+                    bson::RawDocument::from_bytes(b)
+                        .ok()?
+                        .get_i64("__sys_ctid")
+                        .ok()
+                })
+                .collect();
+            self.unique_lookup_scanned(table, filter, &live)?;
+        }
         if rows.len() > 1 && !filter.is_empty() && self.has_heap(table) {
             use serializable::{PricedScan, ScanIndex};
             match self.priced_scan(table, filter) {
@@ -6611,13 +6866,85 @@ impl PgHandler {
                     self.btree_index_scanned(table, &shape, filter)?;
                     return self.in_index_order(table, &shape, rows);
                 }
-                Some(PricedScan::Index(ScanIndex::Hash(_))) | None => {}
+                Some(PricedScan::Index(ScanIndex::Hash(_)) | PricedScan::Am(..)) | None => {}
             }
         }
         if seq && self.heap_scan_disordered(table) {
             return Ok(heap::in_ctid_order(rows));
         }
         Ok(rows)
+    }
+
+    /// `filter` as an equality on every key column of a unique plain
+    /// B-tree of `table` -- a primary-key lookup -- read through that index
+    /// when PostgreSQL's planner would read it so: its entries for the key
+    /// are passed, and the versions behind them that are dead to every
+    /// snapshot marked (`kill_prior_tuple`, RP-196). Whether the index scan
+    /// beats a sequential one depends on the table's size and definition
+    /// only (no constant's statistics enter a unique equality), so the
+    /// verdict is kept until the heap's page count or the catalog moves.
+    fn unique_lookup_scanned(
+        &self,
+        table: &str,
+        filter: &Document,
+        live: &[i64],
+    ) -> PgWireResult<()> {
+        use serializable::{PricedScan, ScanIndex};
+        let equality = |v: &Bson| match v {
+            Bson::Document(d) => {
+                d.len() == 1
+                    && d.get("$eq")
+                        .is_some_and(|e| !matches!(e, Bson::Document(_)))
+            }
+            _ => true,
+        };
+        if !filter
+            .iter()
+            .all(|(k, v)| !k.starts_with('$') && equality(v))
+        {
+            return Ok(());
+        }
+        let Some(shape) = self.btree_shapes(table).into_iter().find(|s| {
+            s.is_unique()
+                && s.is_plain()
+                && s.key_fields().len() == filter.len()
+                && s.key_fields().iter().all(|f| filter.contains_key(f))
+        }) else {
+            return Ok(());
+        };
+        type Verdicts = Mutex<HashMap<(usize, String, i64), (u32, u64, bool)>>;
+        static VERDICTS: OnceLock<Verdicts> = OnceLock::new();
+        let verdicts = VERDICTS.get_or_init(|| Mutex::new(HashMap::new()));
+        let pages = self.with_heap(table, |h| h.nblocks())?;
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let key = (self.store_id(), self.db().to_string(), shape.oid);
+        let known = verdicts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|(p, v, _)| *p == pages && *v == version)
+            .map(|(_, _, index)| *index);
+        let index = match known {
+            Some(index) => index,
+            None => {
+                let index = matches!(
+                    self.priced_scan(table, filter),
+                    Some(PricedScan::Index(ScanIndex::Btree(s))) if s.oid == shape.oid
+                );
+                let mut v = verdicts.lock().unwrap_or_else(|e| e.into_inner());
+                if v.len() >= 4096 {
+                    v.clear();
+                }
+                v.insert(key, (pages, version, index));
+                index
+            }
+        };
+        if index {
+            self.btree_key_scanned(table, &shape, filter, live)?;
+        }
+        Ok(())
     }
 
     /// A read of `table` with no WHERE whose ORDER BY leads a B-tree, which
@@ -7795,6 +8122,295 @@ impl PgHandler {
         })
     }
 
+    /// A base table's paths for a LIMIT's join search, in the order
+    /// `set_plain_rel_pathlist` makes them (RP-028), each with the joined-row
+    /// key an index scan returns its rows in the order of: its sequential
+    /// scan; then, for each index, newest first (`get_relation_info`), its
+    /// index scan through the WHERE's quals on its leading column, or its
+    /// whole scan in a join key's order when it leads with one (an order a
+    /// merge join reads), and its index scan parameterized by each clause
+    /// on that key (`keys`: the clause's class, the key's column, the
+    /// outer table's bit, the outer side's rows -- the scans repeated --
+    /// and its key as a Memoize's cache key), a nested loop's inner; then
+    /// the bitmap heap scan over the WHERE's index quals, and one
+    /// parameterized by each clause's table. `columns` maps the table's
+    /// joined-row keys to its stored fields. `None` when the table or an
+    /// index on a key or a WHERE column is not modelled: an index holding
+    /// a key not first, partial, not a B-tree, with INCLUDE columns or
+    /// descending; a heap with all-visible pages; a WHERE quals of which
+    /// two indexes serve, or one an index on a join key serves.
+    pub(crate) fn limit_base_paths(
+        &self,
+        table: &str,
+        filter: &Document,
+        columns: &[(String, String)],
+        keys: &[(usize, String, u32, f64, secantus_pgplan::joincost::MemoKey)],
+        order_col: Option<(usize, String)>,
+    ) -> Option<Vec<(secantus_pgplan::joincost::InPath, Option<String>)>> {
+        use secantus_pgplan::costsize;
+        use secantus_pgplan::joincost::InPath;
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        if pt.analyzed.is_some() || pt.allvisfrac > 0.0 {
+            return None;
+        }
+        let key_fields: Vec<String> = keys
+            .iter()
+            .map(|(_, c, ..)| pt.def.field_of(c))
+            .collect::<Option<_>>()?;
+        let quals = costsize::conjuncts(filter)?;
+        let qual_fields: Vec<String> = quals.iter().map(|(f, _)| f.clone()).collect();
+        let order_field = match &order_col {
+            Some((_, c)) => Some(pt.def.field_of(c)?),
+            None => None,
+        };
+        for ix in self
+            .storage
+            .list_indexes(self.db(), table)
+            .unwrap_or_default()
+        {
+            let Ok(ikeys) = ix.get_document("key") else {
+                continue;
+            };
+            let opt = |k: &str| {
+                ix.contains_key(k) || ix.get_document("options").is_ok_and(|o| o.contains_key(k))
+            };
+            let descending = ikeys.values().any(|d| {
+                matches!(d, Bson::Int32(n) if *n < 0) || matches!(d, Bson::Int64(n) if *n < 0)
+            });
+            let plain_btree = ix
+                .get_str("sqlMethod")
+                .ok()
+                .or_else(|| {
+                    ix.get_document("options")
+                        .ok()
+                        .and_then(|o| o.get_str("sqlMethod").ok())
+                })
+                .is_none_or(|m| m == "btree");
+            let reads = |f: &String| ikeys.keys().any(|k| k == f);
+            let touches = key_fields
+                .iter()
+                .chain(&qual_fields)
+                .chain(&order_field)
+                .any(reads);
+            if touches
+                && (descending
+                    || !plain_btree
+                    || opt("sqlPredicate")
+                    || opt("include")
+                    || (opt("partialFilterExpression") && !opt("unique")))
+            {
+                return None;
+            }
+        }
+        let mut indexes = self.cost_indexes(table, &pt.def, count as u64);
+        // `get_relation_info` lists the newest index first.
+        indexes.reverse();
+        // An index a path reads is sized as its pages are: the B-tree
+        // model's (`btree_model`, what CREATE INDEX built and every insert
+        // since split and deduplicated: `RelationGetNumberOfBlocks` and the
+        // metapage's root level), or failing one, with its repeated keys
+        // deduplicated where that is modelled.
+        let shapes = self.btree_shapes(table);
+        for ix in &mut indexes {
+            let read = key_fields.contains(&ix.field)
+                || qual_fields.contains(&ix.field)
+                || order_field.as_ref() == Some(&ix.field);
+            if !read {
+                continue;
+            }
+            let modelled = match shapes
+                .iter()
+                .find(|s| s.key_fields() == ix.columns.as_slice())
+            {
+                Some(shape) => self
+                    .with_btree(table, shape, |t| (t.pages(), t.height()))
+                    .ok(),
+                None => None,
+            };
+            match modelled {
+                Some((pages, height)) => {
+                    ix.pages = f64::from(pages);
+                    ix.height = height;
+                }
+                None => {
+                    if let Some((pages, height)) = self.dedup_index_size(table, ix)? {
+                        ix.pages = pages;
+                        ix.height = height;
+                    }
+                }
+            }
+        }
+        // An index holding a key or a WHERE column anywhere but first is
+        // not modelled; nor one leading with a key a WHERE qual reads.
+        for ix in &indexes {
+            let rest = &ix.columns[1..];
+            if rest.iter().any(|c| {
+                key_fields.contains(c) || qual_fields.contains(c) || order_field.as_ref() == Some(c)
+            }) {
+                return None;
+            }
+            if (key_fields.contains(&ix.field) || order_field.as_ref() == Some(&ix.field))
+                && qual_fields.contains(&ix.field)
+            {
+                return None;
+            }
+        }
+        let column_nd = |f: &str| {
+            if pt.unique.iter().any(|u| u == f) {
+                pt.tuples
+            } else if pt
+                .def
+                .columns
+                .iter()
+                .any(|c| c.field() == f && c.pg_type == "bool")
+            {
+                2.0
+            } else {
+                pt.tuples.min(200.0)
+            }
+        };
+        let sel = if filter.is_empty() {
+            1.0
+        } else {
+            secantus_pgplan::hashagg::filter_selectivity(filter, &column_nd)?
+        };
+        let rows = if filter.is_empty() {
+            pt.tuples
+        } else {
+            (pt.tuples * sel).round().max(1.0)
+        };
+        let rel = costsize::Rel {
+            pages: pt.pages,
+            tuples: pt.tuples,
+        };
+        // A leaf's joined-row keys name its columns by their stored
+        // fields, or by their names (a primary key's field is `_id`).
+        let joined_key = |field: &str| {
+            let name = pt
+                .def
+                .columns
+                .iter()
+                .find(|c| c.field() == field)
+                .map(|c| c.name.clone());
+            columns
+                .iter()
+                .find(|(_, f)| f == field || Some(f) == name.as_ref())
+                .map(|(k, _)| k.clone())
+        };
+        let serving: Vec<&costsize::Index> = indexes
+            .iter()
+            .filter(|ix| qual_fields.contains(&ix.field))
+            .collect();
+        if serving.len() > 1 {
+            return None;
+        }
+        let mut out = vec![(
+            {
+                let (s, t) = costsize::seq_scan_path(&rel, &quals);
+                InPath::scan(s, t, rows, None)
+            },
+            None,
+        )];
+        let mut bitmaps: Vec<(InPath, Option<String>)> = Vec::new();
+        let mut param_bitmaps: Vec<(u32, InPath)> = Vec::new();
+        for ix in &indexes {
+            if qual_fields.contains(&ix.field) {
+                // Its index scan through the WHERE's quals: no order of
+                // use, the rows in the index's.
+                let paths = costsize::scan_paths(
+                    &rel,
+                    std::slice::from_ref(ix),
+                    &quals,
+                    &|f| costsize::ColSel::Ndistinct(column_nd(f)),
+                    rows,
+                );
+                for (kind, (s, t)) in paths {
+                    match kind {
+                        costsize::ScanKind::Index(_) => {
+                            out.push((InPath::scan(s, t, rows, None), Some(joined_key(&ix.field)?)))
+                        }
+                        costsize::ScanKind::Bitmap(_) => {
+                            bitmaps.push((InPath::scan(s, t, rows, None), None))
+                        }
+                        costsize::ScanKind::Seq => {}
+                    }
+                }
+                continue;
+            }
+            // Its whole scan in the ORDER BY's order, a column no clause
+            // reads.
+            if let (Some(f), Some((class, _))) = (&order_field, &order_col) {
+                if *f == ix.field {
+                    let (s, t) = costsize::ordered_index_scan(&rel, ix, &quals, column_nd(f));
+                    out.push((
+                        InPath::scan(s, t, rows, Some(*class)),
+                        Some(joined_key(&ix.field)?),
+                    ));
+                    continue;
+                }
+            }
+            let ends: Vec<&(usize, String, u32, f64, secantus_pgplan::joincost::MemoKey)> = keys
+                .iter()
+                .zip(&key_fields)
+                .filter(|(_, f)| **f == ix.field)
+                .map(|(k, _)| k)
+                .collect();
+            if ends.is_empty() {
+                continue;
+            }
+            let nd = column_nd(&ix.field);
+            // Its whole scan, in the key's order.
+            let (s, t) = costsize::ordered_index_scan(&rel, ix, &quals, nd);
+            out.push((
+                InPath::scan(s, t, rows, Some(ends[0].0)),
+                Some(joined_key(&ix.field)?),
+            ));
+            for (_, _, outer, loop_count, memo_key) in ends {
+                // A clause that cannot move into this table's scan (an
+                // outer join's, into its preserved side) parameterizes none.
+                if *outer == 0 {
+                    continue;
+                }
+                // `get_parameterized_baserel_size`: the WHERE's selectivity
+                // and the clause's (`var_eq_non_const`), at most the rows.
+                let ppi_rows = costsize::clamp_row_est(pt.tuples * sel / nd.max(1.0)).min(rows);
+                let param = |(startup, total): (f64, f64)| InPath {
+                    startup,
+                    total,
+                    class: None,
+                    rows: ppi_rows,
+                    req_outer: *outer,
+                    rescan: (startup, total),
+                    indexed: true,
+                    memo_key: Some(*memo_key),
+                };
+                let scan = costsize::param_index_scan(&rel, ix, &quals, nd, *loop_count)?;
+                out.push((param(scan), None));
+                let bitmap =
+                    costsize::param_bitmap_heap_scan(&rel, ix, &quals, nd, *loop_count, ppi_rows)?;
+                // One bitmap heap scan a parameterization, over the cheapest
+                // of its index paths (`choose_bitmap_and`).
+                match param_bitmaps.iter_mut().find(|(o, _)| o == outer) {
+                    Some((_, b)) if bitmap.1 < b.total => *b = param(bitmap),
+                    Some(_) => {}
+                    None => param_bitmaps.push((*outer, param(bitmap))),
+                }
+            }
+        }
+        // A parameterized bitmap heap scan beside a WHERE's bitmap is a
+        // BitmapAnd `choose_bitmap_and` may make, which is not modelled.
+        if !bitmaps.is_empty() && !param_bitmaps.is_empty() {
+            return None;
+        }
+        out.extend(bitmaps);
+        out.extend(param_bitmaps.into_iter().map(|(_, b)| (b, None)));
+        Some(out)
+    }
+
     /// Whether a cursor over the join `js` can scan backward: not when
     /// PostgreSQL's cheapest plan is a merge join already in the ORDER BY's
     /// order, which is then the plan's top; yes when a Sort goes over the
@@ -8319,6 +8935,41 @@ impl PgHandler {
         def.columns
             .iter()
             .map(|c| {
+                // An array of an element type whose storage is modelled
+                // (`heap::array_datum_len`): a varlena aligned as its
+                // elements, which may take the 1-byte header.
+                if let Some(elem) = c.pg_type.strip_suffix("[]") {
+                    let ok = matches!(
+                        elem,
+                        "int2"
+                            | "int4"
+                            | "int8"
+                            | "smallint"
+                            | "integer"
+                            | "bigint"
+                            | "oid"
+                            | "float4"
+                            | "float8"
+                            | "real"
+                            | "double precision"
+                            | "bool"
+                            | "boolean"
+                            | "text"
+                            | "varchar"
+                            | "character varying"
+                    );
+                    let align = if matches!(elem, "int8" | "bigint" | "float8" | "double precision")
+                    {
+                        8
+                    } else {
+                        4
+                    };
+                    return ok.then_some(ColumnLayout {
+                        typlen: -1,
+                        align,
+                        can_short: true,
+                    });
+                }
                 let typlen = match fact(c, "typlen")? {
                     Bson::Int32(n) => i64::from(n),
                     Bson::Int64(n) => n,
@@ -8372,6 +9023,10 @@ impl PgHandler {
                         Some(s.len() + pad)
                     }
                     Some(Bson::Binary(b)) => Some(b.bytes.len()),
+                    Some(a @ Bson::Array(_)) => match c.pg_type.strip_suffix("[]") {
+                        Some(elem) => Some(heap::array_datum_len(elem, a)? - 4),
+                        None => Some(0),
+                    },
                     Some(_) => Some(0),
                 };
                 values.push(v);
@@ -8989,16 +9644,19 @@ impl PgHandler {
             return join_search::with_join_where(join, || self.join_rows(&join.tree));
         }
         let (_, rows) = self.rows_with_schema(stmt)?;
+        // Each column's field name, once rather than once a row.
+        let fields: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
         Ok(rows
             .into_iter()
             .map(|r| {
                 let mut d = Document::new();
-                for (i, c) in def.columns.iter().enumerate() {
+                let mut values = r.into_iter();
+                for field in &fields {
                     // A NULL cell is stored as an explicit `Bson::Null` rather
                     // than left out: the outer query's `col IS NULL` and its
                     // ORDER BY both read the field, and a missing one is not
                     // the same thing as a null one to an MQL filter.
-                    d.insert(c.field(), r.get(i).cloned().flatten().unwrap_or(Bson::Null));
+                    d.insert(field.clone(), values.next().flatten().unwrap_or(Bson::Null));
                 }
                 d
             })
@@ -9017,7 +9675,14 @@ impl PgHandler {
         node: &secantus_pgplan::joins::JoinNode,
     ) -> PgWireResult<Vec<Document>> {
         use secantus_pgplan::joins::JoinNode;
-        let limit = GENERAL_JOIN_LIMIT.with(|c| c.take());
+        let limit_offset = GENERAL_JOIN_LIMIT.with(|c| c.take());
+        let order = GENERAL_JOIN_ORDER.with(|c| c.borrow_mut().take());
+        // A WHERE over several tables is a join filter only the search
+        // places, and an ORDER BY a Sort only it weighs; any other plan is
+        // made for every row.
+        let limit =
+            limit_offset.and_then(|(rows, _, spans)| (!spans && order.is_none()).then_some(rows));
+        let limit_offset = limit_offset.map(|(rows, offset, _)| (rows, offset));
         match node {
             // A LATERAL item only ever sits on a join's right; alone, with
             // nothing to its left, it was planned as an ordinary leaf.
@@ -9053,11 +9718,19 @@ impl PgHandler {
                     Some((sel, _)) => self.materialise_with_row_ids(sel, def)?,
                     None => self.materialise_sub(plan, def)?,
                 };
+                // Only the columns something reads (`JoinRows::project`).
+                let project = join_search::projection();
+                let columns: Vec<&(String, String)> = columns
+                    .iter()
+                    .filter(|(k, _)| {
+                        secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k)
+                    })
+                    .collect();
                 Ok(docs
                     .into_iter()
                     .map(|d| {
                         let mut out = Document::new();
-                        for (key, field) in columns {
+                        for (key, field) in &columns {
                             out.insert(key.clone(), d.get(field).cloned().unwrap_or(Bson::Null));
                         }
                         if let Some((_, key)) = &row_id_key {
@@ -9084,10 +9757,12 @@ impl PgHandler {
                 ..
             } => {
                 // Three to eight tables: PostgreSQL's join order search.
-                if let Some(rows) = self.three_table_join(node, limit)? {
+                if let Some(rows) =
+                    self.three_table_join(node, limit_offset.map(|(rows, _)| rows))?
+                {
                     return Ok(rows);
                 }
-                if let Some(rows) = self.four_table_join(node, limit)? {
+                if let Some(rows) = self.four_table_join(node, limit_offset, order.as_deref())? {
                     return Ok(rows);
                 }
                 let lrows = self.join_rows(left)?;
@@ -9244,9 +9919,16 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         use secantus_pgplan::joins::JoinKind;
         let carry_ids = LOCK_ROW_IDS.with(|c| c.get());
+        // Only the keys something reads (`JoinRows::project`).
+        let project = join_search::projection();
+        let carries = |k: &String| secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k);
+        let merged: Vec<&(String, String, String)> =
+            merged.iter().filter(|(k, _, _)| carries(k)).collect();
+        let left_keys: Vec<&String> = left_keys.iter().filter(|k| carries(k)).collect();
+        let right_keys: Vec<&String> = right_keys.iter().filter(|k| carries(k)).collect();
         let combine = |l: Option<&Document>, r: Option<&Document>| -> Document {
             let mut d = Document::new();
-            for (key, lk, rk) in merged {
+            for (key, lk, rk) in merged.iter().copied() {
                 let lv = l
                     .and_then(|l| l.get(lk))
                     .filter(|v| !matches!(v, Bson::Null));
@@ -9260,13 +9942,13 @@ impl PgHandler {
                 };
                 d.insert(key.clone(), v.cloned().unwrap_or(Bson::Null));
             }
-            for k in left_keys {
+            for k in left_keys.iter().copied() {
                 d.insert(
                     k.clone(),
                     l.and_then(|l| l.get(k)).cloned().unwrap_or(Bson::Null),
                 );
             }
-            for k in right_keys {
+            for k in right_keys.iter().copied() {
                 d.insert(
                     k.clone(),
                     r.and_then(|r| r.get(k)).cloned().unwrap_or(Bson::Null),
@@ -9432,18 +10114,36 @@ impl PgHandler {
         right_keys: &[String],
     ) -> PgWireResult<Vec<Document>> {
         let mut out = Vec::new();
+        // Only the keys something reads (`JoinRows::project`).
+        let project = join_search::projection();
+        let carries = |k: &String| secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k);
+        let merged: Vec<&(String, String, String)> =
+            merged.iter().filter(|(k, _, _)| carries(k)).collect();
+        let left_keys: Vec<&String> = left_keys.iter().filter(|k| carries(k)).collect();
+        let right_keys: Vec<&String> = right_keys.iter().filter(|k| carries(k)).collect();
+        // The statement's own parameters are the same for every left row,
+        // and one may be large (an uncorrelated subquery's rows, resolved
+        // while planning): only those the item's SQL reads are bound, and
+        // the memo is keyed by the left row's values alone (RP-131).
+        let base = lateral_base_params(sql, params);
         for l in lrows {
-            let mut bound = params.to_vec();
-            bound.extend(keys.iter().map(|k| l.get(k).cloned().unwrap_or(Bson::Null)));
-            let memo = format!("{bound:?}");
+            let vals: Vec<Bson> = keys
+                .iter()
+                .map(|k| l.get(k).cloned().unwrap_or(Bson::Null))
+                .collect();
+            let memo = format!("{vals:?}");
             if !cache.contains_key(&memo) {
+                let mut bound = base.clone();
+                bound.extend(vals);
                 let rows = self.run_sql_rows(sql, &bound)?;
                 let docs = rows
                     .into_iter()
                     .map(|r| {
                         let mut d = Document::new();
                         for (key, i) in columns {
-                            d.insert(key.clone(), r.get(*i).cloned().unwrap_or(Bson::Null));
+                            if carries(key) {
+                                d.insert(key.clone(), r.get(*i).cloned().unwrap_or(Bson::Null));
+                            }
                         }
                         d
                     })
@@ -9454,13 +10154,13 @@ impl PgHandler {
             let mut matched = false;
             for r in rights {
                 let mut d = Document::new();
-                for (key, lk, _) in merged {
+                for (key, lk, _) in merged.iter().copied() {
                     d.insert(key.clone(), l.get(lk).cloned().unwrap_or(Bson::Null));
                 }
-                for k in left_keys {
+                for k in left_keys.iter().copied() {
                     d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
                 }
-                for k in right_keys {
+                for k in right_keys.iter().copied() {
                     d.insert(k.clone(), r.get(k).cloned().unwrap_or(Bson::Null));
                 }
                 let keep = match on {
@@ -9477,10 +10177,10 @@ impl PgHandler {
             }
             if !matched && kind == secantus_pgplan::joins::JoinKind::Left {
                 let mut d = Document::new();
-                for k in left_keys {
+                for k in left_keys.iter().copied() {
                     d.insert(k.clone(), l.get(k).cloned().unwrap_or(Bson::Null));
                 }
-                for k in right_keys {
+                for &k in &right_keys {
                     d.insert(k.clone(), Bson::Null);
                 }
                 out.push(d);
@@ -10376,16 +11076,7 @@ impl PgHandler {
     /// begins lazily on the first statement, so the rows are committed and
     /// visible before its snapshot is taken.
     fn open_transaction_handle(&self) -> PgWireResult<UserTransactionHandle> {
-        if !self
-            .catalogs_ensured
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            for coll in Self::CATALOG_COLLECTIONS {
-                self.ensure_collection(coll)?;
-            }
-            self.catalogs_ensured
-                .store(true, std::sync::atomic::Ordering::Relaxed);
-        }
+        self.ensure_catalog_collections()?;
         let handle = self
             .storage
             .begin_user_transaction()
@@ -10396,6 +11087,24 @@ impl PgHandler {
             handle.held_rows(),
         );
         Ok(handle)
+    }
+
+    /// This database's catalog collections, made if missing -- once a
+    /// connection, and at server start for each database a client may use,
+    /// so a fresh store's first statement does not create ten collections
+    /// in a window in which no cancel is seen (RP-202).
+    pub(crate) fn ensure_catalog_collections(&self) -> PgWireResult<()> {
+        if !self
+            .catalogs_ensured
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            for coll in Self::CATALOG_COLLECTIONS {
+                self.ensure_collection(coll)?;
+            }
+            self.catalogs_ensured
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// Make sure a catalog collection exists before writing to it: a delete or
@@ -10611,11 +11320,17 @@ impl PgHandler {
                 ));
             });
         };
+        // The collection names are constants: the same address is the same
+        // name, and only another address needs its text compared.
+        let same_collection = |c: &str| {
+            std::ptr::eq(c.as_ptr(), collection.as_ptr()) && c.len() == collection.len()
+                || c == collection
+        };
         if let Some(docs) = CATALOG_FRONT.with(|f| {
             f.borrow()
                 .iter()
                 .find(|(s, d, c, v, _)| {
-                    *s == storage_id && *c == collection && *v == version && d == self.db()
+                    *s == storage_id && *v == version && same_collection(c) && d == self.db()
                 })
                 .map(|e| Arc::clone(&e.4))
         }) {
@@ -14325,7 +15040,7 @@ impl PgHandler {
     /// the deferred foreign keys) when it is deferred. It used to be judged
     /// nowhere at all, so `unique (n) deferrable` accepted duplicates.
     fn check_deferrable_uniques(&self, table: &str) -> PgWireResult<()> {
-        let Some(def) = self.lookup(table) else {
+        let Some(def) = self.lookup_ref(table) else {
             return Ok(());
         };
         for u in def
@@ -14415,6 +15130,15 @@ impl PgHandler {
                 secantus_pgplan::collation::resolve(c).is_ok_and(|r| !r.deterministic())
             })
         };
+        // A jsonb column is equal by VALUE (`{"x":1}` = `{"x":1.0}`), which the
+        // storage index over its stored text cannot see either.
+        let jsonb = |col: &str| def.column(col).is_some_and(|c| c.pg_type == "jsonb");
+        // Only the constraints with such a column, each judged before its
+        // name is made: most tables have none (RP-014).
+        let judged = |cols: &[String]| {
+            cols.iter()
+                .any(|c| nondeterministic(c).is_some() || jsonb(c))
+        };
         let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
         let pk: Vec<String> = def
             .columns
@@ -14422,7 +15146,7 @@ impl PgHandler {
             .filter(|c| c.pk)
             .map(|c| c.name.clone())
             .collect();
-        if !pk.is_empty() {
+        if !pk.is_empty() && judged(&pk) {
             let name = def
                 .extra
                 .get_str("pk_name")
@@ -14431,17 +15155,10 @@ impl PgHandler {
             constraints.push((name, pk));
         }
         for u in &def.unique_constraints {
-            if u.exclusion_ops.is_empty() && !u.deferrable {
+            if u.exclusion_ops.is_empty() && !u.deferrable && judged(&u.columns) {
                 constraints.push((u.name.clone(), u.columns.clone()));
             }
         }
-        // A jsonb column is equal by VALUE (`{"x":1}` = `{"x":1.0}`), which the
-        // storage index over its stored text cannot see either.
-        let jsonb = |col: &str| def.column(col).is_some_and(|c| c.pg_type == "jsonb");
-        constraints.retain(|(_, cols)| {
-            cols.iter()
-                .any(|c| nondeterministic(c).is_some() || jsonb(c))
-        });
         if constraints.is_empty() {
             return Ok(());
         }
@@ -14674,11 +15391,14 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         let indexes: Vec<Document> = self
             .storage
-            .list_indexes(self.db(), &def.name)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(Self::computed_unique)
-            .collect();
+            .list_indexes_shared(self.db(), &def.name)
+            .map(|all| {
+                all.iter()
+                    .filter(|d| Self::computed_unique(d))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
         if indexes.is_empty() || rows.is_empty() {
             return Ok(());
         }
@@ -15079,6 +15799,12 @@ impl PgHandler {
     /// its output columns are what OR REPLACE is checked against.
     fn create_view(&self, cv: secantus_pgplan::CreateView) -> PgWireResult<Vec<Response>> {
         let name = cv.name.clone();
+        // Parse analysis comes first: what it refuses is refused before the
+        // view's name or its query's columns are looked at (RP-282).
+        {
+            let bare = name.rsplit('.').next().unwrap_or(&name);
+            self.statement_rule_refusal('v', bare, "_RETURN", 0)?;
+        }
         let existing = self
             .views()?
             .into_iter()
@@ -15212,7 +15938,7 @@ impl PgHandler {
                 (first, first + 2, first + 3)
             }
         };
-        let doc = bson::doc! {
+        let mut doc = bson::doc! {
             "_id": &name,
             "view": &name,
             "definition": &definition,
@@ -15223,6 +15949,13 @@ impl PgHandler {
             "type_oid": type_oid,
             "rule_oid": rule_oid,
         };
+        // Its `_RETURN` rule's trees, analysed now as `DefineView` does
+        // (RP-203).
+        let bare = name.rsplit('.').next().unwrap_or(&name).to_string();
+        if let Some((qual, action)) = self.statement_rule_trees('v', &bare, "_RETURN", relid)? {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
         if existing.is_some() {
             self.storage
                 .delete_matching(
@@ -15244,6 +15977,48 @@ impl PgHandler {
         )?;
         self.note_uncommitted_type(Self::VIEW_COLLECTION, &name, Some(doc));
         Ok(vec![Response::Execution(Tag::new("CREATE VIEW"))])
+    }
+
+    /// A table an ON SELECT rule turned into a view keeps its relation and
+    /// row type oids, and its `_RETURN` rule the trees of that rule.
+    pub(crate) fn keep_converted_view(
+        &self,
+        name: &str,
+        relid: i64,
+        reltype: i64,
+        trees: Option<(String, String)>,
+    ) -> PgWireResult<()> {
+        let docs = self.type_catalog_docs(Self::VIEW_COLLECTION)?;
+        let Some(mut doc) = docs.iter().find(|d| d.get_str("_id") == Ok(name)).cloned() else {
+            return Ok(());
+        };
+        doc.insert("oid", relid);
+        doc.insert("type_oid", reltype);
+        doc.remove("ev_qual");
+        doc.remove("ev_action");
+        if let Some((qual, action)) = trees {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
+        self.storage
+            .delete_matching(
+                self.db(),
+                Self::VIEW_COLLECTION,
+                &bson::doc! { "_id": name },
+                0,
+                &Document::new(),
+                None,
+            )
+            .map_err(|e| Self::storage_err("could not replace the view", e))?;
+        let bytes =
+            encode_doc(&doc).map_err(|e| Self::storage_err("could not encode the view", e))?;
+        self.insert_checked(
+            Self::VIEW_COLLECTION,
+            vec![bytes],
+            "could not record the view",
+        )?;
+        self.note_uncommitted_type(Self::VIEW_COLLECTION, name, Some(doc));
+        Ok(())
     }
 
     /// A view's row type -- its output columns' names and types -- as its
@@ -17399,16 +18174,46 @@ impl PgHandler {
             .collect())
     }
 
-    fn put_matview(&self, name: &str, definition: &str, populated: bool) -> PgWireResult<()> {
+    /// `trees` are its `_RETURN` rule's `(ev_qual, ev_action)` (RP-203).
+    fn put_matview(
+        &self,
+        name: &str,
+        definition: &str,
+        populated: bool,
+        trees: Option<(String, String)>,
+    ) -> PgWireResult<()> {
         self.ensure_collection(Self::MATVIEW_COLLECTION)?;
         if self.matviews()?.iter().any(|(n, _, _)| n == name) {
             self.delete_type_doc(Self::MATVIEW_COLLECTION, name)?;
         }
-        self.insert_type_doc(
-            Self::MATVIEW_COLLECTION,
-            name,
-            bson::doc! {"_id": name, "matview": name, "definition": definition, "populated": populated},
-        )
+        let mut doc = bson::doc! {"_id": name, "matview": name, "definition": definition, "populated": populated};
+        if let Some((qual, action)) = trees {
+            doc.insert("ev_qual", qual);
+            doc.insert("ev_action", action);
+        }
+        self.insert_type_doc(Self::MATVIEW_COLLECTION, name, doc)
+    }
+
+    /// A materialized view's stored `_RETURN` trees, which a refresh or a
+    /// rename keeps: they name the relation by oid.
+    pub(crate) fn matview_trees(&self, name: &str) -> Option<(String, String)> {
+        let docs = self.type_catalog_docs(Self::MATVIEW_COLLECTION).ok()?;
+        let d = docs.iter().find(|d| d.get_str("matview") == Ok(name))?;
+        Some((
+            d.get_str("ev_qual").ok()?.to_string(),
+            d.get_str("ev_action").ok()?.to_string(),
+        ))
+    }
+
+    /// The trees `CREATE MATERIALIZED VIEW` stores for `table`, analysed
+    /// from the running statement as `create_ctas_internal` does.
+    fn new_matview_trees(&self, table: &str) -> Option<(String, String)> {
+        let relid = self.relation_oid(table)?;
+        let bare = table.rsplit('.').next().unwrap_or(table);
+        // Refusals were raised before the table was made.
+        self.statement_rule_trees('m', bare, "_RETURN", relid)
+            .ok()
+            .flatten()
     }
 
     /// Every domain CHECK as a `pg_constraint` row's pieces: `(constraint
@@ -17679,7 +18484,8 @@ impl PgHandler {
                 PgWireError::UserError(Box::new(info))
             })?;
         }
-        self.put_matview(name, &definition, with_data)
+        let trees = self.matview_trees(name);
+        self.put_matview(name, &definition, with_data, trees)
     }
 
     /// Every recorded policy document.
@@ -18574,7 +19380,21 @@ impl PgHandler {
         Some(def)
     }
 
+    /// Could `name` be a virtual relation? See [`Self::virtual_table_base`].
+    fn may_be_virtual(name: &str) -> bool {
+        name.starts_with("pg_") || name.starts_with("information_schema.")
+    }
+
     fn virtual_table_base(name: &str) -> Option<TableDef> {
+        // Every virtual relation is a `pg_` name or an `information_schema.`
+        // one -- the names below, `ts_catalog::NAMES`, the foreign-data
+        // catalogs, `system_catalogs` and `catalog_object_table` alike
+        // (`virtual_relation_names_are_prefixed` holds them to it) -- so any
+        // other name, every user table's, is answered without walking them
+        // all: each lookup of a table asks first (RP-014).
+        if !Self::may_be_virtual(name) {
+            return None;
+        }
         match name {
             // `information_schema` keeps its SCHEMA in the name, because its
             // views are called `tables` / `columns` / `sequences` -- names a
@@ -22581,6 +23401,9 @@ impl PgHandler {
             _ => self.catalog_object_rows(name, &def).unwrap_or_default(),
         };
         self.fill_catalog_columns(name, &def, &mut rows);
+        if name == "pg_type" {
+            crate::pg_type_facts::apply_identity(&def, &mut rows);
+        }
         self.schema_qualify_rows(&def, &mut rows);
         // PostgreSQL's own functions, types and catalog constraints, as a
         // fresh 15.19 database lists them, ahead of what this server's users
@@ -22628,6 +23451,12 @@ impl PgHandler {
     /// store is this process's alone -- WiredTiger locks the directory -- so
     /// every write to the catalog passes through `run` and bumps the version.
     fn lookup(&self, name: &str) -> Option<TableDef> {
+        self.lookup_ref(name).map(TableRef::into_owned)
+    }
+
+    /// [`Self::lookup`] without the copy: a cached entry is shared, not
+    /// cloned, for a caller that only reads it.
+    fn lookup_ref(&self, name: &str) -> Option<TableRef> {
         let def = self.lookup_inner(name);
         // PostgreSQL flags the transaction on ANY open of a temporary
         // relation (`XACT_FLAGS_ACCESSEDTEMPNAMESPACE`), and refuses to
@@ -22643,16 +23472,16 @@ impl PgHandler {
         def
     }
 
-    fn lookup_inner(&self, name: &str) -> Option<TableDef> {
+    fn lookup_inner(&self, name: &str) -> Option<TableRef> {
         if let Some(def) = Self::virtual_table(name) {
-            return Some(def);
+            return Some(TableRef::Owned(Box::new(def)));
         }
         // What this transaction has created or dropped, before what is
         // committed. A `None` here is a tombstone: the table was dropped in
         // this transaction and must not be found even though its catalog row
         // is still there.
         if let Some(pending) = self.pending.tables().get(name) {
-            return pending.clone();
+            return pending.clone().map(|d| TableRef::Owned(Box::new(d)));
         }
         let cache = catalog_cache();
         let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
@@ -22668,7 +23497,7 @@ impl PgHandler {
                 .map(|e| Arc::clone(&e.4))
         });
         if let Some(def) = front_hit {
-            return (*def).clone();
+            return TableRef::shared(def);
         }
         // Only an entry the shared cache holds as CURRENT reaches the front,
         // so the front can never serve what the shared cache would not.
@@ -22699,7 +23528,7 @@ impl PgHandler {
             .map(|(_, def)| Arc::clone(def));
         if let Some(def) = shared {
             to_front(&def);
-            return (*def).clone();
+            return TableRef::shared(def);
         }
         let filter = bson::doc! { "_id": name };
         // A storage error is a transient `None`, not a recorded absence.
@@ -22737,7 +23566,7 @@ impl PgHandler {
                 self.sequence_doc(name).ok()
             };
             if let Some(Some(_)) = found {
-                return Some(Self::sequence_table_def(name));
+                return Some(TableRef::Owned(Box::new(Self::sequence_table_def(name))));
             }
         }
         // A miss for a sequence the block wrote is no absence: the
@@ -22753,7 +23582,7 @@ impl PgHandler {
                 .insert(key.clone(), (version, Arc::clone(&entry)));
             to_front(&entry);
         }
-        def
+        def.map(|d| TableRef::Owned(Box::new(d)))
     }
 
     fn err(e: &PlanError) -> PgWireError {
@@ -23714,7 +24543,7 @@ type DescribeKey = (String, usize, Vec<Option<String>>, bool);
 type PlanKey = (String, Vec<Option<String>>, Vec<u8>);
 /// `(catalog version, settings generation, role, the template -- its
 /// stand-in values and plan -- or None when the statement is not templated)`.
-type PlanEntry = (u64, u64, String, Option<(Vec<Bson>, Statement)>);
+type PlanEntry = (u64, u64, String, Option<Arc<(Vec<Bson>, Statement)>>);
 /// `(catalog version, settings generation, role, fields)`.
 type DescribeEntry = (u64, u64, String, Option<Vec<FieldInfo>>);
 
@@ -23753,6 +24582,10 @@ const IDLE_TIMEOUT_GUCS: [(&str, &str, &str); 2] = [
 /// nearest millisecond. `None` when the text is not a duration at all.
 fn parse_ms_guc(text: &str) -> Option<i64> {
     let text = text.trim();
+    // The default, which the server reads before every message (RP-014).
+    if text == "0" {
+        return Some(0);
+    }
     // The unit starts at a letter -- but so does the exponent of `1e3`, so
     // try every letter as the split and take the first that parses.
     let splits = text
@@ -25567,6 +26400,10 @@ impl PgHandler {
         self.install_reload_hook();
         // A session begins (`pgstat_report_connect`).
         self.stats().connect();
+        // `InitPostgres`'s catalog reads (RP-225), reported as the backend
+        // first goes idle, before its first ReadyForQuery.
+        self.catalog_reads_start();
+        self.stats().report(false);
         // ErrorResponse / NoticeResponse fields leave in the session's
         // `client_encoding`, like every other text the server sends: a LATIN9
         // client reading an `ERROR: ... \u{20ac}` expects the single byte 0xA4,
@@ -25908,6 +26745,7 @@ impl SimpleQueryHandler for PgHandler {
             // A lone SELECT outside any transaction streams its rows as
             // pgwire sends them (`portal_stream`), as an extended portal does.
             self.allow_simple_stream();
+            self.set_statement_source(query, 0);
             let out = self.run(query, &[], 0).await;
             self.stream_request.store(
                 portal_stream::STREAM_NEVER,
@@ -26050,6 +26888,7 @@ impl PgHandler {
                 implicit && stmts.len() == 1,
                 std::sync::atomic::Ordering::Relaxed,
             );
+            self.set_statement_source(whole, i);
             let ran = self.run(sql, &[], 0).await;
             self.sole_implicit
                 .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -26819,13 +27658,16 @@ impl PgHandler {
         out
     }
 
-    /// Capture, into every open savepoint that has not got it yet, the contents
-    /// of each table a statement is about to write.
+    /// Capture, into every open savepoint that has not got it yet, the
+    /// storage index definitions of each table a statement is about to write
+    /// (or whose index it names): what a ROLLBACK TO puts back, as the
+    /// subtransaction's abort undoes an index's CREATE, DROP or ALTER.
     ///
     /// "Has not got it yet" is what makes a savepoint's view the state at its
-    /// ESTABLISHMENT: the first write to a table after the savepoint captures
-    /// the table as it was before that write, and later writes find the entry
-    /// already there and leave it alone.
+    /// ESTABLISHMENT. The ROWS are not captured here: the storage's undo
+    /// journal records each row's first write since a savepoint as it
+    /// happens (`secantus_storage::UndoJournal`, RP-018), so a savepoint
+    /// costs what is written after it, never the size of the tables written.
     fn capture_for_savepoints(&self, stmt: &Statement) -> PgWireResult<()> {
         if self
             .savepoints
@@ -26836,15 +27678,11 @@ impl PgHandler {
             return Ok(());
         }
         let mut wanted = Self::written_tables(stmt);
-        // Sequences are not transactional (PostgreSQL never rolls a `nextval`
-        // back), and their collection is written OUTSIDE the block, so a
-        // capture restored on ROLLBACK TO would both un-draw values and
-        // conflict with that outside write.
         wanted.retain(|t| t != SEQUENCE_COLLECTION);
         // A trigger or a user function can write ANY table, and nothing about
-        // the statement says which. While either exists, every table is
-        // captured -- once per savepoint, so the cost is paid on first touch.
-        // So can an ALTER TYPE, which rewrites every value of the type.
+        // the statement says which. While either exists, every table's indexes
+        // are captured -- once per savepoint, so the cost is paid on first
+        // touch. So can an ALTER TYPE, which rewrites every value of the type.
         if !self.trigger_docs()?.is_empty()
             || !self.user_function_docs()?.is_empty()
             || matches!(stmt, Statement::AlterTypeAttributes { .. })
@@ -26855,7 +27693,7 @@ impl PgHandler {
         }
         // The indexes of every table written, and of the table an index's
         // own DDL names (which `written_tables` cannot resolve).
-        let mut index_tables = wanted.clone();
+        let mut index_tables = wanted;
         // Inside the block: an index it made itself is found too.
         index_tables.extend(self.in_open_transaction(|| Ok(self.index_ddl_tables(stmt)))?);
         index_tables.sort();
@@ -26867,60 +27705,26 @@ impl PgHandler {
                 .filter(|t| savepoints.iter().any(|sp| !sp.indexes.contains_key(t)))
                 .collect::<Vec<_>>()
         };
-        let mut index_captured: Vec<(String, Vec<Document>)> = Vec::new();
-        if !index_wanted.is_empty() {
-            self.in_open_transaction(|| {
-                for table in index_wanted {
-                    if !table.starts_with("__") {
-                        let docs = self
-                            .storage
-                            .list_indexes(self.db(), &table)
-                            .unwrap_or_default();
-                        index_captured.push((table, docs));
-                    }
-                }
-                Ok(())
-            })?;
-            let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-            for (table, docs) in &index_captured {
-                for sp in savepoints.iter_mut() {
-                    sp.indexes
-                        .entry(table.clone())
-                        .or_insert_with(|| docs.clone());
-                }
-            }
+        if index_wanted.is_empty() {
+            return Ok(());
         }
-        let tables = {
-            let savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-            // Read what is missing WITHOUT holding the savepoint lock, because
-            // reading goes back through storage.
-            wanted
-                .into_iter()
-                .filter(|t| savepoints.iter().any(|sp| !sp.tables.contains_key(t)))
-                .collect::<Vec<_>>()
-        };
-        let mut captured: Vec<(String, Option<Vec<Vec<u8>>>)> = Vec::new();
+        let mut index_captured: Vec<(String, Vec<Document>)> = Vec::new();
         self.in_open_transaction(|| {
-            for table in tables {
-                // A table that does not exist is captured as `None`, which is not
-                // the same as an empty one: rolling back has to DROP it.
-                let docs = match self.storage.collection_exists(self.db(), &table) {
-                    Ok(true) => Some(
-                        self.storage
-                            .find_matching(self.db(), &table, &Document::new())
-                            .map_err(|e| Self::storage_err("could not read for a savepoint", e))?,
-                    ),
-                    Ok(false) => None,
-                    Err(e) => return Err(Self::storage_err("could not read for a savepoint", e)),
-                };
-                captured.push((table, docs));
+            for table in index_wanted {
+                if !table.starts_with("__") {
+                    let docs = self
+                        .storage
+                        .list_indexes(self.db(), &table)
+                        .unwrap_or_default();
+                    index_captured.push((table, docs));
+                }
             }
             Ok(())
         })?;
         let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
-        for (table, docs) in captured {
+        for (table, docs) in &index_captured {
             for sp in savepoints.iter_mut() {
-                sp.tables
+                sp.indexes
                     .entry(table.clone())
                     .or_insert_with(|| docs.clone());
             }
@@ -27008,126 +27812,188 @@ impl PgHandler {
         Ok(())
     }
 
-    /// Put one table back to a captured state.
-    fn restore_table(&self, table: &str, docs: Option<&Vec<Vec<u8>>>) -> PgWireResult<()> {
-        let exists = self
-            .storage
-            .collection_exists(self.db(), table)
-            .map_err(|e| Self::storage_err("could not check a table", e))?;
-        match docs {
-            // It did not exist at the savepoint, so rolling back drops it.
-            None => {
-                if exists {
-                    self.storage
-                        .drop_collection(self.db(), table)
-                        .map_err(|e| Self::storage_err("could not drop the table", e))?;
-                }
+    /// The rows of the transaction this connection's writes go to -- the
+    /// statement's own when one is running (a PL/pgSQL EXCEPTION block),
+    /// else the block's -- whose undo journal holds the savepoints' frames.
+    fn undo_held(&self) -> Option<secantus_storage::HeldRows> {
+        if self.storage.in_user_txn() {
+            return secantus_storage::active_held_rows();
+        }
+        let guard = self.txn.try_lock().ok()?;
+        guard.as_ref().map(|h| h.held_rows())
+    }
+
+    /// ROLLBACK TO without a move: put back what the undo journal recorded
+    /// since the savepoint (`frame`, the oldest record of each row among the
+    /// savepoint and the ones inside it), through the same storage writes
+    /// the executor makes, so every index follows. What it costs is the rows
+    /// written since the savepoint, as a subtransaction's abort does; the
+    /// tables' size does not come into it.
+    ///
+    /// A collection created since is dropped. One dropped since is made
+    /// again and given its rows, all of which the drop recorded. Otherwise
+    /// each row is put back as it was, or deleted when it did not exist --
+    /// except a sequence's: `nextval` is not transactional, so an advance is
+    /// kept, and only a sequence created or dropped since is undone.
+    fn apply_undo(&self, frame: &secantus_storage::UndoFrame) -> PgWireResult<()> {
+        // The collections created or dropped since, and whether each was there.
+        let mut existed: HashMap<(&str, &str), bool> = HashMap::new();
+        for c in &frame.collections {
+            existed.insert((c.db.as_str(), c.coll.as_str()), c.existed);
+        }
+        // The rows, by collection, in the order the collections were written.
+        let mut order: Vec<(&str, &str)> = Vec::new();
+        let mut rows: HashMap<(&str, &str), Vec<&secantus_storage::UndoRow>> = HashMap::new();
+        for r in &frame.rows {
+            let key = (r.db.as_str(), r.coll.as_str());
+            rows.entry(key)
+                .or_insert_with(|| {
+                    order.push(key);
+                    Vec::new()
+                })
+                .push(r);
+        }
+        let exists = |db: &str, coll: &str| -> PgWireResult<bool> {
+            self.storage
+                .collection_exists(db, coll)
+                .map_err(|e| Self::storage_err("could not check a table", e))
+        };
+        for c in &frame.collections {
+            let (db, coll) = (c.db.as_str(), c.coll.as_str());
+            if exists(db, coll)? {
+                self.storage
+                    .drop_collection(db, coll)
+                    .map_err(|e| Self::storage_err("could not drop the table", e))?;
             }
-            Some(docs) => {
-                if !exists {
-                    self.storage
-                        .create_collection(self.db(), table)
-                        .map_err(|e| Self::storage_err("could not create the table", e))?;
-                }
-                self.restore_rows(table, docs)?;
+            if !c.existed {
+                continue;
             }
+            self.storage
+                .create_collection(db, coll)
+                .map_err(|e| Self::storage_err("could not create the table", e))?;
+            let docs: Vec<Vec<u8>> = rows
+                .get(&(db, coll))
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.prior.clone())
+                .collect();
+            self.insert_restored(db, coll, docs)?;
+        }
+        for key in order {
+            if existed.contains_key(&key) {
+                continue;
+            }
+            let (db, coll) = key;
+            self.undo_rows(db, coll, &rows[&key])?;
         }
         Ok(())
     }
 
-    /// Put `table`'s rows back to `saved` by writing only the rows that
-    /// differ: a row changed since is replaced in place, one added since is
-    /// deleted, one deleted since is inserted. Rewriting EVERY row (as this
-    /// once did) wrote rows the block never touched, so a row another
-    /// session committed since the block's snapshot made the ROLLBACK TO
-    /// itself fail 40001 -- a conflict PostgreSQL, which writes nothing on a
-    /// subtransaction abort, cannot have.
-    fn restore_rows(&self, table: &str, saved: &[Vec<u8>]) -> PgWireResult<()> {
-        let id_of = |raw: &[u8]| -> Option<Vec<u8>> {
-            let doc = bson::RawDocument::from_bytes(raw).ok()?;
-            let id: Bson = doc.get("_id").ok()??.to_raw_bson().try_into().ok()?;
-            bson::to_vec(&bson::doc! { "k": id }).ok()
+    /// Put back the rows of `(db, coll)` the journal recorded (see
+    /// `apply_undo`), writing only the ones that differ from what they were.
+    fn undo_rows(
+        &self,
+        db: &str,
+        coll: &str,
+        rows: &[&secantus_storage::UndoRow],
+    ) -> PgWireResult<()> {
+        let sequence = db == self.db() && coll == SEQUENCE_COLLECTION;
+        let key_of = |id: &Bson| -> PgWireResult<Vec<u8>> {
+            bson::to_vec(&bson::doc! { "k": id.clone() })
+                .map_err(|e| Self::storage_err("could not encode a key", e))
         };
-        let current = self
+        if !self
             .storage
-            .find_matching(self.db(), table, &Document::new())
-            .map_err(|e| Self::storage_err("could not read the table", e))?;
-        let mut now: HashMap<Vec<u8>, &[u8]> = HashMap::with_capacity(current.len());
-        let mut unkeyed = false;
-        for raw in &current {
-            match id_of(raw) {
-                Some(k) => {
-                    now.insert(k, raw.as_slice());
-                }
-                None => unkeyed = true,
-            }
-        }
-        let mut was: HashMap<Vec<u8>, &[u8]> = HashMap::with_capacity(saved.len());
-        for raw in saved {
-            match id_of(raw) {
-                Some(k) => {
-                    was.insert(k, raw.as_slice());
-                }
-                None => unkeyed = true,
-            }
-        }
-        if unkeyed {
-            // No `_id` to pair rows by: rewrite the table whole.
+            .collection_exists(db, coll)
+            .map_err(|e| Self::storage_err("could not check a table", e))?
+        {
             self.storage
-                .delete_matching(
-                    self.db(),
-                    table,
-                    &Document::new(),
-                    0,
-                    &Document::new(),
-                    None,
-                )
-                .map_err(|e| Self::storage_err("could not clear the table", e))?;
-            if !saved.is_empty() {
-                self.insert_checked(table, saved.to_vec(), "could not restore the table")?;
-            }
-            return Ok(());
+                .create_collection(db, coll)
+                .map_err(|e| Self::storage_err("could not create the table", e))?;
         }
-        let decode_id = |raw: &[u8]| -> PgWireResult<Bson> {
-            decode_doc(raw)
-                .map_err(|e| Self::storage_err("could not decode a row", e))?
-                .get("_id")
-                .cloned()
-                .ok_or_else(|| Self::err(&PlanError::Internal("a row without _id".into())))
-        };
-        let gone: Vec<Bson> = now
-            .iter()
-            .filter(|(k, _)| !was.contains_key(*k))
-            .map(|(_, raw)| decode_id(raw))
-            .collect::<PgWireResult<_>>()?;
+        // Each row as it is now, by its `_id`: one lookup a row, so the cost
+        // is the rows written, whatever the table holds.
+        let mut now: HashMap<Vec<u8>, Vec<u8>> = HashMap::with_capacity(rows.len());
+        for r in rows {
+            if let Some(raw) = self
+                .storage
+                .find_by_id(db, coll, &r.id)
+                .map_err(|e| Self::storage_err("could not read the table", e))?
+            {
+                now.insert(key_of(&r.id)?, raw);
+            }
+        }
+        let mut gone: Vec<Bson> = Vec::new();
+        let mut changed: Vec<(&Bson, &Vec<u8>)> = Vec::new();
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        for r in rows {
+            let cur = now.get(&key_of(&r.id)?);
+            match (&r.prior, cur) {
+                (None, Some(_)) => gone.push(r.id.clone()),
+                (None, None) => {}
+                // A sequence's advance is not rolled back.
+                (Some(_), Some(_)) if sequence => {}
+                (Some(was), Some(cur)) if was == cur => {}
+                (Some(was), Some(_)) => changed.push((&r.id, was)),
+                (Some(was), None) => missing.push(was.clone()),
+            }
+        }
         if !gone.is_empty() {
+            self.delete_ids(db, coll, &gone)?;
+        }
+        // In place, where the row can be: a unique value two rows swapped
+        // collides with the other row's until it is put back too, so such a
+        // row is deleted and inserted again once every other one is back.
+        let mut collided: Vec<Bson> = Vec::new();
+        for (id, was) in changed {
+            match self.storage.replace_by_id(db, coll, id, was) {
+                Ok(_) => {}
+                Err(StorageError::DuplicateKey(_)) => {
+                    collided.push(id.clone());
+                    missing.push(was.clone());
+                }
+                Err(e) => return Err(Self::storage_err("could not restore the table", e)),
+            }
+        }
+        if !collided.is_empty() {
+            self.delete_ids(db, coll, &collided)?;
+        }
+        self.insert_restored(db, coll, missing)
+    }
+
+    /// Delete the rows of `(db, coll)` with these `_id`s, one by one.
+    fn delete_ids(&self, db: &str, coll: &str, ids: &[Bson]) -> PgWireResult<()> {
+        for id in ids {
             self.storage
                 .delete_matching(
-                    self.db(),
-                    table,
-                    &bson::doc! { "_id": { "$in": gone } },
-                    0,
+                    db,
+                    coll,
+                    &bson::doc! { "_id": { "$eq": id.clone() } },
+                    1,
                     &Document::new(),
                     None,
                 )
                 .map_err(|e| Self::storage_err("could not restore the table", e))?;
         }
-        let mut missing = Vec::new();
-        for raw in saved {
-            let Some(k) = id_of(raw) else { continue };
-            match now.get(&k) {
-                Some(cur) if *cur == raw.as_slice() => {}
-                Some(_) => {
-                    let id = decode_id(raw)?;
-                    self.storage
-                        .replace_by_id(self.db(), table, &id, raw)
-                        .map_err(|e| Self::storage_err("could not restore the table", e))?;
-                }
-                None => missing.push(raw.clone()),
-            }
+        Ok(())
+    }
+
+    /// Insert rows a ROLLBACK TO puts back, failing on any the storage
+    /// refuses: they were the table's rows at the savepoint, so a refusal is
+    /// a bug, never a constraint to report.
+    fn insert_restored(&self, db: &str, coll: &str, docs: Vec<Vec<u8>>) -> PgWireResult<()> {
+        if docs.is_empty() {
+            return Ok(());
         }
-        if !missing.is_empty() {
-            self.insert_checked(table, missing, "could not restore the table")?;
+        let (_, errors) = self
+            .storage
+            .insert(db, coll, docs, true)
+            .map_err(|e| Self::storage_err("could not restore the table", e))?;
+        if let Some(first) = errors.first() {
+            return Err(Self::storage_err(
+                "could not restore the table",
+                first.get_str("errmsg").unwrap_or("a document was rejected"),
+            ));
         }
         Ok(())
     }
@@ -27468,6 +28334,37 @@ impl PgHandler {
                 // A foreign key over the key depends on its index
                 // (`reportDependentObjects`, 15.19).
                 let dependents = self.key_dependents(table, def, name)?;
+                // A view or rule whose grouping leans on the key depends on
+                // the constraint itself (RP-280).
+                let rule_deps = self.key_rule_dependents(table, name);
+                if !rule_deps.is_empty() && !*cascade {
+                    let shown = secantus_pgplan::schemas::visible_name(table);
+                    let mut info = ErrorInfo::new(
+                        "ERROR".into(),
+                        "2BP01".into(),
+                        format!(
+                            "cannot drop constraint {name} on table {shown} because other objects depend on it"
+                        ),
+                    );
+                    info.detail = Some(
+                        dependents
+                            .iter()
+                            .map(|(fk, t)| {
+                                format!(
+                                    "constraint {fk} on table {} depends on index {name}",
+                                    secantus_pgplan::schemas::visible_name(t)
+                                )
+                            })
+                            .chain(rule_deps.iter().map(|d| {
+                                format!("{d} depends on constraint {name} on table {shown}")
+                            }))
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
+                    info.hint =
+                        Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+                    return Err(PgWireError::UserError(Box::new(info)));
+                }
                 if !dependents.is_empty() && !*cascade {
                     let shown = secantus_pgplan::schemas::visible_name(table);
                     let mut info = ErrorInfo::new(
@@ -27818,6 +28715,10 @@ impl PgHandler {
             // A UNIQUE constraint's index goes with it (the other kinds have
             // none; a missing index is nothing to drop).
             A::DropConstraint { name, cascade, .. } => {
+                // The views and rules that lean on the key go with it.
+                if *cascade {
+                    self.drop_key_rule_dependents(table, name)?;
+                }
                 // The foreign keys over the key go first, each from its own
                 // table (this table's own went with the catalog change).
                 if *cascade {
@@ -28199,6 +29100,74 @@ impl PgHandler {
         }
         out.sort();
         Ok(out)
+    }
+
+    /// The constraint `name` on `table`'s oid, as pg_constraint lists it.
+    fn table_constraint_oid(&self, table: &str, name: &str) -> Option<i64> {
+        let rel = self.relation_oid(table)?;
+        let sql = format!(
+            "select oid::int8 from pg_constraint where conrelid = {rel} and conname = {}",
+            secantus_pgplan::scalar::quote_literal(name)
+        );
+        let (_, rows) = self.internal_query(&sql).ok()?;
+        rows.first()
+            .and_then(|r| r.first().cloned().flatten())
+            .and_then(|v| crate::bson_i64(&v))
+    }
+
+    /// The views and rules whose trees depend on the constraint, described
+    /// as `reportDependentObjects` does: `view v`, `rule r on table t`.
+    fn key_rule_dependents(&self, table: &str, name: &str) -> Vec<String> {
+        let Some(con) = self.table_constraint_oid(table, name) else {
+            return Vec::new();
+        };
+        self.constraint_rule_dependents(con)
+            .into_iter()
+            .map(|(kind, n, t)| {
+                let n = secantus_pgplan::schemas::visible_name(&n);
+                if kind == "rule" {
+                    format!(
+                        "rule {n} on table {}",
+                        secantus_pgplan::schemas::visible_name(&t)
+                    )
+                } else {
+                    format!("{kind} {n}")
+                }
+            })
+            .collect()
+    }
+
+    /// `DROP CONSTRAINT ... CASCADE`: the views, materialized views and
+    /// rules whose trees depend on the constraint are dropped first.
+    fn drop_key_rule_dependents(&self, table: &str, name: &str) -> PgWireResult<()> {
+        let Some(con) = self.table_constraint_oid(table, name) else {
+            return Ok(());
+        };
+        let deps = self.constraint_rule_dependents(con);
+        if deps.is_empty() {
+            return Ok(());
+        }
+        self.cascade_notice(&self.key_rule_dependents(table, name));
+        for (kind, n, t) in deps {
+            let q = |x: &str| {
+                x.split('.')
+                    .map(secantus_pgplan::scalar::quote_identifier)
+                    .collect::<Vec<_>>()
+                    .join(".")
+            };
+            let sql = match kind {
+                "rule" => format!(
+                    "drop rule {} on {}",
+                    secantus_pgplan::scalar::quote_identifier(&n),
+                    q(&t)
+                ),
+                "view" => format!("drop view {} cascade", q(&n)),
+                _ => format!("drop materialized view {} cascade", q(&n)),
+            };
+            let stmt = self.plan_internal(&sql)?;
+            self.execute_inner(stmt, 0)?;
+        }
+        Ok(())
     }
 
     /// `DROP CONSTRAINT t_pkey`: each row's key values go back to fields of
@@ -29574,21 +30543,53 @@ impl PgHandler {
 
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
+        thread_local! {
+            /// The zone parsed last on this thread, by the settings'
+            /// generation (unique across sessions): every statement asks
+            /// several times (RP-014).
+            static PARSED: std::cell::RefCell<Option<(u64, secantus_pgplan::TimeZoneSetting)>> =
+                const { std::cell::RefCell::new(None) };
+        }
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        settings
+        let generation = settings.generation();
+        if let Some(zone) = PARSED.with(|p| {
+            p.borrow()
+                .as_ref()
+                .filter(|(g, _)| *g == generation)
+                .map(|(_, z)| z.clone())
+        }) {
+            return zone;
+        }
+        let zone = settings
             .get("TimeZone")
             .map(|v| secantus_pgplan::TimeZoneSetting::parse(v))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        PARSED.with(|p| *p.borrow_mut() = Some((generation, zone.clone())));
+        zone
     }
 
     /// The session's `DateStyle` GUC, resolved. Drives how date / timestamp /
     /// timestamptz TEXT output is rendered (binary output is style-independent).
     fn session_datestyle(&self) -> secantus_pgplan::DateStyle {
+        thread_local! {
+            /// The style parsed last on this thread, by the settings'
+            /// generation (unique across sessions): every statement asks.
+            static PARSED: std::cell::Cell<Option<(u64, secantus_pgplan::DateStyle)>> =
+                const { std::cell::Cell::new(None) };
+        }
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        settings
+        let generation = settings.generation();
+        if let Some((g, style)) = PARSED.with(std::cell::Cell::get) {
+            if g == generation {
+                return style;
+            }
+        }
+        let style = settings
             .get("DateStyle")
             .map(|v| secantus_pgplan::DateStyle::parse(v))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        PARSED.with(|p| p.set(Some((generation, style))));
+        style
     }
 
     /// The session's `client_encoding` GUC, resolved to its transcoding
@@ -29646,10 +30647,11 @@ impl PgHandler {
 
     fn client_encoding(&self) -> ClientEncoding {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        settings
-            .get("client_encoding")
-            .map(|v| encoding::client_encoding(v))
-            .unwrap_or(ClientEncoding::Utf8)
+        settings.memo(GucSlot::ClientEncoding, |s| {
+            s.get("client_encoding")
+                .map(|v| encoding::client_encoding(v))
+                .unwrap_or(ClientEncoding::Utf8)
+        })
     }
 
     /// Set `client_encoding` from a user-supplied name, mirroring PostgreSQL:
@@ -29979,9 +30981,23 @@ impl PgHandler {
                 .get_or_insert(false);
         }
         self.stats().set_state(true, !outside);
+        // The catalog reads PostgreSQL makes for the statement, and what a
+        // catalog change it makes invalidates (RP-225).
+        let effects = self.catalog_effects(query);
         let result = self
             .run_typed_inner(query, params, param_types, max_rows)
             .await;
+        // A statement cancelled, or refused in an aborted block, never
+        // reached parse analysis.
+        let analysed = !matches!(
+            &result,
+            Err(PgWireError::UserError(info))
+                if matches!(info.code.as_str(), "57014" | "57P01" | "25P02")
+        );
+        if analysed {
+            self.catalog_reads(query);
+        }
+        self.catalog_reads_done(effects, result.is_ok());
         if let Err(PgWireError::UserError(info)) = &result {
             if info.code == "40P01" {
                 self.stats().deadlock();
@@ -30083,7 +31099,12 @@ impl PgHandler {
         activity.state = state;
         activity.state_change = Some(now);
         if let Some(query) = query {
-            activity.query = query.to_string();
+            // Into the text's own buffer: a pipeline reports the same
+            // statement each time.
+            if activity.query != query {
+                activity.query.clear();
+                activity.query.push_str(query);
+            }
             activity.query_start = Some(now);
         }
     }
@@ -30099,7 +31120,14 @@ impl PgHandler {
             .load(std::sync::atomic::Ordering::Relaxed);
         let (guc, code, message) = IDLE_TIMEOUT_GUCS[if in_txn { 0 } else { 1 }];
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        let ms = settings.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0);
+        let slot = if in_txn {
+            GucSlot::IdleInTransaction
+        } else {
+            GucSlot::IdleSession
+        };
+        let ms = settings.memo(slot, |s| {
+            s.get(guc).and_then(|v| parse_ms_guc(v)).unwrap_or(0)
+        });
         if ms <= 0 {
             return None;
         }
@@ -30163,6 +31191,7 @@ impl PgHandler {
         let stats = self.stats();
         if let (Some(failed), false) = (implicit, in_block) {
             stats.end_xact(!failed);
+            self.catcache_end_xact(!failed);
         }
         stats.report(in_block);
         stats.set_state(false, in_block);
@@ -30211,12 +31240,13 @@ impl PgHandler {
     /// A millisecond setting (`statement_timeout`, `lock_timeout`) as a
     /// number; 0 -- off -- when unset.
     fn ms_setting(&self, name: &str) -> i64 {
-        self.settings
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .and_then(|v| parse_ms_guc(v))
-            .unwrap_or(0)
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        let read = |s: &GucMap| s.get(name).and_then(|v| parse_ms_guc(v)).unwrap_or(0);
+        match name {
+            "statement_timeout" => settings.memo(GucSlot::StatementTimeout, read),
+            "lock_timeout" => settings.memo(GucSlot::LockTimeout, read),
+            _ => read(&settings),
+        }
     }
 
     /// `pg_sleep`: in slices, so a `CancelRequest` interrupts the sleep
@@ -30348,10 +31378,21 @@ impl PgHandler {
         let _ = secantus_pgplan::take_error_location();
         // A statement run before with values of the same types reuses its
         // plan, the values substituted (`plan_cache`).
-        let plan_key = self.plan_key(sql, params, param_types);
-        let templated = plan_key
-            .as_ref()
-            .and_then(|k| self.templated_plan(k, params));
+        // The template last used first, compared in place (RP-014); the
+        // key is built only when that is not it.
+        let keyable = self.pending.tables().is_empty() && self.pending.types().is_empty();
+        let templated = keyable
+            .then(|| self.templated_plan_last(sql, params, param_types))
+            .flatten();
+        let plan_key = match templated {
+            Some(_) => None,
+            None => self.plan_key(sql, params, param_types),
+        };
+        let templated = templated.or_else(|| {
+            plan_key
+                .as_ref()
+                .and_then(|k| self.templated_plan(k, params))
+        });
         // An unprepared statement carries its values in its text: it is
         // looked up by the text with those taken out.
         let family = match (&plan_key, &templated) {
@@ -30364,15 +31405,19 @@ impl PgHandler {
         let reused = templated.is_some();
         let plan_now = || {
             self.with_executor_hooks(|| {
-                secantus_pgplan::planning_to_execute(|| {
-                    secantus_pgplan::plan_with_session_types_and_subqueries(
-                        sql,
-                        &|n| self.lookup(n),
-                        params,
-                        param_types,
-                        &tz,
-                        Some(&run),
-                    )
+                // Every expression walk a cancellation point: the caller's
+                // `check_cancel` below takes a cancel that cut a walk short.
+                secantus_pgplan::cancel::with_walk_checks(|| {
+                    secantus_pgplan::planning_to_execute(|| {
+                        secantus_pgplan::plan_with_session_types_and_subqueries(
+                            sql,
+                            &|n| self.lookup(n),
+                            params,
+                            param_types,
+                            &tz,
+                            Some(&run),
+                        )
+                    })
                 })
             })
         };
@@ -30400,6 +31445,9 @@ impl PgHandler {
                 planned = plan_now();
             }
         }
+        // A cancel that cut one of planning's walks short is taken here,
+        // before anything uses the plan (`with_walk_checks`).
+        self.check_cancel()?;
         self.collect_planner_warnings();
         if !reused && planned.is_ok() {
             // Learning plans the statement again: a cancel stops it as it
@@ -33178,9 +34226,11 @@ impl PgHandler {
     /// made since the savepoint are undone AND their rows let go, so a
     /// session waiting on one goes on. The block is moved onto a new
     /// WiredTiger transaction that replays its write set without the entries
-    /// after `write_pos` that touch a table being restored (`restore`): the
-    /// state at the savepoint. Rewriting those tables inside the same
-    /// transaction (the fallback, `restore_table`) keeps every row held,
+    /// after `write_pos` -- the state at the savepoint -- save a sequence's
+    /// advance, which PostgreSQL never rolls back (unless the sequence was
+    /// created since, when it goes with the rest). Putting the rows back
+    /// inside the same transaction (the fallback, `apply_undo`) keeps every
+    /// row held,
     /// collides with any row another session committed since the block's
     /// snapshot (40001 on the ROLLBACK TO itself), and cannot heal a
     /// transaction a write conflict has doomed.
@@ -33192,33 +34242,48 @@ impl PgHandler {
     /// (`FOR UPDATE`, an UPDATE that changed nothing) before the savepoint
     /// are taken again, the later ones let go; a table created after the
     /// savepoint is undone with the rest. `false` leaves the fallback
-    /// (`restore_table`) to run.
+    /// (`apply_undo`) to run.
     fn rollback_to_by_move(
         &self,
         write_pos: Option<usize>,
         lock_pos: Option<usize>,
-        restore: &HashMap<String, Option<Vec<Vec<u8>>>>,
     ) -> PgWireResult<bool> {
         let (Some(pos), Some(lock_pos)) = (write_pos, lock_pos) else {
             return Ok(false);
         };
-        let db = self.db();
-        let undone: HashSet<String> = restore
-            .keys()
-            .filter(|t| t.as_str() != SEQUENCE_COLLECTION)
-            .map(|t| format!("{db}.{t}"))
-            .collect();
-        // A command after the savepoint (a CREATE: the move refuses any
-        // other) is undone with the rest.
+        let sequences = format!("{}.{SEQUENCE_COLLECTION}", self.db());
+        // The sequences created since the savepoint, met in write order
+        // (a sequence's insert comes before any advance of it).
+        let created: std::cell::RefCell<HashSet<Vec<u8>>> = Default::default();
+        let id_key = |op: &Document, field: &str| -> Option<Vec<u8>> {
+            let id = op.get_document(field).ok()?.get("_id")?.clone();
+            bson::to_vec(&bson::doc! { "k": id }).ok()
+        };
+        // Everything written since the savepoint is undone -- a command (a
+        // CREATE: the move refuses any other) included -- but a sequence's
+        // advance, unless the sequence is itself one created since.
         let keep = |i: usize, op: &Document| -> bool {
-            i < pos
-                || (op.get_str("op") != Ok("c")
-                    && !op.get_str("ns").is_ok_and(|ns| undone.contains(ns)))
+            if i < pos {
+                return true;
+            }
+            if op.get_str("ns") != Ok(sequences.as_str()) {
+                return false;
+            }
+            match op.get_str("op") {
+                Ok("i") => {
+                    if let Some(k) = id_key(op, "o") {
+                        created.borrow_mut().insert(k);
+                    }
+                    false
+                }
+                Ok("u") => id_key(op, "o2").is_some_and(|k| !created.borrow().contains(&k)),
+                _ => false,
+            }
         };
         if self.storage.in_user_txn() {
             // A PL/pgSQL EXCEPTION block: the statement running it holds
             // the transaction, and moves it in place.
-            if restore.is_empty()
+            if self.storage.active_write_set_len().is_none_or(|n| n <= pos)
                 && self
                     .storage
                     .active_locked_len()
@@ -33247,7 +34312,7 @@ impl PgHandler {
         };
         // Nothing written and no row locked since the savepoint: nothing to
         // undo or let go of.
-        if restore.is_empty() && handle.locked_len() <= lock_pos {
+        if handle.write_set_len() <= pos && handle.locked_len() <= lock_pos {
             return Ok(false);
         }
         // REPEATABLE READ keeps its snapshot: the move is made only while no
@@ -33314,12 +34379,25 @@ impl PgHandler {
                 let shared_pos = self.shared_lock_mark();
                 let uncommitted = self.pending.tables().clone();
                 let uncommitted_types = self.pending.types().clone();
+                let undo_frame = NEXT_UNDO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let first = self
+                    .savepoints
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_empty();
+                if let Some(held) = self.undo_held() {
+                    let mut held = held.lock().unwrap_or_else(|e| e.into_inner());
+                    if first {
+                        held.undo.reset();
+                    }
+                    held.undo.open(undo_frame);
+                }
                 self.savepoints
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(Savepoint {
                         name,
-                        tables: HashMap::new(),
+                        undo_frame,
                         indexes: HashMap::new(),
                         uncommitted,
                         uncommitted_types,
@@ -33340,20 +34418,23 @@ impl PgHandler {
                     });
                 Ok(vec![Response::Execution(Tag::new("SAVEPOINT"))])
             }
-            // RELEASE keeps the writes, so nothing is restored -- but the
-            // pre-images captured by the savepoints being destroyed have to
-            // MERGE DOWN into the enclosing one, or an outer ROLLBACK TO would
-            // no longer be able to undo them. The OLDEST capture wins, which is
-            // the one nearest the enclosing savepoint.
+            // RELEASE keeps the writes, so nothing is restored -- but what
+            // the savepoints being destroyed recorded has to MERGE DOWN into
+            // the enclosing one, or an outer ROLLBACK TO would no longer be
+            // able to undo it. The OLDEST record wins, which is the one
+            // nearest the enclosing savepoint.
             TransactionControl::Release(_) => {
                 let mut savepoints = self.savepoints.lock().unwrap_or_else(|e| e.into_inner());
                 let idx = index(&savepoints).ok_or_else(missing)?;
                 let dropped: Vec<Savepoint> = savepoints.split_off(idx);
+                if let Some(held) = self.undo_held() {
+                    held.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .undo
+                        .release(dropped[0].undo_frame);
+                }
                 if let Some(outer) = savepoints.last_mut() {
                     for sp in dropped {
-                        for (table, docs) in sp.tables {
-                            outer.tables.entry(table).or_insert(docs);
-                        }
                         for (table, docs) in sp.indexes {
                             outer.indexes.entry(table).or_insert(docs);
                         }
@@ -33362,11 +34443,11 @@ impl PgHandler {
                 Ok(vec![Response::Execution(Tag::new("RELEASE"))])
             }
             _ => {
-                // Restore from the OLDEST capture of each table among this
+                // Restore the OLDEST record of each row and index among this
                 // savepoint and the ones nested inside it: that is the state at
-                // the named savepoint, whichever frame happened to capture it.
+                // the named savepoint, whichever frame happened to record it.
                 let (
-                    (restore, restore_indexes),
+                    (undo_frame, restore_indexes),
                     uncommitted,
                     uncommitted_types,
                     saved_settings,
@@ -33387,13 +34468,9 @@ impl PgHandler {
                     let uncommitted = savepoints[idx].uncommitted.clone();
                     let uncommitted_types = savepoints[idx].uncommitted_types.clone();
                     let dropped: Vec<Savepoint> = savepoints.split_off(idx + 1);
-                    let mut restore: HashMap<String, Option<Vec<Vec<u8>>>> =
-                        savepoints[idx].tables.clone();
+                    let undo_frame = savepoints[idx].undo_frame;
                     let mut restore_indexes = savepoints[idx].indexes.clone();
                     for sp in &dropped {
-                        for (table, docs) in &sp.tables {
-                            restore.entry(table.clone()).or_insert_with(|| docs.clone());
-                        }
                         for (table, docs) in &sp.indexes {
                             restore_indexes
                                 .entry(table.clone())
@@ -33402,10 +34479,9 @@ impl PgHandler {
                     }
                     // The savepoint itself stays open, and starts capturing
                     // again from the state just restored.
-                    savepoints[idx].tables.clear();
                     savepoints[idx].indexes.clear();
                     (
-                        (restore, restore_indexes),
+                        (undo_frame, restore_indexes),
                         uncommitted,
                         uncommitted_types,
                         saved_settings,
@@ -33419,16 +34495,34 @@ impl PgHandler {
                 if let Some(pos) = shared_pos {
                     self.release_shared_locks_after(pos);
                 }
-                if !self.rollback_to_by_move(write_pos, lock_pos, &restore)? {
-                    self.in_open_transaction(|| {
-                        for (table, docs) in &restore {
-                            if table == SEQUENCE_COLLECTION {
-                                continue;
-                            }
-                            self.restore_table(table, docs.as_ref())?;
+                // What the journal recorded since the savepoint; its frame
+                // stays open, empty, for the writes from here on.
+                let held = self.undo_held();
+                let frame = held.as_ref().and_then(|h| {
+                    h.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .undo
+                        .rollback_to(undo_frame)
+                });
+                if !self.rollback_to_by_move(write_pos, lock_pos)? {
+                    match (held, frame) {
+                        (Some(held), Some(frame)) => {
+                            let _paused = secantus_storage::UndoPause::new(&held);
+                            self.in_open_transaction(|| self.apply_undo(&frame))?;
                         }
-                        Ok(())
-                    })?;
+                        // Nothing written since the savepoint: nothing to undo.
+                        _ if matches!(
+                            (self.block_write_pos(), write_pos),
+                            (Some(now), Some(then)) if now == then
+                        ) => {}
+                        // No journal frame for the savepoint: what it would
+                        // put back is not known, and pretending is data loss.
+                        _ => {
+                            return Err(Self::err(&PlanError::Internal(format!(
+                                "savepoint \"{name}\" has no undo journal"
+                            ))));
+                        }
+                    }
                 }
                 if !restore_indexes.is_empty() {
                     self.in_open_transaction(|| {
@@ -33651,6 +34745,7 @@ impl PgHandler {
                         self.commit_failed
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                         self.stats().end_xact(false);
+                        self.catcache_end_xact(false);
                         return Err(e);
                     }
                     self.storage
@@ -33660,6 +34755,7 @@ impl PgHandler {
                 }
                 self.settle_notifies(true);
                 self.stats().end_xact(true);
+                self.catcache_end_xact(true);
                 ("COMMIT", chain)
             }
             TransactionControl::Rollback { chain } => {
@@ -33681,6 +34777,7 @@ impl PgHandler {
                 }
                 self.settle_notifies(false);
                 self.stats().end_xact(false);
+                self.catcache_end_xact(false);
                 ("ROLLBACK", chain)
             }
             TransactionControl::Prepare(gid) => {
@@ -33707,6 +34804,7 @@ impl PgHandler {
                     self.commit_failed
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     self.stats().end_xact(false);
+                    self.catcache_end_xact(false);
                     return Err(e);
                 }
                 self.stats().prepare(&gid);
@@ -34402,6 +35500,7 @@ impl PgHandler {
         sel: &secantus_pgplan::Select,
         max_rows: usize,
     ) -> PgWireResult<(Vec<Document>, TableDef)> {
+        let _hint = am_ssi::hint_select(sel);
         // `FOR UPDATE` over the stored table: the rows returned are locked.
         let mut row_lock: Option<secantus_pgplan::RowLock> = None;
         // A LIMIT straight over a scan of the table, nothing between them
@@ -34420,6 +35519,9 @@ impl PgHandler {
         // this point -- ORDER BY, OFFSET, LIMIT, the encoder -- works
         // on documents and does not care where they came from, which is
         // why the series is a SOURCE rather than its own statement.
+        // The join source's plan already returns its rows in the ORDER BY's
+        // order (RP-028): no Sort over it.
+        let mut presorted = false;
         let (mut docs, mut def): (Vec<Document>, TableDef) = match (&sel.series, &sel.join) {
             // `LIMIT 0`: PostgreSQL's Limit node returns before it asks its
             // subplan for a row (`ExecLimit`, a count of zero), so nothing
@@ -34434,21 +35536,56 @@ impl PgHandler {
                 // A locking select reads its subquery's rows with the stored
                 // row id of each base row along (see `LOCK_ROW_ID`).
                 // A LIMIT straight over a join, nothing between them that
-                // reads more rows than it returns.
-                let join_limit = (matches!(sub.plan.as_ref(), Statement::JoinRows(_))
-                    && sel.order.is_empty()
-                    && sel.filter.is_empty()
-                    && sel.residual.is_none()
-                    && sel.windows.is_empty())
-                .then(|| sort_bound(sel))
-                .flatten();
+                // reads more rows than it returns: no WHERE, or one whose
+                // every conjunct the join's scans and joins evaluate, so
+                // that the join's rows are the ones the LIMIT counts.
+                // With an ORDER BY of one plain column, ascending with its
+                // NULLs last, the search plans the join for the LIMIT and
+                // says whether its plan needs the Sort.
+                let join_order = match sel.order.as_slice() {
+                    [k] if k.ascending
+                        && k.expr.is_none()
+                        && !k.jsonb
+                        && matches!(k.nulls, secantus_pgplan::Nulls::Last)
+                        && sel.distinct == secantus_pgplan::Distinct::None
+                        && !sel.with_ties
+                        && sel.lock_clauses.is_empty() =>
+                    {
+                        Some(k.field.clone())
+                    }
+                    _ => None,
+                };
+                let join_limit = match sub.plan.as_ref() {
+                    Statement::JoinRows(j)
+                        if (sel.order.is_empty() || join_order.is_some())
+                            && sel.windows.is_empty()
+                            && ((sel.filter.is_empty() && sel.residual.is_none())
+                                || j.where_modelled) =>
+                    {
+                        let where_spans = !(sel.filter.is_empty() && sel.residual.is_none())
+                            && !j.where_span_aliases.is_empty();
+                        sort_bound(sel).map(|rows| {
+                            (
+                                rows,
+                                usize::try_from(sel.offset.max(0)).unwrap_or(0),
+                                where_spans,
+                            )
+                        })
+                    }
+                    _ => None,
+                };
                 GENERAL_JOIN_LIMIT.with(|c| c.set(join_limit));
+                GENERAL_JOIN_ORDER
+                    .with(|c| *c.borrow_mut() = join_order.filter(|_| join_limit.is_some()));
+                GENERAL_JOIN_PRESORTED.with(|c| c.set(false));
                 let docs = if !sel.lock_clauses.is_empty() && self.storage.in_user_txn() {
                     with_lock_row_ids(|| self.sub_source_docs(sub, &sel.filter))
                 } else {
                     self.sub_source_docs(sub, &sel.filter)
                 };
                 GENERAL_JOIN_LIMIT.with(|c| c.set(None));
+                GENERAL_JOIN_ORDER.with(|c| *c.borrow_mut() = None);
+                presorted = GENERAL_JOIN_PRESORTED.with(|c| c.replace(false));
                 (docs?, sub.def.clone())
             }
             // A top-level JOIN source: materialise it, treat its
@@ -34717,6 +35854,7 @@ impl PgHandler {
         }
 
         if !sel.order.is_empty()
+            && !presorted
             && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
         {
             materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
@@ -35239,7 +36377,12 @@ impl PgHandler {
     /// A row-producing statement as `(schema, rows)`: what a set operation
     /// needs from each of its sides.
     fn rows_with_schema(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
-        self.with_executor_hooks(|| self.rows_with_schema_inner(stmt))
+        // A statement run inside a join's rows (a leaf's subquery, a
+        // correlated subquery) builds its own joins' rows by their own
+        // projections, never the enclosing one's.
+        join_search::with_projection(None, || {
+            self.with_executor_hooks(|| self.rows_with_schema_inner(stmt))
+        })
     }
 
     fn rows_with_schema_inner(&self, stmt: &Statement) -> PgWireResult<SchemaAndRows> {
@@ -35679,6 +36822,11 @@ impl PgHandler {
         let (row_tz, row_ds, row_cenc) = (env.tz.clone(), env.ds, env.cenc);
         let tz = self.session_timezone();
         let schema_ref = schema.clone();
+        // A row's computed columns are evaluated as it is streamed, after
+        // the statement's own hooks are gone: a cancel (or the statement's
+        // deadline) is still seen there, by a `pg_sleep` in the select list
+        // among others, which slept to its end (RP-202).
+        let backend = self.backend.clone();
         // A `DECLARE CURSOR` over this SELECT arms row capture (see
         // `cursor_capture`); a plain SELECT leaves it disarmed and pays
         // only the `Option` check below -- no lock, no extra clone.
@@ -35715,14 +36863,27 @@ impl PgHandler {
                 // A computed column is applied per row -- the cast
                 // chain or the scalar call the planner recorded.
                 if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
-                    let v = if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
-                        // An expression over the row sees every
-                        // column, not just the one it is filed under.
-                        secantus_pgplan::apply_row_expr(expr, &d)
-                    } else {
-                        let v = secantus_pgplan::field_value(&d, f);
-                        secantus_pgplan::apply_column_expr(expr, v, &tz)
-                    }
+                    let stop = || -> Option<&'static str> {
+                        if backend.cancelled() {
+                            return Some("canceling statement due to user request");
+                        }
+                        backend
+                            .deadline
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .is_some_and(|d| std::time::Instant::now() >= d)
+                            .then_some("canceling statement due to statement timeout")
+                    };
+                    let v = secantus_pgplan::cancel::with_cancel_hook(&stop, || {
+                        if matches!(expr, secantus_pgplan::ColumnExpr::Row { .. }) {
+                            // An expression over the row sees every
+                            // column, not just the one it is filed under.
+                            secantus_pgplan::apply_row_expr(expr, &d)
+                        } else {
+                            let v = secantus_pgplan::field_value(&d, f);
+                            secantus_pgplan::apply_column_expr(expr, v, &tz)
+                        }
+                    })
                     .map_err(|e| PgHandler::err(&e))?;
                     encode_field_value(
                         &mut enc,
@@ -35802,12 +36963,14 @@ impl PgHandler {
     /// what an autocommit statement's implicit transaction takes.
     fn read_only_now(&self) -> bool {
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        let on = |k: &str| settings.get(k).is_some_and(|v| v == "on");
-        on("transaction_read_only")
+        let on = |slot: GucSlot, k: &'static str| {
+            settings.memo(slot, |s| s.get(k).is_some_and(|v| v == "on"))
+        };
+        on(GucSlot::ReadOnly, "transaction_read_only")
             || (!self
                 .in_transaction
                 .load(std::sync::atomic::Ordering::Relaxed)
-                && on("default_transaction_read_only"))
+                && on(GucSlot::DefaultReadOnly, "default_transaction_read_only"))
     }
 
     /// The command a READ ONLY transaction would refuse this statement as,
@@ -36891,6 +38054,12 @@ impl PgHandler {
                 matview_sql,
                 access_method,
             } => {
+                // What PostgreSQL's analysis of the query refuses, before
+                // anything is made (RP-282).
+                if matview_sql.is_some() {
+                    let bare = table.rsplit('.').next().unwrap_or(&table);
+                    self.statement_rule_refusal('m', bare, "_RETURN", 0)?;
+                }
                 if self.lookup(&table).is_some() {
                     if if_not_exists {
                         return Ok(vec![Response::Execution(Tag::new("CREATE TABLE AS"))]);
@@ -36969,7 +38138,8 @@ impl PgHandler {
                 self.execute(Statement::CreateTable(def, false), max_rows)?;
                 if !with_data {
                     if let Some(sql) = &matview_sql {
-                        self.put_matview(&table, sql, false)?;
+                        let trees = self.new_matview_trees(&table);
+                        self.put_matview(&table, sql, false, trees)?;
                     }
                     return Ok(vec![Response::Execution(Tag::new(
                         if matview_sql.is_some() {
@@ -37007,7 +38177,8 @@ impl PgHandler {
                 // Recorded after the fill: the rows go in through the INSERT
                 // path, which refuses a materialized view.
                 if let Some(sql) = &matview_sql {
-                    self.put_matview(&table, sql, true)?;
+                    let trees = self.new_matview_trees(&table);
+                    self.put_matview(&table, sql, true, trees)?;
                 }
                 Ok(vec![Response::Execution(
                     Tag::new("SELECT").with_rows(written),
@@ -37020,7 +38191,7 @@ impl PgHandler {
                     return Err(Self::catalog_write_refused(&ins.table));
                 }
                 let def = self
-                    .lookup(&ins.table)
+                    .lookup_ref(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
@@ -37126,16 +38297,23 @@ impl PgHandler {
                     self.insert_on_conflict(&ins.table, &def, ins.rows, &oc)?
                 } else {
                     self.stamp_inserted(&ins.table, &def, &mut ins.rows)?;
-                    let docs = ins
-                        .rows
-                        .iter()
-                        .map(encode_doc)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| Self::storage_err("could not encode a row", e))?;
-                    let docs = self.with_expr_fields(&ins.table, docs)?;
+                    // Handed to storage decoded as well as encoded: it
+                    // need not decode what was just encoded (RP-014). The rows
+                    // are moved there when nothing reads them after: no
+                    // RETURNING, no AFTER trigger, and a duplicate's error
+                    // needs neither its row for SSI nor its partition.
+                    let keep_rows = ins.returning.is_some()
+                        || triggered
+                        || partition::is_partitioned(&def)
+                        || self.ssi_tracking();
+                    let docs = if keep_rows {
+                        self.stored_rows(&ins.table, &ins.rows)?
+                    } else {
+                        self.stored_rows_owned(&ins.table, std::mem::take(&mut ins.rows))?
+                    };
                     let (written, errors) = self
                         .storage
-                        .insert(self.db(), &ins.table, docs, true)
+                        .insert_documents(self.db(), &ins.table, docs, true)
                         .map_err(|e| Self::storage_err("could not insert", e))?;
                     if let Some(first) = errors.first() {
                         if first.get_i32("code").unwrap_or(0) == 11000 {
@@ -41481,8 +42659,9 @@ impl PgHandler {
                     },
                     max_rows,
                 )?;
+                let trees = self.matview_trees(&matview);
                 self.delete_type_doc(Self::MATVIEW_COLLECTION, &matview)?;
-                self.put_matview(&to, &definition, populated)?;
+                self.put_matview(&to, &definition, populated, trees)?;
                 Ok(vec![Response::Execution(Tag::new(
                     "ALTER MATERIALIZED VIEW",
                 ))])
@@ -43548,6 +44727,38 @@ fn apply_column_defaults(def: &TableDef, rows: &mut [Document]) -> PgWireResult<
 /// companion, or the stored value itself. `None` is SQL NULL. The same three
 /// cases the row encoder (`project_rows`) walks, as a value rather than as
 /// wire bytes.
+/// The statement's parameters as a LATERAL item's SQL is bound with them:
+/// each `$n` its text mentions keeps its value, the rest are NULL. The text
+/// is scanned rather than parsed, so a `$1` inside a literal keeps one too;
+/// a reference is never missed.
+fn lateral_base_params(sql: &str, params: &[Bson]) -> Vec<Bson> {
+    let mut used = vec![false; params.len()];
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'$' {
+            let start = i + 1;
+            let mut j = start;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Ok(n) = sql[start..j].parse::<usize>() {
+                if (1..=params.len()).contains(&n) {
+                    used[n - 1] = true;
+                }
+            }
+            i = j.max(start);
+        } else {
+            i += 1;
+        }
+    }
+    params
+        .iter()
+        .zip(used)
+        .map(|(p, u)| if u { p.clone() } else { Bson::Null })
+        .collect()
+}
+
 fn resolve_cell(
     doc: &Document,
     field: &str,
@@ -48494,6 +49705,19 @@ impl PgHandler {
         // type oid ... are not supported yet` whenever the Bind landed on
         // such a thread -- a scheduling accident, seen only in CI.
         self.install_user_types();
+        self.portal_params_installed(portal, param_types)
+    }
+
+    /// [`Self::portal_params`] for a caller that has installed this
+    /// session's state on the thread already, as Bind's check has.
+    fn portal_params_installed<S>(
+        &self,
+        portal: &Portal<S>,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Vec<Bson>>
+    where
+        S: Clone + Send + Sync,
+    {
         // Sized by the plan's list, which covers every `$n` in the SQL even
         // when the client's oid list is shorter (or empty).
         let n = portal
@@ -48598,6 +49822,11 @@ impl PgHandler {
         declared: Option<&Type>,
         value: &Bson,
     ) -> PgWireResult<()> {
+        // With no enum at all, no parameter is one: asked of every parameter
+        // of every Bind, so the list is not built to find that (RP-014).
+        if self.type_catalog_docs(Self::ENUM_COLLECTION)?.is_empty() {
+            return Ok(());
+        }
         let enums = self.enums()?;
         let by_oid = |oid: i64| enums.iter().find(|(_, o, _)| *o == oid);
         let found = match declared.map(|t| t.kind()) {
@@ -48667,12 +49896,66 @@ impl PgHandler {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .generation();
-        let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
-        let (v, g, role, template) = cache.get(key)?;
-        if *v != version || *g != generation {
-            return None;
-        }
-        let (stand_ins, plan) = template.as_ref()?;
+        let (role, template) = {
+            let cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let entry = cache.get(key)?;
+            let (v, g, role, template) = entry;
+            if *v != version || *g != generation {
+                return None;
+            }
+            let template = Arc::clone(template.as_ref()?);
+            *self.plan_last.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some((key.clone(), entry.clone()));
+            (role.clone(), template)
+        };
+        self.substitute_template(&role, &template, params)
+    }
+
+    /// [`Self::templated_plan`] for the key of `sql`, `param_types` and
+    /// `params`, answered from `plan_last` -- `None` when that holds
+    /// another key, or no template valid now.
+    fn templated_plan_last(
+        &self,
+        sql: &str,
+        params: &[Bson],
+        param_types: &[Option<String>],
+    ) -> Option<Statement> {
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let (role, template) = {
+            let last = self.plan_last.lock().unwrap_or_else(|e| e.into_inner());
+            let ((k_sql, k_types, k_tags), (v, g, role, template)) = last.as_ref()?;
+            let same_key = k_sql == sql
+                && k_types.as_slice() == param_types
+                && k_tags.len() == params.len()
+                && k_tags
+                    .iter()
+                    .zip(params)
+                    .all(|(t, p)| *t == p.element_type() as u8);
+            if !same_key || *v != version || *g != generation {
+                return None;
+            }
+            (role.clone(), Arc::clone(template.as_ref()?))
+        };
+        self.substitute_template(&role, &template, params)
+    }
+
+    /// A valid template's plan with `params` substituted: `None` when they
+    /// do not fit its stand-ins or the role is not the one it was learned
+    /// for.
+    fn substitute_template(
+        &self,
+        role: &str,
+        template: &(Vec<Bson>, Statement),
+        params: &[Bson],
+    ) -> Option<Statement> {
+        let (stand_ins, plan) = template;
         if !plan_cache::fits(params, stand_ins) {
             return None;
         }
@@ -48713,7 +49996,7 @@ impl PgHandler {
         if *v != version || *g != generation || *role != self.current_role_name() {
             return None;
         }
-        let (stand_ins, plan) = template.as_ref()?;
+        let (stand_ins, plan) = &**template.as_ref()?;
         let values = plan_cache::as_kinds_of(&family.values, stand_ins)?;
         plan_cache::substitute(plan, stand_ins, &values)
     }
@@ -48798,7 +50081,7 @@ impl PgHandler {
                 if def.as_ref().is_some_and(|d| d.temp) {
                     touched_temp.set(true);
                 }
-                def
+                def.map(TableRef::into_owned)
             };
             let plan = |values: &[Bson]| {
                 let written = match family {
@@ -48846,9 +50129,10 @@ impl PgHandler {
             if !storable {
                 return None;
             }
-            plan_cache::is_template(&plan_a, &plan_b, &a, &b).then_some((a, plan_a))
+            plan_cache::is_template(&plan_a, &plan_b, &a, &b).then(|| Arc::new((a, plan_a)))
         })();
         let mut cache = self.plan_cache.lock().unwrap_or_else(|e| e.into_inner());
+        *self.plan_last.lock().unwrap_or_else(|e| e.into_inner()) = None;
         if cache.len() >= 256 {
             cache.clear();
         }
@@ -48900,16 +50184,33 @@ impl PgHandler {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed);
+        let valid =
+            |(v, g, r, _): &DescribeEntry| *v == catalog_version && *g == generation && *r == role;
+        {
+            let last = self.describe_last.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((k, entry)) = last.as_ref() {
+                if k.0 == sql
+                    && k.1 == n_params
+                    && k.2.as_slice() == param_types
+                    && k.3 == binary
+                    && valid(entry)
+                {
+                    return Ok(entry.3.clone());
+                }
+            }
+        }
         let key: DescribeKey = (sql.to_string(), n_params, param_types.to_vec(), binary);
-        if let Some((v, g, r, fields)) = self
+        let hit = self
             .describe_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&key)
-        {
-            if *v == catalog_version && *g == generation && *r == role {
-                return Ok(fields.clone());
-            }
+            .filter(|entry| valid(entry))
+            .cloned();
+        if let Some(entry) = hit {
+            let fields = entry.3.clone();
+            *self.describe_last.lock().unwrap_or_else(|e| e.into_inner()) = Some((key, entry));
+            return Ok(fields);
         }
         let ran_subquery = std::cell::Cell::new(false);
         let params = vec![Bson::Null; n_params];
@@ -49516,14 +50817,30 @@ impl ExtendedQueryHandler for PgHandler {
             }
         }
         let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
-        self.check_bound_portal(&portal, message.result_column_format_codes.len())
+        let state = self.param_decoding_state();
+        let (param_types, params) = self
+            .check_bound_portal(&portal, message.result_column_format_codes.len())
             .inspect_err(|_| self.note_failure())?;
         self.note_wire_portal(
             &portal.name,
             &portal.statement.statement.sql,
             &portal.result_column_format,
         );
-        pgwire::api::store::PortalStore::put_portal(client.portal_store(), Arc::new(portal));
+        let portal = Arc::new(portal);
+        // Kept for the portal's Execute only while what the decoding read
+        // was the same before it as after (`BoundParams`).
+        let bound = match (state, self.param_decoding_state()) {
+            (Some(before), Some(after)) if before == after => Some(BoundParams {
+                portal: Arc::clone(&portal),
+                generation: after.0,
+                catalog_version: after.1,
+                param_types,
+                params,
+            }),
+            _ => None,
+        };
+        *self.bound_params.lock().unwrap_or_else(|e| e.into_inner()) = bound;
+        pgwire::api::store::PortalStore::put_portal(client.portal_store(), portal);
         client
             // Buffered to the Sync / Flush that follows, as ParseComplete is.
             .feed(PgWireBackendMessage::BindComplete(
@@ -49580,7 +50897,10 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.install_user_types();
+        // No session state is installed on the thread here: nothing below
+        // reads it but planning, and `describe_fields` installs it before
+        // it plans. A described statement's answer comes from its memo
+        // without (RP-014).
         self.note_result_format(&target.result_column_format);
         self.check_cached_result_type(target.statement.as_ref())?;
         let param_types = self.param_type_names(target.statement.as_ref());
@@ -49619,20 +50939,42 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.note_result_format(&portal.result_column_format);
-        let mut param_types = secantus_pgplan::infer_param_types(
-            &portal.statement.statement.sql,
-            &self.param_type_names(portal.statement.as_ref()),
-        );
-        self.type_untyped_binary_params(portal, &mut param_types);
+        self.set_statement_source(&portal.statement.statement.sql, 0);
+        // What Bind decoded, when nothing it read has changed since: the
+        // same values decoding again would give.
+        let bound = self.take_bound_params(portal);
+        let mut param_types = match &bound {
+            Some((types, _)) => types.clone(),
+            None => secantus_pgplan::infer_param_types(
+                &portal.statement.statement.sql,
+                &self.param_type_names(portal.statement.as_ref()),
+            ),
+        };
+        if bound.is_none() {
+            self.type_untyped_binary_params(portal, &mut param_types);
+        }
         // Every statement between two `Sync`s runs in ONE transaction that
         // the `Sync` commits -- or rolls back, if any of them failed. A
         // pipelining client counts on the rollback: after an error, nothing
         // before it in the pipeline may have landed either.
         self.open_extended_group()?;
         self.check_cached_result_type(portal.statement.as_ref())?;
-        let params = self
-            .portal_params(portal, &param_types)
-            .inspect_err(|_| self.note_failure())?;
+        let params = match bound {
+            Some((_, params)) => {
+                // `portal_params` installs the session's state on the
+                // thread; what follows reads it -- only a catalog change's
+                // effects (`catalog_effects`) before the statement installs
+                // it again itself (`run_typed_inner`), so a statement that
+                // changes no catalog skips this one (RP-014).
+                if catalog_reads::changes_catalogs(&portal.statement.statement.sql) {
+                    self.install_user_types();
+                }
+                params
+            }
+            None => self
+                .portal_params(portal, &param_types)
+                .inspect_err(|_| self.note_failure())?,
+        };
         // The WHOLE result, not `max_rows` of it: the portal hands it out
         // `max_rows` at a time and a later Execute resumes it, as
         // PostgreSQL's does. Truncating here left the resumed portal empty
@@ -49673,30 +51015,34 @@ impl ExtendedQueryHandler for PgHandler {
 /// planned: what runs ahead of planning (the privilege check) must not
 /// take the block's snapshot for it either.
 fn sql_takes_no_snapshot(sql: &str) -> bool {
-    let first: String = sql
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_lowercase();
+    // The leading ASCII letters, compared without a copy (asked of every
+    // statement, RP-014): none of the words is longer than 10 letters.
+    let sql = sql.trim_start();
+    let len = sql.bytes().take_while(u8::is_ascii_alphabetic).count();
+    if len > 10 {
+        return false;
+    }
+    let mut buf = [0u8; 10];
+    buf[..len].copy_from_slice(&sql.as_bytes()[..len]);
+    buf[..len].make_ascii_lowercase();
     matches!(
-        first.as_str(),
-        "set"
-            | "show"
-            | "reset"
-            | "lock"
-            | "listen"
-            | "notify"
-            | "unlisten"
-            | "begin"
-            | "start"
-            | "commit"
-            | "end"
-            | "rollback"
-            | "abort"
-            | "savepoint"
-            | "release"
-            | "checkpoint"
+        &buf[..len],
+        b"set"
+            | b"show"
+            | b"reset"
+            | b"lock"
+            | b"listen"
+            | b"notify"
+            | b"unlisten"
+            | b"begin"
+            | b"start"
+            | b"commit"
+            | b"end"
+            | b"rollback"
+            | b"abort"
+            | b"savepoint"
+            | b"release"
+            | b"checkpoint"
     )
 }
 
@@ -50616,6 +51962,135 @@ mod wire_format_tests {
             hex(&element_binary(&Bson::String("{\"a\": 1}".into()), &Type::JSONB).unwrap()),
             "017b2261223a20317d"
         );
+    }
+}
+
+#[cfg(test)]
+mod virtual_relation_tests {
+    use super::*;
+
+    /// The names a source region matches on, as `"name" =>` arms (an arm
+    /// may list several, `"a" | "b" =>`).
+    fn arm_names(src: &str, from: &str, to: &str) -> Vec<String> {
+        let start = src.find(from).expect("region start");
+        let end = start + src[start..].find(to).expect("region end");
+        // A literal before `|` or `=>`, or after `|`: an arm spread over
+        // lines (`"a"\n | "b" =>`) too.
+        let pattern = regex::Regex::new(r#""([^"]+)"\s*(?:\||=>)|\|\s*"([^"]+)""#).unwrap();
+        let names: Vec<String> = pattern
+            .captures_iter(&src[start..end])
+            .filter_map(|c| c.get(1).or_else(|| c.get(2)))
+            .map(|m| m.as_str().to_string())
+            .collect();
+        assert!(names.len() >= 5, "too few names in {from}: {names:?}");
+        names
+    }
+
+    /// `virtual_table_base` answers `None` for a name `may_be_virtual`
+    /// refuses without looking further, so every virtual relation's name
+    /// must pass it.
+    #[test]
+    fn virtual_relation_names_are_prefixed() {
+        let mut names: Vec<String> = Vec::new();
+        names.extend(arm_names(
+            include_str!("lib.rs"),
+            "    fn virtual_table_base(name: &str)",
+            "    fn builtin_catalog_rows(",
+        ));
+        names.extend(arm_names(
+            include_str!("catalog_objects.rs"),
+            "    pub(crate) fn catalog_object_table(",
+            "\n    }\n",
+        ));
+        names.extend(arm_names(
+            include_str!("fdw.rs"),
+            "pub(crate) fn fdw_catalog_def(",
+            "\n}\n",
+        ));
+        names.extend(
+            secantus_pgplan::ts_catalog::NAMES
+                .iter()
+                .map(|n| n.to_string()),
+        );
+        names.extend(system_catalogs::all_names().map(str::to_string));
+        assert!(names.len() > 100, "too few names found: {}", names.len());
+        for n in &names {
+            assert!(
+                PgHandler::may_be_virtual(n),
+                "{n} is not `pg_` or `information_schema.`"
+            );
+            if system_catalogs::is_system_catalog(n) {
+                assert!(PgHandler::virtual_table_base(n).is_some(), "{n}");
+            }
+        }
+        assert!(PgHandler::virtual_table_base("lotsa_rows_table").is_none());
+    }
+}
+
+#[cfg(test)]
+mod stored_form_tests {
+    use super::*;
+
+    /// `Storage::insert_documents` takes each row's stored document beside
+    /// its encoding instead of decoding the encoding: the two must be what
+    /// storage's own decoding of those bytes gives, for every kind of value
+    /// a row holds -- a value document that looks like extended JSON, and a
+    /// composite key, among them.
+    #[test]
+    fn a_stored_document_is_its_encodings_decoding() {
+        let rows = vec![
+            bson::doc! {
+                "_id": "k",
+                "i32": 1_i32,
+                "i64": 2_i64,
+                "f": -0.0_f64,
+                "nan": f64::NAN,
+                "s": "text",
+                "b": true,
+                "n": Bson::Null,
+                "d": bson::DateTime::from_millis(1_700_000_000_000),
+                "dec": Bson::Decimal128("1.50".parse().unwrap()),
+                "bin": Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid,
+                    bytes: vec![7; 16],
+                }),
+                "old": Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::BinaryOld,
+                    bytes: vec![1, 2, 3],
+                }),
+                "arr": [1_i32, "two", Bson::Null, [3_i64]],
+                "num": { "__numeric": "1e400", "__numkey": 1.0_f64 },
+                "ej": { "$numberLong": "1" },
+                "ej2": { "$date": { "$numberLong": "5" } },
+                "ts": Bson::Timestamp(bson::Timestamp { time: 1, increment: 2 }),
+                "re": Bson::RegularExpression(bson::Regex {
+                    pattern: "a.c".into(),
+                    options: "i".into(),
+                }),
+                "min": Bson::MinKey,
+                "max": Bson::MaxKey,
+                "__sys_xmin": 5_i64,
+            },
+            bson::doc! { "_id.a": 1_i32, "_id.b": "x", "v": 2_i32 },
+            bson::doc! { "v": 3_i32, "_id": { "__numeric": "9", "__numkey": 9.0_f64 } },
+        ];
+        for row in &rows {
+            let stored = stored_form(row);
+            let bytes = bson::to_vec(&stored).unwrap();
+            assert_eq!(bytes, encode_doc(row).unwrap(), "{row}");
+            let read = secantus_core::bsondoc::from_bytes(&bytes).unwrap();
+            // NaN is not equal to itself: compare encodings too.
+            assert_eq!(bson::to_vec(&read).unwrap(), bytes, "{row}");
+            if !row.contains_key("nan") {
+                assert_eq!(read, stored, "{row}");
+            } else {
+                let mut a = read.clone();
+                let mut b = stored.clone();
+                a.remove("nan");
+                b.remove("nan");
+                assert_eq!(a, b, "{row}");
+            }
+        }
     }
 }
 
@@ -51961,6 +53436,89 @@ fn hash_table_order_on(
     tagged.sort_by_key(|(b, _)| *b);
     rows.extend(tagged.into_iter().map(|(_, d)| d));
     true
+}
+
+/// The order a hash join's table leaves `rows` in when they outgrow the
+/// buckets it was sized for (`rows_estimate`, single batch): each insert
+/// (`ExecHashTableInsert`) counts its tuple and doubles the optimal bucket
+/// count past one tuple a bucket (`NTUP_PER_BUCKET`), and the build's end
+/// rebuilds the chains at that count (`ExecHashIncreaseNumBuckets`),
+/// walking the dense-allocation chunks newest first, each in insertion
+/// order, pushing every tuple onto its bucket's head. A chunk holds 32 kB
+/// of tuples (`HASH_CHUNK_SIZE`), each `MAXALIGN(HJTUPLE_OVERHEAD +
+/// t_len)`: the minimal tuple of `cols`, all `typlen` bytes wide, behind
+/// a header with the null bitmap when one is NULL. The rows come back by
+/// bucket, each bucket's chain in order, rows never inserted (a NULL key
+/// an inner join drops, unless `keep_nulls`) last. `None` when the table
+/// does not grow (the caller's order stands) or a key's hash is not
+/// modelled.
+pub(crate) fn hash_grown_order(
+    rows: &[Document],
+    key: &str,
+    ty: &str,
+    rows_estimate: f64,
+    keep_nulls: bool,
+    cols: &[String],
+    typlen: i64,
+) -> Option<Vec<Document>> {
+    const HASH_CHUNK_SIZE: usize = 32 * 1024;
+    const HJTUPLE_OVERHEAD: usize = 16;
+    let maxalign = |n: usize| n.div_ceil(8) * 8;
+    let nbuckets = secantus_pgplan::joincost::hash_buckets(rows_estimate);
+    let mut optimal = nbuckets;
+    // (row, hash) of each tuple inserted, in insertion order.
+    let mut inserted: Vec<(usize, u32)> = Vec::new();
+    let mut dropped = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let hash = match row.get(key).unwrap_or(&Bson::Null) {
+            Bson::Null if keep_nulls => 0,
+            Bson::Null => {
+                dropped.push(i);
+                continue;
+            }
+            v => secantus_pgplan::joincost::hash_value(v, ty)?,
+        };
+        inserted.push((i, hash));
+        if inserted.len() > optimal {
+            optimal *= 2;
+        }
+    }
+    if optimal == nbuckets {
+        return None;
+    }
+    // Each tuple's chunk (`dense_alloc`): a new chunk, at the list's head,
+    // when the current one has no room left.
+    let mut chunks: Vec<Vec<(usize, u32)>> = Vec::new();
+    let mut used = 0usize;
+    for &(i, hash) in &inserted {
+        let row = &rows[i];
+        let nulls = cols
+            .iter()
+            .filter(|c| matches!(row.get(c.as_str()), None | Some(Bson::Null)))
+            .count();
+        let hoff = maxalign(15 + if nulls > 0 { cols.len().div_ceil(8) } else { 0 });
+        let t_len = hoff + (cols.len() - nulls) * typlen as usize;
+        let size = maxalign(HJTUPLE_OVERHEAD + t_len);
+        if chunks.is_empty() || HASH_CHUNK_SIZE - used < size {
+            chunks.push(Vec::new());
+            used = 0;
+        }
+        used += size;
+        chunks.last_mut().expect("a chunk").push((i, hash));
+    }
+    let mask = optimal as u32 - 1;
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); optimal];
+    for chunk in chunks.iter().rev() {
+        for &(i, hash) in chunk {
+            buckets[(hash & mask) as usize].push(i);
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for chain in buckets {
+        out.extend(chain.into_iter().rev().map(|i| rows[i].clone()));
+    }
+    out.extend(dropped.into_iter().map(|i| rows[i].clone()));
+    Some(out)
 }
 
 /// Whether the plan `method` reads `b` (the right side) as its outer: the

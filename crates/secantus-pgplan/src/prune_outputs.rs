@@ -57,6 +57,7 @@ pub(crate) fn rewrite(
 /// output, so the statement fails or answers exactly as before. Nothing the
 /// trial plan raises or records survives it.
 fn plans_alone(body: &pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) -> bool {
+    let _trial = Trial::enter();
     let joins = crate::joins::planned_joins_len();
     let warnings = crate::warnings_len();
     let notices = crate::fts::notices_len();
@@ -79,6 +80,7 @@ fn plans_alone(body: &pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) -> bool {
 /// so a DATA error (class 22, `s.a / 0`) there is evaluation, not the
 /// parse analysis this check is for, and does not count.
 fn lateral_plans(trial: &pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) -> bool {
+    let _trial = Trial::enter();
     let joins = crate::joins::planned_joins_len();
     let warnings = crate::warnings_len();
     let notices = crate::fts::notices_len();
@@ -96,6 +98,78 @@ fn lateral_plans(trial: &pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) -> bool 
         Ok(_) => true,
         Err(e) => e.sqlstate().starts_with("22"),
     }
+}
+
+thread_local! {
+    /// Trial plans in progress (`plans_alone`, `lateral_plans`).
+    static TRIALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A trial plan in progress, until dropped.
+struct Trial;
+
+impl Trial {
+    fn enter() -> Self {
+        TRIALS.with(|t| t.set(t.get() + 1));
+        Trial
+    }
+}
+
+impl Drop for Trial {
+    fn drop(&mut self) {
+        TRIALS.with(|t| t.set(t.get().saturating_sub(1)));
+    }
+}
+
+/// Prune the FROM-subqueries of `sel` itself, not those inside them: each
+/// is pruned in its turn when it is planned. For the subqueries a VIEW
+/// expands into, which exist only once `plan_select` has expanded it -- after
+/// [`rewrite`] ran over the statement. `None` when nothing changed.
+pub(crate) fn rewrite_from_items(
+    sel: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let n = count_from_subqueries(&sel.from_clause);
+    // Not inside a trial plan: a trial only asks whether the body plans, and
+    // a LATERAL trial holds the very FROM list being pruned.
+    if n == 0 || sel.larg.is_some() || TRIALS.with(std::cell::Cell::get) > 0 {
+        return None;
+    }
+    // Only a view's subquery is new since the statement-wide pass.
+    fn from_view(item: &pg_query::protobuf::Node) -> bool {
+        match item.node.as_ref() {
+            Some(N::RangeSubselect(rs)) => {
+                !rs.lateral
+                    && rs
+                        .alias
+                        .as_ref()
+                        .is_some_and(|a| crate::is_expanded_view(&a.aliasname))
+            }
+            Some(N::JoinExpr(j)) => [j.larg.as_deref(), j.rarg.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(from_view),
+            _ => false,
+        }
+    }
+    if !sel.from_clause.iter().any(from_view) {
+        return None;
+    }
+    let ctx = Ctx { lookup, params };
+    let mut out = sel.clone();
+    let mut any = false;
+    for _ in 0..=n {
+        let mut changed = false;
+        for i in 0..n {
+            changed |= prune_one(&mut out, i, &ctx);
+        }
+        if !changed {
+            break;
+        }
+        any = true;
+    }
+    any.then_some(out)
 }
 
 fn rewrite_select(sel: &mut pg_query::protobuf::SelectStmt, ctx: &Ctx<'_>) {
@@ -659,17 +733,35 @@ fn prune_select(s: &mut pg_query::protobuf::SelectStmt, keep: &[bool]) -> bool {
         let Some(N::ResTarget(rt)) = s.target_list[k].node.as_ref() else {
             continue;
         };
-        if !rt.name.is_empty() && names.contains(&rt.name) {
-            continue;
-        }
         let Some(val) = rt.val.as_deref() else {
             continue;
         };
+        // The output's name, written or figured (`FigureColname`): one the
+        // subquery's own clauses name is kept (`ressortgroupref`), and a
+        // removed one keeps it, as PostgreSQL's target entry keeps its
+        // `resname` -- a NULL in its place would be `?column?`, and an ORDER
+        // BY naming the output would then read the table's column instead.
+        let own = if rt.name.is_empty() {
+            figure_colname(val)
+        } else {
+            None
+        };
+        let name = if rt.name.is_empty() {
+            own.as_deref()
+        } else {
+            Some(rt.name.as_str())
+        };
+        if name.is_some_and(|n| names.contains(n)) {
+            continue;
+        }
         if is_null(val) || is_count_star(val) || !removable(val) {
             continue;
         }
         let mut next = s.target_list[k].clone();
         if let Some(N::ResTarget(rt)) = next.node.as_mut() {
+            if let Some(own) = own {
+                rt.name = own;
+            }
             rt.val = Some(Box::new(null_const()));
         }
         let previous = std::mem::replace(&mut s.target_list[k], next);
@@ -757,10 +849,50 @@ fn removable(val: &pg_query::protobuf::Node) -> bool {
     let mut ok = true;
     let mut node = val.clone();
     let _ = walk_expr(&mut node, &mut |n| {
+        // A string literal cast to a type (`'FUNCTION'::text`, `'-1'::int4`)
+        // is read by the type's input function during parse analysis, which
+        // refuses it there or never: one this server's input reads too is no
+        // reason to keep the output (see `node_removable`).
+        if let Some(N::TypeCast(tc)) = n.node.as_mut() {
+            let literal = match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(N::AConst(a)) => match a.val.as_ref() {
+                    Some(pg_query::protobuf::a_const::Val::Sval(s)) => Some(s.sval.clone()),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let (Some(text), Some(tn)) = (literal, tc.type_name.as_ref()) {
+                let target = crate::type_name_of(tn);
+                let reads = matches!(target.as_str(), "text" | "varchar" | "bpchar" | "name")
+                    || target == crate::QUOTED_CHAR
+                    || crate::cast_value(Bson::String(text), &target).is_ok();
+                if reads {
+                    tc.arg = Some(Box::new(null_const()));
+                }
+            }
+        }
         ok &= node_removable(n);
         Ok(())
     });
     ok
+}
+
+/// A built-in PostgreSQL 15.19 marks volatile, set-returning, or as an
+/// aggregate, window function or procedure in any of its overloads
+/// (`SELECT DISTINCT proname FROM pg_proc WHERE provolatile = 'v' OR
+/// proretset OR prokind <> 'f'`): a call PostgreSQL's
+/// `remove_unused_subquery_outputs` keeps (`contain_volatile_functions`,
+/// `expression_returns_set`), or one decided by the aggregate rules here.
+fn unprunable_builtin(name: &str) -> bool {
+    static SET: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        include_str!("pg15_unprunable_functions.tsv")
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+    .contains(name)
 }
 
 fn node_removable(n: &pg_query::protobuf::Node) -> bool {
@@ -792,6 +924,8 @@ fn node_removable(n: &pg_query::protobuf::Node) -> bool {
             | N::NamedArgExpr(_)
             | N::AIndirection(_)
             | N::AIndices(_)
+            // A field selection's name (`(ss.x).n`), not an expression.
+            | N::String(_)
             | N::ParamRef(_)
             | N::SqlvalueFunction(_),
         ) => true,
@@ -802,9 +936,15 @@ fn node_removable(n: &pg_query::protobuf::Node) -> bool {
             if crate::correlated::user_function_named(&name) || returns_set(&name) {
                 return false;
             }
+            // A STABLE built-in is removed as an IMMUTABLE one is: only a
+            // volatile or set-returning call keeps its output.
             f.over.is_some()
                 || crate::aggregate_func(&name, f.agg_within_group).is_some()
                 || crate::correlated::immutable_builtin(&name, f.args.len())
+                || (f.funcname.len() <= 2
+                    && crate::funcsig::is_builtin_function_name(&name)
+                    && !unprunable_builtin(&name)
+                    && !crate::correlated::user_function_bare_named(&name))
         }
         Some(N::SubLink(sl)) => match sl.subselect.as_deref().and_then(|q| q.node.as_ref()) {
             Some(N::SelectStmt(body)) => sublink_removable(body),

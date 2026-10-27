@@ -37,6 +37,9 @@ thread_local! {
 /// held as `public.int4`: the bare name is the built-in, searched first
 /// (measured on 15.19), so only the qualified name reaches the domain.
 pub fn set_user_domains(mut domains: Vec<Domain>) {
+    // A constant cast to a domain is kept under the resolution epoch
+    // (`expr_memo::folded`); a domain's constraints are part of its value.
+    crate::schemas::bump_resolve_epoch();
     for d in &mut domains {
         if crate::pgtypes::shadowed_by_catalog(&d.name) {
             d.name = format!("public.{}", d.name);
@@ -142,9 +145,14 @@ pub fn domain_base(name: &str) -> Option<String> {
 /// Check `value` against domain `name`: 23502 for a NULL the domain refuses,
 /// 23514 naming the first CHECK that is false.
 pub fn domain_check(name: &str, value: &Bson) -> Result<()> {
-    let Some(d) = user_domain(name) else {
-        return Ok(());
-    };
+    match user_domain(name) {
+        Some(d) => check_domain(&d, value),
+        None => Ok(()),
+    }
+}
+
+/// `domain_check` for a domain already looked up.
+pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
     if *value == Bson::Null && d.not_null {
         return Err(Error::Sqlstate(
             "23502",
@@ -154,46 +162,10 @@ pub fn domain_check(name: &str, value: &Bson) -> Result<()> {
     // Every CHECK is evaluated on NULL too; `value > 0` is NULL, which
     // passes, but `value IS NOT NULL` fails.
     for (cname, expr) in &d.checks {
-        let parsed =
-            pg_query::parse(&format!("SELECT {expr}")).map_err(|e| Error::Parse(e.to_string()))?;
-        let Some(N::SelectStmt(sel)) = parsed
-            .protobuf
-            .stmts
-            .first()
-            .and_then(|s| s.stmt.as_ref())
-            .and_then(|s| s.node.clone())
-        else {
+        let Some(node) = check_node(&d.base, expr)? else {
             continue;
         };
-        let Some(N::ResTarget(rt)) = sel.target_list.first().and_then(|t| t.node.clone()) else {
-            continue;
-        };
-        let Some(mut node) = rt.val.map(|v| *v) else {
-            continue;
-        };
-        // `VALUE` is the value being checked, typed as the base type.
-        walk_expr(&mut node, &mut |n| {
-            if let Some(N::ColumnRef(c)) = n.node.as_ref() {
-                if column_ref_name(c).is_some_and(|v| v.eq_ignore_ascii_case("value"))
-                    && c.fields.len() == 1
-                {
-                    *n = pg_query::protobuf::Node {
-                        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-                            arg: Some(Box::new(pg_query::protobuf::Node {
-                                node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
-                                    number: 1,
-                                    location: -1,
-                                })),
-                            })),
-                            type_name: Some(type_name_node(&d.base)),
-                            location: -1,
-                        }))),
-                    };
-                }
-            }
-            Ok(())
-        })?;
-        if const_value(&node, std::slice::from_ref(value))? == Bson::Boolean(false) {
+        if check_fails(&d.base, expr, &node, value)? {
             return Err(Error::Sqlstate(
                 "23514",
                 format!(
@@ -204,6 +176,123 @@ pub fn domain_check(name: &str, value: &Bson) -> Result<()> {
         }
     }
     Ok(())
+}
+
+thread_local! {
+    /// The verdicts of CHECKs that read nothing but their value, by base
+    /// type, expression and value: `information_schema`'s columns cast to
+    /// `cardinal_number` once a row each, and evaluating `VALUE >= 0` every
+    /// time was a quarter of a view's time (RP-131).
+    static CHECK_VERDICTS: std::cell::RefCell<std::collections::HashMap<(String, String, i64, u8), bool>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Whether the CHECK `expr` (prepared as `node`) is false for `value`. An
+/// integer, boolean or NULL value of a CHECK built only of operators,
+/// casts and constants -- no function, which may be volatile, and no
+/// subquery -- answers the same every time, under any session setting, and
+/// is remembered.
+fn check_fails(
+    base: &str,
+    expr: &str,
+    node: &pg_query::protobuf::Node,
+    value: &Bson,
+) -> Result<bool> {
+    let key = match value {
+        Bson::Int32(v) => Some((i64::from(*v), 0u8)),
+        Bson::Int64(v) => Some((*v, 1)),
+        Bson::Boolean(b) => Some((i64::from(*b), 2)),
+        Bson::Null => Some((0, 3)),
+        _ => None,
+    }
+    .filter(|_| {
+        !crate::expr_any(node, &|n| {
+            matches!(n.node.as_ref(), Some(N::FuncCall(_) | N::SubLink(_)))
+        })
+    });
+    let Some((v, tag)) = key else {
+        return Ok(const_value(node, std::slice::from_ref(value))? == Bson::Boolean(false));
+    };
+    let k = (base.to_string(), expr.to_string(), v, tag);
+    if let Some(hit) = CHECK_VERDICTS.with(|c| c.borrow().get(&k).copied()) {
+        return Ok(hit);
+    }
+    let fails = const_value(node, std::slice::from_ref(value))? == Bson::Boolean(false);
+    CHECK_VERDICTS.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= 8192 {
+            c.clear();
+        }
+        c.insert(k, fails);
+    });
+    Ok(fails)
+}
+
+/// A domain CHECK's prepared expression (`check_node`).
+type CheckNode = Option<std::rc::Rc<pg_query::protobuf::Node>>;
+
+thread_local! {
+    /// Each CHECK's expression tree with `VALUE` bound to `$1`, by base type
+    /// and expression text. A cast to an `information_schema` domain runs
+    /// once a row, and parsing the CHECK again for each was most of an
+    /// `information_schema` view's time (RP-131).
+    static CHECK_NODES: std::cell::RefCell<std::collections::HashMap<(String, String), CheckNode>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// A domain CHECK's expression, `VALUE` replaced by `$1::<base>`; `None`
+/// when the text is not a single expression.
+fn check_node(base: &str, expr: &str) -> Result<CheckNode> {
+    let key = (base.to_string(), expr.to_string());
+    if let Some(hit) = CHECK_NODES.with(|c| c.borrow().get(&key).cloned()) {
+        return Ok(hit);
+    }
+    let parsed =
+        pg_query::parse(&format!("SELECT {expr}")).map_err(|e| Error::Parse(e.to_string()))?;
+    let node = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.clone())
+        .and_then(|n| match n {
+            N::SelectStmt(sel) => sel.target_list.first().and_then(|t| t.node.clone()),
+            _ => None,
+        })
+        .and_then(|n| match n {
+            N::ResTarget(rt) => rt.val.map(|v| *v),
+            _ => None,
+        });
+    let node = match node {
+        Some(mut node) => {
+            // `VALUE` is the value being checked, typed as the base type.
+            walk_expr(&mut node, &mut |n| {
+                if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                    if column_ref_name(c).is_some_and(|v| v.eq_ignore_ascii_case("value"))
+                        && c.fields.len() == 1
+                    {
+                        *n = pg_query::protobuf::Node {
+                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                arg: Some(Box::new(pg_query::protobuf::Node {
+                                    node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
+                                        number: 1,
+                                        location: -1,
+                                    })),
+                                })),
+                                type_name: Some(type_name_node(base)),
+                                location: -1,
+                            }))),
+                        };
+                    }
+                }
+                Ok(())
+            })?;
+            Some(std::rc::Rc::new(node))
+        }
+        None => None,
+    };
+    CHECK_NODES.with(|c| c.borrow_mut().insert(key, node.clone()));
+    Ok(node)
 }
 
 /// A constraint list's pieces: NOT NULL, named CHECKs (unnamed ones take

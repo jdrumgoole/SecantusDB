@@ -271,6 +271,20 @@ fn index_cost(
     colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64, f64)> {
+    index_cost_loops(rel, index, quals, colsel, full, 1.0)
+}
+
+/// `index_cost` for a scan repeated `loop_count` times, once per outer row
+/// of a nested loop (`genericcostestimate`'s `num_outer_scans`): the index
+/// pages all the scans fetch, by Mackert and Lohman, pro-rated per scan.
+fn index_cost_loops(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    colsel: ColSel,
+    full: bool,
+    loop_count: f64,
+) -> Option<(f64, f64, f64)> {
     let iq: Vec<&Qual> = quals
         .iter()
         .filter(|(f, q)| {
@@ -310,8 +324,9 @@ fn index_cost(
     } else {
         1.0
     };
-    let mut total = if num_sa > 1.0 {
-        index_pages_fetched(index_pages * num_sa, index.pages) * RANDOM_PAGE_COST
+    let num_scans = num_sa * loop_count;
+    let mut total = if num_scans > 1.0 {
+        index_pages_fetched(index_pages * num_scans, index.pages) * RANDOM_PAGE_COST / loop_count
     } else {
         index_pages * RANDOM_PAGE_COST
     };
@@ -406,19 +421,48 @@ fn index_scan(
     colsel: ColSel,
     full: bool,
 ) -> Option<(f64, f64)> {
-    let (startup, index_total, sel) = index_cost(rel, index, quals, colsel, full)?;
+    index_scan_loops(rel, index, quals, colsel, full, 1.0)
+}
+
+/// `index_scan` repeated `loop_count` times (`cost_index`'s `loop_count >
+/// 1`): the heap pages every scan fetches by Mackert and Lohman, all at
+/// random, pro-rated per scan, between the uncorrelated count and the
+/// selectivity's share of the pages.
+fn index_scan_loops(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    colsel: ColSel,
+    full: bool,
+    loop_count: f64,
+) -> Option<(f64, f64)> {
+    let (startup, index_total, sel) =
+        index_cost_loops(rel, index, quals, colsel, full, loop_count)?;
     let tuples_fetched = clamp_row_est(sel * rel.tuples);
-    let mut max_pages = index_pages_fetched(tuples_fetched, rel.pages);
-    let mut min_pages = (sel * rel.pages).ceil();
-    if index.visible > 0.0 {
-        max_pages = (max_pages * (1.0 - index.visible)).ceil();
-        min_pages = (min_pages * (1.0 - index.visible)).ceil();
-    }
-    let max_io = max_pages * RANDOM_PAGE_COST;
-    let min_io = if min_pages > 0.0 {
-        RANDOM_PAGE_COST + (min_pages - 1.0).max(0.0) * SEQ_PAGE_COST
+    let visible = |pages: f64| {
+        if index.visible > 0.0 {
+            (pages * (1.0 - index.visible)).ceil()
+        } else {
+            pages
+        }
+    };
+    let (max_io, min_io) = if loop_count > 1.0 {
+        let max_pages = visible(index_pages_fetched(tuples_fetched * loop_count, rel.pages));
+        let min_pages = (sel * rel.pages).ceil();
+        let min_pages = visible(index_pages_fetched(min_pages * loop_count, rel.pages));
+        (
+            max_pages * RANDOM_PAGE_COST / loop_count,
+            min_pages * RANDOM_PAGE_COST / loop_count,
+        )
     } else {
-        0.0
+        let max_pages = visible(index_pages_fetched(tuples_fetched, rel.pages));
+        let min_pages = visible((sel * rel.pages).ceil());
+        let min_io = if min_pages > 0.0 {
+            RANDOM_PAGE_COST + (min_pages - 1.0).max(0.0) * SEQ_PAGE_COST
+        } else {
+            0.0
+        };
+        (max_pages * RANDOM_PAGE_COST, min_io)
     };
     let csquared = index.correlation * index.correlation;
     let io = max_io + csquared * (min_io - max_io);
@@ -433,6 +477,78 @@ fn index_scan(
         startup + qs,
         index_total + qs + io + (CPU_TUPLE_COST + qual_cost(others())) * tuples_fetched,
     ))
+}
+
+/// A scan of `index` inside a nested loop, parameterized by the outer row:
+/// its index qual an equality of its leading column to the outer side's
+/// key (`var_eq_non_const`: one of `ndistinct` values), repeated
+/// `loop_count` times (`get_loop_count`: the outer relation's rows), its
+/// other `quals` checked on each row fetched. `(startup, total)`; an
+/// index-only scan when `index.visible` says so (`cost_index`).
+pub fn param_index_scan(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    ndistinct: f64,
+    loop_count: f64,
+) -> Option<(f64, f64)> {
+    let mut quals = quals.to_vec();
+    quals.push((index.field.clone(), Qual::Eq));
+    index_scan_loops(
+        rel,
+        index,
+        &quals,
+        ColSel::Ndistinct(ndistinct),
+        false,
+        loop_count,
+    )
+}
+
+/// A bitmap heap scan over `index` parameterized as [`param_index_scan`]
+/// is (`create_index_paths`' join bitmap paths): the bitmap's index cost
+/// over `loop_count` scans and a tenth of an operator a row it returns
+/// (`cost_bitmap_tree_node`, `rows` the parameterized scan's), the heap
+/// pages all the scans fetch pro-rated per scan (`compute_bitmap_pages`),
+/// and each row fetched checked against the join clause and `quals`
+/// (`get_restriction_qual_cost`). `(startup, total)`.
+pub fn param_bitmap_heap_scan(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    ndistinct: f64,
+    loop_count: f64,
+    rows: f64,
+) -> Option<(f64, f64)> {
+    let mut all = quals.to_vec();
+    all.push((index.field.clone(), Qual::Eq));
+    let plain = Index {
+        visible: 0.0,
+        ..index.clone()
+    };
+    let (_, index_total, sel) = index_cost_loops(
+        rel,
+        &plain,
+        &all,
+        ColSel::Ndistinct(ndistinct),
+        false,
+        loop_count,
+    )?;
+    let startup = index_total + 0.1 * CPU_OPERATOR_COST * rows;
+    let startup = startup + qual_startup(all.iter().map(|(_, q)| q));
+    let tuples_fetched = clamp_row_est(sel * rel.tuples);
+    let t = if rel.pages > 1.0 { rel.pages } else { 1.0 };
+    let mut pages = (2.0 * t * tuples_fetched) / (2.0 * t + tuples_fetched);
+    if loop_count > 1.0 {
+        pages = index_pages_fetched(tuples_fetched * loop_count, rel.pages) / loop_count;
+    }
+    let pages = if pages >= t { t } else { pages.ceil() };
+    let per_page = if pages >= 2.0 {
+        RANDOM_PAGE_COST - (RANDOM_PAGE_COST - SEQ_PAGE_COST) * (pages / t).sqrt()
+    } else {
+        RANDOM_PAGE_COST
+    };
+    let cpu = (CPU_TUPLE_COST + qual_cost(all.iter().map(|(_, q)| q))) * tuples_fetched;
+    Some((startup, startup + pages * per_page + cpu))
 }
 
 /// The cheapest total cost of reading `rel` through `quals`: a sequential
@@ -456,7 +572,7 @@ pub fn seq_scan(rel: &Rel, quals: &[(String, Qual)]) -> f64 {
 }
 
 /// `cost_seqscan`: `(startup, total)`, the quals' startup first.
-fn seq_scan_path(rel: &Rel, quals: &[(String, Qual)]) -> (f64, f64) {
+pub fn seq_scan_path(rel: &Rel, quals: &[(String, Qual)]) -> (f64, f64) {
     let startup = qual_startup(quals.iter().map(|(_, q)| q));
     (
         startup,
@@ -921,6 +1037,165 @@ fn grouping_costs(
     ((hash_startup, hash_total), (sort_startup, group_total))
 }
 
+/// `ginGetStats`: the GIN metapage's statistics, as `gincostestimate`
+/// reads them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GinStats {
+    pub pending_pages: f64,
+    pub total_pages: f64,
+    pub entry_pages: f64,
+    pub data_pages: f64,
+    pub entries: f64,
+}
+
+/// What `gincost_pattern` counts of a GIN scan's quals.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GinCounts {
+    pub exact_entries: f64,
+    pub search_entries: f64,
+    /// A qual needs the whole index (`GIN_SEARCH_MODE_ALL`), and no qual
+    /// searches it normally.
+    pub full_scan: bool,
+    /// A qual can match nothing (no keys, default search mode).
+    pub void: bool,
+}
+
+/// `gincostestimate` for a scan of `pages` index pages over `tuples` heap
+/// tuples: `(startup, total)` with `nquals` index quals of selectivity
+/// `sel` (none of them partial-match, one scan, no nested loop).
+pub fn gin_index_cost(
+    pages: f64,
+    tuples: f64,
+    stats: GinStats,
+    counts: GinCounts,
+    sel: f64,
+    nquals: usize,
+) -> (f64, f64) {
+    if counts.void {
+        return (0.0, 0.0);
+    }
+    let mut num_pages = pages;
+    let pending = if stats.pending_pages < num_pages {
+        stats.pending_pages
+    } else {
+        0.0
+    };
+    let (entry_pages, data_pages, mut entries);
+    if num_pages > 0.0
+        && stats.total_pages <= num_pages
+        && stats.total_pages > num_pages / 4.0
+        && stats.entry_pages > 0.0
+        && stats.entries > 0.0
+    {
+        let scale = num_pages / stats.total_pages;
+        let e = (stats.entry_pages * scale).ceil();
+        let d = (stats.data_pages * scale).ceil();
+        entries = (stats.entries * scale).ceil();
+        entry_pages = e.min(num_pages - pending);
+        data_pages = d.min(num_pages - pending - entry_pages);
+    } else {
+        num_pages = num_pages.max(10.0);
+        entry_pages = ((num_pages - pending) * 0.90).floor();
+        data_pages = num_pages - pending - entry_pages;
+        entries = (entry_pages * 100.0).floor();
+    }
+    if entries < 1.0 {
+        entries = 1.0;
+    }
+    let (mut exact, mut search) = (counts.exact_entries, counts.search_entries);
+    if counts.full_scan || nquals == 0 {
+        exact = entries;
+        search = entries;
+    }
+    let entry_fetched = pending + (search * entry_pages.powf(0.15).round_ties_even()).ceil();
+    let startup = entry_fetched * RANDOM_PAGE_COST;
+    let mut data_fetched = (data_pages * exact / entries).ceil();
+    let by_sel = (sel * (tuples / (8192 / 3) as f64)).ceil();
+    if by_sel > data_fetched {
+        data_fetched = by_sel;
+    }
+    let mut total = startup + data_fetched * RANDOM_PAGE_COST;
+    let qual_op = CPU_OPERATOR_COST * nquals as f64;
+    total += (tuples * sel) * (CPU_INDEX_TUPLE_COST + qual_op);
+    (startup, total)
+}
+
+/// `gistcostestimate` over `genericcostestimate`: `(startup, total)` for
+/// `nquals` index quals of selectivity `sel` on an index of `pages`
+/// pages and `tuples` tuples.
+pub fn gist_index_cost(pages: f64, tuples: f64, sel: f64, nquals: usize) -> (f64, f64) {
+    let mut n_tuples = (sel * tuples).round_ties_even();
+    if n_tuples > tuples {
+        n_tuples = tuples;
+    }
+    if n_tuples < 1.0 {
+        n_tuples = 1.0;
+    }
+    let n_pages = if pages > 1.0 && tuples > 1.0 {
+        (n_tuples * pages / tuples).ceil()
+    } else {
+        1.0
+    };
+    let qual_op = CPU_OPERATOR_COST * nquals as f64;
+    let mut startup = 0.0;
+    let mut total = n_pages * RANDOM_PAGE_COST + n_tuples * (CPU_INDEX_TUPLE_COST + qual_op);
+    let height = if pages > 1.0 {
+        (pages.ln() / 100f64.ln()) as i64 as f64
+    } else {
+        0.0
+    };
+    if tuples > 1.0 {
+        let d = tuples.ln().ceil() * CPU_OPERATOR_COST;
+        startup += d;
+        total += d;
+    }
+    let d = (height + 1.0) * PAGE_CPU_MULTIPLIER * CPU_OPERATOR_COST;
+    startup += d;
+    total += d;
+    (startup, total)
+}
+
+/// `cost_bitmap_heap_scan` over one index whose scan costs `index_total`
+/// and selects `sel` of the rows, `rows` the relation's output: every qual
+/// rechecked on each row fetched.
+pub fn bitmap_heap_over(
+    rel: &Rel,
+    index_total: f64,
+    sel: f64,
+    rows: f64,
+    quals: &[(String, Qual)],
+) -> (f64, f64) {
+    bitmap_heap_from(
+        rel,
+        index_total + 0.1 * CPU_OPERATOR_COST * rows,
+        sel,
+        quals,
+    )
+}
+
+/// `cost_index` with no correlation over an index scan costing
+/// `(index_startup, index_total)` that selects `sel`: the heap pages
+/// fetched at random, and `others` (the quals not in the index) on each
+/// row.
+pub fn index_scan_over(
+    rel: &Rel,
+    index_startup: f64,
+    index_total: f64,
+    sel: f64,
+    others: &[(String, Qual)],
+) -> (f64, f64) {
+    let tuples_fetched = clamp_row_est(sel * rel.tuples);
+    let io = index_pages_fetched(tuples_fetched, rel.pages) * RANDOM_PAGE_COST;
+    let qs = qual_startup(others.iter().map(|(_, q)| q));
+    (
+        index_startup + qs,
+        index_total
+            + qs
+            + io
+            + (CPU_TUPLE_COST + qual_cost(others.iter().map(|(_, q)| q))) * tuples_fetched,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,5 +1438,87 @@ mod tests {
         let or = bitmap_or_path(&[arm, path(19.79, 0.1, 2)], 0);
         // Three costs PostgreSQL displays to two places, summed.
         assert!((or.cost - 40.92).abs() < 0.01, "{or:?}");
+    }
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.005
+    }
+
+    /// `predicate-gin`'s table and index on PostgreSQL 15.19 (EXPLAIN on a
+    /// private cluster, autovacuum off): `p @> '{2}'` is a Bitmap Index
+    /// Scan of 0.00..8.34 under a Bitmap Heap Scan of 8.35..72.25, rows 45;
+    /// `p @> '{2,3}'` 0.00..12.00 (rows 1).
+    #[test]
+    fn gin_costs_match_postgres() {
+        let rel = Rel {
+            pages: 67.0,
+            tuples: 8991.0,
+        };
+        let stats = GinStats {
+            pending_pages: 0.0,
+            total_pages: 10.0,
+            entry_pages: 6.0,
+            data_pages: 3.0,
+            entries: 800.0,
+        };
+        let one = GinCounts {
+            exact_entries: 1.0,
+            search_entries: 1.0,
+            ..GinCounts::default()
+        };
+        let sel = f64::from(2.0f32 * 0.005f32 / 2.0);
+        let (_, total) = gin_index_cost(10.0, 8991.0, stats, one, sel, 1);
+        assert!(near(total, 8.34), "{total}");
+        let quals = vec![(String::new(), Qual::Filter(1.0))];
+        let (startup, total) = bitmap_heap_over(&rel, total, sel, 45.0, &quals);
+        assert!(
+            near(startup, 8.35) && near(total, 72.25),
+            "{startup} {total}"
+        );
+        let two = GinCounts {
+            exact_entries: 2.0,
+            search_entries: 2.0,
+            ..GinCounts::default()
+        };
+        let (_, total) = gin_index_cost(10.0, 8991.0, stats, two, sel * sel, 1);
+        assert!(near(total, 12.00), "{total}");
+    }
+
+    /// `predicate-gist`'s on PostgreSQL 15.19: `p << point(2500,2500)` is a
+    /// Bitmap Index Scan of 0.00..9.42 under a Bitmap Heap Scan of
+    /// 9.46..21.59, or an Index Scan of 0.14..51.12, against a Seq Scan of
+    /// 31.25 (the never-vacuumed heap taken as 10 pages of 1,700 tuples).
+    #[test]
+    fn gist_costs_match_postgres() {
+        let rel = Rel {
+            pages: 10.0,
+            tuples: 1700.0,
+        };
+        let (startup, total) = gist_index_cost(11.0, 1700.0, 0.1, 1);
+        assert!(
+            near(startup, 0.145) && near(total, 9.42),
+            "{startup} {total}"
+        );
+        let quals = vec![(String::new(), Qual::Filter(1.0))];
+        let (bs, bt) = bitmap_heap_over(&rel, total, 0.1, 170.0, &quals);
+        assert!(near(bs, 9.46) && near(bt, 21.59), "{bs} {bt}");
+        let (is, it) = index_scan_over(&rel, startup, total, 0.1, &[]);
+        assert!(near(is, 0.14) && near(it, 51.12), "{is} {it}");
+        assert!(near(seq_scan(&rel, &quals), 31.25));
+    }
+
+    #[test]
+    fn a_scan_parameterized_by_a_nested_loops_outer_row() {
+        // PostgreSQL 15.19, `lm0 join lm1 on lm0.b = lm1.a` with lm1.a a
+        // primary key, both of 20 rows never analysed (10 pages, 2,040
+        // tuples): Index Scan using lm1_pkey (cost=0.15..0.19 rows=1),
+        // repeated for lm0's 2,040 rows.
+        let rel = Rel {
+            pages: 10.0,
+            tuples: 2040.0,
+        };
+        let (s, t) = param_index_scan(&rel, &pkey(), &[], 2040.0, 2040.0).unwrap();
+        assert!((s - 0.1525).abs() < 1e-9, "{s}");
+        assert!((t - 0.19).abs() < 0.005, "{t}");
     }
 }

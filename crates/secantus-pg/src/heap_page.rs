@@ -555,6 +555,27 @@ impl Heap {
         out
     }
 
+    /// [`Self::vacuumable_tids`] for the given chain roots only: what one
+    /// index key's entries point at (RP-196).
+    pub(crate) fn vacuumable_among(
+        &self,
+        roots: &[i64],
+        horizon: u64,
+        running: &dyn Fn(u64) -> bool,
+    ) -> std::collections::HashSet<i64> {
+        roots
+            .iter()
+            .copied()
+            .filter(|&t| {
+                untid(t).is_some_and(|(b, o)| {
+                    self.pages
+                        .get(b as usize)
+                        .is_some_and(|page| self.chain_vacuumable(page, b, o, horizon, running))
+                })
+            })
+            .collect()
+    }
+
     fn chain_vacuumable(
         &self,
         page: &Page,

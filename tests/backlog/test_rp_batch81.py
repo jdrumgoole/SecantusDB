@@ -16,7 +16,7 @@ from typing import Any
 import pytest
 
 
-@pytest.mark.backlog("RP-196")
+@pytest.mark.backlog_fixed("RP-196")
 def test_primary_key_lookups_mark_the_dead_versions(rust_pg: Any) -> None:
     """PostgreSQL 15.19: a 2,000-row table updated three times, with each
     key looked up by its primary key between the updates. The lookups'

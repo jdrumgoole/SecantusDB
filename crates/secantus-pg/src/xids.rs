@@ -261,16 +261,32 @@ pub fn horizon() -> u64 {
         .min(c.latest_completed + 1)
 }
 
-/// The command id a row write of `pid`'s transaction stamps (`cmin`): its
-/// transaction's current one, marked used.
-pub fn command_id(storage: &Arc<Storage>, pid: i32) -> u32 {
+/// What a row write of `pid`'s transaction stamps: its xid -- assigned now
+/// if it has none, as `XidOp::Assign` answers through the planner's hook --
+/// and its command id (`cmin`: its transaction's current one, marked
+/// used), under one hold of the clusters and
+/// without the hook's text (every written row asks, RP-014).
+pub fn writer(storage: &Arc<Storage>, pid: i32) -> (Option<u64>, u32) {
     let mut all = clusters().lock().unwrap_or_else(|e| e.into_inner());
-    let Some(c) = all.get_mut(&key(storage)) else {
-        return 0;
+    let xid = all
+        .get_mut(&CURRENT.with(Cell::get))
+        .map(|c| match c.running.get(&pid) {
+            Some(x) => *x,
+            None => {
+                let xid = take(c);
+                c.running.insert(pid, xid);
+                xid
+            }
+        });
+    let cid = match all.get_mut(&key(storage)) {
+        Some(c) => {
+            let entry = c.commands.entry(pid).or_insert((0, false));
+            entry.1 = true;
+            entry.0
+        }
+        None => 0,
     };
-    let entry = c.commands.entry(pid).or_insert((0, false));
-    entry.1 = true;
-    entry.0
+    (xid, cid)
 }
 
 /// A statement of `pid`'s transaction ended, having consumed `n` command

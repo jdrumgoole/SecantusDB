@@ -2228,6 +2228,14 @@ fn format_type_call(args: &[Bson]) -> Result<Bson> {
         Bson::Int64(x) => i32::try_from(*x).ok(),
         _ => None,
     });
+    // Oid 18 is the one-byte `"char"`, which the planner's names call
+    // `char` and read as `bpchar` elsewhere (`format_type(18, NULL)` was
+    // `character`; RP-301).
+    let name = match oid {
+        18 => crate::QUOTED_CHAR.to_string(),
+        1002 => format!("{}[]", crate::QUOTED_CHAR),
+        _ => name,
+    };
     Ok(Bson::String(format_type_text(&name, typmod)))
 }
 
@@ -2286,7 +2294,13 @@ pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
                 format!("interval{fields}({precision})")
             }
         }
-        _ => display,
+        // `format_type_extended` names these types itself and prints their
+        // modifier by its own rules (above), or not at all.
+        "bool" | "bpchar" | "float4" | "float8" | "int2" | "int4" | "int8" | "numeric"
+        | "decimal" | "varchar" => display,
+        // Any other type is `printTypmod` with no `typmodout`: the modifier
+        // in parentheses (`format_type(25, 7)` is `text(7)`; RP-301).
+        _ => format!("{display}({typmod})"),
     }
 }
 

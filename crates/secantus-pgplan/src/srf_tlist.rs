@@ -189,14 +189,25 @@ fn for_each_site(s: &mut SelectStmt, f: &mut dyn FnMut(&mut Node) -> Result<()>)
     Ok(())
 }
 
+/// Whether a site `for_each_site` visits holds a set-returning call, read in
+/// place: copying the statement to walk it was 40 ms over a 200,000-item
+/// `IN` list (RP-202).
 fn has_srf_site(s: &SelectStmt) -> bool {
-    let mut probe = s.clone();
-    let mut hit = false;
-    let _ = for_each_site(&mut probe, &mut |n| {
-        hit |= contains_srf(n);
-        Ok(())
+    let srf = |n: &Node| crate::expr_any(n, &|m| srf_kind(m).is_some());
+    let target = s.target_list.iter().any(|t| match t.node.as_ref() {
+        Some(N::ResTarget(rt)) => rt.val.as_deref().is_some_and(srf),
+        _ => false,
     });
-    hit
+    let sort = s.sort_clause.iter().any(|t| match t.node.as_ref() {
+        Some(N::SortBy(sb)) => sb.node.as_deref().is_some_and(srf),
+        _ => false,
+    });
+    let grouped = s
+        .group_clause
+        .iter()
+        .chain(s.distinct_clause.iter())
+        .any(|n| n.node.is_some() && srf(n));
+    target || sort || grouped
 }
 
 fn column(rel: &str, col: &str) -> Node {

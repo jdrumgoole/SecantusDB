@@ -4,7 +4,9 @@ DICTIONARY` over the `simple`, `snowball` and `synonym` templates, and
 `ts_lexize` and the configurations lexing through them), operator families
 and classes, subscriptions and transforms; RP-201's `shobj_description`;
 and the gap tests of what is left of RP-169, of RP-199 (the object-address
-functions) and of RP-200 (a block's own index definitions).
+functions) and of RP-200 (a block's own index definitions). RP-203's two
+scenarios (a rule's node trees) are regression tests since the trees
+landed.
 
 The scenarios run as `test_rp_batch34.py`'s do. The expected answers were
 measured on a private, freshly initdb'd PostgreSQL 15.19 cluster by running
@@ -475,11 +477,32 @@ SCENARIOS: dict[str, tuple[str, bool, list[str]]] = {
     ),
     "a rule's node trees": (
         "RP-203",
-        True,
+        False,
         [
             "select ev_qual::text from pg_rewrite where ev_class = 'pg_roles'::regclass",
             "select left(ev_action::text, 20) from pg_rewrite "
             "where ev_class = 'pg_roles'::regclass",
+        ],
+    ),
+    "a rule's node trees for what the analysis does not transcribe": (
+        "RP-203",
+        False,
+        [
+            "begin",
+            "create table rp51_rt (a int primary key, b text)",
+            "create table rp51_rl (a int primary key, b text)",
+            "create view rp51_fu as select a from rp51_rt for update",
+            "create rule rp51_oc as on insert to rp51_rt do also insert into rp51_rl "
+            "values (new.a, new.b) on conflict (a) do update set b = excluded.b",
+            "create view rp51_iv as select interval '1' day as d",
+            "create view rp51_cy as with recursive r(n) as (select 1 union all "
+            "select n + 1 from r where n < 3) search depth first by n set ord select n from r",
+            "create rule rp51_ms as on update to rp51_rt do also update rp51_rl "
+            "set (a, b) = (select new.a, new.b) where a = old.a",
+            "select c.relname, r.rulename, r.ev_qual is not null, r.ev_action is not null "
+            "from pg_rewrite r join pg_class c on c.oid = r.ev_class "
+            "where c.relname like 'rp51%' order by 1, 2",
+            "rollback",
         ],
     ),
     "pg_get_indexdef of an index the block created": (
@@ -926,6 +949,24 @@ EXPECTED: dict[str, Any] = {
         "ROLLBACK",
     ],
     "a rule's node trees": [[("<>",)], [("({QUERY :commandType",)]],
+    "a rule's node trees for what the analysis does not transcribe": [
+        "BEGIN",
+        "CREATE TABLE",
+        "CREATE TABLE",
+        "CREATE VIEW",
+        "CREATE RULE",
+        "CREATE VIEW",
+        "CREATE VIEW",
+        "CREATE RULE",
+        [
+            ("rp51_cy", "_RETURN", "True", "True"),
+            ("rp51_fu", "_RETURN", "True", "True"),
+            ("rp51_iv", "_RETURN", "True", "True"),
+            ("rp51_rt", "rp51_ms", "True", "True"),
+            ("rp51_rt", "rp51_oc", "True", "True"),
+        ],
+        "ROLLBACK",
+    ],
     "a simple, a snowball and a synonym dictionary": [
         "BEGIN",
         "CREATE TEXT SEARCH DICTIONARY",

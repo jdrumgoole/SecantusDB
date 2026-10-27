@@ -35,10 +35,26 @@
 //! `add_path` list (`joincost::JoinRel`), both sides outer in turn
 //! (`populate_joinrel_with_paths`). The rows are then built in the plan the
 //! relation of every table picks, each join by `join_search`'s `run_step`.
+//!
+//! Under a LIMIT (no ORDER BY, or one of a plain column) the search also
+//! takes three tables, and two whose WHERE holds a join filter, and plans
+//! as PostgreSQL does for a positive `tuple_fraction`: every relation
+//! weighs startup costs (`consider_startup`) and keeps its whole pathlist,
+//! each base table's paths are its scans (`PgHandler::limit_base_paths`:
+//! sequential, index and bitmap, whole-index in a key's order, and index
+//! and bitmap scans parameterized by a clause's other table), and each join
+//! relation's are `add_paths_to_joinrel`'s over its inputs' pathlists
+//! (`JoinRel::add_paths_general`: nested loops over every outer path,
+//! parameterized inners and Memoizes of them included). The plan is then
+//! the cheapest under a Limit (`limit_choice`), or, with an ORDER BY, the
+//! cheapest of the paths already in its order and a bounded Sort of the
+//! cheapest (`ordered_limit_choice`).
 
 use super::*;
 use crate::join_search::{alias_of, column_of, filter_fixes, joinrel_side, Input, Step};
-use secantus_pgplan::joincost::{JoinChoice, JoinMethod, JoinRel, JoinSide};
+use secantus_pgplan::joincost::{
+    InPath, JoinChoice, JoinMethod, JoinRel, JoinSide, MemoKey, RelPaths,
+};
 use secantus_pgplan::joins::{JoinKind, JoinNode};
 
 /// A column's width with no statistics (`get_typavgwidth`): its type's
@@ -65,6 +81,9 @@ struct Edge {
     on: usize,
 }
 
+/// `cpu_operator_cost`.
+const CPU_OPERATOR_COST: f64 = 0.0025;
+
 /// An edge's `on` for a WHERE equality: no ON of the tree, an inner clause.
 const ON_WHERE: usize = usize::MAX;
 
@@ -86,9 +105,8 @@ struct Clause {
     /// (`initialize_mergeclause_eclasses` finds the member's class).
     a_in_class: bool,
     b_in_class: bool,
-    /// The equivalence class it is in, for `JoinRel::add_paths_on`: 0 for
-    /// every clause when the chain has no class (as before there was
-    /// one), else 1 for the class and 2 + its index for an edge.
+    /// The equivalence class it is in: 1 for the class, 2 + its index
+    /// for an edge (`JoinRel::add_paths_on` reads only the class's).
     key_class: usize,
     /// The other edges between the two relations, in edge order (the ONs',
     /// then the WHERE's): `(a_key, a_table, b_key, b_table)` each, joined
@@ -117,6 +135,11 @@ struct Rel {
     best: Option<JoinChoice>,
     /// Its cheapest path in the class's order (a merge join on it).
     keyed: Option<JoinChoice>,
+    /// Under a LIMIT, once its level is done: its whole pathlist, in
+    /// `add_path`'s order, and `set_cheapest`'s cheapest-total and
+    /// cheapest-startup paths in it.
+    list: Vec<JoinChoice>,
+    cheapest: (usize, usize),
 }
 
 /// The search's tables, clauses and relations.
@@ -143,7 +166,50 @@ struct Search {
     /// `None` when that is not known, and then no width is.
     widths: Vec<Vec<(String, i64)>>,
     needed: Option<Vec<String>>,
+    /// A LIMIT's `(count, offset)` over the join: every relation then
+    /// weighs startup costs and keeps its whole pathlist, and the plan is
+    /// the one a Limit over it makes cheapest (`limit_choice`).
+    limit: Option<(f64, f64)>,
+    /// The WHERE's join filters, under a LIMIT: each's tables (a bit
+    /// each), selectivity, operators a row, and index in the WHERE's
+    /// filters. Each is evaluated by the first join holding its tables.
+    filters: Vec<(u8, f64, f64, usize)>,
+    /// Each table's alias, in FROM order.
+    aliases: Vec<String>,
+    /// Under a LIMIT, each base table's pathlist (`set_base_rel_pathlists`):
+    /// its paths, each with the key an index scan returns its rows in the
+    /// order of, and its cheapest-total and cheapest-startup paths.
+    #[allow(clippy::type_complexity)]
+    base_lists: Vec<(Vec<(InPath, Option<String>)>, usize, usize)>,
+    /// Under a LIMIT with an ORDER BY of one column, its joined-row key and
+    /// the equivalence class its order is (`query_pathkeys`): the class's,
+    /// an inner join's clause's, or its own (`ORDER_CLASS`). Paths in that
+    /// order are of use at every level.
+    order: Option<(String, usize)>,
+    /// Each edge's outer join (`Search::edges` order): the preserved table
+    /// of a LEFT join, `usize::MAX` for a FULL join, `None` for an inner
+    /// join's clause. An outer join's clause moves only into a scan of its
+    /// nullable side (`join_clause_is_movable_to`).
+    edge_outer: Vec<Option<usize>>,
+    /// The search keeps whole pathlists, base tables' paths parameterized
+    /// scans among them (`add_paths_general`): always under a LIMIT, and
+    /// first without one.
+    general: bool,
+    /// Each base table's parameterized scans' clause: by its index in the
+    /// table's pathlist, the table's key and the outer table's.
+    #[allow(clippy::type_complexity)]
+    param_keys: Vec<Vec<Option<(String, String)>>>,
 }
+
+/// Each base table's pathlist under a LIMIT (`Search::base_lists`) and its
+/// parameterized scans' clause keys (`Search::param_keys`).
+type BaseLists = (
+    Vec<(Vec<(InPath, Option<String>)>, usize, usize)>,
+    Vec<Vec<Option<(String, String)>>>,
+);
+
+/// The class of an ORDER BY column no clause reads: its own.
+const ORDER_CLASS: usize = 1 << 20;
 
 /// A chain of four to eight tables: its leaves, in FROM order, and its
 /// joins' ONs.
@@ -198,12 +264,157 @@ fn walk_tree<'a>(
     }
 }
 
+/// Which of a relation's paths a join above reads.
+#[derive(Clone, Copy)]
+enum Pick {
+    /// Its cheapest path (`Rel::best`).
+    Best,
+    /// Its cheapest path in the class's order (`Rel::keyed`).
+    Keyed,
+    /// Its path at this index in `Rel::list` (a LIMIT's search).
+    Path(usize),
+}
+
 impl Search {
+    /// The tables (a bit each) path `pick` of relation `rel` needs from an
+    /// outer side.
+    fn path_req_outer(&self, rel: usize, pick: Pick) -> u32 {
+        let Pick::Path(i) = pick else { return 0 };
+        let r = &self.rels[rel];
+        if r.set.count_ones() == 1 {
+            let t = r.set.trailing_zeros() as usize;
+            return self
+                .base_lists
+                .get(t)
+                .and_then(|(list, _, _)| list.get(i))
+                .map_or(0, |(p, _)| p.req_outer);
+        }
+        r.list.get(i).map_or(0, |c| c.req_outer)
+    }
+
+    /// The rows path `pick` of relation `rel` is estimated to return, for a
+    /// LIMIT's search's path.
+    fn path_rows(&self, rel: usize, pick: Pick) -> Option<f64> {
+        let Pick::Path(i) = pick else { return None };
+        let r = &self.rels[rel];
+        if r.set.count_ones() == 1 {
+            let t = r.set.trailing_zeros() as usize;
+            return self.base_lists.get(t)?.0.get(i).map(|(p, _)| p.rows);
+        }
+        r.list.get(i).map(|c| c.rows)
+    }
+
+    /// The joined-row keys path `pick` of relation `rel` returns, in the
+    /// order `run_step` builds them: its outer side's, then its inner's.
+    fn rel_keys(&self, chain: &Chain<'_>, rel: usize, pick: Pick) -> Vec<String> {
+        let r = &self.rels[rel];
+        if r.set.count_ones() == 1 {
+            return secantus_pgplan::joins::node_keys(
+                chain.leaves[r.set.trailing_zeros() as usize],
+            );
+        }
+        let choice = match pick {
+            Pick::Best => r.best.as_ref(),
+            Pick::Keyed => r.keyed.as_ref(),
+            Pick::Path(i) => r.list.get(i),
+        };
+        let Some(c) = choice else {
+            return Vec::new();
+        };
+        let built = &r.built[c.combo];
+        let (a, b) = (
+            self.rel_keys(chain, built.a, Pick::Path(c.a_path)),
+            self.rel_keys(chain, built.b, Pick::Path(c.b_path)),
+        );
+        let b_outer = matches!(
+            c.method,
+            JoinMethod::HashOuterB
+                | JoinMethod::MergeOuterB { .. }
+                | JoinMethod::NestOuterB
+                | JoinMethod::HashFullB
+                | JoinMethod::MergeFullB { .. }
+                | JoinMethod::HashRightB
+                | JoinMethod::MergeRightB { .. }
+        );
+        if b_outer {
+            b.into_iter().chain(a).collect()
+        } else {
+            a.into_iter().chain(b).collect()
+        }
+    }
+
+    /// Relation `rel`'s pathlist as a join above reads it, with its
+    /// cheapest-total and cheapest-startup paths' indexes: a base table's
+    /// one scan, `side`'s. `None` for a table whose cheapest scan is not
+    /// the one that starts soonest, or that an index reads in its key's
+    /// order: their paths are not modelled.
+    fn in_paths(&self, rel: usize) -> Option<(Vec<InPath>, usize, usize)> {
+        let r = &self.rels[rel];
+        if r.set.count_ones() == 1 {
+            let (list, ct, cs) = self.base_lists.get(r.set.trailing_zeros() as usize)?;
+            return Some((list.iter().map(|(p, _)| *p).collect(), *ct, *cs));
+        }
+        let paths = r
+            .list
+            .iter()
+            .map(|c| InPath {
+                startup: c.startup,
+                total: c.total,
+                class: c.class,
+                rows: c.rows,
+                req_outer: c.req_outer,
+                rescan: c.rescan,
+                indexed: false,
+                memo_key: None,
+            })
+            .collect();
+        Some((paths, r.cheapest.0, r.cheapest.1))
+    }
+
     /// The width of relation `set`'s rows (`build_joinrel_tlist`): each of
     /// its tables' columns still needed above it -- read by the query, a
     /// key of a clause to a table outside it, or a member of the class
     /// while a member is outside it (`generate_base_implied_equalities`
     /// marks every member needed by every table of the class).
+    /// The columns relation `rel`'s rows carry up to a join above it (its
+    /// hashed tuples' columns, `build_joinrel_tlist`) with their one fixed
+    /// length; `None` when they are not all of one fixed-length type.
+    fn hash_tuple(&self, chain: &Chain<'_>, rel: usize) -> Option<(Vec<String>, i64)> {
+        let set = self.rels[rel].set;
+        let needed = self.needed.as_ref()?;
+        let outside = |t: usize| set & (1 << t) == 0;
+        let class_open = self.class.iter().any(|(t, _)| outside(*t));
+        let mut cols = Vec::new();
+        let mut typlen = None;
+        for (t, widths) in self.widths.iter().enumerate() {
+            if outside(t) {
+                continue;
+            }
+            for (key, _) in widths {
+                let used = needed.contains(key)
+                    || self.edges.iter().any(|e| {
+                        (e.u == t && e.u_key == *key && outside(e.v))
+                            || (e.v == t && e.v_key == *key && outside(e.u))
+                    })
+                    || (class_open && self.class.iter().any(|(ct, k)| *ct == t && k == key));
+                if !used {
+                    continue;
+                }
+                let len = match leaf_key_type(chain.leaves[t], key)?.as_str() {
+                    "int2" => 2,
+                    "int4" | "float4" | "date" => 4,
+                    "int8" | "float8" => 8,
+                    _ => return None,
+                };
+                if *typlen.get_or_insert(len) != len {
+                    return None;
+                }
+                cols.push(key.clone());
+            }
+        }
+        Some((cols, typlen?))
+    }
+
     fn width(&self, set: u8) -> Option<i64> {
         let needed = self.needed.as_ref()?;
         let outside = |t: usize| set & (1 << t) == 0;
@@ -276,7 +487,6 @@ impl Search {
     /// edge beside the class's derived clause (which the search does not
     /// model).
     fn clause_between(&self, a: u8, b: u8) -> Option<Clause> {
-        let classed = !self.class.is_empty();
         let mut found = None;
         for (i, e) in self.edges.iter().enumerate() {
             let (u, v) = (1u8 << e.u, 1u8 << e.v);
@@ -305,7 +515,7 @@ impl Search {
                 b_table,
                 on: Some(e.on),
                 class: false,
-                key_class: if classed { 2 + i } else { 0 },
+                key_class: 2 + i,
             });
         }
         // The class: its first member each side, the leading clause, the
@@ -339,7 +549,11 @@ impl PgHandler {
     /// `node` as a chain of four to eight stored tables joined INNER or
     /// LEFT, each on one column equality to a table before it; the
     /// clauses sharing a column make at most one equivalence class.
-    fn four_table_chain<'a>(&self, node: &'a JoinNode) -> Option<(Chain<'a>, Search)> {
+    fn four_table_chain<'a>(
+        &self,
+        node: &'a JoinNode,
+        limited: bool,
+    ) -> Option<(Chain<'a>, Search)> {
         // The tree, as `deconstruct_jointree` reads it: its tables left to
         // right, and its joins bottom-up, each left side before its right.
         let mut leaves: Vec<&'a JoinNode> = Vec::new();
@@ -347,14 +561,24 @@ impl PgHandler {
         walk_tree(node, &mut leaves, &mut joins)?;
         // Four tables to `join_collapse_limit`'s eight; three only when a
         // join's right side is a join (a left-deep three is
-        // `three_table_plan`'s).
+        // `three_table_plan`'s), or under a LIMIT, which only this search
+        // plans for; two under a LIMIT whose WHERE holds a join filter,
+        // which only this search places.
         let bushy = joins.iter().any(|j| j.right.count_ones() > 1);
         // The WHERE's equalities between tables are join clauses too; with
         // one, three tables' clauses can make a cycle, which only this
         // search takes.
-        let where_clauses = crate::join_search::where_join_clauses().unwrap_or_default();
+        let where_clauses = if limited {
+            crate::join_search::where_clauses_and_filters().map(|(e, _)| e)
+        } else {
+            crate::join_search::where_join_clauses()
+        }
+        .unwrap_or_default();
+        let limit_filtered = limited
+            && crate::join_search::where_clauses_and_filters().is_some_and(|(_, f)| !f.is_empty());
         if !(4..=8).contains(&leaves.len())
-            && !(leaves.len() == 3 && (bushy || !where_clauses.is_empty()))
+            && !(leaves.len() == 3 && (bushy || limited || !where_clauses.is_empty()))
+            && !(leaves.len() == 2 && limit_filtered)
         {
             return None;
         }
@@ -395,7 +619,15 @@ impl PgHandler {
             if !matches!(kind, JoinKind::Inner | JoinKind::Left | JoinKind::Full)
                 || !merged.is_empty()
                 || !expr_keys.is_empty()
-                || ec.is_some()
+                || ec.as_ref().is_some_and(|ec| {
+                    // A two-table join's classes that only restate its own
+                    // clauses (no constant, no equality within a side)
+                    // change nothing here.
+                    !ec.left_restrict.is_empty()
+                        || !ec.right_restrict.is_empty()
+                        || ec.join_keys.len() != equi.len()
+                        || ec.join_keys.iter().any(|k| !equi.contains(k))
+                })
             {
                 return None;
             }
@@ -554,6 +786,16 @@ impl PgHandler {
         // equalities (`distribute_qual_to_rels` delays it), and stays an
         // edge.
         let (class, class_ons) = Self::chain_class(&mut edges, &reversed, &kinds)?;
+        // Each edge's outer join: a LEFT join's preserved table, or
+        // `usize::MAX` for a FULL join's.
+        let edge_outer: Vec<Option<usize>> = edges
+            .iter()
+            .map(|e| match kinds.get(e.on) {
+                Some(JoinKind::Left) => Some(e.u),
+                Some(JoinKind::Full) => Some(usize::MAX),
+                _ => None,
+            })
+            .collect();
         for leaf in &leaves {
             let (table, filter) = plain_leaf_table(leaf)?;
             if !self.join_small_enough(&table) {
@@ -615,6 +857,14 @@ impl PgHandler {
                 class_ons,
                 widths,
                 needed: crate::join_search::needed_keys(),
+                limit: None,
+                filters: Vec::new(),
+                aliases,
+                base_lists: Vec::new(),
+                order: None,
+                edge_outer,
+                general: false,
+                param_keys: Vec::new(),
             },
         ))
     }
@@ -769,20 +1019,34 @@ impl PgHandler {
             }
         }
         let set = sa | sb;
+        // The join filters this join evaluates first: their selectivity
+        // in its rows (`clauselist_selectivity`, each independent) and
+        // their operators' cost a tuple.
+        let firsts: Vec<&(u8, f64, f64, usize)> = search
+            .filters
+            .iter()
+            .filter(|(t, ..)| t & !set == 0 && t & !sa != 0 && t & !sb != 0)
+            .collect();
+        let filter_sel: f64 = firsts.iter().map(|f| f.1).product();
+        let filter_ops: f64 = firsts.iter().map(|f| f.2).sum();
         let idx = match search.rels.iter().position(|r| r.set == set) {
             Some(i) => i,
             None => {
                 search.rels.push(Rel {
                     set,
-                    rows: if full {
-                        secantus_pgplan::joincost::full_join_rows(&side_a, &side_b)
-                    } else {
-                        join_rows(&side_a, &side_b, left)
-                    },
-                    paths: JoinRel::new(false),
+                    rows: secantus_pgplan::costsize::clamp_row_est(
+                        if full {
+                            secantus_pgplan::joincost::full_join_rows(&side_a, &side_b)
+                        } else {
+                            join_rows(&side_a, &side_b, left)
+                        } * filter_sel,
+                    ),
+                    paths: JoinRel::new(search.limit.is_some()),
                     built: Vec::new(),
                     best: None,
                     keyed: None,
+                    list: Vec::new(),
+                    cheapest: (0, 0),
                 });
                 search.rels.len() - 1
             }
@@ -807,6 +1071,112 @@ impl PgHandler {
         } else {
             secantus_pgplan::joincost::USELESS_KEYS
         };
+        if search.general {
+            // Each side's whole pathlist, and the classes its key's order
+            // is in: the class for its derived clause, or for an outer
+            // join's key that is one of its members.
+            let (pa, pb) = (search.in_paths(a)?, search.in_paths(b)?);
+            let (sa_set, sb_set) = (u32::from(sa), u32::from(sb));
+            let ra = RelPaths {
+                side: side_a,
+                paths: &pa.0,
+                cheapest_total: pa.1,
+                cheapest_startup: pa.2,
+                set: sa_set,
+                width: side_a.width?,
+                unique: side_a.unique,
+                key_table: 1 << clause.a_table,
+            };
+            let rb = RelPaths {
+                side: side_b,
+                paths: &pb.0,
+                cheapest_total: pb.1,
+                cheapest_startup: pb.2,
+                set: sb_set,
+                width: side_b.width?,
+                unique: side_b.unique,
+                key_table: 1 << clause.b_table,
+            };
+            // The equivalence class each side's key is in: the class for
+            // its derived clause, or for an outer join's key that is one of
+            // its members; else the clause's own (an inner join's equality
+            // makes one of its two keys, `process_equivalence`).
+            let own = Some(clause.key_class);
+            let a_class = if clause.class || clause.a_in_class {
+                Some(1)
+            } else {
+                own
+            };
+            let b_class = if clause.class || clause.b_in_class {
+                Some(1)
+            } else {
+                own
+            };
+            // A merge on several clauses that a side already in the
+            // class's order would serve on its first is not modelled.
+            if !clause.extra.is_empty() && pa.0.iter().chain(&pb.0).any(|p| p.class.is_some()) {
+                return None;
+            }
+            // `truncate_useless_pathkeys`: an order is of use above a
+            // relation while a clause still to come reads it -- the class's
+            // while a member is outside it, an edge's while one of its
+            // tables is.
+            let open = search.class.iter().any(|(t, _)| set & (1 << *t) == 0);
+            let order_class = search.order.as_ref().map(|(_, c)| *c);
+            let edge_open: Vec<bool> = search
+                .edges
+                .iter()
+                .map(|e| set & (1 << e.u) == 0 || set & (1 << e.v) == 0)
+                .collect();
+            let useful = move |c: usize| {
+                if Some(c) == order_class {
+                    true
+                } else if c == 1 {
+                    open
+                } else {
+                    c.checked_sub(2)
+                        .and_then(|i| edge_open.get(i))
+                        .copied()
+                        .unwrap_or(false)
+                }
+            };
+            // `param_source_rels`: for each outer join whose nullable side
+            // this relation partly holds, without its preserved side, every
+            // table outside that nullable side (a FULL join's both ways).
+            let all = (1u8 << search.tables.len()) - 1;
+            let mut param_source = 0u8;
+            for &(min_l, min_r, full) in &search.outer {
+                if set & min_r != 0 && set & min_l == 0 {
+                    param_source |= all & !min_r;
+                }
+                if full && set & min_l != 0 && set & min_r == 0 {
+                    param_source |= all & !min_l;
+                }
+            }
+            let param_source = u32::from(param_source);
+            let rel = &mut search.rels[idx];
+            let rows = rel.rows;
+            let combo = rel.built.len();
+            rel.built.push(Built { a, b, clause, left });
+            rel.paths.set_filter_cost(CPU_OPERATOR_COST * filter_ops);
+            if full {
+                rel.paths
+                    .add_full_paths_general(combo, a_class, b_class, &ra, &rb, rows);
+            } else {
+                rel.paths.add_paths_general(
+                    combo,
+                    a_class,
+                    b_class,
+                    &useful,
+                    &ra,
+                    &rb,
+                    left,
+                    rows,
+                    param_source,
+                );
+            }
+            return Some(());
+        }
         let rel = &mut search.rels[idx];
         let combo = rel.built.len();
         rel.built.push(Built { a, b, clause, left });
@@ -827,10 +1197,12 @@ impl PgHandler {
             search.rels.push(Rel {
                 set: 1 << i,
                 rows: 0.0,
-                paths: JoinRel::new(false),
+                paths: JoinRel::new(search.limit.is_some()),
                 built: Vec::new(),
                 best: None,
                 keyed: None,
+                list: Vec::new(),
+                cheapest: (0, 0),
             });
         }
         let mut levels: Vec<Vec<usize>> = vec![Vec::new(), (0..n).collect()];
@@ -870,8 +1242,15 @@ impl PgHandler {
             }
             let built: Vec<usize> = (before..search.rels.len()).collect();
             let classed = !search.class.is_empty();
+            let limited = search.general;
             for &i in &built {
                 let rel = &mut search.rels[i];
+                if limited {
+                    rel.list = rel.paths.pathlist();
+                    rel.cheapest = rel.paths.set_cheapest()?;
+                    rel.best = Some(rel.list[rel.cheapest.0]);
+                    continue;
+                }
                 rel.best = Some(rel.paths.cheapest(None, rel.rows)?);
                 if classed {
                     rel.keyed = rel.paths.cheapest_keyed_on(1);
@@ -885,25 +1264,93 @@ impl PgHandler {
     /// The rows of relation `rel` in the plan its cheapest path is, or its
     /// cheapest path in the class's order (`keyed`: a merge join above
     /// reads it unsorted).
+    ///
+    /// `bind`: the outer row a parameterized path is read for (a nested
+    /// loop's, `ExecNestLoop` passing its outer tuple's values down as
+    /// parameters): a parameterized scan returns the rows whose key equals
+    /// the outer row's, and a nested loop over a parameterized inner reads
+    /// the inner again for each of its outer rows. `leaves` caches each
+    /// table's rows across those reads.
+    #[allow(clippy::too_many_arguments)]
     fn run_searched(
         &self,
         search: &Search,
         chain: &Chain<'_>,
         rel: usize,
-        keyed: bool,
+        pick: Pick,
+        bind: &Document,
+        leaves: &mut HashMap<usize, Vec<Document>>,
     ) -> PgWireResult<Option<Input>> {
         let r = &search.rels[rel];
         if r.set.count_ones() == 1 {
-            let leaf = chain.leaves[r.set.trailing_zeros() as usize];
+            let t = r.set.trailing_zeros() as usize;
+            let leaf = chain.leaves[t];
+            if let std::collections::hash_map::Entry::Vacant(e) = leaves.entry(t) {
+                e.insert(self.join_rows(leaf)?);
+            }
+            let all = &leaves[&t];
+            // A scan parameterized by the outer row it is read for: its
+            // index's rows whose key equals the outer row's, in the heap's
+            // order. Read straight under the nested loop that binds it, the
+            // loop's clause matches the same rows.
+            let param = match pick {
+                Pick::Path(i) => search
+                    .param_keys
+                    .get(t)
+                    .and_then(|keys| keys.get(i))
+                    .cloned()
+                    .flatten(),
+                _ => None,
+            };
+            let mut rows = match param
+                .and_then(|(key, outer_key)| bind.get(&outer_key).map(|value| (key, value.clone())))
+            {
+                Some((key, value)) => all
+                    .iter()
+                    .filter(|d| {
+                        value != Bson::Null
+                            && d.get(&key).is_some_and(|v| {
+                                secantus_pgplan::compare_values(v, &value) == Some(Ordering::Equal)
+                            })
+                    })
+                    .cloned()
+                    .collect(),
+                None => all.clone(),
+            };
+            // A scan of a whole index returns its rows in its key's order,
+            // equal keys in the heap's.
+            let order_key = match pick {
+                Pick::Path(i) => search
+                    .base_lists
+                    .get(t)
+                    .and_then(|(list, _, _)| list.get(i))
+                    .and_then(|(_, k)| k.clone()),
+                _ => None,
+            };
+            if let Some(key) = order_key {
+                rows.sort_by(|x, y| {
+                    match (
+                        x.get(&key).filter(|v| **v != Bson::Null),
+                        y.get(&key).filter(|v| **v != Bson::Null),
+                    ) {
+                        (None, None) => Ordering::Equal,
+                        (None, Some(_)) => Ordering::Greater,
+                        (Some(_), None) => Ordering::Less,
+                        (Some(p), Some(q)) => {
+                            secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal)
+                        }
+                    }
+                });
+            }
             return Ok(Some(Input {
-                rows: self.join_rows(leaf)?,
+                rows,
                 keys: secantus_pgplan::joins::node_keys(leaf),
             }));
         }
-        let choice = if keyed {
-            r.keyed.as_ref()
-        } else {
-            r.best.as_ref()
+        let choice = match pick {
+            Pick::Best => r.best.as_ref(),
+            Pick::Keyed => r.keyed.as_ref(),
+            Pick::Path(i) => r.list.get(i),
         };
         let Some(best) = choice else {
             return Ok(None);
@@ -928,13 +1375,105 @@ impl PgHandler {
             } => (a_by_index, b_by_index),
             _ => (false, false),
         };
+        // Each input: the path the plan reads of it (a LIMIT's search
+        // records it), else its cheapest, or its cheapest in the class's
+        // order where the merge join reads it presorted.
+        let legacy = |in_class: bool, sorted: bool| {
+            if in_class && sorted {
+                Pick::Keyed
+            } else {
+                Pick::Best
+            }
+        };
+        let (a_pick, b_pick) = if matches!(pick, Pick::Path(_)) {
+            (Pick::Path(best.a_path), Pick::Path(best.b_path))
+        } else {
+            (
+                legacy(clause.a_in_class, a_sorted),
+                legacy(clause.b_in_class, b_sorted),
+            )
+        };
+        // A nested loop over a parameterized join reads it again for each
+        // outer row, that row bound (`ExecReScan` with the new parameter).
+        let b_outer = matches!(best.method, JoinMethod::NestOuterB);
+        let nest = matches!(best.method, JoinMethod::Other | JoinMethod::NestOuterB);
+        let (outer_rel, outer_pick, inner_rel, inner_pick) = if b_outer {
+            (built.b, b_pick, built.a, a_pick)
+        } else {
+            (built.a, a_pick, built.b, b_pick)
+        };
+        if nest
+            && search.rels[inner_rel].set.count_ones() > 1
+            && search.path_req_outer(inner_rel, inner_pick) != 0
+        {
+            let Some(outer) =
+                self.run_searched(search, chain, outer_rel, outer_pick, bind, leaves)?
+            else {
+                return Ok(None);
+            };
+            let step = Step {
+                method: best.method,
+                left: built.left,
+                a_key: a_key.clone(),
+                b_key: b_key.clone(),
+                a_rows: 0.0,
+                b_rows: 0.0,
+                on: None,
+                filters: Vec::new(),
+                batches: None,
+                hash_tuple: None,
+                extra: clause
+                    .extra
+                    .iter()
+                    .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
+                    .collect(),
+            };
+            let on = clause.on.and_then(|i| chain.ons.get(i).copied().flatten());
+            let mut rows = Vec::new();
+            let mut keys = None;
+            for o in outer.rows {
+                let mut bound = bind.clone();
+                for (k, v) in &o {
+                    bound.insert(k.clone(), v.clone());
+                }
+                let Some(inner) =
+                    self.run_searched(search, chain, inner_rel, inner_pick, &bound, leaves)?
+                else {
+                    return Ok(None);
+                };
+                let one = Input {
+                    rows: vec![o],
+                    keys: outer.keys.clone(),
+                };
+                let (a, b) = if b_outer { (inner, one) } else { (one, inner) };
+                let Some(joined) = self.run_step(&step, a, b, None, None, on)? else {
+                    return Ok(None);
+                };
+                rows.extend(joined.rows);
+                keys = Some(joined.keys);
+            }
+            let keys = match keys {
+                Some(k) => k,
+                None => {
+                    let mut k = outer.keys;
+                    k.extend(search.rel_keys(chain, inner_rel, inner_pick));
+                    k
+                }
+            };
+            return self.finish_join(search, chain, built, Input { rows, keys });
+        }
         let (Some(a), Some(b)) = (
-            self.run_searched(search, chain, built.a, clause.a_in_class && a_sorted)?,
-            self.run_searched(search, chain, built.b, clause.b_in_class && b_sorted)?,
+            self.run_searched(search, chain, built.a, a_pick, bind, leaves)?,
+            self.run_searched(search, chain, built.b, b_pick, bind, leaves)?,
         ) else {
             return Ok(None);
         };
         let rows_of = |rel: usize, table: usize, key: &str| {
+            // The input path's own rows (a parameterized one's are fewer).
+            if let Some(rows) = search.path_rows(rel, if rel == built.a { a_pick } else { b_pick })
+            {
+                return rows;
+            }
             if search.rels[rel].set.count_ones() == 1 {
                 let (name, filter) = &search.tables[table];
                 column_of(key)
@@ -969,6 +1508,9 @@ impl PgHandler {
                 .find_map(|n| leaf_key_type(n, outer_key))?;
             (nbatch > 1).then_some((nbuckets, nbatch, ty))
         });
+        // The hashed side's tuples: the columns needed above it, when all
+        // are of one fixed length (`hash_grown_order`).
+        let hash_tuple = hashed.and_then(|(rel, _, _)| search.hash_tuple(chain, rel));
         let step = Step {
             method: best.method,
             left: built.left,
@@ -979,6 +1521,7 @@ impl PgHandler {
             on: None,
             filters: Vec::new(),
             batches,
+            hash_tuple,
             extra: clause
                 .extra
                 .iter()
@@ -988,13 +1531,47 @@ impl PgHandler {
         let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
         let (a_type, b_type) = (type_of(&step.a_key), type_of(&step.b_key));
         let on = clause.on.and_then(|i| chain.ons.get(i).copied().flatten());
-        let Some(mut joined) = self.run_step(&step, a, b, a_type, b_type, on)? else {
+        let Some(joined) = self.run_step(&step, a, b, a_type, b_type, on)? else {
             return Ok(None);
         };
+        self.finish_join(search, chain, built, joined)
+    }
+
+    /// A join's rows once its inputs are joined: the WHERE's join filters
+    /// and the ONs the class stood in for that its two inputs complete.
+    fn finish_join(
+        &self,
+        search: &Search,
+        chain: &Chain<'_>,
+        built: &Built,
+        mut joined: Input,
+    ) -> PgWireResult<Option<Input>> {
         // The ONs the class's derived clauses stood in for, each where its
         // two tables first meet: an inner join's ON is its own join's
         // qual, below any outer join that could NULL-extend its tables.
+        // A LIMIT's join filters likewise, at the first join holding their
+        // tables (the WHERE above still decides every row).
         let (sa, sb) = (search.rels[built.a].set, search.rels[built.b].set);
+        for &(tables, _, _, i) in &search.filters {
+            let first = tables & !(sa | sb) == 0 && tables & !sa != 0 && tables & !sb != 0;
+            if !first {
+                continue;
+            }
+            let Some(f) = crate::join_search::where_filter(i) else {
+                return Ok(None);
+            };
+            let mut kept = Vec::with_capacity(joined.rows.len());
+            for d in joined.rows {
+                let keep = matches!(
+                    secantus_pgplan::apply_row_expr(&f.expr, &d).map_err(|e| Self::err(&e))?,
+                    Bson::Boolean(true)
+                );
+                if keep {
+                    kept.push(d);
+                }
+            }
+            joined.rows = kept;
+        }
         for &(i, tables) in &search.class_ons {
             let completes = tables & !(sa | sb) == 0 && tables & !sa != 0 && tables & !sb != 0;
             if !completes {
@@ -1023,7 +1600,7 @@ impl PgHandler {
         if crate::join_search::where_join_clauses().is_none() || LOCK_ROW_IDS.with(|c| c.get()) {
             return false;
         }
-        let Some((_, mut search)) = self.four_table_chain(node) else {
+        let Some((_, mut search)) = self.four_table_chain(node, false) else {
             return false;
         };
         self.search_four(&mut search).is_some()
@@ -1031,26 +1608,323 @@ impl PgHandler {
 
     /// `node`'s rows in the plan PostgreSQL's join order search picks for
     /// four to eight tables, or `None` for any other join.
+    ///
+    /// Under a LIMIT (`limit`: its rows with the OFFSET's, and the
+    /// OFFSET's) three tables are searched too, every relation keeping
+    /// the paths that start sooner beside its cheapest
+    /// (`consider_startup`), and the plan is the one a Limit over it makes
+    /// cheapest (`limit_choice`): typically a nested loop that returns its
+    /// first rows at once, in its outer side's order.
+    ///
+    /// With an ORDER BY of one column (`order`, its joined-row key) the
+    /// LIMIT's plan is `create_ordered_paths`' pick: a path already in its
+    /// order, or the cheapest under a bounded Sort, which the select then
+    /// runs (`GENERAL_JOIN_PRESORTED` says it need not).
     pub(crate) fn four_table_join(
         &self,
         node: &JoinNode,
-        limit: Option<usize>,
+        limit: Option<(usize, usize)>,
+        order: Option<&str>,
     ) -> PgWireResult<Option<Vec<Document>>> {
-        if limit.is_some()
-            || crate::join_search::where_join_clauses().is_none()
-            || LOCK_ROW_IDS.with(|c| c.get())
-        {
+        if order.is_some() && limit.is_none() {
             return Ok(None);
         }
-        let Some((chain, mut search)) = self.four_table_chain(node) else {
+        if limit.is_some() {
+            return self.searched_rows(node, limit, order, true);
+        }
+        // With no LIMIT the search keeps whole pathlists too, so that a
+        // nested loop over a parameterized scan is weighed; where that
+        // search declines, the one over cheapest paths runs.
+        if let Some(rows) = self.searched_rows(node, None, None, true)? {
+            return Ok(Some(rows));
+        }
+        self.searched_rows(node, None, None, false)
+    }
+
+    /// [`PgHandler::four_table_join`]'s search, over whole pathlists when
+    /// `general`.
+    fn searched_rows(
+        &self,
+        node: &JoinNode,
+        limit: Option<(usize, usize)>,
+        order: Option<&str>,
+        general: bool,
+    ) -> PgWireResult<Option<Vec<Document>>> {
+        let spanning_modelled = if limit.is_some() {
+            crate::join_search::where_clauses_and_filters().is_some()
+        } else {
+            crate::join_search::where_join_clauses().is_some()
+        };
+        if !spanning_modelled || LOCK_ROW_IDS.with(|c| c.get()) {
+            return Ok(None);
+        }
+        let Some((chain, mut search)) = self.four_table_chain(node, limit.is_some()) else {
             return Ok(None);
         };
+        if general {
+            search.general = true;
+            if limit.is_some() {
+                let Some(filters) = self.search_filters(&search) else {
+                    return Ok(None);
+                };
+                search.filters = filters;
+            }
+            if let Some(key) = order {
+                let Some(class) = Self::order_class(&search, &chain, key) else {
+                    return Ok(None);
+                };
+                search.order = Some((key.to_string(), class));
+            }
+            let Some((base_lists, param_keys)) = self.build_base_lists(&search, &chain) else {
+                return Ok(None);
+            };
+            search.base_lists = base_lists;
+            search.param_keys = param_keys;
+        }
+        if let Some((rows, offset)) = limit {
+            // `preprocess_limit`: a count of at least one.
+            let count = rows.saturating_sub(offset).max(1);
+            search.limit = Some((count as f64, offset as f64));
+        }
         let Some(top) = self.search_four(&mut search) else {
             return Ok(None);
         };
-        let Some(joined) = self.run_searched(&search, &chain, top, false)? else {
+        let pick = match search.limit {
+            Some((count, offset)) => {
+                let r = &search.rels[top];
+                let chosen = match &search.order {
+                    Some((_, class)) => {
+                        let Some(width) = search.width(r.set) else {
+                            return Ok(None);
+                        };
+                        secantus_pgplan::joincost::ordered_limit_choice(
+                            &r.list,
+                            r.cheapest.0,
+                            r.rows,
+                            width,
+                            *class,
+                            count,
+                            offset,
+                        )
+                        .map(|(i, presorted)| {
+                            crate::GENERAL_JOIN_PRESORTED.with(|c| c.set(presorted));
+                            i
+                        })
+                    }
+                    None => secantus_pgplan::joincost::limit_choice(&r.list, r.rows, count, offset),
+                };
+                let Some(i) = chosen else {
+                    return Ok(None);
+                };
+                Pick::Path(i)
+            }
+            // The whole result: the cheapest path in total (`set_cheapest`).
+            None if search.general => Pick::Path(search.rels[top].cheapest.0),
+            None => Pick::Best,
+        };
+        let Some(joined) = self.run_searched(
+            &search,
+            &chain,
+            top,
+            pick,
+            &Document::new(),
+            &mut HashMap::new(),
+        )?
+        else {
             return Ok(None);
         };
         Ok(Some(joined.rows))
+    }
+
+    /// The class of the ORDER BY column `key` (`Search::order`): the class
+    /// when it is a member, the clause's when one inner join's clause reads
+    /// it (both its keys one class), else its own. `None` with an outer
+    /// join in the search (an order over a NULL-extended side is not
+    /// modelled), a column two clauses read, or one not an integer.
+    fn order_class(search: &Search, chain: &Chain<'_>, key: &str) -> Option<usize> {
+        if !search.outer.is_empty() {
+            return None;
+        }
+        let t = search.aliases.iter().position(|a| a == alias_of(key))?;
+        let int = |ty: Option<String>| matches!(ty.as_deref(), Some("int2" | "int4" | "int8"));
+        if !int(leaf_key_type(chain.leaves[t], key)) {
+            return None;
+        }
+        if search.class.iter().any(|(ct, k)| *ct == t && k == key) {
+            return Some(1);
+        }
+        let edges: Vec<usize> = (0..search.edges.len())
+            .filter(|&i| search.edges[i].u_key == key || search.edges[i].v_key == key)
+            .collect();
+        match edges.as_slice() {
+            [] => Some(ORDER_CLASS),
+            [i] => Some(2 + i),
+            _ => None,
+        }
+    }
+
+    /// The WHERE's join filters over the search's tables (`Search::filters`);
+    /// `None` when one reads a table outside them, a filter's selectivity is
+    /// not estimated, or an outer join is in the search (a WHERE over its
+    /// nullable side is not placed).
+    fn search_filters(&self, search: &Search) -> Option<Vec<(u8, f64, f64, usize)>> {
+        let (_, filters) = crate::join_search::where_clauses_and_filters()?;
+        if filters.is_empty() {
+            return Some(Vec::new());
+        }
+        if !search.outer.is_empty() {
+            return None;
+        }
+        let table_of = |alias: &str| search.aliases.iter().position(|a| a == alias);
+        let nd_of = |key: &str| -> Option<f64> {
+            let t = table_of(alias_of(key))?;
+            let (table, filter) = &search.tables[t];
+            self.join_side(table, JoinKey::Column(column_of(key)?), filter, 0)
+                .map(|s| s.ndistinct)
+        };
+        let mut out = Vec::new();
+        for (i, f) in filters {
+            let mut tables = 0u8;
+            for a in &f.aliases {
+                tables |= 1 << table_of(a)?;
+            }
+            let sel = crate::join_search::filter_selectivity(&f.kind, &nd_of)?;
+            out.push((tables, sel, f.ops as f64, i));
+        }
+        Some(out)
+    }
+
+    /// Each base table's pathlist for a LIMIT's search
+    /// (`set_plain_rel_pathlist`, every relation weighing startup costs,
+    /// `PgHandler::limit_base_paths`): its sequential scan, its index and
+    /// bitmap heap scans through its WHERE, its whole index scans in a join
+    /// key's order, and its index and bitmap heap scans parameterized by a
+    /// clause's other table (by each other member's, for the class), a
+    /// nested loop's inner. `None` when a table's paths are not all
+    /// modelled (`limit_base_paths` declines) or, with a parameterized
+    /// scan, the search holds an outer join, a join filter or two clauses
+    /// between two tables.
+    #[allow(clippy::type_complexity)]
+    fn build_base_lists(&self, search: &Search, chain: &Chain<'_>) -> Option<BaseLists> {
+        let side_of = |t: usize, key: &str| {
+            let (table, filter) = &search.tables[t];
+            self.join_side(table, JoinKey::Column(column_of(key)?), filter, 0)
+        };
+        let width_of = |t: usize, key: &str| {
+            search.widths[t]
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, w)| *w)
+        };
+        // Two edges between one pair of tables are several clauses.
+        let mut pairs: Vec<(usize, usize)> = search
+            .edges
+            .iter()
+            .map(|e| (e.u.min(e.v), e.u.max(e.v)))
+            .collect();
+        pairs.sort_unstable();
+        let multi = pairs.windows(2).any(|w| w[0] == w[1]);
+        let mut out = Vec::new();
+        let mut param_keys = Vec::new();
+        let mut parameterized = false;
+        for (t, (table, filter)) in search.tables.iter().enumerate() {
+            // Each outer table's clause with this one: this table's key and
+            // the outer table's, which a scan parameterized by it binds.
+            let mut binds: Vec<(u32, String, String)> = Vec::new();
+            let JoinNode::Leaf { columns, .. } = chain.leaves.get(t)? else {
+                return None;
+            };
+            // The table's ends of the edges, each with the other end's rows
+            // (the times a scan parameterized by it repeats) and key; and
+            // its member of the class with each other member's, whose
+            // derived clause any two join on.
+            let mut keys = Vec::new();
+            if let Some((_, key)) = search.class.iter().find(|(ct, _)| *ct == t) {
+                for (u, u_key) in search.class.iter().filter(|(ct, _)| *ct != t) {
+                    let outer = side_of(*u, u_key)?;
+                    let memo_key = MemoKey {
+                        ndistinct: outer.ndistinct,
+                        default: outer.default_ndistinct,
+                        tuples: outer.tuples,
+                        rel_rows: outer.rows,
+                        width: width_of(*u, u_key)?,
+                    };
+                    keys.push((
+                        1,
+                        column_of(key)?.to_string(),
+                        1u32 << u,
+                        outer.rows,
+                        memo_key,
+                    ));
+                    binds.push((1u32 << u, key.clone(), u_key.clone()));
+                }
+            }
+            for (i, e) in search.edges.iter().enumerate() {
+                let (key, u, u_key) = if e.u == t {
+                    (&e.u_key, e.v, &e.v_key)
+                } else if e.v == t {
+                    (&e.v_key, e.u, &e.u_key)
+                } else {
+                    continue;
+                };
+                let outer = side_of(u, u_key)?;
+                let memo_key = MemoKey {
+                    ndistinct: outer.ndistinct,
+                    default: outer.default_ndistinct,
+                    tuples: outer.tuples,
+                    rel_rows: outer.rows,
+                    width: width_of(u, u_key)?,
+                };
+                // An outer join's clause moves into a scan of its nullable
+                // side only: the preserved table's index serves no
+                // parameterized scan, only its order.
+                let movable = match search.edge_outer.get(i).copied().flatten() {
+                    None => true,
+                    Some(preserved) => preserved != t && preserved != usize::MAX,
+                };
+                let bit = if movable { 1u32 << u } else { 0 };
+                keys.push((
+                    2 + i,
+                    column_of(key)?.to_string(),
+                    bit,
+                    outer.rows,
+                    memo_key,
+                ));
+                binds.push((bit, key.clone(), u_key.clone()));
+            }
+            // An index on the ORDER BY's column of its own: its scan in that
+            // order is of use (`pathkeys_useful_for_ordering`).
+            let order_col = match &search.order {
+                Some((key, ORDER_CLASS)) if alias_of(key) == search.aliases[t] => {
+                    Some((ORDER_CLASS, column_of(key)?.to_string()))
+                }
+                _ => None,
+            };
+            let list = self.limit_base_paths(table, filter, columns, &keys, order_col)?;
+            parameterized |= list.iter().any(|(p, _)| p.req_outer != 0);
+            let cands: Vec<InPath> = list.iter().map(|(p, _)| *p).collect();
+            let (kept, ct, cs) = secantus_pgplan::joincost::base_pathlist(&cands, true)?;
+            param_keys.push(
+                kept.iter()
+                    .map(|&i| {
+                        let req = list[i].0.req_outer;
+                        binds
+                            .iter()
+                            .find(|(b, ..)| req != 0 && *b == req)
+                            .map(|(_, k, uk)| (k.clone(), uk.clone()))
+                    })
+                    .collect(),
+            );
+            out.push((kept.iter().map(|&i| list[i].clone()).collect(), ct, cs));
+        }
+        // With a scan parameterized by an outer row: a FULL join's
+        // parameterized join paths, a join filter or a second clause
+        // between two tables (a clause the scan's index would not enforce)
+        // are not modelled.
+        let full = search.edge_outer.contains(&Some(usize::MAX));
+        if parameterized && (full || !search.filters.is_empty() || multi) {
+            return None;
+        }
+        Some((out, param_keys))
     }
 }

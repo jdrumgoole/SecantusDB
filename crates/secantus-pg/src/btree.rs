@@ -109,6 +109,10 @@ impl Shape for IndexShape {
                 (Bson::Int64(x), Bson::Int64(y)) => x.cmp(y),
                 (Bson::Int32(x), Bson::Int64(y)) => i64::from(*x).cmp(y),
                 (Bson::Int64(x), Bson::Int32(y)) => x.cmp(&i64::from(*y)),
+                // As `compare_values` orders them, without its walk through
+                // the other kinds (a uuid or text key's every comparison).
+                (Bson::String(x), Bson::String(y)) => x.cmp(y),
+                (Bson::Binary(x), Bson::Binary(y)) => x.bytes.cmp(&y.bytes),
                 _ => crate::compare_values(a, b),
             },
         };
@@ -136,6 +140,11 @@ impl IndexShape {
     /// A row's index tuple key, or `None` when a partial index's predicate
     /// leaves the row out.
     /// Its key columns' stored fields.
+    /// A UNIQUE (or primary-key) index.
+    pub(crate) fn is_unique(&self) -> bool {
+        self.unique
+    }
+
     pub(crate) fn key_fields(&self) -> &[String] {
         &self.fields[..self.nkey.min(self.fields.len())]
     }
@@ -262,7 +271,7 @@ fn shape_memo() -> &'static Mutex<ShapeMemo> {
 }
 
 impl PgHandler {
-    fn store_id(&self) -> usize {
+    pub(crate) fn store_id(&self) -> usize {
         Arc::as_ptr(&self.storage) as usize
     }
 
@@ -565,6 +574,55 @@ impl PgHandler {
         })
     }
 
+    /// [`Self::btree_index_scanned`] for a scan that returns at most one row
+    /// -- a lookup by a unique key -- which learns of the versions behind
+    /// that key's entries only: reading the whole heap's dead versions for
+    /// every primary-key lookup is what kept them unmarked (RP-196).
+    pub(crate) fn btree_key_scanned(
+        &self,
+        table: &str,
+        shape: &IndexShape,
+        filter: &Document,
+        live: &[i64],
+    ) -> PgWireResult<()> {
+        if REWRITING.with(|r| r.get()) {
+            return Ok(());
+        }
+        let ranges = crate::serializable::index_scan_ranges(shape, filter);
+        let tids = self.with_btree(table, shape, |t| {
+            ranges
+                .iter()
+                .flat_map(|(lo, hi)| {
+                    t.tids_in(
+                        shape,
+                        lo.as_ref().map(|(v, i)| (v, *i)),
+                        hi.as_ref().map(|(v, i)| (v, *i)),
+                    )
+                })
+                .collect::<Vec<i64>>()
+        })?;
+        // The entry of the row the lookup returned is live; only the others
+        // can name a dead version, and usually there are none.
+        let others: Vec<i64> = tids.into_iter().filter(|t| !live.contains(t)).collect();
+        if others.is_empty() {
+            return Ok(());
+        }
+        let dead = self.dead_index_tids_among(table, &others)?;
+        if dead.is_empty() {
+            return Ok(());
+        }
+        self.with_btree(table, shape, |t| {
+            for (lo, hi) in &ranges {
+                t.kill_items(
+                    shape,
+                    lo.as_ref().map(|(v, i)| (v, *i)),
+                    hi.as_ref().map(|(v, i)| (v, *i)),
+                    &|x| dead.contains(&x),
+                );
+            }
+        })
+    }
+
     /// New tuple versions of `table` that are not heap-only: each B-tree
     /// takes an index tuple for each (`ExecInsertIndexTuples`).
     pub(crate) fn btree_insert_versions(
@@ -579,11 +637,6 @@ impl PgHandler {
         if shapes.is_empty() {
             return Ok(());
         }
-        // What bottom-up deletion may remove: read from the heap now, before
-        // any B-tree is held (RP-196), once per command -- within one, only
-        // deleters that ended before it are dead to every snapshot, and the
-        // command's row-by-row writes would otherwise read the heap per row.
-        let dead = self.command_dead_tids(table)?;
         for shape in shapes {
             // Each new tuple, and whether the UPDATE left this index's key as
             // it was (the executor's `indexUnchanged` hint).
@@ -598,15 +651,66 @@ impl PgHandler {
             if keys.is_empty() {
                 continue;
             }
-            // A model built here is of the rows already stored, which these
-            // versions are not yet among.
-            let events = self.with_btree(table, &shape, |t| {
-                t.ssi_events.clear();
-                for (key, unchanged, ctid) in keys {
-                    t.insert_deleting(&*shape, key, ctid, unchanged, &|t| dead.contains(&t));
+            // What the unique check and simple and bottom-up deletion may
+            // remove: the heap is read, before the tree is changed and with no
+            // B-tree held (RP-196), for the TIDs these inserts can ask about
+            // only -- the whole heap read once per command made a run of
+            // one-row inserts quadratic (RP-014).
+            let pending: i64 = keys
+                .iter()
+                .map(|(key, _, _)| BTree::key_tuple_size(&*shape, key))
+                .sum();
+            // When no TID needs the heap's answer -- the common case, a new
+            // key on a leaf with room -- the heap is not read (its answer
+            // for no TIDs is that none is dead), so a single version goes in
+            // under the same hold of the tree, from where the candidates'
+            // search already landed (RP-014). Otherwise the tree is let go
+            // while the heap is read, as below.
+            let mut keys = Some(keys);
+            let done = self.with_btree(table, &shape, |t| {
+                let all = keys.as_ref().expect("the keys");
+                let mut descents = Vec::with_capacity(all.len());
+                let mut c: Vec<i64> = Vec::new();
+                for (key, _, ctid) in all {
+                    let (tids, descent) = t.candidate_tids_descending(&*shape, key, *ctid, pending);
+                    c.extend(tids);
+                    descents.push(descent);
                 }
-                std::mem::take(&mut t.ssi_events)
+                c.sort_unstable();
+                c.dedup();
+                if !c.is_empty() || all.len() != 1 {
+                    return Err(c);
+                }
+                let (key, unchanged, ctid) = keys.take().expect("the keys").pop().expect("one key");
+                t.ssi_events.clear();
+                t.insert_descended(
+                    &*shape,
+                    key,
+                    ctid,
+                    unchanged,
+                    &|_| false,
+                    descents.pop().flatten(),
+                );
+                Ok(std::mem::take(&mut t.ssi_events))
             })?;
+            let events = match done {
+                Ok(events) => events,
+                Err(candidates) => {
+                    let keys = keys.take().expect("the keys");
+                    let dead = self.dead_index_tids_among(table, &candidates)?;
+                    // A model built here is of the rows already stored, which
+                    // these versions are not yet among.
+                    self.with_btree(table, &shape, |t| {
+                        t.ssi_events.clear();
+                        for (key, unchanged, ctid) in keys {
+                            t.insert_deleting(&*shape, key, ctid, unchanged, &|t| {
+                                dead.contains(&t)
+                            });
+                        }
+                        std::mem::take(&mut t.ssi_events)
+                    })?
+                }
+            };
             // What SSI hears of the inserts (`_bt_doinsert`, `_bt_split`):
             // a split moves its page's locks to the new half too, whoever
             // splits, and each insert checks the page it landed on.
@@ -652,37 +756,6 @@ impl PgHandler {
         Ok(())
     }
 
-    /// [`Self::dead_index_tids`] of `table`, kept for the running command.
-    fn command_dead_tids(
-        &self,
-        table: &str,
-    ) -> PgWireResult<std::sync::Arc<std::collections::HashSet<i64>>> {
-        type Key = (usize, String, String, u64, i64);
-        thread_local! {
-            static MEMO: std::cell::RefCell<Option<(Key, std::sync::Arc<std::collections::HashSet<i64>>)>> =
-                const { std::cell::RefCell::new(None) };
-        }
-        let (xid, cid) = self.command_writer();
-        let key: Key = (
-            self.store_id(),
-            self.db().to_string(),
-            table.to_string(),
-            xid,
-            cid,
-        );
-        if let Some(hit) = MEMO.with(|m| {
-            m.borrow()
-                .as_ref()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, v)| v.clone())
-        }) {
-            return Ok(hit);
-        }
-        let dead = std::sync::Arc::new(self.dead_index_tids(table)?);
-        MEMO.with(|m| *m.borrow_mut() = Some((key, dead.clone())));
-        Ok(dead)
-    }
-
     /// The names of `table`'s B-trees.
     pub(crate) fn btree_names(&self, table: &str) -> Vec<String> {
         self.btree_shapes(table)
@@ -725,6 +798,15 @@ impl PgHandler {
         if !new_hash.is_empty() {
             self.hash_built(table, Some(&new_hash));
         }
+        let new_am: Vec<String> = self
+            .am_shapes(table)
+            .into_iter()
+            .map(|s| s.name().to_string())
+            .filter(|n| !before.contains(n))
+            .collect();
+        if !new_am.is_empty() {
+            self.am_built(table, Some(&new_am));
+        }
         let new: Vec<String> = self
             .btree_names(table)
             .into_iter()
@@ -741,6 +823,11 @@ impl PgHandler {
     pub(crate) fn index_model_names(&self, table: &str) -> Vec<String> {
         let mut names = self.btree_names(table);
         names.extend(self.hash_shapes(table).into_iter().map(|s| s.name));
+        names.extend(
+            self.am_shapes(table)
+                .into_iter()
+                .map(|s| s.name().to_string()),
+        );
         names
     }
 
@@ -748,12 +835,14 @@ impl PgHandler {
     /// (VACUUM FULL, CLUSTER, an ALTER that rewrites) reindexes it.
     pub(crate) fn btree_reindex(&self, table: &str) -> PgWireResult<()> {
         self.hash_built(table, None);
+        self.am_built(table, None);
         self.btree_build_record(table, None)
     }
 
     /// REINDEX INDEX: that B-tree rebuilt and recorded.
     pub(crate) fn btree_reindex_one(&self, table: &str, index: &str) -> PgWireResult<()> {
         self.hash_built(table, Some(&[index.to_string()]));
+        self.am_built(table, Some(&[index.to_string()]));
         self.btree_build_record(table, Some(&[index.to_string()]))
     }
 
@@ -762,6 +851,7 @@ impl PgHandler {
     /// ones in memory are both of the old one.
     pub(crate) fn btree_rebuild_models(&self, table: &str) -> PgWireResult<()> {
         self.hash_built(table, None);
+        self.am_built(table, None);
         for shape in self.btree_shapes(table) {
             let built = BTree::build(&*shape, self.btree_entries(table, &shape)?);
             models()
@@ -777,6 +867,7 @@ impl PgHandler {
     pub(crate) fn btree_truncated(&self, table: &str) -> PgWireResult<()> {
         self.btree_rebuild_models(table)?;
         self.hash_truncated(table);
+        self.am_truncated(table);
         for name in self.btree_names(table) {
             self.record_index_size(table, &name, 0, -1.0)?;
         }
@@ -819,6 +910,7 @@ impl PgHandler {
             return Ok(out);
         }
         self.hash_bulk_delete(table);
+        self.am_bulk_delete(table, dead);
         for shape in self.btree_shapes(table) {
             let (pages, tuples) = self.with_btree(table, &shape, |t| {
                 t.bulk_delete(&*shape, &|c| dead.contains(&c));

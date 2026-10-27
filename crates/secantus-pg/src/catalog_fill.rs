@@ -516,7 +516,31 @@ fn default_opclass(type_oid: i64) -> i64 {
 
 /// A type's collation: `default` for the collatable string types, `C` for
 /// `name`, none (0) for the rest.
+/// A built-in type's `(typelem, typcollation)` as PostgreSQL 15.19's
+/// `pg_type` holds them (`pg15_catalog_rows.txt`).
+fn builtin_type_facts(type_oid: i64) -> Option<(i64, i64)> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<i64, (i64, i64)>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        crate::system_catalogs::dumped("pg_type")
+            .lines()
+            .filter_map(|l| {
+                let c: Vec<&str> = l.split('\t').collect();
+                Some((
+                    c.first()?.parse().ok()?,
+                    (c.get(13)?.parse().ok()?, c.get(28)?.parse().ok()?),
+                ))
+            })
+            .collect()
+    })
+    .get(&type_oid)
+    .copied()
+}
+
 fn type_collation(type_oid: i64) -> i64 {
+    if let Some((_, coll)) = builtin_type_facts(type_oid) {
+        return coll;
+    }
     match type_oid {
         25 | 1042 | 1043 => DEFAULT_COLLATION,
         19 => C_COLLATION,
@@ -1059,6 +1083,38 @@ impl PgHandler {
         } else {
             Vec::new()
         };
+        // Each index's access method, by its oid: `relam` (RP-285).
+        let index_methods: std::collections::HashMap<i64, i64> = if name == "pg_class" {
+            // Each table's indexes listed once, not once per index.
+            let mut listed: std::collections::HashMap<String, Vec<Document>> =
+                std::collections::HashMap::new();
+            self.index_relations()
+                .into_iter()
+                .filter_map(|ix| {
+                    let stored = listed
+                        .entry(ix.table.name.clone())
+                        .or_insert_with(|| {
+                            self.storage
+                                .list_indexes(self.db(), &ix.table.name)
+                                .unwrap_or_default()
+                        })
+                        .iter()
+                        .find(|d| d.get_str("name") == Ok(ix.name.as_str()))?;
+                    let method = stored.get_str("sqlMethod").ok().or_else(|| {
+                        stored
+                            .get_document("options")
+                            .ok()
+                            .and_then(|o| o.get_str("sqlMethod").ok())
+                    });
+                    Some((
+                        ix.oid,
+                        secantus_pgplan::misc_alter::method_oid(method.unwrap_or("btree"))?,
+                    ))
+                })
+                .collect()
+        } else {
+            std::collections::HashMap::new()
+        };
         // Per index: each key's type oid and whether it sorts DESC.
         // Per index, each key's `(type, descending, explicit class)`.
         type IndexKeys = Vec<(i64, Vec<(i64, bool, i64)>)>;
@@ -1187,7 +1243,7 @@ impl PgHandler {
                             "relam" => Bson::Int64(match kind.as_str() {
                                 "r" | "m" => self.table_relam(table),
                                 "t" => 2,
-                                "i" | "I" => 403,
+                                "i" | "I" => index_methods.get(&oid).copied().unwrap_or(403),
                                 _ => 0,
                             }),
                             "relfilenode" => Bson::Int64(match kind.as_str() {
@@ -1469,10 +1525,14 @@ impl PgHandler {
                     }
                     // An array type's element; 0 for any other type.
                     ("pg_type", "typelem") => Bson::Int64(
-                        secantus_pgplan::pgtypes::type_name_of_oid(int(get(row, "oid")))
-                            .and_then(|n| {
-                                n.strip_suffix("[]")
-                                    .and_then(secantus_pgplan::pgtypes::oid_of_name)
+                        builtin_type_facts(int(get(row, "oid")))
+                            .map(|(e, _)| e)
+                            .or_else(|| {
+                                secantus_pgplan::pgtypes::type_name_of_oid(int(get(row, "oid")))
+                                    .and_then(|n| {
+                                        n.strip_suffix("[]")
+                                            .and_then(secantus_pgplan::pgtypes::oid_of_name)
+                                    })
                             })
                             .unwrap_or(0),
                     ),

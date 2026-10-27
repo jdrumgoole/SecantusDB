@@ -786,11 +786,50 @@ fn typed_probe(
     without_side_effects(|| plan_select(&body, lookup, &probe_params)).ok()
 }
 
+/// Is `name` the function a correlated subquery's per-row call is named?
+pub(crate) fn is_correlated_name(name: &str) -> bool {
+    name == CORRELATED
+}
+
 fn is_correlated(f: &pg_query::protobuf::FuncCall) -> bool {
     matches!(
         f.funcname.as_slice(),
         [n] if matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == CORRELATED)
     )
+}
+
+/// Is every overload of the built-in `name` taking `nargs` arguments
+/// VOLATILE (`pg15_volatile_functions.tsv`, dumped from PostgreSQL 15.19's
+/// `pg_proc`)?
+pub(crate) fn volatile_builtin(name: &str, nargs: usize) -> bool {
+    static SET: std::sync::OnceLock<std::collections::HashSet<(&'static str, usize)>> =
+        std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        include_str!("pg15_volatile_functions.tsv")
+            .lines()
+            .filter_map(|l| {
+                let (n, a) = l.split_once('\t')?;
+                Some((n, a.trim().parse().ok()?))
+            })
+            .collect()
+    })
+    .contains(&(name, nargs))
+}
+
+/// Does `node` call a VOLATILE function -- a built-in PostgreSQL marks so,
+/// or a user function declared so (or left at the default) -- where the
+/// expression walk reaches? PostgreSQL never folds one: it runs once a row
+/// (`random()`, `nextval(...)`).
+pub(crate) fn has_volatile_call(node: &pg_query::protobuf::Node) -> bool {
+    crate::expr_any(node, &|n| match n.node.as_ref() {
+        Some(N::FuncCall(f)) => {
+            func_name(f).is_some_and(|name| match user_function_for(&name, &f.args) {
+                Some(u) => u.volatile,
+                None => volatile_builtin(&name, f.args.len()),
+            })
+        }
+        _ => false,
+    })
 }
 
 /// Does `node` hold a correlated subquery's per-row call anywhere?
@@ -1326,6 +1365,8 @@ pub(crate) fn without_side_effects<R>(f: impl FnOnce() -> R) -> R {
 pub struct UserFn {
     /// The bare name (`pg_temp.<name>` for a session's temp function).
     pub name: String,
+    /// Declared `VOLATILE` (PostgreSQL's default for a function).
+    pub volatile: bool,
     /// The schema it lives in (`public` unless created in another).
     pub schema: String,
     pub arg_types: Vec<String>,

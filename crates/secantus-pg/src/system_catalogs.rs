@@ -116,6 +116,16 @@ const ROLE_CLASS: i64 = 1260;
 
 pub(crate) const SHARED_COMMENT_COLLECTION: &str = "__sql_shared_comments__";
 
+/// Every catalog this module declares.
+#[cfg(test)]
+pub(crate) fn all_names() -> impl Iterator<Item = &'static str> {
+    STATIC
+        .iter()
+        .chain(STATEFUL.iter())
+        .copied()
+        .chain(EMPTY.iter().map(|(n, _)| *n))
+}
+
 pub(crate) fn is_system_catalog(name: &str) -> bool {
     STATIC.contains(&name) || STATEFUL.contains(&name) || EMPTY.iter().any(|(n, _)| *n == name)
 }

@@ -81,7 +81,7 @@ pgo-instrument = []
 [dev-dependencies]
 # The official driver, so the tests and the example use the server the way a
 # user's tests would.
-mongodb = { version = "3", features = ["sync", "snappy-compression", "zlib-compression", "zstd-compression"] }
+mongodb = { version = "3", features = ["sync", "snappy-compression", "zlib-compression"] }
 # Raw OP_COMPRESSED frames for the wire-compression tests.
 secantus-wire = { version = "=0.5.3-beta.196", path = "../secantus-wire" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

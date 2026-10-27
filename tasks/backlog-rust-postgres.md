@@ -593,8 +593,7 @@ one beside it.
     (`ExecHashGetHashValue`); 54 of 54 shapes at 20 to 3,000 rows, with a
     primary key and with NULL keys (14 before). Not yet: such a join in
     three or more tables, or FULL; an expression in a class; a LEFT join's class through the general path;
-    a class of text or other non-integer keys; three tables under a LIMIT
-    (a WHERE equality over two tables is a join clause since 2026-10-26,
+    a class of text or other non-integer keys (a WHERE equality over two tables is a join clause since 2026-10-26,
     the join graph a cycle where it closes one, two relations joined on
     every clause between them, a class's clause leading, and an inner
     join's further key pairs edges too: 14 of 14 cyclic shapes of three
@@ -604,13 +603,31 @@ one beside it.
     first, priced with `clause_selectivity`'s defaults -- `DEFAULT_INEQ_SEL`,
     `neqjoinsel`, IS DISTINCT FROM's, `var_eq_const`'s, an OR's -- and an
     operator a row; 117 of 117 shapes, 9 before); four or more tables
-    with a WHERE over two of them or a LIMIT; more than eight tables; an expression key with a function
-    call or a cast that costs; parameterized nested loops (an index scan inner); a LIMIT with
-    an ORDER BY, or with a WHERE over the general path; a join of more
-    than 200,000 rows a side, which streams in scan order.
+    with a WHERE over two of them; more than eight tables; an expression key with a function
+    call or a cast that costs; a join on two equivalence classes (`a JOIN
+    b ON a.b = b.a JOIN c ON a.c = c.a JOIN d ON a.b = d.a JOIN e ON a.c =
+    e.a`: 283 of 288 no-LIMIT shapes match, the 5 left all such); a LIMIT
+    with an ORDER BY over two tables, which the narrow join path plans (84
+    of 108); a join of more than 200,000 rows a side, which streams in
+    scan order.
+  - A LIMIT over three to eight tables (and two whose WHERE holds a join
+    filter) is planned for its first rows (2026-10-26): every relation
+    keeps its whole pathlist with startup costs counting, base tables'
+    paths include whole-index scans in a key's order and index and bitmap
+    scans parameterized by a clause's other table (Memoize, inner-unique
+    nested loops), and the plan is the cheapest under a Limit, or with an
+    ORDER BY of one integer column the cheapest of the presorted paths and
+    a bounded Sort. Join relations parameterized by an outer table
+    (`param_source_rels`, an outer join's) are built and run per outer
+    row; index sizes come from the B-tree model; a hash table that
+    outgrows its buckets is rebuilt in chunk order
+    (`ExecHashIncreaseNumBuckets`); the search keeps whole pathlists with
+    no LIMIT too, falling back to the old search where it declines. 843 of
+    843 LIMIT shapes of three to five tables at 20 to 3,000 rows (514, then
+    812 before). Declined: other ORDER BYs.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_limit_over_three_tables_is_planned
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_join_on_two_equivalence_classes_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -732,6 +749,52 @@ one beside it.
         7.6 s on the script; its storage gate was interrupted and nothing
         else has been run on it.
 
+      - **Measured 2026-10-27, the top-ten batch: PostgreSQL itself does
+        not fit `test_type_error_shadow`'s 20 s on that runner.** The
+        script, timed on `ubuntu-latest` (4 vCPU, 16 GB; a throwaway
+        workflow run, 40456257780) in the gauge's own environment (psycopg
+        3.3.4, binary implementation): the runner's PostgreSQL 16.15
+        (`synchronous_commit` on, `fdatasync`) 23.4, 24.6 and 24.0 s; this
+        server's debug build 55.5, 51.5 and 54.7 s, about 2.8 cores of
+        server CPU throughout. The batch cut the debug server's work on
+        the script by 28% in instructions retired and 31% in CPU
+        (`changelog.d/rust-pg-rp014-insert-cpu.md`: a shared cached
+        `TableDef`, an insert's decode and `_id` work before the
+        collection lock, an insert's heap reads only where PostgreSQL's
+        B-tree insert reads, Bind's parameters reused at Execute, storage
+        given the decoded rows, one B-tree descent fewer per unique
+        insert), and the test still hit 20 s in both transports (run
+        40446794397) -- as it must, when PostgreSQL takes 24 s there. So
+        no server change can make this test pass on that runner; what is
+        left is this server's 2.2x over PostgreSQL there (debug build
+        against PostgreSQL's optimised one). **Decision for Joe**: deselect
+        it on Linux by name with that reason, as Windows already does
+        (PostgreSQL 30 s there), or keep it as a standing failure the
+        lane does not gate on. **Joe (2026-10-27): keep optimising.**
+      - **Second pass, 2026-10-27 (`changelog.d/rust-pg-rp014-insert-cpu-2.md`):**
+        a further 18.6% of instructions retired (225.4G to 183.4G) and
+        17.3% of CPU (28.8 s to 23.8 s) on the development Mac's debug
+        build; the script there went from 9.8 s to 8.1 s, against
+        PostgreSQL 15.19's 7.6 s on a private cluster (16.7 s at the start
+        of the batch). **On `ubuntu-latest` it barely moved**: 49.9, 49.7
+        and 53.9 s against the runner's PostgreSQL's 23.4 to 24.1 s (run
+        40476352850). There the server's three connection threads are
+        flat out, 128 to 170 s of CPU a run (about 0.9 ms an insert,
+        against about 0.16 ms on the Mac); with commits not synced
+        (`SECANTUS_TEST_FAST_STORAGE=1`, a diagnostic only) the CPU is the
+        same, so it is not `fdatasync`. A `perf` profile there (AMD EPYC
+        7763, 2 cores / 4 threads, shared with the client) is flat: 96% in
+        the server's own code, no symbol above 0.6%, the allocator about
+        5%, `format!` about 0.7%; the VM exposes no instruction counter.
+        So that runner pays several times this Mac's cost per instruction
+        of debug code, and only less work an insert will close it. What
+        is left is spread thin (the second pass's spans, per connection
+        of 50,000 statements: storage's insert about 1.95 s, the row's
+        page models about 1.9 s, Bind 0.7 s, privileges + locks + plan
+        0.7 s, the statement wrapper 0.57 s); batching a pipeline's
+        Executes would change per-statement semantics (`cmin`,
+        `statement_timestamp`, where an error lands).
+
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS
       again when run again by itself**. `::test_notify*`,
@@ -773,35 +836,6 @@ one beside it.
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
 
-## Open from the 2026-09-30 batch
-
-- [ ] **Rust PG server: a SAVEPOINT captures whole tables, so its cost is
-      the size of what the block writes.** WiredTiger has no savepoint, so
-      one here is a set of pre-images: the first write to a table after a
-      savepoint copies that table's documents into it. Correct for any size,
-      but a savepoint taken before a write to a large table copies the whole
-      table into memory. Lazy capture is what keeps the common case free (a
-      savepoint nobody writes through costs nothing), and a per-row undo log
-      would be the fix if the cost ever bites.
-      Backlog-ID: RP-018
-      Verify: none -- savepoint memory cost design; no answer differs
-- [ ] **Rust PG server: what the general JOIN planner does not push into
-      its table leaves: a subquery.** A WHERE conjunct that reads ONE
-      alias's columns (qualified, or unqualified and in only one table),
-      built of operators, casts, constants, parameters and calls of
-      IMMUTABLE built-ins, is applied inside that leaf (only on the
-      PRESERVED side of every outer join above it); corpus `join_pushdown`,
-      unit tests `joins::tests` (immutable calls since 2026-10-19). Not
-      pushed: a conjunct holding a subquery, which PostgreSQL runs once as
-      an InitPlan beside the scan. The pushed copy also stays in the outer
-      WHERE, so pushing one here would run the subquery twice, and a
-      volatile one would answer differently; it needs the conjunct moved
-      rather than copied. A volatile or stable call, or a user function,
-      stays out for the same reason. (A conjunct over two aliases is a join
-      clause in PostgreSQL too, not a leaf filter.)
-      Backlog-ID: RP-019
-      Verify: none -- predicate pushdown/index use only; answers identical, EXPLAIN costs are a scope decision
-
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`
@@ -838,6 +872,110 @@ and fixed in the same batch; their tests in
 - RP-271: an autocommit statement took no table lock, so a DROP TABLE ran
   beside an autocommit UPDATE that had waited on a row, and the server
   wedged for good: every later BEGIN waited too.
+
+## Found by the top-ten batch (2026-10-26)
+
+Found while speeding up the `information_schema` views (RP-131), by
+comparing `routines`, `parameters` and `element_types` with PostgreSQL 15.19
+row for row. The tests are in `tests/backlog/test_rp_catalog_identity.py`,
+measured with read-only queries on 15.19. Fixed in the same batch, their
+tests regression tests:
+- RP-300: 56 built-in `pg_type` rows differed from `initdb`'s: a
+  fixed-length subscriptable type's `typelem` (`name`, `int2vector`,
+  `oidvector`, `point`, `lseg`, `box`, `line`, `_record`), a range array's
+  `typtype`, `_box`'s `typdelim`, ten types' `typcollation`, and NULL
+  `typnotnull` / `typbasetype` / `typtypmod` on 26 pseudo-types. So
+  `information_schema` called `int2vector` a plain type, not `ARRAY`.
+- RP-301: `format_type(18, NULL)` was `character` (`"char"` is meant), and a
+  modifier on a type with no `typmodout` was dropped (`format_type(25, 7)`
+  is `text(7)`).
+- RP-285 (found by RP-254's work): `pg_class.relam` was `btree` for every
+  index, so a join to `pg_am` named a GIN, GiST or hash index's method
+  wrong (`tests/backlog/test_rp_catalog_identity.py`).
+- RP-286 (found by RP-202's): a `pg_sleep` in the select list of a streamed
+  SELECT (`select a, pg_sleep(2) from t`) did not look for a cancel and
+  slept to its end; a row streamed after the statement's hooks are gone
+  is evaluated under a cancel hook now (`tests/backlog/test_rp202_cancel.py`).
+
+- [ ] **The built-in relations' `pg_attribute` rows differ from
+      PostgreSQL 15.19's.** Over `attrelid < 16384`: the 648 system-column
+      rows (`attnum < 0`: `ctid`, `xmin` ... of every catalog with storage)
+      are missing; 684 `information_schema` view columns name their domain's
+      base type in `atttypid` where PostgreSQL names the domain
+      (`sql_identifier`, `cardinal_number` ...); 282 `attcollation`s are
+      the default collation or none where a catalog's collatable column is
+      `C` (950); 59 array columns have `attndims` 0, not 1; and 40
+      `attstorage`s differ (a TOAST table's `chunk_data` is `p`). So
+      `element_types` lists the catalogs' text arrays without their
+      collation. Changing `atttypid` is the delicate part: what a client is
+      told a view column's type is follows it.
+      Backlog-ID: RP-302
+      Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
+
+- [ ] **In autocommit, a join whose select list calls `nextval` takes one
+      value more than its rows**: `select a.a, nextval('s') from a, b where
+      a.a = b.b` answers 2, 3, 4 and leaves `last_value` at 4 where
+      PostgreSQL 15.19 answers 1, 2, 3; in a transaction block it does not.
+      Found while working RP-019, which made a volatile WHERE condition run
+      once a row of its table as PostgreSQL's scan does.
+      Backlog-ID: RP-288
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
+- [ ] **`DEFERRABLE` on a primary key is dropped**: `primary key (a, b)
+      deferrable` records `condeferrable` false (15.19: true).
+      Backlog-ID: RP-281
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_deferrable_primary_key_is_deferrable
+- [ ] **A plain SELECT's WITH RECURSIVE is planned without PostgreSQL's
+      checks**: a recursive term of another type, or one holding an
+      aggregate, is answered (and without a LIMIT never ends) where 15.19
+      refuses with 42804 / 42P19. Found while completing RP-203, whose
+      CREATE VIEW now runs those checks first.
+      Backlog-ID: RP-295
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_recursive_query_postgres_refuses
+- [ ] **A hypothetical-set aggregate over two columns is refused**:
+      `dense_rank(2, 'x') WITHIN GROUP (ORDER BY a, b)` is 0A000 here.
+      Backlog-ID: RP-283
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_over_two_columns
+- [ ] **An UPDATE leaves the row's unique-key claim on its old value**
+      (shared storage), so inserting that value again fails XX000 `E11000
+      duplicate key error` where PostgreSQL 15.19 inserts it: the update
+      path (`index_entry_diff`) never moves the row's claim in `UNIQ_TABLE`;
+      only an insert writes claims and only a delete releases them. It also
+      blocks a journal ROLLBACK TO that puts back two rows which swapped a
+      unique value. The MongoDB server links the same code (not yet
+      compared with mongod). Found while closing RP-018.
+      Backlog-ID: RP-296
+      Verify: tests/backlog/test_rp018_savepoint_undo.py::test_an_updated_unique_value_can_be_used_again
+- [ ] **Pricing a key lookup reads the whole table** whenever the cached
+      heap page count is invalid (after any CREATE or DROP, and inside
+      transaction blocks): `priced_scan` -> `heap_pages` -> `heap_spaces` ->
+      `table_docs` decodes every row, so a one-row SELECT or UPDATE took
+      about 2.1 s on 200,000 rows (debug build) and about 1 s on 1,000,000
+      rows (optimised). Found while closing RP-018.
+      Backlog-ID: RP-297
+      Verify: tests/backlog/test_rp018_savepoint_undo.py::test_a_key_lookup_after_ddl_does_not_read_the_table
+- [ ] **An index created in the open transaction is no relation
+      `regclass` finds**: `select pg_relation_size('t_b')` after `create
+      index t_b` in the same block is 42P01; PostgreSQL 15.19 answers 8192.
+      Found while working RP-028.
+      Backlog-ID: RP-299
+      Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation
+- [ ] **OPEN — a cancel sent during a prepared statement was lost once in
+      CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
+      (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
+      job (run 40479482747, attempt 1): the statement answered `ok` after
+      `pg_sleep(3)` ran to its end, where the cancel sent 2.5 s in should
+      have ended it with 57014. Attempt 2 of the same commit passed, and
+      locally (debug build, macOS) every delay from 0.25 to 4.0 s in
+      0.25 s steps answered 57014 within 0.05 s, four runs of the test
+      each passing. Not diagnosed. PostgreSQL itself drops a cancel that
+      lands while it waits for the next message (`DoingCommandRead`), so
+      one candidate is the gap between psycopg's Parse+Sync cycle and its
+      Bind cycle, which both servers would drop -- but that gap is a
+      client round trip, and no measurement shows the cancel landed there.
+      The next step is the server's log of a failing run with the cancel's
+      arrival and the message it landed in.
+      Backlog-ID: RP-303
+      Verify: none -- seen once in CI; does not fail on demand
 
 ## Found by batch 78 (2026-10-25)
 
@@ -891,19 +1029,28 @@ batch, their tests regression tests:
 - RP-260: a REPEATABLE READ transaction took its snapshot at a SET, SHOW
   or LOCK. PostgreSQL takes it at the first statement that needs one.
 
-- [ ] **SERIALIZABLE scans of GIN and GiST indexes lock the whole table.**
-      B-tree and (since batch 77) hash index scans take PostgreSQL's page
-      and tuple SIREAD locks here. GIN and GiST indexes are not modelled,
-      so a scan of one is priced as a sequential scan and locks the
-      relation. PostgreSQL 15.19's `ginget.c` and `gistget.c` lock the
-      index pages a scan reads, and an insert checks the pages it touches.
-      So two transactions working on far-apart keys both commit there and
-      fail here: 16 of `predicate-gin`'s 31 permutations agree, and 22 of
-      `predicate-gist`'s 40. It needs page models of the two access
-      methods, as `btree_model.rs` is for B-trees and `hash_index.rs` for
-      hash indexes.
-      Backlog-ID: RP-254
-      Verify: tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods
+- [ ] **What the GIN and GiST page models do not cover yet.** Since the
+      top-ten batch (2026-10-26) GIN (`gin_index.rs`) and GiST
+      (`gist_index.rs`, `point_ops` and `box_ops`) indexes are modelled page
+      by page, so SERIALIZABLE takes PostgreSQL 15.19's SIREAD page locks
+      on them (`predicate-gin` 31 of 31, `predicate-gist` 40 of 40; was 19
+      and 22, RP-254). Not yet, each falling back to a relation lock as
+      before:
+      - `pg_relation_size` of a GIN or GiST index reads 0 though the model
+        knows its pages;
+      - GIN `=` on arrays, and opclasses other than `array_ops` (jsonb,
+        tsvector, btree_gin); array elements other than ints, floats, bool
+        and C-ordered text; an ANALYZEd array column (MCELEM statistics);
+      - point/box `~=`, polygon and circle containment;
+      - multi-column, partial and expression GIN / GiST indexes;
+      - an UPDATE's or DELETE's scan (only a SELECT passes its residual);
+      - VACUUM deleting emptied GIN posting-tree pages and GiST pages;
+      - GiST's `gistchoose` breaks penalty ties with a per-backend random
+        seed; the model uses a fixed one, so on overlapping `box_ops` data a
+        tuple can land on another page than in a given backend (15.19 gave
+        the same layout on three runs).
+      Backlog-ID: RP-287
+      Verify: tests/backlog/test_rp_top10_found.py::test_gin_and_gist_indexes_have_their_pages
 
 
 
@@ -1033,15 +1180,37 @@ without a Terminate, and counted a terminated one only once its client
 closed the socket) was found and fixed in the same batch; its test there is
 a regression test.
 
-- [ ] **The system catalogs' counters stay at zero.** `pg_stat_sys_tables`
-      and `pg_statio_sys_*` list every catalog, but this server's catalogs
-      are computed, not scanned, so nothing counts a read of `pg_class`;
-      PostgreSQL 15.19 counts every catalog scan a statement or a new
-      session's cache makes (`pg_class` rose by 13 for one new session that
-      ran one query). Modelling them means counting the catalog lookups
-      PostgreSQL's syscache and relcache make, which follow its own caching.
-      Backlog-ID: RP-225
-      Verify: tests/backlog/test_rp_batch55.py::test_scenario[a new session's catalog reads are counted]
+- [ ] **Some statements' catalog reads are not counted.** Since RP-225 a
+      statement's catalog scans are walked as PostgreSQL 15.19's syscache,
+      relcache and planner make them (`catalog_reads.rs`, over the
+      per-session caches in `catcache.rs`), but not for: DDL's own reads
+      (ALTER, DROP, CREATE INDEX; CREATE TABLE checks names only), the rule
+      queries of system views (`pg_stat_*`), psql's `\d` pattern query
+      (regex prefix as an index condition, `pg_table_is_visible` per row,
+      `get_actual_variable_range`), subqueries, CTEs, windows, PL/pgSQL
+      bodies, and texts over 64 KiB. Measured: `\d` 91 counters match, 29
+      differ; a `pg_stat_*` view 53 match, 61 differ.
+      Backlog-ID: RP-290
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ALTER TABLE's own catalog reads], tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+- [ ] **A catalog read counts no blocks** in `pg_statio_sys_*`: the scans
+      are counted (RP-225), the buffers they hit or read are not.
+      Backlog-ID: RP-291
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
+- [ ] **The first backend after a start is counted as a warm one.**
+      PostgreSQL serves it without the relcache init files (about 245
+      `pg_attribute` index scans, `pg_class` heap scans, ...); the model
+      treats every backend as starting with them. Separating the shared
+      and local cold costs needs an instrumented PostgreSQL.
+      Backlog-ID: RP-292
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
+- [ ] **`pg_class.relnatts` leaves out dropped columns** (1 where 15.19
+      says 2 after a DROP COLUMN).
+      Backlog-ID: RP-293
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_found[relnatts counts dropped columns]
+- [ ] **`proargtypes::regtype[]` is refused** ("cannot cast int4 to
+      regtype[]"); 15.19 returns `[0:0]={text}`.
+      Backlog-ID: RP-294
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_found[an oidvector casts to regtype[]]
 
 ## Found by batch 54 (2026-10-24)
 
@@ -1072,24 +1241,6 @@ visibility functions) and RP-211 (`pg_operator` and `pg_rewrite` listed
 none of PostgreSQL's rows) were found and fixed in the same batch; their
 tests are regression tests.
 
-- [ ] **A rule's `ev_qual` and `ev_action` are NULL.** PostgreSQL 15.19
-      stores each rule's qualification and actions as node trees (`<>` for
-      no qualification, `({QUERY :commandType 1 ...})`); here both columns
-      are NULL, for the system views' rules (listed since batch 52, as
-      `initdb` leaves them) and for the database's own. The trees are
-      PostgreSQL's `nodeToString` of its analysed query, which this server
-      does not build.
-      Measured 2026-10-25: `initdb` leaves 142 system-view rules whose trees
-      are 2.85 MB of text (the largest, `information_schema.columns`, 177 KB),
-      embedding catalog oids, attribute numbers and source offsets.
-      **Decided (Joe, 2026-10-25): build `nodeToString`.** Emit
-      PostgreSQL's analysed `Query` tree for every rule, the system views'
-      and the database's own: range table entries, target lists, `Var` /
-      `OpExpr` / `FuncExpr` nodes with their oids, and source locations, as
-      `outfuncs.c` writes them. Neither baked `initdb` trees nor a scope
-      decision.
-      Backlog-ID: RP-203
-      Verify: tests/backlog/test_rp_batch51.py::test_scenario[a rule's node trees]
 
 ## Found by batch 51 (2026-10-23)
 
@@ -1100,23 +1251,6 @@ NULL for a database's or role's comment) was found and fixed in the same
 batch, and RP-200 (a block's own index definitions) in batch 52; their
 tests there are regression tests.
 
-- [ ] **A cancel while a huge statement is planned waits for the pass it
-      lands in.** Planning a statement with a 200,000-item `IN` list runs
-      for about a second in a debug build, as a sequence of passes over the
-      whole tree with a cancellation point between each. A cancel that lands
-      inside one is answered when it ends: up to 0.09 s late here (measured
-      over 28 cancel times through Parse, Describe, Bind and Execute), where
-      PostgreSQL 15.19 answers in 0.015 s. The longest windows left, about
-      0.12 s each, are walks that collect the whole tree through
-      `pg_query`'s `nodes()` before looking at it: the privilege pass at
-      Execute, and the end of `plan_select`. Batch 74 split or moved apart
-      the ones of 0.2 s: the copy of the memoised tree and the scan for its
-      parameters now run on a thread of their own under the cancel hook,
-      and the typing of an `IN` list and each rewrite pass have a
-      cancellation point. Batch 46's follow-up closed the windows outside
-      planning that were 0.8 s long.
-      Backlog-ID: RP-202
-      Verify: none -- a latency budget; every answer is PostgreSQL's 57014, only later
 
 ## Found by batch 50 (2026-10-23)
 
@@ -1133,29 +1267,6 @@ are scenarios in `tests/backlog/test_rp_batch48.py`, measured on a private
 15.19 cluster. RP-195 (`pg_relation_size`) was found and fixed in the same
 batch; its test there is a regression test.
 
-- [ ] **A B-tree's dead entries: what index scans mark.** Each B-tree's
-      pages are modelled (`btree_model.rs`). Since batch 71 a full leaf
-      deletes before it splits, as PostgreSQL 15.19's
-      `_bt_delete_or_dedup_one_page` does:
-      - `_bt_check_unique` marks LP_DEAD the equal keys whose heap
-        versions are dead to all;
-      - simple deletion removes those, and the dead TIDs of their heap
-        blocks;
-      - bottom-up deletion runs for an UPDATE that left the key unchanged,
-        within its six-block budget.
-      Since batch 74 every step of a long run of updates matches too.
-      Since batch 81 an index scan marks LP_DEAD the entries whose heap
-      versions it finds dead to all (`kill_prior_tuple`, `_bt_killitems`):
-      a read the planner prices as an index scan, and an ORDER BY with no
-      WHERE it reads in a B-tree's order rather than sorting (54 of 54
-      shapes of reads between updates, 48 before). What is left is a read
-      that returns one row, which is not priced (the price counts the
-      table's rows, too dear for every primary-key lookup), so a lookup by
-      the primary key marks nothing: after 2,000 of them between each of
-      three updates PostgreSQL keeps the index at 13, 13 and 13 pages,
-      against 13, 14 and 14 here.
-      Backlog-ID: RP-196
-      Verify: tests/backlog/test_rp_batch81.py::test_primary_key_lookups_mark_the_dead_versions
 
 ## Found by batch 46 (2026-10-23)
 
@@ -1185,17 +1296,32 @@ cluster.
 Found while measuring `pg_depend` (RP-105) against PostgreSQL 15.19. The gap
 tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
-- [ ] **The `information_schema` views over every built-in function take
-      seconds** (release build, a fresh database): `routines` 3.6 s,
-      `parameters` 2.5 s, `data_type_privileges` 6.4 s, `element_types` 52 s,
-      where PostgreSQL 15.19 takes 2-47 ms. They answer PostgreSQL's rows
-      since RP-102 listed the 3,244 built-ins. The cost is mostly a LATERAL
-      FROM function (`_pg_expandarray` becomes `unnest(...) WITH
-      ORDINALITY`) re-planned and run as SQL once per left row
-      (`PgHandler::lateral_rows`), and per-row expression evaluation over
-      the joins. Under `LIMIT 0` they ran whole too, until batch 83: on CI's
-      debug build `test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable`
-      passed the 600 s per-test timeout, which ended the xdist worker.
+- [ ] **OPEN — `information_schema.data_type_privileges` and
+      `element_types` take half a second or more** (optimised build without
+      LTO, a fresh database, `count(*)`): `routines` 0.10 s, `parameters`
+      0.21 s, `data_type_privileges` 0.50 s, `element_types` 0.85 s, where
+      PostgreSQL 15.19 takes 10-50 ms. The same build took 0.85, 1.0, 2.0
+      and 13.7 s before the top-ten batch's second pass (2026-10-27: a
+      hashed SubPlan for a row IN over an uncorrelated subquery,
+      `buildSubPlanHash` / `ExecHashSubPlan` with `findPartialMatch`'s NULL
+      rules and `subplan_is_hashable`; a per-expression memo of cast
+      targets and constant casts; unused view outputs pruned after
+      expansion; join rows projected to the keys read), and 3.1, 2.2, 5.6
+      and 62 s before its first. Every row of the four views is the same as
+      before and as 15.19's. What is left:
+      - a LATERAL `_pg_expandarray` item is planned again as SQL for each
+        of `pg_proc`'s 668 distinct argument arrays
+        (`PgHandler::lateral_rows`), where PostgreSQL plans its function
+        scan once (about 20% of `parameters`);
+      - the evaluator still asks operand types per row on operator paths
+        (`array_operand_mismatch`, `static_json_type`,
+        `typed_string_operand`);
+      - a view subquery's pruned outputs are still materialised as NULL
+        cells (`materialise_sub`), and a pruned body is planned alone first
+        to keep its parse errors (about 5% of `data_type_privileges`, 7% of
+        `element_types`);
+      - `element_types` runs `data_type_privileges` (0.5 s) while it is
+        planned; PostgreSQL pulls the IN up into a hash semi-join.
       Backlog-ID: RP-131
       Verify: none -- a performance budget; every answer matches PostgreSQL's
 
