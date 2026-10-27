@@ -1280,14 +1280,14 @@ Still different, all 77:
       times, a regex prefix 0.01 times, now that the router reads the index.
       The plan cache landed 2026-10-27 (RM-154): a shape's trial runs until
       its entry is active, then only the cached plan is worked, within ten
-      times its works. That bought little: debug builds, 2,000 documents,
-      median of 300 finds against 3b47b41a, `{a: 5, b: 3}` 24.3 -> 19.6 ms
-      and a range on both 28.7 -> 24.7 ms, where one index is 2.8 ms. The
+      times its works. That bought little. Release builds, 2,000
+      documents, median of 300 finds, two runs each, against 3b47b41a:
+      `{a: 5, b: 3}` over `a_1` and `b_1` 2.0 -> 1.63 ms, a range on both
+      2.66 -> 2.28 ms, where one index is 0.49 ms and `_id` 0.10 ms. The
       cost is reading and decoding the collection and keying its index,
-      which checking the cached plan's works needs as the trial did.
-      (Release builds could not be made that day: the machine's disk was
-      full.) The lever left: keep a collection's trial documents and index
-      keys between reads, or count the cached plan's works over the index
+      which checking the cached plan's works needs as the trial did. The
+      lever left: keep a collection's trial documents and index keys
+      between reads, or count the cached plan's works over the index
       itself.
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
