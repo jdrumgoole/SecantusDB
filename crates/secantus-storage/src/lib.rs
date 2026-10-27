@@ -8272,15 +8272,7 @@ impl Storage {
                     d.insert("wall", wall.clone());
                     encode_doc(&d)?
                 }
-                OplogEntry::Raw(mut buf) => {
-                    buf.append("ts", bson::RawBsonRef::Timestamp(ts[i]).to_raw_bson());
-                    buf.append(
-                        "wall",
-                        bson::RawBsonRef::DateTime(bson::DateTime::from_millis(wall_millis))
-                            .to_raw_bson(),
-                    );
-                    buf.into_bytes()
-                }
+                OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
             };
             cur.reset()?;
             cur.set_key_q(seq);
@@ -8397,15 +8389,7 @@ impl Storage {
                         vec![5, 0, 0, 0, 0]
                     })
                 }
-                OplogEntry::Raw(mut buf) => {
-                    buf.append("ts", bson::RawBsonRef::Timestamp(ts[i]).to_raw_bson());
-                    buf.append(
-                        "wall",
-                        bson::RawBsonRef::DateTime(bson::DateTime::from_millis(wall_millis))
-                            .to_raw_bson(),
-                    );
-                    buf.into_bytes()
-                }
+                OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
             };
             blobs.push(blob);
             preimages.push(pre);
@@ -23169,6 +23153,23 @@ pub fn take_last_retryable_ts() -> Option<bson::Timestamp> {
 /// whole stored document among them) to find none (RP-014).
 static RW_STAMPED: AtomicBool = AtomicBool::new(false);
 
+/// A raw entry's bytes with `ts` and `wall` appended, as
+/// `RawDocumentBuf::append` writes them, at once (RP-014).
+fn append_ts_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<u8> {
+    b.pop();
+    b.push(0x11);
+    b.extend_from_slice(b"ts\0");
+    b.extend_from_slice(&ts.increment.to_le_bytes());
+    b.extend_from_slice(&ts.time.to_le_bytes());
+    b.push(0x09);
+    b.extend_from_slice(b"wall\0");
+    b.extend_from_slice(&wall_millis.to_le_bytes());
+    b.push(0);
+    let len = b.len() as i32;
+    b[..4].copy_from_slice(&len.to_le_bytes());
+    b
+}
+
 fn has_retryable_stamp(e: &OplogEntry) -> bool {
     match e {
         OplogEntry::Raw(buf) => {
@@ -27022,6 +27023,23 @@ mod oplog_entry_bytes_tests {
             }
         }
         assert!(Storage::oplog_entry_crud("i", "db.c", None, b"\x05\0\0\0", &o2).is_err());
+    }
+
+    #[test]
+    fn ts_and_wall_are_the_appended_bytes() {
+        let o = bson::to_vec(&bson::doc! {"_id": "k"}).unwrap();
+        let entry = Storage::oplog_entry_crud("i", "db.c", None, &o, &o).unwrap();
+        let ts = bson::Timestamp {
+            time: 1_700_000_000,
+            increment: 7,
+        };
+        let mut appended = entry.clone();
+        appended.append("ts", bson::RawBsonRef::Timestamp(ts).to_raw_bson());
+        appended.append(
+            "wall",
+            bson::RawBsonRef::DateTime(bson::DateTime::from_millis(-5)).to_raw_bson(),
+        );
+        assert_eq!(append_ts_wall(entry.into_bytes(), ts, -5), appended.into_bytes());
     }
 
     #[test]

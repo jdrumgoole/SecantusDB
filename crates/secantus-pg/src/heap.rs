@@ -703,11 +703,9 @@ impl PgHandler {
 
     fn writer(&self) -> (u64, i64) {
         let pid = self.pid();
-        let xid =
-            secantus_pgplan::snapshots::ask_pid(pid, secantus_pgplan::snapshots::XidOp::Assign)
-                .and_then(|x| x.parse::<u64>().ok())
-                .unwrap_or(u64::from(crate::xids::FROZEN_XID));
-        let cid = crate::xids::command_id(&self.storage, pid);
+        // The xid as the planner's hook (`xids::answer`) assigns it.
+        let (xid, cid) = crate::xids::writer(&self.storage, pid);
+        let xid = xid.unwrap_or(u64::from(crate::xids::FROZEN_XID));
         (xid, i64::from(cid))
     }
 
