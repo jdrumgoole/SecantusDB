@@ -179,3 +179,118 @@ fn bounded_paths_unchanged() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A filter `$divide: [1, "$d"]`, which fails on a document whose `d` is 0.
+fn divides() -> Document {
+    doc! {"$expr": {"$gt": [{"$divide": [1, "$d"]}, 0]}}
+}
+
+fn n_sum(st: &Storage) -> i64 {
+    st.find_matching("app", "c", &doc! {})
+        .unwrap()
+        .iter()
+        .map(|b| {
+            bson::from_slice::<Document>(b)
+                .unwrap()
+                .get_i32("n")
+                .unwrap_or(0) as i64
+        })
+        .sum()
+}
+
+/// An updateMany whose filter fails part-way leaves the documents before
+/// the failure updated, as mongod 8.2.11 does (measured 2026-10-27: the
+/// third of five failing, the first two are updated), and the failure is
+/// the statement's (RM-313).
+#[test]
+fn multi_update_failing_part_way_keeps_the_documents_before() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let docs: Vec<Vec<u8>> = (0..5i64)
+        .map(|i| enc(&doc! {"_id": i, "d": if i == 2 { 0 } else { 1 }, "n": 0}))
+        .collect();
+    st.insert("app", "c", docs, true).unwrap();
+    let out = st.update_matching(
+        "app",
+        "c",
+        &divides(),
+        &doc! {"$inc": {"n": 1}},
+        true,
+        false,
+        &[],
+        &Document::new(),
+        None,
+        None,
+        false,
+    );
+    match out {
+        Err(secantus_storage::StorageError::QueryError { code, .. }) => assert_eq!(code, 2),
+        other => panic!("expected the filter's error, got {other:?}"),
+    }
+    assert_eq!(n_sum(&st), 2, "the two documents before the failure");
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A deleteMany deletes in mongod's batches of 10: one whose filter fails
+/// on the 25th document has deleted the first 20, and one that fails
+/// inside its first batch none (measured 8.2.11, 2026-10-27).
+#[test]
+fn multi_delete_failing_part_way_keeps_the_batches_before() {
+    for (fails_at, deleted) in [(24i64, 20usize), (2, 0)] {
+        let home = temp_home();
+        let st = Storage::open(home.to_str().unwrap()).unwrap();
+        let docs: Vec<Vec<u8>> = (0..40i64)
+            .map(|i| enc(&doc! {"_id": i, "d": if i == fails_at { 0 } else { 1 }}))
+            .collect();
+        st.insert("app", "c", docs, true).unwrap();
+        let out = st.delete_matching("app", "c", &divides(), 0, &Document::new(), None);
+        assert!(out.is_err(), "the filter's error is the statement's");
+        assert_eq!(
+            st.count_matching("app", "c", &doc! {}, None).unwrap(),
+            40 - deleted,
+            "failing at document {fails_at}"
+        );
+        drop(st);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
+
+/// An interrupted operation -- killed, or out of `maxTimeMS` -- stops a
+/// multi-update in the expression it is evaluating, and the statement
+/// answers the interruption with nothing written (RM-313).
+#[test]
+fn multi_update_interrupted_in_an_expression_writes_nothing() {
+    let home = temp_home();
+    let st = Storage::open(home.to_str().unwrap()).unwrap();
+    let docs: Vec<Vec<u8>> = (0..3i64).map(|i| enc(&doc! {"_id": i, "n": 0})).collect();
+    st.insert("app", "c", docs, true).unwrap();
+    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let watch = secantus_core::deadline::watch_interrupt(flag);
+    // Each document's `$map` evaluates 1,000 elements, an interrupt point
+    // each.
+    let slow = doc! {"$expr": {"$gt": [{"$size": {"$map": {
+        "input": {"$range": [0, 1000]}, "in": "$$this"
+    }}}, 0]}};
+    let out = st.update_matching(
+        "app",
+        "c",
+        &slow,
+        &doc! {"$inc": {"n": 1}},
+        true,
+        false,
+        &[],
+        &Document::new(),
+        None,
+        None,
+        false,
+    );
+    drop(watch);
+    assert!(
+        matches!(out, Err(secantus_storage::StorageError::MaxTimeExpired)),
+        "{out:?}"
+    );
+    assert_eq!(n_sum(&st), 0);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}

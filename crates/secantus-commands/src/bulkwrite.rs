@@ -167,6 +167,13 @@ fn bad_value(msg: String) -> Document {
     CommandError::new(2, "BadValue", msg).into_reply()
 }
 
+/// Whether an op failed because the operation was interrupted (a kill or a
+/// spent `maxTimeMS`): that ends the batch, ordered or not, and `dispatch`
+/// fails the command, as mongod 8.2.11 does (RM-313).
+fn interrupted(code: i32) -> bool {
+    code == secantus_core::deadline::MaxTimeMsExpired::CODE
+}
+
 /// A failed op's cursor entry. mongod leads with `ok`/`idx`/`code`, carries a
 /// duplicate key's `keyPattern` / `keyValue` and a failed validation's
 /// `errInfo`, and ends with the counters an op of that kind reports.
@@ -781,7 +788,7 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // partial result.
                 results.push(op_error(idx, err.code, &err.errmsg, None, is_update));
                 n_errors += 1;
-                if ordered {
+                if ordered || interrupted(err.code) {
                     break;
                 }
                 continue;
@@ -792,7 +799,7 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let msg = reply.get_str("errmsg").unwrap_or("").to_string();
             results.push(op_error(idx, code, &msg, Some(&reply), is_update));
             n_errors += 1;
-            if ordered {
+            if ordered || interrupted(code) {
                 break;
             }
             continue;
@@ -803,7 +810,7 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 let msg = werr.get_str("errmsg").unwrap_or("").to_string();
                 results.push(op_error(idx, code, &msg, Some(werr), is_update));
                 n_errors += 1;
-                if ordered {
+                if ordered || interrupted(code) {
                     break;
                 }
                 continue;

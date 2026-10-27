@@ -73,6 +73,59 @@ thread_local! {
     static INTERRUPT: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
         const { std::cell::RefCell::new(None) };
     static INTERRUPT_TICKS: Cell<u32> = const { Cell::new(0) };
+    /// Set while an expression is evaluated that no interrupt reaches.
+    static OPAQUE: Cell<u32> = const { Cell::new(0) };
+    /// Whether a poll has failed in the running command (see [`tripped`]):
+    /// an interrupt some caller turned into a value is still its answer.
+    static TRIPPED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether one of this command's polls has failed -- a kill or a spent
+/// budget -- since its [`trip_scope`] began, even if the caller that saw
+/// it carried on: a filter that reads an error as a non-match, say. mongod
+/// fails the operation at its interrupt point; this is how the command layer
+/// learns of one it would otherwise have answered `ok` (RM-313).
+pub fn tripped() -> bool {
+    TRIPPED.with(Cell::get)
+}
+
+fn trip() -> MaxTimeMsExpired {
+    TRIPPED.with(|t| t.set(true));
+    MaxTimeMsExpired
+}
+
+/// Restores interrupt checks in expressions when dropped.
+#[must_use = "expressions are interruptible again when this guard drops"]
+pub struct OpaqueGuard(());
+
+impl Drop for OpaqueGuard {
+    fn drop(&mut self) {
+        OPAQUE.with(|o| o.set(o.get().saturating_sub(1)));
+    }
+}
+
+/// Evaluate expressions that neither `killOp` nor `maxTimeMS` interrupts
+/// until the guard drops: a collection validator's. mongod parses a
+/// validator once, with no operation to check, so an insert killed while
+/// its validator runs still inserts, and the kill reaches it only when it
+/// waits for its write concern (measured 8.2.11, 2026-10-27: a 300-document
+/// insert through a slow `$expr` validator, killed after 0.9 s, inserted all
+/// 300). Here it also keeps a check that treats an error as passing from
+/// reading an interrupt as a document that passes.
+pub fn opaque() -> OpaqueGuard {
+    OPAQUE.with(|o| o.set(o.get() + 1));
+    OpaqueGuard(())
+}
+
+/// [`check`] from inside an expression: one element of a `$map`, `$filter`
+/// or `$reduce`, where a single evaluation can run for seconds. mongod checks
+/// its operation for interrupt there too (8.2.11 interrupts a filter's
+/// `$reduce` within a few milliseconds of a kill), except under [`opaque`].
+pub fn check_expression() -> Result<(), MaxTimeMsExpired> {
+    if OPAQUE.with(Cell::get) > 0 {
+        return Ok(());
+    }
+    check()
 }
 
 /// Restores the previous kill flag when dropped.
@@ -92,6 +145,28 @@ impl Drop for InterruptGuard {
 pub fn watch_interrupt(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> InterruptGuard {
     let previous = INTERRUPT.with(|c| c.borrow_mut().replace(flag));
     InterruptGuard { previous }
+}
+
+/// Scopes [`tripped`] to one command: cleared when made, and on drop the
+/// enclosing command's flag again, with this one's failed poll added -- an
+/// inner command's interrupt is the outer one's too.
+#[must_use = "the scope ends when this guard drops"]
+pub struct TripScope {
+    outer: bool,
+}
+
+impl Drop for TripScope {
+    fn drop(&mut self) {
+        let outer = self.outer;
+        TRIPPED.with(|t| t.set(outer || t.get()));
+    }
+}
+
+/// Start counting failed polls for one command (see [`tripped`]).
+pub fn trip_scope() -> TripScope {
+    TripScope {
+        outer: TRIPPED.with(|t| t.replace(false)),
+    }
 }
 
 /// Whether the running operation has been killed.
@@ -168,7 +243,7 @@ pub fn check() -> Result<(), MaxTimeMsExpired> {
         n
     });
     if tick.is_multiple_of(POLL_EVERY) && interrupted() {
-        return Err(MaxTimeMsExpired);
+        return Err(trip());
     }
     CURRENT.with(|c| {
         let Some(mut a) = c.get() else { return Ok(()) };
@@ -176,7 +251,7 @@ pub fn check() -> Result<(), MaxTimeMsExpired> {
         let due = a.ticks % POLL_EVERY == 0;
         c.set(Some(a));
         if due && Instant::now() >= a.deadline {
-            return Err(MaxTimeMsExpired);
+            return Err(trip());
         }
         Ok(())
     })
@@ -189,7 +264,7 @@ pub fn check() -> Result<(), MaxTimeMsExpired> {
 /// entirely.
 pub fn check_now() -> Result<(), MaxTimeMsExpired> {
     if expired() || interrupted() {
-        return Err(MaxTimeMsExpired);
+        return Err(trip());
     }
     Ok(())
 }
@@ -284,5 +359,59 @@ mod tests {
         assert!(expired());
         let other = std::thread::spawn(expired).join().unwrap();
         assert!(!other, "another thread must not see this thread's deadline");
+    }
+
+    fn killed() -> (
+        InterruptGuard,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (watch_interrupt(flag.clone()), flag)
+    }
+
+    /// A kill is read by an expression's poll within one poll interval,
+    /// and not at all under `opaque` -- a collection validator's evaluation.
+    #[test]
+    fn an_expression_reads_the_kill_unless_opaque() {
+        let (_g, flag) = killed();
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        {
+            let _o = opaque();
+            for _ in 0..POLL_EVERY * 2 {
+                assert_eq!(check_expression(), Ok(()), "a validator is not interrupted");
+            }
+        }
+        let failed = (0..POLL_EVERY).any(|_| check_expression().is_err());
+        assert!(failed, "the kill is read within one poll interval");
+    }
+
+    /// A failed poll is remembered for the command, even when its caller
+    /// carried on, and a nested command's failure is the outer one's.
+    #[test]
+    fn a_failed_poll_trips_the_command() {
+        let outer = trip_scope();
+        assert!(!tripped());
+        {
+            let _inner = trip_scope();
+            let (_g, flag) = killed();
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            assert_eq!(check_now(), Err(MaxTimeMsExpired));
+            assert!(tripped());
+        }
+        assert!(tripped(), "the inner command's interrupt reaches the outer");
+        drop(outer);
+        let fresh = trip_scope();
+        assert!(!tripped(), "a new command starts untripped");
+        drop(fresh);
+    }
+
+    /// The kill flag alone, with no budget armed, fails `check_now`.
+    #[test]
+    fn a_kill_fails_check_now_without_a_budget() {
+        let _scope = trip_scope();
+        let (_g, flag) = killed();
+        assert_eq!(check_now(), Ok(()));
+        flag.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(check_now(), Err(MaxTimeMsExpired));
     }
 }

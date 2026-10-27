@@ -2515,6 +2515,11 @@ pub enum StorageError {
 /// query fails before any document is read, and the command layer reports
 /// that (`argtypes::expression_problem_in_filter`).
 pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageError {
+    // An expression interrupted while it ran (RM-313) is the operation's
+    // interruption, as a scan's is, not an error in the query.
+    if fault.is_interruption() {
+        return StorageError::MaxTimeExpired;
+    }
     match fault.as_mongo() {
         Some((code, errmsg)) => StorageError::QueryError {
             code,
@@ -11426,6 +11431,15 @@ impl Storage {
                 if oplog_on && !oplog_entries.is_empty() {
                     self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
                 }
+                // A retryable insert checks for interrupt before its batch
+                // commits, and a kill rolls the whole batch back: mongod
+                // 8.2.11 inserts none of a 300-document retryable insert
+                // killed while it ran, where a plain one inserts all 300
+                // (measured 2026-10-27, RM-313).
+                let retryable = RETRYABLE_SESSION.with(|s| s.borrow().is_some());
+                if retryable && deadline::check_now().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 Ok((inserted, errors, stopped, tally))
             })?;
             // Committed (a capped collection takes no user transaction, and
@@ -19107,29 +19121,41 @@ impl Storage {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        let (matched, modified) = {
+        let (matched, modified, scan_error) = {
             // The coll lock's guard lives only for this block: the zero-match
             // delegation below re-enters `update_matching_single_txn`, which
             // takes the SAME non-reentrant mutex — holding it across that
             // call self-deadlocks (found by the first test run).
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let rids: Vec<i64> = {
+            // The documents the scan found to match, with the bytes it read
+            // them as, and the error that ended the scan early, if one did.
+            // mongod updates each document as its scan reaches it, so a
+            // filter that fails part-way -- an interrupt, or an error on one
+            // document -- leaves the documents before it updated: measured
+            // 8.2.11 (2026-10-27), `$divide: [1, "$d"]` with `d: 0` in the
+            // third of five documents updates the first two, and a kill
+            // half-way through 100 slow documents leaves 13 updated (RM-313).
+            let (rids, scan_error): (Vec<(i64, Vec<u8>)>, Option<StorageError>) = {
                 let session = self.op_session()?;
                 self.create_for_write(&session, db, coll)?;
                 let mut rids = Vec::new();
+                let mut scan_error = None;
                 for (recordid, _id_k, blob) in
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
                 {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
-                    if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(query_fault)?
-                    {
-                        rids.push(recordid);
+                    match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
+                        Ok(true) => rids.push((recordid, blob)),
+                        Ok(false) => {}
+                        Err(fault) => {
+                            scan_error = Some(query_fault(fault));
+                            break;
+                        }
                     }
                 }
-                rids
+                (rids, scan_error)
             };
             let mut matched = 0usize;
             let mut modified = 0usize;
@@ -19165,8 +19191,12 @@ impl Storage {
                 matched += m;
                 modified += w;
             }
-            (matched, modified)
+            (matched, modified, scan_error)
         };
+        // The documents before it are updated; the error is the statement's.
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
         if matched == 0 {
             // Zero matches (an empty scan, or every candidate stopped
             // matching by its chunk's re-check): the single-transaction body
@@ -19198,7 +19228,8 @@ impl Storage {
 
     /// One bounded chunk of the multi-update: process RecordIds from the
     /// front of `rids` until the doc/byte budget closes the transaction.
-    /// Returns `(consumed, matched, modified)` — `consumed` counts every
+    /// Each comes with the bytes the scan matched it as. Returns
+    /// `(consumed, matched, modified)` — `consumed` counts every
     /// examined RecordId (matching or not) so the driver always advances.
     #[allow(clippy::too_many_arguments)]
     fn update_chunk_txn(
@@ -19206,7 +19237,7 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-        rids: &[i64],
+        rids: &[(i64, Vec<u8>)],
         filter: &Document,
         vars: &Document,
         coll_opt: Option<&Collation>,
@@ -19246,7 +19277,8 @@ impl Storage {
         // error back; it used to roll the chunk back, so nothing was updated.
         let mut stopped: Option<StorageError> = None;
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for &recordid in rids {
+        for (recordid, scanned) in rids {
+            let recordid = *recordid;
             if modified >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
                 break;
             }
@@ -19263,12 +19295,21 @@ impl Storage {
                 Err(e) if e.is_not_found() => continue,
                 Err(e) => return Err(e.into()),
             };
-            let raw =
-                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
-            if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                .map_err(query_fault)?
-            {
-                continue;
+            // A document unchanged since the scan matched it still matches:
+            // the filter is evaluated once per document, as mongod's is.
+            // One another writer changed is tested again, and a failure
+            // there ends the update after the documents before it.
+            if blob != *scanned {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(fault) => {
+                        stopped = Some(query_fault(fault));
+                        break;
+                    }
+                }
             }
             let doc = decode_doc(&blob)?;
             let new = match transform(&doc, false) {
@@ -19897,25 +19938,53 @@ impl Storage {
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let rids: Vec<i64> = {
+        // The documents the scan found to match, with the bytes it read them
+        // as, and the error that ended the scan early, if one did. mongod
+        // stages the documents it deletes and removes them a batch at a
+        // time (`batchedDeletesTargetBatchDocs`, 10, or
+        // `batchedDeletesTargetStagedDocBytes`, 2 MiB), so a scan that
+        // fails part-way -- an interrupt, a filter that errors on one
+        // document -- leaves the batches before it deleted and the one it
+        // was staging not: measured 8.2.11 (2026-10-27), killed after 1.0 s
+        // and 1.5 s of slow documents it had deleted 10 and 20, after 1.0 s
+        // of fast ones 360, and an error on the third of five deleted none
+        // (RM-313). (Killed after 0.5 s it had deleted 4, which no
+        // documented target explains.)
+        let (rids, scan_error): (Vec<(i64, Vec<u8>)>, Option<StorageError>) = {
+            const BATCH_DOCS: usize = 10;
+            const BATCH_BYTES: usize = 2 * 1024 * 1024;
             let session = self.op_session()?;
-            let mut rids = Vec::new();
+            let mut rids: Vec<(i64, Vec<u8>)> = Vec::new();
+            let mut scan_error = None;
+            let mut staged_from = 0usize;
+            let mut staged_bytes = 0usize;
             for (recordid, _id_k, blob) in
                 self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?
             {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
-                if secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                    .map_err(query_fault)?
-                {
-                    rids.push(recordid);
+                match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
+                    Ok(true) => {
+                        staged_bytes += blob.len();
+                        rids.push((recordid, blob));
+                        if rids.len() - staged_from >= BATCH_DOCS || staged_bytes >= BATCH_BYTES {
+                            staged_from = rids.len();
+                            staged_bytes = 0;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(fault) => {
+                        rids.truncate(staged_from);
+                        scan_error = Some(query_fault(fault));
+                        break;
+                    }
                 }
             }
             match DELETE_BATCH.with(Cell::get) {
                 0 => {}
-                batch => rids.chunks_mut(batch).for_each(<[i64]>::reverse),
+                batch => rids.chunks_mut(batch).for_each(<[(i64, Vec<u8>)]>::reverse),
             }
-            rids
+            (rids, scan_error)
         };
         // Each batch of two or more is one `applyOps` entry on mongod.
         struct ClearGroups;
@@ -19930,7 +19999,7 @@ impl Storage {
                 let mut g = g.borrow_mut();
                 for chunk in rids.chunks(batch).filter(|c| c.len() > 1) {
                     let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
-                    for rid in chunk {
+                    for (rid, _) in chunk {
                         g.insert(*rid, id);
                     }
                 }
@@ -19939,39 +20008,52 @@ impl Storage {
         let mut deleted = 0usize;
         let mut idx = 0usize;
         while idx < rids.len() {
-            let (consumed, d) = self.retry_write_conflicts("delete_matching_chunk", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.delete_chunk_txn(
-                        &session,
-                        db,
-                        coll,
-                        &rids[idx..],
-                        filter,
-                        let_vars,
-                        coll_opt,
-                    )
-                })
-            })?;
+            let (consumed, d, stopped) =
+                self.retry_write_conflicts("delete_matching_chunk", || {
+                    let session = self.op_session()?;
+                    self.with_statement_txn(&session, || {
+                        self.delete_chunk_txn(
+                            &session,
+                            db,
+                            coll,
+                            &rids[idx..],
+                            filter,
+                            let_vars,
+                            coll_opt,
+                        )
+                    })
+                })?;
+            // The chunk committed what it did before the failure; the
+            // failure is now the statement's.
+            if let Some(e) = stopped {
+                return Err(e);
+            }
             debug_assert!(consumed > 0);
             idx += consumed;
             deleted += d;
         }
+        // The batches before it are deleted; the error is the statement's.
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
         Ok(deleted)
     }
 
-    /// One bounded chunk of the deleteMany. Returns `(consumed, deleted)`.
+    /// One bounded chunk of the deleteMany, over RecordIds with the bytes
+    /// the scan matched them as. Returns `(consumed, deleted, stopped)`:
+    /// `stopped` is the error a document another writer changed met when
+    /// it was tested again, which ends the delete after this chunk commits.
     #[allow(clippy::too_many_arguments)]
     fn delete_chunk_txn(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        rids: &[i64],
+        rids: &[(i64, Vec<u8>)],
         filter: &Document,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, Option<StorageError>)> {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -19993,8 +20075,10 @@ impl Storage {
         let mut chunk_bytes = 0usize;
         let mut oplog_entries: Vec<OplogEntry> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut stopped = None;
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for &recordid in rids {
+        for (recordid, scanned) in rids {
+            let recordid = *recordid;
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
                 break;
             }
@@ -20010,12 +20094,19 @@ impl Storage {
                 Err(e) if e.is_not_found() => continue,
                 Err(e) => return Err(e.into()),
             };
-            let raw =
-                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
-            if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                .map_err(query_fault)?
-            {
-                continue;
+            // A document unchanged since the scan matched it still matches
+            // (see `update_chunk_txn`).
+            if blob != *scanned {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(fault) => {
+                        stopped = Some(query_fault(fault));
+                        break;
+                    }
+                }
             }
             let doc = decode_doc(&blob)?;
             // Doc row first, entries after — see prune_ttl for the lock-free
@@ -20053,7 +20144,7 @@ impl Storage {
         if oplog_on && !oplog_entries.is_empty() {
             self.emit_oplog_entries(session, oplog_entries, pre_images)?;
         }
-        Ok((consumed, deleted))
+        Ok((consumed, deleted, stopped))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -22322,6 +22413,9 @@ fn validator_holds(
 ) -> Result<bool> {
     let own = default_collation(session, db, coll)?.map(|(c, _)| c);
     let _active = secantus_core::collation::activate(own.as_ref());
+    // mongod evaluates a validator where no interrupt reaches it (RM-313):
+    // an error here passes, and an interrupt must not read as one.
+    let _opaque = secantus_core::deadline::opaque();
     Ok(query_matches(doc, validator, &Document::new(), None).unwrap_or(true))
 }
 

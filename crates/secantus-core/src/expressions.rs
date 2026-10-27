@@ -4115,6 +4115,9 @@ fn op_object_to_array(arg: &Bson, ctx: &Ctx) -> R {
 /// of `ctx`'s scope (mirrors `_Ctx.with_var`). The document (so `$$ROOT` and
 /// bare `$field` paths) is unchanged — only the var scope grows.
 fn eval_with_vars(expr: &Bson, ctx: &Ctx, extra: &[(&str, Bson)]) -> R {
+    // One element of a `$map` / `$filter` / `$reduce`: an interrupt point,
+    // as it is in mongod (RM-313).
+    crate::deadline::check_expression()?;
     let mut vars = ctx.vars.clone();
     let mut per_doc = ctx.per_doc.to_vec();
     for (name, value) in extra {
