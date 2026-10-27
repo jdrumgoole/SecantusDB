@@ -522,9 +522,9 @@ impl GucMap {
         slot: GucSlot,
         read: impl FnOnce(&Self) -> T,
     ) -> T {
+        type Slots = Vec<Option<(u64, Box<dyn std::any::Any>)>>;
         thread_local! {
-            static MEMO: std::cell::RefCell<Vec<Option<(u64, Box<dyn std::any::Any>)>>> =
-                const { std::cell::RefCell::new(Vec::new()) };
+            static MEMO: std::cell::RefCell<Slots> = const { std::cell::RefCell::new(Vec::new()) };
         }
         let at = slot as usize;
         let hit = MEMO.with(|m| {
