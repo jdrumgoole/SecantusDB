@@ -66,6 +66,209 @@ pub(crate) struct Trial<'a> {
     pub whole: &'a dyn Whole,
     /// The plans the last counted trial ran, as `explain` lists them.
     pub ranked: RefCell<Vec<Ranked>>,
+    /// mongod's plan cache, which a read consults before any trial and
+    /// writes after one (`super::plan_cache`). `explain` passes none: it
+    /// neither reads nor writes the cache.
+    pub cache: Option<&'a dyn CacheHook>,
+}
+
+/// What the plan cache holds for a query, as the planner asks it.
+pub(crate) struct Lookup {
+    pub key: super::cache_key::CacheKey,
+    /// The active entry's plan (its `signature`) and the works it took.
+    pub active: Option<(String, i64)>,
+    /// The query is a branch of a rooted `$or`, planned by the subplanner.
+    pub branch: bool,
+    /// The active entry's plan was already tried for this read: take it as
+    /// it is.
+    pub trusted: bool,
+}
+
+/// How a trial's winner is written to the cache
+/// (`ConditionalClassicPlanCacheWriter::Mode`).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum CacheMode {
+    Always,
+    /// Not when the best plans tie or the winner returned nothing
+    /// (a branch of a rooted `$or`).
+    Sometimes,
+}
+
+/// A finished trial, for the plan cache.
+pub(crate) struct Decision<'p> {
+    /// The plans, best first, with their scores and what they counted.
+    pub ranked: Vec<(&'p Node, f64, &'p Stats)>,
+    /// The winner's `works`.
+    pub works: i64,
+}
+
+/// The plan cache as the planner sees it.
+pub(crate) trait CacheHook {
+    /// The cache's entry for the query `q` plans. `None`: a query mongod
+    /// does not cache.
+    fn lookup(&self, q: &Query) -> Option<Lookup>;
+    /// A cached plan did worse than its works allowed: the entry goes
+    /// inactive (`PlanCache::deactivate`).
+    fn deactivate(&self, key: &super::cache_key::CacheKey);
+    /// A trial's winner for the query (`PlanCache::set`).
+    fn store(&self, l: &Lookup, q: &Query, d: &Decision, mode: CacheMode);
+    /// The plan the read runs for the query, cached or tried.
+    fn chose(&self, l: &Lookup, signature: String);
+}
+
+/// The query solution as mongod hashes it (`QuerySolution::hash`), which
+/// `explain`'s `isCached` compares with the cached one: every stage of the
+/// plan under whatever the command puts on top -- fetch, sort, skip, limit
+/// and projection included -- and the index and direction each scan reads,
+/// but no value (measured 8.2.11: the plan cached for `{a: {$lt: 5}}` is
+/// `isCached` for `{a: {$lt: 6}}`, and not for it with a skip and limit).
+pub(crate) fn solution(node: &Node) -> String {
+    let mut node = node;
+    while let Node::Count(input) | Node::Update(input) | Node::Delete { input, .. } = node {
+        node = input;
+    }
+    fn walk(node: &Node, out: &mut String) {
+        let doc = node.to_doc(None);
+        out.push_str(doc.get_str("stage").unwrap_or("?"));
+        if let Node::Sort { on_keys, .. } = node {
+            out.push_str(if *on_keys { ":default" } else { ":simple" });
+        }
+        if let Ok(name) = doc.get_str("indexName") {
+            out.push(':');
+            out.push_str(name);
+            out.push(':');
+            out.push_str(doc.get_str("direction").unwrap_or(""));
+        }
+        let inputs: Vec<&Node> = match node {
+            Node::Fetch { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Skip(_, input)
+            | Node::Limit(_, input)
+            | Node::Projection { input, .. }
+            | Node::ReturnKey(input)
+            | Node::Subplan(input) => vec![input],
+            Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
+                inputs.iter().collect()
+            }
+            _ => vec![],
+        };
+        if !inputs.is_empty() {
+            out.push('(');
+            for (i, n) in inputs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                walk(n, out);
+            }
+            out.push(')');
+        }
+    }
+    let mut out = String::new();
+    walk(node, &mut out);
+    out
+}
+
+/// The plan's structure: how it reaches the documents -- the scans, the
+/// indexes they read and in which direction, and per key field the kind of
+/// bounds (`P`oint, `A`ll, a range closed below `L`, above `H`, or both
+/// `C`) -- without the values, and without the stages a query's other
+/// parts put over it (fetch, sort, projection, skip, limit). Two queries of
+/// one shape planned alike have one signature: it stands for mongod's
+/// cached index tags, from which mongod rebuilds the rest of the plan.
+pub(crate) fn signature(node: &Node) -> String {
+    fn kind(i: &Interval) -> char {
+        if i.is_point() {
+            'P'
+        } else if i.is_all() {
+            'A'
+        } else {
+            let low = !matches!(i.lo, Bson::MinKey)
+                && !matches!(&i.lo, Bson::Double(d) if d.is_infinite());
+            let high = !matches!(i.hi, Bson::MaxKey)
+                && !matches!(&i.hi, Bson::Double(d) if d.is_infinite());
+            match (low, high) {
+                (true, true) => 'C',
+                (true, false) => 'L',
+                (false, true) => 'H',
+                (false, false) => 'O',
+            }
+        }
+    }
+    fn scan(ix: &IxScan, out: &mut String) {
+        out.push_str(&ix.index.name);
+        out.push(if ix.backward { '<' } else { '>' });
+        for field in &ix.bounds {
+            let kinds: BTreeSet<char> = field.iter().map(kind).collect();
+            out.extend(kinds);
+            out.push(';');
+        }
+    }
+    fn walk(node: &Node, out: &mut String) {
+        let inputs: Vec<&Node> = match node {
+            // What the rest of the query puts over the access.
+            Node::Fetch { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Skip(_, input)
+            | Node::Limit(_, input)
+            | Node::Projection { input, .. }
+            | Node::ReturnKey(input)
+            | Node::Count(input)
+            | Node::Update(input)
+            | Node::Delete { input, .. } => return walk(input, out),
+            Node::CollScan { backward, .. } => {
+                out.push_str(if *backward { "COLLSCAN<" } else { "COLLSCAN>" });
+                vec![]
+            }
+            Node::IxScan(ix) => {
+                out.push_str("IXSCAN:");
+                scan(ix, out);
+                vec![]
+            }
+            Node::DistinctScan(ix, width, fetching) => {
+                out.push_str(&format!("DISTINCT_SCAN{width}{fetching}:"));
+                scan(ix, out);
+                vec![]
+            }
+            Node::CountScan(ix) => {
+                out.push_str("COUNT_SCAN:");
+                scan(ix, out);
+                vec![]
+            }
+            Node::Or(inputs) => {
+                out.push_str("OR");
+                inputs.iter().collect()
+            }
+            Node::AndSorted(inputs) => {
+                out.push_str("AND_SORTED");
+                inputs.iter().collect()
+            }
+            Node::SortMerge { inputs, .. } => {
+                out.push_str("SORT_MERGE");
+                inputs.iter().collect()
+            }
+            Node::Subplan(input) => {
+                out.push_str("SUBPLAN");
+                vec![input]
+            }
+            other => {
+                out.push_str(other.to_doc(None).get_str("stage").unwrap_or("?"));
+                vec![]
+            }
+        };
+        if !inputs.is_empty() {
+            out.push('(');
+            for (i, n) in inputs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                walk(n, out);
+            }
+            out.push(')');
+        }
+    }
+    let mut out = String::new();
+    walk(node, &mut out);
+    out
 }
 
 /// One plan mongod tried: its tree, its score, and what its stages counted
@@ -386,7 +589,14 @@ fn explode(u: &IndexUse, sort: &Document, parts: &[Document]) -> Option<Node> {
     let mut count = 1;
     for pos in 0..u.bounds.len() {
         let list = &u.bounds[pos];
-        if list.len() < 2 || !list.iter().all(Interval::is_point) {
+        // `explodeForSort`: only the leading fields whose bounds are points
+        // explode; a range ends them (measured 8.2.11: `{b: {$in: [1, 2,
+        // 3]}, a: {$gt: 10}}` sorted on `b` over `a_1_b_1` sorts the scan's
+        // keys, it does not merge three scans).
+        if !list.iter().all(Interval::is_point) {
+            break;
+        }
+        if list.len() < 2 {
             continue;
         }
         if count * list.len() > 200 {
@@ -924,8 +1134,10 @@ fn candidates(
     // `b_1` adds `AND_SORTED`; with `a_1_b_1` beside them it does not).
     let in_order = |a: &Access| match &a.scan {
         Node::IxScan(ix) => {
+            // `IndexScanNode::sortedByDiskLoc`: one key, multikey or not
+            // (measured 8.2.11: `{a: 4, t: 2}` over `a_1` and a multikey
+            // `t_1` adds `AND_SORTED`).
             ix.filter.is_none()
-                && !ix.index.is_multikey()
                 && ix
                     .bounds
                     .iter()
@@ -967,6 +1179,15 @@ fn candidates(
     for x in 0..singles {
         for y in x + 1..singles {
             if !in_order(&out[x].0) || !in_order(&out[y].0) {
+                continue;
+            }
+            // Two scans of one index are intersected only all together,
+            // above (an `$all` over a multikey index).
+            let same = match (&out[x].0.index, &out[y].0.index) {
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            };
+            if same {
                 continue;
             }
             let both: BTreeSet<usize> = covered[x].union(&covered[y]).copied().collect();
@@ -1069,48 +1290,107 @@ fn tried(
     if found.len() < 2 {
         return None;
     }
-    if let [(scan, Some(_)), (walk, None)] = found.as_slice() {
-        if let Some(walk_wins) = counted(scan, walk, q, trial) {
-            return Some(found.swap_remove(usize::from(walk_wins)).0);
+    let plans: Vec<Node> = found.iter().map(|(a, _)| wrap(a.clone(), q)).collect();
+    // mongod looks the query up in its plan cache before any trial: an
+    // active entry's plan runs in place of the trial, as long as it does
+    // no worse than ten times the works it was cached with
+    // (`internalQueryCacheEvictionRatio`); a branch of an `$or` takes it
+    // as it is. A plan that does worse sends the entry inactive and the
+    // query to a trial whose winner is cached whatever happens.
+    let looked = trial.cache.and_then(|c| c.lookup(q).map(|l| (c, l)));
+    let mut mode = CacheMode::Always;
+    if let Some((cache, l)) = &looked {
+        if l.branch {
+            mode = CacheMode::Sometimes;
+        }
+        if let Some((sig, works)) = &l.active {
+            if let Some(at) = plans.iter().position(|p| signature(p) == *sig) {
+                let fits = l.branch
+                    || l.trusted
+                    || trial.whole.env().is_none_or(|env| {
+                        super::trial::within(&plans[at], &env, trial_need(q), works * 10)
+                            != Some(false)
+                    });
+                if fits {
+                    trial.ranked.borrow_mut().clear();
+                    cache.chose(l, sig.clone());
+                    return Some(found.swap_remove(at).0);
+                }
+                cache.deactivate(&l.key);
+                mode = CacheMode::Always;
+            }
         }
     }
-    let plans: Vec<Node> = found.iter().map(|(a, _)| wrap(a.clone(), q)).collect();
-    let standing: Vec<Option<Preference>> = found.iter().map(|(_, p)| *p).collect();
-    let at = pick(plans, &standing, q, trial)?;
+    // Without the cache, a walk of the sort's index against the scan of the
+    // predicate's is decided without reading the documents when it can be.
+    let shortcut = |found: &mut Vec<(Access, Option<Preference>)>| {
+        if let [(scan, Some(_)), (walk, None)] = found.as_slice() {
+            if let Some(walk_wins) = counted(scan, walk, q, trial) {
+                return Some(found.swap_remove(usize::from(walk_wins)).0);
+            }
+        }
+        None
+    };
+    if looked.is_none() {
+        if let Some(found) = shortcut(&mut found) {
+            return Some(found);
+        }
+    }
+    let Some((at, outcome)) = pick(plans.clone(), q, trial) else {
+        // The collection is not to hand to run the trial over.
+        return shortcut(&mut found);
+    };
+    if let Some((cache, l)) = &looked {
+        cache.chose(l, signature(&plans[at]));
+        let ranked = outcome
+            .order
+            .iter()
+            .map(|&i| (&plans[i], outcome.scores[i], &outcome.stats[i]))
+            .collect();
+        let d = Decision {
+            ranked,
+            works: outcome.works,
+        };
+        cache.store(l, q, &d, mode);
+    }
     Some(found.swap_remove(at).0)
+}
+
+/// The documents mongod's trial asks a plan for
+/// (`trial_period::getTrialPeriodNumToReturn`): the query's limit, at most
+/// 101.
+fn trial_need(q: &Query) -> i64 {
+    if q.limit > 0 {
+        q.limit.min(101)
+    } else {
+        101
+    }
 }
 
 /// Which of `plans` mongod's trial keeps: the best score, between equals
 /// the fixed preference, then the first. What each plan did is recorded
 /// on `trial` for `explain`, which lists the plans as they were tried, the
 /// winner swapped with the first.
-fn pick(
-    plans: Vec<Node>,
-    standing: &[Option<Preference>],
-    q: &Query,
-    trial: &Trial,
-) -> Option<usize> {
+fn pick(plans: Vec<Node>, q: &Query, trial: &Trial) -> Option<(usize, super::trial::Outcome)> {
     let env = trial.whole.env()?;
     // Counted where the plan hands documents over, past any skip (measured
     // 8.2.11: `skip: 1, limit: 2` ends the trial at two documents).
-    let need = if q.limit > 0 { q.limit } else { 101 };
-    let ran = super::trial::run(&plans, &env, need)?;
-    let mut at = 0;
-    for i in 1..plans.len() {
-        let better = ran[i].0 > ran[at].0
-            || (ran[i].0 == ran[at].0 && standing[i].is_some() && standing[i] > standing[at]);
-        if better {
-            at = i;
-        }
-    }
+    let outcome = super::trial::run(&plans, &env, trial_need(q))?;
+    // The best score, mongod's tie-breaking bonuses included; between
+    // plans those leave equal, the first.
+    let at = outcome.order[0];
     let mut ranked: Vec<Ranked> = plans
         .into_iter()
-        .zip(ran)
-        .map(|(plan, (score, stats))| Ranked { plan, score, stats })
+        .enumerate()
+        .map(|(i, plan)| Ranked {
+            plan,
+            score: outcome.base_scores[i],
+            stats: outcome.stats[i].clone(),
+        })
         .collect();
     ranked.swap(0, at);
     *trial.ranked.borrow_mut() = ranked;
-    Some(at)
+    Some((at, outcome))
 }
 
 /// Whether mongod keeps the walk of the sort's index over `found`, the scan
@@ -1345,15 +1625,11 @@ pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str, asked: b
         let leaves = leaves_of(&parts);
         let uses = candidate_uses(&leaves, &parts, &bare, catalog);
         if uses.len() > 1 {
-            let standing: Vec<Option<Preference>> = uses
-                .iter()
-                .map(|u| Some(preference(u, &parts, &bare)))
-                .collect();
             let mut plans: Vec<Node> = uses
                 .into_iter()
                 .map(|u| distinct_of(access_of(u, &parts, &bare)))
                 .collect();
-            if let Some(at) = pick(plans.clone(), &standing, &bare, trial) {
+            if let Some((at, _)) = pick(plans.clone(), &bare, trial) {
                 return plans.swap_remove(at);
             }
         }

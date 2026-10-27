@@ -477,7 +477,15 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
                 collation: collation.as_ref(),
                 vars: &let_vars,
                 limit: 1,
-                asked: Default::default(),
+                // The plan is made, and cached, once; a re-pick after a
+                // lost race reads it again. mongod's query carries a limit
+                // of one only under a sort.
+                asked: crate::near::Asked {
+                    limit: i64::from(sort.is_some_and(|s| !s.is_empty())),
+                    sort,
+                    cached: repick_count == 0,
+                    ..Default::default()
+                },
             },
         )
         .map_err(|e| crate::util::command_error_during(e, "findAndModify"))?;

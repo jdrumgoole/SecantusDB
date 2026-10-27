@@ -761,6 +761,8 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         .get_document("projection")
                         .ok()
                         .filter(|p| !p.is_empty()),
+                    cached: true,
+                    distinct: None,
                 },
             },
         )
@@ -1299,6 +1301,7 @@ fn stream_find(
             limit,
             sort: asked.sort,
             projection: projection.as_ref(),
+            ..Default::default()
         },
     };
     let read_error = |e| crate::util::read_exec_error(e, "find", asked.ns);

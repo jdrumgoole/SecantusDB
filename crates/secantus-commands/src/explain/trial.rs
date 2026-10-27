@@ -15,8 +15,9 @@
 //! of `PlanStage::work`, over the documents the caller holds, and what each
 //! stage counted during the trial is kept for `allPlansExecution`.
 
+use super::bounds::Interval;
 use super::exec::{entries, fixed_extra, merge_head, Entry, Env, Head, Scan, Work};
-use super::node::{num, Node, Stats};
+use super::node::{num, Node, Stats, WorkCounts};
 use bson::Document;
 use secantus_core::heap::Heap;
 use std::collections::HashMap;
@@ -49,6 +50,9 @@ struct Stage<'a> {
     returned: i64,
     docs: i64,
     extra: Document,
+    /// Calls to `work()`, and those that answered NEED_TIME.
+    works: i64,
+    need_time: i64,
 }
 
 impl<'a> Stage<'a> {
@@ -103,15 +107,18 @@ impl<'a> Stage<'a> {
             returned: 0,
             docs: 0,
             extra,
+            works: 0,
+            need_time: 0,
         })
     }
 
     fn work(&mut self, env: &Env) -> Work {
         let out = self.step(env);
+        self.works += 1;
         match out {
             Work::Advanced(_) => self.returned += 1,
             Work::Eof => self.ended = true,
-            Work::NeedTime => {}
+            Work::NeedTime => self.need_time += 1,
         }
         out
     }
@@ -207,13 +214,16 @@ impl<'a> Stage<'a> {
             // that ends it included, then one per document it hands over,
             // then one to report that it is done. Which order it hands them
             // over in does not change the counts.
-            Node::Sort { limit, .. } => {
+            Node::Sort { limit, pattern, .. } => {
                 if self.buffer.is_none() {
                     match self.inputs[0].work(env) {
                         Work::Advanced(row) => self.pending.push(row),
                         Work::NeedTime => {}
                         Work::Eof => {
                             let mut all = std::mem::take(&mut self.pending);
+                            // What the sort held, counted when it sorts: a
+                            // sort the trial does not finish reports none.
+                            super::exec::sort_stats(&mut self.extra, pattern, *limit, &all, env);
                             if let Some(n) = limit {
                                 all.truncate((*n).max(0) as usize);
                             }
@@ -333,6 +343,9 @@ impl<'a> Stage<'a> {
     /// What the stage and those under it counted, shaped as the plan.
     fn stats(&self) -> Stats {
         let mut extra = self.extra.clone();
+        if matches!(self.node, Node::Sort { .. }) && !extra.contains_key("totalDataSizeSorted") {
+            extra.insert("totalDataSizeSorted", 0_i32);
+        }
         fixed_extra(self.node, &mut extra);
         let keys = match (self.node, &self.scan) {
             // The key that ends the scan is examined in the work that ends it.
@@ -343,12 +356,28 @@ impl<'a> Stage<'a> {
             _ => 0,
         };
         let docs = super::exec::fetched(self.node, self.returned, &mut extra).unwrap_or(self.docs);
+        let (seeks, dups_tested, dups_dropped) =
+            self.scan.as_ref().map_or((0, 0, 0), Scan::seek_counts);
         Stats {
             n_returned: self.returned,
             keys,
             docs,
             extra,
             children: self.inputs.iter().map(Stage::stats).collect(),
+            work: Some(WorkCounts {
+                works: self.works,
+                advanced: self.returned,
+                need_time: self.need_time,
+                eof: self.is_eof(),
+                seeks,
+                dups_tested,
+                dups_dropped,
+                // mongod yields during a trial only when 10 ms have passed
+                // (measured 8.2.11: none in 6,000 calls into three plans),
+                // which a count cannot say: none here.
+                saved: 0,
+                restored: 0,
+            }),
         }
     }
 }
@@ -373,11 +402,30 @@ fn holds(node: &Node, pick: &dyn Fn(&Node) -> bool) -> bool {
     }
 }
 
-/// Each plan's score after mongod's trial over `env`, in the order given,
-/// with what its stages counted during the trial. `need`: the documents a
-/// plan hands over to end the trial. `None`: a plan holds a stage this
-/// does not step.
-pub(crate) fn run(plans: &[Node], env: &Env, need: i64) -> Option<Vec<(f64, Stats)>> {
+/// What mongod's trial of several plans found.
+pub(crate) struct Outcome {
+    /// Each plan's score, in the order the plans were given, the
+    /// tie-breaking bonuses included (`$planCacheStats`'
+    /// `candidatePlanScores`).
+    pub scores: Vec<f64>,
+    /// The same before the bonuses (`explain`'s `score`).
+    pub base_scores: Vec<f64>,
+    /// What each plan's stages counted during the trial.
+    pub stats: Vec<Stats>,
+    /// The plans best first (`PlanRankingDecision::candidateOrder`).
+    pub order: Vec<usize>,
+    /// The rounds of work the trial ran: each plan's `works`.
+    pub works: i64,
+}
+
+/// `kBonusEpsilon`.
+const BONUS: f64 = 1e-4;
+
+/// Each plan's score after mongod's trial over `env` (`pickBestPlan` in
+/// `plan_ranker_util.h`), with what its stages counted during the trial.
+/// `need`: the documents a plan hands over to end the trial. `None`: a plan
+/// holds a stage this does not step.
+pub(crate) fn run(plans: &[Node], env: &Env, need: i64) -> Option<Outcome> {
     // An index's entries, built once for every scan of it.
     let mut cache = Entries::new();
     let mut stages: Vec<Stage> = plans
@@ -400,26 +448,248 @@ pub(crate) fn run(plans: &[Node], env: &Env, need: i64) -> Option<Vec<(f64, Stat
             break;
         }
     }
-    let epsilon = (1.0 / (10.0 * works as f64)).min(1e-4);
-    Some(
-        plans
+    let mut scores: Vec<f64> = plans
+        .iter()
+        .zip(&stages)
+        .map(|(plan, stage)| {
+            // The tie-breakers' epsilon is set by the plan's advances
+            // (`PlanScorer::calculateScore`): 1e-4 for any trial that ends
+            // at 101 documents or fewer.
+            let advances = stage.returned.max(1) as f64;
+            let epsilon = (1.0 / (10.0 * advances)).min(BONUS);
+            let bonus = |absent: bool| if absent { epsilon } else { 0.0 };
+            let no_fetch = bonus(!holds(plan, &|n| matches!(n, Node::Fetch { .. })));
+            let no_sort = bonus(!holds(plan, &|n| matches!(n, Node::Sort { .. })));
+            let no_ixisect = bonus(!holds(plan, &|n| matches!(n, Node::AndSorted(_))));
+            // Summed in mongod's order, which its doubles' last digit shows.
+            let tie_breakers = no_fetch + no_sort + no_ixisect;
+            let productivity = stage.returned as f64 / stage.works.max(1) as f64;
+            let mut score = 1.0 + productivity + tie_breakers;
+            if stage.is_eof() {
+                score += 1.0;
+            }
+            score
+        })
+        .collect();
+    let stats: Vec<Stats> = stages.iter().map(Stage::stats).collect();
+    let base_scores = scores.clone();
+    let mut order: Vec<usize> = (0..plans.len()).collect();
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    tie_breaking_bonuses(plans, &stats, &mut scores, &order);
+    order.sort_by(|a, b| scores[*b].total_cmp(&scores[*a]));
+    Some(Outcome {
+        scores,
+        base_scores,
+        stats,
+        order,
+        works,
+    })
+}
+
+/// `addTieBreakingHeuristicsBonuses`: when the best scores tie exactly,
+/// the tied plans that examined the fewest documents gain `1e-4`, those
+/// whose index bounds win the index prefix heuristic `2e-4`, and a
+/// DISTINCT_SCAN `1e-4`.
+fn tie_breaking_bonuses(plans: &[Node], stats: &[Stats], scores: &mut [f64], order: &[usize]) {
+    let top = scores[order[0]];
+    let tied: Vec<usize> = order
+        .iter()
+        .copied()
+        .take_while(|&i| scores[i] == top)
+        .collect();
+    if tied.len() < 2 {
+        return;
+    }
+    // Per plan: the docs-examined, index-prefix and distinct-scan bonuses,
+    // summed in that order (`TieBreakingScores::getTotalBonus`).
+    let mut bonus = vec![(0.0, 0.0, 0.0); plans.len()];
+    let docs: Vec<i64> = tied.iter().map(|&i| stats[i].totals().1).collect();
+    let fewest = docs.iter().copied().min().unwrap_or(0);
+    for (&i, &d) in tied.iter().zip(&docs) {
+        if d == fewest {
+            bonus[i].0 = BONUS;
+        }
+    }
+    let solutions: Vec<&Node> = tied.iter().map(|&i| &plans[i]).collect();
+    for winner in index_prefix_winners(&solutions) {
+        bonus[tied[winner]].1 += 2.0 * BONUS;
+    }
+    for &i in &tied {
+        if holds(&plans[i], &|n| matches!(n, Node::DistinctScan(..))) {
+            bonus[i].2 += BONUS;
+        }
+    }
+    for &i in &tied {
+        let (docs, prefix, distinct) = bonus[i];
+        scores[i] += docs + prefix + distinct;
+    }
+}
+
+/// A plan stage's type and children, as `areNodesCompatible` compares them.
+fn kind_and_children(node: &Node) -> (String, Vec<&Node>) {
+    let kind = match node {
+        Node::Sort { on_keys, .. } => {
+            if *on_keys {
+                "SORT_DEFAULT".to_string()
+            } else {
+                "SORT_SIMPLE".to_string()
+            }
+        }
+        Node::Projection { name, .. } => name.to_string(),
+        other => other
+            .to_doc(None)
+            .get_str("stage")
+            .unwrap_or("")
+            .to_string(),
+    };
+    let children: Vec<&Node> = match node {
+        Node::Fetch { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Projection { input, .. }
+        | Node::Skip(_, input)
+        | Node::Limit(_, input)
+        | Node::ReturnKey(input)
+        | Node::Subplan(input)
+        | Node::Count(input)
+        | Node::Update(input)
+        | Node::Delete { input, .. } => vec![input],
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().collect()
+        }
+        _ => vec![],
+    };
+    (kind, children)
+}
+
+/// `isLowerBound`: a value that opens its type's range.
+fn lower_bound(v: &bson::Bson, incl: bool) -> bool {
+    use bson::Bson;
+    match v {
+        Bson::Double(d) => (d.is_infinite() || d.is_nan()) && incl,
+        Bson::Int32(_) | Bson::Int64(_) => false,
+        Bson::Decimal128(d) => {
+            let s = d.to_string();
+            (s.contains("Infinity") || s.contains("NaN")) && incl
+        }
+        Bson::String(s) => s.is_empty() && incl,
+        Bson::DateTime(d) => d.timestamp_millis() == i64::MIN && incl,
+        Bson::Timestamp(t) => t.time == 0 && t.increment == 0 && incl,
+        Bson::ObjectId(o) => o.bytes() == [0u8; 12] && incl,
+        Bson::Document(d) => d.is_empty() && incl,
+        Bson::Array(a) => a.is_empty() && incl,
+        _ => true,
+    }
+}
+
+/// `isUpperBound`: a value that closes its type's range.
+fn upper_bound(v: &bson::Bson, incl: bool) -> bool {
+    use bson::Bson;
+    match v {
+        Bson::Double(d) => d.is_infinite() && incl,
+        Bson::Int32(_) | Bson::Int64(_) => false,
+        Bson::Decimal128(d) => d.to_string().contains("Infinity") && incl,
+        Bson::String(_) => false,
+        Bson::DateTime(d) => d.timestamp_millis() == i64::MAX && incl,
+        Bson::Timestamp(t) => t.time == u32::MAX && t.increment == u32::MAX && incl,
+        Bson::ObjectId(o) => o.bytes() == [0xffu8; 12] && incl,
+        Bson::Document(d) => d.is_empty() && !incl,
+        Bson::Array(a) => a.is_empty() && !incl,
+        Bson::Binary(b) => b.bytes.is_empty() && !incl,
+        _ => true,
+    }
+}
+
+/// `isClosedInterval`, the interval held low to high: both ends of one
+/// BSON type, neither the edge of that type's range. A point is closed.
+fn closed(i: &Interval) -> bool {
+    if std::mem::discriminant(&i.lo) != std::mem::discriminant(&i.hi) {
+        return false;
+    }
+    if i.is_point() {
+        return true;
+    }
+    !lower_bound(&i.lo, i.lo_incl) && !upper_bound(&i.hi, i.hi_incl)
+}
+
+/// `getIndexBoundsScore`: the longest prefix of single points, of points,
+/// of closed intervals, of any bounds, then the shorter key, packed.
+fn bounds_score(bounds: &[Vec<Interval>]) -> u64 {
+    let (mut single, mut points, mut closed_prefix, mut length) = (0u64, 0u64, 0u64, 0u64);
+    for field in bounds {
+        if matches!(field.as_slice(), [one] if one.is_all()) {
+            break;
+        }
+        if length == single && matches!(field.as_slice(), [one] if one.is_point()) {
+            single += 1;
+        }
+        if length == points && field.iter().all(Interval::is_point) {
+            points += 1;
+        }
+        if length == closed_prefix && field.iter().all(closed) {
+            closed_prefix += 1;
+        }
+        length += 1;
+    }
+    (single << 52)
+        | (points << 40)
+        | (closed_prefix << 28)
+        | (length << 16)
+        | (u64::from(u16::MAX) - bounds.len() as u64)
+}
+
+/// `applyIndexPrefixHeuristic`: walking the tied plans side by side (they
+/// must have one shape, or none wins), each set of index scans in the same
+/// place gives a point to the best bounds; the plans with the most points
+/// win.
+fn index_prefix_winners(solutions: &[&Node]) -> Vec<usize> {
+    let mut points = vec![0usize; solutions.len()];
+    let mut stack: Vec<Vec<&Node>> = vec![solutions.to_vec()];
+    while let Some(top) = stack.pop() {
+        let shapes: Vec<(String, Vec<&Node>)> = top.iter().map(|n| kind_and_children(n)).collect();
+        if shapes
+            .windows(2)
+            .any(|w| w[0].0 != w[1].0 || w[0].1.len() != w[1].1.len())
+        {
+            return Vec::new();
+        }
+        for child in 0..shapes[0].1.len() {
+            stack.push(shapes.iter().map(|(_, c)| c[child]).collect());
+        }
+        let bounds: Vec<&[Vec<Interval>]> = top
             .iter()
-            .zip(&stages)
-            .map(|(plan, stage)| {
-                let fetches = holds(plan, &|n| matches!(n, Node::Fetch { .. }));
-                let sorts = holds(plan, &|n| matches!(n, Node::Sort { .. }));
-                let intersects = holds(plan, &|n| matches!(n, Node::AndSorted(_)));
-                let mut score = 1.0 + stage.returned as f64 / works as f64;
-                for absent in [!fetches, !sorts, !intersects] {
-                    if absent {
-                        score += epsilon;
-                    }
-                }
-                if stage.is_eof() {
-                    score += 1.0;
-                }
-                (score, stage.stats())
+            .filter_map(|n| match n {
+                Node::IxScan(ix) | Node::DistinctScan(ix, _, _) => Some(ix.bounds.as_slice()),
+                _ => None,
             })
-            .collect(),
-    )
+            .collect();
+        if bounds.len() == top.len() {
+            let scores: Vec<u64> = bounds.iter().map(|b| bounds_score(b)).collect();
+            let best = scores.iter().copied().max().unwrap_or(0);
+            for (i, s) in scores.iter().enumerate() {
+                if *s == best {
+                    points[i] += 1;
+                }
+            }
+        }
+    }
+    let best = points.iter().copied().max().unwrap_or(0);
+    (0..solutions.len())
+        .filter(|&i| points[i] == best)
+        .collect()
+}
+
+/// mongod's `CachedPlanStage::pickBestPlan`: the cached plan is worked
+/// until it hands over `need` documents or runs out, within `budget`
+/// works. Whether it did; `None`: a stage this does not step.
+pub(crate) fn within(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<bool> {
+    let mut cache = Entries::new();
+    let mut stage = Stage::new(plan, env, &mut cache)?;
+    for _ in 0..budget {
+        match stage.work(env) {
+            Work::Advanced(_) if stage.returned >= need => return Some(true),
+            Work::Eof => return Some(true),
+            _ => {}
+        }
+    }
+    Some(false)
 }

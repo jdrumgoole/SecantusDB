@@ -213,6 +213,25 @@ pub(crate) struct Stats {
     /// Stage-specific counters, appended after the plan's own fields.
     pub extra: Document,
     pub children: Vec<Stats>,
+    /// mongod's per-stage accounting of `work()` calls, kept where a stage
+    /// was stepped one work at a time (a plan's trial).
+    pub work: Option<WorkCounts>,
+}
+
+/// `PlanStage::CommonStats`'s work accounting, and an index scan's seeks
+/// and duplicate checks.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct WorkCounts {
+    pub works: i64,
+    pub advanced: i64,
+    pub need_time: i64,
+    pub eof: bool,
+    pub seeks: i64,
+    pub dups_tested: i64,
+    pub dups_dropped: i64,
+    /// `saveState` and `restoreState`: the yields the stage went through.
+    pub saved: i64,
+    pub restored: i64,
 }
 
 impl Stats {
@@ -243,9 +262,20 @@ impl Node {
     /// The stage as `explain` prints it; with `stats`, as `executionStages`.
     pub fn to_doc(&self, stats: Option<&Stats>) -> Document {
         let mut out = Document::new();
+        let work = stats.and_then(|s| s.work);
         let counted = |out: &mut Document| {
             if let Some(s) = stats {
                 out.insert("nReturned", num(s.n_returned));
+            }
+            if let Some(w) = work {
+                out.insert("executionTimeMillisEstimate", 0_i32);
+                out.insert("works", num(w.works));
+                out.insert("advanced", num(w.advanced));
+                out.insert("needTime", num(w.need_time));
+                out.insert("needYield", 0_i32);
+                out.insert("saveState", num(w.saved));
+                out.insert("restoreState", num(w.restored));
+                out.insert("isEOF", i32::from(w.eof));
             }
         };
         let extra = |out: &mut Document| {
@@ -290,6 +320,11 @@ impl Node {
                 if let Some(s) = stats {
                     out.insert("keysExamined", num(s.keys));
                 }
+                if let Some(w) = work {
+                    out.insert("seeks", num(w.seeks));
+                    out.insert("dupsTested", num(w.dups_tested));
+                    out.insert("dupsDropped", num(w.dups_dropped));
+                }
             }
             Node::Fetch { filter, input } => {
                 out.insert("stage", "FETCH");
@@ -299,6 +334,9 @@ impl Node {
                 counted(&mut out);
                 if let Some(s) = stats {
                     out.insert("docsExamined", num(s.docs));
+                }
+                if work.is_some() {
+                    out.insert("alreadyHasObj", 0_i32);
                 }
                 input_of(&mut out, input);
             }

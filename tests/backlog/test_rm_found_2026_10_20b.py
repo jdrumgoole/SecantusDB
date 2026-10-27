@@ -473,11 +473,9 @@ def test_window_functions(rust_mongo: Any, mongod: Any) -> None:
 
 # -------------------------------------------------- RM-215 stages unknown --
 
+# `$planCacheStats` runs since RM-154 (2026-10-27):
+# `tests/backlog/test_rm_154_plan_cache.py::test_plan_cache_stats_stage`.
 STAGE_CASES = {
-    "$planCacheStats": lambda c: (
-        c.rm215.c.insert_one({"a": 1}),
-        list(c.rm215.c.aggregate([{"$planCacheStats": {}}]))[:0],
-    )[1],
     "$queryStats": lambda c: list(c.admin.aggregate([{"$queryStats": {}}]))[:0],
     "$listSampledQueries": lambda c: list(c.admin.aggregate([{"$listSampledQueries": {}}]))[:0],
 }
@@ -490,9 +488,9 @@ def _stages(client: Any) -> dict:
 
 @pytest.mark.backlog("RM-215")
 def test_diagnostic_stages(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2.11 (one-member replica set) runs `$planCacheStats`,
-    `$queryStats` and `$listSampledQueries`; the Rust server answers 40324
-    (unknown stage) for each."""
+    """mongod 8.2.11 (one-member replica set) runs `$queryStats` and
+    `$listSampledQueries`; the Rust server answers 40324 (unknown stage)
+    for `$queryStats`."""
     assert _stages(rust_mongo) == _stages(mongod_rs)
 
 
