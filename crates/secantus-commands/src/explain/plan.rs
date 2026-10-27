@@ -1181,6 +1181,15 @@ fn candidates(
             if !in_order(&out[x].0) || !in_order(&out[y].0) {
                 continue;
             }
+            // Two scans of one index are intersected only all together,
+            // above (an `$all` over a multikey index).
+            let same = match (&out[x].0.index, &out[y].0.index) {
+                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                _ => false,
+            };
+            if same {
+                continue;
+            }
             let both: BTreeSet<usize> = covered[x].union(&covered[y]).copied().collect();
             if covered.iter().any(|c| c.is_superset(&both)) {
                 continue;

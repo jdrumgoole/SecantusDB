@@ -8,12 +8,14 @@
 //! command. It is a description of the plan mongod runs for the query. This
 //! server's own storage layer may read the same documents another way.
 //!
-//! Not reproduced: the plan cache. The choice mongod makes by trial when
-//! several plans could serve one query is counted over the collection
-//! (`trial.rs`), and the plans it tried are listed as `rejectedPlans` and
-//! `allPlansExecution`; between plans the trial scores alike a fixed order
-//! of preference decides (`plan.rs`). A multikey index with two predicates
-//! on one field is tried once here, where mongod tries a plan per predicate.
+//! The choice mongod makes by trial when several plans could serve one
+//! query is counted over the collection (`trial.rs`), with its plan
+//! ranker's scores and tie-breaking bonuses, and the plans it tried are
+//! listed as `rejectedPlans` and `allPlansExecution`. Without the
+//! collection to count over, a fixed order of preference decides
+//! (`plan.rs`). A read keeps mongod's plan cache (`plan_cache.rs`, keyed by
+//! `cache_key.rs`); `explain` neither reads nor writes it, as mongod's does
+//! not, but reports the key's hashes and which plan is cached (`isCached`).
 
 mod bounds;
 mod cache_key;

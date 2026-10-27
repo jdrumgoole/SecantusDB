@@ -776,14 +776,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$planCacheStats` and `$queryStats` are unknown stages** (40324).
-      mongod 8.2.11 runs each on a one-member replica set (an empty result
-      on a fresh one, filling as queries run, so an empty answer here would
-      be a stand-in). `$planCacheStats` needs a plan cache, which this server
-      does not keep (§7.075); `$queryStats` needs query-shape statistics,
-      which RM-170 (`includeQueryStatsMetrics`) also lacks.
-      (`$listSampledQueries` landed 2026-10-20: it lists none, truthfully,
-      as no query analyzer exists here.)
+- [ ] **`$queryStats` is an unknown stage** (40324). mongod 8.2.11 runs it
+      on a one-member replica set (an empty result on a fresh one, filling
+      as queries run, so an empty answer here would be a stand-in). It needs
+      mongod's query-shape statistics: the query stats store, keyed by the
+      representative query shape's SHA-256 (`queryShapeHash`, which mongod's
+      `explain` of a find, distinct or aggregate also prints and this
+      server's does not), which RM-170 (`includeQueryStatsMetrics`) also
+      lacks. The plan cache's shape (`planCacheShapeHash`) is a different
+      shape and does not serve it. (`$listSampledQueries` landed 2026-10-20,
+      and `$planCacheStats` 2026-10-27 with the plan cache, RM-154.)
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
@@ -1214,8 +1216,16 @@ What the order follows, each measured:
   is kept.
 - Where several plans could serve a query, mongod's trial is reproduced
   (`explain/trial.rs`): works counted round-robin, its plan ranker's
-  scores, AND_SORTED intersections, and one plan per predicate on an
-  index's array field. That trial also picks the read order.
+  scores and tie-breaking bonuses, AND_SORTED intersections (a multikey
+  index's point scan included), and one plan per predicate on an index's
+  array field. That trial also picks the read order.
+- mongod's plan cache (since 2026-10-27, `explain/plan_cache.rs`, RM-154):
+  the trial runs once per query shape and its winner is cached under
+  mongod's own key and hashes (`explain/cache_key.rs`); a repeated shape
+  runs the cached plan, and so reads in its order, until the plan does
+  worse than ten times its works and is replanned. `explain` reports the
+  hashes and `isCached`, `$planCacheStats` the entries, `planCacheClear`
+  clears them. Pinned by `tests/backlog/test_rm_154_plan_cache.py`.
 - Scans a sort merges (an `$in` under a sort) come out through libc++'s
   priority queue (`secantus_core::heap`), as in mongod.
 - A `$match` after `$addFields` or `$unwind` that reads no field the stage
@@ -1268,18 +1278,36 @@ Still different, all 77:
       build before and 1.2 times an update by `_id`
       (`order::store_order_is_the_plans`); `{a: {$ne: 5}}` over `a_1` 0.7
       times, a regex prefix 0.01 times, now that the router reads the index.
-      The lever is mongod's plan cache (RM-154).
+      The lever was mongod's plan cache, which landed 2026-10-27 (RM-154):
+      a shape's trial runs until its entry is active, and then only the
+      cached plan is worked, within ten times its works. Not re-measured
+      yet: the release builds to time it against 43463aa6 could not be made
+      on 2026-10-27 (the build machine's disk was full).
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
-- [ ] **mongod's plan cache is not reproduced.** mongod runs the trial once
-      per query shape, caches the winner and reuses it, replanning when it
-      does badly, until the entry is evicted. Here every query runs its
-      trial. That decides which plan, and so which order, a repeated query
-      shape gets: mongod's second `{a: 1, b: 9}` uses the plan cached for
-      the shape, which this server picks afresh. It is also the cost lever
-      for RM-056.
-      Backlog-ID: RM-154
-      Verify: none -- needs a scenario measured on mongod first; file a gap test with it
+- [ ] **A query SBE runs is not cached.** mongod 8.2.11 runs a `$match`
+      with the `$group` or `$lookup` pushed behind it in SBE, planned by the
+      classic planner (no index intersection among the candidates), and
+      caches the winner under a key ending `s` with `worksType: "reads"`:
+      the keys and documents the winner's trial read. `count_documents` is
+      such a pipeline. Here the pushed-down front is not cached at all
+      (`explain` already prints its `s` key's hashes).
+      Backlog-ID: RM-340
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_a_query_sbe_runs_is_cached_with_its_reads
+- [ ] **`$planCacheStats` lists no `estimatedSizeBytes`.** mongod 8.2.11
+      gives each entry the bytes it takes in mongod's memory: the C++
+      sizes of the entry, its plan and its debug information. The field is
+      left out here rather than given a value that is not mongod's.
+      Backlog-ID: RM-341
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size
+- [ ] **No plan is cached for a collection over 2,000 documents.** mongod
+      tries the candidate plans whatever the collection's size (each for at
+      most `max(10000, 0.3 * documents)` works) and caches the winner. The
+      trial here reads the whole collection into memory, so it runs over at
+      most 2,000 documents (`order::TRIAL_COLLECTION`); past that the fixed
+      order of preference picks the plan and nothing is cached.
+      Backlog-ID: RM-342
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_a_collection_over_2000_documents_is_cached
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
@@ -1361,9 +1389,11 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       three delinquency counters, numInterruptChecks), per batch, on find,
       aggregate, distinct, count and getMore. This server could compute the
       key and document counts, `hasSortStage`, the working time and
-      `cpuNanos`, but not `fromPlanCache` (no plan cache), `bytesRead` /
-      `readingTimeMicros` (no WiredTiger read statistics plumbed) or
-      `numInterruptChecks` (a different mechanism).
+      `cpuNanos`, and since the plan cache landed (2026-10-27, RM-154)
+      `fromPlanCache` and `fromMultiPlanner` too (`explain/order.rs`'s
+      `consult` knows whether a read ran a cached plan or a trial), but not
+      `bytesRead` / `readingTimeMicros` (no WiredTiger read statistics
+      plumbed) or `numInterruptChecks` (a different mechanism).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
       Backlog-ID: RM-170

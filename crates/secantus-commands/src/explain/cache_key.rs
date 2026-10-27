@@ -673,9 +673,9 @@ fn sparse_fits(e: &Expr) -> bool {
         Expr::Leaf { op, value, .. } if matches!(op.as_str(), "$eq" | "$gte" | "$lte") => {
             *value != Bson::Null
         }
-        Expr::Leaf { op, value, .. } if op == "$in" => !value
-            .as_array()
-            .is_some_and(|a| a.iter().any(|v| *v == Bson::Null)),
+        Expr::Leaf { op, value, .. } if op == "$in" => {
+            !value.as_array().is_some_and(|a| a.contains(&Bson::Null))
+        }
         Expr::Not(child) => {
             matches!(&**child, Expr::Leaf { op, value, .. } if op == "$eq" && *value == Bson::Null)
         }
@@ -797,7 +797,7 @@ impl Indexability<'_> {
 
     /// `encodeIndexability`: the partial indexes' global discriminators,
     /// then each node's.
-    pub(crate) fn encode(&self, e: &Expr, whole: &Document) -> String {
+    pub(crate) fn encode(&self, e: &Expr) -> String {
         let mut out = String::new();
         let partial: Vec<&std::rc::Rc<IndexInfo>> = self
             .catalog
@@ -812,7 +812,6 @@ impl Indexability<'_> {
             }
             out.push(')');
         }
-        let _ = whole;
         self.walk(e, "", &mut out);
         out
     }
@@ -834,7 +833,7 @@ pub(crate) fn key_for(parsed: &Document, parts: &Parts, ix: &Indexability) -> Op
     let shape = shape(&e, parts);
     let shape_hash = compute_hash(&shape);
     let mut key = shape;
-    key.push_str(&ix.encode(&e, parsed));
+    key.push_str(&ix.encode(&e));
     Some(CacheKey {
         key_hash: key_hash(&key),
         key,
@@ -860,18 +859,23 @@ mod tests {
     }
 
     #[test]
-    fn murmur_tail_lengths() {
-        // Every tail length, against the reference implementation (mmh3).
+    fn murmur_every_tail_length() {
+        // The first 64 bits of MurmurHash3 x64-128, seed 0, as the reference
+        // implementation (Python's `mmh3.hash128`) gives them.
         let s = "0123456789abcdefghijklmnopqrstuv";
-        let want: [u64; 4] = [
-            murmur3_x64_128_h1(b"", 0),
-            murmur3_x64_128_h1(s[..1].as_bytes(), 0),
-            murmur3_x64_128_h1(s[..9].as_bytes(), 0),
-            murmur3_x64_128_h1(s[..17].as_bytes(), 0),
-        ];
-        assert_eq!(want[0], 0);
-        assert_ne!(want[1], want[2]);
-        assert_ne!(want[2], want[3]);
+        for (n, want) in [
+            (0, 0x0),
+            (1, 0x2ac9_debe_d546_a380),
+            (8, 0x8236_039b_7387_354d),
+            (9, 0x4c1e_8751_9fe7_38ba),
+            (15, 0xa62d_d5f6_c0bf_2351),
+            (16, 0x4be0_6d94_cf4a_d1a7),
+            (17, 0x8e32_612d_aa45_f9de),
+            (31, 0xb828_780c_1a6e_0542),
+            (32, 0x2f28_5cce_c0ed_f1f7),
+        ] {
+            assert_eq!(murmur3_x64_128_h1(&s.as_bytes()[..n], 0), want, "{n} bytes");
+        }
     }
 
     #[test]

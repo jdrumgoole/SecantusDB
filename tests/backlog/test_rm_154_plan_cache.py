@@ -108,7 +108,7 @@ def _repeated_shape(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-154")
+@pytest.mark.backlog_fixed("RM-154")
 def test_a_repeated_shape_runs_the_cached_plan(rust_mongo: Any, mongod: Any) -> None:
     assert _repeated_shape(rust_mongo) == _repeated_shape(mongod)
 
@@ -186,7 +186,7 @@ def _explained(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-154")
+@pytest.mark.backlog_fixed("RM-154")
 def test_explain_reports_the_plan_cache(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 prints `queryHash`, `planCacheShapeHash` and
     `planCacheKey` -- MurmurHash3 of its query shape and key, byte for byte
@@ -226,7 +226,7 @@ def _entries(client: Any) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-154")
+@pytest.mark.backlog_fixed("RM-154")
 def test_plan_cache_stats_lists_the_entries(rust_mongo: Any, mongod: Any) -> None:
     """Each entry as mongod 8.2.11 lists it: hashes, `isActive`, `works`,
     `createdFromQuery`, `cachedPlan`, each candidate's `creationExecStats`
@@ -289,7 +289,7 @@ def _cleared(client: Any) -> list:
     return [x if not isinstance(x, tuple) else x[:2] for x in out]
 
 
-@pytest.mark.backlog("RM-154")
+@pytest.mark.backlog_fixed("RM-154")
 def test_what_clears_the_plan_cache(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 clears a collection's cache when an index is built,
     dropped, hidden, has its TTL changed, or becomes multikey -- not on a
@@ -312,7 +312,7 @@ def _evicted(client: Any) -> Any:
     return len(sorts), sorts[:3], sorts[-3:], "f0" in sorts, "f1" in sorts, "f2" in sorts
 
 
-@pytest.mark.backlog("RM-154")
+@pytest.mark.backlog_fixed("RM-154")
 def test_the_cache_keeps_5000_entries(rust_mongo: Any, mongod: Any) -> None:
     """`internalQueryCacheMaxEntriesPerCollection`: 5000, the least
     recently used evicted (mongod 8.2.11: of 5002 shapes, the first two
@@ -356,7 +356,7 @@ def _stage(client: Any) -> list:
     return [x[:2] if isinstance(x, tuple) else x for x in out]
 
 
-@pytest.mark.backlog("RM-215")
+@pytest.mark.backlog_fixed("RM-215")
 def test_plan_cache_stats_stage(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs `$planCacheStats` as the first stage only (40602),
     on a collection that exists (50933), with at most `allHosts`, and that
