@@ -183,8 +183,14 @@ change.
 **Transactions and writes.**
 - A statement that can run user code (trigger, function, `DO`) is its OWN
   transaction even in autocommit (`runs_user_code`), or a raise after a write
-  leaves the write committed. While any trigger or user function exists, a
-  savepoint captures EVERY table, not just the statement's target.
+  leaves the write committed.
+- A savepoint is an undo journal of rows (RP-018, `UndoJournal` in
+  `secantus-storage`): every document write inside a user transaction
+  records the row as it was, once per savepoint frame, at the ten storage
+  write sites (`undo_note_row`); a table's create or drop is recorded too
+  (`undo_note_collection`). A new storage write path must call the hook, or
+  ROLLBACK TO silently keeps its writes. A sequence's advance is never
+  undone, as in PostgreSQL.
 - Autocommit row writes run in a transaction of their own, retried on a write
   conflict at READ COMMITTED (`run_autocommit_write`). Without it a SET
   computed from a row lost another session's update. Only a probe running two

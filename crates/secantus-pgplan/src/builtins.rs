@@ -86,6 +86,9 @@ pub(crate) fn result_type(name: &str, types: &[String]) -> Option<String> {
         ) => "cstring",
         ("in_range", 5) => "bool",
         ("btvarstrequalimage", 1) => "bool",
+        // `nameconcatoid(name, oid)`, behind `information_schema`'s
+        // `specific_name`.
+        ("nameconcatoid", 2) => "name",
         // A type's modifier as a declaration writes it (`(3)`).
         (
             "bittypmodout"
@@ -209,6 +212,28 @@ fn period_type(t: &str) -> bool {
 }
 
 /// Does a NULL argument make the answer NULL without the function running?
+/// `nameconcatoid(name, oid)` as `name.c` has it: the name, `_`, then the
+/// oid, the NAME part cut back (at a character boundary, `pg_mbcliplen`) so
+/// the whole fits in `NAMEDATALEN - 1` bytes and the suffix is always whole.
+fn nameconcatoid(name: &Bson, oid: &Bson) -> Result<Bson> {
+    const NAMEDATALEN: usize = 64;
+    let oid = int(oid, "oid")?;
+    // An `int4` is an oid by its bits (`-1` is 4294967295), as the cast has it.
+    let oid = u32::try_from(oid)
+        .ok()
+        .or_else(|| i32::try_from(oid).ok().map(i32::cast_unsigned))
+        .ok_or_else(|| Error::Sqlstate("22003", "OID out of range".into()))?;
+    let suffix = format!("_{oid}");
+    let name = crate::value_text(name);
+    // A `name` holds at most NAMEDATALEN - 1 bytes of its own (`namein`).
+    let limit = (NAMEDATALEN - 1).saturating_sub(suffix.len());
+    let mut cut = name.len().min(limit);
+    while !name.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Ok(Bson::String(format!("{}{suffix}", &name[..cut])))
+}
+
 fn strict(name: &str) -> bool {
     !matches!(
         name,
@@ -463,6 +488,7 @@ pub(crate) fn call(name: &str, args: &[Bson], types: &[String], variadic: bool) 
             Ok(bytea::to_binary(out))
         }
         "md5" => Ok(Bson::String(crate::scalar::md5_hex(&bytes(0)?))),
+        "nameconcatoid" => nameconcatoid(&args[0], &args[1]),
         "btrim" | "ltrim" | "rtrim" => {
             let (value, set) = (bytes(0)?, bytes(1)?);
             let mut from = 0;

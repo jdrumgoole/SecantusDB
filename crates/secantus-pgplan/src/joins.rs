@@ -57,6 +57,11 @@ pub enum JoinNode {
         keys: Vec<String>,
         /// `(joined-row key, position in the SQL's select list)`.
         columns: Vec<(String, usize)>,
+        /// When the item is one built-in set-returning function (`FROM
+        /// unnest(p.a) WITH ORDINALITY`): the function scan planned once, so
+        /// each left row only re-runs the function over its own values
+        /// (`ExecReScanFunctionScan`) rather than planning `sql` again.
+        scan: Option<Box<FunctionScan>>,
     },
     Join {
         kind: JoinKind,
@@ -769,6 +774,7 @@ fn finish_join_source(
                     project,
                 }))),
                 def,
+                unread: Vec::new(),
             },
         ));
         name
@@ -1142,6 +1148,7 @@ fn lateral_leaf(
         p => p?,
     };
     let def = sub_plan_def(&plan, lookup)?;
+    let scan = function_scan(&inner, function, &def).map(Box::new);
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
     let bare_alias = matches!(
         item.node.as_ref(),
@@ -1192,9 +1199,202 @@ fn lateral_leaf(
             params: params.to_vec(),
             keys,
             columns,
+            scan,
         },
         scope,
     )))
+}
+
+/// A LATERAL item that is one built-in set-returning function in FROM,
+/// planned once: PostgreSQL's FunctionScan, whose rescan re-evaluates the
+/// function's arguments over the new outer values and calls it again
+/// (`ExecReScanFunctionScan`), where the item's SQL would be planned anew
+/// for every left row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionScan {
+    /// The `RangeFunction`, its references to the left side `$n` parameters,
+    /// with neither an alias nor ORDINALITY.
+    from: pg_query::protobuf::Node,
+    /// `WITH ORDINALITY`: a `bigint` column numbering the rows from 1.
+    ordinality: bool,
+    /// The item's column count, which every row must have.
+    width: usize,
+}
+
+/// The function scan `inner` (a lateral item's SELECT) is, when it is
+/// exactly one: `SELECT * FROM f(...)` for a FROM function, or the
+/// `SELECT s.*, row_number() OVER () AS ordinality FROM (SELECT * FROM
+/// f(...)) s` that `rowsfrom` makes of `f(...) WITH ORDINALITY`. Only a
+/// built-in whose output columns are carried as the SQL path returns them
+/// (`passes_through`) qualifies; anything else keeps planning its SQL.
+fn function_scan(
+    inner: &pg_query::protobuf::SelectStmt,
+    function: bool,
+    def: &TableDef,
+) -> Option<FunctionScan> {
+    fn star_only(s: &pg_query::protobuf::SelectStmt) -> bool {
+        matches!(s.target_list.as_slice(), [t] if matches!(t.node.as_ref(),
+            Some(N::ResTarget(rt)) if rt.name.is_empty() && matches!(
+                rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if matches!(c.fields.as_slice(),
+                    [f] if matches!(f.node, Some(N::AStar(_)))))))
+    }
+    fn plain(s: &pg_query::protobuf::SelectStmt) -> bool {
+        s.where_clause.is_none()
+            && s.group_clause.is_empty()
+            && s.having_clause.is_none()
+            && s.sort_clause.is_empty()
+            && s.distinct_clause.is_empty()
+            && s.window_clause.is_empty()
+            && s.limit_count.is_none()
+            && s.limit_offset.is_none()
+            && s.with_clause.is_none()
+            && s.locking_clause.is_empty()
+            && s.values_lists.is_empty()
+            && s.op == pg_query::protobuf::SetOperation::SetopNone as i32
+    }
+    /// `SELECT * FROM f(...)`: the function, when it is a lone built-in.
+    fn lone_function(
+        s: &pg_query::protobuf::SelectStmt,
+    ) -> Option<&pg_query::protobuf::RangeFunction> {
+        if !plain(s) || !star_only(s) {
+            return None;
+        }
+        let [item] = s.from_clause.as_slice() else {
+            return None;
+        };
+        let Some(N::RangeFunction(rf)) = item.node.as_ref() else {
+            return None;
+        };
+        let [entry] = rf.functions.as_slice() else {
+            return None;
+        };
+        let Some(N::List(l)) = entry.node.as_ref() else {
+            return None;
+        };
+        let call = match l.items.as_slice() {
+            [call] => call,
+            [call, defs] if matches!(defs.node.as_ref(), Some(N::List(d)) if d.items.is_empty()) => {
+                call
+            }
+            [call, defs] if defs.node.is_none() => call,
+            _ => return None,
+        };
+        let Some(N::FuncCall(f)) = call.node.as_ref() else {
+            return None;
+        };
+        let name = func_name(f)?;
+        if rf.is_rowsfrom
+            || !rf.coldeflist.is_empty()
+            || f.over.is_some()
+            || f.agg_star
+            || crate::correlated::user_function_named(&name)
+        {
+            return None;
+        }
+        Some(rf)
+    }
+    let (rf, ordinality) = if function {
+        let rf = lone_function(inner)?;
+        (rf, rf.ordinality)
+    } else {
+        // The rowsfrom shape: `s.*` and `row_number() OVER () AS ordinality`
+        // over `(SELECT * FROM f(...)) s`.
+        if !plain(inner) {
+            return None;
+        }
+        let [star, ord] = inner.target_list.as_slice() else {
+            return None;
+        };
+        let s_star = matches!(star.node.as_ref(), Some(N::ResTarget(rt)) if rt.name.is_empty()
+            && matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::ColumnRef(c)) if matches!(c.fields.as_slice(),
+                    [a, b] if matches!(a.node.as_ref(), Some(N::String(s)) if s.sval == "s")
+                        && matches!(b.node, Some(N::AStar(_))))));
+        let row_number = matches!(ord.node.as_ref(), Some(N::ResTarget(rt)) if rt.name == "ordinality"
+            && matches!(rt.val.as_deref().and_then(|v| v.node.as_ref()),
+                Some(N::FuncCall(f)) if f.args.is_empty()
+                    && func_name(f).as_deref() == Some("row_number")
+                    && f.over.as_deref().is_some_and(|w| w.partition_clause.is_empty()
+                        && w.order_clause.is_empty()
+                        && w.name.is_empty()
+                        && w.refname.is_empty()
+                        && w.start_offset.is_none()
+                        && w.end_offset.is_none())));
+        let [item] = inner.from_clause.as_slice() else {
+            return None;
+        };
+        let Some(N::RangeSubselect(rs)) = item.node.as_ref() else {
+            return None;
+        };
+        let alias_s = rs
+            .alias
+            .as_ref()
+            .is_some_and(|a| a.aliasname == "s" && a.colnames.is_empty());
+        let Some(N::SelectStmt(body)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref()) else {
+            return None;
+        };
+        if !s_star || !row_number || !alias_s || rs.lateral {
+            return None;
+        }
+        let rf = lone_function(body)?;
+        if rf.ordinality {
+            return None;
+        }
+        (rf, true)
+    };
+    // The columns come back from the SQL path as the function made them
+    // only for types its output conversion leaves alone (`resolve_cell`
+    // rewrites a timestamp, a text-search value).
+    let passes_through = |t: &str| {
+        matches!(
+            t,
+            "int2" | "int4" | "int8" | "oid" | "text" | "name" | "bool" | "varchar"
+        )
+    };
+    if !def.columns.iter().all(|c| passes_through(&c.pg_type)) {
+        return None;
+    }
+    let mut bare = rf.clone();
+    bare.alias = None;
+    bare.ordinality = false;
+    bare.lateral = false;
+    Some(FunctionScan {
+        from: pg_query::protobuf::Node {
+            node: Some(N::RangeFunction(bare)),
+        },
+        ordinality,
+        width: def.columns.len(),
+    })
+}
+
+/// The rows a [`FunctionScan`] produces for one left row's values (`params`,
+/// the statement's own followed by the left row's), each in the item's
+/// select-list order: the function's columns, then the ordinality. `None`
+/// when the function is not one a FROM item materialises
+/// (`srf_from_clause`), and the caller plans the item's SQL instead.
+pub fn function_scan_rows(scan: &FunctionScan, params: &[Bson]) -> Result<Option<Vec<Vec<Bson>>>> {
+    // The integer `generate_series` is a range source of its own, planned
+    // ahead of the materialised functions.
+    if crate::series_from_clause(&scan.from, params)?.is_some() {
+        return Ok(None);
+    }
+    let Some(src) = crate::srf_from_clause(&scan.from, params)? else {
+        return Ok(None);
+    };
+    let Statement::ValuesConstant(v) = *src.plan else {
+        return Ok(None);
+    };
+    let mut rows = v.rows;
+    if scan.ordinality {
+        for (i, row) in rows.iter_mut().enumerate() {
+            row.push(Bson::Int64(i64::try_from(i).unwrap_or(i64::MAX) + 1));
+        }
+    }
+    if rows.iter().any(|r| r.len() != scan.width) {
+        return Ok(None);
+    }
+    Ok(Some(rows))
 }
 
 fn star_target() -> pg_query::protobuf::Node {

@@ -86,11 +86,6 @@ const TEMPLATES: &[(&str, usize, &str)] = &[
     ("session_user", 0, "session_user"),
     ("like", 2, "$1 LIKE $2"),
     ("notlike", 2, "$1 NOT LIKE $2"),
-    (
-        "nameconcatoid",
-        2,
-        "($1::text || '_'::text || $2::oid::text)::name",
-    ),
 ];
 
 struct Operator {

@@ -2502,6 +2502,10 @@ pub struct SubSource {
     pub plan: Box<Statement>,
     /// The inner query's output columns.
     pub def: TableDef,
+    /// By position, the outputs nothing outside reads, which
+    /// `prune_outputs` replaced by NULL: the executor need not keep them in
+    /// the rows it materialises (empty: none known).
+    pub unread: Vec<bool>,
 }
 
 /// `generate_series(start, stop [, step])`, the only set-returning function
@@ -4044,9 +4048,7 @@ fn range_accessor_value(
         {
             let untyped = match f.args[0].node.as_ref() {
                 Some(N::AConst(c)) => c.isnull || matches!(c.val, Some(a_const::Val::Sval(_))),
-                Some(N::ParamRef(p)) => {
-                    declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
-                }
+                Some(N::ParamRef(p)) => !param_is_declared(usize::try_from(p.number).unwrap_or(0)),
                 _ => false,
             };
             if untyped {
@@ -4807,6 +4809,7 @@ fn plan_query_node(
     }
     if DEPTH.with(|d| d.replace(d.get() + 1)) == 0 {
         EXPANDED_VIEWS.with(|e| e.borrow_mut().clear());
+        EXPANDED_SYSTEM_VIEWS.with(|e| e.borrow_mut().clear());
     }
     let _nested = Nested;
     // Views expand BEFORE subqueries resolve: a view's body may hold a
@@ -10070,6 +10073,9 @@ thread_local! {
     /// The FROM aliases `expand_views` gave a view's subquery, with the view.
     static EXPANDED_VIEWS: std::cell::RefCell<Vec<(String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// Those of them that are PostgreSQL's own (system) views.
+    static EXPANDED_SYSTEM_VIEWS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Install the views' relation oids beside `set_views`.
@@ -10080,6 +10086,14 @@ pub fn set_view_oids(oids: Vec<(String, i64)>) {
 /// Was a FROM subquery under `alias` expanded from a view by this statement?
 pub(crate) fn is_expanded_view(alias: &str) -> bool {
     EXPANDED_VIEWS.with(|e| e.borrow().iter().any(|(a, _)| a == alias))
+}
+
+/// Was a FROM subquery under `alias` expanded from one of PostgreSQL's own
+/// views (`pg_catalog`, `information_schema`) by this statement? Their
+/// definitions are `system_views.sql` and `information_schema.sql`, analysed
+/// when `initdb` created them.
+pub(crate) fn is_expanded_system_view(alias: &str) -> bool {
+    EXPANDED_SYSTEM_VIEWS.with(|e| e.borrow().iter().any(|a| a == alias))
 }
 
 /// The view a FROM subquery under `alias` was expanded from, and its oid.
@@ -10246,9 +10260,13 @@ fn expand_views_in_from(item: &mut pg_query::protobuf::Node, depth: usize) -> Re
                 let mut e = e.borrow_mut();
                 if e.len() >= 64 {
                     e.clear();
+                    EXPANDED_SYSTEM_VIEWS.with(|s| s.borrow_mut().clear());
                 }
                 e.push((alias.aliasname.clone(), view_name.clone()));
             });
+            if system.is_some() {
+                EXPANDED_SYSTEM_VIEWS.with(|s| s.borrow_mut().push(alias.aliasname.clone()));
+            }
             item.node = Some(N::RangeSubselect(Box::new(
                 pg_query::protobuf::RangeSubselect {
                     lateral: false,
@@ -13495,6 +13513,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         alias,
         plan: Box::new(plan),
         def,
+        unread: Vec::new(),
     }))
 }
 
@@ -16026,7 +16045,9 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
         };
         pad_bpchar(v, widths.get(i).copied().flatten())
     });
-    let previous = declare_row_fields(params.len(), fields);
+    // The declared types are the expression's own, the same for every row:
+    // installed from its memo rather than built again (RP-131).
+    let previous = expr_memo::declare_row_fields(&scratch.1, params.len(), fields);
     let n = params.len();
     let _memo = expr_memo::install(&scratch.1, expr);
     let run = |all: &[Bson]| correlated::with_row_params_from(n, || const_value(expr, all));
@@ -16052,7 +16073,7 @@ pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
             run(&all)
         }
     };
-    PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
+    expr_memo::restore_declared(&scratch.1, previous);
     out
 }
 
@@ -20215,9 +20236,7 @@ fn call_arg_types(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Vec<Stri
             Some(N::AConst(c)) if c.isnull => "unknown".to_string(),
             // A parameter the client sent untyped (oid 0) is `unknown` to
             // resolution, whatever text its value arrived as.
-            Some(N::ParamRef(p))
-                if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none() =>
-            {
+            Some(N::ParamRef(p)) if !param_is_declared(usize::try_from(p.number).unwrap_or(0)) => {
                 "unknown".to_string()
             }
             _ => {
@@ -22957,6 +22976,7 @@ fn plan_select_rest(
                     rows,
                 })),
                 def,
+                unread: Vec::new(),
             });
             let mut rewritten = s.clone();
             rewritten.from_clause = vec![joins::placeholder_from(name)];
@@ -23244,10 +23264,12 @@ fn plan_from_subquery(
     }
     distinct_fields(&mut def);
     def.name = alias.clone();
+    let unread = prune_outputs::unread_outputs(inner);
     Ok(SubSource {
         alias,
         plan: Box::new(plan),
         def,
+        unread,
     })
 }
 
@@ -25109,6 +25131,13 @@ fn default_is_volatile(node: &pg_query::protobuf::Node) -> bool {
 }
 
 fn static_type(node: &pg_query::protobuf::Node, value: &Bson) -> String {
+    // Typed without a value, a node of the expression being evaluated has
+    // the same type for every row: kept with the expression (RP-131).
+    if *value == Bson::Null {
+        if let Some(t) = expr_memo::null_type(node, || static_type_uncached(node, value)) {
+            return t;
+        }
+    }
     // Memoised inside a `const_value` evaluation (see `TYPE_MEMO`), for an
     // operator node typed without a value -- the answer then depends on the
     // node alone.
@@ -25342,7 +25371,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 // An UNTYPED parameter contributes nothing: PostgreSQL takes
                 // the type from the elements that have one.
                 if matches!(element.node.as_ref(), Some(N::ParamRef(p))
-                    if declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none())
+                    if !param_is_declared(usize::try_from(p.number).unwrap_or(0)))
                 {
                     continue;
                 }
@@ -26709,7 +26738,7 @@ fn pg_typeof(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> 
     // shape that reaches this.
     if let Some(N::ParamRef(p)) = arg.node.as_ref() {
         let n = usize::try_from(p.number).unwrap_or(0);
-        if declared_param_type(n).is_none() {
+        if !param_is_declared(n) {
             return Err(Error::IndeterminateDatatype(format!(
                 "could not determine data type of parameter ${n}"
             )));
@@ -29805,7 +29834,11 @@ fn split_subms(micros_since_epoch: i64) -> (i64, i32) {
 /// column (`ts::text`) must see the microseconds the row carries.
 pub fn field_value(doc: &Document, field: &str) -> Bson {
     let v = doc.get(field).cloned().unwrap_or(Bson::Null);
-    if let (Bson::DateTime(_), Some(Bson::Int32(rem))) = (&v, doc.get(companion_field(field))) {
+    // Only a date has a companion, so only a date builds its name (RP-131).
+    if !matches!(v, Bson::DateTime(_)) {
+        return v;
+    }
+    if let Some(Bson::Int32(rem)) = doc.get(companion_field(field)) {
         if *rem != 0 {
             return Bson::Document(doc! { COMPOSITE_DATE: v, COMPOSITE_US: *rem });
         }
@@ -30798,6 +30831,10 @@ fn user_composite_widths(name: &str) -> Option<Vec<Option<usize>>> {
 /// A composite type's `(oid, fields)` by name, compared as `user_enum`
 /// compares it.
 fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
+    // No composite type, nothing to resolve the name for (RP-131).
+    if PLAN_USER_COMPOSITES_BY_NAME.with(|ix| ix.borrow().is_empty()) {
+        return None;
+    }
     let target = canonical_type_ref(name);
     let at = PLAN_USER_COMPOSITES_BY_NAME.with(|ix| ix.borrow().get(&target).copied())?;
     PLAN_USER_COMPOSITES.with(|t| {
@@ -30942,6 +30979,9 @@ pub fn extension_canonical(ty: ExtensionType, text: &str) -> Result<String> {
 /// A base type's `(registered name, oid, defined)` by name, compared as
 /// `user_composite` compares it.
 fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
+    if PLAN_USER_BASE_TYPES.with(|t| t.borrow().is_empty()) {
+        return None;
+    }
     let target = canonical_type_ref(name);
     PLAN_USER_BASE_TYPES.with(|t| {
         t.borrow()
@@ -30953,6 +30993,11 @@ fn user_base_type(name: &str) -> Option<(String, i64, bool)> {
 
 /// The user base type (not an extension's) an expression statically has.
 fn user_defined_base_source(arg: &pg_query::protobuf::Node, value: &Bson) -> Option<String> {
+    // With no user base type there is none to find, nor a type to work out
+    // for every operand of every row (RP-131).
+    if PLAN_USER_BASE_TYPES.with(|t| t.borrow().is_empty()) {
+        return None;
+    }
     user_defined_base_source_of(&static_type(arg, value))
 }
 
@@ -31328,6 +31373,16 @@ fn drop_void_out_params(node: &mut pg_query::protobuf::Node) {
             }
         }
     }
+}
+
+/// Whether parameter `n` has a declared type ([`declared_param_type`]
+/// without copying it).
+fn param_is_declared(n: usize) -> bool {
+    PLAN_PARAM_TYPES.with(|t| {
+        n.checked_sub(1)
+            .and_then(|i| t.borrow().get(i).map(Option::is_some))
+            .unwrap_or(false)
+    })
 }
 
 fn declared_param_type(n: usize) -> Option<String> {
@@ -34914,7 +34969,7 @@ fn refuse_untyped_any_args(f: &pg_query::protobuf::FuncCall) -> Result<()> {
     for arg in f.args.iter().skip(leading_text) {
         if let Some(N::ParamRef(p)) = arg.node.as_ref() {
             let n = usize::try_from(p.number).unwrap_or(0);
-            if declared_param_type(n).is_none() {
+            if !param_is_declared(n) {
                 return Err(Error::IndeterminateDatatype(format!(
                     "could not determine data type of parameter ${n}"
                 )));
@@ -35802,9 +35857,7 @@ fn overload_name(f: &pg_query::protobuf::FuncCall, name: String) -> String {
 fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
     match n.and_then(|x| x.node.as_ref()) {
         Some(N::AConst(c)) => matches!(c.val.as_ref(), Some(a_const::Val::Sval(_))),
-        Some(N::ParamRef(p)) => {
-            declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
-        }
+        Some(N::ParamRef(p)) => !param_is_declared(usize::try_from(p.number).unwrap_or(0)),
         // `'a  ' COLLATE "C"` is still an untyped literal (RP-022).
         Some(N::CollateClause(cc)) => unknown_operand(cc.arg.as_deref()),
         _ => false,
@@ -36023,9 +36076,7 @@ fn coerce_unknown_operand(
             ),
             // A parameter the client typed is RESOLVED: it is the side the
             // literal takes its type from, not a second unknown.
-            Some(N::ParamRef(p)) => {
-                declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
-            }
+            Some(N::ParamRef(p)) => !param_is_declared(usize::try_from(p.number).unwrap_or(0)),
             _ => false,
         };
     let bare_string = unresolved;
@@ -39794,7 +39845,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         if let Some(result) = collation_for_call(f, params) {
             return result;
         }
-        if let Some(e) = function_absent_in_reference(f, params) {
+        if let Some(e) = expr_memo::call_unresolved(f, || function_absent_in_reference(f, params)) {
             return Err(e);
         }
         if let Some(u) = func_name(f).and_then(|n| correlated::user_function_for(&n, &f.args)) {
@@ -41236,9 +41287,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             // and only `h - 'a'::text` deletes a key.
             let rhs_unknown = match e.rexpr.as_deref().and_then(|x| x.node.as_ref()) {
                 Some(N::AConst(c)) => matches!(c.val.as_ref(), Some(a_const::Val::Sval(_))),
-                Some(N::ParamRef(p)) => {
-                    declared_param_type(usize::try_from(p.number).unwrap_or(0)).is_none()
-                }
+                Some(N::ParamRef(p)) => !param_is_declared(usize::try_from(p.number).unwrap_or(0)),
                 _ => false,
             };
             let rhs_hstore = rhs_unknown || static_hstore_operand(e.rexpr.as_deref(), &rhs);
@@ -41343,7 +41392,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         // The array containment operators. Told apart from the json ones
         // above by the operands being arrays -- a json value is a string here,
         // so the two never both match.
-        if let Some(err) = array_operand_mismatch(e, None) {
+        if let Some(err) = expr_memo::operator_unresolved(e, || array_operand_mismatch(e, None)) {
             return Err(err);
         }
         // An untyped literal beside an array IS that array type: `array[1,2]

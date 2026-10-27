@@ -14,15 +14,26 @@ use secantus_pgcatalog::{Column, TableDef};
 const ORDER: &str = include_str!("pg15_catalog_order.tsv");
 
 /// PostgreSQL 15's `(column, type)` list for `catalog`, in order.
+/// The list is read once: every catalog lookup asks (RP-131).
 fn pg15_columns(catalog: &str) -> Vec<(&'static str, &'static str)> {
-    ORDER
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split('\t');
-            let (rel, col, ty) = (it.next()?, it.next()?, it.next()?);
-            (rel == catalog).then_some((col, ty))
+    type Columns = Vec<(&'static str, &'static str)>;
+    static BY_CATALOG: std::sync::OnceLock<std::collections::HashMap<&'static str, Columns>> =
+        std::sync::OnceLock::new();
+    BY_CATALOG
+        .get_or_init(|| {
+            let mut by: std::collections::HashMap<&'static str, Columns> =
+                std::collections::HashMap::new();
+            for l in ORDER.lines() {
+                let mut it = l.split('\t');
+                if let (Some(rel), Some(col), Some(ty)) = (it.next(), it.next(), it.next()) {
+                    by.entry(rel).or_default().push((col, ty));
+                }
+            }
+            by
         })
-        .collect()
+        .get(catalog)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Reorder `def`'s columns to PostgreSQL 15's for `catalog`, adding the

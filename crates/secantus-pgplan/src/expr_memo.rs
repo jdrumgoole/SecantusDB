@@ -35,6 +35,23 @@ struct Inner {
     /// A constant cast (see [`foldable`]), by address: its value, for the
     /// resolution epoch it was computed at.
     folded: HashMap<usize, Option<(u64, Bson)>>,
+    /// A function call, by address: the resolution epoch at which it was
+    /// found to name a function that exists for its argument types
+    /// (`function_absent_in_reference` answered nothing), as parse analysis
+    /// settles once per call (`ParseFuncOrColumn`).
+    resolved: HashMap<usize, Option<u64>>,
+    /// Every node of the tree, by address: its static type as typed without
+    /// a value (`static_type(node, NULL)`), for the resolution epoch it was
+    /// worked out at -- which depends on the node and the declared types
+    /// alone, as parse analysis types each node once.
+    types: HashMap<usize, Option<(u64, String)>>,
+    /// An operator, by its `AExpr`'s address: the epoch at which its
+    /// operands were found to have an operator (`array_operand_mismatch`
+    /// answered nothing).
+    operators: HashMap<usize, Option<u64>>,
+    /// The parameter types the evaluation declares (the statement's, then
+    /// the row's fields), kept to be installed again for the next row.
+    declared: Vec<Option<String>>,
 }
 
 thread_local! {
@@ -75,6 +92,7 @@ fn collect(node: &pg_query::protobuf::Node, inner: &mut Inner) {
     let Some(n) = node.node.as_ref() else {
         return;
     };
+    inner.types.insert(std::ptr::from_ref(node) as usize, None);
     let mut kids: Vec<&pg_query::protobuf::Node> = Vec::new();
     match n {
         N::TypeCast(tc) => {
@@ -89,10 +107,17 @@ fn collect(node: &pg_query::protobuf::Node, inner: &mut Inner) {
             kids.extend(tc.arg.as_deref());
         }
         N::AExpr(e) => {
+            inner
+                .operators
+                .insert(std::ptr::from_ref::<AExpr>(e) as usize, None);
             kids.extend(e.lexpr.as_deref());
             kids.extend(e.rexpr.as_deref());
         }
         N::FuncCall(f) => {
+            inner.resolved.insert(
+                std::ptr::from_ref::<pg_query::protobuf::FuncCall>(f) as usize,
+                None,
+            );
             if func_name(f).as_deref() == Some(hashed_subplan::NAME) {
                 inner.subplans.insert(
                     std::ptr::from_ref::<pg_query::protobuf::FuncCall>(f) as usize,
@@ -171,6 +196,143 @@ pub(crate) fn type_name(
         Some(())
     });
     Some(value)
+}
+
+/// Whether the call `f` names no function for its argument types: `check`
+/// (`function_absent_in_reference`) answers it, and when `f` is a node of
+/// the expression being evaluated a call it passed is not asked again at
+/// the same resolution epoch. Parse analysis resolves a call once, from the
+/// arguments' types, never their values; the evaluator asked for every
+/// row, and the asking evaluated each argument a second time (RP-131).
+pub(crate) fn call_unresolved(
+    f: &pg_query::protobuf::FuncCall,
+    check: impl FnOnce() -> Option<Error>,
+) -> Option<Error> {
+    let addr = std::ptr::from_ref(f) as usize;
+    let epoch = schemas::resolve_epoch();
+    let known = with_current(|m| {
+        let inner =
+            m.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.resolved.get(&addr).copied()
+    });
+    if known == Some(Some(epoch)) {
+        return None;
+    }
+    let out = check();
+    if out.is_none() && known.is_some() {
+        with_current(|m| {
+            let mut inner =
+                m.0.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.resolved.insert(addr, Some(epoch));
+            Some(())
+        });
+    }
+    out
+}
+
+/// `static_type(node, NULL)` for a node of the expression being evaluated,
+/// worked out on first use and kept for the expression at the same
+/// resolution epoch; `None` for a node outside it.
+pub(crate) fn null_type(
+    node: &pg_query::protobuf::Node,
+    compute: impl FnOnce() -> String,
+) -> Option<String> {
+    let addr = std::ptr::from_ref(node) as usize;
+    let epoch = schemas::resolve_epoch();
+    let known = with_current(|m| {
+        let inner =
+            m.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.types.get(&addr).cloned()
+    })?;
+    if let Some((at, t)) = known {
+        if at == epoch {
+            return Some(t);
+        }
+    }
+    let t = compute();
+    with_current(|m| {
+        let mut inner =
+            m.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.types.insert(addr, Some((epoch, t.clone())));
+        Some(())
+    });
+    Some(t)
+}
+
+/// Whether the operator `e` has none for its operands' types: `check`
+/// (`array_operand_mismatch`) answers it, and an operator of the expression
+/// being evaluated that passed is not asked again at the same epoch -- the
+/// types it reads are its operands' static ones, which parse analysis
+/// settles once (`make_op`).
+pub(crate) fn operator_unresolved(
+    e: &AExpr,
+    check: impl FnOnce() -> Option<Error>,
+) -> Option<Error> {
+    let addr = std::ptr::from_ref(e) as usize;
+    let epoch = schemas::resolve_epoch();
+    let known = with_current(|m| {
+        let inner =
+            m.0.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.operators.get(&addr).copied()
+    });
+    if known == Some(Some(epoch)) {
+        return None;
+    }
+    let out = check();
+    if out.is_none() && known.is_some() {
+        with_current(|m| {
+            let mut inner =
+                m.0.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            inner.operators.insert(addr, Some(epoch));
+            Some(())
+        });
+    }
+    out
+}
+
+/// Install `n_params` statement parameter types and `fields`' types after
+/// them as the declared parameter types, from `memo`'s copy when its
+/// statement part still matches; the previous declarations are returned
+/// for [`restore_declared`].
+pub(crate) fn declare_row_fields(
+    memo: &ExprMemo,
+    n_params: usize,
+    fields: &[RowField],
+) -> Vec<Option<String>> {
+    let mut mine = std::mem::take(
+        &mut memo
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .declared,
+    );
+    PLAN_PARAM_TYPES.with(|t| {
+        let mut current = t.borrow_mut();
+        let same = mine.len() == n_params + fields.len()
+            && (0..n_params).all(|i| mine[i].as_ref() == current.get(i).and_then(Option::as_ref));
+        if !same {
+            mine.clear();
+            mine.extend((0..n_params).map(|i| current.get(i).cloned().flatten()));
+            mine.extend(fields.iter().map(|(_, _, ty)| Some(ty.clone())));
+        }
+        std::mem::replace(&mut *current, mine)
+    })
+}
+
+/// Put back the declarations [`declare_row_fields`] replaced, keeping the
+/// row's for the next evaluation.
+pub(crate) fn restore_declared(memo: &ExprMemo, previous: Vec<Option<String>>) {
+    let mine = PLAN_PARAM_TYPES.with(|t| std::mem::replace(&mut *t.borrow_mut(), previous));
+    memo.0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .declared = mine;
 }
 
 /// A hashed SubPlan's table, when `f` is a node of the expression being

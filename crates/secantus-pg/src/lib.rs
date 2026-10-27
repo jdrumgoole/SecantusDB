@@ -9640,23 +9640,47 @@ impl PgHandler {
     }
 
     fn materialise_sub(&self, stmt: &Statement, def: &TableDef) -> PgWireResult<Vec<Document>> {
+        self.materialise_sub_cells(stmt, def, None)
+    }
+
+    /// `materialise_sub`, leaving out the columns `skip` marks (by position):
+    /// ones nothing outside reads (`SubSource::unread`, a join leaf's columns
+    /// no joined row carries), which PostgreSQL never keeps in a tuple
+    /// (RP-131).
+    fn materialise_sub_cells(
+        &self,
+        stmt: &Statement,
+        def: &TableDef,
+        skip: Option<&[bool]>,
+    ) -> PgWireResult<Vec<Document>> {
         if let Statement::JoinRows(join) = stmt {
             return join_search::with_join_where(join, || self.join_rows(&join.tree));
         }
         let (_, rows) = self.rows_with_schema(stmt)?;
         // Each column's field name, once rather than once a row.
-        let fields: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
+        let fields: Vec<Option<String>> = def
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (!skip.is_some_and(|s| s.get(i).copied().unwrap_or(false))).then(|| c.field())
+            })
+            .collect();
         Ok(rows
             .into_iter()
             .map(|r| {
                 let mut d = Document::new();
                 let mut values = r.into_iter();
                 for field in &fields {
+                    let value = values.next().flatten();
+                    let Some(field) = field else {
+                        continue;
+                    };
                     // A NULL cell is stored as an explicit `Bson::Null` rather
                     // than left out: the outer query's `col IS NULL` and its
                     // ORDER BY both read the field, and a missing one is not
                     // the same thing as a null one to an MQL filter.
-                    d.insert(field.clone(), values.next().flatten().unwrap_or(Bson::Null));
+                    d.insert(field.clone(), value.unwrap_or(Bson::Null));
                 }
                 d
             })
@@ -9714,10 +9738,6 @@ impl PgHandler {
                     }
                     _ => None,
                 };
-                let docs = match &row_id_key {
-                    Some((sel, _)) => self.materialise_with_row_ids(sel, def)?,
-                    None => self.materialise_sub(plan, def)?,
-                };
                 // Only the columns something reads (`JoinRows::project`).
                 let project = join_search::projection();
                 let columns: Vec<&(String, String)> = columns
@@ -9726,6 +9746,19 @@ impl PgHandler {
                         secantus_pgplan::joins::JoinRows::carries(project.as_deref(), k)
                     })
                     .collect();
+                // The leaf's rows hold only those columns' fields.
+                let skip: Vec<bool> = def
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let f = c.field();
+                        !columns.iter().any(|(_, field)| *field == f)
+                    })
+                    .collect();
+                let docs = match &row_id_key {
+                    Some((sel, _)) => self.materialise_with_row_ids(sel, def)?,
+                    None => self.materialise_sub_cells(plan, def, Some(&skip))?,
+                };
                 Ok(docs
                     .into_iter()
                     .map(|d| {
@@ -9771,6 +9804,7 @@ impl PgHandler {
                     params,
                     keys,
                     columns,
+                    scan,
                 } = right.as_ref()
                 {
                     return self.lateral_rows(
@@ -9780,6 +9814,7 @@ impl PgHandler {
                         params,
                         keys,
                         columns,
+                        scan.as_deref(),
                         *kind,
                         on.as_ref(),
                         merged,
@@ -10107,6 +10142,7 @@ impl PgHandler {
         params: &[Bson],
         keys: &[String],
         columns: &[(String, usize)],
+        scan: Option<&secantus_pgplan::joins::FunctionScan>,
         kind: secantus_pgplan::joins::JoinKind,
         on: Option<&secantus_pgplan::ColumnExpr>,
         merged: &[(String, String, String)],
@@ -10135,7 +10171,16 @@ impl PgHandler {
             if !cache.contains_key(&memo) {
                 let mut bound = base.clone();
                 bound.extend(vals);
-                let rows = self.run_sql_rows(sql, &bound)?;
+                // A function scan re-runs only the function (RP-131);
+                // anything else plans the item's SQL for these values.
+                let scanned = match scan {
+                    Some(scan) => self.function_scan_rows(scan, &bound)?,
+                    None => None,
+                };
+                let rows = match scanned {
+                    Some(rows) => rows,
+                    None => self.run_sql_rows(sql, &bound)?,
+                };
                 let docs = rows
                     .into_iter()
                     .map(|r| {
@@ -10189,6 +10234,21 @@ impl PgHandler {
         Ok(out)
     }
 
+    /// A LATERAL function scan's rows for one left row's `params`, run as
+    /// the item's SQL would run it while planning (`run_sql_rows`).
+    fn function_scan_rows(
+        &self,
+        scan: &secantus_pgplan::joins::FunctionScan,
+        params: &[Bson],
+    ) -> PgWireResult<Option<Vec<Vec<Bson>>>> {
+        self.with_executor_hooks(|| {
+            secantus_pgplan::planning_to_execute(|| {
+                secantus_pgplan::joins::function_scan_rows(scan, params)
+            })
+        })
+        .map_err(|e| Self::err(&e))
+    }
+
     /// Plan and run a SELECT's SQL with bound parameters, as the executing
     /// statement, for its rows in select-list order.
     fn run_sql_rows(&self, sql: &str, params: &[Bson]) -> PgWireResult<Vec<Vec<Bson>>> {
@@ -10223,7 +10283,7 @@ impl PgHandler {
             Statement::Select(inner) if LOCK_ROW_IDS.with(|c| c.get()) => {
                 self.materialise_with_row_ids(inner, &sub.def)?
             }
-            other => self.materialise_sub(other, &sub.def)?,
+            other => self.materialise_sub_cells(other, &sub.def, Some(&sub.unread))?,
         };
         if filter.is_empty() {
             return Ok(docs);
@@ -44782,6 +44842,12 @@ fn resolve_cell(
             return Ok(Some(Bson::String(text)));
         }
     }
+    // Only a date is reassembled with its companion; anything else is the
+    // cell as stored, read once (RP-131).
+    let cell = doc.get(field);
+    if !matches!(cell, Some(Bson::DateTime(_))) {
+        return Ok(cell.cloned());
+    }
     let reassembled = if *datatype == Type::TIMESTAMPTZ {
         timestamptz_text(doc, field, tz)
     } else {
@@ -44789,7 +44855,7 @@ fn resolve_cell(
     };
     Ok(match reassembled {
         Some(text) => Some(Bson::String(text)),
-        None => doc.get(field).cloned(),
+        None => cell.cloned(),
     })
 }
 
