@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import psycopg
 import pytest
 
 from tests.backlog.conftest import pg_answer
@@ -408,7 +409,7 @@ def test_more_of_parse_analysis_refusals(
     assert got[2].endswith(message), got
 
 
-@pytest.mark.backlog("RP-295")
+@pytest.mark.backlog_fixed("RP-295")
 @pytest.mark.parametrize(
     "query, sqlstate, message",
     [
@@ -438,7 +439,7 @@ def test_a_recursive_query_postgres_refuses(
     assert got[2].endswith(message), got
 
 
-@pytest.mark.backlog("RP-283")
+@pytest.mark.backlog_fixed("RP-283")
 def test_a_hypothetical_set_aggregate_over_two_columns(pg: Any) -> None:
     """`dense_rank(2, 'x') WITHIN GROUP (ORDER BY a, b)` ranks a row of two
     values; over no rows it is 1."""
@@ -448,6 +449,47 @@ def test_a_hypothetical_set_aggregate_over_two_columns(pg: Any) -> None:
         "select dense_rank(2, 'x') within group (order by a, b) from rp283_t",
     )
     assert got == ("ok", [(1,)])
+
+
+@pytest.mark.backlog_fixed("RP-283")
+def test_a_hypothetical_set_aggregate_ranks_a_row_of_several_values(pg: Any) -> None:
+    """Each hypothetical-set aggregate compares a row with the hypothetical
+    one column by column, in each column's own direction (15.19's answers)."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp283_t (a int, b text)",
+            "insert into rp283_t values (1, 'a'), (2, 'a'), (2, 'z'), (3, 'b')",
+        ],
+        "select dense_rank(2, 'x') within group (order by a, b),"
+        " rank(2, 'x') within group (order by a, b),"
+        " percent_rank(2, 'x') within group (order by a, b),"
+        " cume_dist(2, 'x') within group (order by a, b),"
+        " rank(2, 'x') within group (order by a desc, b),"
+        " cume_dist(3, null) within group (order by a, b nulls first)"
+        " from rp283_t",
+    )
+    assert got == ("ok", [(3, 3, 0.5, 0.6, 3, 0.8)])
+
+
+@pytest.mark.backlog("RP-308")
+def test_a_hypothetical_set_aggregate_with_too_few_direct_arguments(pg: Any) -> None:
+    """PostgreSQL names the function by its argument types and says, in a
+    hint, how many direct arguments and ordering columns it found."""
+    pg.execute("begin")
+    try:
+        pg.execute("create table rp308_t (a int, b text)")
+        with pytest.raises(psycopg.errors.UndefinedFunction) as e:
+            pg.execute("select rank(2) within group (order by a, b) from rp308_t")
+        assert str(e.value).splitlines()[0] == (
+            "function rank(integer, integer, text) does not exist"
+        )
+        assert e.value.diag.message_hint == (
+            "To use the hypothetical-set aggregate rank, the number of hypothetical"
+            " direct arguments (here 1) must match the number of ordering columns (here 2)."
+        )
+    finally:
+        pg.execute("rollback")
 
 
 @pytest.mark.backlog("RP-287")

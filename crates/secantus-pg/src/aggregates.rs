@@ -271,24 +271,48 @@ pub(crate) fn compute(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
         | AggFunc::HypDenseRank
         | AggFunc::HypPercentRank
         | AggFunc::HypCumeDist => {
-            let hypo = item.direct.first().cloned().unwrap_or(Bson::Null);
-            let key = item.order.first();
+            // The hypothetical row has one value per ordering column, and a
+            // row compares with it column by column (RP-283).
+            let fields: Vec<String> = item
+                .order
+                .iter()
+                .enumerate()
+                .map(|(i, k)| {
+                    if i == 0 {
+                        field.to_string()
+                    } else {
+                        k.field.clone()
+                    }
+                })
+                .collect();
+            let tuple = |d: &Document| -> Vec<Bson> { fields.iter().map(|f| get(d, f)).collect() };
+            let cmp_tuples = |a: &[Bson], b: &[Bson]| -> Ordering {
+                a.iter()
+                    .zip(b)
+                    .zip(&item.order)
+                    .map(|((x, y), k)| compare_with_key(x, y, Some(k)))
+                    .find(|o| *o != Ordering::Equal)
+                    .unwrap_or(Ordering::Equal)
+            };
+            let hypo: Vec<Bson> = (0..fields.len())
+                .map(|i| item.direct.get(i).cloned().unwrap_or(Bson::Null))
+                .collect();
             let n = rows.len();
-            let cmp_to_hypo = |v: &Bson| compare_with_key(v, &hypo, key);
+            let cmp_to_hypo = |d: &Document| cmp_tuples(&tuple(d), &hypo);
             let before = rows
                 .iter()
-                .filter(|d| cmp_to_hypo(&get(d, field)) == Ordering::Less)
+                .filter(|d| cmp_to_hypo(d) == Ordering::Less)
                 .count();
             Ok(match item.func {
                 AggFunc::HypRank => Bson::Int64(before as i64 + 1),
                 AggFunc::HypDenseRank => {
-                    let mut distinct: Vec<Bson> = Vec::new();
+                    let mut distinct: Vec<Vec<Bson>> = Vec::new();
                     for d in rows {
-                        let v = get(d, field);
-                        if cmp_to_hypo(&v) == Ordering::Less
+                        let v = tuple(d);
+                        if cmp_tuples(&v, &hypo) == Ordering::Less
                             && !distinct
                                 .iter()
-                                .any(|x| compare_with_key(x, &v, key) == Ordering::Equal)
+                                .any(|x| cmp_tuples(x, &v) == Ordering::Equal)
                         {
                             distinct.push(v);
                         }
@@ -305,7 +329,7 @@ pub(crate) fn compute(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
                 _ => {
                     let upto = rows
                         .iter()
-                        .filter(|d| cmp_to_hypo(&get(d, field)) != Ordering::Greater)
+                        .filter(|d| cmp_to_hypo(d) != Ordering::Greater)
                         .count();
                     float_bson((upto + 1) as f64 / (n + 1) as f64)
                 }

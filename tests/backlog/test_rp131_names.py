@@ -40,7 +40,7 @@ def test_nameconcatoid_cuts_the_name_not_the_suffix(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-304")
+@pytest.mark.backlog_fixed("RP-304")
 def test_a_cast_to_name_keeps_namedatalen_bytes(pg: Any) -> None:
     """`namein` keeps at most 63 bytes, cut back to a character boundary:
     70 ASCII letters keep 63, 40 two-byte characters keep 31 (62 bytes).

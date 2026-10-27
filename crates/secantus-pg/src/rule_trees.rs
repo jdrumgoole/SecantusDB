@@ -503,6 +503,53 @@ impl PgHandler {
         }
     }
 
+    /// What PostgreSQL's parse analysis refuses of a plain SELECT with a
+    /// WITH RECURSIVE (RP-295): a recursive term that changes a column's
+    /// type (42804) or holds an aggregate (42P19), which the executor would
+    /// otherwise run -- without a LIMIT, for ever. Anything the
+    /// transcription does not cover lets the statement go ahead.
+    pub(crate) fn recursive_select_refusal(&self, query: &str) -> PgWireResult<()> {
+        if !query.to_ascii_lowercase().contains("recursive") {
+            return Ok(());
+        }
+        let Ok(parsed) = pg_query::parse(query) else {
+            return Ok(());
+        };
+        use pg_query::protobuf::node::Node as N;
+        let [raw] = parsed.protobuf.stmts.as_slice() else {
+            return Ok(());
+        };
+        let recursive = matches!(
+            raw.stmt.as_ref().and_then(|s| s.node.as_ref()),
+            Some(N::SelectStmt(s)) if s.with_clause.as_ref().is_some_and(|w| w.recursive)
+        );
+        if !recursive {
+            return Ok(());
+        }
+        let Ok(data) = self.rule_catalog_data(false) else {
+            return Ok(());
+        };
+        let cat = Catalog::new(data);
+        let ctx = secantus_pgplan::nodetostring::AnalysisContext {
+            catalog: &cat,
+            search_path: self.rule_search_path(&cat),
+            allow_system_table_mods: false,
+        };
+        match secantus_pgplan::nodetostring::analyze_select(&ctx, query, 0) {
+            Err(e) if e.sqlstate.is_some() => {
+                let mut info = ErrorInfo::new(
+                    "ERROR".into(),
+                    e.sqlstate.unwrap_or("XX000").into(),
+                    e.message,
+                );
+                info.detail = e.detail;
+                info.hint = e.hint;
+                Err(PgWireError::UserError(Box::new(info)))
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn statement_rule_trees_inner(
         &self,
         kind: char,

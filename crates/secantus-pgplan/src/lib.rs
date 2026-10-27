@@ -11158,6 +11158,19 @@ fn apply_defer_initial(
     }
 }
 
+/// `namein`: at most NAMEDATALEN - 1 (63) bytes, cut back to a character
+/// boundary as `pg_mbcliplen` cuts (RP-304).
+pub fn name_in(mut s: String) -> String {
+    if s.len() > 63 {
+        let mut end = 63;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
 /// The SQL text of a CHECK predicate, as `pg_get_constraintdef` renders it:
 /// an operator expression is parenthesised (`(c > 0)`), a bare constant or
 /// call is not (`true`). pg_query deparses only whole statements, so the
@@ -17071,10 +17084,28 @@ fn plan_aggregate_item(
         // `percentile_cont(0.5) WITHIN GROUP (ORDER BY v)`: the ordered
         // argument is `v`, sorted as written; the fraction / hypothetical
         // row is a direct argument.
-        let [sort] = f.agg_order.as_slice() else {
-            return Err(Error::Unsupported(format!(
-                "{name}() WITHIN GROUP over more than one column"
-            )));
+        // A hypothetical-set aggregate takes one direct argument per
+        // ordering column (`rank(2, 'x') WITHIN GROUP (ORDER BY a, b)`,
+        // RP-283); the others order by one.
+        let hypothetical = matches!(
+            func,
+            AggFunc::HypRank
+                | AggFunc::HypDenseRank
+                | AggFunc::HypPercentRank
+                | AggFunc::HypCumeDist
+        );
+        let (sort, rest) = match f.agg_order.split_first() {
+            Some((sort, rest)) if rest.is_empty() || hypothetical => (sort, rest),
+            _ => {
+                return Err(Error::Unsupported(format!(
+                    "{name}() WITHIN GROUP over more than one column"
+                )))
+            }
+        };
+        let nargs = if hypothetical {
+            f.agg_order.len()
+        } else {
+            nargs
         };
         let Some(N::SortBy(sb)) = sort.node.as_ref() else {
             return Err(Error::Unsupported("this WITHIN GROUP clause".into()));
@@ -17112,6 +17143,17 @@ fn plan_aggregate_item(
             jsonb: false,
             expr: None,
         }];
+        // The further ordering columns, an expression computed into a
+        // synthetic field before the rows are compared.
+        for (i, mut key) in plan_aggregate_order(rest, def, params)?
+            .into_iter()
+            .enumerate()
+        {
+            if key.expr.is_some() {
+                key.field = format!("__agg{index}_ord{}", i + 1);
+            }
+            item.order.push(key);
+        }
         item.field = Some(field);
         item.source_type = ty;
         item.source_typmod = typmod;
@@ -34038,7 +34080,8 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
                 display_type(inferred_type(other))
             ))),
         },
-        "text" | "varchar" | "bpchar" | "char" | "name" => Ok(Bson::String(as_text(&value))),
+        "text" | "varchar" | "bpchar" | "char" => Ok(Bson::String(as_text(&value))),
+        "name" => Ok(Bson::String(name_in(as_text(&value)))),
         // `json` VALIDATES and keeps the text it was given -- whitespace, key
         // order and duplicate keys all survive. `jsonb` parses and stores a
         // structure, so it comes back normalised.

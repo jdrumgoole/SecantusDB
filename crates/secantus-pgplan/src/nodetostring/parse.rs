@@ -1405,6 +1405,29 @@ fn offset_var_nodes(q: &mut Query, offset: i32) {
     super::nodefuncs::offset_query(q, offset, 0);
 }
 
+/// Parse analysis of a plain SELECT (`transformStmt`), for the refusals
+/// PostgreSQL makes before it plans anything: a WITH RECURSIVE whose
+/// recursive term changes a column's type or holds an aggregate (RP-295).
+/// The analysed tree is thrown away.
+pub fn analyze_select(ctx: &AnalysisContext<'_>, source: &str, stmt_index: usize) -> R<()> {
+    let parsed = parse_source(source)?;
+    let raw = parsed
+        .stmts
+        .get(stmt_index)
+        .ok_or_else(|| AnalysisError::new("no such statement".into()))?;
+    let Some(query) = raw.stmt.as_deref() else {
+        return unsupported("an empty statement");
+    };
+    if !matches!(query.node.as_ref(), Some(N::SelectStmt(_))) {
+        return unsupported("not a SELECT");
+    }
+    let mut a = Analyzer::new(ctx);
+    a.levels.push(ParseState::new());
+    a.transform_stmt(query)?;
+    a.levels.pop();
+    Ok(())
+}
+
 /// The stored trees of `CREATE VIEW` (`DefineView`): the analysed query,
 /// with `OLD` and `NEW` placed in front of its range table as
 /// `UpdateRangeTableOfViewParse` places them.

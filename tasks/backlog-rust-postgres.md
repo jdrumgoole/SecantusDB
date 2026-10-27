@@ -941,17 +941,6 @@ tests regression tests:
       once a row of its table as PostgreSQL's scan does.
       Backlog-ID: RP-288
       Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
-- [ ] **A plain SELECT's WITH RECURSIVE is planned without PostgreSQL's
-      checks**: a recursive term of another type, or one holding an
-      aggregate, is answered (and without a LIMIT never ends) where 15.19
-      refuses with 42804 / 42P19. Found while completing RP-203, whose
-      CREATE VIEW now runs those checks first.
-      Backlog-ID: RP-295
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_recursive_query_postgres_refuses
-- [ ] **A hypothetical-set aggregate over two columns is refused**:
-      `dense_rank(2, 'x') WITHIN GROUP (ORDER BY a, b)` is 0A000 here.
-      Backlog-ID: RP-283
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_over_two_columns
 - [ ] **An UPDATE leaves the row's unique-key claim on its old value**
       (shared storage), so inserting that value again fails XX000 `E11000
       duplicate key error` where PostgreSQL 15.19 inserts it: the update
@@ -962,6 +951,18 @@ tests regression tests:
       compared with mongod). Found while closing RP-018.
       Backlog-ID: RP-296
       Verify: tests/backlog/test_rp018_savepoint_undo.py::test_an_updated_unique_value_can_be_used_again
+- [ ] **A hypothetical-set aggregate with the wrong number of direct
+      arguments names it by `unknown`s and gives the generic hint**:
+      `rank(2) WITHIN GROUP (ORDER BY a, b)` is 42883 `function
+      rank(unknown) does not exist` where PostgreSQL 15.19 says `function
+      rank(integer, integer, text) does not exist` with the hint `To use the
+      hypothetical-set aggregate rank, the number of hypothetical direct
+      arguments (here 1) must match the number of ordering columns (here
+      2).` The planner's `Error::hint` is a `&'static str`, so a hint that
+      carries the counts needs the error type changed. Found while closing
+      RP-283.
+      Backlog-ID: RP-308
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_with_too_few_direct_arguments
 - [ ] **Pricing a key lookup reads the whole table** whenever the cached
       heap page count is invalid (after any CREATE or DROP, and inside
       transaction blocks): `priced_scan` -> `heap_pages` -> `heap_spaces` ->
@@ -976,12 +977,6 @@ tests regression tests:
       Found while working RP-028.
       Backlog-ID: RP-299
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation
-- [ ] **A cast to `name` keeps every byte**: `octet_length(repeat('a',
-      70)::name)` is 70 and `repeat('é', 40)::name` 80 bytes, where
-      PostgreSQL 15.19 cuts to NAMEDATALEN - 1 at a character boundary (63
-      and 62). Found while working RP-131.
-      Backlog-ID: RP-304
-      Verify: tests/backlog/test_rp131_names.py::test_a_cast_to_name_keeps_namedatalen_bytes
 - [ ] **A seven-relation join to a large DISTINCT subquery on an
       expression key exhausts memory**: `element_types`' query with its row
       IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the
