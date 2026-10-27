@@ -539,6 +539,13 @@ pub fn get_log(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
     let version = crate::SERVER_VERSION_ARRAY;
     vec![
+        // How old a `config.transactions` row must be before the transaction
+        // reaper looks at it (`crate::logical_sessions::reap`); startup only.
+        (
+            "TransactionRecordMinimumLifetimeMinutes",
+            true,
+            Bson::Int32(30),
+        ),
         (
             "authenticationMechanisms",
             true,
@@ -552,6 +559,12 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             "cursorTimeoutMillis",
             true,
             Bson::Int64((crate::cursors::DEFAULT_IDLE_TTL_SECONDS * 1000.0) as i64),
+        ),
+        // Whether the logical session cache refreshes and reaps at all.
+        (
+            "disableLogicalSessionCacheRefresh",
+            true,
+            Bson::Boolean(false),
         ),
         ("enableLocalhostAuthBypass", true, Bson::Boolean(true)),
         // The REAL value, not a constant. Drivers gate on this: while it said
@@ -637,8 +650,12 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int64(104_857_600),
         ),
+        // The logical session cache (`crate::logical_sessions`): how long a
+        // session record lives, and how often the cache refreshes and reaps.
+        // Startup only, as on mongod 8.2.11.
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
+        ("logicalSessionRefreshMillis", true, Bson::Int32(300_000)),
         // An index build's sorters' memory, in megabytes (RM-187): mongod
         // 8.2.11's default, a double.
         (

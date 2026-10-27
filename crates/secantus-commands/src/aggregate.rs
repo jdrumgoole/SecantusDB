@@ -1204,14 +1204,12 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
-/// What the session stages list: the sessions commands have come in and
-/// that have not timed out, as mongod shows one
-/// (`{_id: {id, uid}, lastUse}`), each `uid` the SHA-256 of the `user@db`
-/// that used it. As on mongod 8.2.11 (an auth-enabled replica set,
-/// measured 2026-10-16), `{}` lists the caller's own sessions,
-/// `{allUsers: true}` everyone's and `{users: [{user, db}, ...]}` those
-/// users'. Without authentication every session is the empty user's.
-fn known_sessions(spec: Option<&Bson>) -> Vec<Document> {
+/// Whose sessions a session stage lists, as mongod 8.2.11 decides (an
+/// auth-enabled replica set, measured 2026-10-16): `{}` the caller's own,
+/// `{allUsers: true}` everyone's, `{users: [{user, db}, ...]}` those users'.
+/// Each session's `uid` is the SHA-256 of the `user@db` that used it, and
+/// without authentication every session is the empty user's.
+fn session_owner_filter(spec: Option<&Bson>) -> impl Fn(&[u8]) -> bool {
     let spec = spec.and_then(Bson::as_document);
     let all = spec.is_some_and(|s| crate::util::truthy(s.get("allUsers").unwrap_or(&Bson::Null)));
     let named: Option<Vec<Vec<u8>>> = spec.and_then(|s| s.get_array("users").ok()).map(|users| {
@@ -1222,14 +1220,51 @@ fn known_sessions(spec: Option<&Bson>) -> Vec<Document> {
             .map(|(db, user)| crate::session::user_digest(&[(db.to_string(), user.to_string())]))
             .collect()
     });
+    let caller = SESSIONS.with(|sessions| sessions.borrow().1.clone());
+    move |uid: &[u8]| {
+        all || named.as_ref().map_or(uid == caller.as_slice(), |users| {
+            users.iter().any(|u| u.as_slice() == uid)
+        })
+    }
+}
+
+/// What `$listSessions` lists: the records of `config.system.sessions`,
+/// which the logical session cache's refresh writes (RM-224), of the users
+/// `session_owner_filter` picks. A session used since the last refresh has
+/// no record yet and is not listed (mongod 8.2.11, 2026-10-27).
+fn recorded_sessions(
+    storage: &dyn crate::storage::Storage,
+    spec: Option<&Bson>,
+) -> Result<Vec<Document>, CommandError> {
+    let owned = session_owner_filter(spec);
+    let records = storage
+        .find("config", "system.sessions", &Document::new(), None, None)
+        .map_err(crate::util::command_error)?;
+    let mut out = Vec::new();
+    for bytes in records {
+        let record = crate::bsondoc::from_bytes(&bytes).map_err(|e| {
+            CommandError::new(1, "InternalError", format!("config.system.sessions: {e}"))
+        })?;
+        let uid = match record.get_document("_id").ok().and_then(|id| id.get("uid")) {
+            Some(Bson::Binary(b)) => b.bytes.clone(),
+            _ => continue,
+        };
+        if owned(&uid) {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+/// What `$listLocalSessions` lists: the sessions commands have come in
+/// since the logical session cache last refreshed, as mongod shows one
+/// (`{_id: {id, uid}, lastUse}`), of the users `session_owner_filter` picks.
+fn known_sessions(spec: Option<&Bson>) -> Vec<Document> {
+    let owned = session_owner_filter(spec);
     SESSIONS.with(|sessions| {
-        let (seen, caller) = &*sessions.borrow();
+        let (seen, _) = &*sessions.borrow();
         seen.iter()
-            .filter(|(_, _, uid)| {
-                all || named
-                    .as_ref()
-                    .map_or(uid == caller, |users| users.contains(uid))
-            })
+            .filter(|(_, _, uid)| owned(uid))
             .map(|(id, used, uid)| {
                 doc! {
                     "_id": {
@@ -2076,6 +2111,8 @@ pub(crate) fn run_segmented(
                     .unwrap_or(false);
                 crate::ops::current_op_rows(idle)
                     .unwrap_or_else(|| apply_source_stage(name, db, coll, cmd_doc, client_metadata))
+            } else if name == "$listSessions" {
+                recorded_sessions(storage, stage.as_document().and_then(|d| d.get(name)))?
             } else {
                 known_sessions(stage.as_document().and_then(|d| d.get(name)))
             };

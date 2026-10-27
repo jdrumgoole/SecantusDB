@@ -716,6 +716,44 @@ pub fn bypass_user_write_block() -> WriteBlockBypass {
     WriteBlockBypass(WRITE_BLOCK_BYPASS.with(|b| b.replace(true)))
 }
 
+thread_local! {
+    /// Set while this thread's writes are kept beside the oplog rather than
+    /// in it: a retryable `findAndModify`'s image, a session's
+    /// `config.transactions` row (mongod 8.2.11 logs neither).
+    static UNREPLICATED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The time of the first entry the transaction last committed on this
+    /// thread logged.
+    static LAST_COMMIT_TS: std::cell::Cell<Option<bson::Timestamp>> =
+        const { std::cell::Cell::new(None) };
+    /// The time of the first entry the async oplog last minted on this
+    /// thread (`mint_and_enqueue`).
+    static LAST_ENQUEUED_TS: std::cell::Cell<Option<bson::Timestamp>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Writes this thread's writes without oplog entries while it lives.
+#[must_use = "the writes are logged again when this guard drops"]
+pub struct Unreplicated(bool);
+
+impl Drop for Unreplicated {
+    fn drop(&mut self) {
+        UNREPLICATED.with(|u| u.set(self.0));
+    }
+}
+
+/// Write this thread's writes without oplog entries until the guard drops.
+pub fn unreplicated() -> Unreplicated {
+    Unreplicated(UNREPLICATED.with(|u| u.replace(true)))
+}
+
+/// The time of the first entry the transaction this thread last committed
+/// logged, once: what its `config.transactions` row records as its
+/// `lastWriteOpTime`, the time of the one `applyOps` entry the oplog shows
+/// for it. `None` when it logged none.
+pub fn take_last_commit_ts() -> Option<bson::Timestamp> {
+    LAST_COMMIT_TS.with(|t| t.take())
+}
+
 /// Whether an oplog entry writes a user namespace: one outside `admin`,
 /// `config` and `local`, which mongod's user write block leaves alone.
 fn oplog_entry_is_user_write(e: &OplogEntry) -> bool {
@@ -1113,9 +1151,10 @@ fn oplog_entry_is_local(e: &OplogEntry) -> bool {
     if ns.ends_with(".system.profile") {
         return true;
     }
-    // mongod writes a retryable `findAndModify`'s image without an oplog
-    // entry (measured 8.2.11).
-    if ns == "config.image_collection" {
+    // mongod writes a retryable `findAndModify`'s image and a session's
+    // `config.transactions` row without an oplog entry (measured 8.2.11);
+    // the logical session reaper's deletes of them it logs.
+    if UNREPLICATED.with(std::cell::Cell::get) {
         return true;
     }
     ns.ends_with(".$cmd") && target == Some(PROFILE_COLLECTION)
@@ -8068,6 +8107,7 @@ impl Storage {
         // its visibility is governed by the drainer's `written_seq` watermark.
         let rw_at = pending.iter().rposition(|(e, _)| has_retryable_stamp(e));
         let (start, ts) = self.mint_seq_and_ts(n, false);
+        LAST_ENQUEUED_TS.with(|t| t.set(ts.first().copied()));
         if let Some(i) = rw_at {
             LAST_RETRYABLE_TS.with(|t| t.set(Some(ts[i])));
         }
@@ -10047,6 +10087,7 @@ impl Storage {
     /// no-op. A commit failure still closes the session (its `Drop` rolls back
     /// the uncommitted transaction).
     pub fn commit_user_transaction(&self, handle: &mut UserTransactionHandle) -> Result<()> {
+        LAST_COMMIT_TS.with(|t| t.set(None));
         if handle.doomed {
             self.rollback_user_transaction(handle)?;
             return Err(StorageError::WriteConflict);
@@ -10125,6 +10166,18 @@ impl Storage {
                         return Err(e);
                     }
                 }
+                // The time of its first entry, for its `config.transactions`
+                // row (`take_last_commit_ts`).
+                let first_ts = if wrote && self.async_oplog.is_none() {
+                    let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+                    handle
+                        .minted_ranges
+                        .iter()
+                        .filter_map(|(start, _)| st.in_flight.get(start).map(|(_, ts)| *ts))
+                        .min()
+                } else {
+                    None
+                };
                 let mut _reserved: Option<ReleaseStamp<'_>> = None;
                 if wrote && self.async_oplog.is_none() {
                     if let Some((ts, reserved)) = self.commit_stamp(&handle.minted_ranges) {
@@ -10181,6 +10234,7 @@ impl Storage {
                     }
                     return Err(e.into());
                 }
+                LAST_COMMIT_TS.with(|t| t.set(first_ts.map(u64_ts)));
                 // Deregister the transaction's minted ranges — its oplog rows
                 // became visible at this commit, not at emit — advancing the
                 // visible tail and waking tailable change-stream waiters.
@@ -10191,7 +10245,11 @@ impl Storage {
                 // acked commitTransaction therefore has its entries minted
                 // before the reply, which `oplog_open_seq` relies on.
                 let pending = std::mem::take(&mut handle.pending_async);
-                self.mint_and_enqueue(pending);
+                if !pending.is_empty() {
+                    self.mint_and_enqueue(pending);
+                    // In async mode its entries are minted only now.
+                    LAST_COMMIT_TS.with(|t| t.set(LAST_ENQUEUED_TS.with(Cell::take)));
+                }
             }
             // The transaction is over and the session holds nothing: park it
             // for the next one rather than closing it. Only reached on a

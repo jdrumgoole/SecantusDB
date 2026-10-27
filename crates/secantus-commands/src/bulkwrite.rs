@@ -635,7 +635,18 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut retried: Vec<i32> = Vec::new();
 
     let outer_db = ctx.db_name.clone();
+    // The ops a group of inserts ran with the op before them.
+    let mut ran_until = 0usize;
+    let already_ran = |retry: &Option<Retry>, idx: usize| {
+        retry
+            .as_ref()
+            .and_then(|r| r.ids.get(idx).map(|id| r.done.contains(*id)))
+            .unwrap_or(false)
+    };
     for (idx, raw) in ops.iter().enumerate() {
+        if idx < ran_until {
+            continue;
+        }
         let op = raw.as_document().expect("checked above");
         let kind = kinds[idx];
         let (db_name, coll) = namespaces[targets[idx]].clone();
@@ -720,7 +731,55 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             continue;
         }
 
+        // Consecutive inserts into one namespace run as one insert, as mongod
+        // 8.2.11 batches them (measured 2026-10-27): its oplog holds them as
+        // one `applyOps` (with `multiOpType: 1` in a retryable write) of up
+        // to 500 documents or 256 KiB, and a batch with a failed document as
+        // single inserts -- the insert command's own rules. An op a retry
+        // replays ends the group.
+        let uuid_of = |target: usize| {
+            ns_info[target]
+                .as_document()
+                .and_then(|d| d.get("collectionUUID"))
+                .cloned()
+        };
+        let mut group = vec![idx];
+        if kind == "insert" {
+            let mut next = idx + 1;
+            while next < ops.len()
+                && kinds[next] == "insert"
+                && namespaces[targets[next]] == namespaces[targets[idx]]
+                && uuid_of(targets[next]) == uuid_of(targets[idx])
+                && !already_ran(&retry, next)
+            {
+                group.push(next);
+                next += 1;
+            }
+        }
+        // A retryable write logs each op's writes under that op's statement
+        // id (RM-224).
+        if let Some(r) = &retry {
+            let ids: Vec<i32> = group
+                .iter()
+                .filter_map(|i| r.ids.get(*i).copied())
+                .collect();
+            ctx.storage()?.remap_retryable_statements(ids);
+        }
+
         let cmd = match kind {
+            "insert" if group.len() > 1 => {
+                let documents: Vec<Bson> = group
+                    .iter()
+                    .map(|i| {
+                        ops[*i]
+                            .as_document()
+                            .and_then(|o| o.get("document"))
+                            .cloned()
+                            .unwrap_or(Bson::Null)
+                    })
+                    .collect();
+                doc! { "insert": &coll, "documents": documents, "ordered": ordered }
+            }
             "insert" => {
                 let document = op.get("document").cloned().unwrap_or(Bson::Null);
                 doc! { "insert": &coll, "documents": [document] }
@@ -800,6 +859,57 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             results.push(op_error(idx, code, &msg, Some(&reply), is_update));
             n_errors += 1;
             if ordered || interrupted(code) {
+                break;
+            }
+            continue;
+        }
+        if group.len() > 1 {
+            // An entry per op of the group: its document's error, or the
+            // insert it made. An ordered insert stops at its first error, and
+            // so does the batch.
+            let mut errors: std::collections::HashMap<usize, &Document> =
+                std::collections::HashMap::new();
+            if let Ok(write_errors) = reply.get_array("writeErrors") {
+                for werr in write_errors.iter().filter_map(Bson::as_document) {
+                    if let Some(at) = werr.get("index").and_then(whole_number) {
+                        errors.insert(at as usize, werr);
+                    }
+                }
+            }
+            let first_error = errors.keys().min().copied();
+            let mut stop = ordered && first_error.is_some();
+            for (position, op_idx) in group.iter().copied().enumerate() {
+                if ordered && first_error.is_some_and(|first| position > first) {
+                    break;
+                }
+                if let Some(werr) = errors.get(&position) {
+                    let code = werr.get_i32("code").unwrap_or(8);
+                    let msg = werr.get_str("errmsg").unwrap_or("").to_string();
+                    results.push(op_error(op_idx, code, &msg, Some(werr), false));
+                    n_errors += 1;
+                    if interrupted(code) {
+                        stop = true;
+                        break;
+                    }
+                    continue;
+                }
+                counts.inserted += 1;
+                if let Some(r) = retry.as_mut() {
+                    if let Some(id) = r.ids.get(op_idx).copied() {
+                        let inserted = ops[op_idx]
+                            .as_document()
+                            .and_then(|o| o.get_document("document").ok())
+                            .and_then(|d| d.get("_id"))
+                            .cloned();
+                        r.wrote.push((id, StmtRecord::Insert { id: inserted }));
+                    }
+                }
+                if !errors_only {
+                    results.push(doc! { "ok": 1.0, "idx": op_idx as i32, "n": 1i32 });
+                }
+            }
+            ran_until = idx + group.len();
+            if stop {
                 break;
             }
             continue;

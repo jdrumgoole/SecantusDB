@@ -219,7 +219,7 @@ const MAX_LOG_LEVEL: i32 = 5;
 
 /// When a session was last used, and whose it is (the SHA-256 of
 /// `user@db`).
-type SessionUse = (bson::DateTime, Vec<u8>);
+pub type SessionUse = (bson::DateTime, Vec<u8>);
 
 /// Server-wide store for the settable parameters' current values.
 ///
@@ -236,11 +236,15 @@ pub struct ServerParams {
     /// Bumped by every user and role command, so that a connection's cached
     /// effective privileges (`rbac::effective`) are recomputed after one.
     user_cache_generation: std::sync::atomic::AtomicU64,
-    /// The sessions commands have come in, each with when it was last used
-    /// and whose it is (the SHA-256 of `user@db`, `session::user_digest`):
-    /// what `$listLocalSessions` lists. One unused for the session timeout
-    /// (30 minutes) is forgotten.
+    /// The sessions commands have come in since the logical session cache
+    /// last refreshed, each with when it was last used and whose it is (the
+    /// SHA-256 of `user@db`, `session::user_digest`): mongod's active
+    /// sessions, what `$listLocalSessions` lists. A refresh writes them to
+    /// `config.system.sessions` and starts the set again
+    /// (`logical_sessions::refresh`).
     sessions: Mutex<BTreeMap<Vec<u8>, SessionUse>>,
+    /// The logical session cache's ended sessions and job statistics.
+    logical_sessions: crate::logical_sessions::LogicalSessionCache,
     /// The `config.settings` read/write-concern defaults document, read once
     /// and kept so a write need not look it up (`crate::rwconcern`). The
     /// outer `None` is "not read yet"; the inner one is "no document".
@@ -302,27 +306,70 @@ impl ServerParams {
     /// `uid`.
     pub fn note_session(&self, id: &[u8], uid: Vec<u8>) {
         if let Ok(mut sessions) = self.sessions.lock() {
-            let now = bson::DateTime::now();
-            let oldest = now.timestamp_millis() - 30 * 60 * 1000;
-            sessions.retain(|_, (used, _)| used.timestamp_millis() >= oldest);
-            sessions.insert(id.to_vec(), (now, uid));
+            sessions.insert(id.to_vec(), (bson::DateTime::now(), uid));
         }
     }
 
-    /// The sessions seen and not timed out: the id, when each was last
-    /// used, and whose it is.
+    /// The sessions used since the logical session cache last refreshed:
+    /// the id, when each was last used, and whose it is.
     pub fn sessions(&self) -> Vec<(Vec<u8>, bson::DateTime, Vec<u8>)> {
-        let oldest = bson::DateTime::now().timestamp_millis() - 30 * 60 * 1000;
         self.sessions.lock().map_or_else(
             |_| Vec::new(),
             |sessions| {
                 sessions
                     .iter()
-                    .filter(|(_, (used, _))| used.timestamp_millis() >= oldest)
                     .map(|(id, (used, uid))| (id.clone(), *used, uid.clone()))
                     .collect()
             },
         )
+    }
+
+    /// Take the sessions used since the last refresh, starting the set
+    /// again: what a refresh of the logical session cache writes.
+    pub fn take_sessions(&self) -> BTreeMap<Vec<u8>, SessionUse> {
+        self.sessions
+            .lock()
+            .map(|mut sessions| std::mem::take(&mut *sessions))
+            .unwrap_or_default()
+    }
+
+    /// Forget the sessions `ids` (`endSessions`).
+    pub fn forget_sessions(&self, ids: &[Vec<u8>]) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            for id in ids {
+                sessions.remove(id);
+            }
+        }
+    }
+
+    /// The logical session cache's ended sessions and job statistics.
+    pub fn logical_sessions(&self) -> &crate::logical_sessions::LogicalSessionCache {
+        &self.logical_sessions
+    }
+
+    /// Set a parameter the server was started with (`--setParameter`),
+    /// which `getParameter` then reports and the server honours.
+    pub fn set_startup(&self, name: &str, value: Bson) {
+        self.set(name, value);
+    }
+
+    /// A whole-number parameter's value: the one it was started or set
+    /// with, else `default`.
+    pub fn number(&self, name: &str, default: i64) -> i64 {
+        match self.get(name) {
+            Some(Bson::Int32(n)) => i64::from(n),
+            Some(Bson::Int64(n)) => n,
+            Some(Bson::Double(d)) => d as i64,
+            _ => default,
+        }
+    }
+
+    /// A boolean parameter's value, else `default`.
+    pub fn flag(&self, name: &str, default: bool) -> bool {
+        match self.get(name) {
+            Some(Bson::Boolean(b)) => b,
+            _ => default,
+        }
     }
 
     /// Whether a connection being established may go ahead, as mongod's
@@ -457,6 +504,52 @@ impl ServerParams {
             }
         }
     }
+}
+
+/// The parameters `--setParameter name=value` sets when the server starts,
+/// and whether each is a boolean (else a whole number): the logical session
+/// cache's, which mongod takes only at startup.
+const STARTUP: &[(&str, bool)] = &[
+    ("TransactionRecordMinimumLifetimeMinutes", false),
+    ("disableLogicalSessionCacheRefresh", true),
+    ("localLogicalSessionTimeoutMinutes", false),
+    ("logicalSessionRefreshMillis", false),
+];
+
+/// Parse one `--setParameter name=value`, refusing as mongod 8.2.11 refuses
+/// at startup (measured 2026-10-27): a name it does not know is `Unknown
+/// --setParameter 'name'`, a number with more than digits `Did not consume
+/// whole string.`, a boolean other than `true`/`false`/`1`/`0` `Value is
+/// not a valid boolean`. A parameter mongod knows that this server does not
+/// take at startup is refused by name.
+pub fn parse_startup_parameter(arg: &str) -> Result<(String, Bson), String> {
+    let (name, value) = arg.split_once('=').unwrap_or((arg, ""));
+    let bad = |why: &str| format!("Bad value for parameter \"{name}\": {why}");
+    let Some((_, boolean)) = STARTUP.iter().find(|(n, _)| *n == name) else {
+        if crate::serverinfo::known_params(false).contains_key(name) {
+            return Err(format!(
+                "secantusd-rs does not take --setParameter '{name}' at startup"
+            ));
+        }
+        return Err(format!("Unknown --setParameter '{name}'"));
+    };
+    let parsed = if *boolean {
+        match value {
+            "true" | "1" => Bson::Boolean(true),
+            "false" | "0" => Bson::Boolean(false),
+            _ => return Err(bad("Value is not a valid boolean")),
+        }
+    } else {
+        let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(bad("Did not consume whole string."));
+        }
+        match value.parse::<i32>() {
+            Ok(n) => Bson::Int32(n),
+            Err(_) => return Err(bad("Value is out of range")),
+        }
+    };
+    Ok((name.to_string(), parsed))
 }
 
 /// Whether a client may change `name` while the server runs.
@@ -1212,5 +1305,58 @@ mod tests {
         let mut params = crate::serverinfo::known_params(false);
         c.server_params.as_ref().unwrap().overlay(&mut params);
         assert!(params.get_bool("quiet").unwrap());
+    }
+
+    /// `--setParameter` refuses as mongod 8.2.11 refuses at startup
+    /// (measured 2026-10-27).
+    #[test]
+    fn startup_parameters_parse_and_refuse_as_mongod_does() {
+        assert_eq!(
+            parse_startup_parameter("logicalSessionRefreshMillis=0"),
+            Ok(("logicalSessionRefreshMillis".to_string(), Bson::Int32(0)))
+        );
+        assert_eq!(
+            parse_startup_parameter("disableLogicalSessionCacheRefresh=1"),
+            Ok((
+                "disableLogicalSessionCacheRefresh".to_string(),
+                Bson::Boolean(true)
+            ))
+        );
+        assert_eq!(
+            parse_startup_parameter("foo=1"),
+            Err("Unknown --setParameter 'foo'".to_string())
+        );
+        assert_eq!(
+            parse_startup_parameter("logicalSessionRefreshMillis=abc"),
+            Err(
+                "Bad value for parameter \"logicalSessionRefreshMillis\": Did not consume \
+                 whole string."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            parse_startup_parameter("disableLogicalSessionCacheRefresh=yes"),
+            Err(
+                "Bad value for parameter \"disableLogicalSessionCacheRefresh\": Value is not \
+                 a valid boolean"
+                    .to_string()
+            )
+        );
+        // A parameter mongod has that this server takes only at runtime.
+        assert!(parse_startup_parameter("notablescan=1")
+            .unwrap_err()
+            .contains("does not take"));
+    }
+
+    #[test]
+    fn startup_values_are_what_get_parameter_reports() {
+        let params = ServerParams::new();
+        params.set_startup("logicalSessionRefreshMillis", Bson::Int32(1000));
+        assert_eq!(params.number("logicalSessionRefreshMillis", 300_000), 1000);
+        assert_eq!(params.number("localLogicalSessionTimeoutMinutes", 30), 30);
+        assert!(!params.flag("disableLogicalSessionCacheRefresh", false));
+        let mut known = crate::serverinfo::known_params(false);
+        params.overlay(&mut known);
+        assert_eq!(known.get_i32("logicalSessionRefreshMillis"), Ok(1000));
     }
 }
