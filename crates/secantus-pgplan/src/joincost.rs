@@ -849,6 +849,8 @@ pub struct JoinChoice {
     /// Its rows, and what reading it again costs (`cost_rescan`).
     pub rows: f64,
     pub rescan: (f64, f64),
+    /// The tables (a bit each) it needs from an outer side; 0 for none.
+    pub req_outer: u32,
 }
 
 impl JoinPath {
@@ -863,6 +865,7 @@ impl JoinPath {
             b_path: self.b_path,
             rows: self.rows,
             rescan: self.rescan,
+            req_outer: self.req_outer,
         }
     }
 }
@@ -886,6 +889,9 @@ pub struct JoinRel {
     /// (`final_cost_nestloop`'s `restrict_qual_cost`), a hash or merge join
     /// on each tuple its clause passes.
     filter: f64,
+    /// Each parameterization's rows, as the first pair of input paths to
+    /// make it sized them (`ParamPathInfo::ppi_rows`).
+    ppi_rows: Vec<(u32, f64)>,
 }
 
 impl JoinRel {
@@ -896,6 +902,7 @@ impl JoinRel {
             startup_counts,
             extra: 0.0,
             filter: 0.0,
+            ppi_rows: Vec::new(),
         }
     }
 
@@ -1275,6 +1282,7 @@ impl RelPaths<'_> {
     fn at(&self, i: usize, presorted: bool) -> JoinSide {
         let p = self.paths[i];
         JoinSide {
+            rows: p.rows,
             scan: (p.startup, p.total),
             startup_scan: (p.startup, p.total),
             ordered: presorted.then_some((p.startup, p.total)),
@@ -1517,12 +1525,14 @@ impl JoinRel {
     ///   order; and, when the outer path is in its key's order, merge joins
     ///   with the inner's cheapest-total path sorted and with its cheapest
     ///   paths already in order (`generate_mergejoin_paths`);
-    /// - `hash_inner_and_outer`: hash joins of the outer's cheapest-startup
-    ///   path, then its cheapest-total one, over the inner's cheapest-total.
+    /// - `hash_inner_and_outer`: a hash join of the outer's cheapest-startup
+    ///   path over the inner's cheapest-total one, then of every pair of
+    ///   the two sides' `cheapest_parameterized_paths`.
     ///
-    /// A join whose clause a parameterized path does not enforce, or whose
-    /// outer side does not hold the tables it needs, is never built (no
-    /// join here is a parameter source, `param_source_rels`). `a_class` /
+    /// A path that still needs outer tables is built only where
+    /// `param_source` (`param_source_rels`: the tables an outer join keeps
+    /// from joining this relation directly) holds one of them, its rows the
+    /// parameterization's (`get_joinrel_parampathinfo`). `a_class` /
     /// `b_class`: the equivalence class of each side's key, whose order a
     /// merge join reads presorted and leaves (the outer's; none for a right
     /// join, `build_join_pathkeys`). `useful`: whether an order is still of
@@ -1540,10 +1550,12 @@ impl JoinRel {
         b: &RelPaths<'_>,
         left: bool,
         rows: f64,
+        param_source: u32,
     ) {
         let startup_counts = self.startup_counts;
         let extra = self.extra;
         let qp = self.filter;
+        let ppi = &mut self.ppi_rows;
         let paths = &mut self.paths;
         let multi = a.side.extra.n > 0;
         let (a_class, b_class) = if multi {
@@ -1551,12 +1563,31 @@ impl JoinRel {
         } else {
             (a_class, b_class)
         };
+        // `get_joinrel_parampathinfo`: a parameterized path's rows, the
+        // first pair of input paths to make that parameterization sizing it
+        // (`get_parameterized_joinrel_size`: their rows through the join's
+        // clauses), at most the relation's.
+        let mut param_rows = |req: u32, (a_path, b_path): (usize, usize)| -> f64 {
+            if req == 0 {
+                return rows;
+            }
+            if let Some((_, r)) = ppi.iter().find(|(o, _)| *o == req) {
+                return *r;
+            }
+            let (pa, pb) = (a.at(a_path, false), b.at(b_path, false));
+            let r = join_rows(&pa, &pb, left).min(rows);
+            ppi.push((req, r));
+            r
+        };
         let mut consider = |(startup, total): (f64, f64),
                             order: Option<usize>,
                             method: JoinMethod,
-                            (a_path, b_path): (usize, usize),
-                            rescan: Option<(f64, f64)>| {
-            let order = order.filter(|c| useful(*c));
+                            ids: (usize, usize),
+                            rescan: Option<(f64, f64)>,
+                            req_outer: u32| {
+            // A parameterized path's order counts for nothing.
+            let order = order.filter(|c| useful(*c) && req_outer == 0);
+            let path_rows = param_rows(req_outer, ids);
             add_path(
                 paths,
                 JoinPath {
@@ -1566,15 +1597,18 @@ impl JoinRel {
                     class: order.unwrap_or(USELESS_KEYS),
                     method,
                     combo,
-                    a_path,
-                    b_path,
-                    rows,
-                    req_outer: 0,
+                    a_path: ids.0,
+                    b_path: ids.1,
+                    rows: path_rows,
+                    req_outer,
                     rescan: rescan.unwrap_or((startup, total + extra)),
                 },
                 startup_counts,
             );
         };
+        // A path still needing outer tables is made only where some join
+        // above cannot join those tables directly (`param_source_rels`).
+        let sensible = |req: u32| req == 0 || req & param_source != 0;
         for b_outer in [false, true] {
             let (outer, inner, o_class, i_class) = if b_outer {
                 (b, a, b_class, a_class)
@@ -1614,12 +1648,12 @@ impl JoinRel {
             // table's index scan can; a join's output cannot, and is
             // materialised.
             let markable = inner.set.count_ones() == 1;
-            // sort_inner_and_outer.
+            // sort_inner_and_outer: the two cheapest-total paths.
             let (os, is) = (outer.sorted_on(oct, o_class), inner.sorted_on(ict, i_class));
             if let Some(cost) =
                 merge_join_full(&outer.at(oct, os), &inner.at(ict, is), os, is, qp, markable)
             {
-                consider(cost, merge_order, merge(os, is), ids(oct, ict), None);
+                consider(cost, merge_order, merge(os, is), ids(oct, ict), None, 0);
             }
             // match_unsorted_outer.
             let nest = if b_outer {
@@ -1634,9 +1668,15 @@ impl JoinRel {
                 if op.req_outer & inner.set != 0 {
                     continue;
                 }
-                // A path needing tables neither side holds is a
-                // parameterized join, which nothing here asks for.
-                let allowed = |ip: &InPath| (op.req_outer | ip.req_outer) & !outer.set == 0;
+                // `calc_nestloop_required_outer`: what the two paths need
+                // that the outer side does not hold; such a path is made
+                // where it is sensible, or where the inner needs the outer
+                // side and another table too (`allow_star_schema_join`).
+                let nest_req = |ip: &InPath| {
+                    let req = (op.req_outer | ip.req_outer) & !outer.set;
+                    let star = ip.req_outer & outer.set != 0 && ip.req_outer & !outer.set != 0;
+                    (sensible(req) || star).then_some(req)
+                };
                 if !right {
                     for &ii in &inner_params {
                         let ip = &inner.paths[ii];
@@ -1646,18 +1686,19 @@ impl JoinRel {
                         // table of the class leaves the clause a join qual
                         // (`create_nestloop_path` moves only the clauses it
                         // can evaluate into it).
-                        let (q, indexed) = if ip.req_outer == outer.key_table {
+                        let (q, indexed) = if ip.req_outer != 0 && ip.req_outer == outer.key_table {
                             (qp, ip.indexed && qp == 0.0)
                         } else {
                             (qual, false)
                         };
-                        if allowed(ip) {
+                        if let Some(req) = nest_req(ip) {
                             consider(
                                 nestloop_cost(op, ip, unique, indexed, q),
                                 op.class,
                                 nest,
                                 ids(oi, ii),
                                 None,
+                                req,
                             );
                         }
                         let memo = ip.memo_key.filter(|_| {
@@ -1667,45 +1708,51 @@ impl JoinRel {
                         });
                         if let Some(key) = memo {
                             let m = memoize(ip, &key, op.rows, inner.width);
-                            if allowed(&m) {
+                            if let Some(req) = nest_req(&m) {
                                 consider(
                                     nestloop_cost(op, &m, unique, false, q),
                                     op.class,
                                     nest,
                                     ids(oi, ii),
                                     None,
+                                    req,
                                 );
                             }
                         }
                     }
-                    if allowed(&mat) {
+                    if let Some(req) = nest_req(&mat) {
                         consider(
                             nestloop_cost(op, &mat, unique, false, qual),
                             op.class,
                             nest,
                             ids(oi, ict),
                             None,
+                            req,
                         );
                     }
                 }
-                if op.req_outer != 0 || !outer.sorted_on(oi, o_class) {
+                // `generate_mergejoin_paths`; `calc_non_nestloop_required_outer`.
+                let req = op.req_outer | inner.paths[ict].req_outer;
+                if !sensible(req) || !outer.sorted_on(oi, o_class) {
                     continue;
                 }
                 let o = outer.at(oi, true);
                 if let Some(cost) = merge_join_full(&o, &inner.at(ict, is), true, is, qp, markable)
                 {
-                    consider(cost, merge_order, merge(true, is), ids(oi, ict), None);
+                    consider(cost, merge_order, merge(true, is), ids(oi, ict), None, req);
                 }
                 let Some(ic) = i_class else { continue };
                 for ip in inner.presorted_inners(ic, is) {
                     if let Some(cost) =
                         merge_join_full(&o, &inner.at(ip, true), true, true, qp, markable)
                     {
-                        consider(cost, merge_order, merge(true, true), ids(oi, ip), None);
+                        consider(cost, merge_order, merge(true, true), ids(oi, ip), None, req);
                     }
                 }
             }
-            // hash_inner_and_outer.
+            // hash_inner_and_outer: the outer's cheapest-startup path over
+            // the inner's cheapest-total, then every pair of the two sides'
+            // `cheapest_parameterized_paths`.
             let hash = if right {
                 JoinMethod::HashRightB
             } else if b_outer {
@@ -1716,11 +1763,27 @@ impl JoinRel {
                 JoinMethod::HashOuterA
             };
             let cso = outer.cheapest_startup;
-            let i = inner.at(ict, false);
-            for o in std::iter::once(cso).chain((oct != cso).then_some(oct)) {
-                let cost = hash_join_qp(&outer.at(o, false), &i, qp);
-                let rescan = hash_rescan((cost.0, cost.1 + extra), &i);
-                consider(cost, None, hash, ids(o, ict), Some(rescan));
+            let mut pairs = vec![(cso, ict)];
+            for &o in &outer.parameterized() {
+                if outer.paths[o].req_outer & inner.set != 0 {
+                    continue;
+                }
+                for &i in &inner.parameterized() {
+                    if inner.paths[i].req_outer & outer.set != 0 || (o, i) == (cso, ict) {
+                        continue;
+                    }
+                    pairs.push((o, i));
+                }
+            }
+            for (o, i) in pairs {
+                let req = outer.paths[o].req_outer | inner.paths[i].req_outer;
+                if !sensible(req) {
+                    continue;
+                }
+                let isd = inner.at(i, false);
+                let cost = hash_join_qp(&outer.at(o, false), &isd, qp);
+                let rescan = hash_rescan((cost.0, cost.1 + extra), &isd);
+                consider(cost, None, hash, ids(o, i), Some(rescan), req);
             }
         }
     }
@@ -2316,6 +2379,7 @@ mod tests {
             b_path: 0,
             rows: 212_242.0,
             rescan: (0.0, 699_250.20),
+            req_outer: 0,
         };
         let hash = JoinChoice {
             startup: 120.0,
@@ -2340,5 +2404,58 @@ mod tests {
         // Whole: a quicksort, 142.54 as before.
         let (s, _) = cost_sort(30.40, 2040.0, 8, None);
         assert!(close(s, 142.54), "{s}");
+    }
+
+    #[test]
+    fn a_join_parameterized_by_an_outer_table_is_kept_where_one_is_needed() {
+        // `lm0 LEFT JOIN (lm1 LEFT JOIN lm2 ...)`: the relation {lm1, lm2}
+        // may be parameterized by lm0 (bit 1), which the outer join keeps
+        // from joining lm1 alone first (`param_source_rels`). lm1 has a
+        // scan parameterized by lm0 of 2 rows; lm2 a sequential scan.
+        let lm1 = [
+            InPath::scan(0.0, 30.40, 2040.0, None),
+            InPath {
+                req_outer: 1,
+                indexed: true,
+                ..InPath::scan(0.15, 0.19, 2.0, None)
+            },
+        ];
+        let lm2 = [InPath::scan(0.0, 30.40, 2040.0, None)];
+        let side = JoinSide {
+            rows: 2040.0,
+            tuples: 2040.0,
+            rel_rows: 2040.0,
+            width: Some(8),
+            ..plain()
+        };
+        let rel = |paths: &'static [InPath], set: u32| RelPaths {
+            side,
+            paths,
+            cheapest_total: 0,
+            cheapest_startup: 0,
+            set,
+            width: 8,
+            unique: false,
+            key_table: set,
+        };
+        let lm1: &'static [InPath] = Box::leak(Box::new(lm1));
+        let lm2: &'static [InPath] = Box::leak(Box::new(lm2));
+        let (a, b) = (rel(lm1, 2), rel(lm2, 4));
+        let rows = join_rows(&side, &side, true);
+        let mut kept = JoinRel::new(true);
+        kept.add_paths_general(0, Some(2), Some(2), &|_| false, &a, &b, true, rows, 1);
+        // The parameterized paths' rows: lm1's 2 through the LEFT join's
+        // clause, at least the preserved side's (`calc_joinrel_size_estimate`).
+        let param: Vec<JoinChoice> = kept
+            .pathlist()
+            .into_iter()
+            .filter(|p| p.req_outer == 1)
+            .collect();
+        assert!(!param.is_empty());
+        assert!(param.iter().all(|p| p.rows == 20.0), "{param:?}");
+        // With no outer join to need it, none is made.
+        let mut none = JoinRel::new(true);
+        none.add_paths_general(0, Some(2), Some(2), &|_| false, &a, &b, true, rows, 0);
+        assert!(none.pathlist().iter().all(|p| p.req_outer == 0));
     }
 }

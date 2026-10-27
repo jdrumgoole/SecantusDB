@@ -8127,13 +8127,38 @@ impl PgHandler {
         let mut indexes = self.cost_indexes(table, &pt.def, count as u64);
         // `get_relation_info` lists the newest index first.
         indexes.reverse();
-        // An index a path reads is sized with its repeated keys
-        // deduplicated, where that is modelled.
+        // An index a path reads is sized as its pages are: the B-tree
+        // model's (`btree_model`, what CREATE INDEX built and every insert
+        // since split and deduplicated: `RelationGetNumberOfBlocks` and the
+        // metapage's root level), or failing one, with its repeated keys
+        // deduplicated where that is modelled.
+        let shapes = self.btree_shapes(table);
         for ix in &mut indexes {
-            if key_fields.contains(&ix.field) || qual_fields.contains(&ix.field) {
-                if let Some((pages, height)) = self.dedup_index_size(table, ix)? {
-                    ix.pages = pages;
+            let read = key_fields.contains(&ix.field)
+                || qual_fields.contains(&ix.field)
+                || order_field.as_ref() == Some(&ix.field);
+            if !read {
+                continue;
+            }
+            let modelled = match shapes
+                .iter()
+                .find(|s| s.key_fields() == ix.columns.as_slice())
+            {
+                Some(shape) => self
+                    .with_btree(table, shape, |t| (t.pages(), t.height()))
+                    .ok(),
+                None => None,
+            };
+            match modelled {
+                Some((pages, height)) => {
+                    ix.pages = f64::from(pages);
                     ix.height = height;
+                }
+                None => {
+                    if let Some((pages, height)) = self.dedup_index_size(table, ix)? {
+                        ix.pages = pages;
+                        ix.height = height;
+                    }
                 }
             }
         }
@@ -8263,6 +8288,11 @@ impl PgHandler {
                 Some(joined_key(&ix.field)?),
             ));
             for (_, _, outer, loop_count, memo_key) in ends {
+                // A clause that cannot move into this table's scan (an
+                // outer join's, into its preserved side) parameterizes none.
+                if *outer == 0 {
+                    continue;
+                }
                 // `get_parameterized_baserel_size`: the WHERE's selectivity
                 // and the clause's (`var_eq_non_const`), at most the rows.
                 let ppi_rows = costsize::clamp_row_est(pt.tuples * sel / nd.max(1.0)).min(rows);
@@ -53136,6 +53166,89 @@ fn hash_table_order_on(
     tagged.sort_by_key(|(b, _)| *b);
     rows.extend(tagged.into_iter().map(|(_, d)| d));
     true
+}
+
+/// The order a hash join's table leaves `rows` in when they outgrow the
+/// buckets it was sized for (`rows_estimate`, single batch): each insert
+/// (`ExecHashTableInsert`) counts its tuple and doubles the optimal bucket
+/// count past one tuple a bucket (`NTUP_PER_BUCKET`), and the build's end
+/// rebuilds the chains at that count (`ExecHashIncreaseNumBuckets`),
+/// walking the dense-allocation chunks newest first, each in insertion
+/// order, pushing every tuple onto its bucket's head. A chunk holds 32 kB
+/// of tuples (`HASH_CHUNK_SIZE`), each `MAXALIGN(HJTUPLE_OVERHEAD +
+/// t_len)`: the minimal tuple of `cols`, all `typlen` bytes wide, behind
+/// a header with the null bitmap when one is NULL. The rows come back by
+/// bucket, each bucket's chain in order, rows never inserted (a NULL key
+/// an inner join drops, unless `keep_nulls`) last. `None` when the table
+/// does not grow (the caller's order stands) or a key's hash is not
+/// modelled.
+pub(crate) fn hash_grown_order(
+    rows: &[Document],
+    key: &str,
+    ty: &str,
+    rows_estimate: f64,
+    keep_nulls: bool,
+    cols: &[String],
+    typlen: i64,
+) -> Option<Vec<Document>> {
+    const HASH_CHUNK_SIZE: usize = 32 * 1024;
+    const HJTUPLE_OVERHEAD: usize = 16;
+    let maxalign = |n: usize| n.div_ceil(8) * 8;
+    let nbuckets = secantus_pgplan::joincost::hash_buckets(rows_estimate);
+    let mut optimal = nbuckets;
+    // (row, hash) of each tuple inserted, in insertion order.
+    let mut inserted: Vec<(usize, u32)> = Vec::new();
+    let mut dropped = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let hash = match row.get(key).unwrap_or(&Bson::Null) {
+            Bson::Null if keep_nulls => 0,
+            Bson::Null => {
+                dropped.push(i);
+                continue;
+            }
+            v => secantus_pgplan::joincost::hash_value(v, ty)?,
+        };
+        inserted.push((i, hash));
+        if inserted.len() > optimal {
+            optimal *= 2;
+        }
+    }
+    if optimal == nbuckets {
+        return None;
+    }
+    // Each tuple's chunk (`dense_alloc`): a new chunk, at the list's head,
+    // when the current one has no room left.
+    let mut chunks: Vec<Vec<(usize, u32)>> = Vec::new();
+    let mut used = 0usize;
+    for &(i, hash) in &inserted {
+        let row = &rows[i];
+        let nulls = cols
+            .iter()
+            .filter(|c| matches!(row.get(c.as_str()), None | Some(Bson::Null)))
+            .count();
+        let hoff = maxalign(15 + if nulls > 0 { cols.len().div_ceil(8) } else { 0 });
+        let t_len = hoff + (cols.len() - nulls) * typlen as usize;
+        let size = maxalign(HJTUPLE_OVERHEAD + t_len);
+        if chunks.is_empty() || HASH_CHUNK_SIZE - used < size {
+            chunks.push(Vec::new());
+            used = 0;
+        }
+        used += size;
+        chunks.last_mut().expect("a chunk").push((i, hash));
+    }
+    let mask = optimal as u32 - 1;
+    let mut buckets: Vec<Vec<usize>> = vec![Vec::new(); optimal];
+    for chunk in chunks.iter().rev() {
+        for &(i, hash) in chunk {
+            buckets[(hash & mask) as usize].push(i);
+        }
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for chain in buckets {
+        out.extend(chain.into_iter().rev().map(|i| rows[i].clone()));
+    }
+    out.extend(dropped.into_iter().map(|i| rows[i].clone()));
+    Some(out)
 }
 
 /// Whether the plan `method` reads `b` (the right side) as its outer: the

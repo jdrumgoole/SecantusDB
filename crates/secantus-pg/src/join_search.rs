@@ -166,6 +166,10 @@ pub(crate) struct Step {
     /// batches and its OUTER key's type, whose hash places an outer row
     /// in its batch. `None` for one batch.
     pub(crate) batches: Option<(u64, u64, String)>,
+    /// A hash join's hashed side's columns, all of one fixed length, when
+    /// its tuples' sizes are known: a table that outgrows its buckets is
+    /// rebuilt in chunk order (`hash_grown_order`).
+    pub(crate) hash_tuple: Option<(Vec<String>, i64)>,
     /// Further clauses' keys `(a_key, b_key)`, sorted and matched on after
     /// the first (a join of two relations on several clauses).
     pub(crate) extra: Vec<(String, String)>,
@@ -691,6 +695,7 @@ impl PgHandler {
                 filters: Vec::new(),
                 batches: None,
                 extra: Vec::new(),
+                hash_tuple: None,
             },
             joinrel_first: c.pair_first,
             second_step: Step {
@@ -704,6 +709,7 @@ impl PgHandler {
                 filters: rest,
                 batches: None,
                 extra: Vec::new(),
+                hash_tuple: None,
             },
         };
         Some(plan)
@@ -850,21 +856,47 @@ impl PgHandler {
         if !step.extra.is_empty() {
             return self.run_step_on_keys(step, a, b, on);
         }
+        // A hash table that outgrows the buckets its estimate sized: its
+        // rows in the rebuilt chains' order, which every arm below keeps.
+        let mut grown = false;
+        if let (None, Some((cols, typlen))) = (&step.batches, &step.hash_tuple) {
+            let (rows, key, ty, estimate, keep_nulls) = match step.method {
+                JoinMethod::HashOuterA => (&mut b.rows, &step.b_key, &b_type, step.b_rows, false),
+                JoinMethod::HashFullA => (&mut b.rows, &step.b_key, &b_type, step.b_rows, true),
+                JoinMethod::HashOuterB => (&mut a.rows, &step.a_key, &a_type, step.a_rows, false),
+                JoinMethod::HashRightB | JoinMethod::HashFullB => {
+                    (&mut a.rows, &step.a_key, &a_type, step.a_rows, true)
+                }
+                _ => (&mut a.rows, &step.a_key, &None, 0.0, false),
+            };
+            if let Some(ty) = ty {
+                if let Some(ordered) =
+                    crate::hash_grown_order(rows, key, ty, estimate, keep_nulls, cols, *typlen)
+                {
+                    *rows = ordered;
+                    grown = true;
+                }
+            }
+        }
         let (outer, inner, kind, (outer_key, inner_key)) = match step.method {
             // A FULL join: a hash full join's hashed side in its table's
             // order, which its probes' matches and the rows nothing matched
             // both keep; a merge full join's sides in key order.
             JoinMethod::HashFullA => {
-                let ordered = b_type
-                    .is_some_and(|ty| hash_table_order(&mut b.rows, &step.b_key, &ty, step.b_rows));
+                let ordered = grown
+                    || b_type.is_some_and(|ty| {
+                        hash_table_order(&mut b.rows, &step.b_key, &ty, step.b_rows)
+                    });
                 if !ordered {
                     return Ok(None);
                 }
                 (a, b, JoinKind::Full, a_first)
             }
             JoinMethod::HashFullB => {
-                let ordered = a_type
-                    .is_some_and(|ty| hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows));
+                let ordered = grown
+                    || a_type.is_some_and(|ty| {
+                        hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows)
+                    });
                 if !ordered {
                     return Ok(None);
                 }
@@ -907,15 +939,19 @@ impl PgHandler {
                 (b, a, JoinKind::Right, b_first)
             }
             JoinMethod::HashRightB => {
-                let ordered = a_type
-                    .is_some_and(|ty| hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows));
+                let ordered = grown
+                    || a_type.is_some_and(|ty| {
+                        hash_table_order(&mut a.rows, &step.a_key, &ty, step.a_rows)
+                    });
                 if !ordered {
                     return Ok(None);
                 }
                 (b, a, JoinKind::Right, b_first)
             }
             method => {
-                reorder_join_inputs(method, &mut a.rows, &step.a_key, &mut b.rows, &step.b_key);
+                if !grown {
+                    reorder_join_inputs(method, &mut a.rows, &step.a_key, &mut b.rows, &step.b_key);
+                }
                 let kind = if step.left {
                     JoinKind::Left
                 } else {

@@ -604,8 +604,12 @@ one beside it.
     `neqjoinsel`, IS DISTINCT FROM's, `var_eq_const`'s, an OR's -- and an
     operator a row; 117 of 117 shapes, 9 before); four or more tables
     with a WHERE over two of them; more than eight tables; an expression key with a function
-    call or a cast that costs; parameterized nested loops outside a LIMIT's search; a join of more
-    than 200,000 rows a side, which streams in scan order.
+    call or a cast that costs; a join on two equivalence classes (`a JOIN
+    b ON a.b = b.a JOIN c ON a.c = c.a JOIN d ON a.b = d.a JOIN e ON a.c =
+    e.a`: 283 of 288 no-LIMIT shapes match, the 5 left all such); a LIMIT
+    with an ORDER BY over two tables, which the narrow join path plans (84
+    of 108); a join of more than 200,000 rows a side, which streams in
+    scan order.
   - A LIMIT over three to eight tables (and two whose WHERE holds a join
     filter) is planned for its first rows (2026-10-26): every relation
     keeps its whole pathlist with startup costs counting, base tables'
@@ -613,14 +617,17 @@ one beside it.
     scans parameterized by a clause's other table (Memoize, inner-unique
     nested loops), and the plan is the cheapest under a Limit, or with an
     ORDER BY of one integer column the cheapest of the presorted paths and
-    a bounded Sort; 812 of 843 shapes of three to five tables at 20 to
-    3,000 rows (514 before). Declined: an outer join beside a parameterized
-    scan (PostgreSQL parameterizes a join relation, `param_source_rels`),
-    an index on a key, WHERE or ORDER BY column whose deduplicated size is
-    not modelled, and other ORDER BYs.
+    a bounded Sort. Join relations parameterized by an outer table
+    (`param_source_rels`, an outer join's) are built and run per outer
+    row; index sizes come from the B-tree model; a hash table that
+    outgrows its buckets is rebuilt in chunk order
+    (`ExecHashIncreaseNumBuckets`); the search keeps whole pathlists with
+    no LIMIT too, falling back to the old search where it declines. 843 of
+    843 LIMIT shapes of three to five tables at 20 to 3,000 rows (514, then
+    812 before). Declined: other ORDER BYs.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_limit_over_left_joins_reads_a_parameterized_join
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_join_on_two_equivalence_classes_is_searched
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -887,6 +894,12 @@ tests regression tests:
       rows (optimised). Found while closing RP-018.
       Backlog-ID: RP-297
       Verify: tests/backlog/test_rp018_savepoint_undo.py::test_a_key_lookup_after_ddl_does_not_read_the_table
+- [ ] **An index created in the open transaction is no relation
+      `regclass` finds**: `select pg_relation_size('t_b')` after `create
+      index t_b` in the same block is 42P01; PostgreSQL 15.19 answers 8192.
+      Found while working RP-028.
+      Backlog-ID: RP-299
+      Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation
 
 ## Found by batch 78 (2026-10-25)
 
