@@ -225,7 +225,8 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
         client.smoke.command("profile", 0, slowms=100)
         lines = slow_lines()
         assert any(
-            '"ns":"smoke.things","command":{"insert":"things"' in x and '"ninserted":5' in x
+            '"ns":"smoke.things","collectionType":"normal","command":{"insert":"things"' in x
+            and '"ninserted":5' in x
             for x in lines
         ), lines
         assert any('"command":{"find":"things"' in x and '"errCode":2' in x for x in lines), lines
@@ -245,8 +246,8 @@ def test_slow_operations_are_logged_and_the_threshold_is_server_wide(
     stderr = daemon.stderr.read()
     # mongod's structured log line, on standard error as in `getLog`.
     assert (
-        '"msg":"Slow query","attr":{"type":"command","ns":"smoke.things",'
-        '"command":{"insert":"things"' in stderr
+        '"msg":"Slow query","attr":{"type":"command","isFromUserConnection":true,'
+        '"ns":"smoke.things","collectionType":"normal","command":{"insert":"things"' in stderr
     ), stderr
 
 

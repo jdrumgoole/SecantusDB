@@ -203,7 +203,10 @@ pub(crate) fn thread_cpu_nanos() -> Option<i64> {
         };
         // SAFETY: `ts` is a valid timespec for the call to fill.
         let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
-        (rc == 0).then(|| ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64)
+        // `time_t` and `c_long` are i64 on a 64-bit Linux, narrower on others.
+        #[allow(clippy::unnecessary_cast)]
+        let nanos = ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64;
+        (rc == 0).then_some(nanos)
     }
     #[cfg(not(target_os = "linux"))]
     {

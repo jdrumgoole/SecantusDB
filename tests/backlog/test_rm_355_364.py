@@ -66,7 +66,9 @@ _READS = {
 
 
 @pytest.mark.backlog_fixed("RM-023")
-def test_a_read_that_does_not_stream_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
+def test_a_read_that_does_not_stream_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
     """mongod 8.2.11's line and profile entry for a `count` through a
     COUNT_SCAN (9 keys for 8 matches: the scan counts the call that finds
     its end), a `distinct`, an `aggregate` read whole for a `$group` and a

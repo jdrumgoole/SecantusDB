@@ -55,11 +55,11 @@ fn a_session_closed_in_an_operation_adds_its_statistics() {
     assert!(!operation_stats_armed());
     let scope = operation_stats_scope();
     assert!(operation_stats_armed());
-    // 8 MB through a 1 MB cache: the writing thread evicts, and waits.
+    // 8 MB through a 1 MB cache: the writing thread evicts. (How long it
+    // waited for the cache is the clock's to say: Windows' can say 0.)
     write_rows(&conn, 2048);
     let written = scope.stats();
     assert!(written.bytes_written > 0, "{written:?}");
-    assert!(written.cache_wait_micros > 0, "{written:?}");
     drop(scope);
     assert!(!operation_stats_armed());
 

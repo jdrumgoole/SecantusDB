@@ -279,16 +279,16 @@ fn level_two_writes_each_operation_in_mongods_shape() {
             "queryFramework",
             "locks",
             "flowControl",
-            "readConcern",
         ]);
         let after_millis = want.iter().position(|k| *k == "millis").unwrap() + 1;
         want.insert(after_millis, "planSummary");
         want.insert(after_millis + 1, "planningTimeMicros");
+        // `cpuNanos`, before `millis`, where mongod reads a thread's CPU
+        // clock: Linux.
+        if cfg!(target_os = "linux") {
+            want.insert(after_millis - 1, "cpuNanos");
+        }
         assert_eq!(keys(find), want);
-        assert_eq!(
-            find.get_document("readConcern").unwrap(),
-            &doc! {"level": "local", "provenance": "implicitDefault"}
-        );
         assert_eq!(find.get_str("queryFramework"), Ok("classic"));
         assert_eq!(find.get_str("planSummary"), Ok("IXSCAN { _id: 1 }"));
         assert_eq!(
@@ -309,24 +309,25 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         // A duplicate is a write error, not a failure of the command.
         assert_eq!(profiled[1].get_i32("ninserted"), Ok(1));
         assert!(!profiled[1].contains_key("ok"));
-        // A failed read: its locks and read concern, then the error
-        // (mongod 8.2.11, 2026-10-27).
-        assert_eq!(
-            keys(&profiled[2]),
-            with(&[
-                "op",
-                "ns",
-                "command",
-                "numYield",
-                "locks",
-                "flowControl",
-                "readConcern",
-                "ok",
-                "errMsg",
-                "errName",
-                "errCode"
-            ])
-        );
+        // A failed read: its locks, then the error (mongod 8.2.11,
+        // 2026-10-27; a standalone's, with no read concern).
+        let mut failed = with(&[
+            "op",
+            "ns",
+            "command",
+            "numYield",
+            "locks",
+            "flowControl",
+            "ok",
+            "errMsg",
+            "errName",
+            "errCode",
+        ]);
+        if cfg!(target_os = "linux") {
+            let millis = failed.iter().position(|k| *k == "millis").unwrap();
+            failed.insert(millis, "cpuNanos");
+        }
+        assert_eq!(keys(&profiled[2]), failed);
         assert_eq!(
             (
                 profiled[2].get_f64("ok"),
@@ -411,7 +412,6 @@ fn update_and_delete_are_profiled_by_statement() {
             "queryHash",
             "planCacheKey",
             "locks",
-            "readConcern",
             "millis",
             "planSummary",
             "planningTimeMicros",
