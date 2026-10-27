@@ -49,6 +49,12 @@ impl<T: HeapOrder> Heap<T> {
         self.c.first()
     }
 
+    /// Every entry, in the heap's own layout, to change in ways that do not
+    /// move them (the order the comparator sees must stay as it is).
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
+        self.c.iter_mut()
+    }
+
     pub fn push(&mut self, value: T) {
         self.c.push(value);
         let len = self.c.len();

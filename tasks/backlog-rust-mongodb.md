@@ -776,14 +776,16 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$planCacheStats` and `$queryStats` are unknown stages** (40324).
-      mongod 8.2.11 runs each on a one-member replica set (an empty result
-      on a fresh one, filling as queries run, so an empty answer here would
-      be a stand-in). `$planCacheStats` needs a plan cache, which this server
-      does not keep (§7.075); `$queryStats` needs query-shape statistics,
-      which RM-170 (`includeQueryStatsMetrics`) also lacks.
-      (`$listSampledQueries` landed 2026-10-20: it lists none, truthfully,
-      as no query analyzer exists here.)
+- [ ] **`$queryStats` is an unknown stage** (40324). mongod 8.2.11 runs it
+      on a one-member replica set (an empty result on a fresh one, filling
+      as queries run, so an empty answer here would be a stand-in). It needs
+      mongod's query-shape statistics: the query stats store, keyed by the
+      representative query shape's SHA-256 (`queryShapeHash`, which mongod's
+      `explain` of a find, distinct or aggregate also prints and this
+      server's does not), which RM-170 (`includeQueryStatsMetrics`) also
+      lacks. The plan cache's shape (`planCacheShapeHash`) is a different
+      shape and does not serve it. (`$listSampledQueries` landed 2026-10-20,
+      and `$planCacheStats` 2026-10-27 with the plan cache, RM-154.)
       Backlog-ID: RM-215
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
@@ -834,62 +836,50 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refuses `validateMode: "extraIndexKeysCheck"` (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **Text that is not UTF-8 outside a string value is still refused or
-      altered.** Since 2026-10-27 a string VALUE or a field NAME whose bytes
-      are not UTF-8 is kept, compared, indexed, matched and served byte for
-      byte (`bsondoc`'s carrier and escaped names;
-      `tests/mongod_live/test_invalid_utf8.py`). Left, each measured against
-      mongod 8.2.11:
-      - a collection (or database) name that is not UTF-8 is refused (73
-        "Collection name has invalid type string"); mongod creates it.
-        Storage keys its tables by a Rust `String` name;
-      - an error message that quotes such a string (`$convert`,
-        `$dateFromString`, `$toObjectId` ...) quotes it with U+FFFD for each
-        invalid sequence, where mongod writes the raw bytes; `$dateFromString`
-        then lists one "Unexpected character" per byte of each U+FFFD;
-      - JavaScript, a symbol, a regex, a DBPointer or JavaScript with a scope
-        whose text is not UTF-8 is refused (2 "invalid BSON in body");
-        mongod stores it;
-      - a NUL and two lowercase hex digits in a field name taken from a
-        string value elsewhere than `$setField`, `$rename` and a field path
-        (all three refuse it, as mongod does) would read as the escape of a
-        name that is not UTF-8. Not measured to happen: the other places a
-        string becomes a name refuse a NUL through `FieldPath`.
-      Backlog-ID: RM-222
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_collection_name_that_is_not_utf8, tests/backlog/test_rm_222_invalid_utf8.py::test_error_message_quotes_the_bytes, tests/backlog/test_rm_222_invalid_utf8.py::test_other_text_types_that_are_not_utf8
-- [ ] **A `$group` key that is an array sorts by its smallest element.**
-      `[{$group: {_id: "$s"}}, {$sort: {_id: 1}}]` over `s` values `["x",
-      "q"]`, `"b"`, `{x: 1}`, `"z"` returns `b, [x, q], z, {x: 1}`; mongod
-      8.2.11 returns `b, z, {x: 1}, [x, q]`, sorting the array as an array.
-      A find sort's rule (an array sorts by its smallest element ascending)
-      is applied to a `$sort` over a computed `_id`. Found 2026-10-27 while
+- [ ] **A `$group` after a `$match` on `_id` runs in the slot-based
+      engine.** mongod 8.2.11 runs it in its classic engine
+      (`explainVersion` 1) when the leading `$match` is on `_id` (an
+      equality or an `$in`), and in the slot-based engine after a `$match`
+      on another field; the two disagree on errors, so `{$mod: ["$n", 0]}`
+      in the `$group` is 16610 after `{$match: {_id: 1}}` on mongod and
+      4848403 here (`crates/secantus-core/src/sbe.rs` decides). Found
+      2026-10-27 while working RM-222.
+      Backlog-ID: RM-330
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_group_after_an_id_match_runs_in_the_classic_engine
+- [ ] **explain's bounds on a multikey index from two range predicates on
+      one field.** Over a multikey index mongod does not intersect `$gte`
+      and `$lte` on one field and bounds the scan by one of them: for
+      `{s: {$gte: "aé", $lte: "\U0010ffff"}}` it is the `$gte`
+      (`["aé", {})`, the `$lte` left as the filter), for `{$gte: "a",
+      $lte: "b"}` the `$lte`. This server always takes the `$lte`. Which
+      one mongod keeps is its plan ranking's choice between the two
+      single-predicate plans; measured on 8.2.11, 2026-10-27, while
       working RM-222.
-      Backlog-ID: RM-329
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_sort_of_group_ids_that_are_arrays
-- [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
-      2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
-      change-stream description as `o.md`), a batch of inserts (one
-      `applyOps` per group of 500 documents or 256 KiB), a committed
-      transaction (one `applyOps` under its session), a multi-document
-      delete (`applyOps` batches of ten), a delete, a drop
-      (`o2: {numRecords}`), a rename (`stayTemp`), a one-index
-      `createIndexes` and a `dropIndexes` read as mongod 8.2.11 writes them,
-      with its `t` and `v`, and a retryable insert, update or delete with
-      its session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`). Since
-      2026-10-26 an index build over documents is mongod's two-phase build
-      in the oplog too (`config.system.indexBuilds` rows around
-      `startIndexBuild` and `commitIndexBuild`, or `abortIndexBuild` with
-      its cause; RM-187). Open: a `bulkWrite` command's writes carry no
-      session (retryable `insert` / `update` / `delete` / `findAndModify`
-      carry theirs, a `findAndModify` its `needsRetryImage` and its image in
-      `config.image_collection`, since 2026-10-20); and an image is never
-      deleted, where mongod deletes a session's image (an oplogged delete)
-      when its logical-session reaper expires the session, which this
-      server does not run. A tool that reads the oplog (`mongodump
-      --oplog`, then `mongorestore --oplogReplay`) gets entries mongod
-      would not write.
-      Backlog-ID: RM-224
-      Verify: tests/backlog/test_rm_219_apply_ops.py::test_bulk_write_entries_carry_their_session
+      Backlog-ID: RM-331
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_multikey_bounds_from_two_range_predicates
+- [ ] **A sort on two arrays of one document is not refused.** mongod
+      8.2.11 refuses `{$sort: {a: 1, b: 1}}` over `{a: [1, 2], b: [3, 4]}`
+      with 2 "cannot sort with keys that are parallel arrays" (and a
+      `{$sort: {_id: 1, t: 1}}` over a `$group`'s array keys likewise);
+      this server sorts. Found 2026-10-27 while working RM-222/RM-329.
+      Backlog-ID: RM-332
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_sort_on_two_arrays_is_refused
+- [ ] **A retryable write retried after a restart is applied again.** The
+      server keeps a session's `config.transactions` row (RM-224, since
+      2026-10-27), but what each retryable write did lives only in memory
+      (`transactions::TransactionRegistry`), so a retry that reaches a
+      restarted server runs again: a retried insert fails on a duplicate
+      key, a retried `findAndModify` changes the document a second time.
+      mongod 8.2.11 answers the retry from the row and the session's
+      `prevOpTime` chain in the oplog (`retriedStmtIds`; a `findAndModify`
+      its image from `config.image_collection` with `retriedStmtId`) and
+      applies nothing twice. Under `--data-nonlogged` the row and the image
+      are also lost in a crash, since they are written without an oplog
+      entry and that mode recovers data tables by replaying the oplog;
+      mongod rebuilds them from the oplog in recovery. A driver retries
+      exactly when it lost the connection, which a restart is.
+      Backlog-ID: RM-350
+      Verify: tests/backlog/test_rm_350_retry_after_restart.py::test_a_retry_after_a_restart_applies_nothing_twice
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 
@@ -1238,8 +1228,16 @@ What the order follows, each measured:
   is kept.
 - Where several plans could serve a query, mongod's trial is reproduced
   (`explain/trial.rs`): works counted round-robin, its plan ranker's
-  scores, AND_SORTED intersections, and one plan per predicate on an
-  index's array field. That trial also picks the read order.
+  scores and tie-breaking bonuses, AND_SORTED intersections (a multikey
+  index's point scan included), and one plan per predicate on an index's
+  array field. That trial also picks the read order.
+- mongod's plan cache (since 2026-10-27, `explain/plan_cache.rs`, RM-154):
+  the trial runs once per query shape and its winner is cached under
+  mongod's own key and hashes (`explain/cache_key.rs`); a repeated shape
+  runs the cached plan, and so reads in its order, until the plan does
+  worse than ten times its works and is replanned. `explain` reports the
+  hashes and `isCached`, `$planCacheStats` the entries, `planCacheClear`
+  clears them. Pinned by `tests/backlog/test_rm_154_plan_cache.py`.
 - Scans a sort merges (an `$in` under a sort) come out through libc++'s
   priority queue (`secantus_core::heap`), as in mongod.
 - A `$match` after `$addFields` or `$unwind` that reads no field the stage
@@ -1292,18 +1290,42 @@ Still different, all 77:
       build before and 1.2 times an update by `_id`
       (`order::store_order_is_the_plans`); `{a: {$ne: 5}}` over `a_1` 0.7
       times, a regex prefix 0.01 times, now that the router reads the index.
-      The lever is mongod's plan cache (RM-154).
+      The plan cache landed 2026-10-27 (RM-154): a shape's trial runs until
+      its entry is active, then only the cached plan is worked, within ten
+      times its works. That bought little. Release builds, 2,000
+      documents, median of 300 finds, two runs each, against 3b47b41a:
+      `{a: 5, b: 3}` over `a_1` and `b_1` 2.0 -> 1.63 ms, a range on both
+      2.66 -> 2.28 ms, where one index is 0.49 ms and `_id` 0.10 ms. The
+      cost is reading and decoding the collection and keying its index,
+      which checking the cached plan's works needs as the trial did. The
+      lever left: keep a collection's trial documents and index keys
+      between reads, or count the cached plan's works over the index
+      itself.
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
-- [ ] **mongod's plan cache is not reproduced.** mongod runs the trial once
-      per query shape, caches the winner and reuses it, replanning when it
-      does badly, until the entry is evicted. Here every query runs its
-      trial. That decides which plan, and so which order, a repeated query
-      shape gets: mongod's second `{a: 1, b: 9}` uses the plan cached for
-      the shape, which this server picks afresh. It is also the cost lever
-      for RM-056.
-      Backlog-ID: RM-154
-      Verify: none -- needs a scenario measured on mongod first; file a gap test with it
+- [ ] **A query SBE runs is not cached.** mongod 8.2.11 runs a `$match`
+      with the `$group` or `$lookup` pushed behind it in SBE, planned by the
+      classic planner (no index intersection among the candidates), and
+      caches the winner under a key ending `s` with `worksType: "reads"`:
+      the keys and documents the winner's trial read. `count_documents` is
+      such a pipeline. Here the pushed-down front is not cached at all
+      (`explain` already prints its `s` key's hashes).
+      Backlog-ID: RM-340
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_a_query_sbe_runs_is_cached_with_its_reads
+- [ ] **`$planCacheStats` lists no `estimatedSizeBytes`.** mongod 8.2.11
+      gives each entry the bytes it takes in mongod's memory: the C++
+      sizes of the entry, its plan and its debug information. The field is
+      left out here rather than given a value that is not mongod's.
+      Backlog-ID: RM-341
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size
+- [ ] **No plan is cached for a collection over 2,000 documents.** mongod
+      tries the candidate plans whatever the collection's size (each for at
+      most `max(10000, 0.3 * documents)` works) and caches the winner. The
+      trial here reads the whole collection into memory, so it runs over at
+      most 2,000 documents (`order::TRIAL_COLLECTION`); past that the fixed
+      order of preference picks the plan and nothing is cached.
+      Backlog-ID: RM-342
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_a_collection_over_2000_documents_is_cached
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
@@ -1385,9 +1407,11 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       three delinquency counters, numInterruptChecks), per batch, on find,
       aggregate, distinct, count and getMore. This server could compute the
       key and document counts, `hasSortStage`, the working time and
-      `cpuNanos`, but not `fromPlanCache` (no plan cache), `bytesRead` /
-      `readingTimeMicros` (no WiredTiger read statistics plumbed) or
-      `numInterruptChecks` (a different mechanism).
+      `cpuNanos`, and since the plan cache landed (2026-10-27, RM-154)
+      `fromPlanCache` and `fromMultiPlanner` too (`explain/order.rs`'s
+      `consult` knows whether a read ran a cached plan or a trial), but not
+      `bytesRead` / `readingTimeMicros` (no WiredTiger read statistics
+      plumbed) or `numInterruptChecks` (a different mechanism).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
       Backlog-ID: RM-170
@@ -1492,19 +1516,6 @@ What is left, all on the RUST MongoDB server:
       server lists the `$match` alone (found 2026-10-24).
       Backlog-ID: RM-308
       Verify: tests/backlog/test_rm_found_2026_10_24.py::test_explain_lists_the_projection_a_limit_moved_past
-- [ ] **A `$group` read from a DISTINCT_SCAN this server does not stream
-      returns its groups in first-seen order.** mongod 8.2.11 returns the
-      groups of a `$groupByDistinctScan` in the scan's order. This server
-      streams the scan over an ascending, uncollated index of the
-      collection the command names, or of the collection beneath a view
-      (2026-10-25); down a descending index, or along a collated one with
-      the command's collation, it groups the documents in the order they
-      arrive: `{x: -1}`
-      gives `1, 2, 3, 0` where mongod gives `3, 2, 1, 0`, and the `$first`
-      of each group is the first document read, not the first the scan
-      reaches (found 2026-10-25).
-      Backlog-ID: RM-309
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_distinct_scan_group_this_server_does_not_stream_keeps_the_scans_order
 - [ ] **`explain` of a sorted or filtered DISTINCT_SCAN `$group` lists no
       `rejectedPlans`.** mongod 8.2.11 tries each index that could answer
       it (with `$first` of `y` over `x_1`, `x_1_y_1` and `x_1_z_1`, after a
@@ -1593,39 +1604,50 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a cursor that does not stream yet is the
-      result as it was when the command ran.** It reads every matching
-      document and keeps the rest for `getMore`. mongod reads on as the
-      cursor is read, so its `getMore` sees a document inserted, changed or
-      deleted since. Since 2026-10-24 a `find` streams over a collection
-      scan either way (`$natural: -1` too), and over an ascending,
-      uncollated, non-multikey index either way, the `_id` index included,
-      with skip, limit, projection and covered plans; an `aggregate` streams
-      when its stages are `$match`, `$project`, `$unset`, `$addFields` /
-      `$set`, `$replaceRoot` / `$replaceWith`, `$unwind`, `$redact`, `$skip`,
-      `$limit`, `$lookup`, `$unionWith` and a `$sort` the plan reads in
-      order, batch by batch where mongod's planner takes the pipeline whole
-      (or pushes it into SBE), else through mongod's cursor-stage buffer (32
-      documents, doubling, up to 4 MB), and when it opens with a `$group`
-      mongod reads from a DISTINCT_SCAN; one asked for a first batch of none
-      runs at its first `getMore` (2026-10-25). Both read on through a view
-      and under a collation (2026-10-25), a collated index too when its
-      bounds hold only numbers or dates. What is left
-      (`tasks/streaming-cursors-plan.md` phases 2 and 3): a descending or
-      multikey index, and a collated one bounded on strings (this store's
-      keys for a descending string field and for a collated string are not
-      in mongod's order, so walking them would return the wrong order: an
-      entry-format change), OR plans and SORT_MERGE, `min` / `max`,
-      `returnKey` / `showRecordId`, blocking sorts; and in `aggregate`, a
-      time-series collection, `$meta`, `$geoNear` and `notablescan`. An `_id` walk is
-      not used for a collection holding an `_id` whose key keeps entry
-      format 4's encoding (a document, BinData, JavaScript, MaxKey); one
-      inserted after the cursor opened is returned
-      where its key falls, which among several such `_id`s need not be
-      mongod's order. Tests that write between batches see the difference;
-      so does memory, for a large result.
-      Backlog-ID: RM-080
-      Verify: tests/backlog/test_rm_057_084.py::test_descending_index_get_more_sees_writes_made_since_the_find, tests/backlog/test_rm_found_2026_10_25.py::test_a_cursor_over_a_collated_index_of_strings_reads_on
+- [ ] **RUST MongoDB server: a `$near` or `$geoNear` cursor is the result
+      as it was when the command ran.** mongod searches rings around the
+      centre as the cursor is read: the ring searched buffers its documents,
+      and a later ring is searched against the collection as it is then, so
+      a `getMore` returns a document inserted in a ring not yet searched and
+      not one deleted from it (`find` with `$near` and `batchSize: 1` over
+      points at 0..5 degrees, then an insert at 0.5 and 4.5 and a delete at
+      3: mongod 8.2.11 returns `0, 20, 1, 2, 4, 21, 5`; this server `0..5`).
+      The ring order itself is mongod's (`secantus_core::geoorder::near`, a
+      replay over the whole collection); what is missing is running it ring
+      by ring across batches, the search's state (rings, queue, increment)
+      kept between them, each ring reading the store as it is then, and an
+      aggregate's `$geoNear` through its cursor stage (found 2026-10-27,
+      RM-080's remainder).
+      Backlog-ID: RM-347
+      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_near_read_goes_ring_by_ring
+- [ ] **RUST MongoDB server: a time-series cursor is not read bucket by
+      bucket.** mongod reads a time-series collection's buckets through its
+      cursor stage (32 bucket documents first, twice as many at each refill)
+      and unpacks each as the cursor reaches it, so what a `getMore` returns
+      after a delete depends on how many buckets were buffered: over 4,000
+      measurements in 100 buckets, read one at a time and all deleted after
+      the first, mongod 8.2.11 returns 2,303 more. This server keeps
+      measurements as ordinary documents and works the buckets out when
+      asked (section 7.071, the derived buckets), so it has no bucket to
+      buffer; it reads 3,999. Depends on keeping buckets, or deriving them
+      stably enough to resume after one (found 2026-10-27, RM-080's
+      remainder).
+      Backlog-ID: RM-348
+      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_time_series_read_goes_bucket_by_bucket
+- [ ] **RUST MongoDB server: a cursor whose plan mongod picks by trial is
+      the result as it was when the command ran.** When two indexes could
+      answer a query, mongod runs both until one returns 101 documents (or
+      ends, or spends its works budget), keeps the winner's trial results
+      and then reads on from where the winner stopped; this server reads
+      everything at the command (`stream_plan` declines a contested plan).
+      Over 3,000 documents with `a_1` and `b_1` both usable, read two at a
+      time and all deleted after the first batch, mongod 8.2.11 returns 101
+      in all and this server 1,557. Streaming it means streaming the
+      winner after a buffer of its trial's results, with the trial's works
+      and results counted as mongod's are; RM-154 (the plan cache) works in
+      the same code (found 2026-10-27, RM-080's remainder).
+      Backlog-ID: RM-349
+      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_plan_mongod_tried_buffers_only_its_trial
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

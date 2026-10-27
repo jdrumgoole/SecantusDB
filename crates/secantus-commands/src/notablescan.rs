@@ -62,6 +62,8 @@ pub(crate) struct Shown<'a> {
     pub skip: Option<i64>,
     pub limit: Option<i64>,
     pub collation: Option<Document>,
+    /// A `find`'s `batchSize`.
+    pub batch_size: Option<i64>,
 }
 
 impl Read<'_> {
@@ -76,6 +78,7 @@ impl Read<'_> {
             skip: self.shown.skip,
             limit: self.shown.limit,
             collation: self.shown.collation.as_ref(),
+            batch_size: self.shown.batch_size,
         }
     }
 
@@ -132,6 +135,7 @@ pub(crate) fn refusal(
         skip: shown.skip,
         limit: shown.limit,
         collation: shown.collation.as_ref(),
+        batch_size: shown.batch_size,
     };
     CommandError::new(291, "NoQueryExecutionPlans", query.planner_error(reason))
 }
@@ -270,8 +274,13 @@ impl Drop for Aggregate {
 
 /// Mark the aggregate on `ns` as running under `notablescan` (or not).
 pub(crate) fn aggregate(ctx: &CommandContext, ns: &str) -> Aggregate {
-    let now = enabled(ctx).then(|| ns.to_string());
-    Aggregate(AGGREGATE.with(|a| std::mem::replace(&mut *a.borrow_mut(), now)))
+    aggregate_on(enabled(ctx).then(|| ns.to_string()))
+}
+
+/// [`aggregate`] for a cursor that ran under `notablescan` when it opened
+/// (`Some(ns)`), as each of its `getMore`s runs its stages.
+pub(crate) fn aggregate_on(ns: Option<String>) -> Aggregate {
+    Aggregate(AGGREGATE.with(|a| std::mem::replace(&mut *a.borrow_mut(), ns)))
 }
 
 /// A stage's read of `db.<read.coll>` inside an aggregate: refused when the

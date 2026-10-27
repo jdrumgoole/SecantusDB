@@ -199,6 +199,16 @@ pub fn set_filter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let uuid = storage
         .collection_uuid(&db, &coll)
         .map_err(|_| bad("no such collection"))?;
+    // The shape's plan cache entries go: they were planned without it.
+    crate::explain::plan_cache::clear_filtered_shape(
+        storage,
+        &db,
+        &coll,
+        &query,
+        Some(&sort),
+        Some(&projection),
+        collation.as_ref(),
+    )?;
     let filter = Filter {
         shape: shape(&query, Some(&sort), Some(&projection), collation.as_ref()),
         query,
@@ -289,17 +299,45 @@ pub fn clear_filters(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     if query.is_none() && (sort.is_some() || projection.is_some() || collation.is_some()) {
         return Err(bad("sort, projection, or collation provided without query"));
     }
-    current(storage, &db, &coll);
-    let mut guard = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(set) = guard
-        .as_mut()
-        .and_then(|m| m.get_mut(&(db.clone(), coll.clone())))
+    let set_now = current(storage, &db, &coll);
     {
-        match query {
-            None => set.filters.clear(),
-            Some(q) => {
-                let wanted = shape(&q, sort.as_ref(), projection.as_ref(), collation.as_ref());
-                set.filters.retain(|f| f.shape != wanted);
+        let mut guard = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = guard
+            .as_mut()
+            .and_then(|m| m.get_mut(&(db.clone(), coll.clone())))
+        {
+            match &query {
+                None => set.filters.clear(),
+                Some(q) => {
+                    let wanted = shape(q, sort.as_ref(), projection.as_ref(), collation.as_ref());
+                    set.filters.retain(|f| f.shape != wanted);
+                }
+            }
+        }
+    }
+    // The plan cache entries of the shapes cleared go too: of the one
+    // named, or of every filter the collection had.
+    match &query {
+        Some(q) => crate::explain::plan_cache::clear_filtered_shape(
+            storage,
+            &db,
+            &coll,
+            q,
+            sort.as_ref(),
+            projection.as_ref(),
+            collation.as_ref(),
+        )?,
+        None => {
+            for f in &set_now {
+                crate::explain::plan_cache::clear_filtered_shape(
+                    storage,
+                    &db,
+                    &coll,
+                    &f.query,
+                    Some(&f.sort),
+                    Some(&f.projection),
+                    f.collation.as_ref(),
+                )?;
             }
         }
     }

@@ -855,8 +855,56 @@ impl Drop for Cursor {
 // helpers
 // ---------------------------------------------------------------------------
 
+/// A key column's C string. A name that holds a NUL is the escape of a name
+/// whose bytes are not UTF-8 (`secantus_core::bsondoc::escape_key`: each
+/// such byte as a NUL and two lowercase hex digits), and is written as those
+/// bytes, so a store holds the name mongod would hold (RM-222). Any other NUL
+/// is a caller bug, refused where namespaces are read.
 fn cstr(s: &str) -> CString {
-    CString::new(s).expect("string has interior NUL")
+    match name_bytes(s) {
+        Some(bytes) => CString::new(bytes).expect("an escaped name has no NUL"),
+        None => CString::new(s).expect("string has interior NUL"),
+    }
+}
+
+/// The bytes an escaped name stands for, or `None` when `s` is not one.
+/// Mirrors `secantus_core::bsondoc::key_bytes` (this crate sits below it).
+pub fn name_bytes(s: &str) -> Option<Vec<u8>> {
+    if !s.contains('\0') {
+        return None;
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == 0 {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            if hex.bytes().any(|c| c.is_ascii_uppercase()) {
+                return None;
+            }
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    // Only bytes that are not UTF-8 are escaped, and only those.
+    (escape_name(&out) == s).then_some(out)
+}
+
+/// A name of these bytes: itself when UTF-8, else each byte outside valid
+/// UTF-8 as a NUL and two lowercase hex digits.
+pub fn escape_name(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 8);
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        for b in chunk.invalid() {
+            out.push('\0');
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
 }
 
 extern "C" {
@@ -872,11 +920,14 @@ pub fn version_string() -> String {
     owned(unsafe { wiredtiger_version(ptr::null_mut(), ptr::null_mut(), ptr::null_mut()) })
 }
 
+/// A C string the engine returned, as a Rust string: a name whose bytes are
+/// not UTF-8 comes back escaped ([`escape_name`]), never with its bytes
+/// replaced.
 fn owned(p: *const c_char) -> String {
     if p.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+        escape_name(unsafe { CStr::from_ptr(p) }.to_bytes())
     }
 }
 
@@ -896,6 +947,27 @@ fn step(code: c_int) -> Result<bool> {
         Ok(false)
     } else {
         Err(WtError::from_code(code))
+    }
+}
+
+#[cfg(test)]
+mod name_tests {
+    use super::*;
+
+    /// RM-222: a name whose bytes are not UTF-8 is held escaped above this
+    /// crate and written to the engine as its bytes; other names unchanged.
+    #[test]
+    fn an_escaped_name_is_written_as_its_bytes() {
+        assert_eq!(escape_name(b"c\xff"), "c\u{0}ff");
+        assert_eq!(name_bytes("c\u{0}ff"), Some(b"c\xff".to_vec()));
+        assert_eq!(cstr("c\u{0}ff").as_bytes(), b"c\xff");
+        assert_eq!(cstr("plain").as_bytes(), b"plain");
+        // A NUL that is not the canonical escape of invalid bytes is not one.
+        for not_escape in ["a\u{0}61", "a\u{0}FF", "a\u{0}f", "a\u{0}"] {
+            assert_eq!(name_bytes(not_escape), None, "{not_escape:?}");
+        }
+        let c = CString::new(b"d\xfe.t".to_vec()).unwrap();
+        assert_eq!(owned(c.as_ptr()), "d\u{0}fe.t");
     }
 }
 

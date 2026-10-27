@@ -158,23 +158,75 @@ const SESSIONS_TTL_SECONDS: i32 = 1800;
 /// `config` holds `system.sessions` alone). A collection that is already
 /// there is left as it is.
 ///
-/// What this does NOT do is mongod's periodic refresh: mongod recreates the
-/// collection within five minutes when it is dropped; here it comes back at
-/// the next start.
+/// The logical session cache's refresh sets it up again when it is dropped
+/// (`logical_sessions::refresh`), with the TTL the server was started with.
 pub fn record_sessions_collection(
     storage: &dyn crate::storage::Storage,
 ) -> Result<(), crate::storage::StorageError> {
-    if storage.collection_exists(SESSIONS_DB, SESSIONS_COLL)? {
-        return Ok(());
-    }
-    storage.create_collection(SESSIONS_DB, SESSIONS_COLL)?;
+    record_sessions_collection_ttl(storage, SESSIONS_TTL_SECONDS.into())
+}
+
+/// [`record_sessions_collection`] with `lsidTTLIndex` expiring records
+/// after `ttl_seconds` (`localLogicalSessionTimeoutMinutes`). An index of
+/// another TTL is changed to this one, as mongod's `collMod` does.
+pub fn record_sessions_collection_ttl(
+    storage: &dyn crate::storage::Storage,
+    ttl_seconds: i64,
+) -> Result<(), crate::storage::StorageError> {
+    let ttl = Bson::Int32(i32::try_from(ttl_seconds).unwrap_or(i32::MAX));
     let key = doc! {"lastUse": 1_i32};
-    let spec = doc! {
-        "key": key.clone(),
-        "name": SESSIONS_TTL_INDEX,
-        "expireAfterSeconds": SESSIONS_TTL_SECONDS,
-    };
-    storage.create_index(SESSIONS_DB, SESSIONS_COLL, SESSIONS_TTL_INDEX, &key, &spec)?;
+    if !storage.collection_exists(SESSIONS_DB, SESSIONS_COLL)? {
+        storage.create_collection(SESSIONS_DB, SESSIONS_COLL)?;
+    }
+    let indexes = storage.list_indexes(SESSIONS_DB, SESSIONS_COLL)?;
+    match indexes
+        .iter()
+        .find(|ix| ix.get_str("name") == Ok(SESSIONS_TTL_INDEX))
+    {
+        None => {
+            let spec = doc! {
+                "key": key.clone(),
+                "name": SESSIONS_TTL_INDEX,
+                "expireAfterSeconds": ttl,
+            };
+            storage.create_index(SESSIONS_DB, SESSIONS_COLL, SESSIONS_TTL_INDEX, &key, &spec)?;
+        }
+        Some(ix) => {
+            let current = ix.get("expireAfterSeconds").and_then(crate::util::as_i64);
+            if current != Some(ttl_seconds) {
+                storage.set_index_options(
+                    SESSIONS_DB,
+                    SESSIONS_COLL,
+                    SESSIONS_TTL_INDEX,
+                    &doc! {"expireAfterSeconds": ttl},
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Create the collections a replica-set primary keeps its sessions' state
+/// in, as mongod 8.2.11 creates them when it becomes primary:
+/// `config.transactions` (with its `parent_lsid` index) and
+/// `config.image_collection`. Here that is when the server starts on a
+/// store that lacks them; one already there is left as it is.
+pub fn record_session_state_collections(
+    storage: &dyn crate::storage::Storage,
+) -> Result<(), crate::storage::StorageError> {
+    if !storage.collection_exists(SESSIONS_DB, "transactions")? {
+        storage.create_collection(SESSIONS_DB, "transactions")?;
+        let key = doc! {"parentLsid": 1_i32, "_id.txnNumber": 1_i32, "_id": 1_i32};
+        let spec = doc! {
+            "key": key.clone(),
+            "name": "parent_lsid",
+            "partialFilterExpression": {"parentLsid": {"$exists": true}},
+        };
+        storage.create_index(SESSIONS_DB, "transactions", "parent_lsid", &key, &spec)?;
+    }
+    if !storage.collection_exists(SESSIONS_DB, "image_collection")? {
+        storage.create_collection(SESSIONS_DB, "image_collection")?;
+    }
     Ok(())
 }
 

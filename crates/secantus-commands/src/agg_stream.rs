@@ -71,9 +71,6 @@ pub(crate) struct Opened {
 
 /// Open `ask`'s cursor, when its pipeline streams. `None`: read it whole.
 pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, CommandError> {
-    if crate::notablescan::enabled(ctx) {
-        return Ok(None);
-    }
     let storage = ctx
         .storage
         .clone()
@@ -84,6 +81,10 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
     };
     cursor.summary = crate::explain::summary::plan_summary(ask.command, ctx);
     cursor.budgets = crate::aggregate::budgets_of(ctx);
+    // Under `notablescan` the read itself was checked when the command
+    // planned it; the stages that read other collections are checked as
+    // each batch runs them, as the aggregate's own run checks them.
+    cursor.notablescan = crate::notablescan::enabled(ctx).then(|| ask.ns.to_string());
     // `batchSize: 0` asks for the cursor and reads nothing.
     let batch = if ask.batch_size == 0 {
         StreamedBatch {
@@ -144,11 +145,17 @@ fn build(
         return Ok(None);
     }
     let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
-    // A collation leaves no DISTINCT_SCAN over an uncollated index, and
-    // this store's collated index is not in mongod's order (RM-309).
-    if !buffered && ask.collation.is_none() {
-        let grouped = crate::explain::distinct_group_read(storage, ask.db, ask.coll, ask.pipeline)
-            .map_err(read_error)?;
+    // Under a collation, a DISTINCT_SCAN of an index with that collation
+    // (entry format 6 keeps every index in mongod's order: RM-309).
+    if !buffered {
+        let grouped = crate::explain::distinct_group_read(
+            storage,
+            ask.db,
+            ask.coll,
+            ask.pipeline,
+            ask.collation,
+        )
+        .map_err(read_error)?;
         if let Some(read) = grouped {
             return distinct_group(storage, ask, read);
         }
@@ -195,13 +202,50 @@ fn build(
         limit,
         query.projection.as_ref(),
         false,
+        Default::default(),
     )
     .map_err(read_error)?
     else {
         return Ok(None);
     };
-    let Some(source) = Stream::of_plan(storage, &plan, ask.db, ask.coll, &query.filter, ask.vars)
-        .map_err(read_error)?
+    // The projection the planner took is a stage of the pipeline: run as
+    // written, not as `explain` prints it.
+    let mut stages: Vec<Bson> = query.projection_stage.into_iter().collect();
+    stages.extend(query.rest);
+    // `{$meta: "recordId"}` / `{$meta: "indexKey"}` where mongod answers
+    // them: read from fields each document is given as the read passes it
+    // on, as the whole read gives them (`agg_meta`).
+    let metas = if stages.iter().any(mentions_meta) {
+        crate::agg_meta::rewrite(ask.pipeline, &mut stages)
+    } else {
+        Default::default()
+    };
+    // `{$meta: "sortKey"}`: from the `$sort` the plan reads in order, worked
+    // out for each document as a `$sort` stage leaves it (`agg_meta`).
+    if stages
+        .iter()
+        .any(|s| crate::agg_meta::mentions(s, "sortKey"))
+    {
+        match &query.sort {
+            Some(sort) => {
+                let mut with = vec![Bson::Document(doc! { "$sort": sort.clone() })];
+                with.append(&mut stages);
+                crate::agg_meta::rewrite_sort_metadata(&mut with);
+                // The plan sorted: what follows the `$sort` stays.
+                with.remove(0);
+                stages = with;
+            }
+            None => crate::agg_meta::rewrite_sort_metadata(&mut stages),
+        }
+    }
+    let opts = crate::explain::stream::Options {
+        keys: metas.index_key,
+        collation: ask.collation,
+        ..Default::default()
+    };
+    let Some(source) =
+        Stream::of_plan_with(&plan, ask.db, ask.coll, &query.filter, ask.vars, &opts)
+            .map_err(read_error)?
     else {
         return Ok(None);
     };
@@ -210,16 +254,13 @@ fn build(
         crate::explain::order::count_index_use(storage, &order, crate::explain::order::Uses::Find);
     }
     let indexes = crate::explain::order::plan_indexes(storage, &order);
-    // The projection the planner took is a stage of the pipeline: run as
-    // written, not as `explain` prints it.
-    let mut stages: Vec<Bson> = query.projection_stage.into_iter().collect();
-    stages.extend(query.rest);
     if sbe && !stages.is_empty() {
         let end = stages.len();
         stages = secantus_core::sbe::mark(stages, 0, end);
     }
     let mut cursor = AggStream::new(source, (!per_batch).then_some(FIRST_BUFFER), stages, ask);
     cursor.sbe = sbe;
+    cursor.metas = (metas.record_id, metas.index_key);
     Ok(Some((cursor, indexes)))
 }
 
@@ -241,7 +282,7 @@ fn distinct_group(
         filter,
     } = read;
     let Some(source) =
-        Stream::of_plan(storage, &plan, ask.db, ask.coll, &filter, ask.vars).map_err(read_error)?
+        Stream::of_plan(&plan, ask.db, ask.coll, &filter, ask.vars).map_err(read_error)?
     else {
         return Ok(None);
     };
@@ -272,12 +313,13 @@ fn scanned_index(plan: &crate::explain::Node) -> Option<String> {
 }
 
 /// A stage this cursor runs as documents arrive, its spec naming no
-/// `$meta` (the metadata the whole read attaches).
+/// `$meta` but a document's RecordId and index key, which the read keeps
+/// (the other metadata the whole read attaches).
 fn streams(stage: &Bson) -> bool {
     let Some((name, spec)) = stage.as_document().and_then(|d| d.iter().next()) else {
         return false;
     };
-    STREAMING_STAGES.contains(&name.as_str()) && !mentions_meta(spec)
+    STREAMING_STAGES.contains(&name.as_str()) && only_kept_meta(spec)
 }
 
 fn mentions_meta(v: &Bson) -> bool {
@@ -285,6 +327,21 @@ fn mentions_meta(v: &Bson) -> bool {
         Bson::Document(d) => d.iter().any(|(k, v)| k == "$meta" || mentions_meta(v)),
         Bson::Array(items) => items.iter().any(mentions_meta),
         _ => false,
+    }
+}
+
+/// Every `$meta` in `v` asks for `recordId`, `indexKey` or `sortKey`.
+fn only_kept_meta(v: &Bson) -> bool {
+    match v {
+        Bson::Document(d) => d.iter().all(|(k, v)| {
+            if k == "$meta" {
+                matches!(v, Bson::String(s) if s == "recordId" || s == "indexKey" || s == "sortKey")
+            } else {
+                only_kept_meta(v)
+            }
+        }),
+        Bson::Array(items) => items.iter().all(only_kept_meta),
+        _ => true,
     }
 }
 
@@ -338,6 +395,12 @@ struct AggStream {
     gone: Option<String>,
     /// The aggregation memory budgets in force when it was opened (RM-211).
     budgets: secantus_core::memlimit::Budgets,
+    /// Opened under `notablescan`: its namespace, which the stages that
+    /// read other collections are checked under.
+    notablescan: Option<String>,
+    /// The documents read are given their RecordId and their index key, for
+    /// the `$meta`s rewritten into reads of them (`agg_meta`).
+    metas: (bool, bool),
 }
 
 fn stage_name(s: &Bson) -> &str {
@@ -382,6 +445,8 @@ impl AggStream {
             collation: ask.collation.cloned(),
             gone: None,
             budgets: Default::default(),
+            notablescan: None,
+            metas: (false, false),
         }
     }
 
@@ -420,15 +485,18 @@ impl AggStream {
         };
         // A view, a default collation or a time-series collection is read
         // as the whole pipeline reads it.
-        let plain = from.is_some_and(|c| {
-            storage
-                .get_collection_options(&self.db, c)
-                .map_or(true, |o| {
-                    !o.contains_key("viewOn")
-                        && !o.contains_key("collation")
-                        && !o.contains_key("timeseries")
-                })
-        });
+        // Under `notablescan` too, whose check of the read is the whole
+        // pipeline's.
+        let plain = self.notablescan.is_none()
+            && from.is_some_and(|c| {
+                storage
+                    .get_collection_options(&self.db, c)
+                    .map_or(true, |o| {
+                        !o.contains_key("viewOn")
+                            && !o.contains_key("collation")
+                            && !o.contains_key("timeseries")
+                    })
+            });
         if let (true, Some(from)) = (plain, from) {
             let ask = Ask {
                 db: &self.db,
@@ -492,8 +560,25 @@ impl AggStream {
                 }
                 .map_err(read_error)?;
                 drop(engine);
+                let (record_id, index_key) = self.metas;
+                // mongod has an index key only for a read of one index scan.
+                let index_key = index_key && source.single_scan();
+                let docs = if record_id || index_key {
+                    let mut decoded = crate::util::decode_docs(read.docs)?;
+                    for (i, doc) in decoded.iter_mut().enumerate() {
+                        if record_id {
+                            doc.insert(crate::agg_meta::RECORD_ID, Bson::Int64(read.rids[i]));
+                        }
+                        if let (true, Some(key)) = (index_key, &read.keys[i]) {
+                            doc.insert(crate::agg_meta::INDEX_KEY, Bson::Document(key.clone()));
+                        }
+                    }
+                    crate::util::encode_docs(decoded)?
+                } else {
+                    read.docs
+                };
                 Ok(StreamedBatch {
-                    docs: read.docs,
+                    docs,
                     exhausted: read.exhausted,
                     keys_examined: read.keys_examined,
                     docs_examined: read.docs_examined,
@@ -578,6 +663,7 @@ impl StreamCursor for AggStream {
         max_bytes: usize,
     ) -> Result<StreamedBatch, CommandError> {
         let _active = secantus_core::collation::activate(self.collation.as_ref());
+        let _notablescan = crate::notablescan::aggregate_on(self.notablescan.clone());
         let (mut keys, mut examined) = (0, 0);
         let mut out: Vec<Vec<u8>> = Vec::new();
         let mut bytes = 0usize;

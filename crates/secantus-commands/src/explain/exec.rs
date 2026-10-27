@@ -138,8 +138,10 @@ pub(crate) type Entry = (Vec<Vec<u8>>, usize);
 /// first made one no other key starts with: its zero bytes escaped and a
 /// terminator added, as the entries table joins the parts of a compound key.
 pub(crate) fn directed(v: &Bson, reversed: bool, collation: Option<&Collation>) -> Vec<u8> {
+    // Under a collation every string takes it, one inside a document or an
+    // array too, as the index's entries hold them.
     let bytes = match (v, collation) {
-        (Bson::String(_), Some(_)) => {
+        (Bson::String(_) | Bson::Document(_) | Bson::Array(_), Some(_)) => {
             secantus_core::sortkey::encode_sort_value(v, collation).unwrap_or_default()
         }
         _ => sort_key(v),
@@ -375,6 +377,14 @@ pub(crate) struct Scan {
     seen: BTreeSet<usize>,
     keys: i64,
     returned: i64,
+    /// mongod's `seeks`: the first, and one per jump to a later interval,
+    /// counted in the work that makes it (the one after the key that asks
+    /// for it).
+    seeks: i64,
+    seek_pending: bool,
+    /// A multikey scan's checks for a document it already returned.
+    dups_tested: i64,
+    dups_dropped: i64,
 }
 
 impl Scan {
@@ -434,6 +444,10 @@ impl Scan {
             seen: BTreeSet::new(),
             keys: 0,
             returned: 0,
+            seeks: 0,
+            seek_pending: false,
+            dups_tested: 0,
+            dups_dropped: 0,
         }
     }
 
@@ -491,10 +505,16 @@ impl Scan {
     /// The first seek goes straight to the low end of the first intervals:
     /// the keys before it are never examined.
     fn seek_start(&mut self) {
-        let start: Vec<&[u8]> = self
+        // `IndexBoundsChecker::getStartSeekPoint`: each field's first
+        // interval's start. Where that start is exclusive, a key equal to it
+        // there is still before the seek point.
+        let start: Vec<(&[u8], bool)> = self
             .ranges
             .iter()
-            .map(|list| list.first().map_or(&[][..], |r| r.0.as_slice()))
+            .map(|list| {
+                list.first()
+                    .map_or((&[][..], true), |r| (r.0.as_slice(), r.1))
+            })
             .collect();
         while self.pos < self.entries.len() {
             let key = &self.entries[self.pos].0;
@@ -502,7 +522,15 @@ impl Scan {
                 .iter()
                 .map(Vec::as_slice)
                 .zip(start.iter().copied())
-                .find_map(|(k, s)| (k != s).then_some(k < s))
+                .find_map(|(k, (s, inclusive))| {
+                    if k != s {
+                        Some(k < s)
+                    } else if !inclusive {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(false);
             if !before {
                 break;
@@ -518,7 +546,11 @@ impl Scan {
     fn work_entry(&mut self) -> Step {
         if !self.started {
             self.started = true;
+            self.seeks += 1;
             self.seek_start();
+        }
+        if std::mem::take(&mut self.seek_pending) {
+            self.seeks += 1;
         }
         while !self.done && self.pos < self.entries.len() {
             let Some((field, ahead)) = self.outside(&self.entries[self.pos].0) else {
@@ -554,6 +586,7 @@ impl Scan {
                 }
                 self.pos += 1;
             }
+            self.seek_pending = true;
             return Step::Seek;
         }
         self.done = true;
@@ -578,7 +611,14 @@ impl Scan {
             Step::End => Work::Eof,
             Step::Seek => Work::NeedTime,
             Step::Entry(row) => {
-                if (self.multikey && !self.seen.insert(row)) || !env.matches(row, &self.filter) {
+                if self.multikey {
+                    self.dups_tested += 1;
+                }
+                let repeat = self.multikey && !self.seen.insert(row);
+                if repeat {
+                    self.dups_dropped += 1;
+                }
+                if repeat || !env.matches(row, &self.filter) {
                     Work::NeedTime
                 } else {
                     self.returned += 1;
@@ -605,6 +645,11 @@ impl Scan {
     /// The keys the scan has examined.
     pub(crate) fn keys(&self) -> i64 {
         self.keys
+    }
+
+    /// `seeks`, `dupsTested` and `dupsDropped`.
+    pub(crate) fn seek_counts(&self) -> (i64, i64, i64) {
+        (self.seeks, self.dups_tested, self.dups_dropped)
     }
 
     /// A DISTINCT_SCAN's next document: the first entry of a new value of
@@ -987,6 +1032,7 @@ impl<'a> Run<'a> {
             docs,
             extra,
             children: self.inputs.iter().map(Run::stats).collect(),
+            work: None,
         }
     }
 }
@@ -1005,7 +1051,7 @@ pub(crate) fn fetched(node: &Node, returned: i64, extra: &mut Document) -> Optio
 
 /// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
 /// through the sorter its budget holds, as mongod's executes it.
-fn sort_stats(
+pub(crate) fn sort_stats(
     extra: &mut Document,
     pattern: &Document,
     limit: Option<i64>,
@@ -1030,14 +1076,16 @@ fn sort_stats(
     if ran.is_err() {
         return;
     }
-    extra.insert("totalDataSizeSorted", report.sort_total_data_size);
+    // `appendNumber`: an int32 while the count fits (measured 8.2.11, the
+    // trial's SORT in `allPlansExecution`).
+    extra.insert("totalDataSizeSorted", num(report.sort_total_data_size));
     extra.insert("usedDisk", report.sort_spills > 0);
-    extra.insert("spills", report.sort_spills);
-    extra.insert("spilledRecords", report.sort_spilled_records);
-    extra.insert("spilledBytes", report.sort_spilled_bytes);
+    extra.insert("spills", num(report.sort_spills));
+    extra.insert("spilledRecords", num(report.sort_spilled_records));
+    extra.insert("spilledBytes", num(report.sort_spilled_bytes));
     extra.insert(
         "spilledDataStorageSize",
-        report.sort_spilled_data_storage_size,
+        num(report.sort_spilled_data_storage_size),
     );
 }
 

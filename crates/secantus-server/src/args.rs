@@ -74,6 +74,8 @@ pub struct CliArgs {
     /// `--block-compressor` / `[storage] block_compressor`: the compressor for
     /// newly created data tables.
     pub block_compressor: Option<String>,
+    /// `--setParameter name=value`, each checked as mongod checks it.
+    pub startup_parameters: Vec<(String, bson::Bson)>,
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -126,6 +128,11 @@ impl CliArgs {
             checkpoint_seconds: cfg.checkpoint_seconds,
             write_tickets: cfg.write_tickets,
             block_compressor: cfg.block_compressor.clone(),
+            startup_parameters: cfg
+                .set_parameters
+                .iter()
+                .map(|p| secantus_commands::params::parse_startup_parameter(p))
+                .collect::<Result<Vec<_>, String>>()?,
         })
     }
 
@@ -142,6 +149,7 @@ impl CliArgs {
                 ca_file: t.ca_file.clone(),
                 require_client_cert: t.require_client_cert,
             }),
+            startup_parameters: self.startup_parameters.clone(),
             ..ServerConfig::default()
         }
     }
@@ -340,6 +348,10 @@ pub fn parse_args(args: &[String]) -> Result<Parsed, String> {
             "--standalone" => o.standalone = Some(true),
             "--repair" => repair = true,
             "--enable-test-commands" => o.enable_test_commands = Some(true),
+            "--setParameter" => o
+                .set_parameters
+                .get_or_insert_with(Vec::new)
+                .push(take_value("--setParameter")?),
             "--tls-cert-file" => tls_cert_file = Some(take_value("--tls-cert-file")?),
             "--tls-key-file" => tls_key_file = Some(take_value("--tls-key-file")?),
             "--tls-ca-file" => tls_ca_file = Some(take_value("--tls-ca-file")?),
@@ -425,6 +437,12 @@ OPTIONS:
     --standalone                 Drop the single-node replica-set advertisement
                                  from the hello reply (drivers see a STANDALONE
                                  topology; change streams need the default)
+    --setParameter NAME=VALUE    A server parameter mongod takes only at
+                                 startup: localLogicalSessionTimeoutMinutes,
+                                 logicalSessionRefreshMillis,
+                                 disableLogicalSessionCacheRefresh,
+                                 TransactionRecordMinimumLifetimeMinutes.
+                                 Repeatable.
     --cache-size SIZE            WiredTiger cache size, unit-suffixed string like
                                  '256M', '1G', '8G' (default: 4G)
     --log-file-max SIZE          WiredTiger WAL log file_max, unit-suffixed like
@@ -749,6 +767,39 @@ mod tests {
         assert_eq!(
             run(&["--host", "0.0.0.0", "--port", "27018"]).bind_addr(),
             "0.0.0.0:27018"
+        );
+    }
+
+    /// `--setParameter` takes mongod's startup-only session parameters,
+    /// repeated, in either form, and reaches the server's configuration.
+    #[test]
+    fn set_parameter_reaches_the_server_config() {
+        let args = run(&[
+            "--setParameter",
+            "TransactionRecordMinimumLifetimeMinutes=0",
+            "--setParameter=disableLogicalSessionCacheRefresh=true",
+        ]);
+        assert_eq!(
+            args.server_config().startup_parameters,
+            vec![
+                (
+                    "TransactionRecordMinimumLifetimeMinutes".to_string(),
+                    bson::Bson::Int32(0)
+                ),
+                (
+                    "disableLogicalSessionCacheRefresh".to_string(),
+                    bson::Bson::Boolean(true)
+                ),
+            ]
+        );
+        let pr = match parse(&["--setParameter", "nope=1"]).unwrap() {
+            Parsed::Run(pr) => pr,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        let (cfg, _) = crate::config::resolve(None, &pr.overrides).unwrap();
+        assert_eq!(
+            CliArgs::from_resolved(&cfg),
+            Err("Unknown --setParameter 'nope'".to_string())
         );
     }
 }

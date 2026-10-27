@@ -62,6 +62,7 @@ mod generic;
 mod hybrid;
 mod index_builds;
 mod index_filters;
+pub mod names;
 mod snapshot;
 pub use generic::db_field_problem;
 pub mod failpoints;
@@ -73,6 +74,7 @@ mod interrupt;
 mod list_catalog;
 pub mod lock_manager;
 pub mod logbuf;
+pub mod logical_sessions;
 pub mod mapreduce;
 mod misc_admin;
 pub mod mongod_codes;
@@ -606,7 +608,10 @@ pub(crate) fn lookup_for_test(name: &str) -> Option<Handler> {
 /// several) is a one-line change beside this comment, and so the Python
 /// server's mirror has something to be checked against.
 pub fn is_test_only_command(name: &str) -> bool {
-    matches!(name, "configureFailPoint")
+    matches!(
+        name,
+        "configureFailPoint" | "refreshLogicalSessionCacheNow" | "reapLogicalSessionCacheNow"
+    )
 }
 
 /// The commands of this server's own, which mongod does not have.
@@ -742,6 +747,8 @@ fn lookup(name: &str) -> Option<Handler> {
         "planCacheListFilters" => index_filters::list_filters,
         "planCacheSetFilter" => index_filters::set_filter,
         "configureFailPoint" => configure_fail_point,
+        "refreshLogicalSessionCacheNow" => refresh_logical_session_cache_now,
+        "reapLogicalSessionCacheNow" => reap_logical_session_cache_now,
         _ => return None,
     })
 }
@@ -778,6 +785,27 @@ fn configure_fail_point(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
 /// `commands.py::dispatch` runs first. Always returns a reply document (errors
 /// are shaped into `ok: 0`), so the connection survives any single command.
 pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
+    // A database or collection name that is not UTF-8 is escaped on the way
+    // in and written back as its bytes on the way out (RM-222).
+    let escaped = match names::from_bytes_named(doc) {
+        Ok(escaped) => escaped,
+        Err(e) => return e.into_reply(),
+    };
+    let (doc, carried): (&Document, &[String]) = match &escaped {
+        Some((d, carried)) => {
+            if let Ok(db) = d.get_str("$db") {
+                ctx.db_name = db.to_string();
+            }
+            (d, carried)
+        }
+        None => (doc, &[]),
+    };
+    let mut reply = dispatch_named(doc, ctx);
+    names::to_bytes(&mut reply, command_name(doc), carried);
+    reply
+}
+
+fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     handshake::process_started();
     let started = std::time::Instant::now();
     let stats = ctx.top_stats.clone();
@@ -1431,7 +1459,9 @@ fn reject_synthetic_view_write(name: &str, doc: &Document, db: &str) -> Option<C
 /// fault into a whole-server DoS. Reject it here, before it reaches storage,
 /// with the same `InvalidNamespace` error mongod returns. (#139)
 pub(crate) fn nul_in_namespace(kind: &str, value: &str) -> Option<CommandError> {
-    if value.contains('\0') {
+    // An escaped name that is not UTF-8 (`names`) holds NULs of its own; a
+    // client's NUL was refused before it was escaped.
+    if value.contains('\0') && bsondoc::key_bytes(value).is_none() {
         Some(CommandError::new(
             73,
             "InvalidNamespace",
@@ -1744,10 +1774,38 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
 fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let (lsid, txn_number) = txn_envelope(doc);
     match (&ctx.transactions, lsid, txn_number) {
-        (Some(reg), Some(lsid), Some(n)) => match reg.commit(&lsid, n) {
-            None => Ok(doc! { "ok": 1.0 }),
-            Some(reply) => Ok(reply),
-        },
+        (Some(reg), Some(lsid), Some(n)) => {
+            if let Some(s) = ctx.storage.as_ref() {
+                s.take_last_commit_ts();
+            }
+            match reg.commit(&lsid, n) {
+                None => {
+                    let mut reply = doc! { "ok": 1.0 };
+                    // A transaction that logged its writes leaves its
+                    // session's `config.transactions` row, as mongod's does.
+                    if let Some(s) = ctx.storage.as_ref() {
+                        if let Some(ts) = s.take_last_commit_ts() {
+                            session::pin_operation_time(
+                                &mut reply,
+                                ctx.replica_set_name.is_some(),
+                                s.as_ref(),
+                            );
+                            let session =
+                                session::logical_session_id(&lsid, &session::authenticated(ctx));
+                            session::record_session_transaction(
+                                s.as_ref(),
+                                session,
+                                n,
+                                ts,
+                                Some("committed"),
+                            )?;
+                        }
+                    }
+                    Ok(reply)
+                }
+                Some(reply) => Ok(reply),
+            }
+        }
         _ => Ok(doc! { "ok": 1.0 }),
     }
 }
@@ -1756,27 +1814,67 @@ fn commit_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
 /// the list and leaves an open transaction of theirs alone (measured 8.2.11:
 /// a statement after `endSessions` still runs, and the commit succeeds); the
 /// transaction ends when the client ends it or its lifetime runs out.
-fn end_sessions(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    session::listed_sessions(
+///
+/// The logical session cache forgets them at once, and its next refresh
+/// deletes their records from `config.system.sessions`
+/// (`logical_sessions::refresh`).
+fn end_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let ids = session::listed_sessions(
         doc,
         "endSessions",
         "endSessions",
         "endSessions.endSessionsFromClient",
         true,
     )?;
+    if let Some(params) = &ctx.server_params {
+        let uid = session::user_digest(&session::authenticated(ctx));
+        params.forget_sessions(&ids);
+        params.logical_sessions().end(ids, &uid);
+    }
     Ok(doc! { "ok": 1.0 })
 }
 
-/// `refreshSessions` -- checked like `endSessions`; there is no session
-/// timeout here to push back.
-fn refresh_sessions(doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
-    session::listed_sessions(
+/// `refreshSessions` -- checked like `endSessions`. The listed sessions are
+/// used now: the logical session cache's next refresh writes their
+/// `lastUse` to `config.system.sessions`, as mongod's does.
+fn refresh_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let ids = session::listed_sessions(
         doc,
         "refreshSessions",
         "refreshSessions",
         "refreshSessions.refreshSessionsFromClient",
         true,
     )?;
+    if let Some(params) = &ctx.server_params {
+        let uid = session::user_digest(&session::authenticated(ctx));
+        for id in ids {
+            params.note_session(&id, uid.clone());
+        }
+    }
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `refreshLogicalSessionCacheNow` -- a test command (`enableTestCommands`):
+/// run the logical session cache's periodic refresh now
+/// (`logical_sessions::refresh`). mongod 8.2.11 takes any value, on any
+/// database, and ignores other fields.
+fn refresh_logical_session_cache_now(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    ctx.storage()?;
+    if let (Some(storage), Some(params)) = (ctx.storage.clone(), ctx.server_params.clone()) {
+        logical_sessions::refresh(storage.as_ref(), &params, ctx.cursors.as_deref())
+            .map_err(crate::util::command_error)?;
+    }
+    Ok(doc! { "ok": 1.0 })
+}
+
+/// `reapLogicalSessionCacheNow` -- a test command: run the transaction
+/// reaper now (`logical_sessions::reap`).
+fn reap_logical_session_cache_now(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    ctx.storage()?;
+    if let (Some(storage), Some(params)) = (ctx.storage.clone(), ctx.server_params.clone()) {
+        logical_sessions::reap(storage.as_ref(), &params, ctx.transactions.as_deref())
+            .map_err(crate::util::command_error)?;
+    }
     Ok(doc! { "ok": 1.0 })
 }
 
@@ -2439,9 +2537,11 @@ fn attach_cluster_time_gossip(req: &Document, reply: &mut Document, ctx: &Comman
             },
         );
     }
-    if !reply.contains_key("operationTime") {
-        reply.insert("operationTime", Bson::Timestamp(ts));
-    }
+    // A handler may have pinned the time of its own write, before writes it
+    // keeps beside the oplog moved the clock on (`session::pin_operation_time`);
+    // either way it follows `$clusterTime`, as mongod's does.
+    let operation_time = reply.remove("operationTime").unwrap_or(Bson::Timestamp(ts));
+    reply.insert("operationTime", operation_time);
     attach_write_op_time(req, reply);
     // Snapshot sessions: pymongo pins the session's read timestamp from the
     // FIRST snapshot read's reply — `cursor.atClusterTime` for cursor commands,

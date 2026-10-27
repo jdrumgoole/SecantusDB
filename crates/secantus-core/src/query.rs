@@ -1740,8 +1740,13 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
         || is(
             &["object"],
             &[3],
-            matches!(v, Bson::Document(_)) && !crate::bsondoc::is_string(v),
+            matches!(v, Bson::Document(_))
+                && !crate::bsondoc::is_string(v)
+                && crate::bsondoc::as_raw_text(v).is_none(),
         )
+        || crate::bsondoc::as_raw_text(v).is_some_and(|(t, _)| {
+            is(&[crate::bsondoc::raw_text_type_name(t)], &[i64::from(t)], true)
+        })
         || is(&["array"], &[4], matches!(v, Bson::Array(_)))
         || is(&["binData"], &[5], matches!(v, Bson::Binary(_)))
         || is(&["objectId"], &[7], matches!(v, Bson::ObjectId(_)))
@@ -1792,10 +1797,11 @@ fn matches_type(v: &Bson, spec: &Bson) -> bool {
 /// prints `new Date(<millis>)`. Probed across every BSON type against 8.2.11
 /// (2026-09-01); mirrors `secantus.bsontypes.bson_value_repr`.
 pub fn bson_value_repr(v: &Bson) -> String {
-    // A string that is not UTF-8 prints as the string it is, each invalid
-    // sequence replaced (mongod writes the raw bytes; RM-222).
+    // A string that is not UTF-8 prints escaped (`bsondoc::escape_key`); a
+    // reply's error message carries those bytes back out, as mongod quotes
+    // them (RM-222).
     if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
-        return format!("\"{}\"", crate::bsondoc::lossy(b));
+        return format!("\"{}\"", crate::bsondoc::message_escape(b));
     }
     match v {
         Bson::Null | Bson::Undefined => "null".to_string(),
@@ -1880,6 +1886,9 @@ pub fn fmt_double_parse(d: f64) -> String {
 }
 
 pub fn bson_type_name(v: &Bson) -> &'static str {
+    if let Some((t, _)) = crate::bsondoc::as_raw_text(v) {
+        return crate::bsondoc::raw_text_type_name(t);
+    }
     if crate::bsondoc::as_invalid_utf8(v).is_some() {
         return "string";
     }

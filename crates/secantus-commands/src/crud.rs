@@ -1232,7 +1232,10 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation: collation.as_ref(),
                     vars: &let_vars,
                     limit: 0,
-                    asked: Default::default(),
+                    asked: crate::near::Asked {
+                        cached: true,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap_or(None)
@@ -1251,11 +1254,37 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     collation: collation.as_ref(),
                     vars: &let_vars,
                     limit: 0,
-                    asked: Default::default(),
+                    asked: crate::near::Asked {
+                        cached: true,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap_or(None)
         } else {
+            // A standalone reads the matches in no order of its own, and
+            // mongod still plans the delete through its plan cache.
+            let planned = crate::explain::order::through_cache(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &let_vars,
+                    limit: 0,
+                    asked: crate::near::Asked {
+                        cached: true,
+                        ..Default::default()
+                    },
+                },
+                false,
+            );
+            if let Err(e) = planned {
+                log::warn!("planning a delete of many documents: {e:?}");
+            }
             None
         };
         // The statement's interrupt point before it writes: a kill between
@@ -1576,6 +1605,30 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     };
     if view_on.is_none() {
+        // mongod plans the count's query, through its plan cache.
+        crate::explain::order::through_cache(
+            ctx.storage()?,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: argtypes::given_hint(doc),
+                collation: collation.as_ref(),
+                vars: &Document::new(),
+                limit: 0,
+                asked: crate::near::Asked {
+                    skip,
+                    limit: limit.abs(),
+                    cached: true,
+                    ..Default::default()
+                },
+            },
+            true,
+        )
+        .map_err(|e| {
+            crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
+        })?;
         crate::explain::order::count_index_use(
             ctx.storage()?,
             &crate::explain::order::Ask {
@@ -2052,7 +2105,14 @@ pub(crate) fn update_in(
                         collation: collation.as_ref(),
                         vars: &Document::new(),
                         limit: 1,
-                        asked: Default::default(),
+                        // An update of one document under a sort: mongod's
+                        // query has a limit of one.
+                        asked: crate::near::Asked {
+                            limit: 1,
+                            sort: Some(sort),
+                            cached: true,
+                            ..Default::default()
+                        },
                     },
                 )
                 .map_err(|_| CommandError::new(2, "BadValue", "sort resolution failed"))
@@ -2182,6 +2242,32 @@ pub(crate) fn update_in(
         // An update of ONE document changes the first its query matches in
         // the order mongod reads them.
         let first = if multi || absent {
+            if !absent {
+                // An update of many documents reads them in no order of its
+                // own, and mongod still plans it through its plan cache. A
+                // read that fails here fails the update's own read too.
+                let planned = crate::explain::order::through_cache(
+                    storage,
+                    &crate::explain::order::Ask {
+                        db: db_name,
+                        coll: &coll,
+                        filter: &q,
+                        sort: None,
+                        hint: argtypes::given_hint(spec),
+                        collation: collation.as_ref(),
+                        vars: &stmt_vars,
+                        limit: 0,
+                        asked: crate::near::Asked {
+                            cached: true,
+                            ..Default::default()
+                        },
+                    },
+                    false,
+                );
+                if let Err(e) = planned {
+                    log::warn!("planning an update of many documents: {e:?}");
+                }
+            }
             None
         } else {
             crate::explain::order::write_candidates(
@@ -2195,7 +2281,10 @@ pub(crate) fn update_in(
                     collation: collation.as_ref(),
                     vars: &stmt_vars,
                     limit: 0,
-                    asked: Default::default(),
+                    asked: crate::near::Asked {
+                        cached: true,
+                        ..Default::default()
+                    },
                 },
             )
             .unwrap_or(None)

@@ -126,6 +126,12 @@ pub(crate) struct Asked<'a> {
     pub limit: i64,
     pub sort: Option<&'a Document>,
     pub projection: Option<&'a Document>,
+    /// The read is a command's own, which consults and writes mongod's
+    /// plan cache (`explain::plan_cache`); a read made only to learn about
+    /// the plan does not.
+    pub cached: bool,
+    /// `distinct`'s key, part of the plan cache key.
+    pub distinct: Option<&'a str>,
 }
 
 fn shown(d: Option<&Document>) -> String {

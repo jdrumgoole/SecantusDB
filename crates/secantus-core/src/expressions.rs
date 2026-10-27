@@ -3124,10 +3124,11 @@ fn op_expr_min(arg: &Bson, ctx: &Ctx) -> R {
 /// else through its ordinary stream form. Mirrors
 /// `expressions.py::_mongo_val_repr`.
 fn mongo_val_repr(v: &Bson) -> String {
-    // A string that is not UTF-8 prints as the string it is, each invalid
-    // sequence replaced (mongod writes the raw bytes; RM-222).
+    // A string that is not UTF-8 prints escaped (`bsondoc::escape_key`); a
+    // reply's error message carries those bytes back out, as mongod quotes
+    // them (RM-222).
     if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
-        return format!("\"{}\"", crate::bsondoc::lossy(b));
+        return format!("\"{}\"", crate::bsondoc::message_escape(b));
     }
     match v {
         Bson::Boolean(b) => (if *b { "true" } else { "false" }).to_string(),
@@ -5366,7 +5367,7 @@ fn mongo_tz(spec: Option<&Bson>) -> Result<MongoTz, FreeFormError> {
 /// mongod's `TimeZoneDatabase::fromString` without a format, then
 /// `TimeZone::adjustTimeZone`: timelib's free-form parser (`crate::timelib`),
 /// the `timezone` argument's rules, and the resolved instant in milliseconds.
-fn free_form_date(text: &str, tz_spec: Option<&Bson>) -> Result<i64, FreeFormError> {
+fn free_form_date(text: &[u8], tz_spec: Option<&Bson>) -> Result<i64, FreeFormError> {
     // The zone is resolved first, as mongod evaluates `timezone` before it
     // parses: an unknown zone wins over a bad string.
     let tz = mongo_tz(tz_spec)?;
@@ -5378,13 +5379,13 @@ fn free_form_date(text: &str, tz_spec: Option<&Bson>) -> Result<i64, FreeFormErr
 /// parse-from-format with mongod's specifier map, then the `timezone`
 /// argument's rules, as milliseconds. The format is already validated.
 fn resolve_date_string(
-    text: &str,
+    text: &[u8],
     format: Option<&str>,
     tz: MongoTz,
 ) -> Result<i64, FreeFormError> {
     use crate::timelib;
     let mut t = match format {
-        None => timelib::mongo_parse(text),
+        None => timelib::mongo_parse_bytes(text),
         Some(f) => timelib::mongo_parse_format(text, f),
     }
     .map_err(FreeFormError::Conversion)?;
@@ -5532,15 +5533,10 @@ fn op_date_from_string(arg: &Bson, ctx: &Ctx) -> R {
         };
     }
     // Everything from here is a ConversionFailure that onError catches.
-    // A string that is not UTF-8 is parsed as its text with each invalid
-    // sequence replaced, which fails as mongod's parse of the bytes does
-    // (RM-222).
-    let date_string = match invalid_utf8(&date_string) {
-        Some(b) => Bson::String(String::from_utf8_lossy(b).into_owned()),
-        None => date_string,
-    };
     let converted = (|| -> Result<Option<i64>, FreeFormError> {
-        let Bson::String(text) = &date_string else {
+        // A string that is not UTF-8 is parsed as its bytes, as timelib
+        // parses them (RM-222).
+        let Some(text) = str_bytes(&date_string) else {
             return Err(FreeFormError::Conversion(format!(
                 "$dateFromString requires that 'dateString' be a string, found: {} with value {}",
                 type_name(&date_string),
@@ -7662,14 +7658,46 @@ fn nonfinite_conversion(d: f64) -> Fallback {
 
 fn convert_value(value: &Bson, code: i32) -> Conv {
     // A string that is not UTF-8 (RM-222) converts as a string: to a string
-    // it is itself, to a bool true, and to anything else it is parsed --
-    // which fails, as it does on mongod, with the message quoting the text
-    // with each invalid sequence replaced (mongod quotes the raw bytes).
+    // it is itself, to a bool true, to a date through timelib's byte parser,
+    // and to anything else by parsing its text -- which fails, as on mongod.
+    // The message then quotes the string's bytes (escaped here; the reply
+    // writes them back), and an ObjectId's length is counted in bytes, as
+    // mongod counts it (measured 8.2.11, 2026-10-27).
     if let Some(b) = invalid_utf8(value) {
+        let lossy = String::from_utf8_lossy(b).into_owned();
         return match code {
             2 => Conv::Ok(value.clone()),
             8 => Conv::Ok(Bson::Boolean(true)),
-            _ => convert_value(&Bson::String(String::from_utf8_lossy(b).into_owned()), code),
+            9 => match free_form_date(b, None) {
+                Ok(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms))),
+                Err(FreeFormError::Conversion(msg)) => Conv::Named(Fallback::mongo(241, msg)),
+                Err(FreeFormError::Other(f)) => Conv::Named(f),
+            },
+            _ => match convert_value(&Bson::String(lossy.clone()), code) {
+                Conv::Named(Fallback::Mongo {
+                    code,
+                    message,
+                    folded,
+                    exec,
+                    bare,
+                }) => {
+                    let quoted = format!("'{}'", crate::bsondoc::message_escape(b));
+                    let mut message = message.replacen(&format!("'{lossy}'"), &quoted, 1);
+                    let chars = format!("found {}", lossy.chars().count());
+                    if message.ends_with(&chars) {
+                        message.truncate(message.len() - chars.len());
+                        message.push_str(&format!("found {}", b.len()));
+                    }
+                    Conv::Named(Fallback::Mongo {
+                        code,
+                        message,
+                        folded,
+                        exec,
+                        bare,
+                    })
+                }
+                other => other,
+            },
         };
     }
     match code {
@@ -8003,7 +8031,7 @@ fn convert_value(value: &Bson, code: i32) -> Conv {
             // abbreviation tables and its per-position error accumulation. This
             // matches `secantus.expressions._parse_date_string`, so the two
             // servers agree; the shared gap is documented in `tasks/backlog-rust-mongodb.md`.
-            Bson::String(text) => match free_form_date(text, None) {
+            Bson::String(text) => match free_form_date(text.as_bytes(), None) {
                 Ok(ms) => Conv::Ok(Bson::DateTime(bson::DateTime::from_millis(ms))),
                 Err(FreeFormError::Conversion(msg)) => Conv::Named(Fallback::mongo(241, msg)),
                 Err(FreeFormError::Other(f)) => Conv::Named(f),
@@ -9819,6 +9847,9 @@ fn wrong_type(code: i32, template: &str, arg: &Bson, value: &Bson, ctx: &Ctx) ->
 
 /// The BSON type string mongod's `$type` reports for a value.
 fn type_name(v: &Bson) -> &'static str {
+    if let Some((t, _)) = crate::bsondoc::as_raw_text(v) {
+        return crate::bsondoc::raw_text_type_name(t);
+    }
     if crate::bsondoc::as_invalid_utf8(v).is_some() {
         return "string";
     }

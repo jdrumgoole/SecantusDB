@@ -48,6 +48,7 @@ pub(crate) fn check_hint(
         skip: Some(q.skip),
         limit: Some(q.limit),
         collation: Some(&simple),
+        batch_size: None,
     };
     crate::util::validate_hint(storage, db, &base, hint, &query)
 }

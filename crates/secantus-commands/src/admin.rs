@@ -1445,6 +1445,24 @@ pub fn list_collections(doc: &Document, ctx: &mut CommandContext) -> HandlerResu
             *e = doc! { "name": name, "type": ty };
         }
     }
+    // A name that is not UTF-8 is listed, and filtered, as the string of
+    // its bytes (RM-222).
+    for e in &mut entries {
+        if let Some(Bson::String(n)) = e.get("name") {
+            if n.contains('\0') {
+                let v = crate::names::name_value(n);
+                e.insert("name", v);
+            }
+        }
+        if let Some(Bson::Document(o)) = e.get_mut("options") {
+            if let Some(Bson::String(n)) = o.get("viewOn") {
+                if n.contains('\0') {
+                    let v = crate::names::name_value(n);
+                    o.insert("viewOn", v);
+                }
+            }
+        }
+    }
     if let Some(f) = filter {
         entries.retain(|e| {
             secantus_core::query::matches(e, f, &Document::new(), None).unwrap_or(false)
@@ -3715,7 +3733,7 @@ fn invalid_collection_name(db: &str, coll: &str) -> Option<CommandError> {
     if coll.is_empty() {
         return err(format!("Invalid namespace specified: {db}"));
     }
-    if coll.contains('\0') {
+    if coll.contains('\0') && crate::bsondoc::key_bytes(coll).is_none() {
         return err("namespaces cannot have embedded null characters".to_string());
     }
     if coll.starts_with('.') {
@@ -4647,16 +4665,20 @@ fn global_lock(
     }
 }
 
-/// `logicalSessionRecordCache`: the sessions in use (what
-/// `$listLocalSessions` lists) and the sessions holding transaction or
-/// retryable-write state. mongod's other fields time its periodic refresh of
-/// `config.system.sessions`, which this server does not run.
+/// `logicalSessionRecordCache`: the sessions in use since the last refresh
+/// (what `$listLocalSessions` lists), what the cache's refresh and the
+/// transaction reaper last did (`logical_sessions`), and the sessions
+/// holding transaction or retryable-write state.
 fn logical_session_record_cache(ctx: &CommandContext) -> Document {
-    let active = ctx.server_params.as_ref().map_or(0, |p| p.sessions().len());
     let catalog = ctx.transactions.as_ref().map_or(0, |t| t.session_count());
-    doc! {
-        "activeSessionsCount": active as i32,
-        "sessionCatalogSize": catalog as i32,
+    match ctx.server_params.as_ref() {
+        Some(p) => p
+            .logical_sessions()
+            .server_status(p.sessions().len(), catalog),
+        None => doc! {
+            "activeSessionsCount": 0_i32,
+            "sessionCatalogSize": catalog as i32,
+        },
     }
 }
 

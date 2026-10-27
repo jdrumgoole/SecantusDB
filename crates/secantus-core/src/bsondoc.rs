@@ -123,6 +123,70 @@ pub fn fields(bytes: &[u8], keep: impl Fn(&str) -> bool) -> Result<Document, Err
     }
 }
 
+/// The carrier of a value of one of the other types that carry text --
+/// regex (0x0B), DBPointer (0x0C), JavaScript (0x0D), symbol (0x0E),
+/// JavaScript with a scope (0x0F) -- whose text is not UTF-8: its type and
+/// its value's raw bytes, under a key no client can send (a NUL and the type
+/// in hex, which is never the escape of a name: an escaped byte is above
+/// 0x7f). mongod stores and returns such a value (measured 8.2.11,
+/// 2026-10-27); [`write`] writes it back as it came.
+pub fn raw_text(t: u8, value: Vec<u8>) -> Bson {
+    let mut d = Document::new();
+    d.insert(
+        format!("\0{t:02x}"),
+        Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes: value,
+        }),
+    );
+    Bson::Document(d)
+}
+
+/// The type and raw value bytes of a [`raw_text`] carrier.
+pub fn as_raw_text(v: &Bson) -> Option<(u8, &[u8])> {
+    let Bson::Document(d) = v else {
+        return None;
+    };
+    if d.len() != 1 {
+        return None;
+    }
+    let (k, x) = d.iter().next()?;
+    let t = match k.as_bytes() {
+        [0, h @ ..] if h.len() == 2 => u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok()?,
+        _ => return None,
+    };
+    if !(0x0B..=0x0F).contains(&t) || k != &format!("\0{t:02x}") {
+        return None;
+    }
+    match x {
+        Bson::Binary(Binary {
+            subtype: BinarySubtype::Generic,
+            bytes,
+        }) => Some((t, bytes)),
+        _ => None,
+    }
+}
+
+/// The text a [`raw_text`] value compares by: a JavaScript or symbol's
+/// string bytes, the whole raw value otherwise.
+pub fn raw_text_bytes(t: u8, value: &[u8]) -> &[u8] {
+    match t {
+        0x0D | 0x0E if value.len() >= 5 => &value[4..value.len() - 1],
+        _ => value,
+    }
+}
+
+/// mongod's `$type` name of a [`raw_text`] value's type.
+pub fn raw_text_type_name(t: u8) -> &'static str {
+    match t {
+        0x0B => "regex",
+        0x0C => "dbPointer",
+        0x0D => "javascript",
+        0x0E => "symbol",
+        _ => "javascriptWithScope",
+    }
+}
+
 /// The carrier of a string whose bytes are not UTF-8. Use
 /// [`string_from_bytes`] when the bytes may be valid.
 pub fn invalid_utf8(bytes: Vec<u8>) -> Bson {
@@ -196,6 +260,24 @@ pub fn lossy(bytes: &[u8]) -> Cow<'_, str> {
 /// Whether `v` is a string (BSON type 2), of either form.
 pub fn is_string(v: &Bson) -> bool {
     matches!(v, Bson::String(_)) || as_invalid_utf8(v).is_some()
+}
+
+/// A string's bytes as an error MESSAGE quotes them: itself when UTF-8,
+/// else each byte outside valid UTF-8 as two NULs and its two lowercase hex
+/// digits. The reply writes those bytes back out (`names::message_bytes`),
+/// as mongod quotes them (RM-222). Two NULs, not one, so that a client's own
+/// NUL in a quoted string -- which the escape of a NAME (one NUL) would
+/// collide with -- is left as it is.
+pub fn message_escape(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 8);
+    for chunk in bytes.utf8_chunks() {
+        out.push_str(chunk.valid());
+        for b in chunk.invalid() {
+            out.push_str("\0\0");
+            out.push_str(&format!("{b:02x}"));
+        }
+    }
+    out
 }
 
 /// A field name of these bytes: itself when they are UTF-8, escaped when
@@ -322,6 +404,12 @@ fn read_value(t: u8, rest: &[u8]) -> Result<(Bson, usize), Error> {
         }
         0x03 => Bson::Document(read_doc(v)?),
         0x04 => Bson::Array(read_doc(v)?.into_iter().map(|(_, x)| x).collect()),
+        // JavaScript, a symbol, a regex, a DBPointer or JavaScript with a
+        // scope whose text is not UTF-8: kept as its raw value (RM-222).
+        0x0B..=0x0F => match single(t, v) {
+            Ok(value) => value,
+            Err(_) => raw_text(t, v.to_vec()),
+        },
         _ => single(t, v)?,
     };
     Ok((value, size))
@@ -397,6 +485,11 @@ fn write_element(key: &[u8], v: &Bson, out: &mut Vec<u8>) -> Result<(), bson::se
         out.extend_from_slice(key);
         out.push(0);
     };
+    if let Some((t, raw)) = as_raw_text(v) {
+        head(t, out);
+        out.extend_from_slice(raw);
+        return Ok(());
+    }
     if let Some(bytes) = as_invalid_utf8(v) {
         head(0x02, out);
         out.extend_from_slice(&((bytes.len() + 1) as i32).to_le_bytes());
@@ -627,6 +720,42 @@ mod tests {
                 crate::query::matches(&doc, &filter, &no_vars, None).unwrap(),
                 hit,
                 "{filter}"
+            );
+        }
+    }
+
+    /// RM-222: JavaScript, a symbol, a regex, a DBPointer and JavaScript
+    /// with a scope whose text is not UTF-8 keep their raw value, and report
+    /// their own type.
+    #[test]
+    fn the_other_text_types_keep_their_bytes() {
+        let values: [(u8, &[u8]); 5] = [
+            (0x0D, b"\x02\x00\x00\x00\xff\x00"),
+            (0x0E, b"\x02\x00\x00\x00\xff\x00"),
+            (0x0B, b"\xff\x00i\x00"),
+            (
+                0x0C,
+                b"\x04\x00\x00\x00d.\xff\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            ),
+            (
+                0x0F,
+                b"\x0f\x00\x00\x00\x02\x00\x00\x00\xff\x00\x05\x00\x00\x00\x00",
+            ),
+        ];
+        for (t, value) in values {
+            let mut element = vec![t, b'v', 0];
+            element.extend_from_slice(value);
+            let wire = raw_doc(&element);
+            let doc = from_bytes(&wire).unwrap();
+            assert_eq!(
+                super::as_raw_text(doc.get("v").unwrap()),
+                Some((t, value)),
+                "{t:#x}"
+            );
+            assert_eq!(super::to_vec(&doc).unwrap(), wire, "{t:#x}");
+            assert_eq!(
+                crate::query::bson_type_name(doc.get("v").unwrap()),
+                super::raw_text_type_name(t)
             );
         }
     }

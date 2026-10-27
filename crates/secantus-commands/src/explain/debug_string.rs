@@ -24,6 +24,8 @@ pub(crate) struct CanonicalQuery<'a> {
     pub skip: Option<i64>,
     pub limit: Option<i64>,
     pub collation: Option<&'a Document>,
+    /// A `find`'s `batchSize`, which mongod prints whenever it was given.
+    pub batch_size: Option<i64>,
 }
 
 impl<'a> CanonicalQuery<'a> {
@@ -37,6 +39,7 @@ impl<'a> CanonicalQuery<'a> {
             skip: None,
             limit: None,
             collation: None,
+            batch_size: None,
         }
     }
 
@@ -51,6 +54,11 @@ impl<'a> CanonicalQuery<'a> {
 
     fn render(&self) -> String {
         let mut out = format!("ns={}", self.ns);
+        // mongod 8.2.11: ` batchSize=3 limit=2 skip=1`, a given `batchSize`
+        // printed whatever it is (0 too) (RM-346).
+        if let Some(n) = self.batch_size {
+            out.push_str(&format!(" batchSize={n}"));
+        }
         if let Some(limit) = self.limit.filter(|n| *n != 0) {
             out.push_str(&format!(" limit={}", limit.unsigned_abs()));
         }
@@ -356,9 +364,9 @@ fn leaf(path: &str, op: &str, arg: &Bson, level: usize, out: &mut String) {
 
 /// A value as `BSONElement::toString` prints it without its name.
 pub(crate) fn value(v: &Bson) -> String {
-    // A string that is not UTF-8 (RM-222), each invalid sequence replaced.
+    // A string that is not UTF-8 (RM-222), escaped as a message carries it.
     if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
-        return format!("\"{}\"", crate::bsondoc::lossy(b));
+        return format!("\"{}\"", crate::bsondoc::message_escape(b));
     }
     match v {
         Bson::Double(d) => double(*d),
@@ -678,10 +686,11 @@ mod tests {
             skip: Some(2),
             limit: Some(3),
             collation: None,
+            batch_size: Some(4),
         };
         assert_eq!(
             q.planner_error("x"),
-            "error processing query: ns=ds.c limit=3 skip=2Tree: a $eq 1\nSort: { b: -1, a: 1 }\n\
+            "error processing query: ns=ds.c batchSize=4 limit=3 skip=2Tree: a $eq 1\nSort: { b: -1, a: 1 }\n\
              Proj: {}\n planner returned error :: caused by :: x"
         );
         let simple = doc! {"locale": "simple"};
@@ -693,6 +702,7 @@ mod tests {
             skip: None,
             limit: None,
             collation: Some(&simple),
+            batch_size: None,
         };
         assert!(q
             .planner_error("x")

@@ -23,6 +23,19 @@ fn at(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i128 {
     ((days * 86_400 + h * 3600 + mi * 60 + s) as i128) * 1000
 }
 
+/// RM-222: a date string that is not UTF-8 is parsed as bytes, and the
+/// message quotes them -- escaped here, written back as bytes by the reply
+/// -- one entry per byte, as mongod 8.2.11 does.
+#[test]
+fn a_date_string_that_is_not_utf8_is_parsed_as_bytes() {
+    let err = super::mongo_parse_bytes(b"\xff\xfe").unwrap_err();
+    assert_eq!(
+        err,
+        "Error parsing date string '\u{0}\u{0}ff\u{0}\u{0}fe'; 0: Unexpected character \
+         '\u{0}\u{0}ff'; 1: Unexpected character '\u{0}\u{0}fe'"
+    );
+}
+
 #[test]
 fn error_text_matches_mongod() {
     let err = |s: &str| parse_ms(s).unwrap_err();
@@ -290,7 +303,7 @@ fn cases_carried_over_from_the_old_parser() {
 }
 
 fn format_ms(s: &str, f: &str) -> Result<i128, String> {
-    let mut t = mongo_parse_format(s, f)?;
+    let mut t = mongo_parse_format(s.as_bytes(), f)?;
     update_ts(&mut t);
     Ok(millis(&t).expect("in range") as i128)
 }

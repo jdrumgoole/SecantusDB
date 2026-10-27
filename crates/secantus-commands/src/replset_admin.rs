@@ -8,8 +8,8 @@
 //! standalone. Each command says only what is true of this server:
 //!
 //! - `features` has no `js` block, because there is no script engine.
-//! - There is no plan cache here, so clearing it is true. Index filters are
-//!   `index_filters`.
+//! - `planCacheClear` clears the plan cache `explain::plan_cache` keeps.
+//!   Index filters are `index_filters`.
 //! - `replSetResizeOplog` changes the oplog's cap, and `minRetentionHours`
 //!   keeps every entry younger than it whatever the cap.
 
@@ -506,10 +506,15 @@ fn plan_cache_target(
     Ok(())
 }
 
-/// `planCacheClear`: there is no plan cache to clear.
+/// `planCacheClear`: the collection's plan cache, or one query shape's
+/// entry in it (`explain::plan_cache`).
 pub fn plan_cache_clear(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let command = doc.keys().next().cloned().unwrap_or_default();
     plan_cache_target(doc, &command, ctx)?;
+    if let Some(Bson::String(coll)) = doc.get(&command) {
+        let db = ctx.db_name.clone();
+        crate::explain::plan_cache::clear_command(ctx.storage()?, &db, coll, doc)?;
+    }
     Ok(doc! {"ok": 1.0})
 }
 

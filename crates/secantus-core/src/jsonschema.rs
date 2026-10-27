@@ -120,6 +120,9 @@ fn err(code: i32, msg: impl Into<String>) -> Fallback {
 
 /// The BSON type code of a value.
 fn type_code(v: &Bson) -> i32 {
+    if let Some((t, _)) = crate::bsondoc::as_raw_text(v) {
+        return i32::from(t);
+    }
     if crate::bsondoc::as_invalid_utf8(v).is_some() {
         return 2;
     }

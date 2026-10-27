@@ -246,9 +246,35 @@ pub(crate) struct Registry {
     active: AtomicUsize,
     /// The order side writes are made in.
     seq: AtomicU64,
-    /// Signalled when a build is unregistered.
+    /// Builds unregistered whose last writes (the `config.system.indexBuilds`
+    /// row's delete) are still to come: a waiter waits for those too.
+    finishing: Mutex<Vec<[u8; 16]>>,
+    /// Signalled when a build has finished.
     gone_lock: Mutex<()>,
     gone: Condvar,
+}
+
+/// A build unregistered but not yet finished: dropping it finishes it, on
+/// every path, so a waiter is never left waiting.
+pub(crate) struct Finishing<'a> {
+    registry: &'a Registry,
+    uuid: [u8; 16],
+}
+
+impl Drop for Finishing<'_> {
+    fn drop(&mut self) {
+        self.registry
+            .finishing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|u| u != &self.uuid);
+        let _g = self
+            .registry
+            .gone_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.registry.gone.notify_all();
+    }
 }
 
 impl Registry {
@@ -258,14 +284,32 @@ impl Registry {
         self.active.store(builds.len(), Ordering::Release);
     }
 
-    fn remove(&self, uuid: &[u8; 16]) {
-        {
-            let mut builds = self.builds.write().unwrap_or_else(|e| e.into_inner());
-            builds.retain(|b| &b.uuid != uuid);
-            self.active.store(builds.len(), Ordering::Release);
+    /// Unregister a build: no write records itself for it from here. It
+    /// counts as gone for [`Storage::wait_index_builds_gone`] only when the
+    /// answer is dropped, after the build's last writes.
+    #[must_use]
+    fn remove(&self, uuid: &[u8; 16]) -> Finishing<'_> {
+        self.finishing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(*uuid);
+        let mut builds = self.builds.write().unwrap_or_else(|e| e.into_inner());
+        builds.retain(|b| &b.uuid != uuid);
+        self.active.store(builds.len(), Ordering::Release);
+        Finishing {
+            registry: self,
+            uuid: *uuid,
         }
-        let _g = self.gone_lock.lock().unwrap_or_else(|e| e.into_inner());
-        self.gone.notify_all();
+    }
+
+    /// Whether `uuid` is registered or still finishing.
+    fn pending(&self, uuid: &[u8; 16]) -> bool {
+        self.get(uuid).is_some()
+            || self
+                .finishing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(uuid)
     }
 
     fn get(&self, uuid: &[u8; 16]) -> Option<Arc<ActiveBuild>> {
@@ -631,6 +675,14 @@ impl Storage {
         specs: &[IndexBuildSpec],
         member: &str,
     ) -> Result<()> {
+        // A type this engine does not build is refused before anything is
+        // written, as the one-step build refuses it. The build over documents
+        // (#2191) skipped the check, and a text index came back created.
+        for s in specs {
+            if let Some(refused) = crate::unsupported_index_type(&s.key, &s.options) {
+                return Err(refused);
+            }
+        }
         // The collection exists, with its UUID, before anything is logged.
         self.create_collection(db, coll)?;
         let coll_uuid = self.collection_uuid(db, coll)?;
@@ -773,6 +825,7 @@ impl Storage {
     /// [`Self::abort_index_build`].
     pub fn commit_index_build(&self, uuid: &[u8; 16]) -> Result<()> {
         let b = self.registered_build(uuid)?;
+        let _finishing;
         {
             // Planner writes made here are released once they are visible.
             let _planner = PlannerScope::new();
@@ -820,7 +873,7 @@ impl Storage {
             })?;
             // Unregistered under the collection lock: the next write keys
             // the new indexes through the catalog.
-            self.index_builds.remove(&b.uuid);
+            _finishing = self.index_builds.remove(&b.uuid);
         }
         if self.enable_oplog {
             self.delete_by_id(CONFIG_DB, BUILDS_COLL, &uuid_binary(uuid))?;
@@ -835,6 +888,7 @@ impl Storage {
         let Some(b) = self.index_builds.get(uuid) else {
             return Ok(());
         };
+        let _finishing;
         {
             // Planner writes made here are released once they are visible.
             let _planner = PlannerScope::new();
@@ -842,8 +896,10 @@ impl Storage {
             let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             let ns_lock = self.coll_lock(&b.db, &b.coll);
             let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
-            // No new write records itself for the build from here.
-            self.index_builds.remove(&b.uuid);
+            // No new write records itself for the build from here; a drop
+            // waiting on it goes on only once its row's delete is logged,
+            // as mongod's does.
+            _finishing = self.index_builds.remove(&b.uuid);
             self.discard_build_rows(&b)?;
             self.retry_write_conflicts("abort_index_build", || {
                 let session = self.op_session()?;
@@ -920,7 +976,7 @@ impl Storage {
             .gone_lock
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        while uuids.iter().any(|u| self.index_builds.get(u).is_some()) {
+        while uuids.iter().any(|u| self.index_builds.pending(u)) {
             g = self
                 .index_builds
                 .gone
@@ -1495,7 +1551,7 @@ impl Storage {
             self.index_builds.insert(Arc::clone(&b));
             if !exists {
                 // Its collection is gone: nothing to build, nothing to log.
-                self.index_builds.remove(&uuid);
+                let _finishing = self.index_builds.remove(&uuid);
                 self.discard_build_rows(&b)?;
                 self.forget_build_record(&uuid)?;
                 continue;

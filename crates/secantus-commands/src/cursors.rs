@@ -811,6 +811,37 @@ impl CursorRegistry {
             .retain(|_, e| e.owner.as_ref().is_none_or(|o| o.lsid != lsid));
     }
 
+    /// The sessions that have a cursor open, each once, with the `uid` of
+    /// the user who opened it: what the logical session cache refreshes as
+    /// in use.
+    pub fn sessions(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for e in inner.cursors.values() {
+            if let Some(owner) = &e.owner {
+                if !out.iter().any(|(id, _)| *id == owner.lsid) {
+                    out.push((owner.lsid.clone(), crate::session::user_digest(&e.users)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Kill every cursor of the sessions `lsids`, returning how many: the
+    /// logical session cache closes the cursors of the sessions that ended
+    /// or expired.
+    pub fn kill_sessions(&self, lsids: &std::collections::HashSet<Vec<u8>>) -> usize {
+        if lsids.is_empty() {
+            return 0;
+        }
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let before = inner.cursors.len();
+        inner
+            .cursors
+            .retain(|_, e| e.owner.as_ref().is_none_or(|o| !lsids.contains(&o.lsid)));
+        before - inner.cursors.len()
+    }
+
     /// Kill every cursor whose session `matches(lsid, owner uid)` picks
     /// (`killAllSessionsByPattern`). The owner is the user the cursor was
     /// opened by; a cursor outside any session is left alone.

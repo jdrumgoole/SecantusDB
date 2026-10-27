@@ -151,12 +151,16 @@ pub struct ServerConfig {
     /// The store's directory, as mongod's `MongoDB starting` line names it
     /// (`dbPath`); left out when the embedder does not say.
     pub db_path: Option<String>,
+    /// Server parameters given at startup (mongod's `--setParameter`),
+    /// already checked by `secantus_commands::params::parse_startup_parameter`.
+    pub startup_parameters: Vec<(String, bson::Bson)>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             db_path: None,
+            startup_parameters: Vec::new(),
             replica_set_name: None,
             require_auth: false,
             enable_test_commands: false,
@@ -377,9 +381,23 @@ pub fn bind(
     // new store, so `admin` is always there.
     secantus_commands::cluster_admin::record_initial_fcv(storage.as_ref())
         .map_err(|e| io::Error::other(format!("recording the FCV: {e:?}")))?;
-    // ... and sets up `config.system.sessions`, so `config` is there too.
-    secantus_commands::cluster_admin::record_sessions_collection(storage.as_ref())
-        .map_err(|e| io::Error::other(format!("creating config.system.sessions: {e:?}")))?;
+    let server_params = Arc::new(secantus_commands::params::ServerParams::new());
+    for (name, value) in &config.startup_parameters {
+        server_params.set_startup(name, value.clone());
+    }
+    // ... and sets up `config.system.sessions`, so `config` is there too,
+    // with the session timeout it was started with.
+    secantus_commands::cluster_admin::record_sessions_collection_ttl(
+        storage.as_ref(),
+        secantus_commands::logical_sessions::session_timeout_seconds(&server_params),
+    )
+    .map_err(|e| io::Error::other(format!("creating config.system.sessions: {e:?}")))?;
+    // A replica-set primary keeps its sessions' state in `config.transactions`
+    // and `config.image_collection`, which mongod creates as it steps up.
+    if config.replica_set_name.is_some() {
+        secantus_commands::cluster_admin::record_session_state_collections(storage.as_ref())
+            .map_err(|e| io::Error::other(format!("creating the session collections: {e:?}")))?;
+    }
     // Users stored before they carried a `userId` get one (RM-031).
     secantus_commands::auth::backfill_user_ids(storage.as_ref())
         .map_err(|e| io::Error::other(format!("minting user ids: {e:?}")))?;
@@ -463,7 +481,7 @@ pub fn bind(
         transactions,
         locks,
         failpoints,
-        server_params: Arc::new(secantus_commands::params::ServerParams::new()),
+        server_params,
         step_down: Arc::new(secantus_commands::stepdown::StepDownState::new()),
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         slow_ops: Arc::new(secantus_commands::slowop::SlowOpSettings::new()),
@@ -492,6 +510,7 @@ pub fn bind(
 
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
     let mut reaped = std::time::Instant::now();
+    let mut sessions_refreshed = std::time::Instant::now();
     while !shared.stop.load(Ordering::SeqCst) {
         // A transaction nobody ends is aborted when its lifetime runs out,
         // whether or not another request ever touches the registry: a writer
@@ -499,6 +518,27 @@ fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
         if reaped.elapsed() >= Duration::from_secs(1) {
             reaped = std::time::Instant::now();
             shared.transactions.reap();
+            // mongod's logical session cache refreshes and reaps every
+            // `logicalSessionRefreshMillis`. A failure is logged, as
+            // mongod logs a failed refresh, and the next run tries again.
+            if let Err(e) = secantus_commands::logical_sessions::run_if_due(
+                shared.storage.as_ref(),
+                &shared.server_params,
+                Some(&shared.cursors),
+                Some(&shared.transactions),
+                &mut sessions_refreshed,
+            ) {
+                shared.logs.log(
+                    LogEntry::new(
+                        "W",
+                        "CONTROL",
+                        20710,
+                        "LogicalSessionCacheRefresh",
+                        "Failed to refresh session cache, will try again at the next refresh interval",
+                    )
+                    .attr(doc! {"error": format!("{e:?}")}),
+                );
+            }
         }
         match listener.accept() {
             Ok((stream, _peer)) => {

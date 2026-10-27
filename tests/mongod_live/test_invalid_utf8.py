@@ -454,8 +454,9 @@ def test_field_names_that_are_not_utf8(rust_mongo: Any, mongod: Any) -> None:
 
 def test_a_nul_in_a_name_from_a_string_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """A name held escaped (NUL + hex) must not be forgeable from a string:
-    mongod refuses a NUL in `$setField` (9534700), in a field path (16411)
-    and in `$rename` (9867600)."""
+    mongod refuses a NUL in `$setField` (9534700), a field path (16411,
+    16419 for `$unwind`'s), `$count` (40159), `$unset` (9527900), the
+    stages that name an output field and `$rename` (9867600)."""
 
     def run(client: Any) -> list:
         coll = _fresh(client, [{"_id": 1, "a": 1}])
@@ -463,6 +464,15 @@ def test_a_nul_in_a_name_from_a_string_is_refused(rust_mongo: Any, mongod: Any) 
         for stage in [
             {"$replaceWith": {"$setField": {"field": "a\x00ff", "input": "$$ROOT", "value": 5}}},
             {"$project": {"v": {"$getField": {"field": "a\x00ff", "input": "$$ROOT"}}}},
+            {"$count": "a\x00ff"},
+            {"$lookup": {"from": "c", "localField": "_id", "foreignField": "_id", "as": "a\x00ff"}},
+            {"$unwind": {"path": "$a", "includeArrayIndex": "a\x00ff"}},
+            {"$unwind": "$a\x00ff"},
+            {"$group": {"_id": "$a\x00ff"}},
+            {"$sortByCount": "$a\x00ff"},
+            {"$densify": {"field": "a\x00ff", "range": {"step": 1, "bounds": "full"}}},
+            {"$fill": {"output": {"a": {"value": 1}}, "partitionByFields": ["a\x00ff"]}},
+            {"$unset": "a\x00ff"},
         ]:
             out.append(mongo_answer(lambda s=stage: list(coll.aggregate([s]))))
         try:
@@ -516,6 +526,208 @@ def test_explain_bounds_show_the_bytes(rust_mongo: Any, mongod: Any) -> None:
                 plan = plan["inputStage"]
             out.append(plan.get("indexBounds"))
         return out
+
+    same(run(rust_mongo), run(mongod))
+
+
+def _raw_command(client: Any, db: str, cmd: dict) -> dict:
+    """One command over raw OP_MSG, every `str` (the database and collection
+    names included) by `surrogateescape`; the reply without the fields that
+    differ by run."""
+    import socket
+
+    body = _doc({**cmd, "$db": db})
+    payload = struct.pack("<I", 0) + b"\x00" + body
+    with socket.create_connection(client.address, timeout=30) as s:
+        s.sendall(struct.pack("<iiii", 16 + len(payload), 1, 0, 2013) + payload)
+        head = b""
+        while len(head) < 16:
+            chunk = s.recv(16 - len(head))
+            assert chunk, "the server closed the connection"
+            head += chunk
+        length = struct.unpack("<i", head[:4])[0]
+        data = b""
+        while len(data) < length - 16:
+            data += s.recv(length - 16 - len(data))
+    reply = bson.decode(data[5:], codec_options=SURROGATE)
+    for k in ("$clusterTime", "operationTime", "electionId", "opTime"):
+        reply.pop(k, None)
+    if isinstance(reply.get("cursor"), dict):
+        reply["cursor"].pop("id", None)
+    return reply
+
+
+C = "c\udcff"
+D = "d\udcfe"
+
+
+def test_names_that_are_not_utf8(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 creates, uses, lists, renames and drops a collection or
+    database whose name is not UTF-8; replies, error messages and the oplog
+    carry the name's bytes; a NUL in a name is still refused."""
+
+    def run(client: Any) -> list:
+        db = "rm222names"
+        _raw_command(client, db, {"dropDatabase": 1})
+        _raw_command(client, D, {"dropDatabase": 1})
+        out: list = []
+        say = out.append
+        say(_raw_command(client, db, {"create": C}))
+        say(_raw_command(client, db, {"insert": C, "documents": [{"_id": 1, "s": "x"}]}))
+        say(_raw_command(client, db, {"find": C, "filter": {}}))
+        say(_raw_command(client, db, {"count": C}))
+        listed = _raw_command(client, db, {"listCollections": 1, "nameOnly": True})
+        say(sorted(_text(x["name"]) for x in listed["cursor"]["firstBatch"]))
+        filtered = _raw_command(client, db, {"listCollections": 1, "filter": {"name": C}})
+        say([x["name"] for x in filtered["cursor"]["firstBatch"]])
+        say(_raw_command(client, db, {"listIndexes": C}))
+        say(
+            _raw_command(
+                client,
+                db,
+                {"createIndexes": C, "indexes": [{"key": {"s": 1}, "name": "s_1", "unique": True}]},
+            )
+        )
+        say(_raw_command(client, db, {"insert": C, "documents": [{"_id": 2, "s": "x"}]}))
+        stats = _raw_command(client, db, {"collStats": C})
+        say([stats.get("ns"), stats.get("count")])
+        say(
+            _raw_command(
+                client,
+                db,
+                {
+                    "aggregate": C,
+                    "pipeline": [{"$project": {"r": {"$add": ["$s", 1]}}}],
+                    "cursor": {},
+                },
+            )
+        )
+        plan = _raw_command(
+            client, db, {"explain": {"find": C, "filter": {}}, "verbosity": "queryPlanner"}
+        )
+        say(plan["queryPlanner"]["namespace"])
+        say(
+            _raw_command(
+                client,
+                db,
+                {
+                    "aggregate": C,
+                    "pipeline": [
+                        {
+                            "$lookup": {
+                                "from": C,
+                                "localField": "_id",
+                                "foreignField": "_id",
+                                "as": "j",
+                            }
+                        }
+                    ],
+                    "cursor": {},
+                },
+            )
+        )
+        say(_raw_command(client, "admin", {"renameCollection": f"{db}.{C}", "to": f"{db}.r\udcfd"}))
+        listed = _raw_command(client, db, {"listCollections": 1, "nameOnly": True})
+        say(sorted(_text(x["name"]) for x in listed["cursor"]["firstBatch"]))
+        entries = _raw_command(
+            client,
+            "local",
+            {"find": "oplog.rs", "filter": {"op": "c", "o.renameCollection": f"{db}.{C}"}},
+        )
+        say([[e["ns"], e["o"]] for e in entries["cursor"]["firstBatch"]])
+        say(_raw_command(client, db, {"insert": "a\x00b", "documents": [{}]}))
+        say(_raw_command(client, db, {"create": "x$\udcff"}))
+        say(_raw_command(client, D, {"insert": "t", "documents": [{"_id": 1}]}))
+        say(_raw_command(client, D, {"find": "t", "filter": {}}))
+        dbs = _raw_command(client, "admin", {"listDatabases": 1, "nameOnly": True})
+        say(_text(D) in [_text(x["name"]) for x in dbs["databases"]])
+        say(_raw_command(client, D, {"insert": "t", "documents": [{"_id": 1}]}))
+        say(_raw_command(client, db, {"drop": "r\udcfd"}))
+        say(_raw_command(client, D, {"dropDatabase": 1}))
+        dbs = _raw_command(client, "admin", {"listDatabases": 1, "nameOnly": True})
+        say(_text(D) in [_text(x["name"]) for x in dbs["databases"]])
+        return out
+
+    same(run(rust_mongo), run(mongod_rs))
+
+
+def test_change_streams_on_names_that_are_not_utf8(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 refuses a stream on such a collection or database with
+    PCRE2's verdict on its namespace regex (51091), and a database stream
+    shows no event for such a collection."""
+
+    def run(client: Any) -> list:
+        db = "rm222streams"
+        _raw_command(client, db, {"dropDatabase": 1})
+        _raw_command(client, db, {"create": "plain"})
+        out = []
+        for coll in ["r\udcfd", "q\udcc3"]:
+            r = _raw_command(
+                client, db, {"aggregate": coll, "pipeline": [{"$changeStream": {}}], "cursor": {}}
+            )
+            out.append([r.get("code"), r.get("errmsg")])
+        r = _raw_command(
+            client, D, {"aggregate": 1, "pipeline": [{"$changeStream": {}}], "cursor": {}}
+        )
+        out.append([r.get("code"), r.get("errmsg")])
+        coll = client.get_database(db, codec_options=SURROGATE).plain
+        with coll.database.watch() as stream:
+            _raw_command(client, db, {"insert": "r\udcfd", "documents": [{"_id": 9}]})
+            coll.insert_one({"_id": 10})
+            events = []
+            deadline = time.monotonic() + 10
+            while len(events) < 1 and time.monotonic() < deadline:
+                ev = stream.try_next()
+                if ev is not None:
+                    events.append([ev["operationType"], ev["ns"], ev["documentKey"]])
+        out.append(events)
+        return out
+
+    same(run(rust_mongo), run(mongod_rs))
+
+
+@pytest.mark.parametrize(
+    "expr",
+    [
+        {"$toInt": "$s"},
+        {"$toDouble": "$s"},
+        {"$toObjectId": "$s"},
+        {"$toDate": "$s"},
+        {"$dateFromString": {"dateString": "$s"}},
+    ],
+    ids=["toInt", "toDouble", "toObjectId", "toDate", "dateFromString"],
+)
+def test_error_messages_quote_the_bytes(rust_mongo: Any, mongod: Any, expr: dict) -> None:
+    """mongod 8.2.11 quotes the string's own bytes in the message, and counts
+    an ObjectId's length in bytes."""
+    same(_per_shape(rust_mongo, "$project", expr), _per_shape(mongod, "$project", expr))
+
+
+OTHER_TEXT = {
+    "javascript": b"\x0dv\x00\x02\x00\x00\x00\xff\x00",
+    "symbol": b"\x0ev\x00\x02\x00\x00\x00\xff\x00",
+    "regex": b"\x0bv\x00\xff\x00i\x00",
+    "dbPointer": b"\x0cv\x00\x04\x00\x00\x00d.\xff\x00" + b"\x00" * 12,
+    "javascriptWithScope": b"\x0fv\x00\x0f\x00\x00\x00\x02\x00\x00\x00\xff\x00\x05\x00\x00\x00\x00",
+}
+
+
+@pytest.mark.parametrize("element", list(OTHER_TEXT.values()), ids=list(OTHER_TEXT))
+def test_the_other_text_types_keep_their_bytes(
+    rust_mongo: Any, mongod: Any, element: bytes
+) -> None:
+    """mongod 8.2.11 stores and returns JavaScript, a symbol, a regex, a
+    DBPointer and JavaScript with a scope whose text is not UTF-8."""
+
+    def run(client: Any) -> list:
+        db = _db(client)
+        db.drop_collection("t")
+        body = b"\x10_id\x00" + struct.pack("<i", 1) + element
+        document = RawBSONDocument(struct.pack("<i", len(body) + 5) + body + b"\x00")
+        db.command("insert", "t", documents=[document], codec_options=SURROGATE)
+        stored = client.get_database("rm222", codec_options=RAW).t.find_one({})
+        typed = list(db.t.aggregate([{"$project": {"_id": 0, "t": {"$type": "$v"}}}]))
+        return [stored.raw, typed]
 
     same(run(rust_mongo), run(mongod))
 

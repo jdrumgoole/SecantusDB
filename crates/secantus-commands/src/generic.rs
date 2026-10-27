@@ -421,6 +421,8 @@ pub fn db_field_problem(request: &Document) -> Option<Document> {
     let path = format!("{}.$db", struct_name(command));
     match request.get("$db") {
         Some(Bson::String(_)) => None,
+        // A database name that is not UTF-8 is a string (RM-222).
+        Some(v) if crate::bsondoc::as_invalid_utf8(v).is_some() => None,
         None | Some(Bson::Null) => Some(missing(&path).into_reply()),
         Some(v) => Some(wrong_type(&path, v, "type 'string'").into_reply()),
     }
