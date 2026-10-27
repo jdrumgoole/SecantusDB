@@ -1091,15 +1091,37 @@ without a Terminate, and counted a terminated one only once its client
 closed the socket) was found and fixed in the same batch; its test there is
 a regression test.
 
-- [ ] **The system catalogs' counters stay at zero.** `pg_stat_sys_tables`
-      and `pg_statio_sys_*` list every catalog, but this server's catalogs
-      are computed, not scanned, so nothing counts a read of `pg_class`;
-      PostgreSQL 15.19 counts every catalog scan a statement or a new
-      session's cache makes (`pg_class` rose by 13 for one new session that
-      ran one query). Modelling them means counting the catalog lookups
-      PostgreSQL's syscache and relcache make, which follow its own caching.
-      Backlog-ID: RP-225
-      Verify: tests/backlog/test_rp_batch55.py::test_scenario[a new session's catalog reads are counted]
+- [ ] **Some statements' catalog reads are not counted.** Since RP-225 a
+      statement's catalog scans are walked as PostgreSQL 15.19's syscache,
+      relcache and planner make them (`catalog_reads.rs`, over the
+      per-session caches in `catcache.rs`), but not for: DDL's own reads
+      (ALTER, DROP, CREATE INDEX; CREATE TABLE checks names only), the rule
+      queries of system views (`pg_stat_*`), psql's `\d` pattern query
+      (regex prefix as an index condition, `pg_table_is_visible` per row,
+      `get_actual_variable_range`), subqueries, CTEs, windows, PL/pgSQL
+      bodies, and texts over 64 KiB. Measured: `\d` 91 counters match, 29
+      differ; a `pg_stat_*` view 53 match, 61 differ.
+      Backlog-ID: RP-290
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ALTER TABLE's own catalog reads], tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+- [ ] **A catalog read counts no blocks** in `pg_statio_sys_*`: the scans
+      are counted (RP-225), the buffers they hit or read are not.
+      Backlog-ID: RP-291
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
+- [ ] **The first backend after a start is counted as a warm one.**
+      PostgreSQL serves it without the relcache init files (about 245
+      `pg_attribute` index scans, `pg_class` heap scans, ...); the model
+      treats every backend as starting with them. Separating the shared
+      and local cold costs needs an instrumented PostgreSQL.
+      Backlog-ID: RP-292
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
+- [ ] **`pg_class.relnatts` leaves out dropped columns** (1 where 15.19
+      says 2 after a DROP COLUMN).
+      Backlog-ID: RP-293
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_found[relnatts counts dropped columns]
+- [ ] **`proargtypes::regtype[]` is refused** ("cannot cast int4 to
+      regtype[]"); 15.19 returns `[0:0]={text}`.
+      Backlog-ID: RP-294
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_found[an oidvector casts to regtype[]]
 
 ## Found by batch 54 (2026-10-24)
 
