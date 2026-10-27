@@ -36,7 +36,6 @@ pub(crate) mod stream;
 pub(crate) mod summary;
 mod trial;
 
-pub(crate) use plan::{planning_scope, planning_spent};
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
 use bson::{doc, Bson, Document};
@@ -45,6 +44,7 @@ pub(crate) use node::IndexInfo;
 pub(crate) use node::Node;
 use node::{num, Stats};
 pub(crate) use parsed::parsed_query;
+pub(crate) use plan::{planning_scope, planning_spent};
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
 use secantus_core::query::bson_type_name;
@@ -665,6 +665,23 @@ fn cache_view(
         .filter(|e| e.active)
         .map(|e| e.solution);
     Some(CacheView { key, active })
+}
+
+/// The plan cache key mongod builds for the query `s` plans, as a `Slow
+/// query` line prints it: `(planCacheShapeHash, planCacheKey)` in hex.
+pub(crate) fn cache_hashes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> Option<(String, String)> {
+    let canonical = parsed::parsed_query(&s.filter);
+    let view = cache_view(storage, db, s, &canonical, collation, pipeline)?;
+    Some((
+        cache_key::hex(view.key.shape_hash),
+        cache_key::hex(view.key.key_hash),
+    ))
 }
 
 fn query_planner(

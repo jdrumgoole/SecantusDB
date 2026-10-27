@@ -950,7 +950,12 @@ pub fn operation_locks(extra_global_is: bool) -> bson::Document {
         }
     }
     let mut kinds: Vec<&'static str> = rows.iter().map(|r| r.0).collect();
-    kinds.sort_by_key(|k| KIND_ORDER.iter().position(|o| o == k).unwrap_or(KIND_ORDER.len()));
+    kinds.sort_by_key(|k| {
+        KIND_ORDER
+            .iter()
+            .position(|o| o == k)
+            .unwrap_or(KIND_ORDER.len())
+    });
     kinds.dedup();
     let mut out = bson::Document::new();
     for kind in kinds {

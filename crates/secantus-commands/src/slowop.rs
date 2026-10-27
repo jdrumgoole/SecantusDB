@@ -158,6 +158,9 @@ fn outcome(name: &str, reply: &Document, out: &mut Document) {
         failure(reply, out);
         return;
     }
+    if matches!(name, "findAndModify" | "findandmodify") {
+        return;
+    }
     if name == "insert" {
         let n = match reply.get("n") {
             Some(bson::Bson::Int32(n)) => Some(i64::from(*n)),
@@ -221,10 +224,14 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
     let coll = target_collection(name, request).unwrap_or("$cmd");
-    out.insert(
-        "collectionType",
-        crate::opdebug::collection_type(ctx, &ctx.db_name, coll),
-    );
+    // mongod names the namespace's kind as the operation found it: what a
+    // `create` creates was not there.
+    let kind = if name == "create" {
+        "normal"
+    } else {
+        crate::opdebug::collection_type(ctx, &ctx.db_name, coll)
+    };
+    out.insert("collectionType", kind);
     let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
     let exec = ctx.exec_stats.as_ref().filter(|_| ok);
     if ok {
@@ -233,12 +240,27 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
         if let Some(command) = exec.and_then(|e| e.originating_command.clone()) {
             out.insert("originatingCommand", command_shown(&command));
         }
-        let summary = exec
-            .and_then(|e| e.plan_summary.clone())
-            .or_else(|| crate::explain::summary::plan_summary(request, ctx));
+        // A `getMore`'s plan is its cursor's, planned for the command that
+        // opened it.
+        let shaped = crate::opdebug::planned_request(request);
+        let planned = exec
+            .and_then(|e| e.originating_command.as_ref())
+            .unwrap_or(shaped.as_ref());
+        let info = crate::explain::summary::plan_info(planned, ctx);
+        let summary = exec.and_then(|e| e.plan_summary.clone()).or(info.summary);
         if let Some(summary) = summary {
             out.insert("planSummary", summary);
         }
+        if let Some((shape, key)) = info.hashes {
+            out.insert("planCacheShapeHash", shape.clone());
+            out.insert("queryHash", shape);
+            out.insert("planCacheKey", key);
+        }
+        // A `findAndModify` prints no engine (measured 8.2.11).
+        if let (Some(framework), false) = (info.framework, name.eq_ignore_ascii_case("findAndModify")) {
+            out.insert("queryFramework", framework);
+        }
+        spills(exec.is_some_and(|e| e.has_sort_stage), &mut out);
         if let (true, Some(micros)) = (plans(name), ctx.planning_micros) {
             out.insert("planningTimeMicros", micros);
         }
@@ -249,7 +271,13 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             }
             out.insert("keysExamined", e.keys_examined);
             out.insert("docsExamined", e.docs_examined);
-            if matches!(name, "find" | "getMore") {
+            // A `find` of a view or a time-series collection runs as an
+            // `aggregate`, which counts no batches.
+            let as_aggregate = matches!(
+                out.get_str("collectionType"),
+                Ok("view") | Ok("timeseries")
+            );
+            if matches!(name, "find" | "getMore") && !as_aggregate {
                 out.insert("nBatches", 1_i64);
             }
             if e.exhausted {
@@ -267,10 +295,29 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
                 .ok()
                 .map(|b| b.len() as i64)
         };
+        if matches!(name, "findAndModify" | "findandmodify") {
+            // What it matched and changed, as its profile entry has it.
+            let last = reply.get_document("lastErrorObject").ok();
+            let n = last
+                .and_then(|l| crate::util::as_i64(l.get("n")?))
+                .unwrap_or(0);
+            if crate::util::truthy(request.get("remove").unwrap_or(&bson::Bson::Null)) {
+                out.insert("ndeleted", n);
+            } else {
+                let upserted = last.is_some_and(|l| l.contains_key("upserted"));
+                out.insert("nMatched", if upserted { 0 } else { n });
+                out.insert("nModified", ctx.modified.unwrap_or(0));
+                out.insert("nUpserted", i64::from(upserted));
+            }
+        }
         let returned = match name {
             "find" | "aggregate" | "getMore" => batch(),
             "count" => Some(1),
             "distinct" => reply.get_array("values").ok().map(|v| v.len() as i64),
+            "findAndModify" | "findandmodify" => Some(i64::from(!matches!(
+                reply.get("value"),
+                None | Some(bson::Bson::Null)
+            ))),
             _ => None,
         };
         if let Some(n) = returned {
@@ -293,8 +340,18 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     out.insert("reslen", response_length(reply, ctx));
     out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
     out.insert("readConcern", crate::opdebug::read_concern(request));
-    if crate::opdebug::takes_write_concern(name) {
-        out.insert("writeConcern", crate::opdebug::write_concern(request, ctx));
+    // A `getMore` runs under the write concern of the `aggregate` that
+    // opened its cursor.
+    let concerned = match ctx
+        .exec_stats
+        .as_ref()
+        .and_then(|e| e.originating_command.as_ref())
+    {
+        Some(origin) if name == "getMore" => Some(origin),
+        _ => crate::opdebug::takes_write_concern(name).then_some(request),
+    };
+    if let Some(origin) = concerned.filter(|o| crate::opdebug::has_write_concern(o)) {
+        out.insert("writeConcern", crate::opdebug::write_concern(origin, ctx));
     }
     if let Some(storage) = ctx
         .op_counts
@@ -308,6 +365,38 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     }
     out.insert("protocol", if ctx.op_query { "op_query" } else { "op_msg" });
     out
+}
+
+/// What the operation's sorts and groups did with memory (RM-211, RM-315):
+/// `hasSortStage` when its plan sorts in memory, `usedDisk` when a stage
+/// spilled, and the spills' counts. mongod's names; this server's spills.
+pub(crate) fn spills(has_sort_stage: bool, out: &mut Document) {
+    let spilled = secantus_core::memlimit::report();
+    if has_sort_stage || spilled.has_sort_stage {
+        out.insert("hasSortStage", true);
+    }
+    if spilled.used_disk {
+        out.insert("usedDisk", true);
+    }
+    if spilled.sort_spills > 0 {
+        out.insert("sortSpills", spilled.sort_spills);
+        out.insert("sortSpilledBytes", spilled.sort_spilled_bytes);
+        out.insert("sortSpilledRecords", spilled.sort_spilled_records);
+        out.insert(
+            "sortSpilledDataStorageSize",
+            spilled.sort_spilled_data_storage_size,
+        );
+        out.insert("sortTotalDataSizeBytes", spilled.sort_total_data_size);
+    }
+    if spilled.group_spills > 0 {
+        out.insert("groupSpills", spilled.group_spills);
+        out.insert("groupSpilledBytes", spilled.group_spilled_bytes);
+        out.insert("groupSpilledRecords", spilled.group_spilled_records);
+        out.insert(
+            "groupSpilledDataStorageSize",
+            spilled.group_spilled_data_storage_size,
+        );
+    }
 }
 
 /// The size of the reply on the wire, its document batch included: the

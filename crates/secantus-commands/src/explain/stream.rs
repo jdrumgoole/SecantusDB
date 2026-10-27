@@ -46,7 +46,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
-use bson::{Bson, Document};
+use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use secantus_core::heap::{Heap, HeapOrder};
 use secantus_core::sortkey::{self, COMPOUND_SEP};
@@ -91,6 +91,16 @@ pub(crate) struct Batch {
     pub docs_examined: i64,
 }
 
+/// A read made whole ([`Stream::read_all`]).
+#[derive(Default)]
+pub(crate) struct ReadAll {
+    pub docs: Vec<Vec<u8>>,
+    pub rids: Vec<i64>,
+    pub keys: Vec<Option<Document>>,
+    pub keys_examined: i64,
+    pub docs_examined: i64,
+}
+
 /// What a read beyond the plan asks of the stream.
 #[derive(Default)]
 pub(crate) struct Options<'a> {
@@ -102,6 +112,9 @@ pub(crate) struct Options<'a> {
     pub max: Option<&'a Document>,
     /// The command's collation, which a sort of index keys compares under.
     pub collation: Option<&'a Collation>,
+    /// A blocking sort's memory budget and whether it may spill to disk
+    /// (`allowDiskUse`), held to as mongod's `SORT` holds to it (RM-315).
+    pub sort_budget: Option<(secantus_core::memlimit::Budgets, bool)>,
 }
 
 /// What a scan knows of its index.
@@ -231,6 +244,13 @@ struct IndexScan {
     /// keys, and the last such run returned.
     distinct: Option<usize>,
     run: Option<Vec<Vec<u8>>>,
+    /// A COUNT_SCAN: mongod's counts the call that finds its end as a key
+    /// examined, whether or not the index holds a key past the bounds
+    /// (`CountScan::doWork` counts before it looks; measured 8.2.11: a
+    /// count of `{x: {$gt: 3}}` over keys 0 to 11 examines 9).
+    count_scan: bool,
+    /// The end has been counted.
+    ended: bool,
 }
 
 /// What one unit of an index scan's work did.
@@ -498,7 +518,13 @@ impl IndexScan {
             match self.work(cx)? {
                 Step::Entry(m) => return Ok(Some(m)),
                 Step::Seek => continue,
-                Step::End => return Ok(None),
+                Step::End => {
+                    if self.count_scan && !self.ended {
+                        self.ended = true;
+                        cx.keys += 1;
+                    }
+                    return Ok(None);
+                }
             }
         }
     }
@@ -672,6 +698,13 @@ impl Merge {
 
 /// A stage of the plan, as the stream runs it.
 enum Stage {
+    /// A point read through a unique index (`EXPRESS_IXSCAN`, `IDHACK`):
+    /// the one document whose key is the value, one key and one document
+    /// examined when it is there, none when it is not.
+    Point {
+        filter: Document,
+        done: bool,
+    },
     Coll(CollScan),
     Ix(Box<IndexScan>),
     /// Reads each document: `counted` unless the plan is covered. The
@@ -707,11 +740,103 @@ enum Stage {
         /// mongod's sort compares them whatever the index's collation.
         collation: Option<Collation>,
     },
+    /// A blocking sort of whole documents above the FETCH: every document
+    /// read, and examined, for the first batch, then sorted -- documents
+    /// that compare equal in the order they came -- and handed out as each
+    /// batch asks, as they were read (mongod's `SORT` holds them).
+    SortDocs {
+        pattern: Document,
+        limit: Option<i64>,
+        input: Box<Stage>,
+        sorted: Option<VecDeque<Member>>,
+        collation: Option<Collation>,
+        budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+    },
+}
+
+/// Sort `all` by `pattern` as mongod's `SORT` does, holding it to its
+/// memory budget (a sort past it without `allowDiskUse` is refused, 292)
+/// and keeping documents that compare equal in the order they came.
+fn sort_members(
+    cx: &Cx,
+    all: Vec<Member>,
+    pattern: &Document,
+    limit: Option<i64>,
+    collation: Option<&Collation>,
+    budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+) -> Result<VecDeque<Member>, StorageError> {
+    let top = limit.filter(|n| *n > 0).map(|n| n as usize);
+    if let Some((budgets, disk)) = budget {
+        let _disk = secantus_core::memlimit::allow_disk_use(disk);
+        let _budgets = secantus_core::memlimit::with_budgets(budgets);
+        let decoded: Vec<Document> = all
+            .iter()
+            .filter_map(|m| m.doc.as_deref())
+            .map(|b| secantus_core::bsondoc::from_bytes(b).map_err(undecodable))
+            .collect::<Result<_, _>>()?;
+        let sizing = secantus_core::sorter::Sizing {
+            source: secantus_core::sorter::SortSource::QueryLayer,
+            fields: None,
+            budget: budgets.sort,
+            added: None,
+        };
+        secantus_core::sorter::sort_documents(
+            decoded,
+            &Bson::Document(pattern.clone()),
+            &sizing,
+            top,
+        )
+        .map_err(|f| match f.as_mongo() {
+            Some((code, msg)) => StorageError::WriteError {
+                code,
+                errmsg: msg.to_string(),
+                exec: true,
+            },
+            None => fault(f),
+        })?;
+    }
+    let blobs: Vec<&[u8]> = all
+        .iter()
+        .map(|m| m.doc.as_deref().unwrap_or(&[]))
+        .collect();
+    let (order, _) = cx.storage.sort_permutation(&blobs, pattern, collation)?;
+    let mut slots: Vec<Option<Member>> = all.into_iter().map(Some).collect();
+    let mut out: VecDeque<Member> = order
+        .into_iter()
+        .filter_map(|at| slots.get_mut(at).and_then(Option::take))
+        .collect();
+    if let Some(n) = top {
+        out.truncate(n);
+    }
+    Ok(out)
 }
 
 impl Stage {
     fn next(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
         match self {
+            Stage::Point { filter, done } => {
+                if *done {
+                    return Ok(None);
+                }
+                *done = true;
+                let Some(matched) = cx
+                    .storage
+                    .matching_rows(cx.db, cx.coll, filter, None, None, cx.vars)?
+                else {
+                    return Err(StorageError::Internal("this store cannot stream".into()));
+                };
+                let Some((rid, blob)) = matched.rows.into_iter().next() else {
+                    return Ok(None);
+                };
+                cx.keys += 1;
+                cx.docs += 1;
+                Ok(Some(Member {
+                    rid,
+                    doc: Some(blob),
+                    entry: None,
+                    stale: false,
+                }))
+            }
             Stage::Coll(scan) => scan.next(cx),
             Stage::Ix(scan) => scan.next(cx),
             Stage::Fetch {
@@ -845,6 +970,37 @@ impl Stage {
                 }
                 Ok(sorted.as_mut().and_then(VecDeque::pop_front))
             }
+            Stage::SortDocs {
+                pattern,
+                limit,
+                input,
+                sorted,
+                collation,
+                budget,
+            } => {
+                if sorted.is_none() {
+                    let mut all: Vec<Member> = Vec::new();
+                    while let Some(mut m) = input.next(cx)? {
+                        if m.doc.is_none() {
+                            // Read to sort, by a stage below that did not.
+                            match cx.read(m.rid)? {
+                                Some(blob) => m.doc = Some(blob),
+                                None => continue,
+                            }
+                        }
+                        all.push(m);
+                    }
+                    *sorted = Some(sort_members(
+                        cx,
+                        all,
+                        pattern,
+                        *limit,
+                        collation.as_ref(),
+                        *budget,
+                    )?);
+                }
+                Ok(sorted.as_mut().and_then(VecDeque::pop_front))
+            }
         }
     }
 
@@ -874,6 +1030,7 @@ impl Stage {
 
     fn yield_children(&mut self) {
         match self {
+            Stage::Point { .. } => {}
             Stage::Coll(scan) => {
                 scan.buf.clear();
                 scan.end = false;
@@ -896,6 +1053,19 @@ impl Stage {
                     m.stale = m.doc.is_none();
                 }
             }
+            // The sorted documents are held as they were read.
+            Stage::SortDocs { input, .. } => input.yield_children(),
+        }
+    }
+
+    /// Whether the plan sorts in memory: mongod's `hasSortStage`.
+    fn sorts(&self) -> bool {
+        match self {
+            Stage::SortKeys { .. } | Stage::SortDocs { .. } => true,
+            Stage::Point { .. } | Stage::Coll(_) | Stage::Ix(_) => false,
+            Stage::Fetch { input, .. } | Stage::Skip { input, .. } => input.sorts(),
+            Stage::Or { inputs, .. } => inputs.iter().any(Stage::sorts),
+            Stage::Merge(merge) => merge.inputs.iter().any(Stage::sorts),
         }
     }
 }
@@ -1019,6 +1189,8 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         seen: HashSet::new(),
         distinct: None,
         run: None,
+        count_scan: false,
+        ended: false,
     }))
 }
 
@@ -1042,6 +1214,19 @@ fn stage_of(
         Ok(index_scan(ix, opts)?.map(|s| Stage::Ix(Box::new(s))))
     };
     let stage = match node {
+        Node::Express { index, value } => {
+            let Some(field) = index.key.keys().next() else {
+                return Ok(None);
+            };
+            Some(Stage::Point {
+                filter: doc! { field.clone(): { "$eq": value.clone() } },
+                done: false,
+            })
+        }
+        Node::IdHack(value) => Some(Stage::Point {
+            filter: doc! { "_id": { "$eq": value.clone() } },
+            done: false,
+        }),
         Node::CollScan { backward, .. } => Some(Stage::Coll(CollScan {
             after: None,
             backward: *backward,
@@ -1212,6 +1397,9 @@ pub(crate) struct Stream {
     docs: i64,
     /// The key each result was found at is asked for.
     want_keys: bool,
+    /// A COUNT_SCAN: results are index entries, counted without their
+    /// documents.
+    keys_only: bool,
 }
 
 impl Stream {
@@ -1266,6 +1454,40 @@ impl Stream {
             }
         }
         let command = (!filter.is_empty()).then(|| filter.clone());
+        // A blocking sort of documents at the top sorts what the plan below
+        // it returns, whose topmost FETCH matches the command's filter.
+        if let Node::Sort {
+            pattern,
+            limit: sort_limit,
+            on_keys: false,
+            input,
+        } = node
+        {
+            let Some(mut below) = Stream::of_plan_with(input, db, coll, filter, vars, opts)? else {
+                return Ok(None);
+            };
+            let inner = std::mem::replace(
+                &mut below.root,
+                Stage::Coll(CollScan {
+                    after: None,
+                    backward: false,
+                    filter: None,
+                    buf: VecDeque::new(),
+                    end: true,
+                }),
+            );
+            below.root = Stage::SortDocs {
+                pattern: pattern.clone(),
+                limit: *sort_limit,
+                input: Box::new(inner),
+                sorted: None,
+                collation: opts.collation.cloned(),
+                budget: opts.sort_budget,
+            };
+            below.skip = skip;
+            below.limit = limit;
+            return Ok(Some(below));
+        }
         // The topmost FETCH (or the collection scan) matches the command's
         // filter; a bare scan at the top is wrapped in a reading FETCH.
         let top = match node {
@@ -1310,7 +1532,85 @@ impl Stream {
             keys: 0,
             docs: 0,
             want_keys: opts.keys,
+            keys_only: false,
         }))
+    }
+
+    /// The read of a `count`'s plan below its COUNT stage (`input`), when it
+    /// streams: a COUNT_SCAN reads index entries alone, anything else as a
+    /// `find` of the same plan reads.
+    pub(crate) fn of_count(
+        input: &Node,
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        vars: &Document,
+        opts: &Options,
+    ) -> Result<Option<Stream>, StorageError> {
+        let Node::CountScan(ix) = input else {
+            return Stream::of_plan_with(input, db, coll, filter, vars, opts);
+        };
+        if !streams(ix) {
+            return Ok(None);
+        }
+        let Some(mut scan) = index_scan(ix, opts)? else {
+            return Ok(None);
+        };
+        scan.count_scan = true;
+        Ok(Some(Stream {
+            db: db.to_string(),
+            coll: coll.to_string(),
+            root: Stage::Ix(Box::new(scan)),
+            vars: vars.clone(),
+            skip: 0,
+            limit: None,
+            stashed: VecDeque::new(),
+            done: false,
+            keys: 0,
+            docs: 0,
+            want_keys: false,
+            keys_only: true,
+        }))
+    }
+
+    /// Run a `count` over the read: how many results there are after
+    /// `skip`, up to `limit` (0: no limit), and what reading them examined.
+    /// mongod's COUNT stops reading at its limit.
+    pub(crate) fn count(
+        &mut self,
+        storage: &dyn Storage,
+        skip: i64,
+        limit: i64,
+    ) -> Result<(i64, i64, i64), StorageError> {
+        self.skip = skip.max(0);
+        self.limit = (limit > 0).then_some(limit);
+        let (mut n, mut keys, mut docs) = (0i64, 0i64, 0i64);
+        loop {
+            let batch = self.batch(storage, CHUNK, usize::MAX, false)?;
+            n += batch.docs.len() as i64;
+            keys += batch.keys_examined;
+            docs += batch.docs_examined;
+            if batch.exhausted {
+                return Ok((n, keys, docs));
+            }
+        }
+    }
+
+    /// Every result of the read, with each one's RecordId, and what reading
+    /// them examined: a read made whole, as a write's or a `distinct`'s is.
+    pub(crate) fn read_all(&mut self, storage: &dyn Storage) -> Result<ReadAll, StorageError> {
+        let mut out = ReadAll::default();
+        loop {
+            let batch = self.batch(storage, CHUNK, usize::MAX, false)?;
+            out.keys_examined += batch.keys_examined;
+            out.docs_examined += batch.docs_examined;
+            out.rids.extend(batch.rids);
+            out.docs.extend(batch.docs);
+            out.keys.extend(batch.keys);
+            if batch.exhausted {
+                return Ok(out);
+            }
+        }
     }
 
     /// The plan reads one index scan (or none): mongod gives a document's
@@ -1319,14 +1619,20 @@ impl Stream {
         fn scans(stage: &Stage) -> usize {
             match stage {
                 Stage::Coll(_) => 0,
-                Stage::Ix(_) => 1,
+                Stage::Ix(_) | Stage::Point { .. } => 1,
                 Stage::Fetch { input, .. } | Stage::Skip { input, .. } => scans(input),
                 Stage::Or { inputs, .. } => inputs.iter().map(scans).sum(),
                 Stage::Merge(merge) => merge.inputs.iter().map(scans).sum(),
-                Stage::SortKeys { input, .. } => scans(input),
+                Stage::SortKeys { input, .. } | Stage::SortDocs { input, .. } => scans(input),
             }
         }
         scans(&self.root) <= 1
+    }
+
+    /// Whether the plan sorts in memory: mongod's `hasSortStage`, which a
+    /// cursor's every batch reports.
+    pub(crate) fn has_sort_stage(&self) -> bool {
+        self.root.sorts()
     }
 
     /// Up to `want` results that pass the filter (`want` 0: no count
@@ -1356,8 +1662,11 @@ impl Stream {
                     self.done = true;
                     break;
                 };
-                let Some(doc) = m.doc else {
-                    continue;
+                let doc = match m.doc {
+                    Some(doc) => doc,
+                    // A COUNT_SCAN's result is its entry.
+                    None if self.keys_only => Vec::new(),
+                    None => continue,
                 };
                 bytes += doc.len();
                 out.push(Found {

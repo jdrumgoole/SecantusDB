@@ -141,6 +141,8 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A view has no rows of its own: its documents are its pipeline's output
     // over the collection it is defined on. Reading the view's own (empty)
     // storage answered `[]` for every `distinct` on a view.
+    // What the plan examined as it read (RM-023).
+    let mut examined: Option<(i64, i64)> = None;
     let mut values: Vec<Bson> = if on_view {
         crate::views::check_hint(storage, &ctx.db_name, &coll, hint, &filter)?;
         if crate::notablescan::enabled(ctx) {
@@ -208,8 +210,16 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             crate::util::read_error_on_namespace(e, "distinct", &format!("{}.{coll}", ctx.db_name))
         };
         // A plan that is a DISTINCT_SCAN answers from the index's keys.
-        let scanned =
-            crate::explain::distinct::scan_values(storage, &ask, &key).map_err(read_error)?;
+        let streamed = streamed_values(storage, &ask, &key).map_err(read_error)?;
+        let scanned = match streamed {
+            Some((values, keys, docs)) => {
+                examined = Some((keys, docs));
+                Some(values)
+            }
+            None => {
+                crate::explain::distinct::scan_values(storage, &ask, &key).map_err(read_error)?
+            }
+        };
         let values = match scanned {
             Some(values) => values,
             None => {
@@ -244,7 +254,68 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // `ok` as an int32 there, where a collection's is a double.
         return Ok(doc! { "values": values, "ok": 1_i32 });
     }
+    if let Some((keys_examined, docs_examined)) = examined {
+        ctx.exec_stats = Some(crate::ExecStats {
+            keys_examined,
+            docs_examined,
+            ..Default::default()
+        });
+    }
     Ok(doc! { "values": values, "ok": 1.0 })
+}
+
+/// The values of `key`, read as mongod's plan for the `distinct` reads them
+/// (RM-023), with the keys and documents it examined: a DISTINCT_SCAN's
+/// from its keys (or, through a collated index, from the first document of
+/// each), any other plan's from the documents it returns. `None`: the plan
+/// is not one a stream runs, and the values are read as before.
+fn streamed_values(
+    storage: &dyn crate::Storage,
+    ask: &crate::explain::order::Ask,
+    key: &str,
+) -> Result<Option<(Vec<Bson>, i64, i64)>, crate::storage::StorageError> {
+    use crate::explain::Node;
+    let planned = crate::explain::order::Planned::Distinct(key);
+    let Some(plan) = crate::explain::order::counted_plan(storage, ask, planned)? else {
+        return Ok(None);
+    };
+    let scan = match &plan {
+        Node::Projection { input, .. } => input.as_ref(),
+        other => other,
+    };
+    // A covered DISTINCT_SCAN answers from its keys.
+    let from_keys = matches!(scan, Node::DistinctScan(_, _, false));
+    let opts = crate::explain::stream::Options {
+        keys: from_keys,
+        collation: ask.collation,
+        ..Default::default()
+    };
+    let Some(mut stream) = crate::explain::stream::Stream::of_plan_with(
+        &plan, ask.db, ask.coll, ask.filter, ask.vars, &opts,
+    )?
+    else {
+        return Ok(None);
+    };
+    let all = stream.read_all(storage)?;
+    let mut values = Vec::new();
+    if from_keys {
+        for k in all.keys {
+            match k.and_then(|d| d.get(key).cloned()).unwrap_or(Bson::Null) {
+                Bson::Array(items) => values.extend(items),
+                other => values.push(other),
+            }
+        }
+    } else {
+        let mut decoded = Vec::with_capacity(all.docs.len());
+        for b in &all.docs {
+            decoded.push(
+                secantus_core::bsondoc::from_bytes(b.as_slice())
+                    .map_err(|e| crate::storage::StorageError::Internal(format!("decode: {e}")))?,
+            );
+        }
+        values = document_values(&decoded, key);
+    }
+    Ok(Some((values, all.keys_examined, all.docs_examined)))
 }
 
 /// Every value `key` reaches in `documents`, through arrays of documents on

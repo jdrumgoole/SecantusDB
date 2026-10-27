@@ -64,6 +64,10 @@ pub(crate) struct Pending {
 pub(crate) fn begin(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Pending> {
     // What this operation spills is its own (RM-211).
     secantus_core::memlimit::reset_report();
+    // How many documents a `findAndModify` changed: its line says too.
+    if matches!(name, "findAndModify" | "findandmodify") {
+        MODIFIED.with(|m| m.set(Some(0)));
+    }
     let profiler = ctx.profiler.as_ref()?;
     if profiler.held.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return None;
@@ -79,9 +83,6 @@ pub(crate) fn begin(name: &str, doc: &Document, ctx: &CommandContext) -> Option<
     }
     if matches!(name, "update" | "delete") || merges {
         STATEMENTS.with(|s| *s.borrow_mut() = Some(Vec::new()));
-    }
-    if matches!(name, "findAndModify" | "findandmodify") {
-        MODIFIED.with(|m| m.set(Some(0)));
     }
     let existed = name == "create"
         && ctx.storage.as_ref().is_some_and(|s| {
@@ -243,6 +244,7 @@ pub(crate) fn finish(
 ) {
     let statements = STATEMENTS.with(|s| s.borrow_mut().take());
     let modified = MODIFIED.with(|m| m.take());
+    ctx.modified = modified;
     let noted_ns = NAMESPACE.with(|n| n.borrow_mut().take());
     let Some(mut pending) = ctx.profiling.take() else {
         return;
@@ -466,7 +468,16 @@ fn outcome(
                 if spilled.used_disk {
                     entry.insert("usedDisk", true);
                 }
-                if name != "aggregate" {
+                // A `find` of a view or a time-series collection runs as an
+                // `aggregate`, which counts no batches.
+                let coll = doc
+                    .get_str(if name == "getMore" { "collection" } else { name })
+                    .unwrap_or("");
+                let as_aggregate = matches!(
+                    crate::opdebug::collection_type(ctx, &ctx.db_name, coll),
+                    "view" | "timeseries"
+                );
+                if name != "aggregate" && !as_aggregate {
                     entry.insert("nBatches", 1_i32);
                 }
                 if id == 0 {
@@ -548,6 +559,29 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
         entry.insert("keysExamined", e.keys_examined);
         entry.insert("docsExamined", e.docs_examined);
+        if e.has_sort_stage {
+            entry.insert("hasSortStage", true);
+        }
+    }
+    if ok {
+        let shaped = crate::opdebug::planned_request(doc);
+        let planned = ctx
+            .exec_stats
+            .as_ref()
+            .and_then(|e| e.originating_command.as_ref())
+            .unwrap_or(shaped.as_ref());
+        let info = crate::explain::summary::plan_info(planned, ctx);
+        if let Some((shape, key)) = info.hashes {
+            entry.insert("planCacheShapeHash", shape.clone());
+            entry.insert("queryHash", shape);
+            entry.insert("planCacheKey", key);
+        }
+        if let (Some(framework), false) = (
+            info.framework,
+            name.eq_ignore_ascii_case("findAndModify"),
+        ) {
+            entry.insert("queryFramework", framework);
+        }
     }
     if let Some(c) = &ctx.op_counts {
         if let Some(n) = c.keys_inserted {
@@ -571,11 +605,23 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if crate::lock_manager::took_global() {
         bump_global_is(&mut locks);
     }
+    // Flow control holds back writes only: an operation that wrote none
+    // has `{}` (a write's acquisitions are not counted, RM-357).
+    if !crate::opdebug::wrote(&locks) {
+        entry.insert("flowControl", Document::new());
+    }
     entry.insert("locks", locks);
-    entry.insert("flowControl", Document::new());
     entry.insert("readConcern", crate::opdebug::read_concern(doc));
-    if crate::opdebug::takes_write_concern(name) {
-        entry.insert("writeConcern", crate::opdebug::write_concern(doc, ctx));
+    let concerned = match ctx
+        .exec_stats
+        .as_ref()
+        .and_then(|e| e.originating_command.as_ref())
+    {
+        Some(origin) if name == "getMore" => Some(origin),
+        _ => crate::opdebug::takes_write_concern(name).then_some(doc),
+    };
+    if let Some(origin) = concerned.filter(|o| crate::opdebug::has_write_concern(o)) {
+        entry.insert("writeConcern", crate::opdebug::write_concern(origin, ctx));
     }
     if let Some(storage) = ctx
         .op_counts
@@ -822,6 +868,8 @@ struct Ran {
     locks: Document,
     took_global: bool,
     wrote: bool,
+    /// The plan cache key's hashes, where mongod keys the statement's query.
+    hashes: Option<(String, String)>,
     read_concern: Document,
     storage: Option<Document>,
     remote: Option<String>,
@@ -892,6 +940,11 @@ impl Statement {
         }
         if let Some(micros) = self.ran.planning_micros {
             out.insert("planningTimeMicros", micros);
+        }
+        if let Some((shape, key)) = &self.ran.hashes {
+            out.insert("planCacheShapeHash", shape.clone());
+            out.insert("queryHash", shape.clone());
+            out.insert("planCacheKey", key.clone());
         }
         if let (Some((keys, docs)), false) = (self.ran.examined, failed) {
             out.insert("keysExamined", keys);
@@ -964,6 +1017,9 @@ pub(crate) struct Statements<'a> {
     open: Option<Open>,
     storage: Option<&'a dyn crate::storage::Storage>,
     read_concern: Document,
+    /// The command's planning time when the statement now running began:
+    /// it plans before it opens.
+    planning_mark: Option<std::time::Duration>,
 }
 
 struct Open {
@@ -1001,7 +1057,10 @@ pub(crate) fn note_statement_exec(exec: StatementExec) {
 }
 
 impl<'a> Statements<'a> {
-    pub(crate) fn start(storage: Option<&'a dyn crate::storage::Storage>, request: &Document) -> Self {
+    pub(crate) fn start(
+        storage: Option<&'a dyn crate::storage::Storage>,
+        request: &Document,
+    ) -> Self {
         let profiled = STATEMENTS.with(|s| s.borrow().is_some());
         Statements {
             // A statement is timed when it is profiled or may be logged as
@@ -1011,11 +1070,11 @@ impl<'a> Statements<'a> {
             open: None,
             storage,
             read_concern: crate::opdebug::read_concern(request),
+            planning_mark: crate::explain::planning_spent(),
         }
     }
 
     fn open(&mut self, open: Open) {
-        STATEMENT_EXEC.with(|s| *s.borrow_mut() = None);
         self.open = Some(open);
     }
 
@@ -1044,7 +1103,7 @@ impl<'a> Statements<'a> {
                 modified: i64::from(modified),
                 upserted,
                 errors,
-                planning: crate::explain::planning_spent(),
+                planning: self.planning_mark,
                 counts,
             });
         }
@@ -1064,7 +1123,7 @@ impl<'a> Statements<'a> {
                 modified: 0,
                 upserted: 0,
                 errors,
-                planning: crate::explain::planning_spent(),
+                planning: self.planning_mark,
                 counts,
             });
         }
@@ -1073,14 +1132,7 @@ impl<'a> Statements<'a> {
     /// How the open statement ran: what it counted since it started, the
     /// command's locks and storage statistics so far.
     fn ran(&self, open: &Open) -> Ran {
-        let since = |now: Option<i64>, then: Option<i64>| match (now, then) {
-            (Some(a), b) => {
-                let n = a - b.unwrap_or(0);
-                // A count the statement did not move is not its own.
-                (now != then).then_some(n)
-            }
-            (None, _) => None,
-        };
+        let since = |now: Option<i64>, then: Option<i64>| now.map(|a| a - then.unwrap_or(0));
         let now = self.storage.as_ref().and_then(|s| s.operation_counts());
         let then = open.counts;
         let exec = STATEMENT_EXEC.with(|s| s.borrow_mut().take());
@@ -1089,11 +1141,19 @@ impl<'a> Statements<'a> {
             _ => None,
         };
         let locks = crate::lock_manager::operation_locks(false);
-        let wrote = locks.get_document("Global").is_ok_and(|g| {
-            g.get_document("acquireCount")
-                .is_ok_and(|c| c.contains_key("w") || c.contains_key("W"))
+        let wrote = crate::opdebug::wrote(&locks);
+        // The statement's query keys the plan cache as a `find` of it does.
+        let hashes = self.storage.and_then(|s| {
+            let mut query = doc! { "find": open.coll.clone(), "filter": open.command.get("q").cloned().unwrap_or(Bson::Document(Document::new())) };
+            for key in ["hint", "collation"] {
+                if let Some(v) = open.command.get(key) {
+                    query.insert(key, v.clone());
+                }
+            }
+            crate::explain::summary::plan_info_in(s, &open.db, &query).hashes
         });
         Ran {
+            hashes,
             collection_type: self.storage.map_or("normal", |s| {
                 crate::opdebug::collection_type_in(s, &open.db, &open.coll)
             }),
@@ -1120,6 +1180,9 @@ impl<'a> Statements<'a> {
     /// Close the open statement, if any, against the tallies now.
     pub(crate) fn close(&mut self, n: i32, modified: i32, upserted: usize, errors: &[Bson]) {
         let Some(open) = self.open.take() else {
+            // What a statement that never opened noted is not the next's.
+            STATEMENT_EXEC.with(|s| *s.borrow_mut() = None);
+            self.planning_mark = crate::explain::planning_spent();
             return;
         };
         let outcome = if errors.len() > open.errors {
@@ -1141,7 +1204,28 @@ impl<'a> Statements<'a> {
             }
         };
         let worked = open.start.elapsed();
-        let ran = self.ran(&open);
+        let mut ran = self.ran(&open);
+        // mongod prints the keys an update inserted and deleted when it
+        // matched a document, the keys an upsert inserted, and the keys a
+        // delete deleted (measured 8.2.11).
+        let (inserts, deletes) = match &outcome {
+            StatementOutcome::Updated {
+                matched, upserted, ..
+            } => (*matched > 0 || *upserted > 0, *matched > 0),
+            StatementOutcome::Deleted(n) => (false, *n > 0),
+            StatementOutcome::Failed(_) => (false, false),
+        };
+        if inserts {
+            ran.keys_inserted.get_or_insert(0);
+        } else {
+            ran.keys_inserted = None;
+        }
+        if deletes {
+            ran.keys_deleted.get_or_insert(0);
+        } else {
+            ran.keys_deleted = None;
+        }
+        self.planning_mark = crate::explain::planning_spent();
         let statement = Statement {
             ns: format!("{}.{}", open.db, open.coll),
             db: open.db,

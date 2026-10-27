@@ -143,6 +143,63 @@ pub(crate) const PROFILE_ORDER: &[&str] = &[
     "user",
 ];
 
+thread_local! {
+    /// What the read of the command running on this thread examined, and
+    /// its plan's summary, noted by a handler that cannot reach its
+    /// context while it reads (`findAndModify`); `dispatch` takes it.
+    static EXAMINED: std::cell::RefCell<Option<crate::ExecStats>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The running command's read examined `keys` and `docs` more, under the
+/// plan `summary`.
+pub(crate) fn note_examined(keys: i64, docs: i64, summary: Option<String>) {
+    EXAMINED.with(|e| {
+        let mut e = e.borrow_mut();
+        let stats = e.get_or_insert_with(Default::default);
+        stats.keys_examined += keys;
+        stats.docs_examined += docs;
+        if summary.is_some() {
+            stats.plan_summary = summary;
+        }
+    });
+}
+
+/// What [`note_examined`] noted for the command, taken.
+pub(crate) fn take_examined() -> Option<crate::ExecStats> {
+    EXAMINED.with(|e| e.borrow_mut().take())
+}
+
+/// The request a command's plan is made for, as `explain` shapes it: a
+/// `findAndModify`'s query, sort and hint as a `find`; any other command
+/// itself.
+pub(crate) fn planned_request(request: &Document) -> std::borrow::Cow<'_, Document> {
+    let name = request.keys().next().map(String::as_str).unwrap_or("");
+    if !matches!(name, "findAndModify" | "findandmodify") {
+        return std::borrow::Cow::Borrowed(request);
+    }
+    let coll = request.get(name).cloned().unwrap_or(Bson::Null);
+    let mut find = doc! {
+        "find": coll,
+        "filter": request.get("query").cloned().unwrap_or_else(|| Bson::Document(Document::new())),
+    };
+    for key in ["sort", "hint", "collation"] {
+        if let Some(v) = request.get(key) {
+            find.insert(key, v.clone());
+        }
+    }
+    std::borrow::Cow::Owned(find)
+}
+
+/// Whether an operation that took `locks` wrote: it took the global lock
+/// in an exclusive mode.
+pub(crate) fn wrote(locks: &Document) -> bool {
+    locks.get_document("Global").is_ok_and(|g| {
+        g.get_document("acquireCount")
+            .is_ok_and(|c| c.contains_key("w") || c.contains_key("W"))
+    })
+}
+
 /// `doc`'s fields in `order`; any field `order` does not name keeps its
 /// place relative to the others, after them.
 pub(crate) fn reorder(mut doc: Document, order: &[&str]) -> Document {
@@ -160,7 +217,14 @@ pub(crate) fn reorder(mut doc: Document, order: &[&str]) -> Document {
 /// statistics (`WiredTigerOperationStats`): the bytes and times of the
 /// pages its own thread read and wrote, under `data`, and the time it
 /// waited, under `timeWaitingMicros`. A zero is left out, and so is a
-/// section, or the whole, with nothing in it (measured 8.2.11).
+/// section, or the whole, with nothing in it (measured 8.2.11). The wait
+/// for the cache is `cacheMicros` and for a data handle `handleLock`, as
+/// mongod 8.2.11 printed them under eviction and DDL churn (2026-10-27);
+/// no probe made mongod wait on the schema lock, and `schemaLock` follows
+/// `handleLock`'s spelling. mongod's own waits (`cacheInterruptibleMicros`,
+/// which this engine's statistics do not split from the rest of the cache
+/// wait, and `storageExecutionMicros`, its execution admission control)
+/// are not counted here (RM-355).
 pub(crate) fn storage_section(c: &OperationCounts) -> Option<Document> {
     let mut data = Document::new();
     let put = |d: &mut Document, k: &str, v: i64| {
@@ -175,8 +239,8 @@ pub(crate) fn storage_section(c: &OperationCounts) -> Option<Document> {
     put(&mut data, "txnBytesDirty", c.txn_bytes_dirty);
     let mut waiting = Document::new();
     put(&mut waiting, "cacheMicros", c.cache_wait_micros);
-    put(&mut waiting, "schemaLockMicros", c.schema_lock_wait_micros);
-    put(&mut waiting, "handleLockMicros", c.handle_lock_wait_micros);
+    put(&mut waiting, "schemaLock", c.schema_lock_wait_micros);
+    put(&mut waiting, "handleLock", c.handle_lock_wait_micros);
     let mut out = Document::new();
     if !data.is_empty() {
         out.insert("data", data);
@@ -211,6 +275,18 @@ pub(crate) fn read_concern(request: &Document) -> Document {
 /// Whether mongod prints a write concern for `name`: the commands that
 /// take one, `aggregate` among them whatever its stages.
 pub(crate) fn takes_write_concern(name: &str) -> bool {
+    takes_write_concern_named(name)
+}
+
+/// Whether mongod prints a write concern for `request`: a command that
+/// takes one, outside a transaction (a statement of one has its
+/// transaction's, given at commit).
+pub(crate) fn has_write_concern(request: &Document) -> bool {
+    let name = request.keys().next().map(String::as_str).unwrap_or("");
+    takes_write_concern_named(name) && request.get_bool("autocommit") != Ok(false)
+}
+
+fn takes_write_concern_named(name: &str) -> bool {
     matches!(
         name,
         "insert"

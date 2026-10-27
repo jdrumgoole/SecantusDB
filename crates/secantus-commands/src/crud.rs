@@ -1218,9 +1218,41 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let statement_started = std::time::Instant::now();
         // A retryable write's entries name this statement (RM-224).
         storage.set_statement_position(Some(index));
+        // The statement's read of its documents, run as mongod's plan for
+        // it runs, counting what it examines (RM-023).
+        let selection = crate::explain::order::write_selection(
+            storage,
+            &crate::explain::order::Ask {
+                db: &ctx.db_name,
+                coll: &coll,
+                filter: &filter,
+                sort: None,
+                hint: argtypes::given_hint(spec),
+                collation: collation.as_ref(),
+                vars: &let_vars,
+                limit: 0,
+                asked: Default::default(),
+            },
+            crate::explain::order::Planned::Write {
+                delete: true,
+                multi: limit != 1,
+                upsert: false,
+                returns: false,
+            },
+        )
+        .unwrap_or(None);
+        if let Some(sel) = &selection {
+            crate::profiler::note_statement_exec(crate::profiler::StatementExec {
+                summary: Some(sel.summary.clone()),
+                keys_examined: sel.keys_examined,
+                docs_examined: sel.docs_examined,
+            });
+        }
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
-        let first = if limit == 1 {
+        let first = if let Some(sel) = selection {
+            (!sel.rids.is_empty()).then_some(sel.rids)
+        } else if limit == 1 {
             crate::explain::order::write_candidates(
                 storage,
                 &crate::explain::order::Ask {
@@ -1474,6 +1506,10 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .get_collection_options(&ctx.db_name, &coll)
         .ok()
         .and_then(|o| o.get_str("viewOn").ok().map(String::from));
+    // What the count's plan examined, as it read (RM-023), and whether its
+    // read took the skip and limit itself.
+    let mut examined: Option<(i64, i64)> = None;
+    let mut paged = false;
     let mut n = if view_on.is_some() {
         // Run on the VIEW: the aggregation resolves it, through any views
         // beneath it, and a view may hold a stage only a view may hold.
@@ -1577,11 +1613,39 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 },
             },
         )?;
-        if filter.is_empty() {
+        let counted = if filter.is_empty() {
+            None
+        } else {
+            count_read(
+                storage,
+                &crate::explain::order::Ask {
+                    db: &ctx.db_name,
+                    coll: &coll,
+                    filter: &filter,
+                    sort: None,
+                    hint: None,
+                    collation: collation.as_ref(),
+                    vars: &Document::new(),
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                skip,
+                limit.abs(),
+            )
+            .map_err(|e| {
+                crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
+            })?
+        };
+        if let Some((counted, keys, docs)) = counted {
+            examined = Some((keys, docs));
+            paged = true;
+            counted
+        } else if filter.is_empty() {
             // No query and no hint: mongod answers from the collection's
             // record count (`RECORD_STORE_FAST_COUNT`), read without reading
             // a document -- and so counting another transaction's
             // uncommitted insert, as mongod 8.2.11 does (RM-191, RM-087).
+            examined = Some((0, 0));
             storage
                 .collection_sizes(&ctx.db_name, &coll)
                 .map_err(|e| {
@@ -1645,16 +1709,53 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             crate::explain::order::Uses::Count,
         );
     }
-    if skip > 0 {
+    if skip > 0 && !paged {
         n = n.saturating_sub(skip).max(0);
     }
     // A negative limit counts as its size (mongod reads it as the legacy
     // "single batch" spelling of a limit).
     let limit = limit.abs();
-    if limit > 0 {
+    if limit > 0 && !paged {
         n = n.min(limit);
     }
+    if let Some((keys_examined, docs_examined)) = examined {
+        ctx.exec_stats = Some(crate::ExecStats {
+            keys_examined,
+            docs_examined,
+            ..Default::default()
+        });
+    }
     Ok(doc! { "n": n as i32, "ok": 1.0 })
+}
+
+/// A `count` run as mongod's plan for it runs, when a stream can run it
+/// (RM-023): how many documents it counts after `skip`, up to `limit`, and
+/// the keys and documents it examined. `None`: count as before.
+fn count_read(
+    storage: &dyn crate::Storage,
+    ask: &crate::explain::order::Ask,
+    skip: i64,
+    limit: i64,
+) -> Result<Option<(i64, i64, i64)>, StorageError> {
+    let planned = crate::explain::order::Planned::Count { skip, limit };
+    let Some(plan) = crate::explain::order::counted_plan(storage, ask, planned)? else {
+        return Ok(None);
+    };
+    let input = match &plan {
+        crate::explain::Node::Count(input) => input.as_ref(),
+        _ => return Ok(None),
+    };
+    let opts = crate::explain::stream::Options {
+        collation: ask.collation,
+        ..Default::default()
+    };
+    let Some(mut stream) = crate::explain::stream::Stream::of_count(
+        input, ask.db, ask.coll, ask.filter, ask.vars, &opts,
+    )?
+    else {
+        return Ok(None);
+    };
+    stream.count(storage, skip, limit).map(Some)
 }
 
 /// Stages allowed in a pipeline-form (`u: [...]`) update
@@ -2239,9 +2340,47 @@ pub(crate) fn update_in(
         // A retryable write's entries name this statement (RM-224).
         storage.set_statement_position(Some(index));
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
+        // The statement's read of its documents, run as mongod's plan for
+        // it runs, counting what it examines (RM-023): every match for an
+        // update of many, up to the first for an update of one.
+        let selection = if absent {
+            None
+        } else {
+            crate::explain::order::write_selection(
+                storage,
+                &crate::explain::order::Ask {
+                    db: db_name,
+                    coll: &coll,
+                    filter: &q,
+                    sort: None,
+                    hint: argtypes::given_hint(spec),
+                    collation: collation.as_ref(),
+                    vars: &stmt_vars,
+                    limit: 0,
+                    asked: Default::default(),
+                },
+                crate::explain::order::Planned::Write {
+                    delete: false,
+                    multi,
+                    upsert,
+                    returns: false,
+                },
+            )
+            // A read that fails here fails the update's own read too.
+            .unwrap_or(None)
+        };
+        if let Some(sel) = &selection {
+            crate::profiler::note_statement_exec(crate::profiler::StatementExec {
+                summary: Some(sel.summary.clone()),
+                keys_examined: sel.keys_examined,
+                docs_examined: sel.docs_examined,
+            });
+        }
         // An update of ONE document changes the first its query matches in
         // the order mongod reads them.
-        let first = if multi || absent {
+        let first = if let Some(sel) = selection {
+            (!sel.rids.is_empty()).then_some(sel.rids)
+        } else if multi || absent {
             if !absent {
                 // An update of many documents reads them in no order of its
                 // own, and mongod still plans it through its plan cache. A

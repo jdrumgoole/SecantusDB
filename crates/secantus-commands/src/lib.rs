@@ -278,6 +278,8 @@ pub struct CommandContext {
     /// The time spent planning the operation's query, for the line's and
     /// profile entry's `planningTimeMicros`.
     pub planning_micros: Option<i64>,
+    /// How many documents a `findAndModify` changed, for its line.
+    pub modified: Option<i64>,
     /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
     /// handed in by the server **un-decoded** so the insert handler can store the
     /// client's bytes verbatim (the raw-BSON write path) instead of paying a
@@ -313,6 +315,9 @@ pub struct ExecStats {
     /// A `getMore`'s plan summary and the command that opened its cursor.
     pub plan_summary: Option<String>,
     pub originating_command: Option<Document>,
+    /// The plan sorts in memory (`hasSortStage`), which every batch of its
+    /// cursor reports.
+    pub has_sort_stage: bool,
 }
 
 #[derive(Clone)]
@@ -361,6 +366,7 @@ impl CommandContext {
             op_counts: None,
             op_locks: None,
             planning_micros: None,
+            modified: None,
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,
@@ -854,8 +860,12 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         0
     };
     // What the store does for the operation is counted from here (RM-023).
-    let counting = ctx.storage.as_ref().and_then(|s| s.begin_operation_counts());
+    let counting = ctx
+        .storage
+        .as_ref()
+        .and_then(|s| s.begin_operation_counts());
     let planning = explain::planning_scope();
+    opdebug::take_examined();
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
     // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
@@ -920,6 +930,17 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
     // What the operation counted, before its profile entry is written.
+    if ctx.exec_stats.is_none() && explain::summary::reads_no_collection(doc) {
+        opdebug::note_examined(0, 0, None);
+    }
+    if let (None, Some(mut examined)) = (&ctx.exec_stats, opdebug::take_examined()) {
+        // A read made whole hands its cursor over: open, or exhausted.
+        if let Ok(cursor) = reply.get_document("cursor") {
+            examined.cursor_id = cursor.get_i64("id").unwrap_or(0);
+            examined.exhausted = examined.cursor_id == 0;
+        }
+        ctx.exec_stats = Some(examined);
+    }
     ctx.op_counts = ctx.storage.as_ref().and_then(|s| s.operation_counts());
     ctx.op_locks = Some(lock_manager::operation_locks(false));
     ctx.planning_micros = planning.micros();
