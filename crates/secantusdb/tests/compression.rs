@@ -1,6 +1,8 @@
 //! Wire compression (`OP_COMPRESSED`, 2012) end to end, over real WiredTiger:
-//! the official driver with each of mongod's three default compressors, and
-//! raw frames for what a driver never sends.
+//! the official driver with snappy and zlib, raw frames for zstd (the
+//! driver's zstd feature pins zstd 0.13, which carries RUSTSEC-2026-0391 /
+//! 0398 / 0403; the server's own codec is 0.14.3), and raw frames for what
+//! a driver never sends.
 //!
 //! The expectations are mongod 8.2.11's, measured 2026-10-15 over a raw
 //! socket (see `secantus_wire::compression` and `handshake::hello`).
@@ -18,11 +20,15 @@ use secantus_wire::{
 };
 
 const ALL: [Compressor; 3] = [Compressor::Snappy, Compressor::Zlib, Compressor::Zstd];
+/// The compressors the official driver is built with here: not zstd (see
+/// the module header); `raw_frames_round_trip_crud_and_a_large_document_under_zstd`
+/// covers it.
+const DRIVER: [Compressor; 2] = [Compressor::Snappy, Compressor::Zlib];
 
 #[test]
 fn the_driver_round_trips_crud_cursors_and_a_large_document_under_each_compressor() {
     let server = Server::start().expect("start");
-    for c in ALL {
+    for c in DRIVER {
         let uri = format!(
             "{}&compressors={}&serverSelectionTimeoutMS=10000",
             server.uri(),
@@ -285,6 +291,93 @@ fn a_compressed_request_is_answered_under_its_own_compressor() {
         let drop = raw.command(doc! {"dropDatabase": 1, "$db": &db}, Some(c));
         assert_eq!(drop.doc.get_f64("ok").unwrap(), 1.0);
     }
+}
+
+/// The driver test's workload under zstd, over raw frames: every request
+/// compressed with this server's zstd codec, every reply checked to come
+/// back under zstd, a 15 MB document and a cursor read in batches of 7.
+#[test]
+fn raw_frames_round_trip_crud_and_a_large_document_under_zstd() {
+    let server = Server::start().expect("start");
+    let c = Compressor::Zstd;
+    let mut raw = Raw::connect(&server);
+    let hello = raw.hello(doc! {"compression": ["zstd"]});
+    assert_eq!(
+        hello.get_array("compression").unwrap(),
+        &vec![Bson::from("zstd")]
+    );
+    let db = "compress_zstd_raw";
+    let ok = |raw: &mut Raw, cmd: Document| -> Document {
+        let frame = raw.command(cmd, Some(c));
+        assert_eq!(frame.compressor, Some(c.id()));
+        assert_eq!(frame.doc.get_f64("ok").unwrap(), 1.0, "{:?}", frame.doc);
+        frame.doc
+    };
+    let docs: Vec<Document> = (0..1000)
+        .map(|i| doc! {"_id": i, "v": "x".repeat(i as usize % 50)})
+        .collect();
+    let ins = ok(&mut raw, doc! {"insert": "c", "documents": docs, "$db": db});
+    assert_eq!(ins.get_i32("n").unwrap(), 1000);
+    let big = "y".repeat(15 * 1024 * 1024);
+    ok(
+        &mut raw,
+        doc! {"insert": "c", "documents": [{"_id": "big", "s": &big}], "$db": db},
+    );
+    ok(
+        &mut raw,
+        doc! {"update": "c", "updates": [{"q": {"_id": {"$lt": 100}}, "u": {"$set": {"u": true}}, "multi": true}], "$db": db},
+    );
+    ok(
+        &mut raw,
+        doc! {"delete": "c", "deletes": [{"q": {"_id": {"$gte": 900, "$lt": 950}}, "limit": 0}], "$db": db},
+    );
+    let got = ok(
+        &mut raw,
+        doc! {"find": "c", "filter": {"_id": "big"}, "$db": db},
+    );
+    let first = got
+        .get_document("cursor")
+        .unwrap()
+        .get_array("firstBatch")
+        .unwrap();
+    assert_eq!(
+        first[0].as_document().unwrap().get_str("s").unwrap(),
+        big,
+        "the large document"
+    );
+
+    let mut ids = Vec::new();
+    let reply = ok(
+        &mut raw,
+        doc! {"find": "c", "filter": {"_id": {"$type": "int"}}, "sort": {"_id": 1}, "batchSize": 7, "$db": db},
+    );
+    let mut cursor = reply.get_document("cursor").unwrap().clone();
+    let mut batch = cursor.get_array("firstBatch").unwrap().clone();
+    loop {
+        ids.extend(
+            batch
+                .iter()
+                .map(|d| d.as_document().unwrap().get_i32("_id").unwrap()),
+        );
+        let id = cursor.get_i64("id").unwrap();
+        if id == 0 {
+            break;
+        }
+        let more = ok(
+            &mut raw,
+            doc! {"getMore": id, "collection": "c", "batchSize": 7, "$db": db},
+        );
+        cursor = more.get_document("cursor").unwrap().clone();
+        batch = cursor.get_array("nextBatch").unwrap().clone();
+    }
+    let want: Vec<i32> = (0..900).chain(950..1000).collect();
+    assert_eq!(ids, want);
+    let count = ok(
+        &mut raw,
+        doc! {"count": "c", "query": {"u": true}, "$db": db},
+    );
+    assert_eq!(count.get_i32("n").unwrap(), 100);
+    ok(&mut raw, doc! {"dropDatabase": 1, "$db": db});
 }
 
 /// Send `body` (an `OP_MSG` body) wrapped with the given prefix, and report
