@@ -246,7 +246,7 @@ fn render_number(v: &Bson) -> String {
 }
 
 /// mongod's `safeInt64` of a number: `None` for a non-number.
-fn safe_int64(v: &Bson) -> Option<i64> {
+pub(crate) fn safe_int64(v: &Bson) -> Option<i64> {
     match v {
         Bson::Int32(i) => Some(i64::from(*i)),
         Bson::Int64(i) => Some(*i),

@@ -3,10 +3,10 @@ the `information_schema` views, RP-131).
 
 Comparing `information_schema.routines`, `parameters` and `element_types`
 with PostgreSQL 15.19 row for row found answers that differed for reasons of
-the catalogs underneath them: `pg_type` rows of built-in types (RP-270),
+the catalogs underneath them: `pg_type` rows of built-in types (RP-300),
 `format_type` of the one-byte `"char"` and of a modifier on a type with no
-`typmodout` (RP-271), and `pg_attribute` rows of the built-in relations
-(RP-272). Every literal here was measured on PostgreSQL 15.19 with
+`typmodout` (RP-301), and `pg_attribute` rows of the built-in relations
+(RP-302). Every literal here was measured on PostgreSQL 15.19 with
 read-only queries.
 """
 
@@ -19,7 +19,7 @@ import pytest
 from tests.backlog.conftest import pg_answer
 
 
-@pytest.mark.backlog_fixed("RP-270")
+@pytest.mark.backlog_fixed("RP-300")
 def test_builtin_types_carry_postgres_identity_columns(pg: Any) -> None:
     """A fixed-length subscriptable type's element (`name`'s is `"char"`,
     `point`'s `float8`), a range array's `typtype`, `_box`'s delimiter and
@@ -47,7 +47,7 @@ def test_builtin_types_carry_postgres_identity_columns(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog_fixed("RP-270")
+@pytest.mark.backlog_fixed("RP-300")
 def test_information_schema_reports_a_vector_type_as_an_array(pg: Any) -> None:
     """`information_schema` calls a type ARRAY when its `typelem` is set and
     its `typlen` is -1, which `int2vector` and `oidvector` are."""
@@ -59,7 +59,7 @@ def test_information_schema_reports_a_vector_type_as_an_array(pg: Any) -> None:
     assert got == ("ok", [("ARRAY",)])
 
 
-@pytest.mark.backlog_fixed("RP-271")
+@pytest.mark.backlog_fixed("RP-301")
 def test_format_type_of_the_one_byte_char(pg: Any) -> None:
     """Oid 18 is `"char"`, not `character`; so is what `information_schema`
     reports for a function over it."""
@@ -72,7 +72,7 @@ def test_format_type_of_the_one_byte_char(pg: Any) -> None:
     assert got == ("ok", [('"char"', '"char"[]', '"char"')])
 
 
-@pytest.mark.backlog_fixed("RP-271")
+@pytest.mark.backlog_fixed("RP-301")
 def test_format_type_prints_a_modifier_no_typmodout_reads(pg: Any) -> None:
     """`format_type_extended` prints its special-cased types' modifiers by
     their own rules (or not at all) and any other type's in parentheses."""
@@ -102,7 +102,7 @@ def test_format_type_prints_a_modifier_no_typmodout_reads(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-272")
+@pytest.mark.backlog("RP-302")
 def test_builtin_relations_attributes(pg: Any) -> None:
     """`pg_class` lists its six system columns (attnum < 0) as every
     relation with storage does; a catalog's collatable column is collated

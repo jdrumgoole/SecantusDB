@@ -83,6 +83,7 @@ pub(crate) fn open(ctx: &CommandContext, ask: &Ask) -> Result<Option<Opened>, Co
         return Ok(None);
     };
     cursor.summary = crate::explain::summary::plan_summary(ask.command, ctx);
+    cursor.budgets = crate::aggregate::budgets_of(ctx);
     // `batchSize: 0` asks for the cursor and reads nothing.
     let batch = if ask.batch_size == 0 {
         StreamedBatch {
@@ -335,6 +336,8 @@ struct AggStream {
     /// The collection or an index the read needs was dropped: mongod's 175
     /// message, met when the cursor next reads.
     gone: Option<String>,
+    /// The aggregation memory budgets in force when it was opened (RM-211).
+    budgets: secantus_core::memlimit::Budgets,
 }
 
 fn stage_name(s: &Bson) -> &str {
@@ -378,6 +381,7 @@ impl AggStream {
             whole: false,
             collation: ask.collation.cloned(),
             gone: None,
+            budgets: Default::default(),
         }
     }
 
@@ -445,6 +449,7 @@ impl AggStream {
         }
         let _command = crate::aggregate::InCommand::enter(&self.ns);
         let _engine = secantus_core::sbe::enter(false);
+        let _budgets = secantus_core::memlimit::with_budgets(self.budgets);
         let docs = crate::aggregate::run_segmented(
             Vec::new(),
             &[Bson::Document(doc! { "$unionWith": spec })],
@@ -547,6 +552,10 @@ impl AggStream {
         let _command = crate::aggregate::InCommand::enter(&self.ns);
         // The engine markers switch to SBE and back.
         let _engine = secantus_core::sbe::enter(false);
+        let _disk_use = secantus_core::memlimit::allow_disk_use(
+            self.command.get_bool("allowDiskUse").unwrap_or(true),
+        );
+        let _budgets = secantus_core::memlimit::with_budgets(self.budgets);
         crate::aggregate::run_segmented(
             docs,
             &stages,

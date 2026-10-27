@@ -817,12 +817,13 @@ impl<'a> Run<'a> {
                 }
                 None
             }
-            Node::Sort { limit, .. } => {
+            Node::Sort { limit, pattern, .. } => {
                 if self.buffer.is_none() {
                     let mut all = Vec::new();
                     while let Some(row) = self.inputs[0].pull(env) {
                         all.push(row);
                     }
+                    sort_stats(&mut self.extra, pattern, *limit, &all, env);
                     if let Some(n) = limit {
                         all.truncate(*n as usize);
                     }
@@ -1002,15 +1003,55 @@ pub(crate) fn fetched(node: &Node, returned: i64, extra: &mut Document) -> Optio
     }
 }
 
+/// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
+/// through the sorter its budget holds, as mongod's executes it.
+fn sort_stats(
+    extra: &mut Document,
+    pattern: &Document,
+    limit: Option<i64>,
+    rows: &[usize],
+    env: &Env,
+) {
+    if !crate::explain::order::plain_sort(pattern) {
+        return;
+    }
+    let docs: Vec<Document> = rows.iter().map(|&r| env.docs[r].clone()).collect();
+    let sizing = secantus_core::sorter::Sizing {
+        source: secantus_core::sorter::SortSource::QueryLayer,
+        fields: None,
+        budget: secantus_core::memlimit::budgets().sort,
+        added: None,
+    };
+    let top = limit.and_then(|n| usize::try_from(n).ok());
+    let (ran, report) = secantus_core::memlimit::captured(|| {
+        let _disk = secantus_core::memlimit::allow_disk_use(true);
+        secantus_core::sorter::sort_documents(docs, &Bson::Document(pattern.clone()), &sizing, top)
+    });
+    if ran.is_err() {
+        return;
+    }
+    extra.insert("totalDataSizeSorted", report.sort_total_data_size);
+    extra.insert("usedDisk", report.sort_spills > 0);
+    extra.insert("spills", report.sort_spills);
+    extra.insert("spilledRecords", report.sort_spilled_records);
+    extra.insert("spilledBytes", report.sort_spilled_bytes);
+    extra.insert(
+        "spilledDataStorageSize",
+        report.sort_spilled_data_storage_size,
+    );
+}
+
 /// The counters a stage reports whatever it read.
 pub(crate) fn fixed_extra(node: &Node, extra: &mut Document) {
     match node {
         Node::Sort { .. } => {
-            extra.insert("usedDisk", false);
-            extra.insert("spills", 0_i32);
-            extra.insert("spilledRecords", 0_i32);
-            extra.insert("spilledBytes", 0_i32);
-            extra.insert("spilledDataStorageSize", 0_i32);
+            if !extra.contains_key("usedDisk") {
+                extra.insert("usedDisk", false);
+                extra.insert("spills", 0_i32);
+                extra.insert("spilledRecords", 0_i32);
+                extra.insert("spilledBytes", 0_i32);
+                extra.insert("spilledDataStorageSize", 0_i32);
+            }
         }
         Node::DistinctScan(..) => {
             extra.insert("docsExamined", 0_i32);

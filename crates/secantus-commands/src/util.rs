@@ -372,18 +372,8 @@ pub(crate) fn decode_docs_minimal(
     batch
         .iter()
         .map(|b| {
-            let raw = bson::RawDocument::from_bytes(b).map_err(minimal_decode_err)?;
-            let mut out = Document::new();
-            for elem in raw {
-                let (key, val) = elem.map_err(minimal_decode_err)?;
-                if fields.contains(key) {
-                    out.insert(
-                        key.to_string(),
-                        Bson::try_from(val).map_err(minimal_decode_err)?,
-                    );
-                }
-            }
-            Ok(out)
+            secantus_core::bsondoc::fields(b, |key| fields.contains(key))
+                .map_err(minimal_decode_err)
         })
         .collect()
 }
@@ -394,7 +384,7 @@ pub(crate) fn encode_docs_ref(docs: &[Document]) -> Result<Vec<Vec<u8>>, Command
     docs.iter()
         .map(|d| {
             let mut v = Vec::new();
-            d.to_writer(&mut v).map_err(|e| {
+            crate::bsondoc::write(d, &mut v).map_err(|e| {
                 CommandError::new(
                     1,
                     "InternalError",
@@ -410,7 +400,7 @@ pub(crate) fn encode_docs(docs: Vec<Document>) -> Result<Vec<Vec<u8>>, CommandEr
     docs.iter()
         .map(|d| {
             let mut v = Vec::new();
-            d.to_writer(&mut v).map_err(|e| {
+            crate::bsondoc::write(d, &mut v).map_err(|e| {
                 CommandError::new(
                     1,
                     "InternalError",

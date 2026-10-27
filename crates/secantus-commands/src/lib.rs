@@ -60,6 +60,7 @@ pub mod distinct;
 mod explain;
 mod generic;
 mod hybrid;
+mod index_builds;
 mod index_filters;
 mod snapshot;
 pub use generic::db_field_problem;
@@ -68,6 +69,7 @@ pub mod find;
 pub mod findandmodify;
 pub mod handshake;
 mod hostinfo;
+mod interrupt;
 mod list_catalog;
 pub mod lock_manager;
 pub mod logbuf;
@@ -112,7 +114,7 @@ use bson::{doc, Bson, Document};
 pub use cursors::{CursorError, CursorRegistry};
 use secantus_core::deadline;
 pub use secantus_wire::{MAX_BSON_OBJECT_SIZE, MAX_MESSAGE_SIZE};
-pub use storage::{Storage, StorageError, UpdateOutcome};
+pub use storage::{CollectionSizes, Storage, StorageError, UpdateOutcome};
 
 /// Max wire protocol version advertised in `hello` (mongod 8.2).
 ///
@@ -639,6 +641,7 @@ fn lookup(name: &str) -> Option<Handler> {
         "convertToCapped" => capped_admin::convert_to_capped,
         "cloneCollectionAsCapped" => capped_admin::clone_collection_as_capped,
         "compact" => capped_admin::compact,
+        "autoCompact" => capped_admin::auto_compact,
         "reIndex" => capped_admin::re_index,
         "explain" => explain::explain,
         "drop" => admin::drop,
@@ -785,6 +788,8 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     let _active = stats
         .as_ref()
         .map(|s| s.status.activate(status::OpKind::of(name)));
+    // Which of this command's interrupt polls fail (RM-313).
+    let _trips = secantus_core::deadline::trip_scope();
     // Listed by `currentOp` and killable by `killOp` while it runs (RM-216).
     let _op = ctx
         .ops
@@ -809,38 +814,10 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
     };
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
-    // A killed operation's deadline polls fail as a spent budget would; the
-    // operation was interrupted, which mongod reports as 11601, keeping
-    // whatever wrapper the error carries (RM-216).
-    if ops::current_killed() && reply.get_i32("code") == Ok(50) {
-        let message = reply
-            .get_str("errmsg")
-            .unwrap_or("operation exceeded time limit")
-            .replace("operation exceeded time limit", "operation was interrupted");
-        // A kill that lands before execution (in planning) carries no
-        // executor wrapper; mongod reports it under one wherever it lands
-        // (measured 8.2.11: a killed find is "Executor error during find
-        // command: <ns> :: caused by :: operation was interrupted").
-        let message = if message.contains(" :: caused by :: ") {
-            message
-        } else {
-            let ns = |coll: &str| format!("{}.{coll}", ctx.db_name);
-            match (name, doc.get_str(name)) {
-                ("find", Ok(coll)) => {
-                    format!("Executor error during find command: {} :: caused by :: {message}", ns(coll))
-                }
-                ("aggregate" | "count" | "distinct", Ok(coll)) => format!(
-                    "Executor error during {name} command on namespace: {} :: caused by :: {message}",
-                    ns(coll)
-                ),
-                ("getMore", _) => format!("Executor error during getMore :: caused by :: {message}"),
-                _ => message,
-            }
-        };
-        reply.insert("errmsg", message);
-        reply.insert("code", 11601_i32);
-        reply.insert("codeName", "Interrupted");
-    }
+    // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
+    // as mongod does: 11601 for a kill, under the wrapper its command takes,
+    // and a write's interrupted write-concern wait (RM-216, RM-313).
+    interrupt::finish(name, doc, &mut reply, ctx, client_wc, default_wc.as_ref());
     // A journaled write is acknowledged only once the journal holds it:
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
@@ -1495,13 +1472,16 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             | "validate"
             | "listIndexes"
             | "killCursors"
+            | "compact"
     ) {
         return None;
     }
     let invalid = |message: String| Some(CommandError::new(73, "InvalidNamespace", message));
     match doc.get(name) {
         Some(Bson::String(coll)) if coll.is_empty() => invalid(match name {
-            "distinct" | "validate" => format!("Invalid namespace specified '{db}'"),
+            "distinct" | "validate" | "compact" => {
+                format!("Invalid namespace specified '{db}'")
+            }
             _ => format!("Invalid namespace specified: {db}"),
         }),
         Some(Bson::String(_)) => None,
@@ -1540,6 +1520,13 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
 
     // An unknown command says so before anything about its fields.
     if lookup(name).is_some() {
+        // `compact` reads its namespace before its other fields (measured
+        // 8.2.11: `{compact: "", bogus: 1}` is InvalidNamespace).
+        if name == "compact" {
+            if let Some(e) = collection_name_problem(name, doc, &ctx.db_name) {
+                return e.into_reply();
+            }
+        }
         if let Err(e) = generic::check(doc, name) {
             return e.into_reply();
         }
@@ -1586,6 +1573,7 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                 | "abortTransaction"
                 | "commitTransaction"
                 | "getClusterParameter"
+                | "autoCompact"
         )
     {
         return CommandError::new(
@@ -1805,6 +1793,12 @@ fn kill_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if sessions.is_empty() {
         return kill_all_sessions(&doc! {"killAllSessions": []}, ctx);
     }
+    // The sessions' running operations are interrupted first: a
+    // transaction's statement holds its transaction until it ends, so the
+    // abort below waits for it (RM-313).
+    if let Some(ops) = &ctx.ops {
+        ops.kill_sessions(|lsid, _| sessions.iter().any(|s| s == lsid));
+    }
     for lsid in &sessions {
         if let Some(reg) = &ctx.transactions {
             reg.abort_for_session(lsid);
@@ -1966,6 +1960,10 @@ fn kill_all_sessions(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         selected.push(KillPattern::default());
     }
     let picks = |lsid: &[u8], owner: &[u8]| selected.iter().any(|p| p.matches(lsid, owner));
+    // Their running operations first, as `killSessions` (RM-313).
+    if let Some(ops) = &ctx.ops {
+        ops.kill_sessions(picks);
+    }
     if let Some(reg) = &ctx.transactions {
         reg.abort_matching(&session::user_digest(&[]), picks);
     }
@@ -2009,6 +2007,13 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     // The statement's lock chain (mongod's hierarchy). A transaction
     // statement's chain was already taken with the transaction's owner,
     // which holds its collection locks to commit/abort — see `session`.
+    // A command that ends or is refused by an index build in progress meets
+    // it before it waits for its locks (RM-187).
+    if !ctx.txn_locks {
+        if let Some(reply) = index_builds::before_locks(doc, ctx) {
+            return reply;
+        }
+    }
     let _locks = if ctx.txn_locks {
         None
     } else {
@@ -2033,7 +2038,10 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
             if let Some(at) = read_at.filter(|_| command_name(doc) != "getMore") {
                 snapshot::place_at_cluster_time(&mut reply, at);
             }
-            if budget > 0 {
+            // A statement interrupted at a poll is lifted by `dispatch`,
+            // after a retryable write has kept the statements before it
+            // (`interrupt::finish`); this is for a budget spent elsewhere.
+            if budget > 0 && !deadline::tripped() {
                 if let Some(e) = expired_write_statement(doc, &reply) {
                     return e.into_reply();
                 }
@@ -2777,6 +2785,7 @@ const NO_WRITE_CONCERN: &[&str] = &[
     "killOp",
     "fsync",
     "compact",
+    "autoCompact",
     "reIndex",
     "mapReduce",
     // Measured 2026-10-14 (`tools/probes/admin_commands.py`).

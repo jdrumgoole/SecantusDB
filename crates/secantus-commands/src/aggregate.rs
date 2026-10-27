@@ -498,6 +498,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
     let hint = doc.get("hint");
+    // Each stage over its memory budget spills, or refuses, as the command
+    // allows; mongod's `allowDiskUseByDefault` is true (RM-211).
+    let _disk_use =
+        secantus_core::memlimit::allow_disk_use(doc.get_bool("allowDiskUse").unwrap_or(true));
+    let _budgets = secantus_core::memlimit::with_budgets(budgets_of(ctx));
     // A standalone has no cluster time for `$$CLUSTER_TIME` to read.
     if let Some(e) =
         crate::util::cluster_time_unavailable(ctx.replica_set_name.is_none(), &pipeline)
@@ -550,6 +555,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut first_read_of_coll: Option<(Document, Option<Document>, i64)> = None;
     // The stages of the pipeline, a view's in front.
     let mut read_pipeline: Vec<Bson> = Vec::new();
+    // Whether the leading `$sort` blocks, for the pipeline run below.
+    let mut leading_guard: Option<secantus_core::aggregate::LeadingSort> = None;
     // Fetch the input documents + decide the remaining pipeline.
     let (ns, input, working_pipeline): (String, Vec<Document>, Vec<Bson>) = match &coll {
         Some(c) => {
@@ -796,6 +803,30 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     &first_read,
                     crate::explain::order::Uses::Find,
                 );
+                // Whether the pipeline's leading `$sort` is a blocking sort
+                // in mongod's plan, which its budget holds (RM-315).
+                if first_read.sort.is_some() {
+                    leading_guard = Some(secantus_core::aggregate::leading_sort(
+                        crate::explain::order::sorts_in_memory(storage, &first_read),
+                        sbe_read,
+                    ));
+                } else if let Some(sort) = window_sort(&rest) {
+                    // A leading `$setWindowFields` sorts as a leading `$sort`
+                    // would: from an index if one gives the order.
+                    let blocking = match &sort {
+                        None => true,
+                        Some(sort) => crate::explain::order::sorts_in_memory(
+                            storage,
+                            &crate::explain::order::Ask {
+                                sort: Some(sort),
+                                limit: 0,
+                                ..first_read
+                            },
+                        ),
+                    };
+                    leading_guard =
+                        Some(secantus_core::aggregate::leading_sort(blocking, sbe_read));
+                }
                 // A cursor left open over that read is killed when one of its
                 // indexes is dropped, as a `find` cursor is (mongod 8.2.11:
                 // 175 on the `getMore`). Only when the cursor's namespace is
@@ -904,6 +935,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The pipeline result is already decoded `Document`s. Send the `firstBatch`
     // straight to the wire as `Bson` and encode only the cursor remainder for the
     // registry — no encode→decode round-trip on the docs the client gets now.
+    // The pipeline has read its leading-sort verdict, or never will.
+    drop(leading_guard);
     let prefix = format!("Executor error during aggregate command on namespace: {ns}");
     let (first_batch, mut cursor_id) =
         split_docs_into_cursor_checked(result, batch_size, &ns, cursors, false, Some(&prefix))?;
@@ -1952,7 +1985,7 @@ pub(crate) fn run_segmented(
     let ns = format!("{db}.{}", coll.unwrap_or(""));
     let mut docs = input;
     let mut buffer: Vec<Bson> = Vec::new();
-    for stage in pipeline {
+    for (at, stage) in pipeline.iter().enumerate() {
         let name = stage_name(stage);
         if name == "$documents" {
             // `$documents: [<expr>, …]` is a source stage: it ignores its input
@@ -2001,6 +2034,8 @@ pub(crate) fn run_segmented(
             };
         } else if is_storage_backed(name) {
             if !buffer.is_empty() {
+                // The stages from this one on run after the buffered ones.
+                let _after = secantus_core::aggregate::downstream(&pipeline[at..]);
                 docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
@@ -2022,6 +2057,7 @@ pub(crate) fn run_segmented(
         }
     }
     if !buffer.is_empty() {
+        let _after = secantus_core::aggregate::downstream(&[]);
         docs = core_run(docs, &buffer, vars, collation, Some(&ns))?;
     }
     Ok(docs)
@@ -2259,6 +2295,38 @@ fn bad_value(msg: impl Into<String>) -> CommandError {
     CommandError::new(2, "BadValue", msg)
 }
 
+/// The aggregation memory budgets `setParameter` has left (RM-211).
+pub(crate) fn budgets_of(ctx: &CommandContext) -> secantus_core::memlimit::Budgets {
+    ctx.server_params
+        .as_ref()
+        .map(|p| p.budgets())
+        .unwrap_or_default()
+}
+
+/// A storage-backed stage over a memory budget it cannot spill (RM-211):
+/// mongod's error, under the executor prefix of the command running it.
+fn budget_error(f: secantus_core::fallback::Fallback) -> CommandError {
+    let Some((code, msg)) = f.as_mongo() else {
+        return bad_value("aggregation memory budget exceeded");
+    };
+    let ns = COMMAND_NS.with(|n| n.borrow().clone());
+    CommandError::new(
+        code,
+        crate::util::error_code_name(code),
+        wrap_pipeline_error(msg.to_string(), false, ns.as_deref()),
+    )
+}
+
+/// The documents a `$lookup` joins to one outer document, held to mongod's
+/// 100 MiB for one result (RM-211).
+fn lookup_budget(joined: &[Document], from: &str) -> Result<(), CommandError> {
+    let mut used = 0usize;
+    for (n, d) in joined.iter().enumerate() {
+        secantus_core::memlimit::lookup_add(&mut used, n, d, from).map_err(budget_error)?;
+    }
+    Ok(())
+}
+
 /// Dispatch one storage-backed stage.
 #[allow(clippy::too_many_arguments)]
 fn apply_storage_stage(
@@ -2415,6 +2483,7 @@ fn apply_lookup(
                 for doc in docs {
                     let lv = secantus_core::get_path(&doc, lf).cloned();
                     let joined = index_join_lookup(storage, db, from, ff, lv.as_ref())?;
+                    lookup_budget(&joined, from)?;
                     let mut new = doc;
                     set_field_path(
                         &mut new,
@@ -2503,6 +2572,7 @@ fn apply_lookup(
                 .cloned()
                 .collect()
         };
+        lookup_budget(&joined, from)?;
         let mut new = doc;
         let arr = Bson::Array(joined.into_iter().map(Bson::Document).collect());
         set_field_path(&mut new, as_field, arr);
@@ -2685,6 +2755,8 @@ fn apply_facet(
             )
         })?;
     let mut out = Document::new();
+    // The size of the document being built (RM-211).
+    let mut used = 0usize;
     for (name, sub) in s.iter() {
         let sub_pipeline = sub.as_array().ok_or_else(|| {
             CommandError::new(
@@ -2745,6 +2817,9 @@ fn apply_facet(
             &Document::new(),
             None,
         )?;
+        for d in &res {
+            secantus_core::memlimit::facet_add(&mut used, d).map_err(budget_error)?;
+        }
         out.insert(
             name.clone(),
             Bson::Array(res.into_iter().map(Bson::Document).collect()),
@@ -2928,7 +3003,7 @@ fn graph_walk(
 fn graph_id_key(id: Option<&Bson>) -> Vec<u8> {
     match id {
         None => Vec::new(),
-        Some(v) => bson::to_vec(&doc! { "k": v.clone() }).unwrap_or_default(),
+        Some(v) => crate::bsondoc::to_vec(&doc! { "k": v.clone() }).unwrap_or_default(),
     }
 }
 
@@ -3855,9 +3930,13 @@ fn apply_coll_stats(
     };
     let count = match buckets {
         Some(n) => n,
-        None => storage
-            .count_matching(db, coll, &Document::new())
-            .map_err(command_error)? as i64,
+        // The size storer's record count, as mongod's (RM-191).
+        None => {
+            storage
+                .collection_sizes(db, coll)
+                .map_err(command_error)?
+                .records
+        }
     };
     let ns = match buckets {
         Some(_) => format!("{db}.{}{coll}", crate::ts_buckets::BUCKETS_PREFIX),
@@ -4073,6 +4152,8 @@ fn enforce_target_validator(
     if opts.get_str("validationAction").unwrap_or("error") != "error" {
         return Ok(());
     }
+    // A validator no interrupt reaches (RM-313).
+    let _opaque = secantus_core::deadline::opaque();
     for d in docs {
         if !secantus_core::query::matches(d, &validator, &Document::new(), None).unwrap_or(false) {
             // The `errInfo` an insert carries.
@@ -5136,6 +5217,32 @@ struct LeadingSort {
     filter: Option<Document>,
     /// How many documents the stages after the `$sort` take; 0 is all.
     limit: i64,
+}
+
+/// The `$sort` mongod puts in front of a leading `$setWindowFields`: `None`
+/// when the pipeline does not start with one that sorts, `Some(None)` when
+/// it sorts by a computed partition, else its partition field and `sortBy`.
+fn window_sort(rest: &[Bson]) -> Option<Option<Document>> {
+    let spec = rest
+        .iter()
+        .find(|s| stage_name(s) != secantus_core::sbe::ENGINE_STAGE)?
+        .as_document()?
+        .get_document("$setWindowFields")
+        .ok()?;
+    let mut sort = Document::new();
+    match spec.get("partitionBy") {
+        None => {}
+        Some(Bson::String(p)) if p.starts_with('$') && !p.starts_with("$$") => {
+            sort.insert(p[1..].to_string(), 1);
+        }
+        Some(_) => return Some(None),
+    }
+    if let Ok(by) = spec.get_document("sortBy") {
+        for (k, v) in by {
+            sort.insert(k.clone(), v.clone());
+        }
+    }
+    (!sort.is_empty()).then_some(Some(sort))
 }
 
 fn leading_sort(rest: &[Bson], nothing_lifted: bool) -> LeadingSort {

@@ -55,8 +55,7 @@ fn to_pybytes(py: Python<'_>, bytes: Vec<u8>) -> Py<PyBytes> {
 /// `String` error rather than a GIL-bound `PyErr` so it satisfies `Ungil`).
 fn encode_doc(doc: &Document) -> Result<Vec<u8>, String> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
-        .map_err(|e| format!("encode failed: {e}"))?;
+    secantus_core::bsondoc::write(doc, &mut buf).map_err(|e| format!("encode failed: {e}"))?;
     Ok(buf)
 }
 

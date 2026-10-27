@@ -120,6 +120,9 @@ fn err(code: i32, msg: impl Into<String>) -> Fallback {
 
 /// The BSON type code of a value.
 fn type_code(v: &Bson) -> i32 {
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        return 2;
+    }
     match v {
         Bson::Double(_) => 1,
         Bson::String(_) => 2,
@@ -1461,7 +1464,10 @@ impl Node {
             Node::StrLength { path, bound, len } => {
                 Ok(at_path_traversed(doc, path).into_iter().any(|v| match v {
                     Bson::String(s) => bound.holds(s.chars().count(), *len),
-                    _ => false,
+                    // A string that is not UTF-8: one code point per byte that
+                    // is not a continuation byte, as mongod counts (RM-222).
+                    v => crate::bsondoc::as_invalid_utf8(v)
+                        .is_some_and(|b| bound.holds(crate::rawstr::len_cp(b), *len)),
                 }))
             }
             Node::ArrayItems { path, bound, len } => {

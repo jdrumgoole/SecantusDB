@@ -42,6 +42,14 @@ fn empty_doc() -> Document {
     Document::new()
 }
 
+/// An index build entry's `indexBuildUUID`.
+fn build_uuid(o: &Document) -> Option<[u8; 16]> {
+    match o.get("indexBuildUUID") {
+        Some(Bson::Binary(b)) => <[u8; 16]>::try_from(b.bytes.as_slice()).ok(),
+        _ => None,
+    }
+}
+
 /// Apply a `c` (command) oplog entry's `o` to the matching Storage DDL. Mirrors
 /// the `c` shapes Storage emits (create / drop / dropDatabase / createIndexes /
 /// dropIndexes / collMod / renameCollection).
@@ -73,6 +81,39 @@ fn apply_command(storage: &Storage, db: &str, o: &Document) -> Result<()> {
                     .collect();
                 storage.create_index(db, coll, name, key, &options)?;
             }
+        }
+    } else if let Ok(coll) = o.get_str("startIndexBuild") {
+        // A two-phase build (RM-187/RM-224): recorded, so the open restarts
+        // it unless its commit or abort is replayed too.
+        let indexes: Vec<Document> = o
+            .get_array("indexes")
+            .map(|a| a.iter().filter_map(|s| s.as_document().cloned()).collect())
+            .unwrap_or_default();
+        if let Some(uuid) = build_uuid(o) {
+            storage.replay_start_index_build(db, coll, &uuid, &indexes)?;
+        }
+    } else if let Ok(coll) = o.get_str("commitIndexBuild") {
+        // The build's indexes, created as `createIndexes` creates them.
+        if let Ok(indexes) = o.get_array("indexes") {
+            for spec in indexes {
+                let Bson::Document(spec) = spec else { continue };
+                let (Ok(name), Ok(key)) = (spec.get_str("name"), spec.get_document("key")) else {
+                    continue;
+                };
+                let options: Document = spec
+                    .iter()
+                    .filter(|(k, _)| !matches!(k.as_str(), "v" | "key" | "name"))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+                storage.create_index(db, coll, name, key, &options)?;
+            }
+        }
+        if let Some(uuid) = build_uuid(o) {
+            storage.replay_end_index_build(&uuid)?;
+        }
+    } else if o.contains_key("abortIndexBuild") {
+        if let Some(uuid) = build_uuid(o) {
+            storage.replay_end_index_build(&uuid)?;
         }
     } else if let Ok(coll) = o.get_str("dropIndexes") {
         if let Ok(name) = o.get_str("index") {
@@ -156,7 +197,7 @@ fn apply_entry_with(storage: &Storage, entry: &Document, strict: bool) -> Result
                 .get_document("o")
                 .map_err(|_| StorageError::Internal("replay: insert entry missing o".into()))?;
             let mut buf = Vec::new();
-            o.to_writer(&mut buf)
+            secantus_core::bsondoc::write(o, &mut buf)
                 .map_err(|e| StorageError::Bson(e.to_string()))?;
             if strict {
                 storage.insert_one(&db, &coll, &buf)?;

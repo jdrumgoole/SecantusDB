@@ -38,6 +38,10 @@ pub fn hash64(v: &Bson, missing: bool) -> i64 {
 
 /// `canonicalizeBSONType`.
 fn canonical_type(v: &Bson) -> i32 {
+    // A string that is not UTF-8 hashes as the string it is (RM-222).
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        return 15;
+    }
     match v {
         Bson::MinKey => -1,
         Bson::MaxKey => 127,
@@ -62,8 +66,15 @@ fn canonical_type(v: &Bson) -> i32 {
 fn hash_element(m: &mut Md5, name: Option<&str>, v: &Bson) {
     m.update(&canonical_type(v).to_le_bytes());
     if let Some(n) = name {
-        m.update(n.as_bytes());
+        match crate::bsondoc::key_bytes(n) {
+            Some(b) => m.update(&b),
+            None => m.update(n.as_bytes()),
+        }
         m.update(&[0]);
+    }
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        m.update(&raw_value_bytes(v));
+        return;
     }
     match v {
         Bson::Double(_) | Bson::Int32(_) | Bson::Int64(_) | Bson::Decimal128(_) => {
@@ -99,8 +110,7 @@ fn raw_value_bytes(v: &Bson) -> Vec<u8> {
     let mut d = Document::new();
     d.insert("", v.clone());
     let mut buf = Vec::new();
-    d.to_writer(&mut buf)
-        .expect("a leaf BSON value always encodes");
+    crate::bsondoc::write(&d, &mut buf).expect("a leaf BSON value always encodes");
     // [len:4][type:1][name NUL:1] value [doc NUL:1]
     buf[6..buf.len() - 1].to_vec()
 }

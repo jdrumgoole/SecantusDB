@@ -30,6 +30,8 @@ use bson::{doc, Bson, Document};
 /// (when the doc has an `_id`) plus mongod's explanation of every rule it broke
 /// (`validation_errors`). Shared with `findandmodify`.
 pub(crate) fn validation_error_info(validator: &Document, doc: &Document) -> Document {
+    // A validator is evaluated where no interrupt reaches it (RM-313).
+    let _opaque = secantus_core::deadline::opaque();
     let mut info = Document::new();
     if let Some(id) = doc.get("_id") {
         info.insert("failingDocumentId", id.clone());
@@ -598,6 +600,8 @@ fn insert_raw_path(
             // Wire-validated BSON always decodes; if it somehow doesn't, fall through
             // and let storage surface the error rather than dropping the doc.
             if let Ok(d) = secantus_core::bsondoc::from_bytes(&raw[..]) {
+                // Where no interrupt reaches it, as mongod runs it (RM-313).
+                let _opaque = secantus_core::deadline::opaque();
                 if !secantus_core::query::matches(&d, v, &Document::new(), None).unwrap_or(true) {
                     pre_errors.push(doc! {
                         "index": index as i32,
@@ -996,6 +1000,8 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // attaches an `errInfo` (failingDocumentId + per-operator details) that
         // drivers' errorResponse tests read; mirror it.
         if let Some(v) = &validator {
+            // Where no interrupt reaches it, as mongod runs it (RM-313).
+            let _opaque = secantus_core::deadline::opaque();
             if !secantus_core::query::matches(d, v, &Document::new(), None).unwrap_or(true) {
                 pre_errors.push(doc! {
                     "index": index as i32,
@@ -1252,6 +1258,12 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         } else {
             None
         };
+        // The statement's interrupt point before it writes: a kill between
+        // statements, or one the reads above took for an answer (RM-313).
+        if let Some(e) = interrupted_statement(index, "delete") {
+            write_errors.push(Bson::Document(e));
+            break;
+        }
         let deleted = crate::explain::order::in_delete_batches(storage, || {
             crate::explain::order::pinned(storage, first, || {
                 storage.delete_matching_hinted(
@@ -1310,8 +1322,11 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // label and drivers retry the transaction.
             Err(e @ StorageError::WriteConflict) => return Ok(command_error(e).into_reply()),
             Err(e) => {
-                write_errors.push(Bson::Document(write_error(index, e, "delete")));
-                if ordered {
+                // An interrupt ends the batch, ordered or not (RM-313).
+                let stop = ordered || is_interruption(&e);
+                let we = interrupted_in_plan(write_error(index, e, "delete"), "delete");
+                write_errors.push(Bson::Document(we));
+                if stop {
                     break;
                 }
             }
@@ -1533,11 +1548,32 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 },
             },
         )?;
-        storage
-            .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
-            .map_err(|e| {
-                crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
-            })? as i64
+        if filter.is_empty() {
+            // No query and no hint: mongod answers from the collection's
+            // record count (`RECORD_STORE_FAST_COUNT`), read without reading
+            // a document -- and so counting another transaction's
+            // uncommitted insert, as mongod 8.2.11 does (RM-191, RM-087).
+            storage
+                .collection_sizes(&ctx.db_name, &coll)
+                .map_err(|e| {
+                    crate::util::read_error_on_namespace(
+                        e,
+                        "count",
+                        &format!("{}.{coll}", ctx.db_name),
+                    )
+                })?
+                .records
+        } else {
+            storage
+                .count_collated(&ctx.db_name, &coll, &filter, collation.as_ref())
+                .map_err(|e| {
+                    crate::util::read_error_on_namespace(
+                        e,
+                        "count",
+                        &format!("{}.{coll}", ctx.db_name),
+                    )
+                })? as i64
+        }
     };
     if view_on.is_none() {
         crate::explain::order::count_index_use(
@@ -2164,6 +2200,12 @@ pub(crate) fn update_in(
             )
             .unwrap_or(None)
         };
+        // The statement's interrupt point before it writes: a kill between
+        // statements, or one the reads above took for an answer (RM-313).
+        if let Some(e) = interrupted_statement(index, "update") {
+            write_errors.push(Bson::Document(e));
+            break;
+        }
         let outcome = if let Some(Bson::Array(stages)) = spec.get("u") {
             // Validate the shape up-front — real mongod returns a command-level
             // error for a malformed/unknown stage, not a per-op writeError.
@@ -2405,12 +2447,14 @@ pub(crate) fn update_in(
                     StorageError::ValidationFailure(d) => Some(d.clone()),
                     _ => None,
                 };
-                let mut we = write_error(index, e, "update");
+                // An interrupt ends the batch, ordered or not (RM-313).
+                let stop = ordered || is_interruption(&e);
+                let mut we = interrupted_in_plan(write_error(index, e, "update"), "update");
                 if let (Some(d), Some(v)) = (failing, &validator) {
                     we.insert("errInfo", validation_error_info(v, &d));
                 }
                 write_errors.push(Bson::Document(we));
-                if ordered {
+                if stop {
                     break;
                 }
             }
@@ -2430,6 +2474,54 @@ pub(crate) fn update_in(
 
 // --- helpers -------------------------------------------------------------
 
+/// Whether a statement failed because its operation was interrupted -- a
+/// kill or a spent `maxTimeMS` -- which ends a write batch, ordered or not:
+/// mongod 8.2.11 stops an unordered batch at the interrupted statement too
+/// (measured 2026-10-27), and `dispatch` fails the command (RM-313).
+fn is_interruption(e: &StorageError) -> bool {
+    matches!(e, StorageError::WriteError { code, .. }
+        if *code == secantus_core::deadline::MaxTimeMsExpired::CODE)
+}
+
+/// A statement interrupted while its plan ran -- in its scan or a filter's
+/// expression -- under mongod's executor wrapper; one interrupted between
+/// statements is bare (measured 8.2.11: the same kill of a 50-statement
+/// batch answers either, by where it lands).
+fn interrupted_in_plan(mut we: Document, command: &str) -> Document {
+    use secantus_core::deadline::MaxTimeMsExpired as E;
+    if we.get_i32("code") == Ok(E::CODE) && we.get_str("errmsg") == Ok(E::MESSAGE) {
+        we.insert(
+            "errmsg",
+            format!(
+                "Plan executor error during {command} :: caused by :: {}",
+                E::MESSAGE
+            ),
+        );
+    }
+    we
+}
+
+/// Statement `index`'s write error when its operation has been interrupted
+/// before it writes: in the reads that pick its documents, whose poll
+/// already failed (under the executor's wrapper), or between statements
+/// (bare).
+fn interrupted_statement(index: usize, command: &str) -> Option<Document> {
+    use secantus_core::deadline::MaxTimeMsExpired as E;
+    let in_plan = secantus_core::deadline::tripped();
+    secantus_core::deadline::check_now().err().map(|_| {
+        let we = doc! {
+            "index": index as i32,
+            "code": E::CODE,
+            "errmsg": E::MESSAGE,
+        };
+        if in_plan {
+            interrupted_in_plan(we, command)
+        } else {
+            we
+        }
+    })
+}
+
 /// An array-valued field as a slice, or empty.
 fn array_field<'a>(doc: &'a Document, key: &str) -> &'a [Bson] {
     match doc.get(key) {
@@ -2441,7 +2533,7 @@ fn array_field<'a>(doc: &'a Document, key: &str) -> &'a [Bson] {
 /// Encode a document to BSON bytes for the storage seam.
 fn encode_doc(d: &Document) -> Result<Vec<u8>, CommandError> {
     let mut bytes = Vec::new();
-    d.to_writer(&mut bytes).map_err(|e| {
+    crate::bsondoc::write(d, &mut bytes).map_err(|e| {
         CommandError::new(
             1,
             "InternalError",

@@ -50,12 +50,34 @@ use secantus_wt::{Connection, Cursor, Session, WtError};
 pub use secantus_core::bsondoc;
 
 pub mod admission;
+mod auto_compact;
 pub mod changestreams;
+pub mod compact;
 pub mod pitr_archive;
+pub mod repair;
 pub mod replay;
 pub mod share_locks;
 
+mod index_build;
 mod scan_bounds;
+mod sizes;
+
+pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
+pub use sizes::CollectionSizes;
+use sizes::Delta;
+
+thread_local! {
+    /// How many whole-collection document walks (`Storage::visit_docs`)
+    /// this thread has made: what a test reads to show an answer came
+    /// without one (RM-191).
+    static COLLECTION_WALKS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// [`COLLECTION_WALKS`] on the calling thread, for tests.
+#[doc(hidden)]
+pub fn collection_walks() -> u64 {
+    COLLECTION_WALKS.with(Cell::get)
+}
 
 /// Filename of the advisory PITR manifest embedded in a backup archive.
 pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
@@ -793,7 +815,10 @@ fn with_retryable_session(
     let (Ok(lsid), Ok(txn)) = (rw.get_document("lsid"), rw.get_i64("txnNumber")) else {
         return entry;
     };
-    let key = (bson::to_vec(lsid).unwrap_or_default(), txn);
+    let key = (
+        secantus_core::bsondoc::to_vec(lsid).unwrap_or_default(),
+        txn,
+    );
     let prev = chains
         .get(&key)
         .cloned()
@@ -1073,7 +1098,9 @@ const PROFILE_COLLECTION: &str = "system.profile";
 fn oplog_entry_size(e: &OplogEntry) -> u64 {
     match e {
         OplogEntry::Raw(buf) => buf.as_bytes().len() as u64,
-        OplogEntry::Doc(d) => bson::to_vec(d).map(|v| v.len()).unwrap_or(0) as u64,
+        OplogEntry::Doc(d) => secantus_core::bsondoc::to_vec(d)
+            .map(|v| v.len())
+            .unwrap_or(0) as u64,
     }
 }
 
@@ -1422,7 +1449,10 @@ fn data_table_cfg(base: &str, nonlogged: bool) -> String {
 /// that rolled back with the data tables would be useless. It is a single tiny
 /// row per checkpoint; its logging cost is nil.
 fn bootstrap_table_cfg(name: &str, base: &str, data_nonlogged: bool) -> String {
-    if name == OPLOG_META_TABLE {
+    // The index builds' records are always logged, like the oplog they are
+    // logged beside: a crash of a non-logged store must not lose the member
+    // a restarted build records itself as (RM-187).
+    if name == OPLOG_META_TABLE || name == index_build::BUILDS_TABLE {
         base.to_string()
     } else {
         data_table_cfg(base, data_nonlogged)
@@ -2170,6 +2200,7 @@ impl UniqueConflict {
             .zip(&hex)
             .map(|((k, v), is_hex)| match v {
                 Bson::String(h) if *is_hex => format!("{k}: \"CollationKey(0x{h})\""),
+                _ if invalid_utf8_hex(v).is_some() => format!("{k}: {}", shell_value(v)),
                 Bson::Document(_) | Bson::Array(_) => {
                     format!("{k}: {}", secantus_core::query::bson_value_repr(v))
                 }
@@ -2198,16 +2229,30 @@ impl UniqueConflict {
     fn hex_encoded(&self) -> Vec<bool> {
         self.key_value
             .values()
-            .map(|v| self.collation.is_some() && matches!(v, Bson::String(_)))
+            .map(|v| {
+                (self.collation.is_some() && matches!(v, Bson::String(_)))
+                    || invalid_utf8_hex(v).is_some()
+            })
             .collect()
+    }
+
+    /// `keyValue` as mongod replies with it ([`dup_key_value_reply`]).
+    pub fn reply_key_value(&self) -> Document {
+        dup_key_value_reply(&self.key_value).0
     }
 
     /// The reply fields mongod adds after `keyValue` for a collated index.
     pub fn extra(&self) -> Option<Document> {
         let Some(collation) = self.collation.as_ref() else {
-            return self
-                .clustered
-                .then(|| bson::doc! { "foundValue": Document::new() });
+            let hex = self.hex_encoded();
+            let mut out = Document::new();
+            if hex.iter().any(|h| *h) {
+                out.insert("hexEncoded", hex);
+            }
+            if self.clustered {
+                out.insert("foundValue", Document::new());
+            }
+            return (!out.is_empty()).then_some(out);
         };
         let mut out = Document::new();
         let hex = self.hex_encoded();
@@ -2393,6 +2438,11 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "key_format=S,value_format=u",
     ),
     (PREPARED_XACT_TABLE, "key_format=S,value_format=u"),
+    // In-progress index builds (RM-187): each build's record, kept until
+    // it commits or aborts so an open after a crash restarts it, and the
+    // writes made to its collection while it scans.
+    (index_build::BUILDS_TABLE, "key_format=u,value_format=u"),
+    (index_build::SIDE_TABLE, "key_format=u,value_format=u"),
 ];
 
 /// Durable record of every prepared (two-phase) transaction: `gid -> BSON
@@ -2509,6 +2559,11 @@ pub enum StorageError {
 /// query fails before any document is read, and the command layer reports
 /// that (`argtypes::expression_problem_in_filter`).
 pub(crate) fn query_fault(fault: secantus_core::fallback::Fallback) -> StorageError {
+    // An expression interrupted while it ran (RM-313) is the operation's
+    // interruption, as a scan's is, not an error in the query.
+    if fault.is_interruption() {
+        return StorageError::MaxTimeExpired;
+    }
     match fault.as_mongo() {
         Some((code, errmsg)) => StorageError::QueryError {
             code,
@@ -2660,13 +2715,11 @@ fn encode_doc(doc: &Document) -> Result<Vec<u8>> {
                 ordered.insert(k.clone(), v.clone());
             }
         }
-        ordered
-            .to_writer(&mut buf)
+        secantus_core::bsondoc::write(&ordered, &mut buf)
             .map_err(|e| StorageError::Bson(e.to_string()))?;
         return Ok(buf);
     }
-    doc.to_writer(&mut buf)
-        .map_err(|e| StorageError::Bson(e.to_string()))?;
+    secantus_core::bsondoc::write(doc, &mut buf).map_err(|e| StorageError::Bson(e.to_string()))?;
     Ok(buf)
 }
 
@@ -2802,6 +2855,11 @@ fn index_keys_equiv(a: &Document, b: &Document) -> bool {
 /// `dup key: { … }` fragment of an E11000 message (drivers like the PHP extension
 /// pin the text verbatim). Mirrors `storage._shell_value`.
 fn shell_value(v: &Bson) -> String {
+    // A string that is not UTF-8 is printed as its bytes in hex, as mongod
+    // prints it (`{ s: "0xfffe" }`, measured 8.2.11, 2026-10-27; RM-222).
+    if let Some(hex) = invalid_utf8_hex(v) {
+        return format!("\"0x{hex}\"");
+    }
     match v {
         Bson::Boolean(b) => {
             if *b {
@@ -2850,6 +2908,34 @@ fn shell_value(v: &Bson) -> String {
         // 8.2.11, 2026-10-12).
         other => secantus_core::query::bson_value_repr(other),
     }
+}
+
+/// The lowercase hex of a string's bytes when they are not UTF-8.
+fn invalid_utf8_hex(v: &Bson) -> Option<String> {
+    secantus_core::bsondoc::as_invalid_utf8(v)
+        .map(|bytes| bytes.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A duplicate key's `keyValue` as mongod replies with it, and which of its
+/// fields are hex: a string that is not UTF-8 is reported as the hex of its
+/// bytes, flagged in `hexEncoded` (measured 8.2.11, 2026-10-27: `keyValue:
+/// {s: "fffe"}, hexEncoded: [true]`; RM-222).
+pub fn dup_key_value_reply(key_value: &Document) -> (Document, Vec<bool>) {
+    let mut out = Document::new();
+    let mut hex = Vec::with_capacity(key_value.len());
+    for (k, v) in key_value {
+        match invalid_utf8_hex(v) {
+            Some(h) => {
+                out.insert(k.clone(), h);
+                hex.push(true);
+            }
+            None => {
+                out.insert(k.clone(), v.clone());
+                hex.push(false);
+            }
+        }
+    }
+    (out, hex)
 }
 
 /// Build mongod's E11000 duplicate-key `errmsg`:
@@ -3367,6 +3453,33 @@ pub enum RouterAccess {
     Index { name: String, in_order: bool },
     /// Several indexes (an `$or`).
     Indexes,
+}
+
+/// An index's descriptor, from its catalog `options`: what a write keys
+/// it by and what the lookups read.
+fn index_desc_from(name: String, key_spec: Document, opts: &Document) -> IndexDesc {
+    let partial = opts
+        .get_document("partialFilterExpression")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .cloned();
+    let geo_2d = parse_geo_2d(&key_spec, opts);
+    let geo_sphere = parse_geo_sphere(&key_spec);
+    IndexDesc {
+        name,
+        key_spec,
+        sparse: opts.get_bool("sparse").unwrap_or(false),
+        hidden: opts.get_bool("hidden").unwrap_or(false),
+        collation: index_key_collation(opts),
+        unique: opts.get_bool("unique").unwrap_or(false),
+        prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
+        partial,
+        geo_2d,
+        geo_sphere,
+        id_claim: false,
+        clustered: false,
+        key_order: index_bindata_order(opts),
+    }
 }
 
 fn no_geo_keys(doc: &Document, why: &str) -> String {
@@ -4788,6 +4901,9 @@ pub struct Storage {
     /// checkpoint throughout. (The other checkpoints hold `lock`, which the
     /// check holds too.)
     checkpoint_gate: Arc<Mutex<()>>,
+    /// `compact`'s running claims and the `autoCompact` server
+    /// ([`compact`], [`auto_compact`]).
+    compaction: compact::Compaction,
     /// The reason user writes are blocked (`setUserWriteBlockMode`), or
     /// `None`. Persisted in `config.user_writes_critical_sections` and read
     /// back at open.
@@ -4795,6 +4911,13 @@ pub struct Storage {
     /// Ids for the groups of inserts mongod logs as one `applyOps`
     /// (`local.oplog.rs` presents each group as that one entry).
     insert_groups: AtomicI64,
+    /// Every collection's record count, data size and index sizes, kept
+    /// current by every write: mongod's size storer (RM-191, see
+    /// [`sizes`]).
+    sizes: sizes::SizeStorer,
+    /// Index builds in progress (RM-187): what writes to their collections
+    /// must also record, and what `listIndexes` / `currentOp` show.
+    index_builds: index_build::Registry,
 }
 
 /// Strictly-monotonic oplog bookkeeping: the next int64 seq to mint and the last
@@ -6808,6 +6931,11 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        // Background compaction opens WT sessions and checkpoints: it stops
+        // before anything else is torn down (a file in hand finishes).
+        if let Err(e) = self.stop_auto_compact() {
+            fail("stopping background compaction", e);
+        }
         // Stop the background oplog pruner first: it opens WT sessions, so it
         // must be gone before the connection closes below. A parked pruner
         // wakes on the notify; a mid-sweep one finishes its bounded sweep.
@@ -6891,6 +7019,17 @@ impl Storage {
         };
         match self.conn.open_session() {
             Ok(session) => {
+                // The committed counts, beside the oplog state they go with:
+                // the next open trusts them only if it finds that state.
+                let fingerprint = [meta.0, meta.1, meta.2];
+                if std::env::var_os("SECANTUS_CHECK_SIZES").is_some() {
+                    if let Err(e) = self.check_sizes_against_walk(&session) {
+                        fail("checking the collection sizes", e);
+                    }
+                }
+                if let Err(e) = self.sizes.persist(&session, &fingerprint) {
+                    fail("persisting the collection sizes", e);
+                }
                 if let Err(e) = self.persist_oplog_meta(&session, meta) {
                     fail("persisting the oplog meta", e);
                 }
@@ -7043,6 +7182,12 @@ impl Storage {
             // reconstruct them by scanning the oplog table.
             load_oplog_meta(&boot)?
         };
+        // The oplog state as the last close left it: the size storer's
+        // counts are trusted only when it is the state they were saved with.
+        // (`next_nat_seq` is not part of it: the open raises it to the
+        // largest RecordId held, so it can differ from what the close saved
+        // with nothing written in between.)
+        let size_fingerprint = [state.next_seq, state.last_ts_secs, state.last_ts_ord];
         // Cluster-time mints are not persisted per call (see
         // `current_cluster_time`), so the recovered (last_ts_secs, last_ts_ord)
         // can lag mints issued right before a crash. Bump one full second past
@@ -7176,9 +7321,15 @@ impl Storage {
             journal_join: Mutex::new(None),
             closed: AtomicBool::new(false),
             checkpoint_gate: Arc::new(Mutex::new(())),
+            compaction: compact::Compaction::default(),
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
+            sizes: sizes::SizeStorer::default(),
+            index_builds: index_build::Registry::default(),
         };
+        // Before the store takes any write -- crash recovery's replay and the
+        // upgrades below write documents, and each write moves the counts.
+        storage.open_size_storer(&size_fingerprint)?;
         // Before anything looks a key up: crash recovery below replays writes
         // by `_id`.
         storage.upgrade_number_keys()?;
@@ -7208,6 +7359,9 @@ impl Storage {
         storage.backfill_document_id_claims()?;
         storage.backfill_collated_id_claims()?;
         storage.load_user_write_block()?;
+        // Index builds a crash or shutdown interrupted run again from the
+        // start, as mongod restarts them (RM-187).
+        storage.restart_index_builds()?;
         Ok(storage)
     }
 
@@ -9790,6 +9944,16 @@ impl Storage {
         while cursor.next()? {
             stats.push(cursor.get_value_stat()?);
         }
+        // WiredTiger 11.3's background-compaction counters, which 11.2 does
+        // not have: kept by this store's own server (`autoCompact`), and
+        // placed where 11.3 lists them, its statistics being in description
+        // order.
+        let background = self.background_compact_statistics();
+        let at = stats
+            .iter()
+            .position(|(d, _)| d.as_str() > background[0].0.as_str())
+            .unwrap_or(stats.len());
+        stats.splice(at..at, background);
         Ok((secantus_wt::version_string(), stats))
     }
 
@@ -11295,6 +11459,8 @@ impl Storage {
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, blob));
                 cur.insert()?;
+                self.sizes
+                    .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
                 // Maintain secondary indexes: write this doc's entries (still carrying
                 // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
                 // RecordId -> doc), and lazily flag any index this doc makes multikey.
@@ -11552,8 +11718,9 @@ impl Storage {
                         e.insert("code", 11000i32);
                         e.insert("errmsg", c.errmsg());
                         let extra = c.extra();
+                        let key_value = c.reply_key_value();
                         e.insert("keyPattern", Bson::Document(c.key_pattern));
-                        e.insert("keyValue", Bson::Document(c.key_value));
+                        e.insert("keyValue", Bson::Document(key_value));
                         e.extend(extra.unwrap_or_default());
                         errors.push(e);
                         if ordered {
@@ -11637,14 +11804,18 @@ impl Storage {
                                 Some(conflict) => {
                                     ed.insert(
                                         "keyValue",
-                                        Bson::Document(conflict.key_value.clone()),
+                                        Bson::Document(conflict.reply_key_value()),
                                     );
                                     if let Some(extra) = conflict.extra() {
                                         ed.extend(extra);
                                     }
                                 }
                                 None => {
-                                    ed.insert("keyValue", Bson::Document(key_value));
+                                    let (reply, hex) = dup_key_value_reply(&key_value);
+                                    ed.insert("keyValue", Bson::Document(reply));
+                                    if hex.iter().any(|h| *h) {
+                                        ed.insert("hexEncoded", hex);
+                                    }
                                     if clustered {
                                         ed.insert("foundValue", Document::new());
                                     }
@@ -11666,6 +11837,8 @@ impl Storage {
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.set_value_u(&frame_doc_value(&key, blob));
                     doc_cur.insert()?;
+                    self.sizes
+                        .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
                     self.write_index_entries(&session, db, coll, doc, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, doc, &descs)?;
                     inserted += 1;
@@ -11721,6 +11894,15 @@ impl Storage {
                     let any_local = (!ns_may_hold_local_entry(&ns)).then_some(false);
                     self.emit_oplog_entries_of(&session, oplog_entries, pre_images, any_local)?;
                 }
+                // A retryable insert checks for interrupt before its batch
+                // commits, and a kill rolls the whole batch back: mongod
+                // 8.2.11 inserts none of a 300-document retryable insert
+                // killed while it ran, where a plain one inserts all 300
+                // (measured 2026-10-27, RM-313).
+                let retryable = RETRYABLE_SESSION.with(|s| s.borrow().is_some());
+                if retryable && deadline::check_now().is_err() {
+                    return Err(StorageError::MaxTimeExpired);
+                }
                 Ok((inserted, errors, stopped, tally))
             })?;
             // Committed (a capped collection takes no user transaction, and
@@ -11763,7 +11945,8 @@ impl Storage {
         if reason != "Unspecified" {
             row.insert("blockUserWritesReason", reason);
         }
-        let bytes = bson::to_vec(&row).map_err(|e| StorageError::Bson(e.to_string()))?;
+        let bytes =
+            secantus_core::bsondoc::to_vec(&row).map_err(|e| StorageError::Bson(e.to_string()))?;
         if !self.replace_by_id(
             WRITE_BLOCK_DB,
             WRITE_BLOCK_COLL,
@@ -11879,11 +12062,11 @@ impl Storage {
                 };
                 let probe = session.open_cursor(&doc_table_for(db, coll), None)?;
                 probe.set_key_ssq(db, coll, recordid);
-                let old_blob = match probe.search() {
+                let (old_idk_len, old_blob) = match probe.search() {
                     Ok(()) => {
                         let value = probe.get_value_u()?;
-                        let (_idk, blob) = unframe_doc_value(&value)?;
-                        blob.to_vec()
+                        let (idk, blob) = unframe_doc_value(&value)?;
+                        (idk.len(), blob.to_vec())
                     }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
@@ -11916,6 +12099,12 @@ impl Storage {
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
+                self.sizes.adjust(
+                    &session,
+                    db,
+                    coll,
+                    Delta::replace((old_idk_len, old_blob.len()), (key.len(), blob.len())),
+                );
 
                 // Maintain secondary indexes as a set diff (additions first, removals
                 // last — see `index_entry_diff` for why lock-free readers need that
@@ -11930,6 +12119,14 @@ impl Storage {
                     self.remove_index_entries(&session, db, coll, &removals)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                 }
+                self.index_build_side_write(
+                    &session,
+                    db,
+                    coll,
+                    Some(&old_doc),
+                    Some(&doc),
+                    recordid,
+                )?;
                 // Oplog: a full-document replacement is op "u" with `o` = the new doc
                 // (the `$v:2` diff form is for operator-updates, which the storage layer
                 // doesn't expose). The pre-image (old doc) is stored when the collection
@@ -11975,17 +12172,23 @@ impl Storage {
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 cur.set_key_ssq(db, coll, recordid);
                 // Read the doc first so we can retract its index entries, then remove.
-                let old_blob = match cur.search() {
+                let (old_idk_len, old_blob) = match cur.search() {
                     Ok(()) => {
                         let value = cur.get_value_u()?;
-                        let (_idk, blob) = unframe_doc_value(&value)?;
-                        blob.to_vec()
+                        let (idk, blob) = unframe_doc_value(&value)?;
+                        (idk.len(), blob.to_vec())
                     }
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
                 undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
                 cur.remove()?;
+                self.sizes.adjust(
+                    &session,
+                    db,
+                    coll,
+                    Delta::remove(old_idk_len, old_blob.len()),
+                );
                 note_deleted(db, coll, &old_blob);
                 let old_doc = decode_doc(&old_blob)?;
                 let descs = self.index_descs(&session, db, coll)?;
@@ -12333,6 +12536,26 @@ impl Storage {
     /// its registry row. Returns whether it existed. Emits an `op: "c"` `drop`
     /// oplog entry when it existed. Mirrors `storage.drop_collection`.
     pub fn drop_collection(&self, db: &str, coll: &str) -> Result<bool> {
+        // An index build over it is aborted first, as mongod's drop does
+        // (RM-187); the command layer asks before taking its locks, with
+        // the same cause, so this only finds builds a caller below it left.
+        if !self.index_builds(Some(db), Some(coll)).is_empty() {
+            let uuid = self
+                .collection_uuid(db, coll)
+                .ok()
+                .and_then(|u| <[u8; 16]>::try_from(u.as_slice()).ok())
+                .map(|u| bson::uuid::Uuid::from_bytes(u).to_string())
+                .unwrap_or_default();
+            self.abort_index_builds_and_wait(
+                db,
+                Some(coll),
+                &IndexBuildAbort::new(
+                    276,
+                    "IndexBuildAborted",
+                    format!("Collection {db}.{coll}({uuid}) is being dropped"),
+                ),
+            );
+        }
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -12447,7 +12670,13 @@ impl Storage {
         entry.insert("ns", format!("{db}.$cmd"));
         entry.insert("ui", uuid_binary(ui));
         entry.insert("o", Bson::Document(o));
-        // mongod's drop entry says how many documents went with it.
+        // mongod's drop entry says how many documents went with it, as an
+        // int32 while the count fits one (measured 8.2.11, 2026-10-26: 100
+        // documents are `{$numberInt: "100"}`).
+        let records = match i32::try_from(records) {
+            Ok(n) => Bson::Int32(n),
+            Err(_) => Bson::Int64(records),
+        };
         entry.insert("o2", bson::doc! {"numRecords": records});
         self.emit_oplog(session, vec![entry], vec![None])?;
         Ok(())
@@ -12581,6 +12810,13 @@ impl Storage {
     /// Emits one `op: "c"` `drop` per collection plus a final `dropDatabase: 1`
     /// command oplog entry (no `ui`). Mirrors `storage.drop_database`.
     pub fn drop_database(&self, db: &str) -> Result<()> {
+        // Its index builds are aborted first, as mongod's dropDatabase does
+        // (RM-187).
+        self.abort_index_builds_and_wait(
+            db,
+            None,
+            &IndexBuildAbort::new(276, "IndexBuildAborted", "dropDatabase command"),
+        );
         // Planner writes made here are released once they are visible.
         let _planner = PlannerScope::new();
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -12894,6 +13130,12 @@ impl Storage {
                         dcur.set_key_ssq(dst_db, dst_coll, recordid);
                         dcur.set_value_u(&frame_doc_value(id_k, blob));
                         dcur.insert()?;
+                        self.sizes.adjust(
+                            &session,
+                            dst_db,
+                            dst_coll,
+                            Delta::insert(id_k.len(), blob.len()),
+                        );
                         let doc = decode_doc(blob)?;
                         self.write_index_entries(
                             &session, dst_db, dst_coll, &doc, &dst_descs, recordid,
@@ -13061,6 +13303,12 @@ impl Storage {
             dcur.set_key_ssq(dst_db, dst_coll, recordid);
             dcur.set_value_u(&frame_doc_value(id_k, blob));
             dcur.insert()?;
+            self.sizes.adjust(
+                session,
+                dst_db,
+                dst_coll,
+                Delta::insert(id_k.len(), blob.len()),
+            );
             moved.push((recordid, decode_doc(blob)?));
         }
         let icur = session.open_cursor(IDX_TABLE, None)?;
@@ -13181,6 +13429,107 @@ impl Storage {
         Ok(coll_options(&session, db, coll)?
             .map(|o| o.get_bool("capped").unwrap_or(false))
             .unwrap_or(false))
+    }
+
+    /// `(db, coll)`'s record count, data size and index sizes as the size
+    /// storer keeps them: what mongod answers `count` with no query,
+    /// `collStats`, `dbStats` and an estimated `dataSize` from, without
+    /// reading a document. Like mongod's, it counts what transactions still
+    /// running have written: another transaction's uncommitted insert is in
+    /// it until that transaction aborts (RM-191, RM-087).
+    ///
+    /// `local.oplog.rs` is not a collection here but a view of the oplog
+    /// tables, and is counted by reading them.
+    pub fn collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes> {
+        if self.is_oplog_rs(db, coll) {
+            return Ok(CollectionSizes {
+                records: self.count_matching(db, coll, &Document::new(), None)? as i64,
+                data_size: self.collection_data_size(db, coll)?,
+                ..CollectionSizes::default()
+            });
+        }
+        Ok(self.sizes.get(db, coll))
+    }
+
+    /// `(db, coll)`'s sizes counted by reading every document and index
+    /// entry: what [`Self::collection_sizes`] keeps without reading, for a
+    /// check of the two against each other.
+    pub fn counted_collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes> {
+        let session = self.conn.open_session()?;
+        self.walk_sizes(&session, db, coll)
+    }
+
+    /// How many times this store's sizes were made by reading every table
+    /// (at an open after an unclean shutdown, or of a store that never kept
+    /// them), for tests.
+    #[doc(hidden)]
+    pub fn size_recounts(&self) -> u64 {
+        self.sizes.recounts()
+    }
+
+    fn walk_sizes(&self, session: &Session, db: &str, coll: &str) -> Result<CollectionSizes> {
+        let mut out = CollectionSizes::default();
+        self.visit_docs(session, db, coll, |_, id_k, blob| {
+            out.records += 1;
+            out.data_size += blob.len() as i64;
+            out.id_index_size += id_k.len() as i64;
+            Ok(())
+        })?;
+        self.visit_entry_rows(session, db, coll, |name, packed| {
+            *out.index_sizes.entry(name.to_string()).or_insert(0) += packed.len() as i64;
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Compare every collection's committed kept sizes with a walk of the
+    /// store, for `SECANTUS_CHECK_SIZES` (a test sweep: any write path that
+    /// moves a row without counting it shows up here). Runs at close, when
+    /// nothing else writes.
+    fn check_sizes_against_walk(&self, session: &Session) -> Result<()> {
+        let doc_tables: Vec<String> = (0..DOC_SHARDS).map(doc_shard_name).collect();
+        let walked = sizes::SizeStorer::default();
+        walked.recount(session, &doc_tables, IDX_ENTRIES_TABLE)?;
+        let mut wrong = Vec::new();
+        for (db, coll, sizes) in self.sizes.committed_sizes() {
+            if walked.get(&db, &coll) != sizes {
+                wrong.push(format!(
+                    "{db}.{coll}: kept {sizes:?}, walked {:?}",
+                    walked.get(&db, &coll)
+                ));
+            }
+        }
+        for (db, coll, sizes) in walked.committed_sizes() {
+            if self.sizes.committed_of(&db, &coll) != sizes {
+                wrong.push(format!(
+                    "{db}.{coll}: walked {sizes:?}, kept {:?}",
+                    self.sizes.committed_of(&db, &coll)
+                ));
+            }
+        }
+        if wrong.is_empty() {
+            Ok(())
+        } else {
+            Err(StorageError::Internal(format!(
+                "the kept collection sizes differ from the stored rows: {}",
+                wrong.join("; ")
+            )))
+        }
+    }
+
+    /// Start the size storer at open: the counts a clean close saved, or
+    /// one walk of the store when there are none to trust.
+    fn open_size_storer(&self, fingerprint: &[i64]) -> Result<()> {
+        let session = self.conn.open_session()?;
+        // Logged whatever the data tables are: the clean-close marker must
+        // not roll back with them.
+        session.create(sizes::SIZE_STORER_TABLE, sizes::SIZE_STORER_CFG)?;
+        if !self.sizes.load(&session, fingerprint)? {
+            let doc_tables: Vec<String> = (0..DOC_SHARDS).map(doc_shard_name).collect();
+            self.sizes
+                .recount(&session, &doc_tables, IDX_ENTRIES_TABLE)?;
+        }
+        Ok(())
     }
 
     /// Sum of BSON-encoded document bytes for the collection (the `size` /
@@ -13320,10 +13669,9 @@ impl Storage {
         let session = self.op_session()?;
         let mut out = Vec::with_capacity(docs.len());
         for bytes in docs {
-            let id = bson::RawDocument::from_bytes(bytes)
+            let id = secantus_core::bsondoc::fields(bytes, |key| key == "_id")
                 .ok()
-                .and_then(|d| d.get("_id").ok().flatten())
-                .and_then(|v| Bson::try_from(v).ok());
+                .and_then(|mut d| d.remove("_id"));
             let Some(id) = id else {
                 out.push(None);
                 continue;
@@ -13807,13 +14155,10 @@ impl Storage {
         name: &str,
         entries: &[(Vec<u8>, i64)],
     ) -> Result<()> {
-        let ec = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let ec = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (kb, rid) in entries {
             let packed = pack_entry(kb, *rid);
-            ec.reset()?;
-            ec.set_key_sssu(db, coll, name, &packed);
-            ec.set_value_u(b"");
-            ec.insert()?;
+            self.put_index_entry(session, &ec, db, coll, name, &packed)?;
         }
         Ok(())
     }
@@ -13831,6 +14176,53 @@ impl Storage {
         key_spec: &Document,
         options: &Document,
     ) -> Result<Option<IndexPlan>> {
+        let Some(mut stored_options) =
+            self.index_stored_options(session, db, coll, name, key_spec, options, 0)?
+        else {
+            return Ok(None);
+        };
+        let geo = parse_geo_2d(key_spec, options);
+        let geo_sphere = parse_geo_sphere(key_spec);
+        let build_order = index_bindata_order(&stored_options);
+        let key_coll: Option<Collation> = if geo.is_none() && geo_sphere.is_none() {
+            options
+                .get_document("collation")
+                .ok()
+                .and_then(secantus_core::collation::parse)
+        } else {
+            None
+        };
+        self.plan_index_entries(
+            session,
+            db,
+            coll,
+            name,
+            key_spec,
+            options,
+            &mut stored_options,
+            build_order,
+            geo,
+            geo_sphere,
+            key_coll,
+        )
+    }
+
+    /// The catalog `options` a new index `name` is recorded with -- its
+    /// user options plus the entry formats, its build sequence (`seq_after`
+    /// further on for the later indexes of one build) and its key markers --
+    /// registering the collection if it is not. `None` when an identical
+    /// index exists already; a conflicting one is an error.
+    #[allow(clippy::too_many_arguments)]
+    fn index_stored_options(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+        seq_after: i64,
+    ) -> Result<Option<Document>> {
         // It writes the index catalog.
         note_planner_write();
         let geo = parse_geo_2d(key_spec, options);
@@ -13889,7 +14281,6 @@ impl Storage {
         {
             stored_options.insert(BINDATA_ORDER_OPT, "bytes");
         }
-        let build_order = index_bindata_order(&stored_options);
         if !stored_options.contains_key(BUILD_SEQ) {
             let last = self
                 .iter_indexes(session, db, coll)?
@@ -13897,7 +14288,7 @@ impl Storage {
                 .map(|(_, _, o)| build_seq(o))
                 .max()
                 .unwrap_or(0);
-            stored_options.insert(BUILD_SEQ, last + 1);
+            stored_options.insert(BUILD_SEQ, last + 1 + seq_after);
         }
         // An index with a collation keys its entries by collation sort keys,
         // and says so in the catalog (see `COLLATION_KEYS`).
@@ -13915,6 +14306,26 @@ impl Storage {
         if geo.is_some() || geo_sphere.is_some() {
             stored_options.insert(GEO_KEYS, GEO_KEY_FORMAT);
         }
+        Ok(Some(stored_options))
+    }
+
+    /// The scan half of [`Self::plan_index`]: every entry the collection's
+    /// documents give the index, and its catalog row.
+    #[allow(clippy::too_many_arguments)]
+    fn plan_index_entries(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        name: &str,
+        key_spec: &Document,
+        options: &Document,
+        stored_options: &mut Document,
+        build_order: BinDataOrder,
+        geo: Option<Geo2d>,
+        geo_sphere: Option<GeoSphere>,
+        key_coll: Option<Collation>,
+    ) -> Result<Option<IndexPlan>> {
         let entries: Vec<(Vec<u8>, i64)> = if let Some(geo) = &geo {
             // 2d geo index: one geohash cell per point-valued doc. Always flagged
             // multikey so the regular (numeric) pickers skip it.
@@ -14048,7 +14459,7 @@ impl Storage {
         };
         let mut payload_doc = Document::new();
         payload_doc.insert("key", Bson::Document(key_spec.clone()));
-        payload_doc.insert("options", Bson::Document(stored_options));
+        payload_doc.insert("options", Bson::Document(stored_options.clone()));
         let payload = encode_doc(&payload_doc)?;
         Ok(Some(IndexPlan { payload, entries }))
     }
@@ -14592,6 +15003,7 @@ impl Storage {
         coll: &str,
         mut f: impl FnMut(i64, &[u8], &[u8]) -> Result<()>,
     ) -> Result<()> {
+        COLLECTION_WALKS.with(|w| w.set(w.get() + 1));
         // Lazy shards: an absent shard (empty / never-created collection) is empty.
         let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
             Ok(c) => c,
@@ -15129,11 +15541,9 @@ impl Storage {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
-                    match doc_cur.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                    doc_cur.remove()?;
+                    self.sizes
+                        .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
                     self.delete_index_entries(session, db, coll, &doc, descs, recordid)?;
                     self.delete_nat_entry(session, db, coll, &id_k)?;
                     total -= blob.len() as i64;
@@ -15303,6 +15713,8 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
+        // An index being built over the collection records the write too.
+        self.index_build_side_write(session, db, coll, None, Some(doc), recordid)?;
         // A document `_id` is also claimed by value (see `document_id_claim`).
         let with_id_claim;
         let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
@@ -15388,16 +15800,69 @@ impl Storage {
                 }
             }
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for desc in descs {
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
-                cur.reset()?;
-                cur.set_key_sssu(db, coll, &desc.name, &packed);
-                cur.set_value_u(b"");
-                cur.insert()?;
+                self.put_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
             }
         }
         Ok(())
+    }
+
+    /// Write one index entry with `cur` (opened `overwrite=false` on the
+    /// entries table), counting its bytes into the index's size when it is
+    /// new. One a document already has (two geo cells sharing an ancestor,
+    /// an array repeating a value) is there once and counted once.
+    fn put_index_entry(
+        &self,
+        session: &Session,
+        cur: &Cursor,
+        db: &str,
+        coll: &str,
+        name: &str,
+        packed: &[u8],
+    ) -> Result<()> {
+        cur.reset()?;
+        cur.set_key_sssu(db, coll, name, packed);
+        cur.set_value_u(b"");
+        match cur.insert() {
+            Ok(()) => {
+                self.sizes
+                    .adjust(session, db, coll, Delta::entries(name, packed.len() as i64));
+                Ok(())
+            }
+            Err(e) if e.is_duplicate_key() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Remove one index entry with `cur` (opened `overwrite=false`, so a
+    /// missing entry answers not-found rather than nothing), taking its
+    /// bytes off the index's size when it was there.
+    fn drop_index_entry(
+        &self,
+        session: &Session,
+        cur: &Cursor,
+        db: &str,
+        coll: &str,
+        name: &str,
+        packed: &[u8],
+    ) -> Result<()> {
+        cur.reset()?;
+        cur.set_key_sssu(db, coll, name, packed);
+        match cur.remove() {
+            Ok(()) => {
+                self.sizes.adjust(
+                    session,
+                    db,
+                    coll,
+                    Delta::entries(name, -(packed.len() as i64)),
+                );
+                Ok(())
+            }
+            Err(e) if e.is_not_found() => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Remove `doc`'s index entries for every index in `descs` (recomputes the
@@ -15412,6 +15877,8 @@ impl Storage {
         descs: &[IndexDesc],
         recordid: i64,
     ) -> Result<()> {
+        // An index being built over the collection records the write too.
+        self.index_build_side_write(session, db, coll, Some(doc), None, recordid)?;
         // A document `_id` is also claimed by value (see `document_id_claim`).
         let with_id_claim;
         let descs: &[IndexDesc] = match self.document_id_claim(session, db, coll, doc, descs)? {
@@ -15424,7 +15891,7 @@ impl Storage {
         if descs.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         // Release the unique claims this RecordId owns. Only its own: a claim
         // the row never held belongs to somebody else, and dropping it would
         // let a genuine duplicate through. The value is the owning RecordId
@@ -15452,13 +15919,7 @@ impl Storage {
                 }
             }
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
-                cur.reset()?;
-                cur.set_key_sssu(db, coll, &desc.name, &packed);
-                match cur.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
+                self.drop_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
             }
         }
         Ok(())
@@ -15517,12 +15978,9 @@ impl Storage {
         if items.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (name, packed) in items {
-            cur.reset()?;
-            cur.set_key_sssu(db, coll, name, packed);
-            cur.set_value_u(b"");
-            cur.insert()?;
+            self.put_index_entry(session, &cur, db, coll, name, packed)?;
         }
         Ok(())
     }
@@ -15537,15 +15995,9 @@ impl Storage {
         if items.is_empty() {
             return Ok(());
         }
-        let cur = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let cur = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (name, packed) in items {
-            cur.reset()?;
-            cur.set_key_sssu(db, coll, name, packed);
-            match cur.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.drop_index_entry(session, &cur, db, coll, name, packed)?;
         }
         Ok(())
     }
@@ -15617,30 +16069,7 @@ impl Storage {
         let mut descs: Vec<IndexDesc> = self
             .iter_indexes(session, db, coll)?
             .into_iter()
-            .map(|(name, key_spec, opts)| {
-                let partial = opts
-                    .get_document("partialFilterExpression")
-                    .ok()
-                    .filter(|d| !d.is_empty())
-                    .cloned();
-                let geo_2d = parse_geo_2d(&key_spec, &opts);
-                let geo_sphere = parse_geo_sphere(&key_spec);
-                IndexDesc {
-                    name,
-                    key_spec,
-                    sparse: opts.get_bool("sparse").unwrap_or(false),
-                    hidden: opts.get_bool("hidden").unwrap_or(false),
-                    collation: index_key_collation(&opts),
-                    unique: opts.get_bool("unique").unwrap_or(false),
-                    prepare_unique: opts.get_bool("prepareUnique").unwrap_or(false),
-                    partial,
-                    geo_2d,
-                    geo_sphere,
-                    id_claim: false,
-                    clustered: false,
-                    key_order: index_bindata_order(&opts),
-                }
-            })
+            .map(|(name, key_spec, opts)| index_desc_from(name, key_spec, &opts))
             .collect();
         descs.extend(self.id_claim_desc(session, db, coll)?);
         Ok(descs)
@@ -16350,6 +16779,12 @@ impl Storage {
                     docs.set_key_ssq(db, coll, *rid);
                     docs.set_value_u(&frame_doc_value(&new, &blob));
                     docs.update()?;
+                    self.sizes.adjust(
+                        session,
+                        db,
+                        coll,
+                        Delta::replace((old.len(), blob.len()), (new.len(), blob.len())),
+                    );
                 }
                 Ok(kept)
             })();
@@ -16621,15 +17056,9 @@ impl Storage {
             packs.push(packed);
             more = scan.next()?;
         }
-        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for p in &packs {
-            del.reset()?;
-            del.set_key_sssu(db, coll, name, p);
-            match del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.drop_index_entry(session, &del, db, coll, name, p)?;
         }
         Ok(packs.len())
     }
@@ -16693,24 +17122,26 @@ impl Storage {
             Err(e) if e.is_not_found() => false,
             Err(e) => return Err(e.into()),
         };
-        let mut ids: Vec<i64> = Vec::new();
+        // Each row's RecordId and its `_id`-key and document lengths, for
+        // the collection's sizes.
+        let mut ids: Vec<(i64, usize, usize)> = Vec::new();
         while more && ids.len() < limit {
             let (d, c, recordid) = cur.get_key_ssq()?;
             if d != db || c != coll {
                 break;
             }
-            ids.push(recordid);
+            let value = cur.get_value_u()?;
+            let (idk, blob) = unframe_doc_value(&value)?;
+            ids.push((recordid, idk.len(), blob.len()));
             more = cur.next()?;
         }
-        for recordid in &ids {
+        for &(recordid, idk_len, blob_len) in &ids {
             cur.reset()?;
-            note_row(db, coll, *recordid)?;
-            cur.set_key_ssq(db, coll, *recordid);
-            match cur.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            note_row(db, coll, recordid)?;
+            cur.set_key_ssq(db, coll, recordid);
+            cur.remove()?;
+            self.sizes
+                .adjust(session, db, coll, Delta::remove(idk_len, blob_len));
         }
         Ok(ids.len())
     }
@@ -16746,15 +17177,9 @@ impl Storage {
             keys.push((n, packed));
             more = scan.next()?;
         }
-        let del = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+        let del = session.open_cursor(IDX_ENTRIES_TABLE, Some("overwrite=false"))?;
         for (n, p) in &keys {
-            del.reset()?;
-            del.set_key_sssu(db, coll, n, p);
-            match del.remove() {
-                Ok(()) => {}
-                Err(e) if e.is_not_found() => {}
-                Err(e) => return Err(e.into()),
-            }
+            self.drop_index_entry(session, &del, db, coll, n, p)?;
         }
         Ok(keys.len())
     }
@@ -16908,11 +17333,9 @@ impl Storage {
                     note_row(db, coll, recordid)?;
                     undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
-                    match doc_cur.remove() {
-                        Ok(()) => {}
-                        Err(e) if e.is_not_found() => {}
-                        Err(e) => return Err(e.into()),
-                    }
+                    doc_cur.remove()?;
+                    self.sizes
+                        .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
                 }
             }
             Err(e) if e.is_missing_table() => {}
@@ -17038,7 +17461,23 @@ impl Storage {
         let ns_lock = self.coll_lock(db, coll);
         let _c = ns_lock.lock().unwrap_or_else(|e| e.into_inner());
         let session = self.conn.open_session()?;
-        self.check_collection_in(&session, db, coll)
+        let check = self.check_collection_in(&session, db, coll)?;
+        // A validation that found the collection sound sets its count and
+        // sizes to what it read, as mongod's foreground `validate` does
+        // (`updateStatsAfterRepair`): measured 8.2.11, a standalone killed
+        // before its size storer was saved counted 0 of 1,000 documents
+        // until `validate`, and 1,000 after.
+        let sound = check.get_i64("undecodable").unwrap_or(0) == 0
+            && check.get_array("indexes").is_ok_and(|ixs| {
+                ixs.iter().filter_map(Bson::as_document).all(|ix| {
+                    ix.get_i64("missing").unwrap_or(0) == 0 && ix.get_i64("extra").unwrap_or(0) == 0
+                })
+            });
+        if sound {
+            let walked = self.walk_sizes(&session, db, coll)?;
+            self.sizes.correct(db, coll, walked);
+        }
+        Ok(check)
     }
 
     /// [`Self::check_collection`] as of the last checkpoint: what a
@@ -18482,16 +18921,8 @@ impl Storage {
             .collect();
         let mut keyed: Vec<(Vec<SortPart>, usize)> = Vec::with_capacity(blobs.len());
         for (at, blob) in blobs.iter().enumerate() {
-            let raw =
-                bson::RawDocument::from_bytes(blob).map_err(|_| StorageError::QueryUnsupported)?;
-            let mut d = Document::new();
-            for elem in raw {
-                let (key, val) = elem.map_err(|_| StorageError::QueryUnsupported)?;
-                if tops.contains(&key) {
-                    let val = Bson::try_from(val).map_err(|_| StorageError::QueryUnsupported)?;
-                    d.insert(key.to_string(), val);
-                }
-            }
+            let d = secantus_core::bsondoc::fields(blob, |key| tops.contains(&key))
+                .map_err(|_| StorageError::QueryUnsupported)?;
             keyed.push((sort_key(&d, &spec, coll_opt)?, at));
         }
         keyed.sort_by(|a, b| compare_sort_keys(&a.0, &b.0, &spec));
@@ -19244,29 +19675,41 @@ impl Storage {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
-        let (matched, modified) = {
+        let (matched, modified, scan_error) = {
             // The coll lock's guard lives only for this block: the zero-match
             // delegation below re-enters `update_matching_single_txn`, which
             // takes the SAME non-reentrant mutex — holding it across that
             // call self-deadlocks (found by the first test run).
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let rids: Vec<i64> = {
+            // The documents the scan found to match, with the bytes it read
+            // them as, and the error that ended the scan early, if one did.
+            // mongod updates each document as its scan reaches it, so a
+            // filter that fails part-way -- an interrupt, or an error on one
+            // document -- leaves the documents before it updated: measured
+            // 8.2.11 (2026-10-27), `$divide: [1, "$d"]` with `d: 0` in the
+            // third of five documents updates the first two, and a kill
+            // half-way through 100 slow documents leaves 13 updated (RM-313).
+            let (rids, scan_error): (Vec<(i64, Vec<u8>)>, Option<StorageError>) = {
                 let session = self.op_session()?;
                 self.create_for_write(&session, db, coll)?;
                 let mut rids = Vec::new();
+                let mut scan_error = None;
                 for (recordid, _id_k, blob) in
                     self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
                 {
                     let raw = bson::RawDocument::from_bytes(&blob)
                         .map_err(|_| StorageError::QueryUnsupported)?;
-                    if secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                        .map_err(query_fault)?
-                    {
-                        rids.push(recordid);
+                    match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
+                        Ok(true) => rids.push((recordid, blob)),
+                        Ok(false) => {}
+                        Err(fault) => {
+                            scan_error = Some(query_fault(fault));
+                            break;
+                        }
                     }
                 }
-                rids
+                (rids, scan_error)
             };
             let mut matched = 0usize;
             let mut modified = 0usize;
@@ -19302,8 +19745,12 @@ impl Storage {
                 matched += m;
                 modified += w;
             }
-            (matched, modified)
+            (matched, modified, scan_error)
         };
+        // The documents before it are updated; the error is the statement's.
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
         if matched == 0 {
             // Zero matches (an empty scan, or every candidate stopped
             // matching by its chunk's re-check): the single-transaction body
@@ -19335,7 +19782,8 @@ impl Storage {
 
     /// One bounded chunk of the multi-update: process RecordIds from the
     /// front of `rids` until the doc/byte budget closes the transaction.
-    /// Returns `(consumed, matched, modified)` — `consumed` counts every
+    /// Each comes with the bytes the scan matched it as. Returns
+    /// `(consumed, matched, modified)` — `consumed` counts every
     /// examined RecordId (matching or not) so the driver always advances.
     #[allow(clippy::too_many_arguments)]
     fn update_chunk_txn(
@@ -19343,7 +19791,7 @@ impl Storage {
         session: &Session,
         db: &str,
         coll: &str,
-        rids: &[i64],
+        rids: &[(i64, Vec<u8>)],
         filter: &Document,
         vars: &Document,
         coll_opt: Option<&Collation>,
@@ -19383,7 +19831,8 @@ impl Storage {
         // error back; it used to roll the chunk back, so nothing was updated.
         let mut stopped: Option<StorageError> = None;
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for &recordid in rids {
+        for (recordid, scanned) in rids {
+            let recordid = *recordid;
             if modified >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
                 break;
             }
@@ -19400,12 +19849,21 @@ impl Storage {
                 Err(e) if e.is_not_found() => continue,
                 Err(e) => return Err(e.into()),
             };
-            let raw =
-                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
-            if !secantus_core::query::matches_raw(raw, filter, vars, coll_opt)
-                .map_err(query_fault)?
-            {
-                continue;
+            // A document unchanged since the scan matched it still matches:
+            // the filter is evaluated once per document, as mongod's is.
+            // One another writer changed is tested again, and a failure
+            // there ends the update after the documents before it.
+            if blob != *scanned {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(fault) => {
+                        stopped = Some(query_fault(fault));
+                        break;
+                    }
+                }
             }
             let doc = decode_doc(&blob)?;
             let new = match transform(&doc, false) {
@@ -19467,8 +19925,15 @@ impl Storage {
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
+            self.sizes.adjust(
+                session,
+                db,
+                coll,
+                Delta::replace((id_k.len(), blob.len()), (id_k.len(), new_blob.len())),
+            );
             self.remove_index_entries(session, db, coll, &removals)?;
             self.maybe_mark_multikey(session, db, coll, &new, &descs)?;
+            self.index_build_side_write(session, db, coll, Some(&doc), Some(&new), recordid)?;
             if oplog_on {
                 let o_owned: Vec<u8>;
                 // A PIPELINE update (no operator spec) is logged as a full
@@ -19637,8 +20102,22 @@ impl Storage {
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
+                        self.sizes.adjust(
+                            &session,
+                            db,
+                            coll,
+                            Delta::replace((id_k.len(), blob.len()), (id_k.len(), new_blob.len())),
+                        );
                         self.remove_index_entries(&session, db, coll, &removals)?;
                         self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
+                        self.index_build_side_write(
+                            &session,
+                            db,
+                            coll,
+                            Some(&doc),
+                            Some(&new),
+                            recordid,
+                        )?;
                         if oplog_on {
                             // Replacement `o` is the whole new doc — reuse the
                             // `new_blob` we already encoded for the doc-table write
@@ -19856,6 +20335,12 @@ impl Storage {
                     cur.set_key_ssq(db, coll, recordid);
                     cur.set_value_u(&frame_doc_value(&new_id_key, &new_blob));
                     cur.insert()?;
+                    self.sizes.adjust(
+                        &session,
+                        db,
+                        coll,
+                        Delta::insert(new_id_key.len(), new_blob.len()),
+                    );
                     self.write_index_entries(&session, db, coll, &new, &descs, recordid)?;
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                     if want_post_image {
@@ -20019,25 +20504,53 @@ impl Storage {
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-        let rids: Vec<i64> = {
+        // The documents the scan found to match, with the bytes it read them
+        // as, and the error that ended the scan early, if one did. mongod
+        // stages the documents it deletes and removes them a batch at a
+        // time (`batchedDeletesTargetBatchDocs`, 10, or
+        // `batchedDeletesTargetStagedDocBytes`, 2 MiB), so a scan that
+        // fails part-way -- an interrupt, a filter that errors on one
+        // document -- leaves the batches before it deleted and the one it
+        // was staging not: measured 8.2.11 (2026-10-27), killed after 1.0 s
+        // and 1.5 s of slow documents it had deleted 10 and 20, after 1.0 s
+        // of fast ones 360, and an error on the third of five deleted none
+        // (RM-313). (Killed after 0.5 s it had deleted 4, which no
+        // documented target explains.)
+        let (rids, scan_error): (Vec<(i64, Vec<u8>)>, Option<StorageError>) = {
+            const BATCH_DOCS: usize = 10;
+            const BATCH_BYTES: usize = 2 * 1024 * 1024;
             let session = self.op_session()?;
-            let mut rids = Vec::new();
+            let mut rids: Vec<(i64, Vec<u8>)> = Vec::new();
+            let mut scan_error = None;
+            let mut staged_from = 0usize;
+            let mut staged_bytes = 0usize;
             for (recordid, _id_k, blob) in
                 self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?
             {
                 let raw = bson::RawDocument::from_bytes(&blob)
                     .map_err(|_| StorageError::QueryUnsupported)?;
-                if secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                    .map_err(query_fault)?
-                {
-                    rids.push(recordid);
+                match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
+                    Ok(true) => {
+                        staged_bytes += blob.len();
+                        rids.push((recordid, blob));
+                        if rids.len() - staged_from >= BATCH_DOCS || staged_bytes >= BATCH_BYTES {
+                            staged_from = rids.len();
+                            staged_bytes = 0;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(fault) => {
+                        rids.truncate(staged_from);
+                        scan_error = Some(query_fault(fault));
+                        break;
+                    }
                 }
             }
             match DELETE_BATCH.with(Cell::get) {
                 0 => {}
-                batch => rids.chunks_mut(batch).for_each(<[i64]>::reverse),
+                batch => rids.chunks_mut(batch).for_each(<[(i64, Vec<u8>)]>::reverse),
             }
-            rids
+            (rids, scan_error)
         };
         // Each batch of two or more is one `applyOps` entry on mongod.
         struct ClearGroups;
@@ -20052,7 +20565,7 @@ impl Storage {
                 let mut g = g.borrow_mut();
                 for chunk in rids.chunks(batch).filter(|c| c.len() > 1) {
                     let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
-                    for rid in chunk {
+                    for (rid, _) in chunk {
                         g.insert(*rid, id);
                     }
                 }
@@ -20061,39 +20574,52 @@ impl Storage {
         let mut deleted = 0usize;
         let mut idx = 0usize;
         while idx < rids.len() {
-            let (consumed, d) = self.retry_write_conflicts("delete_matching_chunk", || {
-                let session = self.op_session()?;
-                self.with_statement_txn(&session, || {
-                    self.delete_chunk_txn(
-                        &session,
-                        db,
-                        coll,
-                        &rids[idx..],
-                        filter,
-                        let_vars,
-                        coll_opt,
-                    )
-                })
-            })?;
+            let (consumed, d, stopped) =
+                self.retry_write_conflicts("delete_matching_chunk", || {
+                    let session = self.op_session()?;
+                    self.with_statement_txn(&session, || {
+                        self.delete_chunk_txn(
+                            &session,
+                            db,
+                            coll,
+                            &rids[idx..],
+                            filter,
+                            let_vars,
+                            coll_opt,
+                        )
+                    })
+                })?;
+            // The chunk committed what it did before the failure; the
+            // failure is now the statement's.
+            if let Some(e) = stopped {
+                return Err(e);
+            }
             debug_assert!(consumed > 0);
             idx += consumed;
             deleted += d;
         }
+        // The batches before it are deleted; the error is the statement's.
+        if let Some(e) = scan_error {
+            return Err(e);
+        }
         Ok(deleted)
     }
 
-    /// One bounded chunk of the deleteMany. Returns `(consumed, deleted)`.
+    /// One bounded chunk of the deleteMany, over RecordIds with the bytes
+    /// the scan matched them as. Returns `(consumed, deleted, stopped)`:
+    /// `stopped` is the error a document another writer changed met when
+    /// it was tested again, which ends the delete after this chunk commits.
     #[allow(clippy::too_many_arguments)]
     fn delete_chunk_txn(
         &self,
         session: &Session,
         db: &str,
         coll: &str,
-        rids: &[i64],
+        rids: &[(i64, Vec<u8>)],
         filter: &Document,
         let_vars: &Document,
         coll_opt: Option<&Collation>,
-    ) -> Result<(usize, usize)> {
+    ) -> Result<(usize, usize, Option<StorageError>)> {
         // Large scalar `$in` / `$nin` lists hashed once for the scan.
         let in_sets = secantus_core::query::InSets::prepare(filter);
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
@@ -20115,8 +20641,10 @@ impl Storage {
         let mut chunk_bytes = 0usize;
         let mut oplog_entries: Vec<OplogEntry> = Vec::new();
         let mut pre_images: Vec<Option<Vec<u8>>> = Vec::new();
+        let mut stopped = None;
         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
-        for &recordid in rids {
+        for (recordid, scanned) in rids {
+            let recordid = *recordid;
             if deleted >= WRITE_CHUNK_MAX_DOCS || chunk_bytes >= WRITE_CHUNK_MAX_BYTES {
                 break;
             }
@@ -20132,12 +20660,19 @@ impl Storage {
                 Err(e) if e.is_not_found() => continue,
                 Err(e) => return Err(e.into()),
             };
-            let raw =
-                bson::RawDocument::from_bytes(&blob).map_err(|_| StorageError::QueryUnsupported)?;
-            if !secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt)
-                .map_err(query_fault)?
-            {
-                continue;
+            // A document unchanged since the scan matched it still matches
+            // (see `update_chunk_txn`).
+            if blob != *scanned {
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|_| StorageError::QueryUnsupported)?;
+                match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(fault) => {
+                        stopped = Some(query_fault(fault));
+                        break;
+                    }
+                }
             }
             let doc = decode_doc(&blob)?;
             // Doc row first, entries after — see prune_ttl for the lock-free
@@ -20147,6 +20682,8 @@ impl Storage {
             undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
+            self.sizes
+                .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
             note_deleted(db, coll, &blob);
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
             self.delete_nat_entry(session, db, coll, &id_k)?;
@@ -20174,7 +20711,7 @@ impl Storage {
         if oplog_on && !oplog_entries.is_empty() {
             self.emit_oplog_entries(session, oplog_entries, pre_images)?;
         }
-        Ok((consumed, deleted))
+        Ok((consumed, deleted, stopped))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -20234,6 +20771,8 @@ impl Storage {
                     undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
+                    self.sizes
+                        .adjust(&session, db, coll, Delta::remove(id_k.len(), blob.len()));
                     note_deleted(db, coll, &blob);
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
                     self.delete_nat_entry(&session, db, coll, &id_k)?;
@@ -22443,6 +22982,9 @@ fn validator_holds(
 ) -> Result<bool> {
     let own = default_collation(session, db, coll)?.map(|(c, _)| c);
     let _active = secantus_core::collation::activate(own.as_ref());
+    // mongod evaluates a validator where no interrupt reaches it (RM-313):
+    // an error here passes, and an interrupt must not read as one.
+    let _opaque = secantus_core::deadline::opaque();
     Ok(query_matches(doc, validator, &Document::new(), None).unwrap_or(true))
 }
 
@@ -22569,7 +23111,7 @@ fn retryable_stamp(position: usize) -> Option<bson::RawDocumentBuf> {
         let (lsid, txn, ids) = s.as_ref()?;
         let id = *ids.get(position)?;
         let mut rw = bson::RawDocumentBuf::new();
-        rw.append("lsid", bson::RawDocumentBuf::from_document(lsid).ok()?);
+        rw.append("lsid", secantus_core::bsondoc::to_raw(lsid).ok()?);
         rw.append("txnNumber", *txn);
         rw.append("stmtId", id);
         Some(rw)
@@ -22638,7 +23180,7 @@ fn stamp_oplog_session(entry: OplogEntry, lsid: &Document, txn: i64) -> Result<O
                 .get_str("op")
                 .is_ok_and(|op| matches!(op, "i" | "u" | "d"))
             {
-                let lsid_raw = bson::RawDocumentBuf::from_document(lsid)
+                let lsid_raw = secantus_core::bsondoc::to_raw(lsid)
                     .map_err(|e| StorageError::Bson(e.to_string()))?;
                 buf.append("lsid", bson::RawBson::Document(lsid_raw));
                 buf.append("txnNumber", bson::RawBsonRef::Int64(txn).to_raw_bson());
@@ -23232,7 +23774,10 @@ fn doc_was_modified(new: &Document, old: &Document, update_spec: Option<&Documen
             // byte for byte. One that leaves out the `_id` never is, so
             // mongod counts it as a modification even when every other field
             // is the same (measured 8.2.11, 2026-10-12).
-            return match (bson::to_vec(u), bson::to_vec(old)) {
+            return match (
+                secantus_core::bsondoc::to_vec(u),
+                secantus_core::bsondoc::to_vec(old),
+            ) {
                 (Ok(a), Ok(b)) => a != b,
                 _ => false,
             };

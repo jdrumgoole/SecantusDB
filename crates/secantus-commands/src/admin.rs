@@ -1229,6 +1229,8 @@ pub fn drop(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         Ok(ix) => ix.len().max(1),
         Err(_) => 1,
     };
+    // The indexes of a build the drop aborted count (mongod 8.2.11).
+    let n_indexes = n_indexes + crate::index_builds::take_aborted().len();
     // A time-series collection has no `_id` index to count, and a clustered
     // collection does not count its clustered key (measured 8.2.11).
     let n_indexes = if storage
@@ -1714,7 +1716,7 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let storage = ctx.storage()?;
     let cursors = ctx.cursors()?;
     let oplog = ctx.db_name == "local" && coll == "oplog.rs" && ctx.replica_set_name.is_some();
-    let Some(indexes) = listed_indexes(storage, &ctx.db_name, &coll, oplog)? else {
+    let Some(mut indexes) = listed_indexes(storage, &ctx.db_name, &coll, oplog)? else {
         // A collection that exists always has at least the synthesised `_id_`
         // index, so none at all means the namespace doesn't exist — mongod
         // errors NamespaceNotFound (mongo-ruby-driver `Index::View#each ...
@@ -1726,6 +1728,52 @@ pub fn list_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     };
+    // An index being built is listed after the finished ones (mongod
+    // 8.2.11, RM-187); `includeBuildUUIDs` names its build beside it and
+    // `includeIndexBuildInfo` describes the build, wrapping every spec.
+    let with_uuids = doc
+        .get("includeBuildUUIDs")
+        .is_some_and(crate::util::truthy);
+    let with_info = doc
+        .get("includeIndexBuildInfo")
+        .is_some_and(crate::util::truthy);
+    if with_info {
+        indexes = indexes
+            .into_iter()
+            .map(|spec| doc! {"spec": spec})
+            .collect();
+    }
+    for build in storage.index_builds(Some(&ctx.db_name), Some(&coll)) {
+        let uuid = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: build.uuid.to_vec(),
+        });
+        let opid = ctx
+            .ops
+            .as_ref()
+            .and_then(|ops| ops.index_build_opid(&build.uuid));
+        for spec in &build.indexes {
+            let spec = listed_spec(spec.clone());
+            indexes.push(if with_info {
+                let mut info = doc! {
+                    "buildUUID": uuid.clone(),
+                    "method": "Hybrid",
+                    "phase": build.phase,
+                    "phaseStr": build.phase_str.clone(),
+                };
+                if let Some(opid) = opid {
+                    info.insert("opid", opid);
+                }
+                info.insert("resumable", true);
+                info.insert("replicationState", doc! {"state": "In progress"});
+                doc! {"indexBuildInfo": info, "spec": spec}
+            } else if with_uuids {
+                doc! {"buildUUID": uuid.clone(), "spec": spec}
+            } else {
+                spec
+            });
+        }
+    }
     // mongod reports a listIndexes cursor under the PLAIN collection namespace
     // (`db.coll`), not a `$cmd.` pseudo-namespace -- probed on 8.3.4. That is
     // also what drivers put in the follow-up getMore's `collection` field, so a
@@ -2105,10 +2153,35 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     let unlisted = usize::from(ts_fields.is_some() || clustered);
     let before = before.saturating_sub(unlisted);
     // Nor does an `_id` index it does not list conflict with one asked for.
-    let existing: Vec<Document> = existing
+    let mut existing: Vec<Document> = existing
         .into_iter()
         .filter(|ix| ts_fields.is_none() || ix.get_str("name") != Ok("_id_"))
         .collect();
+    // An index being built is an index to this request (RM-187): one asked
+    // for again waits for its build to end, as mongod's does, and any other
+    // spec is checked against it as against a finished one.
+    let requested: Vec<(&str, &Document)> = specs
+        .iter()
+        .filter_map(|s| {
+            let s = s.as_document()?;
+            Some((s.get_str("name").ok()?, s.get_document("key").ok()?))
+        })
+        .collect();
+    let waited = wait_for_builds_of(storage, &ctx.db_name, &coll, &requested)?;
+    if waited {
+        existing = storage
+            .list_indexes(&ctx.db_name, &coll)
+            .map_err(command_error)?
+            .into_iter()
+            .filter(|ix| ts_fields.is_none() || ix.get_str("name") != Ok("_id_"))
+            .collect();
+    }
+    for build in storage.index_builds(Some(&ctx.db_name), Some(&coll)) {
+        existing.extend(build.indexes.into_iter().map(|mut spec| {
+            spec.insert(BUILDING_MARK, true);
+            spec
+        }));
+    }
     let mut any_created = false;
     let mut any_existed = false;
     // The indexes this request has built so far: mongod builds a request's
@@ -2122,6 +2195,11 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         Ok(Some(0))
     );
     let build_started = std::time::Instant::now();
+    // Over documents, outside a transaction, the request's new indexes are
+    // ONE two-phase build that lets writes go on (RM-187): the loop below
+    // only checks them, and the build runs after it.
+    let hybrid = scans && !created_coll && !ctx.txn_locks && storage.supports_index_builds();
+    let mut planned: Vec<(String, Document, Document)> = Vec::new();
     for spec in &specs {
         let Bson::Document(s) = spec else { continue };
         if let Some(e) = ts_fields
@@ -2420,6 +2498,15 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
             undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
             return Ok(e.into_reply());
         }
+        if hybrid {
+            if exists {
+                any_existed = true;
+            } else {
+                built_here.push(spec.clone());
+                planned.push((name, key, spec));
+            }
+            continue;
+        }
         let outcome = storage.create_index(&ctx.db_name, &coll, &name, &key, &spec);
         if outcome.is_err() {
             undo_request(storage, &ctx.db_name, &coll, created_coll, &built_here)?;
@@ -2486,6 +2573,12 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         any_created |= created;
         any_existed |= !created;
     }
+    if !planned.is_empty() {
+        if let Some(failed) = run_index_build(ctx, storage, doc, &coll, &planned)? {
+            return Ok(failed);
+        }
+        any_created = true;
+    }
     // The build thread's line: type `none`, not from a user connection,
     // once for a request's indexes, with the global IS it takes (measured
     // 8.2.11, 2026-10-24; RM-299). An empty collection builds in the
@@ -2541,6 +2634,296 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     }
     reply.insert("ok", 1.0);
     Ok(reply)
+}
+
+/// What `createIndexes` marks an index still being built with, among the
+/// indexes it checks a request against.
+const BUILDING_MARK: &str = "$building";
+
+/// Wait for the builds of any of `requested` (`(name, key)`) over `db.coll`
+/// to end, as a `createIndexes` asking again for an index being built waits
+/// for it on mongod. `true` when there was one to wait for. The request's
+/// `maxTimeMS` bounds the wait (mongod 8.2.11 answers 50). A spec that only
+/// shares a building index's NAME does not wait: it conflicts with it (86).
+fn wait_for_builds_of(
+    storage: &dyn crate::Storage,
+    db: &str,
+    coll: &str,
+    requested: &[(&str, &Document)],
+) -> Result<bool, CommandError> {
+    let building = |b: &crate::storage::IndexBuildInfo| {
+        b.indexes.iter().any(|ix| {
+            requested.iter().any(|(name, key)| {
+                ix.get_str("name") == Ok(*name)
+                    && ix
+                        .get_document("key")
+                        .is_ok_and(|k| docs_equal_by_value(k, key))
+            })
+        })
+    };
+    let mut waited = false;
+    while storage
+        .index_builds(Some(db), Some(coll))
+        .iter()
+        .any(building)
+    {
+        waited = true;
+        if secantus_core::deadline::check_now().is_err() {
+            return Err(if secantus_core::deadline::interrupted() {
+                CommandError::new(11601, "Interrupted", "operation was interrupted")
+            } else {
+                CommandError::max_time_expired()
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Ok(waited)
+}
+
+/// mongod's `writeConcernError` beside a build's interruption (8.2.11).
+fn build_write_concern_error(code: i32, code_name: &str, errmsg: &str) -> Document {
+    doc! {
+        "code": code,
+        "codeName": code_name,
+        "errmsg": errmsg,
+        "errInfo": {"writeConcern": {"w": 1, "wtimeout": 0}},
+    }
+}
+
+/// Run one two-phase build of `planned` (`(name, key, spec)`) over
+/// `db.coll` (RM-187): set up and commit under the collection's exclusive
+/// lock, scan and drain with the collection taking writes. `None` when it
+/// committed; the error reply mongod gives when it did not, the build
+/// aborted and `abortIndexBuild` logged.
+fn run_index_build(
+    ctx: &CommandContext,
+    storage: &dyn crate::Storage,
+    doc: &Document,
+    coll: &str,
+    planned: &[(String, Document, Document)],
+) -> Result<Option<Document>, CommandError> {
+    use crate::storage::IndexBuildAbort;
+    let db = ctx.db_name.as_str();
+    let uuid = bson::uuid::Uuid::new().bytes();
+    let build_text = uuid_text(&uuid).unwrap_or_default();
+    let exclusive = || -> Result<Option<crate::lock_manager::ExtraHold>, CommandError> {
+        match crate::lock_manager::exclusive_round(db, coll) {
+            None => Ok(None),
+            Some(Ok(hold)) => Ok(Some(hold)),
+            Some(Err(_)) => Err(if secantus_core::deadline::interrupted() {
+                CommandError::new(11601, "Interrupted", "operation was interrupted")
+            } else {
+                CommandError::max_time_expired()
+            }),
+        }
+    };
+    let member = match &ctx.server_address {
+        Some((h, p)) => format!("{h}:{p}"),
+        None => "localhost:27017".to_string(),
+    };
+    {
+        let _x = exclusive()?;
+        storage
+            .begin_index_build(db, coll, uuid, planned, &member)
+            .map_err(command_error)?;
+    }
+    // The build's own operation, as mongod lists its build thread.
+    let mut build_command = doc! {"createIndexes": coll};
+    let specs: Vec<Bson> = storage
+        .index_builds(Some(db), Some(coll))
+        .into_iter()
+        .find(|b| b.uuid == uuid)
+        .map(|b| {
+            b.indexes
+                .into_iter()
+                .map(|s| Bson::Document(listed_build_spec(&s)))
+                .collect()
+        })
+        .unwrap_or_default();
+    build_command.insert("indexes", specs);
+    for (k, v) in doc.iter().skip(1) {
+        if k != "indexes" {
+            build_command.insert(k.clone(), v.clone());
+        }
+    }
+    let _op = ctx.ops.as_ref().map(|ops| {
+        let storage = ctx.storage.clone();
+        let (db, coll) = (db.to_string(), coll.to_string());
+        ops.begin_index_build(
+            uuid,
+            format!("{db}.{coll}"),
+            build_command,
+            Box::new(move || {
+                if let Some(s) = &storage {
+                    s.request_index_build_abort(
+                        &db,
+                        Some(&coll),
+                        Some(&uuid),
+                        &IndexBuildAbort::new(11601, "Interrupted", "operation was interrupted"),
+                    );
+                }
+            }),
+        )
+    });
+    let memory = ctx
+        .server_params
+        .as_ref()
+        .and_then(|p| p.get("maxIndexBuildMemoryUsageMegabytes"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(200.0);
+    let memory = (memory * 1024.0 * 1024.0).min(usize::MAX as f64) as usize;
+    let pause = |name: &str| {
+        if let Some(fp) = &ctx.failpoints {
+            fp.pause_while_set(name, || storage.index_build_abort_cause(&uuid).is_some());
+        }
+    };
+    pause("hangAfterStartingIndexBuild");
+    let built = storage
+        .run_index_build(&uuid, memory)
+        .and_then(|()| storage.index_build_ready(&uuid, &member))
+        .map_err(Failure::Storage)
+        .and_then(|()| {
+            pause("hangIndexBuildBeforeCommit");
+            let _x = exclusive().map_err(Failure::Command)?;
+            storage.commit_index_build(&uuid).map_err(Failure::Storage)
+        });
+    let Err(failure) = built else {
+        return Ok(None);
+    };
+    // Why it failed, and what the client and the oplog are told.
+    let coll_uuid = storage
+        .collection_uuid(db, coll)
+        .ok()
+        .and_then(|b| uuid_text(&b))
+        .unwrap_or_default();
+    let wrapped = |why: &str| {
+        format!("Index build failed: {build_text}: Collection {db}.{coll} ( {coll_uuid} ) :: caused by :: {why}")
+    };
+    let interrupted = secantus_core::deadline::interrupted();
+    let spent = secantus_core::deadline::expired();
+    let (cause, reply) = if let Some(cause) = storage.index_build_abort_cause(&uuid) {
+        // Asked for: a dropIndexes, a drop, a killOp of the build.
+        let mut reply = doc! {
+            "ok": 0.0,
+            "errmsg": wrapped(&cause.errmsg),
+            "code": cause.code,
+            "codeName": cause.code_name.clone(),
+        };
+        reply.extend(cause.extra.clone());
+        // A killed build votes to abort itself, and logs the vote (mongod
+        // 8.2.11), while its command answers the interruption.
+        let cause = if cause.code == 11601 {
+            IndexBuildAbort::new(
+                276,
+                "IndexBuildAborted",
+                format!(
+                    "'voteAbortIndexBuild' received from '{member}': {}",
+                    cause.errmsg
+                ),
+            )
+        } else {
+            cause
+        };
+        (cause, reply)
+    } else if interrupted || spent || matches!(&failure, Failure::Command(_)) {
+        // The command itself was killed or ran out of time: the build is
+        // aborted with it (mongod 8.2.11).
+        let (code, code_name, errmsg) = if interrupted {
+            (11601, "Interrupted", "operation was interrupted")
+        } else {
+            (50, "MaxTimeMSExpired", "operation exceeded time limit")
+        };
+        let cause = IndexBuildAbort::new(
+            276,
+            "IndexBuildAborted",
+            format!("Index build aborted: {build_text}: {code_name}: {errmsg}"),
+        );
+        let reply = doc! {
+            "writeConcernError": build_write_concern_error(code, code_name, errmsg),
+            "ok": 0.0,
+            "errmsg": errmsg,
+            "code": code,
+            "codeName": code_name,
+        };
+        (cause, reply)
+    } else {
+        match &failure {
+            Failure::Storage(StorageError::DuplicateKey(info)) => {
+                let mut cause = IndexBuildAbort::new(11000, "DuplicateKey", info.errmsg.clone());
+                let mut reply = doc! {
+                    "ok": 0.0,
+                    "errmsg": wrapped(&info.errmsg),
+                    "code": 11000,
+                    "codeName": "DuplicateKey",
+                };
+                if let Some(kp) = &info.key_pattern {
+                    cause.extra.insert("keyPattern", kp.clone());
+                    reply.insert("keyPattern", kp.clone());
+                }
+                if let Some(kv) = &info.key_value {
+                    cause.extra.insert("keyValue", kv.clone());
+                    reply.insert("keyValue", kv.clone());
+                }
+                if let Some(extra) = &info.extra {
+                    reply.extend(extra.clone());
+                }
+                (cause, reply)
+            }
+            Failure::Storage(StorageError::WriteError { code, errmsg, .. }) => {
+                let name = crate::util::error_code_name(*code);
+                let cause = IndexBuildAbort::new(*code, &name, errmsg.clone());
+                let reply = doc! {
+                    "ok": 0.0,
+                    "errmsg": wrapped(errmsg),
+                    "code": *code,
+                    "codeName": name,
+                };
+                (cause, reply)
+            }
+            Failure::Storage(other) => {
+                let e = command_error(other.clone());
+                let cause = IndexBuildAbort::new(e.code, &e.code_name, e.errmsg.clone());
+                (cause, e.into_reply())
+            }
+            Failure::Command(e) => {
+                let cause = IndexBuildAbort::new(e.code, &e.code_name, e.errmsg.clone());
+                (cause, e.clone().into_reply())
+            }
+        }
+    };
+    {
+        // The abort is not the command's to be interrupted: it runs to the
+        // end whatever the command's budget or kill flag says.
+        let _quiet = secantus_core::deadline::suspend();
+        storage
+            .abort_index_build(&uuid, &cause)
+            .map_err(command_error)?;
+    }
+    Ok(Some(reply))
+}
+
+/// How a build failed: in the storage, or in the command around it (a lock
+/// wait the deadline ended).
+enum Failure {
+    Storage(StorageError),
+    Command(CommandError),
+}
+
+/// A building index's spec as mongod's build operation shows it: `v`,
+/// `unique` and `hidden`, then the rest.
+fn listed_build_spec(spec: &Document) -> Document {
+    let mut out = Document::new();
+    for first in ["v", "unique", "hidden"] {
+        if let Some(v) = spec.get(first) {
+            out.insert(first, v.clone());
+        }
+    }
+    for (k, v) in spec {
+        if !matches!(k.as_str(), "v" | "unique" | "hidden") {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    out
 }
 
 /// What mongod refuses in a `partialFilterExpression`.
@@ -3444,6 +3827,8 @@ fn equivalent_spec_text(spec: &Document) -> String {
 /// Catalog bookkeeping that is not part of an index's options (and that
 /// `listIndexes` already hides from clients).
 pub(crate) const INDEX_CATALOG_ONLY: &[&str] = &[
+    // `createIndexes`'s own mark on an index still being built (RM-187).
+    BUILDING_MARK,
     "entryFormat",
     "multikey",
     "collationKeys",
@@ -3544,7 +3929,18 @@ fn index_conflict(
                      names are not specified, they are auto generated and can cause conflicts. \
                      Please refer to our documentation. Requested index: {}, existing index: {}",
                     conflict_spec_text(spec),
-                    conflict_spec_text(idx),
+                    // An index being built is quoted as its build has it:
+                    // `v`, `key`, `name`, then the options (mongod 8.2.11).
+                    if idx.contains_key(BUILDING_MARK) {
+                        let shown: Document = idx
+                            .iter()
+                            .filter(|(k, _)| k.as_str() != BUILDING_MARK)
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect();
+                        argtypes::render_stage_value(&Bson::Document(shown))
+                    } else {
+                        conflict_spec_text(idx)
+                    },
                 ),
             ));
         }
@@ -3606,9 +4002,12 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let clustered = storage
         .get_collection_options(&ctx.db_name, &coll)
         .is_ok_and(|o| o.contains_key("clusteredIndex"));
-    let before = listed
-        .len()
-        .saturating_sub(usize::from(is_time_series || clustered));
+    // A build this command aborted before its locks (RM-187): its indexes
+    // count as there and as dropped, as on mongod 8.2.11.
+    let aborted = crate::index_builds::take_aborted();
+    let was_building = |name: &str| aborted.iter().any(|(n, _)| n == name);
+    let before =
+        (listed.len() + aborted.len()).saturating_sub(usize::from(is_time_series || clustered));
     // The `_id` index is never dropped, by name, by key or in a list. By key
     // it used to be: `{dropIndexes: c, index: {_id: 1}}` removed it.
     let id_index = || {
@@ -3631,7 +4030,8 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply()
     };
-    let has = |name: &str| listed.iter().any(|ix| ix.get_str("name") == Ok(name));
+    let has =
+        |name: &str| listed.iter().any(|ix| ix.get_str("name") == Ok(name)) || was_building(name);
 
     let mut reply = doc! { "nIndexesWas": before as i32 };
     match (names, doc.get("index")) {
@@ -3665,7 +4065,7 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             let existed = storage
                 .drop_index(&ctx.db_name, &coll, name)
                 .map_err(command_error)?;
-            if !existed {
+            if !existed && !was_building(name) {
                 return Ok(not_found(name));
             }
         }
@@ -3710,6 +4110,7 @@ pub fn drop_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         .drop_index(&ctx.db_name, &coll, &name)
                         .map_err(command_error)?;
                 }
+                None if aborted.iter().any(|(_, k)| k == key) => {}
                 None => {
                     return Ok(CommandError::new(
                         27,
@@ -3925,7 +4326,11 @@ pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResu
     let buckets = crate::ts_buckets::of_collection(storage, &ctx.db_name, coll)?;
     let bucket_size: i64 = buckets
         .iter()
-        .map(|b| bson::to_vec(b).map(|v| v.len() as i64).unwrap_or(0))
+        .map(|b| {
+            crate::bsondoc::to_vec(b)
+                .map(|v| v.len() as i64)
+                .unwrap_or(0)
+        })
         .sum();
     let n = buckets.len() as i64;
     let mut index_sizes = index_sizes;

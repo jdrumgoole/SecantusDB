@@ -32,6 +32,21 @@ pub struct RunningOp {
     /// Set by `killOp`; installed with `deadline` while the operation runs,
     /// so every scan's deadline poll sees it.
     killed: Arc<AtomicBool>,
+    /// The session the operation runs on, if any: its `lsid` id and the
+    /// user who owns it (`uid`), which the kill-session commands match
+    /// (RM-313).
+    session: Option<(Vec<u8>, Vec<u8>)>,
+    /// An index build's own operation (mongod's
+    /// `IndexBuildsCoordinatorMongod-N`): its `desc`, and what `killOp`
+    /// does to it -- asks the build to abort (RM-187).
+    build: Option<BuildOp>,
+}
+
+/// What an index build's operation adds to a running operation.
+struct BuildOp {
+    desc: String,
+    uuid: [u8; 16],
+    on_kill: Box<dyn Fn() + Send + Sync>,
 }
 
 impl RunningOp {
@@ -50,6 +65,28 @@ impl RunningOp {
     /// The operation as `currentOp` lists it, in mongod's field order.
     pub fn describe(&self, host: &str) -> Document {
         let elapsed = self.started.elapsed();
+        if let Some(build) = &self.build {
+            // An index build runs on a thread of its own, from no client
+            // (mongod 8.2.11's row for it).
+            let mut out = doc! {
+                "type": "op",
+                "host": host,
+                "desc": build.desc.clone(),
+                "active": true,
+                "isFromUserConnection": false,
+                "opid": Bson::Int64(self.opid),
+                "secs_running": Bson::Int64(elapsed.as_secs() as i64),
+                "microsecs_running": Bson::Int64(elapsed.as_micros() as i64),
+                "op": "command",
+                "ns": self.ns.clone(),
+                "redacted": false,
+                "command": self.command.clone(),
+            };
+            if self.killed() {
+                out.insert("killPending", true);
+            }
+            return out;
+        }
         let mut out = doc! {
             "type": "op",
             "host": host,
@@ -129,10 +166,101 @@ impl OpRegistry {
         {
             Some(op) => {
                 op.killed.store(true, Ordering::Release);
+                if let Some(build) = &op.build {
+                    (build.on_kill)();
+                }
                 true
             }
             None => false,
         }
+    }
+
+    /// Mark every operation running on a session `picks(lsid, uid)`
+    /// chooses killed: `killSessions`, `killAllSessions` and
+    /// `killAllSessionsByPattern` interrupt the operations of the sessions
+    /// they kill, as mongod 8.2.11 does (RM-313). An operation outside any
+    /// session is left alone (measured: `killAllSessions: []` does not
+    /// interrupt an update sent with no `lsid`).
+    pub fn kill_sessions(&self, picks: impl Fn(&[u8], &[u8]) -> bool) {
+        for op in self.snapshot() {
+            if let Some((lsid, uid)) = &op.session {
+                if picks(lsid, uid) {
+                    op.killed.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    /// Register an index build's own operation, for as long as the guard
+    /// lives: `currentOp` lists it under `desc`, and `killOp` runs
+    /// `on_kill`. mongod numbers its build threads from 1 per process.
+    pub fn begin_index_build(
+        self: &Arc<Self>,
+        uuid: [u8; 16],
+        ns: String,
+        command: Document,
+        on_kill: Box<dyn Fn() + Send + Sync>,
+    ) -> BuildOpGuard {
+        static THREADS: AtomicI64 = AtomicI64::new(1);
+        let opid = self.next_opid.fetch_add(1, Ordering::Relaxed);
+        let running = Arc::new(RunningOp {
+            opid,
+            connection_id: 0,
+            client: None,
+            client_metadata: None,
+            op: "command",
+            ns,
+            command,
+            started: Instant::now(),
+            killed: Arc::new(AtomicBool::new(false)),
+            // The build's thread runs on no session: a kill of the
+            // command's session interrupts the command, which aborts the
+            // build with it (as `killOp` of the command does).
+            session: None,
+            build: Some(BuildOp {
+                desc: format!(
+                    "IndexBuildsCoordinatorMongod-{}",
+                    THREADS.fetch_add(1, Ordering::Relaxed)
+                ),
+                uuid,
+                on_kill,
+            }),
+        });
+        self.ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(opid, running);
+        BuildOpGuard {
+            registry: self.clone(),
+            opid,
+        }
+    }
+}
+
+/// An index build's registered operation, unregistered on drop.
+#[must_use = "the operation is unregistered when this guard drops"]
+pub struct BuildOpGuard {
+    registry: Arc<OpRegistry>,
+    opid: i64,
+}
+
+impl Drop for BuildOpGuard {
+    fn drop(&mut self) {
+        self.registry
+            .ops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.opid);
+    }
+}
+
+impl OpRegistry {
+    /// The opid of index build `uuid`'s operation, while it runs.
+    pub fn index_build_opid(&self, uuid: &[u8; 16]) -> Option<i64> {
+        self.snapshot()
+            .iter()
+            .find(|op| op.build.as_ref().is_some_and(|b| &b.uuid == uuid))
+            .map(|op| op.opid)
     }
 
     /// Whether a running `getMore` is reading the cursor `id`.
@@ -195,7 +323,15 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
             .get_str("collection")
             .map(|c| format!("{}.{c}", ctx.db_name))
             .unwrap_or_else(|_| format!("{}.$cmd", ctx.db_name)),
-        (_, Some(Bson::String(coll))) if op != "command" || name == "aggregate" => {
+        // A command that reads one collection is listed under it (mongod
+        // 8.2.11: `count`, `distinct` and `findAndModify` too, 2026-10-27).
+        (_, Some(Bson::String(coll)))
+            if op != "command"
+                || matches!(
+                    name,
+                    "aggregate" | "count" | "distinct" | "findAndModify" | "findandmodify"
+                ) =>
+        {
             format!("{}.{coll}", ctx.db_name)
         }
         _ => format!("{}.$cmd", ctx.db_name),
@@ -206,6 +342,14 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         .and_then(|a| a.lock().ok())
         .map(|g| (g.peer_address.clone(), g.client_metadata.clone()))
         .unwrap_or_default();
+    let session = doc
+        .get_document("lsid")
+        .ok()
+        .and_then(|lsid| crate::session::session_id(lsid, "lsid").ok())
+        .map(|id| {
+            let uid = crate::session::user_digest(&crate::session::authenticated(ctx));
+            (id, uid)
+        });
     let opid = registry.next_opid.fetch_add(1, Ordering::Relaxed);
     let running = Arc::new(RunningOp {
         opid,
@@ -217,6 +361,8 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         command: doc.clone(),
         started: Instant::now(),
         killed: Arc::new(AtomicBool::new(false)),
+        session,
+        build: None,
     });
     let killed = running.killed.clone();
     registry

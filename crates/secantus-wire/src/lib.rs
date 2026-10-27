@@ -553,49 +553,127 @@ pub fn build_op_msg_reply(
 /// The batch field is emitted first inside `cursor` so the layout matches the
 /// old `doc!{ "cursor": { "firstBatch"/"nextBatch": …, "id": …, "ns": … } }`
 /// ordering exactly (asserted byte-for-byte by the unit test).
+///
+/// `envelope` is that document already encoded. Every element is copied
+/// through byte for byte, never decoded, so a string the envelope holds whose
+/// bytes are not UTF-8 (a namespace mongod accepted) reaches the client as it
+/// is (RM-222).
 pub fn encode_cursor_reply(
-    envelope: &bson::Document,
+    envelope: &[u8],
     batch_field: &str,
     batch: &[Vec<u8>],
 ) -> Result<Vec<u8>, WireError> {
-    use bson::{RawArrayBuf, RawDocument, RawDocumentBuf};
-
-    let internal = |m: String| WireError::Protocol(format!("encode_cursor_reply: {m}"));
-
-    // Encode the small envelope once, then re-read it raw so every top-level
-    // element (ok, $clusterTime, operationTime, writeConcernError, …) is copied
-    // through byte-wise, in order, without decoding.
-    let mut env_bytes = Vec::new();
-    envelope
-        .to_writer(&mut env_bytes)
-        .map_err(|e| internal(e.to_string()))?;
-    let env = RawDocument::from_bytes(&env_bytes).map_err(|e| internal(e.to_string()))?;
-
-    let mut out = RawDocumentBuf::new();
-    for pair in env.iter() {
-        let (key, val) = pair.map_err(|e| internal(e.to_string()))?;
-        if key == "cursor" {
-            let cursor = val
-                .as_document()
-                .ok_or_else(|| internal("reply `cursor` field is not a document".into()))?;
-            let mut cur = RawDocumentBuf::new();
-            // Batch first, then copy the handler's `id` / `ns` in their order.
-            let mut arr = RawArrayBuf::new();
-            for blob in batch {
-                let rd = RawDocument::from_bytes(blob).map_err(|e| internal(e.to_string()))?;
-                arr.push(bson::RawBsonRef::Document(rd).to_raw_bson());
-            }
-            cur.append(batch_field, arr);
-            for cp in cursor.iter() {
-                let (ck, cv) = cp.map_err(|e| internal(e.to_string()))?;
-                cur.append(ck, cv.to_raw_bson());
-            }
-            out.append("cursor", cur);
-        } else {
-            out.append(key, val.to_raw_bson());
+    let internal = |m: &str| WireError::Protocol(format!("encode_cursor_reply: {m}"));
+    let elements = raw_elements(envelope).ok_or_else(|| internal("malformed envelope"))?;
+    let mut out = vec![0u8; 4];
+    let mut have_cursor = false;
+    for (t, key, value) in elements {
+        out.push(t);
+        out.extend_from_slice(key);
+        out.push(0);
+        if key != b"cursor" {
+            out.extend_from_slice(value);
+            continue;
         }
+        if t != 0x03 {
+            return Err(internal("reply `cursor` field is not a document"));
+        }
+        have_cursor = true;
+        let cursor_start = out.len();
+        out.extend_from_slice(&[0; 4]);
+        // Batch first, then the handler's `id` / `ns` in their order.
+        out.push(0x04);
+        out.extend_from_slice(batch_field.as_bytes());
+        out.push(0);
+        let array_start = out.len();
+        out.extend_from_slice(&[0; 4]);
+        for (i, blob) in batch.iter().enumerate() {
+            let len = blob
+                .get(..4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| *n >= 5 && *n <= blob.len())
+                .ok_or_else(|| internal("malformed batch document"))?;
+            out.push(0x03);
+            out.extend_from_slice(i.to_string().as_bytes());
+            out.push(0);
+            out.extend_from_slice(&blob[..len]);
+        }
+        out.push(0);
+        patch_len(&mut out, array_start);
+        // The cursor document's own elements, without its length and NUL.
+        out.extend_from_slice(&value[4..value.len() - 1]);
+        out.push(0);
+        patch_len(&mut out, cursor_start);
     }
-    Ok(out.into_bytes())
+    if !have_cursor {
+        return Err(internal("reply has no `cursor` field"));
+    }
+    out.push(0);
+    patch_len(&mut out, 0);
+    Ok(out)
+}
+
+fn patch_len(out: &mut [u8], start: usize) {
+    let len = (out.len() - start) as i32;
+    out[start..start + 4].copy_from_slice(&len.to_le_bytes());
+}
+
+/// One element of an encoded document: its type, key and value bytes.
+type RawElement<'a> = (u8, &'a [u8], &'a [u8]);
+
+/// The top-level elements of one encoded document, or `None` when it is
+/// malformed.
+fn raw_elements(doc: &[u8]) -> Option<Vec<RawElement<'_>>> {
+    let len = usize::try_from(rd_i32_checked(doc, 0)?).ok()?;
+    if len < 5 || len > doc.len() || doc[len - 1] != 0 {
+        return None;
+    }
+    let end = len - 1;
+    let mut out = Vec::new();
+    let mut i = 4;
+    while i < end {
+        let t = doc[i];
+        i += 1;
+        let k_end = i + doc[i..end].iter().position(|c| *c == 0)?;
+        let key = &doc[i..k_end];
+        i = k_end + 1;
+        let size = value_size(t, &doc[i..end])?;
+        out.push((t, key, doc.get(i..i + size)?));
+        i += size;
+    }
+    (i == end).then_some(out)
+}
+
+fn rd_i32_checked(b: &[u8], at: usize) -> Option<i32> {
+    b.get(at..at + 4)
+        .map(|s| i32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+}
+
+/// The size of a BSON value of type `t` at the start of `rest`.
+fn value_size(t: u8, rest: &[u8]) -> Option<usize> {
+    let len_at = |at: usize, min: i32| -> Option<usize> {
+        let n = rd_i32_checked(rest, at)?;
+        (n >= min).then_some(n as usize)
+    };
+    let size = match t {
+        0x01 | 0x09 | 0x11 | 0x12 => 8,
+        0x02 | 0x0D | 0x0E => 4 + len_at(0, 1)?,
+        0x03 | 0x04 | 0x0F => len_at(0, 5)?,
+        0x05 => 5 + len_at(0, 0)?,
+        0x06 | 0x0A | 0x7F | 0xFF => 0,
+        0x07 => 12,
+        0x08 => 1,
+        0x0B => {
+            let p = rest.iter().position(|c| *c == 0)?;
+            p + 1 + rest[p + 1..].iter().position(|c| *c == 0)? + 1
+        }
+        0x0C => 4 + len_at(0, 1)? + 12,
+        0x10 => 4,
+        0x13 => 16,
+        _ => return None,
+    };
+    (size <= rest.len()).then_some(size)
 }
 
 /// Build a legacy `OP_REPLY` frame for the `OP_QUERY` handshake. Port of
@@ -723,10 +801,54 @@ mod tests {
         *cursor = rebuilt;
         let expected = enc(&owned);
 
-        let got = encode_cursor_reply(&envelope, batch_field, &blobs).unwrap();
+        let got = encode_cursor_reply(&enc(&envelope), batch_field, &blobs).unwrap();
         assert_eq!(
             got, expected,
             "spliced reply body must byte-match the owned reply"
+        );
+    }
+
+    /// RM-222: a batch document and an envelope string whose bytes are not
+    /// UTF-8 are copied through as they are.
+    #[test]
+    fn encode_cursor_reply_copies_strings_that_are_not_utf8() {
+        // {_id: 1, s: <ff fe>}
+        let blob: Vec<u8> = [
+            &24i32.to_le_bytes()[..],
+            &[0x10, b'_', b'i', b'd', 0, 1, 0, 0, 0],
+            &[0x02, b's', 0, 3, 0, 0, 0, 0xff, 0xfe, 0],
+            &[0],
+        ]
+        .concat();
+        assert_eq!(blob.len(), 24);
+        // {cursor: {id: 0L, ns: "d.<ff>"}, ok: 1.0}
+        let cursor: Vec<u8> = [
+            &[0x12, b'i', b'd', 0][..],
+            &0i64.to_le_bytes(),
+            &[0x02, b'n', b's', 0, 4, 0, 0, 0, b'd', b'.', 0xff, 0],
+        ]
+        .concat();
+        let mut cursor_doc = ((cursor.len() + 5) as i32).to_le_bytes().to_vec();
+        cursor_doc.extend(&cursor);
+        cursor_doc.push(0);
+        let mut env_elems = vec![0x03];
+        env_elems.extend_from_slice(b"cursor\0");
+        env_elems.extend(&cursor_doc);
+        env_elems.push(0x01);
+        env_elems.extend_from_slice(b"ok\0");
+        env_elems.extend(1.0f64.to_le_bytes());
+        let mut envelope = ((env_elems.len() + 5) as i32).to_le_bytes().to_vec();
+        envelope.extend(&env_elems);
+        envelope.push(0);
+
+        let got =
+            encode_cursor_reply(&envelope, "firstBatch", std::slice::from_ref(&blob)).unwrap();
+        let find = |needle: &[u8]| got.windows(needle.len()).any(|w| w == needle);
+        assert!(find(&blob), "the batch document is copied whole");
+        assert!(find(b"d.\xff\0"), "the namespace keeps its bytes");
+        assert_eq!(
+            i32::from_le_bytes([got[0], got[1], got[2], got[3]]) as usize,
+            got.len()
         );
     }
 

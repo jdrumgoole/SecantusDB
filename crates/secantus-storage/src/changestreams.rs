@@ -669,7 +669,16 @@ fn project_command(
         )?;
         return Ok((Some(event), false));
     }
-    if let Ok(coll) = cmd.get_str("createIndexes") {
+    // A two-phase index build's commit is a `createIndexes` event for every
+    // index it built (mongod 8.2.11); its start and abort are no event.
+    if cmd.contains_key("startIndexBuild") || cmd.contains_key("abortIndexBuild") {
+        return Ok((None, false));
+    }
+    let created = cmd
+        .get_str("createIndexes")
+        .map(|c| (c, false))
+        .or_else(|_| cmd.get_str("commitIndexBuild").map(|c| (c, true)));
+    if let Ok((coll, whole_build)) = created {
         if !show_expanded_events {
             return Ok((None, false));
         }
@@ -677,14 +686,25 @@ fn project_command(
         if !scope_matches(&affected_ns, scope) {
             return Ok((None, false));
         }
-        let spec = cmd
+        let specs: Vec<&Document> = cmd
             .get_array("indexes")
-            .ok()
-            .and_then(|a| a.first())
-            .and_then(|b| b.as_document());
-        // mongod's order: `v`, the options, then `key` and `name`.
-        let indexes = match spec {
-            Some(s) => {
+            .map(|a| a.iter().filter_map(Bson::as_document).collect())
+            .unwrap_or_default();
+        let specs = if whole_build {
+            specs
+        } else {
+            specs.into_iter().take(1).collect()
+        };
+        // mongod's order: `v`, the options, then `key` and `name` -- except
+        // for a build's commit, whose event gives each spec as its oplog
+        // entry does (`v`, `unique`, `hidden`, `key`, `name`, the rest;
+        // measured 8.2.11).
+        let indexes: Vec<Bson> = specs
+            .into_iter()
+            .map(|s| {
+                if whole_build {
+                    return Bson::Document(s.clone());
+                }
                 let mut idx = Document::new();
                 idx.insert("v", s.get_i32("v").unwrap_or(2));
                 for (k, v) in s {
@@ -697,10 +717,9 @@ fn project_command(
                     Bson::Document(s.get_document("key").cloned().unwrap_or_default()),
                 );
                 idx.insert("name", s.get_str("name").unwrap_or(""));
-                vec![Bson::Document(idx)]
-            }
-            None => vec![],
-        };
+                Bson::Document(idx)
+            })
+            .collect();
         let mut op_desc = Document::new();
         op_desc.insert("indexes", Bson::Array(indexes));
         let event = base(

@@ -402,6 +402,33 @@ mod tests {
         assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
+    /// The kill-session commands interrupt the operations running on the
+    /// sessions they kill, and no other (RM-313): mongod 8.2.11 ends an
+    /// update running on a session `killSessions` names with 11601, and
+    /// leaves one sent with no `lsid` alone under `killAllSessions: []`.
+    #[test]
+    fn kill_sessions_marks_the_operations_of_the_sessions_it_kills() {
+        use bson::spec::BinarySubtype;
+        let lsid =
+            |n: u8| doc! {"id": bson::Binary { subtype: BinarySubtype::Uuid, bytes: vec![n; 16] }};
+        let ops = std::sync::Arc::new(crate::ops::OpRegistry::new());
+        let mut c = ctx().with_ops(ops.clone());
+        let a = crate::ops::begin(&ops, &doc! {"find": "c", "lsid": lsid(1)}, &ctx());
+        let b = crate::ops::begin(&ops, &doc! {"find": "c", "lsid": lsid(2)}, &ctx());
+        let none = crate::ops::begin(&ops, &doc! {"find": "c"}, &ctx());
+        let killed = |ops: &crate::ops::OpRegistry| -> Vec<bool> {
+            ops.snapshot().iter().map(|op| op.killed()).collect()
+        };
+        assert_eq!(killed(&ops), [false, false, false]);
+        let reply = dispatch(&doc! {"killSessions": [lsid(1)]}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(killed(&ops), [true, false, false]);
+        let reply = dispatch(&doc! {"killAllSessions": []}, &mut c);
+        assert_eq!(reply.get_f64("ok").unwrap(), 1.0);
+        assert_eq!(killed(&ops), [true, true, false], "no session, no kill");
+        drop((none, b, a));
+    }
+
     /// mongod takes a number and nothing else: a string of digits is a
     /// type error, and nothing is closed for it.
     #[test]

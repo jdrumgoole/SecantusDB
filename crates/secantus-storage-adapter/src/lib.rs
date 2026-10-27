@@ -47,10 +47,19 @@ pub struct StorageAdapter {
 const SQL_SYSTEM_PREFIX: &str = "__sys_";
 
 /// Might `blob` hold a SQL system field? (Every document a MongoDB client
-/// wrote is answered by this scan alone.)
+/// wrote is answered by this check alone.) The fields are top-level, so only
+/// the top-level field names are read, element by element, never the values:
+/// a scan of every byte cost a debug build 15 s over 110 one-megabyte
+/// documents. A document that does not parse answers yes, and the full
+/// path decides.
 fn may_hold_sql_system_fields(blob: &[u8]) -> bool {
-    let needle = SQL_SYSTEM_PREFIX.as_bytes();
-    blob.windows(needle.len()).any(|w| w == needle)
+    let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
+        return true;
+    };
+    raw.into_iter().any(|item| match item {
+        Ok((key, _)) => key.starts_with(SQL_SYSTEM_PREFIX),
+        Err(_) => true,
+    })
 }
 
 /// `blob` without the SQL system fields.
@@ -458,7 +467,7 @@ impl CmdStorage for StorageAdapter {
         match changestreams::make_resume_token(&data) {
             Ok(doc) => {
                 let mut buf = Vec::new();
-                if doc.to_writer(&mut buf).is_ok() {
+                if secantus_commands::bsondoc::write(&doc, &mut buf).is_ok() {
                     buf
                 } else {
                     Vec::new()
@@ -1062,6 +1071,117 @@ impl CmdStorage for StorageAdapter {
         Ok(dropped)
     }
 
+    fn supports_index_builds(&self) -> bool {
+        true
+    }
+
+    fn begin_index_build(
+        &self,
+        db: &str,
+        coll: &str,
+        uuid: [u8; 16],
+        specs: &[(String, Document, Document)],
+        member: &str,
+    ) -> Result<(), StorageError> {
+        let specs: Vec<secantus_storage::IndexBuildSpec> = specs
+            .iter()
+            .map(|(name, key, options)| secantus_storage::IndexBuildSpec {
+                name: name.clone(),
+                key: key.clone(),
+                options: options.clone(),
+            })
+            .collect();
+        self.inner
+            .begin_index_build(db, coll, uuid, &specs, member)
+            .map_err(map_err)
+    }
+
+    fn run_index_build(&self, uuid: &[u8; 16], memory_limit: usize) -> Result<(), StorageError> {
+        self.inner
+            .run_index_build(uuid, memory_limit)
+            .map_err(map_err)
+    }
+
+    fn index_build_ready(&self, uuid: &[u8; 16], member: &str) -> Result<(), StorageError> {
+        self.inner.index_build_ready(uuid, member).map_err(map_err)
+    }
+
+    fn commit_index_build(&self, uuid: &[u8; 16]) -> Result<(), StorageError> {
+        let info = self
+            .inner
+            .index_builds(None, None)
+            .into_iter()
+            .find(|b| &b.uuid == uuid);
+        self.inner.commit_index_build(uuid).map_err(map_err)?;
+        if let Some(b) = info {
+            for spec in &b.indexes {
+                if let Ok(name) = spec.get_str("name") {
+                    self.index_created(&b.db, &b.coll, name);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn abort_index_build(
+        &self,
+        uuid: &[u8; 16],
+        cause: &secantus_commands::storage::IndexBuildAbort,
+    ) -> Result<(), StorageError> {
+        self.inner
+            .abort_index_build(uuid, &wt_abort(cause))
+            .map_err(map_err)
+    }
+
+    fn request_index_build_abort(
+        &self,
+        db: &str,
+        coll: Option<&str>,
+        uuid: Option<&[u8; 16]>,
+        cause: &secantus_commands::storage::IndexBuildAbort,
+    ) -> Vec<[u8; 16]> {
+        self.inner
+            .request_index_build_abort(db, coll, uuid, &wt_abort(cause))
+    }
+
+    fn wait_index_builds_gone(&self, uuids: &[[u8; 16]]) {
+        self.inner.wait_index_builds_gone(uuids)
+    }
+
+    fn index_build_abort_cause(
+        &self,
+        uuid: &[u8; 16],
+    ) -> Option<secantus_commands::storage::IndexBuildAbort> {
+        self.inner.index_build_abort_cause(uuid).map(|a| {
+            secantus_commands::storage::IndexBuildAbort {
+                code: a.code,
+                code_name: a.code_name,
+                errmsg: a.errmsg,
+                extra: a.extra,
+            }
+        })
+    }
+
+    fn index_builds(
+        &self,
+        db: Option<&str>,
+        coll: Option<&str>,
+    ) -> Vec<secantus_commands::storage::IndexBuildInfo> {
+        self.inner
+            .index_builds(db, coll)
+            .into_iter()
+            .map(|b| secantus_commands::storage::IndexBuildInfo {
+                uuid: b.uuid,
+                db: b.db,
+                coll: b.coll,
+                indexes: b.indexes,
+                phase: b.phase,
+                phase_str: b.phase_str.to_string(),
+                aborting: b.aborting,
+            })
+            .collect()
+    }
+
     fn set_index_options(
         &self,
         db: &str,
@@ -1160,6 +1280,52 @@ impl CmdStorage for StorageAdapter {
 
     fn engine_statistics(&self) -> Option<Result<(String, Vec<(String, i64)>), StorageError>> {
         Some(self.inner.wt_statistics().map_err(map_err))
+    }
+
+    fn compact(
+        &self,
+        target: secantus_commands::storage::CompactTarget<'_>,
+        dry_run: bool,
+        free_space_target_mb: Option<i64>,
+    ) -> Option<Result<secantus_commands::storage::CompactReply, StorageError>> {
+        use secantus_commands::storage::{CompactReply, CompactTarget as Cmd};
+        use secantus_storage::compact::{CompactOutcome, CompactTarget};
+        let target = match target {
+            Cmd::Collection(db, coll) => CompactTarget::Collection(db, coll),
+            Cmd::Oplog => CompactTarget::Oplog,
+            Cmd::Catalog => CompactTarget::Catalog,
+        };
+        Some(
+            self.inner
+                .compact(target, dry_run, free_space_target_mb)
+                .map(|outcome| match outcome {
+                    CompactOutcome::Freed(n) => CompactReply::Freed(n),
+                    CompactOutcome::AlreadyRunning => CompactReply::AlreadyRunning,
+                    CompactOutcome::Busy(table) => CompactReply::Busy(table),
+                })
+                .map_err(map_err),
+        )
+    }
+
+    fn auto_compact(
+        &self,
+        enable: bool,
+        run_once: bool,
+        free_space_target_mb: Option<i64>,
+    ) -> Option<Result<secantus_commands::storage::AutoCompactReply, StorageError>> {
+        use secantus_commands::storage::AutoCompactReply;
+        use secantus_storage::compact::AutoCompactOutcome;
+        Some(
+            self.inner
+                .auto_compact(enable, run_once, free_space_target_mb)
+                .map(|outcome| match outcome {
+                    AutoCompactOutcome::Done => AutoCompactReply::Done,
+                    AutoCompactOutcome::AlreadyRunning => AutoCompactReply::AlreadyRunning,
+                    AutoCompactOutcome::InMemory => AutoCompactReply::InMemory,
+                    AutoCompactOutcome::Busy(text) => AutoCompactReply::Busy(text),
+                })
+                .map_err(map_err),
+        )
     }
 
     fn writes_waiting(&self) -> usize {
@@ -1341,6 +1507,29 @@ impl CmdStorage for StorageAdapter {
         self.inner.index_sizes(db, coll).map_err(map_err)
     }
 
+    fn collection_sizes(
+        &self,
+        db: &str,
+        coll: &str,
+    ) -> Result<secantus_commands::CollectionSizes, StorageError> {
+        let kept = self.inner.collection_sizes(db, coll).map_err(map_err)?;
+        // The shape `index_sizes` answers: `_id_` first when it holds
+        // anything, then the other indexes by name.
+        let mut index_sizes = Document::new();
+        if kept.id_index_size > 0 {
+            index_sizes.insert("_id_", kept.id_index_size);
+        }
+        for (name, bytes) in kept.index_sizes {
+            let prev = index_sizes.get_i64(&name).unwrap_or(0);
+            index_sizes.insert(name, prev + bytes);
+        }
+        Ok(secantus_commands::CollectionSizes {
+            records: kept.records,
+            data_size: kept.data_size,
+            index_sizes,
+        })
+    }
+
     fn collection_ident(&self, db: &str, coll: &str) -> Option<String> {
         Some(match self.stored_as(db, coll)? {
             Stored::Catalog => secantus_storage::CATALOG_TABLE.to_string(),
@@ -1487,7 +1676,7 @@ fn push_event(
     };
     for frag in fragments {
         let mut buf = Vec::new();
-        frag.to_writer(&mut buf)
+        secantus_commands::bsondoc::write(&frag, &mut buf)
             .map_err(|e| StorageError::Internal(format!("event encode: {e}")))?;
         events.push(buf);
     }
@@ -1519,6 +1708,18 @@ fn to_hint(b: RawHint<'_>) -> Hint {
 }
 
 /// Translate a storage error into the command layer's pre-classified error.
+/// The command layer's abort cause, as the storage records it.
+fn wt_abort(
+    cause: &secantus_commands::storage::IndexBuildAbort,
+) -> secantus_storage::IndexBuildAbort {
+    secantus_storage::IndexBuildAbort {
+        code: cause.code,
+        code_name: cause.code_name.clone(),
+        errmsg: cause.errmsg.clone(),
+        extra: cause.extra.clone(),
+    }
+}
+
 fn map_err(e: WtError) -> StorageError {
     match e {
         // mongod's message, with the key rendered as the shell does (the Rust
@@ -1530,8 +1731,8 @@ fn map_err(e: WtError) -> StorageError {
             errmsg: conflict.errmsg(),
             exec: true,
             extra: conflict.extra(),
+            key_value: Some(conflict.reply_key_value()),
             key_pattern: Some(conflict.key_pattern),
-            key_value: Some(conflict.key_value),
         })),
         WtError::DuplicateId => StorageError::WriteError {
             code: 11000,
@@ -1662,5 +1863,25 @@ fn map_err(e: WtError) -> StorageError {
         WtError::ChangeStreamFatal(m) | WtError::Internal(m) => StorageError::Internal(m),
         WtError::Wt(err) => StorageError::Internal(format!("WiredTiger error: {err:?}")),
         WtError::Bson(m) => StorageError::Internal(format!("BSON error: {m}")),
+    }
+}
+
+#[cfg(test)]
+mod sql_field_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_top_level_field_name_counts() {
+        let bytes = |d: Document| bson::to_vec(&d).unwrap();
+        assert!(may_hold_sql_system_fields(&bytes(
+            bson::doc! {"a": 1, "__sys_ctid": 2}
+        )));
+        assert!(!may_hold_sql_system_fields(&bytes(
+            bson::doc! {"a": "__sys_x"}
+        )));
+        assert!(!may_hold_sql_system_fields(&bytes(
+            bson::doc! {"a": {"__sys_x": 1}}
+        )));
+        assert!(may_hold_sql_system_fields(b"not bson"));
     }
 }

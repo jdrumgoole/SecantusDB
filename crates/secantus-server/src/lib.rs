@@ -1351,13 +1351,14 @@ fn write_op_msg<S: Write>(
 fn cursor_or_plain_body(reply: &Document, batch: Option<&PendingBatch>) -> io::Result<Vec<u8>> {
     match batch {
         Some(pending) => {
-            secantus_wire::encode_cursor_reply(reply, pending.batch_field, &pending.batch)
+            let envelope = secantus_commands::bsondoc::to_vec(reply)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            secantus_wire::encode_cursor_reply(&envelope, pending.batch_field, &pending.batch)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
         }
         None => {
             let mut body_bytes = Vec::with_capacity(256);
-            reply
-                .to_writer(&mut body_bytes)
+            secantus_commands::bsondoc::write(reply, &mut body_bytes)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Ok(body_bytes)
         }
@@ -1374,8 +1375,7 @@ fn write_op_msg_flags<S: Write>(
     flags: u32,
 ) -> io::Result<()> {
     let mut body_bytes = Vec::with_capacity(256);
-    reply
-        .to_writer(&mut body_bytes)
+    secantus_commands::bsondoc::write(reply, &mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_msg_reply(req.request_id, next_reply_id(shared), &body_bytes, flags);
     send_frame(stream, req, shared, &frame)
@@ -1652,8 +1652,7 @@ fn write_op_reply_flags<S: Write>(
     response_flags: u32,
 ) -> io::Result<()> {
     let mut body_bytes = Vec::with_capacity(256);
-    reply
-        .to_writer(&mut body_bytes)
+    secantus_commands::bsondoc::write(reply, &mut body_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     let frame = build_op_reply(
         req.request_id,

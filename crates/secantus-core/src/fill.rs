@@ -159,7 +159,7 @@ fn partition_key(
     let key_val = partition_value(doc, fields, by, vars)?;
     let mut wrap = Document::new();
     wrap.insert("k", crate::collation::fold_active(key_val));
-    bson::to_vec(&wrap).map_err(|_| Fallback::Defer)
+    crate::bsondoc::to_vec(&wrap).map_err(|_| Fallback::Defer)
 }
 
 /// The value a doc is partitioned by.

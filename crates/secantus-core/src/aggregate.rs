@@ -51,8 +51,18 @@ pub fn apply_pipeline(
     // key, `$sortArray` -- reads the active collation. A pipeline with none
     // leaves whatever its caller set.
     let _active = coll.map(|c| crate::collation::activate(Some(c)));
-    for stage in pipeline {
-        let Bson::Document(s) = stage else {
+    // A leading `$sort` the caller's query layer runs (RM-315).
+    let leading = LEADING_SORT.with(|l| l.take());
+    // What mongod's scan keeps of each document: the fields the whole
+    // pipeline reads.
+    let scanned = {
+        let mut all: Vec<Bson> = pipeline.to_vec();
+        DOWNSTREAM.with(|d| all.extend(d.borrow().iter().cloned()));
+        group::downstream_fields(&all)
+    };
+    let mut i = 0;
+    while i < pipeline.len() {
+        let Bson::Document(s) = &pipeline[i] else {
             return Err(Fallback::Defer);
         };
         if s.len() != 1 {
@@ -63,7 +73,76 @@ pub fn apply_pipeline(
         // point every stage passes through, including those (a `$sort`) that
         // are a single call with no per-document loop to poll from.
         deadline::check_now()?;
+        if name == "$setWindowFields" {
+            // mongod runs the stage behind a `$sort` on its partition and
+            // `sortBy`, which its budget holds like any other (RM-315).
+            let before = &pipeline[..i];
+            let first = before
+                .iter()
+                .all(|st| matches!(stage_name_of(st), "$match" | crate::sbe::ENGINE_STAGE));
+            let source = match leading {
+                Some((false, _)) if first => None,
+                Some((true, _)) if first => Some(crate::sorter::SortSource::QueryLayer),
+                _ => Some(sort_source(before)),
+            };
+            if let Some(source) = source {
+                let fields = match source {
+                    crate::sorter::SortSource::QueryLayer => None,
+                    _ => scanned.as_ref(),
+                };
+                window_sort_budget(&docs, spec, vars, source, fields)?;
+            }
+            let (out, next) = window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll)?;
+            docs = out;
+            i += 1 + next;
+            continue;
+        }
+        if name == "$sort" {
+            let before = &pipeline[..i];
+            let first = before
+                .iter()
+                .all(|st| matches!(stage_name_of(st), "$match" | crate::sbe::ENGINE_STAGE));
+            let source = match leading {
+                // An index gives the order: mongod sorts nothing.
+                Some((false, _)) if first => None,
+                Some((true, true)) if first => Some(crate::sorter::SortSource::Sbe),
+                _ if crate::sbe::active() => Some(crate::sorter::SortSource::Sbe),
+                Some((true, false)) if first => Some(crate::sorter::SortSource::QueryLayer),
+                _ => Some(sort_source(before)),
+            };
+            // The fields an `$addFields` / `$set` before it wrote.
+            let added: std::collections::BTreeSet<String> = before
+                .iter()
+                .filter_map(|st| st.as_document())
+                .filter_map(|st| st.get("$addFields").or_else(|| st.get("$set")))
+                .filter_map(Bson::as_document)
+                .flat_map(|spec| spec.keys())
+                .map(|k| k.split('.').next().unwrap_or(k).to_string())
+                .collect();
+            let limit = pipeline
+                .get(i + 1)
+                .and_then(|st| st.as_document())
+                .and_then(|st| st.get("$limit"))
+                .and_then(as_int_like)
+                .and_then(|n| usize::try_from(n).ok());
+            docs = match source {
+                None => sort_stage(docs, spec)?,
+                Some(source) => {
+                    let fields = match source {
+                        crate::sorter::SortSource::QueryLayer => None,
+                        _ => scanned.as_ref(),
+                    };
+                    let added = (source == crate::sorter::SortSource::Modified
+                        && !added.is_empty())
+                    .then_some(&added);
+                    budgeted_sort_stage(docs, spec, source, fields, added, limit)?
+                }
+            };
+            i += 1;
+            continue;
+        }
         docs = apply_stage(name, spec, docs, vars, coll)?;
+        i += 1;
     }
     deadline::check_now()?;
     Ok(docs)
@@ -204,6 +283,140 @@ fn apply_stage(
     }
 }
 
+/// The `$sort` mongod puts in front of a `$setWindowFields` (its
+/// `partitionBy` value, then its `sortBy`), counted against the sort budget
+/// and spilled, or refused, as any blocking sort is (RM-315). The stage then
+/// orders its partitions itself, as it always has.
+fn window_sort_budget(
+    docs: &[Document],
+    spec: &Bson,
+    vars: &Document,
+    source: crate::sorter::SortSource,
+    fields: Option<&std::collections::BTreeSet<String>>,
+) -> R<()> {
+    let Some(spec) = spec.as_document() else {
+        return Ok(());
+    };
+    let by = spec.get("partitionBy");
+    let sort = match spec.get("sortBy") {
+        Some(Bson::Document(d)) => sort_fields(&Bson::Document(d.clone()))?,
+        _ => Vec::new(),
+    };
+    if by.is_none() && sort.is_empty() {
+        return Ok(());
+    }
+    let mut items: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
+    for d in docs {
+        let mut keys = Vec::with_capacity(sort.len() + 1);
+        if let Some(by) = by {
+            keys.push(crate::expressions::evaluate(d, by, vars).unwrap_or(Bson::Null));
+        }
+        keys.extend(sort_key_values(d, &sort)?);
+        items.push((keys, d.clone()));
+    }
+    let offset = usize::from(by.is_some());
+    let cmp = |ka: &[Bson], kb: &[Bson]| {
+        if offset == 1 {
+            let c = order::cmp(&ka[0], &kb[0]);
+            if c != Ordering::Equal {
+                return c;
+            }
+        }
+        for (i, (_, rev)) in sort.iter().enumerate() {
+            let c = order::cmp(&ka[i + offset], &kb[i + offset]);
+            let c = if *rev { c.reverse() } else { c };
+            if c != Ordering::Equal {
+                return c;
+            }
+        }
+        Ordering::Equal
+    };
+    let sizing = crate::sorter::Sizing {
+        source,
+        fields,
+        budget: crate::memlimit::budgets().sort,
+        added: None,
+    };
+    crate::sorter::blocking_sort(items, &cmp, &sizing, None)?;
+    Ok(())
+}
+
+/// The stages that take one document and give back at most one, which run
+/// on each `$setWindowFields` output as it is made.
+const PER_DOCUMENT: &[&str] = &[
+    "$project",
+    "$addFields",
+    "$set",
+    "$unset",
+    "$replaceRoot",
+    "$replaceWith",
+    "$match",
+];
+
+thread_local! {
+    /// The stages a caller runs after the pipeline `apply_pipeline` is
+    /// given (the command layer splits a pipeline at its storage stages).
+    static DOWNSTREAM: std::cell::RefCell<Vec<Bson>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Puts the previous downstream stages back when dropped.
+pub struct Downstream(Vec<Bson>);
+
+impl Drop for Downstream {
+    fn drop(&mut self) {
+        let previous = std::mem::take(&mut self.0);
+        DOWNSTREAM.with(|d| *d.borrow_mut() = previous);
+    }
+}
+
+/// While the guard lives, `stages` run after whatever pipeline
+/// `apply_pipeline` runs: a stage's dependency analysis reads on into them.
+pub fn downstream(stages: &[Bson]) -> Downstream {
+    Downstream(DOWNSTREAM.with(|d| std::mem::replace(&mut *d.borrow_mut(), stages.to_vec())))
+}
+
+/// `$setWindowFields`, with the per-document stages right after it run on
+/// each output document as it is made (mongod streams them; holding every
+/// output first held every window's values at once -- RM-211). Returns the
+/// documents and how many of `rest` it ran.
+fn window_fields_streamed(
+    spec: &Bson,
+    docs: Vec<Document>,
+    rest: &[Bson],
+    vars: &Document,
+    coll: Option<&Collation>,
+) -> R<(Vec<Document>, usize)> {
+    let fused = rest
+        .iter()
+        .take_while(|s| {
+            s.as_document()
+                .filter(|d| d.len() == 1)
+                .and_then(|d| d.keys().next())
+                .is_some_and(|k| PER_DOCUMENT.contains(&k.as_str()))
+        })
+        .count();
+    let mut after: Vec<Bson> = rest.to_vec();
+    DOWNSTREAM.with(|d| after.extend(d.borrow().iter().cloned()));
+    let fields = group::downstream_fields(&after);
+    let mut out = Vec::new();
+    windowfields::set_window_fields_each(spec, docs, vars, fields.as_ref(), &mut |d| {
+        let mut one = vec![d];
+        for stage in &rest[..fused] {
+            let (name, spec) = stage
+                .as_document()
+                .and_then(|s| s.iter().next())
+                .ok_or(Fallback::Defer)?;
+            one = apply_stage(name, spec, one, vars, coll)?;
+            if one.is_empty() {
+                break;
+            }
+        }
+        out.extend(one);
+        Ok(())
+    })?;
+    Ok((out, fused))
+}
+
 /// `$facet` — run each named sub-pipeline over a copy of the same input docs and
 /// collect the results into one output doc. Defers if any sub-pipeline defers.
 /// `$redact` — content-based, recursive document / sub-document pruning. The
@@ -331,6 +544,11 @@ fn redact_list(values: &[Bson], spec: &Bson, vars: &Document) -> R<Vec<Bson>> {
 /// `ObjectId('…')`, and a date as ISO-8601 rather than `new Date(<ms>)`. Two
 /// renderers, both mongod's, used by different messages — probed on 8.2.11.
 pub fn render_value_compact(v: &Bson) -> String {
+    // A string that is not UTF-8 prints as the string it is, each invalid
+    // sequence replaced (mongod writes the raw bytes; RM-222).
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
+        return format!("\"{}\"", crate::bsondoc::lossy(b));
+    }
     match v {
         Bson::Null => "null".to_string(),
         Bson::Boolean(b) => b.to_string(),
@@ -876,6 +1094,8 @@ fn facet_stage(
     }
     let n = s.len();
     let mut out = Document::new();
+    // The output document's size so far (RM-211).
+    let mut used = 0usize;
     for (i, (name, sub)) in s.iter().enumerate() {
         let Bson::Array(sub_pipeline) = sub else {
             return Err(Fallback::Defer); // Python raises 40170 (entry must be an array)
@@ -896,6 +1116,9 @@ fn facet_stage(
             docs.clone()
         };
         let result = apply_pipeline(input, sub_pipeline, vars, coll)?;
+        for d in &result {
+            crate::memlimit::facet_add(&mut used, d)?;
+        }
         out.insert(
             name.clone(),
             Bson::Array(result.into_iter().map(Bson::Document).collect()),
@@ -1013,6 +1236,85 @@ fn sort_key_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
             Ok(d)
         })
         .collect()
+}
+
+fn stage_name_of(stage: &Bson) -> &str {
+    stage
+        .as_document()
+        .and_then(|d| d.keys().next())
+        .map_or("", String::as_str)
+}
+
+/// Which of mongod's sorts a `$sort` after `before` is, for what each
+/// document counts (`sorter`): the stages that change a document leave it
+/// counted for its cache.
+fn sort_source(before: &[Bson]) -> crate::sorter::SortSource {
+    use crate::sorter::SortSource;
+    let mut source = SortSource::Stored;
+    for stage in before {
+        source = match (stage_name_of(stage), source) {
+            ("$unwind", _) => SortSource::Unwound,
+            ("$addFields" | "$set" | "$unset", SortSource::Stored) => SortSource::Modified,
+            (
+                "$match"
+                | "$limit"
+                | "$skip"
+                | "$sort"
+                | "$addFields"
+                | "$set"
+                | "$unset"
+                | crate::sbe::ENGINE_STAGE,
+                s,
+            ) => s,
+            // A stage that builds new documents: counted as read, the least
+            // mongod counts.
+            _ => SortSource::Stored,
+        };
+    }
+    source
+}
+
+thread_local! {
+    /// Whether the leading `$sort` of the pipeline the caller runs next is a
+    /// blocking sort in mongod's plan (`Some(true)`) or read from an index
+    /// (`Some(false)`).
+    static LEADING_SORT: std::cell::Cell<Option<(bool, bool)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Forgets an unread leading-sort verdict when dropped.
+pub struct LeadingSort;
+
+impl Drop for LeadingSort {
+    fn drop(&mut self) {
+        LEADING_SORT.with(|l| l.set(None));
+    }
+}
+
+/// The next pipeline's leading `$sort` is a blocking sort (`true`) or read
+/// in order from an index (`false`), as mongod's query layer plans it, and
+/// whether that layer runs in SBE; until the guard drops.
+pub fn leading_sort(blocking: bool, sbe: bool) -> LeadingSort {
+    LEADING_SORT.with(|l| l.set(Some((blocking, sbe))));
+    LeadingSort
+}
+
+/// `$sort` held to its memory budget (RM-315): mongod's external sorter,
+/// which spills to disk or refuses (292).
+fn budgeted_sort_stage(
+    docs: Vec<Document>,
+    spec: &Bson,
+    source: crate::sorter::SortSource,
+    fields: Option<&std::collections::BTreeSet<String>>,
+    added: Option<&std::collections::BTreeSet<String>>,
+    limit: Option<usize>,
+) -> R<Vec<Document>> {
+    let sizing = crate::sorter::Sizing {
+        source,
+        fields,
+        budget: crate::memlimit::budgets().sort,
+        added,
+    };
+    crate::sorter::sort_documents(docs, spec, &sizing, limit)
 }
 
 pub(crate) fn sort_stage(docs: Vec<Document>, spec: &Bson) -> R<Vec<Document>> {
@@ -1221,7 +1523,9 @@ fn add_fields_collect(
         };
         match expr {
             Bson::Document(inner)
-                if !inner.is_empty() && !inner.keys().any(|k| k.starts_with('$')) =>
+                if !inner.is_empty()
+                    && !inner.keys().any(|k| k.starts_with('$'))
+                    && crate::bsondoc::carrier_bytes(inner).is_none() =>
             {
                 add_fields_collect(inner, &path, doc, vars, out)?;
             }

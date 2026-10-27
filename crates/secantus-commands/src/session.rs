@@ -258,7 +258,7 @@ pub(crate) fn run(
                     bytes: user_digest(&users),
                 },
             };
-            bson::to_vec(&lsid).ok().map(|bytes| (bytes, txn))
+            crate::bsondoc::to_vec(&lsid).ok().map(|bytes| (bytes, txn))
         });
     if let Some(s) = ctx.storage.as_ref() {
         s.set_oplog_session(txn_session);
@@ -1172,7 +1172,7 @@ fn retryable_write(
                 bytes: user_digest(&authenticated(ctx)),
             },
         };
-        if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), bson::to_vec(&session)) {
+        if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), crate::bsondoc::to_vec(&session)) {
             s.set_statement_position(None);
             s.set_retryable_session(Some((bytes, txn_number, ids.clone())));
             if fam {

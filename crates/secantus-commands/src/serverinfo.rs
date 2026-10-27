@@ -283,7 +283,7 @@ pub fn record_replset_config(
         }
         None => {
             let config = replset_config(set_name, &host_port, bson::oid::ObjectId::new());
-            let bytes = bson::to_vec(&config)
+            let bytes = crate::bsondoc::to_vec(&config)
                 .map_err(|e| crate::storage::StorageError::Internal(e.to_string()))?;
             storage.insert("local", "system.replset", vec![bytes], true)?;
         }
@@ -589,8 +589,63 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int32(i32::MAX),
         ),
+        // The aggregation memory budgets (RM-211), mongod 8.2.11's
+        // defaults and types.
+        (
+            "internalDocumentSourceBucketAutoMaxMemoryBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalDocumentSourceGroupMaxMemoryBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalDocumentSourceSetWindowFieldsMaxMemoryBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalLookupStageIntermediateDocumentMaxSizeBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryFacetMaxOutputDocSizeBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryMaxAddToSetBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryMaxConcatArraysBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
+        (
+            "internalQueryMaxBlockingSortMemoryUsageBytes",
+            true,
+            Bson::Int32(104_857_600),
+        ),
+        ("internalQueryMaxPushBytes", true, Bson::Int32(104_857_600)),
+        (
+            "internalQueryMaxSetUnionBytes",
+            true,
+            Bson::Int64(104_857_600),
+        ),
         ("localLogicalSessionTimeoutMinutes", true, Bson::Int32(30)),
         ("logLevel", true, Bson::Int32(0)),
+        // An index build's sorters' memory, in megabytes (RM-187): mongod
+        // 8.2.11's default, a double.
+        (
+            "maxIndexBuildMemoryUsageMegabytes",
+            true,
+            Bson::Double(200.0),
+        ),
         (
             "maxTransactionLockRequestTimeoutMillis",
             true,

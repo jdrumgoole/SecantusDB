@@ -62,6 +62,8 @@ pub(crate) struct Pending {
 /// which decides its slow-query log line too -- or when it is an aggregate
 /// whose `$merge` writes to a profiled database.
 pub(crate) fn begin(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Pending> {
+    // What this operation spills is its own (RM-211).
+    secantus_core::memlimit::reset_report();
     let profiler = ctx.profiler.as_ref()?;
     if profiler.held.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return None;
@@ -355,7 +357,7 @@ fn write(ctx: &CommandContext, db: &str, entry: &Document) {
                 .map_err(|e| format!("{e:?}"))?;
         }
         let mut bytes = Vec::new();
-        entry.to_writer(&mut bytes).map_err(|e| format!("{e:?}"))?;
+        crate::bsondoc::write(entry, &mut bytes).map_err(|e| format!("{e:?}"))?;
         let (_, errors) = storage
             .insert(db, PROFILE_COLLECTION, vec![bytes], true)
             .map_err(|e| format!("{e:?}"))?;
@@ -452,6 +454,16 @@ fn outcome(
                     entry.insert("keysExamined", e.keys_examined);
                     entry.insert("docsExamined", e.docs_examined);
                 }
+                // A stage that spilled (RM-211): mongod 8.2.11 puts
+                // `usedDisk` here and its `$group`'s spill counts after
+                // `nreturned`. The counts are this server's own spills.
+                let spilled = secantus_core::memlimit::report();
+                if spilled.has_sort_stage {
+                    entry.insert("hasSortStage", true);
+                }
+                if spilled.used_disk {
+                    entry.insert("usedDisk", true);
+                }
                 if name != "aggregate" {
                     entry.insert("nBatches", 1_i32);
                 }
@@ -460,6 +472,25 @@ fn outcome(
                 }
                 entry.insert("numYield", 0_i32);
                 entry.insert("nreturned", int32(returned()));
+                if spilled.sort_spills > 0 {
+                    entry.insert("sortSpills", spilled.sort_spills);
+                    entry.insert("sortSpilledBytes", spilled.sort_spilled_bytes);
+                    entry.insert("sortSpilledRecords", spilled.sort_spilled_records);
+                    entry.insert(
+                        "sortSpilledDataStorageSize",
+                        spilled.sort_spilled_data_storage_size,
+                    );
+                    entry.insert("sortTotalDataSizeBytes", spilled.sort_total_data_size);
+                }
+                if spilled.group_spills > 0 {
+                    entry.insert("groupSpills", spilled.group_spills);
+                    entry.insert("groupSpilledBytes", spilled.group_spilled_bytes);
+                    entry.insert("groupSpilledRecords", spilled.group_spilled_records);
+                    entry.insert(
+                        "groupSpilledDataStorageSize",
+                        spilled.group_spilled_data_storage_size,
+                    );
+                }
                 return;
             }
             "insert" => {
@@ -522,7 +553,7 @@ const MAX_COMMAND_BYTES: usize = 50 * 1024;
 /// abbreviated rendering of it, `{$truncated: "...", comment}` (strings of
 /// 160 characters or more cut to 150, the whole cut to 50 KB).
 fn abbreviated(command: &Document) -> Document {
-    let size = bson::to_vec(command).map_or(0, |b| b.len());
+    let size = crate::bsondoc::to_vec(command).map_or(0, |b| b.len());
     if size <= MAX_COMMAND_BYTES {
         return command.clone();
     }
@@ -590,7 +621,7 @@ fn failure(reply: &Document, entry: &mut Document) {
 /// The size of the reply on the wire: the frame's header and sections around
 /// the reply document, the cursor batch included.
 fn response_length(reply: &Document, ctx: &CommandContext) -> i32 {
-    let body = bson::to_vec(reply).map_or(0, |b| b.len());
+    let body = crate::bsondoc::to_vec(reply).map_or(0, |b| b.len());
     let batch = ctx.pending_batch.as_ref().map_or(0, |pending| {
         // The batch is an array element of the reply's `cursor`.
         let items: usize = pending

@@ -185,7 +185,7 @@ def test_two_transactions_creating_one_collection_conflict_at_commit(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-087")
+@pytest.mark.backlog_fixed("RM-087")
 def test_fast_count_sees_another_sessions_uncommitted_insert(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
@@ -204,6 +204,32 @@ def test_fast_count_sees_another_sessions_uncommitted_insert(
 
     got, ref = _both(rust_mongo, mongod_rs, probe)
     assert ref == 3
+    assert got == ref
+
+
+@pytest.mark.backlog("RM-087")
+def test_statement_id_count_error_names_the_request(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11: a retryable insert whose `stmtIds` do not match its
+    documents answers 16, naming the statement ids and the whole write
+    command; the Rust server has the code and only the first sentence."""
+    lsid = {"id": bson.Binary(uuid.uuid4().bytes, 4)}
+    coll = _name("rm087")
+    request = SON(
+        [
+            ("insert", coll),
+            ("documents", [{"_id": 4}]),
+            ("lsid", lsid),
+            ("txnNumber", bson.Int64(2)),
+            ("stmtIds", [1, 2]),
+        ]
+    )
+
+    def probe(client: Any) -> Any:
+        reply = _raw_command(client, "rm087", request)
+        return (reply.get("code"), reply.get("errmsg"))
+
+    got, ref = _both(rust_mongo, mongod_rs, probe)
+    assert ref[0] == 16
     assert got == ref
 
 

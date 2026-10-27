@@ -771,6 +771,55 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // measurement with its time and meta fields first.
     let mut docs = crate::ts_buckets::as_read(storage, &ctx.db_name, &coll, docs, sort.is_some())?;
 
+    // A sort mongod's plan does in memory is held to its budget: spilled to
+    // disk, or refused (292) under `allowDiskUse: false` (RM-315). The read
+    // above already put the documents in order; the sorter counts them as
+    // mongod's `SORT` stage does, and writes its runs when they spill.
+    if let (Some(spec), false) = (sort, bounded || inexact) {
+        let ask = crate::explain::order::Ask {
+            db: &ctx.db_name,
+            coll: &coll,
+            filter: &filter,
+            sort,
+            hint,
+            collation: collation.as_ref(),
+            vars: &let_vars,
+            limit: if limit > 0 { (skip + limit) as i64 } else { 0 },
+            asked: Default::default(),
+        };
+        if crate::explain::order::sorts_in_memory(storage, &ask) {
+            let _disk_use = secantus_core::memlimit::allow_disk_use(
+                doc.get_bool("allowDiskUse").unwrap_or(true),
+            );
+            let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
+            let decoded = crate::util::decode_docs(docs.clone())?;
+            let sizing = secantus_core::sorter::Sizing {
+                source: secantus_core::sorter::SortSource::QueryLayer,
+                fields: None,
+                budget: secantus_core::memlimit::budgets().sort,
+                added: None,
+            };
+            let top = (limit > 0).then_some(skip + limit);
+            secantus_core::sorter::sort_documents(
+                decoded,
+                &Bson::Document(spec.clone()),
+                &sizing,
+                top,
+            )
+            .map_err(|f| match f.as_mongo() {
+                Some((code, msg)) => CommandError::new(
+                    code,
+                    crate::util::error_code_name(code),
+                    format!(
+                        "Executor error during find command: {}.{coll} :: caused by :: {msg}",
+                        ctx.db_name
+                    ),
+                ),
+                None => CommandError::new(2, "BadValue", "the sort could not be run"),
+            })?;
+        }
+    }
+
     // A scan that matched nothing never ran the filter: check it now.
     if docs.is_empty() {
         validate_empty_result(&filter, &let_vars, collation.as_ref())?;

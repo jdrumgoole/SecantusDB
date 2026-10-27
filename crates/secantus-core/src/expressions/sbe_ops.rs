@@ -68,12 +68,13 @@ pub(super) fn apply(op: &str, arg: &Bson, ctx: &Ctx) -> Option<R> {
             };
             single(arg, ctx)
                 .and_then(|v| case_convert(name, v))
-                .map(|s| {
-                    Bson::String(if op == "$toUpper" {
-                        s.to_ascii_uppercase()
+                .map(|mut s| {
+                    if op == "$toUpper" {
+                        s.make_ascii_uppercase()
                     } else {
-                        s.to_ascii_lowercase()
-                    })
+                        s.make_ascii_lowercase()
+                    }
+                    crate::bsondoc::string_from_bytes(s)
                 })
         }
         "$strcasecmp" => strcasecmp(arg, ctx),
@@ -86,7 +87,7 @@ pub(super) fn apply(op: &str, arg: &Bson, ctx: &Ctx) -> Option<R> {
                 (5155900, "$strLenCP")
             };
             single(arg, ctx).and_then(|v| match v {
-                Bson::String(_) => classic(op, vec![v], ctx),
+                v if is_str(&v) => classic(op, vec![v], ctx),
                 _ => Err(fail(code, format!("{what} requires a string argument"))),
             })
         }
@@ -510,6 +511,20 @@ fn trig_bounded(
     classic(op, vec![v], ctx)
 }
 
+/// Whether `v` is a string of either form (RM-222).
+fn is_str(v: &Bson) -> bool {
+    crate::bsondoc::is_string(v)
+}
+
+/// [`coerce_to_string`] as bytes, so a string that is not UTF-8 keeps them
+/// (RM-222).
+fn coerce_to_bytes(v: &Bson) -> Option<Vec<u8>> {
+    match crate::bsondoc::as_invalid_utf8(v) {
+        Some(b) => Some(b.to_vec()),
+        None => coerce_to_string(v).map(String::into_bytes),
+    }
+}
+
 /// The VM's `coerceToString`: `None` for a type it does not convert.
 fn coerce_to_string(v: &Bson) -> Option<String> {
     Some(match v {
@@ -530,9 +545,9 @@ fn substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     let get = |i: usize| args.get(i).cloned().unwrap_or(Bson::Undefined);
     let (s, start, len) = (get(0), get(1), get(2));
     let s = if nullish(&s) {
-        String::new()
+        Vec::new()
     } else {
-        coerce_to_string(&s).ok_or_else(|| {
+        coerce_to_bytes(&s).ok_or_else(|| {
             fail(
                 5155608,
                 "$substrBytes: string expression could not be resolved to a string",
@@ -555,7 +570,7 @@ fn substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
     if start < 0 {
         return Ok(Bson::Undefined);
     }
-    let bytes = s.as_bytes();
+    let bytes = s.as_slice();
     let length = if len < 0 { bytes.len() as i64 } else { len };
     let cont = |i: i64| (bytes[i as usize] & 0xC0) == 0x80;
     if start < bytes.len() as i64 && cont(start) {
@@ -580,8 +595,10 @@ fn substr_bytes(arg: &Bson, ctx: &Ctx) -> R {
             .saturating_add(len as usize)
             .min(bytes.len())
     };
-    Ok(Bson::String(
-        String::from_utf8_lossy(&bytes[start as usize..end]).into_owned(),
+    // The bytes in range: valid ones stay valid (the checks above), and a
+    // string that is not UTF-8 keeps its bytes (RM-222).
+    Ok(crate::bsondoc::string_from_bytes(
+        bytes[start as usize..end].to_vec(),
     ))
 }
 
@@ -589,7 +606,8 @@ fn substr_cp(arg: &Bson, ctx: &Ctx) -> R {
     let args = operands(arg, ctx)?;
     let get = |i: usize| args.get(i).cloned().unwrap_or(Bson::Undefined);
     let (s, start, len) = (get(0), get(1), get(2));
-    let s = if nullish(&s) {
+    let raw = crate::bsondoc::as_invalid_utf8(&s).map(<[u8]>::to_vec);
+    let s = if nullish(&s) || raw.is_some() {
         String::new()
     } else {
         coerce_to_string(&s).ok_or_else(|| {
@@ -628,6 +646,13 @@ fn substr_cp(arg: &Bson, ctx: &Ctx) -> R {
             "$substrCP: length must be a non-negative integer",
         ));
     }
+    // A string that is not UTF-8: mongod's walk over the bytes, the same in
+    // the VM as in the classic engine (measured 8.2.11; RM-222).
+    if let Some(raw) = raw {
+        return crate::rawstr::substr_cp(&raw, start as usize, len as usize)
+            .map(|b| crate::bsondoc::string_from_bytes(b.to_vec()))
+            .map_err(|(code, msg)| fail(code, msg));
+    }
     Ok(Bson::String(
         s.chars().skip(start as usize).take(len as usize).collect(),
     ))
@@ -635,9 +660,12 @@ fn substr_cp(arg: &Bson, ctx: &Ctx) -> R {
 
 /// `$toUpper` / `$toLower` (and each side of `$strcasecmp`): the string the
 /// case conversion applies to.
-fn case_convert(name: &str, v: Bson) -> Result<String, Fallback> {
+fn case_convert(name: &str, v: Bson) -> Result<Vec<u8>, Fallback> {
     if nullish(&v) {
-        return Ok(String::new());
+        return Ok(Vec::new());
+    }
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(&v) {
+        return Ok(b.to_vec());
     }
     let convertible = matches!(
         v,
@@ -651,7 +679,7 @@ fn case_convert(name: &str, v: Bson) -> Result<String, Fallback> {
             | Bson::Timestamp(_)
     );
     match convertible.then(|| coerce_to_string(&v)).flatten() {
-        Some(s) => Ok(s),
+        Some(s) => Ok(s.into_bytes()),
         None => Err(fail(
             7158200,
             format!("${name} input type is not supported"),
@@ -664,6 +692,7 @@ fn strcasecmp(arg: &Bson, ctx: &Ctx) -> R {
     // The right operand is lowered first, so its failure comes first.
     let b = case_convert("toUpper", b)?.to_ascii_uppercase();
     let a = case_convert("toUpper", a)?.to_ascii_uppercase();
+    // Byte order, as the VM compares (RM-222).
     Ok(Bson::Int32(match a.cmp(&b) {
         Ordering::Less => -1,
         Ordering::Equal => 0,
@@ -679,7 +708,7 @@ fn index_of(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     if nullish(&s) {
         return Ok(Bson::Null);
     }
-    if !matches!(s, Bson::String(_)) {
+    if !is_str(&s) {
         return Err(fail(
             7158007,
             format!("${name} string must resolve to a string or null"),
@@ -691,7 +720,7 @@ fn index_of(op: &str, arg: &Bson, ctx: &Ctx) -> R {
             format!("${name} substring must resolve to a string"),
         ));
     }
-    if !matches!(sub, Bson::String(_)) {
+    if !is_str(&sub) {
         return Err(fail(
             7158009,
             format!("${name} substring must resolve to a string"),
@@ -728,7 +757,12 @@ fn index_of(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     }
     let mut all = vec![s, sub];
     all.extend(bounds);
-    classic(op, all, ctx)
+    // The VM names a code point that starts with a continuation byte with a
+    // code of its own (measured 8.2.11, 2026-10-27; RM-222).
+    classic(op, all, ctx).map_err(|f| match f.as_mongo() {
+        Some((40095, msg)) => fail(5075307, msg),
+        _ => f,
+    })
 }
 
 fn concat(arg: &Bson, ctx: &Ctx) -> R {
@@ -736,7 +770,7 @@ fn concat(arg: &Bson, ctx: &Ctx) -> R {
     if args.iter().any(nullish) {
         return Ok(Bson::Null);
     }
-    if args.iter().all(|a| matches!(a, Bson::String(_))) {
+    if args.iter().all(is_str) {
         return classic("$concat", args, ctx);
     }
     Err(fail(7158201, "$concat supports only strings"))
@@ -761,6 +795,14 @@ fn regex(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     let pattern = eval_field_value(&regex_expr, ctx)?;
     if nullish(&input) {
         return Ok(null_answer());
+    }
+    // PCRE2 refuses a subject that is not UTF-8; the VM reports only that the
+    // match failed (measured 8.2.11, 2026-10-27; RM-222).
+    if crate::bsondoc::as_invalid_utf8(&input).is_some() && !nullish(&pattern) {
+        return Err(error(
+            5073403,
+            "error occurred while executing the regular expression",
+        ));
     }
     if !matches!(input, Bson::String(_)) {
         return Err(error(5073401, "input must be of type string"));
@@ -1125,7 +1167,7 @@ fn replace_one(arg: &Bson, ctx: &Ctx) -> R {
         (&find, "find"),
         (&replacement, "replacement"),
     ] {
-        if !nullish(v) && !matches!(v, Bson::String(_)) {
+        if !nullish(v) && !is_str(v) {
             return Err(fail(
                 7158302,
                 format!("$replaceOne requires that '{name}' be a string"),
@@ -1823,7 +1865,7 @@ fn trim(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     if nullish(&input) {
         return Ok(Bson::Null);
     }
-    if !matches!(input, Bson::String(_)) {
+    if !is_str(&input) {
         return Err(fail(
             5156302,
             format!("{op} input expression must be a string"),
@@ -1831,7 +1873,8 @@ fn trim(op: &str, arg: &Bson, ctx: &Ctx) -> R {
     }
     match &chars {
         Some(c) if nullish(c) => return Ok(Bson::Null),
-        Some(Bson::String(_)) | None => {}
+        Some(c) if is_str(c) => {}
+        None => {}
         Some(_) => {
             return Err(fail(
                 5156303,

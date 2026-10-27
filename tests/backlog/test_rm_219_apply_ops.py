@@ -344,12 +344,43 @@ def _index_build_entries(client: Any) -> list:
     return entries
 
 
-@pytest.mark.backlog("RM-224")
+@pytest.mark.backlog_fixed("RM-224")
 def test_oplog_entries_have_mongods_shape(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11 logs an index build over documents in two phases:
     `config.system.indexBuilds` rows around `startIndexBuild` and
-    `commitIndexBuild`, where this server logs one `createIndexes`."""
+    `commitIndexBuild` (the hybrid build, RM-187, since 2026-10-26)."""
     assert _index_build_entries(rust_mongo) == _index_build_entries(mongod_rs)
+
+
+def _bulk_write_entries(client: Any) -> list:
+    """The field names and statement ids of a retryable `bulkWrite`'s
+    entries."""
+    from pymongo import InsertOne, UpdateOne
+
+    client.drop_database("rm224")
+    client.rm224.c.insert_many([{"_id": i} for i in range(3)])
+    start = client.local["oplog.rs"].find_one(sort=[("$natural", -1)])["ts"]
+    client.bulk_write(
+        [
+            InsertOne({"_id": 10}, namespace="rm224.c"),
+            UpdateOne({"_id": 1}, {"$set": {"y": 1}}, namespace="rm224.c"),
+        ]
+    )
+    entries = [
+        (sorted(e.keys()), e.get("stmtId"), [o.get("stmtId") for o in e["o"].get("applyOps", [])])
+        for e in client.local["oplog.rs"].find({"ts": {"$gt": start}, "op": {"$ne": "n"}})
+        if e["ns"] in ("rm224.c", "admin.$cmd")
+    ]
+    client.drop_database("rm224")
+    return entries
+
+
+@pytest.mark.backlog("RM-224")
+def test_bulk_write_entries_carry_their_session(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 stamps a retryable `bulkWrite`'s entries with its
+    session (`lsid`, `txnNumber`, `stmtId`, `prevOpTime`), as it does a
+    retryable insert's or update's; this server writes them bare."""
+    assert _bulk_write_entries(rust_mongo) == _bulk_write_entries(mongod_rs)
 
 
 def _ddl_entries(client: Any) -> list:

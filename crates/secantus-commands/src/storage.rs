@@ -35,6 +35,43 @@ pub struct MatchedRows {
     pub via: Option<String>,
 }
 
+/// What a `compact` compacts (see `secantus_storage::compact`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTarget<'a> {
+    /// A collection: the tables its documents and indexes are kept in.
+    Collection(&'a str, &'a str),
+    /// The oplog, `local.oplog.rs`.
+    Oplog,
+    /// The catalog that holds a database's view definitions
+    /// (`system.views`).
+    Catalog,
+}
+
+/// How a `compact` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompactReply {
+    /// The bytes given back (for a dry run, the estimate).
+    Freed(i64),
+    /// Another `compact` of the same target is running.
+    AlreadyRunning,
+    /// The engine was too busy to compact this table.
+    Busy(String),
+}
+
+/// How an `autoCompact` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutoCompactReply {
+    /// On or off, as asked.
+    Done,
+    /// On already, with another configuration.
+    AlreadyRunning,
+    /// A store held in memory, which has nothing to compact.
+    InMemory,
+    /// The previous change has not been taken up yet; carries the
+    /// platform's text for `EBUSY`.
+    Busy(String),
+}
+
 /// `(id_key, bson)` document rows, as returned by the collection scans the
 /// tailable-find producer polls (`scan_docs_after_id_key`).
 pub type IdKeyRows = Vec<(Vec<u8>, Vec<u8>)>;
@@ -44,6 +81,21 @@ pub type IndexEntries = Vec<(Vec<u8>, i64)>;
 
 /// A collection's documents as `(RecordId, BSON)`, in RecordId order.
 pub type Records = Vec<(i64, Vec<u8>)>;
+
+/// A collection's record count and sizes as mongod keeps them in its size
+/// storer, current with every write (uncommitted ones included) rather than
+/// counted when asked: what `count` with no query, `collStats`, `dbStats`
+/// and an estimated `dataSize` answer from (`Storage::collection_sizes`).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CollectionSizes {
+    /// How many documents (mongod's `numRecords`).
+    pub records: i64,
+    /// Their BSON bytes (mongod's `dataSize`).
+    pub data_size: i64,
+    /// Per-index bytes, `{index_name: size}`, as [`Storage::index_sizes`]
+    /// gives them.
+    pub index_sizes: Document,
+}
 
 /// The outcome of an `update` operation (mirrors
 /// `secantus_storage::UpdateOutcome`).
@@ -78,6 +130,41 @@ pub struct DuplicateKey {
     /// Fields that follow `keyValue` in the reply: `hexEncoded` and
     /// `collation`, for a conflict on an index with a collation.
     pub extra: Option<Document>,
+}
+
+/// Why an index build was aborted, as `abortIndexBuild`'s `cause` records it
+/// (`extra`: a duplicate key's `keyPattern` / `keyValue`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexBuildAbort {
+    pub code: i32,
+    pub code_name: String,
+    pub errmsg: String,
+    pub extra: Document,
+}
+
+impl IndexBuildAbort {
+    pub fn new(code: i32, code_name: &str, errmsg: impl Into<String>) -> Self {
+        IndexBuildAbort {
+            code,
+            code_name: code_name.to_string(),
+            errmsg: errmsg.into(),
+            extra: Document::new(),
+        }
+    }
+}
+
+/// An index build in progress.
+#[derive(Debug, Clone)]
+pub struct IndexBuildInfo {
+    pub uuid: [u8; 16],
+    pub db: String,
+    pub coll: String,
+    /// Each index's spec, `{v, key, name, <options>}`.
+    pub indexes: Vec<Document>,
+    /// mongod's phase number and name.
+    pub phase: i32,
+    pub phase_str: String,
+    pub aborting: bool,
 }
 
 /// A storage failure, pre-classified by the adapter into the shape command
@@ -801,6 +888,88 @@ pub trait Storage: Send + Sync {
         Ok(0)
     }
 
+    // --- two-phase index builds (RM-187) ---
+    //
+    // A build over documents runs as mongod's does: set up (the indexes
+    // recorded, `startIndexBuild` logged, the collection's writes recorded
+    // for it from then on), scanned and drained with the collection taking
+    // writes, then committed (`commitIndexBuild`) or aborted
+    // (`abortIndexBuild`). A storage without them (the test fakes) answers
+    // `false` here and the handler creates each index in one step.
+
+    /// Whether this storage runs two-phase builds.
+    fn supports_index_builds(&self) -> bool {
+        false
+    }
+
+    /// Set up a build of `specs` (`(name, key, options)`) over `(db, coll)`
+    /// under `uuid`.
+    fn begin_index_build(
+        &self,
+        _db: &str,
+        _coll: &str,
+        _uuid: [u8; 16],
+        _specs: &[(String, Document, Document)],
+        _member: &str,
+    ) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "index builds are not supported".into(),
+        ))
+    }
+
+    /// Scan the collection into the build and drain the writes made
+    /// meanwhile; `memory_limit` bytes bound its sorters.
+    fn run_index_build(&self, _uuid: &[u8; 16], _memory_limit: usize) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "index builds are not supported".into(),
+        ))
+    }
+
+    /// Record that the build is ready to commit (`commitReadyMembers`).
+    fn index_build_ready(&self, _uuid: &[u8; 16], _member: &str) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Commit the build; an error leaves it to be aborted.
+    fn commit_index_build(&self, _uuid: &[u8; 16]) -> Result<(), StorageError> {
+        Err(StorageError::Internal(
+            "index builds are not supported".into(),
+        ))
+    }
+
+    /// Abort the build for `cause`.
+    fn abort_index_build(
+        &self,
+        _uuid: &[u8; 16],
+        _cause: &IndexBuildAbort,
+    ) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    /// Ask the builds over `db` (one collection, one build) to abort.
+    fn request_index_build_abort(
+        &self,
+        _db: &str,
+        _coll: Option<&str>,
+        _uuid: Option<&[u8; 16]>,
+        _cause: &IndexBuildAbort,
+    ) -> Vec<[u8; 16]> {
+        Vec::new()
+    }
+
+    /// Wait until none of `uuids` is running.
+    fn wait_index_builds_gone(&self, _uuids: &[[u8; 16]]) {}
+
+    /// The cause an abort of a running build was asked with.
+    fn index_build_abort_cause(&self, _uuid: &[u8; 16]) -> Option<IndexBuildAbort> {
+        None
+    }
+
+    /// The builds running over `db` / `(db, coll)` / everything.
+    fn index_builds(&self, _db: Option<&str>, _coll: Option<&str>) -> Vec<IndexBuildInfo> {
+        Vec::new()
+    }
+
     /// Merge `opts` into an existing index's stored options (e.g. `prepareUnique`
     /// / `unique`). Backs `collMod {index: {keyPattern|name, ...}}`. `true` if the
     /// index existed. Default no-op for test fakes; the WT adapter forwards to
@@ -930,6 +1099,28 @@ pub trait Storage: Send + Sync {
     /// Set `ttlMonitorSleepSecs` and / or `ttlMonitorEnabled`; `None` leaves
     /// a setting alone. Default: nothing to set.
     fn set_ttl_monitor(&self, _sleep_secs: Option<i64>, _enabled: Option<bool>) {}
+
+    /// `compact`: compact the tables `target` is kept in. Default: `None`,
+    /// a backend with nothing to compact (answered as freeing nothing).
+    fn compact(
+        &self,
+        _target: CompactTarget<'_>,
+        _dry_run: bool,
+        _free_space_target_mb: Option<i64>,
+    ) -> Option<Result<CompactReply, StorageError>> {
+        None
+    }
+
+    /// `autoCompact`: background compaction on or off. Default: `None`, a
+    /// backend with no storage engine to compact.
+    fn auto_compact(
+        &self,
+        _enable: bool,
+        _run_once: bool,
+        _free_space_target_mb: Option<i64>,
+    ) -> Option<Result<AutoCompactReply, StorageError>> {
+        None
+    }
 
     /// The storage engine's own statistics, `(description, value)` in its
     /// order, and its version string: what `serverStatus.wiredTiger` reports.
@@ -1159,6 +1350,17 @@ pub trait Storage: Send + Sync {
     /// `dbStats`.
     fn index_sizes(&self, _db: &str, _coll: &str) -> Result<Document, StorageError> {
         Ok(Document::new())
+    }
+
+    /// The collection's record count and sizes as its size storer keeps
+    /// them, read without reading a document ([`CollectionSizes`]). A store
+    /// that keeps none answers by counting.
+    fn collection_sizes(&self, db: &str, coll: &str) -> Result<CollectionSizes, StorageError> {
+        Ok(CollectionSizes {
+            records: self.count_matching(db, coll, &Document::new())? as i64,
+            data_size: self.collection_data_size(db, coll)?,
+            index_sizes: self.index_sizes(db, coll)?,
+        })
     }
 
     /// The WiredTiger table that holds the collection's documents, for

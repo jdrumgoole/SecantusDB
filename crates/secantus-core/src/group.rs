@@ -27,6 +27,7 @@ use bson::{Bson, Document};
 use crate::decimal;
 use crate::expressions;
 use crate::fallback::Fallback;
+use crate::memlimit;
 use crate::numeric::{self, as_int_like, int_to_bson, NumVal};
 use crate::summation::DoubleDoubleSum;
 
@@ -366,7 +367,7 @@ fn decimal_zero() -> R<decimal::Dec> {
 
 /// `AccumulatorSum::_processInternalConstant`: int overflows to long, long to
 /// double; a double is a plain sum.
-fn const_add(c: ConstSum, v: &Bson) -> R<ConstSum> {
+pub(crate) fn const_add(c: ConstSum, v: &Bson) -> R<ConstSum> {
     let as_long = |v: &Bson| -> R<i64> {
         Ok(match v {
             Bson::Int32(i) => i64::from(*i),
@@ -414,8 +415,8 @@ pub(crate) enum Acc {
     Max(Option<Bson>),
     First(Option<Bson>), // None == not yet seen any doc
     Last(Option<Bson>),
-    Push(Vec<Bson>),
-    AddToSet(Vec<Bson>),
+    Push(Capped),
+    AddToSet(Capped),
     // `$mergeObjects`: merge each per-doc operand document into the accumulator
     // (later keys override earlier — `dict.update` semantics). A null/missing
     // operand is skipped; a non-null, non-document operand defers to Python
@@ -459,8 +460,8 @@ pub(crate) enum Acc {
     },
     // `$concatArrays` / `$setUnion` (accumulators since 8.1): every element of
     // each array operand, in order; `$setUnion` keeps the first of equal ones.
-    ConcatArrays(Vec<Bson>),
-    SetUnion(Vec<Bson>),
+    ConcatArrays(Capped),
+    SetUnion(Capped),
     // `$accumulator`: user JavaScript, which this server -- like a mongod
     // started with `--noscripting` -- cannot run.
     Script,
@@ -482,6 +483,203 @@ pub(crate) enum TopNKind {
     BottomN,
 }
 
+/// The values an array-building accumulator (`$push`, `$addToSet`,
+/// `$concatArrays`, `$setUnion`) has collected, and mongod's estimate of
+/// their memory in the engine that collects them. Each refuses (146) once
+/// that estimate passes 100 MiB, with the engine's own words: spilling the
+/// `$group` would not make one array smaller (RM-211).
+#[derive(Default)]
+pub(crate) struct Capped {
+    pub(crate) items: Vec<Bson>,
+    /// Classic: the values' `Value` sizes; SBE: their value sizes. Neither
+    /// counts the classic accumulator's own size (`ACCUMULATOR_BASE`).
+    pub(crate) mem: usize,
+}
+
+impl Capped {
+    /// `$push`: `AccumulatorPush::processInternal` (classic), SBE's
+    /// `addToArrayCapped`.
+    pub(crate) fn push(&mut self, v: Bson) -> R<()> {
+        if crate::sbe::active() {
+            let elem = memlimit::sbe_size(&v);
+            if self.mem + elem >= memlimit::budgets().push {
+                return Err(Fallback::mongo(
+                    146,
+                    format!(
+                        "Used too much memory for a single array. Memory limit: {} bytes. The \
+                         array contains {} elements and is of size {} bytes. The element being \
+                         added has size {elem} bytes.",
+                        memlimit::budgets().push,
+                        self.items.len(),
+                        self.mem
+                    ),
+                ));
+            }
+            self.mem += elem;
+            self.items.push(v);
+            return Ok(());
+        }
+        self.mem += memlimit::classic_size(&v);
+        self.items.push(v);
+        if memlimit::PUSH_BASE + self.mem > memlimit::budgets().push {
+            return Err(Fallback::mongo(
+                146,
+                format!(
+                    "$push used too much memory and cannot spill to disk. Memory limit: {} bytes",
+                    memlimit::budgets().push
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `$addToSet`: the value unless an equal one is there already
+    /// (`AccumulatorAddToSet`, SBE's `addToSetCapped`).
+    pub(crate) fn add(&mut self, v: Bson) -> R<()> {
+        for existing in self.items.iter() {
+            if expressions::py_eq(&v, existing).map_err(|_| Fallback::Defer)? {
+                return Ok(());
+            }
+        }
+        if crate::sbe::active() {
+            let elem = memlimit::sbe_size(&v);
+            if self.mem + elem >= memlimit::budgets().add_to_set {
+                return Err(Fallback::mongo(
+                    146,
+                    format!(
+                        "Used too much memory for a single set. Memory limit: {} bytes. The set \
+                         contains {} elements and is of size {} bytes. The element being added \
+                         has size {elem} bytes.",
+                        memlimit::budgets().add_to_set,
+                        self.items.len(),
+                        self.mem
+                    ),
+                ));
+            }
+            self.mem += elem;
+            self.items.push(v);
+            return Ok(());
+        }
+        self.mem += memlimit::classic_size(&v);
+        self.items.push(v);
+        let used = memlimit::ACCUMULATOR_BASE + self.mem;
+        if used > memlimit::budgets().add_to_set {
+            return Err(Fallback::mongo(
+                146,
+                format!(
+                    "$addToSet used too much memory and cannot spill to disk. Used: {used} \
+                     bytes. Memory limit: {} bytes",
+                    memlimit::budgets().add_to_set
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `$concatArrays`: every element of `values`, in order
+    /// (`AccumulatorConcatArrays::addValuesFromArray`, SBE's
+    /// `concatArraysCapped`).
+    pub(crate) fn concat(&mut self, values: Vec<Bson>) -> R<()> {
+        if crate::sbe::active() {
+            // SBE counts the operand array as one value (measured 8.2.11:
+            // `["x" * 100, 1]` is 129 bytes, nine more than its BSON).
+            let whole = Bson::Array(values);
+            let added = memlimit::sbe_size(&whole);
+            let Bson::Array(values) = whole else {
+                unreachable!("built as an array above")
+            };
+            if self.mem + added >= memlimit::budgets().concat_arrays {
+                // mongod names the size of its two-slot state array here,
+                // not of the values (vm_builtin_agg.cpp, 8.2.1). The count
+                // it gives for the operand is a value it never set (8.2.11
+                // printed 87684434848907256); the operand's length stands in
+                // for that.
+                return Err(Fallback::mongo(
+                    146,
+                    format!(
+                        "Used too much memory for a single array. Memory limit: {}. \
+                         Concatentating array of 2 elements and {} bytes with array of {} \
+                         elements and {added} bytes.",
+                        memlimit::budgets().concat_arrays,
+                        self.mem,
+                        values.len()
+                    ),
+                ));
+            }
+            self.mem += added;
+            self.items.extend(values);
+            return Ok(());
+        }
+        let whole = Bson::Array(values);
+        self.mem += memlimit::classic_size(&whole);
+        let Bson::Array(values) = whole else {
+            unreachable!("built as an array above")
+        };
+        self.items.extend(values);
+        if memlimit::PUSH_BASE + self.mem > memlimit::budgets().concat_arrays {
+            // mongod reports the limit as what was used (8.2.1's message).
+            return Err(Fallback::mongo(
+                146,
+                format!(
+                    "$concatArrays used too much memory and spilling to disk will not reduce \
+                     memory usage. Used: {} bytes",
+                    memlimit::budgets().concat_arrays
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// `$setUnion`: each element of `values` no equal one is there for
+    /// (`AccumulatorSetUnion::addValues`, SBE's `setUnionCapped`).
+    pub(crate) fn union(&mut self, values: Vec<Bson>) -> R<()> {
+        for e in values {
+            let key = gkey(&e)?;
+            let mut present = false;
+            for existing in self.items.iter() {
+                if gkey(existing)? == key {
+                    present = true;
+                    break;
+                }
+            }
+            if present {
+                continue;
+            }
+            let sbe = crate::sbe::active();
+            self.mem += if sbe {
+                memlimit::sbe_size(&e)
+            } else {
+                memlimit::classic_size(&e)
+            };
+            self.items.push(e);
+            if sbe && self.mem >= memlimit::budgets().set_union {
+                return Err(Fallback::mongo(
+                    146,
+                    format!(
+                        "Used too much memory for a single array. Memory limit: {}. Current set \
+                         has {} elements and is {} bytes.",
+                        memlimit::budgets().set_union,
+                        self.items.len(),
+                        self.mem
+                    ),
+                ));
+            }
+            let used = memlimit::ACCUMULATOR_BASE + self.mem;
+            if !sbe && used > memlimit::budgets().set_union {
+                return Err(Fallback::mongo(
+                    146,
+                    format!(
+                        "$setUnion used too much memory and spilling to disk will not reduce \
+                         memory usage. Used: {used}bytes. Memory limit: {} bytes",
+                        memlimit::budgets().set_union
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Compiled<'a> {
     field: &'a str,
     op: &'a str,
@@ -497,8 +695,8 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
         "$max" => Acc::Max(None),
         "$first" => Acc::First(None),
         "$last" => Acc::Last(None),
-        "$push" => Acc::Push(Vec::new()),
-        "$addToSet" => Acc::AddToSet(Vec::new()),
+        "$push" => Acc::Push(Capped::default()),
+        "$addToSet" => Acc::AddToSet(Capped::default()),
         "$mergeObjects" => Acc::MergeObjects(Document::new()),
         "$stdDevPop" => Acc::StdDev {
             values: Vec::new(),
@@ -562,8 +760,8 @@ pub(crate) fn new_acc(op: &str) -> R<Acc> {
             ps: None,
             values: Vec::new(),
         },
-        "$concatArrays" => Acc::ConcatArrays(Vec::new()),
-        "$setUnion" => Acc::SetUnion(Vec::new()),
+        "$concatArrays" => Acc::ConcatArrays(Capped::default()),
+        "$setUnion" => Acc::SetUnion(Capped::default()),
         "$accumulator" => Acc::Script,
         _ => return Err(Fallback::Defer), // unsupported accumulator -> Python (raises or handles)
     })
@@ -665,23 +863,14 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
         }
         Acc::Push(list) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
-                list.push(v);
+                list.push(v)?;
             }
         }
         Acc::AddToSet(list) => {
             let Some(v) = eval_or_missing(arg, doc, vars)? else {
                 return Ok(());
             };
-            let mut present = false;
-            for existing in list.iter() {
-                if expressions::py_eq(&v, existing).map_err(|_| Fallback::Defer)? {
-                    present = true;
-                    break;
-                }
-            }
-            if !present {
-                list.push(v);
-            }
+            list.add(v)?;
         }
         Acc::MergeObjects(merged) => {
             // Null / undefined / missing -> skip; a document merges, later
@@ -715,24 +904,12 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
         }
         Acc::ConcatArrays(items) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
-                items.extend(array_operand("$concatArrays", v)?);
+                items.concat(array_operand("$concatArrays", v)?)?;
             }
         }
         Acc::SetUnion(items) => {
             if let Some(v) = eval_or_missing(arg, doc, vars)? {
-                for e in array_operand("$setUnion", v)? {
-                    let key = gkey(&e)?;
-                    let mut present = false;
-                    for existing in items.iter() {
-                        if gkey(existing)? == key {
-                            present = true;
-                            break;
-                        }
-                    }
-                    if !present {
-                        items.push(e);
-                    }
-                }
+                items.union(array_operand("$setUnion", v)?)?;
             }
         }
         Acc::Script => return Err(no_script_engine()),
@@ -1217,7 +1394,7 @@ pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
 /// cross-type order (`order::bson_lt`, the same relation `ordering._SortKey`
 /// uses — bool > string > number > …). `None` defers only a genuinely
 /// unorderable pair (DBPointer, an unclassifiable Decimal128).
-fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
+pub(crate) fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
     if is_null(&v) {
         return Ok(()); // null never updates and never "unsets"
     }
@@ -1251,7 +1428,7 @@ fn update_extreme(cur: &mut Option<Bson>, v: Bson, want: Ordering) -> R<()> {
     Ok(())
 }
 
-fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
+pub(crate) fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
     let mut out = Document::new();
     out.insert("_id".to_string(), id);
     for (field, acc) in accs {
@@ -1284,17 +1461,14 @@ fn finalize(id: Bson, accs: Vec<(&str, Acc)>) -> R<Document> {
             Acc::First(v) | Acc::Last(v) => {
                 out.insert(field.to_string(), v.unwrap_or(Bson::Null));
             }
-            Acc::Push(list) => {
-                out.insert(field.to_string(), Bson::Array(list));
-            }
-            Acc::AddToSet(list) => {
-                out.insert(field.to_string(), Bson::Array(list));
+            Acc::Push(list) | Acc::AddToSet(list) => {
+                out.insert(field.to_string(), Bson::Array(list.items));
             }
             Acc::MergeObjects(merged) => {
                 out.insert(field.to_string(), Bson::Document(merged));
             }
             Acc::ConcatArrays(items) | Acc::SetUnion(items) => {
-                out.insert(field.to_string(), Bson::Array(items));
+                out.insert(field.to_string(), Bson::Array(items.items));
             }
             Acc::Script => return Err(no_script_engine()),
             Acc::StdDev { values, pop } => {
@@ -1358,11 +1532,11 @@ pub(crate) fn finalize_window_value(acc: Acc) -> R<Bson> {
         },
         Acc::Min(v) | Acc::Max(v) => v.unwrap_or(Bson::Null),
         Acc::First(v) | Acc::Last(v) => v.unwrap_or(Bson::Null),
-        Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list),
+        Acc::Push(list) | Acc::AddToSet(list) => Bson::Array(list.items),
         // Empty window -> {} (a fresh accumulator over zero docs), matching
         // `_empty_window_value("$mergeObjects")`.
         Acc::MergeObjects(merged) => Bson::Document(merged),
-        Acc::ConcatArrays(items) | Acc::SetUnion(items) => Bson::Array(items),
+        Acc::ConcatArrays(items) | Acc::SetUnion(items) => Bson::Array(items.items),
         Acc::Script => return Err(no_script_engine()),
         // A window writes a value into every row: empty / degenerate -> null.
         Acc::StdDev { values, pop } => std_dev(&values, pop).map_or(Bson::Null, Bson::Double),
@@ -1534,11 +1708,116 @@ pub fn pipeline_prefix_fields(stages: &[Bson]) -> Option<std::collections::BTree
     None
 }
 
+/// The top-level fields of each document that `stages` read before a stage
+/// that replaces the documents -- or `None` when they need whole documents
+/// (a stage this walk does not know, or the end of the pipeline, where the
+/// documents themselves are the answer). mongod's dependency analysis,
+/// cut down: it decides what a blocking stage in front keeps of each
+/// document (RM-211).
+pub fn downstream_fields(stages: &[Bson]) -> Option<std::collections::BTreeSet<String>> {
+    let mut fields = std::collections::BTreeSet::new();
+    let top = |path: &str| path.split('.').next().unwrap_or(path).to_string();
+    let falsy = |v: &Bson| matches!(v, Bson::Boolean(false)) || as_int_like(v) == Some(0);
+    for stage in stages {
+        let (name, spec) = stage.as_document()?.iter().next()?;
+        match name.as_str() {
+            "$project" => {
+                let Bson::Document(p) = spec else {
+                    return None;
+                };
+                let mut id = true;
+                for (k, v) in p {
+                    if falsy(v) {
+                        if k == "_id" {
+                            id = false;
+                            continue;
+                        }
+                        // An exclusion keeps everything else.
+                        return None;
+                    }
+                    fields.insert(top(k));
+                    if !matches!(v, Bson::Boolean(true)) && as_int_like(v).is_none() {
+                        let mut found = std::collections::BTreeSet::new();
+                        if !collect_fields(v, &mut found) {
+                            return None;
+                        }
+                        // A computed field reads its own paths; a nested
+                        // inclusion names paths under `k`, already kept.
+                        fields.extend(found);
+                    }
+                }
+                if id {
+                    fields.insert("_id".to_string());
+                }
+                return Some(fields);
+            }
+            "$group" => {
+                fields.extend(referenced_top_level_fields(spec)?);
+                return Some(fields);
+            }
+            "$sortByCount" | "$replaceRoot" | "$replaceWith" => {
+                let expr = match (name.as_str(), spec) {
+                    ("$replaceRoot", Bson::Document(d)) => d.get("newRoot")?,
+                    _ => spec,
+                };
+                return collect_fields(expr, &mut fields).then_some(fields);
+            }
+            "$count" => return Some(fields),
+            "$match" => {
+                if !collect_match_fields(spec, &mut fields) {
+                    return None;
+                }
+            }
+            "$sort" => {
+                let Bson::Document(keys) = spec else {
+                    return None;
+                };
+                for (k, dir) in keys {
+                    if matches!(dir, Bson::Document(_)) {
+                        return None;
+                    }
+                    fields.insert(top(k));
+                }
+            }
+            "$addFields" | "$set" => {
+                let Bson::Document(d) = spec else {
+                    return None;
+                };
+                for v in d.values() {
+                    if !collect_fields(v, &mut fields) {
+                        return None;
+                    }
+                }
+            }
+            "$unwind" => {
+                let path = match spec {
+                    Bson::String(p) => p.as_str(),
+                    Bson::Document(d) => d.get_str("path").ok()?,
+                    _ => return None,
+                };
+                let path = path.strip_prefix('$')?;
+                fields.insert(top(path));
+                if let Some(Bson::String(index)) =
+                    spec.as_document().and_then(|d| d.get("includeArrayIndex"))
+                {
+                    fields.insert(top(index));
+                }
+            }
+            "$unset" | "$skip" | "$limit" | crate::sbe::ENGINE_STAGE => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Insert the top-level component of every field a query filter reads.
 /// Returns `false` for a filter that can read a field without naming it
 /// (`$where`, `$jsonSchema`, `$text`, a whole-document `$expr`) or that is not
 /// a document at all.
-fn collect_match_fields(filter: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
+pub(crate) fn collect_match_fields(
+    filter: &Bson,
+    out: &mut std::collections::BTreeSet<String>,
+) -> bool {
     let Bson::Document(filter) = filter else {
         return false;
     };
@@ -1576,7 +1855,7 @@ fn collect_match_fields(filter: &Bson, out: &mut std::collections::BTreeSet<Stri
 /// ignored: they resolve to array elements or already-evaluated values, never
 /// to a top-level document field, and the arrays/values they range over are
 /// themselves reached through `$path` strings collected here.
-fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
+pub(crate) fn collect_fields(expr: &Bson, out: &mut std::collections::BTreeSet<String>) -> bool {
     match expr {
         Bson::String(s) => {
             if let Some(var) = s.strip_prefix("$$") {
@@ -1856,6 +2135,75 @@ fn expression_object_check(expr: &Bson) -> R<()> {
     crate::expr_parse::operand(expr)
 }
 
+/// mongod's estimate of one accumulator's memory: the classic engine's
+/// accumulator object and the values it holds, or SBE's values. Only what
+/// mongod is known to keep is counted -- a `$firstN` keeps n values there,
+/// not every one this state collects -- so the estimate errs low, never
+/// refusing a `$group` mongod runs.
+/// [`acc_memory`] as the classic engine counts it, whatever engine is
+/// running (`$setWindowFields` always runs in the classic engine).
+pub(crate) fn acc_memory_classic(acc: &Acc) -> usize {
+    let _classic = crate::sbe::enter(false);
+    acc_memory(acc)
+}
+
+fn acc_memory(acc: &Acc) -> usize {
+    let sbe = crate::sbe::active();
+    let base = if sbe { 0 } else { classic_base(acc) };
+    base + match acc {
+        Acc::Push(c) | Acc::AddToSet(c) | Acc::ConcatArrays(c) | Acc::SetUnion(c) => c.mem,
+        Acc::Min(Some(v)) | Acc::Max(Some(v)) => memlimit::engine_size(v),
+        // The classic `$first` / `$last` count themselves only.
+        Acc::First(Some(v)) | Acc::Last(Some(v)) if sbe => memlimit::sbe_size(v),
+        Acc::MergeObjects(d) if sbe && !d.is_empty() => {
+            memlimit::sbe_size(&Bson::Null) + memlimit::bson_len(d)
+        }
+        _ => 0,
+    }
+}
+
+/// What mongod's classic accumulator object counts for itself (its
+/// `sizeof`), read from 8.2.11's `explain` (`maxAccumulatorMemoryUsageBytes`
+/// over five documents, 2026-10-26) on the Linux x86-64 build, the
+/// exemplar: the macOS arm64 build differs for some (`$sum` 184, `$topN`
+/// 568, ...). The values a `$push`, `$addToSet`, `$min` or `$max` holds are
+/// counted on top.
+fn classic_base(acc: &Acc) -> usize {
+    match acc {
+        Acc::Sum(_) | Acc::Count(_) => 176,
+        Acc::Avg(_) => 152,
+        Acc::Min(_) | Acc::Max(_) => 104,
+        Acc::First(_) => 120,
+        Acc::Last(_) | Acc::MergeObjects(_) => 112,
+        Acc::Push(_) | Acc::ConcatArrays(_) => memlimit::PUSH_BASE,
+        Acc::AddToSet(_) | Acc::SetUnion(_) => memlimit::ACCUMULATOR_BASE,
+        Acc::StdDev { .. } => 128,
+        Acc::NElem { kind, .. } => match kind {
+            NElemKind::First | NElemKind::Last => 200,
+            NElemKind::Max | NElemKind::Min => 168,
+        },
+        Acc::TopN { kind, .. } => match kind {
+            TopNKind::Top | TopNKind::Bottom => 608,
+            TopNKind::TopN | TopNKind::BottomN => 640,
+        },
+        Acc::Percentile { .. } => 320,
+        Acc::Script => 0,
+    }
+}
+
+/// A `$group` over its budget that may not spill (292), in the words of
+/// the engine running it (measured 8.2.11, 2026-10-26).
+fn group_memory_error(sbe: bool) -> Fallback {
+    let msg = if sbe {
+        "Exceeded memory limit for $group, but didn't allow external spilling; pass \
+         allowDiskUse:true to opt in"
+    } else {
+        "Exceeded memory limit for $group, but didn't allow external sort. Pass \
+         allowDiskUse:true to opt in."
+    };
+    Fallback::mongo(292, msg)
+}
+
 /// Compile the accumulator specs (each must be a single-op doc) and run the
 /// group. Shared by `$group` and `$sortByCount`.
 fn run_group(
@@ -1877,6 +2225,14 @@ fn run_group(
     let mut ids: Vec<Bson> = Vec::new();
     let mut states: Vec<Vec<Acc>> = Vec::new();
 
+    // mongod's estimate of the groups held in memory: each key and each
+    // accumulator's state (RM-211). SBE never spills a group whose key is a
+    // constant -- there is only ever the one -- and checks no budget for it.
+    let sbe = crate::sbe::active();
+    let budgeted = !(sbe && crate::aggregate::is_constant_expression(id_expr, &[]));
+    let mut mem: usize = 0;
+    let mut spills = crate::group_spill::Spills::default();
+
     for d in docs {
         crate::deadline::check()?;
         let key_val = group_key(id_expr, d, vars)?;
@@ -1886,18 +2242,55 @@ fn run_group(
             None => {
                 let i = ids.len();
                 index.insert(gk, i);
+                mem += memlimit::engine_size(&key_val);
                 ids.push(key_val);
                 let mut accs = Vec::with_capacity(compiled.len());
                 for c in &compiled {
-                    accs.push(new_acc(c.op)?);
+                    let acc = new_acc(c.op)?;
+                    mem += acc_memory(&acc);
+                    accs.push(acc);
                 }
                 states.push(accs);
                 i
             }
         };
         for (c, acc) in compiled.iter().zip(states[idx].iter_mut()) {
+            let before = acc_memory(acc);
             apply_acc(acc, c.arg, d, vars)?;
+            mem = mem - before + acc_memory(acc);
         }
+        // SBE holds its hash table to its own 100 MiB
+        // (`internalQuerySBEAggApproxMemoryUseInBytesBeforeSpill`, not
+        // settable at runtime on 8.2.11); the classic engine to
+        // `internalDocumentSourceGroupMaxMemoryBytes` (measured 2026-10-26:
+        // lowering that knob refuses or spills a classic `$group` and leaves
+        // an SBE one alone).
+        let limit = if sbe {
+            memlimit::budgets().sbe_group
+        } else {
+            memlimit::budgets().group
+        };
+        if budgeted && mem > limit {
+            if !memlimit::disk_allowed() {
+                return Err(group_memory_error(sbe));
+            }
+            index.clear();
+            crate::group_spill::spill(
+                std::mem::take(&mut ids),
+                std::mem::take(&mut states),
+                &mut spills,
+                mem,
+            )?;
+            mem = 0;
+        }
+    }
+
+    if !spills.is_empty() {
+        // What is still in memory is spilled too, and every group comes out
+        // of the merge, in key order.
+        crate::group_spill::spill(ids, states, &mut spills, mem)?;
+        let fields: Vec<&str> = compiled.iter().map(|c| c.field).collect();
+        return crate::group_spill::merge(spills, &fields);
     }
 
     let mut out = Vec::with_capacity(ids.len());
@@ -2723,6 +3116,29 @@ pub fn bucket_auto_stage(spec: &Bson, docs: &[Document], vars: &Document) -> R<V
         } else {
             pairs.push((eval(group_by, d, vars)?, d));
         }
+    }
+    // mongod sorts the group keys with its external sorter, held to
+    // `internalDocumentSourceBucketAutoMaxMemoryBytes` (RM-315): spilled, or
+    // refused with 292. What it keeps of each document is what the stage
+    // reads.
+    {
+        let mut fields = std::collections::BTreeSet::new();
+        let bounded = collect_fields(group_by, &mut fields)
+            && output_spec
+                .values()
+                .all(|acc| collect_fields(acc, &mut fields));
+        let sizing = crate::sorter::Sizing {
+            source: crate::sorter::SortSource::BucketAuto,
+            fields: bounded.then_some(&fields),
+            budget: memlimit::budgets().bucket_auto,
+            added: None,
+        };
+        let items: Vec<(Vec<Bson>, Document)> = pairs
+            .iter()
+            .map(|(v, d)| (vec![v.clone()], (*d).clone()))
+            .collect();
+        let cmp = |a: &[Bson], b: &[Bson]| crate::order::cmp(&a[0], &b[0]);
+        crate::sorter::blocking_sort(items, &cmp, &sizing, None)?;
     }
     let mut keyed: Vec<(Vec<u8>, Bson, &Document)> = Vec::with_capacity(pairs.len());
     for (v, d) in pairs {
