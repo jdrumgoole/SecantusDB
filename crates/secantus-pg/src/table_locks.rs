@@ -210,14 +210,23 @@ pub fn acquire<E>(
 }
 
 /// At the end of a transaction, or at disconnect: every hold `pid` has.
+/// No session waits on `pid` for a table once this returns
+/// (`lock_manager::released`): a waiter records its edges while it holds
+/// `holds`, so one recorded before the release is removed here, and one
+/// after it no longer finds `pid`.
 pub fn release(pid: i32) {
     let t = table();
     let mut holds = t.holds.lock().unwrap_or_else(|e| e.into_inner());
     let before = holds.len();
     holds.retain(|h| h.pid != pid);
-    if holds.len() != before {
+    let changed = holds.len() != before;
+    if changed {
         t.count.store(holds.len(), Ordering::Relaxed);
         t.released.notify_all();
+    }
+    drop(holds);
+    if changed {
+        crate::lock_manager::released(pid, crate::lock_manager::WaitKind::Relation);
     }
 }
 

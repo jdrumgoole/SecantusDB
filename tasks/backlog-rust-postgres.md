@@ -826,6 +826,19 @@ tests are scenarios in `tests/backlog/test_rp_batch30.py`, measured on a
 private 15.19 cluster. RP-133 .. RP-136 and RP-138 .. RP-142 were found and
 fixed in the same batch; their tests there are regression tests.
 
+## Found by the isolation flake (2026-10-27)
+
+Found while chasing `test_rp_isolation.py`'s CI flake ("another command is
+already in progress", and a worker killed at the 600 s per-test deadline),
+and fixed in the same batch; their tests in
+`tests/backlog/test_rp_lock_release.py` are regression tests:
+- RP-270: a lock waiter was still reported blocked
+  (`pg_isolation_test_session_is_blocked`, `pg_blocking_pids`) after its
+  holder's COMMIT had answered, 48 times of 50; PostgreSQL 15.19 never.
+- RP-271: an autocommit statement took no table lock, so a DROP TABLE ran
+  beside an autocommit UPDATE that had waited on a row, and the server
+  wedged for good: every later BEGIN waited too.
+
 ## Found by batch 78 (2026-10-25)
 
 Found while working RP-255, which planning folded a function call around,
