@@ -1243,35 +1243,32 @@ cluster.
 Found while measuring `pg_depend` (RP-105) against PostgreSQL 15.19. The gap
 tests are scenarios in `tests/backlog/test_rp_batch26.py`.
 
-- [ ] **OPEN — the `information_schema` views over every built-in function
-      take a second or more** (optimised build without LTO, a fresh
-      database, `count(*)`): `routines` 0.9 s, `parameters` 1.0 s,
-      `data_type_privileges` 2.1 s, `element_types` 14.8 s, where PostgreSQL
-      15.19 takes 10-50 ms. They answer PostgreSQL's rows since RP-102 listed
-      the 3,244 built-ins. The same build took 3.1, 2.2, 5.6 and 62 s before
-      the top-ten batch (2026-10-26), which removed: a domain CHECK parsed
-      again per value; a timestamp companion name built for every field of
-      every row; a row expression copying every column of its source and
-      the statement's parameters -- among them an uncorrelated subquery's
-      rows, resolved while planning -- on every evaluation; the same
-      parameters Debug-printed as a LATERAL item's memo key per left row;
-      and a FROM subquery planned again only to learn its column names
-      (`whole_row_rewrite`) at every level of nesting. What is left:
-      - the evaluator analyses each expression again for every row:
-        `const_value` resolves a cast's target (`type_name_of`,
-        `declared_typmod`, `user_defined_base_source`), `static_type` and
-        the user-cast and composite lookups per value, which PostgreSQL
-        does once at parse analysis. Hoisting that to plan time is the
-        structural fix;
-      - `element_types`' `(a, b, c, d) IN (SELECT ... FROM
-        data_type_privileges)` is an OR over the subquery's 11,734 rows of
-        parameterised equalities (`row_subquery_comparison`), where
-        PostgreSQL runs a hashed SubPlan; and the subquery runs while the
-        statement is planned (2.3 s of its 15.8);
-      - planning `element_types` still takes about 4 s besides that.
-      Under `LIMIT 0` they ran whole too, until batch 83: on CI's
-      debug build `test_rp_found_2026_10_20.py::test_catalog_relations_are_queryable`
-      passed the 600 s per-test timeout, which ended the xdist worker.
+- [ ] **OPEN — `information_schema.data_type_privileges` and
+      `element_types` take half a second or more** (optimised build without
+      LTO, a fresh database, `count(*)`): `routines` 0.10 s, `parameters`
+      0.21 s, `data_type_privileges` 0.50 s, `element_types` 0.85 s, where
+      PostgreSQL 15.19 takes 10-50 ms. The same build took 0.85, 1.0, 2.0
+      and 13.7 s before the top-ten batch's second pass (2026-10-27: a
+      hashed SubPlan for a row IN over an uncorrelated subquery,
+      `buildSubPlanHash` / `ExecHashSubPlan` with `findPartialMatch`'s NULL
+      rules and `subplan_is_hashable`; a per-expression memo of cast
+      targets and constant casts; unused view outputs pruned after
+      expansion; join rows projected to the keys read), and 3.1, 2.2, 5.6
+      and 62 s before its first. Every row of the four views is the same as
+      before and as 15.19's. What is left:
+      - a LATERAL `_pg_expandarray` item is planned again as SQL for each
+        of `pg_proc`'s 668 distinct argument arrays
+        (`PgHandler::lateral_rows`), where PostgreSQL plans its function
+        scan once (about 20% of `parameters`);
+      - the evaluator still asks operand types per row on operator paths
+        (`array_operand_mismatch`, `static_json_type`,
+        `typed_string_operand`);
+      - a view subquery's pruned outputs are still materialised as NULL
+        cells (`materialise_sub`), and a pruned body is planned alone first
+        to keep its parse errors (about 5% of `data_type_privileges`, 7% of
+        `element_types`);
+      - `element_types` runs `data_type_privileges` (0.5 s) while it is
+        planned; PostgreSQL pulls the IN up into a hash semi-join.
       Backlog-ID: RP-131
       Verify: none -- a performance budget; every answer matches PostgreSQL's
 
