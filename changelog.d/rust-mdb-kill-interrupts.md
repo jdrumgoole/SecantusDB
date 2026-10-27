@@ -47,8 +47,17 @@ leaves. Measured against mongod 8.2.11 on a replica set and a standalone
   (`tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_failing_part_way_keeps_the_documents_before`,
   `::test_a_delete_many_failing_part_way_keeps_the_batches_before`).
 
+- `$currentOp` lists a running `count`, `distinct` or `findAndModify`
+  under its collection's namespace, as mongod does, not under `<db>.$cmd`;
+  a `$match` on the namespace found nothing.
+- A `drop` or `createIndexes` waiting for a transaction's lock ends when
+  killed (bare 11601; `createIndexes` with a `writeConcernError`); it waited
+  on.
+
 #### Known gaps
 
 - A multi-document write interrupted while it reads its candidates, or a
   `deleteMany` on a replica set interrupted anywhere, still writes nothing
   where mongod keeps what it wrote (RM-323).
+- `$currentOp` lists a running `bulkWrite` as the whole command, where
+  mongod lists the op it is running (RM-324).

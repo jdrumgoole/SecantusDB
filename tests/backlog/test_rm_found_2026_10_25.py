@@ -575,7 +575,14 @@ def _killed_while_running(client: Any) -> tuple:
     first: list = []
     thread = threading.Thread(target=lambda: first.append(_op_msg(host, port, cmd)), daemon=True)
     thread.start()
-    time.sleep(0.3)
+    # Kill it once it runs: on a loaded box 0.3 s may not see it started.
+    running = {"aggregate": 1, "cursor": {}, "$db": "admin"}
+    running["pipeline"] = [{"$currentOp": {}}, {"$match": {"ns": "rm313.c", "op": "update"}}]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        time.sleep(0.3)
+        if _op_msg(host, port, running)["cursor"]["firstBatch"]:
+            break
     killed = _op_msg(host, port, {"killSessions": [lsid], "$db": "admin"})
     thread.join(timeout=120)
     assert first, "the update never answered"

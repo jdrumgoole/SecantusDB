@@ -146,3 +146,38 @@ def test_an_update_many_out_of_time_keeps_the_documents_it_updated(
     theirs = _update_many_out_of_time(mongod_rs)
     assert theirs == (("err", 50), True), theirs
     assert _update_many_out_of_time(rust_mongo) == theirs
+
+
+def _running_bulk_write(client: Any) -> list:
+    """How `$currentOp` lists a running one-op `bulkWrite`: `op`, `ns` and
+    the command's first field."""
+    slow = Slow(client)
+    slow.seed(1, 1.5)
+    lsid = {"id": Binary(uuid.uuid4().bytes, 4)}
+    command = {
+        "bulkWrite": 1,
+        "ops": [{"update": 0, "filter": SLOW, "updateMods": {"$inc": {"n": 1}}}],
+        "nsInfo": [{"ns": "live_interrupts.c"}],
+        "lsid": lsid,
+    }
+    thread = threading.Thread(target=lambda: slow.run(command, db="admin"), daemon=True)
+    thread.start()
+    time.sleep(0.5)
+    listed = {"$or": [{"op": "bulkWrite"}, {"command.bulkWrite": 1}]}
+    ops = slow.run(
+        {"aggregate": 1, "pipeline": [{"$currentOp": {}}, {"$match": listed}], "cursor": {}},
+        db="admin",
+    )["cursor"]["firstBatch"]
+    thread.join(60)
+    return [(o.get("op"), o.get("ns"), next(iter(o.get("command", {})), None)) for o in ops]
+
+
+@pytest.mark.backlog("RM-324")
+def test_current_op_lists_a_bulk_write_under_its_op(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 lists a running `bulkWrite` as op `bulkWrite`, under
+    the namespace and command of the op it is running (measured
+    2026-10-27). This server lists the whole command, as `command` on
+    `admin.$cmd`."""
+    theirs = _running_bulk_write(mongod_rs)
+    assert theirs == [("bulkWrite", "live_interrupts.c", "update")], theirs
+    assert _running_bulk_write(rust_mongo) == theirs

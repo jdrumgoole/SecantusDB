@@ -150,8 +150,19 @@ class Slow:
             target=lambda: replies.append(self.run(command, db=db)), daemon=True
         )
         thread.start()
-        time.sleep(0.3)
-        kill = self.kill(how, lsid, match or {"ns": f"{DB}.c"})
+        # Kill it once it runs: on a loaded box 0.3 s may not see it started.
+        match = match or {"ns": f"{DB}.c"}
+        running = {
+            "aggregate": 1,
+            "pipeline": [{"$currentOp": {}}, {"$match": match}],
+            "cursor": {},
+        }
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            time.sleep(0.3)
+            if self.run(running, db="admin")["cursor"]["firstBatch"]:
+                break
+        kill = self.kill(how, lsid, match)
         thread.join(120)
         assert replies, "the operation never answered"
         return clean(replies[0]), clean(kill)
@@ -245,7 +256,10 @@ def _killed_batch(client: Any, ordered: bool) -> tuple:
     # by :: operation was interrupted", between two statements the bare
     # message. Both are mongod's answer.
     wrapper = "Plan executor error during update :: caused by :: "
-    assert reply["errmsg"] in ("operation was interrupted", wrapper + "operation was interrupted")
+    assert reply.get("errmsg") in (
+        "operation was interrupted",
+        wrapper + "operation was interrupted",
+    ), reply
     reply["errmsg"] = reply["errmsg"].removeprefix(wrapper)
     # What matters, not when the kill landed: the statements before it are
     # applied, the ones after not, and a retry answers for exactly those.
@@ -284,11 +298,17 @@ def _killed_bulk_write(client: Any, ordered: bool) -> tuple:
         "ordered": ordered,
         "lsid": lsid,
     }
-    reply, _ = slow.killed(command, "killSessions", lsid=lsid, db="admin")
+    # mongod lists a running bulkWrite under the op it runs (RM-324), this
+    # server under the command.
+    running = {"$or": [{"op": "bulkWrite"}, {"command.bulkWrite": 1}]}
+    reply, _ = slow.killed(command, "killSessions", lsid=lsid, match=running, db="admin")
     _, applied = slow.state()
     # As for `update` (above), where the kill lands decides the wrapper.
     wrapper = "Plan executor error during update :: caused by :: "
-    assert reply["errmsg"] in ("operation was interrupted", wrapper + "operation was interrupted")
+    assert reply.get("errmsg") in (
+        "operation was interrupted",
+        wrapper + "operation was interrupted",
+    ), reply
     reply["errmsg"] = reply["errmsg"].removeprefix(wrapper)
     return reply, 0 < applied < 50
 

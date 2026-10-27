@@ -215,7 +215,15 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
             .get_str("collection")
             .map(|c| format!("{}.{c}", ctx.db_name))
             .unwrap_or_else(|_| format!("{}.$cmd", ctx.db_name)),
-        (_, Some(Bson::String(coll))) if op != "command" || name == "aggregate" => {
+        // A command that reads one collection is listed under it (mongod
+        // 8.2.11: `count`, `distinct` and `findAndModify` too, 2026-10-27).
+        (_, Some(Bson::String(coll)))
+            if op != "command"
+                || matches!(
+                    name,
+                    "aggregate" | "count" | "distinct" | "findAndModify" | "findandmodify"
+                ) =>
+        {
             format!("{}.{coll}", ctx.db_name)
         }
         _ => format!("{}.$cmd", ctx.db_name),
