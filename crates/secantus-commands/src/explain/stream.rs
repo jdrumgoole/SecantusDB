@@ -149,6 +149,9 @@ struct Cx<'a> {
     vars: &'a Document,
     keys: i64,
     docs: i64,
+    /// How many more results the batch takes (0: as many as its bytes
+    /// allow): what a FETCH may read ahead.
+    want: usize,
 }
 
 impl Cx<'_> {
@@ -237,7 +240,42 @@ enum Step {
     End,
 }
 
+/// Where an index scan stood before it produced an entry: what a FETCH
+/// that read ahead rewinds it to at a yield, so the next batch reads on from
+/// the last entry handed out, as mongod's scan does.
+struct Snap {
+    last: Option<(Vec<u8>, i64)>,
+    done: bool,
+    run: Option<Vec<Vec<u8>>>,
+    /// The batch's keys examined at that point.
+    keys: i64,
+}
+
 impl IndexScan {
+    fn snapshot(&self, keys: i64) -> Snap {
+        Snap {
+            last: self.last.clone(),
+            done: self.done,
+            run: self.run.clone(),
+            keys,
+        }
+    }
+
+    /// Back to `snap`: the entries produced since are read again by the
+    /// next batch, and a multikey scan forgets it returned them.
+    fn rewind(&mut self, snap: Snap, unread: &[i64]) {
+        self.last = snap.last;
+        self.done = snap.done;
+        self.run = snap.run;
+        self.buf.clear();
+        self.end = false;
+        if self.meta.multikey {
+            for rid in unread {
+                self.seen.remove(rid);
+            }
+        }
+    }
+
     /// Whether an entry is at the front, reading the next chunk if need be.
     fn fill(&mut self, cx: &Cx) -> Result<bool, StorageError> {
         if self.buf.is_empty() && !self.end {
@@ -514,6 +552,14 @@ impl CollScan {
     }
 }
 
+/// An entry a FETCH read ahead: the member, its document as read (`None`:
+/// gone), and where the scan stood before producing it.
+struct Ahead {
+    member: Member,
+    blob: Option<Vec<u8>>,
+    snap: Snap,
+}
+
 /// A SORT_MERGE's head: a child's next document and its sort key.
 struct Head {
     key: Vec<Vec<u8>>,
@@ -628,11 +674,15 @@ impl Merge {
 enum Stage {
     Coll(CollScan),
     Ix(Box<IndexScan>),
-    /// Reads each document: `counted` unless the plan is covered.
+    /// Reads each document: `counted` unless the plan is covered. The
+    /// topmost FETCH over an index scan reads its documents a chunk at a
+    /// time (`ahead`), no more than the batch can still take, and gives back
+    /// at a yield what it did not hand out.
     Fetch {
         filter: Option<Document>,
         input: Box<Stage>,
         counted: bool,
+        ahead: Option<VecDeque<Ahead>>,
     },
     Skip {
         left: i64,
@@ -668,7 +718,51 @@ impl Stage {
                 filter,
                 input,
                 counted,
+                ahead,
             } => loop {
+                if let (Some(queue), Stage::Ix(scan)) = (ahead.as_mut(), input.as_mut()) {
+                    if queue.is_empty() {
+                        let room = match cx.want {
+                            0 => CHUNK,
+                            n => n.min(CHUNK),
+                        };
+                        let mut members = Vec::with_capacity(room);
+                        while members.len() < room {
+                            let snap = scan.snapshot(cx.keys);
+                            match scan.next(cx)? {
+                                Some(m) => members.push((m, snap)),
+                                None => break,
+                            }
+                        }
+                        if members.is_empty() {
+                            return Ok(None);
+                        }
+                        let rids: Vec<i64> = members.iter().map(|(m, _)| m.rid).collect();
+                        let Some(found) = cx.storage.records_by_id(cx.db, cx.coll, &rids)? else {
+                            return Err(StorageError::Internal("this store cannot stream".into()));
+                        };
+                        for ((member, snap), blob) in members.into_iter().zip(found) {
+                            queue.push_back(Ahead { member, blob, snap });
+                        }
+                    }
+                    let Some(Ahead {
+                        mut member, blob, ..
+                    }) = queue.pop_front()
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(blob) = blob else { continue };
+                    if *counted {
+                        cx.docs += 1;
+                    }
+                    if let Some(f) = filter.as_ref() {
+                        if !cx.matches(&blob, f)? {
+                            continue;
+                        }
+                    }
+                    member.doc = Some(blob);
+                    return Ok(Some(member));
+                }
                 let Some(mut m) = input.next(cx)? else {
                     return Ok(None);
                 };
@@ -755,8 +849,30 @@ impl Stage {
     }
 
     /// The end of a batch: what was read ahead is dropped, positions and
-    /// held heads kept (the heads to be checked when fetched).
-    fn yield_now(&mut self) {
+    /// held heads kept (the heads to be checked when fetched). A FETCH that
+    /// read ahead rewinds its scan, and answers the batch's keys examined
+    /// before it read the entries it gives back.
+    fn yield_now(&mut self) -> Option<i64> {
+        if let Stage::Fetch {
+            input,
+            ahead: Some(queue),
+            ..
+        } = self
+        {
+            if let (Some(first), Stage::Ix(scan)) = (queue.pop_front(), input.as_mut()) {
+                let keys = first.snap.keys;
+                let unread: Vec<i64> = std::iter::once(first.member.rid)
+                    .chain(queue.drain(..).map(|a| a.member.rid))
+                    .collect();
+                scan.rewind(first.snap, &unread);
+                return Some(keys);
+            }
+        }
+        self.yield_children();
+        None
+    }
+
+    fn yield_children(&mut self) {
         match self {
             Stage::Coll(scan) => {
                 scan.buf.clear();
@@ -766,16 +882,16 @@ impl Stage {
                 scan.buf.clear();
                 scan.end = false;
             }
-            Stage::Fetch { input, .. } | Stage::Skip { input, .. } => input.yield_now(),
-            Stage::Or { inputs, .. } => inputs.iter_mut().for_each(Stage::yield_now),
+            Stage::Fetch { input, .. } | Stage::Skip { input, .. } => input.yield_children(),
+            Stage::Or { inputs, .. } => inputs.iter_mut().for_each(Stage::yield_children),
             Stage::Merge(merge) => {
-                merge.inputs.iter_mut().for_each(Stage::yield_now);
+                merge.inputs.iter_mut().for_each(Stage::yield_children);
                 for h in merge.heads.iter_mut() {
                     h.member.stale = h.member.doc.is_none();
                 }
             }
             Stage::SortKeys { input, sorted, .. } => {
-                input.yield_now();
+                input.yield_children();
                 for m in sorted.iter_mut().flatten() {
                     m.stale = m.doc.is_none();
                 }
@@ -945,6 +1061,7 @@ fn stage_of(
                 filter,
                 input: Box::new(input),
                 counted: true,
+                ahead: None,
             })
         }
         // mongod skips index entries below the FETCH when nothing is
@@ -970,6 +1087,7 @@ fn stage_of(
                     filter: None,
                     input: Box::new(s),
                     counted: false,
+                    ahead: None,
                 })
             } else {
                 Some(s)
@@ -989,6 +1107,7 @@ fn stage_of(
                 filter: None,
                 input: Box::new(Stage::Ix(Box::new(s))),
                 counted: !covered,
+                ahead: None,
             })
         }
         Node::Or(inputs) => {
@@ -1162,6 +1281,7 @@ impl Stream {
                         filter: None,
                         input: Box::new(other),
                         counted: false,
+                        ahead: None,
                     },
                 })
             })?,
@@ -1169,6 +1289,11 @@ impl Stream {
         let Some(mut root) = root else {
             return Ok(None);
         };
+        if let Stage::Fetch { input, ahead, .. } = &mut root {
+            if matches!(input.as_ref(), Stage::Ix(_)) {
+                *ahead = Some(VecDeque::new());
+            }
+        }
         // An empty filter matches every document: nothing to run.
         if command.is_none() {
             clear_top_filter(&mut root);
@@ -1218,13 +1343,15 @@ impl Stream {
             db: &self.db,
             coll: &self.coll,
             vars: &self.vars,
-            keys: 0,
-            docs: 0,
+            keys: self.keys,
+            docs: self.docs,
+            want: 0,
         };
         let mut out = Vec::new();
         let mut bytes = 0usize;
         let result = (|| {
             while !((want > 0 && out.len() >= want) || budget.is_some_and(|b| bytes >= b)) {
+                cx.want = if want > 0 { want - out.len() } else { 0 };
                 let Some(m) = self.root.next(&mut cx)? else {
                     self.done = true;
                     break;
@@ -1241,8 +1368,8 @@ impl Stream {
             }
             Ok(())
         })();
-        self.keys += cx.keys;
-        self.docs += cx.docs;
+        self.keys = cx.keys;
+        self.docs = cx.docs;
         result.map(|()| out)
     }
 
@@ -1279,8 +1406,12 @@ impl Stream {
         self.keys = 0;
         self.docs = 0;
         let result = self.fill(storage, want, max_bytes, reaching);
-        // The batch is over: every stage yields, keeping only its position.
-        self.root.yield_now();
+        // The batch is over: every stage yields, keeping only its position;
+        // what was read ahead is read again by the next batch, and counted
+        // there.
+        if let Some(keys) = self.root.yield_now() {
+            self.keys = keys;
+        }
         let out = result?;
         let exhausted = self.done && self.stashed.is_empty();
         let mut batch = Batch {

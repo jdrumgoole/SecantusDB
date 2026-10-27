@@ -2933,8 +2933,10 @@ fn shell_value(v: &Bson) -> String {
                 &hex[20..]
             )
         }
-        // An empty array has no element to index, and its key is `undefined`.
+        // An empty array has no element to index, and its key is `undefined`
+        // (entry format 6 holds that key itself).
         Bson::Array(a) if a.is_empty() => "undefined".to_string(),
+        Bson::Undefined => "undefined".to_string(),
         // Every other type as mongod prints it: `new Date(<ms>)`,
         // `{ a: 1, b: "x" }`, `BinData(0, ABCD)`, `Timestamp(5, 6)`, `/a/i`.
         // These reached the client as Rust's `Debug` text (measured against
