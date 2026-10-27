@@ -222,8 +222,7 @@ pub fn create_role(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         record.insert("authenticationRestrictions", r);
     }
     let mut bytes = Vec::new();
-    record
-        .to_writer(&mut bytes)
+    crate::bsondoc::write(&record, &mut bytes)
         .map_err(|e| CommandError::new(1, "InternalError", format!("encode role record: {e}")))?;
     let added = ctx
         .storage()?

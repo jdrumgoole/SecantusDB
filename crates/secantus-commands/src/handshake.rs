@@ -350,7 +350,7 @@ pub(crate) fn validate_client_metadata(client: &Bson, sized: bool) -> Result<(),
             "The client metadata document must be a document",
         ));
     };
-    if sized && bson::to_vec(client).map_or(0, |b| b.len()) > 512 {
+    if sized && crate::bsondoc::to_vec(client).map_or(0, |b| b.len()) > 512 {
         return Err(CommandError::new(
             185,
             "ClientMetadataDocumentTooLarge",

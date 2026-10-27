@@ -945,7 +945,7 @@ def _insert_invalid_utf8(client: Any) -> Any:
     return (reply.get("ok"), reply.get("n"), reply.get("code"))
 
 
-@pytest.mark.backlog("RM-222")
+@pytest.mark.backlog_fixed("RM-222")
 def test_insert_string_with_invalid_utf8(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 stores a document whose string holds bytes that are
     not UTF-8 (ok 1, n 1)."""

@@ -1010,7 +1010,7 @@ type SchemaAndRows = (Vec<FieldInfo>, Vec<Vec<Option<Bson>>>);
 /// `_id.<name>` keys at the same position -- a composite primary key's
 /// layout (see `Column::field_override`). Every other document, catalog rows
 /// included, has a scalar or string `_id` and comes back unchanged.
-fn decode_doc(bytes: &[u8]) -> Result<Document, bson::raw::Error> {
+fn decode_doc(bytes: &[u8]) -> Result<Document, secantus_core::bsondoc::Error> {
     let d = secantus_core::bsondoc::from_bytes(bytes)?;
     // A VALUE can be a document too -- a numeric wider than Decimal128 is
     // `{__numeric, __numkey}` -- and one of those as a single-column key must

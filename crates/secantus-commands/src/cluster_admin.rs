@@ -135,7 +135,7 @@ pub fn record_initial_fcv(
 ) -> Result<(), crate::storage::StorageError> {
     let stored = storage.find(FCV_DB, FCV_COLL, &doc! {"_id": FCV_ID}, None, None)?;
     if stored.is_empty() {
-        let bytes = bson::to_vec(&doc! {"_id": FCV_ID, "version": FCV_LATEST})
+        let bytes = crate::bsondoc::to_vec(&doc! {"_id": FCV_ID, "version": FCV_LATEST})
             .map_err(|e| crate::storage::StorageError::Internal(e.to_string()))?;
         storage.insert(FCV_DB, FCV_COLL, vec![bytes], true)?;
     }

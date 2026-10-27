@@ -834,14 +834,38 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refuses `validateMode: "extraIndexKeysCheck"` (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **A string that is not valid UTF-8 is refused.** An insert whose
-      string holds the bytes `0xff 0xfe` answers 1 "BSON error: utf-8
-      encoding error"; mongod 8.2.11 stores it (n: 1). Data mongod keeps is
-      refused, and data read back from a mongod dump could not be
-      restored. Reading strings as raw bytes where they are not inspected
-      would keep them.
+- [ ] **Text that is not UTF-8 outside a string value is still refused or
+      altered.** Since 2026-10-27 a string VALUE or a field NAME whose bytes
+      are not UTF-8 is kept, compared, indexed, matched and served byte for
+      byte (`bsondoc`'s carrier and escaped names;
+      `tests/mongod_live/test_invalid_utf8.py`). Left, each measured against
+      mongod 8.2.11:
+      - a collection (or database) name that is not UTF-8 is refused (73
+        "Collection name has invalid type string"); mongod creates it.
+        Storage keys its tables by a Rust `String` name;
+      - an error message that quotes such a string (`$convert`,
+        `$dateFromString`, `$toObjectId` ...) quotes it with U+FFFD for each
+        invalid sequence, where mongod writes the raw bytes; `$dateFromString`
+        then lists one "Unexpected character" per byte of each U+FFFD;
+      - JavaScript, a symbol, a regex, a DBPointer or JavaScript with a scope
+        whose text is not UTF-8 is refused (2 "invalid BSON in body");
+        mongod stores it;
+      - a NUL and two lowercase hex digits in a field name taken from a
+        string value elsewhere than `$setField`, `$rename` and a field path
+        (all three refuse it, as mongod does) would read as the escape of a
+        name that is not UTF-8. Not measured to happen: the other places a
+        string becomes a name refuse a NUL through `FieldPath`.
       Backlog-ID: RM-222
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_insert_string_with_invalid_utf8
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_collection_name_that_is_not_utf8, tests/backlog/test_rm_222_invalid_utf8.py::test_error_message_quotes_the_bytes, tests/backlog/test_rm_222_invalid_utf8.py::test_other_text_types_that_are_not_utf8
+- [ ] **A `$group` key that is an array sorts by its smallest element.**
+      `[{$group: {_id: "$s"}}, {$sort: {_id: 1}}]` over `s` values `["x",
+      "q"]`, `"b"`, `{x: 1}`, `"z"` returns `b, [x, q], z, {x: 1}`; mongod
+      8.2.11 returns `b, z, {x: 1}, [x, q]`, sorting the array as an array.
+      A find sort's rule (an array sorts by its smallest element ascending)
+      is applied to a `$sort` over a computed `_id`. Found 2026-10-27 while
+      working RM-222.
+      Backlog-ID: RM-329
+      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_sort_of_group_ids_that_are_arrays
 - [ ] **`local.oplog.rs` entries are not mongod's shape.** Since
       2026-10-20 an update (mongod's `$v: 2` diff, stored beside the
       change-stream description as `o.md`), a batch of inserts (one

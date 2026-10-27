@@ -536,6 +536,8 @@ pub fn is_computed_spec(v: &Bson) -> bool {
         return false;
     }
     match v {
+        // A string that is not UTF-8 (RM-222) is an expression.
+        Bson::Document(_) if crate::bsondoc::as_invalid_utf8(v).is_some() => true,
         Bson::Document(d) => {
             // $slice / $elemMatch / $meta have their own handling upstream.
             slice_spec(v).is_none()
@@ -563,7 +565,10 @@ pub(crate) fn flatten_projection_spec(spec: &Document) -> R<Vec<(String, Bson)>>
 }
 
 fn flatten_entry(key: &str, value: &Bson, out: &mut Vec<(String, Bson)>) -> R<()> {
-    if let Bson::Document(d) = value {
+    if let Some(d) = value
+        .as_document()
+        .filter(|d| crate::bsondoc::carrier_bytes(d).is_none())
+    {
         if d.is_empty() {
             let leaf = key.rsplit('.').next().unwrap_or(key);
             return Err(Fallback::mongo(

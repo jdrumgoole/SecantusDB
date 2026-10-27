@@ -3003,7 +3003,7 @@ fn graph_walk(
 fn graph_id_key(id: Option<&Bson>) -> Vec<u8> {
     match id {
         None => Vec::new(),
-        Some(v) => bson::to_vec(&doc! { "k": v.clone() }).unwrap_or_default(),
+        Some(v) => crate::bsondoc::to_vec(&doc! { "k": v.clone() }).unwrap_or_default(),
     }
 }
 

@@ -544,6 +544,11 @@ fn redact_list(values: &[Bson], spec: &Bson, vars: &Document) -> R<Vec<Bson>> {
 /// `ObjectId('…')`, and a date as ISO-8601 rather than `new Date(<ms>)`. Two
 /// renderers, both mongod's, used by different messages — probed on 8.2.11.
 pub fn render_value_compact(v: &Bson) -> String {
+    // A string that is not UTF-8 prints as the string it is, each invalid
+    // sequence replaced (mongod writes the raw bytes; RM-222).
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
+        return format!("\"{}\"", crate::bsondoc::lossy(b));
+    }
     match v {
         Bson::Null => "null".to_string(),
         Bson::Boolean(b) => b.to_string(),
@@ -1518,7 +1523,9 @@ fn add_fields_collect(
         };
         match expr {
             Bson::Document(inner)
-                if !inner.is_empty() && !inner.keys().any(|k| k.starts_with('$')) =>
+                if !inner.is_empty()
+                    && !inner.keys().any(|k| k.starts_with('$'))
+                    && crate::bsondoc::carrier_bytes(inner).is_none() =>
             {
                 add_fields_collect(inner, &path, doc, vars, out)?;
             }

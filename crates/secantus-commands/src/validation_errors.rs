@@ -710,7 +710,13 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
     let applies = |kind: Kind| stated.is_none_or(|k| k == Some(kind));
 
     // Scalar keywords -- strings and numbers only.
-    if let (Bson::String(s), true) = (value, applies(Kind::String)) {
+    // A string that is not UTF-8 is a string too, its length counted as
+    // mongod counts it (RM-222).
+    let string_len = match value {
+        Bson::String(s) => Some(s.chars().count() as i64),
+        v => crate::bsondoc::as_invalid_utf8(v).map(|b| secantus_core::rawstr::len_cp(b) as i64),
+    };
+    if let (Some(len), true) = (string_len, applies(Kind::String)) {
         if let Some(Bson::String(p)) = schema.get("pattern") {
             if !filter_matches(
                 &doc! {"v": value.clone()},
@@ -724,7 +730,6 @@ fn explain_value(schema: &Document, value: &Bson, top: bool) -> Vec<Bson> {
                 });
             }
         }
-        let len = s.chars().count() as i64;
         for (kw, fails) in [("maxLength", true), ("minLength", false)] {
             if let Some(n) = as_count(schema.get(kw)) {
                 if (fails && len > n) || (!fails && len < n) {

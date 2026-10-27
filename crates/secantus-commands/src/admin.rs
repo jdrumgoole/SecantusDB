@@ -4326,7 +4326,11 @@ pub(crate) fn time_series_stats(coll: &str, ctx: &CommandContext) -> HandlerResu
     let buckets = crate::ts_buckets::of_collection(storage, &ctx.db_name, coll)?;
     let bucket_size: i64 = buckets
         .iter()
-        .map(|b| bson::to_vec(b).map(|v| v.len() as i64).unwrap_or(0))
+        .map(|b| {
+            crate::bsondoc::to_vec(b)
+                .map(|v| v.len() as i64)
+                .unwrap_or(0)
+        })
         .sum();
     let n = buckets.len() as i64;
     let mut index_sizes = index_sizes;

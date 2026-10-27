@@ -68,7 +68,7 @@ pub fn write_segment(
             doc.insert("p", Bson::Document(p.clone()));
         }
         let mut blob = Vec::new();
-        doc.to_writer(&mut blob)
+        secantus_core::bsondoc::write(&doc, &mut blob)
             .map_err(|e| StorageError::Bson(e.to_string()))?;
         framed.extend_from_slice(&(blob.len() as u32).to_be_bytes());
         framed.extend_from_slice(&blob);
@@ -285,7 +285,7 @@ pub fn restore_from_archive_dir(
             rows.entry(seq).or_insert(entry);
             if let Some(p) = pre {
                 let mut buf = Vec::new();
-                p.to_writer(&mut buf)
+                secantus_core::bsondoc::write(&p, &mut buf)
                     .map_err(|e| StorageError::Bson(e.to_string()))?;
                 pre_map.entry(seq).or_insert(buf);
             }

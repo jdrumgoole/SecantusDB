@@ -321,7 +321,7 @@ fn legacy_array_bytes(arr: &[Bson]) -> Result<Vec<u8>, UnsupportedValue> {
 /// [`encode_id_key`].
 fn legacy_doc_bytes(doc: &Document) -> Result<Vec<u8>, UnsupportedValue> {
     let mut buf = Vec::new();
-    doc.to_writer(&mut buf)
+    crate::bsondoc::write(doc, &mut buf)
         .map_err(|e| UnsupportedValue(format!("doc encode failed: {e}")))?;
     Ok(escape(&buf))
 }
@@ -397,6 +397,8 @@ pub fn encode_id_key(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
 
 fn encode_id_key_inner(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
     match v {
+        // A string that is not UTF-8 keys as the string it is (RM-222).
+        Bson::Document(_) if crate::bsondoc::as_invalid_utf8(v).is_some() => encode_value(v, None),
         Bson::Document(d) => {
             let mut out = vec![RANK_DOCUMENT];
             out.extend(legacy_doc_bytes(d)?);
@@ -420,6 +422,22 @@ const FORMAT_4_RANK_MAXKEY: u8 = 14;
 /// it applies to every string, nested ones included (entry format 4).
 pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
     let mut out = Vec::new();
+    // A string whose bytes are not UTF-8 (RM-222) is a string: its bytes,
+    // escaped, so it orders among the other strings byte by byte, as mongod
+    // orders them. Under a collation it folds as the text with each invalid
+    // sequence replaced, which may equal another string's key; the exact
+    // match pass rechecks every index candidate.
+    if let Some(bytes) = crate::bsondoc::as_invalid_utf8(v) {
+        out.push(RANK_STRING);
+        match coll {
+            Some(c) => out.extend(escape(
+                &collation::normalize_index_bytes(&String::from_utf8_lossy(bytes), c)
+                    .ok_or(UnsupportedValue("collation cannot be reproduced".into()))?,
+            )),
+            None => out.extend(escape(bytes)),
+        }
+        return Ok(out);
+    }
     match v {
         Bson::MinKey => out.push(RANK_MINKEY),
         Bson::Null => out.push(RANK_NULL),
@@ -570,6 +588,14 @@ pub fn invert_bytes(b: &[u8]) -> Vec<u8> {
 /// a single sort, so it is free to carry the extra levels that mongod orders by
 /// and that the single-level fold provably cannot express.
 pub fn encode_sort_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, UnsupportedValue> {
+    if let (Some(bytes), Some(c)) = (crate::bsondoc::as_invalid_utf8(v), coll) {
+        let mut out = vec![RANK_STRING];
+        out.extend(escape(&collation::sort_level_bytes(
+            &String::from_utf8_lossy(bytes),
+            c,
+        )));
+        return Ok(out);
+    }
     match (v, coll) {
         (Bson::String(s), Some(c)) => {
             let mut out = Vec::new();

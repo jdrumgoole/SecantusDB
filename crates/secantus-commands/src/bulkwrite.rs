@@ -111,7 +111,7 @@ fn first_batch_len(results: &[Document], batch_size: i64) -> i64 {
         if i as i64 >= batch_size {
             return i as i64;
         }
-        used += bson::to_vec(entry).map(|v| v.len()).unwrap_or(0);
+        used += crate::bsondoc::to_vec(entry).map(|v| v.len()).unwrap_or(0);
         if used > budget {
             return (i as i64).max(1);
         }

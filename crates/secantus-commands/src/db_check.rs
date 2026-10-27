@@ -284,7 +284,7 @@ fn sorted_rows(
         return defs
             .into_iter()
             .map(|d| {
-                let raw = bson::to_vec(&d).map_err(|e| error(1, e.to_string()))?;
+                let raw = crate::bsondoc::to_vec(&d).map_err(|e| error(1, e.to_string()))?;
                 Ok((d.get("_id").cloned().unwrap_or(Bson::Null), raw))
             })
             .collect();
@@ -331,7 +331,7 @@ fn healthlog(
     if let Some((_, _, params)) = collection {
         record.insert("data", doc! {"dbCheckParameters": params.clone()});
     }
-    let bytes = bson::to_vec(&record).map_err(|e| error(1, e.to_string()))?;
+    let bytes = crate::bsondoc::to_vec(&record).map_err(|e| error(1, e.to_string()))?;
     storage
         .insert("local", HEALTHLOG, vec![bytes], true)
         .map_err(crate::util::command_error)?;

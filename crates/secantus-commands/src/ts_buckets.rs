@@ -289,7 +289,7 @@ pub(crate) fn place(docs: &[Document], layout: &Layout) -> Vec<Bucket> {
         let t = layout.time_of(doc);
         let meta = layout.meta_of(doc);
         let key = match &meta {
-            Some(m) => bson::to_vec(&doc! {"m": m.clone()}).unwrap_or_default(),
+            Some(m) => crate::bsondoc::to_vec(&doc! {"m": m.clone()}).unwrap_or_default(),
             None => Vec::new(),
         };
         let s = series.entry(key).or_default();
@@ -434,7 +434,7 @@ fn column(values: &[Option<&Bson>]) -> Result<Bson, CommandError> {
     while i < values.len() {
         match values[i] {
             Some(v) => {
-                let element = bson::to_vec(&doc! {"": v.clone()})
+                let element = crate::bsondoc::to_vec(&doc! {"": v.clone()})
                     .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
                 // The element alone: without the document's length and its
                 // closing zero.
@@ -614,7 +614,7 @@ pub(crate) fn as_read(
     let shaped = |raw: &Vec<u8>| -> Result<Vec<u8>, CommandError> {
         let doc = secantus_core::bsondoc::from_bytes(&raw[..])
             .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
-        bson::to_vec(&measurement(&doc, &layout))
+        crate::bsondoc::to_vec(&measurement(&doc, &layout))
             .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))
     };
     if sorted {

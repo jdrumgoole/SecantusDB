@@ -239,7 +239,7 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
 /// same count as a profile entry's `responseLength`
 /// (`profiler::record::response_length`).
 fn response_length(reply: &Document, ctx: &CommandContext) -> i64 {
-    let body = bson::to_vec(reply).map_or(0, |b| b.len());
+    let body = crate::bsondoc::to_vec(reply).map_or(0, |b| b.len());
     let batch = ctx.pending_batch.as_ref().map_or(0, |pending| {
         let items: usize = pending
             .batch

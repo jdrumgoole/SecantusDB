@@ -779,8 +779,7 @@ pub fn create_user(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     );
     restamp_mechanisms(&mut record);
     let mut record_bytes = Vec::new();
-    record
-        .to_writer(&mut record_bytes)
+    crate::bsondoc::write(&record, &mut record_bytes)
         .map_err(|e| CommandError::new(1, "InternalError", format!("encode user record: {e}")))?;
 
     let added = ctx
@@ -999,8 +998,7 @@ fn save_user_record(
     record: &Document,
 ) -> Result<(), CommandError> {
     let mut bytes = Vec::new();
-    record
-        .to_writer(&mut bytes)
+    crate::bsondoc::write(record, &mut bytes)
         .map_err(|e| CommandError::new(1, "InternalError", format!("encode user record: {e}")))?;
     ctx.storage()?
         .add_user(db_name, username, &bytes, true)
@@ -1233,7 +1231,7 @@ pub fn backfill_user_ids(
             with_id.insert("userId", new_user_id());
         }
         let mut out = Vec::new();
-        if with_id.to_writer(&mut out).is_err() {
+        if crate::bsondoc::write(&with_id, &mut out).is_err() {
             continue;
         }
         storage.add_user(db, user, &out, true)?;

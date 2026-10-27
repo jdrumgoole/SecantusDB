@@ -178,6 +178,7 @@ fn complement(list: &[Interval]) -> Vec<Interval> {
 fn has_string(v: &Bson) -> bool {
     match v {
         Bson::String(_) | Bson::Symbol(_) => true,
+        _ if crate::bsondoc::as_invalid_utf8(v).is_some() => true,
         Bson::Document(d) => d.values().any(has_string),
         Bson::Array(a) => a.iter().any(has_string),
         _ => false,
@@ -218,6 +219,13 @@ fn bracket(v: &Bson) -> Option<(Bson, bool, Bson, bool)> {
             true,
         ),
         Bson::String(_) | Bson::Symbol(_) => (
+            Bson::String(String::new()),
+            true,
+            Bson::Document(Document::new()),
+            false,
+        ),
+        // A string that is not UTF-8 is in the string bracket (RM-222).
+        Bson::Document(_) if crate::bsondoc::as_invalid_utf8(v).is_some() => (
             Bson::String(String::new()),
             true,
             Bson::Document(Document::new()),
@@ -693,8 +701,63 @@ fn render_string(s: &str) -> String {
     out
 }
 
+/// A string that is not UTF-8 as mongod prints it in a bound: its own bytes,
+/// quoted and escaped as [`render_string`] escapes (RM-222).
+fn render_invalid_utf8(bytes: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'"'];
+    for b in bytes {
+        match b {
+            b'"' => out.extend_from_slice(b"\\\""),
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            b'\n' => out.extend_from_slice(b"\\n"),
+            b'\t' => out.extend_from_slice(b"\\t"),
+            b'\r' => out.extend_from_slice(b"\\r"),
+            other => out.push(*other),
+        }
+    }
+    out.push(b'"');
+    out
+}
+
+/// [`render`] as bytes, so a string that is not UTF-8 keeps them (RM-222).
+fn render_bytes(v: &Bson) -> Vec<u8> {
+    if let Some(b) = crate::bsondoc::as_invalid_utf8(v) {
+        return render_invalid_utf8(b);
+    }
+    match v {
+        Bson::Document(d) if !d.is_empty() => {
+            let mut out = b"{ ".to_vec();
+            for (i, (k, x)) in d.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend_from_slice(&crate::bsondoc::key_bytes(k).unwrap_or_default());
+                out.extend_from_slice(b": ");
+                out.extend(render_bytes(x));
+            }
+            out.extend_from_slice(b" }");
+            out
+        }
+        Bson::Array(a) if !a.is_empty() => {
+            let mut out = b"[ ".to_vec();
+            for (i, x) in a.iter().enumerate() {
+                if i > 0 {
+                    out.extend_from_slice(b", ");
+                }
+                out.extend(render_bytes(x));
+            }
+            out.extend_from_slice(b" ]");
+            out
+        }
+        other => render(other).into_bytes(),
+    }
+}
+
 /// A value as mongod prints it inside a bound.
 pub(crate) fn render(v: &Bson) -> String {
+    if crate::bsondoc::as_invalid_utf8(v).is_some() {
+        return String::from_utf8_lossy(&render_bytes(v)).into_owned();
+    }
     match v {
         Bson::Int32(n) => n.to_string(),
         Bson::Int64(n) => n.to_string(),
@@ -737,26 +800,32 @@ pub(crate) fn render_key_pattern(key: &Document) -> String {
 /// the scan meets this field's keys from high to low: a descending field
 /// scanned forward, or an ascending one scanned backward.
 pub(crate) fn render_bounds(list: &[Interval], reversed: bool) -> Vec<Bson> {
+    // Built as bytes: a bound on a string that is not UTF-8 shows its bytes,
+    // as mongod's does (RM-222).
     let one = |i: &Interval| {
-        if reversed {
-            format!(
-                "{}{}, {}{}",
-                if i.hi_incl { '[' } else { '(' },
-                render(&i.hi),
-                render(&i.lo),
-                if i.lo_incl { ']' } else { ')' }
+        let (open, a, b, close) = if reversed {
+            (
+                if i.hi_incl { b'[' } else { b'(' },
+                &i.hi,
+                &i.lo,
+                if i.lo_incl { b']' } else { b')' },
             )
         } else {
-            format!(
-                "{}{}, {}{}",
-                if i.lo_incl { '[' } else { '(' },
-                render(&i.lo),
-                render(&i.hi),
-                if i.hi_incl { ']' } else { ')' }
+            (
+                if i.lo_incl { b'[' } else { b'(' },
+                &i.lo,
+                &i.hi,
+                if i.hi_incl { b']' } else { b')' },
             )
-        }
+        };
+        let mut s = vec![open];
+        s.extend(render_bytes(a));
+        s.extend_from_slice(b", ");
+        s.extend(render_bytes(b));
+        s.push(close);
+        crate::bsondoc::string_from_bytes(s)
     };
-    let mut out: Vec<Bson> = list.iter().map(|i| Bson::String(one(i))).collect();
+    let mut out: Vec<Bson> = list.iter().map(one).collect();
     if reversed {
         out.reverse();
     }
