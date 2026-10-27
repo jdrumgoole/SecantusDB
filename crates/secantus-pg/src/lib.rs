@@ -50956,8 +50956,13 @@ impl ExtendedQueryHandler for PgHandler {
         let params = match bound {
             Some((_, params)) => {
                 // `portal_params` installs the session's state on the
-                // thread; what follows reads it.
-                self.install_user_types();
+                // thread; what follows reads it -- only a catalog change's
+                // effects (`catalog_effects`) before the statement installs
+                // it again itself (`run_typed_inner`), so a statement that
+                // changes no catalog skips this one (RP-014).
+                if catalog_reads::changes_catalogs(&portal.statement.statement.sql) {
+                    self.install_user_types();
+                }
                 params
             }
             None => self

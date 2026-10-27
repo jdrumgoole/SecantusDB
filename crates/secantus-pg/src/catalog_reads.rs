@@ -2698,7 +2698,7 @@ fn default_opclass(typ: i64, am: i64) -> i64 {
 
 /// Whether a statement's first word makes it one whose catalog changes this
 /// model sends invalidations for: it is parsed every time, not remembered.
-fn changes_catalogs(sql: &str) -> bool {
+pub(crate) fn changes_catalogs(sql: &str) -> bool {
     // Compared in place, without lower-casing a copy: every statement asks
     // twice (RP-014).
     let first = sql
