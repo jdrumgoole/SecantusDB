@@ -338,6 +338,12 @@ pub struct UniqueConstraint {
     /// other value. Recorded only when set, so the shared shape is unchanged
     /// for every constraint without it.
     pub nulls_not_distinct: bool,
+    /// A DEFERRABLE PRIMARY KEY (RP-281). Storage's `_id_` is unique per
+    /// write, so a deferrable key cannot be the row's `_id`: the table keeps
+    /// a generated one, and the key is judged as a deferrable UNIQUE is (at
+    /// statement end, or at COMMIT when deferred) while the catalogs report
+    /// it as the PRIMARY KEY. Recorded only when set.
+    pub primary: bool,
     /// The oid its index drew when the constraint was made: PostgreSQL's
     /// one counter, so an index's oid is its place in creation order.
     /// `None` for a constraint recorded before oids were drawn.
@@ -360,6 +366,7 @@ impl UniqueConstraint {
             exclusion_ops: Vec::new(),
             exclusion_method: None,
             nulls_not_distinct: false,
+            primary: false,
             oid: None,
             reloptions: Vec::new(),
         }
@@ -380,6 +387,9 @@ impl UniqueConstraint {
         }
         if let Some(m) = &self.exclusion_method {
             d.insert("exclusion_method", m.as_str());
+        }
+        if self.primary {
+            d.insert("primary", true);
         }
         if self.nulls_not_distinct {
             d.insert("nulls_not_distinct", true);
@@ -416,6 +426,7 @@ impl UniqueConstraint {
                 .unwrap_or_default(),
             exclusion_method: d.get_str("exclusion_method").ok().map(str::to_string),
             nulls_not_distinct: d.get_bool("nulls_not_distinct").unwrap_or(false),
+            primary: d.get_bool("primary").unwrap_or(false),
             oid: d.get_i64("oid").ok(),
             reloptions: d
                 .get_array("reloptions")

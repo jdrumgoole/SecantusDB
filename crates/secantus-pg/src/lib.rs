@@ -12016,7 +12016,7 @@ impl PgHandler {
                     keys,
                     include: Vec::new(),
                     unique: !u.exclusion,
-                    primary: false,
+                    primary: u.primary,
                     exclusion: u.exclusion,
                 });
             }
@@ -14028,7 +14028,8 @@ impl PgHandler {
                     ));
                 } else {
                     push(format!(
-                        "UNIQUE {}({}){}",
+                        "{} {}({}){}",
+                        if u.primary { "PRIMARY KEY" } else { "UNIQUE" },
                         if u.nulls_not_distinct {
                             "NULLS NOT DISTINCT "
                         } else {
@@ -20698,10 +20699,10 @@ impl PgHandler {
                     for u in t.unique_constraints.iter().filter(|u| !u.exclusion) {
                         push(
                             &u.name,
-                            "UNIQUE",
+                            if u.primary { "PRIMARY KEY" } else { "UNIQUE" },
                             u.deferrable,
                             u.initially_deferred,
-                            Some(!u.nulls_not_distinct),
+                            (!u.primary).then_some(!u.nulls_not_distinct),
                             &mut rows,
                         );
                     }
@@ -21253,6 +21254,15 @@ impl PgHandler {
                         d.insert(f("indisunique"), ix.unique);
                         d.insert(f("indisprimary"), ix.primary);
                         d.insert(f("indisexclusion"), ix.exclusion);
+                        // A DEFERRABLE key's index does not check on insert.
+                        if let Some(field) = def.field_of("indimmediate") {
+                            let deferrable = ix
+                                .table
+                                .unique_constraints
+                                .iter()
+                                .any(|u| u.name == ix.name && u.deferrable);
+                            d.insert(field, !deferrable);
+                        }
                         d.insert(
                             f("indisclustered"),
                             ix.table.extra.get_str("clustered_index") == Ok(ix.name.as_str()),
@@ -23380,7 +23390,13 @@ impl PgHandler {
                             // reachable via a hand-off today -- this server
                             // refuses EXCLUDE at DDL, so the flag can only
                             // have been written by the PYTHON server.
-                            if u.exclusion { "x" } else { "u" },
+                            if u.exclusion {
+                                "x"
+                            } else if u.primary {
+                                "p"
+                            } else {
+                                "u"
+                            },
                             cols,
                             u.deferrable,
                             u.initially_deferred,
@@ -28189,7 +28205,9 @@ impl PgHandler {
                 using_index,
                 ..
             } => {
-                if def.columns.iter().any(|c| c.pk) {
+                if def.columns.iter().any(|c| c.pk)
+                    || def.unique_constraints.iter().any(|u| u.primary)
+                {
                     return Err(Self::user_error(
                         "42P16",
                         format!("multiple primary keys for table \"{table}\" are not allowed"),
@@ -28216,6 +28234,8 @@ impl PgHandler {
                         using_index: Some(ix.clone()),
                         include,
                         reloptions,
+                        deferrable: false,
+                        initially_deferred: false,
                     }));
                 }
                 for c in columns {
@@ -28570,9 +28590,10 @@ impl PgHandler {
                 name,
                 columns,
                 using_index,
+                deferrable,
                 ..
             } => {
-                self.add_primary_key(table, def, before, name, columns)?;
+                self.add_primary_key(table, def, before, name, columns, *deferrable)?;
                 // The key's own index replaces the one it was made from.
                 if let Some(ix) = using_index {
                     self.storage
@@ -29028,6 +29049,7 @@ impl PgHandler {
         before: &TableDef,
         name: &str,
         columns: &[String],
+        deferrable: bool,
     ) -> PgWireResult<()> {
         let docs = self.table_docs(table)?;
         // Each key column's field BEFORE it became the key -- in table-column
@@ -29057,6 +29079,10 @@ impl PgHandler {
             }
         }
         self.check_existing_unique(table, before, name, columns, false)?;
+        // A DEFERRABLE key is not the rows' `_id` (RP-281): nothing moves.
+        if deferrable {
+            return Ok(());
+        }
         let composite = old.len() > 1;
         let mut out = Vec::with_capacity(docs.len());
         for mut d in docs {

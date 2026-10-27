@@ -156,6 +156,11 @@ INSERT INTO membership VALUES (1, 100, 'member');  -- error 23505 (duplicate key
 SELECT role FROM membership WHERE org_id = 1 AND user_id = 100;
 ```
 
+On the Rust PostgreSQL server (`secantusd-pg`), a `DEFERRABLE` primary key is
+the exception: the `_id` index checks every write, while PostgreSQL checks a
+deferrable key at the end of the statement or at COMMIT, so its rows keep a
+generated `_id` and the key is enforced as a deferrable `UNIQUE` is.
+
 Both PK columns reflect through `pg_index` / `pg_constraint` / SQLAlchemy's
 `get_pk_constraint`. Updating a PK column (single or a composite subfield) re-keys
 the row — the old `_id` is deleted and the row re-inserted under the new one, with

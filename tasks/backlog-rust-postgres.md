@@ -941,10 +941,6 @@ tests regression tests:
       once a row of its table as PostgreSQL's scan does.
       Backlog-ID: RP-288
       Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
-- [ ] **`DEFERRABLE` on a primary key is dropped**: `primary key (a, b)
-      deferrable` records `condeferrable` false (15.19: true).
-      Backlog-ID: RP-281
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_deferrable_primary_key_is_deferrable
 - [ ] **A plain SELECT's WITH RECURSIVE is planned without PostgreSQL's
       checks**: a recursive term of another type, or one holding an
       aggregate, is answered (and without a LIMIT never ends) where 15.19
