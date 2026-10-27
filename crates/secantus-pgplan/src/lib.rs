@@ -4205,10 +4205,27 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     const MAX_ENTRIES: usize = 4096;
     static MEMO: OnceLock<Mutex<HashMap<String, Arc<pg_query::protobuf::ParseResult>>>> =
         OnceLock::new();
+    thread_local! {
+        /// The tree last answered on this thread, by its text compared in
+        /// place: a statement run over and over is not hashed each time
+        /// (RP-014). A text's tree is the same whoever parsed it.
+        static LAST: std::cell::RefCell<Option<(String, Arc<pg_query::protobuf::ParseResult>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
     let memo = MEMO.get_or_init(|| Mutex::new(HashMap::new()));
     cancel::check()?;
+    if let Some(tree) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(text, _)| text == sql)
+            .map(|(_, tree)| Arc::clone(tree))
+    }) {
+        return Ok(tree);
+    }
     if let Some(tree) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
-        return Ok(Arc::clone(tree));
+        let tree = Arc::clone(tree);
+        LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), Arc::clone(&tree))));
+        return Ok(tree);
     }
     func_cast::check_numeric_junk(sql)?;
     let tree = Arc::new(parse_guarded(sql)?.protobuf);

@@ -2939,11 +2939,27 @@ fn literal_shape(sql: &str) -> Option<String> {
 /// A statement's text, hashed, for the memo.
 pub(crate) fn text_key(sql: &str, path: &str, user: &str) -> u64 {
     use std::hash::{Hash, Hasher};
+    thread_local! {
+        /// The last key made, by its inputs compared in place: a statement
+        /// run over and over is not hashed each time (RP-014).
+        static LAST: std::cell::RefCell<Option<(String, String, String, u64)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(key) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(s, p, u, _)| s == sql && p == path && u == user)
+            .map(|(_, _, _, k)| *k)
+    }) {
+        return key;
+    }
     let mut h = std::collections::hash_map::DefaultHasher::new();
     sql.hash(&mut h);
     path.hash(&mut h);
     user.hash(&mut h);
-    h.finish()
+    let key = h.finish();
+    LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), path.to_string(), user.to_string(), key)));
+    key
 }
 
 /// The invalidations a DDL statement sends, from its parse tree, given the

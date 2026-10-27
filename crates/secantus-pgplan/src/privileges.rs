@@ -106,23 +106,23 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
     // Asked for every statement (the table locks, the privilege check): the
     // parse-tree walk is remembered per thread by text.
     thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(String, &'static str)>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        static MEMO: std::cell::RefCell<TextMemo<Vec<(String, &'static str)>>> =
+            std::cell::RefCell::new(TextMemo::new());
     }
     // The names resolved through the search path, remembered too while
     // nothing resolution reads has been installed anew on this thread
     // (`schemas::resolve_epoch`): resolving was most of this call.
-    type Resolved = std::collections::HashMap<String, (u64, Vec<(String, &'static str)>)>;
+    type Resolved = TextMemo<(u64, Vec<(String, &'static str)>)>;
     thread_local! {
         static RESOLVED: std::cell::RefCell<Resolved> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+            std::cell::RefCell::new(TextMemo::new());
     }
     let epoch = crate::schemas::resolve_epoch();
     if let Some(hit) = RESOLVED.with(|m| {
-        m.borrow()
+        m.borrow_mut()
             .get(sql)
             .filter(|(e, _)| *e == epoch)
-            .map(|(_, v)| v.clone())
+            .map(|(_, v)| v)
     }) {
         return hit;
     }
@@ -138,13 +138,7 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
         return out;
     }
     // Resolving installs nothing, so the epoch read above still holds.
-    RESOLVED.with(|m| {
-        let mut m = m.borrow_mut();
-        if m.len() >= 512 {
-            m.clear();
-        }
-        m.insert(sql.to_string(), (epoch, out.clone()));
-    });
+    RESOLVED.with(|m| m.borrow_mut().insert(sql, (epoch, out.clone()), 512));
     out
 }
 
@@ -153,8 +147,8 @@ pub fn sql_relations(sql: &str) -> Vec<(String, &'static str)> {
 /// the role may use it (a few system relations are not PUBLIC's).
 pub fn sql_catalog_reads(sql: &str) -> Vec<String> {
     thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        static MEMO: std::cell::RefCell<TextMemo<Vec<String>>> =
+            std::cell::RefCell::new(TextMemo::new());
     }
     memoised(&MEMO, sql, |sql| apart(sql, catalog_reads_uncached))
 }
@@ -201,13 +195,51 @@ fn apart<V: Default + Send + 'static>(sql: &str, f: fn(&str) -> V) -> V {
     }
 }
 
+/// A per-thread memo by statement text, with the text last answered kept
+/// beside the map and compared in place: a statement run over and over
+/// (an `executemany`) is answered without hashing its text (RP-014).
+pub(crate) struct TextMemo<V> {
+    last: Option<(String, V)>,
+    map: std::collections::HashMap<String, V>,
+}
+
+impl<V: Clone> TextMemo<V> {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: None,
+            map: std::collections::HashMap::new(),
+        }
+    }
+
+    /// The value remembered for `sql`.
+    pub(crate) fn get(&mut self, sql: &str) -> Option<V> {
+        if let Some((text, v)) = &self.last {
+            if text == sql {
+                return Some(v.clone());
+            }
+        }
+        let v = self.map.get(sql)?.clone();
+        self.last = Some((sql.to_string(), v.clone()));
+        Some(v)
+    }
+
+    /// Remember `v` for `sql`, the map cleared first once it holds `max`.
+    pub(crate) fn insert(&mut self, sql: &str, v: V, max: usize) {
+        if self.map.len() >= max {
+            self.map.clear();
+        }
+        self.last = Some((sql.to_string(), v.clone()));
+        self.map.insert(sql.to_string(), v);
+    }
+}
+
 fn memoised<V: Clone>(
-    memo: &'static std::thread::LocalKey<std::cell::RefCell<std::collections::HashMap<String, V>>>,
+    memo: &'static std::thread::LocalKey<std::cell::RefCell<TextMemo<V>>>,
     sql: &str,
     f: impl FnOnce(&str) -> V,
 ) -> V {
     const MEMO_MAX: usize = 512;
-    if let Some(v) = memo.with(|m| m.borrow().get(sql).cloned()) {
+    if let Some(v) = memo.with(|m| m.borrow_mut().get(sql)) {
         return v;
     }
     let v = f(sql);
@@ -215,13 +247,7 @@ fn memoised<V: Clone>(
     if crate::cancel::pending() {
         return v;
     }
-    memo.with(|m| {
-        let mut m = m.borrow_mut();
-        if m.len() >= MEMO_MAX {
-            m.clear();
-        }
-        m.insert(sql.to_string(), v.clone());
-    });
+    memo.with(|m| m.borrow_mut().insert(sql, v.clone(), MEMO_MAX));
     v
 }
 
@@ -484,8 +510,8 @@ fn push(out: &mut Vec<(String, &'static str)>, table: &str, privilege: &'static 
 /// not block). Empty for any other statement.
 pub fn ddl_locks(sql: &str) -> Vec<(String, i32)> {
     thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<(String, i32)>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        static MEMO: std::cell::RefCell<TextMemo<Vec<(String, i32)>>> =
+            std::cell::RefCell::new(TextMemo::new());
     }
     memoised(&MEMO, sql, ddl_locks_uncached)
 }
@@ -549,8 +575,8 @@ fn ddl_locks_uncached(sql: &str) -> Vec<(String, i32)> {
 /// statement table locks use (`RP-047`).
 pub fn row_locked_tables(sql: &str) -> Vec<String> {
     thread_local! {
-        static MEMO: std::cell::RefCell<std::collections::HashMap<String, Vec<String>>> =
-            std::cell::RefCell::new(std::collections::HashMap::new());
+        static MEMO: std::cell::RefCell<TextMemo<Vec<String>>> =
+            std::cell::RefCell::new(TextMemo::new());
     }
     let raw = memoised(&MEMO, sql, row_locked_tables_uncached);
     let mut out: Vec<String> = Vec::new();
