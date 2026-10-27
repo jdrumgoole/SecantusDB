@@ -148,6 +148,9 @@ unsafe fn item_bytes(it: &sys::WT_ITEM) -> Vec<u8> {
 /// A WiredTiger database connection. One per process (sessions are per-thread).
 pub struct Connection {
     ptr: *mut sys::WT_CONNECTION,
+    /// The connection keeps statistics (`statistics=(fast)` or more): its
+    /// sessions' can be read ([`Session::statistics`]).
+    stats: bool,
     /// The event handler WiredTiger was given. It writes its defaults into
     /// the callbacks left null, so the handler is the connection's own and
     /// outlives it: `Drop` closes the connection before this field drops.
@@ -198,6 +201,22 @@ fn event_handler() -> Box<sys::WT_EVENT_HANDLER> {
     })
 }
 
+/// Whether a connection opened with `config` keeps statistics: its
+/// `statistics=(...)` names a level other than `none` (WiredTiger's
+/// default is none). A statistics cursor on a connection that keeps none
+/// is refused (`EINVAL`).
+fn keeps_statistics(config: &str) -> bool {
+    let Some(at) = config.find("statistics=(") else {
+        return false;
+    };
+    let rest = &config[at + "statistics=(".len()..];
+    let levels = rest.split(')').next().unwrap_or("");
+    levels
+        .split(',')
+        .map(str::trim)
+        .any(|l| matches!(l, "all" | "fast" | "cache_walk" | "tree_walk"))
+}
+
 impl Connection {
     /// Open (creating if needed) a WiredTiger database rooted at `home` with the
     /// given config string (e.g. `"create,cache_size=256M,log=(enabled=true)"`).
@@ -211,6 +230,7 @@ impl Connection {
         })?;
         Ok(Connection {
             ptr,
+            stats: keeps_statistics(config),
             _handler: handler,
         })
     }
@@ -225,6 +245,7 @@ impl Connection {
             cursor_config: None,
             in_txn: Cell::new(false),
             txn_end: RefCell::new(Vec::new()),
+            stats: self.stats,
         })
     }
 }
@@ -284,6 +305,8 @@ pub struct Session {
     /// when it committed and `false` when it rolled back. See
     /// [`Session::on_transaction_end`].
     txn_end: RefCell<Vec<TxnEndHook>>,
+    /// Its connection keeps statistics.
+    stats: bool,
 }
 
 /// A callback run once when a transaction ends: `true` for a commit.
@@ -643,6 +666,9 @@ impl Session {
     /// This session's statistics (`statistics:session`), cleared afterwards
     /// when `clear`. A session starts at zero when it opens.
     pub fn statistics(&self, clear: bool) -> Result<OperationStats> {
+        if !self.stats {
+            return Ok(OperationStats::default());
+        }
         let uri = CString::new("statistics:session").map_err(nul_err)?;
         let cfg = CString::new(if clear { "statistics=(clear)" } else { "" }).map_err(nul_err)?;
         let open = unsafe { (*self.ptr).open_cursor }.unwrap();
@@ -686,7 +712,7 @@ impl Session {
     /// outlives a statement (a transaction's) gives each statement its own
     /// share. Nothing when no operation is counting.
     pub fn collect_operation_statistics(&self) -> Result<()> {
-        if !operation_stats_armed() {
+        if !self.stats || !operation_stats_armed() {
             return Ok(());
         }
         let mut stats = self.statistics(true)?;
@@ -700,7 +726,7 @@ impl Session {
     /// Start this session's statistics over, discarding what they held: a
     /// long-lived session about to run a statement whose share is counted.
     pub fn discard_statistics(&self) -> Result<()> {
-        if !operation_stats_armed() {
+        if !self.stats || !operation_stats_armed() {
             return Ok(());
         }
         self.statistics(true).map(|_| ())
@@ -711,7 +737,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
             // A session the running operation used gives it what it counted.
-            if operation_stats_armed() {
+            if self.stats && operation_stats_armed() {
                 match self.statistics(false) {
                     // A transaction this session ran has ended, or ends
                     // with the close: it holds no dirty bytes.
@@ -1246,5 +1272,18 @@ mod panic_handler_tests {
             stderr.contains("WiredTiger panic, aborting: injected"),
             "stderr: {stderr}"
         );
+    }
+}
+
+#[cfg(test)]
+mod statistics_config_tests {
+    use super::keeps_statistics;
+
+    #[test]
+    fn statistics_are_kept_at_a_level_other_than_none() {
+        assert!(keeps_statistics("create,statistics=(fast)"));
+        assert!(keeps_statistics("statistics=(all,clear),create"));
+        assert!(!keeps_statistics("create,cache_size=1M"));
+        assert!(!keeps_statistics("create,statistics=(none)"));
     }
 }

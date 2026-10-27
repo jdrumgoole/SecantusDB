@@ -280,6 +280,11 @@ pub struct CommandContext {
     pub planning_micros: Option<i64>,
     /// How many documents a `findAndModify` changed, for its line.
     pub modified: Option<i64>,
+    /// How long the operation waited for its write concern, in ms.
+    pub write_concern_wait: Option<i64>,
+    /// The CPU time the operation's thread spent on it, where mongod
+    /// measures it (Linux).
+    pub cpu_nanos: Option<i64>,
     /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
     /// handed in by the server **un-decoded** so the insert handler can store the
     /// client's bytes verbatim (the raw-BSON write path) instead of paying a
@@ -367,6 +372,8 @@ impl CommandContext {
             op_locks: None,
             planning_micros: None,
             modified: None,
+            write_concern_wait: None,
+            cpu_nanos: None,
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,
@@ -865,7 +872,14 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         .as_ref()
         .and_then(|s| s.begin_operation_counts());
     let planning = explain::planning_scope();
+    let cpu_started = opdebug::thread_cpu_nanos();
     opdebug::take_examined();
+    ctx.op_counts = None;
+    ctx.op_locks = None;
+    ctx.planning_micros = None;
+    ctx.modified = None;
+    ctx.write_concern_wait = None;
+    ctx.cpu_nanos = None;
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
     // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
@@ -877,10 +891,16 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
     if wants_journal(name, doc, client_wc, default_wc.as_ref()) {
         if let Some(storage) = &ctx.storage {
+            let waited = std::time::Instant::now();
             if let Err(e) = storage.flush_journal() {
                 // The write is not durable: that is the answer, not a
                 // footnote to an `ok: 1`.
                 reply = crate::util::command_error(e).into_reply();
+            } else if opdebug::wrote_something(name, &reply) {
+                // The wait for the write concern: on a member of one, for
+                // the journal to hold the write (mongod's
+                // `waitForWriteConcernDurationMillis`, RM-023).
+                ctx.write_concern_wait = Some(waited.elapsed().as_millis() as i64);
             }
         }
     }
@@ -944,6 +964,9 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.op_counts = ctx.storage.as_ref().and_then(|s| s.operation_counts());
     ctx.op_locks = Some(lock_manager::operation_locks(false));
     ctx.planning_micros = planning.micros();
+    ctx.cpu_nanos = cpu_started
+        .zip(opdebug::thread_cpu_nanos())
+        .map(|(began, now)| now - began);
     drop(planning);
     drop(counting);
     profiler::finish(name, doc, inner_n, &reply, ctx);
@@ -1167,7 +1190,7 @@ fn wants_journal(
     }
 }
 
-fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
+pub(crate) fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
     match name {
         "insert"
         | "update"

@@ -132,7 +132,8 @@ pub(crate) fn plan_info_in(
     // A read of a view is the view's pipeline over its collection, with the
     // read's query after it: planned as that `aggregate`.
     if let Some(Bson::String(coll)) = request.get(name) {
-        if matches!(name, "find" | "count" | "distinct") && crate::views::is_view(storage, db, coll) {
+        if matches!(name, "find" | "count" | "distinct") && crate::views::is_view(storage, db, coll)
+        {
             let mut tail: Vec<Bson> = Vec::new();
             let filter = match name {
                 "find" => request.get_document("filter").ok(),
@@ -242,11 +243,13 @@ pub(crate) fn plan_info_in(
         Node::Projection { input, .. } => input.as_ref(),
         other => other,
     };
-    let distinct_scan = matches!(scan, Node::DistinctScan(..)) && matches!(s.kind, Kind::Distinct(_));
+    let distinct_scan =
+        matches!(scan, Node::DistinctScan(..)) && matches!(s.kind, Kind::Distinct(_));
     if distinct_scan {
         out.framework = None;
     }
-    let unkeyed = distinct_scan || matches!(node, Node::Express { .. } | Node::IdHack(_) | Node::Eof(_));
+    let unkeyed =
+        distinct_scan || matches!(node, Node::Express { .. } | Node::IdHack(_) | Node::Eof(_));
     if !unkeyed {
         out.hashes = super::cache_hashes(storage, db, &s, collation.as_ref(), &stages);
     }

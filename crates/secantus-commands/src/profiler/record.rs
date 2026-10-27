@@ -471,7 +471,11 @@ fn outcome(
                 // A `find` of a view or a time-series collection runs as an
                 // `aggregate`, which counts no batches.
                 let coll = doc
-                    .get_str(if name == "getMore" { "collection" } else { name })
+                    .get_str(if name == "getMore" {
+                        "collection"
+                    } else {
+                        name
+                    })
                     .unwrap_or("");
                 let as_aggregate = matches!(
                     crate::opdebug::collection_type(ctx, &ctx.db_name, coll),
@@ -576,10 +580,9 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
             entry.insert("queryHash", shape);
             entry.insert("planCacheKey", key);
         }
-        if let (Some(framework), false) = (
-            info.framework,
-            name.eq_ignore_ascii_case("findAndModify"),
-        ) {
+        if let (Some(framework), false) =
+            (info.framework, name.eq_ignore_ascii_case("findAndModify"))
+        {
             entry.insert("queryFramework", framework);
         }
     }
@@ -607,7 +610,7 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     }
     // Flow control holds back writes only: an operation that wrote none
     // has `{}` (a write's acquisitions are not counted, RM-357).
-    if !crate::opdebug::wrote(&locks) {
+    if !crate::opdebug::wrote(&locks) && !crate::takes_default_write_concern(name, doc) {
         entry.insert("flowControl", Document::new());
     }
     entry.insert("locks", locks);
@@ -622,6 +625,12 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     };
     if let Some(origin) = concerned.filter(|o| crate::opdebug::has_write_concern(o)) {
         entry.insert("writeConcern", crate::opdebug::write_concern(origin, ctx));
+    }
+    if let Some(ms) = ctx.write_concern_wait {
+        entry.insert("waitForWriteConcernDuration", ms);
+    }
+    if let Some(n) = ctx.cpu_nanos {
+        entry.insert("cpuNanos", n);
     }
     if let Some(storage) = ctx
         .op_counts
@@ -867,7 +876,6 @@ struct Ran {
     /// mongod's statement lines print as they stand.
     locks: Document,
     took_global: bool,
-    wrote: bool,
     /// The plan cache key's hashes, where mongod keys the statement's query.
     hashes: Option<(String, String)>,
     read_concern: Document,
@@ -993,9 +1001,7 @@ impl Statement {
             bump_global_is(&mut locks);
         }
         entry.insert("locks", locks);
-        if !self.ran.wrote {
-            entry.insert("flowControl", Document::new());
-        }
+        // A write statement's flow control is RM-357's.
         entry.insert("readConcern", self.ran.read_concern.clone());
         if let Some(storage) = &self.ran.storage {
             entry.insert("storage", storage.clone());
@@ -1141,7 +1147,6 @@ impl<'a> Statements<'a> {
             _ => None,
         };
         let locks = crate::lock_manager::operation_locks(false);
-        let wrote = crate::opdebug::wrote(&locks);
         // The statement's query keys the plan cache as a `find` of it does.
         let hashes = self.storage.and_then(|s| {
             let mut query = doc! { "find": open.coll.clone(), "filter": open.command.get("q").cloned().unwrap_or(Bson::Document(Document::new())) };
@@ -1170,7 +1175,6 @@ impl<'a> Statements<'a> {
             ),
             locks,
             took_global: crate::lock_manager::took_global(),
-            wrote,
             read_concern: self.read_concern.clone(),
             storage: now.as_ref().and_then(crate::opdebug::storage_section),
             remote: crate::slowop::remote(),

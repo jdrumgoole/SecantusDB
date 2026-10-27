@@ -124,10 +124,21 @@ connection thread; no WT cursor may outlive its call):
      descending or along a collated index (RM-309), `notablescan` (its
      stages that read other collections checked as each batch runs them),
      `{$meta: "recordId"}`, `"indexKey"` and `"sortKey"`.
-   - Left: a time-series collection (RM-348), `$geoNear` (RM-347);
-     `keysExamined` / `docsExamined` on the `aggregate` command's own line;
-     counts for `count`, `distinct`, write statements and `findAndModify`
-     from their reads.
-4. **`storage` on the line.** WiredTiger's per-session statistics
-   (`timeWaitingMicros`, bytes read and written) for the operation (the last
-   part of RM-023).
+   - Done (2026-10-27, branch `rust-mdb-rm023-slow-query-counts`, RM-023):
+     `keysExamined` / `docsExamined` on the `aggregate` command's own line
+     (streamed or read whole); `count` (a COUNT_SCAN reads index entries
+     alone and counts the call that finds its end, `Stream::of_count`),
+     `distinct` (a DISTINCT_SCAN answers from its keys), a write
+     statement's and `findAndModify`'s read of its documents
+     (`order::write_selection`: every match for a write of many, up to the
+     first for a write of one, then the write takes those RecordIds), a
+     sort of whole documents (`Stage::SortDocs`, read whole for the first
+     batch and held) and an `_id` or unique-index point read
+     (`Stage::Point`).
+   - Left: a time-series collection (RM-348), `$geoNear` (RM-347), a plan
+     chosen by trial (RM-349); their counts (RM-363).
+4. **`storage` on the line.** Done (2026-10-27, RM-023): WiredTiger's
+   per-session statistics, read from each session the operation closes and
+   from a transaction's session at each statement's end
+   (`secantus_wt::operation_stats_scope`), with the index keys a write
+   inserted and deleted (`secantus_storage::operation_scope`).

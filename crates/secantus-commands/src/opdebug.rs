@@ -70,11 +70,11 @@ pub(crate) const LINE_ORDER: &[&str] = &[
     "writeConcern",
     "waitForWriteConcernDurationMillis",
     "storage",
+    "cpuNanos",
     "remote",
     "protocol",
     "numInterruptChecks",
     "queues",
-    "cpuNanos",
     "workingMillis",
     "durationMillis",
 ];
@@ -189,6 +189,43 @@ pub(crate) fn planned_request(request: &Document) -> std::borrow::Cow<'_, Docume
         }
     }
     std::borrow::Cow::Owned(find)
+}
+
+/// The CPU time this thread has spent, in nanoseconds, where mongod
+/// reports an operation's (`cpuNanos`): on Linux, from the thread's CPU
+/// clock. mongod 8.2 reads none elsewhere, and prints none.
+pub(crate) fn thread_cpu_nanos() -> Option<i64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec for the call to fill.
+        let rc = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) };
+        (rc == 0).then(|| ts.tv_sec as i64 * 1_000_000_000 + ts.tv_nsec as i64)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Whether a command that waited for its write concern wrote anything:
+/// mongod reports the wait only then (an insert of a duplicate `_id`
+/// alone has none, measured 8.2.11).
+pub(crate) fn wrote_something(name: &str, reply: &Document) -> bool {
+    if reply.get_f64("ok").unwrap_or(0.0) != 1.0 {
+        return false;
+    }
+    let n = |d: &Document| crate::util::as_i64(d.get("n").unwrap_or(&Bson::Null)).unwrap_or(0);
+    match name {
+        "insert" | "update" | "delete" => n(reply) > 0,
+        "findAndModify" | "findandmodify" => reply
+            .get_document("lastErrorObject")
+            .is_ok_and(|l| n(l) > 0),
+        _ => true,
+    }
 }
 
 /// Whether an operation that took `locks` wrote: it took the global lock

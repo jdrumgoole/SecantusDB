@@ -774,7 +774,12 @@ impl<'a> Run<'a> {
                 let scan = self.scan.as_mut()?;
                 let row = scan.next_entry();
                 self.keys = scan.keys;
-                if row.is_none() && scan.key_beyond() {
+                // mongod's COUNT_SCAN counts the call that finds its end as
+                // a key examined, a key past the bounds there or not
+                // (`CountScan::doWork` counts before it looks; measured
+                // 8.2.11: `{x: {$gt: 3}}` over keys 0 to 11 examines 9, and
+                // `{x: 99}` over them 1). RM-356.
+                if row.is_none() {
                     self.keys += 1;
                 }
                 row

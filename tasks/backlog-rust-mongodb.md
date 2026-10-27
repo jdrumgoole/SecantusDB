@@ -215,7 +215,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **`$where`** — runs JavaScript. We don't ship a JS runtime (confirmed by Joe 2026-10-16; MongoDB deprecated it in 8.0).
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is worse than embedded JS engines. If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
 - **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`, and deprecated by MongoDB (removed from the Stable API in 5.0). **WILL NOT BUILD** (decided 2026-09-27). The canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern is translated to an equivalent `$group` aggregation; anything else, a named `out: "<coll>"` included, is refused as a `--noscripting` mongod 8.2.11 refuses it (31264, re-measured 2026-10-20). mongo-java-driver's `testMapReduceWithGenerics` writes to a NAMED output collection and so fails permanently; that failure is accepted rather than tracked.
-- **Profiling: execution statistics in `system.profile` entries** — no longer out of scope: decided in scope 2026-10-16 (Joe), counted during execution. Tracked as RM-023. A `$jsonSchema` profile filter still reads back as given, where mongod expands it.
+- **Profiling: execution statistics in `system.profile` entries** — no longer out of scope: decided in scope 2026-10-16 (Joe), counted during execution; done in RM-023 (2026-10-27) but for a profile entry's per-stage `execStats` (RM-359). A `$jsonSchema` profile filter still reads back as given, where mongod expands it.
 
 ## 5. Known bugs and edge cases to watch
 
@@ -506,27 +506,102 @@ These are explicit non-goals. Don't add them without a reason.
       held the insert.
       Backlog-ID: RM-022
       Verify: none -- unreproduced 10 s stall on a bad droplet
-- [ ] **RUST MongoDB server: the `Slow query` line does not say where the time
-      went.** `mongod`'s carries `storage.timeWaitingMicros` (cache, schema
-      lock) and bytes written by the operation; ours has only the duration.
-      WiredTiger keeps these per session (`statistics:session`), but the
-      storage layer opens a session per operation and exposes none of it.
-      Also not on the line: on a write statement's line (RM-299),
-      `isFromUserConnection` and `collectionType`, which mongod writes after
-      `type`; and `keysExamined` / `docsExamined` for a read that does not
-      stream yet (`tasks/streaming-cursors-plan.md` phases 2 and 3: an
-      `aggregate`, a blocking sort, a descending, collated or multikey index,
-      an OR plan, `count`, `distinct`, the writes). A streamed `find` counts
-      each batch's own work as mongod does since 2026-10-24, on the line and
-      in its profile entry: collection scans either way, ascending indexes
-      either way, the `_id` index, covered plans.
-      **Decided 2026-10-16 (Joe):** count keys and documents examined during
-      execution (with the streaming cursors), and keep the originating
-      command on a cursor, so the `Slow query` line and `system.profile`
-      entries carry the real counts. Derived counts from `explain`'s walk
-      are not to be used.
-      Backlog-ID: RM-023
-      Verify: tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
+- [ ] **A `Slow query` line and profile entry have no execution admission
+      control's fields.** mongod 8.2.11 admits every operation through its
+      ingress and execution admission control, and its line says so:
+      `queues: {ingress: {admissions: 1}, execution: {admissions: 2}}`, and
+      in `storage.timeWaitingMicros` the `storageExecutionMicros` it waited
+      for admission -- never zero, so a `find` of documents in the cache
+      still has a `storage` section (measured 2026-10-27). This server has
+      no execution admission control (its `admission.rs` holds writes back
+      under a flag, off by default), so neither field: its `storage` section
+      is WiredTiger's per-session statistics alone (RM-023), absent when
+      they counted nothing. A stand-in number is not to be printed; the
+      field follows the mechanism, if one is built.
+      Backlog-ID: RM-355
+      Verify: tests/backlog/test_rm_355_364.py::test_a_line_says_what_execution_control_admitted, tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
+- [ ] **A write's `locks` and `flowControl` are not mongod's.** Since RM-023
+      a line and a profile entry carry the locks the operation took from
+      this server's lock manager, by resource and mode (and, in the entry,
+      the global IS mongod takes to read the storage statistics). A read's
+      are mongod's (`Global: {r: 1}`, `{r: 2}` in the entry); a write's are
+      not: mongod 8.2.11's insert takes `ReplicationStateTransition` w 4,
+      `Global` r 1 w 2, `Database` and `Collection` w 2, where this server's
+      lock rounds (RM-299) take one of each; a statement of a transaction
+      shows `{}` on mongod's line and the transaction's initial locks in its
+      entry. mongod also counts each write's flow control tickets
+      (`flowControl: {acquireCount: 1}`); this server has no flow control
+      and leaves the field off a write (a read's `flowControl: {}` is
+      printed as mongod prints it). Measured 2026-10-27.
+      Backlog-ID: RM-357
+      Verify: tests/backlog/test_rm_355_364.py::test_a_write_reports_mongods_locks_and_flow_control
+- [ ] **No `queryShapeHash` on a line or a profile entry.** mongod 8.2.11
+      prints the SHA-256 of a `find`'s, `aggregate`'s or `distinct`'s
+      representative query shape (`queryShapeHash`) on its line and entry,
+      as its `explain` and `$queryStats` do; this server computes no query
+      shape (see the `$queryStats` item, which needs the same hash).
+      Backlog-ID: RM-358
+      Verify: tests/backlog/test_rm_355_364.py::test_a_read_names_its_query_shape
+- [ ] **A profile entry has no `execStats`.** mongod 8.2.11's entry for a
+      read or a write statement carries the plan's stages with what each
+      did (`works`, `advanced`, `keysExamined`, ...), from the run itself.
+      This server's streaming executor counts keys and documents examined
+      per batch (RM-023) but keeps no per-stage statistics, and the
+      `explain` walk's stage statistics are not to stand in for a run's
+      (decided 2026-10-16 for RM-023).
+      Backlog-ID: RM-359
+      Verify: tests/backlog/test_rm_355_364.py::test_a_profile_entry_carries_the_execution_stats
+- [ ] **No `numInterruptChecks` on a line.** mongod 8.2.11 counts the times
+      an operation checked whether it had been killed (5 for a ten-document
+      `find` through an index) and prints it on every command's line. This
+      server's interrupt polls (`secantus_core::deadline`) are its own,
+      placed where its reads loop, not where mongod's are; their count
+      would be a different number. `includeQueryStatsMetrics` needs it too
+      (RM-170).
+      Backlog-ID: RM-360
+      Verify: tests/backlog/test_rm_355_364.py::test_a_line_counts_its_interrupt_checks
+- [ ] **A write has no `totalOplogSlotDurationMicros`.** mongod 8.2.11's
+      line and entry for an insert, a write statement, a `create` or a
+      `drop` say how long the write held its oplog timestamp before it
+      committed (97 us for an insert, 20 ms for a `create`). This server's
+      storage mints the timestamp inside the write's transaction and does
+      not time it.
+      Backlog-ID: RM-361
+      Verify: tests/backlog/test_rm_355_364.py::test_a_write_says_how_long_it_held_its_oplog_slot
+- [ ] **A read of a view or a time-series collection has no
+      `resolvedViews`.** mongod 8.2.11's line and entry name the view it
+      resolved: `{viewNamespace, dependencyChain: [view, ..., collection],
+      resolvedPipeline}` (a time-series collection's pipeline is its
+      `$_internalUnpackBucket`). This server resolves the view and prints
+      nothing of it.
+      Backlog-ID: RM-362
+      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_a_view_names_the_view_it_resolved
+- [ ] **Operations this server runs another way than mongod's plan say
+      less.** Since RM-023 a read or a write's read that a stream runs as
+      mongod's plan counts its keys and documents examined; these do not:
+      - a read two or more plans could serve, which mongod chooses by trial
+        (RM-349 streams it); its documents come from the store's router;
+      - a time-series collection's read (RM-348) and a geo, `$near` or
+        `$text` read;
+      - a `count` with an empty query has no `planningTimeMicros` (this
+        server answers it from the record count without planning), nor a
+        `find` of a collection that does not exist (mongod plans an `EOF`);
+      - creating a view or a time-series collection counts no
+        `keysInserted`: mongod inserts the definition into `system.views`
+        (`keysInserted: 1`), this server keeps it in its catalog.
+      Measured 2026-10-27.
+      Backlog-ID: RM-363
+      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_creating_a_view_inserts_its_definition
+- [ ] **WiredTiger 11's statistics are not on the line.** mongod 8.2.11's
+      WiredTiger keeps two that the one vendored here (mongodb-7.0.33) does
+      not: the share of a cache wait spent in interruptible eviction
+      (`timeWaitingMicros.cacheInterruptibleMicros`, which this engine
+      counts in `cacheMicros` with the rest), and a transaction's update
+      count (`data.txnNumUpdates`, beside `txnBytesDirty`). Measured
+      2026-10-27 (an insert in a transaction; eviction under a 256 MB
+      cache).
+      Backlog-ID: RM-364
+      Verify: tests/backlog/test_rm_355_364.py::test_a_transaction_statement_counts_its_updates
 
 - [ ] **mongod's connection lines this server does not write.** Since
   RM-302 the log is mongod's structured log, and the lines this server
@@ -1409,9 +1484,11 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       key and document counts, `hasSortStage`, the working time and
       `cpuNanos`, and since the plan cache landed (2026-10-27, RM-154)
       `fromPlanCache` and `fromMultiPlanner` too (`explain/order.rs`'s
-      `consult` knows whether a read ran a cached plan or a trial), but not
-      `bytesRead` / `readingTimeMicros` (no WiredTiger read statistics
-      plumbed) or `numInterruptChecks` (a different mechanism).
+      `consult` knows whether a read ran a cached plan or a trial), and
+      since RM-023 (2026-10-27) `bytesRead` / `readingTimeMicros` from
+      WiredTiger's per-session statistics; not `numInterruptChecks` (RM-360)
+      or the three delinquency counters (mongod's execution admission
+      control, RM-355).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
       Backlog-ID: RM-170

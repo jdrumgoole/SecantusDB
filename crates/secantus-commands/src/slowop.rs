@@ -257,7 +257,9 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             out.insert("planCacheKey", key);
         }
         // A `findAndModify` prints no engine (measured 8.2.11).
-        if let (Some(framework), false) = (info.framework, name.eq_ignore_ascii_case("findAndModify")) {
+        if let (Some(framework), false) =
+            (info.framework, name.eq_ignore_ascii_case("findAndModify"))
+        {
             out.insert("queryFramework", framework);
         }
         spills(exec.is_some_and(|e| e.has_sort_stage), &mut out);
@@ -273,10 +275,8 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             out.insert("docsExamined", e.docs_examined);
             // A `find` of a view or a time-series collection runs as an
             // `aggregate`, which counts no batches.
-            let as_aggregate = matches!(
-                out.get_str("collectionType"),
-                Ok("view") | Ok("timeseries")
-            );
+            let as_aggregate =
+                matches!(out.get_str("collectionType"), Ok("view") | Ok("timeseries"));
             if matches!(name, "find" | "getMore") && !as_aggregate {
                 out.insert("nBatches", 1_i64);
             }
@@ -352,6 +352,12 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     };
     if let Some(origin) = concerned.filter(|o| crate::opdebug::has_write_concern(o)) {
         out.insert("writeConcern", crate::opdebug::write_concern(origin, ctx));
+    }
+    if let Some(ms) = ctx.write_concern_wait {
+        out.insert("waitForWriteConcernDurationMillis", ms);
+    }
+    if let Some(n) = ctx.cpu_nanos {
+        out.insert("cpuNanos", n);
     }
     if let Some(storage) = ctx
         .op_counts
@@ -557,7 +563,58 @@ mod tests {
         ));
         assert_eq!(
             line,
-            r#"{"type":"command","ns":"a.$cmd","command":{"ping":1,"$db":"a"},"ok":0,"errCode":2,"errName":"BadValue","workingMillis":150,"durationMillis":1150}"#
+            r#"{"type":"command","ns":"a.$cmd","command":{"ping":1,"$db":"a"},"ok":0,"errMsg":"x","errName":"BadValue","errCode":2,"workingMillis":150,"durationMillis":1150}"#
+        );
+    }
+
+    /// mongod 8.2.11's order for a write statement's counts, whatever order
+    /// they were put in.
+    #[test]
+    fn a_line_is_in_mongods_order() {
+        let attr = doc! {
+            "durationMillis": 1_i64,
+            "keysDeleted": 0_i64,
+            "keysInserted": 1_i64,
+            "nUpserted": 0_i64,
+            "storage": {"data": {"bytesRead": 274_i64}},
+            "docsExamined": 1_i64,
+            "keysExamined": 1_i64,
+            "planSummary": "IXSCAN { x: 1 }",
+            "nModified": 1_i64,
+            "nMatched": 1_i64,
+            "collectionType": "normal",
+            "ns": "a.c",
+            "isFromUserConnection": true,
+            "type": "update",
+            "numYields": 0_i64,
+            "workingMillis": 1_i64,
+            "locks": {},
+        };
+        let keys: Vec<String> = crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER)
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "type",
+                "isFromUserConnection",
+                "ns",
+                "collectionType",
+                "planSummary",
+                "keysExamined",
+                "docsExamined",
+                "nMatched",
+                "nModified",
+                "nUpserted",
+                "keysInserted",
+                "keysDeleted",
+                "numYields",
+                "locks",
+                "storage",
+                "workingMillis",
+                "durationMillis",
+            ]
         );
     }
 }

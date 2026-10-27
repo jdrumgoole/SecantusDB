@@ -297,7 +297,7 @@ Size: one or two batches; scan order is the hard part.
 - [ ] The `Slow query` line (7.07): `planSummary`, `keysExamined`,
       `docsExamined`, `nreturned`, `reslen`, the storage wait times.
       **2026-10-16:** command document, `planSummary`, `nreturned`,
-      `reslen` done; the examined counts and storage waits remain (RM-023).
+      `reslen` done; the examined counts and storage statistics done too (RM-023, 2026-10-27), with RM-355 and RM-357 to RM-364 left.
 
 Size: one or two batches.
 
@@ -355,7 +355,7 @@ Each unblocks rows that otherwise stay open.
 | Privileges of the `secantusAdmin` commands | keep the mapping; scope decision (formerly RM-028) |
 | `explain` | mongod's plan; where the router reads differently, bring the router to the plan (RM-094) |
 | Stored time-series buckets (RM-088) | store real BSONColumn buckets, with the catalog above |
-| Profiler and `Slow query` execution statistics (RM-023) | count them during execution, with the streaming cursors |
+| Profiler and `Slow query` execution statistics (RM-023, done 2026-10-27) | counted during execution, with the streaming cursors; what is left is RM-355, RM-357 to RM-364 |
 | Wire compression | already speaks snappy, zstd and zlib (2026-10-15); add the `serverStatus` counters (RM-147) |
 | Server-side JavaScript | keep refusing; scope decision (formerly RM-009); the two Go `$where` leaves are expected failures |
 | `configureFailPoint` / `enableTestCommands` | off everywhere, the embedded handles included; a test that needs one asks for it |

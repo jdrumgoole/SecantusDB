@@ -15942,9 +15942,7 @@ impl Storage {
             deleted += before.difference(&after).count() as i64;
         }
         if old.is_some() != new.is_some() {
-            let clustered = self
-                .coll_options_cached(session, db, coll)?
-                .is_some_and(|o| o.contains_key("clusteredIndex"));
+            let clustered = is_clustered(session, db, coll)?;
             if !clustered {
                 if new.is_some() {
                     inserted += 1;

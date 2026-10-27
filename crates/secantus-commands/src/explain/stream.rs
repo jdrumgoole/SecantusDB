@@ -463,7 +463,9 @@ impl IndexScan {
                 }
                 cx.keys += 1;
                 let e = self.pop().expect("an entry is at the front");
-                if self.meta.multikey && !self.seen.insert(e.rid) {
+                // A DISTINCT_SCAN returns each value, whichever document
+                // holds it: a document is returned once by any other scan.
+                if self.meta.multikey && self.distinct.is_none() && !self.seen.insert(e.rid) {
                     continue;
                 }
                 return Ok(Step::Entry(Member {
