@@ -621,6 +621,38 @@ impl std::ops::DerefMut for GucMap {
 /// session sees is its own (see `session_tables_owner`).
 type SessionTablesKey = (usize, u64, u64, String, String, String);
 
+/// A table's catalog entry as [`PgHandler::lookup_ref`] finds it: shared with
+/// the catalog cache when it came from there, owned otherwise.
+pub(crate) enum TableRef {
+    Owned(TableDef),
+    Shared(Arc<Option<TableDef>>),
+}
+
+impl TableRef {
+    /// A cached entry, or `None` when the cache records the table's absence.
+    fn shared(entry: Arc<Option<TableDef>>) -> Option<Self> {
+        entry.is_some().then_some(Self::Shared(entry))
+    }
+
+    fn into_owned(self) -> TableDef {
+        match self {
+            Self::Owned(def) => def,
+            Self::Shared(entry) => Option::clone(&entry).expect("a shared entry holds a table"),
+        }
+    }
+}
+
+impl std::ops::Deref for TableRef {
+    type Target = TableDef;
+
+    fn deref(&self) -> &TableDef {
+        match self {
+            Self::Owned(def) => def,
+            Self::Shared(entry) => entry.as_ref().as_ref().expect("a shared entry holds a table"),
+        }
+    }
+}
+
 thread_local! {
     static INSTALLED_SESSION_TABLES: std::cell::RefCell<Option<SessionTablesKey>> =
         const { std::cell::RefCell::new(None) };
@@ -14773,7 +14805,7 @@ impl PgHandler {
     /// the deferred foreign keys) when it is deferred. It used to be judged
     /// nowhere at all, so `unique (n) deferrable` accepted duplicates.
     fn check_deferrable_uniques(&self, table: &str) -> PgWireResult<()> {
-        let Some(def) = self.lookup(table) else {
+        let Some(def) = self.lookup_ref(table) else {
             return Ok(());
         };
         for u in def
@@ -23165,6 +23197,12 @@ impl PgHandler {
     /// store is this process's alone -- WiredTiger locks the directory -- so
     /// every write to the catalog passes through `run` and bumps the version.
     fn lookup(&self, name: &str) -> Option<TableDef> {
+        self.lookup_ref(name).map(TableRef::into_owned)
+    }
+
+    /// [`Self::lookup`] without the copy: a cached entry is shared, not
+    /// cloned, for a caller that only reads it.
+    fn lookup_ref(&self, name: &str) -> Option<TableRef> {
         let def = self.lookup_inner(name);
         // PostgreSQL flags the transaction on ANY open of a temporary
         // relation (`XACT_FLAGS_ACCESSEDTEMPNAMESPACE`), and refuses to
@@ -23180,16 +23218,16 @@ impl PgHandler {
         def
     }
 
-    fn lookup_inner(&self, name: &str) -> Option<TableDef> {
+    fn lookup_inner(&self, name: &str) -> Option<TableRef> {
         if let Some(def) = Self::virtual_table(name) {
-            return Some(def);
+            return Some(TableRef::Owned(def));
         }
         // What this transaction has created or dropped, before what is
         // committed. A `None` here is a tombstone: the table was dropped in
         // this transaction and must not be found even though its catalog row
         // is still there.
         if let Some(pending) = self.pending.tables().get(name) {
-            return pending.clone();
+            return pending.clone().map(TableRef::Owned);
         }
         let cache = catalog_cache();
         let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
@@ -23205,7 +23243,7 @@ impl PgHandler {
                 .map(|e| Arc::clone(&e.4))
         });
         if let Some(def) = front_hit {
-            return (*def).clone();
+            return TableRef::shared(def);
         }
         // Only an entry the shared cache holds as CURRENT reaches the front,
         // so the front can never serve what the shared cache would not.
@@ -23236,7 +23274,7 @@ impl PgHandler {
             .map(|(_, def)| Arc::clone(def));
         if let Some(def) = shared {
             to_front(&def);
-            return (*def).clone();
+            return TableRef::shared(def);
         }
         let filter = bson::doc! { "_id": name };
         // A storage error is a transient `None`, not a recorded absence.
@@ -23274,7 +23312,7 @@ impl PgHandler {
                 self.sequence_doc(name).ok()
             };
             if let Some(Some(_)) = found {
-                return Some(Self::sequence_table_def(name));
+                return Some(TableRef::Owned(Self::sequence_table_def(name)));
             }
         }
         // A miss for a sequence the block wrote is no absence: the
@@ -23290,7 +23328,7 @@ impl PgHandler {
                 .insert(key.clone(), (version, Arc::clone(&entry)));
             to_front(&entry);
         }
-        def
+        def.map(TableRef::Owned)
     }
 
     fn err(e: &PlanError) -> PgWireError {
@@ -37807,7 +37845,7 @@ impl PgHandler {
                     return Err(Self::catalog_write_refused(&ins.table));
                 }
                 let def = self
-                    .lookup(&ins.table)
+                    .lookup_ref(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
@@ -49618,7 +49656,7 @@ impl PgHandler {
                 if def.as_ref().is_some_and(|d| d.temp) {
                     touched_temp.set(true);
                 }
-                def
+                def.map(TableRef::into_owned)
             };
             let plan = |values: &[Bson]| {
                 let written = match family {

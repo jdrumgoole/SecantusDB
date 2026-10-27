@@ -141,7 +141,7 @@ impl PgHandler {
         table: &str,
         rows: Vec<Vec<u8>>,
     ) -> PgWireResult<Vec<Vec<u8>>> {
-        let Some(def) = self.lookup(table) else {
+        let Some(def) = self.lookup_ref(table) else {
             return Ok(rows);
         };
         let indexes = self.expr_indexes(&def)?;

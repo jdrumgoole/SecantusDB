@@ -567,7 +567,7 @@ impl PgHandler {
 
     /// A table's storage parameter, as `WITH (...)` set it.
     fn reloption(&self, table: &str, name: &str) -> Option<String> {
-        let def = self.lookup(table)?;
+        let def = self.lookup_ref(table)?;
         let opts = def.extra.get_array("reloptions").ok()?;
         opts.iter().find_map(|v| {
             let (k, val) = v.as_str()?.split_once('=')?;
