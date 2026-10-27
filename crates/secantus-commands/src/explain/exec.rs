@@ -1074,14 +1074,16 @@ pub(crate) fn sort_stats(
     if ran.is_err() {
         return;
     }
-    extra.insert("totalDataSizeSorted", report.sort_total_data_size);
+    // `appendNumber`: an int32 while the count fits (measured 8.2.11, the
+    // trial's SORT in `allPlansExecution`).
+    extra.insert("totalDataSizeSorted", num(report.sort_total_data_size));
     extra.insert("usedDisk", report.sort_spills > 0);
-    extra.insert("spills", report.sort_spills);
-    extra.insert("spilledRecords", report.sort_spilled_records);
-    extra.insert("spilledBytes", report.sort_spilled_bytes);
+    extra.insert("spills", num(report.sort_spills));
+    extra.insert("spilledRecords", num(report.sort_spilled_records));
+    extra.insert("spilledBytes", num(report.sort_spilled_bytes));
     extra.insert(
         "spilledDataStorageSize",
-        report.sort_spilled_data_storage_size,
+        num(report.sort_spilled_data_storage_size),
     );
 }
 
