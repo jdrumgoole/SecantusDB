@@ -4027,6 +4027,11 @@ pub struct PgHandler {
     /// REPEATABLE READ or SERIALIZABLE block that has none yet does not
     /// take one for it.
     no_snapshot_stmt: AtomicBool,
+    /// How many statements are running on this session (`run_typed_inner`,
+    /// nested ones -- a `DO` block's, a function's -- counted too): the
+    /// outermost one outside a transaction holds its table locks to its
+    /// end and releases them there (`StatementLocks`).
+    statement_depth: std::sync::atomic::AtomicUsize,
     /// Set with `rc_apart` when the read-apart statement reads tables the
     /// block HAS written: the block's own rows of each, laid over the fresh
     /// snapshot (`secantus_storage::with_read_overlay`) instead of the block
@@ -4514,6 +4519,7 @@ impl PgHandler {
             ssi_registered: AtomicBool::new(false),
             ssi_unique_pending: Mutex::new(Vec::new()),
             no_snapshot_stmt: AtomicBool::new(false),
+            statement_depth: std::sync::atomic::AtomicUsize::new(0),
             rc_overlay: Mutex::new(None),
             plan_apart: Mutex::new(None),
             subtxn_seq: std::sync::atomic::AtomicU64::new(0),
@@ -13522,18 +13528,20 @@ impl PgHandler {
         Self::user_error("42P01", format!("relation \"{name}\" does not exist"))
     }
 
-    /// Wait while another session's `LOCK TABLE` holds a mode that conflicts
-    /// with what this statement would take on a relation it names (ACCESS
-    /// SHARE to read, ROW EXCLUSIVE to write, ACCESS EXCLUSIVE to TRUNCATE).
-    /// One atomic load when no table is locked anywhere.
+    /// Take the mode this statement needs on each relation it names (ACCESS
+    /// SHARE to read, ROW EXCLUSIVE to write, ACCESS EXCLUSIVE to TRUNCATE
+    /// or DROP), waiting while another session holds one it conflicts with.
     ///
-    /// Inside a transaction block the statement also TAKES that mode, held
-    /// to the block's end, so another session's `LOCK` waits for it.
+    /// Inside a transaction block the hold lasts to the block's end. Outside
+    /// one it lasts to the statement's end (`StatementLocks`), as
+    /// PostgreSQL's implicit transaction holds it: an autocommit statement
+    /// used to wait for conflicting holds without taking any, so an
+    /// autocommit UPDATE waiting on a row and a DROP TABLE of its table ran
+    /// at once once the row's holder committed -- and wedged the server:
+    /// the drop held the storage's locks while it waited out the update's
+    /// uncommitted write, which waited for those locks (RP-271).
     fn wait_for_table_locks(&self, sql: &str) -> PgWireResult<()> {
         let in_block = self.transaction_handle_open();
-        if !in_block && !table_locks::any() {
-            return Ok(());
-        }
         let pid = self.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
         let relations = secantus_pgplan::privileges::sql_relations(sql);
         // A cancel that cut the parse short is taken here: the passes below
@@ -13542,9 +13550,12 @@ impl PgHandler {
         // PostgreSQL assigns a transaction its xid at its first write; the
         // granted transactionid row `pg_locks` shows comes from that
         // assignment. Re-assignments return the same xid.
-        if relations
-            .iter()
-            .any(|(_, p)| matches!(*p, "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"))
+        // The xid as before this took autocommit holds: in a block, or
+        // when some table was locked.
+        if (in_block || table_locks::any())
+            && relations
+                .iter()
+                .any(|(_, p)| matches!(*p, "INSERT" | "UPDATE" | "DELETE" | "TRUNCATE"))
         {
             let _ =
                 secantus_pgplan::snapshots::ask_pid(pid, secantus_pgplan::snapshots::XidOp::Assign);
@@ -13596,7 +13607,7 @@ impl PgHandler {
                 &table,
                 pid,
                 mode,
-                in_block,
+                true,
                 false,
                 self.lock_wait_poll(),
                 Self::deadlock_error,
@@ -13608,7 +13619,7 @@ impl PgHandler {
                     &table,
                     pid,
                     table_locks::SHARE,
-                    in_block,
+                    true,
                     false,
                     self.lock_wait_poll(),
                     Self::deadlock_error,
@@ -30272,6 +30283,28 @@ impl PgHandler {
             std::sync::atomic::Ordering::Relaxed,
         );
         let _snapshotless = Snapshotless(&self.no_snapshot_stmt);
+        // The table locks an outermost statement outside a transaction
+        // takes are its implicit transaction's: they end with it, on every
+        // path out of here (`wait_for_table_locks`). A statement that opened
+        // a block (`BEGIN`) or an extended group leaves them to that.
+        struct StatementLocks<'a>(&'a PgHandler, bool);
+        impl Drop for StatementLocks<'_> {
+            fn drop(&mut self) {
+                let h = self.0;
+                let depth = h
+                    .statement_depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                if depth == 1 && self.1 && !h.transaction_handle_open() {
+                    let pid = h.backend_pid.load(std::sync::atomic::Ordering::Relaxed);
+                    table_locks::release(pid);
+                }
+            }
+        }
+        let outermost = self
+            .statement_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            == 0;
+        let _statement_locks = StatementLocks(self, outermost && !self.transaction_handle_open());
 
         // The failed-block gate comes BEFORE the planner's answer, because
         // PostgreSQL's does: in an aborted block `select nosuchcolumn` is
@@ -31261,11 +31294,13 @@ impl PgHandler {
         let mut checked = false;
         let mut delay = std::time::Duration::from_millis(1);
         loop {
-            let blockers = row_waits::holders_in_mode(target, pid, want);
+            // Read and recorded in one step, so a holder's COMMIT cannot
+            // land between them and leave this wait's edge to it standing
+            // after it answered (`lock_manager`).
+            let blockers = waiting.set_with(|| row_waits::holders_in_mode(target, pid, want));
             if blockers.is_empty() {
                 return Ok(true);
             }
-            waiting.set(blockers);
             if !checked && started.elapsed() >= std::time::Duration::from_secs(1) {
                 checked = true;
                 if waiting.deadlocked() {
