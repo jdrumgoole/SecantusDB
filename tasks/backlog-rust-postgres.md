@@ -749,6 +749,29 @@ one beside it.
         7.6 s on the script; its storage gate was interrupted and nothing
         else has been run on it.
 
+      - **Measured 2026-10-27, the top-ten batch: PostgreSQL itself does
+        not fit `test_type_error_shadow`'s 20 s on that runner.** The
+        script, timed on `ubuntu-latest` (4 vCPU, 16 GB; a throwaway
+        workflow run, 40456257780) in the gauge's own environment (psycopg
+        3.3.4, binary implementation): the runner's PostgreSQL 16.15
+        (`synchronous_commit` on, `fdatasync`) 23.4, 24.6 and 24.0 s; this
+        server's debug build 55.5, 51.5 and 54.7 s, about 2.8 cores of
+        server CPU throughout. The batch cut the debug server's work on
+        the script by 28% in instructions retired and 31% in CPU
+        (`changelog.d/rust-pg-rp014-insert-cpu.md`: a shared cached
+        `TableDef`, an insert's decode and `_id` work before the
+        collection lock, an insert's heap reads only where PostgreSQL's
+        B-tree insert reads, Bind's parameters reused at Execute, storage
+        given the decoded rows, one B-tree descent fewer per unique
+        insert), and the test still hit 20 s in both transports (run
+        40446794397) -- as it must, when PostgreSQL takes 24 s there. So
+        no server change can make this test pass on that runner; what is
+        left is this server's 2.2x over PostgreSQL there (debug build
+        against PostgreSQL's optimised one). **Decision for Joe**: deselect
+        it on Linux by name with that reason, as Windows already does
+        (PostgreSQL 30 s there), or keep it as a standing failure the
+        lane does not gate on.
+
       What the lane gates, given that: a run that stopped short, and a
       test that fails over TLS, passes in the clear, **and fails over TLS
       again when run again by itself**. `::test_notify*`,
