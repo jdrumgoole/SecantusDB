@@ -2213,6 +2213,9 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
         Ok(Some(0))
     );
     let build_started = std::time::Instant::now();
+    // The build is an operation of its own on mongod, on a thread of its
+    // own: what it does to the store is not the command's (RM-023).
+    let build_counts = storage.begin_operation_counts_apart();
     // Over documents, outside a transaction, the request's new indexes are
     // ONE two-phase build that lets writes go on (RM-187): the loop below
     // only checks them, and the build runs after it.
@@ -2601,14 +2604,23 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // once for a request's indexes, with the global IS it takes (measured
     // 8.2.11, 2026-10-24; RM-299). An empty collection builds in the
     // command, which logs alone.
+    let build_storage = storage
+        .operation_counts()
+        .as_ref()
+        .and_then(crate::opdebug::storage_section);
+    std::mem::drop(build_counts);
     if any_created && scans {
-        let attr = doc! {
+        let mut attr = doc! {
             "type": "none",
             "isFromUserConnection": false,
             "ns": format!("{}.{coll}", ctx.db_name),
+            "collectionType": crate::opdebug::collection_type(ctx, &ctx.db_name, &coll),
             "command": doc.clone(),
-            "numYields": 0_i32,
+            "numYields": 0_i64,
         };
+        if let Some(s) = build_storage {
+            attr.insert("storage", s);
+        }
         crate::slowop::statement("STORAGE", attr, build_started.elapsed());
     }
 

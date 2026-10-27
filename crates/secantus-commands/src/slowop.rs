@@ -72,6 +72,8 @@ struct Sink {
     connection_id: i64,
     logs: Option<std::sync::Arc<crate::logbuf::LogBuffer>>,
     locks: Option<std::sync::Arc<crate::lock_manager::LockManager>>,
+    /// The client's address and port: the lines' `remote`.
+    remote: Option<String>,
 }
 
 thread_local! {
@@ -88,6 +90,7 @@ pub fn enter(ctx: &CommandContext) -> SinkScope {
         connection_id: ctx.connection_id,
         logs: ctx.logs.clone(),
         locks: ctx.locks.clone(),
+        remote: crate::opdebug::remote(ctx),
     });
     SinkScope(SINK.with(|s| s.replace(sink)))
 }
@@ -102,6 +105,11 @@ impl Drop for SinkScope {
 /// Whether a statement of the running command can be logged at all.
 pub(crate) fn armed() -> bool {
     SINK.with(|s| s.borrow().is_some())
+}
+
+/// The running command's client address and port, for a statement's line.
+pub(crate) fn remote() -> Option<String> {
+    SINK.with(|s| s.borrow().as_ref().and_then(|s| s.remote.clone()))
 }
 
 /// mongod's id for a `Slow query` line, whoever writes it.
@@ -123,7 +131,9 @@ pub(crate) fn statement(component: &'static str, mut attr: Document, worked: Dur
         if let Some(lm) = &sink.locks {
             crate::lock_manager::log_lock(lm);
         }
+        attr.insert("workingMillis", worked.as_millis() as i64);
         attr.insert("durationMillis", worked.as_millis() as i64);
+        let attr = crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER);
         let thread = if component == "STORAGE" {
             "IndexBuildsCoordinatorMongod-0".to_string()
         } else {
@@ -140,98 +150,163 @@ pub(crate) fn statement(component: &'static str, mut attr: Document, worked: Dur
 }
 
 /// The reply fields worth a place on the line: what the operation did, or how
-/// it failed. Names follow mongod's `Slow query` attributes.
+/// it failed. Names follow mongod's `Slow query` attributes. An `update` or
+/// `delete` reports its counts on each statement's line
+/// (`profiler::record`), not the command's.
 fn outcome(name: &str, reply: &Document, out: &mut Document) {
-    let int = |key: &str| match reply.get(key) {
-        Some(bson::Bson::Int32(n)) => Some(i64::from(*n)),
-        Some(bson::Bson::Int64(n)) => Some(*n),
-        _ => None,
-    };
     if reply.get_f64("ok").unwrap_or(1.0) != 1.0 {
-        out.insert("ok", 0_i32);
-        if let Some(code) = int("code") {
-            out.insert("errCode", code);
-        }
-        if let Ok(code_name) = reply.get_str("codeName") {
-            out.insert("errName", code_name);
-        }
+        failure(reply, out);
         return;
     }
-    if let Some(n) = int("n") {
-        let key = match name {
-            "insert" => "ninserted",
-            "delete" => "ndeleted",
-            "update" => "nMatched",
-            _ => "n",
+    if name == "insert" {
+        let n = match reply.get("n") {
+            Some(bson::Bson::Int32(n)) => Some(i64::from(*n)),
+            Some(bson::Bson::Int64(n)) => Some(*n),
+            _ => None,
         };
-        out.insert(key, n);
-    }
-    if let Some(n) = int("nModified") {
-        out.insert("nModified", n);
-    }
-    if let Ok(errors) = reply.get_array("writeErrors") {
-        out.insert("writeErrors", errors.len() as i64);
+        if let Some(n) = n {
+            out.insert("ninserted", n);
+        }
     }
 }
 
-/// What the line says about a read (RM-023): the `planSummary`, how many
-/// documents went back (`nreturned`) and the size of the reply (`reslen`),
-/// in mongod's order. Measured 8.2.11, 2026-10-16. A streamed read adds
-/// what its batch examined (`keysExamined`, `docsExamined`) and, on a
-/// `getMore`, the command that opened the cursor (2026-10-24). The storage
-/// wait times are not given (RM-023).
+/// mongod's error attributes, in its order: `ok: 0`, `errMsg`, `errName`,
+/// `errCode` (measured 8.2.11).
+pub(crate) fn failure(reply: &Document, out: &mut Document) {
+    out.insert("ok", 0_i32);
+    out.insert("errMsg", reply.get_str("errmsg").unwrap_or(""));
+    let code = reply.get_i32("code").unwrap_or(0);
+    let name = match reply.get_str("codeName") {
+        Ok(name) => name.to_string(),
+        Err(_) => crate::mongod_codes::code_name(code)
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("Location{code}")),
+    };
+    out.insert("errName", name);
+    out.insert("errCode", code);
+}
+
+/// The collection a command names: its own value, or `getMore`'s
+/// `collection`.
+fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
+    let target = if name == "getMore" {
+        request.get("collection")
+    } else {
+        request.get(name)
+    };
+    match target {
+        Some(bson::Bson::String(coll)) if !coll.is_empty() => Some(coll.as_str()),
+        _ => None,
+    }
+}
+
+/// Whether `name` plans a query of its own, so its line has the planner's
+/// fields (`planningTimeMicros`).
+fn plans(name: &str) -> bool {
+    matches!(
+        name,
+        "find" | "aggregate" | "count" | "distinct" | "findAndModify" | "findandmodify"
+    )
+}
+
+/// What the line says beyond the command and its outcome (RM-023), each
+/// field placed by [`attributes`] in mongod's order: what the plan was and
+/// what it examined, as the operation counted them while it ran; the index
+/// keys its writes inserted and deleted; the read and write concern it ran
+/// under; the locks it took; WiredTiger's statistics for the sessions it
+/// used (`storage`); and who asked (`remote`, `protocol`). Measured 8.2.11,
+/// 2026-10-27.
 pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContext) -> Document {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let mut out = Document::new();
-    if reply.get_f64("ok").unwrap_or(1.0) != 1.0 {
-        return out;
-    }
-    let exec = ctx.exec_stats.as_ref();
-    // A cursor's `getMore` names the command that opened it, and repeats its
-    // plan (RM-023).
-    if let Some(command) = exec.and_then(|e| e.originating_command.clone()) {
-        out.insert("originatingCommand", command_shown(&command));
-    }
-    let summary = exec
-        .and_then(|e| e.plan_summary.clone())
-        .or_else(|| crate::explain::summary::plan_summary(request, ctx));
-    if let Some(summary) = summary {
-        out.insert("planSummary", summary);
-    }
-    // What a streamed read examined for this batch, in mongod's order.
-    if let Some(e) = exec {
-        if e.cursor_id != 0 {
-            out.insert("cursorid", e.cursor_id);
+    out.insert("isFromUserConnection", true);
+    let coll = target_collection(name, request).unwrap_or("$cmd");
+    out.insert(
+        "collectionType",
+        crate::opdebug::collection_type(ctx, &ctx.db_name, coll),
+    );
+    let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    let exec = ctx.exec_stats.as_ref().filter(|_| ok);
+    if ok {
+        // A cursor's `getMore` names the command that opened it, and
+        // repeats its plan.
+        if let Some(command) = exec.and_then(|e| e.originating_command.clone()) {
+            out.insert("originatingCommand", command_shown(&command));
         }
-        out.insert("keysExamined", e.keys_examined);
-        out.insert("docsExamined", e.docs_examined);
-        out.insert("nBatches", 1_i64);
-        if e.exhausted {
-            out.insert("cursorExhausted", true);
+        let summary = exec
+            .and_then(|e| e.plan_summary.clone())
+            .or_else(|| crate::explain::summary::plan_summary(request, ctx));
+        if let Some(summary) = summary {
+            out.insert("planSummary", summary);
         }
-        out.insert("numYields", 0_i64);
-    }
-    let batch = || -> Option<i64> {
-        if let Some(pending) = &ctx.pending_batch {
-            return Some(pending.batch.len() as i64);
+        if let (true, Some(micros)) = (plans(name), ctx.planning_micros) {
+            out.insert("planningTimeMicros", micros);
         }
-        let cursor = reply.get_document("cursor").ok()?;
-        cursor
-            .get_array("firstBatch")
-            .or_else(|_| cursor.get_array("nextBatch"))
-            .ok()
-            .map(|b| b.len() as i64)
-    };
-    let returned = match name {
-        "find" | "aggregate" | "getMore" => batch(),
-        "count" => Some(1),
-        "distinct" => reply.get_array("values").ok().map(|v| v.len() as i64),
-        _ => None,
-    };
-    if let Some(n) = returned {
-        out.insert("nreturned", n);
+        // What the read examined, in mongod's order.
+        if let Some(e) = exec {
+            if e.cursor_id != 0 {
+                out.insert("cursorid", e.cursor_id);
+            }
+            out.insert("keysExamined", e.keys_examined);
+            out.insert("docsExamined", e.docs_examined);
+            if matches!(name, "find" | "getMore") {
+                out.insert("nBatches", 1_i64);
+            }
+            if e.exhausted {
+                out.insert("cursorExhausted", true);
+            }
+        }
+        let batch = || -> Option<i64> {
+            if let Some(pending) = &ctx.pending_batch {
+                return Some(pending.batch.len() as i64);
+            }
+            let cursor = reply.get_document("cursor").ok()?;
+            cursor
+                .get_array("firstBatch")
+                .or_else(|_| cursor.get_array("nextBatch"))
+                .ok()
+                .map(|b| b.len() as i64)
+        };
+        let returned = match name {
+            "find" | "aggregate" | "getMore" => batch(),
+            "count" => Some(1),
+            "distinct" => reply.get_array("values").ok().map(|v| v.len() as i64),
+            _ => None,
+        };
+        if let Some(n) = returned {
+            out.insert("nreturned", n);
+        }
     }
+    // The index keys the operation's writes inserted and deleted; an
+    // `update` or `delete` reports them on each statement's line.
+    if !matches!(name, "update" | "delete") {
+        if let Some(c) = &ctx.op_counts {
+            if let Some(n) = c.keys_inserted {
+                out.insert("keysInserted", n);
+            }
+            if let Some(n) = c.keys_deleted {
+                out.insert("keysDeleted", n);
+            }
+        }
+    }
+    out.insert("numYields", 0_i64);
     out.insert("reslen", response_length(reply, ctx));
+    out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
+    out.insert("readConcern", crate::opdebug::read_concern(request));
+    if crate::opdebug::takes_write_concern(name) {
+        out.insert("writeConcern", crate::opdebug::write_concern(request, ctx));
+    }
+    if let Some(storage) = ctx
+        .op_counts
+        .as_ref()
+        .and_then(crate::opdebug::storage_section)
+    {
+        out.insert("storage", storage);
+    }
+    if let Some(remote) = crate::opdebug::remote(ctx) {
+        out.insert("remote", remote);
+    }
+    out.insert("protocol", if ctx.op_query { "op_query" } else { "op_msg" });
     out
 }
 
@@ -265,7 +340,9 @@ fn command_shown(request: &Document) -> Document {
 
 /// The attributes of one `Slow query` line. `ns` is `db.collection` for a
 /// command that names a collection and `db.$cmd` otherwise, as mongod has
-/// it. `read` is [`read_attributes`]' part.
+/// it; an `update` or `delete` is `db.$cmd` too, its statements' lines
+/// naming the collection. `read` is [`read_attributes`]' part. The whole
+/// in mongod's order (`opdebug::LINE_ORDER`).
 pub fn attributes(
     request: &Document,
     reply: &Document,
@@ -275,33 +352,20 @@ pub fn attributes(
     total: Duration,
 ) -> Document {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
-    // `getMore` names its collection in `collection`; its own value is the
-    // cursor id.
-    let target = if name == "getMore" {
-        request.get("collection")
-    } else {
-        request.get(name)
-    };
-    let ns = match target {
-        Some(bson::Bson::String(coll)) if !coll.is_empty() => format!("{db}.{coll}"),
-        _ => format!("{db}.$cmd"),
+    let ns = match target_collection(name, request) {
+        Some(_) if matches!(name, "update" | "delete") => format!("{db}.$cmd"),
+        Some(coll) => format!("{db}.{coll}"),
+        None => format!("{db}.$cmd"),
     };
     let mut attr = Document::new();
     attr.insert("type", "command");
     attr.insert("ns", ns);
     attr.insert("command", command_shown(request));
-    let mut read = read;
-    if let Some(command) = read.remove("originatingCommand") {
-        attr.insert("originatingCommand", command);
-    }
-    if let Some(summary) = read.remove("planSummary") {
-        attr.insert("planSummary", summary);
-    }
     outcome(name, reply, &mut attr);
     attr.extend(read);
     attr.insert("workingMillis", worked.as_millis() as i64);
     attr.insert("durationMillis", total.as_millis() as i64);
-    attr
+    crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER)
 }
 
 #[cfg(test)]

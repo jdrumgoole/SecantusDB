@@ -3823,6 +3823,120 @@ thread_local! {
     static DELETE_GROUPS: RefCell<HashMap<i64, i64>> = RefCell::new(HashMap::new());
 }
 
+thread_local! {
+    /// The index keys the operation running on this thread inserted and
+    /// deleted, as mongod counts them (`keysInserted` / `keysDeleted`,
+    /// RM-023), each `None` until a write of its kind; the whole `None`
+    /// while no operation counts them.
+    static INDEX_KEYS: Cell<Option<KeyCounts>> = const { Cell::new(None) };
+}
+
+/// Index keys inserted and deleted; `None`: no write of that kind.
+type KeyCounts = (Option<i64>, Option<i64>);
+
+fn add_keys(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+    }
+}
+
+/// What the store counted for one operation: WiredTiger's per-session
+/// statistics, and the index keys it inserted and deleted (RM-023). A key
+/// count is `None` when the operation made no write of its kind: mongod
+/// prints `keysInserted` for an operation that inserted, `keysDeleted` for
+/// one that deleted, and both for an update.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct OperationCounts {
+    pub engine: secantus_wt::OperationStats,
+    pub keys_inserted: Option<i64>,
+    pub keys_deleted: Option<i64>,
+}
+
+/// Counts the operation running on this thread while it lives
+/// ([`operation_scope`]); the previous scope resumes when it drops.
+#[must_use = "the operation is counted while the scope lives"]
+pub struct OperationScope {
+    engine: secantus_wt::OperationStatsScope,
+    keys: Option<KeyCounts>,
+    merge: bool,
+}
+
+/// Start counting the operation running on this thread: what WiredTiger's
+/// statistics count for every session it uses, and the index keys its
+/// writes insert and delete.
+pub fn operation_scope() -> OperationScope {
+    OperationScope {
+        engine: secantus_wt::operation_stats_scope(),
+        keys: INDEX_KEYS.with(|k| k.replace(Some((None, None)))),
+        merge: true,
+    }
+}
+
+/// [`operation_scope`] for an operation of its own run on this thread
+/// inside another (an index build, which mongod runs on a thread of its
+/// own): what it counts does not go on into the other.
+pub fn operation_scope_apart() -> OperationScope {
+    OperationScope {
+        engine: secantus_wt::operation_stats_scope_apart(),
+        keys: INDEX_KEYS.with(|k| k.replace(Some((None, None)))),
+        merge: false,
+    }
+}
+
+impl OperationScope {
+    /// What the operation has counted so far.
+    pub fn counts(&self) -> OperationCounts {
+        let (keys_inserted, keys_deleted) = INDEX_KEYS.with(Cell::get).unwrap_or_default();
+        OperationCounts {
+            engine: self.engine.stats(),
+            keys_inserted,
+            keys_deleted,
+        }
+    }
+}
+
+impl Drop for OperationScope {
+    /// An operation inside another is part of it: its keys go on into the
+    /// outer one (the engine's statistics do the same).
+    fn drop(&mut self) {
+        let merge = self.merge;
+        INDEX_KEYS.with(|k| {
+            let (i, d) = k.get().unwrap_or_default();
+            k.set(self.keys.take().map(|(oi, od)| {
+                if merge {
+                    (add_keys(oi, i), add_keys(od, d))
+                } else {
+                    (oi, od)
+                }
+            }));
+        });
+    }
+}
+
+/// What the operation running on this thread has counted so far; `None`
+/// outside an [`operation_scope`].
+pub fn operation_counts() -> Option<OperationCounts> {
+    let (keys_inserted, keys_deleted) = INDEX_KEYS.with(Cell::get)?;
+    Some(OperationCounts {
+        engine: secantus_wt::operation_stats().unwrap_or_default(),
+        keys_inserted,
+        keys_deleted,
+    })
+}
+
+fn counting_index_keys() -> bool {
+    INDEX_KEYS.with(|k| k.get().is_some())
+}
+
+fn note_index_keys(inserted: Option<i64>, deleted: Option<i64>) {
+    INDEX_KEYS.with(|k| {
+        if let Some((i, d)) = k.get() {
+            k.set(Some((add_keys(i, inserted), add_keys(d, deleted))));
+        }
+    });
+}
+
 /// Run `f` with an unbounded delete outside a transaction removing its
 /// matches in batches of `batch`, each batch in reverse: mongod's batched
 /// multi-delete. It reads the documents in its plan's order, collects ten at
@@ -10048,6 +10162,12 @@ impl Storage {
         );
         ACTIVE_TXN_SESSION.with(|c| c.set(session_ptr));
         ACTIVE_HANDLE.with(|c| c.set(hp));
+        // The transaction's session outlives the statement: what its
+        // statistics counted before is not this statement's (RM-023).
+        // SAFETY: `session_ptr` is the handle's session, alive for the call.
+        if let Err(e) = unsafe { &*session_ptr }.discard_statistics() {
+            eprintln!("secantus-storage: resetting a transaction's statistics failed: {e}");
+        }
         // Statement dirty accounting: zero the thread-local counter on entry
         // (a panicked prior scope must not leak bytes into this one) and
         // harvest it onto the handle on every exit, panic included.
@@ -10062,6 +10182,15 @@ impl Storage {
         let dirty_scope = DirtyHarvest(hp);
         let out = f();
         drop(dirty_scope);
+        // The statement's share of its transaction's WiredTiger statistics,
+        // from the session it ends on (it may have moved its transaction).
+        let active = ACTIVE_TXN_SESSION.with(|c| c.get());
+        if !active.is_null() {
+            // SAFETY: installed above (or by a rebase) for this call.
+            if let Err(e) = unsafe { &*active }.collect_operation_statistics() {
+                eprintln!("secantus-storage: reading a transaction's statistics failed: {e}");
+            }
+        }
         // SAFETY: `hp` came from `handle`, unused since; back to the borrow.
         let handle = unsafe { &mut *hp };
         // Transaction dirty budget — mongod's `TransactionTooLargeForCache`
@@ -11297,6 +11426,7 @@ impl Storage {
                 // id_key as the fetch pointer in step 1; IXSCAN resolves id_key ->
                 // RecordId -> doc), and lazily flag any index this doc makes multikey.
                 self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
+                self.count_index_keys(&session, db, coll, None, Some(&doc), &descs)?;
                 self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                 // Oplog: an insert is op "i". No pre-image (there's no prior document).
                 if self.enable_oplog {
@@ -11619,6 +11749,7 @@ impl Storage {
                     self.sizes
                         .adjust(&session, db, coll, Delta::insert(key.len(), blob.len()));
                     self.write_index_entries(&session, db, coll, &doc, &descs, recordid)?;
+                    self.count_index_keys(&session, db, coll, None, Some(&doc), &descs)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
                     inserted += 1;
                     inserted_bytes += blob.len() as i64;
@@ -11894,6 +12025,7 @@ impl Storage {
                     // key is the canonical `id_key(_id)` — let the helper recompute it.
                     let (additions, removals) =
                         self.index_entry_diff(&old_doc, &doc, &descs, recordid)?;
+                        self.count_index_keys(&session, db, coll, Some(&old_doc), Some(&doc), &descs)?;
                     self.insert_index_entries(&session, db, coll, &additions)?;
                     self.remove_index_entries(&session, db, coll, &removals)?;
                     self.maybe_mark_multikey(&session, db, coll, &doc, &descs)?;
@@ -11972,6 +12104,7 @@ impl Storage {
                 let descs = self.index_descs(&session, db, coll)?;
                 // `delete_by_id` is a bare-`_id` path (not used for timeseries).
                 self.delete_index_entries(&session, db, coll, &old_doc, &descs, recordid)?;
+                self.count_index_keys(&session, db, coll, Some(&old_doc), None, &descs)?;
                 self.delete_nat_entry(&session, db, coll, &key)?;
                 // Oplog: a delete is op "d" with `o` = `o2` = {_id}. The pre-image (the
                 // deleted doc) is stored when changeStreamPreAndPostImages is enabled.
@@ -15299,6 +15432,7 @@ impl Storage {
                     self.sizes
                         .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
                     self.delete_index_entries(session, db, coll, &doc, descs, recordid)?;
+                    self.count_index_keys(session, db, coll, Some(&doc), None, descs)?;
                     self.delete_nat_entry(session, db, coll, &id_k)?;
                     total -= blob.len() as i64;
                     count -= 1;
@@ -15720,6 +15854,110 @@ impl Storage {
             }
         }
         Ok((additions, removals))
+    }
+
+    /// The keys mongod holds for `doc` in the index `desc`, as a set: each
+    /// field's distinct keys (an array's elements, `undefined` for an empty
+    /// one, a null for a missing field or an element that does not reach the
+    /// leaf) and their product across the fields, none when the document is
+    /// outside a partial index or holds none of a sparse index's fields. The
+    /// whole-array key this store writes besides is not one of mongod's. A
+    /// geo index: its entries.
+    fn reference_keys(&self, doc: &Document, desc: &IndexDesc) -> Result<HashSet<Vec<u8>>> {
+        if desc.id_claim {
+            return Ok(HashSet::new());
+        }
+        if desc.geo_2d.is_some() || desc.geo_sphere.is_some() {
+            return Ok(self.packed_entry_keys(doc, desc, 0)?.into_iter().collect());
+        }
+        if !self.doc_in_partial(doc, desc)? {
+            return Ok(HashSet::new());
+        }
+        if desc.sparse && !sparse_covers(doc, &desc.key_spec) {
+            return Ok(HashSet::new());
+        }
+        let mut combos: Vec<Vec<u8>> = vec![Vec::new()];
+        for (field, dir) in desc.key_spec.iter() {
+            let dir = direction_of(dir).unwrap_or(1);
+            let mut values: Vec<Vec<u8>> = Vec::new();
+            for v in secantus_core::index_keys::field_keys(doc, field, desc.sparse).mongod {
+                let key = with_bindata_order(desc.key_order, || {
+                    enc_dir_c(&v, dir, desc.collation.as_ref())
+                })?;
+                if !values.contains(&key) {
+                    values.push(key);
+                }
+            }
+            if values.is_empty() {
+                values.push(Vec::new());
+            }
+            let mut next = Vec::with_capacity(combos.len() * values.len());
+            for combo in &combos {
+                for v in &values {
+                    if next.len() >= MAX_COMPOUND_KEYS {
+                        break;
+                    }
+                    let mut key = combo.clone();
+                    key.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                    key.extend_from_slice(v);
+                    next.push(key);
+                }
+            }
+            combos = next;
+        }
+        Ok(combos.into_iter().collect())
+    }
+
+    /// Count the index keys a write inserted and deleted, as mongod's
+    /// `keysInserted` / `keysDeleted` count them (RM-023): per index, the
+    /// keys `new` has that `old` had not and the other way about, and the
+    /// `_id` index's key of a document inserted or deleted (a clustered
+    /// collection has no `_id` index). Nothing when no operation counts.
+    fn count_index_keys(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        old: Option<&Document>,
+        new: Option<&Document>,
+        descs: &[IndexDesc],
+    ) -> Result<()> {
+        // A write kept beside the oplog -- a session's `config.transactions`
+        // row, a retryable `findAndModify`'s image -- is not the
+        // operation's: mongod counts neither's keys.
+        if !counting_index_keys() || UNREPLICATED.with(std::cell::Cell::get) {
+            return Ok(());
+        }
+        let (mut inserted, mut deleted) = (0i64, 0i64);
+        for desc in descs {
+            let before = match old {
+                Some(d) => self.reference_keys(d, desc)?,
+                None => HashSet::new(),
+            };
+            let after = match new {
+                Some(d) => self.reference_keys(d, desc)?,
+                None => HashSet::new(),
+            };
+            inserted += after.difference(&before).count() as i64;
+            deleted += before.difference(&after).count() as i64;
+        }
+        if old.is_some() != new.is_some() {
+            let clustered = self
+                .coll_options_cached(session, db, coll)?
+                .is_some_and(|o| o.contains_key("clusteredIndex"));
+            if !clustered {
+                if new.is_some() {
+                    inserted += 1;
+                } else {
+                    deleted += 1;
+                }
+            }
+        }
+        note_index_keys(
+            new.is_some().then_some(inserted),
+            old.is_some().then_some(deleted),
+        );
+        Ok(())
     }
 
     fn insert_index_entries(
@@ -19856,6 +20094,7 @@ impl Storage {
             modified += 1;
             chunk_bytes += new_blob.len();
             let (additions, removals) = self.index_entry_diff(&doc, &new, &descs, recordid)?;
+            self.count_index_keys(session, db, coll, Some(&doc), Some(&new), &descs)?;
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
             note_row(db, coll, recordid)?;
@@ -20030,6 +20269,7 @@ impl Storage {
                         // `index_entry_diff`), never a missing entry for this doc.
                         let (additions, removals) =
                             self.index_entry_diff(&doc, &new, &descs, recordid)?;
+                            self.count_index_keys(&session, db, coll, Some(&doc), Some(&new), &descs)?;
                         self.insert_index_entries(&session, db, coll, &additions)?;
                         // The doc stays at its RecordId (unchanged — `_id` is immutable);
                         // the framed value carries the id_key in-band.
@@ -20277,6 +20517,7 @@ impl Storage {
                         Delta::insert(new_id_key.len(), new_blob.len()),
                     );
                     self.write_index_entries(&session, db, coll, &new, &descs, recordid)?;
+                    self.count_index_keys(&session, db, coll, None, Some(&new), &descs)?;
                     self.maybe_mark_multikey(&session, db, coll, &new, &descs)?;
                     if want_post_image {
                         post_image = Some(new.clone());
@@ -20620,6 +20861,7 @@ impl Storage {
                 .adjust(session, db, coll, Delta::remove(id_k.len(), blob.len()));
             note_deleted(db, coll, &blob);
             self.delete_index_entries(session, db, coll, &doc, &descs, recordid)?;
+            self.count_index_keys(session, db, coll, Some(&doc), None, &descs)?;
             self.delete_nat_entry(session, db, coll, &id_k)?;
             deleted += 1;
             // Index-entry removals are the delete's dirty content; approximate
@@ -20708,6 +20950,7 @@ impl Storage {
                         .adjust(&session, db, coll, Delta::remove(id_k.len(), blob.len()));
                     note_deleted(db, coll, &blob);
                     self.delete_index_entries(&session, db, coll, &doc, &descs, recordid)?;
+                    self.count_index_keys(&session, db, coll, Some(&doc), None, &descs)?;
                     self.delete_nat_entry(&session, db, coll, &id_k)?;
                     deleted += 1;
                     if oplog_on {

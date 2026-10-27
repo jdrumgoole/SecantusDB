@@ -294,7 +294,9 @@ pub(crate) fn finish(
         if let Some(summary) = summary {
             entry.insert("planSummary", summary);
         }
+        execution(name, doc, ok, ctx, &mut entry);
         who.append(&mut entry);
+        let entry = crate::opdebug::reorder(entry, crate::opdebug::PROFILE_ORDER);
         logged |= decide(&pending.db, settings, &entry, millis, ctx);
     }
     if pending.settings.is_some_and(|s| s.filter.is_some()) {
@@ -535,6 +537,102 @@ fn outcome(
     failure(reply, entry);
 }
 
+/// What the entry says of how the operation ran (RM-023), as its
+/// `Slow query` line does (`slowop::read_attributes`): what its read
+/// examined, the index keys its writes inserted and deleted, the time it
+/// spent planning, the locks it took -- with the global IS mongod takes to
+/// read its storage statistics before writing the entry -- its read and
+/// write concern, and WiredTiger's statistics for its sessions. Placed in
+/// mongod's order by `opdebug::PROFILE_ORDER`.
+fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: &mut Document) {
+    if let (true, Some(e)) = (ok, &ctx.exec_stats) {
+        entry.insert("keysExamined", e.keys_examined);
+        entry.insert("docsExamined", e.docs_examined);
+    }
+    if let Some(c) = &ctx.op_counts {
+        if let Some(n) = c.keys_inserted {
+            entry.insert("keysInserted", n);
+        }
+        if let Some(n) = c.keys_deleted {
+            entry.insert("keysDeleted", n);
+        }
+    }
+    if ok
+        && matches!(
+            name,
+            "find" | "aggregate" | "count" | "distinct" | "findAndModify" | "findandmodify"
+        )
+    {
+        if let Some(micros) = ctx.planning_micros {
+            entry.insert("planningTimeMicros", micros);
+        }
+    }
+    let mut locks = ctx.op_locks.clone().unwrap_or_default();
+    if crate::lock_manager::took_global() {
+        bump_global_is(&mut locks);
+    }
+    entry.insert("locks", locks);
+    entry.insert("flowControl", Document::new());
+    entry.insert("readConcern", crate::opdebug::read_concern(doc));
+    if crate::opdebug::takes_write_concern(name) {
+        entry.insert("writeConcern", crate::opdebug::write_concern(doc, ctx));
+    }
+    if let Some(storage) = ctx
+        .op_counts
+        .as_ref()
+        .and_then(crate::opdebug::storage_section)
+    {
+        entry.insert("storage", storage);
+    }
+}
+
+/// One more global IS in an operation's `locks`: the lock mongod takes to
+/// read the operation's storage statistics, which its profile entry counts
+/// and its `Slow query` line does not (measured 8.2.11: a `find`'s line
+/// has `Global: {r: 1}`, its entry `{r: 2}`), when the operation took the
+/// global lock at all (`killCursors`'s are `{}` in both).
+fn bump_global_is(locks: &mut Document) {
+    let global = match locks.get_document_mut("Global") {
+        Ok(g) => g,
+        Err(_) => {
+            // mongod's order puts the global lock after the replication
+            // state transition lock and before the rest.
+            let mut out = Document::new();
+            let mut placed = false;
+            for (k, v) in std::mem::take(locks) {
+                if !placed
+                    && !matches!(
+                        k.as_str(),
+                        "MultiDocumentTransactionsBarrier" | "ReplicationStateTransition"
+                    )
+                {
+                    out.insert("Global", doc! { "acquireCount": { "r": 1_i64 } });
+                    placed = true;
+                }
+                out.insert(k, v);
+            }
+            if !placed {
+                out.insert("Global", doc! { "acquireCount": { "r": 1_i64 } });
+            }
+            *locks = out;
+            return;
+        }
+    };
+    let counts = match global.get_document_mut("acquireCount") {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let r = counts.get_i64("r").unwrap_or(0) + 1;
+    // `r` is the weakest mode and comes first.
+    let mut out = doc! { "r": r };
+    for (k, v) in std::mem::take(counts) {
+        if k != "r" {
+            out.insert(k, v);
+        }
+    }
+    *counts = out;
+}
+
 /// How many documents an `$out` left in its target, which it replaced.
 fn out_count(doc: &Document, ctx: &CommandContext) -> Option<i64> {
     let spec = last_stage(doc, "$out")?;
@@ -705,6 +803,28 @@ struct Statement {
     command: Document,
     outcome: StatementOutcome,
     millis: i64,
+    /// What the statement counted as it ran, and what it ran under
+    /// (RM-023): placed by `opdebug`'s orders.
+    ran: Ran,
+}
+
+/// How a statement ran, as its line and entry report it.
+#[derive(Default)]
+struct Ran {
+    collection_type: &'static str,
+    plan_summary: Option<String>,
+    planning_micros: Option<i64>,
+    examined: Option<(i64, i64)>,
+    keys_inserted: Option<i64>,
+    keys_deleted: Option<i64>,
+    /// The command's locks so far: a statement's are its command's, which
+    /// mongod's statement lines print as they stand.
+    locks: Document,
+    took_global: bool,
+    wrote: bool,
+    read_concern: Document,
+    storage: Option<Document>,
+    remote: Option<String>,
 }
 
 enum StatementOutcome {
@@ -720,10 +840,16 @@ enum StatementOutcome {
 impl Statement {
     /// The statement's `Slow query` line, before its duration: mongod's
     /// attributes for a write statement, in its order (measured 8.2.11,
-    /// 2026-10-24), as far as this server keeps them (RM-023).
+    /// 2026-10-27).
     fn log_attributes(&self) -> Document {
-        let mut attr =
-            doc! { "type": self.op, "ns": self.ns.clone(), "command": self.command.clone() };
+        let mut attr = doc! {
+            "type": self.op,
+            "isFromUserConnection": true,
+            "ns": self.ns.clone(),
+            "collectionType": self.ran.collection_type,
+            "command": self.command.clone(),
+        };
+        self.counts(&mut attr);
         match &self.outcome {
             StatementOutcome::Updated {
                 matched,
@@ -738,17 +864,53 @@ impl Statement {
                 attr.insert("ndeleted", *n);
             }
             StatementOutcome::Failed(error) => {
-                attr.insert("ok", 0_i32);
-                attr.insert("errCode", error.get_i32("code").unwrap_or(0));
+                let reply = doc! {
+                    "errmsg": error.get_str("errmsg").unwrap_or(""),
+                    "code": error.get_i32("code").unwrap_or(0),
+                };
+                crate::slowop::failure(&reply, &mut attr);
             }
         }
-        attr.insert("numYields", 0_i32);
-        attr
+        attr.insert("numYields", 0_i64);
+        attr.insert("locks", self.ran.locks.clone());
+        attr.insert("readConcern", self.ran.read_concern.clone());
+        if let Some(storage) = &self.ran.storage {
+            attr.insert("storage", storage.clone());
+        }
+        if let Some(remote) = &self.ran.remote {
+            attr.insert("remote", remote.clone());
+        }
+        crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER)
+    }
+
+    /// What the statement's plan was and examined, and the index keys it
+    /// inserted and deleted.
+    fn counts(&self, out: &mut Document) {
+        let failed = matches!(self.outcome, StatementOutcome::Failed(_));
+        if let Some(summary) = &self.ran.plan_summary {
+            out.insert("planSummary", summary.clone());
+        }
+        if let Some(micros) = self.ran.planning_micros {
+            out.insert("planningTimeMicros", micros);
+        }
+        if let (Some((keys, docs)), false) = (self.ran.examined, failed) {
+            out.insert("keysExamined", keys);
+            out.insert("docsExamined", docs);
+        }
+        if !failed {
+            if let Some(n) = self.ran.keys_inserted {
+                out.insert("keysInserted", n);
+            }
+            if let Some(n) = self.ran.keys_deleted {
+                out.insert("keysDeleted", n);
+            }
+        }
     }
 
     fn entry(&self, who: &Who) -> Document {
         let mut entry =
             doc! { "op": self.op, "ns": self.ns.clone(), "command": abbreviated(&self.command) };
+        self.counts(&mut entry);
         match &self.outcome {
             StatementOutcome::Updated {
                 matched,
@@ -773,9 +935,21 @@ impl Statement {
                 failure(&reply, &mut entry);
             }
         }
+        let mut locks = self.ran.locks.clone();
+        if self.ran.took_global {
+            bump_global_is(&mut locks);
+        }
+        entry.insert("locks", locks);
+        if !self.ran.wrote {
+            entry.insert("flowControl", Document::new());
+        }
+        entry.insert("readConcern", self.ran.read_concern.clone());
+        if let Some(storage) = &self.ran.storage {
+            entry.insert("storage", storage.clone());
+        }
         entry.insert("millis", int32(self.millis));
         who.append(&mut entry);
-        entry
+        crate::opdebug::reorder(entry, crate::opdebug::PROFILE_ORDER)
     }
 }
 
@@ -783,11 +957,13 @@ impl Statement {
 /// and `delete` handlers; it does nothing unless the command is profiled.
 /// A statement is opened when it starts to execute (one refused before that
 /// is not profiled, as on mongod) and closed by the next one or the end.
-pub(crate) struct Statements {
+pub(crate) struct Statements<'a> {
     armed: bool,
     /// The command is profiled, so each statement gets an entry.
     profiled: bool,
     open: Option<Open>,
+    storage: Option<&'a dyn crate::storage::Storage>,
+    read_concern: Document,
 }
 
 struct Open {
@@ -800,10 +976,32 @@ struct Open {
     modified: i64,
     upserted: usize,
     errors: usize,
+    /// The command's planning time, and the store's counts, as they stood
+    /// when the statement started: its own are what it adds.
+    planning: Option<std::time::Duration>,
+    counts: Option<crate::storage::OperationCounts>,
 }
 
-impl Statements {
-    pub(crate) fn start() -> Self {
+/// What the statement running on this thread's plan was and examined
+/// (RM-023), noted by the write as it selects its documents.
+#[derive(Clone, Default)]
+pub(crate) struct StatementExec {
+    pub summary: Option<String>,
+    pub keys_examined: i64,
+    pub docs_examined: i64,
+}
+
+thread_local! {
+    static STATEMENT_EXEC: RefCell<Option<StatementExec>> = const { RefCell::new(None) };
+}
+
+/// The running statement's plan and what it examined.
+pub(crate) fn note_statement_exec(exec: StatementExec) {
+    STATEMENT_EXEC.with(|s| *s.borrow_mut() = Some(exec));
+}
+
+impl<'a> Statements<'a> {
+    pub(crate) fn start(storage: Option<&'a dyn crate::storage::Storage>, request: &Document) -> Self {
         let profiled = STATEMENTS.with(|s| s.borrow().is_some());
         Statements {
             // A statement is timed when it is profiled or may be logged as
@@ -811,7 +1009,14 @@ impl Statements {
             armed: profiled || crate::slowop::armed(),
             profiled,
             open: None,
+            storage,
+            read_concern: crate::opdebug::read_concern(request),
         }
+    }
+
+    fn open(&mut self, open: Open) {
+        STATEMENT_EXEC.with(|s| *s.borrow_mut() = None);
+        self.open = Some(open);
     }
 
     /// The update statement `spec` of `db.coll` starts to execute, with the
@@ -828,7 +1033,8 @@ impl Statements {
         errors: usize,
     ) {
         if self.armed {
-            self.open = Some(Open {
+            let counts = self.storage.as_ref().and_then(|s| s.operation_counts());
+            self.open(Open {
                 db: db.to_string(),
                 coll: coll.to_string(),
                 op: "update",
@@ -838,6 +1044,8 @@ impl Statements {
                 modified: i64::from(modified),
                 upserted,
                 errors,
+                planning: crate::explain::planning_spent(),
+                counts,
             });
         }
     }
@@ -845,7 +1053,8 @@ impl Statements {
     /// The delete statement `spec` of `db.coll` starts to execute.
     pub(crate) fn delete(&mut self, db: &str, coll: &str, spec: &Document, n: i32, errors: usize) {
         if self.armed {
-            self.open = Some(Open {
+            let counts = self.storage.as_ref().and_then(|s| s.operation_counts());
+            self.open(Open {
                 db: db.to_string(),
                 coll: coll.to_string(),
                 op: "remove",
@@ -855,7 +1064,56 @@ impl Statements {
                 modified: 0,
                 upserted: 0,
                 errors,
+                planning: crate::explain::planning_spent(),
+                counts,
             });
+        }
+    }
+
+    /// How the open statement ran: what it counted since it started, the
+    /// command's locks and storage statistics so far.
+    fn ran(&self, open: &Open) -> Ran {
+        let since = |now: Option<i64>, then: Option<i64>| match (now, then) {
+            (Some(a), b) => {
+                let n = a - b.unwrap_or(0);
+                // A count the statement did not move is not its own.
+                (now != then).then_some(n)
+            }
+            (None, _) => None,
+        };
+        let now = self.storage.as_ref().and_then(|s| s.operation_counts());
+        let then = open.counts;
+        let exec = STATEMENT_EXEC.with(|s| s.borrow_mut().take());
+        let planning = match (crate::explain::planning_spent(), open.planning) {
+            (Some(a), b) if Some(a) != b => Some((a - b.unwrap_or_default()).as_micros() as i64),
+            _ => None,
+        };
+        let locks = crate::lock_manager::operation_locks(false);
+        let wrote = locks.get_document("Global").is_ok_and(|g| {
+            g.get_document("acquireCount")
+                .is_ok_and(|c| c.contains_key("w") || c.contains_key("W"))
+        });
+        Ran {
+            collection_type: self.storage.map_or("normal", |s| {
+                crate::opdebug::collection_type_in(s, &open.db, &open.coll)
+            }),
+            plan_summary: exec.as_ref().and_then(|e| e.summary.clone()),
+            planning_micros: planning,
+            examined: exec.as_ref().map(|e| (e.keys_examined, e.docs_examined)),
+            keys_inserted: since(
+                now.and_then(|c| c.keys_inserted),
+                then.and_then(|c| c.keys_inserted),
+            ),
+            keys_deleted: since(
+                now.and_then(|c| c.keys_deleted),
+                then.and_then(|c| c.keys_deleted),
+            ),
+            locks,
+            took_global: crate::lock_manager::took_global(),
+            wrote,
+            read_concern: self.read_concern.clone(),
+            storage: now.as_ref().and_then(crate::opdebug::storage_section),
+            remote: crate::slowop::remote(),
         }
     }
 
@@ -883,6 +1141,7 @@ impl Statements {
             }
         };
         let worked = open.start.elapsed();
+        let ran = self.ran(&open);
         let statement = Statement {
             ns: format!("{}.{}", open.db, open.coll),
             db: open.db,
@@ -890,6 +1149,7 @@ impl Statements {
             command: open.command,
             outcome,
             millis: worked.as_millis() as i64,
+            ran,
         };
         crate::slowop::statement("WRITE", statement.log_attributes(), worked);
         if self.profiled {

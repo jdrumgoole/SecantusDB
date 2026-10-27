@@ -36,6 +36,7 @@ pub(crate) mod stream;
 pub(crate) mod summary;
 mod trial;
 
+pub(crate) use plan::{planning_scope, planning_spent};
 use crate::util::{as_i64, command_error, decode_docs};
 use crate::{CommandContext, CommandError, HandlerResult, SERVER_VERSION};
 use bson::{doc, Bson, Document};

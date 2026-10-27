@@ -81,6 +81,7 @@ pub mod mongod_codes;
 mod mongod_commands;
 mod near;
 mod notablescan;
+mod opdebug;
 pub mod ops;
 pub mod params;
 mod privileges;
@@ -268,6 +269,15 @@ pub struct CommandContext {
     /// What a streamed read examined for this command's batch, for its
     /// `Slow query` line (RM-023).
     pub exec_stats: Option<ExecStats>,
+    /// What the store counted for this operation, taken when its handler
+    /// finished, before its profile entry is written (RM-023).
+    pub op_counts: Option<storage::OperationCounts>,
+    /// The locks the operation took, as its line prints them, taken with
+    /// [`Self::op_counts`].
+    pub op_locks: Option<Document>,
+    /// The time spent planning the operation's query, for the line's and
+    /// profile entry's `planningTimeMicros`.
+    pub planning_micros: Option<i64>,
     /// The raw BSON byte slices of an `insert`'s kind-1 `documents` sequence,
     /// handed in by the server **un-decoded** so the insert handler can store the
     /// client's bytes verbatim (the raw-BSON write path) instead of paying a
@@ -348,6 +358,9 @@ impl CommandContext {
             awaited: std::cell::Cell::new(std::time::Duration::ZERO),
             pending_batch: None,
             exec_stats: None,
+            op_counts: None,
+            op_locks: None,
+            planning_micros: None,
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,
@@ -840,6 +853,9 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     } else {
         0
     };
+    // What the store does for the operation is counted from here (RM-023).
+    let counting = ctx.storage.as_ref().and_then(|s| s.begin_operation_counts());
+    let planning = explain::planning_scope();
     ctx.profiling = profiler::begin(name, doc, ctx);
     let mut reply = dispatch_inner(doc, ctx);
     // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
@@ -903,6 +919,12 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
     attach_cluster_time_gossip(doc, &mut reply, ctx);
     order_write_reply(doc, &mut reply);
+    // What the operation counted, before its profile entry is written.
+    ctx.op_counts = ctx.storage.as_ref().and_then(|s| s.operation_counts());
+    ctx.op_locks = Some(lock_manager::operation_locks(false));
+    ctx.planning_micros = planning.micros();
+    drop(planning);
+    drop(counting);
     profiler::finish(name, doc, inner_n, &reply, ctx);
     reply
 }

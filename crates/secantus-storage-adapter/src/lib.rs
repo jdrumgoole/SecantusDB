@@ -942,6 +942,30 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::with_candidate_order(order, f)
     }
 
+    fn begin_operation_counts(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(secantus_storage::operation_scope()))
+    }
+
+    fn begin_operation_counts_apart(&self) -> Option<Box<dyn std::any::Any>> {
+        Some(Box::new(secantus_storage::operation_scope_apart()))
+    }
+
+    fn operation_counts(&self) -> Option<secantus_commands::storage::OperationCounts> {
+        let c = secantus_storage::operation_counts()?;
+        Some(secantus_commands::storage::OperationCounts {
+            bytes_read: c.engine.bytes_read,
+            bytes_written: c.engine.bytes_written,
+            read_micros: c.engine.read_micros,
+            write_micros: c.engine.write_micros,
+            cache_wait_micros: c.engine.cache_wait_micros,
+            schema_lock_wait_micros: c.engine.schema_lock_wait_micros,
+            handle_lock_wait_micros: c.engine.handle_lock_wait_micros,
+            txn_bytes_dirty: c.engine.txn_bytes_dirty,
+            keys_inserted: c.keys_inserted,
+            keys_deleted: c.keys_deleted,
+        })
+    }
+
     fn with_reversed_delete_batches(&self, batch: usize, f: &mut dyn FnMut()) {
         secantus_storage::with_reversed_delete_batches(batch, f)
     }

@@ -18,6 +18,65 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
+thread_local! {
+    /// Whether the operation running on this thread times its planning,
+    /// and the time it has spent (`None`: it has planned nothing yet):
+    /// the `planningTimeMicros` of its `Slow query` line (RM-023).
+    static PLANNING: std::cell::Cell<(bool, Option<std::time::Duration>)> =
+        const { std::cell::Cell::new((false, None)) };
+    /// How deep in the planner the thread is: a plan made inside another
+    /// is part of the outer one's time.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Times one call into the planner, when the outermost.
+struct Timing(Option<std::time::Instant>);
+
+fn timing() -> Timing {
+    let depth = DEPTH.with(|d| d.replace(d.get() + 1));
+    let armed = PLANNING.with(|p| p.get().0);
+    Timing((depth == 0 && armed).then(std::time::Instant::now))
+}
+
+impl Drop for Timing {
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if let Some(began) = self.0 {
+            PLANNING.with(|p| {
+                let (armed, spent) = p.get();
+                p.set((armed, Some(spent.unwrap_or_default() + began.elapsed())));
+            });
+        }
+    }
+}
+
+/// Times the operation's planning until it drops ([`PlanningScope::micros`]).
+pub(crate) struct PlanningScope((bool, Option<std::time::Duration>));
+
+/// Start timing the planning of the operation running on this thread.
+pub(crate) fn planning_scope() -> PlanningScope {
+    PlanningScope(PLANNING.with(|p| p.replace((true, None))))
+}
+
+impl PlanningScope {
+    /// The planning time so far, in microseconds; `None` when nothing was
+    /// planned.
+    pub(crate) fn micros(&self) -> Option<i64> {
+        planning_spent().map(|d| d.as_micros() as i64)
+    }
+}
+
+impl Drop for PlanningScope {
+    fn drop(&mut self) {
+        PLANNING.with(|p| p.set(self.0));
+    }
+}
+
+/// The planning time spent so far by the operation running on this thread.
+pub(crate) fn planning_spent() -> Option<std::time::Duration> {
+    PLANNING.with(|p| p.get().1)
+}
+
 /// The index a query asked for.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Hint {
@@ -1554,6 +1613,7 @@ fn unfetched(node: Node) -> Node {
 
 /// The plan for `count`.
 pub(crate) fn count(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
+    let _timing = timing();
     if q.canonical.is_empty() && q.hint == Hint::None {
         return Node::FastCount;
     }
@@ -1593,6 +1653,7 @@ pub(crate) fn count(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
 ///   back as values: its DISTINCT_SCAN fetches the first document of each
 ///   key, and nothing is projected.
 pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str, asked: bool) -> Node {
+    let _timing = timing();
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }
@@ -1687,6 +1748,7 @@ pub(crate) fn write(
     upsert: bool,
     returns: bool,
 ) -> Node {
+    let _timing = timing();
     if let (Hint::None, Some(("_id", value))) = (&q.hint, point_lookup(q.canonical)) {
         let id_index = catalog.iter().find(|ix| ix.name == "_id_");
         match id_index {
@@ -1750,6 +1812,7 @@ pub(crate) fn write(
 
 /// The plan for a `find`-shaped query over a collection that exists.
 pub(crate) fn plan(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
+    let _timing = timing();
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }

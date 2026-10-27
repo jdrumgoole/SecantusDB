@@ -1098,7 +1098,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         _ => None,
     };
     // Each statement that runs is profiled on its own.
-    let mut statements = crate::profiler::Statements::start();
+    let mut statements = crate::profiler::Statements::start(Some(storage), doc);
     for (index, spec) in deletes.iter().copied().enumerate() {
         statements.close(n, 0, 0, &write_errors);
         let Bson::Document(spec) = spec else { continue };
@@ -1920,7 +1920,7 @@ pub(crate) fn update_in(
     };
 
     // Each statement that runs is profiled on its own.
-    let mut statements = crate::profiler::Statements::start();
+    let mut statements = crate::profiler::Statements::start(Some(storage), doc);
     for (index, spec) in updates.iter().enumerate() {
         statements.close(n, n_modified, upserted.len(), &write_errors);
         let Bson::Document(spec) = spec else { continue };
