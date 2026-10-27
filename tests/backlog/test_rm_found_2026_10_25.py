@@ -133,7 +133,7 @@ def _unstreamed_distinct_groups(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-309")
+@pytest.mark.backlog_fixed("RM-309")
 def test_a_distinct_scan_group_this_server_does_not_stream_keeps_the_scans_order(
     rust_mongo: Any, mongod: Any
 ) -> None:
@@ -464,7 +464,7 @@ def test_a_cursor_through_a_view_or_under_a_collation_reads_on(
     assert got == want
 
 
-@pytest.mark.backlog("RM-080")
+@pytest.mark.backlog_fixed("RM-080")
 def test_a_cursor_over_a_collated_index_of_strings_reads_on(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 reads a collated index's strings batch by batch, as any
     index; this store's collated keys are not in mongod's order, and the

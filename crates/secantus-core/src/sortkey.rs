@@ -58,6 +58,18 @@ const NUM_POS_INF: u8 = 0xFF;
 /// `secantus.sortkey.COMPOUND_SEP`.
 pub const COMPOUND_SEP: &[u8] = b"\x00\x00";
 
+/// The byte after [`RANK_MINKEY`] that makes `undefined`'s key: the value
+/// mongod keys an empty array by, between MinKey and null (entry format 6).
+/// A MinKey key is the rank alone, so no MinKey key starts with this one.
+pub const UNDEFINED_TAIL: u8 = 0x80;
+
+/// What ends a DESCENDING field's key (entry format 6): the field's
+/// ascending key inverted, then these two bytes. Inverting alone does not
+/// reverse a prefix (inverted, `"a"` still sorts before `"ab"`); with the
+/// terminator no descending key starts another, because an ascending key
+/// never holds `00 00` where another value's key could end.
+pub const DESC_END: &[u8] = b"\xff\xff";
+
 /// Error type for values the encoder doesn't handle (Python's `encode_value`
 /// doesn't handle them either — Symbol/Code/etc. route to its document branch
 /// and raise). The Python shim treats this as "fall back to the pure-Python
@@ -375,21 +387,67 @@ fn encode_array(a: &[Bson], coll: Option<&Collation>) -> Result<Vec<u8>, Unsuppo
     Ok(out)
 }
 
-/// The `_id` key: [`encode_value`] with formats 1-3's document / array encoding,
-/// frozen.
+/// The format of the `_id` keys a store holds (its oplog-meta row `idKeys`;
+/// none recorded is 1). An `_id` key is stored in every document row and keys
+/// the `_id` index, so a store is re-keyed when it opens with an older one.
 ///
-/// An `_id` key is not an index entry. It is stored in every document row and
-/// keys the `_id` index, so changing it would strand every stored document whose
-/// `_id` is a document -- its lookups would compute a key no row carries,
-/// silently. Entry format 4 changed how documents and arrays ORDER in secondary
-/// indexes; an `_id` key only needs to be the same bytes for the same value,
-/// which the old encoding already is. Mirrors `sortkey.encode_id_key`.
-///
-/// Entry format 5 moved BinData, JavaScript-with-scope and MaxKey in secondary
-/// index keys; an `_id` key keeps format 4's bytes for them
-/// (`order::BinDataOrder::Format4`), or every stored document whose `_id` is a
-/// UUID would be stranded.
+/// * 1 -- [`encode_value`] with formats 1-3's document / array encoding (the
+///   raw BSON, whose leading length made byte order SIZE order) and entry
+///   format 4's BinData (no subtype), JavaScript-with-scope (JavaScript's
+///   rank, code only) and MaxKey (rank 14) keys. The `_id` index was not in
+///   mongod's order for those types.
+/// * 2 -- [`encode_value`] in mongod's order for every type (RM-080,
+///   2026-10-27): a cursor walking the `_id` index returns what mongod's
+///   walk returns.
+pub const ID_KEY_FORMAT: i32 = 2;
+
+thread_local! {
+    static ID_FORMAT_1: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` with this thread's `_id` keys written in `_id` key format 1, as a
+/// build before 2026-10-27 wrote them. For tests that build a store as an
+/// earlier version left it, to check it is brought up to date; nothing else
+/// may call it.
+#[doc(hidden)]
+pub fn with_id_key_format_1<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ID_FORMAT_1.with(|c| c.set(self.0));
+        }
+    }
+    let _r = Restore(ID_FORMAT_1.with(|c| c.replace(true)));
+    f()
+}
+
+/// Whether `key`, a stored `_id` key, may be one `_id` key format 1 wrote
+/// differently from format 2: a document, BinData, JavaScript (with a scope,
+/// format 1's) or MaxKey (format 1's rank 14).
+pub fn may_be_format1_id_key(key: &[u8]) -> bool {
+    matches!(
+        key.first(),
+        Some(&RANK_DOCUMENT | &RANK_ARRAY | &RANK_BINDATA | &RANK_JAVASCRIPT | &RANK_JAVASCRIPT_SCOPE)
+    )
+}
+
+/// The `_id` key (`_id` key format 2): [`encode_value`] in mongod's order,
+/// BinData by length, subtype and bytes whichever server writes. `undefined`
+/// is refused, as it always was.
 pub fn encode_id_key(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
+    if ID_FORMAT_1.with(|c| c.get()) {
+        return encode_id_key_format_1(v);
+    }
+    if matches!(v, Bson::Undefined) {
+        return Err(UnsupportedValue("undefined".into()));
+    }
+    crate::order::with_bindata_order(crate::order::BinDataOrder::Mongod, || encode_value(v, None))
+}
+
+/// The `_id` key `_id` key format 1 wrote: [`encode_value`] with formats
+/// 1-3's document / array encoding and entry format 4's BinData,
+/// JavaScript-with-scope and MaxKey keys (`order::BinDataOrder::Format4`).
+pub fn encode_id_key_format_1(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
     crate::order::with_bindata_order(crate::order::BinDataOrder::Format4, || {
         encode_id_key_inner(v)
     })
@@ -409,6 +467,9 @@ fn encode_id_key_inner(v: &Bson) -> Result<Vec<u8>, UnsupportedValue> {
             out.extend(legacy_array_bytes(a)?);
             Ok(out)
         }
+        // `undefined` has an index key since entry format 6; an `_id` key
+        // keeps refusing it, as it did before.
+        Bson::Undefined => Err(UnsupportedValue("undefined".into())),
         other => encode_value(other, None),
     }
 }
@@ -453,6 +514,9 @@ pub fn encode_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, Unsup
     }
     match v {
         Bson::MinKey => out.push(RANK_MINKEY),
+        // mongod's key for an empty array (and for `undefined` itself), which
+        // it orders after MinKey and before null (entry format 6).
+        Bson::Undefined => out.extend_from_slice(&[RANK_MINKEY, UNDEFINED_TAIL]),
         Bson::Null => out.push(RANK_NULL),
         Bson::MaxKey => out.push(
             if crate::order::bindata_order() == crate::order::BinDataOrder::Format4 {
@@ -620,13 +684,65 @@ pub fn encode_sort_value(v: &Bson, coll: Option<&Collation>) -> Result<Vec<u8>, 
     }
 }
 
+/// The key an index field of `direction` holds for `v`: [`encode_value`]
+/// for an ascending field; for a descending one, those bytes inverted and
+/// then [`DESC_END`] (entry format 6), so that the stored order of a
+/// descending field is exactly the reverse of the ascending order, prefixes
+/// included -- mongod's order, which a cursor walking the index returns.
 pub fn encode_value_directed(
     v: &Bson,
     direction: i32,
     coll: Option<&Collation>,
 ) -> Result<Vec<u8>, UnsupportedValue> {
     let e = encode_value(v, coll)?;
-    Ok(if direction == -1 { invert_bytes(&e) } else { e })
+    Ok(if direction == -1 {
+        let mut out = invert_bytes(&e);
+        out.extend_from_slice(DESC_END);
+        out
+    } else {
+        e
+    })
+}
+
+/// The ascending key behind one field's stored key `part` (a slice
+/// [`split_directed`] gave): the bytes themselves for an ascending field,
+/// the inversion without [`DESC_END`] for a descending one.
+pub fn ascending_part(part: &[u8], direction: i32) -> Vec<u8> {
+    if direction == -1 {
+        invert_bytes(part.strip_suffix(DESC_END).unwrap_or(part))
+    } else {
+        part.to_vec()
+    }
+}
+
+/// The length of the one stored key of a field of `direction` at the start
+/// of `key`, its terminator included for a descending field.
+fn directed_len(key: &[u8], direction: i32) -> Option<usize> {
+    if direction != -1 {
+        return value_len(key);
+    }
+    // The inversion of the ascending key is self-delimiting the same way;
+    // read it through an inverted copy of the rest.
+    let ascending = invert_bytes(key);
+    let n = value_len(&ascending)?;
+    (key.get(n..n + 2)? == DESC_END).then_some(n + 2)
+}
+
+/// A compound key's stored per-field keys, one per entry of `directions`,
+/// as [`encode_value_directed`] wrote them and joined by [`COMPOUND_SEP`].
+/// `None` when `key` is not that.
+pub fn split_directed<'a>(key: &'a [u8], directions: &[i32]) -> Option<Vec<&'a [u8]>> {
+    let mut out = Vec::with_capacity(directions.len());
+    let mut rest = key;
+    for (i, &dir) in directions.iter().enumerate() {
+        let n = directed_len(rest, dir)?;
+        out.push(&rest[..n]);
+        rest = &rest[n..];
+        if i + 1 < directions.len() {
+            rest = rest.strip_prefix(COMPOUND_SEP)?;
+        }
+    }
+    rest.is_empty().then_some(out)
 }
 
 /// The length of the one encoded value at the start of `key`, an
@@ -643,6 +759,7 @@ pub fn value_len(key: &[u8]) -> Option<usize> {
     let len = match rank {
         // Index entries are entry format 5, where 14 is JavaScript with a
         // scope (format 4's MaxKey, kept only by `_id` keys).
+        RANK_MINKEY if body.first() == Some(&UNDEFINED_TAIL) => 1,
         RANK_MINKEY | RANK_NULL | RANK_MAXKEY => 0,
         RANK_NUMBER => number_len(body)?,
         RANK_STRING | RANK_JAVASCRIPT => escaped_len(body),
@@ -979,18 +1096,36 @@ mod tests {
         assert_eq!(ev(bson!({"a": 1})), ev(bson!({"a": 1.0})));
     }
 
-    /// An `_id` key keeps formats 1-3's document encoding: it is stored in
-    /// every document row.
+    /// `_id` key format 1 kept formats 1-3's document encoding; format 2
+    /// keys every `_id` in mongod's order, BinData with its subtype whichever
+    /// server's thread writes it.
     #[test]
-    fn the_id_key_keeps_the_old_document_encoding() {
+    fn id_keys_follow_mongods_order() {
         use bson::doc;
         let d = doc! {"b": 2, "a": [1, "x"]};
         let mut raw = Vec::new();
         d.to_writer(&mut raw).unwrap();
-        let mut want = vec![RANK_DOCUMENT];
-        want.extend(escape(&raw));
-        assert_eq!(encode_id_key(&Bson::Document(d)).unwrap(), want);
+        let mut old = vec![RANK_DOCUMENT];
+        old.extend(escape(&raw));
+        assert_eq!(encode_id_key_format_1(&Bson::Document(d.clone())).unwrap(), old);
+        assert_eq!(with_id_key_format_1(|| encode_id_key(&Bson::Document(d.clone()))).unwrap(), old);
+        assert_eq!(encode_id_key(&Bson::Document(d.clone())).unwrap(), ev(Bson::Document(d)));
         assert_eq!(encode_id_key(&Bson::Int32(5)).unwrap(), ev(Bson::Int32(5)));
+        // A longer document is not a larger one.
+        let small = encode_id_key(&bson::bson!({"a": 2, "b": [3]})).unwrap();
+        let large = encode_id_key(&bson::bson!({"a": 5})).unwrap();
+        assert!(small < large);
+        let bin = Bson::Binary(bson::Binary {
+            subtype: bson::spec::BinarySubtype::Uuid,
+            bytes: vec![1; 16],
+        });
+        let mongod = encode_id_key(&bin).unwrap();
+        let pg = crate::order::with_bindata_order(crate::order::BinDataOrder::Bytes, || {
+            encode_id_key(&bin).unwrap()
+        });
+        assert_eq!(mongod, pg);
+        assert!(may_be_format1_id_key(&encode_id_key_format_1(&bin).unwrap()));
+        assert!(!may_be_format1_id_key(&ev(Bson::Int32(5))));
     }
 
     #[test]
@@ -1035,6 +1170,95 @@ mod tests {
     fn directed_inverts_for_descending() {
         let asc = ev(Bson::Int32(5));
         let desc = encode_value_directed(&Bson::Int32(5), -1, None).unwrap();
-        assert_eq!(desc, invert_bytes(&asc));
+        let mut want = invert_bytes(&asc);
+        want.extend_from_slice(DESC_END);
+        assert_eq!(desc, want);
+        assert_eq!(ascending_part(&desc, -1), asc);
+    }
+
+    /// Entry format 6: a descending field's keys are in exactly the reverse
+    /// of the ascending order, a string before its own prefixes (mongod
+    /// 8.2.11 returns `["c", "ba", "b", "abc", "ab", "a", ""]` walking
+    /// `{s: -1}`), alone and as a compound key's leading field.
+    #[test]
+    fn descending_keys_reverse_prefixes() {
+        let values: Vec<Bson> = vec![
+            Bson::MinKey,
+            Bson::Undefined,
+            Bson::Null,
+            Bson::Int32(-99),
+            Bson::Int32(0),
+            Bson::Double(1.5),
+            Bson::String(String::new()),
+            Bson::String("\0".into()),
+            Bson::String("\0\0".into()),
+            Bson::String("a".into()),
+            Bson::String("a\0".into()),
+            Bson::String("ab".into()),
+            Bson::String("abc".into()),
+            Bson::String("b".into()),
+            Bson::JavaScriptCode("f".into()),
+            Bson::JavaScriptCode("fg".into()),
+            Bson::MaxKey,
+        ];
+        for w in values.windows(2) {
+            assert!(ev(w[0].clone()) < ev(w[1].clone()), "{:?} {:?}", w[0], w[1]);
+            let d = |v: &Bson| encode_value_directed(v, -1, None).unwrap();
+            assert!(d(&w[0]) > d(&w[1]), "descending {:?} {:?}", w[0], w[1]);
+            // Followed by another field, as in a compound index.
+            let mut a = d(&w[0]);
+            a.extend_from_slice(COMPOUND_SEP);
+            a.extend(ev(Bson::Int32(0)));
+            let mut b = d(&w[1]);
+            b.extend_from_slice(COMPOUND_SEP);
+            b.extend(ev(Bson::MaxKey));
+            assert!(a > b, "compound {:?} {:?}", w[0], w[1]);
+        }
+    }
+
+    /// A compound key of mixed directions splits back into its stored
+    /// per-field keys, and each into the ascending key it came from.
+    #[test]
+    fn directed_keys_split_into_their_values() {
+        use bson::doc;
+        let values = vec![
+            Bson::MinKey,
+            Bson::Undefined,
+            Bson::Null,
+            Bson::Int64(-99_9999),
+            Bson::Double(0.5),
+            Bson::String("a\0b".into()),
+            Bson::String(String::new()),
+            Bson::Document(doc! {"a": [1, "x\0"]}),
+            Bson::Array(vec![]),
+            Bson::Boolean(true),
+            Bson::MaxKey,
+        ];
+        for a in &values {
+            for b in &values {
+                for dirs in [[1, -1], [-1, 1], [-1, -1], [1, 1]] {
+                    let pa = encode_value_directed(a, dirs[0], None).unwrap();
+                    let pb = encode_value_directed(b, dirs[1], None).unwrap();
+                    let mut key = pa.clone();
+                    key.extend_from_slice(COMPOUND_SEP);
+                    key.extend_from_slice(&pb);
+                    let parts = split_directed(&key, &dirs).expect("splits");
+                    assert_eq!(parts, vec![&pa[..], &pb[..]], "{a:?} {b:?} {dirs:?}");
+                    assert_eq!(ascending_part(parts[0], dirs[0]), ev(a.clone()));
+                    assert_eq!(ascending_part(parts[1], dirs[1]), ev(b.clone()));
+                }
+            }
+        }
+    }
+
+    /// mongod keys an empty array by `undefined`, after MinKey and before
+    /// null; the key is not a MinKey key's extension of anything else.
+    #[test]
+    fn undefined_keys_between_minkey_and_null() {
+        let u = ev(Bson::Undefined);
+        assert!(ev(Bson::MinKey) < u);
+        assert!(u < ev(Bson::Null));
+        assert_eq!(value_len(&u), Some(2));
+        assert!(encode_id_key(&Bson::Undefined).is_err());
     }
 }

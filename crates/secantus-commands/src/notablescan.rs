@@ -270,8 +270,13 @@ impl Drop for Aggregate {
 
 /// Mark the aggregate on `ns` as running under `notablescan` (or not).
 pub(crate) fn aggregate(ctx: &CommandContext, ns: &str) -> Aggregate {
-    let now = enabled(ctx).then(|| ns.to_string());
-    Aggregate(AGGREGATE.with(|a| std::mem::replace(&mut *a.borrow_mut(), now)))
+    aggregate_on(enabled(ctx).then(|| ns.to_string()))
+}
+
+/// [`aggregate`] for a cursor that ran under `notablescan` when it opened
+/// (`Some(ns)`), as each of its `getMore`s runs its stages.
+pub(crate) fn aggregate_on(ns: Option<String>) -> Aggregate {
+    Aggregate(AGGREGATE.with(|a| std::mem::replace(&mut *a.borrow_mut(), ns)))
 }
 
 /// A stage's read of `db.<read.coll>` inside an aggregate: refused when the

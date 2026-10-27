@@ -1239,7 +1239,7 @@ def test_backward_index_scan_get_more_sees_writes_made_since_the_find(
     assert got == want
 
 
-@pytest.mark.backlog("RM-080")
+@pytest.mark.backlog_fixed("RM-080")
 def test_descending_index_get_more_sees_writes_made_since_the_find(
     rust_mongo: Any, mongod: Any
 ) -> None:

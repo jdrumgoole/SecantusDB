@@ -149,8 +149,8 @@ impl Bounds {
     }
 
     /// Replace every key end of `ranks` -- points included -- by the edges
-    /// of its rank. For the `_id` index, whose documents are keyed by their
-    /// raw BSON rather than by value (`sortkey::encode_id_key`).
+    /// of its rank. For the `_id` index, where a document `_id` re-keyed from
+    /// `_id` key format 1 may keep its raw-BSON key (`Storage::upgrade_id_keys`).
     pub fn widen_ranks(&mut self, ranks: &[u8]) {
         for s in &mut self.stretches {
             if let Some(End::Key(k)) = &s.lo {
@@ -644,9 +644,13 @@ pub(crate) fn to_spans(bounds: &Bounds, dir: i32, escape: fn(&[u8]) -> Vec<u8>) 
             vec![r]
         }
     };
+    // A descending field stores the inverted key and its terminator
+    // (`sortkey::encode_value_directed`, entry format 6).
     let key_bytes = |k: &[u8]| -> Vec<u8> {
         if dir == -1 {
-            escape(&k.iter().map(|b| b ^ 0xFF).collect::<Vec<u8>>())
+            let mut inverted: Vec<u8> = k.iter().map(|b| b ^ 0xFF).collect();
+            inverted.extend_from_slice(secantus_core::sortkey::DESC_END);
+            escape(&inverted)
         } else {
             escape(k)
         }
@@ -805,12 +809,9 @@ mod tests {
         let b = bounds(Bson::Document(doc! {"$in": [1, 3]}));
         let spans = to_spans(&b, -1, plain);
         assert_eq!(spans.len(), 2);
-        // The inverted key of 3 comes first.
-        let three: Vec<u8> = encode_value(&Bson::Int32(3), None)
-            .unwrap()
-            .iter()
-            .map(|x| x ^ 0xFF)
-            .collect();
+        // The stored key of 3 (inverted, terminated) comes first.
+        let three = secantus_core::sortkey::encode_value_directed(&Bson::Int32(3), -1, None)
+            .unwrap();
         assert_eq!(spans[0].lo, Some(three));
     }
 }
