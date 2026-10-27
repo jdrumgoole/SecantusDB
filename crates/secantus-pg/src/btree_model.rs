@@ -31,6 +31,10 @@ const MINUS_INFINITY: i64 = 8;
 /// `BTMaxItemSize / 2`: the largest posting list tuple deduplication
 /// makes (`BTDedupState.maxpostingsize`).
 const MAX_POSTING: i64 = 1352;
+/// CREATE INDEX's limit on a posting list tuple (`_bt_load`): a tenth of a
+/// page, MAXALIGNed down, less its line pointer -- the space a leaf filled
+/// to fillfactor 90 leaves (RP-290).
+const BUILD_MAX_POSTING: i64 = (PAGE as i64 * 10 / 100) / 8 * 8 - LP;
 /// `BTREE_NONLEAF_FILLFACTOR`.
 const NONLEAF_FILLFACTOR: i64 = 70;
 /// `BTREE_SINGLEVAL_FILLFACTOR`.
@@ -1000,8 +1004,8 @@ impl BTree {
             return tree;
         }
         let dedup = shape.dedup() && !shape.unique();
-        // Merge equal keys into posting lists of at most MAX_POSTING bytes
-        // (`_bt_sort_dedup_finish_pending`).
+        // Merge equal keys into posting lists of at most BUILD_MAX_POSTING
+        // bytes (`_bt_sort_dedup_finish_pending`).
         let mut items: Vec<Item> = Vec::new();
         for (key, tid) in entries {
             if dedup {
@@ -1009,7 +1013,7 @@ impl BTree {
                     if keep_natts(shape, &last.key, &key) > shape.nkeyatts() {
                         let base = shape.tuple_size(&last.key);
                         let merged = maxalign(base + TID * (last.tids.len() as i64 + 1));
-                        if merged <= MAX_POSTING {
+                        if merged <= BUILD_MAX_POSTING {
                             last.tids.push(tid);
                             continue;
                         }
@@ -1687,7 +1691,20 @@ impl Builder<'_> {
         let lvl = &self.levels[0];
         // `_bt_blnewpage` reserves the high key's line pointer.
         let free = USABLE - LP - lvl.leaf_items.iter().map(|i| i.size + LP).sum::<i64>() - LP;
-        if free < it.size || (free < self.leaf_full && lvl.leaf_items.len() >= 2) {
+        // `_bt_buildadd`: room for the item and for a heap TID suffix
+        // truncation may add to the high key; and the soft fillfactor
+        // limit counts the posting list the last item's high key would
+        // shed (`btps_lastextra`, RP-290).
+        let last_extra = lvl.leaf_items.last().map_or(0, |l| {
+            if l.tids.len() > 1 {
+                l.size - shape.tuple_size(&l.key)
+            } else {
+                0
+            }
+        });
+        if free < it.size + PIVOT_TID
+            || (free + last_extra < self.leaf_full && lvl.leaf_items.len() >= 2)
+        {
             // Finish the page: its last item starts the next one, and the
             // high key between them closes it.
             let lvl = &mut self.levels[0];
