@@ -1978,7 +1978,11 @@ pub(crate) fn write_selection(
     let (keys_examined, docs_examined) = (batch.keys_examined, batch.docs_examined);
     let first = batch.docs.into_iter().next();
     let mut rids = batch.rids;
-    if !rids.is_empty() && !batch.exhausted {
+    if !rids.is_empty() && store_order_is_the_plans(storage, ask)? {
+        // The store, left to pick, takes the same document (RM-056): the
+        // write reads as it did, and no candidates are read for it.
+        rids.clear();
+    } else if !rids.is_empty() && !batch.exhausted {
         // Should the first no longer match when the write runs, the write
         // takes the next: read, and not counted, as the store's own read
         // of its candidates was.
@@ -2018,12 +2022,10 @@ pub(crate) fn find_counted(
     let Some(plan) = stream_plan(storage, ask, 0, ask.limit, projection, false, flags)? else {
         return Ok(None);
     };
+    // No budget here: the pipeline's leading `$sort` holds the sort to its
+    // budget and counts its spills, once (a second count doubled them).
     let opts = super::stream::Options {
         collation: ask.collation,
-        sort_budget: Some((
-            secantus_core::memlimit::budgets(),
-            secantus_core::memlimit::disk_allowed(),
-        )),
         ..Default::default()
     };
     let Some(mut stream) =

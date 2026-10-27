@@ -130,6 +130,11 @@ def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list
         theirs = {k: v for k, v in theirs.items() if k not in ("numYields", "numYield")}
     if _wrote(theirs):
         leave_out |= {"locks", "flowControl"}
+    # The journal wait is printed once it reaches a millisecond, so whether
+    # it is there follows each machine's sync time (macOS mongod 8.2.11:
+    # 4-8 ms, on every write; Linux 8.2.12: on none). Its presence is not
+    # compared; its value is checked below as any time is.
+    leave_out |= {"waitForWriteConcernDurationMillis", "waitForWriteConcernDuration"}
     a, b = keys(ours, frozenset(leave_out)), keys(theirs, frozenset(leave_out))
     if a != b:
         problems.append(f"{label}: fields\n    ours:   {a}\n    mongod: {b}")

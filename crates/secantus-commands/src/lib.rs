@@ -899,8 +899,12 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
             } else if opdebug::wrote_something(name, &reply) {
                 // The wait for the write concern: on a member of one, for
                 // the journal to hold the write (mongod's
-                // `waitForWriteConcernDurationMillis`, RM-023).
-                ctx.write_concern_wait = Some(waited.elapsed().as_millis() as i64);
+                // `waitForWriteConcernDurationMillis`, RM-023). A wait under
+                // a millisecond is not printed: macOS mongod 8.2.11, whose
+                // journal sync takes 4-8 ms, prints it on every write, and
+                // Linux mongod 8.2.12, whose sync is quicker, on none.
+                let ms = waited.elapsed().as_millis() as i64;
+                ctx.write_concern_wait = (ms > 0).then_some(ms);
             }
         }
     }

@@ -885,6 +885,8 @@ struct Ran {
     /// The plan cache key's hashes, where mongod keys the statement's query.
     hashes: Option<(String, String)>,
     read_concern: Option<Document>,
+    /// The thread's CPU time over the statement, where it can be read.
+    cpu_nanos: Option<i64>,
     storage: Option<Document>,
     remote: Option<String>,
 }
@@ -937,6 +939,9 @@ impl Statement {
         attr.insert("locks", self.ran.locks.clone());
         if let Some(rc) = &self.ran.read_concern {
             attr.insert("readConcern", rc.clone());
+        }
+        if let Some(n) = self.ran.cpu_nanos {
+            attr.insert("cpuNanos", n);
         }
         if let Some(storage) = &self.ran.storage {
             attr.insert("storage", storage.clone());
@@ -1013,6 +1018,9 @@ impl Statement {
         if let Some(rc) = &self.ran.read_concern {
             entry.insert("readConcern", rc.clone());
         }
+        if let Some(n) = self.ran.cpu_nanos {
+            entry.insert("cpuNanos", n);
+        }
         if let Some(storage) = &self.ran.storage {
             entry.insert("storage", storage.clone());
         }
@@ -1052,6 +1060,8 @@ struct Open {
     /// when the statement started: its own are what it adds.
     planning: Option<std::time::Duration>,
     counts: Option<crate::storage::OperationCounts>,
+    /// The thread's CPU clock when the statement started.
+    cpu: Option<i64>,
 }
 
 /// What the statement running on this thread's plan was and examined
@@ -1121,6 +1131,7 @@ impl<'a> Statements<'a> {
                 errors,
                 planning: self.planning_mark,
                 counts,
+                cpu: crate::opdebug::thread_cpu_nanos(),
             });
         }
     }
@@ -1141,6 +1152,7 @@ impl<'a> Statements<'a> {
                 errors,
                 planning: self.planning_mark,
                 counts,
+                cpu: crate::opdebug::thread_cpu_nanos(),
             });
         }
     }
@@ -1186,6 +1198,12 @@ impl<'a> Statements<'a> {
             locks,
             took_global: crate::lock_manager::took_global(),
             read_concern: crate::slowop::replicated().then(|| self.read_concern.clone()),
+            // A statement's CPU time, as its command's: where mongod reads
+            // a thread's CPU clock, Linux (measured 8.2.12).
+            cpu_nanos: open
+                .cpu
+                .zip(crate::opdebug::thread_cpu_nanos())
+                .map(|(a, b)| b - a),
             storage: now.as_ref().and_then(crate::opdebug::storage_section),
             remote: crate::slowop::remote(),
         }
@@ -1218,6 +1236,14 @@ impl<'a> Statements<'a> {
             }
         };
         let worked = open.start.elapsed();
+        // What a statement that is neither logged nor profiled ran is not
+        // worked out: its plan's hashes alone are a second planning.
+        let logged = crate::slowop::will_log(worked);
+        if !logged && !self.profiled {
+            STATEMENT_EXEC.with(|s| *s.borrow_mut() = None);
+            self.planning_mark = crate::explain::planning_spent();
+            return;
+        }
         let mut ran = self.ran(&open);
         // mongod prints the keys an update inserted and deleted when it
         // matched a document, the keys an upsert inserted, and the keys a
@@ -1249,7 +1275,9 @@ impl<'a> Statements<'a> {
             millis: worked.as_millis() as i64,
             ran,
         };
-        crate::slowop::statement("WRITE", statement.log_attributes(), worked);
+        if logged {
+            crate::slowop::statement_line("WRITE", statement.log_attributes(), worked);
+        }
         if self.profiled {
             STATEMENTS.with(|s| {
                 if let Some(list) = s.borrow_mut().as_mut() {

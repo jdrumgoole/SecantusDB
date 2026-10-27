@@ -84,10 +84,30 @@ WiredTiger 11 (RM-364).
 
 #### Cost
 
+This is not free, and the latency is measurable. An A/B of release builds
+(this branch against its `origin/main` base, both servers up at once and
+alternated round by round, 12 rounds of 1,000 operations, medians, an
+M-series Mac at load average 2-6, 2026-10-27):
+
+| operation | base | this | change | of which the counting of statistics and keys |
+| --- | --- | --- | --- | --- |
+| `find_one({_id})` | 111-122 us | 134-147 us | +20% | +14% |
+| `find` of an index range | 178-196 us | 200-220 us | +12% | +10% |
+| `count` through an index | 118-128 us | 151-165 us | +28% | +9% |
+| `update_one` by an indexed field, `w: 1` | 149-167 us | 229-257 us | +54% | +14% |
+
+The last column is measured by switching the operation's statistics and
+key counts off in the same build. The rest of a `count`'s and a write's
+cost is that their read now runs mongod's plan through the streaming
+executor, which counts what it examines, where it used to be the store's
+own count or read. The cost is per operation, whatever the threshold: whether
+an operation is slow is known only at its end, and a session closed before
+then must be read when it closes. A statement neither logged nor profiled
+does not work out its plan's hashes, and an update or delete of one
+document whose plan reads in the store's order reads no extra candidates.
+
 - Reading a session's statistics when it closes costs about 1.5 us
-  (measured on an M-series Mac, release build: a session's open, cursor,
-  search and close took 2.3 us, 3.8 us with the read). The MongoDB server
-  reads them for every operation, since whether an operation is slow is
-  known only at its end; the PostgreSQL server, which links the same
-  storage, never counts an operation and pays one thread-local check per
-  session close.
+  (release build: a session's open, cursor, search and close took 2.3 us,
+  3.8 us with the read).
+- The PostgreSQL server, which links the same storage, never counts an
+  operation and pays one thread-local check per session close.

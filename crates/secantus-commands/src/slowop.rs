@@ -128,15 +128,30 @@ pub const SLOW_QUERY_ID: i32 = 51803;
 /// is slow: a `Slow query` line under `component`, and the global IS mongod
 /// takes for it (`lock_manager::log_lock`). `attr` is the line's attributes
 /// before its durations. An index build's line is its build thread's.
-pub(crate) fn statement(component: &'static str, mut attr: Document, worked: Duration) {
+pub(crate) fn statement(component: &'static str, attr: Document, worked: Duration) {
+    if will_log(worked) {
+        statement_line(component, attr, worked);
+    }
+}
+
+/// Whether a statement of the running command that ran for `worked` is
+/// logged, decided once (it samples): a caller that knows can skip working
+/// out what the line would say.
+pub(crate) fn will_log(worked: Duration) -> bool {
+    SINK.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|sink| sink.settings.should_log(worked, rand::random::<f64>()))
+    })
+}
+
+/// Log a statement [`will_log`] said is logged.
+pub(crate) fn statement_line(component: &'static str, mut attr: Document, worked: Duration) {
     SINK.with(|s| {
         let sink = s.borrow();
         let Some(sink) = sink.as_ref() else {
             return;
         };
-        if !sink.settings.should_log(worked, rand::random::<f64>()) {
-            return;
-        }
         if let Some(lm) = &sink.locks {
             crate::lock_manager::log_lock(lm);
         }
