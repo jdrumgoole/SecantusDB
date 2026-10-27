@@ -351,6 +351,8 @@ def _ended_by(client: Any, how: str) -> dict:
             and not str(o.get("desc", "")).startswith("IndexBuilds")
         )
         reply = _answer(lambda: client.admin.command("killOp", op=opid))
+    elif how == "killAllSessions":
+        reply = _answer(lambda: client.admin.command("killAllSessions", []))
     else:
         raise AssertionError(how)
     result = build.finish()
@@ -380,6 +382,7 @@ def _ended_by(client: Any, how: str) -> dict:
         "dropDatabase",
         "killOp build",
         "killOp command",
+        "killAllSessions",
     ],
 )
 def test_what_ends_a_build(rust_fp: Any, mongod_fp: Any, how: str) -> None:
