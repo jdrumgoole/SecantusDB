@@ -2699,27 +2699,19 @@ fn default_opclass(typ: i64, am: i64) -> i64 {
 /// Whether a statement's first word makes it one whose catalog changes this
 /// model sends invalidations for: it is parsed every time, not remembered.
 fn changes_catalogs(sql: &str) -> bool {
+    // Compared in place, without lower-casing a copy: every statement asks
+    // twice (RP-014).
     let first = sql
         .trim_start()
         .split(|c: char| !c.is_ascii_alphabetic())
         .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    matches!(
-        first.as_str(),
-        "create"
-            | "alter"
-            | "drop"
-            | "vacuum"
-            | "analyze"
-            | "analyse"
-            | "comment"
-            | "grant"
-            | "revoke"
-            | "truncate"
-            | "reindex"
-            | "cluster"
-    )
+        .unwrap_or_default();
+    [
+        "create", "alter", "drop", "vacuum", "analyze", "analyse", "comment", "grant",
+        "revoke", "truncate", "reindex", "cluster",
+    ]
+    .iter()
+    .any(|word| first.eq_ignore_ascii_case(word))
 }
 
 impl PgHandler {

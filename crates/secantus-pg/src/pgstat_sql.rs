@@ -84,8 +84,13 @@ impl PgHandler {
 
     /// `track_counts`: off stops the table and index counters.
     pub(crate) fn tracking(&self) -> bool {
+        // Read in place: every write asks (RP-014).
         !matches!(
-            self.stat_setting("track_counts").as_deref(),
+            self.settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("track_counts")
+                .map(String::as_str),
             Some("off" | "false" | "0" | "no")
         )
     }
@@ -118,11 +123,22 @@ impl PgHandler {
 
     /// Rows of `table` written: inserted (no old version) or updated, `hot`
     /// of the updates heap-only.
-    pub(crate) fn stat_writes(&self, table: &str, inserted: i64, updated: i64, hot: i64) {
+    /// `rel` is the table's `relation_oid` when the caller knows it
+    /// already (`Some`), as a write's stamping does.
+    pub(crate) fn stat_writes_of(
+        &self,
+        table: &str,
+        rel: Option<Option<i64>>,
+        inserted: i64,
+        updated: i64,
+        hot: i64,
+    ) {
         if !self.tracking() || table.starts_with("__") {
             return;
         }
-        let rel = self.relation_oid(table).unwrap_or(0);
+        let rel = rel
+            .unwrap_or_else(|| self.relation_oid(table))
+            .unwrap_or(0);
         let s = self.stats();
         if inserted > 0 {
             s.inserted(rel, inserted);
@@ -143,10 +159,23 @@ impl PgHandler {
     /// Pages of `table` touched (each a read or a hit, as the pool holds
     /// it).
     pub(crate) fn stat_pages(&self, table: &str, blocks: impl IntoIterator<Item = i64>) {
+        self.stat_pages_of(table, None, blocks);
+    }
+
+    /// [`Self::stat_pages`] for a caller that knows the table's
+    /// `relation_oid` already (`Some`).
+    pub(crate) fn stat_pages_of(
+        &self,
+        table: &str,
+        rel: Option<Option<i64>>,
+        blocks: impl IntoIterator<Item = i64>,
+    ) {
         if !self.tracking() || table.starts_with("__") {
             return;
         }
-        let rel = self.relation_oid(table).unwrap_or(0);
+        let rel = rel
+            .unwrap_or_else(|| self.relation_oid(table))
+            .unwrap_or(0);
         self.stats().pages(rel, blocks, self.buffer_pages());
     }
 

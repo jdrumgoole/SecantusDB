@@ -267,6 +267,19 @@ impl PgHandler {
 
     pub(crate) fn ssi_tracking(&self) -> bool {
         let pid = self.ssi_pid();
+        // Only `ssi_begin` registers a transaction, and only after marking
+        // this session registered; `ssi_end` clears the mark as it releases
+        // it. Unmarked, this backend has no transaction to track, which is
+        // known without the cluster's SSI lock (a write asks several times
+        // per row -- RP-014). Pid 0 (no backend yet) is not unique, so it
+        // asks.
+        if pid != 0
+            && !self
+                .ssi_registered
+                .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return false;
+        }
         self.ssi(|s| s.tracking(pid))
     }
 
@@ -839,11 +852,13 @@ impl PgHandler {
         inserted: bool,
         doc: Option<&Document>,
     ) {
-        let doc = doc.map(nested);
-        let doc = doc.as_ref();
+        // Asked first: a transaction SSI does not track keeps no version,
+        // and re-nesting the row for it was most of a write's SSI cost.
         if !self.ssi_tracking() {
             return;
         }
+        let doc = doc.map(nested);
+        let doc = doc.as_ref();
         let Some(rel) = self.ssi_relation(table) else {
             return;
         };

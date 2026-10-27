@@ -621,6 +621,21 @@ impl std::ops::DerefMut for GucMap {
 /// session sees is its own (see `session_tables_owner`).
 type SessionTablesKey = (usize, u64, u64, String, String, String);
 
+/// What Bind decoded of a portal's parameters (`check_bound_portal`), and
+/// the state the decoding read: the session's settings (the zone, the
+/// client encoding, the DateStyle, the role) by their generation, and the
+/// catalog (user types and enums) by its version, with nothing of this
+/// session's uncommitted. While all of it stands, decoding the same
+/// portal's parameters again gives these values, so its Execute takes them
+/// instead of decoding twice (RP-014).
+struct BoundParams {
+    portal: Arc<Portal<ParsedStatement>>,
+    generation: u64,
+    catalog_version: u64,
+    param_types: Vec<Option<String>>,
+    params: Vec<Bson>,
+}
+
 /// A table's catalog entry as [`PgHandler::lookup_ref`] finds it: shared with
 /// the catalog cache when it came from there, owned otherwise.
 pub(crate) enum TableRef {
@@ -1112,6 +1127,12 @@ fn nest_key(d: &Document) -> Option<Document> {
     }
     out.insert("_id", Bson::Document(id));
     Some(out)
+}
+
+/// A document as storage holds it: a composite key nested (see `nest_key`).
+/// `encode_doc` writes exactly this document.
+fn stored_form(d: &Document) -> Document {
+    nest_key(d).unwrap_or_else(|| d.clone())
 }
 
 /// Encode a document for storage, nesting a composite key (see `nest_key`).
@@ -3127,6 +3148,16 @@ impl PgHandler {
         }
     }
 
+    /// [`Self::current_role_name`] for a caller holding the session user's
+    /// name already.
+    fn current_role_name_for(&self, session_user: &str) -> String {
+        let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
+        match settings.get("role") {
+            Some(role) if !role.is_empty() && !role.eq_ignore_ascii_case("none") => role.clone(),
+            _ => session_user.to_string(),
+        }
+    }
+
     /// A table's owner: the role that created it (or took it with `ALTER
     /// TABLE ... OWNER TO`); a table from before owners were recorded
     /// belongs to the session's login role.
@@ -3587,24 +3618,24 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let key = (
-            Arc::as_ptr(&self.storage) as usize,
-            self.db().to_string(),
-            slot,
-        );
+        let store = Arc::as_ptr(&self.storage) as usize;
         // This thread's copy first: several slots are read on every
         // statement, and the shared map's one lock was contended at 8
         // clients (batch 71). Only what the shared map holds as current
-        // reaches the front.
+        // reaches the front. Asked before the shared map's key is made,
+        // which copies the database's name (RP-014).
         let front = COMMITTED_FRONT.with(|f| {
             f.borrow()
                 .iter()
-                .find(|(s, d, sl, v, _)| *s == key.0 && *sl == slot && *v == version && *d == key.1)
+                .find(|(s, d, sl, v, _)| {
+                    *s == store && *sl == slot && *v == version && d == self.db()
+                })
                 .map(|e| Arc::clone(&e.4))
         });
         if let Some(value) = front.as_ref().and_then(|v| v.downcast_ref::<T>()) {
             return value.clone();
         }
+        let key = (store, self.db().to_string(), slot);
         let to_front = |value: &Arc<dyn std::any::Any + Send + Sync>| {
             COMMITTED_FRONT.with(|f| {
                 let mut f = f.borrow_mut();
@@ -3731,9 +3762,15 @@ impl PgHandler {
     /// Is `name` a superuser? The login user this server has no record of
     /// is trusted as one (the password-less bootstrap `postgres`).
     fn is_superuser(&self, name: &str) -> bool {
-        match self.role(name) {
-            Ok(Some(r)) => r.superuser,
-            _ => name == self.session_user_name(),
+        // Read in place: every statement's privilege check asks, and a copy
+        // of the role was most of the cost (RP-014).
+        let found = self
+            .roles_shared()
+            .ok()
+            .and_then(|roles| roles.iter().find(|r| r.name == name).map(|r| r.superuser));
+        match found {
+            Some(superuser) => superuser,
+            None => name == self.session_user_name(),
         }
     }
 }
@@ -4087,6 +4124,9 @@ pub struct PgHandler {
     /// This transaction has registered with SSI, or found it need not
     /// (`serializable.rs`).
     ssi_registered: AtomicBool,
+    /// The parameters Bind decoded for the portal it stored, with what the
+    /// decoding read (`BoundParams`), for its Execute to take.
+    bound_params: Mutex<Option<BoundParams>>,
     /// A unique index's insert-time SSI checks, `(index, leaf)`, held to
     /// the statement's end (`ssi_flush_unique`).
     ssi_unique_pending: Mutex<Vec<(i64, u32)>>,
@@ -4585,6 +4625,7 @@ impl PgHandler {
             sole_implicit: AtomicBool::new(false),
             rc_apart: AtomicBool::new(false),
             ssi_registered: AtomicBool::new(false),
+            bound_params: Mutex::new(None),
             ssi_unique_pending: Mutex::new(Vec::new()),
             no_snapshot_stmt: AtomicBool::new(false),
             rc_overlay: Mutex::new(None),
@@ -5057,7 +5098,12 @@ impl PgHandler {
             self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
         );
         crate::xids::set_current(&self.storage);
-        secantus_pgplan::server_encoding::set_server_encoding(&self.server_encoding_name());
+        secantus_pgplan::server_encoding::set_server_encoding(
+            &self
+                .server_encoding
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
         self.install_reload_hook();
         // Session state, so installed per statement -- the gate below is
         // per catalog version, and a SET DateStyle changes no catalog.
@@ -5112,10 +5158,15 @@ impl PgHandler {
             let start = guard.as_ref().map_or(now, |h| h.opened_at_micros());
             secantus_pgplan::scalar::set_clocks(start, now);
         }
-        secantus_pgplan::set_session_user_str(
-            &self.session_user.lock().unwrap_or_else(|e| e.into_inner()),
-        );
-        let role = self.current_role_name();
+        // Read once for all three uses below: the planner's, the effective
+        // role's fallback (`current_role_name`) and the key (RP-014).
+        let session_user = self
+            .session_user
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        secantus_pgplan::set_session_user_str(&session_user);
+        let role = self.current_role_name_for(&session_user);
         secantus_pgplan::set_current_user_str(&role);
         // The tables below are read from the committed catalog, per role:
         // re-installed only when this thread last installed them for another
@@ -5133,11 +5184,6 @@ impl PgHandler {
             .load(std::sync::atomic::Ordering::SeqCst);
         secantus_pgplan::schemas::set_temp_schema_serial(self.session_serial);
         let owner = self.session_tables_owner();
-        let session_user = self
-            .session_user
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
         // Compared in place: building the key allocated the role and the
         // database name on every statement.
         let fresh = !shareable
@@ -6107,7 +6153,7 @@ impl PgHandler {
         &self,
         portal: &Portal<ParsedStatement>,
         result_formats: usize,
-    ) -> PgWireResult<()> {
+    ) -> PgWireResult<(Vec<Option<String>>, Vec<Bson>)> {
         self.install_user_types();
         self.check_cached_result_type(portal.statement.as_ref())?;
         let declared = self.param_type_names(portal.statement.as_ref());
@@ -6156,8 +6202,47 @@ impl PgHandler {
                 binary_recv::check(&ty, bytes, i, utf8)?;
             }
         }
-        self.portal_params(portal, &param_types)?;
-        Ok(())
+        // Installed at the top of this check, on this thread.
+        let params = self.portal_params_installed(portal, &param_types)?;
+        Ok((param_types, params))
+    }
+
+    /// The state a portal's parameters were decoded under, when it can be
+    /// told apart from any other: the settings' generation and the catalog
+    /// version, and only while this session holds no uncommitted catalog
+    /// change (which neither of them records).
+    fn param_decoding_state(&self) -> Option<(u64, u64)> {
+        if !self.pending.tables().is_empty() || !self.pending.types().is_empty() {
+            return None;
+        }
+        let generation = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation();
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        Some((generation, version))
+    }
+
+    /// The parameters Bind decoded for `portal`, if the state they were
+    /// decoded under still stands. Taken: an Execute uses them once.
+    fn take_bound_params(
+        &self,
+        portal: &Portal<ParsedStatement>,
+    ) -> Option<(Vec<Option<String>>, Vec<Bson>)> {
+        let bound = self
+            .bound_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()?;
+        if !std::ptr::eq(Arc::as_ptr(&bound.portal), portal) {
+            return None;
+        }
+        let (generation, version) = self.param_decoding_state()?;
+        (bound.generation == generation && bound.catalog_version == version)
+            .then_some((bound.param_types, bound.params))
     }
 
     /// A table this transaction block created or truncated (for COPY
@@ -14895,6 +14980,15 @@ impl PgHandler {
                 secantus_pgplan::collation::resolve(c).is_ok_and(|r| !r.deterministic())
             })
         };
+        // A jsonb column is equal by VALUE (`{"x":1}` = `{"x":1.0}`), which the
+        // storage index over its stored text cannot see either.
+        let jsonb = |col: &str| def.column(col).is_some_and(|c| c.pg_type == "jsonb");
+        // Only the constraints with such a column, each judged before its
+        // name is made: most tables have none (RP-014).
+        let judged = |cols: &[String]| {
+            cols.iter()
+                .any(|c| nondeterministic(c).is_some() || jsonb(c))
+        };
         let mut constraints: Vec<(String, Vec<String>)> = Vec::new();
         let pk: Vec<String> = def
             .columns
@@ -14902,7 +14996,7 @@ impl PgHandler {
             .filter(|c| c.pk)
             .map(|c| c.name.clone())
             .collect();
-        if !pk.is_empty() {
+        if !pk.is_empty() && judged(&pk) {
             let name = def
                 .extra
                 .get_str("pk_name")
@@ -14911,17 +15005,10 @@ impl PgHandler {
             constraints.push((name, pk));
         }
         for u in &def.unique_constraints {
-            if u.exclusion_ops.is_empty() && !u.deferrable {
+            if u.exclusion_ops.is_empty() && !u.deferrable && judged(&u.columns) {
                 constraints.push((u.name.clone(), u.columns.clone()));
             }
         }
-        // A jsonb column is equal by VALUE (`{"x":1}` = `{"x":1.0}`), which the
-        // storage index over its stored text cannot see either.
-        let jsonb = |col: &str| def.column(col).is_some_and(|c| c.pg_type == "jsonb");
-        constraints.retain(|(_, cols)| {
-            cols.iter()
-                .any(|c| nondeterministic(c).is_some() || jsonb(c))
-        });
         if constraints.is_empty() {
             return Ok(());
         }
@@ -15154,11 +15241,9 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         let indexes: Vec<Document> = self
             .storage
-            .list_indexes(self.db(), &def.name)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(Self::computed_unique)
-            .collect();
+            .list_indexes_shared(self.db(), &def.name)
+            .map(|all| all.iter().filter(|d| Self::computed_unique(d)).cloned().collect())
+            .unwrap_or_default();
         if indexes.is_empty() || rows.is_empty() {
             return Ok(());
         }
@@ -19140,7 +19225,21 @@ impl PgHandler {
         Some(def)
     }
 
+    /// Could `name` be a virtual relation? See [`Self::virtual_table_base`].
+    fn may_be_virtual(name: &str) -> bool {
+        name.starts_with("pg_") || name.starts_with("information_schema.")
+    }
+
     fn virtual_table_base(name: &str) -> Option<TableDef> {
+        // Every virtual relation is a `pg_` name or an `information_schema.`
+        // one -- the names below, `ts_catalog::NAMES`, the foreign-data
+        // catalogs, `system_catalogs` and `catalog_object_table` alike
+        // (`virtual_relation_names_are_prefixed` holds them to it) -- so any
+        // other name, every user table's, is answered without walking them
+        // all: each lookup of a table asks first (RP-014).
+        if !Self::may_be_virtual(name) {
+            return None;
+        }
         match name {
             // `information_schema` keeps its SCHEMA in the name, because its
             // views are called `tables` / `columns` / `sequences` -- names a
@@ -24328,6 +24427,10 @@ const IDLE_TIMEOUT_GUCS: [(&str, &str, &str); 2] = [
 /// nearest millisecond. `None` when the text is not a duration at all.
 fn parse_ms_guc(text: &str) -> Option<i64> {
     let text = text.trim();
+    // The default, which the server reads before every message (RP-014).
+    if text == "0" {
+        return Some(0);
+    }
     // The unit starts at a letter -- but so does the exponent of `1e3`, so
     // try every letter as the split and take the first that parses.
     let splits = text
@@ -30285,21 +30388,53 @@ impl PgHandler {
 
     /// The session's `TimeZone` GUC, resolved.
     fn session_timezone(&self) -> secantus_pgplan::TimeZoneSetting {
+        thread_local! {
+            /// The zone parsed last on this thread, by the settings'
+            /// generation (unique across sessions): every statement asks
+            /// several times (RP-014).
+            static PARSED: std::cell::RefCell<Option<(u64, secantus_pgplan::TimeZoneSetting)>> =
+                const { std::cell::RefCell::new(None) };
+        }
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        settings
+        let generation = settings.generation();
+        if let Some(zone) = PARSED.with(|p| {
+            p.borrow()
+                .as_ref()
+                .filter(|(g, _)| *g == generation)
+                .map(|(_, z)| z.clone())
+        }) {
+            return zone;
+        }
+        let zone = settings
             .get("TimeZone")
             .map(|v| secantus_pgplan::TimeZoneSetting::parse(v))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        PARSED.with(|p| *p.borrow_mut() = Some((generation, zone.clone())));
+        zone
     }
 
     /// The session's `DateStyle` GUC, resolved. Drives how date / timestamp /
     /// timestamptz TEXT output is rendered (binary output is style-independent).
     fn session_datestyle(&self) -> secantus_pgplan::DateStyle {
+        thread_local! {
+            /// The style parsed last on this thread, by the settings'
+            /// generation (unique across sessions): every statement asks.
+            static PARSED: std::cell::Cell<Option<(u64, secantus_pgplan::DateStyle)>> =
+                const { std::cell::Cell::new(None) };
+        }
         let settings = self.settings.lock().unwrap_or_else(|e| e.into_inner());
-        settings
+        let generation = settings.generation();
+        if let Some((g, style)) = PARSED.with(std::cell::Cell::get) {
+            if g == generation {
+                return style;
+            }
+        }
+        let style = settings
             .get("DateStyle")
             .map(|v| secantus_pgplan::DateStyle::parse(v))
-            .unwrap_or_default()
+            .unwrap_or_default();
+        PARSED.with(|p| p.set(Some((generation, style))));
+        style
     }
 
     /// The session's `client_encoding` GUC, resolved to its transcoding
@@ -37951,16 +38086,12 @@ impl PgHandler {
                     self.insert_on_conflict(&ins.table, &def, ins.rows, &oc)?
                 } else {
                     self.stamp_inserted(&ins.table, &def, &mut ins.rows)?;
-                    let docs = ins
-                        .rows
-                        .iter()
-                        .map(encode_doc)
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|e| Self::storage_err("could not encode a row", e))?;
-                    let docs = self.with_expr_fields(&ins.table, docs)?;
+                    // Handed to storage decoded as well as encoded: it
+                    // need not decode what was just encoded (RP-014).
+                    let docs = self.stored_rows(&ins.table, &ins.rows)?;
                     let (written, errors) = self
                         .storage
-                        .insert(self.db(), &ins.table, docs, true)
+                        .insert_documents(self.db(), &ins.table, docs, true)
                         .map_err(|e| Self::storage_err("could not insert", e))?;
                     if let Some(first) = errors.first() {
                         if first.get_i32("code").unwrap_or(0) == 11000 {
@@ -49352,6 +49483,19 @@ impl PgHandler {
         // type oid ... are not supported yet` whenever the Bind landed on
         // such a thread -- a scheduling accident, seen only in CI.
         self.install_user_types();
+        self.portal_params_installed(portal, param_types)
+    }
+
+    /// [`Self::portal_params`] for a caller that has installed this
+    /// session's state on the thread already, as Bind's check has.
+    fn portal_params_installed<S>(
+        &self,
+        portal: &Portal<S>,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<Vec<Bson>>
+    where
+        S: Clone + Send + Sync,
+    {
         // Sized by the plan's list, which covers every `$n` in the SQL even
         // when the client's oid list is shorter (or empty).
         let n = portal
@@ -50374,14 +50518,33 @@ impl ExtendedQueryHandler for PgHandler {
             }
         }
         let portal = Portal::try_new(&message, statement).inspect_err(|_| self.note_failure())?;
-        self.check_bound_portal(&portal, message.result_column_format_codes.len())
+        let state = self.param_decoding_state();
+        let (param_types, params) = self
+            .check_bound_portal(&portal, message.result_column_format_codes.len())
             .inspect_err(|_| self.note_failure())?;
         self.note_wire_portal(
             &portal.name,
             &portal.statement.statement.sql,
             &portal.result_column_format,
         );
-        pgwire::api::store::PortalStore::put_portal(client.portal_store(), Arc::new(portal));
+        let portal = Arc::new(portal);
+        // Kept for the portal's Execute only while what the decoding read
+        // was the same before it as after (`BoundParams`).
+        let bound = match (state, self.param_decoding_state()) {
+            (Some(before), Some(after)) if before == after => Some(BoundParams {
+                portal: Arc::clone(&portal),
+                generation: after.0,
+                catalog_version: after.1,
+                param_types,
+                params,
+            }),
+            _ => None,
+        };
+        *self
+            .bound_params
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = bound;
+        pgwire::api::store::PortalStore::put_portal(client.portal_store(), portal);
         client
             // Buffered to the Sync / Flush that follows, as ParseComplete is.
             .feed(PgWireBackendMessage::BindComplete(
@@ -50478,20 +50641,36 @@ impl ExtendedQueryHandler for PgHandler {
     {
         self.note_result_format(&portal.result_column_format);
         self.set_statement_source(&portal.statement.statement.sql, 0);
-        let mut param_types = secantus_pgplan::infer_param_types(
-            &portal.statement.statement.sql,
-            &self.param_type_names(portal.statement.as_ref()),
-        );
-        self.type_untyped_binary_params(portal, &mut param_types);
+        // What Bind decoded, when nothing it read has changed since: the
+        // same values decoding again would give.
+        let bound = self.take_bound_params(portal);
+        let mut param_types = match &bound {
+            Some((types, _)) => types.clone(),
+            None => secantus_pgplan::infer_param_types(
+                &portal.statement.statement.sql,
+                &self.param_type_names(portal.statement.as_ref()),
+            ),
+        };
+        if bound.is_none() {
+            self.type_untyped_binary_params(portal, &mut param_types);
+        }
         // Every statement between two `Sync`s runs in ONE transaction that
         // the `Sync` commits -- or rolls back, if any of them failed. A
         // pipelining client counts on the rollback: after an error, nothing
         // before it in the pipeline may have landed either.
         self.open_extended_group()?;
         self.check_cached_result_type(portal.statement.as_ref())?;
-        let params = self
-            .portal_params(portal, &param_types)
-            .inspect_err(|_| self.note_failure())?;
+        let params = match bound {
+            Some((_, params)) => {
+                // `portal_params` installs the session's state on the
+                // thread; what follows reads it.
+                self.install_user_types();
+                params
+            }
+            None => self
+                .portal_params(portal, &param_types)
+                .inspect_err(|_| self.note_failure())?,
+        };
         // The WHOLE result, not `max_rows` of it: the portal hands it out
         // `max_rows` at a time and a later Execute resumes it, as
         // PostgreSQL's does. Truncating here left the resumed portal empty
@@ -50532,30 +50711,37 @@ impl ExtendedQueryHandler for PgHandler {
 /// planned: what runs ahead of planning (the privilege check) must not
 /// take the block's snapshot for it either.
 fn sql_takes_no_snapshot(sql: &str) -> bool {
-    let first: String = sql
-        .trim_start()
-        .chars()
-        .take_while(|c| c.is_ascii_alphabetic())
-        .collect::<String>()
-        .to_ascii_lowercase();
+    // The leading ASCII letters, compared without a copy (asked of every
+    // statement, RP-014): none of the words is longer than 10 letters.
+    let sql = sql.trim_start();
+    let len = sql
+        .bytes()
+        .take_while(u8::is_ascii_alphabetic)
+        .count();
+    if len > 10 {
+        return false;
+    }
+    let mut buf = [0u8; 10];
+    buf[..len].copy_from_slice(&sql.as_bytes()[..len]);
+    buf[..len].make_ascii_lowercase();
     matches!(
-        first.as_str(),
-        "set"
-            | "show"
-            | "reset"
-            | "lock"
-            | "listen"
-            | "notify"
-            | "unlisten"
-            | "begin"
-            | "start"
-            | "commit"
-            | "end"
-            | "rollback"
-            | "abort"
-            | "savepoint"
-            | "release"
-            | "checkpoint"
+        &buf[..len],
+        b"set"
+            | b"show"
+            | b"reset"
+            | b"lock"
+            | b"listen"
+            | b"notify"
+            | b"unlisten"
+            | b"begin"
+            | b"start"
+            | b"commit"
+            | b"end"
+            | b"rollback"
+            | b"abort"
+            | b"savepoint"
+            | b"release"
+            | b"checkpoint"
     )
 }
 
@@ -51475,6 +51661,136 @@ mod wire_format_tests {
             hex(&element_binary(&Bson::String("{\"a\": 1}".into()), &Type::JSONB).unwrap()),
             "017b2261223a20317d"
         );
+    }
+}
+
+#[cfg(test)]
+mod virtual_relation_tests {
+    use super::*;
+
+    /// The names a source region matches on, as `"name" =>` arms (an arm
+    /// may list several, `"a" | "b" =>`).
+    fn arm_names(src: &str, from: &str, to: &str) -> Vec<String> {
+        let start = src.find(from).expect("region start");
+        let end = start + src[start..].find(to).expect("region end");
+        let arm = regex::Regex::new(r#"^\s*((?:"[^"]+"\s*\|\s*)*"[^"]+")\s*=>"#).unwrap();
+        let name = regex::Regex::new(r#""([^"]+)""#).unwrap();
+        src[start..end]
+            .lines()
+            .filter_map(|l| arm.captures(l))
+            .flat_map(|c| {
+                name.captures_iter(&c[1])
+                    .map(|n| n[1].to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// `virtual_table_base` answers `None` for a name `may_be_virtual`
+    /// refuses without looking further, so every virtual relation's name
+    /// must pass it.
+    #[test]
+    fn virtual_relation_names_are_prefixed() {
+        let mut names: Vec<String> = Vec::new();
+        names.extend(arm_names(
+            include_str!("lib.rs"),
+            "    fn virtual_table_base(name: &str)",
+            "    fn builtin_catalog_rows(",
+        ));
+        names.extend(arm_names(
+            include_str!("catalog_objects.rs"),
+            "    pub(crate) fn catalog_object_table(",
+            "\n    }\n",
+        ));
+        names.extend(arm_names(
+            include_str!("fdw.rs"),
+            "pub(crate) fn fdw_catalog_def(",
+            "\n}\n",
+        ));
+        names.extend(
+            secantus_pgplan::ts_catalog::NAMES
+                .iter()
+                .map(|n| n.to_string()),
+        );
+        names.extend(system_catalogs::all_names().map(str::to_string));
+        assert!(names.len() > 150, "too few names found: {}", names.len());
+        for n in &names {
+            assert!(
+                PgHandler::may_be_virtual(n),
+                "{n} is not `pg_` or `information_schema.`"
+            );
+            if system_catalogs::is_system_catalog(n) {
+                assert!(PgHandler::virtual_table_base(n).is_some(), "{n}");
+            }
+        }
+        assert!(PgHandler::virtual_table_base("lotsa_rows_table").is_none());
+    }
+}
+
+#[cfg(test)]
+mod stored_form_tests {
+    use super::*;
+
+    /// `Storage::insert_documents` takes each row's stored document beside
+    /// its encoding instead of decoding the encoding: the two must be what
+    /// storage's own decoding of those bytes gives, for every kind of value
+    /// a row holds -- a value document that looks like extended JSON, and a
+    /// composite key, among them.
+    #[test]
+    fn a_stored_document_is_its_encodings_decoding() {
+        let rows = vec![
+            bson::doc! {
+                "_id": "k",
+                "i32": 1_i32,
+                "i64": 2_i64,
+                "f": -0.0_f64,
+                "nan": f64::NAN,
+                "s": "text",
+                "b": true,
+                "n": Bson::Null,
+                "d": bson::DateTime::from_millis(1_700_000_000_000),
+                "dec": Bson::Decimal128("1.50".parse().unwrap()),
+                "bin": Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::Uuid,
+                    bytes: vec![7; 16],
+                }),
+                "old": Bson::Binary(bson::Binary {
+                    subtype: bson::spec::BinarySubtype::BinaryOld,
+                    bytes: vec![1, 2, 3],
+                }),
+                "arr": [1_i32, "two", Bson::Null, [3_i64]],
+                "num": { "__numeric": "1e400", "__numkey": 1.0_f64 },
+                "ej": { "$numberLong": "1" },
+                "ej2": { "$date": { "$numberLong": "5" } },
+                "ts": Bson::Timestamp(bson::Timestamp { time: 1, increment: 2 }),
+                "re": Bson::RegularExpression(bson::Regex {
+                    pattern: "a.c".into(),
+                    options: "i".into(),
+                }),
+                "min": Bson::MinKey,
+                "max": Bson::MaxKey,
+                "__sys_xmin": 5_i64,
+            },
+            bson::doc! { "_id.a": 1_i32, "_id.b": "x", "v": 2_i32 },
+            bson::doc! { "v": 3_i32, "_id": { "__numeric": "9", "__numkey": 9.0_f64 } },
+        ];
+        for row in &rows {
+            let stored = stored_form(row);
+            let bytes = bson::to_vec(&stored).unwrap();
+            assert_eq!(bytes, encode_doc(row).unwrap(), "{row}");
+            let read = secantus_core::bsondoc::from_bytes(&bytes).unwrap();
+            // NaN is not equal to itself: compare encodings too.
+            assert_eq!(bson::to_vec(&read).unwrap(), bytes, "{row}");
+            if !row.contains_key("nan") {
+                assert_eq!(read, stored, "{row}");
+            } else {
+                let mut a = read.clone();
+                let mut b = stored.clone();
+                a.remove("nan");
+                b.remove("nan");
+                assert_eq!(a, b, "{row}");
+            }
+        }
     }
 }
 

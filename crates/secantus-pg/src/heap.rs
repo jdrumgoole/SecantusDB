@@ -63,6 +63,22 @@ fn layout(pg_type: &str) -> (i64, char) {
     if t.ends_with("[]") {
         return (-1, 'i');
     }
+    thread_local! {
+        /// A built-in type's layout by the name it was asked by: fixed
+        /// facts of PostgreSQL's `pg_type`, asked for every column of every
+        /// row written (RP-014). A name no built-in has is not kept -- a
+        /// user enum's answer depends on the catalog.
+        static BUILTIN: std::cell::RefCell<Vec<(String, (i64, char))>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    if let Some(hit) = BUILTIN.with(|b| {
+        b.borrow()
+            .iter()
+            .find(|(name, _)| name == t)
+            .map(|(_, l)| *l)
+    }) {
+        return hit;
+    }
     let Some(oid) = secantus_pgplan::pgtypes::oid_of_name(t) else {
         return if secantus_pgplan::is_user_enum(t) {
             (4, 'i')
@@ -83,6 +99,13 @@ fn layout(pg_type: &str) -> (i64, char) {
             _ => None,
         })
         .unwrap_or('i');
+    BUILTIN.with(|b| {
+        let mut b = b.borrow_mut();
+        // Bounded: the names a server's columns use are few.
+        if b.len() < 256 {
+            b.push((t.to_string(), (len, al)));
+        }
+    });
     (len, al)
 }
 
@@ -610,7 +633,13 @@ impl PgHandler {
             .contains_key(&key);
         // Read before the lock is taken: deriving reads the store.
         let derived = (!known).then(|| self.derive_heap(table));
-        let (running, _) = visibility();
+        // The running xids alone: the removal horizon `visibility` also
+        // takes is not needed to forget ended inserts. Few run at once, so a
+        // list serves as well as a set.
+        let running: Vec<u64> = crate::xids::running()
+            .into_iter()
+            .map(|(_, x)| x)
+            .collect();
         let mut all = heaps().lock().unwrap_or_else(|e| e.into_inner());
         let heap = all
             .entry(key)
@@ -772,13 +801,17 @@ impl PgHandler {
         def: &TableDef,
         rows: &mut [Document],
     ) -> PgWireResult<()> {
-        let mut versions: Vec<(Option<Document>, Document)> =
-            rows.iter().map(|r| (None, r.clone())).collect();
-        self.stamp_versions(table, def, &mut versions)?;
+        // The rows are moved in and back, not copied (RP-014). Every caller
+        // drops them on an error, so what an error leaves in them is unseen.
+        let mut versions: Vec<(Option<Document>, Document)> = rows
+            .iter_mut()
+            .map(|r| (None, std::mem::take(r)))
+            .collect();
+        let out = self.stamp_versions(table, def, &mut versions);
         for (r, (_, v)) in rows.iter_mut().zip(versions) {
             *r = v;
         }
-        Ok(())
+        out
     }
 
     /// Stamp new versions of updated rows: `(old row, new row)` each, the
@@ -889,8 +922,11 @@ impl PgHandler {
             }
             // The buffers the writes read, as `RelationGetBufferForTuple`,
             // `heap_update` and the free space map read them (RP-239).
-            self.stat_pages(&heap_table, accessed);
-            self.stat_writes(&heap_table, inserted, updated, hot);
+            // The table's oid, asked once for both (RP-014).
+            let rel = (self.tracking() && !heap_table.starts_with("__"))
+                .then(|| self.relation_oid(&heap_table));
+            self.stat_pages_of(&heap_table, rel, accessed);
+            self.stat_writes_of(&heap_table, rel, inserted, updated, hot);
             // Every version that is not heap-only takes a tuple in each of
             // the table's B-trees (RP-196).
             // With the old version, so an index can tell its key was left

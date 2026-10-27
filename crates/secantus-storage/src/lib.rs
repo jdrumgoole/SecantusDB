@@ -1017,6 +1017,17 @@ fn oplog_index_spec(spec: &Document) -> Document {
     out
 }
 
+/// Can an oplog entry naming `ns` be a `local` one (`oplog_entry_is_local`)?
+/// Every namespace that function answers `true` for passes here: `false`
+/// means no entry of `ns` is local, whatever its operation and document.
+fn ns_may_hold_local_entry(ns: &str) -> bool {
+    ns == "local"
+        || ns.starts_with("local.")
+        || ns.ends_with(".system.profile")
+        || ns == "config.image_collection"
+        || ns.ends_with(".$cmd")
+}
+
 fn oplog_entry_is_local(e: &OplogEntry) -> bool {
     let (ns, target) = match e {
         OplogEntry::Doc(d) => (
@@ -7848,13 +7859,29 @@ impl Storage {
         entries: Vec<OplogEntry>,
         pre_images: Vec<Option<Vec<u8>>>,
     ) -> Result<i64> {
+        self.emit_oplog_entries_of(session, entries, pre_images, None)
+    }
+
+    /// [`Self::emit_oplog_entries`] with, when the caller knows it, whether
+    /// any entry is a `local` one (`oplog_entry_is_local`): an insert's
+    /// entries all name its own collection, so its namespace answers for
+    /// every one of them without reading each (RP-014). Everything else --
+    /// the user write block among it -- is as for any emit.
+    fn emit_oplog_entries_of(
+        &self,
+        session: &Session,
+        entries: Vec<OplogEntry>,
+        pre_images: Vec<Option<Vec<u8>>>,
+        any_local: Option<bool>,
+    ) -> Result<i64> {
         if !self.enable_oplog || entries.is_empty() {
             return Ok(0);
         }
         debug_assert_eq!(pre_images.len(), entries.len());
         // The `local` database is not replicated: mongod writes no oplog entry
         // for a write to it, so a change stream never sees one.
-        let (entries, pre_images) = if entries.iter().any(oplog_entry_is_local) {
+        let any_local = any_local.unwrap_or_else(|| entries.iter().any(oplog_entry_is_local));
+        let (entries, pre_images) = if any_local {
             let (entries, pre_images): (Vec<_>, Vec<_>) = entries
                 .into_iter()
                 .zip(pre_images)
@@ -11308,6 +11335,32 @@ impl Storage {
         docs: Vec<Vec<u8>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
+        self.insert_with(db, coll, docs, None, ordered)
+    }
+
+    /// [`Self::insert`] of documents the caller holds decoded as well as
+    /// encoded: each pair is a document and its BSON encoding (`bson`'s, of
+    /// that very document), so the insert need not decode what the caller
+    /// just encoded (RP-014: the PostgreSQL server's rows).
+    pub fn insert_documents(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<(Vec<u8>, Document)>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>)> {
+        let (bytes, decoded): (Vec<Vec<u8>>, Vec<Document>) = docs.into_iter().unzip();
+        self.insert_with(db, coll, bytes, Some(decoded), ordered)
+    }
+
+    fn insert_with(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        decoded: Option<Vec<Document>>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>)> {
         let _admit = self.admit_write();
         // One wire message never runs as ONE statement transaction: its dirty
         // content (doc rows + full-doc oplog entries + index entries, ~2-3x
@@ -11326,7 +11379,7 @@ impl Storage {
         let mut errors: Vec<Document> = Vec::new();
         if docs.is_empty() {
             // An empty batch still lazily creates the collection.
-            let (_, _, _) = self.insert_chunk(db, coll, &[], 0, ordered)?;
+            let (_, _, _) = self.insert_chunk(db, coll, &[], None, 0, ordered)?;
             return Ok((0, errors));
         }
         // A user write block refuses each document as mongod's insert does,
@@ -11346,6 +11399,7 @@ impl Storage {
             }
         }
         let n = docs.len();
+        let mut decoded = decoded.map(Vec::into_iter);
         let mut start = 0usize;
         while start < n {
             let mut end = start + 1;
@@ -11357,8 +11411,17 @@ impl Storage {
                 chunk_bytes += docs[end].len();
                 end += 1;
             }
-            let (chunk_inserted, chunk_errors, stopped) =
-                self.insert_chunk(db, coll, &docs[start..end], start, ordered)?;
+            let chunk_decoded = decoded
+                .as_mut()
+                .map(|d| d.by_ref().take(end - start).collect::<Vec<_>>());
+            let (chunk_inserted, chunk_errors, stopped) = self.insert_chunk(
+                db,
+                coll,
+                &docs[start..end],
+                chunk_decoded,
+                start,
+                ordered,
+            )?;
             inserted += chunk_inserted;
             errors.extend(chunk_errors);
             if stopped {
@@ -11378,6 +11441,7 @@ impl Storage {
         db: &str,
         coll: &str,
         docs: &[Vec<u8>],
+        decoded: Option<Vec<Document>>,
         base_index: usize,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>, bool)> {
@@ -11386,10 +11450,16 @@ impl Storage {
         // -- is done BEFORE the collection's write lock: every writer to the
         // collection waits on that lock, so work done under it is work no
         // other writer can overlap (RP-014).
+        // A caller's decoded documents are its encoded ones' (`insert_documents`).
+        debug_assert!(decoded.as_ref().is_none_or(|d| d.len() == docs.len()));
+        let mut decoded = decoded.map(Vec::into_iter);
         let prepared: Vec<PreparedDoc> = docs
             .iter()
             .map(|doc_bytes| {
-                let mut doc = decode_doc(doc_bytes)?;
+                let mut doc = match decoded.as_mut().and_then(Iterator::next) {
+                    Some(doc) => doc,
+                    None => decode_doc(doc_bytes)?,
+                };
                 let assigned_id = !doc.contains_key("_id");
                 if assigned_id {
                     doc.insert("_id", Bson::ObjectId(secantus_core::oid::new()));
@@ -11655,7 +11725,12 @@ impl Storage {
                     )?;
                 }
                 if oplog_on && !oplog_entries.is_empty() {
-                    self.emit_oplog_entries(&session, oplog_entries, pre_images)?;
+                    // Every entry here names this collection -- its inserts,
+                    // and a capped collection's evictions -- so whether one
+                    // is a `local` entry is its namespace's answer. A
+                    // namespace that could hold one is read entry by entry.
+                    let any_local = (!ns_may_hold_local_entry(&ns)).then_some(false);
+                    self.emit_oplog_entries_of(&session, oplog_entries, pre_images, any_local)?;
                 }
                 Ok((inserted, errors, stopped, tally))
             })?;
@@ -14052,26 +14127,31 @@ impl Storage {
     /// `_id_` index first, then stored indexes), sorted by name. Empty when the
     /// collection doesn't exist. Mirrors `storage.list_indexes`.
     pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>> {
+        self.list_indexes_shared(db, coll)
+            .map(|list| Arc::unwrap_or_clone(list))
+    }
+
+    /// [`Self::list_indexes`] without the copy: the cached list itself, for
+    /// a caller that only reads it (the PostgreSQL server asks on every row
+    /// it writes, and copying the list was most of the cost -- RP-014).
+    pub fn list_indexes_shared(&self, db: &str, coll: &str) -> Result<Arc<Vec<Document>>> {
         // Lock-free read outside a transaction; inside one, the transaction's own
         // session, so a DROP / CREATE earlier in it is seen (see `op_session`).
         let session = self.op_session()?;
         // Read once per catalog generation, as `index_descs_cached` is: the
         // PostgreSQL server asks on every row it writes.
         let Some(gen) = self.planner_shared_gen(&session) else {
-            return self.read_list_indexes(&session, db, coll);
+            return self.read_list_indexes(&session, db, coll).map(Arc::new);
         };
-        let key = (db.to_string(), coll.to_string());
-        if let Some((g, list)) = self
-            .list_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+        if let Some((g, list)) =
+            catalog_entry(&self.list_cache.read().unwrap_or_else(|e| e.into_inner()), db, coll)
         {
             if *g == gen {
-                return Ok(list.as_ref().clone());
+                return Ok(Arc::clone(list));
             }
         }
-        let list = self.read_list_indexes(&session, db, coll)?;
+        let key = (db.to_string(), coll.to_string());
+        let list = Arc::new(self.read_list_indexes(&session, db, coll)?);
         if planner_settled() == Some(gen)
             && deferred_row(&session, db, coll).is_none()
             && collection_registered(&session, db, coll)?
@@ -14080,7 +14160,7 @@ impl Storage {
             if cache.values().any(|(g, _)| *g != gen) {
                 cache.clear();
             }
-            cache.insert(key, (gen, Arc::new(list.clone())));
+            cache.insert(key, (gen, Arc::clone(&list)));
         }
         Ok(list)
     }
@@ -15612,17 +15692,14 @@ impl Storage {
         let Some(gen) = self.planner_shared_gen(session) else {
             return Ok(Arc::new(self.index_descs(session, db, coll)?));
         };
-        let key = (db.to_string(), coll.to_string());
-        if let Some((g, descs)) = self
-            .desc_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+        if let Some((g, descs)) =
+            catalog_entry(&self.desc_cache.read().unwrap_or_else(|e| e.into_inner()), db, coll)
         {
             if *g == gen {
                 return Ok(Arc::clone(descs));
             }
         }
+        let key = (db.to_string(), coll.to_string());
         let descs = Arc::new(self.index_descs(session, db, coll)?);
         // Only the committed registry row: a transaction's deferred create
         // is its own (`deferred_row`), and moves no generation.
@@ -15652,17 +15729,16 @@ impl Storage {
         let Some(gen) = self.planner_shared_gen(session) else {
             return Ok(coll_options(session, db, coll)?.map(Arc::new));
         };
-        let key = (db.to_string(), coll.to_string());
-        if let Some((g, opts)) = self
-            .options_cache
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
+        if let Some((g, opts)) = catalog_entry(
+            &self.options_cache.read().unwrap_or_else(|e| e.into_inner()),
+            db,
+            coll,
+        ) {
             if *g == gen {
                 return Ok(Some(Arc::clone(opts)));
             }
         }
+        let key = (db.to_string(), coll.to_string());
         let Some(opts) = coll_options(session, db, coll)?.map(Arc::new) else {
             return Ok(None);
         };
@@ -22613,6 +22689,63 @@ type PreparedDoc = (Document, bool, Bson, Vec<u8>, Vec<u8>);
 /// generation it was read under (`index_descs_cached` and its siblings).
 type CatalogCache<T> = HashMap<(String, String), (u64, Arc<T>)>;
 
+/// A `(db, collection)` key a [`CatalogCache`] can be asked by without
+/// copying either name: every write asks several times (RP-014). It hashes
+/// and compares as the owned `(String, String)` tuple does.
+trait CatalogKey {
+    fn db(&self) -> &str;
+    fn coll(&self) -> &str;
+}
+
+impl CatalogKey for (String, String) {
+    fn db(&self) -> &str {
+        &self.0
+    }
+    fn coll(&self) -> &str {
+        &self.1
+    }
+}
+
+impl CatalogKey for (&str, &str) {
+    fn db(&self) -> &str {
+        self.0
+    }
+    fn coll(&self) -> &str {
+        self.1
+    }
+}
+
+impl<'a> std::borrow::Borrow<dyn CatalogKey + 'a> for (String, String) {
+    fn borrow(&self) -> &(dyn CatalogKey + 'a) {
+        self
+    }
+}
+
+impl std::hash::Hash for dyn CatalogKey + '_ {
+    // A tuple hashes its fields in turn, a `String` as its `str`.
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.db().hash(state);
+        self.coll().hash(state);
+    }
+}
+
+impl PartialEq for dyn CatalogKey + '_ {
+    fn eq(&self, other: &Self) -> bool {
+        self.db() == other.db() && self.coll() == other.coll()
+    }
+}
+
+impl Eq for dyn CatalogKey + '_ {}
+
+/// `cache`'s entry for `(db, coll)`, looked up without an owned key.
+fn catalog_entry<'c, T>(
+    cache: &'c CatalogCache<T>,
+    db: &str,
+    coll: &str,
+) -> Option<&'c (u64, Arc<T>)> {
+    cache.get(&(db, coll) as &dyn CatalogKey)
+}
+
 /// `planner_indexes` answers by `(db, collection)`, each with the generation
 /// it was read under.
 type PlannerCache = HashMap<(String, String), (u64, Vec<PlannerIndex>)>;
@@ -26175,5 +26308,35 @@ mod tests {
             id_point_lookup_keys(&Bson::Document(doc! {"$eq": {"$gt": 1i32}})).unwrap(),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod catalog_key_tests {
+    use super::*;
+
+    /// A borrowed `(db, collection)` finds exactly the entry its owned key
+    /// was stored under, and no other.
+    #[test]
+    fn a_borrowed_key_finds_the_owned_entry() {
+        let keys = [
+            ("db", "coll", 1),
+            ("dbc", "oll", 2),
+            ("", "dbcoll", 3),
+            ("d", "", 4),
+        ];
+        let mut cache: CatalogCache<u32> = HashMap::new();
+        for (d, c, v) in keys {
+            cache.insert((d.to_string(), c.to_string()), (0, Arc::new(v)));
+        }
+        for (d, c, v) in keys {
+            assert_eq!(
+                catalog_entry(&cache, d, c).map(|e| *e.1),
+                Some(v),
+                "{d}.{c}"
+            );
+        }
+        assert!(catalog_entry(&cache, "db", "col").is_none());
+        assert!(catalog_entry(&cache, "dbcoll", "").is_none());
     }
 }

@@ -1148,12 +1148,15 @@ impl BTree {
     /// `_bt_check_unique`'s pass over the key's equal tuples, from the
     /// leftmost leaf it can be on (a search without the heap TID) rightward
     /// while they go on: each whose every heap version is dead to all is
-    /// marked LP_DEAD as the check passes it.
-    fn check_unique(&mut self, shape: &dyn Shape, key: &[Bson], dead: &dyn Fn(i64) -> bool) {
-        let (mut page, _) = self.descend(shape, key, i64::MIN);
+    /// marked LP_DEAD as the check passes it. Returns that leftmost leaf:
+    /// marking changes no page's place, so it is where a search without the
+    /// heap TID still lands.
+    fn check_unique(&mut self, shape: &dyn Shape, key: &[Bson], dead: &dyn Fn(i64) -> bool) -> u32 {
+        let (first, _) = self.descend(shape, key, i64::MIN);
+        let mut page = first;
         loop {
             let Page::Leaf { items, right, .. } = &mut self.pages[page as usize] else {
-                return;
+                return first;
             };
             let mut marked = false;
             let mut last_equal = false;
@@ -1182,7 +1185,7 @@ impl BTree {
             }
             match next {
                 Some(r) if last_equal => page = r,
-                _ => return,
+                _ => return first,
             }
         }
     }
@@ -1233,17 +1236,14 @@ impl BTree {
             self.ssi_events.push(SsiEvent::Landed(root));
             return;
         }
-        if shape.unique() {
-            self.check_unique(shape, &key, dead);
-        }
+        let unique_first = shape
+            .unique()
+            .then(|| self.check_unique(shape, &key, dead));
         let (leaf, path) = self.descend(shape, &key, tid);
         // The page `_bt_search` lands on, which SSI checks: without the heap
-        // TID for a unique index (the first the key could be on).
-        let landed = if shape.unique() {
-            self.descend(shape, &key, i64::MIN).0
-        } else {
-            leaf
-        };
+        // TID for a unique index (the first the key could be on) -- the
+        // leaf the unique check began at, which its marks did not move.
+        let landed = unique_first.unwrap_or(leaf);
         self.ssi_events.push(SsiEvent::Landed(landed));
         self.touched.insert(leaf);
         let cached = self.used.get(leaf as usize).copied().filter(|u| *u >= 0);

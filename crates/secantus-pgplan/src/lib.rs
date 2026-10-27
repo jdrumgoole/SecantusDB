@@ -34497,9 +34497,36 @@ pub fn max_param_number(sql: &str) -> usize {
     const MAX_ENTRIES: usize = 4096;
     static MEMO: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
         std::sync::OnceLock::new();
+    thread_local! {
+        /// The statement this thread asked about last: a client repeating
+        /// one statement (a pipeline of inserts) asks for it at every Bind
+        /// and Describe, and comparing it is cheaper than hashing it under
+        /// the shared memo's lock (RP-014).
+        static LAST: std::cell::RefCell<Option<(String, usize)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    if let Some(n) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(s, _)| s == sql)
+            .map(|(_, n)| *n)
+    }) {
+        return n;
+    }
+    let remember = |n: usize| {
+        if sql.len() <= 4096 {
+            LAST.with(|l| *l.borrow_mut() = Some((sql.to_string(), n)));
+        }
+    };
     let memo = MEMO.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    if let Some(n) = memo.lock().unwrap_or_else(|e| e.into_inner()).get(sql) {
-        return *n;
+    if let Some(n) = memo
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(sql)
+        .copied()
+    {
+        remember(n);
+        return n;
     }
     // A large statement is scanned on a thread of its own, under the cancel
     // hook (RP-202). A cancelled scan is not remembered; the statement's
@@ -34519,6 +34546,8 @@ pub fn max_param_number(sql: &str) -> usize {
         guard.clear();
     }
     guard.insert(sql.to_string(), n);
+    drop(guard);
+    remember(n);
     n
 }
 

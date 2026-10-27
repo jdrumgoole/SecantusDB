@@ -744,9 +744,14 @@ impl crate::PgHandler {
         if versions.is_empty() {
             return Ok(());
         }
+        // A table with no GIN or GiST index (most) needs no setting read.
+        let shapes = self.am_shapes(table);
+        if shapes.is_empty() {
+            return Ok(());
+        }
         let work_mem = self.kb_setting("work_mem", 4096);
         let pending_limit = self.kb_setting("gin_pending_list_limit", 4096);
-        for shape in self.am_shapes(table) {
+        for shape in shapes {
             let oid = shape.oid();
             for (doc, _, ctid) in versions {
                 let tid = *ctid as u64;
