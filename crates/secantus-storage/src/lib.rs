@@ -11414,14 +11414,8 @@ impl Storage {
             let chunk_decoded = decoded
                 .as_mut()
                 .map(|d| d.by_ref().take(end - start).collect::<Vec<_>>());
-            let (chunk_inserted, chunk_errors, stopped) = self.insert_chunk(
-                db,
-                coll,
-                &docs[start..end],
-                chunk_decoded,
-                start,
-                ordered,
-            )?;
+            let (chunk_inserted, chunk_errors, stopped) =
+                self.insert_chunk(db, coll, &docs[start..end], chunk_decoded, start, ordered)?;
             inserted += chunk_inserted;
             errors.extend(chunk_errors);
             if stopped {
@@ -11683,13 +11677,8 @@ impl Storage {
                         if let Some(last) = outcomes.last_mut() {
                             last.1 = Some(oplog_entries.len());
                         }
-                        let mut entry = Self::oplog_entry_crud(
-                            "i",
-                            &ns,
-                            Some(ui.as_ref().unwrap()),
-                            blob,
-                            o2,
-                        )?;
+                        let mut entry =
+                            Self::oplog_entry_crud("i", &ns, Some(ui.as_ref().unwrap()), blob, o2)?;
                         // A retryable write's insert names its statement:
                         // the position its document had in the command.
                         let position = INSERT_POSITIONS
@@ -14127,8 +14116,7 @@ impl Storage {
     /// `_id_` index first, then stored indexes), sorted by name. Empty when the
     /// collection doesn't exist. Mirrors `storage.list_indexes`.
     pub fn list_indexes(&self, db: &str, coll: &str) -> Result<Vec<Document>> {
-        self.list_indexes_shared(db, coll)
-            .map(|list| Arc::unwrap_or_clone(list))
+        self.list_indexes_shared(db, coll).map(Arc::unwrap_or_clone)
     }
 
     /// [`Self::list_indexes`] without the copy: the cached list itself, for
@@ -14143,9 +14131,11 @@ impl Storage {
         let Some(gen) = self.planner_shared_gen(&session) else {
             return self.read_list_indexes(&session, db, coll).map(Arc::new);
         };
-        if let Some((g, list)) =
-            catalog_entry(&self.list_cache.read().unwrap_or_else(|e| e.into_inner()), db, coll)
-        {
+        if let Some((g, list)) = catalog_entry(
+            &self.list_cache.read().unwrap_or_else(|e| e.into_inner()),
+            db,
+            coll,
+        ) {
             if *g == gen {
                 return Ok(Arc::clone(list));
             }
@@ -15692,9 +15682,11 @@ impl Storage {
         let Some(gen) = self.planner_shared_gen(session) else {
             return Ok(Arc::new(self.index_descs(session, db, coll)?));
         };
-        if let Some((g, descs)) =
-            catalog_entry(&self.desc_cache.read().unwrap_or_else(|e| e.into_inner()), db, coll)
-        {
+        if let Some((g, descs)) = catalog_entry(
+            &self.desc_cache.read().unwrap_or_else(|e| e.into_inner()),
+            db,
+            coll,
+        ) {
             if *g == gen {
                 return Ok(Arc::clone(descs));
             }

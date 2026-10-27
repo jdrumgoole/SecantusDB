@@ -136,9 +136,7 @@ impl PgHandler {
         if !self.tracking() || table.starts_with("__") {
             return;
         }
-        let rel = rel
-            .unwrap_or_else(|| self.relation_oid(table))
-            .unwrap_or(0);
+        let rel = rel.unwrap_or_else(|| self.relation_oid(table)).unwrap_or(0);
         let s = self.stats();
         if inserted > 0 {
             s.inserted(rel, inserted);
@@ -173,9 +171,7 @@ impl PgHandler {
         if !self.tracking() || table.starts_with("__") {
             return;
         }
-        let rel = rel
-            .unwrap_or_else(|| self.relation_oid(table))
-            .unwrap_or(0);
+        let rel = rel.unwrap_or_else(|| self.relation_oid(table)).unwrap_or(0);
         self.stats().pages(rel, blocks, self.buffer_pages());
     }
 

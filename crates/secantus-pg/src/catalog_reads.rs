@@ -2707,8 +2707,8 @@ fn changes_catalogs(sql: &str) -> bool {
         .next()
         .unwrap_or_default();
     [
-        "create", "alter", "drop", "vacuum", "analyze", "analyse", "comment", "grant",
-        "revoke", "truncate", "reindex", "cluster",
+        "create", "alter", "drop", "vacuum", "analyze", "analyse", "comment", "grant", "revoke",
+        "truncate", "reindex", "cluster",
     ]
     .iter()
     .any(|word| first.eq_ignore_ascii_case(word))

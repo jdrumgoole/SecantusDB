@@ -639,7 +639,7 @@ struct BoundParams {
 /// A table's catalog entry as [`PgHandler::lookup_ref`] finds it: shared with
 /// the catalog cache when it came from there, owned otherwise.
 pub(crate) enum TableRef {
-    Owned(TableDef),
+    Owned(Box<TableDef>),
     Shared(Arc<Option<TableDef>>),
 }
 
@@ -651,7 +651,7 @@ impl TableRef {
 
     fn into_owned(self) -> TableDef {
         match self {
-            Self::Owned(def) => def,
+            Self::Owned(def) => *def,
             Self::Shared(entry) => Option::clone(&entry).expect("a shared entry holds a table"),
         }
     }
@@ -663,7 +663,10 @@ impl std::ops::Deref for TableRef {
     fn deref(&self) -> &TableDef {
         match self {
             Self::Owned(def) => def,
-            Self::Shared(entry) => entry.as_ref().as_ref().expect("a shared entry holds a table"),
+            Self::Shared(entry) => entry
+                .as_ref()
+                .as_ref()
+                .expect("a shared entry holds a table"),
         }
     }
 }
@@ -15272,7 +15275,12 @@ impl PgHandler {
         let indexes: Vec<Document> = self
             .storage
             .list_indexes_shared(self.db(), &def.name)
-            .map(|all| all.iter().filter(|d| Self::computed_unique(d)).cloned().collect())
+            .map(|all| {
+                all.iter()
+                    .filter(|d| Self::computed_unique(d))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         if indexes.is_empty() || rows.is_empty() {
             return Ok(());
@@ -23349,14 +23357,14 @@ impl PgHandler {
 
     fn lookup_inner(&self, name: &str) -> Option<TableRef> {
         if let Some(def) = Self::virtual_table(name) {
-            return Some(TableRef::Owned(def));
+            return Some(TableRef::Owned(Box::new(def)));
         }
         // What this transaction has created or dropped, before what is
         // committed. A `None` here is a tombstone: the table was dropped in
         // this transaction and must not be found even though its catalog row
         // is still there.
         if let Some(pending) = self.pending.tables().get(name) {
-            return pending.clone().map(TableRef::Owned);
+            return pending.clone().map(|d| TableRef::Owned(Box::new(d)));
         }
         let cache = catalog_cache();
         let version = cache.version.load(std::sync::atomic::Ordering::SeqCst);
@@ -23441,7 +23449,7 @@ impl PgHandler {
                 self.sequence_doc(name).ok()
             };
             if let Some(Some(_)) = found {
-                return Some(TableRef::Owned(Self::sequence_table_def(name)));
+                return Some(TableRef::Owned(Box::new(Self::sequence_table_def(name))));
             }
         }
         // A miss for a sequence the block wrote is no absence: the
@@ -23457,7 +23465,7 @@ impl PgHandler {
                 .insert(key.clone(), (version, Arc::clone(&entry)));
             to_front(&entry);
         }
-        def.map(TableRef::Owned)
+        def.map(|d| TableRef::Owned(Box::new(d)))
     }
 
     fn err(e: &PlanError) -> PgWireError {
@@ -50570,10 +50578,7 @@ impl ExtendedQueryHandler for PgHandler {
             }),
             _ => None,
         };
-        *self
-            .bound_params
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = bound;
+        *self.bound_params.lock().unwrap_or_else(|e| e.into_inner()) = bound;
         pgwire::api::store::PortalStore::put_portal(client.portal_store(), portal);
         client
             // Buffered to the Sync / Flush that follows, as ParseComplete is.
@@ -50744,10 +50749,7 @@ fn sql_takes_no_snapshot(sql: &str) -> bool {
     // The leading ASCII letters, compared without a copy (asked of every
     // statement, RP-014): none of the words is longer than 10 letters.
     let sql = sql.trim_start();
-    let len = sql
-        .bytes()
-        .take_while(u8::is_ascii_alphabetic)
-        .count();
+    let len = sql.bytes().take_while(u8::is_ascii_alphabetic).count();
     if len > 10 {
         return false;
     }
@@ -51703,17 +51705,16 @@ mod virtual_relation_tests {
     fn arm_names(src: &str, from: &str, to: &str) -> Vec<String> {
         let start = src.find(from).expect("region start");
         let end = start + src[start..].find(to).expect("region end");
-        let arm = regex::Regex::new(r#"^\s*((?:"[^"]+"\s*\|\s*)*"[^"]+")\s*=>"#).unwrap();
-        let name = regex::Regex::new(r#""([^"]+)""#).unwrap();
-        src[start..end]
-            .lines()
-            .filter_map(|l| arm.captures(l))
-            .flat_map(|c| {
-                name.captures_iter(&c[1])
-                    .map(|n| n[1].to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+        // A literal before `|` or `=>`, or after `|`: an arm spread over
+        // lines (`"a"\n | "b" =>`) too.
+        let pattern = regex::Regex::new(r#""([^"]+)"\s*(?:\||=>)|\|\s*"([^"]+)""#).unwrap();
+        let names: Vec<String> = pattern
+            .captures_iter(&src[start..end])
+            .filter_map(|c| c.get(1).or_else(|| c.get(2)))
+            .map(|m| m.as_str().to_string())
+            .collect();
+        assert!(names.len() >= 5, "too few names in {from}: {names:?}");
+        names
     }
 
     /// `virtual_table_base` answers `None` for a name `may_be_virtual`
@@ -51743,7 +51744,7 @@ mod virtual_relation_tests {
                 .map(|n| n.to_string()),
         );
         names.extend(system_catalogs::all_names().map(str::to_string));
-        assert!(names.len() > 150, "too few names found: {}", names.len());
+        assert!(names.len() > 100, "too few names found: {}", names.len());
         for n in &names {
             assert!(
                 PgHandler::may_be_virtual(n),

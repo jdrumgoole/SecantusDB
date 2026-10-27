@@ -636,10 +636,7 @@ impl PgHandler {
         // The running xids alone: the removal horizon `visibility` also
         // takes is not needed to forget ended inserts. Few run at once, so a
         // list serves as well as a set.
-        let running: Vec<u64> = crate::xids::running()
-            .into_iter()
-            .map(|(_, x)| x)
-            .collect();
+        let running: Vec<u64> = crate::xids::running().into_iter().map(|(_, x)| x).collect();
         let mut all = heaps().lock().unwrap_or_else(|e| e.into_inner());
         let heap = all
             .entry(key)
@@ -803,10 +800,8 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         // The rows are moved in and back, not copied (RP-014). Every caller
         // drops them on an error, so what an error leaves in them is unseen.
-        let mut versions: Vec<(Option<Document>, Document)> = rows
-            .iter_mut()
-            .map(|r| (None, std::mem::take(r)))
-            .collect();
+        let mut versions: Vec<(Option<Document>, Document)> =
+            rows.iter_mut().map(|r| (None, std::mem::take(r))).collect();
         let out = self.stamp_versions(table, def, &mut versions);
         for (r, (_, v)) in rows.iter_mut().zip(versions) {
             *r = v;

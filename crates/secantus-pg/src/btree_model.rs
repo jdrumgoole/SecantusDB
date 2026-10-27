@@ -1240,9 +1240,7 @@ impl BTree {
             self.ssi_events.push(SsiEvent::Landed(root));
             return;
         }
-        let unique_first = shape
-            .unique()
-            .then(|| self.check_unique(shape, &key, dead));
+        let unique_first = shape.unique().then(|| self.check_unique(shape, &key, dead));
         let (leaf, path) = self.descend(shape, &key, tid);
         // The page `_bt_search` lands on, which SSI checks: without the heap
         // TID for a unique index (the first the key could be on) -- the
