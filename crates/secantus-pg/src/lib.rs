@@ -31037,6 +31037,7 @@ impl PgHandler {
         {
             return Err(Self::admin_shutdown());
         }
+        self.recursive_select_refusal(query)?;
         // `statement_timeout` starts now, for this statement.
         let timeout = self.ms_setting("statement_timeout");
         *self

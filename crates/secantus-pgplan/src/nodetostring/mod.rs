@@ -119,6 +119,6 @@ pub struct RuleTrees {
 }
 
 pub use parse::{
-    analyze_create_matview, analyze_create_rule, analyze_create_view, split_initdb_file,
-    AnalysisContext,
+    analyze_create_matview, analyze_create_rule, analyze_create_view, analyze_select,
+    split_initdb_file, AnalysisContext,
 };
