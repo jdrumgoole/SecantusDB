@@ -1442,7 +1442,13 @@ def found(dsn: str, steps: list[str]) -> list[Any]:
     out: list[Any] = []
     with _connect(dsn, "found") as c:
         for sql in steps:
-            cur = c.execute(sql)
+            # A refusal is an answer, compared like rows: the gap is the
+            # wrong answer, not a test that could not run.
+            try:
+                cur = c.execute(sql)
+            except psycopg.Error as e:
+                out.append(("err", e.sqlstate))
+                continue
             out.append(cur.fetchall() if cur.description else None)
     return out
 
