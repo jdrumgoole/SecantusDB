@@ -375,6 +375,14 @@ pub(crate) struct Scan {
     seen: BTreeSet<usize>,
     keys: i64,
     returned: i64,
+    /// mongod's `seeks`: the first, and one per jump to a later interval,
+    /// counted in the work that makes it (the one after the key that asks
+    /// for it).
+    seeks: i64,
+    seek_pending: bool,
+    /// A multikey scan's checks for a document it already returned.
+    dups_tested: i64,
+    dups_dropped: i64,
 }
 
 impl Scan {
@@ -434,6 +442,10 @@ impl Scan {
             seen: BTreeSet::new(),
             keys: 0,
             returned: 0,
+            seeks: 0,
+            seek_pending: false,
+            dups_tested: 0,
+            dups_dropped: 0,
         }
     }
 
@@ -491,10 +503,16 @@ impl Scan {
     /// The first seek goes straight to the low end of the first intervals:
     /// the keys before it are never examined.
     fn seek_start(&mut self) {
-        let start: Vec<&[u8]> = self
+        // `IndexBoundsChecker::getStartSeekPoint`: each field's first
+        // interval's start. Where that start is exclusive, a key equal to it
+        // there is still before the seek point.
+        let start: Vec<(&[u8], bool)> = self
             .ranges
             .iter()
-            .map(|list| list.first().map_or(&[][..], |r| r.0.as_slice()))
+            .map(|list| {
+                list.first()
+                    .map_or((&[][..], true), |r| (r.0.as_slice(), r.1))
+            })
             .collect();
         while self.pos < self.entries.len() {
             let key = &self.entries[self.pos].0;
@@ -502,7 +520,15 @@ impl Scan {
                 .iter()
                 .map(Vec::as_slice)
                 .zip(start.iter().copied())
-                .find_map(|(k, s)| (k != s).then_some(k < s))
+                .find_map(|(k, (s, inclusive))| {
+                    if k != s {
+                        Some(k < s)
+                    } else if !inclusive {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                })
                 .unwrap_or(false);
             if !before {
                 break;
@@ -518,7 +544,11 @@ impl Scan {
     fn work_entry(&mut self) -> Step {
         if !self.started {
             self.started = true;
+            self.seeks += 1;
             self.seek_start();
+        }
+        if std::mem::take(&mut self.seek_pending) {
+            self.seeks += 1;
         }
         while !self.done && self.pos < self.entries.len() {
             let Some((field, ahead)) = self.outside(&self.entries[self.pos].0) else {
@@ -554,6 +584,7 @@ impl Scan {
                 }
                 self.pos += 1;
             }
+            self.seek_pending = true;
             return Step::Seek;
         }
         self.done = true;
@@ -578,7 +609,14 @@ impl Scan {
             Step::End => Work::Eof,
             Step::Seek => Work::NeedTime,
             Step::Entry(row) => {
-                if (self.multikey && !self.seen.insert(row)) || !env.matches(row, &self.filter) {
+                if self.multikey {
+                    self.dups_tested += 1;
+                }
+                let repeat = self.multikey && !self.seen.insert(row);
+                if repeat {
+                    self.dups_dropped += 1;
+                }
+                if repeat || !env.matches(row, &self.filter) {
                     Work::NeedTime
                 } else {
                     self.returned += 1;
@@ -605,6 +643,11 @@ impl Scan {
     /// The keys the scan has examined.
     pub(crate) fn keys(&self) -> i64 {
         self.keys
+    }
+
+    /// `seeks`, `dupsTested` and `dupsDropped`.
+    pub(crate) fn seek_counts(&self) -> (i64, i64, i64) {
+        (self.seeks, self.dups_tested, self.dups_dropped)
     }
 
     /// A DISTINCT_SCAN's next document: the first entry of a new value of
@@ -987,6 +1030,7 @@ impl<'a> Run<'a> {
             docs,
             extra,
             children: self.inputs.iter().map(Run::stats).collect(),
+            work: None,
         }
     }
 }
@@ -1005,7 +1049,7 @@ pub(crate) fn fetched(node: &Node, returned: i64, extra: &mut Document) -> Optio
 
 /// A `SORT`'s memory and spill counters (RM-315): the rows it sorts, run
 /// through the sorter its budget holds, as mongod's executes it.
-fn sort_stats(
+pub(crate) fn sort_stats(
     extra: &mut Document,
     pattern: &Document,
     limit: Option<i64>,

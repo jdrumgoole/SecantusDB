@@ -422,7 +422,12 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let Some(d) = stage.as_document() else {
             continue;
         };
-        if let Some(first_only) = ["$collStats", "$indexStats"]
+        if let Some(spec) = d.get("$planCacheStats") {
+            if let Err(e) = crate::explain::plan_cache::check_spec(spec) {
+                return Ok(e.into_reply());
+            }
+        }
+        if let Some(first_only) = ["$collStats", "$indexStats", "$planCacheStats"]
             .iter()
             .find(|name| i > 0 && d.contains_key(**name))
         {
@@ -611,6 +616,34 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ],
             ) {
                 (ns, Vec::new(), pipeline)
+            } else if first_stage_has(&pipeline, "$planCacheStats") {
+                // mongod's plan cache for the collection. A `$match` right
+                // after the stage is absorbed into it.
+                let absorbed = pipeline
+                    .get(1)
+                    .and_then(Bson::as_document)
+                    .and_then(|d| d.get_document("$match").ok().filter(|_| d.len() == 1));
+                let port = ctx.server_address.as_ref().map_or(27017, |(_, p)| *p);
+                let host = format!("{}:{port}", crate::dbhash::host_name());
+                let matched = |entry: &Document| match absorbed {
+                    None => Ok(true),
+                    Some(q) => secantus_core::query::matches(entry, q, &Document::new(), None)
+                        .map_err(|f| match f {
+                            secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
+                                CommandError::new(code, crate::util::error_code_name(code), message)
+                            }
+                            _ => CommandError::new(2, "BadValue", "unsupported $match"),
+                        }),
+                };
+                let entries = crate::explain::plan_cache::stats_stage(
+                    storage,
+                    &ctx.db_name,
+                    c,
+                    &host,
+                    &matched,
+                )?;
+                let rest = if absorbed.is_some() { 2 } else { 1 };
+                (ns, entries, pipeline[rest.min(pipeline.len())..].to_vec())
             } else if first_stage_has(&pipeline, crate::list_catalog::STAGE) {
                 // Through a view, the entry of the collection beneath it.
                 let entries = crate::list_catalog::entries(storage, &ctx.db_name, Some(c))?;
@@ -749,6 +782,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     });
                 }
                 let lead = leading_sort(&rest, filter.is_empty());
+                // The query mongod plans for the pipeline's front, as its
+                // plan cache keys it: the projection of what the stages
+                // read, the skip and limit it takes in.
+                let front = crate::explain::pipeline_canonical(c, &read_pipeline);
                 let read = |sort: Option<&Document>, limit: i64| {
                     let moved = lead.filter.as_ref().filter(|_| sort.is_some());
                     crate::explain::order::find(
@@ -762,7 +799,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                             collation: collation.as_ref(),
                             vars: &vars,
                             limit,
-                            asked: Default::default(),
+                            asked: crate::near::Asked {
+                                skip: front.skip,
+                                limit: front.limit,
+                                sort,
+                                projection: front.projection.as_ref(),
+                                // A front SBE runs is cached with its reads
+                                // (RM-340), which is not reproduced.
+                                cached: !sbe_read,
+                                distinct: None,
+                            },
                         },
                     )
                 };
@@ -1388,6 +1434,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$match"
             | "$merge"
             | "$out"
+            | "$planCacheStats"
             | "$project"
             | "$redact"
             | "$replaceRoot"

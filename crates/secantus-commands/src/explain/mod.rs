@@ -16,6 +16,7 @@
 //! on one field is tried once here, where mongod tries a plan per predicate.
 
 mod bounds;
+mod cache_key;
 pub(crate) mod debug_string;
 mod deps;
 pub(crate) mod distinct;
@@ -27,6 +28,7 @@ mod node;
 pub(crate) mod order;
 mod parsed;
 mod plan;
+pub(crate) mod plan_cache;
 mod shape;
 pub(crate) mod stream;
 pub(crate) mod summary;
@@ -563,6 +565,7 @@ fn plan_for(
         matched: None,
         whole: &whole,
         ranked: Default::default(),
+        cache: None,
     };
     let q = Query {
         canonical,
@@ -597,12 +600,74 @@ fn plan_for(
     Ok((node, ranked))
 }
 
+/// The plan cache as `explain` reports it for the query `s` plans: the
+/// key's hashes, and the active entry's plan when there is one. mongod's
+/// explain neither runs a cached plan nor writes the cache; it only says
+/// which plan is the cached one (`isCached`).
+struct CacheView {
+    key: cache_key::CacheKey,
+    /// The active entry's solution (`plan::solution`).
+    active: Option<String>,
+}
+
+impl CacheView {
+    fn cached(&self, node: &Node) -> bool {
+        self.active.as_deref() == Some(plan::solution(node).as_str())
+    }
+}
+
+fn cache_view(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    canonical: &Document,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> Option<CacheView> {
+    let full = catalog(storage, db, &s.coll, None).ok()?;
+    let implies = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
+    let (projection, distinct) = match &s.kind {
+        Kind::Find => (s.projection.as_ref(), None),
+        Kind::Distinct(key) => (None, Some(key.as_str())),
+        _ => (None, None),
+    };
+    // A pipeline whose `$group` or `$lookup` mongod pushes into its query
+    // runs in SBE: planned by the classic planner, cached as such (`s`).
+    let sbe = !pipeline.is_empty() && {
+        let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+        let hoisted = hoist::hoist_matches(&stages);
+        let is_view = |from: &str| crate::views::is_view(storage, db, from);
+        secantus_core::sbe::pushdown(&hoisted, &is_view).is_some()
+    };
+    let parts = cache_key::Parts {
+        sort: s.sort.as_ref().filter(|d| !d.is_empty()),
+        projection,
+        collation,
+        distinct,
+        sbe,
+    };
+    let ix = cache_key::Indexability {
+        catalog: &full,
+        collation,
+        implies: &implies,
+    };
+    let key = cache_key::key_for(canonical, &parts, &ix)?;
+    let active = plan_cache::place_of(storage, db, &s.coll)
+        .ok()
+        .flatten()
+        .and_then(|place| plan_cache::get(&place, &key))
+        .filter(|e| e.active)
+        .map(|e| e.solution);
+    Some(CacheView { key, active })
+}
+
 fn query_planner(
     ns: &str,
     s: &Shape,
     canonical: &Document,
     collation: Option<&Collation>,
     plan: &Node,
+    cache: Option<&CacheView>,
 ) -> Document {
     let mut out = doc! { "namespace": ns };
     // Plans made without parsing the query say nothing about it.
@@ -622,6 +687,20 @@ fn query_planner(
             out.insert("collation", c.spec().clone());
         }
         out.insert("indexFilterSet", false);
+        // The plan cache key, wherever mongod built one: not for a
+        // collection that does not exist.
+        let missing = |n: &Node| matches!(n, Node::Eof("nonExistentNamespace"));
+        let nothing = match plan {
+            Node::Count(input) | Node::Update(input) => missing(input),
+            Node::Delete { input, .. } => missing(input),
+            other => missing(other),
+        };
+        if let (false, Some(c)) = (nothing, cache) {
+            let shape = cache_key::hex(c.key.shape_hash);
+            out.insert("queryHash", shape.clone());
+            out.insert("planCacheShapeHash", shape);
+            out.insert("planCacheKey", cache_key::hex(c.key.key_hash));
+        }
     }
     if s.optimized_pipeline {
         out.insert("optimizedPipeline", true);
@@ -630,7 +709,7 @@ fn query_planner(
     out.insert("maxIndexedAndSolutionsReached", false);
     out.insert("maxScansToExplodeReached", false);
     out.insert("prunedSimilarIndexes", false);
-    let mut winning = doc! { "isCached": false };
+    let mut winning = doc! { "isCached": cache.is_some_and(|c| c.cached(plan)) };
     winning.extend(plan.to_doc(None));
     out.insert("winningPlan", winning);
     out.insert("rejectedPlans", Bson::Array(vec![]));
@@ -974,6 +1053,16 @@ fn query_fields(filter: &Document) -> Vec<String> {
     out
 }
 
+/// A rejected plan's stages, saved once more as the trial ends.
+fn set_aside(st: &mut Stats) {
+    if let Some(w) = st.work.as_mut() {
+        w.saved += 1;
+    }
+    for c in st.children.iter_mut() {
+        set_aside(c);
+    }
+}
+
 /// Raise each counter of `run` to what `trial` counted in the same stage.
 fn at_least(run: &mut Stats, trial: &Stats) {
     run.n_returned = run.n_returned.max(trial.n_returned);
@@ -1024,9 +1113,11 @@ fn execution_stats(
     stats: &Stats,
     verbosity: Verbosity,
     tried: &[(Node, f64, Stats)],
+    cache: Option<&CacheView>,
 ) -> Document {
+    let cached = |n: &Node| cache.is_some_and(|c| c.cached(n));
     let (keys, docs) = stats.totals();
-    let mut stages = doc! { "isCached": false };
+    let mut stages = doc! { "isCached": cached(plan) };
     stages.extend(plan.to_doc(Some(stats)));
     let mut out = doc! {
         "executionSuccess": true,
@@ -1049,8 +1140,14 @@ fn execution_stats(
                     st.extra = stats.extra.clone();
                     st.n_returned = stats.n_returned;
                 }
+                // A plan the trial rejected is saved once more when it is
+                // set aside (measured 8.2.11: `saveState` 1 on each of its
+                // stages, the winner's 0).
+                if at > 0 {
+                    set_aside(&mut st);
+                }
                 let (keys, docs) = st.totals();
-                let mut stages = doc! { "isCached": false };
+                let mut stages = doc! { "isCached": cached(node) };
                 stages.extend(node.to_doc(Some(&st)));
                 Bson::Document(doc! {
                     "nReturned": num(st.n_returned),
@@ -1374,7 +1471,15 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         crate::notablescan::refuse_planned(ctx.storage()?, &db, &read, why)?;
     }
     let tried = tried_plans(s, &ranked);
-    let mut planner = query_planner(&ns, s, &canonical, collation.as_ref(), &plan);
+    let cache = cache_view(storage, &db, s, &canonical, collation.as_ref(), &r.pipeline);
+    let mut planner = query_planner(
+        &ns,
+        s,
+        &canonical,
+        collation.as_ref(),
+        &plan,
+        cache.as_ref(),
+    );
     if filtered && planner.contains_key("indexFilterSet") {
         planner.insert("indexFilterSet", true);
     }
@@ -1382,7 +1487,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         let rejected: Vec<Bson> = tried[1..]
             .iter()
             .map(|(node, _, _)| {
-                let mut d = doc! { "isCached": false };
+                let mut d = doc! { "isCached": cache.as_ref().is_some_and(|c| c.cached(node)) };
                 d.extend(node.to_doc(None));
                 Bson::Document(d)
             })
@@ -1424,7 +1529,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         if let Some(st) = &stats {
             reply.insert(
                 "executionStats",
-                execution_stats(&plan, st, verbosity, &tried),
+                execution_stats(&plan, st, verbosity, &tried, cache.as_ref()),
             );
         }
         reply.insert("command", r.echo.clone());
@@ -1435,7 +1540,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         if let Some(st) = &stats {
             cursor.insert(
                 "executionStats",
-                execution_stats(&plan, st, verbosity, &tried),
+                execution_stats(&plan, st, verbosity, &tried, cache.as_ref()),
             );
         }
         let counted = |stage: &mut Document, n: i64| {

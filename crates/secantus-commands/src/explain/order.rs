@@ -33,7 +33,7 @@ use super::node::Node;
 use super::plan::{self, Query};
 use super::{catalog, parsed, resolve_hint};
 use crate::storage::{RawHint, Storage, StorageError};
-use bson::{Bson, Document};
+use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
@@ -294,7 +294,10 @@ struct Lazy<'a> {
     storage: &'a dyn Storage,
     ask: &'a Ask<'a>,
     rows: &'a Rows,
-    /// Some index is partial.
+    /// The trial needs whole documents and runs every filter: some index
+    /// is partial (it tests a filter of its own), the query is a rooted
+    /// `$or`, whose branches are each tried against their own filter, or it
+    /// sorts, and a sort counts the bytes of what it holds.
     partial: bool,
     /// The top-level fields the indexes are keyed on.
     fields: BTreeSet<String>,
@@ -361,6 +364,395 @@ pub(crate) fn ask_catalog(
         catalog,
     )
     .0)
+}
+
+/// The collection's indexes as the planner sees them, before any index
+/// filter: what mongod's plan cache discriminates by and is cleared with.
+fn catalog_of(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Rc<super::IndexInfo>>, StorageError> {
+    catalog(storage, ask.db, ask.coll, None)
+}
+
+/// mongod's plan cache as one read of a command consults and writes it
+/// (`super::plan_cache`).
+struct ReadCache<'a> {
+    storage: &'a dyn Storage,
+    place: super::plan_cache::Place<'a>,
+    ask: &'a Ask<'a>,
+    /// The query as parsed, which a rooted `$or`'s branches are found in.
+    canonical: Document,
+    catalog: Vec<Rc<super::IndexInfo>>,
+    index_filter_set: bool,
+    /// The read has consulted and written the cache already: it now only
+    /// reads back the plans chosen.
+    read_only: std::cell::Cell<bool>,
+    /// The plan the read chose for each key (the query's, and a rooted
+    /// `$or`'s branches').
+    chosen: std::cell::RefCell<std::collections::HashMap<String, String>>,
+}
+
+impl<'a> ReadCache<'a> {
+    /// `None` for a read that keeps no plan cache: one made to learn
+    /// about the plan, or of a collection with no UUID.
+    fn new(
+        storage: &'a dyn Storage,
+        ask: &'a Ask<'a>,
+        canonical: Document,
+        catalog: Vec<Rc<super::IndexInfo>>,
+    ) -> Result<Option<ReadCache<'a>>, StorageError> {
+        if !ask.asked.cached {
+            return Ok(None);
+        }
+        let Ok(uuid) = storage.collection_uuid(ask.db, ask.coll) else {
+            return Ok(None);
+        };
+        let index_filter_set = crate::index_filters::apply(
+            storage,
+            ask.db,
+            ask.coll,
+            ask.filter,
+            ask.sort,
+            ask.asked.projection,
+            ask.collation,
+            Vec::new(),
+        )
+        .1;
+        Ok(Some(ReadCache {
+            storage,
+            place: super::plan_cache::Place {
+                store: store_address(storage),
+                db: ask.db,
+                coll: ask.coll,
+                uuid,
+                catalog: super::plan_cache::fingerprint(storage, ask.db, ask.coll, &catalog)?,
+            },
+            ask,
+            canonical,
+            catalog,
+            index_filter_set,
+            read_only: std::cell::Cell::new(false),
+            chosen: Default::default(),
+        }))
+    }
+}
+
+/// A read's consultation of mongod's plan cache: the query mongod plans --
+/// its skip, limit and projection as the command gave them -- through the
+/// cache, as mongod plans it before reading anything, whatever the read
+/// then finds. `rows`: what the query matches. The hook it hands back reads
+/// the plans it chose: the order is then worked out with them.
+fn consult<'a>(
+    storage: &'a dyn Storage,
+    ask: &'a Ask<'a>,
+    rows: &Rows,
+) -> Result<Option<ReadCache<'a>>, StorageError> {
+    if !ask.asked.cached || ask.hint.is_some() {
+        return Ok(None);
+    }
+    let catalog = ask_catalog(storage, ask)?;
+    let canonical = parsed::parsed_query(ask.filter);
+    let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
+    let query = |trial| Query {
+        canonical: &canonical,
+        sort: ask.sort,
+        projection: ask.asked.projection,
+        skip: ask.asked.skip,
+        limit: ask.asked.limit,
+        hint: plan::Hint::None,
+        collation: ask.collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        pipeline: false,
+        implies: &implied,
+        trial,
+    };
+    // One plan is all mongod has: it caches nothing.
+    if !plan::contested(&query(None), &catalog) {
+        return Ok(None);
+    }
+    let full = catalog_of(storage, ask)?;
+    let Some(hook) = ReadCache::new(storage, ask, canonical.clone(), full)? else {
+        return Ok(None);
+    };
+    let whole = Lazy {
+        storage,
+        ask,
+        rows,
+        partial: catalog.iter().any(|ix| ix.partial.is_some())
+            || (canonical.len() == 1 && canonical.contains_key("$or"))
+            || ask.sort.is_some_and(|s| !s.is_empty()),
+        fields: catalog
+            .iter()
+            .flat_map(|ix| ix.key.keys())
+            .map(|field| field.split('.').next().unwrap_or(field).to_string())
+            .collect(),
+        loaded: OnceCell::new(),
+    };
+    let trial = plan::Trial {
+        total: None,
+        matched: Some(rows.len()),
+        whole: &whole,
+        ranked: Default::default(),
+        cache: Some(&hook),
+    };
+    let _chosen = plan::plan(&query(Some(&trial)), &catalog);
+    hook.read_only.set(true);
+    Ok(Some(hook))
+}
+
+/// A plan as the plan cache's debug information holds it: the plan's stage
+/// statistics, where a projection keeps no spec (mongod 8.2.11's
+/// `$planCacheStats` prints `transformBy: {}`).
+fn cached_stages(mut stage: Document) -> Document {
+    if stage
+        .get_str("stage")
+        .is_ok_and(|s| s.starts_with("PROJECTION_"))
+    {
+        stage.insert("transformBy", Document::new());
+    }
+    if let Some(Bson::Document(input)) = stage.get("inputStage").cloned() {
+        stage.insert("inputStage", cached_stages(input));
+    }
+    if let Ok(inputs) = stage.get_array("inputStages") {
+        let inputs: Vec<Bson> = inputs
+            .iter()
+            .map(|i| match i {
+                Bson::Document(d) => Bson::Document(cached_stages(d.clone())),
+                other => other.clone(),
+            })
+            .collect();
+        stage.insert("inputStages", inputs);
+    }
+    stage
+}
+
+/// A store's identity within the process, for the caches kept per store.
+pub(crate) fn store_address(storage: &dyn Storage) -> usize {
+    storage as *const dyn Storage as *const () as usize
+}
+
+/// Whether mongod caches the plan of a query (`shouldCacheQuery`): not a
+/// hinted one, nor one that matches nothing by its form, nor an empty
+/// query with no sort.
+fn cacheable(q: &Query) -> bool {
+    if q.hint != plan::Hint::None || q.min_max {
+        return false;
+    }
+    if q.canonical.len() == 1 && q.canonical.contains_key("$alwaysFalse") {
+        return false;
+    }
+    !(q.canonical.is_empty() && q.sort.is_none_or(|s| s.is_empty()))
+}
+
+impl plan::CacheHook for ReadCache<'_> {
+    fn lookup(&self, q: &Query) -> Option<plan::Lookup> {
+        let top = *q.canonical == self.canonical;
+        // A rooted `$or`'s branch, which the subplanner plans and caches
+        // as a query of its own.
+        let branch = !top
+            && self.canonical.len() == 1
+            && self.canonical.get_array("$or").is_ok_and(|branches| {
+                branches
+                    .iter()
+                    .any(|b| b.as_document() == Some(q.canonical))
+            });
+        if !(top || branch) || !cacheable(q) {
+            return None;
+        }
+        let parts = super::cache_key::Parts {
+            sort: if top { q.sort } else { None },
+            projection: if top { self.ask.asked.projection } else { None },
+            collation: q.collation,
+            distinct: if top { self.ask.asked.distinct } else { None },
+            sbe: false,
+        };
+        let filter = if top { self.ask.filter } else { q.canonical };
+        let implies = |partial: &Document| self.storage.query_implies_partial(filter, partial);
+        let ix = super::cache_key::Indexability {
+            catalog: &self.catalog,
+            collation: q.collation,
+            implies: &implies,
+        };
+        let key = super::cache_key::key_for(q.canonical, &parts, &ix)?;
+        // Read back, the plan this read chose; else the active entry's.
+        let active = if self.read_only.get() {
+            self.chosen
+                .borrow()
+                .get(&key.key)
+                .map(|sig| (sig.clone(), 0))
+        } else {
+            super::plan_cache::get(&self.place, &key)
+                .filter(|e| e.active)
+                .map(|e| (e.signature, e.works))
+        };
+        Some(plan::Lookup {
+            key,
+            active,
+            branch,
+            trusted: self.read_only.get(),
+        })
+    }
+
+    fn chose(&self, l: &plan::Lookup, signature: String) {
+        if !self.read_only.get() {
+            self.chosen
+                .borrow_mut()
+                .insert(l.key.key.clone(), signature);
+        }
+    }
+
+    fn deactivate(&self, key: &super::cache_key::CacheKey) {
+        if !self.read_only.get() {
+            super::plan_cache::deactivate(&self.place, key);
+        }
+    }
+
+    fn store(&self, l: &plan::Lookup, q: &Query, d: &plan::Decision, mode: plan::CacheMode) {
+        if self.read_only.get() {
+            return;
+        }
+        let Some(&(winner, best, winner_stats)) = d.ranked.first() else {
+            return;
+        };
+        if mode == plan::CacheMode::Sometimes {
+            let tie = d
+                .ranked
+                .get(1)
+                .is_some_and(|(_, second, _)| (best - second).abs() < 1e-10);
+            if tie || winner_stats.n_returned == 0 {
+                return;
+            }
+        }
+        let mut created_from = if l.branch {
+            doc! { "query": q.canonical.clone(), "sort": {}, "projection": {} }
+        } else {
+            let projection: Document = self
+                .ask
+                .asked
+                .projection
+                .map(|p| {
+                    p.iter()
+                        .filter(|(k, _)| !k.starts_with('$'))
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            doc! {
+                "query": self.ask.filter.clone(),
+                "sort": self.ask.sort.cloned().unwrap_or_default(),
+                "projection": projection,
+            }
+        };
+        if let Some(c) = q.collation {
+            created_from.insert("collation", c.spec().clone());
+        }
+        if let (false, Some(key)) = (l.branch, self.ask.asked.distinct) {
+            created_from.insert("distinct", doc! { "key": key });
+        }
+        let creation = d
+            .ranked
+            .iter()
+            .map(|(node, _, stats)| {
+                let (keys, docs) = stats.totals();
+                doc! {
+                    "nReturned": super::node::num(stats.n_returned),
+                    "executionTimeMillisEstimate": 0_i32,
+                    "totalKeysExamined": super::node::num(keys),
+                    "totalDocsExamined": super::node::num(docs),
+                    "executionStages": cached_stages(node.to_doc(Some(stats))),
+                }
+            })
+            .collect();
+        let e = super::cache_key::parse(q.canonical);
+        let command_shape = e
+            .map(|e| {
+                super::cache_key::command_shape(
+                    &e,
+                    if l.branch { None } else { q.sort },
+                    if l.branch {
+                        None
+                    } else {
+                        self.ask.asked.projection
+                    },
+                    q.collation,
+                )
+            })
+            .unwrap_or_default();
+        let signature = plan::signature(winner);
+        let solution = plan::solution(winner);
+        super::plan_cache::set(
+            &self.place,
+            super::plan_cache::Entry {
+                key: l.key.key.clone(),
+                shape_hash: l.key.shape_hash,
+                key_hash: l.key.key_hash,
+                command_shape,
+                active: false,
+                works: d.works,
+                reads: false,
+                created: bson::DateTime::now(),
+                created_from,
+                solution_hash: super::plan_cache::solution_hash(&solution),
+                signature,
+                solution,
+                cached_plan: cached_stages(winner.to_doc(None)),
+                creation,
+                scores: d.ranked.iter().map(|(_, s, _)| *s).collect(),
+                index_filter_set: self.index_filter_set,
+            },
+        );
+    }
+}
+
+/// A command that reads no rows in order (`count`, an `update` of many
+/// documents, a `delete` of many) still plans its query as mongod does, and
+/// so consults and writes the plan cache: the read is planned here and its
+/// rows dropped. Nothing is read when one plan is all mongod has: a query no
+/// two plans contest, or a count a COUNT_SCAN answers.
+pub(crate) fn through_cache(
+    storage: &dyn Storage,
+    ask: &Ask,
+    count: bool,
+) -> Result<(), StorageError> {
+    if !ask.asked.cached || ask.hint.is_some() || ask.filter.is_empty() {
+        return Ok(());
+    }
+    let catalog = ask_catalog(storage, ask)?;
+    let canonical = parsed::parsed_query(ask.filter);
+    let implied = |partial: &Document| storage.query_implies_partial(ask.filter, partial);
+    let query = Query {
+        canonical: &canonical,
+        sort: ask.sort,
+        projection: None,
+        skip: 0,
+        limit: ask.limit,
+        hint: plan::Hint::None,
+        collation: ask.collation,
+        min_max: false,
+        return_key: false,
+        show_record_id: false,
+        batch_size: false,
+        keys_only: false,
+        wanted: None,
+        pipeline: false,
+        implies: &implied,
+        trial: None,
+    };
+    if !plan::contested(&query, &catalog) {
+        return Ok(());
+    }
+    let count_scan = |n: &Node| match n {
+        Node::Count(input) => matches!(**input, Node::CountScan(_)),
+        other => matches!(other, Node::CountScan(_)),
+    };
+    if count && count_scan(&plan::count(&query, &catalog)) {
+        return Ok(());
+    }
+    // What the read finds is not used: only the plan it chose is kept.
+    ordered_rows(storage, ask).map(|_| ())
 }
 
 /// `rows` in the order `order` names them.
@@ -516,6 +908,8 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         return Ok(None);
     };
     let (mut rows, mut via) = (matched.rows, matched.via);
+    // mongod plans the query, through its plan cache, before it reads.
+    let hook = consult(storage, ask, &rows)?;
     // A `$near` is the order: mongod's ring search, nearest first, and a
     // sort over what it returns.
     if let Some(near) = &near {
@@ -631,7 +1025,9 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
                 storage,
                 ask,
                 rows: &rows,
-                partial: catalog.iter().any(|ix| ix.partial.is_some()),
+                partial: catalog.iter().any(|ix| ix.partial.is_some())
+                    || (canonical.len() == 1 && canonical.contains_key("$or"))
+                    || ask.sort.is_some_and(|s| !s.is_empty()),
                 fields: catalog
                     .iter()
                     .flat_map(|ix| ix.key.keys())
@@ -639,11 +1035,13 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
                     .collect(),
                 loaded: OnceCell::new(),
             };
+            // The plans the read chose through the plan cache.
             let trial = plan::Trial {
                 total,
                 matched: Some(rows.len()),
                 whole: &whole,
                 ranked: Default::default(),
+                cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
             };
             plan = plan::plan(&query(Some(&trial)), &catalog);
         }

@@ -198,7 +198,11 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             collation: collation.as_ref(),
             vars: &Document::new(),
             limit: 0,
-            asked: Default::default(),
+            asked: crate::near::Asked {
+                cached: true,
+                distinct: Some(&key),
+                ..Default::default()
+            },
         };
         let read_error = |e| {
             crate::util::read_error_on_namespace(e, "distinct", &format!("{}.{coll}", ctx.db_name))
