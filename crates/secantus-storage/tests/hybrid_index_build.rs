@@ -328,3 +328,47 @@ fn a_build_over_its_memory_budget_sorts_externally() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `--repair` over a store a build was cut off in: the repair's open
+/// restarts and commits the build (RM-187) before it checks every
+/// collection, and the index it leaves agrees with the documents.
+#[test]
+fn a_repair_finishes_an_unfinished_build() {
+    let home = temp_home();
+    let opts = secantus_storage::StorageOptions {
+        durable: Some(true),
+        ..Default::default()
+    };
+    {
+        let st = Storage::open_with_options(home.to_str().unwrap(), &opts).unwrap();
+        load(&st, 3_000);
+        st.begin_index_build(
+            "app",
+            "c",
+            [13u8; 16],
+            &[spec("a_1", doc! {"a": 1}, doc! {})],
+            "localhost:27017",
+        )
+        .unwrap();
+        set_a(&st, 7, 9_999);
+    }
+    let report =
+        secantus_storage::repair::repair(home.to_str().unwrap(), &opts, &mut |_| {}).unwrap();
+    assert!(report.salvaged.is_empty(), "{:?}", report.salvaged);
+    let st = Storage::open_with_options(home.to_str().unwrap(), &opts).unwrap();
+    assert!(st
+        .list_indexes("app", "c")
+        .unwrap()
+        .iter()
+        .any(|ix| ix.get_str("name") == Ok("a_1")));
+    assert!(st.index_builds(None, None).is_empty());
+    assert_consistent(&st);
+    assert_eq!(
+        st.find_matching("app", "c", &doc! {"a": 9_999})
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
