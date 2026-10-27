@@ -959,6 +959,23 @@ tests regression tests:
       Found while working RP-028.
       Backlog-ID: RP-299
       Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation
+- [ ] **OPEN — a cancel sent during a prepared statement was lost once in
+      CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
+      (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
+      job (run 40479482747, attempt 1): the statement answered `ok` after
+      `pg_sleep(3)` ran to its end, where the cancel sent 2.5 s in should
+      have ended it with 57014. Attempt 2 of the same commit passed, and
+      locally (debug build, macOS) every delay from 0.25 to 4.0 s in
+      0.25 s steps answered 57014 within 0.05 s, four runs of the test
+      each passing. Not diagnosed. PostgreSQL itself drops a cancel that
+      lands while it waits for the next message (`DoingCommandRead`), so
+      one candidate is the gap between psycopg's Parse+Sync cycle and its
+      Bind cycle, which both servers would drop -- but that gap is a
+      client round trip, and no measurement shows the cancel landed there.
+      The next step is the server's log of a failing run with the cancel's
+      arrival and the message it landed in.
+      Backlog-ID: RP-303
+      Verify: none -- seen once in CI; does not fail on demand
 
 ## Found by batch 78 (2026-10-25)
 
