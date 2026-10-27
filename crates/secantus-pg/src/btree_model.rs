@@ -148,6 +148,10 @@ pub(crate) struct BTree {
     pub(crate) ssi_events: Vec<SsiEvent>,
 }
 
+/// A search's leaf, the internal pages above it (root first), and whether a
+/// search with any heap TID takes the same way (`descend_tidless`).
+pub(crate) type Descent = (u32, Vec<u32>, bool);
+
 /// An insert's report to SSI (`_bt_doinsert`, `_bt_split`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum SsiEvent {
@@ -1129,25 +1133,32 @@ impl BTree {
     /// new tuple (`free < need`), and `pending` -- the size of every tuple
     /// the same command inserts, which may fill the leaf first -- is added
     /// to the need so the set stays a superset.
-    pub(crate) fn candidate_tids(
+    ///
+    /// With them, for a unique index, the TID-less
+    /// descent it made (`descend_tidless`), which an insert of the same key
+    /// into the tree as it still is can take instead of descending again
+    /// ([`Self::insert_descended`]).
+    pub(crate) fn candidate_tids_descending(
         &self,
         shape: &dyn Shape,
         key: &[Bson],
         tid: i64,
         pending: i64,
-    ) -> Vec<i64> {
+    ) -> (Vec<i64>, Option<Descent>) {
         let mut out = Vec::new();
         if self.root.is_none() {
-            return out;
+            return (out, None);
         }
         // The leaf the insert lands on, when the TID-less search already
         // found it (`descend_tidless`).
         let mut landed = None;
+        let mut descent = None;
         if shape.unique() {
-            let (first, _, tid_free) = self.descend_tidless(shape, key);
+            let (first, path, tid_free) = self.descend_tidless(shape, key);
             if tid_free {
                 landed = Some(first);
             }
+            descent = Some((first, path, tid_free));
             let mut page = first;
             while let Page::Leaf { items, right, .. } = &self.pages[page as usize] {
                 let mut last_equal = false;
@@ -1187,12 +1198,13 @@ impl BTree {
                 }
             }
         }
-        out
+        (out, descent)
     }
 
-    /// The size an index tuple for `key` takes (`insertstate->itemsz`).
-    pub(crate) fn tuple_size(shape: &dyn Shape, key: Vec<Bson>, tid: i64) -> i64 {
-        item(shape, key, vec![tid]).size
+    /// The size an index tuple for `key` takes (`insertstate->itemsz`):
+    /// with one heap TID, its key's size (`item`).
+    pub(crate) fn key_tuple_size(shape: &dyn Shape, key: &[Bson]) -> i64 {
+        shape.tuple_size(key)
     }
 
     /// `_bt_check_unique`'s pass over the key's equal tuples, from the
@@ -1210,8 +1222,10 @@ impl BTree {
         shape: &dyn Shape,
         key: &[Bson],
         dead: &dyn Fn(i64) -> bool,
-    ) -> (u32, Vec<u32>, bool) {
-        let (first, path, tid_free) = self.descend_tidless(shape, key);
+        descended: Option<Descent>,
+    ) -> Descent {
+        let (first, path, tid_free) =
+            descended.unwrap_or_else(|| self.descend_tidless(shape, key));
         let done = (first, path, tid_free);
         let mut page = first;
         loop {
@@ -1283,6 +1297,22 @@ impl BTree {
         unchanged: bool,
         dead: &dyn Fn(i64) -> bool,
     ) {
+        self.insert_descended(shape, key, tid, unchanged, dead, None);
+    }
+
+    /// [`Self::insert_deleting`], given for a unique index the TID-less
+    /// descent [`Self::candidate_tids_descending`] made for `key` in the
+    /// tree as it still is -- nothing changed since -- so the unique check
+    /// starts where that search landed rather than descending again.
+    pub(crate) fn insert_descended(
+        &mut self,
+        shape: &dyn Shape,
+        key: Vec<Bson>,
+        tid: i64,
+        unchanged: bool,
+        dead: &dyn Fn(i64) -> bool,
+        descended: Option<Descent>,
+    ) {
         self.dirty = true;
         if self.root.is_none() {
             let new = item(shape, key, vec![tid]);
@@ -1296,7 +1326,10 @@ impl BTree {
             self.ssi_events.push(SsiEvent::Landed(root));
             return;
         }
-        let (unique_first, reuse) = match shape.unique().then(|| self.check_unique(shape, &key, dead)) {
+        let (unique_first, reuse) = match shape
+            .unique()
+            .then(|| self.check_unique(shape, &key, dead, descended))
+        {
             Some((first, path, tid_free)) => (Some(first), tid_free.then_some((first, path))),
             None => (None, None),
         };

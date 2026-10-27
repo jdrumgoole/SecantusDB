@@ -658,27 +658,54 @@ impl PgHandler {
             // one-row inserts quadratic (RP-014).
             let pending: i64 = keys
                 .iter()
-                .map(|(key, _, ctid)| BTree::tuple_size(&*shape, key.clone(), *ctid))
+                .map(|(key, _, _)| BTree::key_tuple_size(&*shape, key))
                 .sum();
-            let candidates = self.with_btree(table, &shape, |t| {
-                let mut c: Vec<i64> = keys
-                    .iter()
-                    .flat_map(|(key, _, ctid)| t.candidate_tids(&*shape, key, *ctid, pending))
-                    .collect();
+            // When no TID needs the heap's answer -- the common case, a new
+            // key on a leaf with room -- the heap is not read (its answer
+            // for no TIDs is that none is dead), so a single version goes in
+            // under the same hold of the tree, from where the candidates'
+            // search already landed (RP-014). Otherwise the tree is let go
+            // while the heap is read, as below.
+            let mut keys = Some(keys);
+            let done = self.with_btree(table, &shape, |t| {
+                let all = keys.as_ref().expect("the keys");
+                let mut descents = Vec::with_capacity(all.len());
+                let mut c: Vec<i64> = Vec::new();
+                for (key, _, ctid) in all {
+                    let (tids, descent) =
+                        t.candidate_tids_descending(&*shape, key, *ctid, pending);
+                    c.extend(tids);
+                    descents.push(descent);
+                }
                 c.sort_unstable();
                 c.dedup();
-                c
-            })?;
-            let dead = self.dead_index_tids_among(table, &candidates)?;
-            // A model built here is of the rows already stored, which these
-            // versions are not yet among.
-            let events = self.with_btree(table, &shape, |t| {
-                t.ssi_events.clear();
-                for (key, unchanged, ctid) in keys {
-                    t.insert_deleting(&*shape, key, ctid, unchanged, &|t| dead.contains(&t));
+                if !c.is_empty() || all.len() != 1 {
+                    return Err(c);
                 }
-                std::mem::take(&mut t.ssi_events)
+                let (key, unchanged, ctid) =
+                    keys.take().expect("the keys").pop().expect("one key");
+                t.ssi_events.clear();
+                t.insert_descended(&*shape, key, ctid, unchanged, &|_| false, descents.pop().flatten());
+                Ok(std::mem::take(&mut t.ssi_events))
             })?;
+            let events = match done {
+                Ok(events) => events,
+                Err(candidates) => {
+                    let keys = keys.take().expect("the keys");
+                    let dead = self.dead_index_tids_among(table, &candidates)?;
+                    // A model built here is of the rows already stored, which
+                    // these versions are not yet among.
+                    self.with_btree(table, &shape, |t| {
+                        t.ssi_events.clear();
+                        for (key, unchanged, ctid) in keys {
+                            t.insert_deleting(&*shape, key, ctid, unchanged, &|t| {
+                                dead.contains(&t)
+                            });
+                        }
+                        std::mem::take(&mut t.ssi_events)
+                    })?
+                }
+            };
             // What SSI hears of the inserts (`_bt_doinsert`, `_bt_split`):
             // a split moves its page's locks to the new half too, whoever
             // splits, and each insert checks the page it landed on.

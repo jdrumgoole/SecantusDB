@@ -4647,7 +4647,7 @@ pub struct Storage {
     /// server restarted, the next insert reuses its RecordId). Kept in memory
     /// only, as mongod keeps it; forgotten when the collection is dropped, so
     /// a re-created one starts again at 1.
-    record_ids: Mutex<HashMap<(String, String), i64>>,
+    record_ids: Mutex<HashMap<String, HashMap<String, i64>>>,
     /// Per `(db, collection, index)`: which components of each key field hold
     /// an array in some document -- mongod's multikey paths, which its planner
     /// reads to decide how far an index's bounds can be narrowed. Computed by
@@ -14730,12 +14730,17 @@ impl Storage {
     /// from 1, as mongod numbers records (`record_ids`).
     fn mint_record_id(&self, db: &str, coll: &str) -> Result<i64> {
         let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        let key = (db.to_string(), coll.to_string());
-        let next = match ids.get(&key) {
-            Some(n) => *n,
-            None => self.largest_record_id(db, coll)? + 1,
-        };
-        ids.insert(key, next + 1);
+        // By database, then collection: asked by borrowed names, with no
+        // key built for a counter already there (every insert asks, RP-014).
+        if let Some(n) = ids.get_mut(db).and_then(|c| c.get_mut(coll)) {
+            let next = *n;
+            *n = next + 1;
+            return Ok(next);
+        }
+        let next = self.largest_record_id(db, coll)? + 1;
+        ids.entry(db.to_string())
+            .or_default()
+            .insert(coll.to_string(), next + 1);
         Ok(next)
     }
 
@@ -14743,7 +14748,7 @@ impl Storage {
     /// reserving it.
     fn next_record_id(&self, db: &str, coll: &str) -> Result<i64> {
         let ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        match ids.get(&(db.to_string(), coll.to_string())) {
+        match ids.get(db).and_then(|c| c.get(coll)) {
             Some(n) => Ok(*n),
             None => Ok(self.largest_record_id(db, coll)? + 1),
         }
@@ -14753,14 +14758,18 @@ impl Storage {
     /// collection keeps its records' ids and goes on from its source's).
     fn set_next_record_id(&self, db: &str, coll: &str, next: i64) {
         let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        ids.insert((db.to_string(), coll.to_string()), next);
+        ids.entry(db.to_string())
+            .or_default()
+            .insert(coll.to_string(), next);
     }
 
     /// Forget the counter of a dropped `(db, coll)`: one created again under
     /// the name numbers its records from 1, as mongod's does.
     fn forget_record_ids(&self, db: &str, coll: &str) {
         let mut ids = self.record_ids.lock().unwrap_or_else(|e| e.into_inner());
-        ids.remove(&(db.to_string(), coll.to_string()));
+        if let Some(c) = ids.get_mut(db) {
+            c.remove(coll);
+        }
     }
 
     /// The largest RecordId `(db, coll)` holds as committed (0 when none):

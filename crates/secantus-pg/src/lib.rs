@@ -5047,14 +5047,14 @@ impl PgHandler {
     /// A session with its own temporary tables or functions, or a database
     /// with row-level security (whose tables are resolved by name), keeps a
     /// private record.
-    fn session_tables_owner(&self) -> u64 {
+    fn session_tables_owner(&self, temp_function: &std::cell::OnceCell<bool>) -> u64 {
         let private = !self
             .temp_tables
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .is_empty()
             || !self.rls_enabled_docs().is_empty()
-            || self.any_temp_function();
+            || *temp_function.get_or_init(|| self.any_temp_function());
         if private {
             self.session_serial
         } else {
@@ -5197,7 +5197,9 @@ impl PgHandler {
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
         secantus_pgplan::schemas::set_temp_schema_serial(self.session_serial);
-        let owner = self.session_tables_owner();
+        // Whether a temporary function exists, asked at most once here.
+        let temp_function = std::cell::OnceCell::new();
+        let owner = self.session_tables_owner(&temp_function);
         // Compared in place: building the key allocated the role and the
         // database name on every statement.
         let fresh = !shareable
@@ -5276,7 +5278,10 @@ impl PgHandler {
         let version = catalog_cache()
             .version
             .load(std::sync::atomic::Ordering::SeqCst);
-        let serial = if overlay_empty && !self.any_temp_function() && !self.block_wrote_catalog() {
+        let serial = if overlay_empty
+            && !*temp_function.get_or_init(|| self.any_temp_function())
+            && !self.block_wrote_catalog()
+        {
             0
         } else {
             self.session_serial
@@ -50778,7 +50783,10 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: std::fmt::Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.install_user_types();
+        // No session state is installed on the thread here: nothing below
+        // reads it but planning, and `describe_fields` installs it before
+        // it plans. A described statement's answer comes from its memo
+        // without (RP-014).
         self.note_result_format(&target.result_column_format);
         self.check_cached_result_type(target.statement.as_ref())?;
         let param_types = self.param_type_names(target.statement.as_ref());

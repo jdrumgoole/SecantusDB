@@ -32,6 +32,9 @@ thread_local! {
     /// are in PostgreSQL, where every backend has its own temp namespace.
     static TEMP_SCHEMA: std::cell::RefCell<Option<String>> =
         const { std::cell::RefCell::new(None) };
+    /// The serial `TEMP_SCHEMA` is known to name, while it does: checked
+    /// before the name is read back (every statement installs it, RP-014).
+    static TEMP_SCHEMA_SERIAL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     /// The schemas the current role holds no `USAGE` on, installed per
     /// statement: PostgreSQL drops them from the active search path, so an
     /// unqualified name never resolves into one and nothing is created there.
@@ -69,12 +72,17 @@ fn schema_usable(schema: &str) -> bool {
 /// Install the session's temporary schema for the statements that follow.
 pub fn set_temp_schema(schema: Option<String>) {
     bump_resolve_epoch();
+    TEMP_SCHEMA_SERIAL.with(|s| s.set(None));
     TEMP_SCHEMA.with(|t| *t.borrow_mut() = schema);
 }
 
 /// Install the session's temporary schema `pg_temp_<serial>`, allocating
 /// only when another session's is installed (every statement installs it).
 pub fn set_temp_schema_serial(serial: u64) {
+    if TEMP_SCHEMA_SERIAL.with(std::cell::Cell::get) == Some(serial) {
+        return;
+    }
+    TEMP_SCHEMA_SERIAL.with(|s| s.set(Some(serial)));
     TEMP_SCHEMA.with(|t| {
         let mut t = t.borrow_mut();
         let same = t
