@@ -18714,6 +18714,10 @@ impl Storage {
             (None, false) => {}
         }
         cur.set_key_sssu(db, coll, name, &seed);
+        // The key columns hold a name's own bytes (RM-222).
+        let key_name =
+            |s: &str| secantus_wt::name_bytes(s).unwrap_or_else(|| s.as_bytes().to_vec());
+        let (db_key, coll_key, name_key) = (key_name(db), key_name(coll), key_name(name));
         let mut out = Vec::with_capacity(max.min(1024));
         let mut more = match cur.search_near() {
             Ok(cmp) if backward => (cmp < 0 || (cmp == 0 && after.is_none())) || cur.prev()?,
@@ -18727,13 +18731,19 @@ impl Storage {
             if deadline::check().is_err() {
                 return Err(StorageError::MaxTimeExpired);
             }
-            let (d, c, n, packed) = cur.get_key_sssu()?;
-            if d != db || c != coll || n != name {
-                break;
-            }
-            let (esc, rid) = unpack_entry(&packed);
-            if let Some(rid) = rid {
-                out.push((unescape_kb(esc), rid));
+            // Read in place: copying the three names out of every entry
+            // was most of a short index scan's cost (RM-365).
+            let entry = cur.with_key_sssu(|d, c, n, packed| {
+                if d != db_key.as_slice() || c != coll_key.as_slice() || n != name_key.as_slice() {
+                    return None;
+                }
+                let (esc, rid) = unpack_entry(packed);
+                Some(rid.map(|rid| (unescape_kb(esc), rid)))
+            })?;
+            match entry {
+                None => break,
+                Some(Some(e)) => out.push(e),
+                Some(None) => {}
             }
             more = if backward { cur.prev()? } else { cur.next()? };
         }

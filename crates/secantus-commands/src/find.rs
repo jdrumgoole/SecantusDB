@@ -1509,7 +1509,9 @@ fn stream_find(
         filter: asked.filter.clone(),
         vars: asked.let_vars.clone(),
         ns: asked.ns.to_string(),
-        summary: crate::explain::summary::plan_summary(doc, ctx),
+        // Planned again only for a cursor that outlives this batch, whose
+        // `getMore` lines print it (RM-365): below.
+        summary: None,
         command: doc.clone(),
         collation: asked.collation.cloned(),
         return_key: asked.return_key,
@@ -1537,6 +1539,7 @@ fn stream_find(
     let cursor_id = if batch.exhausted || asked.single_batch {
         0
     } else {
+        cursor.summary = crate::explain::summary::plan_summary(doc, ctx);
         ctx.cursors()?
             .register_stream(asked.ns, Box::new(cursor))
             .map_err(|e| CommandError::new(1, "InternalError", format!("cursor registry: {e:?}")))?
