@@ -604,30 +604,6 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-364
       Verify: tests/backlog/test_rm_355_364.py::test_a_transaction_statement_counts_its_updates
 
-- [ ] **Counting what an operation examined costs every operation.** Since
-      RM-023 (#2208, 2026-10-27) every operation counts the keys and
-      documents it examines through the streaming executor and reads
-      WiredTiger's `statistics:session` for each session it used, whatever
-      `slowms` is (whether an operation is slow is known only at its end).
-      Re-measured 2026-10-28 (release builds, four servers alternated round
-      by round, 12 x 1,000 ops, macOS arm64, load 3-5), against the build
-      before #2208: `main` was `find_one` by `_id` +17%, an index-range
-      `find` +10%, `count_documents` (an `aggregate`) +46%, `update_one`
-      +12%. Profiling (`sample`) put the cost in the executor's index scan
-      (it read 256 entries ahead and copied three names out of each) and in
-      `find` planning its query again for a `planSummary` only an open
-      cursor uses. With those fixed: `find_one` +12%, index-range `find`
-      -26%, `count_documents` +14%, `update_one` +10%. The session
-      statistics read (1.2 us cheaper since #2216) and `count`'s repeated
-      planning (measured: no gain; pymongo's `count_documents` is an
-      `aggregate`) were not the cost. Left: `find_one`'s remaining time
-      (`get_collection_options` opening a session per call, and each session
-      close now reading statistics), and the write path. Counting only while
-      the profiler or a low `slowms` is armed would be a stand-in: Joe's
-      call, not taken. **Decided (Joe, 2026-10-27):** merge the faithful
-      model and work the cost down.
-      Backlog-ID: RM-365
-      Verify: none -- a latency budget (A/B timings against the build before #2208)
 - [ ] **mongod's connection lines this server does not write.** Since
   RM-302 the log is mongod's structured log, and the lines this server
   writes -- `MongoDB starting`, `Waiting for connections`, `Connection

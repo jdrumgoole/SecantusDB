@@ -742,6 +742,12 @@ impl Session {
         Ok(())
     }
 
+    /// Whether the session can be handed to another operation as it stands:
+    /// no transaction running and no checkpoint read configured on it.
+    pub fn reusable(&self) -> bool {
+        !self.in_txn.get() && self.cursor_config.is_none() && self.txn_end.borrow().is_empty()
+    }
+
     /// Start this session's statistics over, discarding what they held: a
     /// long-lived session about to run a statement whose share is counted.
     pub fn discard_statistics(&self) -> Result<()> {

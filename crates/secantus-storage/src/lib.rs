@@ -106,6 +106,49 @@ thread_local! {
 enum OpSession<'a> {
     Fresh(Session),
     Txn(&'a Session),
+    /// An autocommit session from the store's pool ([`Storage::op_pool`]),
+    /// returned to it when this drops; `None` only while dropping.
+    Pooled(Option<Session>, &'a OpPool),
+}
+
+/// Idle autocommit sessions for [`Storage::op_session`] (RM-365). Opening
+/// and closing a WiredTiger session for every storage call an operation
+/// makes was a measurable share of a point read; mongod likewise keeps a
+/// session cache rather than opening one per operation. Each entry says
+/// whether it was parked while no operation was counting, so statistics it
+/// gathered then are discarded before an operation that counts uses it.
+type OpPool = Mutex<Vec<(Session, bool)>>;
+
+/// Most sessions [`OpPool`] keeps idle: over it a returned session closes,
+/// so the pool never holds more than concurrent work needed.
+const OP_POOL_MAX: usize = 64;
+
+impl Drop for OpSession<'_> {
+    fn drop(&mut self) {
+        let OpSession::Pooled(session, pool) = self else {
+            return;
+        };
+        let Some(session) = session.take() else {
+            return;
+        };
+        // A session in any other state closes, as an unpooled one did.
+        if !session.reusable() {
+            return;
+        }
+        // The running operation takes what the session counted, as a closing
+        // session gives it; then the session counts from zero again.
+        let counted = secantus_wt::operation_stats_armed();
+        if counted {
+            if let Err(e) = session.collect_operation_statistics() {
+                eprintln!("secantus-storage: reading session statistics failed: {e}");
+                return;
+            }
+        }
+        let mut idle = pool.lock().unwrap_or_else(|e| e.into_inner());
+        if idle.len() < OP_POOL_MAX {
+            idle.push((session, !counted));
+        }
+    }
 }
 
 /// Guard half of [`Storage::ddl_generation_scope`]: restores the DDL
@@ -125,6 +168,7 @@ impl std::ops::Deref for OpSession<'_> {
         match self {
             OpSession::Fresh(s) => s,
             OpSession::Txn(s) => s,
+            OpSession::Pooled(s, _) => s.as_ref().expect("a pooled session in use"),
         }
     }
 }
@@ -4954,6 +4998,9 @@ pub struct Storage {
     /// A session whose commit FAILED is never returned -- its `Drop` is what
     /// rolls the dead transaction back.
     txn_session_pool: Mutex<Vec<crate::Session>>,
+    /// Idle autocommit sessions for [`Storage::op_session`]; see [`OpPool`].
+    /// Closed in [`Storage::close`] with `txn_session_pool`, for its reason.
+    op_pool: OpPool,
     /// Per-collection write locks: CRUD on `(db, coll)` serialises here so
     /// writes to different collections run in parallel. Created on first
     /// reference; an entry only the map still holds is pruned once the map
@@ -7214,6 +7261,10 @@ impl Storage {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.op_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         // Background compaction opens WT sessions and checkpoints: it stops
         // before anything else is torn down (a file in hand finishes).
         if let Err(e) = self.stop_auto_compact() {
@@ -7339,6 +7390,13 @@ impl Storage {
             }
             Err(e) => fail("opening a session", e.into()),
         }
+        // Again, now nothing else runs: a background thread stopped above may
+        // have parked a session after the first clear, and every one must
+        // close before the connection does.
+        self.op_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         match first {
             Some(e) => Err(e),
             None => Ok(()),
@@ -7561,6 +7619,7 @@ impl Storage {
             home: home.to_string(),
             lock: Mutex::new(()),
             txn_session_pool: Mutex::new(Vec::new()),
+            op_pool: Mutex::new(Vec::new()),
             coll_locks: Mutex::new(CollLocks {
                 map: HashMap::new(),
                 prune_at: COLL_LOCKS_PRUNE_FLOOR,
@@ -10163,7 +10222,18 @@ impl Storage {
     fn op_session(&self) -> Result<OpSession<'_>> {
         let p = ACTIVE_TXN_SESSION.with(|c| c.get());
         if p.is_null() {
-            Ok(OpSession::Fresh(self.conn.open_session()?))
+            let idle = self.op_pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            let session = match idle {
+                Some((session, stale)) => {
+                    // Counted while no operation was: not this one's.
+                    if stale {
+                        session.discard_statistics()?;
+                    }
+                    session
+                }
+                None => self.conn.open_session()?,
+            };
+            Ok(OpSession::Pooled(Some(session), &self.op_pool))
         } else {
             // SAFETY: `with_user_transaction` installs this pointer to a `Session`
             // it owns, for the strict duration of the closure running on THIS
@@ -11568,10 +11638,7 @@ impl Storage {
             }
             // Same transaction as the replayed writes: the row goes when they
             // do, never before, never without them.
-            match self.op_session()? {
-                OpSession::Txn(session) => Self::delete_prepared_row(session, gid),
-                OpSession::Fresh(session) => Self::delete_prepared_row(&session, gid),
-            }
+            Self::delete_prepared_row(&*self.op_session()?, gid)
         });
         match applied.and_then(|r| r) {
             Ok(()) => self.commit_user_transaction(&mut handle),
