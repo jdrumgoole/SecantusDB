@@ -236,11 +236,18 @@ def _auto_replies(client: Any) -> list:
             _wait_idle(client)
             continue
         assert isinstance(step, dict)
-        out.append((step, reply(client.admin, step)))
-        # A change sent before the server has taken up the last one is 314
-        # ObjectIsBusy on both, which is a timing: each step is given time.
-        # (These run while the files are small, before the large shape
-        # below, so no pass is long.)
+        # A change sent before WiredTiger's compaction thread has taken up
+        # the last one is 314 ObjectIsBusy on both servers, which is a
+        # timing: each step is given time, and one refused as busy is sent
+        # again for up to ten seconds, on both alike. (A fixed pause alone
+        # lost the race on a loaded box.) These run while the files are
+        # small, before the large shape below, so no pass is long.
+        deadline = time.monotonic() + 10
+        answer = reply(client.admin, step)
+        while answer[:2] == ("err", 314) and time.monotonic() < deadline:
+            time.sleep(0.2)
+            answer = reply(client.admin, step)
+        out.append((step, answer))
         time.sleep(0.3)
     out.append(("from another database", reply(client.rm192, {"autoCompact": True})))
     out.append(("bad, from another database", reply(client.rm192, {"autoCompact": 1})))

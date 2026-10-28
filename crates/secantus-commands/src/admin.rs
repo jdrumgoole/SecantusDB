@@ -1598,6 +1598,11 @@ pub(crate) fn collection_entries(
                 );
             }
         }
+        // mongod 8.2.11 marks every collection of `config` as one its
+        // debug dump leaves out, after the uuid (measured 2026-10-28).
+        if db == "config" {
+            info.insert("configDebugDump", false);
+        }
         // Captured before `options` is moved into the entry below.
         // An oplog has no `_id` index either (`autoIndexId: false`).
         let is_clustered = options.contains_key("clusteredIndex")

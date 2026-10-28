@@ -207,11 +207,28 @@ pub fn record_sessions_collection_ttl(
     Ok(())
 }
 
+/// The query sampler's collections mongod 8.2.11 creates as it steps up,
+/// each with a TTL index on `expireAt` that expires a document at that time
+/// (measured 2026-10-28, RM-366).
+const STEP_UP_TTL_COLLECTIONS: [(&str, &str); 3] = [
+    (
+        "analyzeShardKeySplitPoints",
+        "AnalyzeShardKeySplitPointsTTLIndex",
+    ),
+    ("sampledQueries", "SampledQueriesTTLIndex"),
+    ("sampledQueriesDiff", "SampledQueriesDiffTTLIndex"),
+];
+
 /// Create the collections a replica-set primary keeps its sessions' state
 /// in, as mongod 8.2.11 creates them when it becomes primary:
 /// `config.transactions` (with its `parent_lsid` index) and
-/// `config.image_collection`. Here that is when the server starts on a
-/// store that lacks them; one already there is left as it is.
+/// `config.image_collection`; and the others it creates then (RM-366):
+/// `config.system.indexBuilds`, where it records the index builds it would
+/// resume, and the query sampler's three, each with its `expireAt` TTL
+/// index. Here that is when the server starts on a store that lacks them;
+/// one already there is left as it is. (`config.system.preimages`, which
+/// mongod also creates, is where it keeps change stream pre-images; this
+/// server keeps them elsewhere, and RM-366 moves them there.)
 pub fn record_session_state_collections(
     storage: &dyn crate::storage::Storage,
 ) -> Result<(), crate::storage::StorageError> {
@@ -227,6 +244,18 @@ pub fn record_session_state_collections(
     }
     if !storage.collection_exists(SESSIONS_DB, "image_collection")? {
         storage.create_collection(SESSIONS_DB, "image_collection")?;
+    }
+    if !storage.collection_exists(SESSIONS_DB, "system.indexBuilds")? {
+        storage.create_collection(SESSIONS_DB, "system.indexBuilds")?;
+    }
+    for (coll, index) in STEP_UP_TTL_COLLECTIONS {
+        if storage.collection_exists(SESSIONS_DB, coll)? {
+            continue;
+        }
+        storage.create_collection(SESSIONS_DB, coll)?;
+        let key = doc! {"expireAt": 1_i32};
+        let spec = doc! {"key": key.clone(), "name": index, "expireAfterSeconds": 0_i32};
+        storage.create_index(SESSIONS_DB, coll, index, &key, &spec)?;
     }
     Ok(())
 }
