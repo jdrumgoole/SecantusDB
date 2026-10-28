@@ -385,13 +385,19 @@ pub fn bind(
     for (name, value) in &config.startup_parameters {
         server_params.set_startup(name, value.clone());
     }
-    // ... and sets up `config.system.sessions`, so `config` is there too,
-    // with the session timeout it was started with.
-    secantus_commands::cluster_admin::record_sessions_collection_ttl(
-        storage.as_ref(),
-        secantus_commands::logical_sessions::session_timeout_seconds(&server_params),
-    )
-    .map_err(|e| io::Error::other(format!("creating config.system.sessions: {e:?}")))?;
+    // ... and a standalone sets up `config.system.sessions` as it starts, so
+    // `config` is there too, with the session timeout it was started with. A
+    // replica-set member leaves it to its logical session cache's first
+    // refresh, a `logicalSessionRefreshMillis` after it steps up (mongod
+    // 8.2.11, measured 2026-10-28: a standalone lists it within seconds, a
+    // one-member set at 299 s under the default 300,000).
+    if config.replica_set_name.is_none() {
+        secantus_commands::cluster_admin::record_sessions_collection_ttl(
+            storage.as_ref(),
+            secantus_commands::logical_sessions::session_timeout_seconds(&server_params),
+        )
+        .map_err(|e| io::Error::other(format!("creating config.system.sessions: {e:?}")))?;
+    }
     // A replica-set primary keeps its sessions' state in `config.transactions`
     // and `config.image_collection`, which mongod creates as it steps up.
     if config.replica_set_name.is_some() {

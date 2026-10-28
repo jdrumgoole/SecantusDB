@@ -44,11 +44,13 @@ _PARAMETERS = (
 
 
 @contextlib.contextmanager
-def _rust(parameters: tuple[str, ...]) -> Iterator[Any]:
-    """A `secantusd-rs` with test commands on, started with `parameters`."""
+def _rust(parameters: tuple[str, ...], extra: tuple[str, ...] = ()) -> Iterator[Any]:
+    """A `secantusd-rs` with test commands on, started with `parameters`
+    (and the further arguments `extra`)."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
     store = tempfile.mkdtemp(prefix="live-sessions-")
     args = [str(RS_BINARY), "--port", "0", "--storage-path", store, "--enable-test-commands"]
+    args += list(extra)
     for p in parameters:
         args += ["--setParameter", p]
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -347,6 +349,9 @@ def _session_parameters(client: Any) -> list:
         out.append((refused.get("code"), refused.get("errmsg")))
     hello = _op_msg(client, {"hello": 1, "$db": "admin"})
     out.append(hello.get("logicalSessionTimeoutMinutes"))
+    # A set member builds `config.system.sessions` on its first refresh: run
+    # one, so the index does not depend on which test ran before.
+    _op_msg(client, {"refreshLogicalSessionCacheNow": 1, "$db": "admin"})
     out.append(
         [
             ix
@@ -361,6 +366,41 @@ def test_the_session_parameters_are_startup_only(rust_sessions: Any, mongod_sess
     """The four session parameters report what the server was started with
     and refuse a change at runtime (20 IllegalOperation)."""
     same(_session_parameters(rust_sessions), _session_parameters(mongod_sessions))
+
+
+def _sessions_collection(client: Any) -> list:
+    """Whether `config.system.sessions` is there, and its `lsidTTLIndex`,
+    on a server nothing has used. (A set member's other `config`
+    collections are RM-366.)"""
+    there = "system.sessions" in client.config.list_collection_names()
+    ttl = [ix for ix in client.config["system.sessions"].list_indexes()]
+    return [there, [ix for ix in ttl if ix["name"] == "lsidTTLIndex"]]
+
+
+def test_a_set_member_builds_the_sessions_collection_at_its_first_refresh() -> None:
+    """mongod 8.2.11: a standalone creates `config.system.sessions` and its
+    TTL index as it starts; a replica-set member leaves them to its logical
+    session cache's first refresh, a `logicalSessionRefreshMillis` after it
+    steps up (299 s under the default, measured 2026-10-28). This server
+    created them at startup whatever its topology."""
+    from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
+
+    with _rust(_PARAMETERS) as ours, _mongod(_PARAMETERS) as theirs:
+        same(_sessions_collection(ours), _sessions_collection(theirs))
+    assert MONGOD, "no mongod on PATH: the reference server is required"
+    proc, uri, dbpath = _start_mongod(extra_args=("--setParameter", "enableTestCommands=1"))
+    try:
+        theirs = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
+        # A standalone sets the collection up just after it starts listening.
+        deadline = time.monotonic() + 10
+        while "system.sessions" not in theirs.config.list_collection_names():
+            assert time.monotonic() < deadline, "a standalone mongod never built the collection"
+            time.sleep(0.1)
+        with _rust(_PARAMETERS, ("--standalone",)) as ours:
+            same(_sessions_collection(ours), _sessions_collection(theirs))
+        theirs.close()
+    finally:
+        _stop_mongod(proc, dbpath)
 
 
 def test_a_shorter_session_timeout_is_the_records_ttl() -> None:

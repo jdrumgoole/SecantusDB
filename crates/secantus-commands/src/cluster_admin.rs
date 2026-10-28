@@ -149,14 +149,15 @@ const SESSIONS_TTL_INDEX: &str = "lsidTTLIndex";
 /// mongod's `localLogicalSessionTimeoutMinutes` default (30), in seconds.
 const SESSIONS_TTL_SECONDS: i32 = 1800;
 
-/// Create `config.system.sessions` as mongod does shortly after it starts
-/// (its logical session cache sets the collection up on its first
-/// refresh): the collection, plus `lsidTTLIndex` `{lastUse: 1}` with
-/// `expireAfterSeconds: 1800`. That collection is why a fresh mongod always
-/// lists the `config` database (measured 8.2.11, 2026-10-16:
-/// `listDatabases` on a new store names `admin`, `config` and `local`, and
-/// `config` holds `system.sessions` alone). A collection that is already
-/// there is left as it is.
+/// Create `config.system.sessions` as mongod's logical session cache sets
+/// it up: the collection, plus `lsidTTLIndex` `{lastUse: 1}` with
+/// `expireAfterSeconds: 1800`. A standalone mongod does so as it starts, and
+/// that collection is why a fresh standalone lists the `config` database
+/// (measured 8.2.11, 2026-10-16: `config` holds `system.sessions` alone); a
+/// replica-set member does so on its first refresh, a
+/// `logicalSessionRefreshMillis` after it steps up (measured 2026-10-28:
+/// 299 s under the default). A collection that is already there is left as
+/// it is.
 ///
 /// The logical session cache's refresh sets it up again when it is dropped
 /// (`logical_sessions::refresh`), with the TTL the server was started with.
