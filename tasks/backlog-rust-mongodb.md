@@ -640,6 +640,16 @@ These are explicit non-goals. Don't add them without a reason.
   of them (measured 2026-10-24). Found with RM-302.
   Backlog-ID: RM-305
   Verify: tests/backlog/test_rm_001_028.py::test_client_metadata_is_logged
+- [ ] **A replica-set member does not create mongod's step-up `config`
+  collections.** A one-member mongod 8.2.11 set has, within half a second
+  of stepping up, `config.analyzeShardKeySplitPoints`, `sampledQueries`,
+  `sampledQueriesDiff`, `system.indexBuilds` and `system.preimages` beside
+  `transactions` and `image_collection` (three fresh starts, 2026-10-28).
+  This server creates the last two only, so `listCollections` on `config`
+  differs on every fresh store. Found with the sessions-collection fix
+  (`config.system.sessions` waits for the first refresh on a set member).
+  Backlog-ID: RM-366
+  Verify: tests/backlog/test_rm_found_2026_10_28.py::test_a_set_member_creates_its_step_up_collections
 ### 7.091 mongod's slot-based engine (SBE) -- 2026-10-23
 
 mongod 8.2 runs the front of a pipeline in its slot-based engine when it can

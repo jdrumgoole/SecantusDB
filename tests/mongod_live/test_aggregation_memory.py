@@ -13,6 +13,7 @@ knobs themselves, as `getParameter` / `setParameter` answer them. The
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -332,11 +333,35 @@ def _window_runs(coll: Any, shape: str, budget: int, allow: bool = False) -> tup
         return _run(coll, pipeline, allowDiskUse=allow)
 
 
+# The bytes a macOS mongod counts beyond the Linux build, CI's and the
+# exemplar's, by window shape: an unbounded `$sum` is 184 bytes there and
+# 176 on Linux (mongod 8.2.11, measured 2026-10-28: every budget edge of
+# these two shapes 8 higher, the other shapes equal to the byte).
+MACOS_EXTRA = {"unbounded": 8, "unbounded, $project after": 8}
+
+
+def _as_linux(answer: tuple, extra: int) -> tuple:
+    """A macOS mongod's refusal as the Linux build words it: `extra` bytes
+    fewer used, of a budget `extra` bytes smaller."""
+    kind, code, msg = answer
+    used = re.search(r"used (\d+) bytes but max allowed is (\d+)", msg)
+    assert used, msg
+    return (
+        kind,
+        code,
+        msg[: used.start()]
+        + f"used {int(used[1]) - extra} bytes but max allowed is {int(used[2]) - extra}"
+        + msg[used.end() :],
+    )
+
+
 def test_a_window_partition_is_held_to_mongods_budget(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 counts the partition cache the windows need and the
     functions' memory: refused at the same budget, by the same check
     (5643011 adding a document, 5414201 after answering one). The sizes are
-    the Linux build's, CI's: a macOS mongod counts `$sum` 8 bytes more."""
+    the Linux build's, CI's; a macOS reference's are translated to them
+    (`MACOS_EXTRA`), so the test means the same on a developer's Mac."""
+    macos = mongod.admin.command("buildInfo")["buildEnvironment"].get("target_os") == "macOS"
     theirs, ours = _windowed(mongod), _windowed(rust_mongo)
     for shape in WINDOWS:
         lo, hi = 1, 400_000
@@ -348,6 +373,9 @@ def test_a_window_partition_is_held_to_mongods_budget(rust_mongo: Any, mongod: A
                 lo = mid
         below = _window_runs(theirs, shape, lo)
         assert below[0] == "err", (shape, below)
+        extra = MACOS_EXTRA.get(shape, 0) if macos else 0
+        if extra:
+            below, lo, hi = _as_linux(below, extra), lo - extra, hi - extra
         assert _window_runs(ours, shape, lo) == below, shape
         assert _window_runs(ours, shape, hi)[0] == "ok", shape
 

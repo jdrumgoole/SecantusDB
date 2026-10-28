@@ -339,7 +339,22 @@ def _slow_update(host: str, port: int, db: str) -> dict:
         if took > 0.2:
             break
         outer *= 10
-    row = {"_id": 0, "n": 0, "outer": int(outer * 2.0 / took), "inner": 1_000}
+    outer = int(outer * 2.0 / took)
+    # One timing on a busy machine overstates the cost, and the update then
+    # runs far under two seconds once the load passes: the attempt a test
+    # means to catch running ends before it is caught. Time the calibrated
+    # update itself, and lengthen it until it holds a second.
+    for _ in range(5):
+        row = {"_id": 0, "n": 0, "outer": outer, "inner": 1_000}
+        _op_msg(host, port, {"delete": "c", "deletes": [{"q": {}, "limit": 0}], "$db": db})
+        _op_msg(host, port, {"insert": "c", "documents": [row], "$db": db})
+        began = time.monotonic()
+        _op_msg(host, port, {"update": "c", "updates": [update], "$db": db})
+        took = time.monotonic() - began
+        if took >= 1.0:
+            break
+        outer = int(outer * 2.0 / took)
+    row = {"_id": 0, "n": 0, "outer": outer, "inner": 1_000}
     _op_msg(host, port, {"delete": "c", "deletes": [{"q": {}, "limit": 0}], "$db": db})
     _op_msg(host, port, {"insert": "c", "documents": [row], "$db": db})
     return update
@@ -374,7 +389,15 @@ def _retry_while_running(client: Any) -> tuple:
 
     thread = threading.Thread(target=first, daemon=True)
     thread.start()
-    time.sleep(0.3)
+    # Retry once the first attempt runs: a fixed pause raced it on a loaded
+    # box, either side.
+    running = {"aggregate": 1, "cursor": {}, "$db": "admin"}
+    running["pipeline"] = [{"$currentOp": {}}, {"$match": {"ns": "rm230.c", "op": "update"}}]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not first_ended:
+        if _op_msg(host, port, running)["cursor"]["firstBatch"]:
+            break
+        time.sleep(0.05)
     sent = time.monotonic()
     replies.append(_op_msg(host, port, cmd))
     thread.join(timeout=120)

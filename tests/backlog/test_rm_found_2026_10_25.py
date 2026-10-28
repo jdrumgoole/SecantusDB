@@ -579,10 +579,14 @@ def _killed_while_running(client: Any) -> tuple:
     running = {"aggregate": 1, "cursor": {}, "$db": "admin"}
     running["pipeline"] = [{"$currentOp": {}}, {"$match": {"ns": "rm313.c", "op": "update"}}]
     deadline = time.monotonic() + 10
-    while time.monotonic() < deadline:
-        time.sleep(0.3)
+    while time.monotonic() < deadline and not first:
         if _op_msg(host, port, running)["cursor"]["firstBatch"]:
             break
+        time.sleep(0.05)
+    if first:
+        # Not an assertion: the kill found nothing running, so this measured
+        # nothing, and the verifier must say BROKEN rather than REGRESSED.
+        raise RuntimeError("the update finished before the kill was sent")
     killed = _op_msg(host, port, {"killSessions": [lsid], "$db": "admin"})
     thread.join(timeout=120)
     assert first, "the update never answered"
