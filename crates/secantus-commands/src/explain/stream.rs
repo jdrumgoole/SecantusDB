@@ -58,6 +58,12 @@ use crate::storage::{Storage, StorageError};
 /// How many index entries or documents one read of the store takes.
 const CHUNK: usize = 256;
 
+/// An index scan's first read of the store: it doubles on each read after,
+/// up to [`CHUNK`]. mongod reads one key per unit of work and stops at its
+/// bounds; reading ahead in whole chunks made a short range read and
+/// decode 256 entries to return ten (RM-365).
+const FIRST_CHUNK: usize = 16;
+
 /// A filter's failure on a document, as the store reports one
 /// (`secantus_storage::query_fault` through the adapter).
 fn fault(f: secantus_core::fallback::Fallback) -> StorageError {
@@ -251,6 +257,8 @@ struct IndexScan {
     count_scan: bool,
     /// The end has been counted.
     ended: bool,
+    /// How many entries the next read of the store takes.
+    chunk: usize,
 }
 
 /// What one unit of an index scan's work did.
@@ -315,7 +323,7 @@ impl IndexScan {
             &self.meta.name,
             &from,
             after,
-            CHUNK,
+            self.chunk,
             self.backward,
         )?
         else {
@@ -323,9 +331,10 @@ impl IndexScan {
                 "this store cannot stream an index scan".into(),
             ));
         };
-        if rows.len() < CHUNK {
+        if rows.len() < self.chunk {
             self.end = true;
         }
+        self.chunk = (self.chunk * 2).min(CHUNK);
         let unreadable = || {
             StorageError::Internal(format!(
                 "index {} holds an entry this server cannot read",
@@ -1193,6 +1202,7 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         run: None,
         count_scan: false,
         ended: false,
+        chunk: FIRST_CHUNK,
     }))
 }
 

@@ -609,22 +609,23 @@ These are explicit non-goals. Don't add them without a reason.
       documents it examines through the streaming executor and reads
       WiredTiger's `statistics:session` for each session it used, whatever
       `slowms` is (whether an operation is slow is known only at its end).
-      Release-build A/B against the build before, both servers running and
-      alternated round by round at load 2-6: `find_one` by `_id` +20%, an
-      index-range `find` +12%, `count` +28%, `update_one` +54%; of each,
-      10-14 points are the statistics read (about 1.5 us per session) and
-      the key counting, the rest the count and write paths now running
-      mongod's plan through the executor instead of the store's own count
-      or read. Since 2026-10-27 a session keeps its `statistics:session`
-      cursor and refreshes it with a reset, so a read no longer opens one
-      (1.67 us -> 0.47 us per read, release build, `secantus-wt`); the
-      server-level A/B has not been rerun. Levers left that keep the
-      model: drop `count`'s third planning; let a
-      one-document write whose plan reads in the store's order take the
-      store's read. Counting only while the profiler or a low `slowms` is
-      armed would be a stand-in (a slow operation under the default would
-      log without counts): Joe's call, not taken. **Decided (Joe,
-      2026-10-27):** merge the faithful model and work the cost down.
+      Re-measured 2026-10-28 (release builds, four servers alternated round
+      by round, 12 x 1,000 ops, macOS arm64, load 3-5), against the build
+      before #2208: `main` was `find_one` by `_id` +17%, an index-range
+      `find` +10%, `count_documents` (an `aggregate`) +46%, `update_one`
+      +12%. Profiling (`sample`) put the cost in the executor's index scan
+      (it read 256 entries ahead and copied three names out of each) and in
+      `find` planning its query again for a `planSummary` only an open
+      cursor uses. With those fixed: `find_one` +12%, index-range `find`
+      -26%, `count_documents` +14%, `update_one` +10%. The session
+      statistics read (1.2 us cheaper since #2216) and `count`'s repeated
+      planning (measured: no gain; pymongo's `count_documents` is an
+      `aggregate`) were not the cost. Left: `find_one`'s remaining time
+      (`get_collection_options` opening a session per call, and each session
+      close now reading statistics), and the write path. Counting only while
+      the profiler or a low `slowms` is armed would be a stand-in: Joe's
+      call, not taken. **Decided (Joe, 2026-10-27):** merge the faithful
+      model and work the cost down.
       Backlog-ID: RM-365
       Verify: none -- a latency budget (A/B timings against the build before #2208)
 - [ ] **mongod's connection lines this server does not write.** Since
