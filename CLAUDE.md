@@ -102,21 +102,8 @@ throughput / concurrency work to `crates/`.
   counterexamples, and stale "probed 6.0.16" comments: `differential-probe`).
 - **`pymongo` is the conformance target.** Behaviour is "correct" when a `pymongo` client cannot tell SecantusDB apart from a real `mongod` for the operations it supports. When in doubt, write a test that runs the same code against `pymongo` → SecantusDB and `pymongo` → real MongoDB and assert the responses match.
 - **Every server's exemplar is the REAL product it imitates, never another
-  SecantusDB server.** This is one rule with two halves, and it applies to each
-  server independently:
-
-  | server | exemplar |
-  | --- | --- |
-  | the Rust MongoDB server | **`mongod`** |
-  | the Python MongoDB server | **`mongod`** |
-  | the Rust PG server | **PostgreSQL** |
-  | the Python PG server | **PostgreSQL** |
-
-  So: when you want to know what the **Rust MongoDB server** should answer,
-  probe `mongod` — *not* the Python server, and not `secantus.expressions`.
-  When you want to know what the **Rust PG server** should answer, probe
-  PostgreSQL — not the Python PG server. The other implementation is never the
-  authority, however convenient it is to reach.
+  SecantusDB server**: the MongoDB servers' exemplar is **`mongod`**, the PG
+  servers' is **PostgreSQL** -- never the Python server or `secantus.expressions`.
 
   **Comparing two SecantusDB servers to each other is a DRIFT detector, not a
   correctness check.** It tells you the two moved apart; it never tells you
@@ -190,9 +177,9 @@ layers (see "Engines" below).
 
 ### Type-mapping strategy (the critical decision)
 
-Documents are stored as **opaque BSON blobs**. All filtering, projection, sorting, and updates happen in Python after `bson.decode`. The storage layer never inspects document content. This is deliberate: SecantusDB's whole point is that `pymongo` cannot tell us apart from `mongod`, and any lossy intermediate representation (JSON, native column types, etc.) would break that for ObjectId / Decimal128 / int32-vs-int64 / Date-with-tz / Binary / Regex.
+Documents are stored as **opaque BSON blobs**. All filtering, projection, sorting and updates happen in the engines (`secantus-core` on the Rust servers) after decoding. The storage layer never inspects document content. This is deliberate: SecantusDB's whole point is that `pymongo` cannot tell us apart from `mongod`, and any lossy intermediate representation (JSON, native column types, etc.) would break that for ObjectId / Decimal128 / int32-vs-int64 / Date-with-tz / Binary / Regex.
 
-When secondary indexes land they will be WT indexes over typed sort-key columns derived from BSON values — not JSON, not coerced numerics.
+Secondary indexes are WT indexes over typed sort-key columns derived from BSON values -- not JSON, not coerced numerics (`rust-mongodb-explain`).
 
 ### Engines: four separate servers
 
@@ -226,12 +213,7 @@ exactly what lets the Rust server / standalone `secantusd-rs` binary reuse the
 engines.
 
 - **The parity suites (`tests/test_rust_*_parity.py`) no longer run in CI**
-  (2026-10-20). They pinned each pure Rust engine to its Python counterpart,
-  which was only ever a drift detector, and with the Python engine fully
-  deprecated there is nothing to drift from. A parity failure you meet
-  locally is not a bug report: the reference is `mongod`. The transitional
-  in-process engine selection (`src/secantus/engine.py`) and the rest of this
-  history are in the `python-servers` skill.
+  (2026-10-20); a local parity failure is not a bug report (`python-servers`).
 
 ## Tooling
 
@@ -273,11 +255,8 @@ engines.
   extra uncollects ~1,700 parity tests while still exiting 0 (`batch-worktree`).
 - To run a single test serially: `uv run python -m pytest -n0 tests/path::test_name`. The `-p no:xdist` form fails because `addopts` still injects `-n auto`.
 - Sphinx docs in `docs/` (Markdown via `myst-parser`, furo theme). Built with `-W` (warnings-as-errors). `invoke docs` to build, `invoke docs-serve` to preview.
-- **Nothing publishes to PyPI** (2026-10-20). Never run `uv publish` /
-  `twine upload`, and do not push a `vX.Y.Z` tag: it no longer triggers
-  anything, and the tag ruleset protects it once pushed. The PyPI project
-  `SecantusDB` (trusted publisher bound to the deleted `publish.yml`) keeps
-  its existing releases.
+- Never run `uv publish` / `twine upload` or push a `vX.Y.Z` tag (see
+  Distribution, above).
 - The on-disk repo path is `/Users/jdrumgoole/GIT/SecantusDB`. The **import package** is `secantus` (`src/secantus/`, `import secantus`); the distribution name in `pyproject.toml` is `SecantusDB`.
 
 ## Releases and website
@@ -289,7 +268,6 @@ Both are skills, `secantusdb-release` and `secantusdb-website`, under
 - **Website content lives on `main`**: edit `website/` on a short branch, PR,
   then `invoke deploy` from `main`. Its performance numbers and driver panels
   are generated -- never hand-edit them.
-- **The site leads with the two Rust servers.**
 
 ## Backlog of stubs and stopgaps
 
@@ -299,8 +277,7 @@ The backlog is the canonical list of commands that are stubbed, features with si
 | --- | --- |
 | `tasks/backlog-rust-mongodb.md` | the Rust MongoDB server, and the Rust storage both Rust servers use; also CI / build / release items no one server owns |
 | `tasks/backlog-rust-postgres.md` | the Rust PostgreSQL server |
-| `tasks/backlog-python-mongodb.md` | the Python MongoDB server and the admin UI — **deprecated: a record, not worked** |
-| `tasks/backlog-python-postgres.md` | the Python PostgreSQL / SQL server — **deprecated: a record, not worked** |
+| `tasks/backlog-python-*.md` | the deprecated Python servers and admin UI -- **a record, not worked** |
 
 **Update the right file whenever you stub something, defer a slice, or discover a limitation; an item about more than one server goes in each file it concerns** (do not add new items to the two deprecated Python files). When you fix an item, delete its lines** — the files hold open work only, and git history and `changelog.d/` hold what is finished (`tests/test_backlog_markers.py` fails on a ticked `- [x]` item). Future sessions should treat these files as load-bearing — they are the only honest record of where SecantusDB's behaviour diverges from the real products. A section number (`7.077`, `§3.1`) means the same section it did in the single file.
 
@@ -329,11 +306,8 @@ comparison no backlog item asked for goes in `tests/mongod_live/`, which CI
 runs against mongod), not `tests/test_mongod_differential.py`, which targets
 the deprecated Python server.
 
-**Parity is not correctness.** The parity suites pin the two engines to each
-other, so they are equally satisfied by both being wrong (`$bucket`,
-`$densify`, `$stdDev*`), and a hand-run engine-vs-engine sweep is the same
-trap with nothing to warn you. When you are establishing what is correct,
-leave the other SecantusDB server out of the comparison entirely.
+**Parity is not correctness** (`$bucket`, `$densify`, `$stdDev*` were wrong in
+both engines): leave the other SecantusDB server out of any correctness check.
 
 **Before quoting any number** -- a gauge rate, a suite count, a benchmark, a
 corpus divergence count -- read the `measuring` skill.
