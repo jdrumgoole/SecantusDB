@@ -243,15 +243,8 @@ engines.
   `secantusdb-release` skill.
 - `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`).
   Tests must use `port=0` and a unique `storage_path` per test (`tmp_path`).
-  The default suite runs real on-disk WiredTiger in **fast test-storage mode**
-  (`SECANTUS_TEST_FAST_STORAGE=1`: no close-time checkpoint). That mode and
-  `SECANTUS_FORCE_DURABLE=1` govern the PYTHON `Storage`; the CI lane that ran
-  the suite durable was a Python-server lane and is gone (2026-10-20). The
-  Rust servers' durability is covered by their own cargo and pytest tests.
-  Details: `build-and-test`.
-- **Never use a mock storage -- always the real WiredTiger-backed `Storage`**
-  (`Storage(str(tmp_path))`, closed in the fixture teardown). The removed
-  `FakeStorage` mock masked real bugs; do not reintroduce one.
+  Python-`Storage` test modes (fast / durable): `python-servers`.
+- **Never use a mock storage** -- always real WiredTiger (`python-servers`).
 - **Driver-conformance gauges** -- thirteen MongoDB-driver gauges and seven SQL
   ones run **unmodified** upstream test suites against SecantusDB (invocation,
   toolchains and quirks: `/conformance-gauges`). The weekly `validate.yml`
@@ -426,6 +419,4 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   running: `session-cleanup`; closing a whole session: `close-session`;
   opening one: `start-session`.
 - **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Never edit `docs/changelog.md` or bump a version in a feature PR**; `invoke changelog-collate` folds fragments in at release.
-- New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
 - Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.
-- Errors raised inside command handlers are caught by `dispatch` and turned into `{ok: 0, errmsg, code, codeName}`. Don't leak Python tracebacks to the wire.

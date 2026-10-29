@@ -261,3 +261,17 @@ one request path:
 - **The Python PostgreSQL server** (`secantus.sql.pgserver`) — the PostgreSQL wire
   over the same Python `Storage`. Deprecated: the Rust PostgreSQL server is its
   replacement and now the more complete SQL surface.
+
+## Testing the Python servers (moved from CLAUDE.md)
+
+- The default suite runs real on-disk WiredTiger in **fast test-storage mode**
+  (`SECANTUS_TEST_FAST_STORAGE=1`: no close-time checkpoint). That mode and
+  `SECANTUS_FORCE_DURABLE=1` govern the PYTHON `Storage`; the CI lane that ran
+  the suite durable was a Python-server lane and is gone (2026-10-20). The
+  Rust servers' durability is covered by their own cargo and pytest tests.
+  Details: `build-and-test`.
+- **Never use a mock storage -- always the real WiredTiger-backed `Storage`**
+  (`Storage(str(tmp_path))`, closed in the fixture teardown). The removed
+  `FakeStorage` mock masked real bugs; do not reintroduce one.
+- New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
+- Errors raised inside command handlers are caught by `dispatch` and turned into `{ok: 0, errmsg, code, codeName}`. Don't leak Python tracebacks to the wire.
