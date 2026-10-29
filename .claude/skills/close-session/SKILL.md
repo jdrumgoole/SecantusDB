@@ -208,12 +208,13 @@ nobody was watching for any more. Everything in it was true except the word
 the gate that stands between a clean close and the twenty-day waiter above.
 
 ```bash
-# A. Anything holding a session scratchpad store — the catch-all. A server
-#    launched from a script carries no recognisable name (a bare `Python
-#    launch_sd.py` matches no daemon pattern), but every one of them carries
-#    its storage path. The [c]haracter class keeps the gate off its own
-#    command line.
-ps -Ao pid,etime,command | grep '[c]laude-501/-Users-jdrumgoole-GIT-SecantusDB'
+# A. Anything holding a store in a worktree's `.scratch/` (where probe
+#    stores go: CLAUDE.md) or, from before that rule, a session scratchpad
+#    -- the catch-all. A server launched from a script carries no
+#    recognisable name (a bare `Python launch_sd.py` matches no daemon
+#    pattern), but every one of them carries its storage path. The
+#    [c]haracter classes keep the gate off its own command line.
+ps -Ao pid,etime,command | grep -E '[/]\.scratch/|[c]laude-501/-Users-jdrumgoole-GIT-SecantusDB'
 
 # B. Databases and gauge runners by name, for anything storing elsewhere.
 pgrep -fl 'secantusd|python -m secantus|[m]ongod|pytest-xdist|gradle|dotnet test|test-libmongoc|psycopg_validation'

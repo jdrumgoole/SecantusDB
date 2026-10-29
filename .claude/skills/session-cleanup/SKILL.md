@@ -71,7 +71,9 @@ Two distinct sources, both measured on this box:
 - **`tempfile.mkdtemp()` in ad-hoc scripts.** Every probe that does
   `SecantusDBServer(storage_path=tempfile.mkdtemp())` leaves a WiredTiger store
   behind. One evening of probing left **79 such stores** (715 MB when measured
-  a few minutes before deletion). Nothing ever collects them.
+  a few minutes before deletion). Nothing ever collects them. Give an ad-hoc
+  store a path under the worktree's `.scratch/` instead
+  (`tempfile.mkdtemp(dir=".scratch")`), so it goes with the worktree (§3a).
 - **`$TMPDIR/pytest-of-<user>/`.** This one actively damages future runs. A
   pytest process with no `--basetemp` registers an `atexit` hook that `rmtree`s
   every stale run except the newest three, so a backlog makes **every future
