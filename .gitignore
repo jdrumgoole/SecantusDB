@@ -24,6 +24,8 @@ venv/
 *.pfx
 
 build/
+# Session scratch: command logs, ad-hoc scripts, probe stores (CLAUDE.md).
+/.scratch/
 dist/
 wheelhouse/
 *.egg-info/

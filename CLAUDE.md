@@ -529,17 +529,17 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   - The one binary that IS committed on purpose is the PGO profile,
     `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling). Adding
     another needs Joe's say-so.
-- **Command logs and scratch output go in the session's scratchpad
-  directory, never `../`** (Joe, 2026-10-29). Keeping a build or test log out
-  of the repository by redirecting it to `../x.log` (or `../../../x.log` from a
-  crate) puts it in `/Users/jdrumgoole/GIT`, the parent of every worktree,
-  where nothing ever removes it: 80 such logs, 167 MB, had piled up from
-  sessions and their subagents by 2026-10-29. The scratchpad (named in the
-  system prompt) is per-session, outside every repository and cleaned for
-  you; brief a subagent with its path. A log a later session must read
-  belongs in the repository's ignored `build/` tree or in the PR, not beside
-  the worktrees. Before a session ends, `session-cleanup` checks the parent
-  for anything it left there.
+- **Never create a file outside the repository directories** (Joe,
+  2026-10-29): not in `/Users/jdrumgoole/GIT` beside the worktrees, not in
+  `~`, not in `/tmp` or a scratchpad. Command logs, ad-hoc scripts, probe
+  stores and copied binaries go in the worktree's own `.scratch/`
+  (git-ignored), so they go when the worktree does. Keeping a log out of git
+  by redirecting it to `../x.log` (or `../../../x.log` from a crate) is how
+  80 logs, 167 MB, piled up in `/Users/jdrumgoole/GIT` from sessions and
+  their subagents by 2026-10-29, where nothing removed them. Brief a
+  subagent with the `.scratch/` path. In the shared main checkout, delete
+  what you put in its `.scratch/` before the session ends;
+  `session-cleanup` checks both.
 - **One session works on ONE Rust server: the PostgreSQL server or the
   MongoDB server, never both** (Joe, 2026-10-14). The two share
   `secantus-storage` and the WiredTiger build, and parallel sessions on each
