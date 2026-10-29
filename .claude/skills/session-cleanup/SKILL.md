@@ -101,6 +101,27 @@ find $T/pytest-of-$USER -maxdepth 1 -type d -name 'pytest-*' -mmin +60 -print0 |
 Pass `--basetemp <dir>` to any **nested** pytest a test spawns; an explicit
 basetemp skips the cleanup hook entirely.
 
+## 3a. Files outside the repository, and `.scratch/`
+
+No file is created outside the repository directories (CLAUDE.md, Joe
+2026-10-29): logs, scripts, probe stores and copied binaries go in the
+worktree's git-ignored `.scratch/`. Sessions and subagents used to keep logs
+out of git by redirecting them to `../name.log` -- from a worktree that is
+`/Users/jdrumgoole/GIT`, which nothing cleans; it held 80 such logs (167 MB,
+one of 152 MB) by 2026-10-29. Check before you finish:
+
+```bash
+# beside the worktrees: expect nothing of yours
+find /Users/jdrumgoole/GIT -maxdepth 1 -type f -newermt '<session start>' -print
+# the main checkout's scratch, which outlives every session that uses it
+ls -la /Users/jdrumgoole/GIT/SecantusDB/.scratch 2>/dev/null
+```
+
+What this session wrote is yours to delete. A worktree's `.scratch/` goes
+with the worktree. Something older, or whose name you do not recognise, is
+another session's (Section 5): report it rather than delete it, unless the
+user asks for it gone.
+
 ## 4. Background waiters and tasks
 
 Cancel every background wait you armed. Two failure modes, both real:
@@ -144,6 +165,8 @@ Run it, then report what it printed:
 git branch --show-current && git log --oneline -1 && git status --short
 git worktree list
 git ls-remote --heads origin | grep <your-branch>      # expect nothing
+find /Users/jdrumgoole/GIT -maxdepth 1 -type f -newermt '<session start>'   # expect nothing (§3a)
+ls /Users/jdrumgoole/GIT/SecantusDB/.scratch 2>/dev/null                      # only what is still in use
 df -h / | tail -1 && uptime
 ```
 
