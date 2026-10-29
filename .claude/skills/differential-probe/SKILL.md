@@ -508,3 +508,14 @@ real product; a count against the sibling server is not evidence.**
 - Divergences you decline to fix (deliberate hardening, version-dependent
   behaviour, cosmetic ordering) go in the server's backlog file (`tasks/backlog-<server>.md`) **with the reason**,
   so the next session reads a decision rather than an oversight.
+
+## History behind the CLAUDE.md rule
+
+This was learned the expensive way on 2026-09-08. A Rust-vs-Python comparison
+  of `$asinh` showed a disagreement, the Python answer looked mathematically
+  right, and the RUST side was changed to match it — moving the Rust server
+  *away* from `mongod`, which underflows to a bare `0` below `1E-4966`. The
+  engine-vs-engine sweep then reported "0 divergent of 384" and was cited as
+  evidence of correctness; a Rust-vs-`mongod`-only sweep of 1,298 cases found
+  the three shapes it had been blind to. **Report divergence counts against the
+  real product, never against the other SecantusDB server.**
