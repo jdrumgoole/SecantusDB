@@ -94,30 +94,12 @@ throughput / concurrency work to `crates/`.
   6.0-compatibility branches, and do not "fix" a difference that only appears
   on 6.0.
 
-  `tests/test_mongod_differential.py` runs every supported operation against a
-  real `mongod` and asserts an *exact* match, and gates on the **major**
-  (`PROBED_MONGOD_MAJOR`). **It targets the PYTHON server** (its
-  `secantus_uri` fixture starts `SecantusDBServer`), so since 2026-10-20 it
-  does not run in CI and is no evidence about the Rust server. For the Rust
-  MongoDB server the evidence is what CI runs against a live mongod 8.2 on
-  every PR (since 2026-10-21, the storage-engine job): the backlog's gap and
-  `backlog_fixed` regression tests (`tools/backlog.py verify --file
-  backlog-rust-mongodb.md --regressions`) and `tests/mongod_live/`; plus
-  probes (the `differential-probe` skill) and the sweeps under
-  `tools/probes/`, which no workflow runs.
+  Evidence for the Rust MongoDB server is what CI runs against a live mongod
+  8.2: the backlog gap / `backlog_fixed` tests and `tests/mongod_live/`
+  (`tests/test_mongod_differential.py` targets the Python server).
 
-  **"Stable within a major" is a good default and not a guarantee** — two
-  measured counterexamples, so probe rather than assume when a difference looks
-  version-shaped:
-  - `fullDocument`'s position in a change event is the same on 6.0.16 and
-    8.2.1, and **moves to the end in 8.3.4** (a minor bump).
-  - A wrong-type error's expected-type list is rendered in a different ORDER by
-    8.2.1 and 8.2.11 (a *patch* bump). Stable per build, so it pinned a build
-    rather than a behaviour; the gate now compares that list as the set it is.
-
-  Comments saying "probed 6.0.16" without naming 8.x predate the retarget and
-  were not re-verified — they record when something was measured, not what the
-  server does now. Re-probe before relying on one.
+  "Stable within a major" is a default, not a guarantee (measured
+  counterexamples, and stale "probed 6.0.16" comments: `differential-probe`).
 - **`pymongo` is the conformance target.** Behaviour is "correct" when a `pymongo` client cannot tell SecantusDB apart from a real `mongod` for the operations it supports. When in doubt, write a test that runs the same code against `pymongo` → SecantusDB and `pymongo` → real MongoDB and assert the responses match.
 - **Every server's exemplar is the REAL product it imitates, never another
   SecantusDB server.** This is one rule with two halves, and it applies to each
@@ -234,10 +216,7 @@ into the MongoDB line. Release mechanics: the `secantusdb-release` skill.
 time, so a feature PR touches no `version` line (concurrent PRs collided on
 it); describe the change in a `changelog.d/` fragment instead.
 
-**The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
-earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide
-selection / the `secantus.engine` per-component shims / the "5e Python `Storage`
-adapter + `EngineFallback`"). Read it before doing Rust-side work.
+**The authoritative plan is `tasks/rust-server-plan.md`**; read it before Rust-side work.
 
 The Rust side is a Cargo workspace under `crates/`: `secantus-core` (pure-Rust
 engines + geo + aggregation, **no PyO3**), `secantus-storage` (the full WT-backed
@@ -401,16 +380,8 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   `target*/` directory, no `.so` / `.dylib` / `.a` / `.rlib` / `.o`, no
   executable, no wheel or sdist, no `.profraw`, no core dump, no database
   store. Source and small hand-made fixtures only.
-  - **Read `git status --short` before every `git add -A`**, and stage by
-    path when anything in it is not a file you wrote.
-  - A new build directory gets a `.gitignore` line in the same change that
-    creates it.
-  - `tests/test_no_tracked_build_output.py` fails on a tracked cargo target
-    directory or any tracked file over 8 MB. Run it when in doubt; do not
-    raise its limit to get something in.
-  - The one binary that IS committed on purpose is the PGO profile,
-    `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling). Adding
-    another needs Joe's say-so.
+  **Read `git status --short` before every `git add -A`**; the guard test
+  and the PGO-profile exception: `batch-worktree`.
 - **Never create a file outside the repository directories** (Joe,
   2026-10-29): not in `/Users/jdrumgoole/GIT` beside the worktrees, not in
   `~`, not in `/tmp` or a scratchpad. Command logs, ad-hoc scripts, probe
@@ -445,10 +416,7 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   - one PR, one CI watch, one merge, one teardown per batch. An incidental
     discovery is folded into the batch or written down, never its own cycle.
 - **Major features and non-trivial updates go in a git worktree on a feature branch — never directly on `main`.** New CRUD operators, aggregation stages, storage-layer changes, wire-protocol additions, indexing work, and similar multi-file changes all qualify. Trivial one-file tweaks (typo fixes, single-line config edits) can stay on `main`. Create a worktree alongside the repo: `git worktree add ../SecantusDB-<branch> -b <branch>`. Develop and run the full test suite (and `./inv rust-gate` for Rust-server work) there.
-- **Pin a worktree to a commit for any timing / performance measurement**
-  (`git worktree add --detach ../SecantusDB-measure "$(git rev-parse
-  origin/main)"`): parallel sessions move `main` mid-run. The `measuring`
-  skill has the rest of what makes a number trustworthy.
+- **Pin a detached worktree to a commit for any timing measurement** (`measuring`).
 - **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Never push straight to `main`**: CI concurrency is per-ref, so sessions sharing `main` cancel each other's runs.
 - **Cleaning up is part of finishing the work.** Tear down the branch and
   worktree in the SAME session that merges (worktree before branch; `-D` only
