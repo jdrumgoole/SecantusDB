@@ -101,6 +101,24 @@ find $T/pytest-of-$USER -maxdepth 1 -type d -name 'pytest-*' -mmin +60 -print0 |
 Pass `--basetemp <dir>` to any **nested** pytest a test spawns; an explicit
 basetemp skips the cleanup hook entirely.
 
+## 3a. Logs and scratch files beside the worktrees
+
+Sessions and subagents kept build and test logs out of the repository by
+redirecting them to `../name.log` -- from a worktree that is
+`/Users/jdrumgoole/GIT`, which nothing cleans. By 2026-10-29 it held 80 such
+logs (167 MB, one of 152 MB), from `cargo` builds, `./inv` gates and gauge
+runs, none of which a later session read. Write them to the session's
+scratchpad instead (CLAUDE.md), and check the parent before you finish:
+
+```bash
+find /Users/jdrumgoole/GIT -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' -o -name '*.out' \) \
+     -newermt '<session start>' -print
+```
+
+Anything listed that this session wrote is yours to delete; something older,
+or whose name you do not recognise, is another session's (§5), so report it
+rather than delete it, unless the user asks for it gone.
+
 ## 4. Background waiters and tasks
 
 Cancel every background wait you armed. Two failure modes, both real:
@@ -144,6 +162,7 @@ Run it, then report what it printed:
 git branch --show-current && git log --oneline -1 && git status --short
 git worktree list
 git ls-remote --heads origin | grep <your-branch>      # expect nothing
+find /Users/jdrumgoole/GIT -maxdepth 1 -type f -newermt '<session start>'   # expect nothing (§3a)
 df -h / | tail -1 && uptime
 ```
 
