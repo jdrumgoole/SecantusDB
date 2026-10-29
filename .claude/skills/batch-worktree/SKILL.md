@@ -253,3 +253,16 @@ PR, and re-read the plan/backlog entries you touched. A verification pass at
 the end of one campaign found two defects — a plan section still marking
 finished surfaces as untouched, and a backlog item that outlived its bug by
 several hours. Both would have sent the next session to re-do finished work.
+
+## History behind the CLAUDE.md rule
+
+Build output: on 2026-09-30 a
+  `git add -A` swept `crates/secantus-storage/target-dev/` into a feature
+  commit: 6,875 files and 1.77 GB. Nobody noticed for a week, until PyPI
+  refused a 573 MB sdist, and git history had to be rewritten to get the
+  repository back from 513 MB to about 70.
+
+Why batches: nine
+  single-slice PRs in one stretch (each with its own worktree, full suite, lint,
+  changelog fragment, backlog edit, PR, CI watch, merge, teardown) burned a
+  session's budget while the task board barely moved.

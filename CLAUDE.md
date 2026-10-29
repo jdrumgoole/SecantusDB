@@ -18,39 +18,17 @@ the Python servers out of CI and the release process).
 - **The Python servers are not the reference for anything.** The exemplar
   was always the real product (`mongod`, PostgreSQL; see "Design
   constraints"); the Python code remains readable prior art, nothing more.
-- **Nothing publishes them.** No PyPI release since 2026-10-20: the
-  `release-prepare` / `release-finalize` tasks refuse, and the PyPI
-  workflows (`publish.yml`, `wheels.yml`, and `rust-wheels.yml` for the
-  `secantus-core` wheel) are gone. Releases already on PyPI stay up; do not
-  yank them without Joe. The only releases are the Rust ones: the
-  `secantusdb-v*` and `secantusd-pg-v*` tags (binaries) and the crates.
-- **CI does not test them.** The `test` job runs lint plus the files
-  `tools/ci_test_selection.py` picks: every test file that does NOT import
-  the `secantus` package (the ops board's tooling excepted). The Python
-  servers' suites, the durable-storage and Windows lanes built for them, the
-  Python-vs-Rust engine parity step, and the Python gauge lanes in
-  `validate.yml` no longer run. A Python-server test that a change breaks
-  is not your problem to fix; do not spend a session on it.
-- **pytest stays the test runner** (Joe, 2026-10-20), for the Rust servers
-  too: their Python test files (`tests/test_rust_*.py`, the PG slice and login
-  differentials, `tests/backlog/`) run in the `storage-engine` and
-  `pg-oracle` jobs, which build the Rust servers.
-- **The `secantus` package is still load-bearing, so do not delete it.**
-  Every Rust job builds WiredTiger through the package's CMake build
-  (`uv build --wheel` / `uv sync`), and several Rust tests import its
-  `Storage` or SQL layer (`test_rust_pgserver_slice.py`,
-  `test_rust_store_handoff.py`, `test_rust_pitr_cross_server.py`). Removing
-  the code is a later decision for Joe, and needs a standalone WiredTiger
-  build first.
-- **Compatibility with them is no longer a constraint, on-disk format
-  included** (Joe, 2026-10-16: "We no longer need to worry about python
-  server compatibility, we are focussed on the rust servers"). A Rust change
-  may store something the Python servers cannot read, or that they would
-  overwrite. Do not shape a Rust design around the Python servers, and do
-  not add Python-side code to carry it. A Rust test that only checks a
-  Python-server hand-off and that such a change breaks is retired with a
-  written reason naming the decision, not worked around. The two RUST
-  servers still share one store, and that half of the contract stands.
+- **Nothing publishes them, and CI does not test them** (2026-10-20). A
+  Python-server test a change breaks is not your problem to fix. pytest stays
+  the test runner, including for the Rust servers' Python test files.
+- **Do not delete the `secantus` package.** Every Rust job builds WiredTiger
+  through its CMake build, and several Rust tests import its `Storage` / SQL
+  layer. Removing it is a later decision for Joe.
+- **Compatibility with them, on-disk format included, is no longer a
+  constraint** (2026-10-16). Do not shape a Rust design around them. A Rust
+  test that only checks a Python hand-off and that breaks is retired with a
+  written reason naming the decision, not worked around.
+- Which CI jobs and tests these bullets refer to: the `python-servers` skill.
 - `tasks/backlog-python-*.md` stay as a record; their items are not worked.
 
 | server | binary / entry point | wire | role |
@@ -63,51 +41,29 @@ the Python servers out of CI and the release process).
 **Reach for Rust.** The marketing site already leads with the two Rust servers;
 do not "restore" a Python-first framing in docs or on the site.
 
-All four share **one on-disk format** today. Between the two Rust servers that
-is a compatibility promise rather than an accident — breaking it is silent data
-loss. Toward the Python servers it no longer binds (2026-10-16, above): the
-cross-language bullets below record what holds now, not what must keep holding.
-Be precise
-about which half of it is actually pinned by a test, because they are different
-claims and it is easy to cite one as evidence for the other:
-
-- **Cross-LANGUAGE, same protocol — proven.** The Rust PG server and the Python
-  PG server read and write each other's store (`tests/test_rust_pgserver_slice.py`,
-  e.g. `test_python_server_reads_rust_timestamps`, which exists because getting
-  it wrong is silent corruption rather than an error).
-- **Cross-PROTOCOL, Python pair — proven.** A `pymongo`-written collection is
-  queryable as a table, `JOIN`s and all, with no `CREATE TABLE` (`docs/sql.md`).
-- **Cross-PROTOCOL, Rust pair — proven in ONE direction, and never
-  concurrently** (measured 2026-09-18, pinned by three tests in
-  `tests/test_rust_pgserver_slice.py`):
-  - SQL → MongoDB **works**: a table written by `secantusd-pg` reads back
-    through `secantusd-rs` as a collection in the database the SQL session used,
-    with the `PRIMARY KEY` as `_id`.
-  - MongoDB → SQL **does not**: the Rust PG server resolves names through
-    `__sql_catalog__`, which only `CREATE TABLE` writes, so a `pymongo`-written
-    collection is `relation "..." does not exist`. The PYTHON SQL layer samples
-    an uncatalogued collection and serves it; the Rust one does not. Do not
-    carry the Python behaviour across in your head — that is how this bullet
-    got written wrong the first time.
-  - **Not at the same time.** WiredTiger takes an exclusive file lock, so the
-    second server exits rather than opening the store. "Point both at one
-    directory" is a HAND-OFF, never concurrent serving — do not write it on a
-    page as though both can serve at once.
+**One on-disk format.** Between the two RUST servers it is a compatibility
+promise -- breaking it is silent data loss. Cross-protocol between them is
+proven in ONE direction and never concurrently (measured 2026-09-18, pinned in
+`tests/test_rust_pgserver_slice.py`):
+  - SQL -> MongoDB **works**: a `secantusd-pg` table reads back through
+    `secantusd-rs` as a collection, with the `PRIMARY KEY` as `_id`.
+  - MongoDB -> SQL **does not**: the Rust PG server resolves names through
+    `__sql_catalog__`, which only `CREATE TABLE` writes. The Python SQL layer's
+    sampling of uncatalogued collections does NOT carry across.
+  - **Not at the same time.** WiredTiger's exclusive file lock makes the second
+    server exit. "Point both at one directory" is a HAND-OFF, never concurrent
+    serving -- do not write it on a page as though both can serve at once.
 
 The import package is `secantus`; the public Python class is `SecantusDBServer`.
 
 **Distribution: crates and tagged binaries only; nothing goes to PyPI**
-(2026-10-20). The Rust MongoDB server is the `secantus-mdb` crate (`cargo
-install secantus-mdb` gives `secantusd-rs`; `secantus_mdb::Server` embeds it in
-a Rust test), plus the `secantusdb-v*` GitHub binaries; the Rust PostgreSQL
-server is the `secantus-pg` crate plus the `secantusd-pg-v*` binaries. The
-embedded Python `RustServer` / `PgServer` handles are a SOURCE-BUILD tool for
-this repo's own tests and gauges -- never document them to users as something
-`pip install` provides. History: from 2026-10-07 the PyPI wheel carried only
-the Python servers, because bundling the Rust ones had pushed the project past
-PyPI's 10 GB quota; on 2026-10-20 PyPI publishing stopped altogether.
+(2026-10-20): the `secantus-mdb` crate (`secantusd-rs`, `secantus_mdb::Server`)
+plus `secantusdb-v*` binaries, and the `secantus-pg` crate plus `secantusd-pg-v*`
+binaries. The embedded Python `RustServer` / `PgServer` handles are a
+SOURCE-BUILD tool for this repo's tests -- never document them to users as
+something `pip install` provides.
 
-The name was chosen to dodge brand-clash risk: an early prototype was called "fongo", a follow-on was called "fongodb", and the current name avoids both the existing "Fongo" brand and any confusion with MongoDB itself. Internal references to `fongo` or `fongodb` are stale — flag and rename to `secantus` (or `SecantusDB` for the brand form).
+Internal references to `fongo` or `fongodb` (earlier names, dropped to avoid brand clashes) are stale -- flag and rename to `secantus` (or `SecantusDB` for the brand form).
 
 **In scope:** the subset of the MongoDB wire protocol that `pymongo` actually emits — connection handshake, CRUD, cursors, aggregation, findAndModify, and **change streams** (single-node, oplog-backed; collection / db / cluster scope; resume tokens; `fullDocument: "updateLookup"`; `fullDocumentBeforeChange` pre-images; `awaitData` blocking; `$changeStreamSplitLargeEvent` — an event over the BSON limit is split into fragments; on the Rust server a smaller one carries no `splitEvent`, as on `mongod` 8.2.11, while the Python server stamps `{fragment: 1, of: 1}` on every event).
 
@@ -186,14 +142,7 @@ throughput / concurrency work to `crates/`.
   disagree, probe the real product and move whichever side that says is wrong —
   do not reason about which looks more correct.
 
-  This was learned the expensive way on 2026-09-08. A Rust-vs-Python comparison
-  of `$asinh` showed a disagreement, the Python answer looked mathematically
-  right, and the RUST side was changed to match it — moving the Rust server
-  *away* from `mongod`, which underflows to a bare `0` below `1E-4966`. The
-  engine-vs-engine sweep then reported "0 divergent of 384" and was cited as
-  evidence of correctness; a Rust-vs-`mongod`-only sweep of 1,298 cases found
-  the three shapes it had been blind to. **Report divergence counts against the
-  real product, never against the other SecantusDB server.**
+  (The 2026-09-08 `$asinh` incident that set this rule: `differential-probe`.)
 
   A deliberate divergence from the exemplar is Joe's call, and stays as narrow
   as what he actually authorised — a decision about last-digit rounding does not
@@ -203,12 +152,7 @@ throughput / concurrency work to `crates/`.
   2026-10-14: "We always choose the Postgres model"). Build that state the
   way PostgreSQL (or `mongod`) keeps it: what it persists, what survives a
   restart, what moves it. A value that is merely consistent with itself is
-  not the model. The case that set the rule: `age(xid)`. This server had no
-  32-bit xid counter, and the first version froze the catalog at each run's
-  first xid, so `age(datfrozenxid)` counted from startup and reset on every
-  restart. It was replaced before merging by PostgreSQL's own model: one
-  persisted counter that runs on across restarts, and `datfrozenxid` fixed
-  at 722 where `initdb` leaves it (`crates/secantus-pg/src/xids.rs`). When
+  not the model. (The `age(xid)` case that set the rule: `rust-pg-server`.) When
   the real mechanism is out of reach, refuse by name (0A000) and put it in
   the backlog; a plausible stand-in is a decision for Joe, never the
   default.
@@ -239,19 +183,8 @@ SecantusDB stores data. In a database, an error is a **correctness and durabilit
   good. Never let a run that did not account for every test it started be
   reported as a rate, a pass, or a green tick.
 
-  This is not hypothetical. The Go gauge published **100.0%** for months over a
-  run that a hung DNS test killed at 476 of 481 — `go test` panicking on
-  `-timeout` emits no terminal event for the tests still in flight, so the
-  summariser divided what it could see and got a perfect score. **A truncated
-  run looks BETTER the more tests go missing**, which is exactly why it survives
-  review. Before believing any suite number, compare tests STARTED against tests
-  that REPORTED a result.
-
-  And fix the cause, not the symptom. Two sessions treated this one without
-  fixing it: the first raised the timeout from 10 minutes to 30 so the kill
-  would stop "corrupting the signal" (cost tripled, population still capped),
-  the second made the report refuse to print a rate (honest, but still no
-  number). The fix was to stop the test hanging.
+  Compare tests STARTED against tests that REPORTED, and fix the hang, not
+  the timeout (the Go gauge's false 100.0%: `measuring`).
 - **Never skip or hide a failure to get a clean run.** No `-k`, `--deselect`,
   `-skip`, `xfail`, try/except-pass, or quietly narrowed include list to make a
   red thing green. If something genuinely does not belong in a gauge's scope, it
@@ -271,7 +204,7 @@ storage layout or index planning on either side: the Rust storage ported those
 helpers, and the parity suites do not cover them. The Rust crates mirror the
 layers (see "Engines" below).
 
-**The Rust MongoDB server reproduces mongod's `explain` (2026-10-12)** -- `indexBounds`, the `IDHACK` / `EXPRESS_IXSCAN` / `COUNT_SCAN` / `DISTINCT_SCAN` / `PROJECTION_COVERED` executors and every command's stages, because they turned out to follow fixed rules whenever only one index can serve the query: its `explain` (`crates/secantus-commands/src/explain/`) derives the plan from mongod's planning rules — bounds, residual filters, sort and covering, and the `count` / `distinct` / write stages — and derives `executionStats` by walking that plan over the documents. Since 2026-10-27 it also keeps mongod 8.2's classic plan cache (`explain/plan_cache.rs`, `explain/cache_key.rs`, RM-154): the query-shape key and its hashes byte for byte, inactive and active entries, replanning, the 5,000-entry eviction, what clears it, and `$planCacheStats`; the trial ranks plans with mongod's tie-breaking bonuses. Not yet: caching a query SBE runs (RM-340), or any collection over 2,000 documents, where the trial does not run (RM-342). It reports the plan mongod runs, which is not always how the Rust storage router reads the documents (`tasks/backlog-rust-mongodb.md` 7.075). Sweep: `tools/probes/explain_commands.py`, 786 replies. **Since 2026-10-13 the same plan sets the ORDER the Rust server returns documents in** (`explain/order.rs`, `tasks/backlog-rust-mongodb.md` 7.080): the router says only which documents match, and the plan says in what order mongod reads them, which is also which document a `limit: 1` delete or an update without `multi` changes. A sort is still the store's own; the plan decides how documents that compare equal are left. For a sort the predicate's index does not return, the planner counts mongod's trial of the two candidate plans (`plan::walk_finishes_first`) on a collection of up to 2,000 documents. Sweep: `tools/probes/find_order.py`, 6,531 replies. When a change touches the router or the planner, run it: a router change can no longer move the order, and a planner change now can.
+**The Rust MongoDB server reproduces mongod's `explain`, plan cache and document order** -- read the `rust-mongodb-explain` skill before changing the router or the planner, and run its sweeps (`tools/probes/explain_commands.py`, `tools/probes/find_order.py`).
 
 ### Type-mapping strategy (the critical decision)
 
@@ -279,62 +212,27 @@ Documents are stored as **opaque BSON blobs**. All filtering, projection, sortin
 
 When secondary indexes land they will be WT indexes over typed sort-key columns derived from BSON values — not JSON, not coerced numerics.
 
-### Engines: FOUR SEPARATE SERVERS across two wire protocols
+### Engines: four separate servers
 
-**Direction (current):** SecantusDB ships **completely separate servers**, and a
-user runs **one of them** — never a per-operator/per-`Storage` selection inside
-one request path:
-
-- **The Rust MongoDB server** (`secantusd-rs`, `crates/secantusdb`) — a whole,
-  self-contained Rust server (its own wire / dispatch / cursors / accept loop over
-  the pure-Rust `secantus-core` + `secantus-storage` + `secantus-wt` crates). No
-  Python in the request path. Its Python ergonomic is a **thin embedded lifecycle
-  handle** (`start`/`stop`/`address`) — the accept loop runs on a GIL-released Rust
-  thread in-process and `pymongo` connects over real TCP; Python is only the
-  launcher, never an operator. **This is the server the project leads with.**
-- **The Rust PostgreSQL server** (`secantusd-pg`, `crates/secantus-pg`) —
-  the PostgreSQL wire protocol over the same `secantus-storage`. SQL is parsed
-  by **`libpg_query`** (the real PostgreSQL grammar via `pg_query`), lowered by
-  `secantus-pgplan` to the MQL filters `secantus-core` already evaluates,
-  against the catalog in `secantus-pgcatalog`. It builds from **its own
-  directory** (`./inv rust-pgserver-build`), because it links WiredTiger and
-  is excluded from the clean workspace. **Before any work on it, read the
-  `rust-pg-server` skill** (`.claude/skills/rust-pg-server/SKILL.md`): how to
-  build, test and measure it, the reference servers (PostgreSQL 15.19 on port
-  5415, 14 as the default cluster), where each kind of change goes, and the
-  rules earlier batches paid for. Open work is `tasks/backlog-rust-postgres.md`;
-  the record of what landed when is git history and `changelog.d/`.
-- **The Python MongoDB server** — the *original* `SecantusDBServer` (pure-Python
-  `server` / `wire` / `commands` / `Storage` / operator engines). No Rust in the
-  request path.
-- **The Python PostgreSQL server** (`secantus.sql.pgserver`) — the PostgreSQL wire
-  over the same Python `Storage`. Deprecated: the Rust PostgreSQL server is its
-  replacement and now the more complete SQL surface.
+A user runs **one** server -- never a per-operator / per-`Storage` selection
+inside one request path. The Rust MongoDB server is self-contained Rust; its
+Python handle is only a launcher, never an operator. The Rust PG server parses
+SQL with `libpg_query`, lowers it via `secantus-pgplan` to the MQL filters
+`secantus-core` evaluates, and builds from **its own directory**
+(`./inv rust-pgserver-build`). **Before any work on it, read the
+`rust-pg-server` skill.**
 
 #### Versioning: three independent version lines
 
-- **The Python package**: `pyproject.toml` `version` + `src/secantus/__init__.py`
-  `__version__` (PEP 440). Frozen at the last PyPI release: nothing publishes
-  it any more, so nothing bumps it.
-- **The Rust MongoDB server**: the `version` of the thirteen MongoDB-side
-  `crates/*/Cargo.toml`, in **lockstep** (`0.MAJOR.PATCH-beta.N`). Bumping the
-  patch (or minor/major) resets the beta label to 0 (`0.5.2-beta.20` →
-  `0.5.3-beta.0`). Surfaced as `buildInfo.secantusVersion`, `secantusd-rs
-  --version` and `RustServer.version` (from `secantus_server::VERSION`).
-- **The Rust PostgreSQL server**: `secantus-pgcatalog` / `secantus-pgplan` /
-  `secantus-pg`, a line of their own that is NOT bumped with the MongoDB server.
+The three lines (Python package, Rust MongoDB lockstep crates, Rust PG crates) are described in the `secantusdb-release` skill.
 
 Bump a Rust line with `./inv rust-version-bump --to <version> [--line pg]`,
 never a blanket substitution across `crates/`, which would fold the PG crates
 into the MongoDB line. Release mechanics: the `secantusdb-release` skill.
 
 **No version bumps in feature PRs.** The Rust versions are assigned at release
-time, so a feature PR touches no `version` line. This is the whole point: an in-flight PR that bumped a version picked a
-number that was stale by merge time, so any two concurrent PRs collided on that
-one line (Python) or on the thirteen `Cargo.toml` (Rust). Leaving both to the
-release makes concurrent feature PRs — Python-only, Rust-only, or dual-server —
-independent. Describe the change in a `changelog.d/` fragment (see the
-Documentation / Conventions sections); the release stamps the version.
+time, so a feature PR touches no `version` line (concurrent PRs collided on
+it); describe the change in a `changelog.d/` fragment instead.
 
 **The authoritative plan is `tasks/rust-server-plan.md`.** It supersedes the
 earlier *in-process selectable-engine* model (`SECANTUS_ENGINE` process-wide
@@ -358,10 +256,12 @@ engines.
 
 ## Tooling
 
-- **Ad-hoc reproducers and cross-driver smokes use `127.0.0.1:27018`** (mongod's standard "alternate" port — out of the way of any real `mongod` running on `27017`, but predictable enough that test-failure messages cite a verbatim address you can hit by hand). Test scripts that need to talk to SecantusDB ad hoc should try `127.0.0.1:27018` first. (Conformance gauges use kernel-assigned ephemeral ports per run — see `/conformance-gauges`.)
+- **Ad-hoc reproducers and cross-driver smokes use `127.0.0.1:27018`** (clear of a real `mongod` on 27017; gauges use ephemeral ports).
 - Python 3.12 pinned via `.python-version`. Managed with `uv`. Always invoke Python via `uv run python -m ...` so `pyenv` doesn't intercept.
 - Build/admin tasks: `tasks.py` (`invoke`). `invoke test`, `invoke lint`, `invoke fmt`, `invoke docs`, `invoke serve`.
-- **Admin-UI screenshots are generated, never hand-captured.** `invoke admin-screenshots` (`scripts/admin_screenshots.py`, `screenshots` extra + `playwright install chromium`) boots a throwaway server on `127.0.0.1:27018`, seeds a fictional dataset, drives all 22 admin pages with Playwright, scrubs machine-specific strings from the DOM, and writes `docs/screenshots/`. That directory is the single source for all three surfaces that show the shots: Sphinx (`docs/admin.md`) references it, the README links it on raw.githubusercontent, and the Pelican build copies four of them into the theme at build time (`website/tasks.py` `SITE_SCREENSHOTS` — the theme's `static/img/` is an untracked build mirror). **Regenerate on every release** — `tests/test_docs_screenshots.py` checks that every page has an image and every image is referenced, but nothing can detect a *stale* image, so the `secantusdb-release` skill makes regeneration a mandatory pre-flight step. The run is also the admin UI's only browser-level smoke test: it exits non-zero on any JS error and warns on any page shot in an empty state (that's how four dead-dashboard bugs were found). When iterating from a worktree whose venv belongs to another checkout, pass `--from-checkout .` so it renders *your* templates and static assets rather than the installed package's.
+- **Admin-UI screenshots are generated, never hand-captured** (`invoke
+  admin-screenshots`), and regenerated on every release. Details: the
+  `secantusdb-release` skill.
 - `pytest` with `pytest-xdist` parallel by default (`addopts = "-n auto"`).
   Tests must use `port=0` and a unique `storage_path` per test (`tmp_path`).
   The default suite runs real on-disk WiredTiger in **fast test-storage mode**
@@ -370,7 +270,9 @@ engines.
   the suite durable was a Python-server lane and is gone (2026-10-20). The
   Rust servers' durability is covered by their own cargo and pytest tests.
   Details: `build-and-test`.
-- **Never use a mock storage — always the real `Storage`.** The legacy `FakeStorage` mock (`tests/sqlfake.py`) has been **removed**: every SQL / PG-server test now drives the real WiredTiger-backed `Storage`, and no new mock should be reintroduced. A mock lets a test pass while diverging from what WiredTiger actually does (row/type round-trips, transactions, cross-session visibility, persistence) — the migration off it surfaced several real bugs the mock had masked (a swallowed tz-aware/naive datetime comparison, a `bytea` equality mismatch, a Describe/Execute uncommitted-DDL protocol crash, timestamptz text-render). Build a real `Storage(str(tmp_path))` (close it in the fixture teardown — `try: yield s finally: s.close()`), seed it via `run_sql` with an unrestricted `Session`, and drive the SQL/PG-server code against that. This is a database — tests prove behaviour against the real engine or they prove nothing.
+- **Never use a mock storage -- always the real WiredTiger-backed `Storage`**
+  (`Storage(str(tmp_path))`, closed in the fixture teardown). The removed
+  `FakeStorage` mock masked real bugs; do not reintroduce one.
 - **Driver-conformance gauges** -- thirteen MongoDB-driver gauges and seven SQL
   ones run **unmodified** upstream test suites against SecantusDB (invocation,
   toolchains and quirks: `/conformance-gauges`). The weekly `validate.yml`
@@ -408,25 +310,14 @@ engines.
 
 ## Releases and website
 
-Both procedures are managed by skills — they auto-fire on the relevant trigger phrases. To inspect or invoke manually: `/secantusdb-release` and `/secantusdb-website`. The skill files are under `~/.claude/skills/`; treat them as the source of truth and edit them there, not here.
+Both are skills, `secantusdb-release` and `secantusdb-website`, under
+`~/.claude/skills/` (edit them there, not here). Without loading them:
 
-- **Release-time benchmark refresh**: `invoke release-benchmark`, after the
-  version bump lands on `main`, so `docs/benchmark.md` measures the released
-  build (`secantusdb-release`, `bench/DO_CLUSTER.md`).
-- **`secantusdb-release`** — the Rust release tracks: a `secantusdb-v*` tag
-  (Rust MongoDB server binaries) or a `secantusd-pg-v*` tag (Rust PostgreSQL
-  server binaries), and the crates. The PyPI pipeline it used to describe
-  (`release-prepare` / `release-finalize`) is retired and the tasks refuse. Docs are **self-hosted at secantusdb.com/docs/** (main tree) and **/docs/rust/** (Rust server) — they deploy with the post-release website publish, not the release pipeline; the readthedocs.io copies are legacy, kept alive with a moved banner.
-- **A Rust server release ends at the live site, not at the GitHub Release**:
-  bump the pinned tag in `website/pelicanconf.py`, re-read the server's page,
-  write the blog post by hand, deploy. Steps: `secantusdb-release`.
-- **`secantusdb-website`** — **website content lives on `main`** (the retired `SecantusDB-website` / `website-dev` worktree pattern is gone; Pelican builds the live site from `main`). Edit `website/` on a short feature branch and land via PR (website-only commits skip the full pytest run — only `website/`, this `CLAUDE.md`, and `.gitignore` qualify), then `invoke deploy` from `main` to build + `aws s3 sync` + invalidate CloudFront. Also covers the driver-panel regeneration and the per-release blog-post template (descriptive title + prose body + link bar — never a stub linking out to GitHub).
-
-  **The site leads with the two Rust servers.** Its pages are templates,
-  its performance numbers and driver panels are generated (never hand-edit
-  them; a blank panel means a gauge did not finish), and a
-  `validation_summary/` change is not website-only. The traps are in the
-  `secantusdb-website` skill.
+- **A Rust server release ends at the live site, not at the GitHub Release.**
+- **Website content lives on `main`**: edit `website/` on a short branch, PR,
+  then `invoke deploy` from `main`. Its performance numbers and driver panels
+  are generated -- never hand-edit them.
+- **The site leads with the two Rust servers.**
 
 ## Backlog of stubs and stopgaps
 
@@ -477,7 +368,7 @@ corpus divergence count -- read the `measuring` skill.
 
 ## CI is load-bearing — failures are serious bugs, not flakes
 
-After every push (to a feature branch via PR — the default — or to `main`), check the corresponding GitHub Actions run and **resolve any failures before moving on**. CI is the source of truth — it catches cold-cache races, cross-platform / cross-Python drift, and missing-CI-extra gaps that local-only testing misses. Procedure (`gh run list`/`watch`/`view --log-failed`), the docs-only `paths-ignore` exception (markdown / LICENSE / `docs/**` commits skip CI by design), and the recurring-failure-pattern catalog (xdist install-state races, per-platform sysconf, `pytest-subtests` outcome accounting) all live in `/ci-check`. Add new patterns to that skill as they show up. **Watch the PR's CI run, not `main`'s** — with the branch+PR flow (see "Conventions" below) each branch is its own CI lane, so a parallel session's push can no longer cancel your run; a `cancelled` conclusion now means *you* superseded it with a newer push to the same branch.
+After every push (to a feature branch via PR — the default — or to `main`), check the corresponding GitHub Actions run and **resolve any failures before moving on**. CI is the source of truth. Procedure, the docs-only `paths-ignore` exception and the failure-pattern catalog live in `/ci-check` (add new patterns there). **Watch the PR's run, not `main`'s**; a `cancelled` run means you superseded it with a newer push.
 
 ## Parallel sessions and subagents: a machine-wide budget
 
@@ -498,11 +389,8 @@ The limit is the machine, not the session, so it is shared:
   are invisible to you, so ask, or read `uptime`. A load average well above
   12 means the budget is spent.
 
-Measured 2026-10-15: eight agents building at once (five in one session,
-three in the other), each at cargo's default 12 jobs, held the load average
-at **66 on 12 cores** with the memory compressor engaged. Builds that take
-minutes alone took several times longer, and a timing-sensitive test fails
-under that contention for no reason of its own.
+(Measured 2026-10-15: eight agents at cargo's default jobs held the load
+average at 66 on 12 cores.)
 
 The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
 (Tooling, above): do not run a gauge sweep beside building agents at all.
@@ -512,17 +400,11 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
 - **Never commit build output or any other generated binary.** No cargo
   `target*/` directory, no `.so` / `.dylib` / `.a` / `.rlib` / `.o`, no
   executable, no wheel or sdist, no `.profraw`, no core dump, no database
-  store. Source and small hand-made fixtures only. On 2026-09-30 a
-  `git add -A` swept `crates/secantus-storage/target-dev/` into a feature
-  commit: 6,875 files and 1.77 GB. Nobody noticed for a week, until PyPI
-  refused a 573 MB sdist, and git history had to be rewritten to get the
-  repository back from 513 MB to about 70.
+  store. Source and small hand-made fixtures only.
   - **Read `git status --short` before every `git add -A`**, and stage by
-    path when anything in it is not a file you wrote. An unfamiliar
-    directory in that list is the warning.
+    path when anything in it is not a file you wrote.
   - A new build directory gets a `.gitignore` line in the same change that
-    creates it. `CARGO_TARGET_DIR=<anything>` inside the repository is how
-    this one got past the existing ignore rules.
+    creates it.
   - `tests/test_no_tracked_build_output.py` fails on a tracked cargo target
     directory or any tracked file over 8 MB. Run it when in doubt; do not
     raise its limit to get something in.
@@ -556,27 +438,18 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   force-push another session's claim branch. Details: `batch-worktree`.
 - **Batch several slices into ONE branch and PR — do not run the full suite per
   small feature.** The suite is ~6,000 tests and 12–13 minutes; running it after
-  every one-file change makes the ceremony cost dwarf the work. Nine
-  single-slice PRs in one stretch (each with its own worktree, full suite, lint,
-  changelog fragment, backlog edit, PR, CI watch, merge, teardown) burned a
-  session's budget while the task board barely moved. Instead:
+  every one-file change makes the ceremony cost dwarf the work. Instead:
   - while iterating, run only the **targeted** tests (`uv run python -m pytest
-    -n0 tests/test_x.py`) plus whatever gauge / corpus command proves the slice;
-  - accumulate related slices on one branch;
-  - run the **full suite once** at the end, before the batch's commit — this
-    still satisfies "run the full test suite before committing", because the
-    batch is what gets committed;
-  - one PR, one CI watch, one merge, one teardown per batch.
-
-  An incidental discovery (a flaky test, a CI annoyance, a stray temp dir) gets
-  folded into the current batch or written down — it does not get its own full
-  cycle.
+    -n0 tests/test_x.py`) plus whatever proves the slice;
+  - run the **full suite once** at the end, before the batch's commit;
+  - one PR, one CI watch, one merge, one teardown per batch. An incidental
+    discovery is folded into the batch or written down, never its own cycle.
 - **Major features and non-trivial updates go in a git worktree on a feature branch — never directly on `main`.** New CRUD operators, aggregation stages, storage-layer changes, wire-protocol additions, indexing work, and similar multi-file changes all qualify. Trivial one-file tweaks (typo fixes, single-line config edits) can stay on `main`. Create a worktree alongside the repo: `git worktree add ../SecantusDB-<branch> -b <branch>`. Develop and run the full test suite (and `./inv rust-gate` for Rust-server work) there.
 - **Pin a worktree to a commit for any timing / performance measurement**
   (`git worktree add --detach ../SecantusDB-measure "$(git rev-parse
   origin/main)"`): parallel sessions move `main` mid-run. The `measuring`
   skill has the rest of what makes a number trustworthy.
-- **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Do not push straight to `main` from a session** — every session pushing the same ref (`refs/heads/main`) lands them in the same CI concurrency group, so a newer push cancels the older session's in-flight run (and forces constant rebases). One feature branch per session = one CI lane per session; distinct refs never cancel each other. After merge, tear the branch down — see the next bullet. (`test.yml` is keyed `concurrency: ${{ github.workflow }}-${{ github.ref }}`, `cancel-in-progress: true` — per-ref, so the cancel only bites within a single branch, which is what you want.)
+- **Land via branch push + PR, not `git push HEAD:main`.** Push the feature branch (`git push -u origin <branch>`) and open a PR (`gh pr create --base main`); let CI run on the PR, then merge when green. **Never push straight to `main`**: CI concurrency is per-ref, so sessions sharing `main` cancel each other's runs.
 - **Cleaning up is part of finishing the work.** Tear down the branch and
   worktree in the SAME session that merges (worktree before branch; `-D` only
   after `gh pr view <N> --json state` says `MERGED`), and never remove a
@@ -584,7 +457,7 @@ The same arithmetic is why `invoke validate-all --jobs` stays at 4 or fewer
   sequence and its traps: `batch-worktree`. Everything else a session leaves
   running: `session-cleanup`; closing a whole session: `close-session`;
   opening one: `start-session`.
-- **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Do not edit `docs/changelog.md` directly in a feature PR** and **do not bump the Python `version`** (see the Versioning section): those two shared lines are what made every pair of concurrent PRs conflict. New fragment files never collide, so concurrent sessions stay independent. At release, `invoke changelog-collate` folds the fragments into `## [Unreleased]` and deletes them; the normal promote-to-a-dated-section step is unchanged.
+- **Record the changelog with a fragment, not by editing `docs/changelog.md`.** A feature PR adds one file `changelog.d/<short-slug>.md` holding a single entry (a `###` headline + prose lede + `#### Added` / `#### Fixed` / … sections, no version number or `##` header) — see `changelog.d/README.md`. **Never edit `docs/changelog.md` or bump a version in a feature PR**; `invoke changelog-collate` folds fragments in at release.
 - New CRUD operators or aggregation stages should land with both a unit test (in `tests/test_query.py` / `tests/test_update.py` / `tests/test_aggregate.py` / `tests/test_expressions.py`) and a `pymongo`-driven integration test in `tests/test_crud.py`. The integration test is the conformance proof; the unit test pins the semantics.
 - Layer boundaries to defend: the wire layer never knows about commands; the command layer never knows about SQL; pure operator engines (`query`, `update`, `expressions`, `aggregate`, `projection`) take only docs in and out, no I/O.
 - Errors raised inside command handlers are caught by `dispatch` and turned into `{ok: 0, errmsg, code, codeName}`. Don't leak Python tracebacks to the wire.

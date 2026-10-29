@@ -235,3 +235,12 @@ agreement.
   uncatalogued collections; this one does not.)
 - Never both at once: WiredTiger's exclusive lock makes the second server
   exit. Pointing both at one store is a hand-off.
+
+## History behind the CLAUDE.md rule
+
+The `age(xid)` case (model the real mechanism). This server had no
+  32-bit xid counter, and the first version froze the catalog at each run's
+  first xid, so `age(datfrozenxid)` counted from startup and reset on every
+  restart. It was replaced before merging by PostgreSQL's own model: one
+  persisted counter that runs on across restarts, and `datfrozenxid` fixed
+  at 722 where `initdb` leaves it (`crates/secantus-pg/src/xids.rs`).

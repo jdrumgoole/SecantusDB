@@ -161,3 +161,103 @@ match, and a Rust fix is never ported back.
   plan.md`, `tasks/rust-rewrite-phase4-scoping.md`, `tasks/rust-rewrite-spike-
   findings.md`, `tasks/backlog-rust-mongodb.md` §7. Tooling: `invoke rust-test` / `rust-build`
   / `rust-parity`.
+
+
+## Detail moved from CLAUDE.md (2026-10-29)
+
+- **Nothing publishes them.** No PyPI release since 2026-10-20: the
+  `release-prepare` / `release-finalize` tasks refuse, and the PyPI
+  workflows (`publish.yml`, `wheels.yml`, and `rust-wheels.yml` for the
+  `secantus-core` wheel) are gone. Releases already on PyPI stay up; do not
+  yank them without Joe. The only releases are the Rust ones: the
+  `secantusdb-v*` and `secantusd-pg-v*` tags (binaries) and the crates.
+- **CI does not test them.** The `test` job runs lint plus the files
+  `tools/ci_test_selection.py` picks: every test file that does NOT import
+  the `secantus` package (the ops board's tooling excepted). The Python
+  servers' suites, the durable-storage and Windows lanes built for them, the
+  Python-vs-Rust engine parity step, and the Python gauge lanes in
+  `validate.yml` no longer run. A Python-server test that a change breaks
+  is not your problem to fix; do not spend a session on it.
+- **pytest stays the test runner** (Joe, 2026-10-20), for the Rust servers
+  too: their Python test files (`tests/test_rust_*.py`, the PG slice and login
+  differentials, `tests/backlog/`) run in the `storage-engine` and
+  `pg-oracle` jobs, which build the Rust servers.
+- **The `secantus` package is still load-bearing, so do not delete it.**
+  Every Rust job builds WiredTiger through the package's CMake build
+  (`uv build --wheel` / `uv sync`), and several Rust tests import its
+  `Storage` or SQL layer (`test_rust_pgserver_slice.py`,
+  `test_rust_store_handoff.py`, `test_rust_pitr_cross_server.py`). Removing
+  the code is a later decision for Joe, and needs a standalone WiredTiger
+  build first.
+- **Compatibility with them is no longer a constraint, on-disk format
+  included** (Joe, 2026-10-16: "We no longer need to worry about python
+  server compatibility, we are focussed on the rust servers"). A Rust change
+  may store something the Python servers cannot read, or that they would
+  overwrite. Do not shape a Rust design around the Python servers, and do
+  not add Python-side code to carry it. A Rust test that only checks a
+  Python-server hand-off and that such a change breaks is retired with a
+  written reason naming the decision, not worked around. The two RUST
+  servers still share one store, and that half of the contract stands.
+
+All four share **one on-disk format** today. Between the two Rust servers that
+is a compatibility promise rather than an accident — breaking it is silent data
+loss. Toward the Python servers it no longer binds (2026-10-16, above): the
+cross-language bullets below record what holds now, not what must keep holding.
+Be precise
+about which half of it is actually pinned by a test, because they are different
+claims and it is easy to cite one as evidence for the other:
+
+- **Cross-LANGUAGE, same protocol — proven.** The Rust PG server and the Python
+  PG server read and write each other's store (`tests/test_rust_pgserver_slice.py`,
+  e.g. `test_python_server_reads_rust_timestamps`, which exists because getting
+  it wrong is silent corruption rather than an error).
+- **Cross-PROTOCOL, Python pair — proven.** A `pymongo`-written collection is
+  queryable as a table, `JOIN`s and all, with no `CREATE TABLE` (`docs/sql.md`).
+- **Cross-PROTOCOL, Rust pair — proven in ONE direction, and never
+  concurrently** (measured 2026-09-18, pinned by three tests in
+  `tests/test_rust_pgserver_slice.py`):
+  - SQL → MongoDB **works**: a table written by `secantusd-pg` reads back
+    through `secantusd-rs` as a collection in the database the SQL session used,
+    with the `PRIMARY KEY` as `_id`.
+  - MongoDB → SQL **does not**: the Rust PG server resolves names through
+    `__sql_catalog__`, which only `CREATE TABLE` writes, so a `pymongo`-written
+    collection is `relation "..." does not exist`. The PYTHON SQL layer samples
+    an uncatalogued collection and serves it; the Rust one does not. Do not
+    carry the Python behaviour across in your head — that is how this bullet
+    got written wrong the first time.
+  - **Not at the same time.** WiredTiger takes an exclusive file lock, so the
+    second server exits rather than opening the store. "Point both at one
+    directory" is a HAND-OFF, never concurrent serving — do not write it on a
+    page as though both can serve at once.
+
+### Engines: FOUR SEPARATE SERVERS across two wire protocols
+
+**Direction (current):** SecantusDB ships **completely separate servers**, and a
+user runs **one of them** — never a per-operator/per-`Storage` selection inside
+one request path:
+
+- **The Rust MongoDB server** (`secantusd-rs`, `crates/secantusdb`) — a whole,
+  self-contained Rust server (its own wire / dispatch / cursors / accept loop over
+  the pure-Rust `secantus-core` + `secantus-storage` + `secantus-wt` crates). No
+  Python in the request path. Its Python ergonomic is a **thin embedded lifecycle
+  handle** (`start`/`stop`/`address`) — the accept loop runs on a GIL-released Rust
+  thread in-process and `pymongo` connects over real TCP; Python is only the
+  launcher, never an operator. **This is the server the project leads with.**
+- **The Rust PostgreSQL server** (`secantusd-pg`, `crates/secantus-pg`) —
+  the PostgreSQL wire protocol over the same `secantus-storage`. SQL is parsed
+  by **`libpg_query`** (the real PostgreSQL grammar via `pg_query`), lowered by
+  `secantus-pgplan` to the MQL filters `secantus-core` already evaluates,
+  against the catalog in `secantus-pgcatalog`. It builds from **its own
+  directory** (`./inv rust-pgserver-build`), because it links WiredTiger and
+  is excluded from the clean workspace. **Before any work on it, read the
+  `rust-pg-server` skill** (`.claude/skills/rust-pg-server/SKILL.md`): how to
+  build, test and measure it, the reference servers (PostgreSQL 15.19 on port
+  5415, 14 as the default cluster), where each kind of change goes, and the
+  rules earlier batches paid for. Open work is `tasks/backlog-rust-postgres.md`;
+  the record of what landed when is git history and `changelog.d/`.
+- **The Python MongoDB server** — the *original* `SecantusDBServer` (pure-Python
+  `server` / `wire` / `commands` / `Storage` / operator engines). No Rust in the
+  request path.
+- **The Python PostgreSQL server** (`secantus.sql.pgserver`) — the PostgreSQL wire
+  over the same Python `Storage`. Deprecated: the Rust PostgreSQL server is its
+  replacement and now the more complete SQL surface.
