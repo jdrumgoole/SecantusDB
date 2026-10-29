@@ -266,3 +266,14 @@ Why batches: nine
   single-slice PRs in one stretch (each with its own worktree, full suite, lint,
   changelog fragment, backlog edit, PR, CI watch, merge, teardown) burned a
   session's budget while the task board barely moved.
+
+- **Read `git status --short` before every `git add -A`**, and stage by
+    path when anything in it is not a file you wrote.
+  - A new build directory gets a `.gitignore` line in the same change that
+    creates it.
+  - `tests/test_no_tracked_build_output.py` fails on a tracked cargo target
+    directory or any tracked file over 8 MB. Run it when in doubt; do not
+    raise its limit to get something in.
+  - The one binary that IS committed on purpose is the PGO profile,
+    `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling). Adding
+    another needs Joe's say-so.

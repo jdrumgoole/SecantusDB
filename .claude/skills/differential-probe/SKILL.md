@@ -520,3 +520,28 @@ This was learned the expensive way on 2026-09-08. A Rust-vs-Python comparison
   evidence of correctness; a Rust-vs-`mongod`-only sweep of 1,298 cases found
   the three shapes it had been blind to. **Report divergence counts against the
   real product, never against the other SecantusDB server.**
+
+**"Stable within a major" is a good default and not a guarantee** — two
+  measured counterexamples, so probe rather than assume when a difference looks
+  version-shaped:
+  - `fullDocument`'s position in a change event is the same on 6.0.16 and
+    8.2.1, and **moves to the end in 8.3.4** (a minor bump).
+  - A wrong-type error's expected-type list is rendered in a different ORDER by
+    8.2.1 and 8.2.11 (a *patch* bump). Stable per build, so it pinned a build
+    rather than a behaviour; the gate now compares that list as the set it is.
+
+  Comments saying "probed 6.0.16" without naming 8.x predate the retarget and
+  were not re-verified — they record when something was measured, not what the
+  server does now. Re-probe before relying on one.
+
+  `tests/test_mongod_differential.py` runs every supported operation against a
+  real `mongod` and asserts an *exact* match, and gates on the **major**
+  (`PROBED_MONGOD_MAJOR`). **It targets the PYTHON server** (its
+  `secantus_uri` fixture starts `SecantusDBServer`), so since 2026-10-20 it
+  does not run in CI and is no evidence about the Rust server. For the Rust
+  MongoDB server the evidence is what CI runs against a live mongod 8.2 on
+  every PR (since 2026-10-21, the storage-engine job): the backlog's gap and
+  `backlog_fixed` regression tests (`tools/backlog.py verify --file
+  backlog-rust-mongodb.md --regressions`) and `tests/mongod_live/`; plus
+  probes (the `differential-probe` skill) and the sweeps under
+  `tools/probes/`, which no workflow runs.
