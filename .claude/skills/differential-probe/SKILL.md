@@ -80,7 +80,8 @@ finds something belongs there, or the next session re-finds it.
 1. **Pick a surface with many option combinations** — a command's arguments, a
    stage's spec, an error path. Divergence density is highest where options
    multiply, not where the happy path lives.
-2. **Write a throwaway probe** in the scratchpad: a list of
+2. **Write a throwaway probe** in the worktree's git-ignored `.scratch/`
+   (never outside the repository: CLAUDE.md): a list of
    `(name, seed, operation)` cases, run each against both servers, print only
    the ones that differ. Keep each case minimal so a failure names one
    behaviour.
@@ -286,7 +287,7 @@ deprecated) Python SQL server (found 2026-09-03 on the 3.10 shards).
 **Two rules, both learned there:**
 
 - **When CI fails on one Python only, get that interpreter and RUN it** --
-  `uv venv --python 3.10 /tmp/py310` takes seconds. If the module is
+  `uv venv --python 3.10 .scratch/py310` takes seconds. If the module is
   WT-linked, load the pure file directly and skip the package `__init__`:
 
   ```python
