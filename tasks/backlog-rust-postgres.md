@@ -978,14 +978,6 @@ tests regression tests:
       the CI runner's memory, so the test must first bound the server.
       Backlog-ID: RP-306
       Verify: none -- reproducing it exhausts memory; a bounded gap test is still to be written
-- [ ] **An aggregate over a joined FROM subquery drops the subquery's
-      LIMIT and OFFSET**: `select count(*) from (select ... from m0 join m1
-      on m0.b = m1.a limit 3) s` is 18 where PostgreSQL 15.19 answers 3
-      (and so with `offset 15`). The aggregate path plans the inner join
-      with `plan_join_select`, whose `JoinSelect` has no limit or offset,
-      so the clause is parsed and ignored. Found while working RP-028.
-      Backlog-ID: RP-307
-      Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_aggregate_over_a_joined_subquery_keeps_its_limit
 - [ ] **OPEN — a cancel sent during a prepared statement was lost once in
       CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
       (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`

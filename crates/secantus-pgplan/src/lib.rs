@@ -23668,7 +23668,16 @@ fn plan_aggregate_direct(
         // the general materialised source below. Before it did not, and the
         // join planner's own `a subquery without a JOIN` refusal surfaced to
         // the client as though a grouped subquery were unimplementable.
-        match plan_join_select(inner, lookup, params) {
+        // A LIMIT or OFFSET on the inner select also goes to the materialised
+        // source: `JoinSelect` has neither, so the clause was dropped and
+        // `count(*)` over `(... join ... limit 3)` counted every joined row.
+        let limited = inner.limit_count.is_some() || inner.limit_offset.is_some();
+        let joined = if limited {
+            Err(Error::Unsupported("a LIMIT on a joined subquery".into()))
+        } else {
+            plan_join_select(inner, lookup, params)
+        };
+        match joined {
             Ok(join) => {
                 let def = join_output_def(&join, lookup)?;
                 return finish_aggregate(s, String::new(), Some(Box::new(join)), None, def, params);

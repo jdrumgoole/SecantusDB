@@ -2528,13 +2528,14 @@ def test_a_descending_order_by_under_a_limit_over_two_tables(pg: Any) -> None:
     assert got == ("ok", [(132, 6), (279, 6), (90, 6), (125, 6), (118, 6)])
 
 
-@pytest.mark.backlog("RP-307")
+@pytest.mark.backlog_fixed("RP-307")
 def test_an_aggregate_over_a_joined_subquery_keeps_its_limit(pg: Any) -> None:
     """PostgreSQL 15.19, two 20-row tables (`i, i%7, i%5` and `i, i%5,
     i%3`): the join has 18 rows, and a FROM subquery's LIMIT 3 or OFFSET 15
     leaves 3 for the aggregate above it. The aggregate path planned the
     join through `plan_join_select`, whose `JoinSelect` has no limit or
-    offset, so both were parsed and dropped: 18."""
+    offset, so both were parsed and dropped: 18. An inner LIMIT or OFFSET
+    now sends the subquery to the materialised source."""
     pg.execute("begin")
     try:
         pg.execute("create table rp307_m0 (a int, b int, c int)")
