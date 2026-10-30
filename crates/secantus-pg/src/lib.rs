@@ -20953,7 +20953,7 @@ impl PgHandler {
                         self.partition_bound_text(&t)
                             .map_or(Bson::Null, Bson::String),
                     );
-                    d.insert(f("relnatts"), Bson::Int32(t.columns.len() as i32));
+                    d.insert(f("relnatts"), Bson::Int32(i32::from(t.natts())));
                     // Its row type, the composite every table has.
                     if let (Some(field), Some((_, oid, _))) = (
                         def.field_of("reltype"),

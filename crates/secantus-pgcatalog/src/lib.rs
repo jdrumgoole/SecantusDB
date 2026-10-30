@@ -616,6 +616,16 @@ impl TableDef {
         d
     }
 
+    /// `pg_class.relnatts`: every attnum the table has used, a dropped
+    /// column's slot included (PostgreSQL never renumbers or reuses one).
+    pub fn natts(&self) -> i16 {
+        (0..self.columns.len())
+            .map(|i| self.attnum(i))
+            .chain(self.dropped_attnums())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Drop the column at `index`, leaving its attnum as a dropped slot.
     pub fn drop_column_at(&mut self, index: usize) {
         if index >= self.columns.len() {
