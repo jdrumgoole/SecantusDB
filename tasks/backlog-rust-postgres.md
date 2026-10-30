@@ -941,16 +941,6 @@ tests regression tests:
       once a row of its table as PostgreSQL's scan does.
       Backlog-ID: RP-288
       Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
-- [ ] **An UPDATE leaves the row's unique-key claim on its old value**
-      (shared storage), so inserting that value again fails XX000 `E11000
-      duplicate key error` where PostgreSQL 15.19 inserts it: the update
-      path (`index_entry_diff`) never moves the row's claim in `UNIQ_TABLE`;
-      only an insert writes claims and only a delete releases them. It also
-      blocks a journal ROLLBACK TO that puts back two rows which swapped a
-      unique value. The MongoDB server links the same code (not yet
-      compared with mongod). Found while closing RP-018.
-      Backlog-ID: RP-296
-      Verify: tests/backlog/test_rp018_savepoint_undo.py::test_an_updated_unique_value_can_be_used_again
 - [ ] **A hypothetical-set aggregate with the wrong number of direct
       arguments names it by `unknown`s and gives the generic hint**:
       `rank(2) WITHIN GROUP (ORDER BY a, b)` is 42883 `function

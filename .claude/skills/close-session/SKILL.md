@@ -1,5 +1,6 @@
 ---
 name: close-session
+model: sonnet
 description: 'Close out a SecantusDB working session — land every outstanding change, record what is left with measurements, tear down branches and worktrees, and reconcile the documentation with what actually changed. Fires on "close the session", "wrap up", "finish up", "we''re done", "end of session", or when the user stops directing new work. Sequences the per-slice landing (batch-worktree) and the machine cleanup (session-cleanup) and adds the part neither covers: finding the docs, comments and tests that still describe the behaviour you just changed. Refuses to declare the session closed while any of your own work is still in flight, and gates the close on a final process sweep so the session leaves no server, waiter, detached run, subagent, wakeup, cron job or unacknowledged /goal behind.'
 ---
 

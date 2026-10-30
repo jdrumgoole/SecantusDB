@@ -12510,6 +12510,7 @@ impl Storage {
                     // key is the canonical `id_key(_id)` — let the helper recompute it.
                     let (additions, removals) =
                         self.index_entry_diff(&old_doc, &doc, &descs, recordid)?;
+                    self.move_unique_claims(&session, db, coll, &old_doc, &doc, &descs, recordid)?;
                     self.count_index_keys(&session, db, coll, Some(&old_doc), Some(&doc), &descs)?;
                     self.insert_index_entries(&session, db, coll, &additions)?;
                     self.remove_index_entries(&session, db, coll, &removals)?;
@@ -16154,26 +16155,8 @@ impl Storage {
                 match claims.insert() {
                     Ok(()) => {}
                     Err(e) if e.is_duplicate_key() => {
-                        if desc.id_claim {
-                            let owner = session.open_cursor(UNIQ_TABLE, None)?;
-                            owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-                            let held = match owner.search() {
-                                Ok(()) => Some(owner.get_value_q()?),
-                                Err(e) if e.is_not_found() => None,
-                                Err(e) => return Err(e.into()),
-                            };
-                            let stale = match held {
-                                Some(id) if id == recordid => true,
-                                Some(id) => !self.claim_owner_exists(session, db, coll, id)?,
-                                None => true,
-                            };
-                            if stale {
-                                owner.reset()?;
-                                owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
-                                owner.set_value_q(recordid);
-                                owner.insert()?;
-                                continue;
-                            }
+                        if self.take_stale_claim(session, db, coll, desc, &kb, recordid)? {
+                            continue;
                         }
                         return Err(StorageError::DuplicateKey(Box::new(
                             with_bindata_order(desc.key_order, || {
@@ -16313,6 +16296,147 @@ impl Storage {
             }
             for packed in self.packed_entry_keys(doc, desc, recordid)? {
                 self.drop_index_entry(session, &cur, db, coll, &desc.name, &packed)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Take over the claim on `kb` in `desc` for `recordid` when the row
+    /// holding it no longer holds the value, and say whether it was taken.
+    /// A claim is stale when its owner is `recordid` itself, when the owning
+    /// row is gone, or (for a secondary unique index) when the owner has no
+    /// entry for the value any more: entries move with every update, so a
+    /// missing one means the owner moved off the value. Stores written
+    /// before updates moved their claims (RP-296) hold such claims, and
+    /// without this a value an UPDATE left was refused to every later row.
+    /// A claim this transaction cannot see as committed never reaches here:
+    /// WiredTiger answers its `overwrite=false` insert with a write conflict.
+    fn take_stale_claim(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        desc: &IndexDesc,
+        kb: &[u8],
+        recordid: i64,
+    ) -> Result<bool> {
+        let esc = escape_kb(kb);
+        let owner = session.open_cursor(UNIQ_TABLE, None)?;
+        owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
+        let held = match owner.search() {
+            Ok(()) => Some(owner.get_value_q()?),
+            Err(e) if e.is_not_found() => None,
+            Err(e) => return Err(e.into()),
+        };
+        let stale = match held {
+            None => true,
+            Some(id) if id == recordid => true,
+            Some(id) if !self.claim_owner_exists(session, db, coll, id)? => true,
+            Some(_) if desc.id_claim => false,
+            Some(id) => {
+                let entry = session.open_cursor(IDX_ENTRIES_TABLE, None)?;
+                entry.set_key_sssu(db, coll, &desc.name, &pack_entry(kb, id));
+                match entry.search() {
+                    Ok(()) => false,
+                    Err(e) if e.is_not_found() => true,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        };
+        if stale {
+            owner.reset()?;
+            owner.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
+            owner.set_value_q(recordid);
+            owner.insert()?;
+        }
+        Ok(stale)
+    }
+
+    /// Move `recordid`'s unique claims from `old_doc`'s keys to `new_doc`'s,
+    /// as an update must (RP-296): claim each key the new document has that
+    /// the old one had not, then release each the old one had that the new
+    /// one has not -- only where this row owns it. Claiming first, with
+    /// `overwrite=false`, keeps the guarantee `write_index_entries` gives an
+    /// insert: two writers moving onto one value collide in WiredTiger even
+    /// when neither has committed. Run after `unique_conflict` has passed
+    /// the new document, so a duplicate here is a claim whose holder has
+    /// left the value (`take_stale_claim`) or a genuine conflict.
+    #[allow(clippy::too_many_arguments)]
+    fn move_unique_claims(
+        &self,
+        session: &Session,
+        db: &str,
+        coll: &str,
+        old_doc: &Document,
+        new_doc: &Document,
+        descs: &[IndexDesc],
+        recordid: i64,
+    ) -> Result<()> {
+        let mut claims: Option<Cursor> = None;
+        for desc in descs {
+            if !(desc.id_claim || (desc.name != "_id_" && (desc.unique || desc.prepare_unique))) {
+                continue;
+            }
+            let keys = |doc: &Document| -> Result<Vec<Vec<u8>>> {
+                if !self.doc_in_partial(doc, desc)? {
+                    return Ok(Vec::new());
+                }
+                desc.key_variants(doc, desc.sparse)
+            };
+            let old_keys = keys(old_doc)?;
+            let new_keys = keys(new_doc)?;
+            if old_keys == new_keys {
+                continue;
+            }
+            let claims = match &claims {
+                Some(c) => c,
+                None => claims.insert(session.open_cursor(UNIQ_TABLE, Some("overwrite=false"))?),
+            };
+            for kb in new_keys.iter().filter(|k| !old_keys.contains(k)) {
+                let esc = escape_kb(kb);
+                note_unique_claim(db, coll, &desc.name, &esc)?;
+                claims.reset()?;
+                claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
+                claims.set_value_q(recordid);
+                match claims.insert() {
+                    Ok(()) => {}
+                    Err(e) if e.is_duplicate_key() => {
+                        if !self.take_stale_claim(session, db, coll, desc, kb, recordid)? {
+                            return Err(StorageError::DuplicateKey(Box::new(
+                                with_bindata_order(desc.key_order, || {
+                                    UniqueConflict::new(
+                                        format!("{db}.{coll}"),
+                                        &desc.name,
+                                        &desc.key_spec,
+                                        new_doc,
+                                        kb,
+                                        desc.collation.as_ref(),
+                                    )
+                                })
+                                .on_clustered(desc.clustered),
+                            )));
+                        }
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            for kb in old_keys.iter().filter(|k| !new_keys.contains(k)) {
+                let esc = escape_kb(kb);
+                claims.reset()?;
+                claims.set_key_sssu(db, &key_coll(db, coll), &desc.name, &esc);
+                match claims.search() {
+                    Ok(()) if claims.get_value_q().ok() == Some(recordid) => {
+                        note_unique_claim(db, coll, &desc.name, &esc)?;
+                        match claims.remove() {
+                            Ok(()) => {}
+                            Err(e) if e.is_not_found() => {}
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
             }
         }
         Ok(())
@@ -20606,6 +20730,7 @@ impl Storage {
             modified += 1;
             chunk_bytes += new_blob.len();
             let (additions, removals) = self.index_entry_diff(&doc, &new, &descs, recordid)?;
+            self.move_unique_claims(session, db, coll, &doc, &new, &descs, recordid)?;
             self.count_index_keys(session, db, coll, Some(&doc), Some(&new), &descs)?;
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
@@ -20782,6 +20907,7 @@ impl Storage {
                         // `index_entry_diff`), never a missing entry for this doc.
                         let (additions, removals) =
                             self.index_entry_diff(&doc, &new, &descs, recordid)?;
+                        self.move_unique_claims(&session, db, coll, &doc, &new, &descs, recordid)?;
                         self.count_index_keys(&session, db, coll, Some(&doc), Some(&new), &descs)?;
                         self.insert_index_entries(&session, db, coll, &additions)?;
                         // The doc stays at its RecordId (unchanged — `_id` is immutable);

@@ -436,3 +436,33 @@ fn a_non_unique_index_claims_nothing() {
         assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 2);
     });
 }
+
+/// An update moves the row's unique claim with its value (RP-296): the value
+/// it left is free for another row, and the value it took is held against
+/// one. The claim used to stay on the old value, so the second insert below
+/// was refused E11000 and a third row could take the new value.
+#[test]
+fn an_update_moves_its_unique_claim() {
+    with_db(|st| {
+        st.create_index("app", "c", "k_1", &doc! {"k": 1}, &doc! {"unique": true})
+            .unwrap();
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "k": "old"}))
+            .unwrap();
+        assert!(st
+            .replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"k": "new"}))
+            .unwrap());
+        st.insert_one("app", "c", &enc(&doc! {"_id": 2, "k": "old"}))
+            .expect("the value an update left must be free");
+        let taken = st.insert_one("app", "c", &enc(&doc! {"_id": 3, "k": "new"}));
+        assert!(
+            matches!(taken, Err(StorageError::DuplicateKey(_))),
+            "the value an update took must be held: {taken:?}"
+        );
+        let onto = st.replace_by_id("app", "c", &Bson::Int32(2), &enc(&doc! {"k": "new"}));
+        assert!(
+            matches!(onto, Err(StorageError::DuplicateKey(_))),
+            "an update onto a held value must be refused: {onto:?}"
+        );
+        assert_eq!(st.count_matching("app", "c", &doc! {}, None).unwrap(), 2);
+    });
+}
