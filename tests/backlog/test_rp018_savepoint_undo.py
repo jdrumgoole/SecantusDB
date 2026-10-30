@@ -549,12 +549,10 @@ def expected(name: str, forced: bool) -> list[Any]:
     return got
 
 
-# Cases another item holds open: their gap tests until it closes.
-_OPEN_ELSEWHERE = {
-    # Putting back two rows that swapped a unique value deletes and inserts
-    # them again, which the old value's claim refuses (RP-296).
-    ("a unique column's values swapped", True): "RP-296",
-}
+# Cases another item holds open: their gap tests until it closes. (Putting
+# back two rows that swapped a unique value was RP-296's until updates moved
+# their claims.)
+_OPEN_ELSEWHERE: dict[tuple[str, bool], str] = {}
 
 
 def _cases() -> list[Any]:
@@ -617,13 +615,13 @@ def test_savepoint_cost_is_the_rows_written_not_the_table(rust_pg: Any) -> None:
             c.execute(f"drop table if exists {t}")
 
 
-@pytest.mark.backlog("RP-296")
+@pytest.mark.backlog_fixed("RP-296")
 def test_an_updated_unique_value_can_be_used_again(rust_pg: Any) -> None:
     """After an UPDATE moves a row off a unique value, another row may take
     it: PostgreSQL 15.19 inserts it. Here the storage's claim on the old
-    value stays with the row, so the insert failed `XX000 could not
+    value stayed with the row, so the insert failed `XX000 could not
     insert: E11000 duplicate key error on index rp018_uq_u_key`, in a block
-    or out of one."""
+    or out of one, until updates moved their claims (RP-296)."""
     got = run(
         _dsn(rust_pg) + " dbname=postgres",
         [

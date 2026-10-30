@@ -1,5 +1,6 @@
 ---
 name: start-session
+model: sonnet
 description: Get a new SecantusDB session into gear — establish what is actually true about the repo and the machine before touching anything, then set up to work. Fires at the start of a session, on "let's start", "what should I work on", "get set up", "what's the state of things", or before the first substantive change. Holds the freshness checks that stop you working from a stale picture, the leftovers a previous session may have left running, and the claim protocol that stops two sessions building the same thing.
 ---
 
