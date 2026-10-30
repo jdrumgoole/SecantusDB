@@ -24154,9 +24154,15 @@ fn plan_join_select(
             // A CONSTANT beside the join's columns -- `'t1'::regclass::oid`,
             // `1` -- reads no side at all: the value is fixed at plan time and
             // repeated per row. Anything that is not constant (an expression
-            // over a column) stays unsupported.
+            // over a column) stays unsupported, and so does a VOLATILE call
+            // (`nextval('s')`): PostgreSQL runs it once a joined row, so it is
+            // neither folded nor run here (RP-288) -- running it and then
+            // falling back drew one value too many.
             Some(_) => {
                 let val = rt.val.as_ref().expect("ResTarget has a val");
+                if correlated::has_volatile_call(val) {
+                    return Err(Error::Unsupported("a volatile JOIN target".into()));
+                }
                 let value = const_value(val, params)
                     .map_err(|_| Error::Unsupported("this subquery target".into()))?;
                 let out = if rt.name.is_empty() {

@@ -552,20 +552,28 @@ def test_a_volatile_condition_runs_once_a_row_of_its_table(pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-288")
+@pytest.mark.backlog_fixed("RP-288")
 def test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row(rust_pg: Any) -> None:
-    """In autocommit, a join whose select list calls `nextval` took one
-    value more than its rows (in a transaction block it did not)."""
+    """A join whose select list called `nextval` took one value more than
+    its rows (comma join) or one value for every row (JOIN ... ON): the
+    two-table join path ran the call once while planning, as a constant.
+    PostgreSQL 15.19 runs it once a joined row."""
+    got = []
     with rust_pg.connect() as conn:
         for s in ["drop table if exists rp19_a, rp19_b", "drop sequence if exists rp19_s"]:
             conn.execute(s)
         for s in _RP019_SETUP:
             conn.execute(s)
-        rows = conn.execute(
+        for q in [
             "select rp19_a.a, nextval('rp19_s') from rp19_a, rp19_b"
-            " where rp19_a.a = rp19_b.b order by 1"
-        ).fetchall()
-        last = conn.execute("select last_value from rp19_s").fetchone()
+            " where rp19_a.a = rp19_b.b order by 1",
+            "select rp19_a.a, nextval('rp19_s') from rp19_a join rp19_b"
+            " on rp19_a.a = rp19_b.b order by 1",
+        ]:
+            conn.execute("alter sequence rp19_s restart")
+            rows = conn.execute(q).fetchall()
+            last = conn.execute("select last_value from rp19_s").fetchone()
+            got.append((rows, last))
         conn.execute("drop table rp19_a, rp19_b")
         conn.execute("drop sequence rp19_s")
-    assert (rows, last) == ([(1, 1), (2, 2), (3, 3)], (3,))
+    assert got == [([(1, 1), (2, 2), (3, 3)], (3,))] * 2
