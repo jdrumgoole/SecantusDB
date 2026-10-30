@@ -98,8 +98,9 @@ taken through a pipe or a trailing `echo`.
 - the crates you touched: `./inv rust-storage-test` (WT-linked crates are
   not covered by workspace commands), `./inv rust-gate` for server changes;
 - rebuild the binaries from HEAD, then `python tools/backlog.py verify
-  --file <backlog> --regressions`, plus the other Rust backlog when shared
-  code moved. Expected: this item gone, no `REGRESSED`, no new `FIXED?`
+  --file backlog-rust-postgres.md --regressions` (the bare file name, as
+  `--file` refuses a `tasks/` path; `backlog-rust-mongodb.md` for RM),
+  plus the other Rust backlog when shared code moved. Expected: this item gone, no `REGRESSED`, no new `FIXED?`
   or `BROKEN`;
 - the full pytest suite once (`build-and-test` for long runs);
 - `./inv lint` and repo-wide `ruff check .` / `ruff format --check .`.
