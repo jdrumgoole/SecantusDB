@@ -1414,7 +1414,8 @@ def test_the_first_backend_after_a_start(rust_pg: Any, tmp_path: Any) -> None:
 
 
 # Found while measuring: RP-293, `pg_class.relnatts` left out a dropped
-# column's attribute; RP-294, an oidvector would not cast to regtype[].
+# column's attribute (fixed: it counts every attnum the table has used);
+# RP-294, an oidvector would not cast to regtype[].
 FOUND = {
     "relnatts counts dropped columns": (
         "RP-293",
@@ -1431,6 +1432,9 @@ FOUND = {
         ["select proargtypes::regtype[]::text from pg_proc where oid = 1317"],
     ),
 }
+
+# The FOUND items closed since: their cases are regression tests now.
+FOUND_FIXED = {"RP-293"}
 
 EXPECTED_FOUND: dict[str, Any] = {
     "relnatts counts dropped columns": [None, None, None, [(2,)], None],
@@ -1455,7 +1459,14 @@ def found(dsn: str, steps: list[str]) -> list[Any]:
 
 @pytest.mark.parametrize(
     "name",
-    [pytest.param(n, marks=pytest.mark.backlog(item), id=n) for n, (item, _) in FOUND.items()],
+    [
+        pytest.param(
+            n,
+            marks=(pytest.mark.backlog_fixed if item in FOUND_FIXED else pytest.mark.backlog)(item),
+            id=n,
+        )
+        for n, (item, _) in FOUND.items()
+    ],
 )
 def test_found(name: str, rust_pg: Any) -> None:
     assert found(_dsn(rust_pg), FOUND[name][1]) == EXPECTED_FOUND[name]

@@ -1222,10 +1222,6 @@ a regression test.
       and local cold costs needs an instrumented PostgreSQL.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
-- [ ] **`pg_class.relnatts` leaves out dropped columns** (1 where 15.19
-      says 2 after a DROP COLUMN).
-      Backlog-ID: RP-293
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_found[relnatts counts dropped columns]
 - [ ] **`proargtypes::regtype[]` is refused** ("cannot cast int4 to
       regtype[]"); 15.19 returns `[0:0]={text}`.
       Backlog-ID: RP-294
