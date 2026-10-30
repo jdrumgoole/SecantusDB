@@ -38,7 +38,16 @@ command -v claude >/dev/null || {
 }
 
 prompt="/fix-one $*"
+stamp() { date '+%Y-%m-%d %H:%M:%S %Z'; }
+
+# Bracket the session with timestamps so a log shows when it ran and how
+# long it took; not exec'd, so the end line can follow claude's exit.
+echo "[$(stamp)] start: $prompt"
+status=0
 if [[ $headless -eq 1 ]]; then
-    exec claude -p "$prompt"
+    claude -p "$prompt" || status=$?
+else
+    claude "$prompt" || status=$?
 fi
-exec claude "$prompt"
+echo "[$(stamp)] end: $prompt (exit $status)"
+exit "$status"
