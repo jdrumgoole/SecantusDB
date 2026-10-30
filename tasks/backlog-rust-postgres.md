@@ -933,14 +933,6 @@ tests regression tests:
       Backlog-ID: RP-302
       Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
 
-- [ ] **In autocommit, a join whose select list calls `nextval` takes one
-      value more than its rows**: `select a.a, nextval('s') from a, b where
-      a.a = b.b` answers 2, 3, 4 and leaves `last_value` at 4 where
-      PostgreSQL 15.19 answers 1, 2, 3; in a transaction block it does not.
-      Found while working RP-019, which made a volatile WHERE condition run
-      once a row of its table as PostgreSQL's scan does.
-      Backlog-ID: RP-288
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_select_list_nextval_in_an_autocommit_join_runs_once_a_row
 - [ ] **A hypothetical-set aggregate with the wrong number of direct
       arguments names it by `unknown`s and gives the generic hint**:
       `rank(2) WITHIN GROUP (ORDER BY a, b)` is 42883 `function
