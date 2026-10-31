@@ -18863,8 +18863,14 @@ impl PgHandler {
     /// RP-196), as PostgreSQL's are; another index is one page per 16 kB of
     /// its table's rows' encoded bytes, and a database the sum of its
     /// tables' encoded bytes in 8 kB pages, neither of which follows
-    /// PostgreSQL's page arithmetic.
+    /// PostgreSQL's page arithmetic. Read through the open block's
+    /// transaction (`read_in_block`): the planner calls it with the block
+    /// unbound, and an index the block created is a relation (RP-299).
     fn size_call(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
+        self.read_in_block(|| self.size_call_here(name, args))
+    }
+
+    fn size_call_here(&self, name: &str, args: &[Bson]) -> PgWireResult<Bson> {
         const PAGE: i64 = 8192;
         let pages = |bytes: i64| (bytes + PAGE - 1) / PAGE * PAGE;
         let relation = |v: &Bson| -> PgWireResult<Option<String>> {

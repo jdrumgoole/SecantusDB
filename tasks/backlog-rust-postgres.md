@@ -953,12 +953,6 @@ tests regression tests:
       rows (optimised). Found while closing RP-018.
       Backlog-ID: RP-297
       Verify: tests/backlog/test_rp018_savepoint_undo.py::test_a_key_lookup_after_ddl_does_not_read_the_table
-- [ ] **An index created in the open transaction is no relation
-      `regclass` finds**: `select pg_relation_size('t_b')` after `create
-      index t_b` in the same block is 42P01; PostgreSQL 15.19 answers 8192.
-      Found while working RP-028.
-      Backlog-ID: RP-299
-      Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_index_made_in_the_open_transaction_is_a_relation
 - [ ] **A seven-relation join to a large DISTINCT subquery on an
       expression key exhausts memory**: `element_types`' query with its row
       IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the

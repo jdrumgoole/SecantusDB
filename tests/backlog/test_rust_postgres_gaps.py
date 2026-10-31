@@ -2351,12 +2351,14 @@ def test_create_index_packs_posting_lists_as_postgres_builds_them(pg: Any) -> No
     assert got == [("ok", [(11,)]), ("ok", [(27,)]), ("ok", [(5,)])]
 
 
-@pytest.mark.backlog("RP-299")
+@pytest.mark.backlog_fixed("RP-299")
 def test_an_index_made_in_the_open_transaction_is_a_relation(pg: Any) -> None:
     """PostgreSQL 15.19: inside the transaction that created it, an index
     is a relation `regclass` finds, so `pg_relation_size('t_b')` answers
-    (8192 for an empty index: its metapage alone). Here the name is
-    not found until the transaction commits: 42P01."""
+    (8192 for an empty index: its metapage alone). The size functions,
+    called by the planner with the block's transaction unbound, read the
+    committed catalog alone, so the name was not found until the
+    transaction committed: 42P01."""
     pg.execute("begin")
     try:
         pg.execute("create table rp291_t (a int, b int)")
