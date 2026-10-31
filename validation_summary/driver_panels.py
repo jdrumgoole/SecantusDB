@@ -423,7 +423,9 @@ def _refuse_mixed_age(raw_dir: Path, suffix: str, server: str, max_spread_days: 
         if _is_empty(path):
             empty.append(name)
             continue
-        ages[name] = dt.datetime.fromtimestamp(path.stat().st_mtime)
+        # In UTC: a naive local time loses an hour across a DST change, so
+        # 49 days apart read as 48 (2026-10-31).
+        ages[name] = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.timezone.utc)
     if empty:
         # An EMPTY artifact with a fresh mtime passed the age check and rendered
         # a blank panel beside twelve real ones — observed 2026-09-28, when a

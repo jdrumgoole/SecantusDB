@@ -7892,6 +7892,18 @@ impl PgHandler {
     /// `get_variable_numdistinct` reads); `None` when it is not a user table
     /// or VACUUM / ANALYZE gave it statistics this model does not keep.
     fn planner_table(&self, table: &str, table_count: usize) -> Option<PlannerTable> {
+        self.planner_table_lazy(table, &|| Some(table_count))
+    }
+
+    /// [`Self::planner_table`], counting the rows only when it needs them:
+    /// a table whose heap's pages are known is sized from them, as
+    /// `estimate_rel_size` does, and reads no row (RP-297). `None` too when
+    /// the count fails.
+    pub(crate) fn planner_table_lazy(
+        &self,
+        table: &str,
+        table_count: &dyn Fn() -> Option<usize>,
+    ) -> Option<PlannerTable> {
         use secantus_pgplan::hashagg;
         let def = self
             .all_table_defs()
@@ -8005,13 +8017,17 @@ impl PgHandler {
                 hashagg::type_avg_width(&c.pg_type, c.typmod, typlen)
             })
             .sum();
-        let (pages, tuples) = hashagg::table_size(
-            width,
-            table_count as u64,
-            self.heap_pages(table, &def)
-                .and_then(|_| self.measured_pages(table, &def)),
-            measured,
-        );
+        // `RelationGetNumberOfBlocks`: the heap's length, which reads no
+        // row -- whether its rows' sizes are modelled is a question of the
+        // column types alone (RP-297).
+        let heap_pages = Self::heap_pages_modelled(&def)
+            .then(|| self.measured_pages(table, &def))
+            .flatten();
+        let rows = match heap_pages {
+            Some(_) => 0,
+            None => table_count()? as u64,
+        };
+        let (pages, tuples) = hashagg::table_size(width, rows, heap_pages, measured);
         // `table_block_relation_estimate_size`: `relallvisible` as it is,
         // over the pages now.
         let relallvisible = relstats
@@ -9188,15 +9204,35 @@ impl PgHandler {
         entries: u64,
         partial: bool,
     ) -> Vec<secantus_pgplan::costsize::Index> {
+        self.cost_indexes_sized(table, def, partial, &|_, key_width| {
+            Some(secantus_pgplan::costsize::btree_size(entries, key_width))
+        })
+        .unwrap_or_default()
+    }
+
+    /// [`Self::cost_indexes_with`], each index's pages and height from
+    /// `size` (given its key fields and their width); `None` when `size`
+    /// cannot tell one.
+    pub(crate) fn cost_indexes_sized(
+        &self,
+        table: &str,
+        def: &secantus_pgcatalog::TableDef,
+        partial: bool,
+        size: &IndexSizer<'_>,
+    ) -> Option<Vec<secantus_pgplan::costsize::Index>> {
         use secantus_pgplan::costsize;
         let width = |field: &str| Self::column_width(def, field);
         let mut out: Vec<costsize::Index> = Vec::new();
+        let mut failed = false;
         let mut add = |fields: Vec<String>, unique: bool| {
             let Some(first) = fields.first().cloned() else {
                 return;
             };
             let key_width: i64 = fields.iter().map(|f| width(f)).sum();
-            let (pages, height) = costsize::btree_size(entries, key_width);
+            let Some((pages, height)) = size(&fields, key_width) else {
+                failed = true;
+                return;
+            };
             out.push(costsize::Index {
                 field: first,
                 unique: unique && fields.len() == 1,
@@ -9254,7 +9290,7 @@ impl PgHandler {
                 add(key.keys().cloned().collect(), unique);
             }
         }
-        out
+        (!failed).then_some(out)
     }
 
     /// The grouped rows' ORDER BY, HAVING, DISTINCT, OFFSET and LIMIT.
@@ -53723,3 +53759,7 @@ impl ComputedUnique {
             .all(|(x, y)| compare_values(x, y) == Ordering::Equal)
     }
 }
+
+/// Sizes an index for the planner from its key fields and their width:
+/// its pages and height, or `None` when it cannot tell (RP-297).
+pub(crate) type IndexSizer<'a> = dyn Fn(&[String], i64) -> Option<(f64, u32)> + 'a;
