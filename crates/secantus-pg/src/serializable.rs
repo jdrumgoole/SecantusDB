@@ -450,11 +450,17 @@ impl PgHandler {
         if filter.is_empty() && !am {
             return Some(PricedScan::Seq);
         }
-        let count = self
-            .storage
-            .count_matching(self.db(), table, &Document::new(), None)
-            .ok()?;
-        let pt = self.planner_table(table, count)?;
+        // The rows, counted only for what has no pages of its own to be
+        // sized by: PostgreSQL's planner never counts them (RP-297).
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
         let flat: Document =
             flat_conditions(filter)?
                 .into_iter()
@@ -514,7 +520,20 @@ impl PgHandler {
         if filter.is_empty() && am_plan.as_ref().is_none_or(|p| p.paths.is_empty()) {
             return Some(PricedScan::Seq);
         }
-        let mut indexes = self.cost_indexes_with(table, &pt.def, count as u64, false);
+        // Each B-tree as its pages are (`RelationGetNumberOfBlocks` and the
+        // metapage's root level): the B-tree model's, or failing one, sized
+        // from the rows.
+        let shapes = self.btree_shapes(table);
+        let mut indexes = self.cost_indexes_sized(table, &pt.def, false, &|fields, width| {
+            let modelled = shapes
+                .iter()
+                .find(|s| s.key_fields() == fields)
+                .and_then(|s| self.with_btree(table, s, |t| (t.pages(), t.height())).ok());
+            match modelled {
+                Some((pages, height)) => Some((f64::from(pages), height)),
+                None => Some(costsize::btree_size(count()? as u64, width)),
+            }
+        })?;
         let full = indexes.len();
         let partial = self.ssi_partial_indexes(table, &pt, filter, &nd);
         indexes.extend(partial.iter().map(|(ix, _)| ix.clone()));

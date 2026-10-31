@@ -643,15 +643,16 @@ def test_an_updated_unique_value_can_be_used_again(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-297")
+@pytest.mark.backlog_fixed("RP-297")
 def test_a_key_lookup_after_ddl_does_not_read_the_table(rust_pg: Any) -> None:
     """A primary-key SELECT costs about the same over 200,000 rows as over
-    20, as PostgreSQL's index scan does, whatever DDL ran before it. Here
-    the planner prices the scan from the table's heap page count, which
-    `heap_spaces` computes by decoding every row (`table_docs`), and the
-    count is kept only until the catalog moves: after any CREATE or DROP,
-    of any table, the next lookup took about 2.1 s over 200,000 rows on a
-    debug build (2026-10-26), against milliseconds over 20."""
+    20, as PostgreSQL's index scan does, whatever DDL ran before it. The
+    planner priced the scan from a heap page count `heap_spaces` computed
+    by decoding every row, and sized the indexes from a count of every row;
+    after any CREATE or DROP the next lookup took about 2.1 s over 200,000
+    rows on a debug build (2026-10-26), against milliseconds over 20. It
+    now reads the heap's and the B-tree model's page counts, as
+    PostgreSQL's `RelationGetNumberOfBlocks` does, and reads no row."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         _fill(c, "rp297_big", 200_000)
         _fill(c, "rp297_small", 20)

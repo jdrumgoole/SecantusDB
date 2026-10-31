@@ -945,14 +945,6 @@ tests regression tests:
       RP-283.
       Backlog-ID: RP-308
       Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_with_too_few_direct_arguments
-- [ ] **Pricing a key lookup reads the whole table** whenever the cached
-      heap page count is invalid (after any CREATE or DROP, and inside
-      transaction blocks): `priced_scan` -> `heap_pages` -> `heap_spaces` ->
-      `table_docs` decodes every row, so a one-row SELECT or UPDATE took
-      about 2.1 s on 200,000 rows (debug build) and about 1 s on 1,000,000
-      rows (optimised). Found while closing RP-018.
-      Backlog-ID: RP-297
-      Verify: tests/backlog/test_rp018_savepoint_undo.py::test_a_key_lookup_after_ddl_does_not_read_the_table
 - [ ] **A seven-relation join to a large DISTINCT subquery on an
       expression key exhausts memory**: `element_types`' query with its row
       IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the
