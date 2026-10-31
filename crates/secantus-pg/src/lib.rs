@@ -51244,6 +51244,13 @@ fn copy_field(
     if raw == "\\N" {
         return Ok(Bson::Null);
     }
+    // `int2vectorin` / `oidvectorin`: space-separated numbers, kept as the
+    // array a literal's cast makes. The wire type is an array kind, so the
+    // array decoder below took `25` as an integer and refused `16 16`, and
+    // the built-in `pg_proc.proargtypes::regtype[]` was refused (RP-294).
+    if matches!(pg_type, "int2vector" | "oidvector") {
+        return secantus_pgplan::cast_text_to(raw, pg_type, tz).map_err(|e| PgHandler::err(&e));
+    }
     // An ARRAY, and every other type whose text form a bound parameter is
     // parsed from (bytea, uuid, inet / cidr, box, the datetime family, json /
     // jsonb): the SAME decoder a text-format Bind parameter goes through, so

@@ -1200,10 +1200,6 @@ a regression test.
       and local cold costs needs an instrumented PostgreSQL.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
-- [ ] **`proargtypes::regtype[]` is refused** ("cannot cast int4 to
-      regtype[]"); 15.19 returns `[0:0]={text}`.
-      Backlog-ID: RP-294
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_found[an oidvector casts to regtype[]]
 
 ## Found by batch 54 (2026-10-24)
 

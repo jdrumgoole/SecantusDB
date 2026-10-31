@@ -36286,6 +36286,22 @@ fn coerce_unknown_operand(
             (coerced, rhs)
         });
     }
+    // Beside an int2vector / oidvector an unknown is read by its input
+    // function (`'16 16'`), not as an array literal (RP-294). Only the
+    // comparisons: the vectors have no `+`, `-` or `||` of their own.
+    if matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+        if let Some(ty) = typed_node
+            .map(|n| static_type(n, typed))
+            .filter(|t| matches!(t.as_str(), "int2vector" | "oidvector"))
+        {
+            let coerced = cast_value(Bson::String(text.clone()), &ty)?;
+            return Ok(if r_bare {
+                (lhs, coerced)
+            } else {
+                (coerced, rhs)
+            });
+        }
+    }
     // Beside a NULL array an unknown is that array type: `null::int[] ||
     // '{3}'` is array_cat's `{3}`.
     if op == "||" && *typed == Bson::Null {
@@ -42122,6 +42138,10 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         // An array column: the literal is that array type, bounds and all --
         // `a = '[0:1]={5,6}'` must compare the lower bound too.
         Some(ty) if ty.ends_with("[]") => cast_value(value, ty),
+        // An `int2vector` / `oidvector` is stored as its numbers, so the
+        // literal is read by `int2vectorin` / `oidvectorin` first: `indkey =
+        // '1'` compared the text with an array and matched nothing (RP-294).
+        Some(ty @ ("int2vector" | "oidvector")) => cast_value(value, ty),
         _ => Ok(value),
     }
 }
