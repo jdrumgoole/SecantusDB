@@ -554,21 +554,78 @@ def test_a_jsonb_gin_index_has_its_pages(pg: Any) -> None:
     assert got == ("ok", [(4,)])
 
 
-@pytest.mark.backlog("RP-287")
-def test_a_tsvector_gin_index_has_its_pages(pg: Any) -> None:
-    """A GIN index over `tsvector_ops` is not modelled page by page:
-    PostgreSQL 15.19 sizes it at 4 pages; here `pg_relation_size` reads 0."""
-    got = _in_block(
-        pg,
+# `tsvector_ops` keys (`gin_extract_tsvector`): each lexeme a `text` key;
+# a NULL vector a NullItem, an empty one an EmptyItem; built over the rows,
+# then filled through the pending list. PostgreSQL 15.19's sizes.
+_RP287_TSVECTOR = {
+    "small": (
         [
             "create table rp287_v (v tsvector)",
             "insert into rp287_v select to_tsvector('simple', 'w' || (g % 100) || ' x' || (g % 7))"
             " from generate_series(1, 2000) g",
             "create index rp287_vg on rp287_v using gin (v)",
         ],
-        "select pg_relation_size('rp287_vg') / 8192",
+        4,
+    ),
+    "posting trees": (
+        [
+            "create table rp287_v (v tsvector)",
+            "insert into rp287_v select to_tsvector('simple', 'w' || (g % 10) || ' y' || (g % 1000)"
+            " || ' z' || g) from generate_series(1, 20000) g",
+            "create index rp287_vg on rp287_v using gin (v)",
+        ],
+        163,
+    ),
+    "null and empty": (
+        [
+            "create table rp287_v (v tsvector)",
+            "insert into rp287_v select case when g % 5 = 0 then null when g % 7 = 0"
+            " then ''::tsvector else to_tsvector('english', 'The quick brown fox jumped ' || g)"
+            " end from generate_series(1, 3000) g",
+            "create index rp287_vg on rp287_v using gin (v)",
+        ],
+        17,
+    ),
+    "pending list": (
+        [
+            "create table rp287_v (v tsvector)",
+            "insert into rp287_v select case when g % 5 = 0 then null when g % 7 = 0"
+            " then ''::tsvector else to_tsvector('english', 'The quick brown fox jumped ' || g)"
+            " end from generate_series(1, 3000) g",
+            "create index rp287_vg on rp287_v using gin (v)",
+            "insert into rp287_v select to_tsvector('simple', 'n' || g)"
+            " from generate_series(1, 3000) g",
+        ],
+        25,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("case", list(_RP287_TSVECTOR), ids=list(_RP287_TSVECTOR))
+def test_a_tsvector_gin_index_has_its_pages(pg: Any, case: str) -> None:
+    """A GIN index over `tsvector_ops` was not modelled page by page:
+    `pg_relation_size` read 0 where PostgreSQL 15.19 sizes it in pages."""
+    statements, pages = _RP287_TSVECTOR[case]
+    got = _in_block(pg, statements, "select pg_relation_size('rp287_vg') / 8192")
+    assert got == ("ok", [(pages,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_jsonb_path_ops_gin_index_has_its_pages(pg: Any) -> None:
+    """A GIN index over `jsonb_path_ops` is not modelled page by page:
+    PostgreSQL 15.19 sizes it at 2 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_p (j jsonb)",
+            "insert into rp287_p select jsonb_build_object('k', g % 100)"
+            " from generate_series(1, 2000) g",
+            "create index rp287_pg on rp287_p using gin (j jsonb_path_ops)",
+        ],
+        "select pg_relation_size('rp287_pg') / 8192",
     )
-    assert got == ("ok", [(4,)])
+    assert got == ("ok", [(2,)])
 
 
 # `jsonb_ops` keys (`gin_extract_jsonb`): object keys, values, string
