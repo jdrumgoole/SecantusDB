@@ -1477,6 +1477,58 @@ pub struct SetOpSelect {
     pub offset: i64,
     /// `FETCH FIRST n ROWS WITH TIES` (see `Select`).
     pub with_ties: bool,
+    /// Each side's select-list entries that are an UNTYPED literal, read
+    /// from the parse tree: PostgreSQL types such a column `unknown`, and
+    /// `select_common_type` gives it the other side's type, whatever the
+    /// side's FROM (`select 1 union select null from t` is integer).
+    pub left_untyped: UntypedTargets,
+    pub right_untyped: UntypedTargets,
+}
+
+/// Which select-list entries of one set-operation side are a bare untyped
+/// NULL or a bare untyped string literal, by output position. Empty when
+/// the side is itself a set operation (its columns are resolved there) or
+/// expands a `*` (its positions are not known from the parse tree).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UntypedTargets {
+    pub nulls: Vec<bool>,
+    pub strings: Vec<bool>,
+}
+
+impl UntypedTargets {
+    fn of(s: &pg_query::protobuf::SelectStmt) -> Self {
+        use pg_query::protobuf::a_const::Val;
+        if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 || !s.values_lists.is_empty()
+        {
+            return Self::default();
+        }
+        let mut out = Self::default();
+        for item in &s.target_list {
+            let Some(N::ResTarget(rt)) = item.node.as_ref() else {
+                return Self::default();
+            };
+            match rt.val.as_ref().and_then(|v| v.node.as_ref()) {
+                Some(N::ColumnRef(c))
+                    if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))) =>
+                {
+                    return Self::default();
+                }
+                Some(N::AConst(c)) if c.isnull => {
+                    out.nulls.push(true);
+                    out.strings.push(false);
+                }
+                Some(N::AConst(c)) if matches!(c.val, Some(Val::Sval(_))) => {
+                    out.nulls.push(false);
+                    out.strings.push(true);
+                }
+                _ => {
+                    out.nulls.push(false);
+                    out.strings.push(false);
+                }
+            }
+        }
+        out
+    }
 }
 
 impl SetOpSelect {
@@ -16660,6 +16712,8 @@ fn plan_set_operation(
         limit,
         offset,
         with_ties: with_ties(s),
+        left_untyped: UntypedTargets::of(larg),
+        right_untyped: UntypedTargets::of(rarg),
     }))
 }
 

@@ -8,6 +8,7 @@ for the rule trees (RP-203); RP-287 is what the GIN and GiST page models
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -652,11 +653,13 @@ def test_jsonb_ops_indexes_and_their_heaps_have_postgres_pages(pg: Any) -> None:
 
 # Found while measuring RP-287: a UNION branch selecting a bare NULL FROM
 # a relation was typed `text`, not `unknown`.
-@pytest.mark.backlog("RP-310")
+@pytest.mark.backlog_fixed("RP-310")
 def test_a_union_branch_selecting_null_from_a_relation_takes_the_other_type(pg: Any) -> None:
     """PostgreSQL 15.19 resolves `unknown` with the other branch's type
     (`select_common_type`): int4 here, jsonb in the second. This server
-    typed the NULL branch `text` once it had a FROM, and raised 42804."""
+    typed the NULL branch `text` once it had a FROM, and raised 42804,
+    until the set operation read each side's untyped targets from the
+    parse tree."""
     got = [
         pg_answer(pg, "select 1 union all select null from (values (1)) v"),
         pg_answer(
@@ -666,6 +669,25 @@ def test_a_union_branch_selecting_null_from_a_relation_takes_the_other_type(pg: 
         ),
     ]
     assert got == [("ok", [(1,), (None,)]), ("ok", [(1,), (2,), (None,)])]
+
+
+@pytest.mark.backlog_fixed("RP-310")
+def test_a_union_branch_selecting_a_string_from_a_relation_takes_the_other_type(
+    pg: Any,
+) -> None:
+    """An untyped string literal is `unknown` like a NULL, FROM or not:
+    PostgreSQL 15.19 reads `'2'` by int4's input function, refuses `'x'`
+    there (22P02), and a NULL side first takes the right side's numeric."""
+    got = [
+        pg_answer(pg, "select 1 union all select '2' from (values (1)) v"),
+        pg_answer(pg, "select 1 union all select 'x' from (values (1)) v"),
+        pg_answer(pg, "select null from (values (1)) v union all select 1.5"),
+    ]
+    assert got == [
+        ("ok", [(1,), (2,)]),
+        ("err", "22P02", 'invalid input syntax for type integer: "x"'),
+        ("ok", [(None,), (Decimal("1.5"),)]),
+    ]
 
 
 _RP019_SETUP = [
