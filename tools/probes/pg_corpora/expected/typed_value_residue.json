@@ -1,5 +1,5 @@
 {"reference": "15.19 (Homebrew)",
-"volatile": {"6": "reads the clock or the server process", "7": "reads the clock or the server process", "64": "reads the clock or the server process"},
+"volatile": {"6": "reads the clock or the server process", "7": "reads the clock or the server process", "64": "reads the clock or the server process", "202": "reads the time zone rules in force today", "203": "reads the time zone rules in force today"},
 "checks": [
 ["SET timezone = 'UTC'", "", "ok", [], []],
 ["select array[row(1)]", "", "ok", [[["list", [["list", [["str", "1"]]]]]]], [2287]],

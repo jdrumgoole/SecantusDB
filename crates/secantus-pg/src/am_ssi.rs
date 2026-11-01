@@ -699,6 +699,21 @@ impl crate::PgHandler {
         }
     }
 
+    /// The pages of `table`'s GIN or GiST index `index` as its model has
+    /// them, metapage and root included (what `RelationGetNumberOfBlocks`
+    /// reads for `pg_relation_size`); `None` when it is not one of the
+    /// modelled indexes.
+    pub(crate) fn am_pages(&self, table: &str, index: &str) -> Option<u32> {
+        let shape = self
+            .am_shapes(table)
+            .into_iter()
+            .find(|s| s.name() == index)?;
+        Some(self.with_am_model(table, &shape, |m| match m {
+            Model::Gin(g) => g.pages(),
+            Model::Gist(g) => g.pages(),
+        }))
+    }
+
     /// TRUNCATE: each index empty again.
     pub(crate) fn am_truncated(&self, table: &str) {
         for shape in self.am_shapes(table) {

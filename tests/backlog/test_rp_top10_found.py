@@ -493,10 +493,10 @@ def test_a_hypothetical_set_aggregate_with_too_few_direct_arguments(pg: Any) -> 
         pg.execute("rollback")
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_gin_and_gist_indexes_have_their_pages(pg: Any) -> None:
     """PostgreSQL 15.19 sizes these two indexes at 4 and 18 pages; the page
-    models know their pages, but `pg_relation_size` reads 0."""
+    models knew their pages, but `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -510,6 +510,45 @@ def test_gin_and_gist_indexes_have_their_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_g') / 8192, pg_relation_size('rp287_s') / 8192",
     )
     assert got == ("ok", [(4, 18)])
+
+
+_RP287_SETUP = [
+    "create table rp287_t (a int[])",
+    "insert into rp287_t select array[g % 100, g % 7] from generate_series(1, 2000) g",
+    "create index rp287_g on rp287_t using gin (a)",
+    "create table rp287_p (p point)",
+    "insert into rp287_p select point(g % 50, g / 50) from generate_series(1, 2000) g",
+    "create index rp287_s on rp287_p using gist (p)",
+]
+
+
+@pytest.mark.backlog_fixed("RP-287")
+def test_a_tables_gin_and_gist_indexes_size_as_their_pages(pg: Any) -> None:
+    """`pg_indexes_size` sums each index's pages: PostgreSQL 15.19 answers
+    4 and 18 pages; here the GIN and GiST indexes were a heap estimate."""
+    got = _in_block(
+        pg,
+        _RP287_SETUP,
+        "select pg_indexes_size('rp287_t') / 8192, pg_indexes_size('rp287_p') / 8192",
+    )
+    assert got == ("ok", [(4, 18)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_jsonb_gin_index_has_its_pages(pg: Any) -> None:
+    """A GIN index over `jsonb_ops` is not modelled page by page:
+    PostgreSQL 15.19 sizes it at 4 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_j (j jsonb)",
+            "insert into rp287_j select jsonb_build_object('k', g % 100)"
+            " from generate_series(1, 2000) g",
+            "create index rp287_jg on rp287_j using gin (j)",
+        ],
+        "select pg_relation_size('rp287_jg') / 8192",
+    )
+    assert got == ("ok", [(4,)])
 
 
 _RP019_SETUP = [
