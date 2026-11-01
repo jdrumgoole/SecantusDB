@@ -988,7 +988,11 @@ tests regression tests:
       Bind cycle, which both servers would drop -- but that gap is a
       client round trip, and no measurement shows the cancel landed there.
       The next step is the server's log of a failing run with the cancel's
-      arrival and the message it landed in.
+      arrival and the message it landed in. Seen a second time on
+      2026-11-01, in `scripts/gate_pg.sh`'s backlog verify on macOS (debug
+      build, load average about 11 from the suites before it): the same
+      `ok` for `[2.5]`; five runs of the test alone after it passed. Load
+      is the common factor of both sightings.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 

@@ -2453,7 +2453,18 @@ mod tests {
         let (a, b) = (rel(lm1, 2), rel(lm2, 4));
         let rows = join_rows(&side, &side, true);
         let mut kept = JoinRel::new(true);
-        kept.add_paths_general(0, Some(2), Some(2), (false, false), &|_| false, &a, &b, true, rows, 1);
+        kept.add_paths_general(
+            0,
+            Some(2),
+            Some(2),
+            (false, false),
+            &|_| false,
+            &a,
+            &b,
+            true,
+            rows,
+            1,
+        );
         // The parameterized paths' rows: lm1's 2 through the LEFT join's
         // clause, at least the preserved side's (`calc_joinrel_size_estimate`).
         let param: Vec<JoinChoice> = kept
@@ -2465,7 +2476,18 @@ mod tests {
         assert!(param.iter().all(|p| p.rows == 20.0), "{param:?}");
         // With no outer join to need it, none is made.
         let mut none = JoinRel::new(true);
-        none.add_paths_general(0, Some(2), Some(2), (false, false), &|_| false, &a, &b, true, rows, 0);
+        none.add_paths_general(
+            0,
+            Some(2),
+            Some(2),
+            (false, false),
+            &|_| false,
+            &a,
+            &b,
+            true,
+            rows,
+            0,
+        );
         assert!(none.pathlist().iter().all(|p| p.req_outer == 0));
     }
 }
