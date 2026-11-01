@@ -207,6 +207,30 @@ SCENARIOS: dict[str, list[str]] = {
 # The open items' gap tests: what PostgreSQL 15.19 reads for statements
 # this model does not walk.
 GAPS: dict[str, tuple[str, list[str]]] = {
+    # A built-in catalog's first scan in a session builds its descriptors
+    # and reads its planner statistics; the reg* input functions look a
+    # name up, and an operator's oid scan meets its casts and types.
+    "a built-in catalog's first reads": (
+        "RP-316",
+        [
+            "a|",
+            "mark",
+            "a|select count(*) from pg_am",
+            "mark",
+            "a|select 'int4'::regtype::oid",
+            "mark",
+            "a|select oprname from pg_operator where oid = 96",
+            "mark",
+            "a|select 'pg_class'::regclass::oid",
+            "mark",
+            "a|select 'now'::text::regproc::oid",
+            "mark",
+            "a|select count(*) from pg_namespace",
+            "mark",
+            "a|select 'pg_catalog'::regnamespace::oid",
+            "mark",
+        ],
+    ),
     # ALTER TABLE's own reads: the target's descriptor and indexes, the
     # event trigger cache, pg_depend and friends for DROP COLUMN.
     "an ALTER TABLE's own catalog reads": (
@@ -1164,6 +1188,90 @@ EXPECTED: dict[str, Any] = {
 
 
 EXPECTED_GAPS: dict[str, Any] = {
+    "a built-in catalog's first reads": [
+        {
+            "pg_am": [1, 1, 0],
+            "pg_amproc_fam_proc_index": [1, 3, 3],
+            "pg_attribute_relid_attnum_index": [4, 7, 7],
+            "pg_authid_oid_index": [1, 1, 1],
+            "pg_authid_rolname_index": [1, 1, 1],
+            "pg_class_oid_index": [2, 2, 2],
+            "pg_database_datname_index": [1, 1, 1],
+            "pg_database_oid_index": [2, 2, 2],
+            "pg_db_role_setting_databaseid_rol_index": [4, 0, 0],
+            "pg_index_indexrelid_index": [1, 1, 1],
+            "pg_namespace_nspname_index": [2, 1, 1],
+            "pg_opclass_oid_index": [1, 1, 1],
+            "pg_proc_oid_index": [1, 1, 1],
+            "pg_proc_proname_args_nsp_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+        },
+        {
+            "pg_aggregate_fnoid_index": [1, 1, 1],
+            "pg_am": [1, 7, 0],
+            "pg_amop_fam_strat_index": [2, 2, 2],
+            "pg_amproc_fam_proc_index": [1, 3, 3],
+            "pg_attribute_relid_attnum_index": [8, 8, 8],
+            "pg_class_oid_index": [5, 5, 5],
+            "pg_class_relname_nsp_index": [1, 1, 1],
+            "pg_index_indexrelid_index": [4, 4, 4],
+            "pg_index_indrelid_index": [1, 2, 2],
+            "pg_opclass_oid_index": [1, 1, 1],
+            "pg_proc_oid_index": [2, 2, 2],
+            "pg_proc_proname_args_nsp_index": [1, 2, 2],
+            "pg_statistic_ext_relid_index": [1, 0, 0],
+            "pg_statistic_relid_att_inh_index": [2, 2, 2],
+            "pg_tablespace_oid_index": [1, 1, 1],
+            "pg_type_oid_index": [5, 5, 5],
+        },
+        {
+            "pg_cast_source_target_index": [1, 1, 1],
+            "pg_type_oid_index": [2, 2, 2],
+            "pg_type_typname_nsp_index": [3, 3, 3],
+        },
+        {
+            "pg_amop_opr_fam_index": [1, 5, 5],
+            "pg_cast_source_target_index": [42, 3, 3],
+            "pg_class_oid_index": [1, 1, 1],
+            "pg_class_relname_nsp_index": [1, 1, 1],
+            "pg_index_indrelid_index": [1, 2, 2],
+            "pg_operator_oid_index": [2, 2, 2],
+            "pg_operator_oprname_l_r_n_index": [2, 63, 63],
+            "pg_proc_oid_index": [1, 1, 1],
+            "pg_statistic_ext_relid_index": [1, 0, 0],
+            "pg_statistic_relid_att_inh_index": [2, 2, 2],
+            "pg_type_oid_index": [37, 37, 37],
+        },
+        {
+            "pg_cast_source_target_index": [1, 1, 1],
+            "pg_class_relname_nsp_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+            "pg_type_typname_nsp_index": [1, 1, 1],
+        },
+        {
+            "pg_cast_source_target_index": [2, 1, 1],
+            "pg_proc_oid_index": [3, 3, 3],
+            "pg_proc_proname_args_nsp_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+            "pg_type_typname_nsp_index": [2, 2, 2],
+        },
+        {
+            "pg_class_oid_index": [1, 1, 1],
+            "pg_class_relname_nsp_index": [1, 1, 1],
+            "pg_index_indrelid_index": [1, 2, 2],
+            "pg_namespace": [1, 4, 0],
+            "pg_statistic_ext_relid_index": [1, 0, 0],
+            "pg_statistic_relid_att_inh_index": [2, 2, 2],
+            "pg_type_oid_index": [1, 1, 1],
+        },
+        {
+            "pg_cast_source_target_index": [1, 1, 1],
+            "pg_namespace_nspname_index": [1, 1, 1],
+            "pg_type_oid_index": [1, 1, 1],
+            "pg_type_typname_nsp_index": [1, 1, 1],
+        },
+        {},
+    ],
     "an ALTER TABLE's own catalog reads": [
         {
             "pg_am": [1, 1, 0],
@@ -1324,40 +1432,59 @@ def test_gap(name: str, rust_pg: Any) -> None:
     assert got[name] == EXPECTED_GAPS[name]
 
 
-def catalog_blocks(dsn: str) -> list[bool]:
-    """A new session's catalog reads touch catalog pages: `pg_class`'s
-    heap and its name index each count blocks (read or hit) in
-    `pg_statio_sys_tables` / `pg_statio_sys_indexes`."""
-    with _connect(dsn, "setup") as c:
-        for s in SETUP:
-            c.execute(s)
-    obs = Observer(dsn)
-    query = (
-        "select pg_stat_get_blocks_fetched(1259), pg_stat_get_blocks_fetched(2663), "
-        "pg_stat_get_blocks_hit(1259) + pg_stat_get_blocks_hit(2663)"
-    )
-    try:
-        obs.conn.execute(query)
-        obs.conn.execute("select pg_stat_clear_snapshot()")
-        before = obs.conn.execute(query).fetchone()
-        with _connect(dsn, "a") as a:
-            a.execute("select relname from pg_class where relname = 'rpc_t'")
-            a.execute("select pg_stat_force_next_flush()")
-        time.sleep(0.3)
-        obs.conn.execute("select pg_stat_clear_snapshot()")
-        after = obs.conn.execute(query).fetchone()
-        return [after[i] > before[i] for i in range(3)]
-    finally:
-        obs.conn.close()
-        with _connect(dsn, "teardown") as c:
-            for s in TEARDOWN:
-                c.execute(s)
+def catalog_blocks(dsn: str) -> list[dict[str, int]]:
+    """The heap blocks each catalog counts in `pg_statio_sys_tables` over
+    `INDEX_BLOCK_STEPS`, which read this module's objects' catalog rows:
+    rows added after `initdb`, which the model has not placed yet."""
+    return _block_deltas(dsn, INDEX_BLOCK_STEPS, "pg_stat_sys_tables", "relid", True)
+
+
+EXPECTED_CATALOG_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_am": 1,
+        "pg_amproc": 1,
+        "pg_attribute": 4,
+        "pg_authid": 2,
+        "pg_class": 2,
+        "pg_database": 3,
+        "pg_index": 1,
+        "pg_namespace": 1,
+        "pg_opclass": 1,
+        "pg_proc": 2,
+        "pg_type": 1,
+    },
+    {
+        "pg_amop": 4,
+        "pg_attribute": 7,
+        "pg_class": 7,
+        "pg_index": 5,
+        "pg_operator": 2,
+        "pg_proc": 1,
+        "pg_statistic": 1,
+        "pg_tablespace": 1,
+        "pg_type": 3,
+    },
+    {
+        "pg_am": 1,
+        "pg_amop": 3,
+        "pg_amproc": 1,
+        "pg_attribute": 3,
+        "pg_class": 4,
+        "pg_index": 2,
+        "pg_opclass": 1,
+        "pg_operator": 2,
+        "pg_proc": 1,
+        "pg_type": 2,
+    },
+    {},
+]
 
 
 @pytest.mark.backlog("RP-291")
 def test_catalog_blocks(rust_pg: Any) -> None:
-    """PostgreSQL 15.19: all three rise."""
-    assert catalog_blocks(_dsn(rust_pg)) == [True, True, True]
+    """PostgreSQL 15.19: the heap blocks behind every catalog row a scan
+    returns, `initdb`'s or a later one's."""
+    assert catalog_blocks(_dsn(rust_pg)) == EXPECTED_CATALOG_BLOCKS
 
 
 # RP-291, its first slice: the pages a catalog index scan reads, as
@@ -1380,21 +1507,32 @@ INDEX_BLOCK_STEPS = [
 def index_blocks(dsn: str) -> list[dict[str, int]]:
     """Each catalog index's `blocks_fetched` delta between `INDEX_BLOCK_STEPS`'
     marks, as `run_scenario` takes them."""
-    with _connect(dsn, "setup") as c:
-        for s in SETUP:
-            c.execute(s)
-    with _connect(dsn, "warm") as c:
-        for s in WARM:
-            c.execute(s)
+    return _block_deltas(dsn, INDEX_BLOCK_STEPS, "pg_stat_sys_indexes", "indexrelid", True)
+
+
+def _block_deltas(
+    dsn: str, steps: list[str], view: str, column: str, setup: bool
+) -> list[dict[str, int]]:
+    """Each catalog relation of `view`'s `blocks_fetched` delta between
+    `steps`' marks ("drop" takes one and drops it), and over the sessions'
+    ends; with `setup`, over the
+    module's objects, created and warmed first."""
+    if setup:
+        with _connect(dsn, "setup") as c:
+            for s in SETUP:
+                c.execute(s)
+        with _connect(dsn, "warm") as c:
+            for s in WARM:
+                c.execute(s)
     obs = Observer(dsn)
-    indexes = [
+    rels = [
         o
         for (o,) in obs.conn.execute(
-            "select indexrelid::int from pg_stat_sys_indexes where schemaname = 'pg_catalog'"
+            f"select {column}::int from {view} where schemaname = 'pg_catalog'"
         ).fetchall()
     ]
     query = "select o, pg_stat_get_blocks_fetched(o) from (values {}) v(o)".format(
-        ",".join(f"({o})" for o in indexes)
+        ",".join(f"({o})" for o in rels)
     )
 
     def snap() -> dict[str, int]:
@@ -1417,12 +1555,14 @@ def index_blocks(dsn: str) -> list[dict[str, int]]:
         return d
 
     try:
-        for st in INDEX_BLOCK_STEPS:
-            if st == "mark":
+        for st in steps:
+            if st in ("mark", "drop"):
                 for c in conns.values():
                     c.execute("select pg_stat_force_next_flush()")
                 time.sleep(0.2)
-                out.append(delta())
+                d = delta()
+                if st == "mark":
+                    out.append(d)
                 continue
             name, sql = st.split("|", 1)
             if name not in conns:
@@ -1436,9 +1576,10 @@ def index_blocks(dsn: str) -> list[dict[str, int]]:
         return out
     finally:
         obs.conn.close()
-        with _connect(dsn, "teardown") as c:
-            for s in TEARDOWN:
-                c.execute(s)
+        if setup:
+            with _connect(dsn, "teardown") as c:
+                for s in TEARDOWN:
+                    c.execute(s)
 
 
 EXPECTED_INDEX_BLOCKS: list[dict[str, int]] = [
@@ -1499,6 +1640,75 @@ EXPECTED_INDEX_BLOCKS: list[dict[str, int]] = [
 def test_catalog_index_blocks(rust_pg: Any) -> None:
     """The index part of RP-291, its first slice (2026-11-01)."""
     assert index_blocks(_dsn(rust_pg)) == EXPECTED_INDEX_BLOCKS
+
+
+# RP-291, its heap slice: the heap blocks a catalog scan reads, as
+# PostgreSQL 15.19 counts them in `pg_statio_sys_tables` -- an index scan's
+# fetch of each tuple it returns (a block again only after another), a
+# sequential scan's every block -- over reads that meet only `initdb`'s own
+# rows (no object of this module's), whose places `pg15_catalog_heaps.txt`
+# records. Measured as `EXPECTED_INDEX_BLOCKS` was.
+HEAP_BLOCK_STEPS = [
+    "a|",
+    "mark",
+    "a|select typname from pg_type where oid = 23",
+    "mark",
+    "a|select 'postgres'::regrole::oid",
+    "mark",
+    # The first scan of each builds the table's descriptors (not yet the
+    # same reads as PostgreSQL's, RP-316); the second scans its heap alone.
+    "a|select count(*) from pg_namespace",
+    "a|select count(*) from pg_am",
+    "drop",
+    "a|select count(*) from pg_namespace",
+    "mark",
+    "a|select count(*) from pg_am",
+    "mark",
+]
+
+
+def heap_blocks(dsn: str) -> list[dict[str, int]]:
+    """Each catalog's `blocks_fetched` delta between `HEAP_BLOCK_STEPS`' marks."""
+    return _block_deltas(dsn, HEAP_BLOCK_STEPS, "pg_stat_sys_tables", "relid", False)
+
+
+EXPECTED_HEAP_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_am": 1,
+        "pg_amproc": 1,
+        "pg_attribute": 4,
+        "pg_authid": 2,
+        "pg_class": 2,
+        "pg_database": 3,
+        "pg_index": 1,
+        "pg_namespace": 1,
+        "pg_opclass": 1,
+        "pg_proc": 2,
+        "pg_type": 1,
+    },
+    {
+        "pg_amop": 4,
+        "pg_attribute": 4,
+        "pg_cast": 3,
+        "pg_class": 4,
+        "pg_index": 3,
+        "pg_operator": 43,
+        "pg_proc": 1,
+        "pg_statistic": 2,
+        "pg_tablespace": 1,
+        "pg_type": 43,
+    },
+    {"pg_cast": 1, "pg_type": 3},
+    {"pg_namespace": 1},
+    {"pg_am": 1},
+    {},
+]
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_catalog_heap_blocks(rust_pg: Any) -> None:
+    """The heap part of RP-291 over `initdb`'s rows (2026-11-01)."""
+    assert heap_blocks(_dsn(rust_pg)) == EXPECTED_HEAP_BLOCKS
 
 
 @pytest.mark.backlog_fixed("RP-311")
@@ -1693,7 +1903,16 @@ def test_found(name: str, rust_pg: Any) -> None:
     assert found(_dsn(rust_pg), FOUND[name][1]) == EXPECTED_FOUND[name]
 
 
-if __name__ == "__main__":
+if __name__ == "__main__" and sys.argv[2:] == ["heap"]:
+    print(
+        "EXPECTED_CATALOG_BLOCKS: list[dict[str, int]] = "
+        + pprint.pformat(catalog_blocks(sys.argv[1]), width=100, sort_dicts=False)
+    )
+    print(
+        "EXPECTED_HEAP_BLOCKS: list[dict[str, int]] = "
+        + pprint.pformat(heap_blocks(sys.argv[1]), width=100, sort_dicts=False)
+    )
+elif __name__ == "__main__":
     measured = catalog_reads(sys.argv[1])
     print("EXPECTED: dict[str, Any] = " + pprint.pformat(measured, width=100, sort_dicts=False))
     gaps = {n: catalog_reads(sys.argv[1], {n: steps})[n] for n, (_, steps) in GAPS.items()}

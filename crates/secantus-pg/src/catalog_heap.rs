@@ -11,16 +11,17 @@
 //! `pg_database`, `pg_index`), and a HOT update keeps its chain on one page,
 //! so an index fetch reads the block it names either way.
 //!
-//! This is the first of RP-291's heap slices: the next places every later
-//! catalog row with the heap page model and counts each scan's heap pages.
+//! A catalog scan's heap blocks are counted over these
+//! (`catalog_btree.rs`); placing every later catalog row with the heap
+//! page model is RP-291's next slice.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
 /// One built-in catalog's heap as `initdb` left it.
-// Read by the crate's tests until the counting slices of RP-291 land.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct InitdbHeap {
+    // Read by the crate's tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) name: String,
     /// `pg_relation_size / BLCKSZ`: a sequential scan reads every block.
     pub(crate) blocks: u32,
@@ -65,7 +66,6 @@ fn parse(text: &str) -> HashMap<i64, InitdbHeap> {
 }
 
 /// Every built-in catalog's `initdb` heap, by table oid.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn initdb_heaps() -> &'static HashMap<i64, InitdbHeap> {
     static H: OnceLock<HashMap<i64, InitdbHeap>> = OnceLock::new();
     H.get_or_init(|| parse(include_str!("pg15_catalog_heaps.txt")))

@@ -395,11 +395,20 @@ pub(crate) struct Counter {
     pub(crate) stats: Option<Stats>,
     /// The store whose dead catalog index entries a scan meets.
     pub(crate) store: usize,
-    /// The index scans counted, `(index, key)` each in the order made, for
-    /// the pages they read to be counted once the walk is done (RP-291);
-    /// no key for the planner's look at a B-tree's height
+    /// The catalog scans counted, in the order made, for the pages they
+    /// read to be counted once the walk is done (RP-291).
+    scans: std::cell::RefCell<Vec<PageScan>>,
+}
+
+/// A catalog scan whose pages are counted (RP-291).
+#[derive(Debug, Clone)]
+pub(crate) enum PageScan {
+    /// An index scan of the index for the rows whose leading key columns
+    /// are the key; no key for the planner's look at a B-tree's height
     /// (`_bt_getrootheight`), which reads its metapage alone.
-    scans: std::cell::RefCell<Vec<(i64, Option<Key>)>>,
+    Index(i64, Option<Key>),
+    /// A sequential scan of the table: every block of its heap.
+    Seq(i64),
 }
 
 impl Counter {
@@ -416,19 +425,19 @@ impl Counter {
     pub(crate) fn index(&self, index: i64, key: Key, rows: i64) {
         if let Some(s) = &self.stats {
             s.index_scan(index, rows, rows);
-            self.scans.borrow_mut().push((index, Some(key)));
+            self.scans.borrow_mut().push(PageScan::Index(index, Some(key)));
         }
     }
 
     /// `_bt_getrootheight`: the planner asks a B-tree index's height.
     pub(crate) fn tree_height(&self, index: i64) {
         if self.stats.is_some() {
-            self.scans.borrow_mut().push((index, None));
+            self.scans.borrow_mut().push(PageScan::Index(index, None));
         }
     }
 
-    /// The index scans counted since this was last asked.
-    pub(crate) fn take_scans(&self) -> Vec<(i64, Option<Key>)> {
+    /// The scans counted since this was last asked.
+    pub(crate) fn take_scans(&self) -> Vec<PageScan> {
         std::mem::take(&mut *self.scans.borrow_mut())
     }
 
@@ -440,13 +449,14 @@ impl Counter {
         let dead = take_dead(self.store, index, key);
         if let Some(s) = &self.stats {
             s.index_scan(index, rows + dead, rows);
-            self.scans.borrow_mut().push((index, Some(key.clone())));
+            self.scans.borrow_mut().push(PageScan::Index(index, Some(key.clone())));
         }
     }
 
     pub(crate) fn seq(&self, rel: i64, rows: i64) {
         if let Some(s) = &self.stats {
             s.seq_scan(rel, rows);
+            self.scans.borrow_mut().push(PageScan::Seq(rel));
         }
     }
 
