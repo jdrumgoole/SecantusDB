@@ -73,13 +73,14 @@ fn hint_for(table: &str) -> Option<ScanHint> {
     HINTS.with(|h| h.borrow().iter().rev().find(|x| x.table == table).cloned())
 }
 
-/// A GIN index this models: one array column under `array_ops`.
+/// A GIN index this models: one array column under `array_ops`, or one
+/// `jsonb` column under `jsonb_ops`.
 #[derive(Debug, Clone)]
 pub(crate) struct GinShape {
     pub(crate) oid: i64,
     pub(crate) name: String,
     pub(crate) field: String,
-    /// The array's element type.
+    /// The array's element type, or `jsonb` for `jsonb_ops`.
     pub(crate) elem: String,
     /// `fastupdate` (on unless `WITH` turned it off).
     pub(crate) fastupdate: bool,
@@ -119,8 +120,8 @@ impl AmShape {
     }
 }
 
-/// `array_ops` over an element type: its B-tree comparison, and the sizes
-/// its keys take in an index tuple.
+/// `array_ops` over an element type, or `jsonb_ops` (`elem` is `jsonb`):
+/// its keys' comparison, and the sizes they take in an index tuple.
 pub(crate) struct ElemOps {
     elem: String,
 }
@@ -155,11 +156,20 @@ impl ElemOps {
                 | "text"
                 | "varchar"
                 | "character varying"
+                | "jsonb"
         )
     }
 
+    /// `jsonb_ops`' keys are `text` too: a flag byte, then the string.
     fn textual(&self) -> bool {
-        matches!(self.elem.as_str(), "text" | "varchar" | "character varying")
+        matches!(
+            self.elem.as_str(),
+            "text" | "varchar" | "character varying" | "jsonb"
+        )
+    }
+
+    fn jsonb(&self) -> bool {
+        self.elem == "jsonb"
     }
 }
 
@@ -218,8 +228,103 @@ fn models() -> &'static Mutex<HashMap<ModelKey, Model>> {
     M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// `jsonb_gin.c`'s key flags.
+const JGINFLAG_KEY: u8 = 0x01;
+const JGINFLAG_NULL: u8 = 0x02;
+const JGINFLAG_BOOL: u8 = 0x03;
+const JGINFLAG_NUM: u8 = 0x04;
+const JGINFLAG_STR: u8 = 0x05;
+const JGINFLAG_HASHED: u8 = 0x10;
+/// `JGIN_MAXLENGTH`: a longer string is keyed by its hash.
+const JGIN_MAXLENGTH: usize = 125;
+
+/// `make_text_key`: the flag byte, then the string, or the string's
+/// `hash_any` in eight hex digits when it is longer than `JGIN_MAXLENGTH`
+/// bytes. Kept as a string whose bytes are the key's, so that the byte
+/// order `gin_compare_jsonb` (C-collation `varstr_cmp`) sorts by is the
+/// string's.
+fn jsonb_text_key(flag: u8, s: &str) -> Bson {
+    let bytes = secantus_pgplan::server_encoding::bytes(s);
+    let (flag, s) = if bytes.len() > JGIN_MAXLENGTH {
+        let h = secantus_pgplan::hashpart::hash_bytes_extended(&bytes, 0) as u32;
+        (flag | JGINFLAG_HASHED, format!("{h:08x}"))
+    } else {
+        (flag, s.to_string())
+    };
+    let mut out = String::with_capacity(1 + s.len());
+    out.push(char::from(flag));
+    out.push_str(&s);
+    Bson::String(out)
+}
+
+/// `make_scalar_key`.
+fn jsonb_scalar_key(v: &secantus_pgplan::json::Json, is_key: bool) -> Bson {
+    use secantus_pgplan::json::Json;
+    match v {
+        Json::Null => jsonb_text_key(JGINFLAG_NULL, ""),
+        Json::Bool(b) => jsonb_text_key(JGINFLAG_BOOL, if *b { "t" } else { "f" }),
+        Json::Number(n) => {
+            jsonb_text_key(JGINFLAG_NUM, &secantus_pgplan::json::numeric_normalize(n))
+        }
+        Json::Str(s) => jsonb_text_key(if is_key { JGINFLAG_KEY } else { JGINFLAG_STR }, s),
+        // The walk below passes scalars only.
+        Json::Array(_) | Json::Object(_) => jsonb_text_key(JGINFLAG_NULL, ""),
+    }
+}
+
+/// `gin_extract_jsonb`'s walk: every object key a key, every object value
+/// and array element a value, except that a string element is keyed as an
+/// object key would be ("pretend string array elements are keys"). A bare
+/// scalar is a one-element raw-scalar array.
+fn jsonb_walk(v: &secantus_pgplan::json::Json, out: &mut Vec<Bson>, elem: bool) {
+    use secantus_pgplan::json::Json;
+    match v {
+        Json::Array(items) => {
+            for i in items {
+                jsonb_walk(i, out, true);
+            }
+        }
+        Json::Object(members) => {
+            for (k, val) in members {
+                out.push(jsonb_text_key(JGINFLAG_KEY, k));
+                jsonb_walk(val, out, false);
+            }
+        }
+        scalar => out.push(jsonb_scalar_key(
+            scalar,
+            elem && matches!(scalar, Json::Str(_)),
+        )),
+    }
+}
+
+/// `gin_extract_jsonb`'s keys of a stored `jsonb` text, through
+/// `ginExtractEntries` (sorted, duplicates gone, none an `EmptyItem`).
+fn jsonb_keys(ops: &ElemOps, text: &str) -> Vec<GinKey> {
+    use secantus_pgplan::json::Json;
+    let Ok(parsed) = secantus_pgplan::json::parse(text) else {
+        return gin_index::value_keys(ops, None);
+    };
+    // The stored value is normalised; a duplicate key keeps its last value.
+    let parsed = match secantus_pgplan::json::parse(&secantus_pgplan::json::render_jsonb(&parsed)) {
+        Ok(p) => p,
+        Err(_) => parsed,
+    };
+    let mut keys = Vec::new();
+    match &parsed {
+        Json::Array(_) | Json::Object(_) => jsonb_walk(&parsed, &mut keys, false),
+        scalar => jsonb_walk(&Json::Array(vec![scalar.clone()]), &mut keys, false),
+    }
+    gin_index::value_keys(ops, Some(&keys))
+}
+
 /// A GIN key list of a stored value (`ginExtractEntries`).
 fn gin_keys(ops: &ElemOps, v: Option<&Bson>) -> Vec<GinKey> {
+    if ops.jsonb() {
+        return match v {
+            Some(Bson::String(t)) => jsonb_keys(ops, t),
+            _ => gin_index::value_keys(ops, None),
+        };
+    }
     match v {
         None | Some(Bson::Null) => gin_index::value_keys(ops, None),
         Some(Bson::Array(a)) => gin_index::value_keys(ops, Some(a)),
@@ -561,8 +666,13 @@ impl crate::PgHandler {
                 })
             };
             let shape = if method == "gin" {
-                let Some(elem) = col.pg_type.strip_suffix("[]") else {
-                    continue;
+                let elem = if col.pg_type == "jsonb" {
+                    "jsonb"
+                } else {
+                    let Some(elem) = col.pg_type.strip_suffix("[]") else {
+                        continue;
+                    };
+                    elem
                 };
                 if !ElemOps::supported(elem) || col.extra.contains_key("collation") {
                     continue;
@@ -865,10 +975,14 @@ impl crate::PgHandler {
             let (field, served): (&str, Vec<usize>) = match &shape {
                 AmShape::Gin(s) => (
                     &s.field,
+                    // `jsonb_ops`' scans are not modelled: such a scan
+                    // keeps the relation lock.
                     quals
                         .iter()
                         .enumerate()
-                        .filter(|(_, q)| q.field == s.field && gin_strategy(&q.op).is_some())
+                        .filter(|(_, q)| {
+                            s.elem != "jsonb" && q.field == s.field && gin_strategy(&q.op).is_some()
+                        })
                         .map(|(i, _)| i)
                         .collect(),
                 ),
@@ -1229,4 +1343,48 @@ fn gin_scan(g: &Gin, ops: &ElemOps, quals: &[OpQual], served: &[usize]) -> (Vec<
     }
     let pages = g.scan_locks(ops, &entries);
     (pages, result.unwrap_or_default().into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(text: &str) -> Vec<String> {
+        let ops = ElemOps {
+            elem: "jsonb".into(),
+        };
+        gin_keys(&ops, Some(&Bson::String(text.into())))
+            .into_iter()
+            .map(|k| match (k.cat, k.val) {
+                (gin_index::Cat::Norm, Bson::String(s)) => s,
+                (cat, _) => format!("{cat:?}"),
+            })
+            .collect()
+    }
+
+    /// `gin_extract_jsonb` through `ginExtractEntries`: object keys flagged
+    /// as keys, values by their type, a string ELEMENT flagged as a key,
+    /// sorted by their bytes and deduplicated.
+    #[test]
+    fn jsonb_ops_keys_are_gin_extract_jsonbs() {
+        assert_eq!(keys(r#"{"k": 5}"#), ["\u{1}k", "\u{4}5"]);
+        assert_eq!(
+            keys(r#"["a", null, 1.50, true, "a", {"a": "a"}]"#),
+            ["\u{1}a", "\u{2}", "\u{3}t", "\u{4}1.5", "\u{5}a"]
+        );
+        assert_eq!(keys(r#""s""#), ["\u{1}s"]);
+        assert_eq!(keys("{}"), ["EmptyItem"]);
+        let ops = ElemOps {
+            elem: "jsonb".into(),
+        };
+        assert_eq!(gin_keys(&ops, None)[0].cat, gin_index::Cat::NullItem);
+    }
+
+    /// A string over 125 bytes is keyed by `hash_any` (15.19's
+    /// `hashtext(repeat('ab', 70))` is `eff4a7ef`), the hashed flag set.
+    #[test]
+    fn a_long_jsonb_string_is_keyed_by_its_hash() {
+        let text = format!(r#"{{"{}": 1}}"#, "ab".repeat(70));
+        assert_eq!(keys(&text), ["\u{4}1", "\u{11}eff4a7ef"]);
+    }
 }

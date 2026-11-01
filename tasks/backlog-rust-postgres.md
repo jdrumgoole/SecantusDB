@@ -1006,9 +1006,13 @@ batch, their tests regression tests:
       on them (`predicate-gin` 31 of 31, `predicate-gist` 40 of 40; was 19
       and 22, RP-254). Not yet, each falling back to a relation lock as
       before:
-      - GIN `=` on arrays, and opclasses other than `array_ops` (jsonb,
-        tsvector, btree_gin); array elements other than ints, floats, bool
-        and C-ordered text; an ANALYZEd array column (MCELEM statistics);
+      - GIN `=` on arrays, and opclasses other than `array_ops` and
+        `jsonb_ops` (tsvector, `jsonb_path_ops`, btree_gin), whose indexes
+        `pg_relation_size` reads as 0; array elements other than ints,
+        floats, bool and C-ordered text; an ANALYZEd array column (MCELEM
+        statistics);
+      - `jsonb_ops` scans (`@>`, `?`, `?|`, `?&`): its pages and keys are
+        modelled, its `extractQuery` and consistent functions are not;
       - point/box `~=`, polygon and circle containment;
       - multi-column, partial and expression GIN / GiST indexes;
       - an UPDATE's or DELETE's scan (only a SELECT passes its residual);
@@ -1021,7 +1025,17 @@ batch, their tests regression tests:
       first slice); an unmodelled one (a `jsonb_ops` GIN index) still
       reads 0 from `pg_relation_size`.
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_jsonb_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_tsvector_gin_index_has_its_pages
+- [ ] **A UNION branch selecting a bare NULL FROM a relation is typed
+      `text`**, not `unknown`: `select 1 union all select null from
+      (values (1)) v` raises 42804 "UNION types integer and text cannot be
+      matched", as does a jsonb branch against `select null from
+      generate_series(1, 1)`. PostgreSQL 15.19 resolves the `unknown`
+      branch to the other's type (`select_common_type`) and answers the
+      rows. Without a FROM the branch is typed `unknown` here too. Found
+      while measuring RP-287.
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_union_branch_selecting_null_from_a_relation_takes_the_other_type
+      Backlog-ID: RP-310
 
 
 

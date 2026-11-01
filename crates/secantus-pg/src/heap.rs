@@ -218,6 +218,50 @@ pub(crate) fn array_datum_len(elem: &str, v: &Bson) -> Option<usize> {
     Some(off)
 }
 
+/// A `jsonb` datum's size, its 4-byte header included, as `convertToJsonb`
+/// (`jsonb_util.c`) builds it from the stored text: each container padded
+/// to an int boundary, then its header and one `JEntry` a child (an
+/// object's keys, then its values in key order), then the children --
+/// strings as their bytes, a `numeric` padded to an int boundary with its
+/// own 4-byte header, `null` and booleans as nothing. A bare scalar is a
+/// one-element raw-scalar array. `None` when the text is not JSON.
+pub(crate) fn jsonb_datum_len(text: &str) -> Option<usize> {
+    use secantus_pgplan::json::{parse, render_jsonb, Json};
+    // The normalised form: keys sorted, a duplicate's last value kept.
+    let v = parse(&render_jsonb(&parse(text).ok()?)).ok()?;
+    fn pad(n: usize) -> usize {
+        (n + 3) & !3
+    }
+    fn value(v: &Json, mut off: usize) -> usize {
+        match v {
+            Json::Null | Json::Bool(_) => off,
+            Json::Str(s) => off + server_len(s),
+            Json::Number(n) => pad(off) + 4 + numeric_bytes(n),
+            Json::Array(items) => {
+                off = pad(off) + 4 + 4 * items.len();
+                for i in items {
+                    off = value(i, off);
+                }
+                off
+            }
+            Json::Object(members) => {
+                off = pad(off) + 4 + 8 * members.len();
+                for (k, _) in members {
+                    off += server_len(k);
+                }
+                for (_, m) in members {
+                    off = value(m, off);
+                }
+                off
+            }
+        }
+    }
+    Some(match &v {
+        Json::Array(_) | Json::Object(_) => value(&v, 4),
+        scalar => value(&Json::Array(vec![scalar.clone()]), 4),
+    })
+}
+
 /// The bytes a varlena value holds, header aside.
 fn varlena_data(pg_type: &str, typmod: i32, v: &Bson) -> usize {
     if let Some(elem) = pg_type.strip_suffix("[]") {
@@ -228,6 +272,10 @@ fn varlena_data(pg_type: &str, typmod: i32, v: &Bson) -> usize {
     match (pg_type, v) {
         (_, Bson::Binary(b)) => b.bytes.len(),
         ("numeric", v) => numeric_bytes(&text_of(v)),
+        ("jsonb", Bson::String(t)) => match jsonb_datum_len(t) {
+            Some(n) => n - 4,
+            None => server_len(t),
+        },
         // A `char(n)` is stored padded to n characters.
         ("bpchar", v) => {
             let s = text_of(v);
@@ -1748,6 +1796,24 @@ fn flush_changed(storage: &std::sync::Arc<secantus_storage::Storage>, force: boo
 mod tests {
     use super::*;
     use secantus_pgcatalog::Column;
+
+    /// `pg_column_size` of each value cast to jsonb, PostgreSQL 15.19.
+    #[test]
+    fn jsonb_datums_are_sized_as_convert_to_jsonb_builds_them() {
+        for (text, size) in [
+            (r#"{"k": 5}"#, 28),
+            ("1", 20),
+            (r#""abc""#, 15),
+            (r#"[1, "a", null, true]"#, 33),
+            (r#"{"a": {"b": 1.50}, "bb": "x"}"#, 55),
+            ("{}", 8),
+            ("[]", 8),
+            (r#"{"a": 1, "a": "zz"}"#, 19),
+        ] {
+            assert_eq!(jsonb_datum_len(text), Some(size), "{text}");
+        }
+        assert_eq!(jsonb_datum_len("not json"), None);
+    }
 
     /// `(a int, b text)` with 100-byte text: PostgreSQL 15.19 puts 58 such
     /// tuples on a page (a=70 at (1,12), a=200 at (3,26)).
