@@ -142,12 +142,29 @@ fn jsonb_size(text: &str) -> Option<usize> {
     Some(4 + jsonb_container(&v, 4))
 }
 
+/// A `tsvector`'s bytes after its varlena header (`tsvector.h`): the
+/// `size` word, one `WordEntry` per lexeme, then each lexeme's bytes and,
+/// when it has positions, a SHORTALIGN, the count and the positions
+/// (`tsvectorin`'s `buflen`).
+pub fn tsvector_size(text: &str) -> Option<usize> {
+    let v = crate::fts::parse_vector(text).ok()?;
+    let mut buf = 0usize;
+    for (lex, positions) in &v.0 {
+        buf += crate::server_encoding::bytes(lex).len();
+        if !positions.is_empty() {
+            buf = align(buf, 2) + 2 * (positions.len() + 1);
+        }
+    }
+    Some(4 + 4 * v.0.len() + buf)
+}
+
 /// The bytes of a varlena value's data (its header excluded).
 fn varlena_data(v: &Bson, ty: &str) -> Option<usize> {
     let base = ty.split('(').next().unwrap_or(ty).trim();
     Some(match base {
         "numeric" | "decimal" => numeric_size(&numeric_text(v)?) - 4,
         "jsonb" => jsonb_size(&value_text(v))? - 4,
+        "tsvector" => tsvector_size(&value_text(v))?,
         "inet" | "cidr" => 2 + if value_text(v).contains(':') { 16 } else { 4 },
         "bytea" => match v {
             Bson::Binary(b) => b.bytes.len(),
@@ -287,6 +304,23 @@ pub(crate) fn column_size(v: &Bson, ty: &str, from_table: bool) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PostgreSQL 15.19's `pg_column_size(t::tsvector)`, in memory (a
+    /// 4-byte header).
+    #[test]
+    fn tsvector_sizes_match_postgresql() {
+        for (t, want) in [
+            ("", 8),
+            ("a", 13),
+            ("a:1", 18),
+            ("ab:1,2,3", 22),
+            ("a:1 bcd:2A", 30),
+            ("'w1':1 'y1':2 'z1':3", 38),
+            ("abc def", 22),
+        ] {
+            assert_eq!(in_memory(&Bson::String(t.into()), "tsvector"), Some(want), "{t}");
+        }
+    }
 
     #[test]
     fn numeric_sizes_match_postgresql() {

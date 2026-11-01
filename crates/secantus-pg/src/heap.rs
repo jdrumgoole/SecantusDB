@@ -276,6 +276,9 @@ fn varlena_data(pg_type: &str, typmod: i32, v: &Bson) -> usize {
             Some(n) => n - 4,
             None => server_len(t),
         },
+        ("tsvector", Bson::String(t)) => {
+            secantus_pgplan::datum_size::tsvector_size(t).unwrap_or_else(|| server_len(t))
+        }
         // A `char(n)` is stored padded to n characters.
         ("bpchar", v) => {
             let s = text_of(v);
