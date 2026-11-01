@@ -1326,6 +1326,22 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # The `server` shard died of a full disk on 2026-11-01 (PR #2249, run
+      # 41312019513): every backlog test after the first ~70 errored with
+      # "could not create numbered dir", and the runner could not write its
+      # own log. The same commit had passed on main 15 minutes earlier. The
+      # runner starts with ~86 GB free, so that was not a thin margin: tens
+      # of GB were written within ~30 s of the backlog step starting (a
+      # runaway write, open as an RP backlog item). Report the disk around
+      # each suite so the next one is measured, and free the toolchains this
+      # job never uses (.NET, Android, GHC, CodeQL: ~22 GB) for headroom.
+      - name: Free disk the job does not use
+        shell: bash
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why
@@ -1505,6 +1521,7 @@ jobs:
           # the next imbalance is visible in the log instead of guessed.
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
             --dist worksteal --durations=40 -p no:cacheprovider -rs
+          df -h / | tail -1
 
       # The login rules (TLS options, revocation lists, user name maps,
       # pg_hba.conf) are compared with a PostgreSQL 15 this job runs itself:
@@ -1548,6 +1565,7 @@ jobs:
           "$SECANTUS_PG15_BIN/postgres" --version
           uv run python -m pytest tests/test_rust_pg_login_differential.py -q -n 3 \
             -p no:cacheprovider -rs
+          df -h / | tail -1
 
       # The regression tests fixed Rust PG backlog items became
       # (`backlog_fixed`, tests/backlog/). The default run deselects them,
@@ -1575,10 +1593,21 @@ jobs:
           SECANTUS_PG15_BIN: /usr/lib/postgresql/15/bin
         run: |
           # `-m backlog_fixed` replaces addopts' `-m`, which deselects them.
+          df -h / | tail -1
           uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
             tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs
+          df -h / | tail -1
           # And the OPEN items' gap tests, through the backlog's own runner: it
           # exits non-zero when a gap test no longer measures its gap (BROKEN)
           # or now passes (FIXED? -- a change fixed the item; close it in the
           # same PR, as the backlog skill says). About ten seconds.
           uv run python tools/backlog.py verify --file backlog-rust-postgres.md
+
+      # RP-312: name what filled the disk, if anything did. Runs on every
+      # failure of this job, after whichever step failed.
+      - name: Largest directories (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          df -h / | tail -1
+          sudo du -xh -d 3 /tmp "$RUNNER_TEMP" "$GITHUB_WORKSPACE" 2>/dev/null | sort -h | tail -25

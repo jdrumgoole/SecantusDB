@@ -866,6 +866,27 @@ one beside it.
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
 
+## Found by a CI run (2026-11-01)
+
+- [ ] **OPEN — CI: the pg-oracle `server` shard's backlog step filled an
+      86 GB-free runner disk within ~30 seconds; cause UNKNOWN.** PR #2249,
+      run 41312019513, job `pg-oracle (server)`: the slice suite (872
+      passed) and the login comparisons passed; ~70 `backlog_fixed` tests
+      passed, then one failed and every later test errored with `could not
+      create numbered dir with prefix rust-pg` (ENOSPC), and the runner
+      could not write its own log, so the test that wrote the data is not
+      named. The same base commit (`b9a9a5b7`) had passed this job on `main`
+      15 minutes earlier. A run of the job on the next commit showed 86 GB
+      free on `/` at the start, so this was not a thin margin: tens of GB
+      were written in seconds, which looks like a runaway write (a WT log or
+      file growing without bound, or a test materialising something huge).
+      `test.yml` now prints `df` around each pg-oracle suite and, on
+      failure, the largest directories under the temp and work trees.
+      **If it recurs, read those lines first**: they name the directory,
+      and so the test, before any theory.
+      Backlog-ID: RP-312
+      Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
+
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`
