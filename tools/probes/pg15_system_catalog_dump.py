@@ -17,11 +17,20 @@ Writes three files the server compiles in:
 * ``crates/secantus-pg/src/pg15_catalog_rows.txt`` -- for each table in
   ``STATIC_TABLES``, a ``\\relation schema.table`` line and then the table's
   rows in COPY text format, in ``ctid`` order, a ``reg*`` column as its oid.
+* ``crates/secantus-pg/src/pg15_catalog_indexes.txt`` -- every built-in
+  catalog index's B-tree pages as ``initdb`` left them (RP-291), read from
+  the cluster's data files, so the cluster must be LOCAL and the user a
+  superuser: a ``\\index oid root level`` line, then one line per page,
+  ``block flags next level items``, where a leaf's items are each index
+  tuple's heap TID count (``1x40`` is forty plain tuples; a posting list
+  counts its TIDs) and an internal page's are its downlinks' blocks. A
+  non-rightmost page's high key is not an item.
 """
 
 from __future__ import annotations
 
 import pathlib
+import struct
 import sys
 
 import psycopg
@@ -208,6 +217,167 @@ def main(dsn: str) -> None:
                 for block in copy:
                     out.append(bytes(block).decode())
         (ROOT / "crates/secantus-pg/src/pg15_catalog_rows.txt").write_text("".join(out))
+
+        index_pages(conn)
+
+
+BLCKSZ = 8192
+BTP_LEAF, BTP_META, BTP_DELETED = 1, 8, 4
+INDEX_ALT_TID_MASK, BT_IS_POSTING, BT_OFFSET_MASK = 0x2000, 0x2000, 0x0FFF
+
+
+def page_items(
+    page: bytes,
+) -> tuple[int, int, int, list[int], list[int], list[list[tuple[int, int]]], list[bytes]]:
+    """A B-tree page's flags, right link, level, and per data item (the high
+    key left out) its heap TID count on a leaf or its downlink's block on an
+    internal page, and a leaf item's heap TIDs (``nbtree.h``, ``itup.h``,
+    ``bufpage.h``), with each leaf item's bytes and its data offset."""
+    lower = struct.unpack_from("<H", page, 12)[0]
+    special = struct.unpack_from("<H", page, 16)[0]
+    _prev, nxt, level, flags = struct.unpack_from("<IIIH", page, special)
+    counts: list[int] = []
+    downlinks: list[int] = []
+    tids: list[list[tuple[int, int]]] = []
+    datas: list[bytes] = []
+    first = 1 if nxt != 0 else 0  # P_FIRSTDATAKEY: a high key on a non-rightmost page
+    for n, off in enumerate(range(24, lower, 4)):
+        lp = struct.unpack_from("<I", page, off)[0]
+        lp_off, lp_flags = lp & 0x7FFF, (lp >> 15) & 3
+        if n < first or lp_flags == 0:
+            continue
+        bi_hi, bi_lo, posid, info = struct.unpack_from("<HHHH", page, lp_off)
+        block = (bi_hi << 16) | bi_lo
+        if flags & BTP_LEAF:
+            posting = info & INDEX_ALT_TID_MASK and posid & BT_IS_POSTING
+            if posting:
+                n = posid & BT_OFFSET_MASK
+                at = lp_off + block  # BTreeTupleGetPostingOffset
+                item_tids = []
+                for k in range(n):
+                    hi, lo, off = struct.unpack_from("<HHH", page, at + 6 * k)
+                    item_tids.append(((hi << 16) | lo, off))
+            else:
+                item_tids = [(block, posid)]
+            counts.append(len(item_tids))
+            tids.append(item_tids)
+            size = info & 0x1FFF
+            header = 16 if info & 0x8000 else 8  # INDEX_NULL_MASK: a null bitmap
+            datas.append(page[lp_off : lp_off + size] + bytes([header]))
+        else:
+            downlinks.append(block)
+    return flags, nxt, level, counts, downlinks, tids, datas
+
+
+def decode_key(raw: bytes, types: list[tuple[int, int, str, str]]) -> list[str | None]:
+    """An index tuple's key values as their types' text output, read from
+    its bytes (``index_getattr``): each at its type's alignment, a varlena
+    unaligned when it has a 1-byte header. `types` holds each column's
+    ``(oid, typlen, typalign, typname)``; `raw` ends with the data offset."""
+    data, offset = raw[:-1], raw[-1]
+    info = struct.unpack_from("<H", data, 6)[0]
+    nulls = data[8] if info & 0x8000 else 0
+    out: list[str | None] = []
+    at = offset
+    align = {"c": 1, "s": 2, "i": 4, "d": 8}
+    for n, (_oid, length, alignment, name) in enumerate(types):
+        if info & 0x8000 and not nulls & (1 << n):
+            out.append(None)
+            continue
+        if name == "name":
+            # `name_ops` stores a `cstring` (`opckeytype`): unaligned, its
+            # bytes to the terminating NUL.
+            end = data.index(b"\0", at)
+            out.append(data[at:end].decode())
+            at = end + 1
+            continue
+        if length == -1:
+            if at < len(data) and data[at] & 1 and data[at] != 1:
+                size = data[at] >> 1
+                out.append(varlena(name, data[at + 1 : at + size]))
+                at += size
+                continue
+            a = align[alignment]
+            at = (at + a - 1) // a * a
+            size = struct.unpack_from("<I", data, at)[0] >> 2
+            out.append(varlena(name, data[at + 4 : at + size]))
+            at += size
+            continue
+        a = align[alignment]
+        at = (at + a - 1) // a * a
+        chunk = data[at : at + length]
+        at += length
+        if name == "char":
+            out.append(chunk.decode("latin-1"))
+        elif name == "bool":
+            out.append("t" if chunk[0] else "f")
+        elif length == 2:
+            out.append(str(struct.unpack("<h", chunk)[0]))
+        elif length == 8:
+            out.append(str(struct.unpack("<q", chunk)[0]))
+        elif name in ("int4",):
+            out.append(str(struct.unpack("<i", chunk)[0]))
+        else:
+            out.append(str(struct.unpack("<I", chunk)[0]))
+    return out
+
+
+def varlena(name: str, body: bytes) -> str:
+    """A varlena key's text: an ``oidvector`` / ``int2vector``'s elements
+    (after ``ndim``, ``dataoffset``, ``elemtype``, ``dim1``, ``lbound1``),
+    else the bytes as text."""
+    if name in ("oidvector", "int2vector"):
+        dim = struct.unpack_from("<i", body, 12)[0] if len(body) >= 20 else 0
+        fmt = "<I" if name == "oidvector" else "<h"
+        width = 4 if name == "oidvector" else 2
+        return " ".join(str(struct.unpack_from(fmt, body, 20 + width * k)[0]) for k in range(dim))
+    return body.decode()
+
+
+def run_length(counts: list[int]) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(counts):
+        j = i
+        while j < len(counts) and counts[j] == counts[i]:
+            j += 1
+        out.append(f"{counts[i]}x{j - i}" if j - i > 1 else str(counts[i]))
+        i = j
+    return ",".join(out)
+
+
+def index_pages(conn: psycopg.Connection) -> None:
+    conn.execute("checkpoint")
+    datadir = pathlib.Path(conn.execute("show data_directory").fetchone()[0])
+    out = []
+    for oid, path, types in conn.execute(
+        "select c.oid, pg_relation_filepath(c.oid),"
+        " (select array_agg(array[t.oid::text, t.typlen::text, t.typalign::text, t.typname::text]"
+        " order by k.n) from unnest(i.indkey) with ordinality k(att, n)"
+        " join pg_attribute a on a.attrelid = i.indrelid and a.attnum = k.att"
+        " join pg_type t on t.oid = a.atttypid where k.n <= i.indnkeyatts)"
+        " from pg_class c join pg_index i on i.indexrelid = c.oid"
+        " where c.relkind = 'i' and c.oid < 16384"
+        " and c.relam = (select oid from pg_am where amname = 'btree') order by 1"
+    ).fetchall():
+        key_types = [(int(t[0]), int(t[1]), t[2], t[3]) for t in types]
+        data = (datadir / path).read_bytes()
+        root, level = struct.unpack_from("<II", data, 24 + 8)  # btm_magic, btm_version, then these
+        out.append(f"\\index {oid} {root} {level} {' '.join(str(t[0]) for t in key_types)}\n")
+        for blk in range(1, len(data) // BLCKSZ):
+            flags, nxt, lvl, counts, downlinks, tids, datas = page_items(
+                data[blk * BLCKSZ : (blk + 1) * BLCKSZ]
+            )
+            items = run_length(counts) if flags & BTP_LEAF else ",".join(map(str, downlinks))
+            out.append(f"{blk} {flags} {nxt} {lvl} {items}\n")
+            # A leaf's tuples: `= tid[,tid...]` then each key value, `\\N`
+            # for NULL, as its type's text output.
+            for item_tids, raw in zip(tids, datas, strict=True) if flags & BTP_LEAF else []:
+                values = decode_key(raw, key_types)
+                cells = ["\\N" if v is None else escape(v) for v in values]
+                tid_text = ",".join(f"{b}.{o}" for b, o in item_tids)
+                out.append("= " + "\t".join([tid_text, *cells]) + "\n")
+    (ROOT / "crates/secantus-pg/src/pg15_catalog_indexes.txt").write_text("".join(out))
 
 
 if __name__ == "__main__":

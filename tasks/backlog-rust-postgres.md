@@ -1197,10 +1197,41 @@ a regression test.
       differ; a `pg_stat_*` view 53 match, 61 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ALTER TABLE's own catalog reads], tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **A catalog read counts no blocks** in `pg_statio_sys_*`: the scans
-      are counted (RP-225), the buffers they hit or read are not.
+- [ ] **A catalog read counts no heap blocks** in `pg_statio_sys_tables`:
+      the scans are counted (RP-225), and since 2026-11-01 the catalog
+      INDEX pages they read are too (`catalog_btree.rs`: each built-in
+      catalog index is PostgreSQL 15.19's own pages, every tuple's key and
+      heap TIDs, from `pg15_catalog_indexes.txt`; the metapage as
+      `rd_amcache` caches it, the planner's `_bt_getrootheight`;
+      regression test `test_catalog_index_blocks`), but not the heap pages
+      behind them.
+      **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
+      sequence of PRs, this item open until the last. Remaining slices:
+      (1) record each built-in catalog row's `initdb` ctid in the 15.19
+      dump's rows (`tools/probes/pg15_system_catalog_dump.py`, the rows
+      file and the generated `pg_class` / `pg_attribute` tables) -- the
+      index entries' TIDs are recorded already; (2) place every later
+      catalog row with the heap page model (`heap_page.rs`) and insert its
+      index entries into the index trees, which hold only `initdb`'s
+      tuples and are shared by every database -- with a non-HOT update's
+      new version and entries, and VACUUM's removal of dead ones (reading
+      this server's catalog rows to find them is not the way: on a
+      statement's path it cost a new session hundreds of milliseconds,
+      inside a transaction that changed the catalogs it blinded the
+      session to its own new objects, and off a statement's path it lost
+      other sessions' new tables); (3) count each catalog scan's heap
+      pages (an index scan's fetches, a sequential scan's every page) in
+      `pg_statio_sys_tables`. Also open: the shared buffer pool keys a
+      page by relation oid and block, not database, so two databases'
+      copies of one catalog index share hits.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
+- [ ] **`pg_statistic` holds no row for the built-in catalogs.** PostgreSQL
+      15.19's `initdb` ANALYZEs them: 404 rows over 38 catalogs, which
+      `pg_stats` lists and the planner reads; here there are none (found
+      while building RP-291's index slice).
+      Backlog-ID: RP-311
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_builtin_statistics
 - [ ] **The first backend after a start is counted as a warm one.**
       PostgreSQL serves it without the relcache init files (about 245
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model

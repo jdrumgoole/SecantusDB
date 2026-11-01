@@ -40,6 +40,7 @@ mod binary_recv;
 mod btree;
 mod btree_model;
 mod casts;
+mod catalog_btree;
 mod catalog_facts;
 mod catalog_fill;
 mod catalog_meta;

@@ -124,6 +124,17 @@ pub(crate) enum Page {
     Deleted,
 }
 
+/// One page of a recorded layout ([`BTree::from_layout`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct LayoutPage {
+    pub(crate) block: u32,
+    pub(crate) level: u32,
+    /// The right sibling, 0 for none.
+    pub(crate) next: u32,
+    /// A leaf's tuples' heap TID counts, or an internal page's downlinks.
+    pub(crate) items: Vec<u32>,
+}
+
 /// One index's pages, block 0 its metapage.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct BTree {
@@ -1050,6 +1061,184 @@ impl BTree {
         }
         b.finish();
         tree
+    }
+
+    /// The tree a recorded page layout describes (RP-291): PostgreSQL's
+    /// own pages, read from a cluster's files, holding `entries`, which
+    /// are in index order. `pages` gives each block's level, right link
+    /// (0 for none) and items -- a leaf's as each tuple's heap TID count (more than one for a
+    /// posting list), an internal page's as its downlinks' blocks. The high
+    /// keys and separators are what `_bt_truncate` makes of the tuples on
+    /// either side as they stand. `None` when the entries do not fill the
+    /// layout exactly or a posting list would mix keys.
+    pub(crate) fn from_layout(
+        shape: &dyn Shape,
+        root: u32,
+        pages: &[LayoutPage],
+        entries: Vec<(Vec<Bson>, i64)>,
+    ) -> Option<BTree> {
+        let nblocks = pages.iter().map(|p| p.block + 1).max().unwrap_or(1).max(1);
+        let mut out = vec![Page::Deleted; nblocks as usize];
+        out[0] = Page::Meta;
+        let by_block: std::collections::HashMap<u32, &LayoutPage> =
+            pages.iter().map(|p| (p.block, p)).collect();
+        // The leaves, leftmost first.
+        let mut at = root;
+        loop {
+            let p = by_block.get(&at)?;
+            if p.level == 0 {
+                break;
+            }
+            at = *p.items.first()?;
+        }
+        let mut leaves: Vec<(u32, Vec<Item>)> = Vec::new();
+        let mut rest = entries.into_iter();
+        loop {
+            let p = by_block.get(&at)?;
+            let mut items = Vec::with_capacity(p.items.len());
+            for &n in &p.items {
+                let mut key = None;
+                let mut tids = Vec::with_capacity(n as usize);
+                for _ in 0..n {
+                    let (k, t) = rest.next()?;
+                    match &key {
+                        None => key = Some(k),
+                        Some(first) if cmp_keys(shape, first, &k) != Ordering::Equal => {
+                            return None
+                        }
+                        Some(_) => {}
+                    }
+                    tids.push(t);
+                }
+                items.push(item(shape, key?, tids));
+            }
+            leaves.push((at, items));
+            if p.next == 0 {
+                break;
+            }
+            at = p.next;
+        }
+        if rest.next().is_some() {
+            return None;
+        }
+        // Each page's high key, by block: a leaf's from the tuples either
+        // side of its right edge, an internal page's its last child's.
+        let mut high: std::collections::HashMap<u32, Pivot> = Default::default();
+        for w in leaves.windows(2) {
+            let (Some(last), Some(first)) = (w[0].1.last(), w[1].1.first()) else {
+                return None;
+            };
+            high.insert(w[0].0, truncate(shape, last, first));
+        }
+        let mut internal: Vec<&LayoutPage> = pages.iter().filter(|p| p.level > 0).collect();
+        internal.sort_by_key(|p| p.level);
+        for p in &internal {
+            if p.next != 0 {
+                if let Some(h) = p.items.last().and_then(|c| high.get(c)).cloned() {
+                    high.insert(p.block, h);
+                }
+            }
+        }
+        for (blk, items) in leaves {
+            let p = by_block.get(&blk)?;
+            out[blk as usize] = Page::Leaf {
+                items,
+                high: high.get(&blk).cloned(),
+                right: (p.next != 0).then_some(p.next),
+            };
+        }
+        for p in internal {
+            let mut items = Vec::with_capacity(p.items.len());
+            for (i, &child) in p.items.iter().enumerate() {
+                let pivot = if i == 0 {
+                    Pivot::minus_infinity()
+                } else {
+                    high.get(&p.items[i - 1])?.clone()
+                };
+                items.push(Downlink { pivot, child });
+            }
+            out[p.block as usize] = Page::Internal {
+                items,
+                high: high.get(&p.block).cloned(),
+                right: (p.next != 0).then_some(p.next),
+            };
+        }
+        Some(BTree {
+            pages: out,
+            root: Some(root),
+            free: Vec::new(),
+            pending: Vec::new(),
+            dirty: false,
+            full: true,
+            touched: Default::default(),
+            used: Vec::new(),
+            ssi_events: Vec::new(),
+        })
+    }
+
+    /// The pages an index scan for the rows whose leading key columns
+    /// equal `prefix` reads, the metapage aside (`_bt_first`, `_bt_search`,
+    /// `_bt_readpage`, `_bt_steppage`): the way down, root first, to the
+    /// first leaf such a row could be on, then each leaf rightward until a
+    /// tuple, or a page's high key, is past the prefix. Empty for an empty
+    /// index.
+    pub(crate) fn prefix_scan_pages(&self, shape: &dyn Shape, prefix: &[Bson]) -> Vec<u32> {
+        let Some(mut at) = self.root else {
+            return Vec::new();
+        };
+        let n = prefix.len().min(shape.nkeyatts());
+        let prefix = &prefix[..n];
+        // `_bt_compare` of the scan key against a tuple or pivot: equal
+        // when every attribute both have is equal and the tuple has more;
+        // greater when the pivot was truncated to exactly the scan key's
+        // attributes (or fewer) with no heap TID.
+        let cmp = |key: &[Bson], truncated: bool| -> Ordering {
+            for (a, p) in prefix.iter().enumerate() {
+                let Some(k) = key.get(a) else {
+                    return Ordering::Greater;
+                };
+                match shape.cmp_attr(a, p, k) {
+                    Ordering::Equal => {}
+                    o => return o,
+                }
+            }
+            if truncated && key.len() == prefix.len() {
+                Ordering::Greater
+            } else {
+                Ordering::Equal
+            }
+        };
+        let mut pages = Vec::new();
+        while let Page::Internal { items, .. } = &self.pages[at as usize] {
+            pages.push(at);
+            // The last downlink whose separator is below the scan key.
+            let below = items[1..]
+                .partition_point(|d| cmp(&d.pivot.key, d.pivot.tid.is_none()) == Ordering::Greater);
+            at = items[below].child;
+        }
+        let mut first = true;
+        loop {
+            let Page::Leaf { items, high, right } = &self.pages[at as usize] else {
+                return pages;
+            };
+            pages.push(at);
+            let start = if first {
+                items.partition_point(|it| cmp(&it.key, false) == Ordering::Greater)
+            } else {
+                0
+            };
+            first = false;
+            if items[start..]
+                .iter()
+                .any(|it| cmp(&it.key, false) == Ordering::Less)
+            {
+                return pages;
+            }
+            match (right, high) {
+                (Some(next), Some(h)) if cmp(&h.key, false) != Ordering::Less => at = *next,
+                _ => return pages,
+            }
+        }
     }
 
     /// The leaf `_bt_search` puts a unique index's key on without its heap
