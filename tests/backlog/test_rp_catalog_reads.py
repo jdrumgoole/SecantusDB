@@ -1415,7 +1415,8 @@ def test_the_first_backend_after_a_start(rust_pg: Any, tmp_path: Any) -> None:
 
 # Found while measuring: RP-293, `pg_class.relnatts` left out a dropped
 # column's attribute (fixed: it counts every attnum the table has used);
-# RP-294, an oidvector would not cast to regtype[].
+# RP-294, an oidvector would not cast to regtype[] (fixed: COPY input and a
+# literal beside a vector read it by `oidvectorin`, as an array).
 FOUND = {
     "relnatts counts dropped columns": (
         "RP-293",
@@ -1429,16 +1430,25 @@ FOUND = {
     ),
     "an oidvector casts to regtype[]": (
         "RP-294",
-        ["select proargtypes::regtype[]::text from pg_proc where oid = 1317"],
+        [
+            "select proargtypes::regtype[]::text from pg_proc where oid = 1317",
+            "select proargtypes = '16 16', proargtypes::oid[]::text from pg_proc where oid = 60",
+            "select count(*) from pg_index where indexrelid = 'pg_class_oid_index'::regclass"
+            " and indkey = '1'",
+        ],
     ),
 }
 
 # The FOUND items closed since: their cases are regression tests now.
-FOUND_FIXED = {"RP-293"}
+FOUND_FIXED = {"RP-293", "RP-294"}
 
 EXPECTED_FOUND: dict[str, Any] = {
     "relnatts counts dropped columns": [None, None, None, [(2,)], None],
-    "an oidvector casts to regtype[]": [[("[0:0]={text}",)]],
+    "an oidvector casts to regtype[]": [
+        [("[0:0]={text}",)],
+        [(True, "[0:1]={16,16}")],
+        [(1,)],
+    ],
 }
 
 
