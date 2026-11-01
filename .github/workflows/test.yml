@@ -1326,6 +1326,20 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      # The `server` shard died of a full disk on 2026-11-01 (PR #2249, run
+      # 41312019513): every backlog test after the first ~70 errored with
+      # "could not create numbered dir", and the runner could not write its
+      # own log. The same commit had passed on main 15 minutes earlier, so the
+      # margin is thin and varies by runner. Free the image's toolchains this
+      # job never uses (.NET, Android, GHC, CodeQL: ~20 GB), and report the
+      # disk around each suite so the next shortfall is measured, not guessed.
+      - name: Free disk the job does not use
+        shell: bash
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h / | tail -1
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why
@@ -1503,8 +1517,13 @@ jobs:
           # its last 24 tests. None of these files uses `xdist_group`, which
           # worksteal would not honour. --durations names the long tests, so
           # the next imbalance is visible in the log instead of guessed.
+          # When the session ends, passed tests' temp trees (their WiredTiger
+          # stores) are deleted; only failures keep theirs. Without it each
+          # pytest step left its whole tree for the next. See "Free disk".
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
-            --dist worksteal --durations=40 -p no:cacheprovider -rs
+            --dist worksteal --durations=40 -p no:cacheprovider -rs \
+            -o tmp_path_retention_policy=failed
+          df -h / | tail -1
 
       # The login rules (TLS options, revocation lists, user name maps,
       # pg_hba.conf) are compared with a PostgreSQL 15 this job runs itself:
@@ -1547,7 +1566,8 @@ jobs:
         run: |
           "$SECANTUS_PG15_BIN/postgres" --version
           uv run python -m pytest tests/test_rust_pg_login_differential.py -q -n 3 \
-            -p no:cacheprovider -rs
+            -p no:cacheprovider -rs -o tmp_path_retention_policy=failed
+          df -h / | tail -1
 
       # The regression tests fixed Rust PG backlog items became
       # (`backlog_fixed`, tests/backlog/). The default run deselects them,
@@ -1575,8 +1595,11 @@ jobs:
           SECANTUS_PG15_BIN: /usr/lib/postgresql/15/bin
         run: |
           # `-m backlog_fixed` replaces addopts' `-m`, which deselects them.
+          df -h / | tail -1
           uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
-            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs
+            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs \
+            -o tmp_path_retention_policy=failed
+          df -h / | tail -1
           # And the OPEN items' gap tests, through the backlog's own runner: it
           # exits non-zero when a gap test no longer measures its gap (BROKEN)
           # or now passes (FIXED? -- a change fixed the item; close it in the
