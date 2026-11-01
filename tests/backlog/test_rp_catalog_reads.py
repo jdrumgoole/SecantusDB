@@ -1494,37 +1494,22 @@ EXPECTED_INDEX_BLOCKS: list[dict[str, int]] = [
     {},
 ]
 
-# `pg_statistic` holds no row for the built-in catalogs on this server
-# (RP-311), so its index is empty where `initdb`'s has a root page: a scan of
-# it reads the metapage twice instead of the root once. Left out here, and
-# checked by RP-311's gap test.
-NO_BUILTIN_STATISTICS = "pg_statistic_relid_att_inh_index"
-
-
-def _without_statistics(segments: list[dict[str, int]]) -> list[dict[str, int]]:
-    return [{k: v for k, v in seg.items() if k != NO_BUILTIN_STATISTICS} for seg in segments]
-
 
 @pytest.mark.backlog_fixed("RP-291")
 def test_catalog_index_blocks(rust_pg: Any) -> None:
     """The index part of RP-291, its first slice (2026-11-01)."""
-    got = index_blocks(_dsn(rust_pg))
-    assert _without_statistics(got) == _without_statistics(EXPECTED_INDEX_BLOCKS)
+    assert index_blocks(_dsn(rust_pg)) == EXPECTED_INDEX_BLOCKS
 
 
 @pytest.mark.backlog("RP-311")
 def test_builtin_statistics(rust_pg: Any) -> None:
     """PostgreSQL 15.19: `initdb`'s ANALYZE leaves 404 `pg_statistic` rows
-    over 38 catalogs, and a scan of their index reads its root."""
+    over 38 catalogs."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         got = c.execute(
             "select count(*), count(distinct starelid) from pg_statistic where starelid < 16384"
         ).fetchone()
     assert tuple(got) == (404, 38)
-    blocks = index_blocks(_dsn(rust_pg))
-    assert [seg.get(NO_BUILTIN_STATISTICS) for seg in blocks] == [
-        seg.get(NO_BUILTIN_STATISTICS) for seg in EXPECTED_INDEX_BLOCKS
-    ]
 
 
 # RP-292: the first backend after the server starts finds no relation cache

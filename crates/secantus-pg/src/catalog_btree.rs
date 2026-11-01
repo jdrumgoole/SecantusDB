@@ -1,28 +1,27 @@
 //! The pages a catalog index scan reads (RP-291), counted as
 //! `pg_statio_sys_indexes` counts them: each B-tree index of the catalogs
 //! is modelled page by page ([`crate::btree_model`]), and a scan reads the
-//! metapage on its backend's first use of the index (`_bt_getroot`, which
-//! then caches it in `rd_amcache`), the way down from the root, and each
-//! leaf it walks right across (`_bt_first`, `_bt_readpage`).
+//! metapage on its backend's first use of the index (`_bt_metaversion`,
+//! which then caches it in `rd_amcache`), the way down from the root, and
+//! each leaf it walks right across (`_bt_first`, `_bt_readpage`).
 //!
-//! A database starts with PostgreSQL 15.19's own pages: `initdb`'s layout
-//! of every built-in catalog index, read from a fresh cluster's files by
-//! `tools/probes/pg15_system_catalog_dump.py` into
-//! `pg15_catalog_indexes.txt` -- which block holds which tuples, each
-//! posting list's TID count, every internal page's downlinks. The built-in
-//! rows' keys fill it in index order; a row the database already held
-//! beyond them when the tree is built (on its first scan) is inserted as
-//! `nbtinsert.c` inserts it, splitting pages as PostgreSQL would.
+//! Each index is PostgreSQL 15.19's own: the pages `initdb` left, read from
+//! a fresh cluster's files by `tools/probes/pg15_system_catalog_dump.py`
+//! into `pg15_catalog_indexes.txt` -- which block holds which tuples, each
+//! tuple's key as decoded from its bytes and its heap TIDs, every internal
+//! page's downlinks. Nothing is read from this server's catalogs to build
+//! it: reading a catalog's rows on a statement's path cost a new session
+//! hundreds of milliseconds, inside a transaction that changed the
+//! catalogs it blinded the session to its own new objects, and off a
+//! statement's path it lost other sessions' new tables.
 //!
-//! Not yet modelled, and recorded in RP-291: a row added after the tree is
-//! built (placing later catalog rows is the heap slice's), the heap's own
-//! pages (the TIDs here are ordinals, the built-in rows' in index order,
-//! later rows' after them), a non-HOT update of a catalog row, and
-//! VACUUM's deletion of dead entries.
+//! Not yet modelled, and recorded in RP-291: a row any database adds after
+//! `initdb` (placing later catalog rows, and their index entries, is the
+//! heap slice's), and VACUUM's deletion of dead entries.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use bson::Bson;
 
@@ -31,37 +30,58 @@ use crate::catalog_facts::builtin;
 use crate::catcache::{Backend, Key, K};
 use crate::PgHandler;
 
-/// `FirstNormalObjectId`: an oid below it is `initdb`'s.
-const FIRST_NORMAL_OBJECT_ID: i64 = 16384;
-
-/// One built-in index's recorded layout.
+/// One built-in index as `initdb` left it.
 struct Layout {
     root: u32,
+    /// Its key columns' types.
+    types: Vec<i64>,
     pages: Vec<LayoutPage>,
-    /// Its heap TIDs, every leaf's counts summed.
-    tids: usize,
+    /// Each leaf's tuples' keys and heap TIDs, by block, in page order.
+    entries: HashMap<u32, Vec<(Vec<Bson>, i64)>>,
 }
 
-fn layouts() -> &'static HashMap<i64, Layout> {
-    static L: OnceLock<HashMap<i64, Layout>> = OnceLock::new();
-    L.get_or_init(|| parse(include_str!("pg15_catalog_indexes.txt")))
+impl Layout {
+    /// Every leaf tuple in index order: the leaves leftmost first, along
+    /// their right links.
+    fn in_order(&self) -> Vec<(Vec<Bson>, i64)> {
+        let by_block: HashMap<u32, &LayoutPage> = self.pages.iter().map(|p| (p.block, p)).collect();
+        let mut at = self.root;
+        while let Some(p) = by_block.get(&at).filter(|p| p.level > 0) {
+            match p.items.first() {
+                Some(c) => at = *c,
+                None => return Vec::new(),
+            }
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        while at != 0 && seen.insert(at) {
+            out.extend(self.entries.get(&at).into_iter().flatten().cloned());
+            at = by_block.get(&at).map_or(0, |p| p.next);
+        }
+        out
+    }
 }
 
-/// `\index oid root level`, then `block flags next level items` per page,
-/// a leaf's items run-length coded (`1x40`).
+/// `\index oid root level type...`, then per page `block flags next level
+/// items` (a leaf's items each tuple's TID count, run-length coded as
+/// `1x40`; an internal page's its downlinks), and after a leaf page one
+/// `= tid[,tid...]<TAB>key...` line per tuple, a TID as `block.offset`,
+/// a key value as its type's text output (escaped as COPY escapes it,
+/// `\N` for NULL).
 fn parse(text: &str) -> HashMap<i64, Layout> {
     let mut out: HashMap<i64, Layout> = HashMap::new();
     let mut current = None;
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("\\index ") {
             let f: Vec<i64> = rest.split(' ').filter_map(|v| v.parse().ok()).collect();
-            if let [oid, root, _level] = f[..] {
+            if let [oid, root, _level, ref types @ ..] = f[..] {
                 out.insert(
                     oid,
                     Layout {
                         root: root as u32,
+                        types: types.to_vec(),
                         pages: Vec::new(),
-                        tids: 0,
+                        entries: HashMap::new(),
                     },
                 );
                 current = Some(oid);
@@ -71,6 +91,28 @@ fn parse(text: &str) -> HashMap<i64, Layout> {
         let Some(layout) = current.and_then(|o| out.get_mut(&o)) else {
             continue;
         };
+        if let Some(rest) = line.strip_prefix("= ") {
+            let mut cells = rest.split('\t');
+            let tids: Vec<i64> = cells
+                .next()
+                .unwrap_or("")
+                .split(',')
+                .filter_map(|t| {
+                    let (b, o) = t.split_once('.')?;
+                    Some(b.parse::<i64>().ok()? * 65536 + o.parse::<i64>().ok()?)
+                })
+                .collect();
+            let key: Vec<Bson> = cells
+                .zip(&layout.types)
+                .map(|(c, typ)| value(c, *typ))
+                .collect();
+            let block = layout.pages.last().map_or(0, |p| p.block);
+            let leaf = layout.entries.entry(block).or_default();
+            for t in tids {
+                leaf.push((key.clone(), t));
+            }
+            continue;
+        }
         let mut f = line.splitn(5, ' ');
         let mut num = || f.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(0);
         let (block, flags, next, level) = (num(), num(), num(), num());
@@ -90,9 +132,6 @@ fn parse(text: &str) -> HashMap<i64, Layout> {
                 None => items.push(part.parse().unwrap_or(0)),
             }
         }
-        if level == 0 {
-            layout.tids += items.iter().map(|&n| n as usize).sum::<usize>();
-        }
         layout.pages.push(LayoutPage {
             block,
             level,
@@ -101,6 +140,54 @@ fn parse(text: &str) -> HashMap<i64, Layout> {
         });
     }
     out
+}
+
+/// A key value from its text output, as the shape compares it.
+fn value(text: &str, typ: i64) -> Bson {
+    if text == "\\N" {
+        return Bson::Null;
+    }
+    let text = text
+        .replace("\\t", "\t")
+        .replace("\\n", "\n")
+        .replace("\\\\", "\\");
+    match typ {
+        NAME | TEXT | CHAR => Bson::String(text),
+        BOOL => Bson::Boolean(text == "t"),
+        OIDVECTOR | INT2VECTOR => normal(&Bson::String(text), typ),
+        _ => text.parse::<i64>().map_or(Bson::String(text), Bson::Int64),
+    }
+}
+
+/// The trees, one per built-in index, built on first use.
+fn trees() -> &'static HashMap<i64, OnceLock<Option<Tree>>> {
+    static T: OnceLock<HashMap<i64, OnceLock<Option<Tree>>>> = OnceLock::new();
+    T.get_or_init(|| layouts().keys().map(|k| (*k, OnceLock::new())).collect())
+}
+
+fn layouts() -> &'static HashMap<i64, Layout> {
+    static L: OnceLock<HashMap<i64, Layout>> = OnceLock::new();
+    L.get_or_init(|| parse(include_str!("pg15_catalog_indexes.txt")))
+}
+
+fn tree(index: i64) -> Option<&'static Tree> {
+    trees()
+        .get(&index)?
+        .get_or_init(|| {
+            let l = layouts().get(&index)?;
+            let unique = builtin().indexes.get(&index).is_some_and(|i| i.unique);
+            let shape = CatalogShape {
+                types: l.types.clone(),
+                unique,
+            };
+            let btree = if l.root == 0 {
+                BTree::build(&shape, Vec::new())
+            } else {
+                BTree::from_layout(&shape, l.root, &l.pages, l.in_order())?
+            };
+            Some(Tree { shape, btree })
+        })
+        .as_ref()
 }
 
 /// A catalog index's key columns, by type: how PostgreSQL's default
@@ -202,7 +289,13 @@ impl Shape for CatalogShape {
             }
             size = match *typ {
                 BOOL | CHAR => size + 1,
-                NAME => size + 64,
+                // `name_ops` keeps a `cstring`: its bytes and a NUL.
+                NAME => {
+                    size + match v {
+                        Bson::String(s) => s.len() as i64 + 1,
+                        _ => 1,
+                    }
+                }
                 INT2 => align(size, 2) + 2,
                 INT8 | FLOAT8 => align(size, 8) + 8,
                 // Plain storage keeps the 4-byte header: `vl_len_`, `ndim`,
@@ -243,26 +336,10 @@ impl Shape for CatalogShape {
     }
 }
 
-/// One catalog index of one database (or of the cluster, a shared
-/// catalog's).
+/// One built-in catalog index.
 struct Tree {
     shape: CatalogShape,
     btree: BTree,
-}
-
-type Trees = HashMap<(usize, i64, i64), Tree>;
-
-fn trees() -> &'static Mutex<Trees> {
-    static T: OnceLock<Mutex<Trees>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// The store's trees go with it.
-pub(crate) fn forget(store: usize) {
-    trees()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|(s, _, _), _| *s != store);
 }
 
 impl PgHandler {
@@ -280,209 +357,36 @@ impl PgHandler {
         let stats = self.stats();
         let capacity = self.buffer_pages();
         for (index, key) in scans {
-            let Some(pages) = self.catalog_scan_pages(index, key.as_ref()) else {
+            let Some(t) = tree(index) else {
                 continue;
             };
             let mut blocks: Vec<i64> = Vec::new();
-            match pages {
+            if t.btree.root.is_none() {
                 // No root: nothing is cached.
-                None => blocks.extend(if key.is_some() {
-                    [0, 0].as_slice()
-                } else {
-                    &[0]
-                }),
-                Some(pages) => {
-                    if be.read_metapage(index) {
-                        blocks.push(0);
-                    }
-                    if key.is_some() {
-                        blocks.extend(pages.into_iter().map(i64::from));
-                    }
+                blocks.push(0);
+                if key.is_some() {
+                    blocks.push(0);
+                }
+            } else {
+                if be.read_metapage(index) {
+                    blocks.push(0);
+                }
+                if let Some(key) = key {
+                    let prefix: Vec<Bson> = key
+                        .iter()
+                        .zip(&t.shape.types)
+                        .map(|(k, typ)| from_k(k, *typ))
+                        .collect();
+                    blocks.extend(
+                        t.btree
+                            .prefix_scan_pages(&t.shape, &prefix)
+                            .into_iter()
+                            .map(i64::from),
+                    );
                 }
             }
             stats.pages(index, blocks, capacity);
         }
-    }
-
-    /// The pages below the metapage a scan of `index` for `key` reads
-    /// (none asked without one), `Some(None)` for an index with no root,
-    /// `None` for one this does not model.
-    ///
-    /// A tree is built on its database's first scan of the index, with the
-    /// catalog's other indexes' from the same read, and is not brought up
-    /// to the catalogs as they change after (RP-291, the heap slice):
-    /// reading every row of a catalog again after each change made a new
-    /// session's first statement after any DDL slower by hundreds of
-    /// milliseconds, reading them inside a transaction that changed the
-    /// catalogs left its later lookups blind to its own new objects, and
-    /// reading them from a thread of their own lost tables other sessions
-    /// had just made.
-    fn catalog_scan_pages(&self, index: i64, key: Option<&Key>) -> Option<Option<Vec<u32>>> {
-        let ix = builtin().indexes.get(&index)?;
-        let table = builtin().relations.get(&ix.table)?;
-        let db = if table.shared { 0 } else { self.stats().db };
-        let store = std::sync::Arc::as_ptr(&self.storage) as usize;
-        let tree_key = (store, db, index);
-        let built = trees()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&tree_key);
-        if !built {
-            if self.marks.catalog_changed() {
-                // Not read inside a transaction that changed the catalogs;
-                // built once it ends.
-                return None;
-            }
-            self.build_catalog_trees(ix.table, store, db);
-        }
-        let t = trees().lock().unwrap_or_else(|e| e.into_inner());
-        let tree = t.get(&tree_key)?;
-        if tree.btree.root.is_none() {
-            return Some(None);
-        }
-        let Some(key) = key else {
-            return Some(Some(Vec::new()));
-        };
-        let prefix: Vec<Bson> = key
-            .iter()
-            .zip(&tree.shape.types)
-            .map(|(k, typ)| from_k(k, *typ))
-            .collect();
-        Some(Some(tree.btree.prefix_scan_pages(&tree.shape, &prefix)))
-    }
-
-    /// Build the trees of every index of catalog `table` this database has
-    /// none of yet, from one read of its rows.
-    fn build_catalog_trees(&self, table: i64, store: usize, db: i64) {
-        let Some(indexes) = builtin().indexes_of.get(&table) else {
-            return;
-        };
-        let Some(rows) = self.catalog_rows(table) else {
-            return;
-        };
-        for &index in indexes {
-            let Some(ix) = builtin().indexes.get(&index) else {
-                continue;
-            };
-            if !layouts().contains_key(&index) {
-                continue;
-            }
-            let rows = rows.keys(&ix.keys);
-            let mut t = trees().lock().unwrap_or_else(|e| e.into_inner());
-            t.entry((store, db, index))
-                .or_insert_with(|| Tree::new(index, rows));
-        }
-    }
-
-    /// Every row of catalog `table`, with whether `initdb` made it.
-    fn catalog_rows(&self, table: i64) -> Option<TableRows> {
-        let rel = self.cr_catalog(table)?;
-        let def = Self::virtual_table(&rel.name)?;
-        let field = |name: &str| def.field_of(name).unwrap_or_default();
-        // The row's own identity: its oid, a dependency's object, else its
-        // first column (the relation an attribute or index belongs to, the
-        // object a description is of).
-        let identity = if rel.columns.iter().any(|c| c.1 == "oid") {
-            field("oid")
-        } else if matches!(rel.name.as_str(), "pg_depend" | "pg_shdepend") {
-            field("objid")
-        } else {
-            rel.columns
-                .iter()
-                .find(|c| c.0 == 1)
-                .map_or_else(String::new, |c| field(&c.1))
-        };
-        let docs = self
-            .virtual_rows_uncached(&rel.name, &bson::Document::new())
-            .unwrap_or_default();
-        let rows = docs
-            .into_iter()
-            .map(|row| {
-                let builtin = row
-                    .get(&identity)
-                    .and_then(crate::bson_i64)
-                    .is_some_and(|o| (0..FIRST_NORMAL_OBJECT_ID).contains(&o));
-                (builtin, row)
-            })
-            .collect();
-        let columns = rel
-            .columns
-            .iter()
-            .map(|(att, name, typ)| (*att, field(name), *typ))
-            .collect();
-        Some(TableRows { columns, rows })
-    }
-}
-
-/// A catalog's rows, read once for all its indexes.
-struct TableRows {
-    /// `(attnum, the row's field, type)`.
-    columns: Vec<(i64, String, i64)>,
-    rows: Vec<(bool, bson::Document)>,
-}
-
-impl TableRows {
-    /// Each row's values of an index's key columns (`attnums`).
-    fn keys(&self, attnums: &[i64]) -> CatalogRows {
-        let cols: Vec<(String, i64)> = attnums
-            .iter()
-            .map(|a| {
-                self.columns
-                    .iter()
-                    .find(|c| c.0 == *a)
-                    .map_or((String::new(), 0), |c| (c.1.clone(), c.2))
-            })
-            .collect();
-        CatalogRows {
-            types: cols.iter().map(|c| c.1).collect(),
-            rows: self
-                .rows
-                .iter()
-                .map(|(b, row)| {
-                    let key = cols
-                        .iter()
-                        .map(|(f, typ)| normal(row.get(f).unwrap_or(&Bson::Null), *typ))
-                        .collect();
-                    (*b, key)
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Default)]
-struct CatalogRows {
-    types: Vec<i64>,
-    rows: Vec<(bool, Vec<Bson>)>,
-}
-
-impl Tree {
-    /// `initdb`'s pages holding the built-in rows, then every later row
-    /// inserted. Without a recorded layout, or when the built-in rows do
-    /// not fill it, the built-in rows are loaded as CREATE INDEX loads
-    /// them.
-    fn new(index: i64, rows: CatalogRows) -> Tree {
-        let unique = builtin().indexes.get(&index).is_some_and(|i| i.unique);
-        let shape = CatalogShape {
-            types: rows.types,
-            unique,
-        };
-        let (initdb, later): (Vec<_>, Vec<_>) = rows.rows.into_iter().partition(|(b, _)| *b);
-        let initdb: Vec<(Vec<Bson>, i64)> = initdb
-            .into_iter()
-            .enumerate()
-            .map(|(i, (_, k))| (k, i as i64))
-            .collect();
-        let first_later = initdb.len() as i64;
-        let mut btree = layouts()
-            .get(&index)
-            .filter(|l| l.tids == initdb.len())
-            .and_then(|l| BTree::from_layout(&shape, l.root, &l.pages, initdb.clone()))
-            .unwrap_or_else(|| BTree::build(&shape, initdb));
-        for (tid, (_, k)) in (first_later..).zip(later) {
-            btree.insert(&shape, k, tid);
-        }
-        Tree { shape, btree }
     }
 }
 
@@ -491,14 +395,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_layouts_parse() {
-        let l = layouts();
+    fn every_recorded_index_builds() {
+        assert!(layouts().len() > 150);
+        for (oid, l) in layouts() {
+            let t = tree(*oid).unwrap_or_else(|| panic!("index {oid} does not fill its layout"));
+            assert_eq!(t.btree.root.is_none(), l.root == 0, "index {oid}");
+        }
+        // PostgreSQL's order is the shape's: every index's tuples are
+        // already sorted as this model compares them.
+        for (oid, l) in layouts() {
+            let shape = &tree(*oid).expect("built").shape;
+            for w in l.in_order().windows(2) {
+                let o = (0..shape.nkeyatts())
+                    .map(|a| shape.cmp_attr(a, &w[0].0[a], &w[1].0[a]))
+                    .find(|o| *o != Ordering::Equal)
+                    .unwrap_or(Ordering::Equal);
+                assert_ne!(
+                    o,
+                    Ordering::Greater,
+                    "index {oid}: {:?} before {:?}",
+                    w[0],
+                    w[1]
+                );
+            }
+        }
         // pg_class_relname_nsp_index: a root over three leaves.
-        let c = &l[&2663];
-        assert_eq!(c.root, 3);
-        assert_eq!(c.tids, 136 + 120 + 154);
-        assert_eq!(c.pages.len(), 4);
-        assert!(l.len() > 150);
+        let c = &layouts()[&2663];
+        assert_eq!((c.root, c.in_order().len()), (3, 410));
+        assert_eq!(c.types, vec![NAME, 26]);
+    }
+
+    #[test]
+    fn a_name_lookup_reads_the_way_down_to_its_leaf() {
+        let t = tree(2663).expect("pg_class_relname_nsp_index");
+        let pages = |name: &str| {
+            t.btree
+                .prefix_scan_pages(&t.shape, &[Bson::String(name.into()), Bson::Int64(11)])
+        };
+        // The root, then the one leaf the name is on.
+        assert_eq!(pages("pg_class").len(), 2);
+        assert_eq!(pages("pg_class")[0], 3);
     }
 
     #[test]

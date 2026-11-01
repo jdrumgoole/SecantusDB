@@ -1064,9 +1064,9 @@ impl BTree {
     }
 
     /// The tree a recorded page layout describes (RP-291): PostgreSQL's
-    /// own pages, read from a cluster's files, holding `entries` in index
-    /// order. `pages` gives each block's level, right link (0 for none) and
-    /// items -- a leaf's as each tuple's heap TID count (more than one for a
+    /// own pages, read from a cluster's files, holding `entries`, which
+    /// are in index order. `pages` gives each block's level, right link
+    /// (0 for none) and items -- a leaf's as each tuple's heap TID count (more than one for a
     /// posting list), an internal page's as its downlinks' blocks. The high
     /// keys and separators are what `_bt_truncate` makes of the tuples on
     /// either side as they stand. `None` when the entries do not fill the
@@ -1075,9 +1075,8 @@ impl BTree {
         shape: &dyn Shape,
         root: u32,
         pages: &[LayoutPage],
-        mut entries: Vec<(Vec<Bson>, i64)>,
+        entries: Vec<(Vec<Bson>, i64)>,
     ) -> Option<BTree> {
-        entries.sort_by(|a, b| cmp_keys(shape, &a.0, &b.0).then(a.1.cmp(&b.1)));
         let nblocks = pages.iter().map(|p| p.block + 1).max().unwrap_or(1).max(1);
         let mut out = vec![Page::Deleted; nblocks as usize];
         out[0] = Page::Meta;
