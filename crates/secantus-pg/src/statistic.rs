@@ -125,26 +125,9 @@ fn builtin_values(elem: i64, json: &str) -> Option<Bson> {
 
 /// `initdb`'s `pg_statistic` rows, parsed once: each the column names'
 /// values, in the order the dump wrote them.
-fn builtin_rows() -> &'static [Vec<(&'static str, Bson)>] {
-    static ROWS: OnceLock<Vec<Vec<(&'static str, Bson)>>> = OnceLock::new();
+fn builtin_rows() -> &'static [Vec<(String, Bson)>] {
+    static ROWS: OnceLock<Vec<Vec<(String, Bson)>>> = OnceLock::new();
     ROWS.get_or_init(|| {
-        const KINDS: [&str; 5] = ["stakind1", "stakind2", "stakind3", "stakind4", "stakind5"];
-        const OPS: [&str; 5] = ["staop1", "staop2", "staop3", "staop4", "staop5"];
-        const COLLS: [&str; 5] = ["stacoll1", "stacoll2", "stacoll3", "stacoll4", "stacoll5"];
-        const NUMBERS: [&str; 5] = [
-            "stanumbers1",
-            "stanumbers2",
-            "stanumbers3",
-            "stanumbers4",
-            "stanumbers5",
-        ];
-        const VALUES: [&str; 5] = [
-            "stavalues1",
-            "stavalues2",
-            "stavalues3",
-            "stavalues4",
-            "stavalues5",
-        ];
         include_str!("pg15_catalog_statistics.txt")
             .lines()
             .map(|line| {
@@ -156,23 +139,21 @@ fn builtin_rows() -> &'static [Vec<(&'static str, Bson)>] {
                 let cell = |i: usize| cells[i].as_deref().expect("dumped NOT NULL column");
                 let int = |i: usize| cell(i).parse::<i64>().expect("dumped integer");
                 let mut row = vec![
-                    ("starelid", Bson::Int64(int(0))),
-                    ("staattnum", Bson::Int32(int(1) as i32)),
-                    ("stainherit", Bson::Boolean(cell(2) == "t")),
-                    ("stanullfrac", float4(cell(3)).expect("dumped real")),
-                    ("stawidth", Bson::Int32(int(4) as i32)),
-                    ("stadistinct", float4(cell(5)).expect("dumped real")),
+                    ("starelid".to_string(), Bson::Int64(int(0))),
+                    ("staattnum".to_string(), Bson::Int32(int(1) as i32)),
+                    ("stainherit".to_string(), Bson::Boolean(cell(2) == "t")),
+                    (
+                        "stanullfrac".to_string(),
+                        float4(cell(3)).expect("dumped real"),
+                    ),
+                    ("stawidth".to_string(), Bson::Int32(int(4) as i32)),
+                    (
+                        "stadistinct".to_string(),
+                        float4(cell(5)).expect("dumped real"),
+                    ),
                 ];
                 for n in 0..5 {
-                    row.push((KINDS[n], Bson::Int32(int(6 + n) as i32)));
-                }
-                for n in 0..5 {
-                    row.push((OPS[n], Bson::Int64(int(11 + n))));
-                }
-                for n in 0..5 {
-                    row.push((COLLS[n], Bson::Int64(int(16 + n))));
-                }
-                for n in 0..5 {
+                    let slot = n + 1;
                     let numbers = cells[21 + n].as_deref().map(|text| {
                         Bson::Array(
                             text.trim_start_matches('{')
@@ -182,9 +163,6 @@ fn builtin_rows() -> &'static [Vec<(&'static str, Bson)>] {
                                 .collect(),
                         )
                     });
-                    row.push((NUMBERS[n], numbers.unwrap_or(Bson::Null)));
-                }
-                for n in 0..5 {
                     let values = match (&cells[26 + 2 * n], &cells[27 + 2 * n]) {
                         (Some(elem), Some(json)) => {
                             builtin_values(elem.parse().expect("dumped type oid"), json)
@@ -192,7 +170,13 @@ fn builtin_rows() -> &'static [Vec<(&'static str, Bson)>] {
                         }
                         _ => Bson::Null,
                     };
-                    row.push((VALUES[n], values));
+                    row.extend([
+                        (format!("stakind{slot}"), Bson::Int32(int(6 + n) as i32)),
+                        (format!("staop{slot}"), Bson::Int64(int(11 + n))),
+                        (format!("stacoll{slot}"), Bson::Int64(int(16 + n))),
+                        (format!("stanumbers{slot}"), numbers.unwrap_or(Bson::Null)),
+                        (format!("stavalues{slot}"), values),
+                    ]);
                 }
                 row
             })
