@@ -1815,10 +1815,10 @@ impl PgHandler {
             // modelled.
             if search.order_desc {
                 let class = search.order.as_ref().map(|(_, c)| *c);
-                if base_lists
-                    .iter()
-                    .any(|(list, _, _)| list.iter().any(|(p, _)| p.class.is_some() && p.class == class))
-                {
+                if base_lists.iter().any(|(list, _, _)| {
+                    list.iter()
+                        .any(|(p, _)| p.class.is_some() && p.class == class)
+                }) {
                     return Ok(None);
                 }
             }
