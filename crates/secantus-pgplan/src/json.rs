@@ -325,17 +325,26 @@ pub fn jsonb_value_key(text: &str) -> Option<String> {
     Some(out)
 }
 
+/// `numeric_normalize` of a jsonb number token: `numeric_out` with the
+/// trailing fractional zeros, and a point left bare, removed (`1.50` is
+/// `1.5`, `1.0` is `1`, `1e3` is `1000`).
+pub fn numeric_normalize(n: &str) -> String {
+    let t = normalise_number(n);
+    let t = if t.contains('.') {
+        t.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        t
+    };
+    if t == "-0" {
+        "0".to_string()
+    } else {
+        t
+    }
+}
+
 fn write_value_key(v: &Json, out: &mut String) {
     match v {
-        Json::Number(n) => {
-            let t = normalise_number(n);
-            let t = if t.contains('.') {
-                t.trim_end_matches('0').trim_end_matches('.').to_string()
-            } else {
-                t
-            };
-            out.push_str(if t == "-0" { "0" } else { &t });
-        }
+        Json::Number(n) => out.push_str(&numeric_normalize(n)),
         Json::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {

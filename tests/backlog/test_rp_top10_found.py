@@ -534,10 +534,12 @@ def test_a_tables_gin_and_gist_indexes_size_as_their_pages(pg: Any) -> None:
     assert got == ("ok", [(4, 18)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_jsonb_gin_index_has_its_pages(pg: Any) -> None:
-    """A GIN index over `jsonb_ops` is not modelled page by page:
-    PostgreSQL 15.19 sizes it at 4 pages; here `pg_relation_size` reads 0."""
+    """A GIN index over `jsonb_ops` was not modelled page by page:
+    PostgreSQL 15.19 sizes it at 4 pages, and `pg_relation_size` read 0.
+    It also needed the heap's TIDs: a jsonb datum was sized as its text, so
+    186 rows fitted a page where PostgreSQL fits 136."""
     got = _in_block(
         pg,
         [
@@ -549,6 +551,121 @@ def test_a_jsonb_gin_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_jg') / 8192",
     )
     assert got == ("ok", [(4,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_tsvector_gin_index_has_its_pages(pg: Any) -> None:
+    """A GIN index over `tsvector_ops` is not modelled page by page:
+    PostgreSQL 15.19 sizes it at 4 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_v (v tsvector)",
+            "insert into rp287_v select to_tsvector('simple', 'w' || (g % 100) || ' x' || (g % 7))"
+            " from generate_series(1, 2000) g",
+            "create index rp287_vg on rp287_v using gin (v)",
+        ],
+        "select pg_relation_size('rp287_vg') / 8192",
+    )
+    assert got == ("ok", [(4,)])
+
+
+# `jsonb_ops` keys (`gin_extract_jsonb`): object keys, values, string
+# elements keyed as keys, scalars at the root, a NULL and an empty value,
+# strings over 125 bytes keyed by their hash, numerics by their normalised
+# text; built over the rows, and filled after the build through the pending
+# list or, with fastupdate off, straight into the entry tree. The heap's
+# size checks the jsonb datum widths the TIDs come from.
+_RP287_JSONB = {
+    "flat": [
+        "insert into rp287_jt select jsonb_build_object('k', g % 100)"
+        " from generate_series(1, 2000) g",
+        "build",
+    ],
+    "nested": [
+        "insert into rp287_jt select jsonb_build_object('a', g % 37, 'b',"
+        " jsonb_build_object('c', g % 11, 'd', array[g % 5, g % 3]), 'e', (g % 2 = 0))"
+        " from generate_series(1, 3000) g",
+        "build",
+    ],
+    "strings": [
+        "insert into rp287_jt select jsonb_build_array('s' || (g % 300), 'x', null)"
+        " from generate_series(1, 2000) g",
+        "build",
+    ],
+    "long": [
+        "insert into rp287_jt select jsonb_build_object('k', repeat('ab', 70) || (g % 400))"
+        " from generate_series(1, 2000) g",
+        "build",
+    ],
+    "scale": [
+        "insert into rp287_jt select jsonb_build_object('n', ((g % 50)::numeric / 4))"
+        " from generate_series(1, 2000) g",
+        "build",
+    ],
+    "scalars": [
+        "insert into rp287_jt select to_jsonb(g % 200) from generate_series(1, 1500) g",
+        "insert into rp287_jt select '{}'::jsonb from generate_series(1, 10)",
+        "insert into rp287_jt select null from generate_series(1, 10)",
+        "build",
+    ],
+    "after": [
+        "build",
+        "insert into rp287_jt select jsonb_build_object('k', g % 500, 'w', 'v' || (g % 13))"
+        " from generate_series(1, 3000) g",
+    ],
+    "after_nofast": [
+        "build_nofast",
+        "insert into rp287_jt select jsonb_build_object('k', g % 500, 'w', 'v' || (g % 13))"
+        " from generate_series(1, 3000) g",
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RP-287")
+def test_jsonb_ops_indexes_and_their_heaps_have_postgres_pages(pg: Any) -> None:
+    """PostgreSQL 15.19's heap and `jsonb_ops` GIN index pages, and the
+    heap's last TID, for each shape."""
+    build = {
+        "build": "create index rp287_jg on rp287_jt using gin (j)",
+        "build_nofast": "create index rp287_jg on rp287_jt using gin (j) with (fastupdate = off)",
+    }
+    got = {}
+    for name, steps in _RP287_JSONB.items():
+        got[name] = _in_block(
+            pg,
+            ["create table rp287_jt (j jsonb)"] + [build.get(s, s) for s in steps],
+            "select pg_relation_size('rp287_jt') / 8192, max(ctid)::text,"
+            " pg_relation_size('rp287_jg') / 8192 from rp287_jt",
+        )
+    assert got == {
+        "flat": ("ok", [(15, "(14,96)", 4)]),
+        "nested": ("ok", [(50, "(49,11)", 10)]),
+        "strings": ("ok", [(13, "(12,116)", 6)]),
+        "long": ("ok", [(47, "(46,22)", 7)]),
+        "scale": ("ok", [(15, "(14,96)", 2)]),
+        "scalars": ("ok", [(10, "(9,107)", 4)]),
+        "after": ("ok", [(25, "(24,120)", 32)]),
+        "after_nofast": ("ok", [(25, "(24,120)", 9)]),
+    }
+
+
+# Found while measuring RP-287: a UNION branch selecting a bare NULL FROM
+# a relation was typed `text`, not `unknown`.
+@pytest.mark.backlog("RP-310")
+def test_a_union_branch_selecting_null_from_a_relation_takes_the_other_type(pg: Any) -> None:
+    """PostgreSQL 15.19 resolves `unknown` with the other branch's type
+    (`select_common_type`): int4 here, jsonb in the second. This server
+    typed the NULL branch `text` once it had a FROM, and raised 42804."""
+    got = [
+        pg_answer(pg, "select 1 union all select null from (values (1)) v"),
+        pg_answer(
+            pg,
+            "select to_jsonb(g) from generate_series(1, 2) g"
+            " union all select null from generate_series(1, 1)",
+        ),
+    ]
+    assert got == [("ok", [(1,), (None,)]), ("ok", [(1,), (2,), (None,)])]
 
 
 _RP019_SETUP = [
