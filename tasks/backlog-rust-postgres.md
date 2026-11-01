@@ -1226,12 +1226,6 @@ a regression test.
       copies of one catalog index share hits.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
-- [ ] **`pg_statistic` holds no row for the built-in catalogs.** PostgreSQL
-      15.19's `initdb` ANALYZEs them: 404 rows over 38 catalogs, which
-      `pg_stats` lists and the planner reads; here there are none (found
-      while building RP-291's index slice).
-      Backlog-ID: RP-311
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_builtin_statistics
 - [ ] **The first backend after a start is counted as a warm one.**
       PostgreSQL serves it without the relcache init files (about 245
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model
@@ -1239,6 +1233,21 @@ a regression test.
       and local cold costs needs an instrumented PostgreSQL.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
+- [ ] **A database-wide ANALYZE does not analyse the catalogs.** Since
+      RP-311 each database holds `initdb`'s `pg_statistic` rows for the
+      built-in catalogs, but a plain `ANALYZE` leaves them as they were, where PostgreSQL 15.19 measures the
+      catalogs again: a new table's oid becomes the top of `pg_class.oid`'s
+      histogram (found while working RP-311).
+      Backlog-ID: RP-313
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_the_catalogs
+- [ ] **EXPLAIN of a scan of a catalog has no estimate.** `explain select *
+      from pg_class where relkind = 'v'` is `Seq Scan on pg_class
+      (cost=0.00..0.00 rows=0 width=0)` with no `Filter` line; PostgreSQL
+      15.19 in a fresh database prices it from the catalog's `relpages` /
+      `reltuples` and `initdb`'s statistics (RP-311): `cost=0.00..19.12
+      rows=140 width=265` and the filter (found while working RP-311).
+      Backlog-ID: RP-314
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scan_is_estimated
 
 ## Found by batch 54 (2026-10-24)
 

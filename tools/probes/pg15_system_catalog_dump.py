@@ -17,6 +17,11 @@ Writes three files the server compiles in:
 * ``crates/secantus-pg/src/pg15_catalog_rows.txt`` -- for each table in
   ``STATIC_TABLES``, a ``\\relation schema.table`` line and then the table's
   rows in COPY text format, in ``ctid`` order, a ``reg*`` column as its oid.
+* ``crates/secantus-pg/src/pg15_catalog_statistics.txt`` -- the
+  ``pg_statistic`` rows ``initdb``'s ANALYZE left for the built-in catalogs
+  (RP-311), in COPY text format: every column up to ``stanumbers5``, then
+  for each slot its values' element type oid and the values as
+  ``array_to_json`` (an ``anyarray`` has no other way out).
 * ``crates/secantus-pg/src/pg15_catalog_indexes.txt`` -- every built-in
   catalog index's B-tree pages as ``initdb`` left them (RP-291), read from
   the cluster's data files, so the cluster must be LOCAL and the user a
@@ -218,7 +223,40 @@ def main(dsn: str) -> None:
                     out.append(bytes(block).decode())
         (ROOT / "crates/secantus-pg/src/pg15_catalog_rows.txt").write_text("".join(out))
 
+        statistics(conn)
         index_pages(conn)
+
+
+def statistics(conn: psycopg.Connection) -> None:
+    slots = range(1, 6)
+    cols = ", ".join(
+        [
+            "s.starelid",
+            "s.staattnum",
+            "s.stainherit",
+            "s.stanullfrac",
+            "s.stawidth",
+            "s.stadistinct",
+        ]
+        + [f"s.{c}{n}" for c in ("stakind", "staop", "stacoll", "stanumbers") for n in slots]
+        # A most-common-elements slot (kind 4) holds the array's elements.
+        + [
+            f"case when s.stavalues{n} is null then null when s.stakind{n} = 4"
+            f" then t.typelem else a.atttypid end, array_to_json(s.stavalues{n})"
+            for n in slots
+        ]
+    )
+    query = (
+        f"copy (select {cols} from pg_statistic s join pg_attribute a"
+        " on a.attrelid = s.starelid and a.attnum = s.staattnum"
+        " join pg_type t on t.oid = a.atttypid where s.starelid < 16384"
+        " order by s.ctid) to stdout"
+    )
+    out = []
+    with conn.cursor().copy(query) as copy:
+        for block in copy:
+            out.append(bytes(block).decode())
+    (ROOT / "crates/secantus-pg/src/pg15_catalog_statistics.txt").write_text("".join(out))
 
 
 BLCKSZ = 8192

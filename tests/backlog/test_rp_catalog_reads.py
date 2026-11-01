@@ -1501,15 +1501,74 @@ def test_catalog_index_blocks(rust_pg: Any) -> None:
     assert index_blocks(_dsn(rust_pg)) == EXPECTED_INDEX_BLOCKS
 
 
-@pytest.mark.backlog("RP-311")
+@pytest.mark.backlog_fixed("RP-311")
 def test_builtin_statistics(rust_pg: Any) -> None:
     """PostgreSQL 15.19: `initdb`'s ANALYZE leaves 404 `pg_statistic` rows
-    over 38 catalogs."""
+    over 38 catalogs, in every database. They were missing; they are its
+    rows now (`pg15_catalog_statistics.txt`)."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         got = c.execute(
             "select count(*), count(distinct starelid) from pg_statistic where starelid < 16384"
         ).fetchone()
-    assert tuple(got) == (404, 38)
+        assert tuple(got) == (404, 38)
+        # Read as text: the anyarray's values print as PostgreSQL's do.
+        row = c.execute(
+            "select null_frac::text, avg_width, n_distinct::text, most_common_vals::text,"
+            " most_common_freqs::text from pg_stats"
+            " where tablename = 'pg_class' and attname = 'relkind'"
+        ).fetchone()
+        assert tuple(row) == (
+            "0",
+            1,
+            "4",
+            "{i,v,r,t}",
+            "{0.39512196,0.34146342,0.16585366,0.09756097}",
+        )
+        # An array column's values are each its own text, quoted.
+        mcv = c.execute(
+            "select most_common_vals::text from pg_stats"
+            " where tablename = 'pg_class' and attname = 'reloptions'"
+        ).fetchone()[0]
+        assert mcv == '{"{security_barrier=true}"}'
+        c.execute("drop database if exists rp311_d")
+        c.execute("create database rp311_d")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp311_d", autocommit=True) as c:
+        got = c.execute(
+            "select count(*), count(distinct starelid) from pg_statistic where starelid < 16384"
+        ).fetchone()
+        assert tuple(got) == (404, 38)
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_the_catalogs(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: a plain ANALYZE analyses the catalogs too, so a
+    new table's oid becomes the top of `pg_class.oid`'s histogram."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_d")
+        c.execute("create database rp313_d")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_d", autocommit=True) as c:
+        c.execute("create table rp313_t (a int)")
+        c.execute("analyze")
+        top = c.execute(
+            "select (histogram_bounds::text::oid[])[array_upper(histogram_bounds::text::oid[], 1)]"
+            " from pg_stats where tablename = 'pg_class' and attname = 'oid'"
+        ).fetchone()[0]
+        assert top >= 16384
+
+
+@pytest.mark.backlog("RP-314")
+def test_a_catalog_scan_is_estimated(rust_pg: Any) -> None:
+    """PostgreSQL 15.19, a fresh database: the planner estimates a scan of
+    a catalog from `initdb`'s statistics and `relpages` / `reltuples`."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp314_d")
+        c.execute("create database rp314_d")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp314_d", autocommit=True) as c:
+        plan = [r[0] for r in c.execute("explain select * from pg_class where relkind = 'v'")]
+    assert plan == [
+        "Seq Scan on pg_class  (cost=0.00..19.12 rows=140 width=265)",
+        "  Filter: (relkind = 'v'::\"char\")",
+    ]
 
 
 # RP-292: the first backend after the server starts finds no relation cache
