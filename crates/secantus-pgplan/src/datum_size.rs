@@ -318,7 +318,11 @@ mod tests {
             ("'w1':1 'y1':2 'z1':3", 38),
             ("abc def", 22),
         ] {
-            assert_eq!(in_memory(&Bson::String(t.into()), "tsvector"), Some(want), "{t}");
+            assert_eq!(
+                in_memory(&Bson::String(t.into()), "tsvector"),
+                Some(want),
+                "{t}"
+            );
         }
     }
 
