@@ -73,14 +73,16 @@ fn hint_for(table: &str) -> Option<ScanHint> {
     HINTS.with(|h| h.borrow().iter().rev().find(|x| x.table == table).cloned())
 }
 
-/// A GIN index this models: one array column under `array_ops`, or one
-/// `jsonb` column under `jsonb_ops`.
+/// A GIN index this models: one array column under `array_ops`, one
+/// `jsonb` column under `jsonb_ops`, or one `tsvector` column under
+/// `tsvector_ops`.
 #[derive(Debug, Clone)]
 pub(crate) struct GinShape {
     pub(crate) oid: i64,
     pub(crate) name: String,
     pub(crate) field: String,
-    /// The array's element type, or `jsonb` for `jsonb_ops`.
+    /// The array's element type, `jsonb` for `jsonb_ops`, or `tsvector`
+    /// for `tsvector_ops`.
     pub(crate) elem: String,
     /// `fastupdate` (on unless `WITH` turned it off).
     pub(crate) fastupdate: bool,
@@ -157,15 +159,21 @@ impl ElemOps {
                 | "varchar"
                 | "character varying"
                 | "jsonb"
+                | "tsvector"
         )
     }
 
-    /// `jsonb_ops`' keys are `text` too: a flag byte, then the string.
+    /// `jsonb_ops`' keys are `text` too: a flag byte, then the string;
+    /// `tsvector_ops`' are each lexeme as a `text`.
     fn textual(&self) -> bool {
         matches!(
             self.elem.as_str(),
-            "text" | "varchar" | "character varying" | "jsonb"
+            "text" | "varchar" | "character varying" | "jsonb" | "tsvector"
         )
+    }
+
+    fn tsvector(&self) -> bool {
+        self.elem == "tsvector"
     }
 
     fn jsonb(&self) -> bool {
@@ -317,8 +325,27 @@ fn jsonb_keys(ops: &ElemOps, text: &str) -> Vec<GinKey> {
     gin_index::value_keys(ops, Some(&keys))
 }
 
+/// `gin_extract_tsvector`'s keys of a stored `tsvector` text: each
+/// lexeme as a `text`, through `ginExtractEntries`. `gin_cmp_tslexeme`
+/// (`tsCompareString`, not prefix) is a byte comparison, shorter first on
+/// a common prefix -- the order `ElemOps::cmp` gives two strings. An empty
+/// vector has no keys (an `EmptyItem`).
+fn tsvector_keys(ops: &ElemOps, text: &str) -> Vec<GinKey> {
+    let Ok(v) = secantus_pgplan::fts::parse_vector(text) else {
+        return gin_index::value_keys(ops, None);
+    };
+    let lexemes: Vec<Bson> = v.0.into_keys().map(Bson::String).collect();
+    gin_index::value_keys(ops, Some(&lexemes))
+}
+
 /// A GIN key list of a stored value (`ginExtractEntries`).
 fn gin_keys(ops: &ElemOps, v: Option<&Bson>) -> Vec<GinKey> {
+    if ops.tsvector() {
+        return match v {
+            Some(Bson::String(t)) => tsvector_keys(ops, t),
+            _ => gin_index::value_keys(ops, None),
+        };
+    }
     if ops.jsonb() {
         return match v {
             Some(Bson::String(t)) => jsonb_keys(ops, t),
@@ -666,8 +693,8 @@ impl crate::PgHandler {
                 })
             };
             let shape = if method == "gin" {
-                let elem = if col.pg_type == "jsonb" {
-                    "jsonb"
+                let elem = if matches!(col.pg_type.as_str(), "jsonb" | "tsvector") {
+                    col.pg_type.as_str()
                 } else {
                     let Some(elem) = col.pg_type.strip_suffix("[]") else {
                         continue;
@@ -975,13 +1002,15 @@ impl crate::PgHandler {
             let (field, served): (&str, Vec<usize>) = match &shape {
                 AmShape::Gin(s) => (
                     &s.field,
-                    // `jsonb_ops`' scans are not modelled: such a scan
-                    // keeps the relation lock.
+                    // `jsonb_ops`' and `tsvector_ops`' scans are not
+                    // modelled: such a scan keeps the relation lock.
                     quals
                         .iter()
                         .enumerate()
                         .filter(|(_, q)| {
-                            s.elem != "jsonb" && q.field == s.field && gin_strategy(&q.op).is_some()
+                            !matches!(s.elem.as_str(), "jsonb" | "tsvector")
+                                && q.field == s.field
+                                && gin_strategy(&q.op).is_some()
                         })
                         .map(|(i, _)| i)
                         .collect(),
@@ -1350,9 +1379,11 @@ mod tests {
     use super::*;
 
     fn keys(text: &str) -> Vec<String> {
-        let ops = ElemOps {
-            elem: "jsonb".into(),
-        };
+        keys_of("jsonb", text)
+    }
+
+    fn keys_of(elem: &str, text: &str) -> Vec<String> {
+        let ops = ElemOps { elem: elem.into() };
         gin_keys(&ops, Some(&Bson::String(text.into())))
             .into_iter()
             .map(|k| match (k.cat, k.val) {
@@ -1386,5 +1417,17 @@ mod tests {
     fn a_long_jsonb_string_is_keyed_by_its_hash() {
         let text = format!(r#"{{"{}": 1}}"#, "ab".repeat(70));
         assert_eq!(keys(&text), ["\u{4}1", "\u{11}eff4a7ef"]);
+    }
+
+    /// `gin_extract_tsvector`: each lexeme a key, positions and weights
+    /// dropped, in `tsCompareString`'s byte order; an empty vector an
+    /// `EmptyItem`.
+    #[test]
+    fn tsvector_ops_keys_are_its_lexemes() {
+        assert_eq!(
+            keys_of("tsvector", "'w10':1 'w1':3A 'x2':2 'ab' 'a'"),
+            ["a", "ab", "w1", "w10", "x2"]
+        );
+        assert_eq!(keys_of("tsvector", ""), ["EmptyItem"]);
     }
 }

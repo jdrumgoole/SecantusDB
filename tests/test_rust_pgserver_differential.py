@@ -831,7 +831,11 @@ def oracle() -> Iterator[psycopg.Connection]:
         # it is the oracle that went away.
         pytest.skip(f"PostgreSQL oracle unreachable ({ORACLE_DSN}): {_LAST_ERROR[0]}")
     worker = os.environ.get("PYTEST_XDIST_WORKER", "serial")
-    schema = f"secantus_diff_{worker}"
+    # The pid too: two checkouts running this suite at once against the
+    # same reference server shared `secantus_diff_gw0`, and each run's DROP
+    # SCHEMA took the other's tables away mid-test (265 failures, "no schema
+    # has been selected to create in", 2026-11-01).
+    schema = f"secantus_diff_{worker}_{os.getpid()}"
     try:
         cur = conn.cursor()
         # Recreate rather than reuse: a previous run's leftovers would seed the

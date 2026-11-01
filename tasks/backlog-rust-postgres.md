@@ -887,6 +887,18 @@ one beside it.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
+## Found by RP-287's tsvector slice (2026-11-01)
+
+- [ ] **`pg_column_size` of a column under GROUP BY reads the in-memory
+      size**: `select max(pg_column_size(v)), pg_column_size(j) from t
+      group by 2` gives 38 and 28 where PostgreSQL 15.19 gives the stored
+      sizes, 35 and 25 (a short varlena header); without the GROUP BY both
+      servers give 35 and 25. The column's table provenance is lost on the
+      aggregate path, and the two values come back as text (`'38'`), not
+      `int4`.
+      Backlog-ID: RP-315
+      Verify: tests/backlog/test_rp_found_2026_11_01.py::test_a_grouped_column_size_is_the_stored_one
+
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`
@@ -1036,13 +1048,16 @@ batch, their tests regression tests:
       on them (`predicate-gin` 31 of 31, `predicate-gist` 40 of 40; was 19
       and 22, RP-254). Not yet, each falling back to a relation lock as
       before:
-      - GIN `=` on arrays, and opclasses other than `array_ops` and
-        `jsonb_ops` (tsvector, `jsonb_path_ops`, btree_gin), whose indexes
-        `pg_relation_size` reads as 0; array elements other than ints,
+      - GIN `=` on arrays, and opclasses other than `array_ops`,
+        `jsonb_ops` and `tsvector_ops` (`jsonb_path_ops`, btree_gin), whose
+        indexes `pg_relation_size` reads as 0; array elements other than ints,
         floats, bool and C-ordered text; an ANALYZEd array column (MCELEM
         statistics);
       - `jsonb_ops` scans (`@>`, `?`, `?|`, `?&`): its pages and keys are
         modelled, its `extractQuery` and consistent functions are not;
+      - `tsvector_ops` scans (`@@`): its pages and keys
+        (`gin_extract_tsvector`) are modelled, its `extractQuery` and
+        consistent functions are not;
       - point/box `~=`, polygon and circle containment;
       - multi-column, partial and expression GIN / GiST indexes;
       - an UPDATE's or DELETE's scan (only a SELECT passes its residual);
@@ -1055,7 +1070,7 @@ batch, their tests regression tests:
       first slice); an unmodelled one (a `jsonb_ops` GIN index) still
       reads 0 from `pg_relation_size`.
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_tsvector_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_jsonb_path_ops_gin_index_has_its_pages
 
 
 

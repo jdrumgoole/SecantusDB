@@ -97,7 +97,7 @@ pub mod copy_opts;
 pub mod correlated;
 pub mod cursor_scroll;
 pub mod datetime;
-mod datum_size;
+pub mod datum_size;
 pub mod domains;
 pub mod dtparse;
 mod enum_order;
