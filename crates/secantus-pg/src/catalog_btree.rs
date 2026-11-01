@@ -15,9 +15,10 @@
 //! catalogs it blinded the session to its own new objects, and off a
 //! statement's path it lost other sessions' new tables.
 //!
-//! Not yet modelled, and recorded in RP-291: a row any database adds after
-//! `initdb` (placing later catalog rows, and their index entries, is the
-//! heap slice's), and VACUUM's deletion of dead entries.
+//! The heap blocks behind a scan are counted too, over `initdb`'s heaps
+//! (`catalog_heap.rs`). Not yet modelled, and recorded in RP-291: a row
+//! any database adds after `initdb` (placing later catalog rows, and their
+//! index entries), and VACUUM's deletion of dead entries.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -27,7 +28,8 @@ use bson::Bson;
 
 use crate::btree_model::{BTree, LayoutPage, Shape};
 use crate::catalog_facts::builtin;
-use crate::catcache::{Backend, Key, K};
+use crate::catalog_heap::initdb_heaps;
+use crate::catcache::{Backend, PageScan, K};
 use crate::PgHandler;
 
 /// One built-in index as `initdb` left it.
@@ -343,24 +345,43 @@ struct Tree {
 }
 
 impl PgHandler {
-    /// Count the pages each catalog index scan in `scans` read, in order:
-    /// the metapage, which `_bt_metaversion` and then `_bt_getroot` read
-    /// and cache in `rd_amcache` on the backend's first scan -- but never
-    /// cache while the index has no root, so that both read it on every
-    /// scan of an empty index -- then the way down and the leaves.
+    /// Count the pages each catalog scan in `scans` read, in order.
+    ///
+    /// An index scan reads the metapage, which `_bt_metaversion` and then
+    /// `_bt_getroot` read and cache in `rd_amcache` on the backend's first
+    /// scan -- but never cache while the index has no root, so that both
+    /// read it on every scan of an empty index -- then the way down and
+    /// the leaves; and then the heap block of each tuple it returns, in
+    /// index order, a block again only when the one before was another
+    /// (`heapam_index_fetch_tuple` keeps its buffer pinned, and
+    /// `ReleaseAndReadBuffer` reads nothing for the block it holds).
     /// `_bt_getrootheight` (no key) reads the metapage alone, and caches
-    /// it as they do.
-    pub(crate) fn catalog_index_pages(&self, be: &mut Backend, scans: Vec<(i64, Option<Key>)>) {
+    /// it as they do. A sequential scan reads every block of the heap.
+    ///
+    /// The heap is `initdb`'s (`catalog_heap.rs`): a row added after it is
+    /// not yet placed (RP-291).
+    pub(crate) fn catalog_index_pages(&self, be: &mut Backend, scans: Vec<PageScan>) {
         if scans.is_empty() || !self.tracking() {
             return;
         }
         let stats = self.stats();
         let capacity = self.buffer_pages();
-        for (index, key) in scans {
+        let heaps = initdb_heaps();
+        for scan in scans {
+            let (index, key) = match scan {
+                PageScan::Seq(table) => {
+                    if let Some(h) = heaps.get(&table) {
+                        stats.pages(table, 0..i64::from(h.blocks), capacity);
+                    }
+                    continue;
+                }
+                PageScan::Index(index, key) => (index, key),
+            };
             let Some(t) = tree(index) else {
                 continue;
             };
             let mut blocks: Vec<i64> = Vec::new();
+            let mut heap: Vec<i64> = Vec::new();
             if t.btree.root.is_none() {
                 // No root: nothing is cached.
                 blocks.push(0);
@@ -377,15 +398,22 @@ impl PgHandler {
                         .zip(&t.shape.types)
                         .map(|(k, typ)| from_k(k, *typ))
                         .collect();
-                    blocks.extend(
-                        t.btree
-                            .prefix_scan_pages(&t.shape, &prefix)
-                            .into_iter()
-                            .map(i64::from),
-                    );
+                    let (pages, tids) = t.btree.prefix_scan(&t.shape, &prefix);
+                    blocks.extend(pages.into_iter().map(i64::from));
+                    for tid in tids {
+                        let block = tid / 65536;
+                        if heap.last() != Some(&block) {
+                            heap.push(block);
+                        }
+                    }
                 }
             }
             stats.pages(index, blocks, capacity);
+            if !heap.is_empty() {
+                if let Some(table) = builtin().indexes.get(&index).map(|i| i.table) {
+                    stats.pages(table, heap, capacity);
+                }
+            }
         }
     }
 }
@@ -462,6 +490,24 @@ mod tests {
                 heap.name
             );
         }
+    }
+
+    #[test]
+    fn a_scan_returns_its_rows_heap_tids() {
+        // pg_class_relname_nsp_index: `pg_class` in `pg_catalog` is one
+        // row, on a block of pg_class's initdb heap.
+        let t = tree(2663).expect("pg_class_relname_nsp_index");
+        let (_, tids) = t.btree.prefix_scan(
+            &t.shape,
+            &[Bson::String("pg_class".into()), Bson::Int64(11)],
+        );
+        assert_eq!(tids.len(), 1);
+        assert!(tids[0] / 65536 < 14);
+        // pg_attribute_relid_attnum_index by pg_class's oid: its every
+        // column, user and system.
+        let t = tree(2659).expect("pg_attribute_relid_attnum_index");
+        let (_, tids) = t.btree.prefix_scan(&t.shape, &[Bson::Int64(1259)]);
+        assert_eq!(tids.len(), 33 + 6);
     }
 
     #[test]

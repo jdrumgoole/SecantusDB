@@ -1219,21 +1219,20 @@ a regression test.
       differ; a `pg_stat_*` view 53 match, 61 differ.
       Backlog-ID: RP-290
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ALTER TABLE's own catalog reads], tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
-- [ ] **A catalog read counts no heap blocks** in `pg_statio_sys_tables`:
-      the scans are counted (RP-225), and since 2026-11-01 the catalog
-      INDEX pages they read are too (`catalog_btree.rs`: each built-in
-      catalog index is PostgreSQL 15.19's own pages, every tuple's key and
-      heap TIDs, from `pg15_catalog_indexes.txt`; the metapage as
-      `rd_amcache` caches it, the planner's `_bt_getrootheight`;
-      regression test `test_catalog_index_blocks`), but not the heap pages
-      behind them.
+- [ ] **A catalog row added after `initdb` counts no heap block** in
+      `pg_statio_sys_tables`. A catalog scan counts its index pages
+      (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since
+      2026-11-01, the heap blocks behind `initdb`'s own rows: an index
+      scan's fetch of each tuple it returns, a sequential scan's every
+      block, over `pg15_catalog_heaps.txt` (`catalog_heap.rs`; regression
+      test `test_catalog_heap_blocks`). A row any database adds later has
+      no place yet, so a scan that returns one (a new table's `pg_class`
+      and `pg_attribute` rows) counts neither its heap block nor, for a
+      sequential scan, the blocks it grew the heap by.
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
-      sequence of PRs, this item open until the last. Done: every
-      built-in catalog's `initdb` heap -- each live tuple's ctid and the
-      heap's blocks -- is recorded (`pg15_catalog_heaps.txt`,
-      `catalog_heap.rs`; an index entry names a HOT chain's root).
-      Remaining slices: (2) place every later
-      catalog row with the heap page model (`heap_page.rs`) and insert its
+      sequence of PRs, this item open until the last. Remaining: place
+      every later catalog row with the heap page model (`heap_page.rs`),
+      filling `initdb`'s free space first as the FSM does, and insert its
       index entries into the index trees, which hold only `initdb`'s
       tuples and are shared by every database -- with a non-HOT update's
       new version and entries, and VACUUM's removal of dead ones (reading
@@ -1241,13 +1240,26 @@ a regression test.
       statement's path it cost a new session hundreds of milliseconds,
       inside a transaction that changed the catalogs it blinded the
       session to its own new objects, and off a statement's path it lost
-      other sessions' new tables); (3) count each catalog scan's heap
-      pages (an index scan's fetches, a sequential scan's every page) in
-      `pg_statio_sys_tables`. Also open: the shared buffer pool keys a
-      page by relation oid and block, not database, so two databases'
-      copies of one catalog index share hits.
+      other sessions' new tables). Also open: the shared buffer pool keys
+      a page by relation oid and block, not database, so two databases'
+      copies of one catalog share hits.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
+- [ ] **A built-in catalog's first reads in a session are not
+      PostgreSQL's** (found while building RP-291's heap slice). Measured
+      on 15.19 against a new session: `select count(*) from pg_am` builds
+      the table's index descriptors (`pg_opclass`, `pg_amop`, `pg_amproc`,
+      eight `pg_attribute` scans where this server makes four) and reads
+      its planner statistics (`pg_statistic`, since RP-311 gave the
+      catalogs theirs); `'pg_class'::regclass`, `'now'::regproc` and
+      `'pg_catalog'::regnamespace` make no name lookup here
+      (`pg_class_relname_nsp_index`, `pg_proc_proname_args_nsp_index`,
+      `pg_namespace_nspname_index`); `'int4'::regtype` makes one of
+      PostgreSQL's three `pg_type_typname_nsp_index` scans too few, and a
+      `pg_operator` lookup by oid three `pg_cast` and three `pg_type` too
+      many.
+      Backlog-ID: RP-316
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a built-in catalog's first reads]
 - [ ] **The first backend after a start is counted as a warm one.**
       PostgreSQL serves it without the relcache init files (about 245
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model

@@ -1182,9 +1182,17 @@ impl BTree {
     /// first leaf such a row could be on, then each leaf rightward until a
     /// tuple, or a page's high key, is past the prefix. Empty for an empty
     /// index.
+    #[cfg(test)]
     pub(crate) fn prefix_scan_pages(&self, shape: &dyn Shape, prefix: &[Bson]) -> Vec<u32> {
+        self.prefix_scan(shape, prefix).0
+    }
+
+    /// [`Self::prefix_scan_pages`], and the heap TIDs of the tuples the
+    /// scan returns, in index order (a posting list's in its order).
+    pub(crate) fn prefix_scan(&self, shape: &dyn Shape, prefix: &[Bson]) -> (Vec<u32>, Vec<i64>) {
+        let mut tids = Vec::new();
         let Some(mut at) = self.root else {
-            return Vec::new();
+            return (Vec::new(), tids);
         };
         let n = prefix.len().min(shape.nkeyatts());
         let prefix = &prefix[..n];
@@ -1219,7 +1227,7 @@ impl BTree {
         let mut first = true;
         loop {
             let Page::Leaf { items, high, right } = &self.pages[at as usize] else {
-                return pages;
+                return (pages, tids);
             };
             pages.push(at);
             let start = if first {
@@ -1228,15 +1236,25 @@ impl BTree {
                 0
             };
             first = false;
-            if items[start..]
-                .iter()
-                .any(|it| cmp(&it.key, false) == Ordering::Less)
-            {
-                return pages;
+            let mut past = false;
+            for it in &items[start..] {
+                match cmp(&it.key, false) {
+                    // `_bt_readpage` skips an `LP_DEAD` item.
+                    Ordering::Equal if !it.dead => tids.extend(&it.tids),
+                    Ordering::Equal => {}
+                    Ordering::Less => {
+                        past = true;
+                        break;
+                    }
+                    Ordering::Greater => {}
+                }
+            }
+            if past {
+                return (pages, tids);
             }
             match (right, high) {
                 (Some(next), Some(h)) if cmp(&h.key, false) != Ordering::Less => at = *next,
-                _ => return pages,
+                _ => return (pages, tids),
             }
         }
     }
