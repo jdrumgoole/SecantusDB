@@ -1360,6 +1360,173 @@ def test_catalog_blocks(rust_pg: Any) -> None:
     assert catalog_blocks(_dsn(rust_pg)) == [True, True, True]
 
 
+# RP-291, its first slice: the pages a catalog index scan reads, as
+# PostgreSQL 15.19 counts them in `pg_statio_sys_indexes` -- the metapage on
+# the backend's first scan of the index, the way down from the root, and
+# each leaf the scan walks across -- over `initdb`'s own index pages
+# (`pg15_catalog_indexes.txt`). Measured on the private cluster the module
+# docstring describes; `blocks_fetched` per catalog index, a new session's
+# start and then its statement.
+INDEX_BLOCK_STEPS = [
+    "a|",
+    "mark",
+    "a|select relname from pg_class where relname = 'rpc_t'",
+    "mark",
+    "a|select * from rpc_t where id = 1",
+    "mark",
+]
+
+
+def index_blocks(dsn: str) -> list[dict[str, int]]:
+    """Each catalog index's `blocks_fetched` delta between `INDEX_BLOCK_STEPS`'
+    marks, as `run_scenario` takes them."""
+    with _connect(dsn, "setup") as c:
+        for s in SETUP:
+            c.execute(s)
+    with _connect(dsn, "warm") as c:
+        for s in WARM:
+            c.execute(s)
+    obs = Observer(dsn)
+    indexes = [
+        o
+        for (o,) in obs.conn.execute(
+            "select indexrelid::int from pg_stat_sys_indexes where schemaname = 'pg_catalog'"
+        ).fetchall()
+    ]
+    query = "select o, pg_stat_get_blocks_fetched(o) from (values {}) v(o)".format(
+        ",".join(f"({o})" for o in indexes)
+    )
+
+    def snap() -> dict[str, int]:
+        obs.conn.execute("select pg_stat_clear_snapshot()")
+        return {obs.names[o]: n for o, n in obs.conn.execute(query).fetchall()}
+
+    for _ in range(3):
+        snap()
+    obs.conn.execute("select pg_stat_force_next_flush()")
+    time.sleep(1.2)
+    conns: dict[str, Any] = {}
+    out = []
+    last = snap()
+
+    def delta() -> dict[str, int]:
+        nonlocal last
+        now = snap()
+        d = {k: v - last.get(k, 0) for k, v in sorted(now.items()) if v != last.get(k, 0)}
+        last = now
+        return d
+
+    try:
+        for st in INDEX_BLOCK_STEPS:
+            if st == "mark":
+                for c in conns.values():
+                    c.execute("select pg_stat_force_next_flush()")
+                time.sleep(0.2)
+                out.append(delta())
+                continue
+            name, sql = st.split("|", 1)
+            if name not in conns:
+                conns[name] = _connect(dsn, name)
+            if sql:
+                conns[name].execute(sql)
+        for c in conns.values():
+            c.close()
+        time.sleep(0.5)
+        out.append(delta())
+        return out
+    finally:
+        obs.conn.close()
+        with _connect(dsn, "teardown") as c:
+            for s in TEARDOWN:
+                c.execute(s)
+
+
+EXPECTED_INDEX_BLOCKS: list[dict[str, int]] = [
+    {
+        "pg_amproc_fam_proc_index": 3,
+        "pg_attribute_relid_attnum_index": 9,
+        "pg_authid_oid_index": 2,
+        "pg_authid_rolname_index": 2,
+        "pg_class_oid_index": 5,
+        "pg_database_datname_index": 2,
+        "pg_database_oid_index": 3,
+        "pg_db_role_setting_databaseid_rol_index": 8,
+        "pg_index_indexrelid_index": 2,
+        "pg_namespace_nspname_index": 3,
+        "pg_opclass_oid_index": 2,
+        "pg_proc_oid_index": 3,
+        "pg_proc_proname_args_nsp_index": 3,
+        "pg_type_oid_index": 3,
+    },
+    {
+        "pg_amop_fam_strat_index": 3,
+        "pg_amop_opr_fam_index": 3,
+        "pg_attribute_relid_attnum_index": 14,
+        "pg_class_oid_index": 8,
+        "pg_class_relname_nsp_index": 5,
+        "pg_class_tblspc_relfilenode_index": 1,
+        "pg_index_indexrelid_index": 3,
+        "pg_index_indrelid_index": 2,
+        "pg_operator_oid_index": 3,
+        "pg_operator_oprname_l_r_n_index": 3,
+        "pg_proc_oid_index": 2,
+        "pg_statistic_ext_relid_index": 2,
+        "pg_statistic_relid_att_inh_index": 2,
+        "pg_tablespace_oid_index": 2,
+        "pg_type_oid_index": 6,
+    },
+    {
+        "pg_amop_opr_fam_index": 2,
+        "pg_amproc_fam_proc_index": 2,
+        "pg_attribute_relid_attnum_index": 6,
+        "pg_class_oid_index": 6,
+        "pg_class_relname_nsp_index": 4,
+        "pg_index_indexrelid_index": 1,
+        "pg_index_indrelid_index": 1,
+        "pg_opclass_oid_index": 1,
+        "pg_operator_oid_index": 2,
+        "pg_operator_oprname_l_r_n_index": 2,
+        "pg_proc_oid_index": 2,
+        "pg_statistic_ext_relid_index": 2,
+        "pg_statistic_relid_att_inh_index": 2,
+        "pg_type_oid_index": 4,
+    },
+    {},
+]
+
+# `pg_statistic` holds no row for the built-in catalogs on this server
+# (RP-311), so its index is empty where `initdb`'s has a root page: a scan of
+# it reads the metapage twice instead of the root once. Left out here, and
+# checked by RP-311's gap test.
+NO_BUILTIN_STATISTICS = "pg_statistic_relid_att_inh_index"
+
+
+def _without_statistics(segments: list[dict[str, int]]) -> list[dict[str, int]]:
+    return [{k: v for k, v in seg.items() if k != NO_BUILTIN_STATISTICS} for seg in segments]
+
+
+@pytest.mark.backlog_fixed("RP-291")
+def test_catalog_index_blocks(rust_pg: Any) -> None:
+    """The index part of RP-291, its first slice (2026-11-01)."""
+    got = index_blocks(_dsn(rust_pg))
+    assert _without_statistics(got) == _without_statistics(EXPECTED_INDEX_BLOCKS)
+
+
+@pytest.mark.backlog("RP-311")
+def test_builtin_statistics(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: `initdb`'s ANALYZE leaves 404 `pg_statistic` rows
+    over 38 catalogs, and a scan of their index reads its root."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        got = c.execute(
+            "select count(*), count(distinct starelid) from pg_statistic where starelid < 16384"
+        ).fetchone()
+    assert tuple(got) == (404, 38)
+    blocks = index_blocks(_dsn(rust_pg))
+    assert [seg.get(NO_BUILTIN_STATISTICS) for seg in blocks] == [
+        seg.get(NO_BUILTIN_STATISTICS) for seg in EXPECTED_INDEX_BLOCKS
+    ]
+
+
 # RP-292: the first backend after the server starts finds no relation cache
 # init file and builds every critical relation's descriptor, by heap scans
 # until the critical indexes are built, and writes the files. PostgreSQL

@@ -17,11 +17,20 @@ Writes three files the server compiles in:
 * ``crates/secantus-pg/src/pg15_catalog_rows.txt`` -- for each table in
   ``STATIC_TABLES``, a ``\\relation schema.table`` line and then the table's
   rows in COPY text format, in ``ctid`` order, a ``reg*`` column as its oid.
+* ``crates/secantus-pg/src/pg15_catalog_indexes.txt`` -- every built-in
+  catalog index's B-tree pages as ``initdb`` left them (RP-291), read from
+  the cluster's data files, so the cluster must be LOCAL and the user a
+  superuser: a ``\\index oid root level`` line, then one line per page,
+  ``block flags next level items``, where a leaf's items are each index
+  tuple's heap TID count (``1x40`` is forty plain tuples; a posting list
+  counts its TIDs) and an internal page's are its downlinks' blocks. A
+  non-rightmost page's high key is not an item.
 """
 
 from __future__ import annotations
 
 import pathlib
+import struct
 import sys
 
 import psycopg
@@ -208,6 +217,69 @@ def main(dsn: str) -> None:
                 for block in copy:
                     out.append(bytes(block).decode())
         (ROOT / "crates/secantus-pg/src/pg15_catalog_rows.txt").write_text("".join(out))
+
+        index_pages(conn)
+
+
+BLCKSZ = 8192
+BTP_LEAF, BTP_META, BTP_DELETED = 1, 8, 4
+INDEX_ALT_TID_MASK, BT_IS_POSTING, BT_OFFSET_MASK = 0x2000, 0x2000, 0x0FFF
+
+
+def page_items(page: bytes) -> tuple[int, int, int, list[int], list[int]]:
+    """A B-tree page's flags, right link, level, and per data item (the high
+    key left out) its heap TID count on a leaf or its downlink's block on an
+    internal page (``nbtree.h``, ``itup.h``, ``bufpage.h``)."""
+    lower = struct.unpack_from("<H", page, 12)[0]
+    special = struct.unpack_from("<H", page, 16)[0]
+    _prev, nxt, level, flags = struct.unpack_from("<IIIH", page, special)
+    counts: list[int] = []
+    downlinks: list[int] = []
+    first = 1 if nxt != 0 else 0  # P_FIRSTDATAKEY: a high key on a non-rightmost page
+    for n, off in enumerate(range(24, lower, 4)):
+        lp = struct.unpack_from("<I", page, off)[0]
+        lp_off, lp_flags = lp & 0x7FFF, (lp >> 15) & 3
+        if n < first or lp_flags == 0:
+            continue
+        bi_hi, bi_lo, posid, info = struct.unpack_from("<HHHH", page, lp_off)
+        block = (bi_hi << 16) | bi_lo
+        if flags & BTP_LEAF:
+            posting = info & INDEX_ALT_TID_MASK and posid & BT_IS_POSTING
+            counts.append(posid & BT_OFFSET_MASK if posting else 1)
+        else:
+            downlinks.append(block)
+    return flags, nxt, level, counts, downlinks
+
+
+def run_length(counts: list[int]) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(counts):
+        j = i
+        while j < len(counts) and counts[j] == counts[i]:
+            j += 1
+        out.append(f"{counts[i]}x{j - i}" if j - i > 1 else str(counts[i]))
+        i = j
+    return ",".join(out)
+
+
+def index_pages(conn: psycopg.Connection) -> None:
+    conn.execute("checkpoint")
+    datadir = pathlib.Path(conn.execute("show data_directory").fetchone()[0])
+    out = []
+    for oid, path in conn.execute(
+        "select c.oid, pg_relation_filepath(c.oid) from pg_class c"
+        " where c.relkind = 'i' and c.oid < 16384"
+        " and c.relam = (select oid from pg_am where amname = 'btree') order by 1"
+    ).fetchall():
+        data = (datadir / path).read_bytes()
+        root, level = struct.unpack_from("<II", data, 24 + 8)  # btm_magic, btm_version, then these
+        out.append(f"\\index {oid} {root} {level}\n")
+        for blk in range(1, len(data) // BLCKSZ):
+            flags, nxt, lvl, counts, downlinks = page_items(data[blk * BLCKSZ : (blk + 1) * BLCKSZ])
+            items = run_length(counts) if flags & BTP_LEAF else ",".join(map(str, downlinks))
+            out.append(f"{blk} {flags} {nxt} {lvl} {items}\n")
+    (ROOT / "crates/secantus-pg/src/pg15_catalog_indexes.txt").write_text("".join(out))
 
 
 if __name__ == "__main__":

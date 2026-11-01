@@ -324,23 +324,24 @@ impl<'a> Model<'a> {
     /// `InitPostgres` with the init files in place.
     pub(crate) fn backend_start(&mut self, db_oid: i64, db_name: &str, role_oid: i64) {
         // `GetDatabaseTuple`: a direct scan by name, uncached.
-        self.ct.index(2671, 1);
+        self.ct.index(2671, vec![K::N(db_name.to_string())], 1);
         // `InitializeSessionUserId`: AUTHNAME, then AUTHOID.
         let user = self.user.clone();
         self.search(Cache::AuthName, vec![K::N(user)], |_| true);
         self.search(Cache::AuthOid, vec![K::O(role_oid)], |_| true);
         // `GetDatabaseTupleByOid`, rechecking after the lock: uncached.
-        self.ct.index(2672, 1);
+        self.ct.index(2672, vec![K::O(db_oid)], 1);
         // `CheckMyDatabase`: DATABASEOID.
         self.search(Cache::DatabaseOid, vec![K::O(db_oid)], |_| true);
-        let _ = db_name;
         // `process_settings`: four scans of pg_db_role_setting's index,
         // each through the relation's descriptor, which no init file holds.
         self.open_catalog(2964);
         self.open_catalog_index(2965);
         let rows = self.h.cr_role_settings(db_oid, role_oid);
-        for n in rows {
-            self.ct.index(2965, n);
+        // `ApplySetting`'s four keys, in `process_settings`' order.
+        let keys = [(db_oid, role_oid), (0, role_oid), (db_oid, 0), (0, 0)];
+        for ((d, r), n) in keys.into_iter().zip(rows) {
+            self.ct.index(2965, vec![K::O(d), K::O(r)], n);
         }
         self.be.started = true;
     }
@@ -480,16 +481,16 @@ impl<'a> Model<'a> {
             // `AttrDefaultFetch`.
             self.open_catalog(2604);
             self.open_catalog_index(2656);
-            self.ct.index(2656, rel.defaults);
+            self.ct.index(2656, vec![K::O(rel.oid)], rel.defaults);
         }
         if rel.checks > 0 {
             // `CheckConstraintFetch`.
             self.open_catalog_index(2665);
-            self.ct.index(2665, rel.checks);
+            self.ct.index(2665, vec![K::O(rel.oid)], rel.checks);
         }
         if rel.kind == 'v' {
             // `RelationBuildRuleLock`: the view's one rule.
-            self.ct.index(2693, 1);
+            self.ct.index(2693, vec![K::O(rel.oid)], 1);
         }
     }
 
@@ -532,9 +533,15 @@ impl<'a> Model<'a> {
         if !self.be.opclasses.insert(class) {
             return;
         }
-        self.ct.index(2687, 1);
+        self.ct.index(2687, vec![K::O(class)], 1);
         let b = builtin();
-        let procs = self.h.cr_opclass(class).map_or(0, |o| {
+        let opclass = self.h.cr_opclass(class);
+        // `LookupOpclassInfo` scans the family's procedures for the class's
+        // input type on both sides.
+        let key = opclass.as_ref().map_or_else(Vec::new, |o| {
+            vec![K::O(o.family), K::O(o.intype), K::O(o.intype)]
+        });
+        let procs = opclass.map_or(0, |o| {
             if am == BTREE_AM || am != 0 {
                 b.amproc_count
                     .get(&(o.family, o.intype, o.intype))
@@ -544,14 +551,15 @@ impl<'a> Model<'a> {
                 0
             }
         });
-        self.ct.index(2655, procs);
+        self.ct.index(2655, key, procs);
     }
 
     /// `RelationGetIndexList`: read once per descriptor.
     fn index_list(&mut self, rel: &Rel) {
         if self.be.load_index_list(rel.oid) {
             self.open_catalog_index(2678);
-            self.ct.index(2678, rel.indexes.len() as i64);
+            self.ct
+                .index(2678, vec![K::O(rel.oid)], rel.indexes.len() as i64);
         }
     }
 
@@ -559,7 +567,8 @@ impl<'a> Model<'a> {
     fn statext_list(&mut self, rel: &Rel) {
         if self.be.load_statext_list(rel.oid) {
             self.open_catalog_index(3379);
-            self.ct.index(3379, self.h.cr_statext_count(rel.oid));
+            self.ct
+                .index(3379, vec![K::O(rel.oid)], self.h.cr_statext_count(rel.oid));
         }
     }
 
@@ -576,6 +585,11 @@ impl<'a> Model<'a> {
         }
         for ix in &rel.indexes {
             self.open_index(ix);
+            // For a B-tree, its height while it is open: a catalog index's
+            // pages are modelled (RP-291); an oid below 16384 is initdb's.
+            if ix.am == BTREE_AM && ix.oid < 16384 {
+                self.ct.tree_height(ix.oid);
+            }
         }
         self.statext_list(rel);
         let needs = self.needs.get(&rel.oid).cloned().unwrap_or_default();
@@ -671,13 +685,28 @@ impl<'a> Model<'a> {
         }
         // A catalog read directly is scanned by the executor.
         if rel.catalog && matches!(rel.kind, 'r') {
-            let scan = match &used {
-                Some((ix, _)) => {
-                    let n = self.h.cr_catalog_matches(rel, ix, &needs.eq_consts);
-                    Scan::Index(ix.oid, n)
-                }
-                None => Scan::Seq(rel.oid, self.h.cr_catalog_rows(rel)),
-            };
+            let scan =
+                match &used {
+                    Some((ix, _)) => {
+                        let n = self.h.cr_catalog_matches(rel, ix, &needs.eq_consts);
+                        // The equalities on the index's leading columns are the
+                        // scan's key.
+                        let key =
+                            ix.keys
+                                .iter()
+                                .map_while(|k| {
+                                    needs.eq_consts.iter().find(|(a, _)| a == k).map(|(_, v)| {
+                                        match v {
+                                            Bson::String(s) => K::N(s.clone()),
+                                            v => K::O(crate::bson_i64(v).unwrap_or_default()),
+                                        }
+                                    })
+                                })
+                                .collect();
+                        Scan::Index(ix.oid, key, n)
+                    }
+                    None => Scan::Seq(rel.oid, self.h.cr_catalog_rows(rel)),
+                };
             self.exec.push(scan);
         }
     }
@@ -808,7 +837,7 @@ impl<'a> Model<'a> {
             })
             .unwrap_or_default();
         self.open_catalog_index(2686);
-        self.ct.index(2686, classes.len() as i64);
+        self.ct.index(2686, vec![K::O(am)], classes.len() as i64);
         let mut nexact = 0;
         let mut ncompat_pref = 0;
         let mut result = None;
@@ -2420,14 +2449,7 @@ impl PgHandler {
             .relation_oid(key)
             .unwrap_or_else(|| self.view_relid(key));
         let mut be = Backend::default();
-        let mut m = Model::new(
-            self,
-            &mut be,
-            Counter {
-                stats: None,
-                store: 0,
-            },
-        );
+        let mut m = Model::new(self, &mut be, Counter::new(None, 0));
         m.stored = true;
         m.silent = 1;
         let parsed = pg_query::parse(sql).ok()?;
@@ -2716,10 +2738,10 @@ pub(crate) fn changes_catalogs(sql: &str) -> bool {
 
 impl PgHandler {
     fn catcache_counter(&self) -> Counter {
-        Counter {
-            stats: self.tracking().then(|| self.stats()),
-            store: std::sync::Arc::as_ptr(&self.storage) as usize,
-        }
+        Counter::new(
+            self.tracking().then(|| self.stats()),
+            std::sync::Arc::as_ptr(&self.storage) as usize,
+        )
     }
 
     fn catcache_ids(&self) -> (usize, i32) {
@@ -2739,7 +2761,10 @@ impl PgHandler {
         let db = self.db().to_string();
         let mut be = self.catcache.lock().unwrap_or_else(|e| e.into_inner());
         be.attach(store);
-        Model::new(self, &mut be, ct).backend_start(db_oid, &db, role_oid);
+        let mut m = Model::new(self, &mut be, ct);
+        m.backend_start(db_oid, &db, role_oid);
+        let scans = m.ct.take_scans();
+        self.catalog_index_pages(&mut be, scans);
     }
 
     /// What a statement that changes the catalogs will leave if it
@@ -2791,6 +2816,8 @@ impl PgHandler {
                 for s in m.scans.clone() {
                     ct.scan(s);
                 }
+                let scans = ct.take_scans();
+                self.catalog_index_pages(&mut be, scans);
                 return;
             }
         }
@@ -2817,11 +2844,15 @@ impl PgHandler {
             };
             let mut m = Model::new(self, &mut be, self.catcache_counter());
             m.statement(stmt);
-            scans.extend(m.exec);
+            let made = m.ct.take_scans();
+            scans.extend(std::mem::take(&mut m.exec));
+            self.catalog_index_pages(&mut be, made);
         }
         for s in &scans {
-            ct.scan(*s);
+            ct.scan(s.clone());
         }
+        let made = ct.take_scans();
+        self.catalog_index_pages(&mut be, made);
         if !ddl {
             if let (Some(shape), true) = (shape, scans.is_empty()) {
                 be.remember(shape, version, Vec::new());

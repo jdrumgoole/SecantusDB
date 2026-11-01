@@ -115,6 +115,8 @@ pub(crate) struct CatalogIndex {
     pub natts: i64,
     pub keys: Vec<i64>,
     pub classes: Vec<i64>,
+    /// `indisunique`.
+    pub unique: bool,
 }
 
 #[derive(Debug, Default)]
@@ -414,6 +416,7 @@ fn load() -> Builtin {
             natts: c[2].parse().unwrap_or(0),
             keys: ints(c[15]),
             classes: ints(c[17]),
+            unique: matches!(c[4], "1" | "t"),
         };
         b.indexes_of.entry(ix.table).or_default().push(ix.oid);
         b.indexes.insert(ix.oid, ix);

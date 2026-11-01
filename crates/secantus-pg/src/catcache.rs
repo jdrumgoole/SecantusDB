@@ -166,10 +166,11 @@ pub(crate) struct Memo {
 }
 
 /// A scan counted against a catalog relation.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Scan {
-    /// An index scan of `index` returning `n` live rows.
-    Index(i64, i64),
+    /// An index scan of `index` for the rows whose leading key columns are
+    /// `key`, returning `n` live rows.
+    Index(i64, Key, i64),
     /// A sequential scan of `rel` returning `n` rows.
     Seq(i64, i64),
 }
@@ -210,6 +211,10 @@ pub(crate) struct Backend {
     pending_dead: Vec<(i64, Key)>,
     memo: HashMap<u64, Memo>,
     pub(crate) started: bool,
+    /// The B-tree indexes whose metapage this backend has cached
+    /// (`rd_amcache`, which `_bt_getroot` fills on the index's first scan
+    /// and a relation cache rebuild empties) (RP-291).
+    amcache: HashSet<i64>,
 }
 
 impl Backend {
@@ -267,6 +272,12 @@ impl Backend {
     #[cfg(test)]
     pub(crate) fn has_relation(&self, rel: i64) -> bool {
         self.relcache.contains(&rel)
+    }
+
+    /// `_bt_getroot`: true when the index's metapage must be read, which
+    /// it then caches.
+    pub(crate) fn read_metapage(&mut self, index: i64) -> bool {
+        self.amcache.insert(index)
     }
 
     /// Mark `rel`'s descriptor built; true if it was not.
@@ -332,12 +343,14 @@ impl Backend {
                 self.lists.retain(|(c, _)| c != cache);
             }
             Inval::Rel(rel) => {
+                self.amcache.remove(rel);
                 self.relcache.remove(rel);
                 self.index_lists.remove(rel);
                 self.statext_lists.remove(rel);
                 self.pubdescs.remove(rel);
             }
             Inval::Reset => {
+                self.amcache.clear();
                 self.entries.clear();
                 self.lists.clear();
                 // Every relation cache entry is rebuilt; the init file's
@@ -382,13 +395,41 @@ pub(crate) struct Counter {
     pub(crate) stats: Option<Stats>,
     /// The store whose dead catalog index entries a scan meets.
     pub(crate) store: usize,
+    /// The index scans counted, `(index, key)` each in the order made, for
+    /// the pages they read to be counted once the walk is done (RP-291);
+    /// no key for the planner's look at a B-tree's height
+    /// (`_bt_getrootheight`), which reads its metapage alone.
+    scans: std::cell::RefCell<Vec<(i64, Option<Key>)>>,
 }
 
 impl Counter {
-    pub(crate) fn index(&self, index: i64, rows: i64) {
+    pub(crate) fn new(stats: Option<Stats>, store: usize) -> Self {
+        Counter {
+            stats,
+            store,
+            scans: Default::default(),
+        }
+    }
+
+    /// An index scan of `index` for the rows whose leading key columns are
+    /// `key`, returning `rows`.
+    pub(crate) fn index(&self, index: i64, key: Key, rows: i64) {
         if let Some(s) = &self.stats {
             s.index_scan(index, rows, rows);
+            self.scans.borrow_mut().push((index, Some(key)));
         }
+    }
+
+    /// `_bt_getrootheight`: the planner asks a B-tree index's height.
+    pub(crate) fn tree_height(&self, index: i64) {
+        if self.stats.is_some() {
+            self.scans.borrow_mut().push((index, None));
+        }
+    }
+
+    /// The index scans counted since this was last asked.
+    pub(crate) fn take_scans(&self) -> Vec<(i64, Option<Key>)> {
+        std::mem::take(&mut *self.scans.borrow_mut())
     }
 
     /// An index scan of `index` whose keys start with `key`: the live rows
@@ -399,6 +440,7 @@ impl Counter {
         let dead = take_dead(self.store, index, key);
         if let Some(s) = &self.stats {
             s.index_scan(index, rows + dead, rows);
+            self.scans.borrow_mut().push((index, Some(key.clone())));
         }
     }
 
@@ -410,7 +452,7 @@ impl Counter {
 
     pub(crate) fn scan(&self, scan: Scan) {
         match scan {
-            Scan::Index(i, n) => self.index(i, n),
+            Scan::Index(i, k, n) => self.index(i, k, n),
             Scan::Seq(r, n) => self.seq(r, n),
         }
     }
@@ -575,10 +617,7 @@ mod tests {
     use super::*;
 
     fn counter() -> Counter {
-        Counter {
-            stats: None,
-            store: 0,
-        }
+        Counter::new(None, 0)
     }
 
     #[test]
