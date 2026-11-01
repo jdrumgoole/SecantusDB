@@ -1329,10 +1329,12 @@ jobs:
       # The `server` shard died of a full disk on 2026-11-01 (PR #2249, run
       # 41312019513): every backlog test after the first ~70 errored with
       # "could not create numbered dir", and the runner could not write its
-      # own log. The same commit had passed on main 15 minutes earlier, so the
-      # margin is thin and varies by runner. Free the image's toolchains this
-      # job never uses (.NET, Android, GHC, CodeQL: ~20 GB), and report the
-      # disk around each suite so the next shortfall is measured, not guessed.
+      # own log. The same commit had passed on main 15 minutes earlier. The
+      # runner starts with ~86 GB free, so that was not a thin margin: tens
+      # of GB were written within ~30 s of the backlog step starting (a
+      # runaway write, open as an RP backlog item). Report the disk around
+      # each suite so the next one is measured, and free the toolchains this
+      # job never uses (.NET, Android, GHC, CodeQL: ~22 GB) for headroom.
       - name: Free disk the job does not use
         shell: bash
         run: |
@@ -1517,12 +1519,8 @@ jobs:
           # its last 24 tests. None of these files uses `xdist_group`, which
           # worksteal would not honour. --durations names the long tests, so
           # the next imbalance is visible in the log instead of guessed.
-          # When the session ends, passed tests' temp trees (their WiredTiger
-          # stores) are deleted; only failures keep theirs. Without it each
-          # pytest step left its whole tree for the next. See "Free disk".
           PYTHONPATH=tests uv run python -m pytest $files -q -n auto \
-            --dist worksteal --durations=40 -p no:cacheprovider -rs \
-            -o tmp_path_retention_policy=failed
+            --dist worksteal --durations=40 -p no:cacheprovider -rs
           df -h / | tail -1
 
       # The login rules (TLS options, revocation lists, user name maps,
@@ -1566,7 +1564,7 @@ jobs:
         run: |
           "$SECANTUS_PG15_BIN/postgres" --version
           uv run python -m pytest tests/test_rust_pg_login_differential.py -q -n 3 \
-            -p no:cacheprovider -rs -o tmp_path_retention_policy=failed
+            -p no:cacheprovider -rs
           df -h / | tail -1
 
       # The regression tests fixed Rust PG backlog items became
@@ -1597,11 +1595,19 @@ jobs:
           # `-m backlog_fixed` replaces addopts' `-m`, which deselects them.
           df -h / | tail -1
           uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
-            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs \
-            -o tmp_path_retention_policy=failed
+            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs
           df -h / | tail -1
           # And the OPEN items' gap tests, through the backlog's own runner: it
           # exits non-zero when a gap test no longer measures its gap (BROKEN)
           # or now passes (FIXED? -- a change fixed the item; close it in the
           # same PR, as the backlog skill says). About ten seconds.
           uv run python tools/backlog.py verify --file backlog-rust-postgres.md
+
+      # RP-312: name what filled the disk, if anything did. Runs on every
+      # failure of this job, after whichever step failed.
+      - name: Largest directories (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          df -h / | tail -1
+          sudo du -xh -d 3 /tmp "$RUNNER_TEMP" "$GITHUB_WORKSPACE" 2>/dev/null | sort -h | tail -25
