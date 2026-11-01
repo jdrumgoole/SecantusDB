@@ -1026,16 +1026,6 @@ batch, their tests regression tests:
       reads 0 from `pg_relation_size`.
       Backlog-ID: RP-287
       Verify: tests/backlog/test_rp_top10_found.py::test_a_tsvector_gin_index_has_its_pages
-- [ ] **A UNION branch selecting a bare NULL FROM a relation is typed
-      `text`**, not `unknown`: `select 1 union all select null from
-      (values (1)) v` raises 42804 "UNION types integer and text cannot be
-      matched", as does a jsonb branch against `select null from
-      generate_series(1, 1)`. PostgreSQL 15.19 resolves the `unknown`
-      branch to the other's type (`select_common_type`) and answers the
-      rows. Without a FROM the branch is typed `unknown` here too. Found
-      while measuring RP-287.
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_union_branch_selecting_null_from_a_relation_takes_the_other_type
-      Backlog-ID: RP-310
 
 
 

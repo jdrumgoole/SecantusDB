@@ -36654,10 +36654,36 @@ impl PgHandler {
         }
         // The column NAMES are the left side's; each TYPE is the two sides
         // unified, which is also where mismatched types are refused.
-        let left_nulls = Self::null_constant_columns(&set.left);
-        let right_nulls = Self::null_constant_columns(&set.right);
-        let left_strs = Self::untyped_string_columns(&set.left);
-        let right_strs = Self::untyped_string_columns(&set.right);
+        // A constant side knows its own untyped columns (a bound parameter's
+        // value is typed); any other leaf side is read from the parse tree,
+        // which is where PostgreSQL decides a column is `unknown`.
+        let side = |stmt: &Statement, parsed: &[bool], own: fn(&Statement) -> Vec<bool>| {
+            if matches!(stmt, Statement::SelectConstant(_)) {
+                own(stmt)
+            } else {
+                parsed.to_vec()
+            }
+        };
+        let left_nulls = side(
+            &set.left,
+            &set.left_untyped.nulls,
+            Self::null_constant_columns,
+        );
+        let right_nulls = side(
+            &set.right,
+            &set.right_untyped.nulls,
+            Self::null_constant_columns,
+        );
+        let left_strs = side(
+            &set.left,
+            &set.left_untyped.strings,
+            Self::untyped_string_columns,
+        );
+        let right_strs = side(
+            &set.right,
+            &set.right_untyped.strings,
+            Self::untyped_string_columns,
+        );
         let flag = |v: &[bool], i: usize| v.get(i).copied().unwrap_or(false);
         let mut schema = Vec::with_capacity(left_schema.len());
         // The columns whose untyped literal side is read as the other side's
