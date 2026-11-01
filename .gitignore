@@ -26,6 +26,8 @@ venv/
 build/
 # Session scratch: command logs, ad-hoc scripts, probe stores (CLAUDE.md).
 /.scratch/
+# The nightly security review's skill output (scripts/security-review-prompt.md).
+/.security-audit/
 dist/
 wheelhouse/
 *.egg-info/

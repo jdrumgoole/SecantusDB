@@ -1,7 +1,8 @@
 name: Security Review
 
 # Nightly automated security review of the whole repo (both servers).
-# Runs the prompt in scripts/security-review-prompt.md via Claude Code,
+# Runs the prompt in scripts/security-review-prompt.md via Claude Code
+# (which runs the vendored security-audit skill for the method),
 # writes a dated report under docs/security-reports/, self-merges the
 # docs-only report PR, and files `security`-labelled issues for any
 # CRITICAL / WARNING findings. Mirrors the regstack process.
@@ -37,7 +38,9 @@ concurrency:
 jobs:
   security-review:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # 90 since 2026-11-01: the security-audit skill's quick profile (up to 15
+    # agent invocations) plus the advisory, CI and release checks.
+    timeout-minutes: 90
     steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
@@ -81,9 +84,10 @@ jobs:
             the review silently produces nothing — which is exactly how the 2026-07-20
             run spent $4.70, launched 8 background agents, and wrote no report. Finish
             the report, merge the PR, and file the issues before you stop.
-          # Allow the tools the procedure needs: shell (git/gh/uv), file
-          # read/write for the report, and web access for CVE lookups.
-          claude_args: '--allowed-tools "Bash,Read,Grep,Glob,Write,Edit,WebSearch,WebFetch"'
+          # Allow the tools the procedure needs: shell (git/gh/node), file
+          # read/write for the report, web access for advisory lookups, and
+          # Task for the security-audit skill's hunter and verifier agents.
+          claude_args: '--allowed-tools "Bash,Read,Grep,Glob,Write,Edit,WebSearch,WebFetch,Task"'
 
       # The action writes a full execution log to the runner temp dir and then
       # never surfaces it, so a failed review shows only `is_error: true` with
