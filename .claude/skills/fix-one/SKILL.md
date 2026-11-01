@@ -7,7 +7,14 @@ description: Take ONE item from a named SecantusDB backlog, fix it, commit it an
 
 To start from a clean context, run it in a new session:
 `scripts/fix_one.sh postgres [ID|rule]` (add `-p` for headless). A skill
-cannot run `/clear` itself.
+cannot run `/clear` itself. Several items: `scripts/fix_many.sh postgres
+<count>` runs fix_one sessions in two lanes.
+
+**Headless (`-p`) sessions end when your turn ends.** Never end a turn
+while a background build, gate, CI wait or agent of yours is still
+running: the work dies with the session (2026-11-01: a run ended mid-gate
+and left its fix uncommitted). Wait for each result before you stop, and
+commit as soon as the fix exists so nothing is lost.
 
 One item, one branch, one PR, one merge, one teardown. Every step below
 points at the skill that owns its detail -- read that skill when you reach
@@ -30,6 +37,12 @@ item touches the planner or explain.
 
 ## 1. Pick the item
 
+- **PG backlog: check `main`'s psycopg Windows gauge first.** PRs that do
+  not touch the wire, TLS or auth no longer run it, so the push-to-main run
+  is where a regression shows:
+  `gh run list --workflow psycopg-windows.yml --branch main --event push --limit 1 --json conclusion,headSha,url`.
+  If it is `failure`, that regression is the item: reproduce it, fix it,
+  file it if it is not one PR.
 - An ID was given: take it.
 - Otherwise list the open items (`grep -n '^- \[ \] \*\*' <file>`), read
   the candidates, and pick by the rule given (default: the most
@@ -92,6 +105,19 @@ run the item's `Verify:` tests:
 
 ## 6. Gate, once, at the end
 
+**PG backlog: run `scripts/gate_pg.sh`** (`--storage` if you touched the
+shared storage crates) through `scripts/detached_run.py`, and wait for it.
+It runs every step below that a PG change can reach -- the PG crate and
+the clean workspace, a rebuild, the suites CI's pg-oracle lane runs, the
+login comparisons, the backlog verify with `--regressions`, lint and ruff
+-- writes each step's exit code to `.scratch/gate/<step>.rc`, and ends
+with `gate=0|1`. It replaces `rust-gate` and the full pytest suite for a
+PG change: their extra cost is the MongoDB parity files, which CI no
+longer runs. Read every `.rc` that is not 0, and the log beside it.
+
+**RM backlog, or a change to the shared storage crates that the MongoDB
+server links:** the full list below.
+
 Run every one of these and read each exit code itself. Do not trust one
 taken through a pipe or a trailing `echo`.
 
@@ -116,8 +142,10 @@ git add <paths> && git commit -m "<server>: <headline> (<ID>)"
 git push && gh pr create --base main --title "..." --body "... Fixes <ID> ..."
 ```
 
-- Watch the PR's own run by polling REST run status with a sleep, in the
-  background (`ci-check`). Fix every red check and push again.
+- Watch the PR's own run with `scripts/wait_ci.sh <N>`, in the background
+  (exit 0 green, 1 red, 2 timed out). Do not write your own polling loop:
+  two hand-written ones wedged for half an hour each on 2026-10-31. Fix
+  every red check and push again (`ci-check`).
 - Merge only after `gh pr checks <N>` is all green: `gh pr merge <N>
   --squash`. Then check `gh pr view <N> --json state` says `MERGED`, and
   grep `origin/main` for the deliverable (a merged PR is not landed

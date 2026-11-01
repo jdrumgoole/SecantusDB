@@ -6,8 +6,15 @@
 # not this binary), and the gauge once hung there in a way no Linux/macOS run
 # could show (tasks/backlog.md, "The Rust PG psycopg gauge does not finish on
 # Windows"). A Windows WiredTiger + bindgen + libpg_query build is ~15 minutes,
-# so this does NOT run on every PR: weekly, on demand, and on PRs that touch
-# the PG crates, the gauge runner or this file.
+# so this does NOT run on every PR: weekly, on demand, on every push to main
+# that touches the PG crates, and on PRs that touch the wire protocol, TLS
+# and authentication, the gauge runner or this file.
+#
+# Since 2026-11-01 a PR touching only the planner, executor or catalog no
+# longer runs it: at 43-67 minutes it was the critical path of every such
+# PR (the next slowest check takes 17-33), and it passed on all of them. The
+# push-to-main run still measures every merge; fix-one checks the latest
+# main run before taking an item and fixes a red one first.
 #
 # What it gates: that the run COMPLETES and every test it started reported a
 # result. A truncated run is a failure, never a pass (CLAUDE.md, "A test that
@@ -18,10 +25,25 @@ on:
   schedule:
     - cron: "17 4 * * 0"  # Sundays, off the hour
   workflow_dispatch:
-  pull_request:
+  push:
     branches: [main]
     paths:
       - "crates/secantus-pg*/**"
+      - "psycopg_validation/**"
+      - ".github/workflows/psycopg-windows.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/secantus-pgwire/**"
+      - "crates/secantus-pg/src/tls.rs"
+      - "crates/secantus-pg/src/hba.rs"
+      - "crates/secantus-pg/src/crl.rs"
+      - "crates/secantus-pg/src/ident.rs"
+      - "crates/secantus-pg/src/live.rs"
+      - "crates/secantus-pg/src/scram_binding.rs"
+      - "crates/secantus-pg/src/main.rs"
+      - "crates/secantus-pg/Cargo.toml"
+      - "crates/secantus-pg/Cargo.lock"
       - "psycopg_validation/**"
       - ".github/workflows/psycopg-windows.yml"
 
