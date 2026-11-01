@@ -1538,13 +1538,18 @@ impl JoinRel {
     /// join, `build_join_pathkeys`). `useful`: whether an order is still of
     /// use above the new relation (`truncate_useless_pathkeys`). A join on
     /// several clauses sorts on all of them: no single class's order serves
-    /// it.
+    /// it. `desc_outer`: whether `a`'s or `b`'s key is a descending ORDER
+    /// BY's own class (a key an outer join NULL-extends), which
+    /// `select_outer_pathkeys_for_merge` gives the merge with that side
+    /// outer in `sort_inner_and_outer`: both sides are then sorted
+    /// descending, and an ascending presorted path serves neither.
     #[allow(clippy::too_many_arguments)]
     pub fn add_paths_general(
         &mut self,
         combo: usize,
         a_class: Option<usize>,
         b_class: Option<usize>,
+        desc_outer: (bool, bool),
         useful: &dyn Fn(usize) -> bool,
         a: &RelPaths<'_>,
         b: &RelPaths<'_>,
@@ -1649,7 +1654,12 @@ impl JoinRel {
             // materialised.
             let markable = inner.set.count_ones() == 1;
             // sort_inner_and_outer: the two cheapest-total paths.
-            let (os, is) = (outer.sorted_on(oct, o_class), inner.sorted_on(ict, i_class));
+            let desc = if b_outer { desc_outer.1 } else { desc_outer.0 };
+            let (os, is) = if desc {
+                (false, false)
+            } else {
+                (outer.sorted_on(oct, o_class), inner.sorted_on(ict, i_class))
+            };
             if let Some(cost) =
                 merge_join_full(&outer.at(oct, os), &inner.at(ict, is), os, is, qp, markable)
             {
@@ -2443,7 +2453,18 @@ mod tests {
         let (a, b) = (rel(lm1, 2), rel(lm2, 4));
         let rows = join_rows(&side, &side, true);
         let mut kept = JoinRel::new(true);
-        kept.add_paths_general(0, Some(2), Some(2), &|_| false, &a, &b, true, rows, 1);
+        kept.add_paths_general(
+            0,
+            Some(2),
+            Some(2),
+            (false, false),
+            &|_| false,
+            &a,
+            &b,
+            true,
+            rows,
+            1,
+        );
         // The parameterized paths' rows: lm1's 2 through the LEFT join's
         // clause, at least the preserved side's (`calc_joinrel_size_estimate`).
         let param: Vec<JoinChoice> = kept
@@ -2455,7 +2476,18 @@ mod tests {
         assert!(param.iter().all(|p| p.rows == 20.0), "{param:?}");
         // With no outer join to need it, none is made.
         let mut none = JoinRel::new(true);
-        none.add_paths_general(0, Some(2), Some(2), &|_| false, &a, &b, true, rows, 0);
+        none.add_paths_general(
+            0,
+            Some(2),
+            Some(2),
+            (false, false),
+            &|_| false,
+            &a,
+            &b,
+            true,
+            rows,
+            0,
+        );
         assert!(none.pathlist().iter().all(|p| p.req_outer == 0));
     }
 }

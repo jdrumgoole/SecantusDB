@@ -895,15 +895,13 @@ impl PgHandler {
             }
             return self.run_step_on_keys(step, a, b, on);
         }
-        // A descending merge: an inner or LEFT one. A right or full merge
-        // places its unmatched rows by the ascending order (`merge_full_place`,
-        // `merge_right_fill`), which is not modelled descending.
+        // A descending merge: an inner, LEFT or right one. A full merge
+        // places its unmatched rows by the ascending order
+        // (`merge_full_place`), which is not modelled descending.
         if step.desc
             && matches!(
                 step.method,
-                JoinMethod::MergeFullA { .. }
-                    | JoinMethod::MergeFullB { .. }
-                    | JoinMethod::MergeRightB { .. }
+                JoinMethod::MergeFullA { .. } | JoinMethod::MergeFullB { .. }
             )
         {
             return Ok(None);
@@ -978,15 +976,16 @@ impl PgHandler {
                 a_by_index,
                 b_by_index,
             } => {
-                reorder_join_inputs(
+                crate::reorder_join_inputs_dir(
                     JoinMethod::MergeOuterB {
                         a_by_index,
                         b_by_index,
                     },
                     &mut a.rows,
-                    &step.a_key,
+                    std::slice::from_ref(&step.a_key),
                     &mut b.rows,
-                    &step.b_key,
+                    std::slice::from_ref(&step.b_key),
+                    step.desc,
                 );
                 (b, a, JoinKind::Right, b_first)
             }
@@ -1102,7 +1101,7 @@ impl PgHandler {
             out = crate::merge_full_place(out, tail, &fill_outer, &fill_inner, inner_max.as_ref());
         }
         if matches!(step.method, JoinMethod::MergeRightB { .. }) {
-            out = merge_right_fill(out, &step.b_key, &step.a_key);
+            out = merge_right_fill(out, &step.b_key, &step.a_key, step.desc);
         }
         let keys = outer.keys.into_iter().chain(inner.keys).collect();
         Ok(Some(Input { rows: out, keys }))
@@ -1179,8 +1178,14 @@ impl PgHandler {
 /// the matched rows of an equal key -- where the merge passes it
 /// (`ExecMergeJoin` fills an inner tuple once the outer has moved past
 /// it). A row is unmatched when its outer key is NULL, which a matched
-/// row's never is.
-fn merge_right_fill(rows: Vec<Document>, outer_key: &str, inner_key: &str) -> Vec<Document> {
+/// row's never is. A descending merge (`desc`) reads both sides in the
+/// exact reverse order, NULLs first, and places by that order.
+fn merge_right_fill(
+    rows: Vec<Document>,
+    outer_key: &str,
+    inner_key: &str,
+    desc: bool,
+) -> Vec<Document> {
     let is_null = |d: &Document, k: &str| matches!(d.get(k), None | Some(Bson::Null));
     let (matched, unmatched): (Vec<Document>, Vec<Document>) =
         rows.into_iter().partition(|d| !is_null(d, outer_key));
@@ -1192,6 +1197,14 @@ fn merge_right_fill(rows: Vec<Document>, outer_key: &str, inner_key: &str) -> Ve
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         (Some(p), Some(q)) => secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal),
+    };
+    let key_cmp = |x: &Document, y: &Document| {
+        let o = key_cmp(x, y);
+        if desc {
+            o.reverse()
+        } else {
+            o
+        }
     };
     let mut out = Vec::with_capacity(matched.len() + unmatched.len());
     let mut m = matched.into_iter().peekable();
@@ -1206,4 +1219,44 @@ fn merge_right_fill(rows: Vec<Document>, outer_key: &str, inner_key: &str) -> Ve
     }
     out.extend(m);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_right_fill;
+    use bson::{doc, Bson, Document};
+
+    fn rows(keys: &[(Option<i32>, i32, &str)]) -> Vec<Document> {
+        keys.iter()
+            .map(|(o, i, tag)| {
+                let outer = o.map_or(Bson::Null, Bson::Int32);
+                doc! { "o": outer, "i": *i, "t": *tag }
+            })
+            .collect()
+    }
+
+    fn tags(rows: &[Document]) -> Vec<&str> {
+        rows.iter().map(|d| d.get_str("t").unwrap()).collect()
+    }
+
+    /// A descending merge right join passes an unmatched inner row once the
+    /// outer has moved below its key: after the matched rows of a greater
+    /// or equal key, before those of a smaller one.
+    #[test]
+    fn a_descending_merge_right_join_fills_in_descending_key_order() {
+        let built = rows(&[
+            (Some(5), 5, "m5"),
+            (Some(3), 3, "m3"),
+            (Some(1), 1, "m1"),
+            (None, 4, "u4"),
+            (None, 3, "u3"),
+            (None, 0, "u0"),
+        ]);
+        let out = merge_right_fill(built.clone(), "o", "i", true);
+        assert_eq!(tags(&out), ["m5", "u4", "m3", "u3", "m1", "u0"]);
+        let asc: Vec<Document> = built.into_iter().rev().collect();
+        let asc = [&asc[3..], &asc[..3]].concat();
+        let out = merge_right_fill(asc, "o", "i", false);
+        assert_eq!(tags(&out), ["u0", "m1", "m3", "u3", "u4", "m5"]);
+    }
 }

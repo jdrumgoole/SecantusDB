@@ -647,17 +647,20 @@ one beside it.
     is searched too, every merge on its class sorting both sides
     descending (`select_outer_pathkeys_for_merge`): on the matrix with
     every ORDER BY made DESC, 1,097 of 1,140 LIMIT shapes and 212 of 240
-    two-table ones match (1,017 and 177 before). The 71 left: a DESC key
-    on a LEFT join's nullable side, ties among the NULL-extended rows in
-    another order; and the search declines a DESC ORDER BY when an index
-    scan is in its class's order (PostgreSQL keeps both the forward scan,
-    ascending, and a backward one), so those shapes are joined whole and
-    sorted. Declined still: an ORDER BY with NULLs against its direction's
+    two-table ones match (1,017 and 177 before). Since 2026-11-01 a DESC
+    key on a LEFT join's nullable side is searched too: the merge with that
+    side outer sorts both sides descending, and a side presorted ascending
+    is sorted for it (1,130 of 1,140 and 212 of 240). All 38 left are
+    shapes with an index: the search declines a DESC ORDER BY when an
+    index scan is in its class's order, or on a nullable key's table
+    (PostgreSQL keeps both the forward scan, ascending, and a backward
+    one), so those shapes are joined whole and sorted. Declined still: an
+    ORDER BY with NULLs against its direction's
     default (ASC NULLS FIRST, DESC NULLS LAST), an ORDER BY of several
     columns, and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_order_by_of_a_nullable_key_under_a_limit
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_order_by_with_an_index_in_its_order
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
@@ -985,7 +988,11 @@ tests regression tests:
       Bind cycle, which both servers would drop -- but that gap is a
       client round trip, and no measurement shows the cancel landed there.
       The next step is the server's log of a failing run with the cancel's
-      arrival and the message it landed in.
+      arrival and the message it landed in. Seen a second time on
+      2026-11-01, in `scripts/gate_pg.sh`'s backlog verify on macOS (debug
+      build, load average about 11 from the suites before it): the same
+      `ok` for `[2.5]`; five runs of the test alone after it passed. Load
+      is the common factor of both sightings.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 

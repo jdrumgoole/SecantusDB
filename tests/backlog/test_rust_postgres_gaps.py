@@ -2532,13 +2532,15 @@ def test_a_descending_order_by_under_a_limit_over_two_tables(pg: Any) -> None:
     assert got == ("ok", [(132, 6), (279, 6), (90, 6), (125, 6), (118, 6)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_descending_order_by_of_a_nullable_key_under_a_limit(pg: Any) -> None:
     """PostgreSQL 15.19, three 20-row tables never analysed: `t0 JOIN t1 ON
     t0.b = t1.a LEFT JOIN t2 ON t1.b = t2.a ORDER BY t2.a DESC LIMIT 5`
-    leaves its NULL-extended ties as t0's rows 19, 5, 12 and then 18, 11.
-    The search plans a DESC key on a LEFT join's nullable side (a class of
-    its own) and the ties come out 19, 12, 5 and 11, 18."""
+    leaves its NULL-extended ties as t0's rows 19, 5, 12 and then 18, 11:
+    its Merge Right Join, t2 outer, sorts both sides DESC, as
+    `select_outer_pathkeys_for_merge` matched the ORDER BY to t2.a's class.
+    The search sorted that merge ascending, and the ties came out 19, 12, 5
+    and 11, 18."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_n", 3, 20)
@@ -2555,6 +2557,55 @@ def test_a_descending_order_by_of_a_nullable_key_under_a_limit(pg: Any) -> None:
         "ok",
         [(19, 5, None), (5, 5, None), (12, 5, None), (18, 4, 4), (11, 4, 4)],
     )
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_descending_nullable_key_beside_an_inner_class_keeps_its_ties(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a LEFT JOIN t2 ON t0.b = t2.a ORDER BY t2.a DESC LIMIT 5`
+    runs a Merge Left Join of t0 and t2, ascending, under the merge with
+    t1: a Merge Right Join with t2 outer is descending, so the join of t0
+    and t1 in the class's ascending order is sorted for it, not read
+    presorted. The search read it presorted and chose that join, its ties
+    6, 13, 20."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_s", 3, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_s0.a, rp028_s1.a, rp028_s2.a from rp028_s0"
+            " join rp028_s1 on rp028_s0.b = rp028_s1.a"
+            " left join rp028_s2 on rp028_s0.b = rp028_s2.a"
+            " order by rp028_s2.a desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(13, 6, 6), (20, 6, 6), (6, 6, 6), (12, 5, 5), (19, 5, 5)],
+    )
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_descending_order_by_with_an_index_in_its_order(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables never analysed, an index on
+    t1.a: `t0 JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC LIMIT 5` leaves its
+    ties as t0's rows 6, 13, 20. The search declines a DESC ORDER BY with an
+    index scan in its class's order (PostgreSQL weighs the forward scan and
+    a backward one), joins whole and sorts: 20, 13, 6."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_i", 2, 20)
+        pg.execute("create index on rp028_i1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_i0.a, rp028_i1.a from rp028_i0"
+            " join rp028_i1 on rp028_i0.b = rp028_i1.a"
+            " order by rp028_i1.a desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == ("ok", [(6, 6), (13, 6), (20, 6), (5, 5), (12, 5)])
 
 
 @pytest.mark.backlog_fixed("RP-307")

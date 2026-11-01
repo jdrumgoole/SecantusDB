@@ -1262,6 +1262,15 @@ impl PgHandler {
                 }
             }
             let param_source = u32::from(param_source);
+            // A descending ORDER BY of a key an outer join NULL-extends: the
+            // merge with that key's side outer sorts both sides descending
+            // (`Search::order_desc`, `select_outer_pathkeys_for_merge`).
+            let desc_outer = match &search.order {
+                Some((key, ORDER_CLASS)) if search.order_desc => {
+                    (clause.a_key == *key, clause.b_key == *key)
+                }
+                _ => (false, false),
+            };
             let rel = &mut search.rels[idx];
             let rows = rel.rows;
             let combo = rel.built.len();
@@ -1275,6 +1284,7 @@ impl PgHandler {
                     combo,
                     a_class,
                     b_class,
+                    desc_outer,
                     &useful,
                     &ra,
                     &rb,
@@ -1509,7 +1519,23 @@ impl PgHandler {
                     | JoinMethod::MergeFullA { .. }
                     | JoinMethod::MergeFullB { .. }
             )
-            && search.order.as_ref().is_some_and(|(_, order)| {
+            && search.order.as_ref().is_some_and(|(key, order)| {
+                // A key an outer join NULL-extends is a class of its own
+                // (`ORDER_CLASS`), the one its clause's side has
+                // (`get_eclass_for_sort_expr` finds it): the merge takes the
+                // query's direction when that side is its outer one, as
+                // `select_outer_pathkeys_for_merge` matches the query's
+                // pathkeys against the outer side's classes only.
+                if *order == ORDER_CLASS {
+                    let outer_key = match best.method {
+                        JoinMethod::MergeOuterB { .. } | JoinMethod::MergeRightB { .. } => {
+                            &clause.b_key
+                        }
+                        JoinMethod::MergeOuterA { .. } => &clause.a_key,
+                        _ => return false,
+                    };
+                    return outer_key == key;
+                }
                 let own = Some(clause.key_class);
                 let side = |table: usize, key: &str| match clause.class {
                     Some(k) => Some(class_id(k)),
@@ -1820,6 +1846,23 @@ impl PgHandler {
                         .any(|(p, _)| p.class.is_some() && p.class == class)
                 }) {
                     return Ok(None);
+                }
+                // A key an outer join NULL-extends, read by an index scan
+                // in its order: a merge with it outer presorted is ascending
+                // (`generate_mergejoin_paths` takes the outer's pathkeys)
+                // beside the descending one, which is not modelled.
+                let order_table = search.order.as_ref().and_then(|(key, c)| {
+                    (*c == ORDER_CLASS)
+                        .then(|| search.aliases.iter().position(|a| a == alias_of(key)))
+                        .flatten()
+                });
+                if let Some(t) = order_table {
+                    if base_lists
+                        .get(t)
+                        .is_some_and(|(list, _, _)| list.iter().any(|(p, _)| p.class.is_some()))
+                    {
+                        return Ok(None);
+                    }
                 }
             }
             search.base_lists = base_lists;

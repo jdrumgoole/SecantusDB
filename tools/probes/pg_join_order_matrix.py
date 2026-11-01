@@ -25,7 +25,10 @@ them. Use a PRIVATE PostgreSQL 15 cluster (the probe creates tables), e.g.
 
     PROBE_PG="host=127.0.0.1 port=25917 user=postgres dbname=postgres" \
     PROBE_SERVER="host=127.0.0.1 port=25918 user=postgres dbname=postgres" \
-    python tools/probes/pg_join_order_matrix.py [--filter SUBSTR] [--out DIR]
+    python tools/probes/pg_join_order_matrix.py [--filter SUBSTR] [--out DIR] [--desc]
+
+`--desc` makes every ORDER BY descending (`DESC`, its NULLs first); give it
+its own `--out` directory, as the reference's cache is per matrix.
 
 The reference's answers are cached in `DIR/matrix_pg.json` (`--pg`
 measures them again); the server's go to `DIR/matrix_rs.json`, and the
@@ -40,10 +43,13 @@ import itertools
 import json
 import os
 import pathlib
+import re
 import sys
 import time
 
 import psycopg
+
+DESC = False
 
 MODS = [(7, 5), (5, 3), (3, 4), (4, 6), (6, 5)]
 
@@ -146,6 +152,8 @@ def run(dsn: str, flt: str | None) -> dict:
         ]
         if not keyed:
             continue
+        if DESC:
+            keyed = [(k, re.sub(r"order by (\S+)", r"order by \1 desc", q)) for k, q in keyed]
         conn.execute("begin")
         for s in setup(n, size, index):
             conn.execute(s)
@@ -158,7 +166,9 @@ def run(dsn: str, flt: str | None) -> dict:
 
 
 def main() -> None:
+    global DESC
     args = sys.argv[1:]
+    DESC = "--desc" in args
     flt = args[args.index("--filter") + 1] if "--filter" in args else None
     out = pathlib.Path(args[args.index("--out") + 1] if "--out" in args else ".")
     out.mkdir(parents=True, exist_ok=True)
