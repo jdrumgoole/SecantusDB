@@ -1347,7 +1347,26 @@ impl PgHandler {
                     },
                     ("pg_attribute", c) => {
                         let type_oid = int(get(row, "atttypid"));
+                        // One of PostgreSQL's own relations: what 15.19
+                        // records, not what the type implies.
+                        let system = table_by_oid(int(get(row, "attrelid")))
+                            .is_none()
+                            .then(|| {
+                                crate::catalog_meta::system_attribute_facts(
+                                    int(get(row, "attrelid")),
+                                    int(get(row, "attnum")),
+                                )
+                            })
+                            .flatten();
                         match c {
+                            "attcollation" | "attndims" | "attstorage" if system.is_some() => {
+                                let (collation, ndims, storage) = system.unwrap_or_default();
+                                match c {
+                                    "attcollation" => Bson::Int64(collation),
+                                    "attndims" => Bson::Int32(ndims),
+                                    _ => Bson::String(storage),
+                                }
+                            }
                             "attidentity" => {
                                 let table = table_by_oid(int(get(row, "attrelid")));
                                 let attname = text(get(row, "attname"));

@@ -102,11 +102,12 @@ def test_format_type_prints_a_modifier_no_typmodout_reads(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-302")
+@pytest.mark.backlog_fixed("RP-302")
 def test_builtin_relations_attributes(pg: Any) -> None:
-    """`pg_class` lists its six system columns (attnum < 0) as every
-    relation with storage does; a catalog's collatable column is collated
-    `C` (950); an array column records one dimension."""
+    """`pg_class` listed none of its six system columns (attnum < 0), which
+    every relation with storage has; a catalog's collatable column was
+    collated by its type's default, not `C` (950); and an array column
+    recorded no dimensions."""
     got = pg_answer(
         pg,
         "select (select count(*) from pg_attribute where attrelid = 'pg_class'::regclass),"

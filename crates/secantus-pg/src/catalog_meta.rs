@@ -444,13 +444,14 @@ pub(crate) fn system_column_source(relation: &str, column: &str) -> Option<(i64,
 /// (`pg_attribute_system.tsv`: attrelid, attname, the column's type with an
 /// `information_schema` domain smashed to its base type (what this server
 /// computes the column as), attnum, attnotnull, atttypmod, atthasdef, then
-/// the column's declared type and its collation as PostgreSQL 15.19 records
-/// them).
+/// the column's declared type, its collation, `attndims` and `attstorage` as
+/// PostgreSQL 15.19 records them). The system columns (`ctid`, `xmin` ...,
+/// attnum < 0) of every relation with storage are rows too.
 pub(crate) fn attribute_rows(def: &TableDef) -> Vec<Document> {
     let f = |name: &str| def.field_of(name);
     let mut out = Vec::new();
     for l in ATTRIBUTES.lines() {
-        let [relid, name, _base, num, notnull, typmod, hasdef, ty, collation] =
+        let [relid, name, _base, num, notnull, typmod, hasdef, ty, collation, _, _] =
             l.split('\t').collect::<Vec<_>>()[..]
         else {
             continue;
@@ -553,6 +554,36 @@ pub(crate) fn system_relation_columns(relation: &str) -> Option<Vec<(String, i64
         .collect();
     cols.sort_by_key(|c| c.0);
     Some(cols.into_iter().map(|(_, n, t, m)| (n, t, m)).collect())
+}
+
+/// `(attcollation, attndims, attstorage)` of a system relation's column.
+pub(crate) type AttributeFacts = (i64, i32, String);
+
+/// What PostgreSQL 15.19 records for one of its own relations' columns
+/// that this server does not compute: `(attcollation, attndims,
+/// attstorage)` (`pg_attribute_system.tsv`). A catalog's collatable column
+/// is collated `C`, an array column has one dimension, and a TOAST table's
+/// `chunk_data` is stored plain -- none of which follows from the type.
+pub(crate) fn system_attribute_facts(relid: i64, attnum: i64) -> Option<AttributeFacts> {
+    static MAP: std::sync::OnceLock<std::collections::HashMap<(i64, i64), AttributeFacts>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        ATTRIBUTES
+            .lines()
+            .filter_map(|l| {
+                let c: Vec<&str> = l.split('\t').collect();
+                let key = (c.first()?.parse().ok()?, c.get(3)?.parse().ok()?);
+                let facts = (
+                    c.get(8)?.parse().ok()?,
+                    c.get(9)?.parse().ok()?,
+                    c.get(10)?.to_string(),
+                );
+                Some((key, facts))
+            })
+            .collect()
+    })
+    .get(&(relid, attnum))
+    .cloned()
 }
 
 /// A system relation's column name by number (`pg_attribute_system.tsv`).
