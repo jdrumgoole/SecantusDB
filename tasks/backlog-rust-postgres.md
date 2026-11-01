@@ -918,21 +918,6 @@ tests regression tests:
   slept to its end; a row streamed after the statement's hooks are gone
   is evaluated under a cancel hook now (`tests/backlog/test_rp202_cancel.py`).
 
-- [ ] **The built-in relations' `pg_attribute` rows differ from
-      PostgreSQL 15.19's.** Over `attrelid < 16384`: the 648 system-column
-      rows (`attnum < 0`: `ctid`, `xmin` ... of every catalog with storage)
-      are missing; 684 `information_schema` view columns name their domain's
-      base type in `atttypid` where PostgreSQL names the domain
-      (`sql_identifier`, `cardinal_number` ...); 282 `attcollation`s are
-      the default collation or none where a catalog's collatable column is
-      `C` (950); 59 array columns have `attndims` 0, not 1; and 40
-      `attstorage`s differ (a TOAST table's `chunk_data` is `p`). So
-      `element_types` lists the catalogs' text arrays without their
-      collation. Changing `atttypid` is the delicate part: what a client is
-      told a view column's type is follows it.
-      Backlog-ID: RP-302
-      Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
-
 - [ ] **A seven-relation join to a large DISTINCT subquery on an
       expression key exhausts memory**: `element_types`' query with its row
       IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the
