@@ -497,9 +497,10 @@ mod tests {
         // pg_class_relname_nsp_index: `pg_class` in `pg_catalog` is one
         // row, on a block of pg_class's initdb heap.
         let t = tree(2663).expect("pg_class_relname_nsp_index");
-        let (_, tids) = t
-            .btree
-            .prefix_scan(&t.shape, &[Bson::String("pg_class".into()), Bson::Int64(11)]);
+        let (_, tids) = t.btree.prefix_scan(
+            &t.shape,
+            &[Bson::String("pg_class".into()), Bson::Int64(11)],
+        );
         assert_eq!(tids.len(), 1);
         assert!(tids[0] / 65536 < 14);
         // pg_attribute_relid_attnum_index by pg_class's oid: its every

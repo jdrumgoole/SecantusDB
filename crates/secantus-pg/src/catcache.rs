@@ -425,7 +425,9 @@ impl Counter {
     pub(crate) fn index(&self, index: i64, key: Key, rows: i64) {
         if let Some(s) = &self.stats {
             s.index_scan(index, rows, rows);
-            self.scans.borrow_mut().push(PageScan::Index(index, Some(key)));
+            self.scans
+                .borrow_mut()
+                .push(PageScan::Index(index, Some(key)));
         }
     }
 
@@ -449,7 +451,9 @@ impl Counter {
         let dead = take_dead(self.store, index, key);
         if let Some(s) = &self.stats {
             s.index_scan(index, rows + dead, rows);
-            self.scans.borrow_mut().push(PageScan::Index(index, Some(key.clone())));
+            self.scans
+                .borrow_mut()
+                .push(PageScan::Index(index, Some(key.clone())));
         }
     }
 
