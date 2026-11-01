@@ -17126,10 +17126,36 @@ fn plan_aggregate_item(
             _ => Nulls::First,
         };
         if f.args.len() != nargs {
-            return Err(Error::UndefinedFunction(format!(
-                "function {name}({}) does not exist",
-                vec!["unknown"; f.args.len()].join(", ")
-            )));
+            // `ParseFuncOrColumn` (parse_func.c): the candidate is looked up
+            // by every argument's type, the direct ones and then the
+            // ordering columns', and a hypothetical-set aggregate's hint
+            // gives both counts (measured on 15.19, RP-308).
+            let mut types: Vec<String> = call_arg_types(f, params)
+                .iter()
+                .map(|t| display_type(t))
+                .collect();
+            types.push(display_type(ty.as_deref().unwrap_or("unknown")));
+            for (i, key) in rest.iter().enumerate() {
+                let t = match key.node.as_ref() {
+                    Some(N::SortBy(sb)) => match sb.node.as_deref() {
+                        Some(n) => resolve(n, format!("__agg{index}_ord{}", i + 1))?.1,
+                        None => None,
+                    },
+                    _ => None,
+                };
+                types.push(display_type(t.as_deref().unwrap_or("unknown")));
+            }
+            let mut message = format!("function {name}({}) does not exist", types.join(", "));
+            if hypothetical {
+                message.push_str(&format!(
+                    "\nHint: To use the hypothetical-set aggregate {name}, the number of \
+                     hypothetical direct arguments (here {}) must match the number of \
+                     ordering columns (here {}).",
+                    f.args.len(),
+                    f.agg_order.len()
+                ));
+            }
+            return Err(Error::UndefinedFunction(message));
         }
         item.direct = f
             .args
