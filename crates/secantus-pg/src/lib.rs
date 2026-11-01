@@ -18977,15 +18977,18 @@ impl PgHandler {
         let Some(rel) = relation(args.first().unwrap_or(&Bson::Null))? else {
             return Ok(Bson::Null);
         };
-        // A B-tree index: its pages as the model has them (RP-196).
+        // A B-tree, GIN or GiST index: its pages as the model has them
+        // (RP-196, RP-287).
         let index = self
             .index_relations()
             .into_iter()
             .find(|ix| Self::index_relstats_key(&ix.table.name, &ix.name) == rel);
         if let Some(ix) = index {
-            let bytes = self
-                .btree_size(&ix.table.name, &ix.name)?
-                .map_or(0, |(p, _, _)| i64::from(p) * PAGE);
+            let pages = match self.btree_size(&ix.table.name, &ix.name)? {
+                Some((p, _, _)) => Some(p),
+                None => self.am_pages(&ix.table.name, &ix.name),
+            };
+            let bytes = pages.map_or(0, |p| i64::from(p) * PAGE);
             return Ok(Bson::Int64(match name {
                 "pg_indexes_size" => 0,
                 _ => bytes,
@@ -19026,18 +19029,27 @@ impl PgHandler {
             catalog_meta::system_index_count(oid)
         });
         let encoded = catalog_blocks.map_or(encoded, |b| b * PAGE);
-        // A B-tree is the model's pages; another index an estimate.
-        let btrees = if catalog.is_none() {
-            self.btree_names(&rel)
+        // A B-tree, GIN or GiST index is the model's pages; another index
+        // an estimate.
+        let modelled: Vec<i64> = if catalog.is_none() {
+            let mut out = Vec::new();
+            for b in self.btree_names(&rel) {
+                if let Some((p, _, _)) = self.btree_size(&rel, &b)? {
+                    out.push(i64::from(p) * PAGE);
+                }
+            }
+            for shape in self.am_shapes(&rel) {
+                if let Some(p) = self.am_pages(&rel, shape.name()) {
+                    out.push(i64::from(p) * PAGE);
+                }
+            }
+            out
         } else {
             Vec::new()
         };
-        let mut indexes = (index_count - btrees.len() as i64).max(0) * pages(encoded.max(PAGE) / 2);
-        for b in &btrees {
-            if let Some((p, _, _)) = self.btree_size(&rel, b)? {
-                indexes += i64::from(p) * PAGE;
-            }
-        }
+        let mut indexes =
+            (index_count - modelled.len() as i64).max(0) * pages(encoded.max(PAGE) / 2);
+        indexes += modelled.iter().sum::<i64>();
         // A table with a TOASTable column has a TOAST table, whose index is
         // one page even when empty; `pg_table_size` counts it.
         let toast = match self.lookup(&rel) {

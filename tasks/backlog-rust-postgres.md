@@ -1006,8 +1006,6 @@ batch, their tests regression tests:
       on them (`predicate-gin` 31 of 31, `predicate-gist` 40 of 40; was 19
       and 22, RP-254). Not yet, each falling back to a relation lock as
       before:
-      - `pg_relation_size` of a GIN or GiST index reads 0 though the model
-        knows its pages;
       - GIN `=` on arrays, and opclasses other than `array_ops` (jsonb,
         tsvector, btree_gin); array elements other than ints, floats, bool
         and C-ordered text; an ANALYZEd array column (MCELEM statistics);
@@ -1019,8 +1017,11 @@ batch, their tests regression tests:
         seed; the model uses a fixed one, so on overlapping `box_ops` data a
         tuple can land on another page than in a given backend (15.19 gave
         the same layout on three runs).
+      The size functions read the modelled indexes' pages (since RP-287's
+      first slice); an unmodelled one (a `jsonb_ops` GIN index) still
+      reads 0 from `pg_relation_size`.
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_gin_and_gist_indexes_have_their_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_jsonb_gin_index_has_its_pages
 
 
 
