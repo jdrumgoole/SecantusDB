@@ -30,6 +30,11 @@ Writes three files the server compiles in:
   tuple's heap TID count (``1x40`` is forty plain tuples; a posting list
   counts its TIDs) and an internal page's are its downlinks' blocks. A
   non-rightmost page's high key is not an item.
+* ``crates/secantus-pg/src/pg15_catalog_heaps.txt`` -- every built-in
+  catalog's heap as ``initdb`` left it (RP-291): a ``\\heap oid name blocks``
+  line, then one line per block holding live tuples, ``block offsets``, the
+  offsets as ranges (``1-57,60``) in ``ctid`` order. A row of the rows file
+  above is the table's n-th live tuple here.
 """
 
 from __future__ import annotations
@@ -225,6 +230,7 @@ def main(dsn: str) -> None:
 
         statistics(conn)
         index_pages(conn)
+        heap_tids(conn)
 
 
 def statistics(conn: psycopg.Connection) -> None:
@@ -416,6 +422,36 @@ def index_pages(conn: psycopg.Connection) -> None:
                 tid_text = ",".join(f"{b}.{o}" for b, o in item_tids)
                 out.append("= " + "\t".join([tid_text, *cells]) + "\n")
     (ROOT / "crates/secantus-pg/src/pg15_catalog_indexes.txt").write_text("".join(out))
+
+
+def ranges(offsets: list[int]) -> str:
+    out: list[str] = []
+    i = 0
+    while i < len(offsets):
+        j = i
+        while j + 1 < len(offsets) and offsets[j + 1] == offsets[j] + 1:
+            j += 1
+        out.append(f"{offsets[i]}-{offsets[j]}" if j > i else str(offsets[i]))
+        i = j + 1
+    return ",".join(out)
+
+
+def heap_tids(conn: psycopg.Connection) -> None:
+    """Each built-in catalog's live tuples' ``ctid``, by block (RP-291)."""
+    out = []
+    for oid, name in conn.execute(
+        "select c.oid, c.relname from pg_class c where c.relkind = 'r'"
+        " and c.relnamespace = 'pg_catalog'::regnamespace and c.oid < 16384 order by 1"
+    ).fetchall():
+        blocks = conn.execute("select pg_relation_size(%s) / 8192", (oid,)).fetchone()[0]
+        out.append(f"\\heap {oid} {name} {blocks}\n")
+        by_block: dict[int, list[int]] = {}
+        for (tid,) in conn.execute(f"select t.ctid::text from pg_catalog.{name} t order by t.ctid"):
+            blk, off = tid.strip("()").split(",")
+            by_block.setdefault(int(blk), []).append(int(off))
+        for blk, offs in by_block.items():
+            out.append(f"{blk} {ranges(offs)}\n")
+    (ROOT / "crates/secantus-pg/src/pg15_catalog_heaps.txt").write_text("".join(out))
 
 
 if __name__ == "__main__":

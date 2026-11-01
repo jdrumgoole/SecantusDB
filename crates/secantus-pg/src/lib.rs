@@ -43,6 +43,7 @@ mod casts;
 mod catalog_btree;
 mod catalog_facts;
 mod catalog_fill;
+mod catalog_heap;
 mod catalog_meta;
 mod catalog_objects;
 mod catalog_order;

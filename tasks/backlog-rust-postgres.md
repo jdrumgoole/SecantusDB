@@ -1221,11 +1221,11 @@ a regression test.
       regression test `test_catalog_index_blocks`), but not the heap pages
       behind them.
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
-      sequence of PRs, this item open until the last. Remaining slices:
-      (1) record each built-in catalog row's `initdb` ctid in the 15.19
-      dump's rows (`tools/probes/pg15_system_catalog_dump.py`, the rows
-      file and the generated `pg_class` / `pg_attribute` tables) -- the
-      index entries' TIDs are recorded already; (2) place every later
+      sequence of PRs, this item open until the last. Done: every
+      built-in catalog's `initdb` heap -- each live tuple's ctid and the
+      heap's blocks -- is recorded (`pg15_catalog_heaps.txt`,
+      `catalog_heap.rs`; an index entry names a HOT chain's root).
+      Remaining slices: (2) place every later
       catalog row with the heap page model (`heap_page.rs`) and insert its
       index entries into the index trees, which hold only `initdb`'s
       tuples and are shared by every database -- with a non-HOT update's

@@ -426,6 +426,45 @@ mod tests {
     }
 
     #[test]
+    fn every_index_entry_names_a_block_of_its_initdb_heap() {
+        // Each index's entries against its table's recorded heap: one per
+        // tuple, as many on each heap block (an entry names a HOT chain's
+        // root, which is on its live tuple's page).
+        let heaps = crate::catalog_heap::initdb_heaps();
+        let per_block = |tids: &mut dyn Iterator<Item = i64>| {
+            let mut m: HashMap<i64, usize> = HashMap::new();
+            for t in tids {
+                *m.entry(t / 65536).or_default() += 1;
+            }
+            m
+        };
+        for (index, table) in [
+            (2662, 1259),
+            (2663, 1259),
+            (3455, 1259),
+            (2658, 1249),
+            (2659, 1249),
+            (2690, 1255),
+            (2691, 1255),
+            (2684, 2615),
+            (2685, 2615),
+            (2678, 2610),
+            (2679, 2610),
+            (2703, 1247),
+            (2704, 1247),
+        ] {
+            let entries = layouts()[&index].in_order();
+            let heap = &heaps[&table];
+            assert_eq!(
+                per_block(&mut entries.iter().map(|e| e.1)),
+                per_block(&mut heap.tids.iter().copied()),
+                "index {index} over {}",
+                heap.name
+            );
+        }
+    }
+
+    #[test]
     fn a_name_lookup_reads_the_way_down_to_its_leaf() {
         let t = tree(2663).expect("pg_class_relname_nsp_index");
         let pages = |name: &str| {
