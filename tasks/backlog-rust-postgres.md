@@ -650,17 +650,22 @@ one beside it.
     two-table ones match (1,017 and 177 before). Since 2026-11-01 a DESC
     key on a LEFT join's nullable side is searched too: the merge with that
     side outer sorts both sides descending, and a side presorted ascending
-    is sorted for it (1,130 of 1,140 and 212 of 240). All 38 left are
-    shapes with an index: the search declines a DESC ORDER BY when an
-    index scan is in its class's order, or on a nullable key's table
-    (PostgreSQL keeps both the forward scan, ascending, and a backward
-    one), so those shapes are joined whole and sorted. Declined still: an
+    is sorted for it (1,130 of 1,140 and 212 of 240). Since 2026-11-01 an
+    index scan in a DESC ORDER BY's class gives two paths, as
+    `build_index_paths` does: the forward scan, ascending and of use for
+    merging, and a backward one in the query's order; a merge reading a
+    side presorted takes that side's direction (1,140 of 1,140 and 226 of
+    240). The 14 left are LEFT joins of 3,000-row tables with an index,
+    where the search declines a DESC ORDER BY of a key an outer join
+    NULL-extends (or one no clause reads) with an index scan in its
+    order: whether the forward scan is of use there is not modelled, so
+    those shapes are joined whole and sorted. Declined still: an
     ORDER BY with NULLs against its direction's
     default (ASC NULLS FIRST, DESC NULLS LAST), an ORDER BY of several
     columns, and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_order_by_with_an_index_in_its_order
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_nullable_key_with_an_index_keeps_its_ties
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
