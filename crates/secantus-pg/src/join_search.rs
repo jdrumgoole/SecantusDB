@@ -203,6 +203,10 @@ pub(crate) struct Step {
     /// Further clauses' keys `(a_key, b_key)`, sorted and matched on after
     /// the first (a join of two relations on several clauses).
     pub(crate) extra: Vec<(String, String)>,
+    /// A merge join on the ORDER BY's class under a DESC ORDER BY: both
+    /// sides sorted descending (`select_outer_pathkeys_for_merge` takes
+    /// the query's pathkeys' direction for the merge's).
+    pub(crate) desc: bool,
 }
 
 /// The search's answer: which two tables join first (by index into the
@@ -726,6 +730,7 @@ impl PgHandler {
                 batches: None,
                 extra: Vec::new(),
                 hash_tuple: None,
+                desc: false,
             },
             joinrel_first: c.pair_first,
             second_step: Step {
@@ -740,6 +745,7 @@ impl PgHandler {
                 batches: None,
                 extra: Vec::new(),
                 hash_tuple: None,
+                desc: false,
             },
         };
         Some(plan)
@@ -884,7 +890,23 @@ impl PgHandler {
         // Several clauses: every key, sorted on in clause order and matched
         // on. The fills and table orders below are single-key.
         if !step.extra.is_empty() {
+            if step.desc {
+                return Ok(None);
+            }
             return self.run_step_on_keys(step, a, b, on);
+        }
+        // A descending merge: an inner or LEFT one. A right or full merge
+        // places its unmatched rows by the ascending order (`merge_full_place`,
+        // `merge_right_fill`), which is not modelled descending.
+        if step.desc
+            && matches!(
+                step.method,
+                JoinMethod::MergeFullA { .. }
+                    | JoinMethod::MergeFullB { .. }
+                    | JoinMethod::MergeRightB { .. }
+            )
+        {
+            return Ok(None);
         }
         // A hash table that outgrows the buckets its estimate sized: its
         // rows in the rebuilt chains' order, which every arm below keeps.
@@ -980,7 +1002,14 @@ impl PgHandler {
             }
             method => {
                 if !grown {
-                    reorder_join_inputs(method, &mut a.rows, &step.a_key, &mut b.rows, &step.b_key);
+                    crate::reorder_join_inputs_dir(
+                        method,
+                        &mut a.rows,
+                        std::slice::from_ref(&step.a_key),
+                        &mut b.rows,
+                        std::slice::from_ref(&step.b_key),
+                        step.desc,
+                    );
                 }
                 let kind = if step.left {
                     JoinKind::Left
