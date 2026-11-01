@@ -933,18 +933,6 @@ tests regression tests:
       Backlog-ID: RP-302
       Verify: tests/backlog/test_rp_catalog_identity.py::test_builtin_relations_attributes
 
-- [ ] **A hypothetical-set aggregate with the wrong number of direct
-      arguments names it by `unknown`s and gives the generic hint**:
-      `rank(2) WITHIN GROUP (ORDER BY a, b)` is 42883 `function
-      rank(unknown) does not exist` where PostgreSQL 15.19 says `function
-      rank(integer, integer, text) does not exist` with the hint `To use the
-      hypothetical-set aggregate rank, the number of hypothetical direct
-      arguments (here 1) must match the number of ordering columns (here
-      2).` The planner's `Error::hint` is a `&'static str`, so a hint that
-      carries the counts needs the error type changed. Found while closing
-      RP-283.
-      Backlog-ID: RP-308
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_hypothetical_set_aggregate_with_too_few_direct_arguments
 - [ ] **A seven-relation join to a large DISTINCT subquery on an
       expression key exhausts memory**: `element_types`' query with its row
       IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the

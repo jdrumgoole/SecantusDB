@@ -15611,6 +15611,49 @@ def test_statistical_and_ordered_set_aggregates(home: Path) -> None:
         ) == [('{"a" : 1, "b" : [1,2]}', '[1, "x", null]', '{"f1":1,"f2":"x"}')]
 
 
+def test_within_group_argument_count_mismatch(home: Path) -> None:
+    """A WITHIN GROUP call whose direct arguments do not fit is 42883 naming
+    every argument's type, direct then ordering; a hypothetical-set
+    aggregate's hint gives both counts (PostgreSQL 15.19's answers, RP-308)."""
+    hyp = (
+        "To use the hypothetical-set aggregate {}, the number of hypothetical direct"
+        " arguments (here {}) must match the number of ordering columns (here {})."
+    )
+    generic = (
+        "No function matches the given name and argument types. You might need to add"
+        " explicit type casts."
+    )
+    cases = [
+        (
+            "select rank(1, 2) within group (order by a) from t",
+            "function rank(integer, integer, integer) does not exist",
+            hyp.format("rank", 2, 1),
+        ),
+        (
+            "select percent_rank(1, 'x') within group (order by a) from t",
+            "function percent_rank(integer, unknown, integer) does not exist",
+            hyp.format("percent_rank", 2, 1),
+        ),
+        (
+            "select dense_rank(1) within group (order by a, b) from t",
+            "function dense_rank(integer, integer, text) does not exist",
+            hyp.format("dense_rank", 1, 2),
+        ),
+        (
+            "select percentile_cont(0.5, 1) within group (order by a) from t",
+            "function percentile_cont(numeric, integer, integer) does not exist",
+            generic,
+        ),
+    ]
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("create table t (a int, b text)")
+        for sql, message, hint in cases:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as e:
+                conn.execute(sql)
+            assert (e.value.diag.message_primary, e.value.diag.message_hint) == (message, hint)
+
+
 def test_char_n_padding_and_length(home: Path) -> None:
     """`char(n)` pads on output, compares blank-insensitively, and an
     assignment that is too long is 22001 unless the excess is blanks."""

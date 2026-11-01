@@ -472,10 +472,11 @@ def test_a_hypothetical_set_aggregate_ranks_a_row_of_several_values(pg: Any) -> 
     assert got == ("ok", [(3, 3, 0.5, 0.6, 3, 0.8)])
 
 
-@pytest.mark.backlog("RP-308")
+@pytest.mark.backlog_fixed("RP-308")
 def test_a_hypothetical_set_aggregate_with_too_few_direct_arguments(pg: Any) -> None:
-    """PostgreSQL names the function by its argument types and says, in a
-    hint, how many direct arguments and ordering columns it found."""
+    """PostgreSQL named the function by its argument types and said, in a
+    hint, how many direct arguments and ordering columns it found; the
+    server named them by `unknown`s with the generic hint."""
     pg.execute("begin")
     try:
         pg.execute("create table rp308_t (a int, b text)")
