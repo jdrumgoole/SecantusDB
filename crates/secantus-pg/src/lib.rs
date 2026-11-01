@@ -353,11 +353,12 @@ thread_local! {
     static GENERAL_JOIN_LIMIT: std::cell::Cell<Option<(usize, usize, bool)>> =
         const { std::cell::Cell::new(None) };
     /// With `GENERAL_JOIN_LIMIT`, the joined-row key of the ORDER BY over
-    /// the join (one plain column, ascending), which only the join order
+    /// the join (one plain column, ascending with its NULLs last or
+    /// descending with them first, `true`), which only the join order
     /// search plans for (`four_table_join`); and, once it has, whether the
     /// plan it picked returns its rows in that order already, so that the
     /// select runs no Sort of its own (`create_ordered_paths`).
-    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<String>> =
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool)>> =
         const { std::cell::RefCell::new(None) };
     static GENERAL_JOIN_PRESORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -9831,7 +9832,11 @@ impl PgHandler {
                 {
                     return Ok(rows);
                 }
-                if let Some(rows) = self.four_table_join(node, limit_offset, order.as_deref())? {
+                if let Some(rows) = self.four_table_join(
+                    node,
+                    limit_offset,
+                    order.as_ref().map(|(k, desc)| (k.as_str(), *desc)),
+                )? {
                     return Ok(rows);
                 }
                 let lrows = self.join_rows(left)?;
@@ -35681,18 +35686,18 @@ impl PgHandler {
                 // every conjunct the join's scans and joins evaluate, so
                 // that the join's rows are the ones the LIMIT counts.
                 // With an ORDER BY of one plain column, ascending with its
-                // NULLs last, the search plans the join for the LIMIT and
-                // says whether its plan needs the Sort.
+                // NULLs last or descending with them first (each the other's
+                // exact reverse), the search plans the join for the LIMIT
+                // and says whether its plan needs the Sort.
                 let join_order = match sel.order.as_slice() {
-                    [k] if k.ascending
+                    [k] if k.ascending == matches!(k.nulls, secantus_pgplan::Nulls::Last)
                         && k.expr.is_none()
                         && !k.jsonb
-                        && matches!(k.nulls, secantus_pgplan::Nulls::Last)
                         && sel.distinct == secantus_pgplan::Distinct::None
                         && !sel.with_ties
                         && sel.lock_clauses.is_empty() =>
                     {
-                        Some(k.field.clone())
+                        Some((k.field.clone(), !k.ascending))
                     }
                     _ => None,
                 };
@@ -53320,6 +53325,22 @@ pub(crate) fn reorder_join_inputs_on(
     right: &mut Vec<Document>,
     rf: &[String],
 ) {
+    reorder_join_inputs_dir(method, left, lf, right, rf, false);
+}
+
+/// `reorder_join_inputs_on`, a merge join's sides sorted descending with
+/// their NULLs first when `desc`: the exact reverse of the ascending
+/// comparator, as a DESC pathkey's Sort applies it (`ApplySortComparator`
+/// inverts the comparison), so equal keys still compare equal and
+/// PostgreSQL's quicksort leaves them where its own DESC sort does.
+pub(crate) fn reorder_join_inputs_dir(
+    method: secantus_pgplan::joincost::JoinMethod,
+    left: &mut Vec<Document>,
+    lf: &[String],
+    right: &mut Vec<Document>,
+    rf: &[String],
+    desc: bool,
+) {
     use secantus_pgplan::joincost::JoinMethod;
     let by_key = |fields: &[String]| {
         let fields = fields.to_vec();
@@ -53337,7 +53358,7 @@ pub(crate) fn reorder_join_inputs_on(
                     }
                 };
                 if o != Ordering::Equal {
-                    return o;
+                    return if desc { o.reverse() } else { o };
                 }
             }
             Ordering::Equal

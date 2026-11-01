@@ -2510,13 +2510,15 @@ def test_an_order_by_under_a_limit_over_two_tables_reads_a_merge_join(pg: Any) -
     assert got == ("ok", [(29, 1), (85, 1), (127, 1), (92, 1), (239, 1)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_descending_order_by_under_a_limit_over_two_tables(pg: Any) -> None:
     """PostgreSQL 15.19, two 300-row tables never analysed: `t0 JOIN t1 ON
     t0.b = t1.a ORDER BY t0.b DESC LIMIT 5` is a Limit over a Merge Join
     whose sides are sorted descending, and returns t0's rows 132, 279, 90,
-    125, 118. The join search plans an ascending ORDER BY only; this one is
-    joined whole and sorted, and returns other ties."""
+    125, 118. The join search planned an ascending ORDER BY only; this one
+    was joined whole and sorted, and returned other ties. A DESC NULLS
+    FIRST key is now searched, its class's merges sorted descending
+    (`select_outer_pathkeys_for_merge`)."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_d", 2, 300)
@@ -2528,6 +2530,31 @@ def test_a_descending_order_by_under_a_limit_over_two_tables(pg: Any) -> None:
     finally:
         pg.execute("rollback")
     assert got == ("ok", [(132, 6), (279, 6), (90, 6), (125, 6), (118, 6)])
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_descending_order_by_of_a_nullable_key_under_a_limit(pg: Any) -> None:
+    """PostgreSQL 15.19, three 20-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a LEFT JOIN t2 ON t1.b = t2.a ORDER BY t2.a DESC LIMIT 5`
+    leaves its NULL-extended ties as t0's rows 19, 5, 12 and then 18, 11.
+    The search plans a DESC key on a LEFT join's nullable side (a class of
+    its own) and the ties come out 19, 12, 5 and 11, 18."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_n", 3, 20)
+        got = pg_answer(
+            pg,
+            "select rp028_n0.a, rp028_n1.a, rp028_n2.a from rp028_n0"
+            " join rp028_n1 on rp028_n0.b = rp028_n1.a"
+            " left join rp028_n2 on rp028_n1.b = rp028_n2.a"
+            " order by rp028_n2.a desc limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(19, 5, None), (5, 5, None), (12, 5, None), (18, 4, 4), (11, 4, 4)],
+    )
 
 
 @pytest.mark.backlog_fixed("RP-307")

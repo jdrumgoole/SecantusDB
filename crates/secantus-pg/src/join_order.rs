@@ -193,6 +193,12 @@ struct Search {
     /// an inner join's clause's, or its own (`ORDER_CLASS`). Paths in that
     /// order are of use at every level.
     order: Option<(String, usize)>,
+    /// That ORDER BY is descending, its NULLs first. Every path in its
+    /// class's order is then in the descending one: with no index scan in
+    /// that class (the search declines one), the class's order comes only
+    /// from merge joins on it, whose Sorts take the query's direction
+    /// (`select_outer_pathkeys_for_merge`, `make_inner_pathkeys_for_merge`).
+    order_desc: bool,
     /// Each edge's outer join (`Search::edges` order): the preserved table
     /// of a LEFT join, `usize::MAX` for a FULL join, `None` for an inner
     /// join's clause. An outer join's clause moves only into a scan of its
@@ -957,6 +963,7 @@ impl PgHandler {
                 aliases,
                 base_lists: Vec::new(),
                 order: None,
+                order_desc: false,
                 edge_outer,
                 general: false,
                 param_keys: Vec::new(),
@@ -1491,6 +1498,26 @@ impl PgHandler {
                 legacy(clause.b_in_class, b_sorted),
             )
         };
+        // A merge join on the ORDER BY's class under a descending ORDER BY
+        // sorts both sides descending (`Search::order_desc`).
+        let merge_desc = search.order_desc
+            && matches!(
+                best.method,
+                JoinMethod::MergeOuterA { .. }
+                    | JoinMethod::MergeOuterB { .. }
+                    | JoinMethod::MergeRightB { .. }
+                    | JoinMethod::MergeFullA { .. }
+                    | JoinMethod::MergeFullB { .. }
+            )
+            && search.order.as_ref().is_some_and(|(_, order)| {
+                let own = Some(clause.key_class);
+                let side = |table: usize, key: &str| match clause.class {
+                    Some(k) => Some(class_id(k)),
+                    None => search.key_ec(table, key).or(own),
+                };
+                side(clause.a_table, &clause.a_key) == Some(*order)
+                    || side(clause.b_table, &clause.b_key) == Some(*order)
+            });
         // A nested loop over a parameterized join reads it again for each
         // outer row, that row bound (`ExecReScan` with the new parameter).
         let b_outer = matches!(best.method, JoinMethod::NestOuterB);
@@ -1525,6 +1552,7 @@ impl PgHandler {
                     .iter()
                     .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
                     .collect(),
+                desc: merge_desc,
             };
             let on = clause.on.and_then(|i| chain.ons.get(i).copied().flatten());
             let mut rows = Vec::new();
@@ -1625,6 +1653,7 @@ impl PgHandler {
                 .iter()
                 .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
                 .collect(),
+            desc: merge_desc,
         };
         let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
         let (a_type, b_type) = (type_of(&step.a_key), type_of(&step.b_key));
@@ -1722,7 +1751,7 @@ impl PgHandler {
         &self,
         node: &JoinNode,
         limit: Option<(usize, usize)>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
     ) -> PgWireResult<Option<Vec<Document>>> {
         if order.is_some() && limit.is_none() {
             return Ok(None);
@@ -1745,7 +1774,7 @@ impl PgHandler {
         &self,
         node: &JoinNode,
         limit: Option<(usize, usize)>,
-        order: Option<&str>,
+        order: Option<(&str, bool)>,
         general: bool,
     ) -> PgWireResult<Option<Vec<Document>>> {
         let spanning_modelled = if limit.is_some() {
@@ -1769,15 +1798,30 @@ impl PgHandler {
                 };
                 search.filters = filters;
             }
-            if let Some(key) = order {
+            if let Some((key, desc)) = order {
                 let Some(class) = Self::order_class(&search, &chain, key) else {
                     return Ok(None);
                 };
                 search.order = Some((key.to_string(), class));
+                search.order_desc = desc;
             }
             let Some((base_lists, param_keys)) = self.build_base_lists(&search, &chain) else {
                 return Ok(None);
             };
+            // A descending ORDER BY with an index scan in its class's
+            // order: that scan's forward order is the ascending one, of use
+            // for merging, beside a backward scan in the query's
+            // (`build_index_paths`). Both directions of the class are not
+            // modelled.
+            if search.order_desc {
+                let class = search.order.as_ref().map(|(_, c)| *c);
+                if base_lists
+                    .iter()
+                    .any(|(list, _, _)| list.iter().any(|(p, _)| p.class.is_some() && p.class == class))
+                {
+                    return Ok(None);
+                }
+            }
             search.base_lists = base_lists;
             search.param_keys = param_keys;
         }

@@ -643,12 +643,21 @@ one beside it.
     of 285 with no LIMIT (247), and 228 of 240 two-table ORDER BY + LIMIT
     shapes (168); the 12 left are LEFT joins of 3,000-row tables with an
     index on the nullable key, which PostgreSQL reads by an Index Only Scan
-    under a Merge Right Join. Declined: a DESC or NULLS FIRST ORDER BY, an
-    ORDER BY of several columns, and a two-table join with a subquery
-    side.
+    under a Merge Right Join. Since 2026-11-01 a DESC NULLS FIRST ORDER BY
+    is searched too, every merge on its class sorting both sides
+    descending (`select_outer_pathkeys_for_merge`): on the matrix with
+    every ORDER BY made DESC, 1,097 of 1,140 LIMIT shapes and 212 of 240
+    two-table ones match (1,017 and 177 before). The 71 left: a DESC key
+    on a LEFT join's nullable side, ties among the NULL-extended rows in
+    another order; and the search declines a DESC ORDER BY when an index
+    scan is in its class's order (PostgreSQL keeps both the forward scan,
+    ascending, and a backward one), so those shapes are joined whole and
+    sorted. Declined still: an ORDER BY with NULLs against its direction's
+    default (ASC NULLS FIRST, DESC NULLS LAST), an ORDER BY of several
+    columns, and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_order_by_under_a_limit_over_two_tables
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_order_by_of_a_nullable_key_under_a_limit
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
