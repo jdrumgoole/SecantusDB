@@ -874,6 +874,19 @@ impl JoinPath {
 /// it can use: no join clause still to come and no ORDER BY reads it.
 pub const USELESS_KEYS: usize = usize::MAX;
 
+/// The flag that marks an equivalence class's ascending order under a
+/// descending ORDER BY on it: there the class's own id stands for the
+/// query's (descending) order, which merge joins on it take
+/// (`select_outer_pathkeys_for_merge`), and `asc_keys(c)` for the order a
+/// forward index scan returns -- a different pathkey list, so `add_path`
+/// keeps both (`build_index_paths` makes the forward and the backward scan).
+pub const ASC_KEYS: usize = 1 << 22;
+
+/// Class `class`'s ascending order under a descending ORDER BY on it.
+pub fn asc_keys(class: usize) -> usize {
+    class | ASC_KEYS
+}
+
 /// One join relation's paths (`RelOptInfo::pathlist`), as `add_path` keeps
 /// them across every pair of inputs it can be built from.
 #[derive(Debug, Clone)]
@@ -1742,16 +1755,34 @@ impl JoinRel {
                     }
                 }
                 // `generate_mergejoin_paths`; `calc_non_nestloop_required_outer`.
+                // An outer path in the class's order, or in its ascending
+                // order under a descending ORDER BY (a forward index scan):
+                // the merge takes the outer's direction, its inner sorted or
+                // presorted the same way (`find_mergeclauses_for_outer_pathkeys`,
+                // `make_inner_pathkeys_for_merge`).
                 let req = op.req_outer | inner.paths[ict].req_outer;
-                if !sensible(req) || !outer.sorted_on(oi, o_class) {
+                let asc =
+                    o_class.is_some_and(|c| op.class == Some(asc_keys(c))) && op.req_outer == 0;
+                if !sensible(req) || !(asc || outer.sorted_on(oi, o_class)) {
                     continue;
                 }
+                let (o_order, i_order) = if asc {
+                    (o_class.map(asc_keys), i_class.map(asc_keys))
+                } else {
+                    (o_class, i_class)
+                };
+                let merge_order = if right { None } else { o_order };
+                let is = if asc {
+                    inner.sorted_on(ict, i_order)
+                } else {
+                    is
+                };
                 let o = outer.at(oi, true);
                 if let Some(cost) = merge_join_full(&o, &inner.at(ict, is), true, is, qp, markable)
                 {
                     consider(cost, merge_order, merge(true, is), ids(oi, ict), None, req);
                 }
-                let Some(ic) = i_class else { continue };
+                let Some(ic) = i_order else { continue };
                 for ip in inner.presorted_inners(ic, is) {
                     if let Some(cost) =
                         merge_join_full(&o, &inner.at(ip, true), true, true, qp, markable)

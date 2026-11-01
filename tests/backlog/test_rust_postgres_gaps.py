@@ -2586,13 +2586,15 @@ def test_a_descending_nullable_key_beside_an_inner_class_keeps_its_ties(pg: Any)
     )
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_descending_order_by_with_an_index_in_its_order(pg: Any) -> None:
     """PostgreSQL 15.19, two 20-row tables never analysed, an index on
-    t1.a: `t0 JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC LIMIT 5` leaves its
-    ties as t0's rows 6, 13, 20. The search declines a DESC ORDER BY with an
-    index scan in its class's order (PostgreSQL weighs the forward scan and
-    a backward one), joins whole and sorts: 20, 13, 6."""
+    t1.a: `t0 JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC LIMIT 5` is a Limit
+    over a Nested Loop whose outer is an Index Only Scan Backward on t1, and
+    leaves its ties as t0's rows 6, 13, 20. The search declined a DESC
+    ORDER BY with an index scan in its class's order, joined whole and
+    sorted: 20, 13, 6. The forward scan (ascending, of use for merging) and
+    the backward one (`build_index_paths`) are now both in the pathlist."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_i", 2, 20)

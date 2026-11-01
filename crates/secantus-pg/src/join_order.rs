@@ -188,6 +188,9 @@ struct Search {
     /// order of, and its cheapest-total and cheapest-startup paths.
     #[allow(clippy::type_complexity)]
     base_lists: Vec<(Vec<(InPath, Option<String>)>, usize, usize)>,
+    /// By table and path index, as `base_lists`: an index scan run
+    /// backward (`BackwardScanDirection`), its key descending.
+    base_backward: Vec<Vec<bool>>,
     /// Under a LIMIT with an ORDER BY of one column, its joined-row key and
     /// the equivalence class its order is (`query_pathkeys`): the class's,
     /// an inner join's clause's, or its own (`ORDER_CLASS`). Paths in that
@@ -372,6 +375,18 @@ impl Search {
                 .map_or(0, |(p, _)| p.req_outer);
         }
         r.list.get(i).map_or(0, |c| c.req_outer)
+    }
+
+    /// The order path `pick` of relation `rel` comes out in, for a LIMIT's
+    /// search's path.
+    fn path_class(&self, rel: usize, pick: Pick) -> Option<usize> {
+        let Pick::Path(i) = pick else { return None };
+        let r = &self.rels[rel];
+        if r.set.count_ones() == 1 {
+            let t = r.set.trailing_zeros() as usize;
+            return self.base_lists.get(t)?.0.get(i)?.0.class;
+        }
+        r.list.get(i)?.class
     }
 
     /// The rows path `pick` of relation `rel` is estimated to return, for a
@@ -962,6 +977,7 @@ impl PgHandler {
                 filters: Vec::new(),
                 aliases,
                 base_lists: Vec::new(),
+                base_backward: Vec::new(),
                 order: None,
                 order_desc: false,
                 edge_outer,
@@ -1237,7 +1253,16 @@ impl PgHandler {
                 }
             }
             let useful = move |c: usize| {
-                if Some(c) == order_class || outer_reads.contains(&c) {
+                // A class's ascending order under a descending ORDER BY on
+                // it is of use for merging only.
+                let asc = c != secantus_pgplan::joincost::USELESS_KEYS
+                    && c & secantus_pgplan::joincost::ASC_KEYS != 0;
+                let c = if asc {
+                    c & !secantus_pgplan::joincost::ASC_KEYS
+                } else {
+                    c
+                };
+                if (!asc && Some(c) == order_class) || outer_reads.contains(&c) {
                     true
                 } else if let Some(k) = class_index(c) {
                     open.get(k).copied().unwrap_or(false)
@@ -1459,6 +1484,18 @@ impl PgHandler {
                         }
                     }
                 });
+                // A backward scan returns them in the exact reverse.
+                if let Pick::Path(i) = pick {
+                    if search
+                        .base_backward
+                        .get(t)
+                        .and_then(|b| b.get(i))
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        rows.reverse();
+                    }
+                }
             }
             return Ok(Some(Input {
                 rows,
@@ -1510,7 +1547,18 @@ impl PgHandler {
         };
         // A merge join on the ORDER BY's class under a descending ORDER BY
         // sorts both sides descending (`Search::order_desc`).
+        // A merge reading a side presorted in the class's ascending order (a
+        // forward index scan) runs ascending: it takes its outer's pathkeys.
+        let asc_input = |rel: usize, pick: Pick, sorted: bool| {
+            sorted
+                && search.path_class(rel, pick).is_some_and(|c| {
+                    c != secantus_pgplan::joincost::USELESS_KEYS
+                        && c & secantus_pgplan::joincost::ASC_KEYS != 0
+                })
+        };
         let merge_desc = search.order_desc
+            && !asc_input(built.a, a_pick, a_sorted)
+            && !asc_input(built.b, b_pick, b_sorted)
             && matches!(
                 best.method,
                 JoinMethod::MergeOuterA { .. }
@@ -1831,21 +1879,55 @@ impl PgHandler {
                 search.order = Some((key.to_string(), class));
                 search.order_desc = desc;
             }
-            let Some((base_lists, param_keys)) = self.build_base_lists(&search, &chain) else {
+            let Some((mut base_lists, mut param_keys)) = self.build_base_lists(&search, &chain)
+            else {
                 return Ok(None);
             };
-            // A descending ORDER BY with an index scan in its class's
-            // order: that scan's forward order is the ascending one, of use
-            // for merging, beside a backward scan in the query's
-            // (`build_index_paths`). Both directions of the class are not
-            // modelled.
+            let mut base_backward: Vec<Vec<bool>> = base_lists
+                .iter()
+                .map(|(list, _, _)| vec![false; list.len()])
+                .collect();
             if search.order_desc {
                 let class = search.order.as_ref().map(|(_, c)| *c);
-                if base_lists.iter().any(|(list, _, _)| {
-                    list.iter()
-                        .any(|(p, _)| p.class.is_some() && p.class == class)
-                }) {
+                let in_order = |p: &InPath| p.class.is_some() && p.class == class;
+                // A descending ORDER BY of a key no clause reads, or one an
+                // outer join NULL-extends (`ORDER_CLASS`), with an index
+                // scan in its order: whether the forward scan is of use
+                // (`truncate_useless_pathkeys`, an index-only scan's) is not
+                // modelled.
+                if class == Some(ORDER_CLASS)
+                    && base_lists
+                        .iter()
+                        .any(|(list, _, _)| list.iter().any(|(p, _)| in_order(p)))
+                {
                     return Ok(None);
+                }
+                // An index scan in the class's order: its forward scan's
+                // order is the ascending one, of use for merging, and a
+                // backward scan beside it is in the query's
+                // (`build_index_paths`). Equal costs and different pathkeys:
+                // `add_path` keeps both, the backward one after.
+                for (t, (list, ct, cs)) in base_lists.iter_mut().enumerate() {
+                    let mut i = 0;
+                    while i < list.len() {
+                        if !in_order(&list[i].0) {
+                            i += 1;
+                            continue;
+                        }
+                        let forward = list[i].clone();
+                        let c = forward.0.class.unwrap_or(ORDER_CLASS);
+                        list[i].0.class = Some(secantus_pgplan::joincost::asc_keys(c));
+                        list.insert(i + 1, forward);
+                        param_keys[t].insert(i + 1, None);
+                        base_backward[t].insert(i + 1, true);
+                        if *ct > i {
+                            *ct += 1;
+                        }
+                        if *cs > i {
+                            *cs += 1;
+                        }
+                        i += 2;
+                    }
                 }
                 // A key an outer join NULL-extends, read by an index scan
                 // in its order: a merge with it outer presorted is ascending
@@ -1866,6 +1948,7 @@ impl PgHandler {
                 }
             }
             search.base_lists = base_lists;
+            search.base_backward = base_backward;
             search.param_keys = param_keys;
         }
         if let Some((rows, offset)) = limit {
