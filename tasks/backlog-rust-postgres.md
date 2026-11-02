@@ -1567,6 +1567,20 @@ and most of RP-193 in batch 48; their tests there are regression tests.
 
 ## Found while working RP-316 (2026-11-02)
 
+- [ ] **CREATE DATABASE ... TEMPLATE and ALTER DATABASE ... RENAME do not
+      wait for other sessions to leave.** PostgreSQL 15.19's
+      `CountOtherDBBackends` polls up to 50 times, 100 ms apart, before
+      raising 55006 `... is being accessed by other users`; a session
+      that closes 1 s into `create database d template s` lets it succeed
+      after about 1.3 s. Here `sessions_on` (`database_ddl.rs`) counts
+      once, so a session whose client has just hung up but whose backend
+      has not yet deregistered fails the statement. It failed
+      `test_rp_found_2026_10_20.py::test_create_database_options` (RP-064)
+      in CI on PR #2278's `pg-oracle (server)` job, run 41501403251,
+      straight after the test closed its own connection to the template
+      (found while working RP-341).
+      Backlog-ID: RP-343
+      Verify: tests/backlog/test_rp_other_backends_wait.py::test_create_database_waits_for_a_closing_template_session
 - [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
       `rule_trees`' catalog snapshot by running internal queries over the
       whole of `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,

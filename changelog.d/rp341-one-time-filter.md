@@ -14,3 +14,6 @@ there.
 
 - Files RP-342: a WHERE that calls a function (not folded by PostgreSQL)
   still prints no One-Time Filter.
+- Files RP-343: CREATE DATABASE ... TEMPLATE does not wait for a closing
+  session on the template as PostgreSQL does, which failed RP-064's test
+  once in CI.
