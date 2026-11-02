@@ -467,6 +467,22 @@ fn range_hash(r: &range::Range, element: &str, h: H) -> Result<u64> {
     })
 }
 
+/// `JsonbHashScalarValue`'s fold of one scalar into `hash` (the 32-bit
+/// form `jsonb_path_ops` keys with): rotate left one bit, then XOR the
+/// scalar's own hash -- `0x01` for null, `hash_any` of a string's bytes,
+/// `hash_numeric` of a number, `0x02` / `0x04` for true / false.
+pub fn jsonb_hash_scalar(v: &json::Json, hash: u32) -> u32 {
+    let tmp = match v {
+        json::Json::Null => 1,
+        json::Json::Str(s) => H::Plain.bytes(&crate::server_encoding::bytes(s)) as u32,
+        json::Json::Number(n) => hash_numeric(&Bson::String(n.clone()), H::Plain).unwrap_or(0) as u32,
+        json::Json::Bool(true) => 2,
+        json::Json::Bool(false) => 4,
+        json::Json::Array(_) | json::Json::Object(_) => 0,
+    };
+    hash.rotate_left(1) ^ tmp
+}
+
 /// `jsonb_hash` / `jsonb_hash_extended`: the iterator's tokens folded in --
 /// an array's or object's flag at its start, each key, value and element
 /// as `JsonbHashScalarValue` hashes it -- with object keys in jsonb's own

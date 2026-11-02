@@ -159,6 +159,7 @@ impl ElemOps {
                 | "varchar"
                 | "character varying"
                 | "jsonb"
+                | "jsonb_path"
                 | "tsvector"
         )
     }
@@ -178,6 +179,12 @@ impl ElemOps {
 
     fn jsonb(&self) -> bool {
         self.elem == "jsonb"
+    }
+
+    /// `jsonb_path_ops` (`elem` is `jsonb_path`): its keys are `int4`
+    /// path hashes, compared as `btint4cmp` compares them.
+    fn jsonb_path(&self) -> bool {
+        self.elem == "jsonb_path"
     }
 }
 
@@ -305,6 +312,46 @@ fn jsonb_walk(v: &secantus_pgplan::json::Json, out: &mut Vec<Bson>, elem: bool) 
     }
 }
 
+/// `gin_extract_jsonb_path`'s walk: each value and element keyed by the
+/// hash of the keys on its path and then its own value
+/// (`JsonbHashScalarValue`). A container passes its hash on to what it
+/// holds, so nesting in an array adds nothing; each key starts again from
+/// its object's hash.
+fn jsonb_path_walk(v: &secantus_pgplan::json::Json, hash: u32, out: &mut Vec<Bson>) {
+    use secantus_pgplan::hashfn::jsonb_hash_scalar;
+    use secantus_pgplan::json::Json;
+    match v {
+        Json::Array(items) => {
+            for i in items {
+                jsonb_path_walk(i, hash, out);
+            }
+        }
+        Json::Object(members) => {
+            for (k, val) in members {
+                let keyed = jsonb_hash_scalar(&Json::Str(k.clone()), hash);
+                jsonb_path_walk(val, keyed, out);
+            }
+        }
+        scalar => out.push(Bson::Int32(jsonb_hash_scalar(scalar, hash) as i32)),
+    }
+}
+
+/// `gin_extract_jsonb_path`'s keys of a stored `jsonb` text, through
+/// `ginExtractEntries`. A bare scalar is a one-element raw-scalar array.
+fn jsonb_path_keys(ops: &ElemOps, text: &str) -> Vec<GinKey> {
+    let Ok(parsed) = secantus_pgplan::json::parse(text) else {
+        return gin_index::value_keys(ops, None);
+    };
+    // The stored value is normalised; a duplicate key keeps its last value.
+    let parsed = match secantus_pgplan::json::parse(&secantus_pgplan::json::render_jsonb(&parsed)) {
+        Ok(p) => p,
+        Err(_) => parsed,
+    };
+    let mut keys = Vec::new();
+    jsonb_path_walk(&parsed, 0, &mut keys);
+    gin_index::value_keys(ops, Some(&keys))
+}
+
 /// `gin_extract_jsonb`'s keys of a stored `jsonb` text, through
 /// `ginExtractEntries` (sorted, duplicates gone, none an `EmptyItem`).
 fn jsonb_keys(ops: &ElemOps, text: &str) -> Vec<GinKey> {
@@ -343,6 +390,12 @@ fn gin_keys(ops: &ElemOps, v: Option<&Bson>) -> Vec<GinKey> {
     if ops.tsvector() {
         return match v {
             Some(Bson::String(t)) => tsvector_keys(ops, t),
+            _ => gin_index::value_keys(ops, None),
+        };
+    }
+    if ops.jsonb_path() {
+        return match v {
+            Some(Bson::String(t)) => jsonb_path_keys(ops, t),
             _ => gin_index::value_keys(ops, None),
         };
     }
@@ -660,12 +713,30 @@ impl crate::PgHandler {
             if !matches!(method, "gin" | "gist") || opt("sqlPredicate").is_some() {
                 continue;
             }
-            // The column's default opclass only.
-            let explicit = match opt("sqlOpclasses") {
-                Some(Bson::Array(a)) => a.iter().any(|v| crate::bson_i64(v).unwrap_or(0) != 0),
-                _ => false,
+            // The column's default opclass, or `jsonb_path_ops`.
+            let explicit: Vec<i64> = match opt("sqlOpclasses") {
+                Some(Bson::Array(a)) => a
+                    .iter()
+                    .map(|v| crate::bson_i64(v).unwrap_or(0))
+                    .filter(|c| *c != 0)
+                    .collect(),
+                _ => Vec::new(),
             };
-            if explicit || opt("sqlExpressions").is_some() {
+            let path_ops = match explicit.as_slice() {
+                [] => false,
+                [oid] if method == "gin" => {
+                    let named = secantus_pgplan::misc_alter::all_opclasses()
+                        .into_iter()
+                        .find(|o| o.oid == *oid)
+                        .map(|o| o.schema == "pg_catalog" && o.name == "jsonb_path_ops");
+                    if named != Some(true) {
+                        continue;
+                    }
+                    true
+                }
+                _ => continue,
+            };
+            if opt("sqlExpressions").is_some() {
                 continue;
             }
             let Some(field) = d
@@ -693,7 +764,12 @@ impl crate::PgHandler {
                 })
             };
             let shape = if method == "gin" {
-                let elem = if matches!(col.pg_type.as_str(), "jsonb" | "tsvector") {
+                let elem = if path_ops {
+                    if col.pg_type != "jsonb" {
+                        continue;
+                    }
+                    "jsonb_path"
+                } else if matches!(col.pg_type.as_str(), "jsonb" | "tsvector") {
                     col.pg_type.as_str()
                 } else {
                     let Some(elem) = col.pg_type.strip_suffix("[]") else {
@@ -1008,7 +1084,7 @@ impl crate::PgHandler {
                         .iter()
                         .enumerate()
                         .filter(|(_, q)| {
-                            !matches!(s.elem.as_str(), "jsonb" | "tsvector")
+                            !matches!(s.elem.as_str(), "jsonb" | "jsonb_path" | "tsvector")
                                 && q.field == s.field
                                 && gin_strategy(&q.op).is_some()
                         })
@@ -1409,6 +1485,33 @@ mod tests {
             elem: "jsonb".into(),
         };
         assert_eq!(gin_keys(&ops, None)[0].cat, gin_index::Cat::NullItem);
+    }
+
+    fn path_keys(text: &str) -> Vec<i32> {
+        let ops = ElemOps {
+            elem: "jsonb_path".into(),
+        };
+        gin_keys(&ops, Some(&Bson::String(text.into())))
+            .into_iter()
+            .map(|k| match k.val {
+                Bson::Int32(i) => i,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// `gin_extract_jsonb_path` through `ginExtractEntries`: each leaf
+    /// keyed by its path's hash, sorted as int4. The values are 15.19's
+    /// `JsonbHashScalarValue` folds of `hashtext` / `hash_numeric`
+    /// (e.g. `{"k": 5}` is rotl(hashtext('k')) # hash_numeric(5)).
+    #[test]
+    fn jsonb_path_ops_keys_are_path_hashes() {
+        assert_eq!(path_keys(r#"{"k": 5}"#), [1323579723]);
+        assert_eq!(
+            path_keys(r#"{"a": [1, {"b": null}], "c": true}"#),
+            [-825163222, -487677322, -142180987]
+        );
+        assert_eq!(path_keys(r#""s""#), [-1559524521]);
     }
 
     /// A string over 125 bytes is keyed by `hash_any` (15.19's

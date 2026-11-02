@@ -1058,12 +1058,15 @@ batch, their tests regression tests:
       and 22, RP-254). Not yet, each falling back to a relation lock as
       before:
       - GIN `=` on arrays, and opclasses other than `array_ops`,
-        `jsonb_ops` and `tsvector_ops` (`jsonb_path_ops`, btree_gin), whose
+        `jsonb_ops`, `jsonb_path_ops` and `tsvector_ops` (btree_gin), whose
         indexes `pg_relation_size` reads as 0; array elements other than ints,
         floats, bool and C-ordered text; an ANALYZEd array column (MCELEM
         statistics);
       - `jsonb_ops` scans (`@>`, `?`, `?|`, `?&`): its pages and keys are
         modelled, its `extractQuery` and consistent functions are not;
+      - `jsonb_path_ops` scans (`@>`, `@?`, `@@`): its pages and keys
+        (`gin_extract_jsonb_path`) are modelled, its `extractQuery` and
+        consistent functions are not;
       - `tsvector_ops` scans (`@@`): its pages and keys
         (`gin_extract_tsvector`) are modelled, its `extractQuery` and
         consistent functions are not;
@@ -1076,10 +1079,11 @@ batch, their tests regression tests:
         tuple can land on another page than in a given backend (15.19 gave
         the same layout on three runs).
       The size functions read the modelled indexes' pages (since RP-287's
-      first slice); an unmodelled one (a `jsonb_ops` GIN index) still
-      reads 0 from `pg_relation_size`.
+      first slice); an unmodelled one (a partial, multi-column or
+      expression GIN index, or a btree_gin one) still reads 0 from
+      `pg_relation_size`.
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_jsonb_path_ops_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_a_partial_gin_index_has_its_pages
 
 
 
