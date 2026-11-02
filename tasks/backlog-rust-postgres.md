@@ -641,9 +641,9 @@ one beside it.
     (`tools/probes/pg_join_order_matrix.py`, 1,665 shapes, private 15.19):
     1,140 of 1,140 LIMIT shapes of three to five tables (1,031 before), 285
     of 285 with no LIMIT (247), and 228 of 240 two-table ORDER BY + LIMIT
-    shapes (168); the 12 left are LEFT joins of 3,000-row tables with an
+    shapes (168); the 12 left were LEFT joins of 3,000-row tables with an
     index on the nullable key, which PostgreSQL reads by an Index Only Scan
-    under a Merge Right Join. Since 2026-11-01 a DESC NULLS FIRST ORDER BY
+    under a Merge Right Join (closed 2026-11-02, below). Since 2026-11-01 a DESC NULLS FIRST ORDER BY
     is searched too, every merge on its class sorting both sides
     descending (`select_outer_pathkeys_for_merge`): on the matrix with
     every ORDER BY made DESC, 1,097 of 1,140 LIMIT shapes and 212 of 240
@@ -655,17 +655,26 @@ one beside it.
     `build_index_paths` does: the forward scan, ascending and of use for
     merging, and a backward one in the query's order; a merge reading a
     side presorted takes that side's direction (1,140 of 1,140 and 226 of
-    240). The 14 left are LEFT joins of 3,000-row tables with an index,
-    where the search declines a DESC ORDER BY of a key an outer join
-    NULL-extends (or one no clause reads) with an index scan in its
-    order: whether the forward scan is of use there is not modelled, so
-    those shapes are joined whole and sorted. Declined still: an
-    ORDER BY with NULLs against its direction's
-    default (ASC NULLS FIRST, DESC NULLS LAST), an ORDER BY of several
-    columns, and a two-table join with a subquery side.
+    240). Since 2026-11-02 a DESC ORDER BY of a key an outer join
+    NULL-extends, or one no clause reads, keeps only the backward index
+    scan: the forward scan's ascending pathkey is the wrong direction for
+    merging under that ORDER BY (`right_merge_direction`) and of no use
+    for ordering, so `truncate_useless_pathkeys` leaves it none; that
+    key's class (`ORDER_CLASS`) is the one its merge clause finds, so a
+    merge reads the backward scan presorted. And a SELECT of an ORDER BY
+    of one column under a LIMIT over two tables the search plans is no
+    longer streamed (`try_stream_join_select`): the streamed merge join
+    was another plan's and left ties in another order, which had hidden the
+    search's answer for the shapes with an index on the nullable key.
+    On the matrix (`tools/probes/pg_join_order_matrix.py`, private 15.19):
+    1,140 of 1,140 LIMIT shapes, 285 of 285 with no LIMIT and 240 of 240
+    two-table ones, ascending and with every ORDER BY made DESC (228 and
+    226 before). Declined still: an ORDER BY with NULLs against its
+    direction's default (ASC NULLS FIRST, DESC NULLS LAST), an ORDER BY of
+    several columns, and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_nullable_key_with_an_index_keeps_its_ties
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_ascending_nulls_first_order_by_keeps_its_ties
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

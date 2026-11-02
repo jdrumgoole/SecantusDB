@@ -2610,15 +2610,18 @@ def test_a_descending_order_by_with_an_index_in_its_order(pg: Any) -> None:
     assert got == ("ok", [(6, 6), (13, 6), (20, 6), (5, 5), (12, 5)])
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_descending_nullable_key_with_an_index_keeps_its_ties(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
     t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC LIMIT 5`
     leaves its NULL-extended ties as t0's rows 1722, 1274, 1288, 1281,
-    1729. The search declines a DESC ORDER BY of a key an outer join
-    NULL-extends when an index scan is in its order (whether its forward
-    scan is of use is not modelled), joins whole and sorts: 28, 7, 14, 21,
-    35."""
+    1729: a Merge Right Join with t1 read by an Index Only Scan Backward
+    and t0 sorted descending. The streamed join ran its own merge (a LIMIT
+    over two tables was never offered to the search while the stream
+    applied) and the search kept the forward index scan's ascending order as
+    one of use for merging, where `right_merge_direction` makes it the
+    wrong direction under a DESC ORDER BY of that class: 28, 7, 14, 21,
+    35. Only the backward scan is kept now, and the search plans the join."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_r", 2, 3000)
@@ -2634,6 +2637,31 @@ def test_a_descending_nullable_key_with_an_index_keeps_its_ties(pg: Any) -> None
     assert got == (
         "ok",
         [(1722, None), (1274, None), (1288, None), (1281, None), (1729, None)],
+    )
+
+
+@pytest.mark.backlog("RP-028")
+def test_an_ascending_nulls_first_order_by_keeps_its_ties(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a ORDER BY t1.a NULLS FIRST LIMIT 5` (an ORDER BY with its
+    NULLs against its direction's default) leaves its ties as t0's rows
+    1877, 1289, 1709, 1296, 2815. The join search plans only an ORDER BY
+    with the default NULLs, so this joins whole and sorts: 1289, 1709,
+    1296, 2815, 1877."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_n", 2, 3000)
+        got = pg_answer(
+            pg,
+            "select rp028_n0.a, rp028_n1.a from rp028_n0"
+            " join rp028_n1 on rp028_n0.b = rp028_n1.a"
+            " order by rp028_n1.a nulls first limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(1877, 1), (1289, 1), (1709, 1), (1296, 1), (2815, 1)],
     )
 
 

@@ -1212,12 +1212,23 @@ impl PgHandler {
             // its members; else the clause's own (an inner join's equality
             // makes one of its two keys, `process_equivalence`).
             let own = Some(clause.key_class);
+            // The ORDER BY's key, when an outer join NULL-extends it or no
+            // clause reads it, has the class of its own (`ORDER_CLASS`) its
+            // index scan's pathkeys are in: the one-member class
+            // `get_eclass_for_sort_expr` finds for the ORDER BY and for the
+            // merge clause alike.
+            let order_key = match &search.order {
+                Some((key, ORDER_CLASS)) => Some(key.as_str()),
+                _ => None,
+            };
             let a_class = match clause.class {
                 Some(k) => Some(class_id(k)),
+                None if order_key == Some(clause.a_key.as_str()) => Some(ORDER_CLASS),
                 None => search.key_ec(clause.a_table, &clause.a_key).or(own),
             };
             let b_class = match clause.class {
                 Some(k) => Some(class_id(k)),
+                None if order_key == Some(clause.b_key.as_str()) => Some(ORDER_CLASS),
                 None => search.key_ec(clause.b_table, &clause.b_key).or(own),
             };
             // A merge on several clauses that a side already in the
@@ -1795,6 +1806,12 @@ impl PgHandler {
         Ok(Some(joined))
     }
 
+    /// Whether the search plans `node` for an ORDER BY of one column under
+    /// a LIMIT (`four_table_join` with both).
+    pub(crate) fn ordered_limit_searched(&self, node: &JoinNode) -> bool {
+        self.four_table_chain(node, true, true).is_some()
+    }
+
     /// Whether `node` is a chain of four to eight tables whose join order is
     /// searched.
     pub(crate) fn four_table_plan_applies(&self, node: &JoinNode) -> bool {
@@ -1890,18 +1907,15 @@ impl PgHandler {
             if search.order_desc {
                 let class = search.order.as_ref().map(|(_, c)| *c);
                 let in_order = |p: &InPath| p.class.is_some() && p.class == class;
-                // A descending ORDER BY of a key no clause reads, or one an
-                // outer join NULL-extends (`ORDER_CLASS`), with an index
-                // scan in its order: whether the forward scan is of use
-                // (`truncate_useless_pathkeys`, an index-only scan's) is not
-                // modelled.
-                if class == Some(ORDER_CLASS)
-                    && base_lists
-                        .iter()
-                        .any(|(list, _, _)| list.iter().any(|(p, _)| in_order(p)))
-                {
-                    return Ok(None);
-                }
+                // The ORDER BY's own class (`ORDER_CLASS`: a key an outer
+                // join NULL-extends, or one no clause reads) has a
+                // one-member equivalence class that the query's pathkeys
+                // and the merge clause's share; the forward scan's
+                // ascending pathkey there is the wrong direction for
+                // merging (`right_merge_direction`) and of no use for the
+                // ORDER BY, so `truncate_useless_pathkeys` leaves it none
+                // and the backward scan, at the same cost, replaces it.
+                let unread = class == Some(ORDER_CLASS);
                 // An index scan in the class's order: its forward scan's
                 // order is the ascending one, of use for merging, and a
                 // backward scan beside it is in the query's
@@ -1911,6 +1925,15 @@ impl PgHandler {
                     let mut i = 0;
                     while i < list.len() {
                         if !in_order(&list[i].0) {
+                            i += 1;
+                            continue;
+                        }
+                        // A forward scan no clause reads the order of has
+                        // no useful pathkeys (`truncate_useless_pathkeys`):
+                        // the backward scan, in the query's order at the
+                        // same cost, replaces it.
+                        if unread {
+                            base_backward[t][i] = true;
                             i += 1;
                             continue;
                         }
@@ -1927,23 +1950,6 @@ impl PgHandler {
                             *cs += 1;
                         }
                         i += 2;
-                    }
-                }
-                // A key an outer join NULL-extends, read by an index scan
-                // in its order: a merge with it outer presorted is ascending
-                // (`generate_mergejoin_paths` takes the outer's pathkeys)
-                // beside the descending one, which is not modelled.
-                let order_table = search.order.as_ref().and_then(|(key, c)| {
-                    (*c == ORDER_CLASS)
-                        .then(|| search.aliases.iter().position(|a| a == alias_of(key)))
-                        .flatten()
-                });
-                if let Some(t) = order_table {
-                    if base_lists
-                        .get(t)
-                        .is_some_and(|(list, _, _)| list.iter().any(|(p, _)| p.class.is_some()))
-                    {
-                        return Ok(None);
                     }
                 }
             }

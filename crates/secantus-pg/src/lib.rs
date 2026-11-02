@@ -48225,7 +48225,7 @@ fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<
 /// The bound a select's LIMIT passes down to the Sort beneath it
 /// (`ExecSetTupleBound`: OFFSET + LIMIT), when it reaches one: a Unique (any
 /// DISTINCT) or a LockRows in between passes none.
-fn sort_bound(sel: &secantus_pgplan::Select) -> Option<usize> {
+pub(crate) fn sort_bound(sel: &secantus_pgplan::Select) -> Option<usize> {
     // `compute_tuples_needed`: none under WITH TIES, whose last rows are
     // not known until the ties end.
     if sel.distinct != secantus_pgplan::Distinct::None
