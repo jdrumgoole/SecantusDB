@@ -238,7 +238,10 @@ impl PgHandler {
             }
             // The primary key is listed both as the SQL key and as the
             // storage's own `_id` index: one relation in PostgreSQL.
-            if !serving.iter().any(|s: &costsize::Index| s.columns == ix.columns) {
+            if !serving
+                .iter()
+                .any(|s: &costsize::Index| s.columns == ix.columns)
+            {
                 serving.push(ix.clone());
             }
         }
