@@ -143,7 +143,14 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
             n.children.push(plan_tree(&set.right, scan));
             n
         }
-        Statement::SelectConstant(_) => PlanNode::new("Result"),
+        Statement::SelectConstant(sc) => {
+            let mut n = PlanNode::new("Result");
+            // A WHERE folded to false or NULL gates the row (RP-341).
+            if let Some(f) = &sc.one_time_filter {
+                n.details.push(("One-Time Filter".into(), f.clone()));
+            }
+            n
+        }
         Statement::ValuesConstant(_) => PlanNode::new("Values Scan on \"*VALUES*\""),
         Statement::Insert(ins) => {
             let child = match &ins.source {

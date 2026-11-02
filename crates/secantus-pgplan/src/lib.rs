@@ -3337,6 +3337,13 @@ pub struct SelectConstant {
     /// where false` is ZERO rows in PostgreSQL; before this was carried, the
     /// predicate was ignored and the row answered anyway.
     pub where_true: bool,
+    /// What `EXPLAIN` prints as the `Result`'s `One-Time Filter` (RP-341):
+    /// a WHERE that `eval_const_expressions` folds to `false` or NULL
+    /// stays as the gating qual (`false`, `NULL::boolean`), one folded to
+    /// `true` is dropped. `None` too for a WHERE holding anything but
+    /// constants and built-in operators, which PostgreSQL may keep
+    /// unfolded and deparse instead.
+    pub one_time_filter: Option<String>,
     /// `FROM function(...)`: the function stands in for a table. It is
     /// evaluated once per statement (so `select 'ok' from pg_sleep(0.5)`
     /// still waits), a set-returning one yields one row per result, and
@@ -15327,6 +15334,31 @@ fn series_where(
 /// A WHERE with no row to range over -- a constant, or a parameter -- keeps
 /// (`true`) or drops (`false`, NULL) what it guards. A non-boolean is 42804,
 /// worded as PostgreSQL words it (probed PG 16).
+/// Whether a WHERE with no FROM is one `eval_const_expressions` folds to a
+/// constant (RP-341): literals, casts, `AND` / `OR` / `NOT`, `IS [NOT]
+/// NULL` and the built-in comparison and arithmetic operators, all
+/// immutable. A function call (`now()`, stable) or anything else may stay
+/// unfolded in PostgreSQL's plan, so it is not claimed.
+fn folds_to_constant(n: &pg_query::protobuf::Node) -> bool {
+    use pg_query::protobuf::AExprKind;
+    const OPS: &[&str] = &[
+        "+", "-", "*", "/", "%", "=", "<>", "!=", "<", "<=", ">", ">=",
+    ];
+    match n.node.as_ref() {
+        Some(N::AConst(_)) => true,
+        Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(folds_to_constant),
+        Some(N::BoolExpr(b)) => b.args.iter().all(folds_to_constant),
+        Some(N::NullTest(t)) => t.arg.as_deref().is_some_and(folds_to_constant),
+        Some(N::AExpr(e)) => {
+            AExprKind::try_from(e.kind) == Ok(AExprKind::AexprOp)
+                && operator_name(e).is_ok_and(|op| OPS.contains(&op) && !user_ops::defines(op))
+                && e.lexpr.as_deref().is_none_or(folds_to_constant)
+                && e.rexpr.as_deref().is_some_and(folds_to_constant)
+        }
+        _ => false,
+    }
+}
+
 fn constant_where(w: &pg_query::protobuf::Node, params: &[Bson]) -> Result<bool> {
     Ok(match const_value(w, params)? {
         Bson::Boolean(b) => b,
@@ -27498,6 +27530,13 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         None => true,
         Some(w) => constant_where(w, params)?,
     };
+    let one_time_filter = match s.where_clause.as_deref() {
+        Some(w) if !where_true && folds_to_constant(w) => Some(match const_value(w, params)? {
+            Bson::Null => "NULL::boolean".to_string(),
+            _ => "false".to_string(),
+        }),
+        _ => None,
+    };
     // LIMIT and OFFSET over the one row: read (and refused) as anywhere
     // else -- 42P02 at a missing `$1`, 2201W for a negative count -- and a
     // LIMIT 0 or an OFFSET past the row leaves none (15.19: `select 1 limit
@@ -28264,6 +28303,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
     Ok(Statement::SelectConstant(SelectConstant {
         columns,
         where_true,
+        one_time_filter,
         source: None,
         untyped,
     }))
@@ -28419,6 +28459,7 @@ fn plan_function_source_select(
     Ok(Statement::SelectConstant(SelectConstant {
         columns,
         where_true: rest.where_true,
+        one_time_filter: None,
         source: Some(Box::new(source_col)),
         untyped: Vec::new(),
     }))

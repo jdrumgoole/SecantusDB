@@ -991,7 +991,10 @@ tests regression tests:
       (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
       job (run 40479482747, attempt 1): the statement answered `ok` after
       `pg_sleep(3)` ran to its end, where the cancel sent 2.5 s in should
-      have ended it with 57014. Attempt 2 of the same commit passed, and
+      have ended it with 57014. It recurred LOCALLY on 2026-11-02 (macOS
+      release build, under `scripts/gate_pg.sh`'s parallel load, the
+      RP-341 branch, which touches no wire or cancel code): `[2.5]`
+      answered `ok`; nine reruns idle passed. Attempt 2 of the same commit passed, and
       locally (debug build, macOS) every delay from 0.25 to 4.0 s in
       0.25 s steps answered 57014 within 0.05 s, four runs of the test
       each passing. Not diagnosed. PostgreSQL itself drops a cancel that
@@ -1453,13 +1456,17 @@ a regression test.
       (found while working RP-325).
       Backlog-ID: RP-340
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result of a function call]
-- [ ] **EXPLAIN prints no One-Time Filter for a constant WHERE.**
-      `explain select 1 where false` is `Result  (cost=0.00..0.01 rows=1
-      width=4)` with `One-Time Filter: false` on PostgreSQL 15.19 (the
-      gating qual of a Result); here the detail line is missing (found
-      while working RP-325).
-      Backlog-ID: RP-341
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result's one-time filter]
+- [ ] **EXPLAIN prints no One-Time Filter for a WHERE that calls a function.**
+      `explain select 1 where current_setting('work_mem') <> ''` is
+      `Result  (cost=0.01..0.01 rows=1 width=4)` with `One-Time Filter:
+      (current_setting('work_mem'::text) <> ''::text)` on PostgreSQL
+      15.19: a stable call is not folded, so the qual is deparsed and
+      its evaluation costed. RP-341 prints the line only for a WHERE of
+      constants and built-in operators, which folds to `false` or NULL;
+      here the line and the cost are missing (found while working
+      RP-341).
+      Backlog-ID: RP-342
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result's one-time filter of a call]
 - [ ] **A catalog read index-only is a zero-cost Seq Scan here.**
       `explain select attname from pg_attribute where attrelid = 1259`
       in a fresh database is `Index Only Scan using
@@ -1560,6 +1567,20 @@ and most of RP-193 in batch 48; their tests there are regression tests.
 
 ## Found while working RP-316 (2026-11-02)
 
+- [ ] **CREATE DATABASE ... TEMPLATE and ALTER DATABASE ... RENAME do not
+      wait for other sessions to leave.** PostgreSQL 15.19's
+      `CountOtherDBBackends` polls up to 50 times, 100 ms apart, before
+      raising 55006 `... is being accessed by other users`; a session
+      that closes 1 s into `create database d template s` lets it succeed
+      after about 1.3 s. Here `sessions_on` (`database_ddl.rs`) counts
+      once, so a session whose client has just hung up but whose backend
+      has not yet deregistered fails the statement. It failed
+      `test_rp_found_2026_10_20.py::test_create_database_options` (RP-064)
+      in CI on PR #2278's `pg-oracle (server)` job, run 41501403251,
+      straight after the test closed its own connection to the template
+      (found while working RP-341).
+      Backlog-ID: RP-343
+      Verify: tests/backlog/test_rp_other_backends_wait.py::test_create_database_waits_for_a_closing_template_session
 - [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
       `rule_trees`' catalog snapshot by running internal queries over the
       whole of `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
