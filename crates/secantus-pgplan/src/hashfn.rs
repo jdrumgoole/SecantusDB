@@ -475,7 +475,9 @@ pub fn jsonb_hash_scalar(v: &json::Json, hash: u32) -> u32 {
     let tmp = match v {
         json::Json::Null => 1,
         json::Json::Str(s) => H::Plain.bytes(&crate::server_encoding::bytes(s)) as u32,
-        json::Json::Number(n) => hash_numeric(&Bson::String(n.clone()), H::Plain).unwrap_or(0) as u32,
+        json::Json::Number(n) => {
+            hash_numeric(&Bson::String(n.clone()), H::Plain).unwrap_or(0) as u32
+        }
         json::Json::Bool(true) => 2,
         json::Json::Bool(false) => 4,
         json::Json::Array(_) | json::Json::Object(_) => 0,

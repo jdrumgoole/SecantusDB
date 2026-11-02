@@ -647,8 +647,7 @@ _RP287_PATH_OPS = {
     "nofastupdate": (
         [
             "create table rp287_p (j jsonb)",
-            "create index rp287_pg on rp287_p using gin (j jsonb_path_ops)"
-            " with (fastupdate = off)",
+            "create index rp287_pg on rp287_p using gin (j jsonb_path_ops) with (fastupdate = off)",
             "insert into rp287_p select jsonb_build_object('u', g, 'n', null)"
             " from generate_series(1, 5000) g",
         ],
