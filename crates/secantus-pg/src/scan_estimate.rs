@@ -682,6 +682,107 @@ pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
     (startup, startup + run, rows, width)
 }
 
+/// A Unique's estimate over the Sort beneath it (RP-320): PostgreSQL 15's
+/// `create_upper_unique_path` (`pathnode.c`). It starts when the Sort
+/// does, compares `ncols` columns of every input row, and returns `groups`
+/// rows (`estimate_num_groups`).
+pub(crate) fn unique_estimate(input: Estimate, ncols: usize, groups: f64) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    let (startup, total, rows, width) = input;
+    (
+        startup,
+        total + CPU_OPERATOR_COST * rows * ncols as f64,
+        groups,
+        width,
+    )
+}
+
+/// The HashAggregate `create_distinct_paths` builds for a SELECT DISTINCT
+/// (RP-320): `cost_agg` with `AGG_HASHED` and no aggregates, over its
+/// input's estimate. Its spilling past `hash_mem` is not priced, which
+/// only ever makes it cheaper than PostgreSQL's.
+pub(crate) fn hashed_distinct_estimate(input: Estimate, ncols: usize, groups: f64) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    let (_, in_total, rows, width) = input;
+    let startup = in_total + CPU_OPERATOR_COST * ncols as f64 * rows;
+    (startup, startup + CPU_TUPLE_COST * groups, groups, width)
+}
+
+impl PgHandler {
+    /// `estimate_num_groups` for a SELECT DISTINCT of user table `table`'s
+    /// stored `fields` through `filter` (RP-320): each column's
+    /// `get_variable_numdistinct`, over the rows the WHERE keeps. `None`
+    /// for a catalog, or a WHERE or column the model does not estimate.
+    pub(crate) fn distinct_groups(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+    ) -> Option<f64> {
+        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            return None;
+        }
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        let keys: Vec<hashagg::KeyStat> = fields
+            .iter()
+            .map(|f| {
+                let c = pt.def.columns.iter().find(|c| &c.field() == f)?;
+                let unique = pt.unique.contains(f);
+                let measured = pt.analyzed.as_ref().and_then(|a| a.get(f));
+                Some(if c.pg_type == "bool" {
+                    hashagg::KeyStat::Bool
+                } else if let Some(stats) = measured {
+                    hashagg::KeyStat::Analyzed {
+                        stats: stats.as_ref()?.stats,
+                        unique,
+                    }
+                } else if unique {
+                    hashagg::KeyStat::Unique
+                } else {
+                    hashagg::KeyStat::Unknown
+                })
+            })
+            .collect::<Option<_>>()?;
+        let (_, _, rows, _) = self.user_seq_scan(table, filter, &[])?;
+        Some(hashagg::estimate_groups(&keys, pt.tuples, rows) as f64)
+    }
+}
+
+#[cfg(test)]
+mod unique_tests {
+    use super::{hashed_distinct_estimate, sort_estimate, unique_estimate};
+
+    #[test]
+    fn a_unique_compares_each_sorted_row() {
+        // PostgreSQL 15.19: `select distinct a from e order by a` over a Sort
+        // of (64.83..67.33 rows=1000 width=4) is (64.83..69.83 rows=1000).
+        let (s, t, r, w) = unique_estimate((64.83, 67.33, 1000.0, 4), 1, 1000.0);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("64.83".into(), "69.83".into(), 1000.0, 4)
+        );
+    }
+
+    #[test]
+    fn few_groups_are_cheaper_hashed() {
+        // Ten groups of 1000 rows: the HashAggregate and a Sort of its ten
+        // rows undercut the Sort of all 1000, as PostgreSQL chooses.
+        let scan = (0.0, 15.0, 1000.0, 3);
+        let unique = unique_estimate(sort_estimate(scan, 4096), 1, 10.0);
+        let hashed = sort_estimate(hashed_distinct_estimate(scan, 1, 10.0), 4096);
+        assert!(hashed.1 < unique.1);
+    }
+}
+
 #[cfg(test)]
 mod sort_tests {
     use super::sort_estimate;

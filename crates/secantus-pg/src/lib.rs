@@ -40765,6 +40765,76 @@ impl PgHandler {
                         }
                     }
                 }
+                // A SELECT DISTINCT read through a Sort of one user table's
+                // sequential scan (RP-320): `create_upper_unique_path` over
+                // `cost_sort`. Only where the ORDER BY is the distinct
+                // columns themselves (the Sort Key is then the ORDER BY's),
+                // and where that path is cheaper than the HashAggregate
+                // `create_distinct_paths` also offers with the ORDER BY's
+                // Sort above it, which PostgreSQL keeps otherwise.
+                if tree.name == "Unique"
+                    && tree.children.len() == 1
+                    && tree.children[0].name == "Sort"
+                    && tree.children[0].children.len() == 1
+                    && tree.children[0].children[0].children.is_empty()
+                    && tree.children[0].children[0]
+                        .name
+                        .starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == sel.table);
+                        let fields: Vec<String> =
+                            sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                        let distinct_fields =
+                            (1..fields.len()).all(|i| !fields[..i].contains(&fields[i]));
+                        if !indexed
+                            && distinct_fields
+                            && sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::All)
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && sel.order.len() == fields.len()
+                            && sel
+                                .order
+                                .iter()
+                                .all(|k| k.expr.is_none() && fields.contains(&k.field))
+                        {
+                            if let (Some((scan, None)), Some(groups)) = (
+                                self.scan_estimate(&sel.table, &sel.filter, &fields),
+                                self.distinct_groups(&sel.table, &sel.filter, &fields),
+                            ) {
+                                let work_mem = self.kb_setting("work_mem", 4096);
+                                let sort = scan_estimate::sort_estimate(scan, work_mem);
+                                let unique =
+                                    scan_estimate::unique_estimate(sort, fields.len(), groups);
+                                let hashed = scan_estimate::sort_estimate(
+                                    scan_estimate::hashed_distinct_estimate(
+                                        scan,
+                                        fields.len(),
+                                        groups,
+                                    ),
+                                    work_mem,
+                                );
+                                // `add_path`'s fuzz factor: within 1% either
+                                // may be kept, so neither is priced.
+                                if unique.1 * 1.01 < hashed.1 {
+                                    tree.children[0].children[0].estimate = Some(scan);
+                                    tree.children[0].estimate = Some(sort);
+                                    tree.estimate = Some(unique);
+                                }
+                            }
+                        }
+                    }
+                }
                 // A plan that is one user table's plain Index Scan prints
                 // `cost_index`'s estimate when that is the cheapest path
                 // (RP-317).
