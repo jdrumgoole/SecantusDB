@@ -1432,6 +1432,70 @@ def test_gap(name: str, rust_pg: Any) -> None:
     assert got[name] == EXPECTED_GAPS[name]
 
 
+# The reg* input functions' name lookups (`regproc.c`), each statement in
+# one new session: `regtypein` parses its string as a type name,
+# `regclassin` looks the relation up along the path (an explicit schema by
+# name first), `regprocin` lists the functions of the name, and
+# `regnamespacein` looks the schema up (`pg_catalog`, already looked up by
+# the qualified `regclass` before it, is a cache hit); an oid string looks
+# nothing up. Measured on PostgreSQL 15.19; the session's start (segment 0)
+# is "a new session"'s and is left out.
+REG_INPUT_STEPS = [
+    "a|",
+    "mark",
+    "a|select 'int4'::regtype::oid",
+    "mark",
+    "a|select 'pg_class'::regclass::oid",
+    "mark",
+    "a|select 'pg_catalog.pg_type'::regclass::oid",
+    "mark",
+    "a|select 'now'::regproc::oid",
+    "mark",
+    "a|select 'pg_catalog'::regnamespace::oid",
+    "mark",
+    "a|select '1259'::regclass::oid",
+    "mark",
+]
+
+EXPECTED_REG_INPUT: list[dict[str, list[int]]] = [
+    {
+        "pg_cast_source_target_index": [1, 1, 1],
+        "pg_type_oid_index": [3, 3, 3],
+        "pg_type_typname_nsp_index": [3, 3, 3],
+    },
+    {
+        "pg_cast_source_target_index": [1, 1, 1],
+        "pg_class_relname_nsp_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+        "pg_type_typname_nsp_index": [1, 1, 1],
+    },
+    {
+        "pg_class_relname_nsp_index": [1, 1, 1],
+        "pg_namespace_nspname_index": [1, 1, 1],
+    },
+    {
+        "pg_cast_source_target_index": [1, 1, 1],
+        "pg_proc_proname_args_nsp_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+        "pg_type_typname_nsp_index": [1, 1, 1],
+    },
+    {
+        "pg_cast_source_target_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+        "pg_type_typname_nsp_index": [1, 1, 1],
+    },
+    {},
+    {},
+]
+
+
+@pytest.mark.backlog_fixed("RP-316")
+def test_the_reg_input_functions_look_names_up(rust_pg: Any) -> None:
+    """RP-316 (slice): the reg* input functions made no name lookup."""
+    got = catalog_reads(_dsn(rust_pg), {"reg": REG_INPUT_STEPS})["reg"]
+    assert got[1:] == EXPECTED_REG_INPUT
+
+
 def catalog_blocks(dsn: str) -> list[dict[str, int]]:
     """The heap blocks each catalog counts in `pg_statio_sys_tables` over
     `INDEX_BLOCK_STEPS`, which read this module's objects' catalog rows:

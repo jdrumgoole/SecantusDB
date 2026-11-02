@@ -1437,6 +1437,12 @@ impl<'a> Model<'a> {
                     return UNKNOWN;
                 };
                 self.coerce(input, target, true);
+                if let Some(text) = node(&tc.arg).and_then(string_literal) {
+                    // The reg* input function runs on the literal: at
+                    // parse time on an unknown one (`stringTypeDatum`),
+                    // as the planner folds the I/O coercion on a text one.
+                    self.reg_input(target, &text);
+                }
                 target
             }
             N::AExpr(a) => self.a_expr(a, scope, in_target),
@@ -1900,32 +1906,7 @@ impl<'a> Model<'a> {
             Some(s) => vec![self.explicit_namespace(s)?],
             None => self.active_path(),
         };
-        // `FuncnameGetCandidates`: every function of the name.
-        let all = self.functions_named(&name);
-        let members: Vec<Key> = all
-            .iter()
-            .map(|p| {
-                vec![
-                    K::N(p.name.clone()),
-                    K::N(
-                        p.args
-                            .iter()
-                            .map(i64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    ),
-                    K::O(p.nsp),
-                ]
-            })
-            .collect();
-        if self.silent == 0 {
-            self.be.search_list(
-                &self.ct,
-                Cache::ProcNameArgsNsp,
-                vec![K::N(name.clone())],
-                || members,
-            );
-        }
+        let all = self.function_candidates(&name);
         let nargs = argv.len();
         let candidates: Vec<cf::ProcFact> = all
             .into_iter()
@@ -1967,6 +1948,126 @@ impl<'a> Model<'a> {
             }
         };
         best
+    }
+
+    /// `FuncnameGetCandidates`: every function of the name, one list
+    /// search of `PROCNAMEARGSNSP`.
+    fn function_candidates(&mut self, name: &str) -> Vec<cf::ProcFact> {
+        let all = self.functions_named(name);
+        let members: Vec<Key> = all
+            .iter()
+            .map(|p| {
+                vec![
+                    K::N(p.name.clone()),
+                    K::N(
+                        p.args
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                    ),
+                    K::O(p.nsp),
+                ]
+            })
+            .collect();
+        if self.silent == 0 {
+            self.be.search_list(
+                &self.ct,
+                Cache::ProcNameArgsNsp,
+                vec![K::N(name.to_string())],
+                || members,
+            );
+        }
+        all
+    }
+
+    /// The name lookups of a reg* type's input function on `text`
+    /// (`regclassin`, `regtypein`, `regprocin`, `regnamespacein` in
+    /// `regproc.c`); an all-digits string is an oid and looks nothing up.
+    fn reg_input(&mut self, typ: i64, text: &str) {
+        let text = text.trim();
+        if text.is_empty() || text == "-" || text.bytes().all(|b| b.is_ascii_digit()) {
+            return;
+        }
+        match typ {
+            REGCLASS => {
+                // `makeRangeVarFromNameList` + `RangeVarGetRelid(NoLock)`.
+                let Some(names) = qualified_names(text) else {
+                    return;
+                };
+                let (schema, name) = match names.as_slice() {
+                    [n] => (None, n.clone()),
+                    [s, n] => (Some(s.clone()), n.clone()),
+                    _ => return,
+                };
+                let spaces = match schema {
+                    Some(s) => match self.explicit_namespace(&s) {
+                        Some(n) => vec![n],
+                        None => return,
+                    },
+                    None => self.active_path(),
+                };
+                for nsp in spaces {
+                    let rel = self.rel_in(nsp, &name);
+                    let key = vec![K::N(name.clone()), K::O(nsp)];
+                    self.search(Cache::RelNameNsp, key, |_| rel.is_some());
+                    if rel.is_some() {
+                        return;
+                    }
+                }
+            }
+            REGPROC => {
+                // `stringToQualifiedNameList`, then `FuncnameGetCandidates`.
+                let Some(names) = qualified_names(text) else {
+                    return;
+                };
+                let name = match names.as_slice() {
+                    [n] => n.clone(),
+                    [s, n] => {
+                        if self.explicit_namespace(s).is_none() {
+                            return;
+                        }
+                        n.clone()
+                    }
+                    _ => return,
+                };
+                self.function_candidates(&name);
+            }
+            REGNAMESPACE => {
+                // `get_namespace_oid`: no permission check.
+                let Some(names) = qualified_names(text) else {
+                    return;
+                };
+                if let [n] = names.as_slice() {
+                    let oid = self.h.cr_namespace_oid(n);
+                    self.search(Cache::NamespaceName, vec![K::N(n.clone())], |_| {
+                        oid.is_some()
+                    });
+                }
+            }
+            REGTYPE => {
+                // `parseTypeString`: the string parsed as a cast's type.
+                let Ok(parsed) = pg_query::parse(&format!("SELECT NULL::{text}")) else {
+                    return;
+                };
+                let tn = parsed.protobuf.stmts.first().and_then(|st| {
+                    let Some(N::SelectStmt(sel)) = st.stmt.as_ref()?.node.as_ref() else {
+                        return None;
+                    };
+                    let Some(N::ResTarget(rt)) = sel.target_list.first()?.node.as_ref() else {
+                        return None;
+                    };
+                    let Some(N::TypeCast(tc)) = node(&rt.val) else {
+                        return None;
+                    };
+                    tc.type_name.clone()
+                });
+                if let Some(tn) = tn {
+                    self.parser(|m| m.type_name(&tn));
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A SQL function's body: analysed and planned, its result not sent.
@@ -2194,6 +2295,70 @@ impl<'a> Model<'a> {
         }
     }
 }
+
+/// A string constant, seen through casts to a string type
+/// (`'now'::text::regproc`).
+fn string_literal(n: &N) -> Option<String> {
+    match n {
+        N::AConst(c) => match c.val.as_ref()? {
+            pb::a_const::Val::Sval(s) => Some(s.sval.clone()),
+            _ => None,
+        },
+        N::TypeCast(tc) => {
+            let names = names_of(&tc.type_name.as_ref()?.names);
+            match names.last().map(String::as_str) {
+                Some("text" | "varchar" | "bpchar" | "name") => string_literal(node(&tc.arg)?),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `stringToQualifiedNameList`: dotted identifiers, an unquoted one
+/// folded to lower case, a quoted one kept as written.
+fn qualified_names(s: &str) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut chars = s.chars().peekable();
+    loop {
+        let mut cur = String::new();
+        if chars.peek() == Some(&'"') {
+            chars.next();
+            loop {
+                match chars.next()? {
+                    '"' if chars.peek() == Some(&'"') => {
+                        chars.next();
+                        cur.push('"');
+                    }
+                    '"' => break,
+                    c => cur.push(c),
+                }
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c == '.' || c.is_whitespace() {
+                    break;
+                }
+                cur.extend(c.to_lowercase());
+                chars.next();
+            }
+        }
+        if cur.is_empty() {
+            return None;
+        }
+        out.push(cur);
+        match chars.next() {
+            None => return Some(out),
+            Some('.') => {}
+            Some(_) => return None,
+        }
+    }
+}
+
+const REGPROC: i64 = 24;
+const REGCLASS: i64 = 2205;
+const REGTYPE: i64 = 2206;
+const REGNAMESPACE: i64 = 4089;
 
 fn self_coercible(input: &[i64], target: &[i64]) -> bool {
     input
@@ -2899,6 +3064,23 @@ pub(crate) struct Effects {
 /// where a number names a column.
 fn literal_shape(sql: &str) -> Option<String> {
     let lower = sql.to_ascii_lowercase();
+    // A reg* type's input function looks its literal up by name, so the
+    // literal decides what the statement reads (RP-316).
+    const REG_TYPES: [&str; 10] = [
+        "regclass",
+        "regcollation",
+        "regconfig",
+        "regdictionary",
+        "regnamespace",
+        "regoper",
+        "regproc",
+        "regrole",
+        "regtype",
+        "to_reg",
+    ];
+    if REG_TYPES.iter().any(|t| lower.contains(t)) {
+        return None;
+    }
     if lower.contains("order by")
         || lower.contains("group by")
         || sql.contains('$')
@@ -3171,5 +3353,24 @@ mod tests {
         assert_eq!(literal_shape("select a from t order by 1"), None);
         assert_eq!(literal_shape("select 1.5"), None);
         assert_eq!(literal_shape("select E'x'"), None);
+        // A reg* literal is a name the input function looks up.
+        assert_eq!(literal_shape("select 'pg_class'::regclass::oid"), None);
+    }
+
+    #[test]
+    fn a_reg_literal_s_names_are_parsed_as_postgresql_parses_them() {
+        assert_eq!(
+            qualified_names("Pg_Catalog.\"My \"\"T\"\"\""),
+            Some(vec!["pg_catalog".to_string(), "My \"T\"".to_string()])
+        );
+        assert_eq!(qualified_names("a..b"), None);
+        assert_eq!(qualified_names("\"open"), None);
+        assert_eq!(
+            string_literal(&N::AConst(pb::AConst {
+                val: Some(pb::a_const::Val::Sval(pb::String { sval: "now".into() })),
+                ..Default::default()
+            })),
+            Some("now".to_string())
+        );
     }
 }
