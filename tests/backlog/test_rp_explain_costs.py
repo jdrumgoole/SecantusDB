@@ -241,6 +241,24 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select 1",
         ["Result  (cost=0.00..0.01 rows=1 width=4)"],
     ),
+    "a result's widths": (
+        "RP-325",
+        [],
+        "explain select 1, 'abc'::text, 2.5, 1::int8, true",
+        ["Result  (cost=0.00..0.01 rows=1 width=77)"],
+    ),
+    "a result's untyped literal and null": (
+        "RP-325",
+        [],
+        "explain select 'x', null",
+        ["Result  (cost=0.00..0.01 rows=1 width=64)"],
+    ),
+    "a result of a bounded varchar": (
+        "RP-325",
+        [],
+        "explain select 'ab'::varchar(10)",
+        ["Result  (cost=0.00..0.01 rows=1 width=38)"],
+    ),
     "values scan": (
         "RP-326",
         [],
@@ -474,6 +492,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # ------------------------------------------------ found while working
+    "a result of a function call": (
+        "RP-340",
+        [],
+        "explain select current_setting('work_mem')",
+        ["Result  (cost=0.00..0.01 rows=1 width=32)"],
+    ),
+    "a result's one-time filter": (
+        "RP-341",
+        [],
+        "explain select 1 where false",
+        ["Result  (cost=0.00..0.01 rows=1 width=4)", "  One-Time Filter: false"],
+    ),
     "a catalog read index-only": (
         "RP-337",
         [],
@@ -512,7 +542,7 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-334", "RP-335")
+    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-325", "RP-334", "RP-335")
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
