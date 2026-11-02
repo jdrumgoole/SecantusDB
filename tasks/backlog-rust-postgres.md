@@ -1311,16 +1311,6 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for a Unique.**
-      `explain select distinct a from e order by a` is `Unique
-      (cost=64.83..69.83 rows=1000 width=4)` over a Sort
-      (`create_upper_unique_path`). PostgreSQL 15.19 prices it
-      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
-      Since RP-314 a plan that is one relation's Seq Scan prints the
-      estimate; the scenario's expected plan is PostgreSQL's, measured
-      on a fresh cluster.
-      Backlog-ID: RP-320
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[unique]
 - [ ] **EXPLAIN prints no estimate for an Aggregate.**
       `explain select count(*) from e` is `Aggregate  (cost=17.50..17.51
       rows=1 width=8)` over a Seq Scan of width 0 (`cost_agg`,
