@@ -40658,6 +40658,51 @@ impl PgHandler {
                         }
                     }
                 }
+                // A Limit straight over one relation's sequential scan
+                // (RP-319): the scan's estimate, then
+                // `adjust_limit_rows_costs`. Only where the Seq Scan is the
+                // path PostgreSQL keeps under a LIMIT too: no clause an
+                // index could serve (`get_cheapest_fractional_path` may
+                // prefer a cheaper-to-start index scan) and no ORDER BY,
+                // DISTINCT or other node between them.
+                if tree.name == "Limit"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 1
+                    && tree.children[0].children.is_empty()
+                    && tree.children[0].name.starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == sel.table);
+                        if sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                            && sel.order.is_empty()
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && (sel.filter.is_empty() || !indexed)
+                        {
+                            let fields: Vec<String> =
+                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            if let Some((estimate, None)) =
+                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                            {
+                                // `preprocess_limit`: a constant LIMIT of 0
+                                // or less is estimated as one row.
+                                let count = sel.limit.map_or(0, |n| n.max(1));
+                                tree.children[0].estimate = Some(estimate);
+                                tree.estimate = Some(scan_estimate::limit_estimate(
+                                    estimate, sel.offset, count,
+                                ));
+                            }
+                        }
+                    }
+                }
                 // A plan that is one user table's plain Index Scan prints
                 // `cost_index`'s estimate when that is the cheapest path
                 // (RP-317).

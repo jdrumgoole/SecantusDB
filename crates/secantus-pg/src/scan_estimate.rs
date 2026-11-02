@@ -565,3 +565,81 @@ impl PgHandler {
         Some(((startup, total, rows, width), index))
     }
 }
+
+/// `clamp_row_est`: a row count rounded, and never below one.
+fn clamp_rows(rows: f64) -> f64 {
+    if rows <= 1.0 {
+        1.0
+    } else {
+        rows.round_ties_even()
+    }
+}
+
+/// A Limit's estimate over its input's (RP-319): PostgreSQL 15's
+/// `adjust_limit_rows_costs` (`pathnode.c`). `offset` and `count` are
+/// `preprocess_limit`'s estimates: 0 is none, a negative one is unknown
+/// (10% of the input), a constant LIMIT of 0 or less is counted as 1.
+pub(crate) fn limit_estimate(input: Estimate, offset: i64, count: i64) -> Estimate {
+    let (in_startup, in_total, in_rows, width) = input;
+    let (mut startup, mut total, mut rows) = (in_startup, in_total, in_rows);
+    if offset != 0 {
+        let mut skip = if offset > 0 {
+            offset as f64
+        } else {
+            clamp_rows(in_rows * 0.10)
+        };
+        if skip > rows {
+            skip = rows;
+        }
+        if in_rows > 0.0 {
+            startup += (in_total - in_startup) * skip / in_rows;
+        }
+        rows -= skip;
+        if rows < 1.0 {
+            rows = 1.0;
+        }
+    }
+    if count != 0 {
+        let mut take = if count > 0 {
+            count as f64
+        } else {
+            clamp_rows(in_rows * 0.10)
+        };
+        if take > rows {
+            take = rows;
+        }
+        if in_rows > 0.0 {
+            total = startup + (in_total - in_startup) * take / in_rows;
+        }
+        rows = take;
+        if rows < 1.0 {
+            rows = 1.0;
+        }
+    }
+    (startup, total, rows, width)
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::limit_estimate;
+
+    #[test]
+    fn a_limit_prices_its_share_of_the_input() {
+        // PostgreSQL 15.19: `select * from e limit 5` over a Seq Scan of
+        // (0.00..15.00 rows=1000 width=7) is (0.00..0.07 rows=5 width=7).
+        let (s, t, r, w) = limit_estimate((0.0, 15.0, 1000.0, 7), 0, 5);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("0.00".into(), "0.07".into(), 5.0, 7)
+        );
+        // `offset 100 limit 5`: (1.50..1.57 rows=5).
+        let (s, t, r, _) = limit_estimate((0.0, 15.0, 1000.0, 7), 100, 5);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r),
+            ("1.50".into(), "1.57".into(), 5.0)
+        );
+        // A limit past the input keeps the input's rows.
+        let (_, t, r, _) = limit_estimate((0.0, 15.0, 1000.0, 7), 0, 5000);
+        assert_eq!((t, r), (15.0, 1000.0));
+    }
+}
