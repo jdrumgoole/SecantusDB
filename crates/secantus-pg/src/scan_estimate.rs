@@ -783,6 +783,35 @@ mod unique_tests {
     }
 }
 
+/// A plain Aggregate's estimate over its input's (RP-321), for `n` counts:
+/// PostgreSQL 15's `cost_agg` with AGG_PLAIN (`costsize.c`). Each count's
+/// transition function costs one `cpu_operator_cost` per input row and
+/// none has a final function; the one output row costs `cpu_tuple_cost`.
+/// Each result is an int8, eight bytes wide.
+pub(crate) fn count_agg_estimate(input: Estimate, n: usize) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    let (_, in_total, rows, _) = input;
+    let startup = in_total + CPU_OPERATOR_COST * n as f64 * rows;
+    (startup, startup + CPU_TUPLE_COST, 1.0, 8 * n as i64)
+}
+
+#[cfg(test)]
+mod agg_tests {
+    use super::count_agg_estimate;
+
+    #[test]
+    fn a_count_prices_one_transition_per_input_row() {
+        // PostgreSQL 15.19: `select count(*) from e` over a Seq Scan of
+        // (0.00..15.00 rows=1000 width=0) is (17.50..17.51 rows=1 width=8).
+        let (s, t, r, w) = count_agg_estimate((0.0, 15.0, 1000.0, 0), 1);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("17.50".into(), "17.51".into(), 1.0, 8)
+        );
+    }
+}
+
 #[cfg(test)]
 mod sort_tests {
     use super::sort_estimate;

@@ -40838,6 +40838,77 @@ impl PgHandler {
                         }
                     }
                 }
+                // A plain Aggregate of `count` straight over one relation's
+                // sequential scan (RP-321): the scan's estimate, then
+                // `cost_agg` (AGG_PLAIN). Only `count(*)` / `count(col)`,
+                // whose transition function (`int8inc`, `int8inc_any`) is one
+                // `cpu_operator_cost` a row and whose result is an int8; and
+                // only where the Seq Scan is the path PostgreSQL keeps (no
+                // clause an index could serve).
+                if tree.name == "Aggregate"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 1
+                    && tree.children[0].children.is_empty()
+                    && tree.children[0].name.starts_with("Seq Scan on ")
+                {
+                    if let Statement::Aggregate(agg) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == agg.table);
+                        let counts = !agg.items.is_empty()
+                            && agg.items.iter().all(|it| {
+                                matches!(
+                                    it.func,
+                                    secantus_pgplan::AggFunc::CountStar
+                                        | secantus_pgplan::AggFunc::Count
+                                ) && it.expr.is_none()
+                                    && it.expr2.is_none()
+                                    && it.field2.is_none()
+                                    && !it.distinct
+                                    && it.filter.is_none()
+                                    && it.order.is_empty()
+                            });
+                        if counts
+                            && agg.group_by.is_empty()
+                            && agg.grouping_sets.is_none()
+                            && agg.groupings.is_empty()
+                            && agg.having.is_none()
+                            && agg.exprs.is_empty()
+                            && agg.order.is_empty()
+                            && agg.limit.is_none()
+                            && agg.offset == 0
+                            && !agg.with_ties
+                            && !agg.distinct
+                            && agg.sub.is_none()
+                            && agg.series.is_none()
+                            && agg.join.is_none()
+                            && agg.items.len() == agg.select.len()
+                            && agg
+                                .select
+                                .iter()
+                                .enumerate()
+                                .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
+                            && (agg.filter.is_empty() || !indexed)
+                        {
+                            let mut fields: Vec<String> = Vec::new();
+                            for f in agg.items.iter().filter_map(|it| it.field.clone()) {
+                                if !fields.contains(&f) {
+                                    fields.push(f);
+                                }
+                            }
+                            if let Some((estimate, None)) =
+                                self.scan_estimate(&agg.table, &agg.filter, &fields)
+                            {
+                                tree.children[0].estimate = Some(estimate);
+                                tree.estimate = Some(scan_estimate::count_agg_estimate(
+                                    estimate,
+                                    agg.items.len(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 // A plan that is one user table's plain Index Scan prints
                 // `cost_index`'s estimate when that is the cheapest path
                 // (RP-317).
