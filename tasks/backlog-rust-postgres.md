@@ -1555,6 +1555,22 @@ cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
 and most of RP-193 in batch 48; their tests there are regression tests.
 
 
+## Found while working RP-316 (2026-11-02)
+
+- [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
+      `rule_trees`' catalog snapshot by running internal queries over the
+      whole of `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
+      `pg_proc` and the rest (`rule_trees.rs`, `text_rows`), to render the
+      view's `pg_rewrite` tree. On an M-series Mac, `CREATE VIEW v AS SELECT a
+      FROM t` takes 1.3 s (1.6 s before `system_relation_columns` was
+      built once). PostgreSQL 15.19 takes about a millisecond. On a loaded CI
+      runner, `test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
+      went past its client's 10 s socket timeout twice on PR #2265. The
+      snapshot should hold only what the view's tree references, or be kept
+      up to date as DDL changes the catalogs.
+      Backlog-ID: RP-336
+      Verify: none -- a wall-clock cost; a timing assertion would flake, so the measurement above is the evidence
+
 ## Found by batch 34 (2026-10-23)
 
 Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap

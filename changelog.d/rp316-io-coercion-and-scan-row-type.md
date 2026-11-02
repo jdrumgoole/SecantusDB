@@ -17,3 +17,10 @@ backend.
   column's type for the executor's tuple descriptor.
 
 Fixes part of RP-316 (tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scans_types_and_an_io_coercions_functions); the rest of RP-316 stays open.
+
+#### Changed
+
+- A built-in relation's column list (`catalog_meta::system_relation_columns`)
+  is now built once instead of being re-read from the dumps on every call,
+  which takes about 15% off each `CREATE VIEW`. The rest of that cost is
+  RP-336.
