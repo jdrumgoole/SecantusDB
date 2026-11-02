@@ -561,36 +561,58 @@ pub(crate) fn pg_get_keywords_rows(def: &TableDef) -> Vec<Document> {
 /// `(name, type oid, typmod)` for each column of one of PostgreSQL's own
 /// relations, in attnum order, by the name this server gives it (`pg_amop`,
 /// `information_schema.sql_features`).
+///
+/// Built once from the dumps: a view's `pg_rewrite` tree (`rule_trees`)
+/// asks for it per column it renders, and re-reading `pg_class` and
+/// `pg_attribute` on each call made every `CREATE VIEW` take ~1.6 s.
 pub(crate) fn system_relation_columns(relation: &str) -> Option<Vec<(String, i64, i32)>> {
+    type Cols = Vec<(String, i64, i32)>;
+    static MAP: std::sync::OnceLock<std::collections::HashMap<(String, String), Cols>> =
+        std::sync::OnceLock::new();
     let (nsp, rel) = match relation.split_once('.') {
         Some(("information_schema", r)) => ("information_schema", r),
         Some(_) => return None,
         None => ("pg_catalog", relation),
     };
-    let oid = CLASSES.lines().find_map(|line| {
-        let c: Vec<&str> = line.split('\t').collect();
-        (c.get(1) == Some(&rel) && c.get(2) == Some(&nsp)).then(|| c[0].to_string())
-    })?;
-    let mut cols: Vec<(i32, String, i64, i32)> = ATTRIBUTES
-        .lines()
-        .filter_map(|l| {
+    MAP.get_or_init(|| {
+        let mut by_oid: std::collections::HashMap<&str, Vec<(i32, String, i64, i32)>> =
+            std::collections::HashMap::new();
+        for l in ATTRIBUTES.lines() {
             let c: Vec<&str> = l.split('\t').collect();
-            if c.first() != Some(&oid.as_str()) {
-                return None;
-            }
-            let num: i32 = c.get(3)?.parse().ok()?;
-            (num > 0).then(|| {
-                (
+            let (Some(oid), Some(num)) = (c.first(), c.get(3).and_then(|n| n.parse::<i32>().ok()))
+            else {
+                continue;
+            };
+            if num > 0 {
+                by_oid.entry(oid).or_default().push((
                     num,
                     c[1].to_string(),
                     c[2].parse().unwrap_or(25),
                     c.get(5).and_then(|t| t.parse().ok()).unwrap_or(-1),
-                )
-            })
-        })
-        .collect();
-    cols.sort_by_key(|c| c.0);
-    Some(cols.into_iter().map(|(_, n, t, m)| (n, t, m)).collect())
+                ));
+            }
+        }
+        let mut out = std::collections::HashMap::new();
+        for line in CLASSES.lines() {
+            let c: Vec<&str> = line.split('\t').collect();
+            let (Some(oid), Some(name), Some(space)) = (c.first(), c.get(1), c.get(2)) else {
+                continue;
+            };
+            let key = (space.to_string(), name.to_string());
+            if out.contains_key(&key) {
+                continue; // the first row of the name, as the scan found it
+            }
+            let mut cols = by_oid.get(oid).cloned().unwrap_or_default();
+            cols.sort_by_key(|c| c.0);
+            out.insert(
+                key,
+                cols.into_iter().map(|(_, n, t, m)| (n, t, m)).collect(),
+            );
+        }
+        out
+    })
+    .get(&(nsp.to_string(), rel.to_string()))
+    .cloned()
 }
 
 /// `(attcollation, attndims, attstorage)` of a system relation's column.

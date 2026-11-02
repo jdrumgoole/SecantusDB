@@ -1264,15 +1264,15 @@ a regression test.
       PostgreSQL's** (found while building RP-291's heap slice). Measured
       on 15.19 against a new session: `select count(*) from pg_am` builds
       the table's index descriptors (`pg_opclass`, `pg_amop`, `pg_amproc`,
-      eight `pg_attribute` scans where this server makes four, and the
-      `pg_type` lookups that leave `int4` cached for a later
-      `'int4'::regtype`) and reads its planner statistics
-      (`pg_statistic`, since RP-311 gave the catalogs theirs), as does
-      `select count(*) from pg_namespace`; the planner's folding of
-      `'now'::text::regproc` makes three `pg_proc` oid lookups this server
-      does not; and a `pg_operator` lookup by oid makes three `pg_cast` and
-      three `pg_type` scans too many. (The reg* input functions' name
-      lookups were the first slice.)
+      eight `pg_attribute` scans where this server makes four, five
+      `pg_class` and four `pg_index` oid lookups where it makes three and
+      two) and reads its planner statistics (`pg_statistic`, since RP-311
+      gave the catalogs theirs), as does `select count(*) from
+      pg_namespace`; and a `pg_operator` lookup by oid makes three
+      `pg_cast` scans too many and one `pg_amop_fam_strat_index` scan
+      PostgreSQL does not. (The reg* input functions' name lookups, the
+      scan's row type under an aggregate and the folding of
+      `'now'::text::regproc` were earlier slices.)
       Backlog-ID: RP-316
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a built-in catalog's first reads]
 - [ ] **The first backend after a start is counted as a warm one.**
@@ -1554,6 +1554,22 @@ scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
 cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
 and most of RP-193 in batch 48; their tests there are regression tests.
 
+
+## Found while working RP-316 (2026-11-02)
+
+- [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
+      `rule_trees`' catalog snapshot by running internal queries over the
+      whole of `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,
+      `pg_proc` and the rest (`rule_trees.rs`, `text_rows`), to render the
+      view's `pg_rewrite` tree. On an M-series Mac, `CREATE VIEW v AS SELECT a
+      FROM t` takes 1.3 s (1.6 s before `system_relation_columns` was
+      built once). PostgreSQL 15.19 takes about a millisecond. On a loaded CI
+      runner, `test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
+      went past its client's 10 s socket timeout twice on PR #2265. The
+      snapshot should hold only what the view's tree references, or be kept
+      up to date as DDL changes the catalogs.
+      Backlog-ID: RP-336
+      Verify: none -- a wall-clock cost; a timing assertion would flake, so the measurement above is the evidence
 
 ## Found by batch 34 (2026-10-23)
 

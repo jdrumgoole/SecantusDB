@@ -1496,6 +1496,31 @@ def test_the_reg_input_functions_look_names_up(rust_pg: Any) -> None:
     assert got[1:] == EXPECTED_REG_INPUT
 
 
+# The type and function lookups of "a built-in catalog's first reads", as
+# PostgreSQL 15.19 makes them (traced in the backend): `count(*)` over a
+# lone catalog scans it with a physical target list, so the executor's
+# tuple descriptor looks up every column's type (`pg_am`'s oid, name,
+# regproc and char); and `'now'::text::regproc` is a `CoerceViaIO` the
+# planner folds as far as it can -- `textout` and `regprocin` fetched by
+# `simplify_function`, `cstring`'s type by `evaluate_expr`, and
+# `cstring_out` by `cost_qual_eval` pricing the rebuilt coercion over the
+# folded `cstring`, since the stable `regprocin` does not fold.
+TYPE_AND_PROC_LOOKUPS = ("pg_type_oid_index", "pg_proc_oid_index")
+
+
+@pytest.mark.backlog_fixed("RP-316")
+def test_a_catalog_scans_types_and_an_io_coercions_functions(rust_pg: Any) -> None:
+    """RP-316 (slice): a scan under an aggregate looked up none of its row's
+    column types, and an I/O coercion's folding fetched no functions."""
+    name = "a built-in catalog's first reads"
+    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][1]})[name]
+
+    def only(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
+        return [{k: v for k, v in seg.items() if k in TYPE_AND_PROC_LOOKUPS} for seg in segments]
+
+    assert only(got) == only(EXPECTED_GAPS[name])
+
+
 def catalog_blocks(dsn: str) -> list[dict[str, int]]:
     """The heap blocks each catalog counts in `pg_statio_sys_tables` over
     `INDEX_BLOCK_STEPS`, which read this module's objects' catalog rows:

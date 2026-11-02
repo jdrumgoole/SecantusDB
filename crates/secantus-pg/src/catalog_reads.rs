@@ -170,6 +170,8 @@ pub(crate) struct Model<'a> {
     /// Walking a stored query (a view's rule): its names and operators were
     /// resolved when it was stored, so only the planner and executor read.
     stored: bool,
+    /// Aggregate calls the parser has resolved so far.
+    aggs: usize,
     /// Inside a stored query's name resolution: nothing is read.
     silent: u32,
     /// Expression nesting, and the SQL functions whose bodies are being
@@ -208,6 +210,7 @@ impl<'a> Model<'a> {
             exec: Vec::new(),
             needs: HashMap::new(),
             stored: false,
+            aggs: 0,
             silent: 0,
             depth: 0,
             active_fns: Vec::new(),
@@ -1156,6 +1159,7 @@ impl<'a> Model<'a> {
             self.range_item(f, &mut scope);
         }
         // The target list.
+        let aggs_before = self.aggs;
         let mut out_types = Vec::new();
         for t in &s.target_list {
             let Some(N::ResTarget(rt)) = t.node.as_ref() else {
@@ -1238,6 +1242,19 @@ impl<'a> Model<'a> {
         // result's types (the tuple descriptor and the row description).
         for (_, rel) in scope.rels.clone() {
             self.search(Cache::RelOid, vec![K::O(rel.oid)], |_| true);
+        }
+        // `use_physical_tlist`: a lone table scanned beneath a plain
+        // aggregate (no grouping, so no sort-group references) returns its
+        // whole row, and `ExecInitResultTypeTL` builds that row's tuple
+        // descriptor, looking up every column's type.
+        if self.aggs > aggs_before && s.group_clause.is_empty() && scope.rels.len() == 1 {
+            if let Some((_, rel)) = scope.rels.first().cloned() {
+                if rel.view.is_none() {
+                    for (_, _, typ) in &rel.columns {
+                        self.type_oid(*typ);
+                    }
+                }
+            }
         }
         if top {
             for t in &out_types {
@@ -1437,6 +1454,7 @@ impl<'a> Model<'a> {
                     return UNKNOWN;
                 };
                 self.coerce(input, target, true);
+                self.io_coercion(input, target, node(&tc.arg).is_some_and(is_constant));
                 if let Some(text) = node(&tc.arg).and_then(string_literal) {
                     // The reg* input function runs on the literal: at
                     // parse time on an unknown one (`stringTypeDatum`),
@@ -1855,6 +1873,7 @@ impl<'a> Model<'a> {
         };
         self.proc_oid(p.oid);
         if p.kind == 'a' {
+            self.aggs += 1;
             // `transformAggregateCall`, and the planner's
             // `get_agg_clause_costs`: the aggregate's row, its transition
             // and final functions' costs, its state type's width.
@@ -2273,6 +2292,44 @@ impl<'a> Model<'a> {
         }
     }
 
+    /// The planner's reads of a `CoerceViaIO` (a cast with no `pg_cast`
+    /// entry between two typed values): `eval_const_expressions` fetches
+    /// the source type's output function and the target's input function
+    /// (`simplify_function`). Over a constant, an immutable output function
+    /// folds to a `cstring` constant; when the input function cannot fold
+    /// (stable, as the reg* and date/time ones are), the rebuilt
+    /// `CoerceViaIO` reads from that `cstring`, so `cost_qual_eval` looks up
+    /// `cstring`'s output function as well (traced on PostgreSQL 15.19:
+    /// `add_function_cost` of `cstring_out` for `'now'::text::regproc`).
+    fn io_coercion(&mut self, input: i64, target: i64, constant: bool) {
+        if input == UNKNOWN || input == target || target == 0 || input == 0 {
+            return;
+        }
+        let (s, t) = (self.h.cr_base_type(input), self.h.cr_base_type(target));
+        if s == t || self.h.cr_cast(s, t).is_some() {
+            return;
+        }
+        let b = builtin();
+        let (Some(out), Some(inp)) = (b.types.get(&input), b.types.get(&target)) else {
+            return;
+        };
+        let (outfunc, infunc) = (out.output, inp.input);
+        if outfunc == 0 || infunc == 0 {
+            return;
+        }
+        self.ptype(input);
+        self.proc_oid(outfunc);
+        self.ptype(target);
+        self.proc_oid(infunc);
+        let immutable = |f: i64| b.procs.get(&f).is_some_and(|p| p.volatile == 'i');
+        if constant && immutable(outfunc) && !immutable(infunc) {
+            self.ptype(CSTRING);
+            if let Some(c) = b.types.get(&CSTRING) {
+                self.proc_oid(c.output);
+            }
+        }
+    }
+
     /// `coerce_type`: an untyped literal takes the target's input function;
     /// anything else goes through `pg_cast`.
     fn coerce(&mut self, input: i64, target: i64, explicit: bool) {
@@ -2293,6 +2350,15 @@ impl<'a> Model<'a> {
             // The coercion node's type, for its collation.
             self.ptype(target);
         }
+    }
+}
+
+/// A constant the planner folds: a literal, or casts of one.
+fn is_constant(n: &N) -> bool {
+    match n {
+        N::AConst(c) => c.val.is_some(),
+        N::TypeCast(tc) => node(&tc.arg).is_some_and(is_constant),
+        _ => false,
     }
 }
 
@@ -2356,6 +2422,7 @@ fn qualified_names(s: &str) -> Option<Vec<String>> {
 }
 
 const REGPROC: i64 = 24;
+const CSTRING: i64 = 2275;
 const REGCLASS: i64 = 2205;
 const REGTYPE: i64 = 2206;
 const REGNAMESPACE: i64 = 4089;
