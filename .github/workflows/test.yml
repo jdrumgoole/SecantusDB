@@ -1611,3 +1611,8 @@ jobs:
         run: |
           df -h / | tail -1
           sudo du -xh -d 3 /tmp "$RUNNER_TEMP" "$GITHUB_WORKSPACE" 2>/dev/null | sort -h | tail -25
+          # pytest's tmp_path is /tmp/pytest-of-<user>/pytest-<n>/popen-gw<k>/<test>0:
+          # depth 3 from /tmp stops at the worker, so list the per-test dirs and
+          # the stores inside them -- the directory name is the test's name.
+          echo "--- largest per-test pytest directories"
+          sudo du -xh -d 4 /tmp/pytest-of-* 2>/dev/null | sort -h | tail -25
