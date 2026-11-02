@@ -1242,15 +1242,15 @@ a regression test.
       PostgreSQL's** (found while building RP-291's heap slice). Measured
       on 15.19 against a new session: `select count(*) from pg_am` builds
       the table's index descriptors (`pg_opclass`, `pg_amop`, `pg_amproc`,
-      eight `pg_attribute` scans where this server makes four) and reads
-      its planner statistics (`pg_statistic`, since RP-311 gave the
-      catalogs theirs); `'pg_class'::regclass`, `'now'::regproc` and
-      `'pg_catalog'::regnamespace` make no name lookup here
-      (`pg_class_relname_nsp_index`, `pg_proc_proname_args_nsp_index`,
-      `pg_namespace_nspname_index`); `'int4'::regtype` makes one of
-      PostgreSQL's three `pg_type_typname_nsp_index` scans too few, and a
-      `pg_operator` lookup by oid three `pg_cast` and three `pg_type` too
-      many.
+      eight `pg_attribute` scans where this server makes four, and the
+      `pg_type` lookups that leave `int4` cached for a later
+      `'int4'::regtype`) and reads its planner statistics
+      (`pg_statistic`, since RP-311 gave the catalogs theirs), as does
+      `select count(*) from pg_namespace`; the planner's folding of
+      `'now'::text::regproc` makes three `pg_proc` oid lookups this server
+      does not; and a `pg_operator` lookup by oid makes three `pg_cast` and
+      three `pg_type` scans too many. (The reg* input functions' name
+      lookups were the first slice.)
       Backlog-ID: RP-316
       Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a built-in catalog's first reads]
 - [ ] **The first backend after a start is counted as a warm one.**
