@@ -16579,6 +16579,12 @@ impl PgHandler {
             ("int2" | "int4" | "int8", Bson::Int64(n)) => {
                 Some(Some((secantus_pgplan::colstats::int_key(*n), 0)))
             }
+            // `oideq`: an oid sorts as the unsigned number it is.
+            ("oid", Bson::Int32(n)) => Some(Some((
+                secantus_pgplan::colstats::int_key(i64::from(*n as u32)),
+                0,
+            ))),
+            ("oid", Bson::Int64(n)) => Some(Some((secantus_pgplan::colstats::int_key(*n), 0))),
             ("bool", Bson::Boolean(b)) => Some(Some((vec![u8::from(*b)], 0))),
             // `float8eq`: -0 equals 0, and NaN equals NaN.
             ("float4" | "float8", Bson::Double(x)) => {
@@ -42271,6 +42277,11 @@ impl PgHandler {
                             self.heap_invalidate(t)?;
                             self.stat_maintained(t, true)?;
                         }
+                    }
+                    // A database-wide ANALYZE (`get_all_vacuum_rels`) takes
+                    // the catalogs too (RP-313).
+                    if analyze && !full && tables.is_empty() {
+                        self.analyze_catalogs()?;
                     }
                 }
                 let tag = command.split(' ').next().unwrap_or_default().to_string();

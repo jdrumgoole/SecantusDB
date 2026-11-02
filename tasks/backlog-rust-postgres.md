@@ -1279,13 +1279,22 @@ a regression test.
       and local cold costs needs an instrumented PostgreSQL.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
-- [ ] **A database-wide ANALYZE does not analyse the catalogs.** Since
+- [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
-      built-in catalogs, but a plain `ANALYZE` leaves them as they were, where PostgreSQL 15.19 measures the
-      catalogs again: a new table's oid becomes the top of `pg_class.oid`'s
-      histogram (found while working RP-311).
+      built-in catalogs. Since 2026-11-02 a plain `ANALYZE` (or `VACUUM
+      ANALYZE`) re-measures the catalog columns of a type whose statistics
+      are modelled (`oid`, the integers, `bool`, `float4` / `float8`,
+      `text`), over the catalog's rows as they stand, and their rows
+      replace `initdb`'s. The other columns keep `initdb`'s rows, where
+      PostgreSQL 15.19 measures them too: `name` (a new table named
+      `zzzz_rp313` becomes the top of `pg_class.relname`'s histogram),
+      `"char"`, the `reg*` types, the arrays, `aclitem[]` and
+      `pg_node_tree`. Not modelled either: the measured catalogs'
+      `relpages` / `reltuples` in `pg_class`, and the row order of the
+      replaced `pg_statistic` rows (an update moves PostgreSQL's) (found
+      while working RP-311).
       Backlog-ID: RP-313
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_the_catalogs
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
 - [ ] **EXPLAIN of a scan of a catalog has no estimate.** `explain select *
       from pg_class where relkind = 'v'` is `Seq Scan on pg_class
       (cost=0.00..0.00 rows=0 width=0)`; PostgreSQL 15.19 in a fresh
