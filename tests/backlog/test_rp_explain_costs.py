@@ -41,6 +41,15 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# A table with a secondary and a composite index, analysed.
+_N = [
+    "create table n (a int, b int, c text)",
+    "insert into n select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",
+    "create index n_b on n (b)",
+    "create index n_ab on n (a, b)",
+    "analyze n",
+]
+
 # name: (item, setup, query, PostgreSQL 15.19's rows)
 SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     # ------------------------------------------- RP-314 a single Seq Scan
@@ -119,6 +128,15 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         [
             "Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
             "  Index Cond: (a = 5)",
+        ],
+    ),
+    "an index scan's output column": (
+        "RP-317",
+        _ANALYSED,
+        "explain select b from k where a = 500",
+        [
+            "Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=3)",
+            "  Index Cond: (a = 500)",
         ],
     ),
     "sort": (
@@ -288,6 +306,46 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select a + 1 from e",
         ["Seq Scan on e  (cost=0.00..17.50 rows=1000 width=4)"],
     ),
+    # ---------------------- RP-339 a user table's index path, chosen
+    "an index scan with a filter": (
+        "RP-339",
+        _ANALYSED,
+        "explain select * from k where a = 5 and b = 'v5'",
+        [
+            "Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "  Index Cond: (a = 5)",
+            "  Filter: (b = 'v5'::text)",
+        ],
+    ),
+    "an index scan of a key range": (
+        "RP-339",
+        _ANALYSED,
+        "explain select * from k where a < 3",
+        [
+            "Index Scan using k_pkey on k  (cost=0.28..8.31 rows=2 width=7)",
+            "  Index Cond: (a < 3)",
+        ],
+    ),
+    "an index scan of a composite index's leading column": (
+        "RP-339",
+        _N,
+        "explain select * from n where a = 7",
+        [
+            "Index Scan using n_ab on n  (cost=0.28..8.30 rows=1 width=11)",
+            "  Index Cond: (a = 7)",
+        ],
+    ),
+    "a bitmap heap scan of a user table": (
+        "RP-339",
+        _N,
+        "explain select * from n where b = 7",
+        [
+            "Bitmap Heap Scan on n  (cost=5.06..34.31 rows=100 width=11)",
+            "  Recheck Cond: (b = 7)",
+            "  ->  Bitmap Index Scan on n_b  (cost=0.00..5.03 rows=100 width=0)",
+            "        Index Cond: (b = 7)",
+        ],
+    ),
     # --------------------------------- RP-334 / RP-335 a catalog's index
     "a catalog read by its index": (
         "RP-334",
@@ -426,7 +484,7 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    fixed = item in ("RP-314", "RP-334", "RP-335")
+    fixed = item in ("RP-314", "RP-317", "RP-334", "RP-335")
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
