@@ -1870,7 +1870,8 @@ def test_a_database_wide_analyze_measures_a_name_column(rust_pg: Any) -> None:
         c.execute("create table zzzz_rp313 (a int)")
         c.execute("analyze")
         top = c.execute(
-            "select (histogram_bounds::text::name[])[array_upper(histogram_bounds::text::name[], 1)]"
+            "select (histogram_bounds::text::name[])"
+            "[array_upper(histogram_bounds::text::name[], 1)]"
             " from pg_stats where tablename = 'pg_class' and attname = 'relname'"
         ).fetchone()[0]
         assert top == "zzzz_rp313"
