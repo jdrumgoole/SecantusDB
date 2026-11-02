@@ -1472,24 +1472,26 @@ a regression test.
       plan is PostgreSQL's, measured on a fresh cluster.
       Backlog-ID: RP-333
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan of an expression]
-- [ ] **A catalog read by its index is a Seq Scan here.**
-      `explain select oid from pg_class where relname = 'pg_class'` in a
-      fresh database is `Index Scan using pg_class_relname_nsp_index on
-      pg_class  (cost=0.27..8.29 rows=1 width=4)` with `Index Cond:
-      (relname = 'pg_class'::name)` on PostgreSQL 15.19; here it is a
-      `Seq Scan` with a Filter, printed with zeros: the explain chooser
-      asks the storage planner, which has no index on a catalog (found
-      while working RP-314).
-      Backlog-ID: RP-334
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read by its index]
-- [ ] **A `name` column compared with a literal is shown cast to `text`.**
-      With index scans off, PostgreSQL 15.19 shows `explain (costs off)
-      select oid from pg_class where relname = 'pg_class'` as `Filter:
-      (relname = 'pg_class'::name)` (`name = name`); here it is `Filter:
-      ((relname)::text = 'pg_class'::text)` (found while working
-      RP-314).
-      Backlog-ID: RP-335
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a name compared with a literal]
+- [ ] **A catalog read index-only is a zero-cost Seq Scan here.**
+      `explain select attname from pg_attribute where attrelid = 1259`
+      in a fresh database is `Index Only Scan using
+      pg_attribute_relid_attnam_index on pg_attribute  (cost=0.28..4.96
+      rows=39 width=64)` with `Index Cond: (attrelid = '1259'::oid)` on
+      PostgreSQL 15.19 (`cost_index` with the heap's `relallvisible`);
+      here it is a `Seq Scan` printed with zeros. RP-334 prices a
+      catalog's plain index scan and leaves a scan whose index holds
+      every column read unpriced (found while working RP-334).
+      Backlog-ID: RP-337
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read index-only]
+- [ ] **A catalog read by a bitmap is a zero-cost Seq Scan here.**
+      With `enable_indexscan = off`, `explain select oid from pg_class
+      where relname = 'pg_class'` is a `Bitmap Heap Scan on pg_class
+      (cost=4.28..8.29 rows=1 width=4)` over a `Bitmap Index Scan on
+      pg_class_relname_nsp_index` on PostgreSQL 15.19; here the bitmap
+      path is costed cheapest but its nodes are not built, so it prints
+      a `Seq Scan` with zeros (found while working RP-334).
+      Backlog-ID: RP-338
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read by a bitmap]
 
 ## Found by batch 54 (2026-10-24)
 

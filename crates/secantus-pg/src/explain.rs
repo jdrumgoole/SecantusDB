@@ -335,6 +335,11 @@ fn structured(
         }
         fields.push(("Parallel Aware".into(), Value::Num("false".into())));
         fields.push(("Async Capable".into(), Value::Num("false".into())));
+        // An index scan reads its index forward unless an ORDER BY runs
+        // it backward (`ExplainIndexScanDetails`).
+        if node_type == "Index Scan" || node_type == "Index Only Scan" {
+            fields.push(("Scan Direction".into(), Value::Str("Forward".into())));
+        }
         for (k, v) in &n.props {
             fields.push((k.clone(), Value::Str(v.clone())));
         }

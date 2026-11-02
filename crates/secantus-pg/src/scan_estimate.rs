@@ -17,6 +17,100 @@ use secantus_pgplan::{colstats, costsize, hashagg};
 /// A plan node's `(startup cost, total cost, rows, width)`.
 pub(crate) type Estimate = (f64, f64, f64, i64);
 
+/// A scan's estimate, and the index it reads when the cheapest path is a
+/// plain index scan (`None` for a sequential scan).
+pub(crate) type ScanEstimate = (Estimate, Option<String>);
+
+/// One of PostgreSQL's own B-tree indexes on a catalog: its oid, name,
+/// key columns (stored fields, in order) and uniqueness.
+pub(crate) struct CatalogIndex {
+    pub oid: i64,
+    pub name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+/// The built-in indexes of catalog `oid` (`pg_index_system.tsv`), their
+/// key columns named as `def` stores them; `None` where a key is not a
+/// column of `def`.
+pub(crate) fn catalog_indexes(
+    oid: i64,
+    def: &secantus_pgcatalog::TableDef,
+) -> Option<Vec<CatalogIndex>> {
+    let mut out = Vec::new();
+    for line in catalog_meta::system_index_lines() {
+        let c: Vec<&str> = line.split('\t').collect();
+        if c.get(1)?.parse::<i64>().ok()? != oid {
+            continue;
+        }
+        let index: i64 = c.first()?.parse().ok()?;
+        let nkey: usize = c.get(3)?.parse().ok()?;
+        let unique = *c.get(4)? == "1";
+        let columns = c
+            .get(15)?
+            .split(' ')
+            .take(nkey)
+            .map(|a| {
+                let attnum: i64 = a.parse().ok()?;
+                let i = (0..def.columns.len()).find(|&i| i64::from(def.attnum(i)) == attnum)?;
+                Some(def.columns[i].field())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let name = catalog_meta::system_class_lines().find_map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            (c.first()?.parse::<i64>().ok()? == index).then(|| c.get(1).map(|s| s.to_string()))?
+        })?;
+        out.push(CatalogIndex {
+            oid: index,
+            name,
+            columns,
+            unique,
+        });
+    }
+    Some(out)
+}
+
+/// The key columns of the built-in catalog index `name` (by column name),
+/// for `EXPLAIN`'s `Index Cond`; empty for any other name.
+pub(crate) fn catalog_index_columns(name: &str) -> Vec<String> {
+    let found = catalog_meta::system_class_lines().find_map(|l| {
+        let c: Vec<&str> = l.split('\t').collect();
+        (c.get(1) == Some(&name) && c.get(3) == Some(&"i"))
+            .then(|| c.first()?.parse::<i64>().ok())
+            .flatten()
+    });
+    let Some(index) = found else {
+        return Vec::new();
+    };
+    let table = catalog_meta::system_index_lines().find_map(|l| {
+        let c: Vec<&str> = l.split('\t').collect();
+        (c.first()?.parse::<i64>().ok()? == index)
+            .then(|| c.get(1)?.parse::<i64>().ok())
+            .flatten()
+    });
+    let def = table.and_then(|t| {
+        catalog_meta::system_class_lines().find_map(|l| {
+            let c: Vec<&str> = l.split('\t').collect();
+            (c.first()?.parse::<i64>().ok()? == t)
+                .then(|| PgHandler::virtual_table(c.get(1)?))
+                .flatten()
+        })
+    });
+    match (table, def) {
+        (Some(t), Some(def)) => catalog_indexes(t, &def)
+            .and_then(|ix| ix.into_iter().find(|i| i.oid == index))
+            .map(|i| {
+                i.columns
+                    .iter()
+                    .filter_map(|f| def.columns.iter().find(|c| &c.field() == f))
+                    .map(|c| c.name.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// `get_typavgwidth` of a column with no `stawidth`.
 fn type_width(pg_type: &str, typmod: i32) -> i64 {
     let typlen = secantus_pgplan::pgtypes::oid_of_name(pg_type)
@@ -56,18 +150,20 @@ fn output_width(
 }
 
 impl PgHandler {
-    /// The estimate of a sequential scan of `table` through `filter` that
+    /// The estimate of the cheapest scan of `table` through `filter` that
     /// outputs `fields` (stored fields), or `None` where it is not priced.
-    pub(crate) fn seq_scan_estimate(
+    /// A user table's scan is the sequential one the storage planner
+    /// chose; a catalog's is the cheapest of its paths (RP-334).
+    pub(crate) fn scan_estimate(
         &self,
         table: &str,
         filter: &Document,
         fields: &[String],
-    ) -> Option<Estimate> {
+    ) -> Option<ScanEstimate> {
         if self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
-            self.user_seq_scan(table, filter, fields)
+            Some((self.user_seq_scan(table, filter, fields)?, None))
         } else {
-            self.catalog_seq_scan(table, filter, fields)
+            self.catalog_scan(table, filter, fields)
         }
     }
 
@@ -127,12 +223,22 @@ impl PgHandler {
     /// left it. Its rows written since are not counted: its heap's later
     /// pages are RP-291's, and PostgreSQL's estimate does not move with
     /// them until a VACUUM or ANALYZE of the catalog (RP-313).
-    fn catalog_seq_scan(
+    ///
+    /// A clause on a column one of its B-tree indexes leads with opens that
+    /// index's paths (`create_index_paths`): a plain index scan
+    /// (`cost_index` over `btcostestimate`, the index's `initdb` pages and
+    /// height) and a bitmap heap scan, kept over the sequential scan when
+    /// cheaper (`set_cheapest`). Not priced: a range on an indexed column
+    /// (`get_actual_variable_range` reads the index), a clause on an
+    /// index's later column, an index holding every column read (an
+    /// index-only scan), an `OR` over indexed columns (a BitmapOr), and a
+    /// bitmap heap scan winning (its node is not built).
+    fn catalog_scan(
         &self,
         table: &str,
         filter: &Document,
         fields: &[String],
-    ) -> Option<Estimate> {
+    ) -> Option<ScanEstimate> {
         let name = table.strip_prefix("pg_catalog.").unwrap_or(table);
         let oid = catalog_meta::system_class_lines().find_map(|line| {
             let c: Vec<&str> = line.split('\t').collect();
@@ -245,39 +351,101 @@ impl PgHandler {
             .sum();
         let measured = (reltuples >= 0.0).then_some((f64::from(relpages), reltuples));
         let (pages, tuples) = hashagg::table_size(data_width, 0, Some(u64::from(blocks)), measured);
-        let (sel, quals) = if filter.is_empty() {
-            (1.0, Vec::new())
-        } else {
-            // A clause on a column a catalog index leads with opens index
-            // paths, whose costs (and `get_actual_variable_range`) are not
-            // modelled for the catalogs.
-            let leading: Vec<String> = catalog_meta::system_index_lines()
-                .filter_map(|line| {
-                    let c: Vec<&str> = line.split('\t').collect();
-                    (c.get(1)?.parse::<i64>().ok()? == oid)
-                        .then(|| c.get(15)?.split(' ').next()?.parse::<i64>().ok())
-                        .flatten()
-                })
-                .filter_map(|attnum| {
-                    let i = (0..def.columns.len()).find(|&i| i64::from(def.attnum(i)) == attnum)?;
-                    Some(def.columns[i].field())
-                })
-                .collect();
-            let mut named = Vec::new();
-            filter_fields(filter, &mut named)?;
-            if named.iter().any(|f| leading.contains(f)) {
+        let rel = costsize::Rel { pages, tuples };
+        let width = output_width(&def, Some(&stats), fields)?;
+        if filter.is_empty() {
+            let (startup, total) = costsize::seq_scan_path(&rel, &[]);
+            return Some((
+                (startup, total, costsize::clamp_row_est(tuples), width),
+                None,
+            ));
+        }
+        let w = self.analyzed_where(table, &def, &[], &stats, tuples, filter, &[])?;
+        let rows = costsize::clamp_row_est(tuples * w.selectivity);
+        let mut named = Vec::new();
+        filter_fields(filter, &mut named)?;
+        let catalog = catalog_indexes(oid, &def)?;
+        let mut indexes = Vec::new();
+        for ix in &catalog {
+            if !named.iter().any(|f| ix.columns.contains(f)) {
+                continue;
+            }
+            let lead = ix.columns.first()?;
+            // A clause only on a later key column: the B-tree path that
+            // scans the whole index for it is not costed, and the index is
+            // left out, as before RP-334.
+            if !named.contains(lead) {
+                continue;
+            }
+            let later = named.iter().any(|f| ix.columns[1..].contains(f));
+            let ranged = w
+                .quals
+                .iter()
+                .any(|(f, q)| f == lead && matches!(q, costsize::Qual::Range(_)));
+            let covering = fields
+                .iter()
+                .chain(named.iter())
+                .all(|f| ix.columns.contains(f));
+            if later || ranged || covering || !w.bitmap_ors.is_empty() {
                 return None;
             }
-            let w = self.analyzed_where(table, &def, &[], &stats, tuples, filter, &[])?;
-            (w.selectivity, w.quals)
+            let (ipages, height) = catalog_btree::initdb_index_size(ix.oid)?;
+            let c = stats
+                .get(lead)
+                .and_then(|a| a.as_ref()?.slots.as_ref()?.correlation)
+                .map_or(0.0, f64::from);
+            indexes.push((
+                ix.name.clone(),
+                costsize::Index {
+                    field: lead.clone(),
+                    unique: ix.unique && ix.columns.len() == 1,
+                    pages: f64::from(ipages),
+                    height,
+                    columns: ix.columns.clone(),
+                    correlation: if ix.columns.len() > 1 { c * 0.75 } else { c },
+                    visible: 0.0,
+                    tuples: None,
+                    predicate: None,
+                    hash: false,
+                },
+            ));
+        }
+        // Two indexes' bitmap paths may be ANDed (`choose_bitmap_and`),
+        // which is not costed here.
+        if indexes.len() > 1 {
+            return None;
+        }
+        let paths: Vec<costsize::Index> = indexes.iter().map(|(_, ix)| ix.clone()).collect();
+        let colsel =
+            |f: &str| costsize::ColSel::Given(w.index_selectivity.get(f).copied().unwrap_or(1.0));
+        // `set_cheapest` over every path, `disable_cost` added to the
+        // startup and total of a kind an `enable_*` setting turns off.
+        const DISABLE_COST: f64 = 1.0e10;
+        let off = |name: &str| self.setting_is(name, "off");
+        let mut best: Option<(costsize::ScanKind, (f64, f64))> = None;
+        for (kind, (mut startup, mut total)) in
+            costsize::scan_paths(&rel, &paths, &w.quals, &colsel, rows)
+        {
+            let disabled = match kind {
+                costsize::ScanKind::Seq => off("enable_seqscan"),
+                costsize::ScanKind::Bitmap(_) => off("enable_bitmapscan"),
+                costsize::ScanKind::Index(_) => off("enable_indexscan"),
+            };
+            if disabled {
+                startup += DISABLE_COST;
+                total += DISABLE_COST;
+            }
+            if best.is_none_or(|(_, (bs, bt))| total < bt || (total == bt && startup < bs)) {
+                best = Some((kind, (startup, total)));
+            }
+        }
+        let (kind, (startup, total)) = best?;
+        let index = match kind {
+            costsize::ScanKind::Seq => None,
+            costsize::ScanKind::Index(i) => Some(indexes.get(i)?.0.clone()),
+            // A bitmap heap scan, whose node is not built here.
+            costsize::ScanKind::Bitmap(_) => return None,
         };
-        let rel = costsize::Rel { pages, tuples };
-        let (startup, total) = costsize::seq_scan_path(&rel, &quals);
-        Some((
-            startup,
-            total,
-            costsize::clamp_row_est(tuples * sel),
-            output_width(&def, Some(&stats), fields)?,
-        ))
+        Some(((startup, total, rows, width), index))
     }
 }

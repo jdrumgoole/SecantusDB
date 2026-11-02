@@ -66,8 +66,11 @@ either line.
   The box's 14 cluster runs locale `C`, which maps no non-ASCII letter; the
   server reports `C.UTF-8`, so case and character-class corpora need the
   directive.
-- **Never change the shared reference servers.** Create objects inside a
-  rolled-back transaction; clean up anything you could not avoid creating.
+- **Never create objects on the shared reference servers, not even in a
+  rolled-back transaction.** Rolled-back DDL leaves dead catalog rows that
+  move the catalogs' estimates (`EXPLAIN` of a catalog read, RP-314 /
+  RP-334). Measure an answer that needs DDL on a private `initdb`'d 15.19
+  cluster (`-k ''`, TCP only), and record the fresh cluster's literal.
 - `pg_hba` / login rules: `tests/test_rust_pg_login_differential.py` (915
   scenarios) needs `SECANTUS_PG15_BIN` and **skips without it**, so a green
   local suite says nothing about a login change. Run it by name.
