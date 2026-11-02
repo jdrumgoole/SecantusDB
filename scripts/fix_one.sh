@@ -45,7 +45,11 @@ stamp() { date '+%Y-%m-%d %H:%M:%S %Z'; }
 echo "[$(stamp)] start: $prompt"
 status=0
 if [[ $headless -eq 1 ]]; then
-    claude -p "$prompt" || status=$?
+    # Headless claude stops a turn's background tasks 10 minutes after its
+    # last turn and exits, which cut off two sessions mid-gate on
+    # 2026-11-02 (RP-320, RP-344) with their fixes committed but unlanded.
+    # 0 means wait for them, however long the gate and CI take.
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p "$prompt" || status=$?
 else
     claude "$prompt" || status=$?
 fi
