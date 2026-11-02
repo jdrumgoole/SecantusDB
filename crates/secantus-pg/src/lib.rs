@@ -40720,6 +40720,51 @@ impl PgHandler {
                         }
                     }
                 }
+                // A Sort straight over one relation's sequential scan
+                // (RP-318): the scan's estimate, then `cost_sort`. Only on a
+                // table with no index, where the Seq Scan is the only path
+                // PostgreSQL can sort (an index may give the order instead),
+                // and by stored columns the select list returns (a
+                // resjunk or computed key widens the sorted row).
+                if tree.name == "Sort"
+                    && tree.children.len() == 1
+                    && tree.children[0].children.is_empty()
+                    && tree.children[0].name.starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == sel.table);
+                        if !indexed
+                            && sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && sel.order.iter().all(|k| {
+                                k.expr.is_none() && sel.columns.iter().any(|(_, f)| *f == k.field)
+                            })
+                        {
+                            let fields: Vec<String> =
+                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            if let Some((estimate, None)) =
+                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                            {
+                                tree.children[0].estimate = Some(estimate);
+                                tree.estimate = Some(scan_estimate::sort_estimate(
+                                    estimate,
+                                    self.kb_setting("work_mem", 4096),
+                                ));
+                            }
+                        }
+                    }
+                }
                 // A plan that is one user table's plain Index Scan prints
                 // `cost_index`'s estimate when that is the cheapest path
                 // (RP-317).

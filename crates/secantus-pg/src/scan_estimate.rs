@@ -641,6 +641,87 @@ pub(crate) fn limit_estimate(input: Estimate, offset: i64, count: i64) -> Estima
     (startup, total, rows, width)
 }
 
+/// A Sort's estimate over its input's (RP-318): PostgreSQL 15's
+/// `cost_sort` and `cost_tuplesort` (`costsize.c`), with no LIMIT bound,
+/// `work_mem` in kB (`sort_mem`) and a comparison of
+/// `2 * cpu_operator_cost`. The input is read in full before the first row
+/// is returned, so its total cost is the Sort's startup.
+pub(crate) fn sort_estimate(input: Estimate, work_mem_kb: usize) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const SEQ_PAGE_COST: f64 = 1.0;
+    const RANDOM_PAGE_COST: f64 = 4.0;
+    const BLCKSZ: f64 = 8192.0;
+    let (_, in_total, rows, width) = input;
+    let tuples = if rows < 2.0 { 2.0 } else { rows };
+    let comparison_cost = 2.0 * CPU_OPERATOR_COST;
+    // `relation_byte_size`: MAXALIGN(width) + MAXALIGN(SizeofHeapTupleHeader).
+    let maxalign = |n: i64| ((n + 7) / 8 * 8) as f64;
+    let input_bytes = tuples * (maxalign(width) + maxalign(23));
+    let sort_mem_bytes = work_mem_kb as f64 * 1024.0;
+    let mut startup = if input_bytes > sort_mem_bytes {
+        // An external merge sort.
+        let npages = (input_bytes / BLCKSZ).ceil();
+        let nruns = input_bytes / sort_mem_bytes;
+        // `tuplesort_merge_order`.
+        let merge_order = (sort_mem_bytes / (2.0 * BLCKSZ + 32.0 * BLCKSZ))
+            .floor()
+            .clamp(6.0, 500.0);
+        let log_runs = if nruns > merge_order {
+            (nruns.ln() / merge_order.ln()).ceil()
+        } else {
+            1.0
+        };
+        let page_accesses = 2.0 * npages * log_runs;
+        comparison_cost * tuples * tuples.log2()
+            + page_accesses * (SEQ_PAGE_COST * 0.75 + RANDOM_PAGE_COST * 0.25)
+    } else {
+        comparison_cost * tuples * tuples.log2()
+    };
+    let run = CPU_OPERATOR_COST * tuples;
+    startup += in_total;
+    (startup, startup + run, rows, width)
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::sort_estimate;
+
+    #[test]
+    fn a_sort_prices_its_comparisons_over_the_whole_input() {
+        // PostgreSQL 15.19: `select * from e order by b` over a Seq Scan of
+        // (0.00..15.00 rows=1000 width=7) is (64.83..67.33).
+        let (s, t, r, w) = sort_estimate((0.0, 15.0, 1000.0, 7), 4096);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("64.83".into(), "67.33".into(), 1000.0, 7)
+        );
+    }
+
+    #[test]
+    fn a_sort_past_work_mem_prices_its_merge_pages() {
+        // PostgreSQL 15.19, `work_mem = 4MB`: 200000 rows of width 7 over a
+        // Seq Scan of (0.00..2885.00) is (23231.64..23731.64); with 8MB it
+        // sorts in memory, (20494.64..20994.64).
+        let (s, t, _, _) = sort_estimate((0.0, 2885.0, 200000.0, 7), 4096);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}")),
+            ("23231.64".into(), "23731.64".into())
+        );
+        let (s, t, _, _) = sort_estimate((0.0, 2885.0, 200000.0, 7), 8192);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}")),
+            ("20494.64".into(), "20994.64".into())
+        );
+    }
+
+    #[test]
+    fn a_sort_of_one_row_counts_two() {
+        // `cost_tuplesort` sorts at least two tuples; the rows stay one.
+        let (s, t, r, _) = sort_estimate((0.0, 1.0, 1.0, 4), 4096);
+        assert!((s - 1.01).abs() < 1e-9 && (t - 1.015).abs() < 1e-9 && r == 1.0);
+    }
+}
+
 #[cfg(test)]
 mod limit_tests {
     use super::limit_estimate;
