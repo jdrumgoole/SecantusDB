@@ -40629,6 +40629,10 @@ impl PgHandler {
                     }
                 };
                 let mut tree = explain::plan_tree(&inner, &chooser);
+                // A select with no FROM is a one-row Result (RP-325).
+                if let Statement::SelectConstant(sc) = inner.as_ref() {
+                    tree.estimate = scan_estimate::result_estimate(sc);
+                }
                 // A plan that is one relation's sequential scan, of plain
                 // columns, prints the planner's estimate (RP-314); a
                 // catalog's cheapest path may be one of its indexes'

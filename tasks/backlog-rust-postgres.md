@@ -1365,14 +1365,6 @@ a regression test.
       PostgreSQL's, measured on a fresh cluster.
       Backlog-ID: RP-324
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[append]
-- [ ] **EXPLAIN prints no estimate for a Result.**
-      `explain select 1` is `Result  (cost=0.00..0.01 rows=1 width=4)`.
-      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
-      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
-      relation's Seq Scan prints the estimate; the scenario's expected
-      plan is PostgreSQL's, measured on a fresh cluster.
-      Backlog-ID: RP-325
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[result]
 - [ ] **EXPLAIN prints no estimate for a Values Scan.**
       `explain values (1), (2)` is `Values Scan on "*VALUES*"
       (cost=0.00..0.03 rows=2 width=4)` (`cost_valuesscan`). PostgreSQL
@@ -1463,6 +1455,24 @@ a regression test.
       plan is PostgreSQL's, measured on a fresh cluster.
       Backlog-ID: RP-333
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan of an expression]
+- [ ] **EXPLAIN prints no estimate for a Result whose select list calls
+      a function the planner keeps as a call.** `explain select
+      current_setting('work_mem')` is `Result  (cost=0.00..0.01 rows=1
+      width=32)` on PostgreSQL 15.19: `cost_resultscan`'s
+      `cpu_tuple_cost` plus `cost_qual_eval` of the target (each call
+      `procost` x `cpu_operator_cost`). RP-325 prices a select list of
+      constants only; a `ConstCol` other than `Value` (`current_setting`,
+      `set_config`, `nextval`, `currval`, `setval`, ...) prints zeros
+      (found while working RP-325).
+      Backlog-ID: RP-340
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result of a function call]
+- [ ] **EXPLAIN prints no One-Time Filter for a constant WHERE.**
+      `explain select 1 where false` is `Result  (cost=0.00..0.01 rows=1
+      width=4)` with `One-Time Filter: false` on PostgreSQL 15.19 (the
+      gating qual of a Result); here the detail line is missing (found
+      while working RP-325).
+      Backlog-ID: RP-341
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result's one-time filter]
 - [ ] **A catalog read index-only is a zero-cost Seq Scan here.**
       `explain select attname from pg_attribute where attrelid = 1259`
       in a fresh database is `Index Only Scan using

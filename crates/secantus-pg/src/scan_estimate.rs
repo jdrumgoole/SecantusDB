@@ -124,6 +124,28 @@ fn type_width(pg_type: &str, typmod: i32) -> i64 {
     hashagg::type_avg_width(pg_type, typmod, typlen)
 }
 
+/// What `EXPLAIN` prints of a select with no FROM (RP-325): PostgreSQL 15
+/// plans it as a `Result` over an `RTE_RESULT` relation of one row
+/// (`cost_resultscan`: `cpu_tuple_cost` for its row, no startup), its width
+/// the select list's (`set_pathtarget_cost_width`: each expression's type's
+/// `get_typavgwidth`). A constant WHERE is a one-time filter that leaves
+/// the row estimate at one. Only a select list of constants is priced:
+/// any other expression adds its own evaluation cost (`cost_qual_eval`),
+/// which is not modelled here, and a FROM function is a Function Scan.
+pub(crate) fn result_estimate(sc: &secantus_pgplan::SelectConstant) -> Option<Estimate> {
+    if sc.source.is_some() {
+        return None;
+    }
+    let mut width = 0;
+    for (_, col, pg_type, typmod) in &sc.columns {
+        if !matches!(col, secantus_pgplan::ConstCol::Value(_)) {
+            return None;
+        }
+        width += type_width(pg_type, *typmod);
+    }
+    Some((0.0, costsize::CPU_TUPLE_COST, 1.0, width))
+}
+
 /// The width of a select list of plain columns (`fields`, stored fields),
 /// which the planner applies to the scan as its target
 /// (`set_pathtarget_cost_width`): each entry, a repeated one again, its

@@ -3,7 +3,8 @@
 //! The node TYPES and their nesting are real -- a scan is an `Index Scan`
 //! exactly when the storage planner would use the index. A node's costs,
 //! rows and width are PostgreSQL's estimate where the cost model prices
-//! that node (a single relation's Seq Scan, `scan_estimate.rs`, RP-314);
+//! that node (a single relation's Seq Scan, `scan_estimate.rs`, RP-314; a
+//! select of constants with no FROM, a `Result`, RP-325);
 //! every other node still prints zeros, each kind its own backlog item.
 
 use bson::Document;
