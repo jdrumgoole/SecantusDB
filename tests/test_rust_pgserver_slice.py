@@ -15362,7 +15362,7 @@ def test_explain_reports_the_plans_shape(home: Path) -> None:
             "  Group Key: g",
             "  ->  Seq Scan on ex",
         ]
-        assert plan("EXPLAIN SELECT 1") == ["Result  (cost=0.00..0.00 rows=0 width=0)"]
+        assert plan("EXPLAIN SELECT 1") == ["Result  (cost=0.00..0.01 rows=1 width=4)"]  # RP-325
         cur.execute("EXPLAIN (FORMAT JSON, COSTS OFF) SELECT * FROM ex")
         assert cur.fetchone()[0][0]["Plan"]["Node Type"] == "Seq Scan"
         assert plan("EXPLAIN ANALYZE SELECT * FROM ex")[-1] == "Execution Time: 0.000 ms"
