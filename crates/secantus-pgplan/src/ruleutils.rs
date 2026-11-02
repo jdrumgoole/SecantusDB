@@ -64,6 +64,10 @@ struct Printer<'a> {
     pretty: bool,
     /// `pg_get_expr` over one relation: columns print bare.
     unqualified: bool,
+    /// EXPLAIN prints the planned expression, whose constants
+    /// `eval_const_expressions` has folded: an integer literal coerced to
+    /// `oid` is the constant `'1259'::oid`, not `(1259)::oid`.
+    fold_consts: bool,
     /// Leave each target-list / FROM-list line-wrap decision to
     /// [`render_wrapped`] (the int `wrapColumn` form of `pg_get_viewdef`)
     /// rather than wrapping every item, as the default column (0) does.
@@ -239,6 +243,7 @@ impl<'a> Printer<'a> {
             col_names_visible: true,
             pretty: false,
             unqualified: false,
+            fold_consts: false,
             markers: false,
         }
     }
@@ -730,9 +735,12 @@ impl<'a> Printer<'a> {
             }
             return Some((String::new(), String::new()));
         }
+        // An untyped literal takes the other side's type when that type has
+        // an `=` of its own (`binary_oper_exact`): `name = name` exists, so
+        // a name stays a name; `varchar` has none and meets as text.
         if l == "unknown" {
             let t = match r {
-                "varchar" | "name" => "text",
+                "varchar" => "text",
                 other => other,
             };
             let rt = if t == r { "" } else { t };
@@ -740,11 +748,20 @@ impl<'a> Printer<'a> {
         }
         if r == "unknown" {
             let t = match l {
-                "varchar" | "name" => "text",
+                "varchar" => "text",
                 other => other,
             };
             let lt = if t == l { "" } else { t };
             return Some((lt.into(), t.into()));
+        }
+        // `oid` meets an integer through the implicit cast to `oid`
+        // (`oideq`): the integer side is coerced, a constant folded into
+        // an `oid` literal (`'1259'::oid`).
+        if l == "oid" && is_int(r) {
+            return Some((String::new(), "oid".into()));
+        }
+        if r == "oid" && is_int(l) {
+            return Some(("oid".into(), String::new()));
         }
         if let Some((meet, cast)) = numeric_meet(l, r) {
             if !cast || (is_int(l) && is_int(r)) {
@@ -801,6 +818,14 @@ impl<'a> Printer<'a> {
                 return self.const_as(n, want);
             }
             if own != want {
+                if self.fold_consts && want == "oid" {
+                    if let Some(N::AConst(c)) = n.node.as_ref() {
+                        if let Some(Val::Ival(i)) = c.val.as_ref() {
+                            self.buf.push_str(&format!("'{}'::oid", i.ival));
+                            return Some(());
+                        }
+                    }
+                }
                 if self.pretty {
                     self.child(n, "", Parent::Cast)?;
                     self.buf.push_str(&format!("::{}", display_type(want)));
@@ -3723,7 +3748,7 @@ pub fn explain_conjuncts(
     parts
         .into_iter()
         .map(|p| {
-            let text = expr_node_def(p, def)?;
+            let text = expr_node_planned(p, def)?;
             let column = match p.node.as_ref() {
                 Some(N::AExpr(e))
                     if e.kind == AExprKind::AexprOp as i32
@@ -3896,6 +3921,16 @@ pub fn join_where(
 
 /// An expression node over one table, printed as `pg_get_expr` does.
 pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
+    expr_node_printed(n, def, false)
+}
+
+/// [`expr_node_def`] as EXPLAIN prints the planned expression, its
+/// constants folded.
+fn expr_node_planned(n: &Node, def: &TableDef) -> Option<String> {
+    expr_node_printed(n, def, true)
+}
+
+fn expr_node_printed(n: &Node, def: &TableDef, fold_consts: bool) -> Option<String> {
     let none_lookup = |_: &str| None;
     let none_views = |_: &str| None;
     let cat = Catalog {
@@ -3904,6 +3939,7 @@ pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
     };
     let mut p = Printer::new(&cat, 0);
     p.unqualified = true;
+    p.fold_consts = fold_consts;
     p.scopes.push(vec![Rte {
         refname: def.name.clone(),
         name: def.name.clone(),

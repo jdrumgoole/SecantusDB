@@ -182,7 +182,7 @@ impl PgHandler {
         ssi::with(self.ssi_key(), xids::next_xid(&self.storage), f)
     }
 
-    fn setting_is(&self, name: &str, value: &str) -> bool {
+    pub(crate) fn setting_is(&self, name: &str, value: &str) -> bool {
         self.settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())

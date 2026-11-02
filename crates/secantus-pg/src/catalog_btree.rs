@@ -192,6 +192,14 @@ fn tree(index: i64) -> Option<&'static Tree> {
         .as_ref()
 }
 
+/// A catalog index's size as the planner reads it for `IndexOptInfo`:
+/// its blocks (`RelationGetNumberOfBlocks`, the metapage among them) and
+/// its root's level (`_bt_getrootheight`), from `initdb`'s pages.
+pub(crate) fn initdb_index_size(index: i64) -> Option<(u32, u32)> {
+    let t = tree(index)?;
+    Some((t.btree.pages(), t.btree.height()))
+}
+
 /// A catalog index's key columns, by type: how PostgreSQL's default
 /// operator class orders each (a catalog's `name` and `text` columns
 /// under the "C" collation) and lays it out in an index tuple.

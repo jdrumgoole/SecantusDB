@@ -40629,6 +40629,35 @@ impl PgHandler {
                     }
                 };
                 let mut tree = explain::plan_tree(&inner, &chooser);
+                // A plan that is one relation's sequential scan, of plain
+                // columns, prints the planner's estimate (RP-314); a
+                // catalog's cheapest path may be one of its indexes'
+                // (RP-334).
+                // Chosen with or without COSTS, which only hides the numbers.
+                if tree.children.is_empty() && tree.name.starts_with("Seq Scan on ") {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                            && sel.casts.iter().all(Option::is_none)
+                        {
+                            let fields: Vec<String> =
+                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            if let Some((estimate, index)) =
+                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                            {
+                                tree.estimate = Some(estimate);
+                                if let Some(index) = index {
+                                    tree.name =
+                                        format!("Index Scan using {index} on {}", sel.table);
+                                    tree.props.insert(0, ("Index Name".into(), index));
+                                }
+                            }
+                        }
+                    }
+                }
                 let relations = self.index_relations();
                 let index_columns = |name: &str| -> Vec<String> {
                     relations
@@ -40641,32 +40670,11 @@ impl PgHandler {
                                 .filter_map(|i| ix.table.columns.get(i).map(|c| c.name.clone()))
                                 .collect()
                         })
-                        .unwrap_or_default()
+                        .unwrap_or_else(|| scan_estimate::catalog_index_columns(name))
                 };
                 explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
                 explain::attach_join_conds(&mut tree, &options.join_conds);
                 explain::attach_join_where(&mut tree, &options.join_where);
-                // A plan that is one relation's sequential scan, of plain
-                // columns, prints the planner's estimate (RP-314).
-                if options.costs
-                    && tree.children.is_empty()
-                    && tree.name.starts_with("Seq Scan on ")
-                {
-                    if let Statement::Select(sel) = inner.as_ref() {
-                        if sel.residual.is_none()
-                            && sel.sub.is_none()
-                            && sel.series.is_none()
-                            && sel.join.is_none()
-                            && sel.windows.is_empty()
-                            && sel.casts.iter().all(Option::is_none)
-                        {
-                            let fields: Vec<String> =
-                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
-                            tree.estimate =
-                                self.seq_scan_estimate(&sel.table, &sel.filter, &fields);
-                        }
-                    }
-                }
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {

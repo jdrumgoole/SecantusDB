@@ -288,7 +288,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select a + 1 from e",
         ["Seq Scan on e  (cost=0.00..17.50 rows=1000 width=4)"],
     ),
-    # ------------------------------------------------ found while working
+    # --------------------------------- RP-334 / RP-335 a catalog's index
     "a catalog read by its index": (
         "RP-334",
         [],
@@ -304,6 +304,111 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ["set local enable_indexscan = off", "set local enable_bitmapscan = off"],
         "explain (costs off) select oid from pg_class where relname = 'pg_class'",
         ["Seq Scan on pg_class", "  Filter: (relname = 'pg_class'::name)"],
+    ),
+    "a catalog read by its oid index": (
+        "RP-334",
+        [],
+        "explain select relname from pg_class where oid = 1259",
+        [
+            "Index Scan using pg_class_oid_index on pg_class  (cost=0.27..8.29 rows=1 width=64)",
+            "  Index Cond: (oid = '1259'::oid)",
+        ],
+    ),
+    "a type read by its oid index": (
+        "RP-334",
+        [],
+        "explain select typname from pg_type where oid = 23",
+        [
+            "Index Scan using pg_type_oid_index on pg_type  (cost=0.28..8.29 rows=1 width=64)",
+            "  Index Cond: (oid = '23'::oid)",
+        ],
+    ),
+    "a function read by its name index": (
+        "RP-334",
+        [],
+        "explain select oid from pg_proc where proname = 'now'",
+        [
+            "Index Scan using pg_proc_proname_args_nsp_index on pg_proc"
+            "  (cost=0.28..8.30 rows=1 width=4)",
+            "  Index Cond: (proname = 'now'::name)",
+        ],
+    ),
+    "a catalog index scan with a filter": (
+        "RP-334",
+        [],
+        "explain select oid, relkind from pg_class where relname = 'pg_type' and relkind = 'r'",
+        [
+            "Index Scan using pg_class_relname_nsp_index on pg_class"
+            "  (cost=0.27..8.29 rows=1 width=5)",
+            "  Index Cond: (relname = 'pg_type'::name)",
+            "  Filter: (relkind = 'r'::\"char\")",
+        ],
+    ),
+    "a small catalog is read sequentially": (
+        "RP-334",
+        [],
+        "explain select oid from pg_namespace where nspname = 'public'",
+        [
+            "Seq Scan on pg_namespace  (cost=0.00..1.05 rows=1 width=4)",
+            "  Filter: (nspname = 'public'::name)",
+        ],
+    ),
+    "a catalog index scan without costs": (
+        "RP-334",
+        [],
+        "explain (costs off) select oid from pg_class where relname = 'pg_class'",
+        [
+            "Index Scan using pg_class_relname_nsp_index on pg_class",
+            "  Index Cond: (relname = 'pg_class'::name)",
+        ],
+    ),
+    "a catalog seq scan turned off": (
+        "RP-334",
+        ["set local enable_seqscan = off"],
+        "explain select oid from pg_class where relkind = 'r'",
+        [
+            "Seq Scan on pg_class  (cost=10000000000.00..10000000019.12 rows=68 width=4)",
+            "  Filter: (relkind = 'r'::\"char\")",
+        ],
+    ),
+    "a catalog index scan as json": (
+        "RP-334",
+        [],
+        "explain (format json) select oid from pg_class where relname = 'pg_class'",
+        [
+            '[\n  {\n    "Plan": {\n      "Node Type": "Index Scan",\n'
+            '      "Parallel Aware": false,\n      "Async Capable": false,\n'
+            '      "Scan Direction": "Forward",\n'
+            '      "Index Name": "pg_class_relname_nsp_index",\n'
+            '      "Relation Name": "pg_class",\n      "Alias": "pg_class",\n'
+            '      "Startup Cost": 0.27,\n      "Total Cost": 8.29,\n'
+            '      "Plan Rows": 1,\n      "Plan Width": 4,\n'
+            '      "Index Cond": "(relname = \'pg_class\'::name)"\n'
+            "    }\n  }\n]"
+        ],
+    ),
+    # ------------------------------------------------ found while working
+    "a catalog read index-only": (
+        "RP-337",
+        [],
+        "explain select attname from pg_attribute where attrelid = 1259",
+        [
+            "Index Only Scan using pg_attribute_relid_attnam_index on pg_attribute"
+            "  (cost=0.28..4.96 rows=39 width=64)",
+            "  Index Cond: (attrelid = '1259'::oid)",
+        ],
+    ),
+    "a catalog read by a bitmap": (
+        "RP-338",
+        ["set local enable_indexscan = off"],
+        "explain select oid from pg_class where relname = 'pg_class'",
+        [
+            "Bitmap Heap Scan on pg_class  (cost=4.28..8.29 rows=1 width=4)",
+            "  Recheck Cond: (relname = 'pg_class'::name)",
+            "  ->  Bitmap Index Scan on pg_class_relname_nsp_index"
+            "  (cost=0.00..4.28 rows=1 width=0)",
+            "        Index Cond: (relname = 'pg_class'::name)",
+        ],
     ),
 }
 
@@ -321,7 +426,8 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    mark = pytest.mark.backlog_fixed if item == "RP-314" else pytest.mark.backlog
+    fixed = item in ("RP-314", "RP-334", "RP-335")
+    mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
 

@@ -168,9 +168,12 @@ it and move on (RP-044, notice deduplication).
 
 ## Measuring against the reference
 
-- **Never change the shared reference servers.** A gap test or probe that
-  needs objects creates them inside a rolled-back transaction; a corpus
-  that needs none uses `VALUES` lists and a `.setup.sql` of `SELECT 1`.
+- **Never create objects on the shared reference servers, not even in a
+  rolled-back transaction**: rolled-back DDL leaves dead catalog rows that
+  move estimates. A gap test or probe that needs objects measures its
+  answer on a private `initdb`'d 15.19 cluster and records the literal; a
+  corpus that needs none uses `VALUES` lists and a `.setup.sql` of
+  `SELECT 1`.
 - **Prove a new corpus or matrix is not vacuous**: run it against a build
   WITHOUT the fix and see it diverge (`jsonb_order.sql`: 9 of 9 diverging
   before, 0 after). Two sides failing alike reads as agreement.
