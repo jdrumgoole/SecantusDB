@@ -38,6 +38,9 @@ pub(crate) struct TypeFact {
     pub elem: i64,
     pub array: i64,
     pub basetype: i64,
+    /// `typinput` / `typoutput`, by oid (0 until resolved).
+    pub input: i64,
+    pub output: i64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +54,8 @@ pub(crate) struct ProcFact {
     pub ndefaults: usize,
     pub ret: i64,
     pub args: Vec<i64>,
+    /// `provolatile`.
+    pub volatile: char,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -246,6 +251,7 @@ pub(crate) fn builtin() -> &'static Builtin {
 
 fn load() -> Builtin {
     let mut b = Builtin::default();
+    let mut io_names: Vec<(i64, String, String)> = Vec::new();
     for r in rows("pg_type") {
         let oid = int(&r, "oid");
         let t = TypeFact {
@@ -257,7 +263,10 @@ fn load() -> Builtin {
             elem: int(&r, "typelem"),
             array: int(&r, "typarray"),
             basetype: int(&r, "typbasetype"),
+            input: 0,
+            output: 0,
         };
+        io_names.push((oid, text(&r, "typinput"), text(&r, "typoutput")));
         b.type_by_name.insert((t.name.clone(), t.nsp), oid);
         b.types.insert(oid, t);
     }
@@ -277,9 +286,29 @@ fn load() -> Builtin {
             ndefaults: int(&r, "pronargdefaults") as usize,
             ret: int(&r, "prorettype"),
             args,
+            volatile: ch(&r, "provolatile"),
         };
         b.procs_by_name.entry(p.name.clone()).or_default().push(oid);
         b.procs.insert(oid, p);
+    }
+    // `typinput` / `typoutput` are dumped as `regproc` names: every
+    // built-in I/O function's name is unique in `pg_catalog`.
+    for (typ, input, output) in io_names {
+        let resolve = |n: &str| -> i64 {
+            n.parse().ok().unwrap_or_else(|| {
+                let bare = n.rsplit('.').next().unwrap_or(n);
+                b.procs_by_name
+                    .get(bare)
+                    .and_then(|v| v.first())
+                    .copied()
+                    .unwrap_or(0)
+            })
+        };
+        let (i, o) = (resolve(&input), resolve(&output));
+        if let Some(t) = b.types.get_mut(&typ) {
+            t.input = i;
+            t.output = o;
+        }
     }
     for r in rows("pg_operator") {
         let oid = int(&r, "oid");
