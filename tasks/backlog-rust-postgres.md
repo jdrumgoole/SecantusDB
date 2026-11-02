@@ -991,7 +991,10 @@ tests regression tests:
       (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
       job (run 40479482747, attempt 1): the statement answered `ok` after
       `pg_sleep(3)` ran to its end, where the cancel sent 2.5 s in should
-      have ended it with 57014. Attempt 2 of the same commit passed, and
+      have ended it with 57014. It recurred LOCALLY on 2026-11-02 (macOS
+      release build, under `scripts/gate_pg.sh`'s parallel load, the
+      RP-341 branch, which touches no wire or cancel code): `[2.5]`
+      answered `ok`; nine reruns idle passed. Attempt 2 of the same commit passed, and
       locally (debug build, macOS) every delay from 0.25 to 4.0 s in
       0.25 s steps answered 57014 within 0.05 s, four runs of the test
       each passing. Not diagnosed. PostgreSQL itself drops a cancel that

@@ -27531,12 +27531,10 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         Some(w) => constant_where(w, params)?,
     };
     let one_time_filter = match s.where_clause.as_deref() {
-        Some(w) if !where_true && folds_to_constant(w) => {
-            Some(match const_value(w, params)? {
-                Bson::Null => "NULL::boolean".to_string(),
-                _ => "false".to_string(),
-            })
-        }
+        Some(w) if !where_true && folds_to_constant(w) => Some(match const_value(w, params)? {
+            Bson::Null => "NULL::boolean".to_string(),
+            _ => "false".to_string(),
+        }),
         _ => None,
     };
     // LIMIT and OFFSET over the one row: read (and refused) as anywhere
