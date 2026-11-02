@@ -40658,6 +40658,44 @@ impl PgHandler {
                         }
                     }
                 }
+                // A plan that is one user table's plain Index Scan prints
+                // `cost_index`'s estimate when that is the cheapest path
+                // (RP-317).
+                if tree.children.is_empty() {
+                    let index = tree
+                        .name
+                        .strip_prefix("Index Scan using ")
+                        .and_then(|r| r.split_once(" on "))
+                        .map(|(i, _)| i.to_string());
+                    if let (Some(index), Statement::Select(sel)) = (index, inner.as_ref()) {
+                        let key: Option<Vec<String>> = self
+                            .index_relations()
+                            .into_iter()
+                            .find(|ix| ix.name == index)
+                            .and_then(|ix| {
+                                ix.keys
+                                    .iter()
+                                    .map(|k| {
+                                        let i = usize::try_from(*k).ok()?.checked_sub(1)?;
+                                        Some(ix.table.columns.get(i)?.field())
+                                    })
+                                    .collect()
+                            });
+                        if let Some(key) = key.filter(|_| {
+                            sel.residual.is_none()
+                                && sel.sub.is_none()
+                                && sel.series.is_none()
+                                && sel.join.is_none()
+                                && sel.windows.is_empty()
+                                && sel.casts.iter().all(Option::is_none)
+                        }) {
+                            let fields: Vec<String> =
+                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            tree.estimate =
+                                self.index_scan_estimate(&sel.table, &sel.filter, &fields, &key);
+                        }
+                    }
+                }
                 let relations = self.index_relations();
                 let index_columns = |name: &str| -> Vec<String> {
                     relations
