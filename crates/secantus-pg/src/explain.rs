@@ -1,11 +1,10 @@
 //! `EXPLAIN`: the SHAPE of a statement's plan, in PostgreSQL's layout.
 //!
-//! This server has no cost model, and inventing one would be the kind of
-//! plausible-but-wrong answer the project refuses: a client comparing costs
-//! would be comparing fiction. So the node TYPES and their nesting are real --
-//! a scan is an `Index Scan` exactly when the storage planner would use the
-//! index -- and the costs print as zeros (`COSTS OFF` omits them, which is
-//! what a test comparing plans uses anyway).
+//! The node TYPES and their nesting are real -- a scan is an `Index Scan`
+//! exactly when the storage planner would use the index. A node's costs,
+//! rows and width are PostgreSQL's estimate where the cost model prices
+//! that node (a single relation's Seq Scan, `scan_estimate.rs`, RP-314);
+//! every other node still prints zeros, each kind its own backlog item.
 
 use bson::Document;
 use secantus_pgplan::joins::{JoinKind, JoinNode};
@@ -19,6 +18,8 @@ pub(crate) struct PlanNode {
     pub children: Vec<PlanNode>,
     /// JSON-only facts (`Relation Name`, `Index Name`).
     pub props: Vec<(String, String)>,
+    /// The planner's `(startup, total, rows, width)`; `None` prints zeros.
+    pub estimate: Option<crate::scan_estimate::Estimate>,
 }
 
 impl PlanNode {
@@ -28,6 +29,7 @@ impl PlanNode {
             details: Vec::new(),
             children: Vec::new(),
             props: Vec::new(),
+            estimate: None,
         }
     }
 
@@ -240,7 +242,18 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
     }
 }
 
-const ZERO_COSTS: &str = "  (cost=0.00..0.00 rows=0 width=0)";
+/// A node's estimate, zeros where it has none; `+ 0.0` turns the `-0.0` an
+/// empty sum is into the `0.00` PostgreSQL prints.
+fn estimate_of(n: &PlanNode) -> (f64, f64, f64, i64) {
+    let (startup, total, rows, width) = n.estimate.unwrap_or((0.0, 0.0, 0.0, 0));
+    (startup + 0.0, total + 0.0, rows + 0.0, width)
+}
+
+/// The header's costs, as `ExplainNode` prints them: `%.2f`, rows `%.0f`.
+fn costs_text(n: &PlanNode) -> String {
+    let (startup, total, rows, width) = estimate_of(n);
+    format!("  (cost={startup:.2}..{total:.2} rows={rows:.0} width={width})")
+}
 
 /// The `QUERY PLAN` text rows, PostgreSQL's layout: a child at depth d is
 /// `2 + 6(d-1)` spaces and `->  `, and a node's details sit at `2 + 6d`.
@@ -263,7 +276,7 @@ pub(crate) fn render_text(
             format!("{}->  {}", " ".repeat(2 + 6 * (depth - 1)), n.name)
         };
         if options.costs {
-            header.push_str(ZERO_COSTS);
+            header.push_str(&costs_text(n));
         }
         if let Some(rows) = actual {
             if options.timing {
@@ -337,6 +350,14 @@ fn structured(
                 .unwrap_or_default();
             fields.push(("Alias".into(), Value::Str(rel)));
         }
+        // The costs come before the node's quals, as `ExplainNode` prints.
+        if options.costs {
+            let (startup, total, rows, width) = estimate_of(n);
+            fields.push(("Startup Cost".into(), Value::Num(format!("{startup:.2}"))));
+            fields.push(("Total Cost".into(), Value::Num(format!("{total:.2}"))));
+            fields.push(("Plan Rows".into(), Value::Num(format!("{rows:.0}"))));
+            fields.push(("Plan Width".into(), Value::Num(width.to_string())));
+        }
         for (k, v) in &n.details {
             let value = if k.ends_with("Key") {
                 Value::Arr(v.split(", ").map(|s| Value::Str(s.to_string())).collect())
@@ -344,14 +365,6 @@ fn structured(
                 Value::Str(v.clone())
             };
             fields.push((k.clone(), value));
-        }
-        if options.costs {
-            for k in ["Startup Cost", "Total Cost"] {
-                fields.push((k.into(), Value::Num("0.00".into())));
-            }
-            for k in ["Plan Rows", "Plan Width"] {
-                fields.push((k.into(), Value::Num("0".into())));
-            }
         }
         if let Some(rows) = actual {
             if options.timing {
@@ -725,5 +738,20 @@ pub(crate) fn attach_join_where(root: &mut PlanNode, quals: &[(String, Option<St
             let label = if inner { "Join Filter" } else { "Filter" };
             n.details.push((label.into(), combine(&parts)));
         }
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    #[test]
+    fn a_node_prints_its_estimate_or_zeros() {
+        let mut n = PlanNode::new("Seq Scan on t");
+        assert_eq!(costs_text(&n), "  (cost=0.00..0.00 rows=0 width=0)");
+        // PostgreSQL 15.19's `Seq Scan on pg_class` through a filter; an
+        // empty sum's -0.0 prints as 0.00.
+        n.estimate = Some((-0.0, 19.125, 140.0, 265));
+        assert_eq!(costs_text(&n), "  (cost=0.00..19.12 rows=140 width=265)");
     }
 }

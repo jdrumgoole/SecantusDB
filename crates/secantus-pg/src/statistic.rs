@@ -25,7 +25,7 @@ const DEFAULT_COLLATION: i64 = 100;
 
 /// The `RELSTATS_COLLECTION` row holding a database-wide ANALYZE's measure
 /// of the built-in catalogs, by `"<relid>:<attnum>"` (RP-313).
-const CATALOG_STATISTICS: &str = "\u{0}catalogs";
+pub(crate) const CATALOG_STATISTICS: &str = "\u{0}catalogs";
 
 /// A type's `=` and `<` operators (its default B-tree opclass), and
 /// whether it is collatable.
@@ -187,6 +187,15 @@ fn builtin_rows() -> &'static [Vec<(String, Bson)>] {
             })
             .collect()
     })
+}
+
+/// `initdb`'s `pg_statistic` rows of the built-in catalog `starelid`, as
+/// the planner reads them (RP-314).
+pub(crate) fn builtin_stats(starelid: i64) -> impl Iterator<Item = &'static [(String, Bson)]> {
+    builtin_rows()
+        .iter()
+        .filter(move |row| row.first().map(|(_, v)| v) == Some(&Bson::Int64(starelid)))
+        .map(Vec::as_slice)
 }
 
 impl PgHandler {
