@@ -1902,10 +1902,11 @@ def test_a_database_wide_analyze_measures_a_name_column(rust_pg: Any) -> None:
         assert top == "zzzz_rp313"
 
 
-@pytest.mark.backlog("RP-314")
+@pytest.mark.backlog_fixed("RP-314")
 def test_a_catalog_scan_is_estimated(rust_pg: Any) -> None:
-    """PostgreSQL 15.19, a fresh database: the planner estimates a scan of
-    a catalog from `initdb`'s statistics and `relpages` / `reltuples`."""
+    """PostgreSQL 15.19, a fresh database: the planner estimated a scan of
+    a catalog from `initdb`'s statistics and `relpages` / `reltuples`, where
+    this server printed zeros."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp314_d")
         c.execute("create database rp314_d")

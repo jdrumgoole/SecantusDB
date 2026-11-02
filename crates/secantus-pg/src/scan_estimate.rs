@@ -1,0 +1,283 @@
+//! What `EXPLAIN` prints of a sequential scan of one relation (RP-314):
+//! PostgreSQL 15's `cost_seqscan` over the relation's size
+//! (`table_block_relation_estimate_size`), its rows (`clamp_row_est` of the
+//! tuples through `clauselist_selectivity`) and its width (`set_rel_width`:
+//! each output column's `stawidth`, or its type's `get_typavgwidth`).
+//!
+//! A user table is sized as the planner's cost model already sizes it
+//! ([`PgHandler::planner_table_lazy`]); a built-in catalog from what
+//! `initdb` left: its `relpages` / `reltuples`, its heap's blocks
+//! (`catalog_heap`) and its `pg_statistic` rows (RP-311). Anything the model
+//! does not price -- a clause it does not estimate, an output expression --
+//! has no estimate, and the scan prints PostgreSQL's layout with zeros.
+
+use super::*;
+use secantus_pgplan::{colstats, costsize, hashagg};
+
+/// A plan node's `(startup cost, total cost, rows, width)`.
+pub(crate) type Estimate = (f64, f64, f64, i64);
+
+/// `get_typavgwidth` of a column with no `stawidth`.
+fn type_width(pg_type: &str, typmod: i32) -> i64 {
+    let typlen = secantus_pgplan::pgtypes::oid_of_name(pg_type)
+        .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+        .and_then(|v| match v {
+            Bson::Int32(n) => Some(i64::from(n)),
+            Bson::Int64(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(-1);
+    hashagg::type_avg_width(pg_type, typmod, typlen)
+}
+
+/// The width of a select list of plain columns (`fields`, stored fields),
+/// which the planner applies to the scan as its target
+/// (`set_pathtarget_cost_width`): each entry, a repeated one again, its
+/// column's `stawidth` where ANALYZE stored one above zero, else its type's
+/// average. `None` for an entry that is not a column.
+fn output_width(
+    def: &secantus_pgcatalog::TableDef,
+    analyzed: Option<&HashMap<String, Option<AnalyzedColumn>>>,
+    fields: &[String],
+) -> Option<i64> {
+    let mut width = 0;
+    for f in fields {
+        let c = def.columns.iter().find(|c| &c.field() == f)?;
+        let stawidth = analyzed
+            .and_then(|stats| stats.get(f)?.as_ref())
+            .map_or(0, |a| a.stats.width);
+        width += if stawidth > 0 {
+            i64::from(stawidth)
+        } else {
+            type_width(&c.pg_type, c.typmod)
+        };
+    }
+    Some(width)
+}
+
+impl PgHandler {
+    /// The estimate of a sequential scan of `table` through `filter` that
+    /// outputs `fields` (stored fields), or `None` where it is not priced.
+    pub(crate) fn seq_scan_estimate(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+    ) -> Option<Estimate> {
+        if self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            self.user_seq_scan(table, filter, fields)
+        } else {
+            self.catalog_seq_scan(table, filter, fields)
+        }
+    }
+
+    fn user_seq_scan(&self, table: &str, filter: &Document, fields: &[String]) -> Option<Estimate> {
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        let (sel, quals) = if filter.is_empty() {
+            (1.0, Vec::new())
+        } else if let Some(stats) = &pt.analyzed {
+            let indexes = self.cost_indexes(table, &pt.def, count()? as u64);
+            let w = self.analyzed_where(
+                table, &pt.def, &pt.unique, stats, pt.tuples, filter, &indexes,
+            )?;
+            (w.selectivity, w.quals)
+        } else {
+            let nd = |f: &str| {
+                if pt.unique.iter().any(|u| u == f) {
+                    pt.tuples
+                } else if pt
+                    .def
+                    .columns
+                    .iter()
+                    .any(|c| c.field() == f && c.pg_type == "bool")
+                {
+                    2.0
+                } else {
+                    pt.tuples.min(200.0)
+                }
+            };
+            (
+                hashagg::filter_selectivity(filter, &nd)?,
+                costsize::conjuncts(filter)?,
+            )
+        };
+        let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
+        let rel = costsize::Rel {
+            pages: pt.pages,
+            tuples: pt.tuples,
+        };
+        let (startup, total) = costsize::seq_scan_path(&rel, &quals);
+        Some((
+            startup,
+            total,
+            costsize::clamp_row_est(pt.tuples * sel),
+            width,
+        ))
+    }
+
+    /// A built-in catalog of `pg_catalog`, sized and measured as `initdb`
+    /// left it. Its rows written since are not counted: its heap's later
+    /// pages are RP-291's, and PostgreSQL's estimate does not move with
+    /// them until a VACUUM or ANALYZE of the catalog (RP-313).
+    fn catalog_seq_scan(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+    ) -> Option<Estimate> {
+        let name = table.strip_prefix("pg_catalog.").unwrap_or(table);
+        let oid = catalog_meta::system_class_lines().find_map(|line| {
+            let c: Vec<&str> = line.split('\t').collect();
+            (c.get(1) == Some(&name) && c.get(2) == Some(&"pg_catalog") && c.get(3) == Some(&"r"))
+                .then(|| c.first()?.parse::<i64>().ok())
+                .flatten()
+        })?;
+        let blocks = catalog_heap::initdb_heaps().get(&oid)?.blocks;
+        let (relpages, reltuples, _) = catalog_meta::initdb_class_size(oid)?;
+        let def = Self::virtual_table(name)?;
+        // Each column's `pg_statistic` row, its slots keyed as `colstats`
+        // compares them; a column of a type whose order is not modelled
+        // has its scalars only, so a clause on it is not estimated.
+        // A database-wide ANALYZE's measure replaces `initdb`'s row of each
+        // column it re-measured (RP-313).
+        let measured = self
+            .relstats(statistic::CATALOG_STATISTICS)
+            .and_then(|d| d.get_document("catalogs").ok().cloned())
+            .unwrap_or_default();
+        let mut stats: HashMap<String, Option<AnalyzedColumn>> = HashMap::new();
+        for row in statistic::builtin_stats(oid) {
+            let get = |k: &str| row.iter().find(|(n, _)| n == k).map(|(_, v)| v);
+            let Some(Bson::Int32(attnum)) = get("staattnum") else {
+                continue;
+            };
+            let Some(i) =
+                (0..def.columns.len()).find(|&i| i64::from(def.attnum(i)) == i64::from(*attnum))
+            else {
+                continue;
+            };
+            let c = &def.columns[i];
+            if let Ok(entry) = measured.get_document(format!("{oid}:{attnum}")) {
+                stats.insert(
+                    c.field(),
+                    Some(AnalyzedColumn {
+                        stats: hashagg::ColumnStats {
+                            null_frac: entry.get_f64("null_frac").unwrap_or(0.0) as f32,
+                            distinct: entry.get_f64("distinct").unwrap_or(0.0) as f32,
+                            width: entry.get_i32("width").unwrap_or(0),
+                        },
+                        slots: Self::stored_slots(entry),
+                    }),
+                );
+                continue;
+            }
+            let base = c.pg_type.trim_start_matches("pg_catalog.");
+            let float = |k: &str| get(k).and_then(Bson::as_f64).unwrap_or(0.0) as f32;
+            let scalars = hashagg::ColumnStats {
+                null_frac: float("stanullfrac"),
+                distinct: float("stadistinct"),
+                width: match get("stawidth") {
+                    Some(Bson::Int32(w)) => *w,
+                    _ => 0,
+                },
+            };
+            let slot = |kind: i32| {
+                (1..=5).find(|n| get(&format!("stakind{n}")) == Some(&Bson::Int32(kind)))
+            };
+            let keys = |n: usize| -> Option<Vec<Vec<u8>>> {
+                match get(&format!("stavalues{n}"))? {
+                    Bson::Array(values) => {
+                        values.iter().map(|v| Self::stats_key(base, v)).collect()
+                    }
+                    _ => None,
+                }
+            };
+            let slots = (|| {
+                let mcv = match slot(1) {
+                    Some(n) => {
+                        let freqs = match get(&format!("stanumbers{n}"))? {
+                            Bson::Array(f) => f
+                                .iter()
+                                .map(|x| x.as_f64().map(|x| x as f32))
+                                .collect::<Option<Vec<_>>>()?,
+                            _ => return None,
+                        };
+                        keys(n)?.into_iter().zip(freqs).collect()
+                    }
+                    None => Vec::new(),
+                };
+                let histogram = match slot(2) {
+                    Some(n) => keys(n)?,
+                    None => Vec::new(),
+                };
+                let correlation = slot(3).and_then(|n| match get(&format!("stanumbers{n}"))? {
+                    Bson::Array(f) => f.first()?.as_f64().map(|x| x as f32),
+                    _ => None,
+                });
+                Some(colstats::Slots {
+                    mcv,
+                    histogram,
+                    correlation,
+                    // The list `initdb`'s ANALYZE stored, not one this
+                    // server sampled: its ties are already decided.
+                    mcv_complete: true,
+                })
+            })();
+            stats.insert(
+                c.field(),
+                Some(AnalyzedColumn {
+                    stats: scalars,
+                    slots,
+                }),
+            );
+        }
+        let data_width: i64 = def
+            .columns
+            .iter()
+            .map(|c| type_width(&c.pg_type, c.typmod))
+            .sum();
+        let measured = (reltuples >= 0.0).then_some((f64::from(relpages), reltuples));
+        let (pages, tuples) = hashagg::table_size(data_width, 0, Some(u64::from(blocks)), measured);
+        let (sel, quals) = if filter.is_empty() {
+            (1.0, Vec::new())
+        } else {
+            // A clause on a column a catalog index leads with opens index
+            // paths, whose costs (and `get_actual_variable_range`) are not
+            // modelled for the catalogs.
+            let leading: Vec<String> = catalog_meta::system_index_lines()
+                .filter_map(|line| {
+                    let c: Vec<&str> = line.split('\t').collect();
+                    (c.get(1)?.parse::<i64>().ok()? == oid)
+                        .then(|| c.get(15)?.split(' ').next()?.parse::<i64>().ok())
+                        .flatten()
+                })
+                .filter_map(|attnum| {
+                    let i = (0..def.columns.len()).find(|&i| i64::from(def.attnum(i)) == attnum)?;
+                    Some(def.columns[i].field())
+                })
+                .collect();
+            let mut named = Vec::new();
+            filter_fields(filter, &mut named)?;
+            if named.iter().any(|f| leading.contains(f)) {
+                return None;
+            }
+            let w = self.analyzed_where(table, &def, &[], &stats, tuples, filter, &[])?;
+            (w.selectivity, w.quals)
+        };
+        let rel = costsize::Rel { pages, tuples };
+        let (startup, total) = costsize::seq_scan_path(&rel, &quals);
+        Some((
+            startup,
+            total,
+            costsize::clamp_row_est(tuples * sel),
+            output_width(&def, Some(&stats), fields)?,
+        ))
+    }
+}

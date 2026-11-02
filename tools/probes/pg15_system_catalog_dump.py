@@ -231,6 +231,7 @@ def main(dsn: str) -> None:
         (ROOT / "crates/secantus-pg/src/pg15_catalog_rows.txt").write_text("".join(out))
 
         statistics(conn)
+        class_sizes(conn)
         index_pages(conn)
         heap_tids(conn)
 
@@ -265,6 +266,19 @@ def statistics(conn: psycopg.Connection) -> None:
         for block in copy:
             out.append(bytes(block).decode())
     (ROOT / "crates/secantus-pg/src/pg15_catalog_statistics.txt").write_text("".join(out))
+
+
+def class_sizes(conn: psycopg.Connection) -> None:
+    """Each built-in relation's `relpages`, `reltuples` and `relallvisible`
+    as `initdb`'s VACUUM left them, which the planner reads (RP-314)."""
+    out = [
+        f"{oid}\t{pages}\t{tuples}\t{allvisible}\n"
+        for oid, pages, tuples, allvisible in conn.execute(
+            "select oid, relpages, reltuples::text, relallvisible from pg_class"
+            " where oid < 16384 order by oid"
+        )
+    ]
+    (ROOT / "crates/secantus-pg/src/pg15_class_sizes.tsv").write_text("".join(out))
 
 
 BLCKSZ = 8192

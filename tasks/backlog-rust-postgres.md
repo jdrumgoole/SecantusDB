@@ -89,13 +89,16 @@ one beside it.
   `col / CAST(32 AS REAL)` is a real; `415.0000000000000000` for numeric; an
   ungrouped column under COALESCE is 42803). The Python lane marks the same
   ones as expected divergences.
-- **Scope decision — EXPLAIN** prints PostgreSQL's plan SHAPE with zero
-  costs, and which side of a hash join is built follows this server's join
-  order. Costs and join sides are PostgreSQL's cost model (statistics, page
-  counts), which this server does not have. A PARTIAL expression index is not
-  used for a WHERE comparing the expression with a constant (its field is
-  absent outside the predicate) -- a plan choice; the WHERE still runs, as a
-  scan.
+- **Scope decision withdrawn — EXPLAIN costs** (Joe, 2026-11-02, deciding
+  RP-314). EXPLAIN printed PostgreSQL's plan shape with zero costs, on the
+  ground that this server had no cost model; it now has one (`costsize.rs`)
+  and the catalogs' `pg_statistic` rows, so every node prints PostgreSQL's
+  estimate. A single relation's Seq Scan does since RP-314; each other node
+  kind is its own item (RP-317 to RP-333), and which side of a hash join is
+  built goes with RP-330.
+- **Scope decision — a PARTIAL expression index** is not used for a WHERE
+  comparing the expression with a constant (its field is absent outside the
+  predicate) -- a plan choice; the WHERE still runs, as a scan.
 - **Scope decision — planning-time constant-folding errors.** PostgreSQL
   raises `select 1/0 from (values (1)) v(a) where false` and `select f(0)
   from t where false` because `eval_const_expressions` folds every immutable
@@ -1295,29 +1298,198 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN of a scan of a catalog has no estimate.** `explain select *
-      from pg_class where relkind = 'v'` is `Seq Scan on pg_class
-      (cost=0.00..0.00 rows=0 width=0)`; PostgreSQL 15.19 in a fresh
-      database prices it from the catalog's `relpages` / `reltuples` and
-      `initdb`'s statistics (RP-311): `cost=0.00..19.12 rows=140 width=265`
-      (found while working RP-311). The `Filter: (relkind = 'v'::"char")`
-      line already matches (probed 2026-11-02).
-      **Decision needed (2026-11-02):** what is left is the costs alone, and
-      no EXPLAIN here prints costs -- a user table's scan is `cost=0.00..0.00
-      rows=0 width=0` too, per the "Scope decision -- EXPLAIN" at the top of
-      this file. Pricing only catalog scans would make the two disagree. The
-      scope decision predates the cost model the planner now has
-      (`secantus-pgplan/src/costsize.rs` prices seq / index / bitmap paths
-      from `relpages` / `reltuples` to choose plans) and the catalogs'
-      `pg_statistic` rows (RP-311). Options: (a, faithful, recommended)
-      withdraw the scope decision and print `costsize`'s startup / total
-      cost, `clamp_row_est` rows and the `stawidth` sum as width on every
-      node, starting with a single-relation Seq Scan (user tables and
-      catalogs alike) and filing each other node kind as its own item;
-      (b) keep zero costs everywhere and retire this item under the scope
-      decision.
-      Backlog-ID: RP-314
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scan_is_estimated
+- [ ] **EXPLAIN prints no estimate for an Index Scan.**
+      `explain select * from k where a = 5` over an analysed primary key
+      is `Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1
+      width=7)` (`cost_index`, `btcostestimate`). PostgreSQL 15.19
+      prices it (`costsize.c`); here it prints `cost=0.00..0.00 rows=0
+      width=0`. Since RP-314 a plan that is one relation's Seq Scan
+      prints the estimate; the scenario's expected plan is PostgreSQL's,
+      measured on a fresh cluster.
+      Backlog-ID: RP-317
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[index scan]
+- [ ] **EXPLAIN prints no estimate for a Sort.**
+      `explain select * from e order by b` is `Sort  (cost=64.83..67.33
+      rows=1000 width=7)` (`cost_sort`) over its Seq Scan, which prints
+      zeros too beneath it (RP-332). PostgreSQL 15.19 prices it
+      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
+      Since RP-314 a plan that is one relation's Seq Scan prints the
+      estimate; the scenario's expected plan is PostgreSQL's, measured
+      on a fresh cluster.
+      Backlog-ID: RP-318
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[sort]
+- [ ] **EXPLAIN prints no estimate for a Limit.**
+      `explain select * from e limit 5` is `Limit  (cost=0.00..0.07
+      rows=5 width=7)` (`adjust_limit_rows_costs`). PostgreSQL 15.19
+      prices it (`costsize.c`); here it prints `cost=0.00..0.00 rows=0
+      width=0`. Since RP-314 a plan that is one relation's Seq Scan
+      prints the estimate; the scenario's expected plan is PostgreSQL's,
+      measured on a fresh cluster.
+      Backlog-ID: RP-319
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[limit]
+- [ ] **EXPLAIN prints no estimate for a Unique.**
+      `explain select distinct a from e order by a` is `Unique
+      (cost=64.83..69.83 rows=1000 width=4)` over a Sort
+      (`create_upper_unique_path`). PostgreSQL 15.19 prices it
+      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
+      Since RP-314 a plan that is one relation's Seq Scan prints the
+      estimate; the scenario's expected plan is PostgreSQL's, measured
+      on a fresh cluster.
+      Backlog-ID: RP-320
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[unique]
+- [ ] **EXPLAIN prints no estimate for an Aggregate.**
+      `explain select count(*) from e` is `Aggregate  (cost=17.50..17.51
+      rows=1 width=8)` over a Seq Scan of width 0 (`cost_agg`,
+      AGG_PLAIN). PostgreSQL 15.19 prices it (`costsize.c`); here it
+      prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that
+      is one relation's Seq Scan prints the estimate; the scenario's
+      expected plan is PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-321
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[aggregate]
+- [ ] **EXPLAIN prints no estimate for a HashAggregate.**
+      `explain select b, count(*) from e group by b` is `HashAggregate
+      (cost=20.00..20.10 rows=10 width=11)` (`cost_agg`, AGG_HASHED,
+      `estimate_num_groups`). PostgreSQL 15.19 prices it (`costsize.c`);
+      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
+      plan that is one relation's Seq Scan prints the estimate; the
+      scenario's expected plan is PostgreSQL's, measured on a fresh
+      cluster.
+      Backlog-ID: RP-322
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hashaggregate]
+- [ ] **EXPLAIN prints no estimate for a WindowAgg.**
+      `explain select a, row_number() over () from e` is `WindowAgg
+      (cost=0.00..27.50 rows=1000 width=12)` (`cost_windowagg`).
+      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
+      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
+      relation's Seq Scan prints the estimate; the scenario's expected
+      plan is PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-323
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[windowagg]
+- [ ] **EXPLAIN prints no estimate for an Append.**
+      `explain select a from e union all select a from k` is `Append
+      (cost=0.00..40.00 rows=2000 width=4)` (`cost_append`). PostgreSQL
+      15.19 prices it (`costsize.c`); here it prints `cost=0.00..0.00
+      rows=0 width=0`. Since RP-314 a plan that is one relation's Seq
+      Scan prints the estimate; the scenario's expected plan is
+      PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-324
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[append]
+- [ ] **EXPLAIN prints no estimate for a Result.**
+      `explain select 1` is `Result  (cost=0.00..0.01 rows=1 width=4)`.
+      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
+      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
+      relation's Seq Scan prints the estimate; the scenario's expected
+      plan is PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-325
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[result]
+- [ ] **EXPLAIN prints no estimate for a Values Scan.**
+      `explain values (1), (2)` is `Values Scan on "*VALUES*"
+      (cost=0.00..0.03 rows=2 width=4)` (`cost_valuesscan`). PostgreSQL
+      15.19 prices it (`costsize.c`); here it prints `cost=0.00..0.00
+      rows=0 width=0`. Since RP-314 a plan that is one relation's Seq
+      Scan prints the estimate; the scenario's expected plan is
+      PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-326
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[values scan]
+- [ ] **EXPLAIN prints no estimate for a Function Scan.**
+      `explain select * from generate_series(1, 10)` is `Function Scan
+      on generate_series  (cost=0.00..0.10 rows=10 width=4)`
+      (`cost_functionscan`, the support function's row estimate).
+      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
+      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
+      relation's Seq Scan prints the estimate; the scenario's expected
+      plan is PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-327
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[function scan]
+- [ ] **EXPLAIN prints no estimate for a Subquery Scan, nor its Filter.**
+      `explain select * from (select a from e limit 3) s where a > 1` is
+      `Subquery Scan on s  (cost=0.00..0.08 rows=2 width=4)` with
+      `Filter: (s.a > 1)` over the Limit; here the Filter line is
+      missing too. PostgreSQL 15.19 prices it (`costsize.c`); here it
+      prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that
+      is one relation's Seq Scan prints the estimate; the scenario's
+      expected plan is PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-328
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[subquery scan]
+- [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
+      `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
+      (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:
+      (e.a < e2.a)` and a `Materialize` over the inner Seq Scan
+      (`cost_nestloop`, `cost_material`); here neither line nor the
+      Materialize is printed. PostgreSQL 15.19 prices it (`costsize.c`);
+      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
+      plan that is one relation's Seq Scan prints the estimate; the
+      scenario's expected plan is PostgreSQL's, measured on a fresh
+      cluster.
+      Backlog-ID: RP-329
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop]
+- [ ] **EXPLAIN prints no estimate for a Hash Join or its Hash.**
+      `explain select * from e join k on e.b = k.b` is `Hash Join
+      (cost=27.50..1170.00 rows=100000 width=14)` over `Hash
+      (cost=15.00..15.00 rows=1000 width=7)` (`cost_hashjoin`). Which
+      side is hashed is the cost model's choice too; here it follows
+      this server's join order. PostgreSQL 15.19 prices it
+      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
+      Since RP-314 a plan that is one relation's Seq Scan prints the
+      estimate; the scenario's expected plan is PostgreSQL's, measured
+      on a fresh cluster.
+      Backlog-ID: RP-330
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join]
+- [ ] **EXPLAIN prints no estimate for an Insert, Update or Delete.**
+      A ModifyTable node is `Insert on e  (cost=0.00..0.01 rows=0
+      width=0)` over a `Result` of width 36, `Update on e
+      (cost=0.00..17.50 rows=0 width=0)` over a Seq Scan of width 38
+      (the new row and the `ctid`), and `Delete on e` over a Seq Scan of
+      width 6 (the `ctid`). PostgreSQL 15.19 prices it (`costsize.c`);
+      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
+      plan that is one relation's Seq Scan prints the estimate; the
+      scenario's expected plan is PostgreSQL's, measured on a fresh
+      cluster.
+      Backlog-ID: RP-331
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[insert], tests/backlog/test_rp_explain_costs.py::test_plan[update], tests/backlog/test_rp_explain_costs.py::test_plan[delete]
+- [ ] **EXPLAIN prints no estimate for a Seq Scan beneath another node.**
+      RP-314 prices a Seq Scan only when it is the whole plan. Under a
+      Sort, `explain select * from e where a < 10 order by b` has `Seq
+      Scan on e  (cost=0.00..17.50 rows=9 width=7)`, and the Sort above
+      it is `cost=17.64..17.67 rows=9` (RP-318). The scan's width is
+      then what the node above needs of it. PostgreSQL 15.19 prices it
+      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
+      Since RP-314 a plan that is one relation's Seq Scan prints the
+      estimate; the scenario's expected plan is PostgreSQL's, measured
+      on a fresh cluster.
+      Backlog-ID: RP-332
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan beneath another node]
+- [ ] **EXPLAIN prints no estimate for a Seq Scan whose select list holds an expression.**
+      `explain select a + 1 from e` is `Seq Scan on e  (cost=0.00..17.50
+      rows=1000 width=4)`: the expression is evaluated per row
+      (`cost_qual_eval` of the target, one operator) and its width is
+      its type's. RP-314 prices only a select list of plain columns (as
+      it does a WHERE it cannot estimate: a residual, an `OR` on an
+      indexed column, a clause on a column a catalog index leads with).
+      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
+      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
+      relation's Seq Scan prints the estimate; the scenario's expected
+      plan is PostgreSQL's, measured on a fresh cluster.
+      Backlog-ID: RP-333
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan of an expression]
+- [ ] **A catalog read by its index is a Seq Scan here.**
+      `explain select oid from pg_class where relname = 'pg_class'` in a
+      fresh database is `Index Scan using pg_class_relname_nsp_index on
+      pg_class  (cost=0.27..8.29 rows=1 width=4)` with `Index Cond:
+      (relname = 'pg_class'::name)` on PostgreSQL 15.19; here it is a
+      `Seq Scan` with a Filter, printed with zeros: the explain chooser
+      asks the storage planner, which has no index on a catalog (found
+      while working RP-314).
+      Backlog-ID: RP-334
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read by its index]
+- [ ] **A `name` column compared with a literal is shown cast to `text`.**
+      With index scans off, PostgreSQL 15.19 shows `explain (costs off)
+      select oid from pg_class where relname = 'pg_class'` as `Filter:
+      (relname = 'pg_class'::name)` (`name = name`); here it is `Filter:
+      ((relname)::text = 'pg_class'::text)` (found while working
+      RP-314).
+      Backlog-ID: RP-335
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a name compared with a literal]
 
 ## Found by batch 54 (2026-10-24)
 

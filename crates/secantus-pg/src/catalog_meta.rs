@@ -180,7 +180,10 @@ pub(crate) fn class_rows(def: &TableDef, namespace_oid: impl Fn(&str) -> i64) ->
         put("relchecks", Bson::Int32(int(checks) as i32));
         put("relfilenode", Bson::Int64(int(filenode)));
         put("reltablespace", Bson::Int64(int(tablespace)));
-        put("reltuples", Bson::Double(-1.0));
+        let (pages, tuples, allvisible) = initdb_class_size(int(oid)).unwrap_or((0, -1.0, 0));
+        put("relpages", Bson::Int32(pages));
+        put("reltuples", Bson::Double(tuples));
+        put("relallvisible", Bson::Int32(allvisible));
         put("relowner", Bson::Int64(10));
         put("relrowsecurity", Bson::Boolean(false));
         put("relforcerowsecurity", Bson::Boolean(false));
@@ -192,6 +195,40 @@ pub(crate) fn class_rows(def: &TableDef, namespace_oid: impl Fn(&str) -> i64) ->
         out.push(d);
     }
     out
+}
+
+/// `relpages`, `reltuples` and `relallvisible` of each of PostgreSQL's own
+/// relations as `initdb`'s VACUUM left them in a fresh database
+/// (`pg15_class_sizes.tsv`, dumped by
+/// `tools/probes/pg15_system_catalog_dump.py`), by oid. The planner sizes a
+/// catalog from them (RP-314).
+pub(crate) fn initdb_class_size(oid: i64) -> Option<(i32, f64, i32)> {
+    static SIZES: std::sync::OnceLock<std::collections::HashMap<i64, (i32, f64, i32)>> =
+        std::sync::OnceLock::new();
+    SIZES
+        .get_or_init(|| {
+            include_str!("pg15_class_sizes.tsv")
+                .lines()
+                .map(|line| {
+                    let c: Vec<&str> = line.split('\t').collect();
+                    let [oid, pages, tuples, allvisible] = c.as_slice() else {
+                        panic!("pg15_class_sizes.tsv: {line}");
+                    };
+                    let parse = |s: &str| s.parse::<i64>().expect("pg15_class_sizes.tsv: integer");
+                    (
+                        parse(oid),
+                        (
+                            parse(pages) as i32,
+                            // A `real`: the double its float4 is carried as.
+                            f64::from(tuples.parse::<f32>().expect("pg15_class_sizes.tsv: real")),
+                            parse(allvisible) as i32,
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .get(&oid)
+        .copied()
 }
 
 /// `relacl` of one of PostgreSQL's own relations, as initdb leaves it
