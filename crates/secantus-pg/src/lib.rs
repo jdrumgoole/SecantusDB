@@ -111,6 +111,7 @@ mod renames;
 mod row_waits;
 mod rule_trees;
 mod rules;
+mod scan_estimate;
 mod scan_partitions;
 mod schema_rows;
 mod scram_binding;
@@ -8497,13 +8498,18 @@ impl PgHandler {
         fields_of(&clauses, &mut fields);
         // A column any index holds, which an index path could read.
         let indexed = |f: &str| indexes.iter().any(|ix| ix.columns.iter().any(|c| c == f));
-        let docs = self.table_docs(table).ok()?;
+        // Read only for `get_actual_variable_range`, which needs an index.
+        let docs = if indexes.is_empty() {
+            Vec::new()
+        } else {
+            self.table_docs(table).ok()?
+        };
         let mut columns = Vec::with_capacity(fields.len());
         let mut bases = Vec::with_capacity(fields.len());
         for f in &fields {
             let c = def.columns.iter().find(|c| c.field() == *f)?;
             let base = c.pg_type.trim_start_matches("pg_catalog.");
-            let numeric = matches!(base, "int2" | "int4" | "int8");
+            let numeric = matches!(base, "int2" | "int4" | "int8" | "oid");
             let measured = match stats.get(*f) {
                 Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
                 Some(None) => return None,
@@ -8767,9 +8773,15 @@ impl PgHandler {
             ("int2" | "int4" | "int8", Bson::Int64(n)) => {
                 Some(secantus_pgplan::colstats::int_key(*n))
             }
-            ("text" | "varchar" | "character varying", Bson::String(s)) => {
-                Some(s.as_bytes().to_vec())
-            }
+            // An `oid` sorts as the unsigned number it is.
+            ("oid", Bson::Int32(n)) => Some(secantus_pgplan::colstats::int_key(i64::from(*n))),
+            ("oid", Bson::Int64(n)) => Some(secantus_pgplan::colstats::int_key(*n)),
+            // `name` compares in the C collation, `"char"` as an unsigned
+            // byte: both as their bytes (the catalogs' statistics, RP-314).
+            (
+                "text" | "varchar" | "character varying" | "name" | "char" | "\"char\"",
+                Bson::String(s),
+            ) => Some(s.as_bytes().to_vec()),
             ("bool", Bson::Boolean(b)) => Some(vec![u8::from(*b)]),
             _ => None,
         }
@@ -40634,6 +40646,27 @@ impl PgHandler {
                 explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
                 explain::attach_join_conds(&mut tree, &options.join_conds);
                 explain::attach_join_where(&mut tree, &options.join_where);
+                // A plan that is one relation's sequential scan, of plain
+                // columns, prints the planner's estimate (RP-314).
+                if options.costs
+                    && tree.children.is_empty()
+                    && tree.name.starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                            && sel.casts.iter().all(Option::is_none)
+                        {
+                            let fields: Vec<String> =
+                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
+                            tree.estimate =
+                                self.seq_scan_estimate(&sel.table, &sel.filter, &fields);
+                        }
+                    }
+                }
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
