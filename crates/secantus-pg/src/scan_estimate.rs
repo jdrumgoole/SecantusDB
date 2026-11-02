@@ -167,6 +167,122 @@ impl PgHandler {
         }
     }
 
+    /// The estimate of a plain index scan of user table `table` through the
+    /// index whose key columns are `key` (stored fields), when that is the
+    /// path `set_cheapest` keeps over an analysed table (RP-317):
+    /// `cost_index` over `btcostestimate`, the index sized as the planner's
+    /// cost model sizes it and read in its leading column's correlation.
+    /// `None` -- the node prints zeros -- where another path is cheaper or
+    /// the scan is one the model does not price: a table never analysed, a
+    /// clause on a later key column, a range on the leading one (its ends
+    /// are read from the index, `get_actual_variable_range`), an index
+    /// holding every column read (an index-only scan), an `OR`, or more
+    /// than one index a clause serves (`choose_bitmap_and`).
+    pub(crate) fn index_scan_estimate(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        key: &[String],
+    ) -> Option<Estimate> {
+        if filter.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            return None;
+        }
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(table, &count)?;
+        let stats = pt.analyzed.as_ref()?;
+        let mut indexes = self.cost_indexes(table, &pt.def, count()? as u64);
+        let w = self.analyzed_where(
+            table, &pt.def, &pt.unique, stats, pt.tuples, filter, &indexes,
+        )?;
+        if !w.bitmap_ors.is_empty() {
+            return None;
+        }
+        let mut named = Vec::new();
+        filter_fields(filter, &mut named)?;
+        let correlations = Self::stats_correlations(&pt.def, stats);
+        let mut serving = Vec::new();
+        for ix in &mut indexes {
+            if !named.iter().any(|f| ix.columns.contains(f)) {
+                continue;
+            }
+            let lead = ix.columns.first()?.clone();
+            if !named.contains(&lead) || named.iter().any(|f| ix.columns[1..].contains(f)) {
+                return None;
+            }
+            let ranged = w
+                .quals
+                .iter()
+                .any(|(f, q)| *f == lead && matches!(q, costsize::Qual::Range(_)));
+            let covering = fields
+                .iter()
+                .chain(named.iter())
+                .all(|f| ix.columns.contains(f));
+            if ranged || covering {
+                return None;
+            }
+            let c = correlations.get(&lead).copied().flatten()?;
+            ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+            if !ix.unique {
+                if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
+                    ix.pages = pages;
+                    ix.height = height;
+                }
+            }
+            // The primary key is listed both as the SQL key and as the
+            // storage's own `_id` index: one relation in PostgreSQL.
+            if !serving
+                .iter()
+                .any(|s: &costsize::Index| s.columns == ix.columns)
+            {
+                serving.push(ix.clone());
+            }
+        }
+        if serving.len() != 1 || serving[0].columns != key {
+            return None;
+        }
+        let rows = costsize::clamp_row_est(pt.tuples * w.selectivity);
+        let rel = costsize::Rel {
+            pages: pt.pages,
+            tuples: pt.tuples,
+        };
+        let colsel =
+            |f: &str| costsize::ColSel::Given(w.index_selectivity.get(f).copied().unwrap_or(1.0));
+        // `set_cheapest` over every path, `disable_cost` added to a kind an
+        // `enable_*` setting turns off.
+        const DISABLE_COST: f64 = 1.0e10;
+        let off = |name: &str| self.setting_is(name, "off");
+        let mut best: Option<(costsize::ScanKind, (f64, f64))> = None;
+        for (kind, (mut startup, mut total)) in
+            costsize::scan_paths(&rel, &serving, &w.quals, &colsel, rows)
+        {
+            let disabled = match kind {
+                costsize::ScanKind::Seq => off("enable_seqscan"),
+                costsize::ScanKind::Bitmap(_) => off("enable_bitmapscan"),
+                costsize::ScanKind::Index(_) => off("enable_indexscan"),
+            };
+            if disabled {
+                startup += DISABLE_COST;
+                total += DISABLE_COST;
+            }
+            if best.is_none_or(|(_, (bs, bt))| total < bt || (total == bt && startup < bs)) {
+                best = Some((kind, (startup, total)));
+            }
+        }
+        let (costsize::ScanKind::Index(_), (startup, total)) = best? else {
+            return None;
+        };
+        let width = output_width(&pt.def, Some(stats), fields)?;
+        Some((startup, total, rows, width))
+    }
+
     fn user_seq_scan(&self, table: &str, filter: &Document, fields: &[String]) -> Option<Estimate> {
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
         let count = || {

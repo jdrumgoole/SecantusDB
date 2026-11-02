@@ -1298,16 +1298,6 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for an Index Scan.**
-      `explain select * from k where a = 5` over an analysed primary key
-      is `Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1
-      width=7)` (`cost_index`, `btcostestimate`). PostgreSQL 15.19
-      prices it (`costsize.c`); here it prints `cost=0.00..0.00 rows=0
-      width=0`. Since RP-314 a plan that is one relation's Seq Scan
-      prints the estimate; the scenario's expected plan is PostgreSQL's,
-      measured on a fresh cluster.
-      Backlog-ID: RP-317
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[index scan]
 - [ ] **EXPLAIN prints no estimate for a Sort.**
       `explain select * from e order by b` is `Sort  (cost=64.83..67.33
       rows=1000 width=7)` (`cost_sort`) over its Seq Scan, which prints
@@ -1492,6 +1482,19 @@ a regression test.
       a `Seq Scan` with zeros (found while working RP-334).
       Backlog-ID: RP-338
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read by a bitmap]
+- [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
+      index path.** Over an analysed table PostgreSQL 15.19's
+      `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`
+      (the key's Index Cond and a Filter), for a range on the key
+      (`a < 3`) and for a composite index's leading column, and a Bitmap
+      Heap Scan over a secondary index (`n_b`, 100 of 5,000 rows); here
+      the node is what the storage planner chose -- a `Seq Scan` printed
+      with the sequential scan's cost. RP-317 prices the Index Scan when
+      the storage planner already chose it; the node choice itself is
+      PostgreSQL's cost comparison (found while working RP-317, measured
+      on a fresh private cluster).
+      Backlog-ID: RP-339
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an index scan with a filter]
 
 ## Found by batch 54 (2026-10-24)
 
