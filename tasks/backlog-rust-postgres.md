@@ -1453,13 +1453,17 @@ a regression test.
       (found while working RP-325).
       Backlog-ID: RP-340
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result of a function call]
-- [ ] **EXPLAIN prints no One-Time Filter for a constant WHERE.**
-      `explain select 1 where false` is `Result  (cost=0.00..0.01 rows=1
-      width=4)` with `One-Time Filter: false` on PostgreSQL 15.19 (the
-      gating qual of a Result); here the detail line is missing (found
-      while working RP-325).
-      Backlog-ID: RP-341
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result's one-time filter]
+- [ ] **EXPLAIN prints no One-Time Filter for a WHERE that calls a function.**
+      `explain select 1 where current_setting('work_mem') <> ''` is
+      `Result  (cost=0.01..0.01 rows=1 width=4)` with `One-Time Filter:
+      (current_setting('work_mem'::text) <> ''::text)` on PostgreSQL
+      15.19: a stable call is not folded, so the qual is deparsed and
+      its evaluation costed. RP-341 prints the line only for a WHERE of
+      constants and built-in operators, which folds to `false` or NULL;
+      here the line and the cost are missing (found while working
+      RP-341).
+      Backlog-ID: RP-342
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result's one-time filter of a call]
 - [ ] **A catalog read index-only is a zero-cost Seq Scan here.**
       `explain select attname from pg_attribute where attrelid = 1259`
       in a fresh database is `Index Only Scan using

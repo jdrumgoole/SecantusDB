@@ -531,6 +531,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select 1 where false",
         ["Result  (cost=0.00..0.01 rows=1 width=4)", "  One-Time Filter: false"],
     ),
+    "a result's one-time filter folded to null": (
+        "RP-341",
+        [],
+        "explain select 1 where 1 = null",
+        ["Result  (cost=0.00..0.01 rows=1 width=4)", "  One-Time Filter: NULL::boolean"],
+    ),
+    "a result's one-time filter folded from operators": (
+        "RP-341",
+        [],
+        "explain select 1, 'a' where 1 = 2 or false",
+        ["Result  (cost=0.00..0.01 rows=1 width=36)", "  One-Time Filter: false"],
+    ),
+    "a result's one-time filter of a call": (
+        "RP-342",
+        [],
+        "explain select 1 where current_setting('work_mem') <> ''",
+        [
+            "Result  (cost=0.01..0.01 rows=1 width=4)",
+            "  One-Time Filter: (current_setting('work_mem'::text) <> ''::text)",
+        ],
+    ),
+    "a result's true where drops its filter": (
+        "RP-341",
+        [],
+        "explain select 1 where 1 = 1",
+        ["Result  (cost=0.00..0.01 rows=1 width=4)"],
+    ),
     "a catalog read index-only": (
         "RP-337",
         [],
@@ -569,7 +596,7 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-325", "RP-333", "RP-334", "RP-335")
+    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-325", "RP-333", "RP-334", "RP-335", "RP-341")
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
