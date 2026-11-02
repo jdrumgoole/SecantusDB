@@ -26,7 +26,7 @@ mod functional_grouping;
 mod guc_args;
 pub mod hashagg;
 mod hashed_subplan;
-mod hashfn;
+pub mod hashfn;
 pub mod joincost;
 mod like_match;
 pub mod misc_alter;

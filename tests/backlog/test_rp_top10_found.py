@@ -611,21 +611,75 @@ def test_a_tsvector_gin_index_has_its_pages(pg: Any, case: str) -> None:
     assert got == ("ok", [(pages,)])
 
 
-@pytest.mark.backlog("RP-287")
-def test_a_jsonb_path_ops_gin_index_has_its_pages(pg: Any) -> None:
-    """A GIN index over `jsonb_path_ops` is not modelled page by page:
-    PostgreSQL 15.19 sizes it at 2 pages; here `pg_relation_size` reads 0."""
-    got = _in_block(
-        pg,
+# `jsonb_path_ops` keys (`gin_extract_jsonb_path`): each leaf keyed by the
+# int4 hash of its path, built over the rows or, with fastupdate off,
+# inserted straight into the entry and posting trees. Sizes measured on
+# PostgreSQL 15.19.
+_RP287_PATH_OPS = {
+    "flat": (
         [
             "create table rp287_p (j jsonb)",
             "insert into rp287_p select jsonb_build_object('k', g % 100)"
             " from generate_series(1, 2000) g",
             "create index rp287_pg on rp287_p using gin (j jsonb_path_ops)",
         ],
-        "select pg_relation_size('rp287_pg') / 8192",
+        2,
+    ),
+    "nested": (
+        [
+            "create table rp287_p (j jsonb)",
+            "insert into rp287_p select jsonb_build_object('a', g % 37, 'b',"
+            " jsonb_build_object('c', g % 11, 'd', array[g % 5, g % 3]), 'e', (g % 2 = 0))"
+            " from generate_series(1, 30000) g",
+            "create index rp287_pg on rp287_p using gin (j jsonb_path_ops)",
+        ],
+        39,
+    ),
+    "unique": (
+        [
+            "create table rp287_p (j jsonb)",
+            "insert into rp287_p select jsonb_build_object('u', g, 's', 'x' || g)"
+            " from generate_series(1, 20000) g",
+            "create index rp287_pg on rp287_p using gin (j jsonb_path_ops)",
+        ],
+        274,
+    ),
+    "nofastupdate": (
+        [
+            "create table rp287_p (j jsonb)",
+            "create index rp287_pg on rp287_p using gin (j jsonb_path_ops) with (fastupdate = off)",
+            "insert into rp287_p select jsonb_build_object('u', g, 'n', null)"
+            " from generate_series(1, 5000) g",
+        ],
+        33,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("case", list(_RP287_PATH_OPS), ids=list(_RP287_PATH_OPS))
+def test_a_jsonb_path_ops_gin_index_has_its_pages(pg: Any, case: str) -> None:
+    """A GIN index over `jsonb_path_ops` was not modelled page by page:
+    `pg_relation_size` read 0 where PostgreSQL 15.19 sizes it in pages."""
+    statements, pages = _RP287_PATH_OPS[case]
+    got = _in_block(pg, statements, "select pg_relation_size('rp287_pg') / 8192")
+    assert got == ("ok", [(pages,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_partial_gin_index_has_its_pages(pg: Any) -> None:
+    """A partial GIN index is not modelled page by page: PostgreSQL 15.19
+    sizes this one at 8 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_q (a int[])",
+            "insert into rp287_q select array[g % 100, g % 7] from generate_series(1, 20000) g",
+            "create index rp287_qg on rp287_q using gin (a) where a[1] < 50",
+        ],
+        "select pg_relation_size('rp287_qg') / 8192",
     )
-    assert got == ("ok", [(2,)])
+    assert got == ("ok", [(8,)])
 
 
 # `jsonb_ops` keys (`gin_extract_jsonb`): object keys, values, string
