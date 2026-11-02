@@ -730,9 +730,12 @@ impl<'a> Printer<'a> {
             }
             return Some((String::new(), String::new()));
         }
+        // An untyped literal takes the other side's type when that type has
+        // the operator itself: `name` does (`nameeq`, `namelt` ...), so
+        // `relname = 'x'` is `name = name`; varchar has none, so text.
         if l == "unknown" {
             let t = match r {
-                "varchar" | "name" => "text",
+                "varchar" => "text",
                 other => other,
             };
             let rt = if t == r { "" } else { t };
@@ -740,7 +743,7 @@ impl<'a> Printer<'a> {
         }
         if r == "unknown" {
             let t = match l {
-                "varchar" | "name" => "text",
+                "varchar" => "text",
                 other => other,
             };
             let lt = if t == l { "" } else { t };
@@ -4031,6 +4034,7 @@ mod tests {
                     Column::new("n", "numeric", false),
                     Column::new("d", "date", false),
                     Column::new("b", "bool", false),
+                    Column::new("nm", "name", false),
                 ],
             )),
             "vd_u" => Some(TableDef::new(
@@ -4060,5 +4064,29 @@ mod tests {
             render("SELECT id, t FROM vd_t").as_deref(),
             Some(" SELECT vd_t.id,\n    vd_t.t\n   FROM vd_t;")
         );
+    }
+
+    /// RP-335: `name` has comparison operators of its own, so an untyped
+    /// literal becomes a `name` (PostgreSQL 15.19: `(nm = 'x'::name)`),
+    /// while varchar, which has none, compares as text.
+    #[test]
+    fn a_name_compared_with_a_literal_stays_a_name() {
+        let def = cat_lookup("vd_t").unwrap();
+        let conj = |w: &str| {
+            let parsed = pg_query::parse(&format!("SELECT 1 FROM vd_t WHERE {w}")).unwrap();
+            let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+                .stmt
+                .as_ref()
+                .and_then(|n| n.node.as_ref())
+            else {
+                panic!()
+            };
+            explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap()[0]
+                .0
+                .clone()
+        };
+        assert_eq!(conj("nm = 'x'"), "(nm = 'x'::name)");
+        assert_eq!(conj("'x' < nm"), "('x'::name < nm)");
+        assert_eq!(conj("v = 'x'"), "((v)::text = 'x'::text)");
     }
 }

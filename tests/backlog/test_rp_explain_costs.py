@@ -320,8 +320,12 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
             c.rollback()
 
 
+# Items fixed: their scenarios are regression tests.
+FIXED = {"RP-314", "RP-335"}
+
+
 def _marked(name: str, item: str) -> Any:
-    mark = pytest.mark.backlog_fixed if item == "RP-314" else pytest.mark.backlog
+    mark = pytest.mark.backlog_fixed if item in FIXED else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
 

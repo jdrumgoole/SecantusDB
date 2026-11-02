@@ -1482,14 +1482,6 @@ a regression test.
       while working RP-314).
       Backlog-ID: RP-334
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read by its index]
-- [ ] **A `name` column compared with a literal is shown cast to `text`.**
-      With index scans off, PostgreSQL 15.19 shows `explain (costs off)
-      select oid from pg_class where relname = 'pg_class'` as `Filter:
-      (relname = 'pg_class'::name)` (`name = name`); here it is `Filter:
-      ((relname)::text = 'pg_class'::text)` (found while working
-      RP-314).
-      Backlog-ID: RP-335
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a name compared with a literal]
 
 ## Found by batch 54 (2026-10-24)
 
