@@ -1442,19 +1442,6 @@ a regression test.
       on a fresh cluster.
       Backlog-ID: RP-332
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan beneath another node]
-- [ ] **EXPLAIN prints no estimate for a Seq Scan whose select list holds an expression.**
-      `explain select a + 1 from e` is `Seq Scan on e  (cost=0.00..17.50
-      rows=1000 width=4)`: the expression is evaluated per row
-      (`cost_qual_eval` of the target, one operator) and its width is
-      its type's. RP-314 prices only a select list of plain columns (as
-      it does a WHERE it cannot estimate: a residual, an `OR` on an
-      indexed column, a clause on a column a catalog index leads with).
-      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
-      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
-      relation's Seq Scan prints the estimate; the scenario's expected
-      plan is PostgreSQL's, measured on a fresh cluster.
-      Backlog-ID: RP-333
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan of an expression]
 - [ ] **EXPLAIN prints no estimate for a Result whose select list calls
       a function the planner keeps as a call.** `explain select
       current_setting('work_mem')` is `Result  (cost=0.00..0.01 rows=1

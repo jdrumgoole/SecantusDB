@@ -665,3 +665,116 @@ mod limit_tests {
         assert_eq!((t, r), (15.0, 1000.0));
     }
 }
+
+/// The built-in operators whose every PostgreSQL 15 implementation over
+/// the built-in types is a function of `procost` 1 (`pg_proc.dat`): one
+/// `cpu_operator_cost` per evaluation.
+const UNIT_COST_OPERATORS: &[&str] = &[
+    "+", "-", "*", "/", "%", "||", "=", "<>", "<", ">", "<=", ">=",
+];
+
+/// `cost_qual_eval_node`'s per-row cost, in operators, of a select-list
+/// expression over one row (RP-333): each operator one `cpu_operator_cost`
+/// (its function's `procost`), a column, a constant or a parameter free. A
+/// subtree reading no column is folded to a constant by
+/// `eval_const_expressions` and costs nothing. `None` for any node not
+/// modelled here: a cast (a relabelling, a cast function or an I/O
+/// conversion, priced differently), a function call, an operator not
+/// known to cost one.
+fn row_expr_ops(n: &pg_query::protobuf::Node, nparams: usize) -> Option<(u32, bool)> {
+    use pg_query::protobuf::node::Node as N;
+    match n.node.as_ref()? {
+        N::AConst(_) => Some((0, false)),
+        N::ParamRef(p) => Some((0, usize::try_from(p.number).ok()? > nparams)),
+        N::AExpr(e) if e.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
+            let op = match e.name.last()?.node.as_ref()? {
+                N::String(s) => s.sval.as_str(),
+                _ => return None,
+            };
+            if !UNIT_COST_OPERATORS.contains(&op) {
+                return None;
+            }
+            let (mut ops, mut reads) = (0, false);
+            for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let (o, r) = row_expr_ops(side, nparams)?;
+                ops += o;
+                reads |= r;
+            }
+            Some((if reads { ops + 1 } else { 0 }, reads))
+        }
+        _ => None,
+    }
+}
+
+/// A select list's cost and width beside its plain columns (RP-333):
+/// `(per-row cost, width)` of its computed entries, as
+/// `set_pathtarget_cost_width` sets them -- an expression's width is its
+/// type's `get_typavgwidth` -- and the plain columns' stored fields, whose
+/// widths the scan measures. `None` where an entry is not priced.
+pub(crate) fn target_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64, Vec<String>)> {
+    use secantus_pgplan::ColumnExpr;
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    let (mut cost, mut width, mut fields) = (0.0, 0, Vec::new());
+    for (i, (_, field)) in sel.columns.iter().enumerate() {
+        match sel.casts.get(i).and_then(Option::as_ref) {
+            None => fields.push(field.clone()),
+            Some(ColumnExpr::Const { result_type, .. }) => {
+                width += type_width(result_type, -1);
+            }
+            Some(ColumnExpr::Row {
+                expr,
+                fields: read,
+                params,
+                result_type,
+                ..
+            }) => {
+                if read.iter().any(|(_, _, t)| {
+                    secantus_pgplan::pgtypes::oid_of_name(t).is_none_or(|oid| oid >= 10000)
+                }) || secantus_pgplan::pgtypes::oid_of_name(result_type)
+                    .is_none_or(|oid| oid >= 10000)
+                {
+                    return None;
+                }
+                let (ops, _) = row_expr_ops(expr, params.len())?;
+                cost += f64::from(ops) * CPU_OPERATOR_COST;
+                width += type_width(result_type, -1);
+            }
+            Some(_) => return None,
+        }
+    }
+    Some((cost, width, fields))
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::row_expr_ops;
+
+    fn target(sql: &str) -> pg_query::protobuf::Node {
+        use pg_query::protobuf::node::Node as N;
+        let tree = pg_query::parse(sql).unwrap().protobuf;
+        let Some(N::SelectStmt(s)) = tree.stmts[0].stmt.as_ref().unwrap().node.as_ref() else {
+            panic!("not a select");
+        };
+        let Some(N::ResTarget(t)) = s.target_list[0].node.as_ref() else {
+            panic!("not a target");
+        };
+        *t.val.clone().unwrap()
+    }
+
+    #[test]
+    fn each_operator_over_a_column_costs_one() {
+        // `$1` is the statement's parameter, `$2` a column.
+        assert_eq!(
+            row_expr_ops(&target("select $2 * 2 + 1"), 1),
+            Some((2, true))
+        );
+        // Folded by `eval_const_expressions`: free.
+        assert_eq!(row_expr_ops(&target("select $1 + 2"), 1), Some((0, false)));
+        // Not modelled: a cast, a function call.
+        assert_eq!(row_expr_ops(&target("select $2::text"), 1), None);
+        assert_eq!(row_expr_ops(&target("select abs($2)"), 1), None);
+    }
+}

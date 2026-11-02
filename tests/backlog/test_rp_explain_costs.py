@@ -352,6 +352,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select a + 1 from e",
         ["Seq Scan on e  (cost=0.00..17.50 rows=1000 width=4)"],
     ),
+    "expressions over a filtered scan": (
+        "RP-333",
+        _ANALYSED,
+        "explain select a, a * 2 + 1, b from e where a < 10",
+        [
+            "Seq Scan on e  (cost=0.00..17.55 rows=9 width=11)",
+            "  Filter: (a < 10)",
+        ],
+    ),
+    "a constant in the select list": (
+        "RP-333",
+        _ANALYSED,
+        "explain select 1 from e",
+        ["Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)"],
+    ),
+    "a text expression": (
+        "RP-333",
+        _ANALYSED,
+        "explain select b || 'x' from e",
+        ["Seq Scan on e  (cost=0.00..17.50 rows=1000 width=32)"],
+    ),
+    "a folded constant expression": (
+        "RP-333",
+        _ANALYSED,
+        "explain select 1 + 2, a from e",
+        ["Seq Scan on e  (cost=0.00..15.00 rows=1000 width=8)"],
+    ),
     # ---------------------- RP-339 a user table's index path, chosen
     "an index scan with a filter": (
         "RP-339",
@@ -542,7 +569,7 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-325", "RP-334", "RP-335")
+    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-325", "RP-333", "RP-334", "RP-335")
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 

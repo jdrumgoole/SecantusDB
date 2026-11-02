@@ -40645,13 +40645,26 @@ impl PgHandler {
                             && sel.series.is_none()
                             && sel.join.is_none()
                             && sel.windows.is_empty()
-                            && sel.casts.iter().all(Option::is_none)
                         {
-                            let fields: Vec<String> =
-                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
-                            if let Some((estimate, index)) =
-                                self.scan_estimate(&sel.table, &sel.filter, &fields)
-                            {
+                            // A computed select-list entry is evaluated per
+                            // output row (`cost_seqscan`'s target cost) and
+                            // is its type's width (RP-333).
+                            // An index path is chosen by the columns it
+                            // holds, and an expression's reads are not
+                            // counted there: priced only as a Seq Scan.
+                            let computed = sel.casts.iter().any(Option::is_some);
+                            let priced = scan_estimate::target_cost(sel).and_then(
+                                |(cost, width, fields)| {
+                                    let (est, index) =
+                                        self.scan_estimate(&sel.table, &sel.filter, &fields)?;
+                                    if computed && index.is_some() {
+                                        return None;
+                                    }
+                                    let (startup, total, rows, w) = est;
+                                    Some(((startup, total + cost * rows, rows, w + width), index))
+                                },
+                            );
+                            if let Some((estimate, index)) = priced {
                                 tree.estimate = Some(estimate);
                                 if let Some(index) = index {
                                     tree.name =
