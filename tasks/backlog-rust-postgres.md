@@ -1287,6 +1287,9 @@ a regression test.
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model
       treats every backend as starting with them. Separating the shared
       and local cold costs needs an instrumented PostgreSQL.
+      **Decided** (Joe, 2026-11-02): build it -- a private PostgreSQL
+      15.19 from source with the catalog-read counters, kept in the
+      worktree's `.scratch/`, never the shared reference servers.
       Backlog-ID: RP-292
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
