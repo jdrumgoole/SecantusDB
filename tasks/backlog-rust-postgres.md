@@ -1315,15 +1315,6 @@ a regression test.
       on a fresh cluster.
       Backlog-ID: RP-318
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[sort]
-- [ ] **EXPLAIN prints no estimate for a Limit.**
-      `explain select * from e limit 5` is `Limit  (cost=0.00..0.07
-      rows=5 width=7)` (`adjust_limit_rows_costs`). PostgreSQL 15.19
-      prices it (`costsize.c`); here it prints `cost=0.00..0.00 rows=0
-      width=0`. Since RP-314 a plan that is one relation's Seq Scan
-      prints the estimate; the scenario's expected plan is PostgreSQL's,
-      measured on a fresh cluster.
-      Backlog-ID: RP-319
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[limit]
 - [ ] **EXPLAIN prints no estimate for a Unique.**
       `explain select distinct a from e order by a` is `Unique
       (cost=64.83..69.83 rows=1000 width=4)` over a Sort

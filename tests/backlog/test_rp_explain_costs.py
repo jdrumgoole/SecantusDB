@@ -158,6 +158,34 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "limit with an offset and a filter": (
+        "RP-319",
+        _ANALYSED,
+        "explain select * from e where a < 500 offset 100 limit 5",
+        [
+            "Limit  (cost=3.51..3.68 rows=5 width=7)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=499 width=7)",
+            "        Filter: (a < 500)",
+        ],
+    ),
+    "limit 0": (
+        "RP-319",
+        _ANALYSED,
+        "explain select a from e limit 0",
+        [
+            "Limit  (cost=0.00..0.01 rows=1 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "an offset alone": (
+        "RP-319",
+        _ANALYSED,
+        "explain select * from e offset 990",
+        [
+            "Limit  (cost=14.85..15.00 rows=10 width=7)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "unique": (
         "RP-320",
         _ANALYSED,
@@ -484,7 +512,7 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    fixed = item in ("RP-314", "RP-317", "RP-334", "RP-335")
+    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-334", "RP-335")
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
