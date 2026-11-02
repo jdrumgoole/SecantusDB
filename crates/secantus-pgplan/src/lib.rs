@@ -15736,6 +15736,7 @@ fn row_column_expr(
     sample: &Document,
 ) -> Result<ColumnExpr> {
     let mut expr = node.clone();
+    mark_stored_column_sizes(&mut expr, fields)?;
     rewrite_column_refs(&mut expr, fields, params.len())?;
     let pruned = prune_row_fields(&mut expr, fields, params.len());
     let fields: &[RowField] = pruned.as_deref().unwrap_or(fields);
@@ -15821,6 +15822,47 @@ fn row_column_expr(
         *t = result_type;
     }
     Ok(out)
+}
+
+/// `pg_column_size(col)` of a row column reads the stored datum, a short
+/// varlena header (RP-074, RP-315): pass the column's declared type as the
+/// call's internal second argument, as the single-table lowering does,
+/// BEFORE the column becomes a `$n` and the evaluator can no longer tell it
+/// from a computed value.
+fn mark_stored_column_sizes(
+    node: &mut pg_query::protobuf::Node,
+    fields: &[RowField],
+) -> Result<()> {
+    walk_expr(node, &mut |n| {
+        let Some(N::FuncCall(f)) = n.node.as_mut() else {
+            return Ok(());
+        };
+        if func_name(f).as_deref() != Some("pg_column_size")
+            || f.args.len() != 1
+            || f.over.is_some()
+        {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = f.args[0].node.as_ref() else {
+            return Ok(());
+        };
+        let Some(ty) = column_ref_name(c)
+            .and_then(|name| fields.iter().find(|(f, _, _)| *f == name))
+            .map(|(_, _, t)| t.clone())
+        else {
+            return Ok(());
+        };
+        f.args.push(pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: false,
+                location: -1,
+                val: Some(a_const::Val::Sval(pg_query::protobuf::String {
+                    sval: format!("{}{ty}", scalar::STORED_SIZE_MARK),
+                })),
+            })),
+        });
+        Ok(())
+    })
 }
 
 /// The row fields an expression reads, its `$n` renumbered to match, when
@@ -25516,6 +25558,11 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
     if let Some(N::FuncCall(f)) = node.node.as_ref() {
         if f.funcname.len() == 1 && func_name(f).as_deref() == Some(hashed_subplan::NAME) {
             return "bool".to_string();
+        }
+        // `pg_column_size("any")` is int4 whatever its argument (RP-315):
+        // over a row column, a `$n` here, the value alone typed it as text.
+        if func_name(f).as_deref() == Some("pg_column_size") && f.over.is_none() {
+            return "int4".to_string();
         }
     }
     // `x COLLATE c` is `x`'s type: a collation changes the comparison, not
