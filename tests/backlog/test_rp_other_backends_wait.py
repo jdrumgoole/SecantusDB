@@ -55,9 +55,9 @@ def test_alter_database_rename_waits_for_a_closing_session(rust_pg: Any) -> None
         assert got == "ok"
 
 
-@pytest.mark.backlog("RP-344")
+@pytest.mark.backlog_fixed("RP-344")
 def test_drop_database_refuses_while_another_session_is_on_it(rust_pg: Any) -> None:
-    """A session idle on the database makes DROP DATABASE 55006 (15.19)."""
+    """A session idle on the database made DROP DATABASE 55006, as on 15.19."""
     dsn = f"host=127.0.0.1 port={rust_pg.port} user=postgres"
     with psycopg.connect(dsn + " dbname=postgres", autocommit=True) as c:
         c.execute("create database rp344_d")

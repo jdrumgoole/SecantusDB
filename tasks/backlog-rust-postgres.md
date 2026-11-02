@@ -1535,17 +1535,6 @@ and most of RP-193 in batch 48; their tests there are regression tests.
 
 ## Found while working RP-316 (2026-11-02)
 
-- [ ] **DROP DATABASE drops a database other sessions are connected to.**
-      PostgreSQL 15.19's `dropdb` calls `CountOtherDBBackends` and, with a
-      second session idle on the database, raises 55006 `database "d" is
-      being accessed by other users` / `There is 1 other session using the
-      database.` (measured: after about 11 s of waiting). Here DROP
-      DATABASE (`lib.rs`, `Statement::DropDatabase`) never counts the other
-      sessions and drops it out from under them. RP-343's
-      `other_sessions_after_wait` is the wait it needs (found while
-      working RP-343).
-      Backlog-ID: RP-344
-      Verify: tests/backlog/test_rp_other_backends_wait.py::test_drop_database_refuses_while_another_session_is_on_it
 - [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds
       `rule_trees`' catalog snapshot by running internal queries over the
       whole of `pg_namespace`, `pg_class`, `pg_attribute`, `pg_type`,

@@ -38668,6 +38668,9 @@ impl PgHandler {
                     });
                     return Err(PgWireError::UserError(Box::new(e)));
                 }
+                // `CountOtherDBBackends`: a database another session is on
+                // is not dropped out from under it (RP-344).
+                self.refuse_busy_database(&info.name)?;
                 self.databases.remove(&self.storage, &info.name)?;
                 // Its tables' heaps go with it (RP-233).
                 heap::forget_database(&self.storage, &info.name);
