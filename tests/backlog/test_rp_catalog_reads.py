@@ -1813,10 +1813,11 @@ def test_builtin_statistics(rust_pg: Any) -> None:
         assert tuple(got) == (404, 38)
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_the_catalogs(rust_pg: Any) -> None:
-    """PostgreSQL 15.19: a plain ANALYZE analyses the catalogs too, so a
-    new table's oid becomes the top of `pg_class.oid`'s histogram."""
+    """PostgreSQL 15.19: a plain ANALYZE analysed the catalogs too, so a
+    new table's oid became the top of `pg_class.oid`'s histogram (fixed
+    for the catalog columns of a modelled type, `oid` among them)."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_d")
         c.execute("create database rp313_d")
@@ -1828,6 +1829,51 @@ def test_a_database_wide_analyze_measures_the_catalogs(rust_pg: Any) -> None:
             " from pg_stats where tablename = 'pg_class' and attname = 'oid'"
         ).fetchone()[0]
         assert top >= 16384
+
+
+@pytest.mark.backlog_fixed("RP-313")
+def test_an_oid_column_is_analysed(rust_pg: Any) -> None:
+    """PostgreSQL 15.19: ANALYZE measured an `oid` column (`oideq` /
+    `oidlt`), an oid above 2^31 sorting as the unsigned number it is."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("create table rp313_o (o oid)")
+        c.execute("insert into rp313_o select (g % 7)::oid from generate_series(1, 200) g")
+        c.execute("insert into rp313_o select 4000000000::oid from generate_series(1, 3)")
+        c.execute("analyze rp313_o")
+        row = c.execute(
+            "select null_frac, avg_width, n_distinct, most_common_vals::text,"
+            " most_common_freqs::text, histogram_bounds::text, correlation"
+            " from pg_stats where tablename = 'rp313_o'"
+        ).fetchone()
+        c.execute("drop table rp313_o")
+    assert row == (
+        0.0,
+        4,
+        8.0,
+        "{1,2,3,4,0,5,6,4000000000}",
+        "{0.14285715,0.14285715,0.14285715,0.14285715,0.13793103,0.13793103,0.13793103,0.014778325}",
+        None,
+        0.1805073,
+    )
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_a_name_column(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (measured on a fresh database): a plain ANALYZE
+    measures the catalogs' `name` columns too, so a new table whose name
+    sorts last becomes the top of `pg_class.relname`'s histogram, where
+    `initdb`'s was `views`."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_n")
+        c.execute("create database rp313_n")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_n", autocommit=True) as c:
+        c.execute("create table zzzz_rp313 (a int)")
+        c.execute("analyze")
+        top = c.execute(
+            "select (histogram_bounds::text::name[])[array_upper(histogram_bounds::text::name[], 1)]"
+            " from pg_stats where tablename = 'pg_class' and attname = 'relname'"
+        ).fetchone()[0]
+        assert top == "zzzz_rp313"
 
 
 @pytest.mark.backlog("RP-314")
