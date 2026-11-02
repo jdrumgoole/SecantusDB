@@ -55,6 +55,28 @@ impl PgHandler {
             .count()
     }
 
+    /// `CountOtherDBBackends`: the other sessions still on `db` after
+    /// waiting for them to leave. PostgreSQL 15.19 counts up to 50 times,
+    /// 100 ms apart (5 s in all), so a session whose client has just hung
+    /// up but whose backend has not yet exited does not fail the statement
+    /// (RP-343). A cancel or terminate ends the wait, as its
+    /// `CHECK_FOR_INTERRUPTS` does.
+    pub(crate) fn other_sessions_after_wait(&self, db: &str) -> PgWireResult<usize> {
+        const TRIES: usize = 50;
+        crate::blocking_wait(|| {
+            let mut others = 0;
+            for _ in 0..TRIES {
+                self.check_cancel()?;
+                others = self.sessions_on(db);
+                if others == 0 {
+                    return Ok(0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Ok(others)
+        })
+    }
+
     pub(crate) fn create_database(
         &self,
         name: &str,
@@ -251,7 +273,7 @@ impl PgHandler {
                 format!("database \"{name}\" already exists"),
             ));
         }
-        let others = self.sessions_on(&template);
+        let others = self.other_sessions_after_wait(&template)?;
         if others > 0 {
             let mut info = ErrorInfo::new(
                 "ERROR".into(),
@@ -365,7 +387,7 @@ impl PgHandler {
                     format!("database \"{new}\" already exists"),
                 ));
             }
-            let others = self.sessions_on(name);
+            let others = self.other_sessions_after_wait(name)?;
             if others > 0 {
                 let mut info = ErrorInfo::new(
                     "ERROR".into(),
