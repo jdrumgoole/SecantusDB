@@ -1284,10 +1284,25 @@ a regression test.
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_the_catalogs
 - [ ] **EXPLAIN of a scan of a catalog has no estimate.** `explain select *
       from pg_class where relkind = 'v'` is `Seq Scan on pg_class
-      (cost=0.00..0.00 rows=0 width=0)` with no `Filter` line; PostgreSQL
-      15.19 in a fresh database prices it from the catalog's `relpages` /
-      `reltuples` and `initdb`'s statistics (RP-311): `cost=0.00..19.12
-      rows=140 width=265` and the filter (found while working RP-311).
+      (cost=0.00..0.00 rows=0 width=0)`; PostgreSQL 15.19 in a fresh
+      database prices it from the catalog's `relpages` / `reltuples` and
+      `initdb`'s statistics (RP-311): `cost=0.00..19.12 rows=140 width=265`
+      (found while working RP-311). The `Filter: (relkind = 'v'::"char")`
+      line already matches (probed 2026-11-02).
+      **Decision needed (2026-11-02):** what is left is the costs alone, and
+      no EXPLAIN here prints costs -- a user table's scan is `cost=0.00..0.00
+      rows=0 width=0` too, per the "Scope decision -- EXPLAIN" at the top of
+      this file. Pricing only catalog scans would make the two disagree. The
+      scope decision predates the cost model the planner now has
+      (`secantus-pgplan/src/costsize.rs` prices seq / index / bitmap paths
+      from `relpages` / `reltuples` to choose plans) and the catalogs'
+      `pg_statistic` rows (RP-311). Options: (a, faithful, recommended)
+      withdraw the scope decision and print `costsize`'s startup / total
+      cost, `clamp_row_est` rows and the `stawidth` sum as width on every
+      node, starting with a single-relation Seq Scan (user tables and
+      catalogs alike) and filing each other node kind as its own item;
+      (b) keep zero costs everywhere and retire this item under the scope
+      decision.
       Backlog-ID: RP-314
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_scan_is_estimated
 
