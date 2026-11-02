@@ -1311,16 +1311,6 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for a Sort.**
-      `explain select * from e order by b` is `Sort  (cost=64.83..67.33
-      rows=1000 width=7)` (`cost_sort`) over its Seq Scan, which prints
-      zeros too beneath it (RP-332). PostgreSQL 15.19 prices it
-      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
-      Since RP-314 a plan that is one relation's Seq Scan prints the
-      estimate; the scenario's expected plan is PostgreSQL's, measured
-      on a fresh cluster.
-      Backlog-ID: RP-318
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[sort]
 - [ ] **EXPLAIN prints no estimate for a Unique.**
       `explain select distinct a from e order by a` is `Unique
       (cost=64.83..69.83 rows=1000 width=4)` over a Sort
@@ -1433,18 +1423,6 @@ a regression test.
       cluster.
       Backlog-ID: RP-331
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[insert], tests/backlog/test_rp_explain_costs.py::test_plan[update], tests/backlog/test_rp_explain_costs.py::test_plan[delete]
-- [ ] **EXPLAIN prints no estimate for a Seq Scan beneath another node.**
-      RP-314 prices a Seq Scan only when it is the whole plan. Under a
-      Sort, `explain select * from e where a < 10 order by b` has `Seq
-      Scan on e  (cost=0.00..17.50 rows=9 width=7)`, and the Sort above
-      it is `cost=17.64..17.67 rows=9` (RP-318). The scan's width is
-      then what the node above needs of it. PostgreSQL 15.19 prices it
-      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
-      Since RP-314 a plan that is one relation's Seq Scan prints the
-      estimate; the scenario's expected plan is PostgreSQL's, measured
-      on a fresh cluster.
-      Backlog-ID: RP-332
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a seq scan beneath another node]
 - [ ] **EXPLAIN prints no estimate for a Result whose select list calls
       a function the planner keeps as a call.** `explain select
       current_setting('work_mem')` is `Result  (cost=0.00..0.01 rows=1

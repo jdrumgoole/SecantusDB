@@ -820,7 +820,7 @@ impl crate::PgHandler {
     }
 
     /// A kB setting of this session, or its default.
-    fn kb_setting(&self, name: &str, default: usize) -> usize {
+    pub(crate) fn kb_setting(&self, name: &str, default: usize) -> usize {
         let v = self
             .settings
             .lock()

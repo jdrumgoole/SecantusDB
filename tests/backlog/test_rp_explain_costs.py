@@ -149,6 +149,21 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "a sort past work_mem": (
+        "RP-318",
+        [
+            "set local work_mem = '64kB'",
+            "create table s (a int, b text)",
+            "insert into s select g, 'v' || (g % 10) from generate_series(1, 5000) g",
+            "analyze s",
+        ],
+        "explain select * from s order by b desc",
+        [
+            "Sort  (cost=450.19..462.69 rows=5000 width=7)",
+            "  Sort Key: b DESC",
+            "  ->  Seq Scan on s  (cost=0.00..73.00 rows=5000 width=7)",
+        ],
+    ),
     "limit": (
         "RP-319",
         _ANALYSED,
@@ -596,7 +611,18 @@ def run(dsn: str, setup: list[str], query: str) -> list[str]:
 
 
 def _marked(name: str, item: str) -> Any:
-    fixed = item in ("RP-314", "RP-317", "RP-319", "RP-325", "RP-333", "RP-334", "RP-335", "RP-341")
+    fixed = item in (
+        "RP-314",
+        "RP-317",
+        "RP-318",
+        "RP-319",
+        "RP-325",
+        "RP-332",
+        "RP-333",
+        "RP-334",
+        "RP-335",
+        "RP-341",
+    )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
 
