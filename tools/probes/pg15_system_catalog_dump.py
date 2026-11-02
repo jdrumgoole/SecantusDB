@@ -34,7 +34,9 @@ Writes three files the server compiles in:
   catalog's heap as ``initdb`` left it (RP-291): a ``\\heap oid name blocks``
   line, then one line per block holding live tuples, ``block offsets``, the
   offsets as ranges (``1-57,60``) in ``ctid`` order. A row of the rows file
-  above is the table's n-th live tuple here.
+  above is the table's n-th live tuple here. Each heap's pages follow, as
+  ``heap_pages`` writes them: free space, line pointers and the free space
+  map, read from the data files (a LOCAL cluster, a superuser).
 """
 
 from __future__ import annotations
@@ -436,11 +438,59 @@ def ranges(offsets: list[int]) -> str:
     return ",".join(out)
 
 
+def heap_pages(datadir: pathlib.Path, path: str) -> list[str]:
+    """Each heap page as the page model keeps it (RP-291): a ``\\page block
+    free nlp`` line (``pd_upper - pd_lower``, the line pointer count), then
+    each line pointer that is not an ordinary tuple, ``off:u`` unused,
+    ``off:r>to`` a redirect, ``off:h<len>`` a heap-only tuple of its
+    MAXALIGNed length (``bufpage.h``, ``itemid.h``, ``htup_details.h``);
+    then, when the fork exists, ``\\fsm nblocks`` and each free space map
+    page as ``\\fsmpage block fp_next_slot node:value,...``, its nonzero
+    nodes (``fsm_internals.h``): the fork exactly, stale upper nodes and
+    all."""
+    data = (datadir / path).read_bytes()
+    out = []
+    for blk in range(len(data) // BLCKSZ):
+        page = data[blk * BLCKSZ : (blk + 1) * BLCKSZ]
+        lower, upper = struct.unpack_from("<HH", page, 12)
+        nlp = (lower - 24) // 4
+        exc = []
+        for i in range(nlp):
+            word = struct.unpack_from("<I", page, 24 + 4 * i)[0]
+            off, flags, length = word & 0x7FFF, (word >> 15) & 3, word >> 17
+            if flags == 0:
+                exc.append(f"{i + 1}:u")
+            elif flags == 2:
+                exc.append(f"{i + 1}:r>{off}")
+            elif flags == 3:
+                raise SystemExit(f"{path} block {blk}: a dead line pointer")
+            else:
+                infomask2 = struct.unpack_from("<H", page, off + 18)[0]
+                if infomask2 & 0x4000:
+                    raise SystemExit(f"{path} block {blk}: a HOT-updated live tuple")
+                if infomask2 & 0x8000:
+                    exc.append(f"{i + 1}:h{(length + 7) & ~7}")
+        out.append(f"\\page {blk} {upper - lower} {nlp}{''.join(' ' + e for e in exc)}\n")
+    fsm = datadir / (path + "_fsm")
+    if fsm.exists():
+        raw = fsm.read_bytes()
+        out.append(f"\\fsm {len(raw) // BLCKSZ}\n")
+        for blk in range(len(raw) // BLCKSZ):
+            page = raw[blk * BLCKSZ : (blk + 1) * BLCKSZ]
+            next_slot = struct.unpack_from("<i", page, 24)[0]
+            nodes = page[28:BLCKSZ]
+            cells = ",".join(f"{n}:{v}" for n, v in enumerate(nodes) if v)
+            out.append(f"\\fsmpage {blk} {next_slot} {cells}\n")
+    return out
+
+
 def heap_tids(conn: psycopg.Connection) -> None:
     """Each built-in catalog's live tuples' ``ctid``, by block (RP-291)."""
+    conn.execute("checkpoint")
+    datadir = pathlib.Path(conn.execute("show data_directory").fetchone()[0])
     out = []
-    for oid, name in conn.execute(
-        "select c.oid, c.relname from pg_class c where c.relkind = 'r'"
+    for oid, name, path in conn.execute(
+        "select c.oid, c.relname, pg_relation_filepath(c.oid) from pg_class c where c.relkind = 'r'"
         " and c.relnamespace = 'pg_catalog'::regnamespace and c.oid < 16384 order by 1"
     ).fetchall():
         blocks = conn.execute("select pg_relation_size(%s) / 8192", (oid,)).fetchone()[0]
@@ -451,6 +501,7 @@ def heap_tids(conn: psycopg.Connection) -> None:
             by_block.setdefault(int(blk), []).append(int(off))
         for blk, offs in by_block.items():
             out.append(f"{blk} {ranges(offs)}\n")
+        out.extend(heap_pages(datadir, path))
     (ROOT / "crates/secantus-pg/src/pg15_catalog_heaps.txt").write_text("".join(out))
 
 

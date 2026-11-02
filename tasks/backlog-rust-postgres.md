@@ -1223,9 +1223,15 @@ a regression test.
       and `pg_attribute` rows) counts neither its heap block nor, for a
       sequential scan, the blocks it grew the heap by.
       **Decided** (Joe, 2026-11-01): option A, the full model, landed as a
-      sequence of PRs, this item open until the last. Remaining: place
-      every later catalog row with the heap page model (`heap_page.rs`),
-      filling `initdb`'s free space first as the FSM does, and insert its
+      sequence of PRs, this item open until the last. Since 2026-11-02
+      each built-in catalog's `initdb` pages (free space, line pointers,
+      redirects, heap-only tuples) and free space map fork are recorded
+      too, and `catalog_heap::initdb_heap_model` builds the heap a new
+      row goes in, placed FSM-first as PostgreSQL places it (regression
+      test `a_new_tables_catalog_rows_go_where_postgresql_puts_them`).
+      Remaining: place every later catalog row in those models as DDL
+      writes it (each catalog's `heap_form_tuple` length, and the HOT or
+      non-HOT updates DDL makes of its own new rows), and insert its
       index entries into the index trees, which hold only `initdb`'s
       tuples and are shared by every database -- with a non-HOT update's
       new version and entries, and VACUUM's removal of dead ones (reading
