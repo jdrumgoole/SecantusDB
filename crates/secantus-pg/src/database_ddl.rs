@@ -77,6 +77,26 @@ impl PgHandler {
         })
     }
 
+    /// `dropdb` / `RenameDatabase`: 55006 with `errdetail_busy_db` when
+    /// other sessions are still on `db` after `CountOtherDBBackends`' wait.
+    pub(crate) fn refuse_busy_database(&self, db: &str) -> PgWireResult<()> {
+        let others = self.other_sessions_after_wait(db)?;
+        if others == 0 {
+            return Ok(());
+        }
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "55006".into(), // object_in_use
+            format!("database \"{db}\" is being accessed by other users"),
+        );
+        info.detail = Some(if others == 1 {
+            "There is 1 other session using the database.".into()
+        } else {
+            format!("There are {others} other sessions using the database.")
+        });
+        Err(PgWireError::UserError(Box::new(info)))
+    }
+
     pub(crate) fn create_database(
         &self,
         name: &str,
@@ -387,20 +407,7 @@ impl PgHandler {
                     format!("database \"{new}\" already exists"),
                 ));
             }
-            let others = self.other_sessions_after_wait(name)?;
-            if others > 0 {
-                let mut info = ErrorInfo::new(
-                    "ERROR".into(),
-                    "55006".into(),
-                    format!("database \"{name}\" is being accessed by other users"),
-                );
-                info.detail = Some(if others == 1 {
-                    "There is 1 other session using the database.".into()
-                } else {
-                    format!("There are {others} other sessions using the database.")
-                });
-                return Err(PgWireError::UserError(Box::new(info)));
-            }
+            self.refuse_busy_database(name)?;
             self.copy_database(name, new)?;
             self.storage
                 .drop_database(name)
