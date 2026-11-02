@@ -1126,6 +1126,23 @@ impl PgHandler {
             Narrow(&'a secantus_pgplan::JoinSelect, NarrowRight),
         }
         let (source, def) = if let Some(sub) = sel.sub.as_ref() {
+            // An ORDER BY of one column under a LIMIT over a join the search
+            // plans for the rows the LIMIT takes (`create_ordered_paths`)
+            // is read whole, where the materialised path puts its rows in
+            // that plan's order (RP-028): a streamed merge join is another
+            // plan's, and leaves ties in another order.
+            if let Statement::JoinRows(j) = sub.plan.as_ref() {
+                if sel.order.len() == 1
+                    && sel.windows.is_empty()
+                    && ((sel.filter.is_empty() && sel.residual.is_none()) || j.where_modelled)
+                    && crate::sort_bound(sel).is_some()
+                    && crate::join_search::with_join_where(j, || {
+                        self.ordered_limit_searched(&j.tree)
+                    })
+                {
+                    return Ok(None);
+                }
+            }
             match self.prepared_join_rows(&sub.plan)? {
                 Some(p) => (Source::General(p), sub.def.clone()),
                 None => return Ok(None),
