@@ -904,6 +904,13 @@ one beside it.
       failure, the largest directories under the temp and work trees.
       **If it recurs, read those lines first**: they name the directory,
       and so the test, before any theory.
+      Checked 2026-11-02 (fix-one): no ENOSPC in any pg-oracle run since,
+      across 4 red runs (each red for another reason) and ~50 green ones.
+      Run 41397005963 shows the step's normal footprint: 798 `backlog_fixed`
+      tests left 21 GB under `/tmp/pytest-of-runner`, spread evenly over the
+      four workers (~26 MB a test) -- accumulation, not the runaway seen
+      here. The `du -d 3` stopped at `popen-gw<k>`, which names a worker,
+      not a test; the step now also lists the per-test directories.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
