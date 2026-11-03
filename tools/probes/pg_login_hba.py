@@ -42,6 +42,16 @@ import time
 import psycopg
 import trustme
 
+
+def _free_port():
+    """An ephemeral port, so two gates' reference clusters never share one (RP-345)."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port()
+
 PGB = sys.argv[1]
 BIN = sys.argv[2] if len(sys.argv) > 2 else None
 d = tempfile.mkdtemp(prefix="pghba-")
@@ -458,7 +468,7 @@ shutil.copy(key, f"{pgd}/server.key")
 os.chmod(f"{pgd}/server.key", 0o600)
 shutil.copy(capem, f"{pgd}/root.crt")
 open(f"{pgd}/postgresql.conf", "a").write(
-    "\nssl = on\nssl_ca_file = 'root.crt'\nport = 5419\nlisten_addresses = '127.0.0.1'\n"
+    f"\nssl = on\nssl_ca_file = 'root.crt'\nport = {PORT}\nlisten_addresses = '127.0.0.1'\n"
     "unix_socket_directories = ''\npassword_encryption = 'scram-sha-256'\n"
 )
 open(f"{pgd}/pg_hba.conf", "w").write("host all all 127.0.0.1/32 trust\n")
@@ -468,24 +478,24 @@ subprocess.run(
     capture_output=True,
 )
 setup(
-    5419,
+    PORT,
     lambda: psycopg.connect(
-        host="127.0.0.1", port=5419, dbname="postgres", user="postgres", autocommit=True
+        host="127.0.0.1", port=PORT, dbname="postgres", user="postgres", autocommit=True
     ),
 )
-with psycopg.connect(host="127.0.0.1", port=5419, dbname="postgres", user="postgres") as c:
+with psycopg.connect(host="127.0.0.1", port=PORT, dbname="postgres", user="postgres") as c:
     print("reference:", c.execute("show server_version").fetchone()[0])
 open(f"{pgd}/pg_hba.conf", "w").write(HBA)
 open(f"{pgd}/incusers", "w").write(INCUSERS)
 subprocess.run([f"{PGB}/pg_ctl", "-D", pgd, "reload"], check=True, capture_output=True)
 time.sleep(1)
-assert attempt(5419, **PLAIN) == ("ok", False), "self-check: postgres is trusted in the clear"
-ref = scenarios(5419)
+assert attempt(PORT, **PLAIN) == ("ok", False), "self-check: postgres is trusted in the clear"
+ref = scenarios(PORT)
 open(f"{pgd}/pg_hba.conf", "w").write(HBA2)
 open(f"{pgd}/pg_ident.conf", "w").write(IDENT)
 subprocess.run([f"{PGB}/pg_ctl", "-D", pgd, "reload"], check=True, capture_output=True)
 time.sleep(1)
-ref.update({f"[2] {k}": v for k, v in scenarios2(5419).items()})
+ref.update({f"[2] {k}": v for k, v in scenarios2(PORT).items()})
 subprocess.run(
     [f"{PGB}/pg_ctl", "-D", pgd, "-m", "fast", "-w", "stop"], check=True, capture_output=True
 )
