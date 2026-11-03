@@ -40644,6 +40644,7 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {

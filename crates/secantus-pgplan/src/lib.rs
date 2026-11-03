@@ -3544,6 +3544,11 @@ pub struct ExplainOptions {
     /// `Filter` print it: each AND conjunct's text and, for an index-usable
     /// one, the column it constrains.
     pub scan_quals: Vec<(String, Option<String>)>,
+    /// A single-relation statement's top-level `col IN (...)` conjuncts:
+    /// each column's stored field and the list's length, NULL elements
+    /// included. The lowered filter drops the NULLs, which select nothing,
+    /// but `estimate_array_length` counts them in the cost (RP-349).
+    pub scan_in_lengths: Vec<(String, usize)>,
     /// Each JOIN's ON condition, post-order, as its join node prints it.
     pub join_conds: Vec<String>,
     /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
@@ -9953,6 +9958,7 @@ fn plan_explain(
         summary: false,
         format: "text".into(),
         scan_quals: Vec::new(),
+        scan_in_lengths: Vec::new(),
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
         join_where: Vec::new(),
@@ -10023,6 +10029,7 @@ fn plan_explain(
         .and_then(|q| q.node.clone())
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let join_conds = match &query {
@@ -43702,6 +43709,73 @@ fn explain_subquery_quals(
     ruleutils::explain_subquery_conjuncts(where_clause, &def)
 }
 
+/// A statement over ONE relation: its WHERE's top-level `col IN (...)`
+/// conjuncts, each the column's stored field and the list's length with
+/// its NULL elements (`estimate_array_length`, RP-349).
+fn explain_scan_in_lengths(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<(String, usize)>> {
+    let (table, where_clause) = explain_scan_where(query)?;
+    let def = lookup(&table)?;
+    fn walk(n: &pg_query::protobuf::Node, def: &TableDef, out: &mut Vec<(String, usize)>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 =>
+            {
+                for a in &b.args {
+                    walk(a, def, out);
+                }
+            }
+            Some(N::AExpr(e))
+                if e.kind == pg_query::protobuf::AExprKind::AexprIn as i32
+                    && operator_name(e).ok() == Some("=") =>
+            {
+                let Some(N::ColumnRef(c)) = e.lexpr.as_deref().and_then(|l| l.node.as_ref()) else {
+                    return;
+                };
+                let Some(Some(N::String(name))) = c.fields.last().map(|f| f.node.as_ref()) else {
+                    return;
+                };
+                let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+                    return;
+                };
+                if let Some(field) = def.field_of(&name.sval) {
+                    out.push((field, list.items.len()));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(where_clause, &def, &mut out);
+    Some(out)
+}
+
+/// A single-relation statement's table and WHERE.
+fn explain_scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> {
+    Some(match query {
+        N::SelectStmt(s) => {
+            let [item] = s.from_clause.as_slice() else {
+                return None;
+            };
+            let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+                return None;
+            };
+            (rv.relname.clone(), s.where_clause.as_deref()?)
+        }
+        N::UpdateStmt(u) if u.from_clause.is_empty() => (
+            u.relation.as_ref()?.relname.clone(),
+            u.where_clause.as_deref()?,
+        ),
+        N::DeleteStmt(d) if d.using_clause.is_empty() => (
+            d.relation.as_ref()?.relname.clone(),
+            d.where_clause.as_deref()?,
+        ),
+        _ => return None,
+    })
+}
+
 /// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
 fn explain_scan_quals(
     query: &N,
@@ -43751,5 +43825,30 @@ mod rp342_one_time_filter {
             Some("(current_setting('nope'::text, true) <> ''::text)")
         );
         assert!((sc.one_time_cost - 2.0 * crate::costsize::CPU_OPERATOR_COST).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod rp349_in_lengths {
+    use super::*;
+
+    /// An IN list's length, for its cost, counts its NULL elements
+    /// (`estimate_array_length`, RP-349).
+    #[test]
+    fn an_in_lists_length_counts_its_nulls() {
+        let def = TableDef::new(
+            "e",
+            vec![secantus_pgcatalog::Column::new("a", "int4", false)],
+        );
+        let tree = pg_query::parse("select * from e where a in (1, null, 3) and a > 0").unwrap();
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.clone())
+        else {
+            panic!("not a select");
+        };
+        let lengths = explain_scan_in_lengths(&N::SelectStmt(s), &|_| Some(def.clone())).unwrap();
+        assert_eq!(lengths, vec![("a".to_string(), 3)]);
     }
 }
