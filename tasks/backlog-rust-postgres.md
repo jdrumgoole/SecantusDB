@@ -918,6 +918,13 @@ one beside it.
       log), so the job left no log at all; the rerun passed. That job has
       no on-failure disk report, and the PR changed only login probes, so
       the writer is not specific to the pg-oracle shard.
+      Since 2026-11-03 both jobs run `scripts/ci_disk_watch.sh` all job
+      long (proved on each runner first by `ci_disk_watch_selftest.sh`):
+      under 10 GB free it reports the largest files, the processes holding
+      them and each one's pytest test, kills those processes so the runner
+      survives, and its last step fails the job and prints the report.
+      **The next occurrence names the writer: read the "Disk watchdog
+      report (RP-312)" step first.**
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
