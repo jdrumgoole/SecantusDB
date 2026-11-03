@@ -719,8 +719,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     "a result of four nextval": (
         "RP-340",
         ["create sequence rp340s"],
-        "explain select nextval('rp340s'), nextval('rp340s'),"
-        " nextval('rp340s'), nextval('rp340s')",
+        "explain select nextval('rp340s'), nextval('rp340s'), nextval('rp340s'), nextval('rp340s')",
         ["Result  (cost=0.00..0.02 rows=1 width=32)"],
     ),
     "a result's one-time filter": (
