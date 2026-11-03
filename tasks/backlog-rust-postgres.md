@@ -1349,15 +1349,6 @@ a regression test.
       PostgreSQL's, measured on a fresh cluster.
       Backlog-ID: RP-324
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[append]
-- [ ] **EXPLAIN prints no estimate for a Values Scan.**
-      `explain values (1), (2)` is `Values Scan on "*VALUES*"
-      (cost=0.00..0.03 rows=2 width=4)` (`cost_valuesscan`). PostgreSQL
-      15.19 prices it (`costsize.c`); here it prints `cost=0.00..0.00
-      rows=0 width=0`. Since RP-314 a plan that is one relation's Seq
-      Scan prints the estimate; the scenario's expected plan is
-      PostgreSQL's, measured on a fresh cluster.
-      Backlog-ID: RP-326
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[values scan]
 - [ ] **EXPLAIN prints no estimate for a Function Scan.**
       `explain select * from generate_series(1, 10)` is `Function Scan
       on generate_series  (cost=0.00..0.10 rows=10 width=4)`
