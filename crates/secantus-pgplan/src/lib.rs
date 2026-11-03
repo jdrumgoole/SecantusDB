@@ -3350,6 +3350,9 @@ pub struct SelectConstant {
     /// constants and built-in operators, which PostgreSQL may keep
     /// unfolded and deparse instead.
     pub one_time_filter: Option<String>,
+    /// `cost_qual_eval` of that filter when PostgreSQL keeps it unfolded
+    /// (RP-342): `create_result_path` adds it to the startup and the total.
+    pub one_time_cost: f64,
     /// `FROM function(...)`: the function stands in for a table. It is
     /// evaluated once per statement (so `select 'ok' from pg_sleep(0.5)`
     /// still waits), a set-returning one yields one row per result, and
@@ -15371,6 +15374,63 @@ fn folds_to_constant(n: &pg_query::protobuf::Node) -> bool {
         }
         _ => false,
     }
+}
+
+/// `cost_qual_eval` of a FROM-less WHERE PostgreSQL leaves unfolded
+/// (RP-342): a constant subtree is folded and free, each built-in operator
+/// and each stable call kept (`procost` 1 for every one listed here) costs
+/// `cpu_operator_cost`, AND / OR / NOT nothing of their own. `None` when
+/// the WHERE folds whole, or holds a node whose folding or cost this does
+/// not model.
+fn one_time_qual_cost(n: &pg_query::protobuf::Node) -> Option<f64> {
+    use pg_query::protobuf::AExprKind;
+    const OPS: &[&str] = &[
+        "+", "-", "*", "/", "%", "=", "<>", "!=", "<", "<=", ">", ">=",
+    ];
+    const STABLE_CALLS: &[&str] = &["current_setting", "current_database", "pg_backend_pid"];
+    fn walk(n: &pg_query::protobuf::Node) -> Option<f64> {
+        if folds_to_constant(n) {
+            return Some(0.0);
+        }
+        let op = crate::costsize::CPU_OPERATOR_COST;
+        match n.node.as_ref()? {
+            N::BoolExpr(b) => b.args.iter().map(walk).sum(),
+            N::AExpr(e) => {
+                let name = operator_name(e).ok()?;
+                if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp)
+                    || !OPS.contains(&name)
+                    || user_ops::defines(name)
+                {
+                    return None;
+                }
+                let l = match e.lexpr.as_deref() {
+                    Some(l) => walk(l)?,
+                    None => 0.0,
+                };
+                Some(op + l + walk(e.rexpr.as_deref()?)?)
+            }
+            N::FuncCall(f) => {
+                let name = func_name(f)?;
+                if f.funcname.len() != 1
+                    || !STABLE_CALLS.contains(&name.as_str())
+                    || f.agg_star
+                    || f.agg_distinct
+                    || f.func_variadic
+                    || f.over.is_some()
+                    || f.agg_filter.is_some()
+                    || !f.agg_order.is_empty()
+                {
+                    return None;
+                }
+                Some(op + f.args.iter().map(walk).sum::<Option<f64>>()?)
+            }
+            _ => None,
+        }
+    }
+    if folds_to_constant(n) {
+        return None;
+    }
+    walk(n)
 }
 
 fn constant_where(w: &pg_query::protobuf::Node, params: &[Bson]) -> Result<bool> {
@@ -27564,12 +27624,25 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         None => true,
         Some(w) => constant_where(w, params)?,
     };
-    let one_time_filter = match s.where_clause.as_deref() {
-        Some(w) if !where_true && folds_to_constant(w) => Some(match const_value(w, params)? {
-            Bson::Null => "NULL::boolean".to_string(),
-            _ => "false".to_string(),
-        }),
-        _ => None,
+    let (one_time_filter, one_time_cost) = match s.where_clause.as_deref() {
+        Some(w) if folds_to_constant(w) => (
+            match where_true {
+                true => None,
+                false => Some(match const_value(w, params)? {
+                    Bson::Null => "NULL::boolean".to_string(),
+                    _ => "false".to_string(),
+                }),
+            },
+            0.0,
+        ),
+        // A WHERE that calls a stable function is not folded: PostgreSQL
+        // keeps it as the gating qual, deparsed, and charges its
+        // evaluation once (RP-342).
+        Some(w) => match (one_time_qual_cost(w), ruleutils::explain_one_time_qual(w)) {
+            (Some(cost), Some(text)) => (Some(text), cost),
+            _ => (None, 0.0),
+        },
+        None => (None, 0.0),
     };
     // LIMIT and OFFSET over the one row: read (and refused) as anywhere
     // else -- 42P02 at a missing `$1`, 2201W for a negative count -- and a
@@ -28338,6 +28411,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         columns,
         where_true,
         one_time_filter,
+        one_time_cost,
         source: None,
         untyped,
     }))
@@ -28494,6 +28568,7 @@ fn plan_function_source_select(
         columns,
         where_true: rest.where_true,
         one_time_filter: None,
+        one_time_cost: 0.0,
         source: Some(Box::new(source_col)),
         untyped: Vec::new(),
     }))
@@ -43583,4 +43658,27 @@ fn explain_scan_quals(
     };
     let def = lookup(&table)?;
     ruleutils::explain_conjuncts(where_clause, &def)
+}
+
+#[cfg(test)]
+mod rp342_one_time_filter {
+    use super::*;
+
+    /// A WHERE calling a stable function is kept unfolded and deparsed as
+    /// the Result's One-Time Filter, its evaluation priced (RP-342).
+    #[test]
+    fn a_stable_call_is_the_one_time_filter() {
+        let Statement::SelectConstant(sc) = plan(
+            "select 1 where current_setting('nope', true) <> ''",
+            &|_| None,
+        )
+        .unwrap() else {
+            panic!("not a SelectConstant");
+        };
+        assert_eq!(
+            sc.one_time_filter.as_deref(),
+            Some("(current_setting('nope'::text, true) <> ''::text)")
+        );
+        assert!((sc.one_time_cost - 2.0 * crate::costsize::CPU_OPERATOR_COST).abs() < 1e-12);
+    }
 }

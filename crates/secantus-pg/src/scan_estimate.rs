@@ -145,7 +145,15 @@ pub(crate) fn result_estimate(sc: &secantus_pgplan::SelectConstant) -> Option<Es
         per_tuple += call_cost(col)?;
         width += type_width(pg_type, *typmod);
     }
-    Some((0.0, costsize::CPU_TUPLE_COST + per_tuple, 1.0, width))
+    // The one-time filter's evaluation is paid before the first row and
+    // counted in the total too (`create_result_path`, RP-342).
+    let gate = sc.one_time_cost;
+    Some((
+        gate,
+        gate + costsize::CPU_TUPLE_COST + per_tuple,
+        1.0,
+        width,
+    ))
 }
 
 /// `cost_qual_eval_walker`'s per-tuple cost of one select-list column
