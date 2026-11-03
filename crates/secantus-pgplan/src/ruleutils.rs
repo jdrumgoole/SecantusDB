@@ -1354,8 +1354,7 @@ impl<'a> Printer<'a> {
                     let elem = if via_text { "text" } else { common.as_str() };
                     if let Some(lit) = folded_array_literal(&list.items, elem) {
                         self.buf.push_str(&lit);
-                        self.buf
-                            .push_str(&format!("::{}[]", display_type(elem)));
+                        self.buf.push_str(&format!("::{}[]", display_type(elem)));
                         self.buf.push(')');
                         if open {
                             self.buf.push(')');
@@ -3890,7 +3889,10 @@ fn qual_order(
     // The classes' clauses after the rest, then a stable sort by cost.
     keyed.sort_by_key(|k| k.0);
     keyed.sort_by(|a, b| a.1.total_cmp(&b.1));
-    keyed.into_iter().map(|(_, _, i)| printed[i].clone()).collect()
+    keyed
+        .into_iter()
+        .map(|(_, _, i)| printed[i].clone())
+        .collect()
 }
 
 /// Each JOIN's ON condition in a SELECT's FROM, post-order (a left-deep
