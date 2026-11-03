@@ -582,6 +582,14 @@ pub fn seq_scan_path(rel: &Rel, quals: &[(String, Qual)]) -> (f64, f64) {
     )
 }
 
+/// `cost_subqueryscan`: `(startup, total)` over the subquery's path, which
+/// returns `tuples` rows; the quals are evaluated on each (RP-328).
+pub fn subquery_scan_path(sub: (f64, f64), tuples: f64, quals: &[(String, Qual)]) -> (f64, f64) {
+    let startup = qual_startup(quals.iter().map(|(_, q)| q));
+    let run = (CPU_TUPLE_COST + qual_cost(quals.iter().map(|(_, q)| q))) * tuples;
+    (sub.0 + startup, sub.1 + startup + run)
+}
+
 /// `cheapest_scan`'s path as `(startup, total)`: the cheapest in total, a
 /// tie going to the cheaper startup (`set_cheapest`).
 pub fn cheapest_scan_path(
@@ -1214,6 +1222,18 @@ mod tests {
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.006
+    }
+
+    #[test]
+    fn a_subquery_scan_prices_its_qual_on_each_subquery_row() {
+        // PostgreSQL 15.19: `select * from (select a from e limit 3) s
+        // where a > 1` is (0.00..0.08) over a Limit of (0.00..0.04 rows=3).
+        let (startup, total) =
+            subquery_scan_path((0.0, 0.045), 3.0, &[("a".into(), Qual::Range(true))]);
+        assert!(
+            close(startup, 0.0) && close(total, 0.0825),
+            "{startup} {total}"
+        );
     }
 
     /// PostgreSQL 15.19, fresh tables of 40 rows: t2 (k int primary key,

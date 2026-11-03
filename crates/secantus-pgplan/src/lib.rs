@@ -3550,6 +3550,9 @@ pub struct ExplainOptions {
     /// WHERE conjuncts, as `scan_quals` holds one statement's. Empty unless
     /// every arm reads one relation.
     pub setop_quals: Vec<Vec<(String, Option<String>)>>,
+    /// A SELECT over one FROM-subquery: its WHERE's conjuncts as the
+    /// Subquery Scan's `Filter` prints them (RP-328).
+    pub subquery_quals: Vec<String>,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -9950,6 +9953,7 @@ fn plan_explain(
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
         join_where: Vec::new(),
+        subquery_quals: Vec::new(),
     };
     let (mut timing, mut summary) = (None, None);
     for o in &e.options {
@@ -10017,6 +10021,7 @@ fn plan_explain(
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
+    options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let join_conds = match &query {
         N::SelectStmt(s) => {
             let none = |_: &str| None;
@@ -43554,6 +43559,72 @@ fn explain_setop_quals(
             }
         })
         .collect()
+}
+
+/// A SELECT over ONE FROM-subquery that reads one relation's stored
+/// columns: its WHERE's conjuncts for the Subquery Scan (RP-328), typed by
+/// the subquery's output columns and qualified by its alias.
+fn explain_subquery_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<String>> {
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeSubselect(sub)) = item.node.as_ref() else {
+        return None;
+    };
+    let where_clause = s.where_clause.as_deref()?;
+    let alias = sub.alias.as_ref()?;
+    if !alias.colnames.is_empty() {
+        return None;
+    }
+    let Some(N::SelectStmt(inner)) = sub.subquery.as_deref().and_then(|n| n.node.as_ref()) else {
+        return None;
+    };
+    let [from] = inner.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeVar(rv)) = from.node.as_ref() else {
+        return None;
+    };
+    let base = lookup(&rv.relname)?;
+    // The subquery's output columns: `*`, or plain column references.
+    let mut columns = Vec::new();
+    for t in &inner.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            return None;
+        };
+        let star = c
+            .fields
+            .last()
+            .is_some_and(|f| matches!(f.node.as_ref(), Some(N::AStar(_))));
+        if star {
+            columns.extend(base.columns.iter().cloned());
+            continue;
+        }
+        let Some(N::String(name)) = c.fields.last().and_then(|f| f.node.as_ref()) else {
+            return None;
+        };
+        let name = name.sval.clone();
+        let mut col = base.columns.iter().find(|col| col.name == name)?.clone();
+        if !rt.name.is_empty() {
+            col.name = rt.name.clone();
+        }
+        columns.push(col);
+    }
+    let def = TableDef {
+        name: alias.aliasname.clone(),
+        columns,
+        ..base
+    };
+    ruleutils::explain_subquery_conjuncts(where_clause, &def)
 }
 
 /// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.

@@ -415,6 +415,78 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
+    "subquery scan of two clauses": (
+        "RP-328",
+        _ANALYSED,
+        "explain select a from (select a, b from e limit 100) s where a < 3 and b <> 'x'",
+        [
+            "Subquery Scan on s  (cost=0.00..3.00 rows=1 width=4)",
+            "  Filter: ((s.a < 3) AND (s.b <> 'x'::text))",
+            "  ->  Limit  (cost=0.00..1.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "subquery scan over an offset": (
+        "RP-328",
+        _ANALYSED,
+        "explain select * from (select a from e limit 10 offset 5) s where a = 7",
+        [
+            "Subquery Scan on s  (cost=0.07..0.35 rows=1 width=4)",
+            "  Filter: (s.a = 7)",
+            "  ->  Limit  (cost=0.07..0.22 rows=10 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "subquery scan of a renamed column": (
+        "RP-328",
+        _ANALYSED,
+        "explain select x from (select a as x from e limit 50) s where x > 10",
+        [
+            "Subquery Scan on s  (cost=0.00..1.38 rows=50 width=4)",
+            "  Filter: (s.x > 10)",
+            "  ->  Limit  (cost=0.00..0.75 rows=50 width=4)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "subquery scan of a table never analysed": (
+        "RP-328",
+        _E,
+        "explain select * from (select a, b from e limit 100) s where a > 500",
+        [
+            "Subquery Scan on s  (cost=0.00..3.04 rows=33 width=36)",
+            "  Filter: (s.a > 500)",
+            "  ->  Limit  (cost=0.00..1.79 rows=100 width=36)",
+            "        ->  Seq Scan on e  (cost=0.00..22.70 rows=1270 width=36)",
+        ],
+    ),
+    # ------------------------------------- RP-348 a Filter's text and order
+    "an IN list's filter": (
+        "RP-348",
+        _ANALYSED,
+        "explain select * from e where a in (1, 2, 3)",
+        [
+            "Seq Scan on e  (cost=0.00..18.75 rows=3 width=7)",
+            "  Filter: (a = ANY ('{1,2,3}'::integer[]))",
+        ],
+    ),
+    "a filter's clauses in cost order": (
+        "RP-348",
+        _E,
+        "explain select * from e where a = 5 and b > 'q'",
+        [
+            "Seq Scan on e  (cost=0.00..29.05 rows=2 width=36)",
+            "  Filter: ((b > 'q'::text) AND (a = 5))",
+        ],
+    ),
+    "a text range on an analysed table": (
+        "RP-348",
+        _ANALYSED,
+        "explain select * from e where b > 'q'",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=1000 width=7)",
+            "  Filter: (b > 'q'::text)",
+        ],
+    ),
     "nested loop": (
         "RP-329",
         _ANALYSED,
@@ -806,6 +878,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-325",
         "RP-326",
         "RP-327",
+        "RP-328",
         "RP-331",
         "RP-332",
         "RP-333",

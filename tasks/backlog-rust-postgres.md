@@ -1338,16 +1338,19 @@ a regression test.
       function with an argument.
       Backlog-ID: RP-347
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a windowagg over a sort]
-- [ ] **EXPLAIN prints no estimate for a Subquery Scan, nor its Filter.**
-      `explain select * from (select a from e limit 3) s where a > 1` is
-      `Subquery Scan on s  (cost=0.00..0.08 rows=2 width=4)` with
-      `Filter: (s.a > 1)` over the Limit; here the Filter line is
-      missing too. PostgreSQL 15.19 prices it (`costsize.c`); here it
-      prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that
-      is one relation's Seq Scan prints the estimate; the scenario's
-      expected plan is PostgreSQL's, measured on a fresh cluster.
-      Backlog-ID: RP-328
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[subquery scan]
+- [ ] **A Seq Scan's Filter line prints an IN list and a clause order
+      PostgreSQL does not, and a text range on an analysed table is
+      unpriced.** On PostgreSQL 15.19, `explain select * from e where a
+      in (1, 2, 3)` prints `Filter: (a = ANY ('{1,2,3}'::integer[]))` (the
+      planner folds the ARRAY to a constant); here it is `(a = ANY
+      (ARRAY[1, 2, 3]))`. `where a = 5 and b > 'q'` prints `((b > 'q'::text)
+      AND (a = 5))`; here the clauses keep the order written. And on an
+      analysed table `where b > 'q'` is `(cost=0.00..17.50 rows=1000)`;
+      here zeros (`analyzed_where` gives no selectivity for a text range).
+      The same three show on a Subquery Scan's Filter (found while working
+      RP-328).
+      Backlog-ID: RP-348
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an IN list's filter]
 - [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
       `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
       (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:
