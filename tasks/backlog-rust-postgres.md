@@ -1342,16 +1342,6 @@ a regression test.
       function with an argument.
       Backlog-ID: RP-347
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a windowagg over a sort]
-- [ ] **An IN list's NULL element is not counted in its cost.** On
-      PostgreSQL 15.19, `explain select * from e where a in (1, null, 3)`
-      over an analysed table is `(cost=0.00..18.75 rows=2)`: the
-      ScalarArrayOpExpr's per-row cost is half its array's length, NULL
-      elements included (`estimate_array_length`). Here it is
-      `cost=0.00..17.50` -- `costsize::conjuncts` drops the NULLs before
-      `qual_cost` counts them, though they should drop out of the
-      selectivity only (found while working RP-348).
-      Backlog-ID: RP-349
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an IN list with a NULL]
 - [ ] **A column equal to two constants is not a One-Time Filter: false.**
       On PostgreSQL 15.19, `explain select * from e where a = 1 and a =
       2` is a `Result` with `One-Time Filter: false` over `Seq Scan on e`

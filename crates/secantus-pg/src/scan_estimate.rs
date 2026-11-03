@@ -737,6 +737,7 @@ impl PgHandler {
                 costsize::conjuncts(filter)?,
             )
         };
+        let quals = with_in_lengths(quals);
         let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
         let rel = costsize::Rel {
             pages: pt.pages,
@@ -1591,4 +1592,46 @@ mod append_tests {
             ("0.00".into(), "38.98".into(), 1099.0, 7)
         );
     }
+}
+
+thread_local! {
+    /// The EXPLAIN being estimated: its single relation's top-level
+    /// `col IN (...)` lists, each column's stored field and the list's
+    /// length with its NULL elements (RP-349).
+    static EXPLAIN_IN_LENGTHS: std::cell::RefCell<Vec<(String, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds an EXPLAIN's `IN` list lengths until it is dropped.
+pub(crate) struct InLengthsGuard(());
+
+impl Drop for InLengthsGuard {
+    fn drop(&mut self) {
+        EXPLAIN_IN_LENGTHS.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// Make `lengths` (`ExplainOptions::scan_in_lengths`) what this EXPLAIN's
+/// scans are priced with, until the guard is dropped.
+pub(crate) fn explain_in_lengths(lengths: &[(String, usize)]) -> InLengthsGuard {
+    EXPLAIN_IN_LENGTHS.with(|c| *c.borrow_mut() = lengths.to_vec());
+    InLengthsGuard(())
+}
+
+/// An `IN` list's cost counts every element, NULLs included
+/// (`estimate_array_length`), though the lowered filter -- where a NULL
+/// would match a NULL column -- drops them; its selectivity keeps counting
+/// only the non-NULL ones (RP-349).
+fn with_in_lengths(mut quals: Vec<(String, costsize::Qual)>) -> Vec<(String, costsize::Qual)> {
+    EXPLAIN_IN_LENGTHS.with(|c| {
+        let lengths = c.borrow();
+        for (field, q) in &mut quals {
+            if let costsize::Qual::In(len, nonnull) = q {
+                if let Some((_, full)) = lengths.iter().find(|(f, n)| f == field && *n > *len) {
+                    *q = costsize::Qual::In(*full, *nonnull);
+                }
+            }
+        }
+    });
+    quals
 }

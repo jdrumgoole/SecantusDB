@@ -8578,7 +8578,10 @@ impl PgHandler {
                         _ => Qual::Eq,
                     },
                 )),
-                WhereClause::In(f, v) => Some((f, Qual::In(v.len()))),
+                WhereClause::In(f, v) => Some((
+                    f,
+                    Qual::In(v.len(), v.iter().filter(|x| **x != Bson::Null).count()),
+                )),
                 WhereClause::Null(f, is_null) => Some((f, Qual::IsNull(*is_null))),
                 _ => None,
             }
@@ -40641,6 +40644,7 @@ impl PgHandler {
                 "a join source reached execution on its own".into(),
             ))),
             Statement::Explain { inner, options } => {
+                let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
