@@ -1017,7 +1017,10 @@ tests regression tests:
       2026-11-01, in `scripts/gate_pg.sh`'s backlog verify on macOS (debug
       build, load average about 11 from the suites before it): the same
       `ok` for `[2.5]`; five runs of the test alone after it passed. Load
-      is the common factor of both sightings.
+      is the common factor of both sightings. A fourth sighting on
+      2026-11-03, the same gate's backlog verify on the RP-331 branch
+      (EXPLAIN costing only; load average about 15): `[2.5]` answered `ok`;
+      six runs of all three delays alone after it passed at load 8.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
