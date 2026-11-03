@@ -75,6 +75,8 @@ jobs:
       SECANTUS_HANG_SECONDS: "1500"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Free disk the job does not use
+        uses: ./.github/actions/free-disk
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host.
@@ -195,6 +197,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Free disk the job does not use
+        uses: ./.github/actions/free-disk
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why
@@ -435,6 +439,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Free disk the job does not use
+        uses: ./.github/actions/free-disk
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why
@@ -769,6 +775,8 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || github.event_name == 'push' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Free disk the job does not use
+        uses: ./.github/actions/free-disk
       - name: Start the disk watchdog (RP-312)
         # Something has twice written tens of GB within seconds and filled the
         # disk so completely that the runner died and left no log (2026-11-01
@@ -1370,12 +1378,7 @@ jobs:
       # each suite so the next one is measured, and free the toolchains this
       # job never uses (.NET, Android, GHC, CodeQL: ~22 GB) for headroom.
       - name: Free disk the job does not use
-        shell: bash
-        run: |
-          df -h / | tail -1
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
-          df -h / | tail -1
+        uses: ./.github/actions/free-disk
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why

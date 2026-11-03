@@ -888,8 +888,8 @@ one beside it.
 
 ## Found by a CI run (2026-11-01)
 
-- [ ] **OPEN — CI: the pg-oracle `server` shard's backlog step filled an
-      86 GB-free runner disk within ~30 seconds; cause UNKNOWN.** PR #2249,
+- [ ] **OPEN — CI: three jobs ran out of disk; the one that left a log had
+      been given a 72 GB runner, not the usual 145 GB one.** PR #2249,
       run 41312019513, job `pg-oracle (server)`: the slice suite (872
       passed) and the login comparisons passed; ~70 `backlog_fixed` tests
       passed, then one failed and every later test errored with `could not
@@ -925,6 +925,21 @@ one beside it.
       survives, and its last step fails the job and prints the report.
       **The next occurrence names the writer: read the "Disk watchdog
       report (RP-312)" step first.**
+      **Diagnosis (2026-11-03): probably no runaway write at all.** A scan
+      of every failed Tests job since 2026-10-20 found a third occurrence
+      with its log intact: `rust-storage`, run 41630467524, where `df`
+      shows `/dev/mapper/cow-root 72G`, 13 GB free before `cargo test` and
+      157 MB after, rustc and ld dying of ENOSPC with an 11 GB target dir.
+      Every green job measured (6 runs x 3 jobs) ran on `/dev/root 145G`.
+      So `ubuntu-latest` sometimes hands out a 72 GB disk on which the same
+      image leaves ~13 GB, and the heavy jobs use 21 GB (`rust-storage`),
+      31 GB (`pg-oracle`) and 33 GB (`storage-engine`). The 2026-11-01 and
+      2026-11-03 storage-engine occurrences left no `df` line, so that they
+      were the same small runner is inferred, not measured. Since
+      2026-11-03 every heavy Linux job runs `.github/actions/free-disk`
+      (removes unused toolchains, prints the disk device and size, warns
+      under 40 GB free). Close this when a job on a `cow-root` runner is
+      seen passing, or the watchdog names a real writer.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
