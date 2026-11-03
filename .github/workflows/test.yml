@@ -769,6 +769,17 @@ jobs:
         os: ${{ fromJSON((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '["ubuntu-latest","windows-latest","macos-14"]' || github.event_name == 'push' && '["ubuntu-latest","windows-latest"]' || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Start the disk watchdog (RP-312)
+        # Something has twice written tens of GB within seconds and filled the
+        # disk so completely that the runner died and left no log (2026-11-01
+        # pg-oracle server shard; 2026-11-03 this job). The watchdog samples
+        # free space all job long; under 10 GB it records the largest files,
+        # their processes and the pytest test running in each, then kills
+        # those processes so the runner survives and the test fails by name.
+        if: runner.os != 'Windows'
+        run: |
+          scripts/ci_disk_watch_selftest.sh
+          nohup scripts/ci_disk_watch.sh "$RUNNER_TEMP/disk-watch.txt" / >/dev/null 2>&1 &
       - name: Move the host time zone off UTC
         # Every hosted runner is UTC, which hides any code that wrongly uses
         # the host's local time. See .github/actions/non-utc-host for why
@@ -1270,6 +1281,18 @@ jobs:
         run: |
           free -m
           sudo dmesg -T | grep -iE "out of memory|oom-kill|killed process" | tail -20 || true
+      - name: Disk watchdog report (RP-312)
+        # A fired watchdog fails the job: it means a runaway write happened,
+        # whatever the test steps reported.
+        if: always() && runner.os != 'Windows'
+        run: |
+          f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f" ]; then
+            cat "$f"
+            echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
+            exit 1
+          fi
+          echo "disk watchdog: free space never fell under the threshold"
 
   pg-oracle:
     # The SQL suites that diff against a REAL PostgreSQL. They exist because
@@ -1326,6 +1349,17 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Start the disk watchdog (RP-312)
+        # Something has twice written tens of GB within seconds and filled the
+        # disk so completely that the runner died and left no log (2026-11-01
+        # pg-oracle server shard; 2026-11-03 this job). The watchdog samples
+        # free space all job long; under 10 GB it records the largest files,
+        # their processes and the pytest test running in each, then kills
+        # those processes so the runner survives and the test fails by name.
+        if: runner.os != 'Windows'
+        run: |
+          scripts/ci_disk_watch_selftest.sh
+          nohup scripts/ci_disk_watch.sh "$RUNNER_TEMP/disk-watch.txt" / >/dev/null 2>&1 &
       # The `server` shard died of a full disk on 2026-11-01 (PR #2249, run
       # 41312019513): every backlog test after the first ~70 errored with
       # "could not create numbered dir", and the runner could not write its
@@ -1616,3 +1650,15 @@ jobs:
           # the stores inside them -- the directory name is the test's name.
           echo "--- largest per-test pytest directories"
           sudo du -xh -d 4 /tmp/pytest-of-* 2>/dev/null | sort -h | tail -25
+      - name: Disk watchdog report (RP-312)
+        # A fired watchdog fails the job: it means a runaway write happened,
+        # whatever the test steps reported.
+        if: always() && runner.os != 'Windows'
+        run: |
+          f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f" ]; then
+            cat "$f"
+            echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
+            exit 1
+          fi
+          echo "disk watchdog: free space never fell under the threshold"
