@@ -8506,10 +8506,33 @@ impl PgHandler {
         };
         let mut columns = Vec::with_capacity(fields.len());
         let mut bases = Vec::with_capacity(fields.len());
+        // A collation that compares strings by their bytes, which is how
+        // `stats_key` orders them (`C.UTF-8` by code point, the same order
+        // in UTF-8).
+        let bytewise = |collation: &str| matches!(collation, "C" | "POSIX" | "C.UTF-8");
+        let db_bytewise = || {
+            self.databases
+                .lookup(&self.storage, self.db())
+                .ok()
+                .flatten()
+                .is_some_and(|info| bytewise(&info.collate))
+        };
         for f in &fields {
             let c = def.columns.iter().find(|c| c.field() == *f)?;
             let base = c.pg_type.trim_start_matches("pg_catalog.");
             let numeric = matches!(base, "int2" | "int4" | "int8" | "oid");
+            // `name` and `"char"` always compare as bytes; a text column in
+            // its own or the database's collation.
+            let ordered = match base {
+                "name" | "char" | "\"char\"" => true,
+                "text" | "varchar" | "character varying" => match c.extra.get_str("collation") {
+                    Ok(coll) if coll.trim_matches('"') != "default" => {
+                        bytewise(coll.trim_matches('"'))
+                    }
+                    _ => db_bytewise(),
+                },
+                _ => false,
+            };
             let measured = match stats.get(*f) {
                 Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
                 Some(None) => return None,
@@ -8532,6 +8555,7 @@ impl PgHandler {
                 unique: unique.iter().any(|u| u == f),
                 boolean: base == "bool",
                 numeric,
+                ordered,
                 actual,
                 tuples,
             });

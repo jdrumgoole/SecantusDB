@@ -1347,6 +1347,22 @@ impl<'a> Printer<'a> {
                 }
                 self.child(l, &lw, Parent::Other)?;
                 self.buf.push_str(&format!(" {word} {quant} ("));
+                // `eval_const_expressions` folds an ARRAY of constants (and
+                // varchar's coercion of it to text[]) to one array constant,
+                // printed as its `array_out` text (RP-348).
+                if self.fold_consts {
+                    let elem = if via_text { "text" } else { common.as_str() };
+                    if let Some(lit) = folded_array_literal(&list.items, elem) {
+                        self.buf.push_str(&lit);
+                        self.buf
+                            .push_str(&format!("::{}[]", display_type(elem)));
+                        self.buf.push(')');
+                        if open {
+                            self.buf.push(')');
+                        }
+                        return Some(());
+                    }
+                }
                 if via_text && open {
                     self.buf.push('(');
                 }
@@ -3749,7 +3765,8 @@ pub fn explain_conjuncts(
     }
     flatten(where_clause, &mut parts);
     parts
-        .into_iter()
+        .iter()
+        .copied()
         .map(|p| {
             let text = expr_node_planned(p, def)?;
             let column = match p.node.as_ref() {
@@ -3783,7 +3800,97 @@ pub fn explain_conjuncts(
             };
             Some((text, column))
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()
+        .map(|printed| qual_order(&parts, printed))
+}
+
+/// The order PostgreSQL 15's planner leaves a scan's quals in (RP-348). A
+/// `column = constant` is absorbed into an equivalence class
+/// (`distribute_qual_to_rels`) and put back after the other clauses, one
+/// class at a time (`generate_base_implied_equalities`); then
+/// `order_qual_clauses` sorts the list by each clause's per-row cost
+/// (`cost_qual_eval`), keeping the order of equal costs. Kept as written
+/// when a clause's cost or class is not modelled: anything but a column
+/// compared with a literal, an `IN` list of literals and a null test, or a
+/// column equal to two constants (a class whose clauses are generated
+/// otherwise).
+fn qual_order(
+    parts: &[&Node],
+    printed: Vec<(String, Option<String>)>,
+) -> Vec<(String, Option<String>)> {
+    use crate::costsize::CPU_OPERATOR_COST as OP;
+    let literal = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+        Some(N::AConst(_)) => true,
+        Some(N::TypeCast(t)) => matches!(
+            t.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::AConst(_))
+        ),
+        _ => false,
+    };
+    let column = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+        Some(N::ColumnRef(c)) => names(&c.fields).pop(),
+        _ => None,
+    };
+    // (cost, the column of an equivalence class it joins).
+    let classify = |n: &Node, text: &str| -> Option<(f64, Option<String>)> {
+        // A coercion of the column that is a function call (not varchar's
+        // relabelling to text) costs an operator more: not modelled.
+        if text.starts_with("((") && !text.contains(")::text ") {
+            return None;
+        }
+        match n.node.as_ref()? {
+            N::AExpr(e) if e.kind == AExprKind::AexprOp as i32 => {
+                let op = crate::operator_name(e).ok()?;
+                if !matches!(op, "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
+                    return None;
+                }
+                let col = column(e.lexpr.as_deref())?;
+                if !literal(e.rexpr.as_deref()) {
+                    return None;
+                }
+                Some((OP, (op == "=").then_some(col)))
+            }
+            N::AExpr(e) if e.kind == AExprKind::AexprIn as i32 => {
+                let op = crate::operator_name(e).ok()?;
+                let col = column(e.lexpr.as_deref())?;
+                let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+                    return None;
+                };
+                if !list.items.iter().all(|i| literal(Some(i))) {
+                    return None;
+                }
+                match list.items.len() {
+                    // One element is the plain operator.
+                    1 => Some((OP, (op == "=").then_some(col))),
+                    n if n >= 9 => Some((2.0 * OP, None)),
+                    n => Some((OP * n as f64 * 0.5, None)),
+                }
+            }
+            N::NullTest(t) => {
+                column(t.arg.as_deref())?;
+                Some((0.0, None))
+            }
+            _ => None,
+        }
+    };
+    let mut keyed = Vec::with_capacity(printed.len());
+    let mut classes: Vec<String> = Vec::new();
+    for (i, (p, item)) in parts.iter().zip(printed.iter()).enumerate() {
+        let Some((cost, class)) = classify(p, &item.0) else {
+            return printed;
+        };
+        if let Some(c) = &class {
+            if classes.contains(c) {
+                return printed;
+            }
+            classes.push(c.clone());
+        }
+        keyed.push((class.is_some(), cost, i));
+    }
+    // The classes' clauses after the rest, then a stable sort by cost.
+    keyed.sort_by_key(|k| k.0);
+    keyed.sort_by(|a, b| a.1.total_cmp(&b.1));
+    keyed.into_iter().map(|(_, _, i)| printed[i].clone()).collect()
 }
 
 /// Each JOIN's ON condition in a SELECT's FROM, post-order (a left-deep
@@ -3929,6 +4036,58 @@ pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
 
 /// [`expr_node_def`] as EXPLAIN prints the planned expression, its
 /// constants folded.
+/// An `IN` list of constants of type `elem` as the array constant the
+/// planner folds it to, quoted as a SQL literal: `array_out`'s text
+/// (`'{1,2,3}'`, an element quoted when it is empty, `NULL`, or holds a
+/// space, a brace, a comma, a quote or a backslash). `None` for an element
+/// that is not a bare literal, or a type whose output is not reproduced
+/// here.
+fn folded_array_literal(items: &[Node], elem: &str) -> Option<String> {
+    let mut out = String::from("{");
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let Some(N::AConst(c)) = item.node.as_ref() else {
+            return None;
+        };
+        if c.isnull {
+            out.push_str("NULL");
+            continue;
+        }
+        let text = match (elem, c.val.as_ref()?) {
+            ("int2" | "int4" | "int8" | "numeric", Val::Ival(v)) => v.ival.to_string(),
+            ("int8", Val::Fval(f)) => f.fval.parse::<i64>().ok()?.to_string(),
+            ("text", Val::Sval(v)) => {
+                let s = &v.sval;
+                let quote = s.is_empty()
+                    || s.eq_ignore_ascii_case("NULL")
+                    || s.chars().any(|ch| {
+                        matches!(ch, '"' | '\\' | '{' | '}' | ',')
+                            || matches!(ch, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+                    });
+                if quote {
+                    let mut q = String::from("\"");
+                    for ch in s.chars() {
+                        if matches!(ch, '"' | '\\') {
+                            q.push('\\');
+                        }
+                        q.push(ch);
+                    }
+                    q.push('"');
+                    q
+                } else {
+                    s.clone()
+                }
+            }
+            _ => return None,
+        };
+        out.push_str(&text);
+    }
+    out.push('}');
+    Some(format!("'{}'", out.replace('\'', "''")))
+}
+
 fn expr_node_planned(n: &Node, def: &TableDef) -> Option<String> {
     expr_node_printed(n, def, true)
 }
@@ -3950,10 +4109,17 @@ pub fn explain_subquery_conjuncts(where_clause: &Node, def: &TableDef) -> Option
         }
     }
     flatten(where_clause, &mut parts);
-    parts
-        .into_iter()
-        .map(|p| expr_node_printed_with(p, def, true, false))
-        .collect()
+    let printed = parts
+        .iter()
+        .map(|p| Some((expr_node_printed_with(p, def, true, false)?, None)))
+        .collect::<Option<Vec<_>>>()?;
+    // In the planner's order, as a scan's (RP-348).
+    Some(
+        qual_order(&parts, printed)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect(),
+    )
 }
 
 fn expr_node_printed(n: &Node, def: &TableDef, fold_consts: bool) -> Option<String> {

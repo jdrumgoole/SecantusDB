@@ -1338,19 +1338,26 @@ a regression test.
       function with an argument.
       Backlog-ID: RP-347
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a windowagg over a sort]
-- [ ] **A Seq Scan's Filter line prints an IN list and a clause order
-      PostgreSQL does not, and a text range on an analysed table is
-      unpriced.** On PostgreSQL 15.19, `explain select * from e where a
-      in (1, 2, 3)` prints `Filter: (a = ANY ('{1,2,3}'::integer[]))` (the
-      planner folds the ARRAY to a constant); here it is `(a = ANY
-      (ARRAY[1, 2, 3]))`. `where a = 5 and b > 'q'` prints `((b > 'q'::text)
-      AND (a = 5))`; here the clauses keep the order written. And on an
-      analysed table `where b > 'q'` is `(cost=0.00..17.50 rows=1000)`;
-      here zeros (`analyzed_where` gives no selectivity for a text range).
-      The same three show on a Subquery Scan's Filter (found while working
-      RP-328).
-      Backlog-ID: RP-348
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an IN list's filter]
+- [ ] **An IN list's NULL element is not counted in its cost.** On
+      PostgreSQL 15.19, `explain select * from e where a in (1, null, 3)`
+      over an analysed table is `(cost=0.00..18.75 rows=2)`: the
+      ScalarArrayOpExpr's per-row cost is half its array's length, NULL
+      elements included (`estimate_array_length`). Here it is
+      `cost=0.00..17.50` -- `costsize::conjuncts` drops the NULLs before
+      `qual_cost` counts them, though they should drop out of the
+      selectivity only (found while working RP-348).
+      Backlog-ID: RP-349
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an IN list with a NULL]
+- [ ] **A column equal to two constants is not a One-Time Filter: false.**
+      On PostgreSQL 15.19, `explain select * from e where a = 1 and a =
+      2` is a `Result` with `One-Time Filter: false` over `Seq Scan on e`
+      with `Filter: (a = 1)` (`generate_base_implied_equalities_const`
+      folds the class's second constant into `1 = 2`); here it is one
+      Seq Scan with `Filter: ((a = 1) AND (a = 2))` and that cost. RP-348
+      leaves such a WHERE's clauses in the order written (found while
+      working RP-348).
+      Backlog-ID: RP-350
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a column equal to two constants]
 - [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
       `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
       (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:
