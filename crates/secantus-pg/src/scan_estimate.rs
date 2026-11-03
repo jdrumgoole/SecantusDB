@@ -921,6 +921,49 @@ pub(crate) fn count_agg_estimate(input: Estimate, n: usize) -> Estimate {
     (startup, startup + CPU_TUPLE_COST, 1.0, 8 * n as i64)
 }
 
+/// A HashAggregate's estimate for a GROUP BY of `ncols` keys with `n`
+/// counts (RP-322): PostgreSQL 15's `cost_agg` with AGG_HASHED
+/// (`costsize.c`), over its input's estimate. Every input row hashes each
+/// key (one `cpu_operator_cost` a column) and runs each count's transition
+/// function (one more); each of the `groups` output rows costs
+/// `cpu_tuple_cost`, and a count has no final function. `width` is the
+/// projected keys' width; each count adds an int8. The hash table's
+/// spilling past `hash_mem` is not priced: the caller prices no plan with
+/// that many groups.
+pub(crate) fn hashed_count_agg_estimate(
+    input: Estimate,
+    ncols: usize,
+    n: usize,
+    groups: f64,
+    width: i64,
+) -> Estimate {
+    let (startup, total) = secantus_pgplan::costsize::hashed_grouping_cost(
+        input.1,
+        input.2,
+        groups,
+        ncols,
+        Some(secantus_pgplan::costsize::AggCosts::simple(n, 0)),
+    );
+    (startup, total, groups, width + 8 * n as i64)
+}
+
+#[cfg(test)]
+mod hashed_agg_tests {
+    use super::hashed_count_agg_estimate;
+
+    #[test]
+    fn a_grouped_count_hashes_each_input_row() {
+        // PostgreSQL 15.19: `select b, count(*) from e group by b` over a
+        // Seq Scan of (0.00..15.00 rows=1000 width=3), ten groups, is
+        // (20.00..20.10 rows=10 width=11).
+        let (s, t, r, w) = hashed_count_agg_estimate((0.0, 15.0, 1000.0, 3), 1, 1, 10.0, 3);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("20.00".into(), "20.10".into(), 10.0, 11)
+        );
+    }
+}
+
 /// A `generate_series` Function Scan's estimate (RP-327): PostgreSQL 15's
 /// `cost_functionscan` (`costsize.c`). The row count is the support
 /// function's (`generate_series_int4_support` / `_int8_support`, which

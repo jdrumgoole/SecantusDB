@@ -41020,6 +41020,108 @@ impl PgHandler {
                         }
                     }
                 }
+                // A GROUP BY of plain columns with counts, straight over
+                // one user table's sequential scan, hashed (RP-322): the
+                // scan's estimate, then `cost_agg` (AGG_HASHED). Priced only
+                // where PostgreSQL keeps the HashAggregate over a Sort +
+                // GroupAggregate (`sorted_grouping_wins`), with no index on
+                // the table to offer presorted input, every key projected
+                // once, and few enough groups that the hash table fits
+                // `hash_mem` (past about 50,000 the planner prices its
+                // spilling, which is not modelled).
+                if tree.name == "HashAggregate"
+                    && tree.details.len() == 1
+                    && tree.children.len() == 1
+                    && tree.children[0].children.is_empty()
+                    && tree.children[0].name.starts_with("Seq Scan on ")
+                {
+                    if let Statement::Aggregate(agg) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == agg.table);
+                        let counts = agg.items.iter().all(|it| {
+                            matches!(
+                                it.func,
+                                secantus_pgplan::AggFunc::CountStar
+                                    | secantus_pgplan::AggFunc::Count
+                            ) && it.expr.is_none()
+                                && it.expr2.is_none()
+                                && it.field2.is_none()
+                                && !it.distinct
+                                && it.filter.is_none()
+                                && it.order.is_empty()
+                        });
+                        let keys: Vec<String> =
+                            agg.group_by.iter().map(|k| k.field.clone()).collect();
+                        let projected = |i: usize| {
+                            agg.select
+                                .iter()
+                                .filter(|(_, c)| *c == secantus_pgplan::OutputCol::Group(i))
+                                .count()
+                                == 1
+                        };
+                        if counts
+                            && !indexed
+                            && !keys.is_empty()
+                            && agg.group_by.iter().all(|k| k.expr.is_none())
+                            && (1..keys.len()).all(|i| !keys[..i].contains(&keys[i]))
+                            && (0..keys.len()).all(projected)
+                            && agg.select.len() == keys.len() + agg.items.len()
+                            && (0..agg.items.len()).all(|i| {
+                                agg.select
+                                    .iter()
+                                    .any(|(_, c)| *c == secantus_pgplan::OutputCol::Agg(i))
+                            })
+                            && agg.grouping_sets.is_none()
+                            && agg.groupings.is_empty()
+                            && agg.having.is_none()
+                            && agg.exprs.is_empty()
+                            && agg.order.is_empty()
+                            && agg.limit.is_none()
+                            && agg.offset == 0
+                            && !agg.with_ties
+                            && !agg.distinct
+                            && agg.sub.is_none()
+                            && agg.series.is_none()
+                            && agg.join.is_none()
+                        {
+                            let mut fields = keys.clone();
+                            for f in agg.items.iter().filter_map(|it| it.field.clone()) {
+                                if !fields.contains(&f) {
+                                    fields.push(f);
+                                }
+                            }
+                            if let (Some((scan, None)), Some((keyed, None)), Some(groups)) = (
+                                self.scan_estimate(&agg.table, &agg.filter, &fields),
+                                self.scan_estimate(&agg.table, &agg.filter, &keys),
+                                self.distinct_groups(&agg.table, &agg.filter, &keys),
+                            ) {
+                                let aggs =
+                                    secantus_pgplan::costsize::AggCosts::simple(agg.items.len(), 0);
+                                if groups <= 50_000.0
+                                    && !secantus_pgplan::costsize::sorted_grouping_wins(
+                                        scan.1,
+                                        scan.2,
+                                        groups,
+                                        keys.len(),
+                                        Some(aggs),
+                                        false,
+                                    )
+                                {
+                                    tree.children[0].estimate = Some(scan);
+                                    tree.estimate = Some(scan_estimate::hashed_count_agg_estimate(
+                                        scan,
+                                        keys.len(),
+                                        agg.items.len(),
+                                        groups,
+                                        keyed.3,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
                 // A plan that is one user table's plain Index Scan prints
                 // `cost_index`'s estimate when that is the cheapest path
                 // (RP-317).

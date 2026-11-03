@@ -250,6 +250,27 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=3)",
         ],
     ),
+    "a grouped count of a column under a filter": (
+        "RP-322",
+        _ANALYSED,
+        "explain select count(a), b from e where a < 500 group by b",
+        [
+            "HashAggregate  (cost=19.99..20.09 rows=10 width=11)",
+            "  Group Key: b",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=499 width=7)",
+            "        Filter: (a < 500)",
+        ],
+    ),
+    "a group with two counts": (
+        "RP-322",
+        _ANALYSED,
+        "explain select b, count(*), count(a) from e group by b",
+        [
+            "HashAggregate  (cost=22.50..22.60 rows=10 width=19)",
+            "  Group Key: b",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "windowagg": (
         "RP-323",
         _ANALYSED,
@@ -708,6 +729,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-319",
         "RP-320",
         "RP-321",
+        "RP-322",
         "RP-323",
         "RP-324",
         "RP-325",
