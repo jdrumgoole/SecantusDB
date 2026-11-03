@@ -695,6 +695,34 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select current_setting('work_mem')",
         ["Result  (cost=0.00..0.01 rows=1 width=32)"],
     ),
+    # Four calls cost 0.01 + 4 x 0.0025 = 0.02: the rounding shows each
+    # call's cpu_operator_cost (PostgreSQL 15.19, fresh cluster).
+    "a result of four session_user": (
+        "RP-340",
+        [],
+        "explain select session_user, session_user, session_user, session_user",
+        ["Result  (cost=0.00..0.02 rows=1 width=256)"],
+    ),
+    "a result of four void calls": (
+        "RP-340",
+        [],
+        "explain select pg_sleep(0), pg_sleep(0), pg_sleep(0), pg_sleep(0)",
+        ["Result  (cost=0.00..0.02 rows=1 width=16)"],
+    ),
+    "a result of nested calls": (
+        "RP-340",
+        [],
+        "explain select pg_terminate_backend(pg_backend_pid()),"
+        " pg_terminate_backend(pg_backend_pid())",
+        ["Result  (cost=0.00..0.02 rows=1 width=2)"],
+    ),
+    "a result of four nextval": (
+        "RP-340",
+        ["create sequence rp340s"],
+        "explain select nextval('rp340s'), nextval('rp340s'),"
+        " nextval('rp340s'), nextval('rp340s')",
+        ["Result  (cost=0.00..0.02 rows=1 width=32)"],
+    ),
     "a result's one-time filter": (
         "RP-341",
         [],
@@ -784,6 +812,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-333",
         "RP-334",
         "RP-335",
+        "RP-340",
         "RP-341",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

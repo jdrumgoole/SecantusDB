@@ -16,7 +16,7 @@ const SEQ_PAGE_COST: f64 = 1.0;
 const RANDOM_PAGE_COST: f64 = 4.0;
 pub const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_INDEX_TUPLE_COST: f64 = 0.005;
-const CPU_OPERATOR_COST: f64 = 0.0025;
+pub const CPU_OPERATOR_COST: f64 = 0.0025;
 const STD_FUZZ_FACTOR: f64 = 1.01;
 /// `DEFAULT_PAGE_CPU_MULTIPLIER`: a B-tree page descended, in operators.
 const PAGE_CPU_MULTIPLIER: f64 = 50.0;

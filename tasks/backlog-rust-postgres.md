@@ -1382,17 +1382,6 @@ a regression test.
       on a fresh cluster.
       Backlog-ID: RP-330
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join]
-- [ ] **EXPLAIN prints no estimate for a Result whose select list calls
-      a function the planner keeps as a call.** `explain select
-      current_setting('work_mem')` is `Result  (cost=0.00..0.01 rows=1
-      width=32)` on PostgreSQL 15.19: `cost_resultscan`'s
-      `cpu_tuple_cost` plus `cost_qual_eval` of the target (each call
-      `procost` x `cpu_operator_cost`). RP-325 prices a select list of
-      constants only; a `ConstCol` other than `Value` (`current_setting`,
-      `set_config`, `nextval`, `currval`, `setval`, ...) prints zeros
-      (found while working RP-325).
-      Backlog-ID: RP-340
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a result of a function call]
 - [ ] **EXPLAIN prints no One-Time Filter for a WHERE that calls a function.**
       `explain select 1 where current_setting('work_mem') <> ''` is
       `Result  (cost=0.01..0.01 rows=1 width=4)` with `One-Time Filter:
