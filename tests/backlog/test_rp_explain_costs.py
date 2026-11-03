@@ -259,6 +259,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
+    "two ranking functions alone": (
+        "RP-323",
+        _ANALYSED,
+        "explain select row_number() over (), rank() over () from e",
+        [
+            "WindowAgg  (cost=0.00..30.00 rows=1000 width=16)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=0)",
+        ],
+    ),
+    "a windowagg over a sort": (
+        "RP-347",
+        _ANALYSED,
+        "explain select a, row_number() over (order by a) from e",
+        [
+            "WindowAgg  (cost=64.83..82.33 rows=1000 width=12)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=4)",
+            "        Sort Key: a",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "a ranking function under a filter": (
+        "RP-323",
+        _ANALYSED,
+        "explain select b, dense_rank() over () from e where a < 500",
+        [
+            "WindowAgg  (cost=0.00..23.74 rows=499 width=11)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=499 width=3)",
+            "        Filter: (a < 500)",
+        ],
+    ),
     "append": (
         "RP-324",
         _ANALYSED,
@@ -678,6 +708,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-319",
         "RP-320",
         "RP-321",
+        "RP-323",
         "RP-324",
         "RP-325",
         "RP-326",

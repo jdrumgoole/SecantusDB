@@ -1331,15 +1331,20 @@ a regression test.
       cluster.
       Backlog-ID: RP-322
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hashaggregate]
-- [ ] **EXPLAIN prints no estimate for a WindowAgg.**
-      `explain select a, row_number() over () from e` is `WindowAgg
-      (cost=0.00..27.50 rows=1000 width=12)` (`cost_windowagg`).
-      PostgreSQL 15.19 prices it (`costsize.c`); here it prints
-      `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a plan that is one
-      relation's Seq Scan prints the estimate; the scenario's expected
-      plan is PostgreSQL's, measured on a fresh cluster.
-      Backlog-ID: RP-323
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[windowagg]
+- [ ] **EXPLAIN prints no estimate for a WindowAgg over a Sort, nor
+      for a window aggregate.** Since RP-323 a WindowAgg of
+      `row_number` / `rank` / `dense_rank` over `OVER ()`, straight over
+      one relation's Seq Scan, prints `cost_windowagg`'s estimate. A
+      window with ORDER BY or PARTITION BY still prints zeros:
+      `explain select a, row_number() over (order by a) from e` is
+      `WindowAgg (cost=64.83..82.33 rows=1000 width=12)` over `Sort
+      (cost=64.83..67.33 ...)` in PostgreSQL 15.19 (the order columns'
+      comparisons, `cpu_operator_cost` each per row, and the Sort below
+      it). So does an aggregate over the window (`sum(a) over ()`, whose
+      transition and argument costs `cost_windowagg` adds), and any
+      function with an argument.
+      Backlog-ID: RP-347
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a windowagg over a sort]
 - [ ] **EXPLAIN prints no Filter on a set operation's scans.**
       `explain select a, b from e where a < 100 union all select a, b
       from k` prints `Filter: (a < 100)` under the Append's `Seq Scan on
