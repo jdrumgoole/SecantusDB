@@ -297,6 +297,89 @@ impl PgHandler {
         Some((children.into_iter().map(|(e, _)| e).collect(), estimate))
     }
 
+    /// The child's and the node's estimates of an `INSERT`, `UPDATE` or
+    /// `DELETE` with no RETURNING (RP-331). `create_modifytable_path` takes
+    /// its subpath's startup and total costs and, with no RETURNING list,
+    /// zero rows and zero width. The subpath is:
+    ///
+    /// - for a one-row `VALUES` insert, a `Result` (`cost_resultscan`:
+    ///   `cpu_tuple_cost`) whose target list is every column of the table
+    ///   (`expand_insert_targetlist` fills an unnamed one with its default
+    ///   or NULL), each its type's `get_typavgwidth`;
+    /// - for an `UPDATE`, the relation's scan, emitting the new values of
+    ///   the assigned columns (each a non-Var, so its type's width) and the
+    ///   `ctid` (6 bytes);
+    /// - for a `DELETE`, the relation's scan emitting the `ctid` alone.
+    ///
+    /// Not priced (`None`, zeros): RETURNING, ON CONFLICT, `INSERT ...
+    /// SELECT` and multi-row VALUES, a write through a view, a SET that
+    /// reads the row (its expression's `cost_qual_eval` is not modelled),
+    /// a WHERE that does not lower to a filter, and a WHERE on a table
+    /// with an index, where PostgreSQL may choose an index path.
+    pub(crate) fn modify_table_estimate(&self, stmt: &Statement) -> Option<(Estimate, Estimate)> {
+        const CTID_WIDTH: i64 = 6;
+        let defs = self.all_table_defs().ok()?;
+        let def_of = |table: &str| defs.iter().find(|d| d.name == table);
+        let scan = |table: &str, filter: &Document, width: i64| -> Option<Estimate> {
+            if !filter.is_empty()
+                && self
+                    .index_relations()
+                    .iter()
+                    .any(|ix| ix.table.name == table)
+            {
+                return None;
+            }
+            let ((startup, total, rows, _), index) = self.scan_estimate(table, filter, &[])?;
+            index.is_none().then_some((startup, total, rows, width))
+        };
+        let child = match stmt {
+            Statement::Insert(ins) => {
+                if ins.rows.len() != 1
+                    || ins.source.is_some()
+                    || ins.returning.is_some()
+                    || ins.on_conflict.is_some()
+                    || !ins.view_checks.is_empty()
+                {
+                    return None;
+                }
+                let def = def_of(&ins.table)?;
+                let width = def
+                    .columns
+                    .iter()
+                    .map(|c| type_width(&c.pg_type, c.typmod))
+                    .sum();
+                (0.0, costsize::CPU_TUPLE_COST, 1.0, width)
+            }
+            Statement::Update(u) => {
+                if u.returning.is_some()
+                    || u.residual.is_some()
+                    || !u.view_checks.is_empty()
+                    || !u.set_exprs.is_empty()
+                    || !u.set_subscripts.is_empty()
+                    || u.set.is_empty()
+                {
+                    return None;
+                }
+                let def = def_of(&u.table)?;
+                let mut width = CTID_WIDTH;
+                for (field, _) in &u.set {
+                    let c = def.columns.iter().find(|c| &c.field() == field)?;
+                    width += type_width(&c.pg_type, c.typmod);
+                }
+                scan(&u.table, &u.filter, width)?
+            }
+            Statement::Delete(d) => {
+                if d.returning.is_some() || d.residual.is_some() {
+                    return None;
+                }
+                def_of(&d.table)?;
+                scan(&d.table, &d.filter, CTID_WIDTH)?
+            }
+            _ => return None,
+        };
+        Some((child, (child.0, child.1, 0.0, 0)))
+    }
+
     /// The estimate of the cheapest scan of `table` through `filter` that
     /// outputs `fields` (stored fields), or `None` where it is not priced.
     /// A user table's scan is the sequential one the storage planner

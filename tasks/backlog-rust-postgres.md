@@ -1017,7 +1017,10 @@ tests regression tests:
       2026-11-01, in `scripts/gate_pg.sh`'s backlog verify on macOS (debug
       build, load average about 11 from the suites before it): the same
       `ok` for `[2.5]`; five runs of the test alone after it passed. Load
-      is the common factor of both sightings.
+      is the common factor of both sightings. A fourth sighting on
+      2026-11-03, the same gate's backlog verify on the RP-331 branch
+      (EXPLAIN costing only; load average about 15): `[2.5]` answered `ok`;
+      six runs of all three delays alone after it passed at load 8.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
@@ -1379,18 +1382,6 @@ a regression test.
       on a fresh cluster.
       Backlog-ID: RP-330
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join]
-- [ ] **EXPLAIN prints no estimate for an Insert, Update or Delete.**
-      A ModifyTable node is `Insert on e  (cost=0.00..0.01 rows=0
-      width=0)` over a `Result` of width 36, `Update on e
-      (cost=0.00..17.50 rows=0 width=0)` over a Seq Scan of width 38
-      (the new row and the `ctid`), and `Delete on e` over a Seq Scan of
-      width 6 (the `ctid`). PostgreSQL 15.19 prices it (`costsize.c`);
-      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
-      plan that is one relation's Seq Scan prints the estimate; the
-      scenario's expected plan is PostgreSQL's, measured on a fresh
-      cluster.
-      Backlog-ID: RP-331
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[insert], tests/backlog/test_rp_explain_costs.py::test_plan[update], tests/backlog/test_rp_explain_costs.py::test_plan[delete]
 - [ ] **EXPLAIN prints no estimate for a Result whose select list calls
       a function the planner keeps as a call.** `explain select
       current_setting('work_mem')` is `Result  (cost=0.00..0.01 rows=1
