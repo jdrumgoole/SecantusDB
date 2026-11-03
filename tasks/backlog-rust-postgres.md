@@ -1328,20 +1328,22 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for a WindowAgg over a Sort, nor
-      for a window aggregate.** Since RP-323 a WindowAgg of
-      `row_number` / `rank` / `dense_rank` over `OVER ()`, straight over
-      one relation's Seq Scan, prints `cost_windowagg`'s estimate. A
-      window with ORDER BY or PARTITION BY still prints zeros:
-      `explain select a, row_number() over (order by a) from e` is
-      `WindowAgg (cost=64.83..82.33 rows=1000 width=12)` over `Sort
-      (cost=64.83..67.33 ...)` in PostgreSQL 15.19 (the order columns'
-      comparisons, `cpu_operator_cost` each per row, and the Sort below
-      it). So does an aggregate over the window (`sum(a) over ()`, whose
-      transition and argument costs `cost_windowagg` adds), and any
-      function with an argument.
-      Backlog-ID: RP-347
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a windowagg over a sort]
+- [ ] **EXPLAIN prints no estimate for a window aggregate, nor for a
+      window function with an argument.** Since RP-347 a WindowAgg of
+      `row_number` / `rank` / `dense_rank` over one window prints
+      `cost_windowagg`'s estimate, over the Sort its PARTITION BY / ORDER BY
+      needs. Any other window function still prints zeros:
+      `explain select a, sum(a) over () from e` is `WindowAgg
+      (cost=0.00..27.50 rows=1000 width=12)` in PostgreSQL 15.19 (the
+      aggregate's `procost` and its argument's evaluation, which
+      `cost_windowagg` adds per row), and `explain select a, lag(a) over
+      (order by a) from e` is `WindowAgg (cost=64.83..82.33 rows=1000
+      width=8)` over its Sort (the result is the argument's type, not int8).
+      Several distinct windows in one SELECT, which PostgreSQL plans as
+      stacked WindowAggs, each over its own Sort, print one WindowAgg here
+      (found while working RP-347).
+      Backlog-ID: RP-351
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a window], tests/backlog/test_rp_explain_costs.py::test_plan[a window function with an argument]
 - [ ] **A column equal to two constants is not a One-Time Filter: false.**
       On PostgreSQL 15.19, `explain select * from e where a = 1 and a =
       2` is a `Result` with `One-Time Filter: false` over `Seq Scan on e`

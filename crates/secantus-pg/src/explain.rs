@@ -77,6 +77,40 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
                 node.details.push(("Filter".into(), "(...)".into()));
             }
             if !sel.windows.is_empty() {
+                // One window with PARTITION BY or ORDER BY reads its rows
+                // through a Sort by the partition columns, then the order
+                // columns (RP-347), as PostgreSQL's planner puts one below
+                // the WindowAgg. Several distinct windows stack WindowAggs
+                // and Sorts there; that tree is not built yet.
+                let first = &sel.windows[0];
+                let keys: Vec<&secantus_pgplan::OrderKey> =
+                    first.partition_by.iter().chain(&first.order_by).collect();
+                let one_window = sel.windows.iter().all(|w| {
+                    w.partition_by == first.partition_by
+                        && w.order_by == first.order_by
+                        && w.frame == first.frame
+                });
+                if one_window && !keys.is_empty() && keys.iter().all(|k| k.expr.is_none()) {
+                    let mut sort = PlanNode::over("Sort", node);
+                    let shown: Vec<String> = keys
+                        .iter()
+                        .map(|k| {
+                            let name = display_alias(&k.field);
+                            match (k.ascending, k.nulls) {
+                                (true, secantus_pgplan::Nulls::Last) => name,
+                                (true, secantus_pgplan::Nulls::First) => {
+                                    format!("{name} NULLS FIRST")
+                                }
+                                (false, secantus_pgplan::Nulls::First) => format!("{name} DESC"),
+                                (false, secantus_pgplan::Nulls::Last) => {
+                                    format!("{name} DESC NULLS LAST")
+                                }
+                            }
+                        })
+                        .collect();
+                    sort.details.push(("Sort Key".into(), shown.join(", ")));
+                    node = sort;
+                }
                 node = PlanNode::over("WindowAgg", node);
             }
             if !sel.order.is_empty() {
