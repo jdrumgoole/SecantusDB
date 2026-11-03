@@ -913,7 +913,7 @@ one beside it.
       not a test; the step now also lists the per-test directories.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
-- [ ] **The TLS login probe binds a fixed port, so two gates collide.**
+- [ ] **The TLS login probe binds a hard-coded port, so two gates collide.**
       `tools/probes/pg_login_tls_files.py` starts its private PostgreSQL
       15.19 on `PORT = 5418`. Two worktrees running `scripts/gate_pg.sh`'s
       `login` step at once (2026-11-02, RP-320 and RP-344) made the second
