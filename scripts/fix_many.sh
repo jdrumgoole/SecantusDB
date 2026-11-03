@@ -9,7 +9,8 @@
 # machine-wide); a lane spends most of its time waiting on CI, so two lanes
 # roughly double throughput. The lanes cannot take the same item: fix-one's
 # claim is a pushed branch, checked before work starts. Do not raise -j above
-# 2 while another session builds.
+# 2 while another session builds. Each lane also waits for the load average
+# to fall under SECANTUS_LOAD_CEILING (default 10) before it starts.
 #
 # Each session's report goes to .scratch/fix_many/<n>.log, and one line per
 # session (its exit code, plus the PR it merged if any) to
@@ -33,6 +34,10 @@ run() {
     # Stagger the lanes so the second does not pick while the first is
     # claiming the same item.
     [[ $n -le $jobs ]] && sleep $(((n - 1) * 120))
+    # Start no session while the machine is already over budget: the other
+    # lane, a leftover gate or another session may be building
+    # (scripts/wait_for_load.sh has the 2026-11-02 numbers).
+    scripts/wait_for_load.sh "fix_many item $n" 2>>"$out/summary.txt"
     scripts/fix_one.sh -p "$backlog" >"$out/$n.log" 2>&1
     local rc=$?
     local pr

@@ -35,6 +35,10 @@ step() {
     local name=$1
     shift
     echo "==> $name: $*"
+    # Each step waits its turn on a busy machine (another lane's gate, another
+    # session's build): a timing test run at load 68 fails for no reason in
+    # the change. A gate that waited says so in its output.
+    scripts/wait_for_load.sh "gate $name"
     local start=$SECONDS
     "$@" >"$out/$name.log" 2>&1
     local rc=$?
