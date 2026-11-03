@@ -663,6 +663,41 @@ pub(crate) fn attach_scan_quals(
     quals_on_scan(scan, quals, index_columns);
 }
 
+/// Gate a single-relation plan's scan with the `false` pseudoconstants its
+/// equivalence classes generated (RP-350): a `Result` directly over the
+/// scan, as `create_gating_plan` builds it, printing `One-Time Filter:
+/// false` (one) or `(false AND false ...)`. A constant qual costs nothing,
+/// so the Result carries the scan's estimate. A plan with more than one
+/// scan is left alone.
+pub(crate) fn gate_scan(root: &mut PlanNode, falses: usize) {
+    if falses == 0 {
+        return;
+    }
+    fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
+        if n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ") {
+            out.push(n);
+            return;
+        }
+        for c in &mut n.children {
+            scans(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    scans(root, &mut found);
+    let [scan] = found.as_mut_slice() else {
+        return;
+    };
+    let filter = if falses == 1 {
+        "false".to_string()
+    } else {
+        format!("({})", vec!["false"; falses].join(" AND "))
+    };
+    let child = std::mem::replace(&mut **scan, PlanNode::new("Result"));
+    scan.estimate = child.estimate;
+    scan.details.push(("One-Time Filter".into(), filter));
+    scan.children.push(child);
+}
+
 /// Put a set operation's per-arm WHERE conjuncts on its scans, left to
 /// right, as PostgreSQL prints each arm's own `Filter` / `Index Cond`
 /// (RP-346). A plan whose scans do not pair one-to-one with the arms is

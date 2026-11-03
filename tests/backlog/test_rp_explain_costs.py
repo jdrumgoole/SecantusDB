@@ -580,6 +580,50 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a = 1)",
         ],
     ),
+    "a column equal to three constants": (
+        "RP-350",
+        _ANALYSED,
+        "explain select * from e where a = 2 and a = 1 and a = 2 and a = 3",
+        [
+            "Result  (cost=0.00..17.50 rows=1 width=7)",
+            "  One-Time Filter: (false AND false)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 2)",
+        ],
+    ),
+    "two classes each equal to two constants": (
+        "RP-350",
+        _ANALYSED,
+        "explain select * from e where a = 1 and b = 'v1' and a = 2 and a > 0 and b = 'v2'",
+        [
+            "Result  (cost=0.00..22.50 rows=1 width=7)",
+            "  One-Time Filter: (false AND false)",
+            "  ->  Seq Scan on e  (cost=0.00..22.50 rows=1 width=7)",
+            "        Filter: ((a > 0) AND (a = 1) AND (b = 'v1'::text))",
+        ],
+    ),
+    "a repeated equality is one clause": (
+        "RP-350",
+        _ANALYSED,
+        "explain select * from e where a = 1 and b = 'v1' and 1 = a",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=1 width=7)",
+            "  Filter: ((a = 1) AND (b = 'v1'::text))",
+        ],
+    ),
+    "a gated scan under a sort": (
+        "RP-350",
+        _ANALYSED,
+        "explain select * from e where a = 1 and a = 2 order by b",
+        [
+            "Sort  (cost=17.51..17.52 rows=1 width=7)",
+            "  Sort Key: b",
+            "  ->  Result  (cost=0.00..17.50 rows=1 width=7)",
+            "        One-Time Filter: false",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "              Filter: (a = 1)",
+        ],
+    ),
     "nested loop": (
         "RP-329",
         _ANALYSED,
@@ -984,6 +1028,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-347",
         "RP-348",
         "RP-349",
+        "RP-350",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

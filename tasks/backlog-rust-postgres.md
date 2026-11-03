@@ -1359,16 +1359,6 @@ a regression test.
       (found while working RP-347).
       Backlog-ID: RP-351
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a window], tests/backlog/test_rp_explain_costs.py::test_plan[a window function with an argument]
-- [ ] **A column equal to two constants is not a One-Time Filter: false.**
-      On PostgreSQL 15.19, `explain select * from e where a = 1 and a =
-      2` is a `Result` with `One-Time Filter: false` over `Seq Scan on e`
-      with `Filter: (a = 1)` (`generate_base_implied_equalities_const`
-      folds the class's second constant into `1 = 2`); here it is one
-      Seq Scan with `Filter: ((a = 1) AND (a = 2))` and that cost. RP-348
-      leaves such a WHERE's clauses in the order written (found while
-      working RP-348).
-      Backlog-ID: RP-350
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a column equal to two constants]
 - [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
       `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
       (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:
