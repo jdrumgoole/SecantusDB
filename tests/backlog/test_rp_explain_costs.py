@@ -221,6 +221,25 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=0)",
         ],
     ),
+    "a count of a column under a filter": (
+        "RP-321",
+        _ANALYSED,
+        "explain select count(a) from e where a < 500",
+        [
+            "Aggregate  (cost=18.75..18.76 rows=1 width=8)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=499 width=4)",
+            "        Filter: (a < 500)",
+        ],
+    ),
+    "two counts": (
+        "RP-321",
+        _ANALYSED,
+        "explain select count(*), count(b) from e",
+        [
+            "Aggregate  (cost=20.00..20.01 rows=1 width=16)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
     "hashaggregate": (
         "RP-322",
         _ANALYSED,
@@ -617,6 +636,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-318",
         "RP-319",
         "RP-320",
+        "RP-321",
         "RP-325",
         "RP-332",
         "RP-333",
