@@ -40665,6 +40665,24 @@ impl PgHandler {
                         }
                     }
                 }
+                // A UNION ALL of two relations' sequential scans is an
+                // Append over them (RP-324).
+                if tree.name == "Append"
+                    && tree.children.len() == 2
+                    && tree
+                        .children
+                        .iter()
+                        .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
+                {
+                    if let Statement::SetOp(set) = inner.as_ref() {
+                        if let Some((children, estimate)) = self.union_all_estimate(set) {
+                            for (node, est) in tree.children.iter_mut().zip(children) {
+                                node.estimate = Some(est);
+                            }
+                            tree.estimate = Some(estimate);
+                        }
+                    }
+                }
                 // A plan that is one relation's sequential scan, of plain
                 // columns, prints the planner's estimate (RP-314); a
                 // catalog's cheapest path may be one of its indexes'
