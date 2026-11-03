@@ -113,7 +113,10 @@ pub(crate) fn catalog_index_columns(name: &str) -> Vec<String> {
 
 /// `get_typavgwidth` of a column with no `stawidth`.
 fn type_width(pg_type: &str, typmod: i32) -> i64 {
+    // A pseudo-type (`void`, a call's return type, RP-340) has its own
+    // typlen too.
     let typlen = secantus_pgplan::pgtypes::oid_of_name(pg_type)
+        .or_else(|| secantus_pgplan::pgtypes::pseudo_type_oid(pg_type))
         .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
         .and_then(|v| match v {
             Bson::Int32(n) => Some(i64::from(n)),
