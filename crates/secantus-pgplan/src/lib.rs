@@ -3546,6 +3546,10 @@ pub struct ExplainOptions {
     /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
     /// it filters (`None`: the top join's filter).
     pub join_where: Vec<(String, Option<String>)>,
+    /// A set operation's arms, left to right: each single-relation arm's
+    /// WHERE conjuncts, as `scan_quals` holds one statement's. Empty unless
+    /// every arm reads one relation.
+    pub setop_quals: Vec<Vec<(String, Option<String>)>>,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -9943,6 +9947,7 @@ fn plan_explain(
         summary: false,
         format: "text".into(),
         scan_quals: Vec::new(),
+        setop_quals: Vec::new(),
         join_conds: Vec::new(),
         join_where: Vec::new(),
     };
@@ -10011,6 +10016,7 @@ fn plan_explain(
         .and_then(|q| q.node.clone())
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     let join_conds = match &query {
         N::SelectStmt(s) => {
             let none = |_: &str| None;
@@ -10036,6 +10042,7 @@ fn plan_explain(
         planning_without_running(|| plan_node(query, lookup, params))?
     };
     options.scan_quals = scan_quals;
+    options.setop_quals = setop_quals;
     options.join_conds = join_conds;
     if !matches!(
         inner,
@@ -43501,6 +43508,49 @@ fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
         actions,
         replace: r.replace,
     })
+}
+
+/// A UNION / INTERSECT / EXCEPT whose every arm reads one relation: each
+/// arm's WHERE conjuncts, left to right, as its scan prints them (RP-346).
+fn explain_setop_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<Vec<(String, Option<String>)>>> {
+    fn arms<'a>(
+        s: &'a pg_query::protobuf::SelectStmt,
+        out: &mut Vec<&'a pg_query::protobuf::SelectStmt>,
+    ) -> Option<()> {
+        if s.op == pg_query::protobuf::SetOperation::SetopNone as i32 {
+            out.push(s);
+            return Some(());
+        }
+        let side = |n: &'a Option<Box<pg_query::protobuf::SelectStmt>>| n.as_deref();
+        arms(side(&s.larg)?, out)?;
+        arms(side(&s.rarg)?, out)
+    }
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    if s.op == pg_query::protobuf::SetOperation::SetopNone as i32 {
+        return None;
+    }
+    let mut found = Vec::new();
+    arms(s, &mut found)?;
+    found
+        .into_iter()
+        .map(|arm| {
+            let [item] = arm.from_clause.as_slice() else {
+                return None;
+            };
+            let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+                return None;
+            };
+            match arm.where_clause.as_deref() {
+                None => Some(Vec::new()),
+                Some(w) => ruleutils::explain_conjuncts(w, &lookup(&rv.relname)?),
+            }
+        })
+        .collect()
 }
 
 /// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.

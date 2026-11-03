@@ -1338,16 +1338,6 @@ a regression test.
       function with an argument.
       Backlog-ID: RP-347
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a windowagg over a sort]
-- [ ] **EXPLAIN prints no Filter on a set operation's scans.**
-      `explain select a, b from e where a < 100 union all select a, b
-      from k` prints `Filter: (a < 100)` under the Append's `Seq Scan on
-      e` on PostgreSQL 15.19. Here EXPLAIN attaches a WHERE's conjuncts
-      only to a statement over one relation (`explain_scan_quals`), so
-      each side of a UNION, INTERSECT or EXCEPT prints its scan with no
-      `Filter` or `Index Cond`. The estimates are PostgreSQL's since
-      RP-324 (found while working RP-324).
-      Backlog-ID: RP-346
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an append of a filtered text column]
 - [ ] **EXPLAIN prints no estimate for a Subquery Scan, nor its Filter.**
       `explain select * from (select a from e limit 3) s where a > 1` is
       `Subquery Scan on s  (cost=0.00..0.08 rows=2 width=4)` with
