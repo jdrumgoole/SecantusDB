@@ -487,6 +487,57 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (b > 'q'::text)",
         ],
     ),
+    "an IN list of strings array_out quotes": (
+        "RP-348",
+        _ANALYSED,
+        "explain select * from e where b in ('x', 'a b', '', 'NULL', 'it''s', 'q\"r')",
+        [
+            "Seq Scan on e  (cost=0.00..22.50 rows=1 width=7)",
+            '  Filter: (b = ANY (\'{x,"a b","","NULL",it\'\'s,"q\\"r"}\'::text[]))',
+        ],
+    ),
+    "a null test, a range and an equality in cost order": (
+        "RP-348",
+        _ANALYSED,
+        "explain select * from e where b is null and a = 3 and b < 'z'",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=1 width=7)",
+            "  Filter: ((b IS NULL) AND (b < 'z'::text) AND (a = 3))",
+        ],
+    ),
+    "a subquery scan's filter in cost order": (
+        "RP-348",
+        _ANALYSED,
+        "explain select * from (select a, b from e limit 50) s where a = 5 and b > 'q'",
+        [
+            "Subquery Scan on s  (cost=0.00..1.50 rows=1 width=7)",
+            "  Filter: ((s.b > 'q'::text) AND (s.a = 5))",
+            "  ->  Limit  (cost=0.00..0.75 rows=50 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ------------------------------ RP-349 an IN list's NULL element's cost
+    "an IN list with a NULL": (
+        "RP-349",
+        _ANALYSED,
+        "explain select * from e where a in (1, null, 3)",
+        [
+            "Seq Scan on e  (cost=0.00..18.75 rows=2 width=7)",
+            "  Filter: (a = ANY ('{1,NULL,3}'::integer[]))",
+        ],
+    ),
+    # ----------------------------- RP-350 a column equal to two constants
+    "a column equal to two constants": (
+        "RP-350",
+        _ANALYSED,
+        "explain select * from e where a = 1 and a = 2",
+        [
+            "Result  (cost=0.00..17.50 rows=1 width=7)",
+            "  One-Time Filter: false",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "        Filter: (a = 1)",
+        ],
+    ),
     "nested loop": (
         "RP-329",
         _ANALYSED,
@@ -888,6 +939,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-341",
         "RP-342",
         "RP-346",
+        "RP-348",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

@@ -238,6 +238,12 @@ pub struct Column<'a> {
     /// Its keys order as the histogram does and convert to numbers
     /// (`convert_to_scalar`): the integers.
     pub numeric: bool,
+    /// Its keys are not numbers but order bytewise as the column's
+    /// comparison does: a string in a collation that compares by bytes
+    /// (`C`, `POSIX`, `C.UTF-8`), whose most common values a range is
+    /// compared with but whose histogram bins are not interpolated here
+    /// (`convert_string_to_scalar`).
+    pub ordered: bool,
     /// The column's current least and greatest value, when a B-tree index
     /// leads with it (`get_actual_variable_range`).
     pub actual: Option<(Vec<u8>, Vec<u8>)>,
@@ -303,7 +309,10 @@ impl Column<'_> {
         let Some((stats, slots)) = self.stats else {
             return Some(DEFAULT_INEQ_SEL);
         };
-        if !self.numeric {
+        // A string's position inside a histogram bin is
+        // `convert_string_to_scalar`'s, not modelled: only its most common
+        // values are compared, which needs no histogram.
+        if !self.numeric && !(self.ordered && slots.histogram.len() < 2) {
             return None;
         }
         let holds = |v: &[u8]| match (isgt, iseq) {
@@ -616,6 +625,7 @@ mod tests {
             unique: true,
             boolean: false,
             numeric: true,
+            ordered: false,
             actual: Some((int_key(1), int_key(tuples as i64))),
             tuples,
         };
@@ -639,6 +649,7 @@ mod tests {
             unique: false,
             boolean: false,
             numeric: true,
+            ordered: false,
             actual: None,
             tuples: 300.0,
         };
@@ -664,6 +675,7 @@ mod tests {
                 unique: false,
                 boolean: false,
                 numeric: true,
+                ordered: false,
                 actual: None,
                 tuples: 300.0,
             }
