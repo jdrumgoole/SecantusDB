@@ -40751,34 +40751,37 @@ impl PgHandler {
                     && tree.children[0].name.starts_with("Seq Scan on ")
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        let indexed = self
-                            .index_relations()
-                            .iter()
-                            .any(|ix| ix.table.name == sel.table);
-                        if sel.residual.is_none()
-                            && sel.sub.is_none()
-                            && sel.series.is_none()
-                            && sel.join.is_none()
-                            && sel.windows.is_empty()
-                            && sel.order.is_empty()
-                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
-                            && !sel.with_ties
-                            && sel.casts.iter().all(Option::is_none)
-                            && (sel.filter.is_empty() || !indexed)
-                        {
-                            let fields: Vec<String> =
-                                sel.columns.iter().map(|(_, f)| f.clone()).collect();
-                            if let Some((estimate, None)) =
-                                self.scan_estimate(&sel.table, &sel.filter, &fields)
-                            {
-                                // `preprocess_limit`: a constant LIMIT of 0
-                                // or less is estimated as one row.
-                                let count = sel.limit.map_or(0, |n| n.max(1));
-                                tree.children[0].estimate = Some(estimate);
-                                tree.estimate = Some(scan_estimate::limit_estimate(
-                                    estimate, sel.offset, count,
-                                ));
-                            }
+                        if let Some((scan, limit)) = self.limit_scan_estimate(sel) {
+                            tree.children[0].estimate = Some(scan);
+                            tree.estimate = Some(limit);
+                        }
+                    }
+                }
+                // A Subquery Scan with a WHERE over such a Limit (RP-328):
+                // the qual keeps it from being removed as trivial, so it
+                // is `cost_subqueryscan` over the Limit's estimate.
+                if tree.name.starts_with("Subquery Scan on ")
+                    && tree.details.is_empty()
+                    && tree.children.len() == 1
+                    && tree.children[0].name == "Limit"
+                    && tree.children[0].details.is_empty()
+                    && tree.children[0].children.len() == 1
+                    && tree.children[0].children[0].children.is_empty()
+                    && tree.children[0].children[0]
+                        .name
+                        .starts_with("Seq Scan on ")
+                    && !options.subquery_quals.is_empty()
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if let Some((scan, limit, node)) = self.subquery_scan_estimate(sel) {
+                            tree.children[0].children[0].estimate = Some(scan);
+                            tree.children[0].estimate = Some(limit);
+                            tree.estimate = Some(node);
+                            let text = match options.subquery_quals.as_slice() {
+                                [one] => one.clone(),
+                                many => format!("({})", many.join(" AND ")),
+                            };
+                            tree.details.push(("Filter".into(), text));
                         }
                     }
                 }

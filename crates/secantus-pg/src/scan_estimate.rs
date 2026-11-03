@@ -342,6 +342,147 @@ impl PgHandler {
         Some((children.into_iter().map(|(e, _)| e).collect(), estimate))
     }
 
+    /// The Seq Scan's and the Limit's estimates of a LIMIT straight over
+    /// one relation's sequential scan (RP-319): the scan's estimate, then
+    /// `adjust_limit_rows_costs`. Only where the Seq Scan is the path
+    /// PostgreSQL keeps under a LIMIT too: no clause an index could serve
+    /// (`get_cheapest_fractional_path` may prefer a cheaper-to-start index
+    /// scan) and no ORDER BY, DISTINCT or other node between them.
+    pub(crate) fn limit_scan_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(Estimate, Estimate)> {
+        let indexed = self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == sel.table);
+        if sel.residual.is_some()
+            || sel.sub.is_some()
+            || sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || sel.casts.iter().any(Option::is_some)
+            || (!sel.filter.is_empty() && indexed)
+        {
+            return None;
+        }
+        let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+        let (estimate, None) = self.scan_estimate(&sel.table, &sel.filter, &fields)? else {
+            return None;
+        };
+        // `preprocess_limit`: a constant LIMIT of 0 or less is estimated
+        // as one row.
+        let count = sel.limit.map_or(0, |n| n.max(1));
+        Some((estimate, limit_estimate(estimate, sel.offset, count)))
+    }
+
+    /// The Seq Scan's, the Limit's and the Subquery Scan's estimates of a
+    /// WHERE over a FROM-subquery that is such a LIMIT of one user table's
+    /// stored columns (RP-328). The qual keeps the Subquery Scan
+    /// (`trivial_subqueryscan` needs none), priced by `cost_subqueryscan`:
+    /// the Limit's costs, plus `cpu_tuple_cost` and the qual's per-tuple
+    /// cost for each row the Limit returns.
+    ///
+    /// The subquery's rows are its relation's `tuples`
+    /// (`set_subquery_size_estimates`), and a clause on one of its columns
+    /// reads the base column's statistics through it
+    /// (`examine_simple_variable`), so a distinct count stored as a
+    /// fraction of the table scales to the subquery's rows. A subquery's
+    /// column is never `isunique` and has no index to read a range from.
+    pub(crate) fn subquery_scan_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(Estimate, Estimate, Estimate)> {
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::Select(isel) = sub.plan.as_ref() else {
+            return None;
+        };
+        if sel.filter.is_empty()
+            || sel.residual.is_some()
+            || sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || sel.casts.iter().any(Option::is_some)
+            || isel.limit.is_none()
+        {
+            return None;
+        }
+        let (scan, limit) = self.limit_scan_estimate(isel)?;
+        if !self
+            .all_table_defs()
+            .ok()?
+            .iter()
+            .any(|d| d.name == isel.table)
+        {
+            return None;
+        }
+        // The subquery's output columns are stored fields of its relation.
+        let field_of = |f: &str| {
+            isel.columns
+                .iter()
+                .find(|(out, _)| out == f)
+                .map(|(_, field)| field.clone())
+        };
+        let fields = sel
+            .columns
+            .iter()
+            .map(|(_, f)| field_of(f))
+            .collect::<Option<Vec<_>>>()?;
+        let filter = rename_fields(&sel.filter, &field_of)?;
+        let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
+        let count = || {
+            *counted.get_or_init(|| {
+                self.storage
+                    .count_matching(self.db(), &isel.table, &Document::new(), None)
+                    .ok()
+            })
+        };
+        let pt = self.planner_table_lazy(&isel.table, &count)?;
+        let tuples = limit.2;
+        let (sel_frac, quals) = if let Some(stats) = &pt.analyzed {
+            let w = self.analyzed_where(&isel.table, &pt.def, &[], stats, tuples, &filter, &[])?;
+            (w.selectivity, w.quals)
+        } else {
+            let nd = |f: &str| {
+                if pt
+                    .def
+                    .columns
+                    .iter()
+                    .any(|c| c.field() == f && c.pg_type == "bool")
+                {
+                    2.0
+                } else {
+                    tuples.min(200.0)
+                }
+            };
+            (
+                secantus_pgplan::hashagg::filter_selectivity(&filter, &nd)?,
+                costsize::conjuncts(&filter)?,
+            )
+        };
+        let width = output_width(&pt.def, pt.analyzed.as_ref(), &fields)?;
+        let (startup, total) = costsize::subquery_scan_path((limit.0, limit.1), tuples, &quals);
+        Some((
+            scan,
+            limit,
+            (
+                startup,
+                total,
+                costsize::clamp_row_est(tuples * sel_frac),
+                width,
+            ),
+        ))
+    }
+
     /// The child's and the node's estimates of an `INSERT`, `UPDATE` or
     /// `DELETE` with no RETURNING (RP-331). `create_modifytable_path` takes
     /// its subpath's startup and total costs and, with no RETURNING list,
@@ -842,6 +983,36 @@ impl PgHandler {
 }
 
 /// `clamp_row_est`: a row count rounded, and never below one.
+/// `filter` with every field it names replaced by `rename`'s answer; `None`
+/// where one has none.
+fn rename_fields(filter: &Document, rename: &dyn Fn(&str) -> Option<String>) -> Option<Document> {
+    let mut out = Document::new();
+    for (k, v) in filter {
+        let key = if k.starts_with('$') {
+            k.clone()
+        } else {
+            rename(k)?
+        };
+        let value = match (k.starts_with('$'), v) {
+            (true, bson::Bson::Array(items)) => bson::Bson::Array(
+                items
+                    .iter()
+                    .map(|i| match i {
+                        bson::Bson::Document(d) => {
+                            rename_fields(d, rename).map(bson::Bson::Document)
+                        }
+                        other => Some(other.clone()),
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            ),
+            (true, bson::Bson::Document(d)) => bson::Bson::Document(rename_fields(d, rename)?),
+            _ => v.clone(),
+        };
+        out.insert(key, value);
+    }
+    Some(out)
+}
+
 fn clamp_rows(rows: f64) -> f64 {
     if rows <= 1.0 {
         1.0

@@ -3933,7 +3933,39 @@ fn expr_node_planned(n: &Node, def: &TableDef) -> Option<String> {
     expr_node_printed(n, def, true)
 }
 
+/// A WHERE over one FROM-subquery as EXPLAIN prints its Subquery Scan's
+/// `Filter` (RP-328): each AND conjunct, its columns qualified by the
+/// subquery's alias (`def.name`), as ruleutils does once the plan's range
+/// table holds more than one relation.
+pub fn explain_subquery_conjuncts(where_clause: &Node, def: &TableDef) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    flatten(where_clause, &mut parts);
+    parts
+        .into_iter()
+        .map(|p| expr_node_printed_with(p, def, true, false))
+        .collect()
+}
+
 fn expr_node_printed(n: &Node, def: &TableDef, fold_consts: bool) -> Option<String> {
+    expr_node_printed_with(n, def, fold_consts, true)
+}
+
+fn expr_node_printed_with(
+    n: &Node,
+    def: &TableDef,
+    fold_consts: bool,
+    unqualified: bool,
+) -> Option<String> {
     let none_lookup = |_: &str| None;
     let none_views = |_: &str| None;
     let cat = Catalog {
@@ -3941,7 +3973,7 @@ fn expr_node_printed(n: &Node, def: &TableDef, fold_consts: bool) -> Option<Stri
         view_sql: &none_views,
     };
     let mut p = Printer::new(&cat, 0);
-    p.unqualified = true;
+    p.unqualified = unqualified;
     p.fold_consts = fold_consts;
     p.scopes.push(vec![Rte {
         refname: def.name.clone(),
