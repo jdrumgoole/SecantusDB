@@ -43887,14 +43887,11 @@ fn reduce_const_classes(query: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>
             keep.push(true);
             continue;
         };
-        let Some(ty) = def
+        let ty = def
             .columns
             .iter()
             .find(|c| c.name == col)
-            .map(|c| c.pg_type.trim_start_matches("pg_catalog.").to_string())
-        else {
-            return None;
-        };
+            .map(|c| c.pg_type.trim_start_matches("pg_catalog.").to_string())?;
         let value = match constant(other, &ty) {
             // Not a constant, or not a class modelled here: an ordinary
             // clause.
