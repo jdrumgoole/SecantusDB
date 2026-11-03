@@ -443,7 +443,10 @@ impl<'a> Printer<'a> {
                         .map(|a| self.typ(a))
                         .collect::<Option<Vec<String>>>()?;
                     return crate::funcsig::selected_result_type(&name, &types)
-                        .or_else(|| crate::funcsig::resolved_result_type(&name, &types));
+                        .or_else(|| crate::funcsig::resolved_result_type(&name, &types))
+                        .or_else(|| {
+                            crate::funcsig::session_reader_result_type(&name, types.len())
+                        });
                 };
                 match result {
                     Some(r) => r.to_string(),
@@ -3950,6 +3953,24 @@ fn expr_node_printed(n: &Node, def: &TableDef, fold_consts: bool) -> Option<Stri
             .collect(),
         qualified_only: false,
     }]);
+    p.expr(n)?;
+    Some(p.buf)
+}
+
+/// A FROM-less statement's unfolded WHERE as EXPLAIN prints it as the
+/// `Result`'s `One-Time Filter` (RP-342): no relation in scope, constants
+/// folded. `None` for a shape the printer does not know.
+pub fn explain_one_time_qual(n: &Node) -> Option<String> {
+    let none_lookup = |_: &str| None;
+    let none_views = |_: &str| None;
+    let cat = Catalog {
+        lookup: &none_lookup,
+        view_sql: &none_views,
+    };
+    let mut p = Printer::new(&cat, 0);
+    p.unqualified = true;
+    p.fold_consts = true;
+    p.scopes.push(Vec::new());
     p.expr(n)?;
     Some(p.buf)
 }

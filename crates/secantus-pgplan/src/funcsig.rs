@@ -809,6 +809,31 @@ pub(crate) fn builtin_beats(
     catalog_first
 }
 
+/// The result type of a session or catalog reader (`current_setting`,
+/// `current_database`, ...) that overload selection leaves to the server,
+/// read from PG 15's `pg_proc` when every overload of that arity returns
+/// the same concrete type, so no choice between them can change it
+/// (RP-342: `current_setting(...) <> ''` resolves `text <> text`).
+pub(crate) fn session_reader_result_type(name: &str, arity: usize) -> Option<String> {
+    if !crate::scalar::is_catalog_reader(name) {
+        return None;
+    }
+    let mut rets = sigs()
+        .get(name)?
+        .iter()
+        .filter(|s| !s.variadic && s.args.len() == arity)
+        .map(|s| (s.ret.as_str(), s.retset));
+    let (ret, retset) = rets.next()?;
+    if retset
+        || ret.starts_with("any")
+        || matches!(ret, "record" | "void" | "internal" | "trigger" | "unknown")
+        || rets.any(|r| r != (ret, retset))
+    {
+        return None;
+    }
+    Some(ret.to_string())
+}
+
 /// Several overloads take `args` equally well: 42725 `is not unique`.
 pub(crate) fn ambiguous(name: &str, args: &[String]) -> bool {
     select_candidates(name, args).is_some_and(|c| c.len() > 1)
