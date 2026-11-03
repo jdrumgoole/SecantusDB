@@ -40872,6 +40872,101 @@ impl PgHandler {
                                 tree.estimate = Some(scan_estimate::window_agg_estimate(
                                     estimate,
                                     sel.windows.len(),
+                                    0,
+                                ));
+                            }
+                        }
+                    }
+                }
+                // A WindowAgg over a Sort of one relation's sequential scan
+                // (RP-347): the scan's estimate, `cost_sort` by the window's
+                // partition then order columns, then `cost_windowagg`, which
+                // compares each of those columns once per row. Only
+                // argument-less ranking functions that all share one window
+                // (one WindowAgg), by distinct stored columns, and only on a
+                // table with no index, where the Sort is the only way
+                // PostgreSQL gets the order.
+                if tree.name == "WindowAgg"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 1
+                    && tree.children[0].name == "Sort"
+                    && tree.children[0].children.len() == 1
+                    && tree.children[0].children[0].children.is_empty()
+                    && tree.children[0].children[0]
+                        .name
+                        .starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == sel.table);
+                        let first = sel.windows.first();
+                        let keys: Vec<&secantus_pgplan::OrderKey> = first
+                            .map(|w| w.partition_by.iter().chain(&w.order_by).collect())
+                            .unwrap_or_default();
+                        let distinct_keys = (1..keys.len())
+                            .all(|i| keys[..i].iter().all(|k| k.field != keys[i].field));
+                        let one_window = sel.windows.iter().all(|w| {
+                            let f = first.expect("windows is not empty here");
+                            matches!(
+                                w.func,
+                                secantus_pgplan::WindowFunc::RowNumber
+                                    | secantus_pgplan::WindowFunc::Rank
+                                    | secantus_pgplan::WindowFunc::DenseRank
+                            ) && w.arg.is_none()
+                                && w.args.is_empty()
+                                && w.filter.is_none()
+                                && w.partition_by == f.partition_by
+                                && w.order_by == f.order_by
+                                && w.frame == f.frame
+                        });
+                        let is_window = |f: &str| sel.windows.iter().any(|w| w.field == f);
+                        if one_window
+                            && !keys.is_empty()
+                            && distinct_keys
+                            && keys.iter().all(|k| k.expr.is_none() && !k.jsonb)
+                            && !indexed
+                            && sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.order.is_empty()
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && sel.columns.iter().filter(|(_, f)| is_window(f)).count()
+                                == sel.windows.len()
+                        {
+                            // The scan returns the select list's columns and
+                            // the window's keys, each once.
+                            let mut fields: Vec<String> = Vec::new();
+                            for f in sel
+                                .columns
+                                .iter()
+                                .map(|(_, f)| f.as_str())
+                                .filter(|f| !is_window(f))
+                                .chain(keys.iter().map(|k| k.field.as_str()))
+                            {
+                                if !fields.iter().any(|g| g == f) {
+                                    fields.push(f.to_string());
+                                }
+                            }
+                            if let Some((estimate, None)) =
+                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                            {
+                                let sorted = scan_estimate::sort_estimate(
+                                    estimate,
+                                    self.kb_setting("work_mem", 4096),
+                                );
+                                tree.children[0].children[0].estimate = Some(estimate);
+                                tree.children[0].estimate = Some(sorted);
+                                tree.estimate = Some(scan_estimate::window_agg_estimate(
+                                    sorted,
+                                    sel.windows.len(),
+                                    keys.len(),
                                 ));
                             }
                         }
