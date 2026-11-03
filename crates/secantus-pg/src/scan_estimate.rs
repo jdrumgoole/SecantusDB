@@ -146,6 +146,31 @@ pub(crate) fn result_estimate(sc: &secantus_pgplan::SelectConstant) -> Option<Es
     Some((0.0, costsize::CPU_TUPLE_COST, 1.0, width))
 }
 
+/// What `EXPLAIN` prints of a `VALUES` list of several rows (RP-326):
+/// PostgreSQL 15's `cost_valuesscan` charges each row one
+/// `cpu_operator_cost` for evaluating its list and one `cpu_tuple_cost`,
+/// with no startup; the rows are the lists' count and the width each
+/// column's type's `get_typavgwidth` under its common typmod
+/// (`set_rel_width` over the RTE_VALUES' Vars). A one-row list is a
+/// `Result` in PostgreSQL, and rows a set-returning function produced are
+/// not a Values Scan: neither is priced here.
+pub(crate) fn values_estimate(vc: &secantus_pgplan::ValuesConstant) -> Option<Estimate> {
+    let typmods = vc.typmods.as_ref()?;
+    if vc.rows.len() < 2 {
+        return None;
+    }
+    let rows = vc.rows.len() as f64;
+    let width = vc
+        .types
+        .iter()
+        .zip(typmods)
+        .map(|(t, m)| type_width(t, *m))
+        .sum();
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    let total = (CPU_OPERATOR_COST + costsize::CPU_TUPLE_COST) * rows;
+    Some((0.0, total, rows, width))
+}
+
 /// The width of a select list of plain columns (`fields`, stored fields),
 /// which the planner applies to the scan as its target
 /// (`set_pathtarget_cost_width`): each entry, a repeated one again, its

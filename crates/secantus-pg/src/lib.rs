@@ -40636,6 +40636,10 @@ impl PgHandler {
                 if let Statement::SelectConstant(sc) = inner.as_ref() {
                     tree.estimate = scan_estimate::result_estimate(sc);
                 }
+                // A VALUES list of several rows is a Values Scan (RP-326).
+                if let Statement::ValuesConstant(vc) = inner.as_ref() {
+                    tree.estimate = scan_estimate::values_estimate(vc);
+                }
                 // A plan that is one relation's sequential scan, of plain
                 // columns, prints the planner's estimate (RP-314); a
                 // catalog's cheapest path may be one of its indexes'

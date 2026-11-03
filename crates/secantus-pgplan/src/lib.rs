@@ -3317,6 +3317,12 @@ pub struct ValuesConstant {
     pub types: Vec<String>,
     /// The already-resolved literal rows, each with one value per column.
     pub rows: Vec<Vec<Bson>>,
+    /// Each column's common type modifier (`select_common_typmod`: the
+    /// rows' shared one, else -1), for a real `VALUES` list -- the
+    /// `RTE_VALUES` EXPLAIN prices as a Values Scan (RP-326). `None` for
+    /// the rows a set-returning function materialised here, which
+    /// PostgreSQL plans as a Function Scan or ProjectSet instead.
+    pub typmods: Option<Vec<i32>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13662,6 +13668,7 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         names: names.clone(),
         types: types.clone(),
         rows,
+        typmods: None,
     });
     let mut def = TableDef::new(
         &alias,
@@ -23262,6 +23269,7 @@ fn plan_select_rest(
                     names: vec![series.column.clone()],
                     types: vec![ty.to_string()],
                     rows,
+                    typmods: None,
                 })),
                 def,
                 unread: Vec::new(),
@@ -27352,6 +27360,7 @@ fn plan_select_unnest(
             }],
             types: vec![record_type],
             rows,
+            typmods: None,
         })));
     }
     let names = vec![if rt.name.is_empty() {
@@ -27363,6 +27372,7 @@ fn plan_select_unnest(
         names,
         types,
         rows,
+        typmods: None,
     })))
 }
 
@@ -27439,11 +27449,28 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
             };
         }
     }
+    // The common typmod of each column (`select_common_typmod`): the one
+    // every row's expression carries, else -1.
+    let typmods = (0..width)
+        .map(|i| {
+            let mut mods = s.values_lists.iter().map(|vl| match vl.node.as_ref() {
+                Some(N::List(l)) => l.items.get(i).map_or(-1, cast_typmod),
+                _ => -1,
+            });
+            let first = mods.next().unwrap_or(-1);
+            if mods.all(|m| m == first) {
+                first
+            } else {
+                -1
+            }
+        })
+        .collect();
     let names = (1..=width).map(|i| format!("column{i}")).collect();
     Ok(Statement::ValuesConstant(ValuesConstant {
         names,
         types,
         rows,
+        typmods: Some(typmods),
     }))
 }
 

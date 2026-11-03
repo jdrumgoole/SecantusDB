@@ -299,6 +299,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain values (1), (2)",
         ['Values Scan on "*VALUES*"  (cost=0.00..0.03 rows=2 width=4)'],
     ),
+    "a values scan of modified and common types": (
+        "RP-326",
+        [],
+        "explain values ('a'::varchar(10), 1.5), ('bb'::varchar(10), 2)",
+        ['Values Scan on "*VALUES*"  (cost=0.00..0.03 rows=2 width=70)'],
+    ),
+    "a values scan whose typmods differ": (
+        "RP-326",
+        [],
+        "explain values ('a'::varchar(10)), ('bb'), ('c')",
+        ['Values Scan on "*VALUES*"  (cost=0.00..0.04 rows=3 width=32)'],
+    ),
     "function scan": (
         "RP-327",
         [],
@@ -638,6 +650,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-320",
         "RP-321",
         "RP-325",
+        "RP-326",
         "RP-332",
         "RP-333",
         "RP-334",
