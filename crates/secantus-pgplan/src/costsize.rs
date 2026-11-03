@@ -1011,6 +1011,18 @@ fn presorted_group(
     (startup, total)
 }
 
+/// The HashAggregate's `(startup, total)` alone (`cost_agg`, AGG_HASHED,
+/// no spilling), as `EXPLAIN` prints it.
+pub fn hashed_grouping_cost(
+    input_total: f64,
+    rows: f64,
+    groups: f64,
+    ncols: usize,
+    aggs: Option<AggCosts>,
+) -> (f64, f64) {
+    grouping_costs(input_total, rows, groups, ncols, aggs).0
+}
+
 /// The HashAggregate's and the Sort + Group's `(startup, total)`.
 fn grouping_costs(
     input_total: f64,

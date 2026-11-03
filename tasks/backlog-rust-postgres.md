@@ -1321,16 +1321,6 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for a HashAggregate.**
-      `explain select b, count(*) from e group by b` is `HashAggregate
-      (cost=20.00..20.10 rows=10 width=11)` (`cost_agg`, AGG_HASHED,
-      `estimate_num_groups`). PostgreSQL 15.19 prices it (`costsize.c`);
-      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
-      plan that is one relation's Seq Scan prints the estimate; the
-      scenario's expected plan is PostgreSQL's, measured on a fresh
-      cluster.
-      Backlog-ID: RP-322
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hashaggregate]
 - [ ] **EXPLAIN prints no estimate for a WindowAgg over a Sort, nor
       for a window aggregate.** Since RP-323 a WindowAgg of
       `row_number` / `rank` / `dense_rank` over `OVER ()`, straight over
