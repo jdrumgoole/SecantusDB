@@ -39,8 +39,11 @@ pub enum Qual {
     Ne,
     /// `col > const`, `>=`, `<`, `<=`; `true` for a lower bound.
     Range(bool),
-    /// `col IN (...)` of this many non-NULL values (a `ScalarArrayOpExpr`).
-    In(usize),
+    /// `col IN (...)` of this many elements, then this many of them
+    /// non-NULL (a `ScalarArrayOpExpr`). Its cost counts every element
+    /// (`estimate_array_length`); its selectivity only the non-NULL ones,
+    /// as a strict `=` with a NULL selects nothing (`scalararraysel`).
+    In(usize, usize),
     /// A clause no index serves here (an `OR`), costing this many operators
     /// a row.
     Filter(f64),
@@ -95,13 +98,13 @@ pub fn conjuncts(filter: &Document) -> Option<Vec<(String, Qual)>> {
                             "$ne" => Qual::Ne,
                             "$gt" | "$gte" => Qual::Range(true),
                             "$lt" | "$lte" => Qual::Range(false),
-                            "$in" => Qual::In(
-                                operand
-                                    .as_array()?
-                                    .iter()
-                                    .filter(|v| **v != Bson::Null)
-                                    .count(),
-                            ),
+                            "$in" => {
+                                let list = operand.as_array()?;
+                                Qual::In(
+                                    list.len(),
+                                    list.iter().filter(|v| **v != Bson::Null).count(),
+                                )
+                            }
                             _ => return None,
                         };
                         out.push((field.to_string(), q));
@@ -120,8 +123,8 @@ pub fn conjuncts(filter: &Document) -> Option<Vec<(String, Qual)>> {
 fn qual_cost<'a>(quals: impl Iterator<Item = &'a Qual>) -> f64 {
     quals
         .map(|q| match q {
-            Qual::In(n) | Qual::NotIn(n) if *n >= HASHED_SAOP => 2.0 * CPU_OPERATOR_COST,
-            Qual::In(n) | Qual::NotIn(n) => CPU_OPERATOR_COST * *n as f64 * 0.5,
+            Qual::In(n, _) | Qual::NotIn(n) if *n >= HASHED_SAOP => 2.0 * CPU_OPERATOR_COST,
+            Qual::In(n, _) | Qual::NotIn(n) => CPU_OPERATOR_COST * *n as f64 * 0.5,
             Qual::Filter(ops) => CPU_OPERATOR_COST * ops,
             Qual::IsNull(_) => 0.0,
             _ => CPU_OPERATOR_COST,
@@ -134,7 +137,7 @@ fn qual_cost<'a>(quals: impl Iterator<Item = &'a Qual>) -> f64 {
 fn qual_startup<'a>(quals: impl Iterator<Item = &'a Qual>) -> f64 {
     quals
         .map(|q| match q {
-            Qual::In(n) | Qual::NotIn(n) if *n >= HASHED_SAOP => CPU_OPERATOR_COST * *n as f64,
+            Qual::In(n, _) | Qual::NotIn(n) if *n >= HASHED_SAOP => CPU_OPERATOR_COST * *n as f64,
             _ => 0.0,
         })
         .sum()
@@ -151,7 +154,7 @@ fn column_selectivity<'a>(quals: impl Iterator<Item = &'a Qual>, ndistinct: f64)
             Qual::Eq => sel *= eq,
             Qual::Ne => sel *= 1.0 - eq,
             Qual::Filter(_) | Qual::IsNull(_) | Qual::NotIn(_) => {}
-            Qual::In(n) => sel *= (eq * *n as f64).min(1.0),
+            Qual::In(_, n) => sel *= (eq * *n as f64).min(1.0),
             Qual::Range(true) => lower = true,
             Qual::Range(false) => upper = true,
         }
@@ -290,7 +293,7 @@ fn index_cost_loops(
         .filter(|(f, q)| {
             f == &index.field
                 && if index.hash {
-                    matches!(q, Qual::Eq | Qual::In(_))
+                    matches!(q, Qual::Eq | Qual::In(..))
                 } else {
                     q.indexable()
                 }
@@ -304,13 +307,13 @@ fn index_cost_loops(
     let itup = index.tuples.unwrap_or(rel.tuples);
     let mut num_sa = 1.0;
     for q in &iq {
-        if let Qual::In(n) = q {
+        if let Qual::In(n, _) = q {
             if *n > 1 {
                 num_sa *= *n as f64;
             }
         }
     }
-    let saop = iq.iter().any(|q| matches!(q, Qual::In(_)));
+    let saop = iq.iter().any(|q| matches!(q, Qual::In(..)));
     let unique_eq =
         index.unique && !index.hash && !saop && iq.iter().any(|q| matches!(q, Qual::Eq));
     let mut nit = if unique_eq {
@@ -1443,8 +1446,25 @@ mod tests {
             pages: 2.0,
             tuples: 300.0,
         };
-        let (s, t) = seq_scan_path(&rel, &[("g".into(), Qual::In(9))]);
+        let (s, t) = seq_scan_path(&rel, &[("g".into(), Qual::In(9, 9))]);
         assert!(close(s, 0.02) && close(t, 6.52), "{s} {t}");
+    }
+
+    /// PostgreSQL 15.19 over 1,000 rows (5 pages): `a in (1, null, 3)`
+    /// costs 0.00..18.75 -- half the array's three elements an operator a
+    /// row, the NULL included (`estimate_array_length`), though it selects
+    /// nothing (RP-349).
+    #[test]
+    fn an_in_lists_null_counts_in_its_cost() {
+        let filter = bson::doc! {"a": {"$in": [1, Bson::Null, 3]}};
+        let quals = conjuncts(&filter).unwrap();
+        assert!(matches!(quals[0].1, Qual::In(3, 2)), "{quals:?}");
+        let rel = Rel {
+            pages: 5.0,
+            tuples: 1000.0,
+        };
+        let (s, t) = seq_scan_path(&rel, &quals);
+        assert!(close(s, 0.0) && close(t, 18.75), "{s} {t}");
     }
 
     /// PostgreSQL 15.19, 10,000 analysed rows of (k primary key, g, t) with

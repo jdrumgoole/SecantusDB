@@ -8578,7 +8578,10 @@ impl PgHandler {
                         _ => Qual::Eq,
                     },
                 )),
-                WhereClause::In(f, v) => Some((f, Qual::In(v.len()))),
+                WhereClause::In(f, v) => Some((
+                    f,
+                    Qual::In(v.len(), v.iter().filter(|x| **x != Bson::Null).count()),
+                )),
                 WhereClause::Null(f, is_null) => Some((f, Qual::IsNull(*is_null))),
                 _ => None,
             }
