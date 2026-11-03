@@ -222,7 +222,9 @@ def verify(
                 marks, paths = "backlog or backlog_fixed", [*tests, "tests/backlog"]
             cmd = [
                 sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                "-o", "addopts=", "-n", "auto", "-m", marks, *paths,
+                "-o", "addopts=",
+                "-n", os.environ.get("SECANTUS_BACKLOG_WORKERS", "auto"),
+                "-m", marks, *paths,
             ]  # fmt: skip
             subprocess.run(cmd, cwd=REPO, env=env, check=False)
             if report.exists():

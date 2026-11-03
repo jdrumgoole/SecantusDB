@@ -71,7 +71,10 @@ step login env SECANTUS_PG15_BIN="$pg15_bin" SECANTUS_REQUIRE_PG15=1 \
     "$py" -m pytest tests/test_rust_pg_login_differential.py -q -n 3 -rs -p no:cacheprovider
 
 # The backlog's gap and regression tests against the PostgreSQL 15 reference.
+# Four workers, as the other pytest steps use: each starts its own server,
+# and -n auto's twelve held the load at 54 on 2026-11-03 beside another lane.
 step backlog env \
+    SECANTUS_BACKLOG_WORKERS=4 \
     SECANTUS_PG_ORACLE_DSN_15="${SECANTUS_PG_ORACLE_DSN_15:-host=127.0.0.1 port=5415 dbname=postgres user=$USER}" \
     SECANTUS_PG15_BIN="$pg15_bin" \
     "$py" tools/backlog.py verify --file backlog-rust-postgres.md --regressions
