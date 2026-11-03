@@ -40665,6 +40665,18 @@ impl PgHandler {
                         }
                     }
                 }
+                // An INSERT, UPDATE or DELETE is a ModifyTable over a
+                // Result or the relation's sequential scan (RP-331).
+                if tree.children.len() == 1
+                    && tree.children[0].children.is_empty()
+                    && (tree.children[0].name == "Result"
+                        || tree.children[0].name.starts_with("Seq Scan on "))
+                {
+                    if let Some((child, node)) = self.modify_table_estimate(&inner) {
+                        tree.children[0].estimate = Some(child);
+                        tree.estimate = Some(node);
+                    }
+                }
                 // A UNION ALL of two relations' sequential scans is an
                 // Append over them (RP-324).
                 if tree.name == "Append"

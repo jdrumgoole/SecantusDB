@@ -1379,18 +1379,6 @@ a regression test.
       on a fresh cluster.
       Backlog-ID: RP-330
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join]
-- [ ] **EXPLAIN prints no estimate for an Insert, Update or Delete.**
-      A ModifyTable node is `Insert on e  (cost=0.00..0.01 rows=0
-      width=0)` over a `Result` of width 36, `Update on e
-      (cost=0.00..17.50 rows=0 width=0)` over a Seq Scan of width 38
-      (the new row and the `ctid`), and `Delete on e` over a Seq Scan of
-      width 6 (the `ctid`). PostgreSQL 15.19 prices it (`costsize.c`);
-      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
-      plan that is one relation's Seq Scan prints the estimate; the
-      scenario's expected plan is PostgreSQL's, measured on a fresh
-      cluster.
-      Backlog-ID: RP-331
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[insert], tests/backlog/test_rp_explain_costs.py::test_plan[update], tests/backlog/test_rp_explain_costs.py::test_plan[delete]
 - [ ] **EXPLAIN prints no estimate for a Result whose select list calls
       a function the planner keeps as a call.** `explain select
       current_setting('work_mem')` is `Result  (cost=0.00..0.01 rows=1

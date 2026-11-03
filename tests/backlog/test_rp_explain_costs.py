@@ -41,6 +41,13 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# A table with a defaulted varchar column, analysed (RP-331).
+_EC = [
+    "create table e (a int, b text, c varchar(10) default 'z')",
+    "insert into e select g, 'v' || (g % 10) from generate_series(1, 1000) g",
+    "analyze e",
+]
+
 # A table with a secondary and a composite index, analysed.
 _N = [
     "create table n (a int, b int, c text)",
@@ -461,6 +468,43 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a = 1)",
         ],
     ),
+    "insert of some columns": (
+        "RP-331",
+        _EC,
+        "explain insert into e(a) values (1)",
+        [
+            "Insert on e  (cost=0.00..0.01 rows=0 width=0)",
+            "  ->  Result  (cost=0.00..0.01 rows=1 width=74)",
+        ],
+    ),
+    "update of every row": (
+        "RP-331",
+        _EC,
+        "explain update e set c = 'q'",
+        [
+            "Update on e  (cost=0.00..16.00 rows=0 width=0)",
+            "  ->  Seq Scan on e  (cost=0.00..16.00 rows=1000 width=44)",
+        ],
+    ),
+    "update of two columns": (
+        "RP-331",
+        _EC,
+        "explain update e set b = 'y', c = 'w' where a < 5",
+        [
+            "Update on e  (cost=0.00..18.50 rows=0 width=0)",
+            "  ->  Seq Scan on e  (cost=0.00..18.50 rows=4 width=76)",
+            "        Filter: (a < 5)",
+        ],
+    ),
+    "delete of every row": (
+        "RP-331",
+        _EC,
+        "explain delete from e",
+        [
+            "Delete on e  (cost=0.00..16.00 rows=0 width=0)",
+            "  ->  Seq Scan on e  (cost=0.00..16.00 rows=1000 width=6)",
+        ],
+    ),
     "a seq scan beneath another node": (
         "RP-332",
         _ANALYSED,
@@ -735,6 +779,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-325",
         "RP-326",
         "RP-327",
+        "RP-331",
         "RP-332",
         "RP-333",
         "RP-334",
