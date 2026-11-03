@@ -269,6 +269,17 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
+    "an append of a filtered text column": (
+        "RP-346",
+        _ANALYSED,
+        "explain select a, b from e where a < 100 union all select a, b from k",
+        [
+            "Append  (cost=0.00..38.98 rows=1099 width=7)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=99 width=7)",
+            "        Filter: (a < 100)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "result": (
         "RP-325",
         [],
@@ -667,6 +678,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-319",
         "RP-320",
         "RP-321",
+        "RP-324",
         "RP-325",
         "RP-326",
         "RP-327",

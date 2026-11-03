@@ -171,6 +171,29 @@ pub(crate) fn values_estimate(vc: &secantus_pgplan::ValuesConstant) -> Option<Es
     Some((0.0, total, rows, width))
 }
 
+/// What `EXPLAIN` prints of the `Append` a top-level `UNION ALL` becomes
+/// (RP-324). `flatten_simple_union_all` makes it an appendrel, whose rows
+/// are its children's and whose width is their row-weighted average
+/// (`set_append_rel_size`); PostgreSQL 15's `cost_append` for an
+/// unordered, non-parallel append starts when its first child does and
+/// totals its children's totals plus half a `cpu_tuple_cost` per row
+/// (`APPEND_CPU_COST_MULTIPLIER`). Each child is `(estimate, costed)`:
+/// the scan EXPLAIN prints, and the total the Append was priced with.
+pub(crate) fn append_estimate(children: &[(Estimate, f64)]) -> Option<Estimate> {
+    const APPEND_CPU_COST_MULTIPLIER: f64 = 0.5;
+    let startup = children.first()?.0 .0;
+    let rows: f64 = children.iter().map(|(c, _)| c.2).sum();
+    let total = children.iter().map(|(_, t)| t).sum::<f64>()
+        + costsize::CPU_TUPLE_COST * APPEND_CPU_COST_MULTIPLIER * rows;
+    let size: f64 = children.iter().map(|(c, _)| c.2 * c.3 as f64).sum();
+    let width = if rows > 0.0 {
+        (size / rows).round_ties_even() as i64
+    } else {
+        0
+    };
+    Some((startup, total, rows, width))
+}
+
 /// The width of a select list of plain columns (`fields`, stored fields),
 /// which the planner applies to the scan as its target
 /// (`set_pathtarget_cost_width`): each entry, a repeated one again, its
@@ -197,6 +220,83 @@ fn output_width(
 }
 
 impl PgHandler {
+    /// The children's and the node's estimates of a `UNION ALL` of two
+    /// plain selects, each one user table's sequential scan of stored
+    /// columns of the same types (RP-324), or `None` where it is not
+    /// priced: another set operation, an ORDER BY or LIMIT over it, a
+    /// side PostgreSQL would read through an index or project (a computed
+    /// column, a coercion), or a nested union, which PostgreSQL flattens
+    /// into one Append.
+    ///
+    /// A side with a WHERE is not a safe append member
+    /// (`is_safe_append_member`: its quals have nowhere to go), so it
+    /// stays a subquery: the Append is priced over its Subquery Scan
+    /// (`cost_subqueryscan`, one `cpu_tuple_cost` per row), which
+    /// `set_plan_references` then removes as trivial, leaving the scan's
+    /// own estimate on the printed node.
+    pub(crate) fn union_all_estimate(
+        &self,
+        set: &secantus_pgplan::SetOpSelect,
+    ) -> Option<(Vec<Estimate>, Estimate)> {
+        use secantus_pgplan::Statement;
+        if !matches!(set.kind, secantus_pgplan::SetOpKind::Union)
+            || !set.all
+            || !set.order.is_empty()
+            || set.limit.is_some()
+            || set.offset != 0
+            || set.with_ties
+        {
+            return None;
+        }
+        let defs = self.all_table_defs().ok()?;
+        let mut children = Vec::new();
+        let mut types: Vec<Vec<String>> = Vec::new();
+        for side in [&set.left, &set.right] {
+            let Statement::Select(sel) = side.as_ref() else {
+                return None;
+            };
+            if sel.residual.is_some()
+                || sel.sub.is_some()
+                || sel.series.is_some()
+                || sel.join.is_some()
+                || !sel.windows.is_empty()
+                || !sel.order.is_empty()
+                || sel.limit.is_some()
+                || sel.offset != 0
+                || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                || sel.with_ties
+                || sel.casts.iter().any(Option::is_some)
+            {
+                return None;
+            }
+            let def = defs.iter().find(|d| d.name == sel.table)?;
+            let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
+            let typed = fields
+                .iter()
+                .map(|f| {
+                    let c = def.columns.iter().find(|c| &c.field() == f)?;
+                    Some(c.pg_type.clone())
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let (estimate, None) = self.scan_estimate(&sel.table, &sel.filter, &fields)? else {
+                return None;
+            };
+            let costed = if sel.filter.is_empty() {
+                estimate.1
+            } else {
+                estimate.1 + costsize::CPU_TUPLE_COST * estimate.2
+            };
+            children.push((estimate, costed));
+            types.push(typed);
+        }
+        // Sides of different types are coerced, which a projection does.
+        if types[0] != types[1] {
+            return None;
+        }
+        let estimate = append_estimate(&children)?;
+        Some((children.into_iter().map(|(e, _)| e).collect(), estimate))
+    }
+
     /// The estimate of the cheapest scan of `table` through `filter` that
     /// outputs `fields` (stored fields), or `None` where it is not priced.
     /// A user table's scan is the sequential one the storage planner
@@ -1082,5 +1182,39 @@ mod target_tests {
         // Not modelled: a cast, a function call.
         assert_eq!(row_expr_ops(&target("select $2::text"), 1), None);
         assert_eq!(row_expr_ops(&target("select abs($2)"), 1), None);
+    }
+}
+
+#[cfg(test)]
+mod append_tests {
+    use super::append_estimate;
+
+    fn shown(e: (f64, f64, f64, i64)) -> (String, String, f64, i64) {
+        (format!("{:.2}", e.0), format!("{:.2}", e.1), e.2, e.3)
+    }
+
+    #[test]
+    fn an_append_adds_half_a_tuple_cost_per_row() {
+        // PostgreSQL 15.19: `select a from e union all select a from k`,
+        // two analysed 1000-row tables, is (0.00..40.00 rows=2000 width=4).
+        let scan = (0.0, 15.0, 1000.0, 4);
+        assert_eq!(
+            shown(append_estimate(&[(scan, 15.0), (scan, 15.0)]).unwrap()),
+            ("0.00".into(), "40.00".into(), 2000.0, 4)
+        );
+    }
+
+    #[test]
+    fn a_filtered_side_is_priced_through_its_subquery_scan() {
+        // PostgreSQL 15.19: `select a from e where a < 100 union all select
+        // a from k` is (0.00..38.98 rows=1099); the filtered side's 17.50
+        // carries a cpu_tuple_cost per row of the Subquery Scan setrefs
+        // removes. Widths 3 and 7 weigh by rows: (99*3 + 1000*7) / 1099.
+        let filtered = (0.0, 17.5, 99.0, 3);
+        let plain = (0.0, 15.0, 1000.0, 7);
+        assert_eq!(
+            shown(append_estimate(&[(filtered, 17.5 + 0.99), (plain, 15.0)]).unwrap()),
+            ("0.00".into(), "38.98".into(), 1099.0, 7)
+        );
     }
 }
