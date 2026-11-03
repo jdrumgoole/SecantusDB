@@ -1,0 +1,37 @@
+name: Free disk the job does not use
+description: >
+  Remove the hosted Linux image's toolchains no SecantusDB job uses, and
+  report the disk before and after. No-op on macOS and Windows.
+
+# Why (RP-312): `ubuntu-latest` is not one disk size. Most jobs get a 145 GB
+# `/dev/root` with ~86 GB free, but some get a 72 GB `/dev/mapper/cow-root`,
+# where the same image leaves ~13 GB free (rust-storage, 2026-11-03, run
+# 41630467524: 157 MB free, rustc and ld died of ENOSPC). The heavy jobs
+# use 21-33 GB, so on the small disk they cannot fit without this. The
+# device and size printed first say which runner a job got.
+runs:
+  using: composite
+  steps:
+    - name: Free disk
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        echo "--- before"
+        df -h / | tail -1
+        # Every directory below is a toolchain no job in this repo runs on
+        # Linux. /opt/hostedtoolcache/Python stays: setup-python uses it.
+        sudo rm -rf \
+          /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+          /usr/share/swift /usr/local/julia* /usr/local/share/boost \
+          /usr/local/share/powershell /usr/local/share/chromium \
+          /opt/microsoft /opt/google /opt/az /usr/lib/jvm \
+          /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
+          /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby \
+          /opt/hostedtoolcache/node
+        sudo docker image prune --all --force >/dev/null 2>&1 || true
+        echo "--- after"
+        df -h / | tail -1
+        free_gb=$(df -Pk / | awk 'NR == 2 { print int($4 / 1048576) }')
+        if [ "$free_gb" -lt 40 ]; then
+          echo "::warning::only ${free_gb} GB free on / after freeing ($(df -h / | awk 'NR == 2 { print $1, $2 }')): a small runner; RP-312"
+        fi
