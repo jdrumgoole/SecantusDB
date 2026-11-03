@@ -1007,6 +1007,38 @@ mod agg_tests {
     }
 }
 
+/// A WindowAgg's estimate over its input's (RP-323), for `n`
+/// argument-less ranking functions (`row_number`, `rank`, `dense_rank`)
+/// over an empty window: PostgreSQL 15's `cost_windowagg` (`costsize.c`).
+/// Each function costs its `procost` (1) times `cpu_operator_cost` per
+/// input row, there are no partition or order columns to compare, and
+/// each row passed up costs `cpu_tuple_cost`; the startup is the input's.
+/// The rows are the input's, each wider by the functions' int8 results.
+pub(crate) fn window_agg_estimate(input: Estimate, n: usize) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    const CPU_TUPLE_COST: f64 = 0.01;
+    let (startup, in_total, rows, width) = input;
+    let total = in_total + CPU_OPERATOR_COST * n as f64 * rows + CPU_TUPLE_COST * rows;
+    (startup, total, rows, width + 8 * n as i64)
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::window_agg_estimate;
+
+    #[test]
+    fn a_row_number_prices_one_call_and_one_tuple_per_row() {
+        // PostgreSQL 15.19: `select a, row_number() over () from e` over a
+        // Seq Scan of (0.00..15.00 rows=1000 width=4) is
+        // (0.00..27.50 rows=1000 width=12).
+        let (s, t, r, w) = window_agg_estimate((0.0, 15.0, 1000.0, 4), 1);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("0.00".into(), "27.50".into(), 1000.0, 12)
+        );
+    }
+}
+
 #[cfg(test)]
 mod sort_tests {
     use super::sort_estimate;

@@ -40770,6 +40770,70 @@ impl PgHandler {
                         }
                     }
                 }
+                // A WindowAgg straight over one relation's sequential scan
+                // (RP-323): the scan's estimate, then `cost_windowagg`. Only
+                // argument-less ranking functions over an empty window
+                // (`OVER ()`), which need no Sort below, and only where the
+                // Seq Scan is the path PostgreSQL keeps (no clause an index
+                // could serve).
+                if tree.name == "WindowAgg"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 1
+                    && tree.children[0].children.is_empty()
+                    && tree.children[0].name.starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        let indexed = self
+                            .index_relations()
+                            .iter()
+                            .any(|ix| ix.table.name == sel.table);
+                        let ranking = sel.windows.iter().all(|w| {
+                            matches!(
+                                w.func,
+                                secantus_pgplan::WindowFunc::RowNumber
+                                    | secantus_pgplan::WindowFunc::Rank
+                                    | secantus_pgplan::WindowFunc::DenseRank
+                            ) && w.arg.is_none()
+                                && w.args.is_empty()
+                                && w.filter.is_none()
+                                && w.partition_by.is_empty()
+                                && w.order_by.is_empty()
+                        });
+                        let is_window = |f: &str| sel.windows.iter().any(|w| w.field == f);
+                        if ranking
+                            && !sel.windows.is_empty()
+                            && sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.order.is_empty()
+                            && sel.limit.is_none()
+                            && sel.offset == 0
+                            && matches!(sel.distinct, secantus_pgplan::Distinct::None)
+                            && !sel.with_ties
+                            && sel.casts.iter().all(Option::is_none)
+                            && sel.columns.iter().filter(|(_, f)| is_window(f)).count()
+                                == sel.windows.len()
+                            && (sel.filter.is_empty() || !indexed)
+                        {
+                            let fields: Vec<String> = sel
+                                .columns
+                                .iter()
+                                .filter(|(_, f)| !is_window(f))
+                                .map(|(_, f)| f.clone())
+                                .collect();
+                            if let Some((estimate, None)) =
+                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                            {
+                                tree.children[0].estimate = Some(estimate);
+                                tree.estimate = Some(scan_estimate::window_agg_estimate(
+                                    estimate,
+                                    sel.windows.len(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 // A Sort straight over one relation's sequential scan
                 // (RP-318): the scan's estimate, then `cost_sort`. Only on a
                 // table with no index, where the Seq Scan is the only path
