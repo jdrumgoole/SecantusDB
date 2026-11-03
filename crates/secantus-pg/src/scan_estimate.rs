@@ -113,7 +113,10 @@ pub(crate) fn catalog_index_columns(name: &str) -> Vec<String> {
 
 /// `get_typavgwidth` of a column with no `stawidth`.
 fn type_width(pg_type: &str, typmod: i32) -> i64 {
+    // A pseudo-type (`void`, a call's return type, RP-340) has its own
+    // typlen too.
     let typlen = secantus_pgplan::pgtypes::oid_of_name(pg_type)
+        .or_else(|| secantus_pgplan::pgtypes::pseudo_type_oid(pg_type))
         .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
         .and_then(|v| match v {
             Bson::Int32(n) => Some(i64::from(n)),
@@ -126,24 +129,58 @@ fn type_width(pg_type: &str, typmod: i32) -> i64 {
 
 /// What `EXPLAIN` prints of a select with no FROM (RP-325): PostgreSQL 15
 /// plans it as a `Result` over an `RTE_RESULT` relation of one row
-/// (`cost_resultscan`: `cpu_tuple_cost` for its row, no startup), its width
-/// the select list's (`set_pathtarget_cost_width`: each expression's type's
+/// (`cost_resultscan`: `cpu_tuple_cost` for its row, no startup, plus the
+/// target list's per-tuple cost), its width the select list's
+/// (`set_pathtarget_cost_width`: each expression's type's
 /// `get_typavgwidth`). A constant WHERE is a one-time filter that leaves
-/// the row estimate at one. Only a select list of constants is priced:
-/// any other expression adds its own evaluation cost (`cost_qual_eval`),
-/// which is not modelled here, and a FROM function is a Function Scan.
+/// the row estimate at one. A call the planner keeps (RP-340) adds its
+/// `cost_qual_eval`: see [`call_cost`]. A FROM function is a Function Scan.
 pub(crate) fn result_estimate(sc: &secantus_pgplan::SelectConstant) -> Option<Estimate> {
     if sc.source.is_some() {
         return None;
     }
     let mut width = 0;
+    let mut per_tuple = 0.0;
     for (_, col, pg_type, typmod) in &sc.columns {
-        if !matches!(col, secantus_pgplan::ConstCol::Value(_)) {
-            return None;
-        }
+        per_tuple += call_cost(col)?;
         width += type_width(pg_type, *typmod);
     }
-    Some((0.0, costsize::CPU_TUPLE_COST, 1.0, width))
+    Some((0.0, costsize::CPU_TUPLE_COST + per_tuple, 1.0, width))
+}
+
+/// `cost_qual_eval_walker`'s per-tuple cost of one select-list column
+/// (RP-340): a constant is free, and each call the planner keeps unfolded
+/// -- a stable or volatile function (`current_setting`, `nextval`, ...)
+/// or an `SQLValueFunction` (`session_user`, `current_user`) -- costs its
+/// `procost` (1 for every one of these built-ins) times
+/// `cpu_operator_cost`, plus its arguments' own cost. `None` for a
+/// set-returning call (a ProjectSet, not a Result) and a FROM column.
+fn call_cost(col: &secantus_pgplan::ConstCol) -> Option<f64> {
+    use secantus_pgplan::ConstCol as C;
+    let op = costsize::CPU_OPERATOR_COST;
+    Some(match col {
+        C::Value(_) => 0.0,
+        C::CurrentSetting { .. }
+        | C::SetConfig { .. }
+        | C::BackendPid
+        | C::SessionUser
+        | C::CurrentUser
+        | C::CurrentDatabase
+        | C::Sleep(_)
+        | C::PgNotify { .. } => op,
+        C::BlockingPids(a)
+        | C::NextVal(a)
+        | C::CurrVal(a)
+        | C::TerminateBackend(a)
+        | C::CancelBackend(a) => op + call_cost(a)?,
+        C::SetVal {
+            sequence,
+            value,
+            is_called,
+        } => op + call_cost(sequence)? + call_cost(value)? + call_cost(is_called)?,
+        C::SerialSequence { table, column } => op + call_cost(table)? + call_cost(column)?,
+        C::ListeningChannels | C::FromColumn => return None,
+    })
 }
 
 /// What `EXPLAIN` prints of a `VALUES` list of several rows (RP-326):
