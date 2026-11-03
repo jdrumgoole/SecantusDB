@@ -43,6 +43,16 @@ import tempfile
 import psycopg
 import trustme
 
+
+def _free_port():
+    """An ephemeral port, so two gates' reference clusters never share one (RP-345)."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port()
+
 PGB = sys.argv[1]
 BIN = sys.argv[2] if len(sys.argv) > 2 else None
 EXTRA = sys.argv[3:]
@@ -398,7 +408,7 @@ shutil.copy(key, f"{pgd}/server.key")
 os.chmod(f"{pgd}/server.key", 0o600)
 shutil.copy(capem, f"{pgd}/root.crt")
 open(f"{pgd}/postgresql.conf", "a").write(
-    "\nssl = on\nssl_ca_file = 'root.crt'\nport = 5417\nlisten_addresses = '127.0.0.1'\n"
+    f"\nssl = on\nssl_ca_file = 'root.crt'\nport = {PORT}\nlisten_addresses = '127.0.0.1'\n"
     "unix_socket_directories = ''\npassword_encryption = 'scram-sha-256'\n"
 )
 ref, ours = {}, {}
@@ -411,13 +421,13 @@ for name, (hba, _flags) in CONFIGS.items():
         capture_output=True,
     )
     if first:
-        setup(5417)
-        with psycopg.connect(host="127.0.0.1", port=5417, dbname="postgres", user="postgres") as c:
+        setup(PORT)
+        with psycopg.connect(host="127.0.0.1", port=PORT, dbname="postgres", user="postgres") as c:
             print("reference:", c.execute("show server_version").fetchone()[0])
         first = False
         open(f"{pgd}/pg_hba.conf", "w").write(hba)
         subprocess.run([f"{PGB}/pg_ctl", "-D", pgd, "reload"], check=True, capture_output=True)
-    ref[name] = scenarios(5417, name)
+    ref[name] = scenarios(PORT, name)
 subprocess.run(
     [f"{PGB}/pg_ctl", "-D", pgd, "-m", "fast", "-w", "stop"], check=True, capture_output=True
 )

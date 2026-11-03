@@ -53,7 +53,16 @@ ONLY = set(sys.argv[3:])
 d = tempfile.mkdtemp(prefix="pgtlsgaps-")
 NOW = datetime.datetime.now(datetime.timezone.utc)
 DAY = datetime.timedelta(days=1)
-PORT = 5418
+
+
+def _free_port():
+    """An ephemeral port, so two gates' reference clusters never share one (RP-345)."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PORT = _free_port()
 
 
 # --- certificates -----------------------------------------------------------
