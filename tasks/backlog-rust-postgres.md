@@ -911,6 +911,13 @@ one beside it.
       four workers (~26 MB a test) -- accumulation, not the runaway seen
       here. The `du -d 3` stopped at `popen-gw<k>`, which names a worker,
       not a test; the step now also lists the per-test directories.
+      Seen again on 2026-11-03 in a DIFFERENT job: `storage-engine
+      (ubuntu-latest)` on PR #2301 (run 41710470392, attempt 1, job
+      126176901872). The disk filled so completely that the Actions runner
+      itself died ("No space left on device" writing its `_diag` worker
+      log), so the job left no log at all; the rerun passed. That job has
+      no on-failure disk report, and the PR changed only login probes, so
+      the writer is not specific to the pg-oracle shard.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
