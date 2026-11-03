@@ -43510,12 +43510,15 @@ fn plan_create_rule(r: &pg_query::protobuf::RuleStmt) -> Result<Statement> {
     })
 }
 
+/// One scan's WHERE conjuncts: each one's text and the column it constrains.
+type ScanQuals = Vec<(String, Option<String>)>;
+
 /// A UNION / INTERSECT / EXCEPT whose every arm reads one relation: each
 /// arm's WHERE conjuncts, left to right, as its scan prints them (RP-346).
 fn explain_setop_quals(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
-) -> Option<Vec<Vec<(String, Option<String>)>>> {
+) -> Option<Vec<ScanQuals>> {
     fn arms<'a>(
         s: &'a pg_query::protobuf::SelectStmt,
         out: &mut Vec<&'a pg_query::protobuf::SelectStmt>,
