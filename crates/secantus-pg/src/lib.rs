@@ -40640,6 +40640,31 @@ impl PgHandler {
                 if let Statement::ValuesConstant(vc) = inner.as_ref() {
                     tree.estimate = scan_estimate::values_estimate(vc);
                 }
+                // A FROM `generate_series(...)` read whole, of its column
+                // alone, is `cost_functionscan`'s estimate (RP-327).
+                if tree.children.is_empty()
+                    && tree.details.is_empty()
+                    && tree.name == "Function Scan on generate_series"
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if let Some(series) = &sel.series {
+                            if sel.filter.is_empty()
+                                && sel.residual.is_none()
+                                && sel.sub.is_none()
+                                && sel.join.is_none()
+                                && sel.windows.is_empty()
+                                && !sel.columns.is_empty()
+                                && sel.casts.iter().all(Option::is_none)
+                                && sel.columns.iter().all(|(_, f)| *f == series.column)
+                            {
+                                tree.estimate = Some(scan_estimate::series_scan_estimate(
+                                    series,
+                                    sel.columns.len(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 // A plan that is one relation's sequential scan, of plain
                 // columns, prints the planner's estimate (RP-314); a
                 // catalog's cheapest path may be one of its indexes'

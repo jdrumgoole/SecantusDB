@@ -317,6 +317,24 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select * from generate_series(1, 10)",
         ["Function Scan on generate_series  (cost=0.00..0.10 rows=10 width=4)"],
     ),
+    "a bigint function scan": (
+        "RP-327",
+        [],
+        "explain select * from generate_series(1::int8, 300)",
+        ["Function Scan on generate_series  (cost=0.00..3.00 rows=300 width=8)"],
+    ),
+    "an empty function scan": (
+        "RP-327",
+        [],
+        "explain select * from generate_series(5, 1)",
+        ["Function Scan on generate_series  (cost=0.00..0.01 rows=1 width=4)"],
+    ),
+    "a function scan with a step": (
+        "RP-327",
+        [],
+        "explain select generate_series from generate_series(10, 1, -2)",
+        ["Function Scan on generate_series  (cost=0.00..0.05 rows=5 width=4)"],
+    ),
     "subquery scan": (
         "RP-328",
         _ANALYSED,
@@ -651,6 +669,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-321",
         "RP-325",
         "RP-326",
+        "RP-327",
         "RP-332",
         "RP-333",
         "RP-334",

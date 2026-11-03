@@ -821,6 +821,76 @@ pub(crate) fn count_agg_estimate(input: Estimate, n: usize) -> Estimate {
     (startup, startup + CPU_TUPLE_COST, 1.0, 8 * n as i64)
 }
 
+/// A `generate_series` Function Scan's estimate (RP-327): PostgreSQL 15's
+/// `cost_functionscan` (`costsize.c`). The row count is the support
+/// function's (`generate_series_int4_support` / `_int8_support`, which
+/// answer for constant arguments): `floor((stop - start) / step) + 1`, none
+/// when that is negative, clamped to at least one row
+/// (`expression_returns_set_rows`; PostgreSQL 15.19 prints `rows=1` for
+/// `generate_series(5, 1)`). The function call's own
+/// cost (`procost` 1, one `cpu_operator_cost`) is paid at startup; each row
+/// then costs `cpu_tuple_cost`. Each of `columns` output entries is the
+/// series' type wide: four bytes for int4, eight for int8.
+pub(crate) fn series_scan_estimate(series: &secantus_pgplan::Series, columns: usize) -> Estimate {
+    const CPU_OPERATOR_COST: f64 = 0.0025;
+    let nsteps = ((series.stop as f64 - series.start as f64) / series.step as f64).floor() + 1.0;
+    let rows = nsteps.max(0.0);
+    // clamp_row_est
+    let rows = if rows <= 1.0 { 1.0 } else { rows.round() };
+    let startup = CPU_OPERATOR_COST;
+    let width = if series.int8 { 8 } else { 4 } * columns as i64;
+    (
+        startup,
+        startup + costsize::CPU_TUPLE_COST * rows,
+        rows,
+        width,
+    )
+}
+
+#[cfg(test)]
+mod series_tests {
+    use super::series_scan_estimate;
+
+    fn series(start: i64, stop: i64, step: i64, int8: bool) -> secantus_pgplan::Series {
+        secantus_pgplan::Series {
+            start,
+            stop,
+            step,
+            column: "generate_series".into(),
+            int8,
+        }
+    }
+
+    fn shown(e: super::Estimate) -> (String, String, f64, i64) {
+        (format!("{:.2}", e.0), format!("{:.2}", e.1), e.2, e.3)
+    }
+
+    #[test]
+    fn ten_steps_are_ten_rows() {
+        // PostgreSQL 15.19: `select * from generate_series(1, 10)` is
+        // (cost=0.00..0.10 rows=10 width=4).
+        assert_eq!(
+            shown(series_scan_estimate(&series(1, 10, 1, false), 1)),
+            ("0.00".into(), "0.10".into(), 10.0, 4)
+        );
+    }
+
+    #[test]
+    fn an_empty_series_is_one_row_and_a_bigint_is_eight_bytes() {
+        // PostgreSQL 15.19: `generate_series(5, 1)` is (0.00..0.01 rows=1
+        // width=4) and `generate_series(1::int8, 300)` (0.00..3.00 rows=300
+        // width=8).
+        assert_eq!(
+            shown(series_scan_estimate(&series(5, 1, 1, false), 1)),
+            ("0.00".into(), "0.01".into(), 1.0, 4)
+        );
+        assert_eq!(
+            shown(series_scan_estimate(&series(1, 300, 1, true), 1)),
+            ("0.00".into(), "3.00".into(), 300.0, 8)
+        );
+    }
+}
+
 #[cfg(test)]
 mod agg_tests {
     use super::count_agg_estimate;
