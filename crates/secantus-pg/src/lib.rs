@@ -41187,6 +41187,7 @@ impl PgHandler {
                         .unwrap_or_else(|| scan_estimate::catalog_index_columns(name))
                 };
                 explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
+                explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 explain::attach_join_conds(&mut tree, &options.join_conds);
                 explain::attach_join_where(&mut tree, &options.join_where);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write

@@ -626,6 +626,47 @@ pub(crate) fn attach_scan_quals(
     let [scan] = found.as_mut_slice() else {
         return;
     };
+    quals_on_scan(scan, quals, index_columns);
+}
+
+/// Put a set operation's per-arm WHERE conjuncts on its scans, left to
+/// right, as PostgreSQL prints each arm's own `Filter` / `Index Cond`
+/// (RP-346). A plan whose scans do not pair one-to-one with the arms is
+/// left alone.
+pub(crate) fn attach_setop_quals(
+    root: &mut PlanNode,
+    arms: &[Vec<(String, Option<String>)>],
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
+    if arms.iter().all(Vec::is_empty) {
+        return;
+    }
+    fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
+        if n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ") {
+            out.push(n);
+            return;
+        }
+        for c in &mut n.children {
+            scans(c, out);
+        }
+    }
+    let mut found = Vec::new();
+    scans(root, &mut found);
+    if found.len() != arms.len() {
+        return;
+    }
+    for (scan, quals) in found.into_iter().zip(arms) {
+        if !quals.is_empty() {
+            quals_on_scan(scan, quals, index_columns);
+        }
+    }
+}
+
+fn quals_on_scan(
+    scan: &mut PlanNode,
+    quals: &[(String, Option<String>)],
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
     let keys = scan
         .props
         .iter()
@@ -767,5 +808,40 @@ mod cost_tests {
         // empty sum's -0.0 prints as 0.00.
         n.estimate = Some((-0.0, 19.125, 140.0, 265));
         assert_eq!(costs_text(&n), "  (cost=0.00..19.12 rows=140 width=265)");
+    }
+}
+
+#[cfg(test)]
+mod setop_quals_tests {
+    use super::*;
+
+    fn append() -> PlanNode {
+        let mut root = PlanNode::new("Append");
+        root.children.push(PlanNode::new("Seq Scan on e"));
+        root.children.push(PlanNode::new("Seq Scan on k"));
+        root
+    }
+
+    #[test]
+    fn each_arm_filters_its_own_scan() {
+        let mut root = append();
+        let arms = vec![
+            vec![("(a < 100)".to_string(), Some("a".to_string()))],
+            vec![],
+        ];
+        attach_setop_quals(&mut root, &arms, &|_| Vec::new());
+        assert_eq!(
+            root.children[0].details,
+            vec![("Filter".to_string(), "(a < 100)".to_string())]
+        );
+        assert!(root.children[1].details.is_empty());
+    }
+
+    #[test]
+    fn unpaired_scans_are_left_alone() {
+        let mut root = append();
+        let arms = vec![vec![("(a < 100)".to_string(), None)]];
+        attach_setop_quals(&mut root, &arms, &|_| Vec::new());
+        assert!(root.children.iter().all(|c| c.details.is_empty()));
     }
 }
