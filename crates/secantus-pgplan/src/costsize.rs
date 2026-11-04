@@ -728,6 +728,20 @@ pub fn measured_scan_path<'a>(
     best
 }
 
+/// A Bitmap Index Scan node of `index` over `quals`' index quals on it,
+/// as `create_bitmap_subplan` prices it: `(0, indexTotalCost)` and the
+/// index's selectivity, which times the relation's tuples is its rows.
+/// `None` with no index qual.
+pub fn bitmap_index_scan(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    colsel: ColSel,
+) -> Option<(f64, f64)> {
+    let (_, total, selectivity) = index_cost(rel, index, quals, colsel, false)?;
+    Some((total, selectivity))
+}
+
 /// A bitmap path (`cost_bitmap_tree_node`'s view of it): its cost, its
 /// selectivity, the clauses it reads (by position, for
 /// `classify_index_clause_usage`), and whether it is a single index scan.

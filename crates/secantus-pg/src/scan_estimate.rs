@@ -27,11 +27,17 @@ pub(crate) type ScanEstimate = (Estimate, Option<ScanIndex>);
 pub(crate) struct ScanIndex {
     pub name: String,
     pub only: bool,
+    /// A bitmap heap scan over the index: its Bitmap Index Scan's
+    /// estimate (RP-338).
+    pub bitmap: Option<Estimate>,
 }
 
 impl ScanIndex {
     /// The plan node's name, as `ExplainNode` prints it.
     pub(crate) fn node_name(&self, table: &str) -> String {
+        if self.bitmap.is_some() {
+            return format!("Bitmap Heap Scan on {table}");
+        }
         let kind = if self.only {
             "Index Only Scan"
         } else {
@@ -1175,8 +1181,7 @@ impl PgHandler {
     /// fraction (RP-337). Not priced: a range on an indexed column
     /// (`get_actual_variable_range` reads the index), a clause on an
     /// index's later column, an `OR` over indexed columns (a BitmapOr),
-    /// two indexes on different leading columns (a BitmapAnd), and a
-    /// bitmap heap scan winning (its node is not built).
+    /// two indexes on different leading columns (a BitmapAnd).
     fn catalog_scan(
         &self,
         table: &str,
@@ -1419,10 +1424,22 @@ impl PgHandler {
                 Some(ScanIndex {
                     name: name.clone(),
                     only: *only,
+                    bitmap: None,
                 })
             }
-            // A bitmap heap scan, whose node is not built here.
-            costsize::ScanKind::Bitmap(_) => return None,
+            // A bitmap heap scan over one index (`create_bitmap_subplan`):
+            // the Bitmap Index Scan prints the index's own cost and the
+            // rows its selectivity yields, width 0 (RP-338).
+            costsize::ScanKind::Bitmap(i) => {
+                let (name, ix, _) = indexes.get(i)?;
+                let (itotal, isel) =
+                    costsize::bitmap_index_scan(&rel, ix, &w.quals, colsel(&ix.field))?;
+                Some(ScanIndex {
+                    name: name.clone(),
+                    only: false,
+                    bitmap: Some((0.0, itotal, costsize::clamp_row_est(isel * tuples), 0)),
+                })
+            }
         };
         Some(((startup, total, rows, width), index))
     }
