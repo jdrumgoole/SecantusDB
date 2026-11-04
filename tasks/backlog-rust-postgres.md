@@ -1392,7 +1392,10 @@ a regression test.
       bounds), which `joincost::merge_join` does not model (it reads both
       inputs whole). Until it does, the hash estimate should be checked
       against it. Found while working RP-364; the row estimate (3208) is
-      already right.
+      already right. Nor do they weigh an index scan of a filtered side:
+      a WHERE over a table with an index leaves the join unpriced (zeros,
+      not a wrong number) on both join paths (RP-365; see RP-354 for the
+      parameterized inner index scan).
       Backlog-ID: RP-366
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected join PostgreSQL merges]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
@@ -1483,7 +1486,9 @@ and most of RP-193 in batch 48; their tests there are regression tests.
       FROM t` takes 1.3 s (1.6 s before `system_relation_columns` was
       built once). PostgreSQL 15.19 takes about a millisecond. On a loaded CI
       runner, `test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
-      went past its client's 10 s socket timeout twice on PR #2265. The
+      went past its client's 10 s socket timeout twice on PR #2265, and
+      again on PR #2332's `pg-oracle (server)` job (2026-11-04; that PR
+      changes EXPLAIN only, and locally the test took 3.5 s). The
       snapshot should hold only what the view's tree references, or be kept
       up to date as DDL changes the catalogs.
       Backlog-ID: RP-336

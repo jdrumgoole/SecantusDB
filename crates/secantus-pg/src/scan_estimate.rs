@@ -511,10 +511,10 @@ impl PgHandler {
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
             || sel.casts.iter().any(Option::is_some)
-            || !sel.filter.is_empty()
             || sel.residual.is_some()
             || !j.where_filters.is_empty()
             || j.where_spans_equality
+            || !j.where_modelled
         {
             return None;
         }
@@ -539,6 +539,12 @@ impl PgHandler {
             return None;
         }
         let project = j.project.as_deref();
+        let indexes = self.index_relations();
+        // The WHERE conjuncts still above the join, each over one table's
+        // joined keys: PostgreSQL pushes each down to that table's scan
+        // (`distribute_qual_to_rels`), as it does a reduced LEFT join's
+        // (RP-365). `None` for any other shape of filter.
+        let above_filter = joined_conjuncts(&sel.filter)?;
         // A side: its scan's estimate, the width it carries above the
         // join, its key column's statistics and type, and its planner
         // table.
@@ -549,8 +555,7 @@ impl PgHandler {
             let Statement::Select(leaf) = plan.as_ref() else {
                 return None;
             };
-            if !leaf.filter.is_empty()
-                || leaf.residual.is_some()
+            if leaf.residual.is_some()
                 || leaf.sub.is_some()
                 || leaf.series.is_some()
                 || leaf.join.is_some()
@@ -572,17 +577,67 @@ impl PgHandler {
                     .map(|(_, f)| f.clone())
             };
             let field = stored(&columns.iter().find(|(k, _)| k == key)?.1)?;
-            let read: Vec<String> = columns
-                .iter()
-                .filter(|(key, _)| JoinRows::carries(project, key))
-                .map(|(_, f)| stored(f))
-                .collect::<Option<_>>()?;
+            // This side's share of the conjuncts above the join, over its
+            // stored fields, ANDed with its own scan filter.
+            let mut clauses: Vec<bson::Bson> = Vec::new();
+            if !leaf.filter.is_empty() {
+                clauses.push(bson::Bson::Document(leaf.filter.clone()));
+            }
+            for (k, v) in &above_filter {
+                let Some((_, f)) = columns.iter().find(|(ck, _)| ck == k) else {
+                    continue;
+                };
+                let field = stored(f)?;
+                // The planner pushes such a conjunct into the scan and
+                // keeps it above as well; count it once.
+                if leaf.filter.get(&field) == Some(v) {
+                    continue;
+                }
+                let mut d = Document::new();
+                d.insert(field, v.clone());
+                clauses.push(bson::Bson::Document(d));
+            }
+            let scan_filter = match clauses.len() {
+                0 => Document::new(),
+                1 => match clauses.pop() {
+                    Some(bson::Bson::Document(d)) => d,
+                    _ => return None,
+                },
+                _ => bson::doc! { "$and": clauses },
+            };
+            // A WHERE conjunct pushed into this side's scan (RP-365) is
+            // priced as that scan's filter. Not where an index could serve
+            // it (an index scan may win, not weighed here), nor where it
+            // names the join key: a constant there joins the key's
+            // equivalence class, which leaves no join clause (RP-363).
+            if !scan_filter.is_empty()
+                && (indexes.iter().any(|ix| ix.table.name == leaf.table)
+                    || filter_names(&scan_filter, &field))
+            {
+                return None;
+            }
             let above: Vec<String> = columns
                 .iter()
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
-            self.hash_side(&leaf.table, &leaf.filter, &field, &read, &above)
+            // The scan's target list (`build_base_rel_tlists`): what the
+            // join and the rows above it read. A WHERE conjunct run in the
+            // scan adds nothing to it, unlike one left above the join.
+            let read: Vec<String> = if above_filter.is_empty() {
+                columns
+                    .iter()
+                    .filter(|(key, _)| JoinRows::carries(project, key))
+                    .map(|(_, f)| stored(f))
+                    .collect::<Option<_>>()?
+            } else {
+                let mut r = above.clone();
+                if !r.contains(&field) {
+                    r.push(field.clone());
+                }
+                r
+            };
+            self.hash_side(&leaf.table, &scan_filter, &field, &read, &above)
         };
         let a = side(left, left_key)?;
         let b = side(right, right_key)?;
@@ -2581,3 +2636,46 @@ fn hash_join_of(
 /// its outer key, `(alias, column)` each, and that outer key `(alias,
 /// column)` (RP-364).
 pub(crate) type LeftImplied = (Vec<(String, String)>, (String, String));
+
+/// Whether a stored filter reads `field` anywhere (under `$and`, `$or`
+/// and operators alike).
+fn filter_names(filter: &Document, field: &str) -> bool {
+    filter.iter().any(|(k, v)| {
+        k == field
+            || match v {
+                bson::Bson::Document(d) => filter_names(d, field),
+                bson::Bson::Array(items) => items.iter().any(|x| match x {
+                    bson::Bson::Document(d) => filter_names(d, field),
+                    _ => false,
+                }),
+                _ => false,
+            }
+    })
+}
+
+/// A joined rows' filter as its top-level conjuncts, each one joined-row
+/// key against a value or an operator document (`{k: v}`, `{k: {$lt:
+/// v}}`), flattening `$and`. Every key names one table, so each conjunct
+/// can be pushed to that table's scan (RP-365). `None` for anything else
+/// (an `$or`, an expression).
+fn joined_conjuncts(filter: &Document) -> Option<Vec<(String, bson::Bson)>> {
+    let mut out = Vec::new();
+    for (k, v) in filter {
+        if k == "$and" {
+            let bson::Bson::Array(items) = v else {
+                return None;
+            };
+            for item in items {
+                let bson::Bson::Document(d) = item else {
+                    return None;
+                };
+                out.extend(joined_conjuncts(d)?);
+            }
+        } else if k.starts_with('$') || !k.contains(secantus_pgplan::joins::SEP) {
+            return None;
+        } else {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    Some(out)
+}
