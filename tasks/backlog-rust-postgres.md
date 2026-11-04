@@ -1043,6 +1043,10 @@ tests regression tests:
       2026-11-03, the same gate's backlog verify on the RP-331 branch
       (EXPLAIN costing only; load average about 15): `[2.5]` answered `ok`;
       six runs of all three delays alone after it passed at load 8.
+      A fifth on 2026-11-04, `tools/backlog.py verify --regressions` on
+      the RP-362 branch (EXPLAIN costing only; load average about 17 from
+      a parallel session's builds): `[2.5]` answered `ok`; four runs of all
+      three delays alone after it passed at load 8.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
