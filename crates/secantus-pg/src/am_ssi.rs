@@ -88,6 +88,10 @@ pub(crate) struct GinShape {
     pub(crate) fastupdate: bool,
     /// `gin_pending_list_limit`, kB, when `WITH` set it.
     pub(crate) pending_limit_kb: Option<usize>,
+    /// A partial index's WHERE, planned: only a row it holds true for
+    /// has entries (`index_build`'s and `ExecInsertIndexTuples`'
+    /// `ExecQual` on the predicate).
+    pub(crate) predicate: Option<secantus_pgplan::ColumnExpr>,
 }
 
 /// A GiST index this models: one `point` or `box` column under its
@@ -413,6 +417,16 @@ fn gin_keys(ops: &ElemOps, v: Option<&Bson>) -> Vec<GinKey> {
 }
 
 /// A GiST key of a stored value (`gist_point_compress`, or the box).
+/// Whether `row` has entries in `s`: always, unless `s` is partial and
+/// its predicate is not true for the row (false and NULL both leave it out).
+/// The model only mirrors the write: an error evaluating the predicate is
+/// raised by the write path itself, which evaluates it too.
+fn gin_admits(s: &GinShape, row: &Document) -> bool {
+    s.predicate.as_ref().map_or(true, |p| {
+        secantus_pgplan::apply_row_expr(p, row).ok() == Some(Bson::Boolean(true))
+    })
+}
+
 fn gist_key(v: Option<&Bson>) -> gist_index::Key {
     match secantus_pgplan::geom::from_bson(v?)? {
         secantus_pgplan::geom::Geo::Point(p) => Some(BoxF::point(p.x, p.y)),
@@ -710,9 +724,21 @@ impl crate::PgHandler {
             };
             let method = opt("sqlMethod");
             let method = method.as_ref().and_then(Bson::as_str).unwrap_or("btree");
-            if !matches!(method, "gin" | "gist") || opt("sqlPredicate").is_some() {
+            if !matches!(method, "gin" | "gist") {
                 continue;
             }
+            // A partial GIN index is modelled; a partial GiST one is not.
+            let predicate = match opt("sqlPredicate") {
+                None => None,
+                Some(_) if method == "gist" => continue,
+                Some(Bson::String(sql)) => {
+                    match secantus_pgplan::plan_check_expression(&sql, def) {
+                        Ok(p) => Some(p),
+                        Err(_) => continue,
+                    }
+                }
+                Some(_) => continue,
+            };
             // The column's default opclass, or `jsonb_path_ops`.
             let explicit: Vec<i64> = match opt("sqlOpclasses") {
                 Some(Bson::Array(a)) => a
@@ -791,6 +817,7 @@ impl crate::PgHandler {
                     ),
                     pending_limit_kb: reloption("gin_pending_list_limit")
                         .and_then(|v| v.parse().ok()),
+                    predicate,
                 })
             } else {
                 let opclass = match col.pg_type.as_str() {
@@ -865,6 +892,7 @@ impl crate::PgHandler {
                 };
                 let keyed: Vec<(u64, Vec<GinKey>)> = rows
                     .iter()
+                    .filter(|(_, d)| gin_admits(s, d))
                     .map(|(c, d)| (*c, gin_keys(&ops, d.get(&s.field))))
                     .collect();
                 Model::Gin(Gin::build(
@@ -982,6 +1010,11 @@ impl crate::PgHandler {
         for shape in shapes {
             let oid = shape.oid();
             for (doc, _, ctid) in versions {
+                if let AmShape::Gin(s) = &shape {
+                    if !gin_admits(s, doc) {
+                        continue;
+                    }
+                }
                 let tid = *ctid as u64;
                 let events: Vec<(bool, u32, u32)> = match &shape {
                     AmShape::Gin(s) => {
@@ -1076,6 +1109,10 @@ impl crate::PgHandler {
         let mut paths = Vec::new();
         for shape in self.am_shapes(table) {
             let (field, served): (&str, Vec<usize>) = match &shape {
+                // A partial index serves a scan only when the WHERE implies
+                // its predicate (`predicate_implied_by`), which is not
+                // modelled: such a scan keeps the relation lock.
+                AmShape::Gin(s) if s.predicate.is_some() => (&s.field, Vec::new()),
                 AmShape::Gin(s) => (
                     &s.field,
                     // `jsonb_ops`' and `tsvector_ops`' scans are not

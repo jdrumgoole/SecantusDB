@@ -666,10 +666,10 @@ def test_a_jsonb_path_ops_gin_index_has_its_pages(pg: Any, case: str) -> None:
     assert got == ("ok", [(pages,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_partial_gin_index_has_its_pages(pg: Any) -> None:
-    """A partial GIN index is not modelled page by page: PostgreSQL 15.19
-    sizes this one at 8 pages; here `pg_relation_size` reads 0."""
+    """A partial GIN index was not modelled page by page: PostgreSQL 15.19
+    sizes this one at 8 pages, where `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -680,6 +680,42 @@ def test_a_partial_gin_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_qg') / 8192",
     )
     assert got == ("ok", [(8,)])
+
+
+@pytest.mark.backlog("RP-287")
+def test_a_multi_column_gin_index_has_its_pages(pg: Any) -> None:
+    """A multi-column GIN index is not modelled page by page: PostgreSQL
+    15.19 sizes this one at 22 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_m (a int[], b int[])",
+            "insert into rp287_m select array[g % 100, g % 7], array[g % 13]"
+            " from generate_series(1, 20000) g",
+            "create index rp287_mg on rp287_m using gin (a, b)",
+        ],
+        "select pg_relation_size('rp287_mg') / 8192",
+    )
+    assert got == ("ok", [(22,)])
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize(("fastupdate", "pages"), [("on", 51), ("off", 7)])
+def test_a_partial_gin_index_takes_only_its_rows(pg: Any, fastupdate: str, pages: int) -> None:
+    """Rows inserted after CREATE INDEX enter a partial GIN index only when
+    its predicate holds (`ExecInsertIndexTuples`), through the pending list
+    or straight into the entry tree: PostgreSQL 15.19's sizes."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_qi (a int[])",
+            f"create index rp287_qig on rp287_qi using gin (a) with (fastupdate={fastupdate})"
+            " where a[1] < 50",
+            "insert into rp287_qi select array[g % 100, g % 7] from generate_series(1, 20000) g",
+        ],
+        "select pg_relation_size('rp287_qig') / 8192",
+    )
+    assert got == ("ok", [(pages,)])
 
 
 # `jsonb_ops` keys (`gin_extract_jsonb`): object keys, values, string
