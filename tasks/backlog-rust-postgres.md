@@ -1343,22 +1343,23 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for a window aggregate, nor for a
-      window function with an argument.** Since RP-347 a WindowAgg of
-      `row_number` / `rank` / `dense_rank` over one window prints
-      `cost_windowagg`'s estimate, over the Sort its PARTITION BY / ORDER BY
-      needs. Any other window function still prints zeros:
-      `explain select a, sum(a) over () from e` is `WindowAgg
-      (cost=0.00..27.50 rows=1000 width=12)` in PostgreSQL 15.19 (the
-      aggregate's `procost` and its argument's evaluation, which
-      `cost_windowagg` adds per row), and `explain select a, lag(a) over
-      (order by a) from e` is `WindowAgg (cost=64.83..82.33 rows=1000
-      width=8)` over its Sort (the result is the argument's type, not int8).
-      Several distinct windows in one SELECT, which PostgreSQL plans as
-      stacked WindowAggs, each over its own Sort, print one WindowAgg here
-      (found while working RP-347).
-      Backlog-ID: RP-351
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a window], tests/backlog/test_rp_explain_costs.py::test_plan[a window function with an argument]
+- [ ] **EXPLAIN prints no estimate for a window function under FILTER,
+      over an expression, or for stacked windows.** Since RP-351 a
+      WindowAgg prices any built-in window function or aggregate whose
+      argument is a plain column (a `Var`, free in `cost_qual_eval`).
+      PostgreSQL 15.19 adds the FILTER clause's and an expression
+      argument's `cost_qual_eval` per row: `explain select a, sum(a)
+      filter (where a > 5) over () from e` and `explain select a,
+      sum(a+1) over () from e` are both `WindowAgg (cost=0.00..30.00
+      rows=1000 width=12)`; here both print zeros. Several distinct
+      windows in one SELECT are stacked WindowAggs, each over its own
+      Sort (`select a, row_number() over (order by a), rank() over (order
+      by b) from e` is a WindowAgg (132.16..149.66) over a Sort by `a` over
+      a WindowAgg over a Sort by `b`); here one WindowAgg is printed, with
+      zeros (found while working RP-351, measured on a fresh private
+      cluster).
+      Backlog-ID: RP-352
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate under a filter clause], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate of an expression], tests/backlog/test_rp_explain_costs.py::test_plan[two windows stacked]
 - [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
       `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
       (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:

@@ -349,6 +349,56 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
+    "a count of a column a window reads": (
+        "RP-351",
+        _ANALYSED,
+        "explain select a, count(b) over () from e",
+        [
+            "WindowAgg  (cost=0.00..27.50 rows=1000 width=12)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an aggregate with a constant argument": (
+        "RP-351",
+        _ANALYSED,
+        "explain select a, string_agg(b, ',') over () from e",
+        [
+            "WindowAgg  (cost=0.00..27.50 rows=1000 width=36)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an aggregate under a filter clause": (
+        "RP-352",
+        _ANALYSED,
+        "explain select a, sum(a) filter (where a > 5) over () from e",
+        [
+            "WindowAgg  (cost=0.00..30.00 rows=1000 width=12)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "an aggregate of an expression": (
+        "RP-352",
+        _ANALYSED,
+        "explain select a, sum(a+1) over () from e",
+        [
+            "WindowAgg  (cost=0.00..30.00 rows=1000 width=12)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "two windows stacked": (
+        "RP-352",
+        _ANALYSED,
+        "explain select a, row_number() over (order by a), rank() over (order by b) from e",
+        [
+            "WindowAgg  (cost=132.16..149.66 rows=1000 width=23)",
+            "  ->  Sort  (cost=132.16..134.66 rows=1000 width=15)",
+            "        Sort Key: a",
+            "        ->  WindowAgg  (cost=64.83..82.33 rows=1000 width=15)",
+            "              ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "                    Sort Key: b",
+            "                    ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "a ranking function under a filter": (
         "RP-323",
         _ANALYSED,
@@ -1029,6 +1079,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-348",
         "RP-349",
         "RP-350",
+        "RP-351",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

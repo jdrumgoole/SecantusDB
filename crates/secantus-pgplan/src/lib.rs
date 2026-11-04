@@ -2395,6 +2395,12 @@ pub struct WindowItem {
     /// The function's argument, evaluated per row. `None` for the
     /// argument-less ranking functions and for `count(*)`.
     pub arg: Option<ColumnExpr>,
+    /// The FIELD of the stored column `arg` is, when the argument is a
+    /// bare column reference (`sum(a)`, `lag(a)`): a `Var`, which
+    /// `cost_qual_eval` prices at nothing, and a column the scan below the
+    /// WindowAgg must return (RP-351). `None` for an argument-less
+    /// function and for any other expression.
+    pub arg_field: Option<String>,
     /// Extra LITERAL arguments: `lag`/`lead`'s offset and default,
     /// `nth_value`'s N, `ntile`'s bucket count.
     pub args: Vec<Bson>,
@@ -13021,11 +13027,18 @@ fn plan_window_call(
     let def_order = reference
         .and_then(|r| named.iter().position(|w| w.name == r))
         .unwrap_or(named.len() + windows.len());
+    let arg_field = match (&arg, f.args.first().and_then(|a| a.node.as_ref())) {
+        (Some(_), Some(N::ColumnRef(c))) if c.fields.len() == 1 => {
+            column_ref_name(c).and_then(|n| def.column(&n).map(|c| c.field()))
+        }
+        _ => None,
+    };
     windows.push(WindowItem {
         def_order,
         field: field.clone(),
         func,
         arg,
+        arg_field,
         args,
         partition_by,
         partition_jsonb,
