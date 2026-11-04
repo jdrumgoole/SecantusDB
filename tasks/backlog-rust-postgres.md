@@ -1394,15 +1394,6 @@ a regression test.
       RP-361.
       Backlog-ID: RP-362
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join hashed as a right join], tests/backlog/test_rp_explain_costs.py::test_plan[a projected join under a WHERE], tests/backlog/test_rp_explain_costs.py::test_plan[a projected cross join]
-- [ ] **A catalog read by a bitmap is a zero-cost Seq Scan here.**
-      With `enable_indexscan = off`, `explain select oid from pg_class
-      where relname = 'pg_class'` is a `Bitmap Heap Scan on pg_class
-      (cost=4.28..8.29 rows=1 width=4)` over a `Bitmap Index Scan on
-      pg_class_relname_nsp_index` on PostgreSQL 15.19; here the bitmap
-      path is costed cheapest but its nodes are not built, so it prints
-      a `Seq Scan` with zeros (found while working RP-334).
-      Backlog-ID: RP-338
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read by a bitmap]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
       index path.** Over an analysed table PostgreSQL 15.19's
       `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`

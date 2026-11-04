@@ -42,7 +42,7 @@ pub(crate) struct PlanNode {
 }
 
 impl PlanNode {
-    fn new(name: impl Into<String>) -> Self {
+    pub(crate) fn new(name: impl Into<String>) -> Self {
         PlanNode {
             name: name.into(),
             details: Vec::new(),
@@ -1189,10 +1189,14 @@ fn quals_on_scan(
     quals: &[(String, Option<String>)],
     index_columns: &dyn Fn(&str) -> Vec<String>,
 ) {
-    let keys = scan
-        .props
-        .iter()
-        .find(|(k, _)| k == "Index Name")
+    let bitmap = scan.name.starts_with("Bitmap Heap Scan on ");
+    let index_node = if bitmap {
+        scan.children.first()
+    } else {
+        Some(&*scan)
+    };
+    let keys = index_node
+        .and_then(|n| n.props.iter().find(|(k, _)| k == "Index Name"))
         .map(|(_, v)| index_columns(v))
         .unwrap_or_default();
     let (cond, filter): (Vec<&String>, Vec<&String>) = {
@@ -1219,12 +1223,31 @@ fn quals_on_scan(
             ),
         }
     };
+    // A Bitmap Heap Scan rechecks its index quals on each heap row
+    // (`Recheck Cond`, its `bitmapqualorig`); its Bitmap Index Scan child
+    // holds them as `Index Cond` (`create_bitmap_scan_plan`).
     if !cond.is_empty() {
-        scan.details.push(("Index Cond".into(), join(&cond)));
+        if bitmap {
+            scan.details.push(("Recheck Cond".into(), join(&cond)));
+            if let Some(child) = scan.children.first_mut() {
+                child.details.push(("Index Cond".into(), join(&cond)));
+            }
+        } else {
+            scan.details.push(("Index Cond".into(), join(&cond)));
+        }
     }
     if !filter.is_empty() {
         scan.details.push(("Filter".into(), join(&filter)));
     }
+}
+
+/// The Bitmap Index Scan under a Bitmap Heap Scan (RP-338): it names its
+/// index and no relation, and prints `estimate`, width 0.
+pub(crate) fn bitmap_index_scan(index: &str, estimate: crate::scan_estimate::Estimate) -> PlanNode {
+    let mut n = PlanNode::new(format!("Bitmap Index Scan on {index}"));
+    n.props.push(("Index Name".into(), index.to_string()));
+    n.estimate = Some(estimate);
+    n
 }
 
 /// Put each join's ON condition on its join node (post-order, as
@@ -1424,8 +1447,63 @@ mod join_type_tests {
 /// Scan over one of its indexes.
 fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
+        || name.starts_with("Bitmap Heap Scan on ")
         || name.starts_with("Index Scan using ")
         || name.starts_with("Index Only Scan using ")
+}
+
+#[cfg(test)]
+mod bitmap_scan_tests {
+    use super::*;
+
+    /// A Bitmap Heap Scan rechecks its index quals and its Bitmap Index
+    /// Scan holds them as its Index Cond; a qual on another column stays
+    /// the heap's Filter (RP-338).
+    #[test]
+    fn a_bitmap_heap_scan_splits_its_quals_as_postgresql_does() {
+        let mut heap = PlanNode::new("Bitmap Heap Scan on pg_class");
+        heap.children.push(bitmap_index_scan(
+            "pg_class_relname_nsp_index",
+            (0.0, 4.28, 1.0, 0),
+        ));
+        let quals = vec![
+            (
+                "(relname = 'pg_class'::name)".to_string(),
+                Some("relname".to_string()),
+            ),
+            (
+                "(relkind = 'r'::\"char\")".to_string(),
+                Some("relkind".to_string()),
+            ),
+        ];
+        attach_scan_quals(&mut heap, &quals, &|_| {
+            vec!["relname".into(), "relnamespace".into()]
+        });
+        assert_eq!(
+            heap.details,
+            vec![
+                (
+                    "Recheck Cond".to_string(),
+                    "(relname = 'pg_class'::name)".to_string()
+                ),
+                (
+                    "Filter".to_string(),
+                    "(relkind = 'r'::\"char\")".to_string()
+                ),
+            ]
+        );
+        assert_eq!(
+            heap.children[0].details,
+            vec![(
+                "Index Cond".to_string(),
+                "(relname = 'pg_class'::name)".to_string()
+            )]
+        );
+        assert!(heap.children[0]
+            .props
+            .iter()
+            .all(|(k, _)| k != "Relation Name"));
+    }
 }
 
 #[cfg(test)]

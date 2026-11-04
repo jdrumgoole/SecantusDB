@@ -40829,7 +40829,19 @@ impl PgHandler {
                                 tree.estimate = Some(estimate);
                                 if let Some(index) = index {
                                     tree.name = index.node_name(&sel.table);
-                                    tree.props.insert(0, ("Index Name".into(), index.name));
+                                    match index.bitmap {
+                                        // A Bitmap Heap Scan over its index's
+                                        // Bitmap Index Scan (RP-338).
+                                        Some(child) => {
+                                            tree.children.push(explain::bitmap_index_scan(
+                                                &index.name,
+                                                child,
+                                            ));
+                                        }
+                                        None => {
+                                            tree.props.insert(0, ("Index Name".into(), index.name))
+                                        }
+                                    }
                                 }
                             }
                         }
