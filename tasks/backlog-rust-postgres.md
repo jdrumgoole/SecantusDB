@@ -1354,18 +1354,6 @@ a regression test.
       RP-351, measured on a fresh private cluster; split from RP-352).
       Backlog-ID: RP-355
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[two windows stacked]
-- [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
-      `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
-      (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:
-      (e.a < e2.a)` and a `Materialize` over the inner Seq Scan
-      (`cost_nestloop`, `cost_material`); here neither line nor the
-      Materialize is printed. PostgreSQL 15.19 prices it (`costsize.c`);
-      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
-      plan that is one relation's Seq Scan prints the estimate; the
-      scenario's expected plan is PostgreSQL's, measured on a fresh
-      cluster.
-      Backlog-ID: RP-329
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop]
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),
