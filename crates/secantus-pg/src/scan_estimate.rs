@@ -657,10 +657,10 @@ impl PgHandler {
         read: &[String],
         above: &[String],
     ) -> Option<HashSide> {
-        let (scan, None) = self.scan_estimate(table, filter, &read)? else {
+        let (scan, None) = self.scan_estimate(table, filter, read)? else {
             return None;
         };
-        let (width, None) = self.scan_estimate(table, &Document::new(), &above)? else {
+        let (width, None) = self.scan_estimate(table, &Document::new(), above)? else {
             return None;
         };
         let count = self
