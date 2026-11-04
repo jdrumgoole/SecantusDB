@@ -23,7 +23,17 @@ use super::*;
 pub(crate) type Equality = (usize, String, usize, String);
 
 fn family(pg_type: &str) -> Option<u8> {
-    match pg_type {
+    // A domain's values are its base type's (`information_schema.
+    // sql_identifier` is `name`), so it hashes as that base does; a domain
+    // over a domain is followed to the bottom, as `getBaseType` does.
+    let mut ty = pg_type.to_string();
+    for _ in 0..16 {
+        match crate::domains::domain_base(&ty) {
+            Some(base) => ty = base,
+            None => break,
+        }
+    }
+    match ty.as_str() {
         "int2" | "int4" | "int8" | "oid" => Some(0),
         "text" | "name" | "varchar" => Some(1),
         _ => None,
@@ -174,6 +184,15 @@ mod tests {
             pairs_between(&eq, &[0, 1, 3], 2),
             vec![("d.y".to_string(), "c.y".to_string())]
         );
+    }
+
+    #[test]
+    fn a_domain_hashes_as_its_base_type() {
+        // RP-306: element_types' semijoin keys `name` to `sql_identifier`.
+        assert_eq!(family("information_schema.sql_identifier"), family("name"));
+        assert_eq!(family("information_schema.character_data"), family("text"));
+        assert_eq!(family("information_schema.cardinal_number"), family("int4"));
+        assert_eq!(family("information_schema.time_stamp"), None);
     }
 
     #[test]
