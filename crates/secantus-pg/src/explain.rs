@@ -1723,6 +1723,7 @@ mod heap_fetches_tests {
             format: format.into(),
             scan_quals: Vec::new(),
             scan_in_lengths: Vec::new(),
+            scan_array_quals: None,
             setop_quals: Vec::new(),
             join_conds: Vec::new(),
             join_where: Vec::new(),
