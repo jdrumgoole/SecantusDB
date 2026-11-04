@@ -1009,6 +1009,33 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (a > 10)",
         ],
     ),
+    "a RIGHT join reduced by its WHERE": (
+        "RP-365",
+        _NULLS,
+        "explain select k.a from e right join k on e.b = k.b where e.a = 7",
+        [
+            "Hash Join  (cost=17.51..36.97 rows=71 width=4)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=1 width=3)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=3)",
+            "              Filter: (a = 7)",
+        ],
+    ),
+    "a join with a WHERE on each side": (
+        "RP-365",
+        _NULLS,
+        "explain select * from e join k on e.b = k.b where e.a > 10 and k.a < 900",
+        [
+            "Hash Join  (cost=29.88..833.87 rows=63591 width=14)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..17.50 rows=899 width=7)",
+            "        Filter: (a < 900)",
+            "  ->  Hash  (cost=17.50..17.50 rows=990 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=990 width=7)",
+            "              Filter: (a > 10)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,

@@ -1392,7 +1392,10 @@ a regression test.
       bounds), which `joincost::merge_join` does not model (it reads both
       inputs whole). Until it does, the hash estimate should be checked
       against it. Found while working RP-364; the row estimate (3208) is
-      already right.
+      already right. Nor do they weigh an index scan of a filtered side:
+      a WHERE over a table with an index leaves the join unpriced (zeros,
+      not a wrong number) on both join paths (RP-365; see RP-354 for the
+      parameterized inner index scan).
       Backlog-ID: RP-366
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected join PostgreSQL merges]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
