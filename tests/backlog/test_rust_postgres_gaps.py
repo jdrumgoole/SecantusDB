@@ -2693,12 +2693,16 @@ def test_a_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> None:
 def test_a_left_join_order_by_puts_its_nulls_where_it_says(pg: Any) -> None:
     """PostgreSQL 15.19, two 20-row tables: `t0 LEFT JOIN t1 ON t0.b = t1.a
     ORDER BY t1.a DESC NULLS LAST` puts its two NULL-extended rows (t0.b
-    is 0, which no t1.a is) last, and `ORDER BY t1.a NULLS FIRST` first. The two-table join path dropped the NULLS clause and sorted by
-    the direction's default: NULLs first descending, last ascending."""
+    is 0, which no t1.a is) last, and `ORDER BY t1.a NULLS FIRST` first.
+    The two-table join path dropped the NULLS clause and sorted by the
+    direction's default: NULLs first descending, last ascending."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_z", 2, 20)
-        join = "select rp028_z0.a, rp028_z1.a from rp028_z0 left join rp028_z1 on rp028_z0.b = rp028_z1.a"
+        join = (
+            "select rp028_z0.a, rp028_z1.a from rp028_z0"
+            " left join rp028_z1 on rp028_z0.b = rp028_z1.a"
+        )
         got = [
             pg_answer(pg, f"{join} order by rp028_z1.a desc nulls last limit 5"),
             [r[1] for r in pg_answer(pg, f"{join} order by rp028_z1.a desc nulls last")[1]],
