@@ -207,6 +207,10 @@ pub(crate) struct Step {
     /// sides sorted descending (`select_outer_pathkeys_for_merge` takes
     /// the query's pathkeys' direction for the merge's).
     pub(crate) desc: bool,
+    /// A merge join on the ORDER BY's class under an ascending ORDER BY
+    /// with its NULLs first: both sides sorted ascending, NULLs first
+    /// (`select_outer_pathkeys_for_merge` takes the query's pathkey).
+    pub(crate) nulls_first: bool,
 }
 
 /// The search's answer: which two tables join first (by index into the
@@ -731,6 +735,7 @@ impl PgHandler {
                 extra: Vec::new(),
                 hash_tuple: None,
                 desc: false,
+                nulls_first: false,
             },
             joinrel_first: c.pair_first,
             second_step: Step {
@@ -746,6 +751,7 @@ impl PgHandler {
                 extra: Vec::new(),
                 hash_tuple: None,
                 desc: false,
+                nulls_first: false,
             },
         };
         Some(plan)
@@ -890,7 +896,7 @@ impl PgHandler {
         // Several clauses: every key, sorted on in clause order and matched
         // on. The fills and table orders below are single-key.
         if !step.extra.is_empty() {
-            if step.desc {
+            if step.desc || step.nulls_first {
                 return Ok(None);
             }
             return self.run_step_on_keys(step, a, b, on);
@@ -898,7 +904,7 @@ impl PgHandler {
         // A descending merge: an inner, LEFT or right one. A full merge
         // places its unmatched rows by the ascending order
         // (`merge_full_place`), which is not modelled descending.
-        if step.desc
+        if (step.desc || step.nulls_first)
             && matches!(
                 step.method,
                 JoinMethod::MergeFullA { .. } | JoinMethod::MergeFullB { .. }
@@ -986,6 +992,7 @@ impl PgHandler {
                     &mut b.rows,
                     std::slice::from_ref(&step.b_key),
                     step.desc,
+                    step.nulls_first,
                 );
                 (b, a, JoinKind::Right, b_first)
             }
@@ -1008,6 +1015,7 @@ impl PgHandler {
                         &mut b.rows,
                         std::slice::from_ref(&step.b_key),
                         step.desc,
+                        step.nulls_first,
                     );
                 }
                 let kind = if step.left {
@@ -1101,7 +1109,7 @@ impl PgHandler {
             out = crate::merge_full_place(out, tail, &fill_outer, &fill_inner, inner_max.as_ref());
         }
         if matches!(step.method, JoinMethod::MergeRightB { .. }) {
-            out = merge_right_fill(out, &step.b_key, &step.a_key, step.desc);
+            out = merge_right_fill(out, &step.b_key, &step.a_key, step.desc, step.nulls_first);
         }
         let keys = outer.keys.into_iter().chain(inner.keys).collect();
         Ok(Some(Input { rows: out, keys }))
@@ -1185,6 +1193,7 @@ fn merge_right_fill(
     outer_key: &str,
     inner_key: &str,
     desc: bool,
+    nulls_first: bool,
 ) -> Vec<Document> {
     let is_null = |d: &Document, k: &str| matches!(d.get(k), None | Some(Bson::Null));
     let (matched, unmatched): (Vec<Document>, Vec<Document>) =
@@ -1194,6 +1203,8 @@ fn merge_right_fill(
         y.get(inner_key).filter(|v| **v != Bson::Null),
     ) {
         (None, None) => Ordering::Equal,
+        (None, Some(_)) if nulls_first => Ordering::Less,
+        (Some(_), None) if nulls_first => Ordering::Greater,
         (None, Some(_)) => Ordering::Greater,
         (Some(_), None) => Ordering::Less,
         (Some(p), Some(q)) => secantus_pgplan::compare_values(p, q).unwrap_or(Ordering::Equal),

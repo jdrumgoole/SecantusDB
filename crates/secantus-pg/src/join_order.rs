@@ -202,6 +202,12 @@ struct Search {
     /// from merge joins on it, whose Sorts take the query's direction
     /// (`select_outer_pathkeys_for_merge`, `make_inner_pathkeys_for_merge`).
     order_desc: bool,
+    /// That ORDER BY is ascending with its NULLs first, against the
+    /// direction's default. No index scan returns that order (its forward
+    /// scan's is NULLS LAST, of use for merging only), and a merge join on
+    /// the class sorts both sides in it (`select_outer_pathkeys_for_merge`
+    /// takes the query's pathkey, its `nulls_first` included).
+    order_nulls_first: bool,
     /// Each edge's outer join (`Search::edges` order): the preserved table
     /// of a LEFT join, `usize::MAX` for a FULL join, `None` for an inner
     /// join's clause. An outer join's clause moves only into a scan of its
@@ -980,6 +986,7 @@ impl PgHandler {
                 base_backward: Vec::new(),
                 order: None,
                 order_desc: false,
+                order_nulls_first: false,
                 edge_outer,
                 general: false,
                 param_keys: Vec::new(),
@@ -1302,7 +1309,7 @@ impl PgHandler {
             // merge with that key's side outer sorts both sides descending
             // (`Search::order_desc`, `select_outer_pathkeys_for_merge`).
             let desc_outer = match &search.order {
-                Some((key, ORDER_CLASS)) if search.order_desc => {
+                Some((key, ORDER_CLASS)) if search.order_desc || search.order_nulls_first => {
                     (clause.a_key == *key, clause.b_key == *key)
                 }
                 _ => (false, false),
@@ -1567,7 +1574,7 @@ impl PgHandler {
                         && c & secantus_pgplan::joincost::ASC_KEYS != 0
                 })
         };
-        let merge_desc = search.order_desc
+        let merge_in_order = (search.order_desc || search.order_nulls_first)
             && !asc_input(built.a, a_pick, a_sorted)
             && !asc_input(built.b, b_pick, b_sorted)
             && matches!(
@@ -1637,7 +1644,8 @@ impl PgHandler {
                     .iter()
                     .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
                     .collect(),
-                desc: merge_desc,
+                desc: merge_in_order && search.order_desc,
+                nulls_first: merge_in_order && search.order_nulls_first,
             };
             let on = clause.on.and_then(|i| chain.ons.get(i).copied().flatten());
             let mut rows = Vec::new();
@@ -1738,7 +1746,8 @@ impl PgHandler {
                 .iter()
                 .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
                 .collect(),
-            desc: merge_desc,
+            desc: merge_in_order && search.order_desc,
+            nulls_first: merge_in_order && search.order_nulls_first,
         };
         let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
         let (a_type, b_type) = (type_of(&step.a_key), type_of(&step.b_key));
@@ -1842,7 +1851,7 @@ impl PgHandler {
         &self,
         node: &JoinNode,
         limit: Option<(usize, usize)>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
     ) -> PgWireResult<Option<Vec<Document>>> {
         if order.is_some() && limit.is_none() {
             return Ok(None);
@@ -1865,7 +1874,7 @@ impl PgHandler {
         &self,
         node: &JoinNode,
         limit: Option<(usize, usize)>,
-        order: Option<(&str, bool)>,
+        order: Option<(&str, bool, bool)>,
         general: bool,
     ) -> PgWireResult<Option<Vec<Document>>> {
         let spanning_modelled = if limit.is_some() {
@@ -1889,12 +1898,13 @@ impl PgHandler {
                 };
                 search.filters = filters;
             }
-            if let Some((key, desc)) = order {
+            if let Some((key, desc, nulls_first)) = order {
                 let Some(class) = Self::order_class(&search, &chain, key) else {
                     return Ok(None);
                 };
                 search.order = Some((key.to_string(), class));
                 search.order_desc = desc;
+                search.order_nulls_first = nulls_first;
             }
             let Some((mut base_lists, mut param_keys)) = self.build_base_lists(&search, &chain)
             else {
@@ -1904,7 +1914,7 @@ impl PgHandler {
                 .iter()
                 .map(|(list, _, _)| vec![false; list.len()])
                 .collect();
-            if search.order_desc {
+            if search.order_desc || search.order_nulls_first {
                 let class = search.order.as_ref().map(|(_, c)| *c);
                 let in_order = |p: &InPath| p.class.is_some() && p.class == class;
                 // The ORDER BY's own class (`ORDER_CLASS`: a key an outer
@@ -1932,6 +1942,17 @@ impl PgHandler {
                         // no useful pathkeys (`truncate_useless_pathkeys`):
                         // the backward scan, in the query's order at the
                         // same cost, replaces it.
+                        // Ascending, NULLs first: the forward scan's order
+                        // (NULLS LAST) is of use for merging only, and a
+                        // backward scan is the wrong direction for merging
+                        // and of no use for the ORDER BY (`build_index_paths`
+                        // keeps none).
+                        if search.order_nulls_first {
+                            let c = list[i].0.class.unwrap_or(ORDER_CLASS);
+                            list[i].0.class = Some(secantus_pgplan::joincost::asc_keys(c));
+                            i += 1;
+                            continue;
+                        }
                         if unread {
                             base_backward[t][i] = true;
                             i += 1;

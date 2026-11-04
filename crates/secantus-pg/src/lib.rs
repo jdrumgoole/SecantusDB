@@ -361,7 +361,7 @@ thread_local! {
     /// search plans for (`four_table_join`); and, once it has, whether the
     /// plan it picked returns its rows in that order already, so that the
     /// select runs no Sort of its own (`create_ordered_paths`).
-    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool)>> =
+    static GENERAL_JOIN_ORDER: std::cell::RefCell<Option<(String, bool, bool)>> =
         const { std::cell::RefCell::new(None) };
     static GENERAL_JOIN_PRESORTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -9906,7 +9906,7 @@ impl PgHandler {
                 if let Some(rows) = self.four_table_join(
                     node,
                     limit_offset,
-                    order.as_ref().map(|(k, desc)| (k.as_str(), *desc)),
+                    order.as_ref().map(|(k, desc, nf)| (k.as_str(), *desc, *nf)),
                 )? {
                     return Ok(rows);
                 }
@@ -35771,17 +35771,19 @@ impl PgHandler {
                 // that the join's rows are the ones the LIMIT counts.
                 // With an ORDER BY of one plain column, ascending with its
                 // NULLs last or descending with them first (each the other's
-                // exact reverse), the search plans the join for the LIMIT
-                // and says whether its plan needs the Sort.
+                // exact reverse), or ascending with its NULLs first, the
+                // search plans the join for the LIMIT and says whether its
+                // plan needs the Sort.
                 let join_order = match sel.order.as_slice() {
-                    [k] if k.ascending == matches!(k.nulls, secantus_pgplan::Nulls::Last)
+                    [k] if (k.ascending || matches!(k.nulls, secantus_pgplan::Nulls::First))
                         && k.expr.is_none()
                         && !k.jsonb
                         && sel.distinct == secantus_pgplan::Distinct::None
                         && !sel.with_ties
                         && sel.lock_clauses.is_empty() =>
                     {
-                        Some((k.field.clone(), !k.ascending))
+                        let nulls_first = matches!(k.nulls, secantus_pgplan::Nulls::First);
+                        Some((k.field.clone(), !k.ascending, k.ascending && nulls_first))
                     }
                     _ => None,
                 };
@@ -54148,7 +54150,7 @@ pub(crate) fn reorder_join_inputs_on(
     right: &mut Vec<Document>,
     rf: &[String],
 ) {
-    reorder_join_inputs_dir(method, left, lf, right, rf, false);
+    reorder_join_inputs_dir(method, left, lf, right, rf, false, false);
 }
 
 /// `reorder_join_inputs_on`, a merge join's sides sorted descending with
@@ -54163,6 +54165,7 @@ pub(crate) fn reorder_join_inputs_dir(
     right: &mut Vec<Document>,
     rf: &[String],
     desc: bool,
+    nulls_first: bool,
 ) {
     use secantus_pgplan::joincost::JoinMethod;
     let by_key = |fields: &[String]| {
@@ -54174,6 +54177,9 @@ pub(crate) fn reorder_join_inputs_dir(
                     y.get(field).filter(|v| **v != Bson::Null),
                 ) {
                     (None, None) => Ordering::Equal,
+                    // Ascending with its NULLs first (`nulls_first`).
+                    (None, Some(_)) if nulls_first => Ordering::Less,
+                    (Some(_), None) if nulls_first => Ordering::Greater,
                     (None, Some(_)) => Ordering::Greater,
                     (Some(_), None) => Ordering::Less,
                     (Some(p), Some(q)) => {

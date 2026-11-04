@@ -2640,14 +2640,14 @@ def test_a_descending_nullable_key_with_an_index_keeps_its_ties(pg: Any) -> None
     )
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_an_ascending_nulls_first_order_by_keeps_its_ties(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
     t0.b = t1.a ORDER BY t1.a NULLS FIRST LIMIT 5` (an ORDER BY with its
     NULLs against its direction's default) leaves its ties as t0's rows
-    1877, 1289, 1709, 1296, 2815. The join search plans only an ORDER BY
-    with the default NULLs, so this joins whole and sorts: 1289, 1709,
-    1296, 2815, 1877."""
+    1877, 1289, 1709, 1296, 2815. The two-table join path kept it and
+    joined whole: 1289, 1709, 1296, 2815, 1877. The join search now plans
+    it, an index scan's ascending order of use for merging only."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_n", 2, 3000)
@@ -2663,6 +2663,54 @@ def test_an_ascending_nulls_first_order_by_keeps_its_ties(pg: Any) -> None:
         "ok",
         [(1877, 1), (1289, 1), (1709, 1), (1296, 1), (2815, 1)],
     )
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a ORDER BY t1.a DESC NULLS LAST LIMIT 5` leaves its ties as
+    t0's rows 2141, 2939, 860, 1763, 433, as a plain DESC does: a bounded
+    Sort over the hash join. The join search declines a DESC NULLS LAST,
+    so this joins whole and sorts: 1280, 1728, 1448, 1721, 1273."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_l", 2, 3000)
+        got = pg_answer(
+            pg,
+            "select rp028_l0.a, rp028_l1.a from rp028_l0"
+            " join rp028_l1 on rp028_l0.b = rp028_l1.a"
+            " order by rp028_l1.a desc nulls last limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(2141, 6), (2939, 6), (860, 6), (1763, 6), (433, 6)],
+    )
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_left_join_order_by_puts_its_nulls_where_it_says(pg: Any) -> None:
+    """PostgreSQL 15.19, two 20-row tables: `t0 LEFT JOIN t1 ON t0.b = t1.a
+    ORDER BY t1.a DESC NULLS LAST` puts its two NULL-extended rows (t0.b
+    is 0, which no t1.a is) last, and `ORDER BY t1.a NULLS FIRST` first. The two-table join path dropped the NULLS clause and sorted by
+    the direction's default: NULLs first descending, last ascending."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_z", 2, 20)
+        join = "select rp028_z0.a, rp028_z1.a from rp028_z0 left join rp028_z1 on rp028_z0.b = rp028_z1.a"
+        got = [
+            pg_answer(pg, f"{join} order by rp028_z1.a desc nulls last limit 5"),
+            [r[1] for r in pg_answer(pg, f"{join} order by rp028_z1.a desc nulls last")[1]],
+            [r[1] for r in pg_answer(pg, f"{join} order by rp028_z1.a nulls first")[1]][:3],
+        ]
+    finally:
+        pg.execute("rollback")
+    assert got == [
+        ("ok", [(13, 6), (20, 6), (6, 6), (12, 5), (19, 5)]),
+        [6] * 3 + [5] * 3 + [4] * 3 + [3] * 3 + [2] * 3 + [1] * 3 + [None] * 2,
+        [None, None, 1],
+    ]
 
 
 @pytest.mark.backlog_fixed("RP-307")
