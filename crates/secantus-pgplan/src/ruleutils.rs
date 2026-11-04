@@ -3962,25 +3962,34 @@ pub fn join_where(
             _ => {}
         }
     }
-    fn nullable(n: &Node, out: &mut Vec<String>) {
+    // `reduce_outer_joins`: a side some WHERE conjunct proves non-NULL is
+    // not null-extended, its join an inner one (`find_nonnullable_rels`).
+    fn nullable(n: &Node, nonnull: &[String], out: &mut Vec<String>) {
         if let Some(N::JoinExpr(j)) = n.node.as_ref() {
             let (l, r) = (j.larg.as_deref(), j.rarg.as_deref());
+            let forced = |x: &Node| {
+                let mut names = Vec::new();
+                refnames(x, &mut names);
+                names.iter().any(|n| nonnull.contains(n))
+            };
+            let side = |x: Option<&Node>, out: &mut Vec<String>| {
+                if let Some(x) = x.filter(|x| !forced(x)) {
+                    refnames(x, out);
+                }
+            };
             match JoinType::try_from(j.jointype) {
-                Ok(JoinType::JoinLeft) => r.into_iter().for_each(|x| refnames(x, out)),
-                Ok(JoinType::JoinRight) => l.into_iter().for_each(|x| refnames(x, out)),
+                Ok(JoinType::JoinLeft) => side(r, out),
+                Ok(JoinType::JoinRight) => side(l, out),
                 Ok(JoinType::JoinFull) => {
-                    [l, r].into_iter().flatten().for_each(|x| refnames(x, out))
+                    side(l, out);
+                    side(r, out);
                 }
                 _ => {}
             }
             for side in [l, r].into_iter().flatten() {
-                nullable(side, out);
+                nullable(side, nonnull, out);
             }
         }
-    }
-    let mut nulls = Vec::new();
-    for item in &s.from_clause {
-        nullable(item, &mut nulls);
     }
     let mut parts = Vec::new();
     fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
@@ -3994,6 +4003,46 @@ pub fn join_where(
         }
     }
     flatten(w, &mut parts);
+    // The relations a conjunct proves non-NULL: a comparison operator
+    // (every one strict) over a plain column, or `IS NOT NULL` of one.
+    let mut nonnull: Vec<String> = Vec::new();
+    for part in &parts {
+        let mut cols: Vec<&Node> = Vec::new();
+        match part.node.as_ref() {
+            Some(N::AExpr(a)) if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
+                let strict = matches!(
+                    a.name.as_slice(),
+                    [one] if matches!(
+                        one.node.as_ref(),
+                        Some(N::String(op)) if matches!(op.sval.as_str(), "=" | "<>" | "<" | "<=" | ">" | ">=")
+                    )
+                );
+                if strict {
+                    cols.extend(a.lexpr.as_deref());
+                    cols.extend(a.rexpr.as_deref());
+                }
+            }
+            Some(N::NullTest(t))
+                if t.nulltesttype == pg_query::protobuf::NullTestType::IsNotNull as i32 =>
+            {
+                cols.extend(t.arg.as_deref());
+            }
+            _ => {}
+        }
+        for c in cols {
+            if let Some(N::ColumnRef(c)) = c.node.as_ref() {
+                if let Some((rel, _, _)) = p.resolve(&names(&c.fields)) {
+                    if !nonnull.contains(&rel) {
+                        nonnull.push(rel);
+                    }
+                }
+            }
+        }
+    }
+    let mut nulls = Vec::new();
+    for item in &s.from_clause {
+        nullable(item, &nonnull, &mut nulls);
+    }
     let mut out = Vec::new();
     for part in parts {
         p.buf.clear();

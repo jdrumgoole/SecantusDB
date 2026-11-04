@@ -1037,6 +1037,9 @@ tests regression tests:
       the RP-362 branch (EXPLAIN costing only; load average about 17 from
       a parallel session's builds): `[2.5]` answered `ok`; four runs of all
       three delays alone after it passed at load 8.
+      A sixth on 2026-11-04 in CI: PR #2331's `pg-oracle (server)` job
+      (run 41889009200, job 126781059052; the RP-364 branch, EXPLAIN
+      costing and narrow-join planning only): `[2.5]` answered `ok`.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
@@ -1375,22 +1378,6 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN of a LEFT join whose WHERE names its nullable side is
-      unpriced and puts the WHERE on the join.** A WHERE on the nullable
-      side makes the LEFT join an inner one (`reduce_outer_joins`). The
-      general join planner reduces it, but EXPLAIN's WHERE placement
-      (`ruleutils::join_where`, `attach_join_where`) reads the SQL as
-      written and prints the qual as the top join's `Join Filter`, and the
-      joined-rows hash estimate (`hash_join_estimate`) refuses a WHERE, so
-      every number is zero. With `e.b` a quarter NULL over ten values and
-      `k.b` seven, PostgreSQL 15.19 prints `explain select e.a from e left
-      join k on e.b = k.b where k.a = 3` as `Hash Join (cost=17.51..36.97
-      rows=71 width=4)`, with `Filter: (a = 3)` on `k`'s scan under the
-      Hash. Also unpriced on both join paths: a WHERE or join over a table
-      with an index, whose index scan PostgreSQL may pick (see RP-354).
-      Found while working RP-363.
-      Backlog-ID: RP-365
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join reduced by its WHERE]
 - [ ] **EXPLAIN prints a priced Hash Join where PostgreSQL merges.** The
       analysed-table hash-join estimates (RP-330 to RP-364) weigh the two
       hash orders but no merge join, so where PostgreSQL's merge path is

@@ -3587,3 +3587,39 @@ fn float8_against_numeric_lowers_as_float8() {
         assert!(residual, "{sql} should be evaluated per row");
     }
 }
+
+/// A strict WHERE on a LEFT join's nullable side drops every
+/// NULL-extended row, so the narrow path plans an inner join
+/// (`reduce_outer_joins`, RP-365); `NOT col` is not strict and keeps the
+/// join a LEFT one, which the narrow path refuses.
+#[test]
+fn left_join_reduced_by_a_strict_where_on_its_nullable_side() {
+    let two = |name: &str| -> Option<TableDef> {
+        matches!(name, "e" | "k").then(|| {
+            TableDef::new(
+                name,
+                vec![
+                    Column::new("a", "int4", false),
+                    Column::new("b", "text", false),
+                    Column::new("f", "bool", false),
+                ],
+            )
+        })
+    };
+    let join_of = |sql: &str| match plan(sql, &two) {
+        Ok(Statement::Select(s)) => s.join.map(|j| j.left_join),
+        _ => None,
+    };
+    assert_eq!(
+        join_of("select e.a from e left join k on e.b = k.b where k.a = 3"),
+        Some(false)
+    );
+    assert_eq!(
+        join_of("select e.a from e left join k on e.b = k.b where e.b = 'v1'"),
+        Some(true)
+    );
+    assert_ne!(
+        join_of("select e.a from e left join k on e.b = k.b where not k.f"),
+        Some(false)
+    );
+}
