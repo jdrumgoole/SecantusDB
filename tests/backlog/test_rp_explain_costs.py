@@ -71,6 +71,18 @@ _NULLS = [
     "analyze k",
 ]
 
+# `e.b` nine tenths one value, `k.b` ten, both analysed: PostgreSQL merges
+# their LEFT join (RP-366).
+_SKEW_MOST = [
+    "create table e (a int, b text)",
+    "insert into e select g, case when g < 900 then 'x' else 'v' || (g % 50) end"
+    " from generate_series(1, 1000) g",
+    "analyze e",
+    "create table k (a int, b text)",
+    "insert into k select g, 'v' || (g % 10) from generate_series(1, 1000) g",
+    "analyze k",
+]
+
 # A table with a defaulted varchar column, analysed (RP-331).
 _EC = [
     "create table e (a int, b text, c varchar(10) default 'z')",
@@ -1122,6 +1134,34 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (a > 10)",
         ],
     ),
+    "a LEFT join PostgreSQL merges": (
+        "RP-366",
+        _SKEW_MOST,
+        "explain select e.a from e left join k on e.b = k.b",
+        [
+            "Merge Left Join  (cost=129.66..166.16 rows=2100 width=4)",
+            "  Merge Cond: (e.b = k.b)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=6)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=6)",
+            "  ->  Sort  (cost=64.83..67.33 rows=1000 width=3)",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    "a join whose filtered side is an index scan": (
+        "RP-368",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b where k.a = 5",
+        [
+            "Hash Join  (cost=8.30..27.04 rows=100 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.29..8.29 rows=1 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1530,6 +1570,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-364",
         "RP-365",
         "RP-367",
+        "RP-366",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

@@ -551,6 +551,173 @@ fn hash_join_core(
     (startup, startup + run)
 }
 
+/// `get_variable_range`: a column's least and greatest value its
+/// statistics record -- the histogram's ends and every most common value --
+/// as keys. `None` with no statistics, or for keys this module cannot order
+/// (`Column::ineq_sel` declines them too).
+fn variable_range(col: &crate::colstats::Column<'_>) -> Option<(Vec<u8>, Vec<u8>)> {
+    let (_, slots) = col.stats?;
+    if !col.numeric && !(col.ordered && slots.histogram.len() < 2) {
+        return None;
+    }
+    let mut keys = slots
+        .histogram
+        .first()
+        .into_iter()
+        .chain(slots.histogram.last())
+        .chain(slots.mcv.iter().map(|(k, _)| k));
+    let first = keys.next()?.clone();
+    let (mut min, mut max) = (first.clone(), first);
+    for k in keys {
+        if *k < min {
+            min = k.clone();
+        }
+        if *k > max {
+            max = k.clone();
+        }
+    }
+    Some((min, max))
+}
+
+/// `mergejoinscansel` for an ascending merge on `left = right` (NULLs
+/// last): the fractions of each input scanned before the first join pair
+/// and up to the last, `(left start, left end, right start, right end)`.
+/// Each end is `scalarineqsel(var <= other's max)`, each start
+/// `scalarineqsel(var < other's min)`; only the smaller end below 1 and
+/// the larger start above 0 are believed, a default estimate never is.
+/// `None` where a selectivity is one this module does not compute.
+pub fn mergejoinscansel(
+    left: &crate::colstats::Column<'_>,
+    right: &crate::colstats::Column<'_>,
+) -> Option<(f64, f64, f64, f64)> {
+    use crate::colstats::DEFAULT_INEQ_SEL;
+    let (mut ls, mut le, mut rs, mut re) = (0.0, 1.0, 0.0, 1.0);
+    let (Some((lmin, lmax)), Some((rmin, rmax))) = (variable_range(left), variable_range(right))
+    else {
+        return Some((ls, le, rs, re));
+    };
+    let believed = |s: f64| (s != DEFAULT_INEQ_SEL).then_some(s);
+    if let Some(s) = believed(left.ineq_sel(&rmax, false, true)?) {
+        le = s;
+    }
+    if let Some(s) = believed(right.ineq_sel(&lmax, false, true)?) {
+        re = s;
+    }
+    if le > re {
+        le = 1.0;
+    } else if le < re {
+        re = 1.0;
+    } else {
+        le = 1.0;
+        re = 1.0;
+    }
+    if let Some(s) = believed(left.ineq_sel(&rmin, false, false)?) {
+        ls = s;
+    }
+    if let Some(s) = believed(right.ineq_sel(&lmin, false, false)?) {
+        rs = s;
+    }
+    if ls < rs {
+        ls = 0.0;
+    } else if ls > rs {
+        rs = 0.0;
+    } else {
+        ls = 0.0;
+        rs = 0.0;
+    }
+    if ls >= le {
+        ls = 0.0;
+        le = 1.0;
+    }
+    if rs >= re {
+        rs = 0.0;
+        re = 1.0;
+    }
+    Some((ls, le, rs, re))
+}
+
+/// A merge join's plan and cost (RP-366): each input sorted
+/// (`cost_sort` of its scan), the inner rescanned or read through a
+/// Material, as `initial_cost_mergejoin` and `final_cost_mergejoin` price
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MergePlan {
+    pub startup: f64,
+    pub total: f64,
+    /// The outer and inner Sort nodes' `(startup, total)`.
+    pub outer_sort: (f64, f64),
+    pub inner_sort: (f64, f64),
+    /// The inner is read through a Material node, and its cost.
+    pub material: Option<(f64, f64)>,
+}
+
+/// `initial_cost_mergejoin` + `final_cost_mergejoin` for `outer` merged with
+/// `inner` on one clause, both sorted from their scans, `scansel` being
+/// `mergejoinscansel`'s fractions (outer start, outer end, inner start,
+/// inner end) and `tuples` the clause's `approx_tuple_count`.
+pub fn merge_join_sorted(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    scansel: (f64, f64, f64, f64),
+    tuples: f64,
+) -> MergePlan {
+    let (outer_path_rows, inner_path_rows) = (outer.rows.max(1.0), inner.rows.max(1.0));
+    let (os, oe, is, ie) = scansel;
+    let outer_skip_rows = (outer_path_rows * os).round();
+    let inner_skip_rows = (inner_path_rows * is).round();
+    let outer_rows = clamp_row_est(outer_path_rows * oe);
+    let inner_rows = clamp_row_est(inner_path_rows * ie);
+    // Readjusted for the rounding above.
+    let os = outer_skip_rows / outer_path_rows;
+    let is = inner_skip_rows / inner_path_rows;
+    let oe = outer_rows / outer_path_rows;
+    let ie = inner_rows / inner_path_rows;
+    let osort = cost_sort(
+        outer.scan.1,
+        outer_path_rows,
+        outer.width.unwrap_or(0),
+        None,
+    );
+    let isort = cost_sort(
+        inner.scan.1,
+        inner_path_rows,
+        inner.width.unwrap_or(0),
+        None,
+    );
+    let mut startup = osort.0 + (osort.1 - osort.0) * os;
+    let mut run = (osort.1 - osort.0) * (oe - os);
+    startup += isort.0 + (isort.1 - isort.0) * is;
+    let inner_run_cost = (isort.1 - isort.0) * (ie - is);
+    // `final_cost_mergejoin`.
+    let rescanned = if inner.unique {
+        0.0
+    } else {
+        (tuples - inner_path_rows).max(0.0)
+    };
+    let rescanratio = 1.0 + rescanned / inner_rows;
+    let bare = inner_run_cost * rescanratio;
+    let mat = inner_run_cost + CPU_OPERATOR_COST * inner_rows * rescanratio;
+    // A Material when cheaper, and always over a Sort expected to spill.
+    let spills = relation_byte_size(inner_path_rows, inner.width.unwrap_or(0)) > WORK_MEM_BYTES;
+    let materialize = mat < bare || spills;
+    run += if materialize { mat } else { bare };
+    let qual = CPU_OPERATOR_COST * (1.0 + outer.key_ops + inner.key_ops);
+    startup += qual * (outer_skip_rows + inner_skip_rows * rescanratio);
+    run += qual * ((outer_rows - outer_skip_rows) + (inner_rows - inner_skip_rows) * rescanratio);
+    run = CPU_TUPLE_COST.mul_add(tuples, run);
+    // A Material over the Sort: `cost_material`, two operator costs a
+    // tuple over its input.
+    let material =
+        materialize.then(|| (isort.0, isort.1 + 2.0 * CPU_OPERATOR_COST * inner_path_rows));
+    MergePlan {
+        startup,
+        total: startup + run,
+        outer_sort: osort,
+        inner_sort: isort,
+        material,
+    }
+}
+
 /// A nested loop rescanning `inner` for each outer row, the inner read
 /// whole each time or, when `materialized`, once into a Material node
 /// (`cost_material`: two operator costs a tuple, in memory) and rescanned
@@ -2296,6 +2463,44 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `mergejoinscansel` (RP-366): over two integer columns whose values
+    /// are all most common values, the left `1..=10` and the right
+    /// `6..=15`, the left is skipped up to the right's least value and the
+    /// right is read only up to the left's greatest.
+    #[test]
+    fn mergejoinscansel_bounds_each_side_by_the_other() {
+        use crate::colstats::{int_key, Column, Slots};
+        use crate::hashagg::ColumnStats;
+        let slots = |lo: i64| Slots {
+            mcv: (lo..lo + 10).map(|v| (int_key(v), 0.1f32)).collect(),
+            histogram: Vec::new(),
+            correlation: None,
+            mcv_complete: true,
+        };
+        let stats = ColumnStats {
+            null_frac: 0.0,
+            distinct: 10.0,
+            width: 4,
+        };
+        let (sl, sr) = (slots(1), slots(6));
+        let col = |s| Column {
+            stats: Some((stats, s)),
+            unique: false,
+            boolean: false,
+            numeric: true,
+            ordered: false,
+            actual: None,
+            tuples: 1000.0,
+        };
+        let (ls, le, rs, re) = mergejoinscansel(&col(&sl), &col(&sr)).expect("integers");
+        // Left values below 6: 1..=5, half. Right values up to 10: 6..=10,
+        // half. The other start and end stay 0 and 1.
+        assert!((ls - 0.5).abs() < 1e-6, "{ls}");
+        assert_eq!(le, 1.0);
+        assert_eq!(rs, 0.0);
+        assert!((re - 0.5).abs() < 1e-6, "{re}");
+    }
 
     /// `eqjoinsel_inner` (RP-330): two complete MCV lists of the same ten
     /// values join at their frequency products, 10 x 0.1 x 0.1; a NULL
