@@ -1377,20 +1377,23 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN of a join that selects only some columns is a Nested
-      Loop of unnamed scans.** `explain select e.a from e join k on e.b =
-      k.b` over two analysed tables is, on PostgreSQL 15.19, `Hash Join
-      (cost=27.50..1170.00 rows=100000 width=4)` with `Hash Cond: (e.b =
-      k.b)` over `Seq Scan on e` and a `Hash` over `Seq Scan on k`
-      (width=3, only `b` read from it). Here it is `Nested Loop` with
-      `Join Filter: (e.b = k.b)` over two `Seq Scan` lines naming no
-      relation, all zeros; `select *` over the same join prints
-      PostgreSQL's plan (RP-330, RP-359). Found while working RP-359.
-      Still unpriced beside it: a hash join over a key unique on either
-      side, a WHERE, keys of different types, an outer join, and three or
-      more relations.
-      Backlog-ID: RP-361
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join reading one side's column]
+- [ ] **EXPLAIN does not price a two-table join on the narrow path with
+      a WHERE, a LEFT join or no join clause.** Since RP-361 a join this
+      server plans on its narrow two-table path (`Select::join`, a select
+      list naming columns) prints the right tree, and an inner join on one
+      column equality with nothing else is priced. These still print
+      zeros, each over PostgreSQL 15.19's other choice: a LEFT join
+      PostgreSQL hashes as a `Hash Right Join` (`explain select e.a from e
+      left join k on e.b = k.b`, with `e.b` a quarter NULL: `Hash Right
+      Join (cost=27.50..925.75 rows=71450 width=4)`, `k` outer); a WHERE on
+      one side, whose filtered side PostgreSQL hashes (`... where e.a = 3`:
+      `Hash Join (cost=17.51..36.97 rows=71 width=4)` over `Seq Scan on k`
+      and a `Hash` over the filtered `e`); and a cross join, a `Nested
+      Loop` over a `Materialize` (`explain select e.a, k.a from e, k`:
+      `cost=0.00..12532.50 rows=1000000 width=8`). Found while working
+      RP-361.
+      Backlog-ID: RP-362
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join hashed as a right join], tests/backlog/test_rp_explain_costs.py::test_plan[a projected join under a WHERE], tests/backlog/test_rp_explain_costs.py::test_plan[a projected cross join]
 - [ ] **A catalog read by a bitmap is a zero-cost Seq Scan here.**
       With `enable_indexscan = off`, `explain select oid from pg_class
       where relname = 'pg_class'` is a `Bitmap Heap Scan on pg_class

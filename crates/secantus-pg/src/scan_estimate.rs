@@ -490,7 +490,6 @@ impl PgHandler {
         &self,
         sel: &secantus_pgplan::Select,
     ) -> Option<(Estimate, Estimate, Estimate, bool)> {
-        use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -537,15 +536,7 @@ impl PgHandler {
         // A side: its scan's estimate, the width it carries above the
         // join, its key column's statistics and type, and its planner
         // table.
-        struct Side {
-            scan: Estimate,
-            above: i64,
-            pg_type: String,
-            stats: (f64, f64, Vec<(Vec<u8>, f32)>),
-            unique: bool,
-            tuples: f64,
-        }
-        let side = |node: &JoinNode, key: &str| -> Option<Side> {
+        let side = |node: &JoinNode, key: &str| -> Option<HashSide> {
             let JoinNode::Leaf { plan, columns, .. } = node else {
                 return None;
             };
@@ -585,106 +576,131 @@ impl PgHandler {
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
                 .map(|(_, f)| stored(f))
                 .collect::<Option<_>>()?;
-            let (scan, None) = self.scan_estimate(&leaf.table, &leaf.filter, &read)? else {
-                return None;
-            };
-            let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
+            self.hash_side(&leaf.table, &leaf.filter, &field, &read, &above)
+        };
+        let a = side(left, left_key)?;
+        let b = side(right, right_key)?;
+        hash_join_of(a, b)
+    }
+
+    /// [`Self::hash_join_estimate`] for a two-table inner join planned on
+    /// the narrow path (`Select::join`, RP-361): each side's scan reads
+    /// the columns the select list takes from it and its join key, and
+    /// carries the select list's above the join.
+    pub(crate) fn join_select_hash_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(Estimate, Estimate, Estimate, bool)> {
+        let j = sel.join.as_ref()?;
+        if sel.sub.is_some()
+            || sel.series.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || !sel.filter.is_empty()
+            || sel.residual.is_some()
+            || j.left_join
+            || j.left_sub.is_some()
+            || j.right_sub.is_some()
+            || !j.filter.is_empty()
+            || j.order.is_some()
+            || j.exprs.iter().any(Option::is_some)
+        {
+            return None;
+        }
+        let (a, b) = j.on.as_ref()?;
+        let side = |(table, alias): &(String, String)| -> Option<HashSide> {
+            let key = if a.0 == *alias {
+                &a.1
+            } else if b.0 == *alias {
+                &b.1
+            } else {
                 return None;
             };
             let count = self
                 .storage
-                .count_matching(self.db(), &leaf.table, &Document::new(), None)
+                .count_matching(self.db(), table, &Document::new(), None)
                 .ok()?;
-            let pt = self.planner_table(&leaf.table, count)?;
-            let col = pt.def.columns.iter().find(|c| c.field() == field)?;
-            let analysed = pt.analyzed.as_ref()?.get(&field)?.as_ref()?;
-            let unique = pt.unique.contains(&field);
-            // `get_variable_numdistinct`: a unique column's distinct count
-            // is its non-null rows; a negative `stadistinct` is a fraction
-            // of the rows; none measured is the 200 default, which the
-            // estimate below does not model.
-            let null_frac = f64::from(analysed.stats.null_frac);
-            let stadistinct = if unique {
-                -(1.0 - null_frac)
-            } else {
-                f64::from(analysed.stats.distinct)
-            };
-            let nd = if stadistinct > 0.0 {
-                stadistinct
-            } else if stadistinct < 0.0 {
-                -stadistinct * pt.tuples
-            } else {
-                return None;
-            };
-            let nd = costsize::clamp_row_est(nd.min(pt.tuples.max(1.0)));
-            let mcv = analysed
-                .slots
-                .as_ref()
-                .map(|s| s.mcv.clone())
-                .unwrap_or_default();
-            Some(Side {
-                scan,
-                above: width.3,
-                pg_type: col.pg_type.clone(),
-                stats: (nd, null_frac, mcv),
-                unique,
-                tuples: pt.tuples,
-            })
-        };
-        let a = side(left, left_key)?;
-        let b = side(right, right_key)?;
-        if a.pg_type != b.pg_type {
-            return None;
-        }
-        fn key(s: &Side) -> KeyStats<'_> {
-            KeyStats {
-                ndistinct: s.stats.0,
-                default_ndistinct: false,
-                null_frac: s.stats.1,
-                mcv: &s.stats.2,
+            let def = self.planner_table(table, count)?.def;
+            let above: Vec<String> = j
+                .columns
+                .iter()
+                .filter(|(_, side, _)| side == alias)
+                .map(|(_, _, c)| def.field_of(c))
+                .collect::<Option<_>>()?;
+            let field = def.field_of(key)?;
+            let mut read = above.clone();
+            if !read.contains(&field) {
+                read.push(field.clone());
             }
-        }
-        let (ka, kb) = (key(&a), key(&b));
-        let selectivity = joincost::eqjoinsel_inner(&ka, &kb);
-        let join_side = |s: &Side| JoinSide {
-            rows: s.scan.2,
-            tuples: s.tuples,
-            scan: (s.scan.0, s.scan.1),
-            startup_scan: (s.scan.0, s.scan.1),
-            ordered: None,
-            scan_ordered: false,
-            unique: s.unique,
-            ndistinct: s.stats.0,
-            default_ndistinct: false,
-            key_ops: 0.0,
-            rel_rows: s.scan.2,
-            width: Some(s.scan.3),
-            extra: joincost::ExtraKeys::default(),
+            self.hash_side(table, &Document::new(), &field, &read, &above)
         };
-        let (outer, inner) = (join_side(&a), join_side(&b));
-        // A side unique on the key is `inner_unique` when hashed, and
-        // PostgreSQL may then prefer another plan; not modelled here.
-        if outer.unique || inner.unique {
+        // A self-join's two sides share a table; their aliases differ.
+        if j.left.1 == j.right.1 {
             return None;
         }
-        let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &kb);
-        // PostgreSQL builds the path hashing the right relation first
-        // (`add_paths_to_joinrel` with the left one outer) and then the
-        // other way round; `add_path` keeps the second only when it is
-        // cheaper beyond the fuzz factor (`compare_path_costs_fuzzily`,
-        // 1.01), and `set_cheapest` then takes the cheaper total. The
-        // plan printed follows it: with `swap`, the left table hashed
-        // (RP-359).
-        let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
-        let fuzzy_eq = |x: f64, y: f64| x <= y * 1.01 && y <= x * 1.01;
-        let right_kept =
-            total <= l_total || (fuzzy_eq(startup, l_startup) && fuzzy_eq(total, l_total));
-        let rows = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
-        let width = a.above + b.above;
-        Some(if right_kept {
-            (a.scan, b.scan, (startup, total, rows, width), false)
+        hash_join_of(side(&j.left)?, side(&j.right)?)
+    }
+
+    /// One table of a hash join priced by `cost_hashjoin` (RP-330): its
+    /// scan's estimate reading `read`, the width of `above` (the columns
+    /// it carries above the join), and its key `field`'s statistics.
+    /// `None` where the key column is not analysed.
+    fn hash_side(
+        &self,
+        table: &str,
+        filter: &Document,
+        field: &str,
+        read: &[String],
+        above: &[String],
+    ) -> Option<HashSide> {
+        let (scan, None) = self.scan_estimate(table, filter, read)? else {
+            return None;
+        };
+        let (width, None) = self.scan_estimate(table, &Document::new(), above)? else {
+            return None;
+        };
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        let col = pt.def.columns.iter().find(|c| c.field() == field)?;
+        let analysed = pt.analyzed.as_ref()?.get(field)?.as_ref()?;
+        let unique = pt.unique.iter().any(|u| u == field);
+        // `get_variable_numdistinct`: a unique column's distinct count
+        // is its non-null rows; a negative `stadistinct` is a fraction
+        // of the rows; none measured is the 200 default, which the
+        // estimate below does not model.
+        let null_frac = f64::from(analysed.stats.null_frac);
+        let stadistinct = if unique {
+            -(1.0 - null_frac)
         } else {
-            (b.scan, a.scan, (l_startup, l_total, rows, width), true)
+            f64::from(analysed.stats.distinct)
+        };
+        let nd = if stadistinct > 0.0 {
+            stadistinct
+        } else if stadistinct < 0.0 {
+            -stadistinct * pt.tuples
+        } else {
+            return None;
+        };
+        let nd = costsize::clamp_row_est(nd.min(pt.tuples.max(1.0)));
+        let mcv = analysed
+            .slots
+            .as_ref()
+            .map(|s| s.mcv.clone())
+            .unwrap_or_default();
+        Some(HashSide {
+            scan,
+            above: width.3,
+            pg_type: col.pg_type.clone(),
+            stats: (nd, null_frac, mcv),
+            unique,
+            tuples: pt.tuples,
         })
     }
 
@@ -2187,4 +2203,76 @@ fn with_in_lengths(mut quals: Vec<(String, costsize::Qual)>) -> Vec<(String, cos
         }
     });
     quals
+}
+
+/// A side of a priced hash join: its scan's estimate, the width it
+/// carries above the join, its key column's type and statistics
+/// (distinct count, null fraction, MCVs), whether the key is unique, and
+/// the table's tuples.
+struct HashSide {
+    scan: Estimate,
+    above: i64,
+    pg_type: String,
+    stats: (f64, f64, Vec<(Vec<u8>, f32)>),
+    unique: bool,
+    tuples: f64,
+}
+
+/// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's
+/// `add_path` keeps (RP-330, RP-359): the printed outer scan's, the hashed
+/// scan's and the join's estimates, and whether the left table is hashed.
+fn hash_join_of(a: HashSide, b: HashSide) -> Option<(Estimate, Estimate, Estimate, bool)> {
+    use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
+    if a.pg_type != b.pg_type {
+        return None;
+    }
+    fn key(s: &HashSide) -> KeyStats<'_> {
+        KeyStats {
+            ndistinct: s.stats.0,
+            default_ndistinct: false,
+            null_frac: s.stats.1,
+            mcv: &s.stats.2,
+        }
+    }
+    let (ka, kb) = (key(&a), key(&b));
+    let selectivity = joincost::eqjoinsel_inner(&ka, &kb);
+    let join_side = |s: &HashSide| JoinSide {
+        rows: s.scan.2,
+        tuples: s.tuples,
+        scan: (s.scan.0, s.scan.1),
+        startup_scan: (s.scan.0, s.scan.1),
+        ordered: None,
+        scan_ordered: false,
+        unique: s.unique,
+        ndistinct: s.stats.0,
+        default_ndistinct: false,
+        key_ops: 0.0,
+        rel_rows: s.scan.2,
+        width: Some(s.scan.3),
+        extra: joincost::ExtraKeys::default(),
+    };
+    let (outer, inner) = (join_side(&a), join_side(&b));
+    // A side unique on the key is `inner_unique` when hashed, and
+    // PostgreSQL may then prefer another plan; not modelled here.
+    if outer.unique || inner.unique {
+        return None;
+    }
+    let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &kb);
+    // PostgreSQL builds the path hashing the right relation first
+    // (`add_paths_to_joinrel` with the left one outer) and then the
+    // other way round; `add_path` keeps the second only when it is
+    // cheaper beyond the fuzz factor (`compare_path_costs_fuzzily`,
+    // 1.01), and `set_cheapest` then takes the cheaper total. The
+    // plan printed follows it: with `swap`, the left table hashed
+    // (RP-359).
+    let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
+    let fuzzy_eq = |x: f64, y: f64| x <= y * 1.01 && y <= x * 1.01;
+    let right_kept = total <= l_total || (fuzzy_eq(startup, l_startup) && fuzzy_eq(total, l_total));
+    let rows = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
+    let width = a.above + b.above;
+    Some(if right_kept {
+        (a.scan, b.scan, (startup, total, rows, width), false)
+    } else {
+        (b.scan, a.scan, (l_startup, l_total, rows, width), true)
+    })
 }

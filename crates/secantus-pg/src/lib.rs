@@ -40836,8 +40836,9 @@ impl PgHandler {
                     }
                 }
                 // An inner Hash Join of two tables' sequential scans on one
-                // column equality, both analysed (RP-330): `cost_hashjoin`
-                // with `eqjoinsel` over their MCV lists.
+                // column equality, both analysed (RP-330), planned as joined
+                // rows or on the narrow two-table path (RP-361):
+                // `cost_hashjoin` with `eqjoinsel` over their MCV lists.
                 if tree.name == "Hash Join"
                     && tree.children.len() == 2
                     && tree.children[0].children.is_empty()
@@ -40850,7 +40851,10 @@ impl PgHandler {
                         .starts_with("Seq Scan on ")
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((a, b, join, swap)) = self.hash_join_estimate(sel) {
+                        if let Some((a, b, join, swap)) = self
+                            .hash_join_estimate(sel)
+                            .or_else(|| self.join_select_hash_estimate(sel))
+                        {
                             explain::price_hash_join(&mut tree, a, b, join, swap);
                         }
                     }

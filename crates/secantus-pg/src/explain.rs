@@ -84,11 +84,8 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
                 }
             } else if sel.series.is_some() {
                 PlanNode::new("Function Scan on generate_series")
-            } else if sel.join.is_some() {
-                let mut n = PlanNode::new("Nested Loop");
-                n.children.push(PlanNode::new("Seq Scan"));
-                n.children.push(PlanNode::new("Seq Scan"));
-                n
+            } else if let Some(j) = &sel.join {
+                join_select_tree(j, scan)
             } else if sel.table.is_empty() {
                 PlanNode::new("Result")
             } else {
@@ -564,6 +561,59 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
             } else {
                 PlanNode::over("Hash", right)
             });
+            n
+        }
+    }
+}
+
+/// The plan tree of a two-table join planned on the narrow path
+/// (`Select::join`, RP-361), as `join_tree` draws a `JoinRows` join: each
+/// side its table's scan named by its alias, or its subquery's; an ON
+/// equality a `Hash Join` with the right side under a `Hash` (a LEFT join
+/// `Hash Left Join`), and a cross join a `Nested Loop`.
+fn join_select_tree(j: &secantus_pgplan::JoinSelect, scan: &ScanChooser<'_>) -> PlanNode {
+    let side = |(table, alias): &(String, String), sub: &Option<Box<Statement>>| {
+        let mut n = match sub {
+            Some(plan) => {
+                let mut n = PlanNode::over(
+                    format!("Subquery Scan on {}", display_alias(alias)),
+                    plan_tree(plan, scan),
+                );
+                n.props.push(("Alias".into(), display_alias(alias)));
+                return n;
+            }
+            None => table_scan(table, &Document::new(), scan),
+        };
+        if !alias.is_empty() && alias != table {
+            n.name = format!("{} {alias}", n.name);
+            n.props.push(("Alias".into(), alias.clone()));
+        }
+        n
+    };
+    let kind = if j.left_join { " Left" } else { "" };
+    let left = side(&j.left, &j.left_sub);
+    let right = side(&j.right, &j.right_sub);
+    match &j.on {
+        Some((a, b)) => {
+            let mut n = PlanNode::new(format!("Hash{kind} Join"));
+            // The inner side a plain table: the column its join clause
+            // fixes, for `resolve_inner_unique`.
+            if j.right_sub.is_none() && !j.right.0.is_empty() {
+                let col = if a.0 == j.right.1 { &a.1 } else { &b.1 };
+                n.unique_probe = Some((j.right.0.clone(), vec![col.clone()]));
+            }
+            n.children.push(left);
+            n.children.push(PlanNode::over("Hash", right));
+            n
+        }
+        None => {
+            let mut n = PlanNode::new(if j.left_join {
+                "Nested Loop Left Join"
+            } else {
+                "Nested Loop"
+            });
+            n.children.push(left);
+            n.children.push(right);
             n
         }
     }
