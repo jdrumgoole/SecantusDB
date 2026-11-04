@@ -1377,23 +1377,24 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN does not price a two-table join on the narrow path with
-      a WHERE, a LEFT join or no join clause.** Since RP-361 a join this
-      server plans on its narrow two-table path (`Select::join`, a select
-      list naming columns) prints the right tree, and an inner join on one
-      column equality with nothing else is priced. These still print
-      zeros, each over PostgreSQL 15.19's other choice: a LEFT join
-      PostgreSQL hashes as a `Hash Right Join` (`explain select e.a from e
-      left join k on e.b = k.b`, with `e.b` a quarter NULL: `Hash Right
-      Join (cost=27.50..925.75 rows=71450 width=4)`, `k` outer); a WHERE on
-      one side, whose filtered side PostgreSQL hashes (`... where e.a = 3`:
-      `Hash Join (cost=17.51..36.97 rows=71 width=4)` over `Seq Scan on k`
-      and a `Hash` over the filtered `e`); and a cross join, a `Nested
-      Loop` over a `Materialize` (`explain select e.a, k.a from e, k`:
-      `cost=0.00..12532.50 rows=1000000 width=8`). Found while working
-      RP-361.
-      Backlog-ID: RP-362
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join hashed as a right join], tests/backlog/test_rp_explain_costs.py::test_plan[a projected join under a WHERE], tests/backlog/test_rp_explain_costs.py::test_plan[a projected cross join]
+- [ ] **EXPLAIN draws the wrong plan for a narrow-path join whose WHERE
+      changes PostgreSQL's join.** Since RP-362 a two-table join on the
+      narrow path (`Select::join`) is priced with a WHERE on either side, as
+      a LEFT join (`Hash Right Join` where PostgreSQL hashes the preserved
+      side) and as a cross join. Two WHEREs change the plan itself, and
+      both print zeros over the wrong tree: a WHERE fixing a join key to a
+      constant puts it in the key's equivalence class, leaving no join
+      clause (`explain select e.a from e join k on e.b = k.b where e.b =
+      'v1'`, `e.b` a quarter NULL: a `Nested Loop (cost=0.00..214.00
+      rows=14300 width=4)` over a filtered `Seq Scan on k` and a
+      `Materialize` over the filtered `e`); and a WHERE on a LEFT join's
+      nullable side makes it an inner join (`reduce_outer_joins`: `...
+      left join k ... where k.a = 3` is a `Hash Join (cost=17.51..36.97
+      rows=71 width=4)`). Also unpriced: a WHERE or cross join over a table
+      with an index, whose index scan PostgreSQL may pick (see RP-354).
+      Found while working RP-362.
+      Backlog-ID: RP-363
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected join whose WHERE fixes the key], tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join reduced by its WHERE]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
       index path.** Over an analysed table PostgreSQL 15.19's
       `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`

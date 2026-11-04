@@ -586,7 +586,7 @@ impl PgHandler {
         };
         let a = side(left, left_key)?;
         let b = side(right, right_key)?;
-        hash_join_of(a, b)
+        hash_join_of(a, b, false)
     }
 
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
@@ -608,16 +608,57 @@ impl PgHandler {
             || sel.with_ties
             || !sel.filter.is_empty()
             || sel.residual.is_some()
-            || j.left_join
             || j.left_sub.is_some()
             || j.right_sub.is_some()
-            || !j.filter.is_empty()
             || j.order.is_some()
             || j.exprs.iter().any(Option::is_some)
         {
             return None;
         }
         let (a, b) = j.on.as_ref()?;
+        // Each side's WHERE as its scan's filter (RP-362). A predicate on a
+        // join key puts a constant in the key's equivalence class, which
+        // leaves no join clause; that plan is not this one.
+        for pred in &j.filter {
+            if (pred.alias == a.0 && pred.col == a.1) || (pred.alias == b.0 && pred.col == b.1) {
+                return None;
+            }
+        }
+        // A WHERE on a LEFT join's nullable side is strict, so PostgreSQL
+        // reduces the join to an inner one (`reduce_outer_joins`).
+        if j.left_join && j.filter.iter().any(|p| p.alias == j.right.1) {
+            return None;
+        }
+        let indexes = self.index_relations();
+        let side_filter = |table: &str, alias: &str| -> Option<Document> {
+            use secantus_pgplan::JoinOp;
+            let def = self.lookup(table)?;
+            let mut clauses = Vec::new();
+            // A WHERE over a table with an index may be an index scan's,
+            // which this estimate does not weigh.
+            if j.filter.iter().any(|p| p.alias == alias)
+                && indexes.iter().any(|ix| ix.table.name == table)
+            {
+                return None;
+            }
+            for pred in j.filter.iter().filter(|p| p.alias == alias) {
+                let op = match pred.op {
+                    JoinOp::Eq => "$eq",
+                    JoinOp::Gt => "$gt",
+                    JoinOp::Ge => "$gte",
+                    JoinOp::Lt => "$lt",
+                    JoinOp::Le => "$lte",
+                    JoinOp::NotTrue => return None,
+                };
+                let field = def.field_of(&pred.col)?;
+                clauses.push(bson::doc! { field: { op: pred.value.clone() } });
+            }
+            Some(match clauses.len() {
+                0 => Document::new(),
+                1 => clauses.pop().expect("one clause"),
+                _ => bson::doc! { "$and": clauses },
+            })
+        };
         let side = |(table, alias): &(String, String)| -> Option<HashSide> {
             let key = if a.0 == *alias {
                 &a.1
@@ -642,13 +683,72 @@ impl PgHandler {
             if !read.contains(&field) {
                 read.push(field.clone());
             }
-            self.hash_side(table, &Document::new(), &field, &read, &above)
+            let filter = side_filter(table, alias)?;
+            self.hash_side(table, &filter, &field, &read, &above)
         };
         // A self-join's two sides share a table; their aliases differ.
         if j.left.1 == j.right.1 {
             return None;
         }
-        hash_join_of(side(&j.left)?, side(&j.right)?)
+        hash_join_of(side(&j.left)?, side(&j.right)?, j.left_join)
+    }
+
+    /// [`Self::nest_loop_estimate`] for a cross join planned on the narrow
+    /// two-table path (`Select::join` with no ON, RP-362): each side's
+    /// sequential scan of the columns the select list takes from it, over
+    /// tables with no index, and the plan `cheapest_nest_loop` keeps.
+    pub(crate) fn join_select_nest_loop_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(
+        secantus_pgplan::joincost::NestLoopPlan,
+        Estimate,
+        Estimate,
+        Estimate,
+    )> {
+        let j = sel.join.as_ref()?;
+        if j.on.is_some()
+            || sel.sub.is_some()
+            || sel.series.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || !sel.filter.is_empty()
+            || sel.residual.is_some()
+            || j.left_join
+            || j.left_sub.is_some()
+            || j.right_sub.is_some()
+            || !j.filter.is_empty()
+            || j.order.is_some()
+            || j.exprs.iter().any(Option::is_some)
+            || j.left.1 == j.right.1
+        {
+            return None;
+        }
+        let indexes = self.index_relations();
+        let side = |(table, alias): &(String, String)| -> Option<Estimate> {
+            if indexes.iter().any(|ix| &ix.table.name == table) {
+                return None;
+            }
+            let def = self.lookup(table)?;
+            let read: Vec<String> = j
+                .columns
+                .iter()
+                .filter(|(_, side, _)| side == alias)
+                .map(|(_, _, c)| def.field_of(c))
+                .collect::<Option<_>>()?;
+            let (scan, None) = self.scan_estimate(table, &Document::new(), &read)? else {
+                return None;
+            };
+            Some(scan)
+        };
+        let (a, b) = (side(&j.left)?, side(&j.right)?);
+        let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, 0.0);
+        let rows = costsize::clamp_row_est(a.2 * b.2);
+        Some((plan, a, b, (plan.startup, plan.total, rows, a.3 + b.3)))
     }
 
     /// One table of a hash join priced by `cost_hashjoin` (RP-330): its
@@ -2238,7 +2338,14 @@ struct HashSide {
 /// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's
 /// `add_path` keeps (RP-330, RP-359): the printed outer scan's, the hashed
 /// scan's and the join's estimates, and whether the left table is hashed.
-fn hash_join_of(a: HashSide, b: HashSide) -> Option<(Estimate, Estimate, Estimate, bool)> {
+/// With `left_join`, `a` is the preserved side: the join keeps at least
+/// its rows (`calc_joinrel_size_estimate`), and the swapped path is the
+/// `Hash Right Join` PostgreSQL builds the other way round.
+fn hash_join_of(
+    a: HashSide,
+    b: HashSide,
+    left_join: bool,
+) -> Option<(Estimate, Estimate, Estimate, bool)> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     if a.pg_type != b.pg_type {
         return None;
@@ -2285,7 +2392,11 @@ fn hash_join_of(a: HashSide, b: HashSide) -> Option<(Estimate, Estimate, Estimat
     let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
     let fuzzy_eq = |x: f64, y: f64| x <= y * 1.01 && y <= x * 1.01;
     let right_kept = total <= l_total || (fuzzy_eq(startup, l_startup) && fuzzy_eq(total, l_total));
-    let rows = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
+    let mut rows = outer.rows * inner.rows * selectivity;
+    if left_join {
+        rows = rows.max(outer.rows);
+    }
+    let rows = costsize::clamp_row_est(rows);
     let width = a.above + b.above;
     Some(if right_kept {
         (a.scan, b.scan, (startup, total, rows, width), false)
