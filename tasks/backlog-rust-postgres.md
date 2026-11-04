@@ -1369,15 +1369,6 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **A join's inner DISTINCT or GROUP BY subquery is not proven
-      unique.** `explain (format json) select * from r join (select
-      distinct x from r) s on r.x = s.x` is a Hash Join with `"Inner
-      Unique": true` on PostgreSQL 15.19 (`rel_is_distinct_for` over a
-      subquery's DISTINCT / GROUP BY / set operation); here only a base
-      table's unique index proves it, so it prints `false` (found while
-      working RP-353).
-      Backlog-ID: RP-355
-      Verify: tests/backlog/test_rp_explain_join_json.py::test_a_distinct_subquery_inner_side_is_unique
 - [ ] **EXPLAIN prints no estimate for a Hash Join or its Hash.**
       `explain select * from e join k on e.b = k.b` is `Hash Join
       (cost=27.50..1170.00 rows=100000 width=14)` over `Hash
