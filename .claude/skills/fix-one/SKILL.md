@@ -143,7 +143,8 @@ git push && gh pr create --base main --title "..." --body "... Fixes <ID> ..."
 ```
 
 - Watch the PR's own run with `scripts/wait_ci.sh <N>`, in the background
-  (exit 0 green, 1 red, 2 timed out). Do not write your own polling loop:
+  (exit 0 green, 1 red, 2 timed out, 3 the PR conflicts with main: rebase
+  onto origin/main, push, and wait again). Do not write your own polling loop:
   two hand-written ones wedged for half an hour each on 2026-10-31. Fix
   every red check and push again (`ci-check`).
 - Merge only after `gh pr checks <N>` is all green: `gh pr merge <N>

@@ -6,6 +6,8 @@
 # Exit 0: every check completed and passed (success / skipped / neutral).
 # Exit 1: a check completed with any other conclusion (it is named).
 # Exit 2: still running at the deadline, or the PR could not be read.
+# Exit 3: the PR conflicts with its base, so GitHub starts no CI at all;
+#         rebase onto origin/main, push, and wait again.
 #
 # Polls the REST check-runs API once a minute: `gh pr checks` in a loop
 # burns the GraphQL quota and its exit codes (8 pending, 1 failed) wedge
@@ -30,6 +32,15 @@ while :; do
         2>/dev/null || echo "0 1")
     if [[ "${total:-0}" -gt 0 && "${pending:-1}" -eq 0 ]]; then
         break
+    fi
+    # No checks yet: a conflicting PR never gets any (a fix-one session
+    # waited 70 min on #2308 for CI that could not start, 2026-11-04).
+    if [[ "${total:-0}" -eq 0 ]]; then
+        state=$(gh api "repos/$repo/pulls/$pr" --jq .mergeable_state 2>/dev/null)
+        if [[ "$state" == dirty ]]; then
+            echo "CONFLICT: PR #$pr conflicts with its base; no CI will run. Rebase onto origin/main and push."
+            exit 3
+        fi
     fi
     if [[ $SECONDS -ge $deadline ]]; then
         echo "TIMEOUT after $max min: $pending of $total checks still running"
