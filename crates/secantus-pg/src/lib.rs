@@ -40690,6 +40690,38 @@ impl PgHandler {
                     }
                 };
                 let mut tree = explain::plan_tree(&inner, &chooser);
+                // Each join's `Inner Unique` (RP-353): a unique index of
+                // the inner table that is immediate, has no WHERE and keys
+                // only plain columns, every one fixed by the join's clauses
+                // or a constant (`relation_has_unique_index_for`).
+                if explain::has_unique_probe(&tree) {
+                    let relations = self.index_relations();
+                    let defs = self.index_defs();
+                    let unique = |table: &str, fixed: &[String]| -> bool {
+                        relations.iter().any(|ix| {
+                            let t = &ix.table;
+                            ix.unique
+                                && t.name == table
+                                && !ix.keys.is_empty()
+                                && !t
+                                    .unique_constraints
+                                    .iter()
+                                    .any(|u| u.name == ix.name && u.deferrable)
+                                && !defs
+                                    .iter()
+                                    .any(|(o, d)| *o == ix.oid && d.contains(" WHERE "))
+                                && ix.keys.iter().all(|&k| {
+                                    k > 0
+                                        && t.columns
+                                            .iter()
+                                            .enumerate()
+                                            .find(|(i, _)| i32::from(t.attnum(*i)) == k)
+                                            .is_some_and(|(_, c)| fixed.contains(&c.name))
+                                })
+                        })
+                    };
+                    explain::resolve_inner_unique(&mut tree, &unique);
+                }
                 // A select with no FROM is a one-row Result (RP-325).
                 if let Statement::SelectConstant(sc) = inner.as_ref() {
                     tree.estimate = scan_estimate::result_estimate(sc);

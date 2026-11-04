@@ -23,6 +23,14 @@ pub(crate) struct PlanNode {
     pub props: Vec<(String, String)>,
     /// The planner's `(startup, total, rows, width)`; `None` prints zeros.
     pub estimate: Option<crate::scan_estimate::Estimate>,
+    /// A join whose inner side can match each outer row at most once
+    /// (`Join.inner_unique`, `innerrel_is_unique`), which the structured
+    /// formats print as `Inner Unique` (RP-353).
+    pub inner_unique: bool,
+    /// For a join whose inner side is one table's scan: that table and
+    /// the columns its join clauses and constant equalities fix, which
+    /// [`resolve_inner_unique`] checks against the table's unique indexes.
+    pub unique_probe: Option<(String, Vec<String>)>,
 }
 
 impl PlanNode {
@@ -33,6 +41,8 @@ impl PlanNode {
             children: Vec::new(),
             props: Vec::new(),
             estimate: None,
+            inner_unique: false,
+            unique_probe: None,
         }
     }
 
@@ -208,6 +218,75 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
     }
 }
 
+/// A join node's `(Node Type, Join Type)` from the name the text format
+/// prints (`Hash Left Join` is a `Hash Join` of type `Left`), as
+/// `ExplainNode` builds the one from the other; `None` for any other node.
+fn join_type_of(name: &str) -> Option<(&'static str, &'static str)> {
+    let (pname, rest) = if let Some(r) = name.strip_prefix("Nested Loop") {
+        ("Nested Loop", r)
+    } else if let Some(r) = name.strip_prefix("Hash") {
+        ("Hash Join", r)
+    } else {
+        ("Merge Join", name.strip_prefix("Merge")?)
+    };
+    let jt = match rest {
+        "" if pname == "Nested Loop" => "Inner",
+        " Join" if pname != "Nested Loop" => "Inner",
+        " Left Join" => "Left",
+        " Full Join" => "Full",
+        " Right Join" => "Right",
+        " Semi Join" => "Semi",
+        " Anti Join" => "Anti",
+        _ => return None,
+    };
+    Some((pname, jt))
+}
+
+/// Decide each join's `inner_unique` (RP-353) as `innerrel_is_unique`
+/// does for a base relation: its inner side is unique when one of the
+/// table's unique indexes -- immediate, without a predicate, on plain
+/// columns -- has every key column fixed by a join clause or a constant
+/// equality (`relation_has_unique_index_for`). `unique` answers that for
+/// `(table, fixed fields)`.
+pub(crate) fn resolve_inner_unique(n: &mut PlanNode, unique: &dyn Fn(&str, &[String]) -> bool) {
+    if let Some((table, fields)) = n.unique_probe.take() {
+        n.inner_unique = unique(&table, &fields);
+    }
+    for c in &mut n.children {
+        resolve_inner_unique(c, unique);
+    }
+}
+
+/// Whether any join in the tree waits on [`resolve_inner_unique`].
+pub(crate) fn has_unique_probe(n: &PlanNode) -> bool {
+    n.unique_probe.is_some() || n.children.iter().any(has_unique_probe)
+}
+
+/// The fields of a leaf table's rows that a scan filter fixes to a
+/// constant: `{f: v}` or `{f: {$eq: v}}` at the top level, or under `$and`.
+fn constant_equalities(filter: &Document, out: &mut Vec<String>) {
+    for (k, v) in filter {
+        if k == "$and" {
+            if let bson::Bson::Array(a) = v {
+                for d in a.iter().filter_map(bson::Bson::as_document) {
+                    constant_equalities(d, out);
+                }
+            }
+        } else if k.starts_with('$') {
+            continue;
+        } else if let bson::Bson::Document(d) = v {
+            if d.len() == 1
+                && d.contains_key("$eq")
+                && !matches!(d.get("$eq"), Some(bson::Bson::Null))
+            {
+                out.push(k.clone());
+            }
+        } else if !matches!(v, bson::Bson::Null | bson::Bson::RegularExpression(_)) {
+            out.push(k.clone());
+        }
+    }
+}
+
 /// A join's key names are `alias<US>column`; a plan names only the alias.
 fn display_alias(name: &str) -> String {
     name.split(secantus_pgplan::joins::SEP)
@@ -260,6 +339,7 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
             left,
             right,
             equi,
+            merged,
             ..
         } => {
             let side = match kind {
@@ -274,6 +354,42 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
                 format!("Hash{side} Join")
             };
             let mut n = PlanNode::new(name);
+            // The inner side one table's plain scan: the fields its join
+            // clauses fix, for `resolve_inner_unique`.
+            if let JoinNode::Leaf { plan, columns, .. } = right.as_ref() {
+                if let Statement::Select(leaf) = plan.as_ref() {
+                    if leaf.sub.is_none()
+                        && leaf.join.is_none()
+                        && leaf.series.is_none()
+                        && !leaf.table.is_empty()
+                    {
+                        // Column names: a join key is `alias<US>column`.
+                        let name = |key: &str| {
+                            key.split(secantus_pgplan::joins::SEP)
+                                .nth(1)
+                                .map(str::to_string)
+                        };
+                        let mut fixed: Vec<String> = equi
+                            .iter()
+                            .map(|(_, r)| r.as_str())
+                            .chain(merged.iter().map(|(_, _, r)| r.as_str()))
+                            .filter(|k| columns.iter().any(|(c, _)| c == k))
+                            .filter_map(name)
+                            .collect();
+                        if !fixed.is_empty() {
+                            let mut consts = Vec::new();
+                            constant_equalities(&leaf.filter, &mut consts);
+                            fixed.extend(consts.iter().filter_map(|f| {
+                                columns
+                                    .iter()
+                                    .find(|(_, cf)| cf == f)
+                                    .and_then(|(k, _)| name(k))
+                            }));
+                            n.unique_probe = Some((leaf.table.clone(), fixed));
+                        }
+                    }
+                }
+            }
             n.children.push(join_tree(left, scan));
             let right = join_tree(right, scan);
             n.children.push(if equi.is_empty() {
@@ -410,12 +526,21 @@ fn structured(
             .next()
             .unwrap_or(&n.name)
             .to_string();
+        let join_type = join_type_of(&node_type);
+        let node_type = match join_type {
+            Some((pname, _)) => pname.to_string(),
+            None => node_type,
+        };
         fields.push(("Node Type".into(), Value::Str(node_type.clone())));
         if let Some(r) = relationship {
             fields.push(("Parent Relationship".into(), Value::Str(r.into())));
         }
         fields.push(("Parallel Aware".into(), Value::Num("false".into())));
         fields.push(("Async Capable".into(), Value::Num("false".into())));
+        // A join names its type after `Async Capable` (`ExplainNode`).
+        if let Some((_, jt)) = join_type {
+            fields.push(("Join Type".into(), Value::Str(jt.into())));
+        }
         // An index scan reads its index forward unless an ORDER BY runs
         // it backward (`ExplainIndexScanDetails`).
         if node_type == "Index Scan" || node_type == "Index Only Scan" {
@@ -443,6 +568,12 @@ fn structured(
             fields.push(("Total Cost".into(), Value::Num(format!("{total:.2}"))));
             fields.push(("Plan Rows".into(), Value::Num(format!("{rows:.0}"))));
             fields.push(("Plan Width".into(), Value::Num(width.to_string())));
+        }
+        // Every join says whether its inner side is unique, before its
+        // quals; the text format only under VERBOSE (`ExplainNode`).
+        if join_type.is_some() {
+            let b = if n.inner_unique { "true" } else { "false" };
+            fields.push(("Inner Unique".into(), Value::Num(b.into())));
         }
         for (k, v) in &n.details {
             let value = if k.ends_with("Key") {
@@ -950,5 +1081,40 @@ mod setop_quals_tests {
         let arms = vec![vec![("(a < 100)".to_string(), None)]];
         attach_setop_quals(&mut root, &arms, &|_| Vec::new());
         assert!(root.children.iter().all(|c| c.details.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod join_type_tests {
+    use super::*;
+
+    #[test]
+    fn a_join_name_splits_into_node_and_join_type() {
+        // `ExplainNode` builds the text name from the two (RP-353).
+        assert_eq!(join_type_of("Nested Loop"), Some(("Nested Loop", "Inner")));
+        assert_eq!(
+            join_type_of("Nested Loop Left Join"),
+            Some(("Nested Loop", "Left"))
+        );
+        assert_eq!(join_type_of("Hash Join"), Some(("Hash Join", "Inner")));
+        assert_eq!(join_type_of("Hash Full Join"), Some(("Hash Join", "Full")));
+        assert_eq!(
+            join_type_of("Merge Anti Join"),
+            Some(("Merge Join", "Anti"))
+        );
+        assert_eq!(join_type_of("Hash"), None);
+        assert_eq!(join_type_of("HashAggregate"), None);
+        assert_eq!(join_type_of("Seq Scan"), None);
+    }
+
+    #[test]
+    fn a_constant_equality_fixes_its_field() {
+        let mut out = Vec::new();
+        let f = bson::doc! {
+            "a": 3, "b": {"$eq": 4}, "c": {"$gt": 1}, "d": null,
+            "$and": [{"e": "x"}],
+        };
+        constant_equalities(&f, &mut out);
+        assert_eq!(out, ["a", "b", "e"]);
     }
 }
