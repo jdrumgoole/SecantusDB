@@ -999,7 +999,7 @@ pub(crate) fn attach_scan_quals(
         return;
     }
     fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
-        if n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ") {
+        if is_scan_name(&n.name) {
             out.push(n);
             return;
         }
@@ -1026,7 +1026,7 @@ pub(crate) fn gate_scan(root: &mut PlanNode, falses: usize) {
         return;
     }
     fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
-        if n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ") {
+        if is_scan_name(&n.name) {
             out.push(n);
             return;
         }
@@ -1063,7 +1063,7 @@ pub(crate) fn attach_setop_quals(
         return;
     }
     fn scans<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
-        if n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ") {
+        if is_scan_name(&n.name) {
             out.push(n);
             return;
         }
@@ -1163,7 +1163,7 @@ pub(crate) fn attach_join_where(root: &mut PlanNode, quals: &[(String, Option<St
         return;
     }
     fn is_scan(n: &PlanNode) -> bool {
-        n.name.starts_with("Seq Scan on ") || n.name.starts_with("Index Scan using ")
+        is_scan_name(&n.name)
     }
     fn scan_for<'a>(n: &'a mut PlanNode, rel: &str) -> Option<&'a mut PlanNode> {
         if is_scan(n) {
@@ -1300,4 +1300,12 @@ mod join_type_tests {
         constant_equalities(&f, &mut out);
         assert_eq!(out, ["a", "b", "e"]);
     }
+}
+
+/// A relation scan's node name: a Seq Scan, or an Index Scan or Index Only
+/// Scan over one of its indexes.
+fn is_scan_name(name: &str) -> bool {
+    name.starts_with("Seq Scan on ")
+        || name.starts_with("Index Scan using ")
+        || name.starts_with("Index Only Scan using ")
 }

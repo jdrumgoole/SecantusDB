@@ -1390,17 +1390,20 @@ a regression test.
       RP-330).
       Backlog-ID: RP-359
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join hashing the left table]
-- [ ] **A catalog read index-only is a zero-cost Seq Scan here.**
-      `explain select attname from pg_attribute where attrelid = 1259`
-      in a fresh database is `Index Only Scan using
-      pg_attribute_relid_attnam_index on pg_attribute  (cost=0.28..4.96
-      rows=39 width=64)` with `Index Cond: (attrelid = '1259'::oid)` on
-      PostgreSQL 15.19 (`cost_index` with the heap's `relallvisible`);
-      here it is a `Seq Scan` printed with zeros. RP-334 prices a
-      catalog's plain index scan and leaves a scan whose index holds
-      every column read unpriced (found while working RP-334).
-      Backlog-ID: RP-337
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a catalog read index-only]
+- [ ] **EXPLAIN ANALYZE of an index-only scan prints no `Heap Fetches`.**
+      Since RP-337 a catalog read whose index holds every column it reads
+      is an `Index Only Scan` priced by `cost_index` with the heap's
+      `relallvisible`. Under ANALYZE PostgreSQL 15.19 adds `Heap Fetches:
+      N` (`show_instrumentation_count` of `ioss_HeapFetches`): the rows
+      whose heap page the visibility map does not mark all-visible. In a
+      fresh database `explain (analyze, timing off, summary off) select
+      attname from pg_attribute where attrelid = 1259` prints `Heap
+      Fetches: 0`; here the line is missing. Counting it needs the
+      catalog heap's visibility map, so a row DDL adds later (RP-291)
+      counts as a fetch until VACUUM sets its page all-visible (found while
+      working RP-337).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an index-only scan's heap fetches]
+      Backlog-ID: RP-360
 - [ ] **A catalog read by a bitmap is a zero-cost Seq Scan here.**
       With `enable_indexscan = off`, `explain select oid from pg_class
       where relname = 'pg_class'` is a `Bitmap Heap Scan on pg_class

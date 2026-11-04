@@ -40828,9 +40828,8 @@ impl PgHandler {
                             if let Some((estimate, index)) = priced {
                                 tree.estimate = Some(estimate);
                                 if let Some(index) = index {
-                                    tree.name =
-                                        format!("Index Scan using {index} on {}", sel.table);
-                                    tree.props.insert(0, ("Index Name".into(), index));
+                                    tree.name = index.node_name(&sel.table);
+                                    tree.props.insert(0, ("Index Name".into(), index.name));
                                 }
                             }
                         }
