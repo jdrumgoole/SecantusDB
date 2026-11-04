@@ -407,6 +407,50 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    # Measured on a fresh private PostgreSQL 15.19 cluster (RP-355): the
+    # window with the higher first key ref goes below, a window whose keys
+    # prefix the order below needs no Sort, and functions over one window
+    # share its WindowAgg.
+    "two windows stacked, later key first": (
+        "RP-355",
+        _ANALYSED,
+        "explain select a, rank() over (order by b), row_number() over (order by a) from e",
+        [
+            "WindowAgg  (cost=132.16..149.66 rows=1000 width=23)",
+            "  ->  Sort  (cost=132.16..134.66 rows=1000 width=15)",
+            "        Sort Key: b",
+            "        ->  WindowAgg  (cost=64.83..82.33 rows=1000 width=15)",
+            "              ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "                    Sort Key: a",
+            "                    ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "two windows stacked on one sort": (
+        "RP-355",
+        _ANALYSED,
+        "explain select a, row_number() over (order by a),"
+        " rank() over (partition by a order by b) from e",
+        [
+            "WindowAgg  (cost=64.83..99.83 rows=1000 width=23)",
+            "  ->  WindowAgg  (cost=64.83..84.83 rows=1000 width=15)",
+            "        ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "              Sort Key: a, b",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "an empty window over a shared one": (
+        "RP-355",
+        _ANALYSED,
+        "explain select a, row_number() over (), rank() over (order by b),"
+        " dense_rank() over (order by b) from e",
+        [
+            "WindowAgg  (cost=64.83..97.33 rows=1000 width=31)",
+            "  ->  WindowAgg  (cost=64.83..84.83 rows=1000 width=23)",
+            "        ->  Sort  (cost=64.83..67.33 rows=1000 width=7)",
+            "              Sort Key: b",
+            "              ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "a ranking function under a filter": (
         "RP-323",
         _ANALYSED,
@@ -1186,6 +1230,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-350",
         "RP-351",
         "RP-352",
+        "RP-355",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

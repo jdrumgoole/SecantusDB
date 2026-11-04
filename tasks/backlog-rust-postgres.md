@@ -1355,17 +1355,6 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN prints one WindowAgg, with zeros, for stacked windows.**
-      Several distinct windows in one SELECT are stacked WindowAggs, each
-      over its own Sort: PostgreSQL 15.19 plans `explain select a,
-      row_number() over (order by a), rank() over (order by b) from e` as a
-      WindowAgg (132.16..149.66 rows=1000 width=23) over a Sort by `a` over
-      a WindowAgg (64.83..82.33) over a Sort by `b` over the Seq Scan
-      (`select_active_windows` orders them; the top Sort also sets the row
-      order). Here one WindowAgg is printed, with zeros (found while working
-      RP-351, measured on a fresh private cluster; split from RP-352).
-      Backlog-ID: RP-355
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[two windows stacked]
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),

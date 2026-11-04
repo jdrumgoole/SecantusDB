@@ -40975,47 +40975,61 @@ impl PgHandler {
                         }
                     }
                 }
-                // A WindowAgg over a Sort of one relation's sequential scan
-                // (RP-347): the scan's estimate, `cost_sort` by the window's
-                // partition then order columns, then `cost_windowagg`, which
-                // compares each of those columns once per row. Only
-                // argument-less ranking functions that all share one window
-                // (one WindowAgg), by distinct stored columns, and only on a
-                // table with no index, where the Sort is the only way
-                // PostgreSQL gets the order.
+                // A stack of WindowAggs over Sorts of one relation's
+                // sequential scan (RP-347, RP-355): the scan's estimate, then
+                // bottom up, `cost_sort` by each window's partition then order
+                // columns where the rows are not already in that order, and
+                // `cost_windowagg`, which compares each of those columns once
+                // per row. Only priced functions, by distinct stored columns,
+                // and only on a table with no index, where a Sort is the only
+                // way PostgreSQL gets an order.
                 if tree.name == "WindowAgg"
                     && tree.details.is_empty()
                     && tree.children.len() == 1
-                    && tree.children[0].name == "Sort"
-                    && tree.children[0].children.len() == 1
-                    && tree.children[0].children[0].children.is_empty()
-                    && tree.children[0].children[0]
-                        .name
-                        .starts_with("Seq Scan on ")
+                    && matches!(tree.children[0].name.as_str(), "Sort" | "WindowAgg")
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
                         let indexed = self
                             .index_relations()
                             .iter()
                             .any(|ix| ix.table.name == sel.table);
-                        let first = sel.windows.first();
-                        let keys: Vec<&secantus_pgplan::OrderKey> = first
-                            .map(|w| w.partition_by.iter().chain(&w.order_by).collect())
-                            .unwrap_or_default();
-                        let distinct_keys = (1..keys.len())
-                            .all(|i| keys[..i].iter().all(|k| k.field != keys[i].field));
-                        let one_window = sel.windows.iter().all(|w| {
-                            let f = first.expect("windows is not empty here");
-                            priced_window_func(w).is_some()
-                                && w.partition_by == f.partition_by
-                                && w.order_by == f.order_by
-                                && w.frame == f.frame
+                        let steps = explain::window_stack(sel).unwrap_or_default();
+                        let mut all_keys: Vec<&secantus_pgplan::OrderKey> = Vec::new();
+                        for k in steps.iter().flat_map(|s| s.keys.iter().copied()) {
+                            if !all_keys.iter().any(|a| a.field == k.field) {
+                                all_keys.push(k);
+                            }
+                        }
+                        let distinct_keys = steps.iter().all(|s| {
+                            (1..s.keys.len())
+                                .all(|i| s.keys[..i].iter().all(|k| k.field != s.keys[i].field))
                         });
                         let is_window = |f: &str| sel.windows.iter().any(|w| w.field == f);
-                        if one_window
-                            && !keys.is_empty()
+                        // The tree's nodes, top down, must be the stack's.
+                        let mut shape: Vec<&str> = Vec::new();
+                        for s in steps.iter().rev() {
+                            shape.push("WindowAgg");
+                            if s.sort {
+                                shape.push("Sort");
+                            }
+                        }
+                        let mut node = &tree;
+                        let mut shaped = true;
+                        for name in &shape {
+                            if node.name != *name || node.children.len() != 1 {
+                                shaped = false;
+                                break;
+                            }
+                            node = &node.children[0];
+                        }
+                        let shaped = shaped
+                            && node.children.is_empty()
+                            && node.name.starts_with("Seq Scan on ");
+                        if shaped
+                            && steps.iter().any(|s| s.sort)
+                            && sel.windows.iter().all(|w| priced_window_func(w).is_some())
                             && distinct_keys
-                            && keys.iter().all(|k| k.expr.is_none() && !k.jsonb)
+                            && all_keys.iter().all(|k| k.expr.is_none() && !k.jsonb)
                             && !indexed
                             && sel.residual.is_none()
                             && sel.sub.is_none()
@@ -41032,10 +41046,9 @@ impl PgHandler {
                         {
                             // The scan returns the select list's columns, the
                             // columns the functions' arguments and FILTERs
-                            // read, and the window's keys, each once.
+                            // read, and the windows' keys, each once.
                             let priced: Vec<(u32, Vec<String>)> =
                                 sel.windows.iter().filter_map(priced_window_func).collect();
-                            let arg_ops: u32 = priced.iter().map(|(o, _)| o).sum();
                             let mut fields: Vec<String> = Vec::new();
                             for f in sel
                                 .columns
@@ -41044,31 +41057,59 @@ impl PgHandler {
                                 .filter(|f| !is_window(f))
                                 .map(str::to_string)
                                 .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned()))
-                                .chain(keys.iter().map(|k| k.field.clone()))
+                                .chain(all_keys.iter().map(|k| k.field.clone()))
                             {
                                 if !fields.contains(&f) {
                                     fields.push(f);
                                 }
                             }
-                            let results: Vec<&str> =
-                                sel.windows.iter().map(|w| w.result_type.as_str()).collect();
                             if let (Some((estimate, None)), Some(out)) = (
                                 self.scan_estimate(&sel.table, &sel.filter, &fields),
-                                self.window_output_width(sel, &keys),
+                                self.window_output_width(sel, &all_keys),
                             ) {
-                                let sorted = scan_estimate::sort_estimate(
-                                    estimate,
-                                    self.kb_setting("work_mem", 4096),
-                                );
-                                tree.children[0].children[0].estimate = Some(estimate);
-                                tree.children[0].estimate = Some(sorted);
-                                let (s0, t0, r0, _) = sorted;
-                                tree.estimate = Some(scan_estimate::window_agg_estimate(
-                                    (s0, t0, r0, out),
-                                    &results,
-                                    arg_ops,
-                                    keys.len(),
-                                ));
+                                // Bottom up: each node's estimate, then laid
+                                // on the tree top down.
+                                let work_mem = self.kb_setting("work_mem", 4096);
+                                let mut ests: Vec<scan_estimate::Estimate> = vec![estimate];
+                                let mut below = estimate;
+                                for (n, s) in steps.iter().enumerate() {
+                                    if s.sort {
+                                        below = scan_estimate::sort_estimate(below, work_mem);
+                                        ests.push(below);
+                                    }
+                                    if n == 0 {
+                                        // The first WindowAgg returns the
+                                        // scan's columns but those only the
+                                        // functions read.
+                                        below.3 = out;
+                                    }
+                                    let results: Vec<&str> = s
+                                        .funcs
+                                        .iter()
+                                        .map(|&i| sel.windows[i].result_type.as_str())
+                                        .collect();
+                                    let arg_ops: u32 = s
+                                        .funcs
+                                        .iter()
+                                        .filter_map(|&i| priced_window_func(&sel.windows[i]))
+                                        .map(|(o, _)| o)
+                                        .sum();
+                                    below = scan_estimate::window_agg_estimate(
+                                        below,
+                                        &results,
+                                        arg_ops,
+                                        s.keys.len(),
+                                    );
+                                    ests.push(below);
+                                }
+                                let mut node = &mut tree;
+                                while let Some(e) = ests.pop() {
+                                    node.estimate = Some(e);
+                                    match node.children.first_mut() {
+                                        Some(c) => node = c,
+                                        None => break,
+                                    }
+                                }
                             }
                         }
                     }
