@@ -708,7 +708,7 @@ pub fn merge_join_sorted(
     // A Material over the Sort: `cost_material`, two operator costs a
     // tuple over its input.
     let material =
-        materialize.then(|| (isort.0, isort.1 + 2.0 * CPU_OPERATOR_COST * inner_path_rows));
+        materialize.then_some((isort.0, isort.1 + 2.0 * CPU_OPERATOR_COST * inner_path_rows));
     MergePlan {
         startup,
         total: startup + run,
