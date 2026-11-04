@@ -1416,10 +1416,10 @@ impl PgHandler {
     }
 
     /// A user table's sequential scan whose WHERE is only array operators
-    /// against constants (RP-367): each a `Filter` of one operator a row,
-    /// selecting `arraycontsel`'s default. `None` over an analysed table,
-    /// whose MCELEM / DECHIST slots `mcelem_array_selec` would read, and
-    /// over a catalog.
+    /// against constants (RP-367) and `constant OP ANY / ALL (array
+    /// column)` (RP-368): each a `Filter`, selecting what `arraycontsel` /
+    /// `scalararraysel` estimate over the column's element statistics.
+    /// `None` over a catalog.
     pub(crate) fn array_qual_scan_estimate(
         &self,
         table: &str,
@@ -1430,6 +1430,71 @@ impl PgHandler {
             return None;
         }
         self.user_seq_scan_with(table, &Document::new(), fields, quals)
+    }
+
+    /// One array conjunct's selectivity (`arraycontsel`, or
+    /// `scalararraysel` of a `ScalarArrayOpExpr` over the column). `None`
+    /// over an analysed table whose column's statistics are not modelled,
+    /// or a constant element with no key.
+    fn array_qual_selectivity(
+        &self,
+        pt: &PlannerTable,
+        q: &secantus_pgplan::ArrayQual,
+    ) -> Option<f64> {
+        use crate::array_selfuncs as af;
+        let col = pt.def.columns.iter().find(|c| c.field() == q.field)?;
+        let stats = match &pt.analyzed {
+            None => af::ColumnStats::None,
+            Some(columns) => {
+                let a = columns.get(&q.field)?.as_ref()?;
+                af::ColumnStats::Analysed {
+                    null_frac: a.stats.null_frac,
+                    slots: a.elements.as_ref(),
+                }
+            }
+        };
+        if let Some((use_or, containment)) = q.scalar {
+            return match containment {
+                Some(is_equality) => {
+                    let key = self.array_element_keys(col, &q.elems)?;
+                    Some(af::scalararraysel_containment(
+                        key.first()?,
+                        is_equality,
+                        use_or,
+                        &stats,
+                    ))
+                }
+                None => af::scalararraysel_default(&q.op, use_or),
+            };
+        }
+        let keys = self.array_element_keys(col, &q.elems)?;
+        Some(af::arraycontsel(
+            af::ArrayOp::of(&q.op)?,
+            &keys,
+            q.has_null,
+            &stats,
+        ))
+    }
+
+    /// The sort keys of an array column's element values, ascending and
+    /// distinct, as ANALYZE keyed its MCELEM slot.
+    fn array_element_keys(
+        &self,
+        col: &secantus_pgcatalog::Column,
+        elems: &[Bson],
+    ) -> Option<Vec<Vec<u8>>> {
+        let e = crate::statistic::element_column(col)?;
+        let mut keys = elems
+            .iter()
+            .map(|v| {
+                Self::analyze_sample(&e, Some(v), true)
+                    .flatten()
+                    .map(|(k, _)| k)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        keys.sort();
+        keys.dedup();
+        Some(keys)
     }
 
     fn user_seq_scan_with(
@@ -1478,14 +1543,12 @@ impl PgHandler {
         };
         let mut quals = with_in_lengths(quals);
         let mut sel = sel;
-        if !array_quals.is_empty() {
-            if pt.analyzed.is_some() {
-                return None;
-            }
-            for q in array_quals {
-                sel *= crate::am_ssi::arraycontsel_default(&q.op, q.distinct, q.has_null)?;
-                quals.push((q.field.clone(), costsize::Qual::Filter(1.0)));
-            }
+        for q in array_quals {
+            sel *= self.array_qual_selectivity(&pt, q)?;
+            quals.push((
+                q.field.clone(),
+                costsize::Qual::Filter(q.operators_per_row()),
+            ));
         }
         let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
         let rel = costsize::Rel {
@@ -1563,6 +1626,7 @@ impl PgHandler {
                             width: entry.get_i32("width").unwrap_or(0),
                         },
                         slots: Self::stored_slots(entry),
+                        elements: Self::stored_element_slots(entry),
                     }),
                 );
                 continue;
@@ -1624,6 +1688,7 @@ impl PgHandler {
                 Some(AnalyzedColumn {
                     stats: scalars,
                     slots,
+                    elements: None,
                 }),
             );
         }

@@ -1365,23 +1365,14 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN of `x = ANY (array column)` and of an analysed array
-      column's operators prints zeros.** Since RP-367 an array column's
-      `@>`, `<@` and `&&` against a constant, over a table never analysed,
-      prints PostgreSQL 15.19's estimate (`arraycontsel`'s default). Still
-      zeros: `1 = ANY (a)`, which 15.19 prints as `Seq Scan on ud
-      (cost=0.00..40.60 rows=7 width=32)` (`scalararraysel`, the operator
-      costed over `estimate_array_length`'s 10 elements, half applied;
-      `1 < ANY (a)` and `1 <> ALL (a)` move the rows differently, so
-      `scalararraysel` and `scalararraysel_containment` need porting, not
-      a constant); and the containment operators over an analysed table,
-      where `mcelem_array_selec` reads the column's MCELEM and DECHIST
-      slots: after `insert into ud select array[i % 10, i % 7] from
-      generate_series(1, 1000) i; analyze ud`, `a @> '{1}'` is
-      `(cost=0.00..20.50 rows=228 width=29)`. The Filter text is already
-      right in both (found while working RP-367).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a constant equal to ANY of an array column], tests/backlog/test_rp_explain_costs.py::test_plan[an analysed array containment]
-      Backlog-ID: RP-368
+- [ ] **EXPLAIN deparses a cast constant as a cast of an expression.**
+      `explain select * from ud where 1::bigint = any(a)` (`a int[]`) prints
+      `Filter: ((1)::bigint = ANY (a))`; PostgreSQL 15.19 folds the cast
+      into a `bigint` Const (`eval_const_expressions`) and prints
+      `Filter: ('1'::bigint = ANY (a))`. The cost line already matches
+      (found while working RP-368).
+      Backlog-ID: RP-369
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a cross-type constant equal to ANY of an array column]
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),

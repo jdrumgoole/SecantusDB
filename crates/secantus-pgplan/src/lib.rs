@@ -3534,7 +3534,7 @@ pub struct TriggerDef {
 }
 
 /// `EXPLAIN`'s options, as PostgreSQL defaults them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExplainOptions {
     pub analyze: bool,
     pub verbose: bool,
@@ -43800,17 +43800,27 @@ fn explain_scan_in_lengths(
     Some(out)
 }
 
-/// One `array_column OP constant` conjunct of a single-relation WHERE
-/// (RP-367): the column's stored field, the operator with the column on
-/// its left (`'{1}' <@ a` is `a @> '{1}'`, as `arraycontsel` commutes it),
-/// and what `mcelem_array_selec` reads of the constant: its distinct
-/// non-NULL elements and whether any element is NULL.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One conjunct of a single-relation WHERE over an array column against a
+/// constant: `array_column OP constant` (RP-367), the operator with the
+/// column on its left (`'{1}' <@ a` is `a @> '{1}'`, as `arraycontsel`
+/// commutes it), or `constant OP ANY / ALL (array_column)` (RP-368), a
+/// `ScalarArrayOpExpr` `scalararraysel` estimates. Holds the column's
+/// stored field, the operator, and what the estimators read of the
+/// constant: its distinct non-NULL elements and whether any is NULL.
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArrayQual {
     pub field: String,
     pub op: String,
     pub distinct: usize,
     pub has_null: bool,
+    /// The constant's distinct non-NULL elements, ascending, as values of
+    /// the column's element type.
+    pub elems: Vec<Bson>,
+    /// For `constant OP ANY / ALL (column)`: `useOr` (`true` for ANY), and
+    /// whether the operator is the element type's own `=` (`Some(true)`)
+    /// or its negator `<>` (`Some(false)`), the two `scalararraysel`
+    /// estimates as containment; `None` for any other operator.
+    pub scalar: Option<(bool, Option<bool>)>,
 }
 
 impl ArrayQual {
@@ -43827,6 +43837,19 @@ impl ArrayQual {
             op: op.to_string(),
             distinct: vals.len(),
             has_null,
+            elems: vals,
+            scalar: None,
+        }
+    }
+
+    /// The operators `cost_qual_eval` charges a row: one for an array
+    /// operator; for a `ScalarArrayOpExpr` over a column, half of
+    /// `estimate_array_length`'s 10 elements.
+    pub fn operators_per_row(&self) -> f64 {
+        if self.scalar.is_some() {
+            0.5 * 10.0
+        } else {
+            1.0
         }
     }
 }
@@ -43897,12 +43920,61 @@ fn explain_scan_array_quals(
             _ => None,
         }
     };
+    // `constant OP ANY / ALL (array_column)`: a literal, untyped or cast,
+    // whose type decides whether OP is the element type's own `=` / `<>`
+    // (`scalararraysel`'s containment path) or a cross-type one.
+    let scalar_array = |e: &AExpr, any: bool| -> Option<ArrayQual> {
+        let op = operator_name(e).ok()?;
+        if !matches!(op, "=" | "<>" | "<" | ">" | "<=" | ">=") {
+            return None;
+        }
+        let (field, ty) = column(e.rexpr.as_deref()?)?;
+        let elem_ty = ruleutils::base_type(ty.strip_suffix("[]")?);
+        let (lit, lit_ty) = match e.lexpr.as_deref()?.node.as_ref()? {
+            N::AConst(c) => (c, None),
+            N::TypeCast(tc) => match tc.arg.as_deref()?.node.as_ref()? {
+                N::AConst(c) => (
+                    c,
+                    Some(ruleutils::base_type(&crate::type_name_of(
+                        tc.type_name.as_ref()?,
+                    ))),
+                ),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        use pg_query::protobuf::a_const::Val;
+        // A NULL operand folds the clause away before it is estimated.
+        let (text, natural) = match lit.val.as_ref()? {
+            Val::Ival(i) => (i.ival.to_string(), Some("integer")),
+            Val::Sval(s) => (s.sval.clone(), None),
+            _ => return None,
+        };
+        let lit_ty = lit_ty.or_else(|| natural.map(ruleutils::base_type));
+        let own = lit_ty.as_ref().is_none_or(|t| *t == elem_ty);
+        let value = cast_value(Bson::String(text), &elem_ty).ok()?;
+        if matches!(value, Bson::Null | Bson::Array(_)) {
+            return None;
+        }
+        let containment = match op {
+            "=" if own => Some(true),
+            "<>" if own => Some(false),
+            _ => None,
+        };
+        let mut q = ArrayQual::new(field, op, vec![value]);
+        q.scalar = Some((any, containment));
+        Some(q)
+    };
     parts
         .into_iter()
         .map(|p| {
             let Some(N::AExpr(e)) = p.node.as_ref() else {
                 return None;
             };
+            let any = e.kind == pg_query::protobuf::AExprKind::AexprOpAny as i32;
+            if any || e.kind == pg_query::protobuf::AExprKind::AexprOpAll as i32 {
+                return scalar_array(e, any);
+            }
             if e.kind != pg_query::protobuf::AExprKind::AexprOp as i32 {
                 return None;
             }

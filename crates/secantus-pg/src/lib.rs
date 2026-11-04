@@ -35,6 +35,7 @@ mod advisory;
 mod aggregates;
 mod alter_system;
 mod am_ssi;
+mod array_selfuncs;
 mod autovacuum;
 mod binary_recv;
 mod btree;
@@ -869,6 +870,9 @@ pub(crate) struct PlannerTable {
 struct AnalyzedColumn {
     stats: secantus_pgplan::hashagg::ColumnStats,
     slots: Option<secantus_pgplan::colstats::Slots>,
+    /// An array column's MCELEM and DECHIST slots (`compute_array_stats`),
+    /// where ANALYZE recorded an MCELEM slot.
+    elements: Option<array_selfuncs::ElementSlots>,
 }
 
 /// A WHERE over a table ANALYZE measured, as the planner estimates it
@@ -8016,6 +8020,7 @@ impl PgHandler {
                                         width: entry.get_i32("width").ok()?,
                                     },
                                     slots: Self::stored_slots(entry),
+                                    elements: Self::stored_element_slots(entry),
                                 })
                             })
                             .flatten();
@@ -16634,6 +16639,39 @@ impl PgHandler {
 
     /// The most common values, histogram and correlation `record_analyze`
     /// kept in a column's entry; `None` for an entry without them.
+    /// The MCELEM and DECHIST slots `record_analyze` kept in an array
+    /// column's entry; `None` without an MCELEM slot (no element was
+    /// common enough, or not an array).
+    fn stored_element_slots(entry: &Document) -> Option<array_selfuncs::ElementSlots> {
+        let nums = |k: &str| -> Option<Vec<f32>> {
+            entry
+                .get_array(k)
+                .ok()?
+                .iter()
+                .map(|v| v.as_f64().map(|f| f as f32))
+                .collect()
+        };
+        let mut mcelem = Vec::new();
+        let mut numbers = Vec::new();
+        for m in entry.get_array("mcelem").ok()? {
+            let pair = m.as_array()?;
+            let Some(Bson::Binary(b)) = pair.first() else {
+                return None;
+            };
+            mcelem.push(b.bytes.clone());
+            numbers.push(pair.get(1)?.as_f64()? as f32);
+        }
+        if mcelem.is_empty() {
+            return None;
+        }
+        numbers.extend(nums("mcelem_tail")?);
+        Some(array_selfuncs::ElementSlots {
+            mcelem,
+            numbers,
+            hist: nums("dechist").unwrap_or_default(),
+        })
+    }
+
     fn stored_slots(entry: &Document) -> Option<secantus_pgplan::colstats::Slots> {
         let key = |b: &Bson| match b {
             Bson::Binary(b) => Some(b.bytes.clone()),
