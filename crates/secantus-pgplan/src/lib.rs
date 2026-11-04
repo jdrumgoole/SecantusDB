@@ -24497,8 +24497,13 @@ fn plan_join_select(
     // This path applies each predicate to its side BEFORE joining. For the
     // NULLABLE side of a LEFT JOIN that is a different query: PostgreSQL's
     // WHERE runs after the join and drops the NULL-extended rows, while a
-    // pre-filter keeps them. Such a query goes to the general join planner.
-    if left_join && filter.iter().any(|p| p.alias != left.1) {
+    // pre-filter keeps them. A strict one (any comparison: it cannot hold
+    // for a NULL) drops every NULL-extended row, so the join is an inner
+    // one (`reduce_outer_joins`, RP-365). Any other goes to the general
+    // join planner.
+    let nullable: Vec<&JoinPred> = filter.iter().filter(|p| p.alias != left.1).collect();
+    let left_join = left_join && !nullable.iter().any(|p| p.op != JoinOp::NotTrue);
+    if left_join && !nullable.is_empty() {
         return Err(Error::Unsupported(
             "a WHERE on the nullable side of a LEFT JOIN".into(),
         ));
