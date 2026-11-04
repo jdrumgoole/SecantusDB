@@ -569,20 +569,28 @@ fn qual_selectivity(q: &OpQual, column_type: &str, analyzed: bool) -> Option<f64
     let Bson::Array(elems) = &q.value else {
         return None;
     };
-    // `mcelem_array_selec` with no most-common elements: each distinct
-    // element `Min(DEFAULT_CONTAIN_SEL, minfreq / 2)`, minfreq a float4.
+    let has_null = elems.iter().any(|e| matches!(e, Bson::Null));
+    let mut vals: Vec<&Bson> = elems.iter().filter(|e| !matches!(e, Bson::Null)).collect();
+    vals.sort_by(|a, b| crate::compare_values(a, b));
+    vals.dedup_by(|a, b| crate::compare_values(a, b) == std::cmp::Ordering::Equal);
+    arraycontsel_default(&q.op, vals.len(), has_null)
+}
+
+/// `arraycontsel` over a column with no statistics, its constant having
+/// `distinct` distinct non-NULL elements and a NULL one if `has_null`:
+/// `mcelem_array_selec` with no most-common elements, each distinct
+/// element `Min(DEFAULT_CONTAIN_SEL, minfreq / 2)` (minfreq a float4);
+/// `<@` the default. `None` for another operator.
+pub(crate) fn arraycontsel_default(op: &str, distinct: usize, has_null: bool) -> Option<f64> {
     let elem_selec = 0.005f64.min(f64::from(2.0f32 * 0.005f32 / 2.0));
-    match q.op.as_str() {
+    match op {
         "@>" | "&&" => {
-            if q.op == "@>" && elems.iter().any(|e| matches!(e, Bson::Null)) {
+            if op == "@>" && has_null {
                 return Some(0.0);
             }
-            let mut vals: Vec<&Bson> = elems.iter().filter(|e| !matches!(e, Bson::Null)).collect();
-            vals.sort_by(|a, b| crate::compare_values(a, b));
-            vals.dedup_by(|a, b| crate::compare_values(a, b) == std::cmp::Ordering::Equal);
-            let mut selec = if q.op == "@>" { 1.0 } else { 0.0 };
-            for _ in vals {
-                if q.op == "@>" {
+            let mut selec = if op == "@>" { 1.0 } else { 0.0 };
+            for _ in 0..distinct {
+                if op == "@>" {
                     selec *= elem_selec;
                 } else {
                     selec = selec + elem_selec - selec * elem_selec;

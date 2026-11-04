@@ -3555,6 +3555,10 @@ pub struct ExplainOptions {
     /// included. The lowered filter drops the NULLs, which select nothing,
     /// but `estimate_array_length` counts them in the cost (RP-349).
     pub scan_in_lengths: Vec<(String, usize)>,
+    /// A single-relation statement whose WHERE is only array operators
+    /// against constants (`a @> '{1}'`, `a && '{1,2}'`): each conjunct, as
+    /// `arraycontsel` reads it (RP-367). `None` for any other WHERE.
+    pub scan_array_quals: Option<Vec<ArrayQual>>,
     /// Each JOIN's ON condition, post-order, as its join node prints it.
     pub join_conds: Vec<String>,
     /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
@@ -9970,6 +9974,7 @@ fn plan_explain(
         format: "text".into(),
         scan_quals: Vec::new(),
         scan_in_lengths: Vec::new(),
+        scan_array_quals: None,
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
         join_where: Vec::new(),
@@ -10051,6 +10056,7 @@ fn plan_explain(
     }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
+    options.scan_array_quals = explain_scan_array_quals(&query, lookup);
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let join_conds = match &query {
@@ -43792,6 +43798,132 @@ fn explain_scan_in_lengths(
     let mut out = Vec::new();
     walk(where_clause, &def, &mut out);
     Some(out)
+}
+
+/// One `array_column OP constant` conjunct of a single-relation WHERE
+/// (RP-367): the column's stored field, the operator with the column on
+/// its left (`'{1}' <@ a` is `a @> '{1}'`, as `arraycontsel` commutes it),
+/// and what `mcelem_array_selec` reads of the constant: its distinct
+/// non-NULL elements and whether any element is NULL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArrayQual {
+    pub field: String,
+    pub op: String,
+    pub distinct: usize,
+    pub has_null: bool,
+}
+
+impl ArrayQual {
+    fn new(field: String, op: &str, elems: Vec<Bson>) -> Self {
+        let has_null = elems.iter().any(|e| matches!(e, Bson::Null));
+        let mut vals: Vec<Bson> = elems
+            .into_iter()
+            .filter(|e| !matches!(e, Bson::Null))
+            .collect();
+        vals.sort_by(|a, b| compare_values(a, b).unwrap_or(std::cmp::Ordering::Equal));
+        vals.dedup_by(|a, b| compare_values(a, b) == Some(std::cmp::Ordering::Equal));
+        ArrayQual {
+            field,
+            op: op.to_string(),
+            distinct: vals.len(),
+            has_null,
+        }
+    }
+}
+
+/// A single-relation statement's WHERE as [`ArrayQual`]s: `Some` only when
+/// every AND conjunct is an array column's `@>`, `<@` or `&&` against a
+/// non-NULL constant of the column's type.
+fn explain_scan_array_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<ArrayQual>> {
+    let (table, where_clause) = explain_scan_where(query)?;
+    let def = lookup(&table)?;
+    fn conjuncts<'n>(n: &'n pg_query::protobuf::Node, out: &mut Vec<&'n pg_query::protobuf::Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 =>
+            {
+                for a in &b.args {
+                    conjuncts(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    let mut parts = Vec::new();
+    conjuncts(where_clause, &mut parts);
+    let column = |n: &pg_query::protobuf::Node| -> Option<(String, String)> {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return None;
+        };
+        let [only] = c.fields.as_slice() else {
+            return None;
+        };
+        let Some(N::String(name)) = only.node.as_ref() else {
+            return None;
+        };
+        let col = def.column(&name.sval)?;
+        col.pg_type
+            .ends_with("[]")
+            .then(|| (col.field(), col.pg_type.clone()))
+    };
+    // An untyped literal, or one cast to the column's own type.
+    let constant = |n: &pg_query::protobuf::Node, ty: &str| -> Option<Vec<Bson>> {
+        let lit = match n.node.as_ref()? {
+            N::AConst(c) => c.val.as_ref(),
+            N::TypeCast(tc) => {
+                let target = crate::type_name_of(tc.type_name.as_ref()?);
+                let norm = |t: &str| match t.strip_suffix("[]") {
+                    Some(b) => format!("{}[]", ruleutils::base_type(b)),
+                    None => ruleutils::base_type(t),
+                };
+                if norm(&target) != norm(ty) {
+                    return None;
+                }
+                match tc.arg.as_deref()?.node.as_ref()? {
+                    N::AConst(c) => c.val.as_ref(),
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        };
+        let Some(pg_query::protobuf::a_const::Val::Sval(s)) = lit else {
+            return None;
+        };
+        match cast_value(Bson::String(s.sval.clone()), ty).ok()? {
+            Bson::Array(elems) => Some(elems),
+            _ => None,
+        }
+    };
+    parts
+        .into_iter()
+        .map(|p| {
+            let Some(N::AExpr(e)) = p.node.as_ref() else {
+                return None;
+            };
+            if e.kind != pg_query::protobuf::AExprKind::AexprOp as i32 {
+                return None;
+            }
+            let op = operator_name(e).ok()?;
+            if !matches!(op, "@>" | "<@" | "&&") {
+                return None;
+            }
+            let (l, r) = (e.lexpr.as_deref()?, e.rexpr.as_deref()?);
+            if let Some((field, ty)) = column(l) {
+                return Some(ArrayQual::new(field, op, constant(r, &ty)?));
+            }
+            let (field, ty) = column(r)?;
+            let elems = constant(l, &ty)?;
+            let op = match op {
+                "@>" => "<@",
+                "<@" => "@>",
+                other => other,
+            };
+            Some(ArrayQual::new(field, op, elems))
+        })
+        .collect()
 }
 
 /// A single-relation statement's table and WHERE.

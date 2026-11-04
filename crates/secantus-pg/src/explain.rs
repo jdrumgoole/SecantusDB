@@ -1203,6 +1203,9 @@ fn quals_on_scan(
     quals: &[(String, Option<String>)],
     index_columns: &dyn Fn(&str) -> Vec<String>,
 ) {
+    // The printed WHERE replaces the placeholder a residual left (RP-367).
+    scan.details
+        .retain(|(k, v)| !(k == "Filter" && v == "(...)"));
     let bitmap = scan.name.starts_with("Bitmap Heap Scan on ");
     let index_node = if bitmap {
         scan.children.first()

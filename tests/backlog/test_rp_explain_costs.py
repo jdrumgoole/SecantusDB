@@ -702,6 +702,82 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (a @> '{1}'::integer[])",
         ],
     ),
+    "an array overlap of two elements": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where a && '{1,2}'",
+        [
+            "Seq Scan on ud  (cost=0.00..27.00 rows=14 width=32)",
+            "  Filter: (a && '{1,2}'::integer[])",
+        ],
+    ),
+    "an array contained by a constant": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where a <@ '{1,2}'",
+        [
+            "Seq Scan on ud  (cost=0.00..27.00 rows=7 width=32)",
+            "  Filter: (a <@ '{1,2}'::integer[])",
+        ],
+    ),
+    "an array containing a repeated element": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where a @> '{1,2,2}'",
+        [
+            "Seq Scan on ud  (cost=0.00..27.00 rows=1 width=32)",
+            "  Filter: (a @> '{1,2,2}'::integer[])",
+        ],
+    ),
+    "an array containing a NULL": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where a @> '{1,NULL}'",
+        [
+            "Seq Scan on ud  (cost=0.00..27.00 rows=1 width=32)",
+            "  Filter: (a @> '{1,NULL}'::integer[])",
+        ],
+    ),
+    "two array operators": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where a @> '{1}' and a && '{3}'",
+        [
+            "Seq Scan on ud  (cost=0.00..30.40 rows=1 width=32)",
+            "  Filter: ((a @> '{1}'::integer[]) AND (a && '{3}'::integer[]))",
+        ],
+    ),
+    "a constant contained by an array": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where '{1}' <@ a",
+        [
+            "Seq Scan on ud  (cost=0.00..27.00 rows=7 width=32)",
+            "  Filter: ('{1}'::integer[] <@ a)",
+        ],
+    ),
+    "a constant equal to ANY of an array column": (
+        "RP-368",
+        ["create table ud (a int[])"],
+        "explain select * from ud where 1 = any(a)",
+        [
+            "Seq Scan on ud  (cost=0.00..40.60 rows=7 width=32)",
+            "  Filter: (1 = ANY (a))",
+        ],
+    ),
+    "an analysed array containment": (
+        "RP-368",
+        [
+            "create table ud (a int[])",
+            "insert into ud select array[i % 10, i % 7] from generate_series(1, 1000) i",
+            "analyze ud",
+        ],
+        "explain select * from ud where a @> '{1}'",
+        [
+            "Seq Scan on ud  (cost=0.00..20.50 rows=228 width=29)",
+            "  Filter: (a @> '{1}'::integer[])",
+        ],
+    ),
     # ----------------------------- RP-350 a column equal to two constants
     "a column equal to two constants": (
         "RP-350",
@@ -1453,6 +1529,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-363",
         "RP-364",
         "RP-365",
+        "RP-367",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

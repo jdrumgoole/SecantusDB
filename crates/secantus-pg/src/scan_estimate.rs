@@ -1412,6 +1412,33 @@ impl PgHandler {
     }
 
     fn user_seq_scan(&self, table: &str, filter: &Document, fields: &[String]) -> Option<Estimate> {
+        self.user_seq_scan_with(table, filter, fields, &[])
+    }
+
+    /// A user table's sequential scan whose WHERE is only array operators
+    /// against constants (RP-367): each a `Filter` of one operator a row,
+    /// selecting `arraycontsel`'s default. `None` over an analysed table,
+    /// whose MCELEM / DECHIST slots `mcelem_array_selec` would read, and
+    /// over a catalog.
+    pub(crate) fn array_qual_scan_estimate(
+        &self,
+        table: &str,
+        quals: &[secantus_pgplan::ArrayQual],
+        fields: &[String],
+    ) -> Option<Estimate> {
+        if quals.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            return None;
+        }
+        self.user_seq_scan_with(table, &Document::new(), fields, quals)
+    }
+
+    fn user_seq_scan_with(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        array_quals: &[secantus_pgplan::ArrayQual],
+    ) -> Option<Estimate> {
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
         let count = || {
             *counted.get_or_init(|| {
@@ -1449,7 +1476,17 @@ impl PgHandler {
                 costsize::conjuncts(filter)?,
             )
         };
-        let quals = with_in_lengths(quals);
+        let mut quals = with_in_lengths(quals);
+        let mut sel = sel;
+        if !array_quals.is_empty() {
+            if pt.analyzed.is_some() {
+                return None;
+            }
+            for q in array_quals {
+                sel *= crate::am_ssi::arraycontsel_default(&q.op, q.distinct, q.has_null)?;
+                quals.push((q.field.clone(), costsize::Qual::Filter(1.0)));
+            }
+        }
         let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
         let rel = costsize::Rel {
             pages: pt.pages,
