@@ -1037,6 +1037,9 @@ tests regression tests:
       the RP-362 branch (EXPLAIN costing only; load average about 17 from
       a parallel session's builds): `[2.5]` answered `ok`; four runs of all
       three delays alone after it passed at load 8.
+      A sixth on 2026-11-04 in CI: PR #2331's `pg-oracle (server)` job
+      (run 41889009200, job 126781059052; the RP-364 branch, EXPLAIN
+      costing and narrow-join planning only): `[2.5]` answered `ok`.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
