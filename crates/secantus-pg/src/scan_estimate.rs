@@ -355,7 +355,12 @@ impl PgHandler {
     pub(crate) fn nest_loop_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(secantus_pgplan::joincost::NestLoopPlan, Estimate, Estimate, Estimate)> {
+    ) -> Option<(
+        secantus_pgplan::joincost::NestLoopPlan,
+        Estimate,
+        Estimate,
+        Estimate,
+    )> {
         use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -374,7 +379,9 @@ impl PgHandler {
             || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
             || j.where_spans_equality
             || j.where_span_aliases.len() != j.where_filters.len()
-            || j.where_filters.iter().any(|f| f.kind != FilterKind::Inequality)
+            || j.where_filters
+                .iter()
+                .any(|f| f.kind != FilterKind::Inequality)
         {
             return None;
         }

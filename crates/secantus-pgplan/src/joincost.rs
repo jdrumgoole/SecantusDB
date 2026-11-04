@@ -2253,7 +2253,10 @@ mod tests {
         // plain scan is cheaper than materialising it.
         let one = (0.0, 1.01, 1.0, 4);
         let p = cheapest_nest_loop(one, e, 0.0);
-        assert!(!p.b_outer && !p.materialized && p.material.is_none(), "{p:?}");
+        assert!(
+            !p.b_outer && !p.materialized && p.material.is_none(),
+            "{p:?}"
+        );
     }
 
     #[test]
