@@ -24517,13 +24517,28 @@ fn plan_join_select(
                 pg_query::protobuf::SortByDir::try_from(sb.sortby_dir),
                 Ok(pg_query::protobuf::SortByDir::SortbyDesc)
             );
+            // This path sorts NULLs where the direction puts them by default
+            // (last ascending, first descending). `NULLS FIRST` ascending or
+            // `NULLS LAST` descending goes to the general join planner, whose
+            // Sort honours it: here the clause was dropped, and a LEFT
+            // join's NULL-extended rows came out at the wrong end.
+            let default_nulls = match pg_query::protobuf::SortByNulls::try_from(sb.sortby_nulls) {
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsDefault) => true,
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => ascending,
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => !ascending,
+                _ => false,
+            };
+            if !default_nulls {
+                return Err(Error::Unsupported(
+                    "an ORDER BY with its NULLs against its direction's default".into(),
+                ));
+            }
             Some((alias, col, ascending))
         }
         _ => return Err(Error::Unsupported("this subquery ORDER BY".into())),
     };
     // An ORDER BY under a LIMIT over an inner or LEFT join of two stored
-    // user tables, ascending with its NULLs last or descending with them
-    // first: PostgreSQL plans the join for the rows the LIMIT takes,
+    // user tables: PostgreSQL plans the join for the rows the LIMIT takes,
     // and runs a path already in the ORDER BY's order (a merge join on its
     // column, an index scan) when that is cheaper than a bounded Sort of
     // the cheapest (`create_ordered_paths`). This path joins every row and
@@ -24535,22 +24550,7 @@ fn plan_join_select(
             || name.starts_with("pg_catalog.")
             || name.starts_with("information_schema.")
     };
-    // The NULLs where the direction puts them by default: last ascending,
-    // first descending.
-    let default_nulls = |ascending: bool| {
-        matches!(
-            s.sort_clause.first().and_then(|n| n.node.as_ref()),
-            Some(N::SortBy(sb)) if match pg_query::protobuf::SortByNulls::try_from(sb.sortby_nulls) {
-                Ok(pg_query::protobuf::SortByNulls::SortbyNullsDefault) => true,
-                Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => ascending,
-                Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => !ascending,
-                _ => false,
-            }
-        )
-    };
-    if order
-        .as_ref()
-        .is_some_and(|(_, _, ascending)| default_nulls(*ascending))
+    if order.is_some()
         && s.limit_count.is_some()
         && quals.is_some()
         && left_sub.is_none()

@@ -672,12 +672,15 @@ one beside it.
     On the matrix (`tools/probes/pg_join_order_matrix.py`, private 15.19):
     1,140 of 1,140 LIMIT shapes, 285 of 285 with no LIMIT and 240 of 240
     two-table ones, ascending and with every ORDER BY made DESC (228 and
-    226 before). Declined still: an ORDER BY with NULLs against its
-    direction's default (ASC NULLS FIRST, DESC NULLS LAST), an ORDER BY of
+    226 before). Since 2026-11-04 an ascending ORDER BY with its NULLs
+    first is searched too: an index scan's forward order (NULLS LAST) is
+    of use for merging only, and a merge on the ORDER BY's class sorts
+    NULLS FIRST. Declined still: a DESC NULLS LAST ORDER BY (joined whole
+    and sorted, so its ties come out in another order), an ORDER BY of
     several columns, and a two-table join with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_an_ascending_nulls_first_order_by_keeps_its_ties
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_nulls_last_order_by_keeps_its_ties
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran
