@@ -1332,17 +1332,29 @@ a regression test.
       built-in catalogs. Since 2026-11-02 a plain `ANALYZE` (or `VACUUM
       ANALYZE`) re-measures the catalog columns of a type whose statistics
       are modelled (`oid`, the integers, `bool`, `float4` / `float8`,
-      `text`), over the catalog's rows as they stand, and their rows
-      replace `initdb`'s. The other columns keep `initdb`'s rows, where
-      PostgreSQL 15.19 measures them too: `name` (a new table named
-      `zzzz_rp313` becomes the top of `pg_class.relname`'s histogram),
-      `"char"`, the `reg*` types, the arrays, `aclitem[]` and
-      `pg_node_tree`. Not modelled either: the measured catalogs'
+      `text`, and since 2026-11-04 `name` and `"char"`), over the
+      catalog's rows as they stand, and their rows replace `initdb`'s. The
+      other columns keep `initdb`'s rows, where PostgreSQL 15.19 measures
+      them too: the `reg*` types, the arrays (after a table created `with
+      (fillfactor=50)`, `pg_class.reloptions` gains a second distinct
+      value), `aclitem[]` and `pg_node_tree`. Not modelled either: the measured catalogs'
       `relpages` / `reltuples` in `pg_class`, and the row order of the
       replaced `pg_statistic` rows (an update moves PostgreSQL's) (found
       while working RP-311).
       Backlog-ID: RP-313
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_an_array_column
+- [ ] **A database-wide ANALYZE's correlation of a catalog column is not
+      PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
+      with the rows' heap order; here the catalog's rows are walked in this
+      server's own order, not PostgreSQL's heap's (`initdb`'s pages, then
+      where a new row goes, RP-291). In a fresh database after `create table
+      zzzz_rp313 (a int)` and `analyze`, PostgreSQL 15.19's `pg_class`
+      correlations are `oid` 0.6547713, `relkind` 0.7882681, `relname`
+      -0.12838678, `relnatts` 0.67018104; here 0.9854369, 0.8315357,
+      0.1999988 and 0.50667804. The most common values and their
+      frequencies match (found while working RP-313).
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
+      Backlog-ID: RP-358
 - [ ] **EXPLAIN prints one WindowAgg, with zeros, for stacked windows.**
       Several distinct windows in one SELECT are stacked WindowAggs, each
       over its own Sort: PostgreSQL 15.19 plans `explain select a,
