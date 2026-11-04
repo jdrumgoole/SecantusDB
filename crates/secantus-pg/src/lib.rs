@@ -41493,6 +41493,18 @@ impl PgHandler {
                 } else {
                     None
                 };
+                // An index-only scan's heap fetches, under ANALYZE (RP-360).
+                if let (Some(rows), Statement::Select(sel)) = (actual, inner.as_ref()) {
+                    let index = tree
+                        .name
+                        .strip_prefix("Index Only Scan using ")
+                        .and_then(|r| r.split_once(" on "))
+                        .map(|(i, _)| i.to_string());
+                    if let Some(index) = index.filter(|_| tree.children.is_empty()) {
+                        tree.heap_fetches =
+                            self.catalog_heap_fetches(&sel.table, &index, &sel.filter, rows);
+                    }
+                }
                 let (ty, lines) = if options.format == "json" {
                     (
                         Type::JSON,

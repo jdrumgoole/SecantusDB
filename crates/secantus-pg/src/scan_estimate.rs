@@ -929,6 +929,53 @@ impl PgHandler {
         }
     }
 
+    /// Under ANALYZE, the `Heap Fetches` of an index-only scan of catalog
+    /// `table` through its index `index` for `filter`, which returned
+    /// `rows` rows (RP-360): the index walked for the equalities on its
+    /// leading columns, each tuple on a block the visibility map leaves
+    /// uncovered fetched ([`catalog_btree::index_only_heap_fetches`]).
+    /// `None` where the scan's key is not those equalities.
+    pub(crate) fn catalog_heap_fetches(
+        &self,
+        table: &str,
+        index: &str,
+        filter: &Document,
+        rows: usize,
+    ) -> Option<usize> {
+        let name = table.strip_prefix("pg_catalog.").unwrap_or(table);
+        let oid = catalog_meta::system_class_lines().find_map(|line| {
+            let c: Vec<&str> = line.split('\t').collect();
+            (c.get(1) == Some(&name) && c.get(2) == Some(&"pg_catalog") && c.get(3) == Some(&"r"))
+                .then(|| c.first()?.parse::<i64>().ok())
+                .flatten()
+        })?;
+        let def = Self::virtual_table(name)?;
+        let ix = catalog_indexes(oid, &def)?
+            .into_iter()
+            .find(|ix| ix.name == index)?;
+        let mut key = Vec::new();
+        for column in &ix.columns {
+            let Some(value) = filter.get(column) else {
+                break;
+            };
+            let value = match value {
+                Bson::Document(d) if d.len() == 1 => d.get("$eq")?,
+                Bson::Document(_) => return None,
+                v => v,
+            };
+            key.push(match value {
+                Bson::Int32(v) => catcache::K::O(i64::from(*v)),
+                Bson::Int64(v) => catcache::K::O(*v),
+                Bson::String(v) => catcache::K::N(v.clone()),
+                _ => return None,
+            });
+        }
+        if key.is_empty() {
+            return None;
+        }
+        catalog_btree::index_only_heap_fetches(ix.oid, &key, rows)
+    }
+
     /// The estimate of a plain index scan of user table `table` through the
     /// index whose key columns are `key` (stored fields), when that is the
     /// path `set_cheapest` keeps over an analysed table (RP-317):

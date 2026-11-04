@@ -1302,7 +1302,11 @@ a regression test.
       session to its own new objects, and off a statement's path it lost
       other sessions' new tables). Also open: the shared buffer pool keys
       a page by relation oid and block, not database, so two databases'
-      copies of one catalog share hits.
+      copies of one catalog share hits. An index-only scan's `Heap
+      Fetches` (RP-360) reads `initdb`'s visibility map: until later rows
+      are placed, a row DDL adds counts as fetched but the `initdb` rows
+      on the page it cleared do not, and a row DDL deleted or updated
+      still reads as all-visible.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
 - [ ] **A built-in catalog's first reads in a session are not
@@ -1373,20 +1377,6 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN ANALYZE of an index-only scan prints no `Heap Fetches`.**
-      Since RP-337 a catalog read whose index holds every column it reads
-      is an `Index Only Scan` priced by `cost_index` with the heap's
-      `relallvisible`. Under ANALYZE PostgreSQL 15.19 adds `Heap Fetches:
-      N` (`show_instrumentation_count` of `ioss_HeapFetches`): the rows
-      whose heap page the visibility map does not mark all-visible. In a
-      fresh database `explain (analyze, timing off, summary off) select
-      attname from pg_attribute where attrelid = 1259` prints `Heap
-      Fetches: 0`; here the line is missing. Counting it needs the
-      catalog heap's visibility map, so a row DDL adds later (RP-291)
-      counts as a fetch until VACUUM sets its page all-visible (found while
-      working RP-337).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an index-only scan's heap fetches]
-      Backlog-ID: RP-360
 - [ ] **EXPLAIN of a join that selects only some columns is a Nested
       Loop of unnamed scans.** `explain select e.a from e join k on e.b =
       k.b` over two analysed tables is, on PostgreSQL 15.19, `Hash Join

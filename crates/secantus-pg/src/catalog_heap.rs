@@ -18,7 +18,9 @@
 //! free space map's category for each block when the fork exists. From
 //! these [`initdb_heap_model`] builds the heap a later catalog row is
 //! placed in, filling `initdb`'s free space first as
-//! `RelationGetBufferForTuple` does through the map.
+//! `RelationGetBufferForTuple` does through the map. The visibility map's
+//! all-visible bits are recorded as well: an index-only scan fetches the
+//! heap for a tuple on a block without one (RP-360).
 //!
 //! A catalog scan's heap blocks are counted over these
 //! (`catalog_btree.rs`); placing every later catalog row into these models
@@ -49,6 +51,20 @@ pub(crate) struct InitdbHeap {
     /// The free space map fork, as [`crate::fsm::Fsm::from_doc`] reads
     /// it; `None` without one.
     pub(crate) fsm: Option<bson::Document>,
+    /// The visibility map's all-visible bit of each block
+    /// (`VISIBILITYMAP_ALL_VISIBLE`); a heap without the fork has none set.
+    pub(crate) all_visible: Vec<bool>,
+}
+
+impl InitdbHeap {
+    /// `VM_ALL_VISIBLE`: whether `initdb` left `block` all-visible.
+    pub(crate) fn block_all_visible(&self, block: i64) -> bool {
+        usize::try_from(block)
+            .ok()
+            .and_then(|b| self.all_visible.get(b))
+            .copied()
+            .unwrap_or(false)
+    }
 }
 
 /// One heap page as `initdb` left it.
@@ -98,6 +114,7 @@ fn parse(text: &str) -> HashMap<i64, InitdbHeap> {
                         tids: Vec::new(),
                         pages: Vec::new(),
                         fsm: None,
+                        all_visible: Vec::new(),
                     },
                 );
                 current = Some(oid);
@@ -122,6 +139,19 @@ fn parse(text: &str) -> HashMap<i64, InitdbHeap> {
         if let Some(rest) = line.strip_prefix("\\fsm ") {
             let nblocks: i64 = rest.parse().unwrap_or(0);
             heap.fsm = Some(bson::doc! { "nblocks": nblocks, "pages": [] });
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("\\vm") {
+            heap.all_visible = vec![false; heap.blocks as usize];
+            for part in rest.trim().split(',').filter(|p| !p.is_empty()) {
+                let (a, b) = part.split_once('-').unwrap_or((part, part));
+                let (a, b): (usize, usize) = (a.parse().unwrap_or(0), b.parse().unwrap_or(0));
+                for blk in a..=b {
+                    if let Some(v) = heap.all_visible.get_mut(blk) {
+                        *v = true;
+                    }
+                }
+            }
             continue;
         }
         if let Some(rest) = line.strip_prefix("\\fsmpage ") {
