@@ -916,6 +916,42 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
         ],
     ),
+    "a projected LEFT join hashed as a right join": (
+        "RP-362",
+        _NULLS,
+        "explain select e.a from e left join k on e.b = k.b",
+        [
+            "Hash Right Join  (cost=27.50..925.75 rows=71450 width=4)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a projected join under a WHERE": (
+        "RP-362",
+        _NULLS,
+        "explain select e.a from e join k on e.b = k.b where e.a = 3",
+        [
+            "Hash Join  (cost=17.51..36.97 rows=71 width=4)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+            "  ->  Hash  (cost=17.50..17.50 rows=1 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "              Filter: (a = 3)",
+        ],
+    ),
+    "a projected cross join": (
+        "RP-362",
+        _NULLS,
+        "explain select e.a, k.a from e, k",
+        [
+            "Nested Loop  (cost=0.00..12532.50 rows=1000000 width=8)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1317,6 +1353,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-355",
         "RP-359",
         "RP-360",
+        "RP-361",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
