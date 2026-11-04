@@ -979,6 +979,20 @@ impl<'a> Printer<'a> {
                                 crate::scalar::quote_literal(&crate::value_text(&v))
                             ));
                         }
+                        // An array constant prints as `array_out` gives it
+                        // (`'{ 1 }'` is `'{1}'::integer[]`).
+                        _ if is_array(t) => {
+                            let v = crate::cast_value(bson::Bson::String(lit.clone()), t).ok()?;
+                            let text = crate::cast_value(v, "text").ok()?;
+                            let bson::Bson::String(text) = text else {
+                                return None;
+                            };
+                            self.buf.push_str(&format!(
+                                "{}::{}",
+                                crate::scalar::quote_literal(&text),
+                                display_type(t)
+                            ));
+                        }
                         // A jsonb constant prints as jsonb's output form.
                         "jsonb" => {
                             let v = crate::json::parse(&lit).ok()?;
@@ -1270,6 +1284,16 @@ impl<'a> Printer<'a> {
                         return None;
                     }
                     return self.binary(l, "", &op, r, "");
+                }
+                // An untyped literal against an array takes the array's
+                // type (`anyarray` resolution), printed as its constant.
+                if matches!(op.as_str(), "@>" | "<@" | "&&") {
+                    if is_array(&lt) && rt == "unknown" {
+                        return self.binary(l, "", &op, r, &lt);
+                    }
+                    if lt == "unknown" && is_array(&rt) {
+                        return self.binary(l, &rt, &op, r, "");
+                    }
                 }
                 let json_op = match lt.as_str() {
                     "jsonb" => jsonb_operator(&op, &rt),
@@ -2304,7 +2328,7 @@ fn flatten_bool<'n>(
 }
 
 /// A declared type without its modifier, as the analyser compares types.
-fn base_type(t: &str) -> String {
+pub(crate) fn base_type(t: &str) -> String {
     let t = t.trim();
     let base = t.split('(').next().unwrap_or(t).trim();
     match base {
@@ -4366,5 +4390,32 @@ mod tests {
             render("SELECT id, t FROM vd_t").as_deref(),
             Some(" SELECT vd_t.id,\n    vd_t.t\n   FROM vd_t;")
         );
+    }
+}
+#[cfg(test)]
+mod array_quals {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    /// An array operator against an untyped literal prints the literal as
+    /// the column's array constant, in `array_out` form, as PostgreSQL
+    /// 15.19's EXPLAIN does (RP-367).
+    #[test]
+    fn an_array_operators_literal_takes_the_columns_type() {
+        let def = TableDef::new("ud", vec![Column::new("a", "int4[]", false)]);
+        for (sql, want) in [
+            ("a @> '{1}'", "(a @> '{1}'::integer[])"),
+            ("a && '{1,2}'", "(a && '{1,2}'::integer[])"),
+            ("a <@ '{ 1 , 2 }'", "(a <@ '{1,2}'::integer[])"),
+            ("'{1}' <@ a", "('{1}'::integer[] <@ a)"),
+        ] {
+            let p = pg_query::parse(&format!("select * from ud where {sql}")).unwrap();
+            let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+            else {
+                panic!()
+            };
+            let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
+            assert_eq!(got, vec![(want.to_string(), None)], "{sql}");
+        }
     }
 }

@@ -1365,19 +1365,23 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN of an array operator prints `Filter: (...)` and zeros.**
-      Over `create table ud (a int[])`, PostgreSQL 15.19 prints `explain
-      select * from ud where a @> '{1}'` as `Seq Scan on ud
-      (cost=0.00..27.00 rows=7 width=32)` with `Filter: (a @> '{1}'::integer[])`
-      (`arraycontsel`'s default without statistics; `&&` the same), and
-      `1 = any(a)` with `Filter: (1 = ANY (a))` (cost 40.60). Here each is
-      `cost=0.00..0.00 rows=0 width=0` with the filter printed as `(...)`,
-      and the `ANY` form prints a second `Filter:` line. After an ANALYZE
-      PostgreSQL reads the column's MCELEM / DECHIST slots
-      (`mcelem_array_selec`), which this server now records (found while
-      working RP-313).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an array containment]
-      Backlog-ID: RP-367
+- [ ] **EXPLAIN of `x = ANY (array column)` and of an analysed array
+      column's operators prints zeros.** Since RP-367 an array column's
+      `@>`, `<@` and `&&` against a constant, over a table never analysed,
+      prints PostgreSQL 15.19's estimate (`arraycontsel`'s default). Still
+      zeros: `1 = ANY (a)`, which 15.19 prints as `Seq Scan on ud
+      (cost=0.00..40.60 rows=7 width=32)` (`scalararraysel`, the operator
+      costed over `estimate_array_length`'s 10 elements, half applied;
+      `1 < ANY (a)` and `1 <> ALL (a)` move the rows differently, so
+      `scalararraysel` and `scalararraysel_containment` need porting, not
+      a constant); and the containment operators over an analysed table,
+      where `mcelem_array_selec` reads the column's MCELEM and DECHIST
+      slots: after `insert into ud select array[i % 10, i % 7] from
+      generate_series(1, 1000) i; analyze ud`, `a @> '{1}'` is
+      `(cost=0.00..20.50 rows=228 width=29)`. The Filter text is already
+      right in both (found while working RP-367).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a constant equal to ANY of an array column], tests/backlog/test_rp_explain_costs.py::test_plan[an analysed array containment]
+      Backlog-ID: RP-368
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),

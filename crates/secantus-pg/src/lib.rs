@@ -40893,7 +40893,13 @@ impl PgHandler {
                 // Chosen with or without COSTS, which only hides the numbers.
                 if tree.children.is_empty() && tree.name.starts_with("Seq Scan on ") {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if sel.residual.is_none()
+                        // A WHERE of array operators runs per row as a
+                        // residual, priced by `arraycontsel` (RP-367).
+                        let array_quals = options
+                            .scan_array_quals
+                            .as_deref()
+                            .filter(|_| sel.residual.is_some() && sel.filter.is_empty());
+                        if (sel.residual.is_none() || array_quals.is_some())
                             && sel.sub.is_none()
                             && sel.series.is_none()
                             && sel.join.is_none()
@@ -40908,8 +40914,17 @@ impl PgHandler {
                             let computed = sel.casts.iter().any(Option::is_some);
                             let priced = scan_estimate::target_cost(sel).and_then(
                                 |(cost, width, fields)| {
-                                    let (est, index) =
-                                        self.scan_estimate(&sel.table, &sel.filter, &fields)?;
+                                    let (est, index) = match array_quals {
+                                        Some(quals) => (
+                                            self.array_qual_scan_estimate(
+                                                &sel.table, quals, &fields,
+                                            )?,
+                                            None,
+                                        ),
+                                        None => {
+                                            self.scan_estimate(&sel.table, &sel.filter, &fields)?
+                                        }
+                                    };
                                     if computed && index.is_some() {
                                         return None;
                                     }
