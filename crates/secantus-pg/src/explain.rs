@@ -819,7 +819,10 @@ fn structured(
         // An index-only scan's instrumentation after its quals; the
         // structured formats print a zero count too (`show_instrumentation_count`).
         if let (Some(_), Some(f)) = (actual, n.heap_fetches) {
-            fields.push(("Rows Removed by Index Recheck".into(), Value::Num("0".into())));
+            fields.push((
+                "Rows Removed by Index Recheck".into(),
+                Value::Num("0".into()),
+            ));
             fields.push(("Heap Fetches".into(), Value::Num(f.to_string())));
         }
         if !n.children.is_empty() {
