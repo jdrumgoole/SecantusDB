@@ -789,8 +789,7 @@ impl PgHandler {
             }
             let ty = entry.get_str("type").unwrap_or("text");
             let col = secantus_pgcatalog::Column::new("expr", ty, false);
-            let (eq, lt, collatable) = statistic::operators(ty)?;
-            let coll = if collatable { 100 } else { 0 };
+            let (eq, lt, coll) = statistic::operators(ty)?;
             // (kind, operator, numbers, values), compute_scalar_stats' order.
             let mut slots: Vec<(i32, i64, Option<String>, Option<String>)> = Vec::new();
             if let Some(sl) = Self::stored_slots(entry) {

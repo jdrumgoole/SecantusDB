@@ -16621,7 +16621,8 @@ impl PgHandler {
     /// NULL, otherwise its key under the type's equality (`=` of its
     /// default B-tree opclass; an integer's sorts as the number,
     /// `colstats::int_key`) and its stored size (`VARSIZE_ANY`: a 1-byte
-    /// header up to 126 bytes, else 4; the type's width when fixed). `None`
+    /// header up to 126 bytes, else 4; 0 for a fixed-width type, whose
+    /// `typlen` `analyze_column_of` takes as the width). `None`
     /// when the type's equality is not modelled, or the value is wider than
     /// ANALYZE compares (`WIDTH_THRESHOLD`, 1,024 bytes).
     fn analyze_sample(
@@ -16668,6 +16669,12 @@ impl PgHandler {
             }
             ("text" | "varchar" | "character varying", Bson::String(s)) => {
                 varlena(s.as_bytes(), s.len())
+            }
+            // `nameeq` compares the C string, and `name` is fixed-width
+            // (`NAMEDATALEN`); `chareq` compares the one unsigned byte.
+            // Both order as their bytes, `name` under the C collation.
+            ("name" | secantus_pgplan::QUOTED_CHAR, Bson::String(s)) => {
+                Some(Some((s.as_bytes().to_vec(), 0)))
             }
             // Stored trimmed, compared trimmed (`bpchareq`), and kept padded
             // to its declared length.

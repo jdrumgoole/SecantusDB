@@ -6,8 +6,8 @@
 //! `pg_stats` is PostgreSQL's own view over it.
 //!
 //! Only the columns whose type's equality ANALYZE models here have a row
-//! (`analyze_sample`): integers, booleans, floats, `text` / `varchar` and
-//! `char(n)`; a table larger than ANALYZE's sample has relation statistics
+//! (`analyze_sample`): integers, booleans, floats, `text` / `varchar`,
+//! `char(n)`, `name` and `"char"`; a table larger than ANALYZE's sample has relation statistics
 //! only.
 //!
 //! The built-in catalogs' rows are the ones PostgreSQL 15.19's `initdb`
@@ -22,24 +22,29 @@ const MCV: i32 = 1;
 const HISTOGRAM: i32 = 2;
 const CORRELATION: i32 = 3;
 const DEFAULT_COLLATION: i64 = 100;
+const C_COLLATION: i64 = 950;
 
 /// The `RELSTATS_COLLECTION` row holding a database-wide ANALYZE's measure
 /// of the built-in catalogs, by `"<relid>:<attnum>"` (RP-313).
 pub(crate) const CATALOG_STATISTICS: &str = "\u{0}catalogs";
 
-/// A type's `=` and `<` operators (its default B-tree opclass), and
-/// whether it is collatable.
-pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, bool)> {
+/// A type's `=` and `<` operators (its default B-tree opclass), and the
+/// collation its slots are recorded under (`stacollN`; 0 for a type that
+/// is not collatable): the database's default for `text` and `bpchar`, and
+/// `C` (950) for `name`, whose `typcollation` it is.
+pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
     Some(match pg_type.trim_start_matches("pg_catalog.") {
-        "int2" => (94, 95, false),
-        "int4" => (96, 97, false),
-        "int8" => (410, 412, false),
-        "float4" => (620, 622, false),
-        "float8" => (670, 672, false),
-        "bool" => (91, 58, false),
-        "oid" => (607, 609, false),
-        "text" | "varchar" | "character varying" => (98, 664, true),
-        "bpchar" | "character" => (1054, 1058, true),
+        "int2" => (94, 95, 0),
+        "int4" => (96, 97, 0),
+        "int8" => (410, 412, 0),
+        "float4" => (620, 622, 0),
+        "float8" => (670, 672, 0),
+        "bool" => (91, 58, 0),
+        "oid" => (607, 609, 0),
+        "text" | "varchar" | "character varying" => (98, 664, DEFAULT_COLLATION),
+        "bpchar" | "character" => (1054, 1058, DEFAULT_COLLATION),
+        "name" => (93, 660, C_COLLATION),
+        secantus_pgplan::QUOTED_CHAR => (92, 631, 0),
         _ => return None,
     })
 }
@@ -53,7 +58,7 @@ pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bso
             Bson::Double(f64::from_bits(u64::from_be_bytes(key.try_into().ok()?)))
         }
         "bool" => Bson::Boolean(*key.first()? != 0),
-        "text" | "varchar" | "character varying" => {
+        "text" | "varchar" | "character varying" | "name" | secantus_pgplan::QUOTED_CHAR => {
             Bson::String(String::from_utf8(key.to_vec()).ok()?)
         }
         // Compared trimmed, shown padded to the declared length.
@@ -307,8 +312,7 @@ impl PgHandler {
         if entry.get_bool("unmodelled").unwrap_or(false) {
             return None;
         }
-        let (eq, lt, collatable) = operators(&c.pg_type)?;
-        let coll = if collatable { DEFAULT_COLLATION } else { 0 };
+        let (eq, lt, coll) = operators(&c.pg_type)?;
         let mut d = Document::new();
         d.insert(f("starelid"), Bson::Int64(rel));
         d.insert(f("staattnum"), Bson::Int32(i32::from(attnum)));

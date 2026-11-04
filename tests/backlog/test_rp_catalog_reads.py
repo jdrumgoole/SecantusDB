@@ -1882,12 +1882,12 @@ def test_an_oid_column_is_analysed(rust_pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_a_name_column(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (measured on a fresh database): a plain ANALYZE
-    measures the catalogs' `name` columns too, so a new table whose name
-    sorts last becomes the top of `pg_class.relname`'s histogram, where
-    `initdb`'s was `views`."""
+    measured the catalogs' `name` columns too, so a new table whose name
+    sorts last became the top of `pg_class.relname`'s histogram, where
+    `initdb`'s was `views`; this server kept `initdb`'s row."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_n")
         c.execute("create database rp313_n")
@@ -1900,6 +1900,70 @@ def test_a_database_wide_analyze_measures_a_name_column(rust_pg: Any) -> None:
             " from pg_stats where tablename = 'pg_class' and attname = 'relname'"
         ).fetchone()[0]
         assert top == "zzzz_rp313"
+
+
+@pytest.mark.backlog_fixed("RP-313")
+def test_a_database_wide_analyze_measures_a_quoted_char_column(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster): after a new
+    table and a plain ANALYZE, `pg_class.relkind`'s (`"char"`) most common
+    values are re-measured over the catalog's rows; this server kept
+    `initdb`'s row."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_c")
+        c.execute("create database rp313_c")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_c", autocommit=True) as c:
+        c.execute("create table zzzz_rp313 (a int)")
+        c.execute("analyze")
+        row = c.execute(
+            "select most_common_vals::text, most_common_freqs::text, n_distinct"
+            " from pg_stats where tablename = 'pg_class' and attname = 'relkind'"
+        ).fetchone()
+    # Its correlation (0.7882681) follows PostgreSQL's heap order: RP-358.
+    assert row == ("{i,v,r,t}", "{0.3941606,0.34063262,0.16788322,0.097323604}", 4.0)
+
+
+@pytest.mark.backlog("RP-358")
+def test_a_catalog_columns_correlation_follows_the_heap(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster): ANALYZE
+    correlates each catalog column with PostgreSQL's heap order, so after a
+    new table `pg_class`'s correlations are these; this server walks its own
+    row order."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp358")
+        c.execute("create database rp358")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp358", autocommit=True) as c:
+        c.execute("create table zzzz_rp313 (a int)")
+        c.execute("analyze")
+        rows = c.execute(
+            "select attname::text, correlation from pg_stats where tablename = 'pg_class'"
+            " and attname in ('oid', 'relkind', 'relname', 'relnatts') order by 1"
+        ).fetchall()
+    assert rows == [
+        ("oid", 0.6547713),
+        ("relkind", 0.7882681),
+        ("relname", -0.12838678),
+        ("relnatts", 0.67018104),
+    ]
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_an_array_column(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster): a plain
+    ANALYZE measures the catalogs' array columns too, so after a table
+    created `with (fillfactor=50)` `pg_class.reloptions` (`text[]`) has a
+    second distinct value and a smaller null fraction than `initdb`'s
+    0.99268293 / 1."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_a")
+        c.execute("create database rp313_a")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_a", autocommit=True) as c:
+        c.execute("create table zz_opt (a int) with (fillfactor=50)")
+        c.execute("analyze")
+        row = c.execute(
+            "select null_frac, n_distinct, most_common_vals::text from pg_stats"
+            " where tablename = 'pg_class' and attname = 'reloptions'"
+        ).fetchone()
+    assert row == (0.99026763, 2.0, '{"{security_barrier=true}"}')
 
 
 @pytest.mark.backlog_fixed("RP-314")
