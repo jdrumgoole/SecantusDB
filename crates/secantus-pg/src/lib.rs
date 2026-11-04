@@ -40850,8 +40850,8 @@ impl PgHandler {
                         .starts_with("Seq Scan on ")
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((a, b, join)) = self.hash_join_estimate(sel) {
-                            explain::price_hash_join(&mut tree, a, b, join);
+                        if let Some((a, b, join, swap)) = self.hash_join_estimate(sel) {
+                            explain::price_hash_join(&mut tree, a, b, join, swap);
                         }
                     }
                 }

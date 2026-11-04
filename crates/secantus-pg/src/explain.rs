@@ -32,6 +32,10 @@ pub(crate) struct PlanNode {
     /// the columns its join clauses and constant equalities fix, which
     /// [`resolve_inner_unique`] checks against the table's unique indexes.
     pub unique_probe: Option<(String, Vec<String>)>,
+    /// A hash join whose sides the cost model swapped (RP-359): its
+    /// `Hash Cond` is written outer side first, as `create_hashjoin_plan`
+    /// commutes the clause to `outer = inner`.
+    pub commute_cond: bool,
 }
 
 impl PlanNode {
@@ -44,6 +48,7 @@ impl PlanNode {
             estimate: None,
             inner_unique: false,
             unique_probe: None,
+            commute_cond: false,
         }
     }
 
@@ -597,25 +602,53 @@ pub(crate) fn price_nest_loop(
     root.estimate = Some(join);
 }
 
+/// `(a = b)` as `(b = a)`: one equality of two operands, neither holding
+/// an ` = ` of its own; `None` for anything else.
+fn commute_equality(c: &str) -> Option<String> {
+    let inner = c.strip_prefix('(')?.strip_suffix(')')?;
+    let (a, b) = inner.split_once(" = ")?;
+    if b.contains(" = ") {
+        return None;
+    }
+    Some(format!("({b} = {a})"))
+}
+
 /// Give an inner `Hash Join` of two scans, the right one under a `Hash`,
 /// the cost model's estimate (RP-330): the join's, each scan's, and the
 /// Hash node's, which is its input's total for both startup and total
-/// (`create_hashjoin_plan` copies the inner path's costs).
+/// (`create_hashjoin_plan` copies the inner path's costs). With `swap`,
+/// the path PostgreSQL keeps hashes the LEFT table (RP-359): the right
+/// scan becomes the outer side and the left one goes under the Hash.
+/// `outer` and `inner` are the estimates of the scans in the order
+/// printed.
 pub(crate) fn price_hash_join(
     root: &mut PlanNode,
     outer: crate::scan_estimate::Estimate,
     inner: crate::scan_estimate::Estimate,
     join: crate::scan_estimate::Estimate,
+    swap: bool,
 ) {
     if root.name != "Hash Join" || root.children.len() != 2 {
         return;
     }
+    if root.children[1].name != "Hash" || root.children[1].children.len() != 1 {
+        return;
+    }
+    if swap {
+        let mut hash = root.children.pop().expect("two children");
+        let left = root.children.pop().expect("two children");
+        let right = hash.children.pop().expect("one child");
+        hash.children.push(left);
+        root.children.push(right);
+        root.children.push(hash);
+        root.commute_cond = true;
+        // The hashed side is now the left table, not proven unique on
+        // the key (a unique key is not priced).
+        root.inner_unique = false;
+    }
     let [scan, hash] = root.children.as_mut_slice() else {
         return;
     };
-    if hash.name != "Hash" || hash.children.len() != 1 {
-        return;
-    }
     scan.estimate = Some(outer);
     hash.children[0].estimate = Some(inner);
     hash.estimate = Some((inner.1, inner.1, inner.2, inner.3));
@@ -1143,7 +1176,12 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
         };
         if let Some(c) = conds.get(*next) {
             if !c.is_empty() {
-                n.details.insert(0, (label.into(), c.clone()));
+                let c = if n.commute_cond {
+                    commute_equality(c).unwrap_or_else(|| c.clone())
+                } else {
+                    c.clone()
+                };
+                n.details.insert(0, (label.into(), c));
             }
         }
         *next += 1;
@@ -1270,6 +1308,18 @@ mod setop_quals_tests {
 #[cfg(test)]
 mod join_type_tests {
     use super::*;
+
+    /// A swapped hash join's `Hash Cond` is written outer side first
+    /// (RP-359); anything but one plain equality is left as it was.
+    #[test]
+    fn commute_equality_swaps_one_equality() {
+        assert_eq!(
+            commute_equality("(e.b = k.b)").as_deref(),
+            Some("(k.b = e.b)")
+        );
+        assert_eq!(commute_equality("((e.a = k.a) AND (e.b = k.b))"), None);
+        assert_eq!(commute_equality("e.b = k.b"), None);
+    }
 
     #[test]
     fn a_join_name_splits_into_node_and_join_type() {

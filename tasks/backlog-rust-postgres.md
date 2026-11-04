@@ -1373,23 +1373,6 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN does not price a Hash Join whose left table PostgreSQL
-      hashes.** Since RP-330 an inner JOIN of two analysed tables' Seq
-      Scans on one column equality prints `cost_hashjoin`'s estimate, with
-      `eqjoinsel_inner` over the columns' MCV lists, when the right table
-      is the one PostgreSQL 15.19 hashes. This server always hashes the
-      right table; where PostgreSQL's `add_path` keeps the other order
-      (cheaper beyond the 1.01 fuzz factor), the plan printed is not
-      PostgreSQL's, so it is left at zeros: with `e.b` a quarter NULL over
-      ten values and `k.b` seven, `explain select * from e join k on e.b =
-      k.b` is `Hash Join (cost=27.50..925.75 rows=71450 width=14)` with
-      `Hash Cond: (k.b = e.b)` over `Seq Scan on k` and `Hash` over `Seq
-      Scan on e`. Also left unpriced: a key column unique on either side
-      (`inner_unique`), a WHERE, a join of differently typed keys, an outer
-      join, and a join of three or more relations (found while working
-      RP-330).
-      Backlog-ID: RP-359
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join hashing the left table]
 - [ ] **EXPLAIN ANALYZE of an index-only scan prints no `Heap Fetches`.**
       Since RP-337 a catalog read whose index holds every column it reads
       is an `Index Only Scan` priced by `cost_index` with the heap's
@@ -1404,6 +1387,20 @@ a regression test.
       working RP-337).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an index-only scan's heap fetches]
       Backlog-ID: RP-360
+- [ ] **EXPLAIN of a join that selects only some columns is a Nested
+      Loop of unnamed scans.** `explain select e.a from e join k on e.b =
+      k.b` over two analysed tables is, on PostgreSQL 15.19, `Hash Join
+      (cost=27.50..1170.00 rows=100000 width=4)` with `Hash Cond: (e.b =
+      k.b)` over `Seq Scan on e` and a `Hash` over `Seq Scan on k`
+      (width=3, only `b` read from it). Here it is `Nested Loop` with
+      `Join Filter: (e.b = k.b)` over two `Seq Scan` lines naming no
+      relation, all zeros; `select *` over the same join prints
+      PostgreSQL's plan (RP-330, RP-359). Found while working RP-359.
+      Still unpriced beside it: a hash join over a key unique on either
+      side, a WHERE, keys of different types, an outer join, and three or
+      more relations.
+      Backlog-ID: RP-361
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join reading one side's column]
 - [ ] **A catalog read by a bitmap is a zero-cost Seq Scan here.**
       With `enable_indexscan = off`, `explain select oid from pg_class
       where relname = 'pg_class'` is a `Bitmap Heap Scan on pg_class

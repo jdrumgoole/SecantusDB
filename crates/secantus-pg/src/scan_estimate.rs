@@ -481,14 +481,15 @@ impl PgHandler {
     /// `cost_seqscan` of the columns the join reads from it, the clause's
     /// selectivity `eqjoinsel_inner` over the two columns' MCV lists, the
     /// hashed side's buckets `estimate_hash_bucket_stats`, and the join
-    /// `cost_hashjoin` with the right side hashed, as this server's plan
-    /// prints it. Returns the outer scan's, the inner scan's and the
-    /// join's estimates; the Hash node is its input's total. `None` --
-    /// zeros -- for any other shape.
+    /// `cost_hashjoin` over the side PostgreSQL's `add_path` keeps hashed
+    /// (RP-359). Returns the printed outer scan's, the hashed scan's and
+    /// the join's estimates, and whether the left table is the hashed one;
+    /// the Hash node is its input's total. `None` -- zeros -- for any
+    /// other shape.
     pub(crate) fn hash_join_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate)> {
+    ) -> Option<(Estimate, Estimate, Estimate, bool)> {
         use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
@@ -667,22 +668,24 @@ impl PgHandler {
             return None;
         }
         let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &kb);
-        // This server always hashes the right side. PostgreSQL builds that
-        // path first (`add_paths_to_joinrel` with the left relation outer)
-        // and then the other way round, and `add_path` keeps the second
-        // only when it is cheaper beyond the fuzz factor
-        // (`compare_path_costs_fuzzily`, 1.01) -- and `set_cheapest` then
-        // takes the cheaper total. Where PostgreSQL would hash the left
-        // side the plan printed here is not its plan, so it is not priced.
+        // PostgreSQL builds the path hashing the right relation first
+        // (`add_paths_to_joinrel` with the left one outer) and then the
+        // other way round; `add_path` keeps the second only when it is
+        // cheaper beyond the fuzz factor (`compare_path_costs_fuzzily`,
+        // 1.01), and `set_cheapest` then takes the cheaper total. The
+        // plan printed follows it: with `swap`, the left table hashed
+        // (RP-359).
         let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
         let fuzzy_eq = |x: f64, y: f64| x <= y * 1.01 && y <= x * 1.01;
         let right_kept =
             total <= l_total || (fuzzy_eq(startup, l_startup) && fuzzy_eq(total, l_total));
-        if !right_kept {
-            return None;
-        }
         let rows = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
-        Some((a.scan, b.scan, (startup, total, rows, a.above + b.above)))
+        let width = a.above + b.above;
+        Some(if right_kept {
+            (a.scan, b.scan, (startup, total, rows, width), false)
+        } else {
+            (b.scan, a.scan, (l_startup, l_total, rows, width), true)
+        })
     }
 
     /// The Seq Scan's and the Limit's estimates of a LIMIT straight over
