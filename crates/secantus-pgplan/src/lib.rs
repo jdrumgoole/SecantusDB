@@ -3561,6 +3561,11 @@ pub struct ExplainOptions {
     /// A SELECT over one FROM-subquery: its WHERE's conjuncts as the
     /// Subquery Scan's `Filter` prints them (RP-328).
     pub subquery_quals: Vec<String>,
+    /// A single-relation SELECT whose column is equated to two or more
+    /// distinct constants: how many `false` pseudoconstants the equivalence
+    /// class generates, which gate the scan as a `Result`'s
+    /// `One-Time Filter` (RP-350). Zero when there are none.
+    pub one_time_false: usize,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -9963,6 +9968,7 @@ fn plan_explain(
         join_conds: Vec::new(),
         join_where: Vec::new(),
         subquery_quals: Vec::new(),
+        one_time_false: 0,
     };
     let (mut timing, mut summary) = (None, None);
     for o in &e.options {
@@ -10023,11 +10029,20 @@ fn plan_explain(
     }
     options.timing = options.analyze && timing.unwrap_or(true);
     options.summary = summary.unwrap_or(options.analyze);
-    let query = e
+    let mut query = e
         .query
         .as_deref()
         .and_then(|q| q.node.clone())
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    // A column's equalities to constants become one equivalence class: the
+    // scan keeps the first constant, each other distinct one is a `false`
+    // gate (RP-350). Only planned, never run: under ANALYZE the statement
+    // executes as written.
+    if !options.analyze {
+        if let Some(n) = reduce_const_classes(&mut query, lookup) {
+            options.one_time_false = n;
+        }
+    }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
@@ -43776,6 +43791,157 @@ fn explain_scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> 
     })
 }
 
+/// `generate_base_implied_equalities_const` over a single-relation
+/// SELECT's top-level AND conjuncts (RP-350). Each `column = constant` (or
+/// `constant = column`) on an integer or text column joins that column's
+/// equivalence class; the class keeps its first distinct constant as the
+/// scan's `column = constant`, and each other distinct constant yields
+/// `other = first`, which `eval_const_expressions` folds to `false`, a
+/// pseudoconstant gating the plan. A repeated constant is the same member
+/// and adds nothing (`a = 1 and 1 = a` is one clause).
+///
+/// Rewrites the WHERE to the clauses the scan keeps and returns how many
+/// `false` gates there are; `None` (the WHERE untouched) when no class has a
+/// second member, or a shape is met whose class or constant is not modelled
+/// here (a NULL, a constant that is not its column's type, a reversed first
+/// member, which would print differently).
+fn reduce_const_classes(query: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Option<usize> {
+    use pg_query::protobuf::Node as PNode;
+    let N::SelectStmt(s) = query else {
+        return None;
+    };
+    let [item] = s.from_clause.as_slice() else {
+        return None;
+    };
+    let Some(N::RangeVar(rv)) = item.node.as_ref() else {
+        return None;
+    };
+    let def = lookup(&rv.relname)?;
+    let where_clause = s.where_clause.as_deref()?;
+    fn flatten(n: &PNode, out: &mut Vec<PNode>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n.clone()),
+        }
+    }
+    let mut parts = Vec::new();
+    flatten(where_clause, &mut parts);
+    let column_of = |n: Option<&PNode>| match n.and_then(|n| n.node.as_ref()) {
+        Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+            Some(N::String(name)) => Some(name.sval.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    // A constant's value as the column's type would hold it: an integer,
+    // or a string; `Err` for a NULL or an integer column's unparsable text.
+    #[derive(PartialEq)]
+    enum Value {
+        Int(i64),
+        Text(String),
+    }
+    let constant = |n: Option<&PNode>, ty: &str| -> Option<std::result::Result<Value, ()>> {
+        let Some(N::AConst(c)) = n.and_then(|n| n.node.as_ref()) else {
+            return None;
+        };
+        if c.isnull {
+            return Some(Err(()));
+        }
+        let integer = matches!(ty, "int2" | "int4" | "int8");
+        let text = matches!(ty, "text");
+        Some(match c.val.as_ref() {
+            Some(a_const::Val::Ival(v)) if integer => Ok(Value::Int(i64::from(v.ival))),
+            Some(a_const::Val::Sval(v)) if integer => {
+                v.sval.trim().parse::<i64>().map(Value::Int).map_err(|_| ())
+            }
+            Some(a_const::Val::Sval(v)) if text => Ok(Value::Text(v.sval.clone())),
+            // Another type's constant (`a = 1.0` is numeric's operator, in
+            // no integer class), or a column type not modelled here: an
+            // ordinary clause.
+            _ => return None,
+        })
+    };
+    // (column, its members' values in order of appearance).
+    let mut classes: Vec<(String, Vec<Value>)> = Vec::new();
+    let mut keep = Vec::with_capacity(parts.len());
+    let mut gates = 0usize;
+    for p in &parts {
+        let member = match p.node.as_ref() {
+            Some(N::AExpr(e))
+                if e.kind == AExprKind::AexprOp as i32 && operator_name(e).ok() == Some("=") =>
+            {
+                let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+                match (column_of(l), column_of(r)) {
+                    (Some(col), None) => Some((col, r, false)),
+                    (None, Some(col)) => Some((col, l, true)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let Some((col, other, reversed)) = member else {
+            keep.push(true);
+            continue;
+        };
+        let ty = def
+            .columns
+            .iter()
+            .find(|c| c.name == col)
+            .map(|c| c.pg_type.trim_start_matches("pg_catalog.").to_string())?;
+        let value = match constant(other, &ty) {
+            // Not a constant, or not a class modelled here: an ordinary
+            // clause.
+            None => {
+                keep.push(true);
+                continue;
+            }
+            Some(Err(())) => return None,
+            Some(Ok(v)) => v,
+        };
+        match classes.iter_mut().find(|(c, _)| *c == col) {
+            None => {
+                if reversed {
+                    return None;
+                }
+                classes.push((col, vec![value]));
+                keep.push(true);
+            }
+            Some((_, members)) => {
+                if !members.contains(&value) {
+                    members.push(value);
+                    gates += 1;
+                }
+                keep.push(false);
+            }
+        }
+    }
+    if keep.iter().all(|k| *k) {
+        return None;
+    }
+    let kept: Vec<PNode> = parts
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(p, k)| k.then_some(p))
+        .collect();
+    let new_where = match <[PNode; 1]>::try_from(kept) {
+        Ok([one]) => one,
+        Err(args) => PNode {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                xpr: None,
+                boolop: BoolExprType::AndExpr as i32,
+                args,
+                location: -1,
+            }))),
+        },
+    };
+    s.where_clause = Some(Box::new(new_where));
+    Some(gates)
+}
+
 /// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
 fn explain_scan_quals(
     query: &N,
@@ -43850,5 +44016,64 @@ mod rp349_in_lengths {
         };
         let lengths = explain_scan_in_lengths(&N::SelectStmt(s), &|_| Some(def.clone())).unwrap();
         assert_eq!(lengths, vec![("a".to_string(), 3)]);
+    }
+}
+
+#[cfg(test)]
+mod rp350_const_classes {
+    use super::*;
+
+    fn reduce(sql: &str) -> (Option<usize>, Vec<String>) {
+        let def = TableDef::new(
+            "e",
+            vec![
+                secantus_pgcatalog::Column::new("a", "int4", false),
+                secantus_pgcatalog::Column::new("b", "text", false),
+            ],
+        );
+        let tree = pg_query::parse(sql).unwrap();
+        let mut query = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.clone())
+            .unwrap();
+        let lookup = |_: &str| Some(def.clone());
+        let gates = reduce_const_classes(&mut query, &lookup);
+        let quals = explain_scan_quals(&query, &lookup)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect();
+        (gates, quals)
+    }
+
+    /// A column equated to two constants keeps the first as the scan's
+    /// clause; each other distinct constant is a `false` gate, as
+    /// `generate_base_implied_equalities_const` makes it (RP-350).
+    #[test]
+    fn a_class_keeps_its_first_constant() {
+        assert_eq!(
+            reduce("select * from e where a = 1 and a = 2"),
+            (Some(1), vec!["(a = 1)".to_string()])
+        );
+        assert_eq!(
+            reduce("select * from e where a = 2 and a = 1 and a = 2"),
+            (Some(1), vec!["(a = 2)".to_string()])
+        );
+        assert_eq!(
+            reduce("select * from e where a = 1 and a = 2 and b = 'x' and b = 'y'"),
+            (
+                Some(2),
+                vec!["(a = 1)".to_string(), "(b = 'x'::text)".to_string()]
+            )
+        );
+        // A repeated member is one clause, and no gate.
+        assert_eq!(
+            reduce("select * from e where a = 1 and 1 = a"),
+            (Some(0), vec!["(a = 1)".to_string()])
+        );
+        // numeric's `=` is in no integer class; a NULL is not modelled.
+        assert_eq!(reduce("select * from e where a = 1 and a = 1.0").0, None);
+        assert_eq!(reduce("select * from e where a = 1 and a = null").0, None);
     }
 }
