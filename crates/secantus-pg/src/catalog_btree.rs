@@ -352,6 +352,36 @@ struct Tree {
     btree: BTree,
 }
 
+/// `Heap Fetches` of an index-only scan of catalog index `index` for the
+/// rows whose leading key columns are `key`, returning `rows` rows
+/// (`IndexOnlyNext`): a tuple whose heap block the visibility map does not
+/// mark all-visible is fetched from the heap, and counted, before its
+/// visibility is checked. The tuples are `initdb`'s, on the blocks and
+/// visibility map it left (`catalog_heap.rs`); a row returned beyond them
+/// was written later, onto a page whose bit the write cleared
+/// (`heap_insert`'s `visibilitymap_clear`), so it is fetched too. `None`
+/// for an index this server does not model.
+pub(crate) fn index_only_heap_fetches(index: i64, key: &[K], rows: usize) -> Option<usize> {
+    let t = tree(index)?;
+    let table = builtin().indexes.get(&index)?.table;
+    let heap = initdb_heaps().get(&table)?;
+    let tids = if t.btree.root.is_none() {
+        Vec::new()
+    } else {
+        let prefix: Vec<Bson> = key
+            .iter()
+            .zip(&t.shape.types)
+            .map(|(k, typ)| from_k(k, *typ))
+            .collect();
+        t.btree.prefix_scan(&t.shape, &prefix).1
+    };
+    let invisible = tids
+        .iter()
+        .filter(|tid| !heap.block_all_visible(*tid / 65536))
+        .count();
+    Some(invisible + rows.saturating_sub(tids.len()))
+}
+
 impl PgHandler {
     /// Count the pages each catalog scan in `scans` read, in order.
     ///
@@ -459,6 +489,25 @@ mod tests {
         let c = &layouts()[&2663];
         assert_eq!((c.root, c.in_order().len()), (3, 410));
         assert_eq!(c.types, vec![NAME, 26]);
+    }
+
+    #[test]
+    fn an_index_only_scan_fetches_only_what_the_visibility_map_does_not_cover() {
+        // pg_attribute_relid_attnam_index for pg_class's 39 columns:
+        // initdb's VACUUM left every pg_attribute block all-visible.
+        assert_eq!(index_only_heap_fetches(2658, &[K::O(1259)], 39), Some(0));
+        // Two rows a later ALTER TABLE added are on a page it cleared.
+        assert_eq!(index_only_heap_fetches(2658, &[K::O(1259)], 41), Some(2));
+        // A heap with no visibility map fork has no block all-visible.
+        let heaps = initdb_heaps();
+        let no_vm = heaps
+            .values()
+            .find(|h| !h.tids.is_empty() && h.all_visible.iter().all(|v| !v));
+        if let Some(h) = no_vm {
+            assert!(!h.block_all_visible(0), "{}", h.name);
+        }
+        assert!(heaps[&1249].block_all_visible(0));
+        assert!(!heaps[&1249].block_all_visible(i64::from(heaps[&1249].blocks)));
     }
 
     #[test]

@@ -36,7 +36,8 @@ Writes three files the server compiles in:
   offsets as ranges (``1-57,60``) in ``ctid`` order. A row of the rows file
   above is the table's n-th live tuple here. Each heap's pages follow, as
   ``heap_pages`` writes them: free space, line pointers and the free space
-  map, read from the data files (a LOCAL cluster, a superuser).
+  map and the visibility map's all-visible blocks, read from the data files
+  (a LOCAL cluster, a superuser).
 """
 
 from __future__ import annotations
@@ -461,7 +462,10 @@ def heap_pages(datadir: pathlib.Path, path: str) -> list[str]:
     then, when the fork exists, ``\\fsm nblocks`` and each free space map
     page as ``\\fsmpage block fp_next_slot node:value,...``, its nonzero
     nodes (``fsm_internals.h``): the fork exactly, stale upper nodes and
-    all."""
+    all; then, when the visibility map fork exists, ``\\vm blocks`` naming
+    the heap blocks whose all-visible bit is set, as ranges
+    (``visibilitymap.c``: two bits per heap block after the page header,
+    ``VISIBILITYMAP_ALL_VISIBLE`` the low one)."""
     data = (datadir / path).read_bytes()
     out = []
     for blk in range(len(data) // BLCKSZ):
@@ -495,6 +499,17 @@ def heap_pages(datadir: pathlib.Path, path: str) -> list[str]:
             nodes = page[28:BLCKSZ]
             cells = ",".join(f"{n}:{v}" for n, v in enumerate(nodes) if v)
             out.append(f"\\fsmpage {blk} {next_slot} {cells}\n")
+    vm = datadir / (path + "_vm")
+    if vm.exists():
+        raw = vm.read_bytes()
+        per_page = (BLCKSZ - 24) * 4
+        visible = [
+            blk
+            for blk in range(len(data) // BLCKSZ)
+            if (blk // per_page + 1) * BLCKSZ <= len(raw)
+            and raw[(blk // per_page) * BLCKSZ + 24 + (blk % per_page) // 4] >> (2 * (blk % 4)) & 1
+        ]
+        out.append(f"\\vm {ranges(visible)}\n")
     return out
 
 

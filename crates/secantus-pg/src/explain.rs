@@ -36,6 +36,9 @@ pub(crate) struct PlanNode {
     /// `Hash Cond` is written outer side first, as `create_hashjoin_plan`
     /// commutes the clause to `outer = inner`.
     pub commute_cond: bool,
+    /// Under ANALYZE, an index-only scan's `Heap Fetches`
+    /// (`ioss_HeapFetches`), printed after its quals (RP-360).
+    pub heap_fetches: Option<usize>,
 }
 
 impl PlanNode {
@@ -49,6 +52,7 @@ impl PlanNode {
             inner_unique: false,
             unique_probe: None,
             commute_cond: false,
+            heap_fetches: None,
         }
     }
 
@@ -702,6 +706,9 @@ pub(crate) fn render_text(
         for (label, value) in &n.details {
             out.push(format!("{}{label}: {value}", " ".repeat(2 + 6 * depth)));
         }
+        if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
+            out.push(format!("{}Heap Fetches: {n}", " ".repeat(2 + 6 * depth)));
+        }
         for c in &n.children {
             walk(c, depth + 1, options, None, out);
         }
@@ -785,6 +792,16 @@ fn structured(
             fields.push(("Plan Rows".into(), Value::Num(format!("{rows:.0}"))));
             fields.push(("Plan Width".into(), Value::Num(width.to_string())));
         }
+        // The actuals follow the costs, before any node's quals
+        // (`ExplainNode`).
+        if let Some(rows) = actual {
+            if options.timing {
+                fields.push(("Actual Startup Time".into(), Value::Num("0.000".into())));
+                fields.push(("Actual Total Time".into(), Value::Num("0.000".into())));
+            }
+            fields.push(("Actual Rows".into(), Value::Num(rows.to_string())));
+            fields.push(("Actual Loops".into(), Value::Num("1".into())));
+        }
         // Every join says whether its inner side is unique, before its
         // quals; the text format only under VERBOSE (`ExplainNode`).
         if join_type.is_some() {
@@ -799,13 +816,14 @@ fn structured(
             };
             fields.push((k.clone(), value));
         }
-        if let Some(rows) = actual {
-            if options.timing {
-                fields.push(("Actual Startup Time".into(), Value::Num("0.000".into())));
-                fields.push(("Actual Total Time".into(), Value::Num("0.000".into())));
-            }
-            fields.push(("Actual Rows".into(), Value::Num(rows.to_string())));
-            fields.push(("Actual Loops".into(), Value::Num("1".into())));
+        // An index-only scan's instrumentation after its quals; the
+        // structured formats print a zero count too (`show_instrumentation_count`).
+        if let (Some(_), Some(f)) = (actual, n.heap_fetches) {
+            fields.push((
+                "Rows Removed by Index Recheck".into(),
+                Value::Num("0".into()),
+            ));
+            fields.push(("Heap Fetches".into(), Value::Num(f.to_string())));
         }
         if !n.children.is_empty() {
             let kids = n
@@ -1358,4 +1376,57 @@ fn is_scan_name(name: &str) -> bool {
     name.starts_with("Seq Scan on ")
         || name.starts_with("Index Scan using ")
         || name.starts_with("Index Only Scan using ")
+}
+
+#[cfg(test)]
+mod heap_fetches_tests {
+    use super::*;
+
+    fn options(format: &str) -> ExplainOptions {
+        ExplainOptions {
+            analyze: true,
+            verbose: false,
+            costs: false,
+            timing: false,
+            summary: false,
+            format: format.into(),
+            scan_quals: Vec::new(),
+            scan_in_lengths: Vec::new(),
+            setop_quals: Vec::new(),
+            join_conds: Vec::new(),
+            join_where: Vec::new(),
+            subquery_quals: Vec::new(),
+            one_time_false: 0,
+        }
+    }
+
+    fn index_only_scan() -> PlanNode {
+        let mut n = PlanNode::new("Index Only Scan using i on pg_attribute");
+        n.details
+            .push(("Index Cond".into(), "(attrelid = '1259'::oid)".into()));
+        n.heap_fetches = Some(0);
+        n
+    }
+
+    #[test]
+    fn heap_fetches_follow_the_quals_under_analyze() {
+        // PostgreSQL 15.19 (RP-360).
+        let n = index_only_scan();
+        assert_eq!(
+            render_text(&n, &options("text"), Some(39)),
+            vec![
+                "Index Only Scan using i on pg_attribute (actual rows=39 loops=1)",
+                "  Index Cond: (attrelid = '1259'::oid)",
+                "  Heap Fetches: 0",
+            ]
+        );
+        assert_eq!(render_text(&n, &options("text"), None).len(), 2);
+        // The structured formats: the actuals after the costs, then the
+        // quals, the recheck count and the fetches.
+        let json = render_json(&n, &options("json"), Some(39));
+        let at = |k: &str| json.find(k).unwrap_or_else(|| panic!("{k} in {json}"));
+        assert!(at("\"Actual Loops\"") < at("\"Index Cond\""));
+        assert!(at("\"Index Cond\"") < at("\"Rows Removed by Index Recheck\": 0"));
+        assert!(at("\"Rows Removed by Index Recheck\"") < at("\"Heap Fetches\": 0"));
+    }
 }
