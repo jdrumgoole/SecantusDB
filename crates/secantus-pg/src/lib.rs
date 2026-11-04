@@ -40836,6 +40836,26 @@ impl PgHandler {
                         }
                     }
                 }
+                // An inner Hash Join of two tables' sequential scans on one
+                // column equality, both analysed (RP-330): `cost_hashjoin`
+                // with `eqjoinsel` over their MCV lists.
+                if tree.name == "Hash Join"
+                    && tree.children.len() == 2
+                    && tree.children[0].children.is_empty()
+                    && tree.children[0].name.starts_with("Seq Scan on ")
+                    && tree.children[1].name == "Hash"
+                    && tree.children[1].children.len() == 1
+                    && tree.children[1].children[0].children.is_empty()
+                    && tree.children[1].children[0]
+                        .name
+                        .starts_with("Seq Scan on ")
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if let Some((a, b, join)) = self.hash_join_estimate(sel) {
+                            explain::price_hash_join(&mut tree, a, b, join);
+                        }
+                    }
+                }
                 // A Nested Loop of two tables' sequential scans with no
                 // clause to hash or merge on (RP-329): `cost_nestloop` over
                 // each side's Seq Scan, the inner materialised when that

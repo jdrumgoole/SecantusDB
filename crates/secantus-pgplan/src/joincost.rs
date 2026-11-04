@@ -14,6 +14,8 @@ use crate::costsize::clamp_row_est;
 
 const CPU_TUPLE_COST: f64 = 0.01;
 const CPU_OPERATOR_COST: f64 = 0.0025;
+/// `disable_cost` (`costsize.c`).
+const DISABLE_COST: f64 = 1.0e10;
 
 /// One side of the join, as the planner sees it.
 #[derive(Debug, Clone, Copy)]
@@ -341,6 +343,114 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
 /// the hash clause passes (`final_cost_hashjoin`'s `qp_qual_cost` over
 /// `hashjointuples`).
 fn hash_join_qp(outer: &JoinSide, inner: &JoinSide, qp: f64) -> (f64, f64) {
+    hash_join_core(outer, inner, qp, join_selectivity(outer, inner), None)
+}
+
+/// One join key's statistics as `eqjoinsel` and
+/// `estimate_hash_bucket_stats` read them from its `pg_statistic` row
+/// (`selfuncs.c`): its distinct count (`get_variable_numdistinct`) and
+/// whether that is the 200 default, its null fraction, and its most common
+/// values with their frequencies (keys compared bytewise, the type's
+/// equality).
+#[derive(Debug, Clone, Copy)]
+pub struct KeyStats<'a> {
+    pub ndistinct: f64,
+    pub default_ndistinct: bool,
+    pub null_frac: f64,
+    pub mcv: &'a [(Vec<u8>, f32)],
+}
+
+/// `eqjoinsel_inner` (PostgreSQL 15 `selfuncs.c`): with both sides' MCV
+/// lists, the matched MCVs' frequency products plus the unmatched and
+/// non-MCV remainders spread over the distinct values left, the smaller of
+/// the two directions; without them, `(1 - nullfrac1)(1 - nullfrac2)` over
+/// the larger distinct count.
+pub fn eqjoinsel_inner(k1: &KeyStats<'_>, k2: &KeyStats<'_>) -> f64 {
+    let clamp = |p: f64| p.clamp(0.0, 1.0);
+    let (nd1, nd2) = (k1.ndistinct, k2.ndistinct);
+    if !k1.mcv.is_empty() && !k2.mcv.is_empty() {
+        let mut has1 = vec![false; k1.mcv.len()];
+        let mut has2 = vec![false; k2.mcv.len()];
+        let mut matchprodfreq = 0.0f64;
+        let mut nmatches = 0usize;
+        for (i, (v1, f1)) in k1.mcv.iter().enumerate() {
+            for (j, (v2, f2)) in k2.mcv.iter().enumerate() {
+                if has2[j] || v1 != v2 {
+                    continue;
+                }
+                has1[i] = true;
+                has2[j] = true;
+                // float4 * float4 is a float4 in C, added to a double.
+                matchprodfreq += f64::from(f1 * f2);
+                nmatches += 1;
+                break;
+            }
+        }
+        let matchprodfreq = clamp(matchprodfreq);
+        let (mut matchfreq1, mut unmatchfreq1) = (0.0f64, 0.0f64);
+        for (i, (_, f)) in k1.mcv.iter().enumerate() {
+            if has1[i] {
+                matchfreq1 += f64::from(*f);
+            } else {
+                unmatchfreq1 += f64::from(*f);
+            }
+        }
+        let matchfreq1 = clamp(matchfreq1);
+        let unmatchfreq1 = clamp(unmatchfreq1);
+        let (mut matchfreq2, mut unmatchfreq2) = (0.0f64, 0.0f64);
+        for (j, (_, f)) in k2.mcv.iter().enumerate() {
+            if has2[j] {
+                matchfreq2 += f64::from(*f);
+            } else {
+                unmatchfreq2 += f64::from(*f);
+            }
+        }
+        let matchfreq2 = clamp(matchfreq2);
+        let unmatchfreq2 = clamp(unmatchfreq2);
+        let otherfreq1 = clamp(1.0 - k1.null_frac - matchfreq1 - unmatchfreq1);
+        let otherfreq2 = clamp(1.0 - k2.null_frac - matchfreq2 - unmatchfreq2);
+        let (n1, n2, m) = (k1.mcv.len() as f64, k2.mcv.len() as f64, nmatches as f64);
+        let mut totalsel1 = matchprodfreq;
+        if nd2 > n2 {
+            totalsel1 += unmatchfreq1 * otherfreq2 / (nd2 - n2);
+        }
+        if nd2 > m {
+            totalsel1 += otherfreq1 * (otherfreq2 + unmatchfreq2) / (nd2 - m);
+        }
+        let mut totalsel2 = matchprodfreq;
+        if nd1 > n1 {
+            totalsel2 += unmatchfreq2 * otherfreq1 / (nd1 - n1);
+        }
+        if nd1 > m {
+            totalsel2 += otherfreq2 * (otherfreq1 + unmatchfreq1) / (nd1 - m);
+        }
+        clamp(totalsel1.min(totalsel2))
+    } else {
+        let sel = (1.0 - k1.null_frac) * (1.0 - k2.null_frac);
+        clamp(if nd1 > nd2 { sel / nd1 } else { sel / nd2 })
+    }
+}
+
+/// A hash join with `inner` hashed whose clause's selectivity is `sel`
+/// and whose inner key's statistics are `inner_key`
+/// (`estimate_hash_bucket_stats` with the column's null fraction and its
+/// first MCV's frequency, RP-330): `(startup, total)`.
+pub fn hash_join_stats(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    sel: f64,
+    inner_key: &KeyStats<'_>,
+) -> (f64, f64) {
+    hash_join_core(outer, inner, 0.0, sel, Some(inner_key))
+}
+
+fn hash_join_core(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    qp: f64,
+    sel: f64,
+    inner_key: Option<&KeyStats<'_>>,
+) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
     startup += (CPU_OPERATOR_COST + CPU_TUPLE_COST) * inner.rows;
@@ -383,14 +493,39 @@ fn hash_join_qp(outer: &JoinSide, inner: &JoinSide, qp: f64) -> (f64, f64) {
         };
         f.clamp(1.0e-6, 1.0)
     };
-    let mut bucketsize = bucket_of(inner.ndistinct, inner.default_ndistinct);
+    let mut bucketsize = match inner_key {
+        // `estimate_hash_bucket_stats` with statistics: a bucket's
+        // fraction scaled up by how much more common the first MCV is
+        // than the average value; and `final_cost_hashjoin` disables a
+        // hash join whose most common value alone overflows `hash_mem`.
+        Some(k) => {
+            let mut f = bucket_of(k.ndistinct, k.default_ndistinct);
+            let mcv_freq = k.mcv.first().map_or(0.0, |m| f64::from(m.1));
+            if !k.default_ndistinct {
+                let mut nd = k.ndistinct;
+                if inner.tuples > 0.0 {
+                    nd = clamp_row_est(nd * inner.rel_rows / inner.tuples);
+                }
+                let avgfreq = (1.0 - k.null_frac) / nd;
+                if avgfreq > 0.0 && mcv_freq > avgfreq {
+                    f = (f * mcv_freq / avgfreq).clamp(1.0e-6, 1.0);
+                }
+            }
+            let mcv_rows = clamp_row_est(inner.rows * mcv_freq);
+            let bytes = mcv_rows * (maxalign(inner.width.unwrap_or(0).max(0) as u64) + 24) as f64;
+            if bytes > HASH_MEM_BYTES as f64 {
+                startup += DISABLE_COST;
+            }
+            f
+        }
+        None => bucket_of(inner.ndistinct, inner.default_ndistinct),
+    };
     for i in 0..inner.extra.n {
         bucketsize = bucketsize.min(bucket_of(
             inner.extra.ndistinct[i],
             inner.extra.default_ndistinct[i],
         ));
     }
-    let sel = join_selectivity(outer, inner);
     let tuples = if inner.unique {
         let match_frac = sel;
         let match_count = (sel * inner.rows / sel).max(1.0);
@@ -2159,6 +2294,37 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `eqjoinsel_inner` (RP-330): two complete MCV lists of the same ten
+    /// values join at their frequency products, 10 x 0.1 x 0.1; a NULL
+    /// fraction and an unmatched remainder spread over the values left;
+    /// without MCVs, `(1 - nf1)(1 - nf2) / max(nd)`.
+    #[test]
+    fn eqjoinsel_inner_matches_selfuncs() {
+        let ten: Vec<(Vec<u8>, f32)> = (0..10u8).map(|v| (vec![v], 0.1f32)).collect();
+        let k = KeyStats {
+            ndistinct: 10.0,
+            default_ndistinct: false,
+            null_frac: 0.0,
+            mcv: &ten,
+        };
+        assert!((eqjoinsel_inner(&k, &k) - 0.1).abs() < 1e-7);
+        let two: Vec<(Vec<u8>, f32)> = vec![(vec![0], 0.25), (vec![99], 0.25)];
+        let k2 = KeyStats {
+            ndistinct: 20.0,
+            default_ndistinct: false,
+            null_frac: 0.2,
+            mcv: &two,
+        };
+        // matched 0.25 x 0.1; k's 0.9 unmatched over k2's 18 others
+        // (0.3 left of it) and k2's 0.25 unmatched over k's 9 others.
+        let one = 0.025 + 0.9 * 0.3 / 18.0 + 0.0;
+        let other = 0.025 + 0.25 * 0.0 / 8.0 + 0.3 * (0.0 + 0.9) / 9.0;
+        let got = eqjoinsel_inner(&k, &k2);
+        assert!((got - f64::min(one, other)).abs() < 1e-7, "{got}");
+        let none = KeyStats { mcv: &[], ..k2 };
+        assert!((eqjoinsel_inner(&k, &none) - 0.8 / 20.0).abs() < 1e-12);
+    }
 
     fn close(a: f64, b: f64) -> bool {
         (a - b).abs() < 0.006

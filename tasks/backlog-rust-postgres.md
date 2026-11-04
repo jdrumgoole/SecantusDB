@@ -1384,18 +1384,23 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN prints no estimate for a Hash Join or its Hash.**
-      `explain select * from e join k on e.b = k.b` is `Hash Join
-      (cost=27.50..1170.00 rows=100000 width=14)` over `Hash
-      (cost=15.00..15.00 rows=1000 width=7)` (`cost_hashjoin`). Which
-      side is hashed is the cost model's choice too; here it follows
-      this server's join order. PostgreSQL 15.19 prices it
-      (`costsize.c`); here it prints `cost=0.00..0.00 rows=0 width=0`.
-      Since RP-314 a plan that is one relation's Seq Scan prints the
-      estimate; the scenario's expected plan is PostgreSQL's, measured
-      on a fresh cluster.
-      Backlog-ID: RP-330
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join]
+- [ ] **EXPLAIN does not price a Hash Join whose left table PostgreSQL
+      hashes.** Since RP-330 an inner JOIN of two analysed tables' Seq
+      Scans on one column equality prints `cost_hashjoin`'s estimate, with
+      `eqjoinsel_inner` over the columns' MCV lists, when the right table
+      is the one PostgreSQL 15.19 hashes. This server always hashes the
+      right table; where PostgreSQL's `add_path` keeps the other order
+      (cheaper beyond the 1.01 fuzz factor), the plan printed is not
+      PostgreSQL's, so it is left at zeros: with `e.b` a quarter NULL over
+      ten values and `k.b` seven, `explain select * from e join k on e.b =
+      k.b` is `Hash Join (cost=27.50..925.75 rows=71450 width=14)` with
+      `Hash Cond: (k.b = e.b)` over `Seq Scan on k` and `Hash` over `Seq
+      Scan on e`. Also left unpriced: a key column unique on either side
+      (`inner_unique`), a WHERE, a join of differently typed keys, an outer
+      join, and a join of three or more relations (found while working
+      RP-330).
+      Backlog-ID: RP-359
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[hash join hashing the left table]
 - [ ] **A catalog read index-only is a zero-cost Seq Scan here.**
       `explain select attname from pg_attribute where attrelid = 1259`
       in a fresh database is `Index Only Scan using

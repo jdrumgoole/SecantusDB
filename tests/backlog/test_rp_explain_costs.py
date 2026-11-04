@@ -49,6 +49,28 @@ _ANALYSED_SMALL = _ANALYSED + [
     "create table zu (a int, b text)",
 ]
 
+# Two analysed tables joined on b: one whose b is mostly one value (its
+# first MCV 0.6), and one whose b is a quarter NULL against seven values
+# (RP-330).
+_SKEWED = [
+    "create table e (a int, b text)",
+    "insert into e select g, case when g < 600 then 'x' else 'v' || (g % 50) end"
+    " from generate_series(1, 1000) g",
+    "analyze e",
+    "create table k (a int, b text)",
+    "insert into k select g, 'v' || (g % 10) from generate_series(1, 1000) g",
+    "analyze k",
+]
+_NULLS = [
+    "create table e (a int, b text)",
+    "insert into e select g, case when g % 4 = 0 then null else 'v' || (g % 10) end"
+    " from generate_series(1, 1000) g",
+    "analyze e",
+    "create table k (a int, b text)",
+    "insert into k select g, 'v' || (g % 7) from generate_series(1, 1000) g",
+    "analyze k",
+]
+
 # A table with a defaulted varchar column, analysed (RP-331).
 _EC = [
     "create table e (a int, b text, c varchar(10) default 'z')",
@@ -802,6 +824,42 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "hash join on a skewed column": (
+        "RP-330",
+        _SKEWED,
+        "explain select * from e join k on e.b = k.b",
+        [
+            "Hash Join  (cost=27.50..251.00 rows=8100 width=13)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=6)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "hash join over nulls": (
+        "RP-330",
+        _NULLS,
+        "explain select * from k join e on k.b = e.b",
+        [
+            "Hash Join  (cost=27.50..925.75 rows=71450 width=14)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "hash join hashing the left table": (
+        "RP-359",
+        _NULLS,
+        "explain select * from e join k on e.b = k.b",
+        [
+            "Hash Join  (cost=27.50..925.75 rows=71450 width=14)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1171,6 +1229,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-327",
         "RP-328",
         "RP-329",
+        "RP-330",
         "RP-331",
         "RP-332",
         "RP-333",

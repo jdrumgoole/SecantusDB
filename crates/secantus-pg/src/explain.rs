@@ -6,7 +6,8 @@
 //! that node (a single relation's Seq Scan, `scan_estimate.rs`, RP-314; a
 //! select with no FROM, a `Result`, RP-325 and RP-340; an INSERT,
 //! UPDATE or DELETE, RP-331; a Nested Loop of two Seq Scans with its
-//! Materialize, RP-329);
+//! Materialize, RP-329; an inner Hash Join of two Seq Scans and its Hash,
+//! RP-330);
 //! every other node still prints zeros, each kind its own backlog item.
 
 use bson::Document;
@@ -494,6 +495,31 @@ pub(crate) fn price_nest_loop(
     };
     root.children.push(outer);
     root.children.push(inner);
+    root.estimate = Some(join);
+}
+
+/// Give an inner `Hash Join` of two scans, the right one under a `Hash`,
+/// the cost model's estimate (RP-330): the join's, each scan's, and the
+/// Hash node's, which is its input's total for both startup and total
+/// (`create_hashjoin_plan` copies the inner path's costs).
+pub(crate) fn price_hash_join(
+    root: &mut PlanNode,
+    outer: crate::scan_estimate::Estimate,
+    inner: crate::scan_estimate::Estimate,
+    join: crate::scan_estimate::Estimate,
+) {
+    if root.name != "Hash Join" || root.children.len() != 2 {
+        return;
+    }
+    let [scan, hash] = root.children.as_mut_slice() else {
+        return;
+    };
+    if hash.name != "Hash" || hash.children.len() != 1 {
+        return;
+    }
+    scan.estimate = Some(outer);
+    hash.children[0].estimate = Some(inner);
+    hash.estimate = Some((inner.1, inner.1, inner.2, inner.3));
     root.estimate = Some(join);
 }
 
