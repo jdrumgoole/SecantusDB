@@ -586,7 +586,7 @@ impl PgHandler {
         };
         let a = side(left, left_key)?;
         let b = side(right, right_key)?;
-        hash_join_of(a, b, false)
+        hash_join_of(a, b, false, false)
     }
 
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
@@ -617,18 +617,31 @@ impl PgHandler {
         }
         let (a, b) = j.on.as_ref()?;
         // Each side's WHERE as its scan's filter (RP-362). A predicate on a
-        // join key puts a constant in the key's equivalence class, which
-        // leaves no join clause; that plan is not this one.
-        for pred in &j.filter {
-            if (pred.alias == a.0 && pred.col == a.1) || (pred.alias == b.0 && pred.col == b.1) {
-                return None;
+        // join key puts a constant in the key's equivalence class: an
+        // inner join is then left with no join clause (RP-363's Nested
+        // Loop, not this plan); a LEFT join whose OUTER key it fixes
+        // filters the nullable side by the constant too
+        // (`reconsider_outer_join_clauses`, RP-364) and keeps the ON as a
+        // redundant clause, whose selectivity is 1 (`norm_selec` above 1).
+        let (implied, by) = self.narrow_with_implied(j)?;
+        let (filters, redundant) = match by {
+            crate::NarrowImplied::Nothing => (j.filter.clone(), false),
+            crate::NarrowImplied::InnerKey => (implied.filter.clone(), true),
+            crate::NarrowImplied::NoJoinClause => return None,
+        };
+        if !redundant {
+            for pred in &filters {
+                if (pred.alias == a.0 && pred.col == a.1) || (pred.alias == b.0 && pred.col == b.1)
+                {
+                    return None;
+                }
             }
         }
         // A WHERE on a LEFT join's nullable side never reaches this path:
         // the narrow planner refuses it, and the general one plans it.
         let left_join = j.left_join;
         let side_filter =
-            |table: &str, alias: &str| self.narrow_side_filter(&j.filter, table, alias);
+            |table: &str, alias: &str| self.narrow_side_filter(&filters, table, alias);
         let side = |(table, alias): &(String, String)| -> Option<HashSide> {
             let key = if a.0 == *alias {
                 &a.1
@@ -660,7 +673,7 @@ impl PgHandler {
         if j.left.1 == j.right.1 {
             return None;
         }
-        hash_join_of(side(&j.left)?, side(&j.right)?, left_join)
+        hash_join_of(side(&j.left)?, side(&j.right)?, left_join, redundant)
     }
 
     /// [`Self::nest_loop_estimate`] for a cross join planned on the narrow
@@ -760,6 +773,35 @@ impl PgHandler {
             1 => clauses.pop().expect("one clause"),
             _ => bson::doc! { "$and": clauses },
         })
+    }
+
+    /// The filters an equivalence class adds to a narrow-path LEFT join
+    /// whose WHERE fixes its outer key (RP-364): `(alias, column)` of the
+    /// nullable side's key, and the alias whose WHERE fixed it.
+    pub(crate) fn join_select_left_implied(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<LeftImplied> {
+        let j = sel.join.as_ref()?;
+        if !j.left_join {
+            return None;
+        }
+        let (implied, by) = self.narrow_with_implied(j)?;
+        if !matches!(by, crate::NarrowImplied::InnerKey) {
+            return None;
+        }
+        let added = implied.filter[j.filter.len()..]
+            .iter()
+            .map(|p| (p.alias.clone(), p.col.clone()))
+            .collect();
+        // The outer key the WHERE fixed.
+        let (a, b) = j.on.as_ref()?;
+        let from = if a.0 == j.left.1 {
+            a.clone()
+        } else {
+            b.clone()
+        };
+        Some((added, from))
     }
 
     /// The Nested Loop of a narrow-path inner join whose WHERE fixes a join
@@ -2441,10 +2483,15 @@ struct HashSide {
 /// With `left_join`, `a` is the preserved side: the join keeps at least
 /// its rows (`calc_joinrel_size_estimate`), and the swapped path is the
 /// `Hash Right Join` PostgreSQL builds the other way round.
+/// With `redundant`, the join clause is one an equivalence class with a
+/// constant already enforces on both sides, so its selectivity is 1
+/// (`clause_selectivity` of a clause whose `norm_selec` is above 1,
+/// RP-364).
 fn hash_join_of(
     a: HashSide,
     b: HashSide,
     left_join: bool,
+    redundant: bool,
 ) -> Option<(Estimate, Estimate, Estimate, bool)> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     if a.pg_type != b.pg_type {
@@ -2459,7 +2506,11 @@ fn hash_join_of(
         }
     }
     let (ka, kb) = (key(&a), key(&b));
-    let selectivity = joincost::eqjoinsel_inner(&ka, &kb);
+    let selectivity = if redundant {
+        1.0
+    } else {
+        joincost::eqjoinsel_inner(&ka, &kb)
+    };
     let join_side = |s: &HashSide| JoinSide {
         rows: s.scan.2,
         tuples: s.tuples,
@@ -2490,8 +2541,29 @@ fn hash_join_of(
     // plan printed follows it: with `swap`, the left table hashed
     // (RP-359).
     let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
-    let fuzzy_eq = |x: f64, y: f64| x <= y * 1.01 && y <= x * 1.01;
-    let right_kept = total <= l_total || (fuzzy_eq(startup, l_startup) && fuzzy_eq(total, l_total));
+    // `add_path` of the swapped path against the first:
+    // `compare_path_costs_fuzzily` with the 1.01 fuzz -- total first, the
+    // startup deciding only between fuzzily equal totals (startup costs
+    // are not considered with no LIMIT) -- and, when fuzzily equal, the
+    // same comparison with a 1.0000000001 fuzz (RP-364).
+    let swap_better = |fuzz: f64| -> Option<bool> {
+        if l_total > total * fuzz {
+            Some(false)
+        } else if total > l_total * fuzz {
+            Some(true)
+        } else if l_startup > startup * fuzz {
+            Some(false)
+        } else if startup > l_startup * fuzz {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let swapped = match swap_better(1.01) {
+        Some(better) => better,
+        None => swap_better(1.000_000_000_1) == Some(true),
+    };
+    let right_kept = !swapped;
     let mut rows = outer.rows * inner.rows * selectivity;
     if left_join {
         rows = rows.max(outer.rows);
@@ -2504,3 +2576,8 @@ fn hash_join_of(
         (b.scan, a.scan, (l_startup, l_total, rows, width), true)
     })
 }
+
+/// The filters an equivalence class adds to a LEFT join whose WHERE fixes
+/// its outer key, `(alias, column)` each, and that outer key `(alias,
+/// column)` (RP-364).
+pub(crate) type LeftImplied = (Vec<(String, String)>, (String, String));

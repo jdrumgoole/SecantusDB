@@ -1375,30 +1375,39 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN draws the wrong plan for a LEFT join that a WHERE
-      changes.** Since RP-363 an inner join whose WHERE fixes a join key
-      to a constant prints PostgreSQL 15.19's Nested Loop of the two scans,
-      each filtered by the constant. Two LEFT joins a WHERE changes still
-      print zeros over the wrong tree, with `e.b` a quarter NULL over ten
-      values and `k.b` seven:
-      - a WHERE on the nullable side makes it an inner join
-        (`reduce_outer_joins`). The narrow path refuses that WHERE, and the
-        general planner's tree prints a `Hash Join` with the WHERE as a
-        top-level `Join Filter`, unpriced. PostgreSQL: `explain select e.a
-        from e left join k on e.b = k.b where k.a = 3` is `Hash Join
-        (cost=17.51..36.97 rows=71 width=4)`, `Filter: (a = 3)` on `k`'s
-        scan under the Hash.
-      - a WHERE fixing the OUTER key filters the nullable side by the
-        constant too (`reconsider_outer_join_clauses`; the narrow
-        executor's `NarrowImplied::InnerKey`). PostgreSQL: `... where e.b =
-        'v1'` is `Hash Right Join (cost=18.75..197.48 rows=14300
-        width=4)`, both scans filtered `(b = 'v1'::text)`. Here it is a
-        `Hash Left Join` with no filter on `k`, all zeros.
-      Also unpriced: either shape, or the inner one, over a table with an
-      index, whose index scan PostgreSQL may pick (see RP-354). Found while
-      working RP-363.
-      Backlog-ID: RP-364
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join reduced by its WHERE], tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join whose WHERE fixes the outer key]
+- [ ] **EXPLAIN of a LEFT join whose WHERE names its nullable side is
+      unpriced and puts the WHERE on the join.** A WHERE on the nullable
+      side makes the LEFT join an inner one (`reduce_outer_joins`). The
+      general join planner reduces it, but EXPLAIN's WHERE placement
+      (`ruleutils::join_where`, `attach_join_where`) reads the SQL as
+      written and prints the qual as the top join's `Join Filter`, and the
+      joined-rows hash estimate (`hash_join_estimate`) refuses a WHERE, so
+      every number is zero. With `e.b` a quarter NULL over ten values and
+      `k.b` seven, PostgreSQL 15.19 prints `explain select e.a from e left
+      join k on e.b = k.b where k.a = 3` as `Hash Join (cost=17.51..36.97
+      rows=71 width=4)`, with `Filter: (a = 3)` on `k`'s scan under the
+      Hash. Also unpriced on both join paths: a WHERE or join over a table
+      with an index, whose index scan PostgreSQL may pick (see RP-354).
+      Found while working RP-363.
+      Backlog-ID: RP-365
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected LEFT join reduced by its WHERE]
+- [ ] **EXPLAIN prints a priced Hash Join where PostgreSQL merges.** The
+      analysed-table hash-join estimates (RP-330 to RP-364) weigh the two
+      hash orders but no merge join, so where PostgreSQL's merge path is
+      cheaper this server prints a Hash Join with numbers PostgreSQL never
+      prints. Over `e.b` mostly one value (first MCV 0.6) and `k.b` ten,
+      `explain select e.a from e join k on e.b = k.b where e.a > 10 and
+      k.a <= 400` is, on 15.19, `Merge Join (cost=101.55..148.70 rows=3208
+      width=4)` over a `Sort` of each filtered scan; here it is `Hash Join
+      (cost=22.50..198.31 ...)`. The skew makes the hash table's buckets
+      long, and the merge path's cost needs `mergejoinscansel` over the
+      keys' statistics (`get_variable_range` from the histogram or MCV
+      bounds), which `joincost::merge_join` does not model (it reads both
+      inputs whole). Until it does, the hash estimate should be checked
+      against it. Found while working RP-364; the row estimate (3208) is
+      already right.
+      Backlog-ID: RP-366
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected join PostgreSQL merges]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
       index path.** Over an analysed table PostgreSQL 15.19's
       `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`

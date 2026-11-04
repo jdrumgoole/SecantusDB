@@ -40860,7 +40860,7 @@ impl PgHandler {
                                     .filter
                                     .iter()
                                     .find(|p| !implied.iter().any(|(al, _)| *al == p.alias))
-                                    .map(|p| p.alias.clone())
+                                    .map(|p| (p.alias.clone(), p.col.clone()))
                                     .unwrap_or_default();
                                 explain::implied_nest_loop(&mut tree, &implied, &from);
                                 explain::price_nest_loop(&mut tree, &plan, a, b, join);
@@ -40888,6 +40888,12 @@ impl PgHandler {
                             .hash_join_estimate(sel)
                             .or_else(|| self.join_select_hash_estimate(sel))
                         {
+                            // A LEFT join whose WHERE fixes its outer key:
+                            // the nullable side's scan is filtered by the
+                            // constant too (RP-364).
+                            if let Some((implied, from)) = self.join_select_left_implied(sel) {
+                                explain::mark_implied_filters(&mut tree, &implied, &from);
+                            }
                             explain::price_hash_join(&mut tree, a, b, join, swap);
                         }
                     }

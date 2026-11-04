@@ -454,7 +454,10 @@ fn hash_join_core(
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
     startup += (CPU_OPERATOR_COST + CPU_TUPLE_COST) * inner.rows;
-    run += CPU_OPERATOR_COST * outer.rows;
+    // PostgreSQL on arm64 contracts `run_cost += a * b` into a fused
+    // multiply-add (`initial_cost_hashjoin`, `final_cost_hashjoin`), which
+    // decides the last printed digit (RP-364).
+    run = CPU_OPERATOR_COST.mul_add(outer.rows, run);
     // ExecChooseHashTableSize; a side whose width is not known is priced
     // as one batch of a power of two at least the rows, at least 1,024.
     let (nbuckets, nbatch) = match inner.width {
@@ -502,11 +505,10 @@ fn hash_join_core(
             let mut f = bucket_of(k.ndistinct, k.default_ndistinct);
             let mcv_freq = k.mcv.first().map_or(0.0, |m| f64::from(m.1));
             if !k.default_ndistinct {
-                let mut nd = k.ndistinct;
-                if inner.tuples > 0.0 {
-                    nd = clamp_row_est(nd * inner.rel_rows / inner.tuples);
-                }
-                let avgfreq = (1.0 - k.null_frac) / nd;
+                // The average frequency is the RAW relation's: taken
+                // before the distinct count is scaled to the rows the
+                // scan's restriction leaves (RP-364).
+                let avgfreq = (1.0 - k.null_frac) / k.ndistinct;
                 if avgfreq > 0.0 && mcv_freq > avgfreq {
                     f = (f * mcv_freq / avgfreq).clamp(1.0e-6, 1.0);
                 }
@@ -545,7 +547,7 @@ fn hash_join_core(
             clause_cost(outer, inner) * outer.rows * clamp_row_est(inner.rows * bucketsize) * 0.5;
         clamp_row_est(outer.rows * inner.rows * sel)
     };
-    run += (CPU_TUPLE_COST + qp) * tuples;
+    run = (CPU_TUPLE_COST + qp).mul_add(tuples, run);
     (startup, startup + run)
 }
 
