@@ -36,6 +36,13 @@ pub(crate) struct PlanNode {
     /// `Hash Cond` is written outer side first, as `create_hashjoin_plan`
     /// commutes the clause to `outer = inner`.
     pub commute_cond: bool,
+    /// A join whose clause an equivalence class with a constant replaced
+    /// (RP-363): the ON's condition is not printed on it.
+    pub skip_cond: bool,
+    /// A scan the class filters by the constant too (RP-363): `(own key
+    /// column, the alias whose WHERE fixed the other key)`. Its `Filter`
+    /// is the other scan's, over this column.
+    pub implied_filter: Option<(String, String)>,
     /// Under ANALYZE, an index-only scan's `Heap Fetches`
     /// (`ioss_HeapFetches`), printed after its quals (RP-360).
     pub heap_fetches: Option<usize>,
@@ -53,6 +60,8 @@ impl PlanNode {
             unique_probe: None,
             commute_cond: false,
             heap_fetches: None,
+            skip_cond: false,
+            implied_filter: None,
         }
     }
 
@@ -1271,7 +1280,7 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
             return;
         };
         if let Some(c) = conds.get(*next) {
-            if !c.is_empty() {
+            if !c.is_empty() && !n.skip_cond {
                 let c = if n.commute_cond {
                     commute_equality(c).unwrap_or_else(|| c.clone())
                 } else {
@@ -1287,6 +1296,108 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
     }
     let mut next = 0;
     walk(root, conds, &mut next);
+}
+
+/// Give each scan an equivalence class filters (RP-363) the constant its
+/// other side's WHERE compares the other key with: that scan's `Filter`,
+/// one equality, over this scan's key column. A filter of several
+/// conjuncts is left as it is.
+pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
+    fn scans<'a>(n: &'a PlanNode, out: &mut Vec<&'a PlanNode>) {
+        if n.children.is_empty() {
+            out.push(n);
+        }
+        for c in &n.children {
+            scans(c, out);
+        }
+    }
+    fn alias_of(n: &PlanNode) -> Option<&str> {
+        n.props
+            .iter()
+            .find(|(k, _)| k == "Alias")
+            .or_else(|| n.props.iter().find(|(k, _)| k == "Relation Name"))
+            .map(|(_, v)| v.as_str())
+    }
+    let mut found = Vec::new();
+    scans(root, &mut found);
+    // (target alias, filter text) for each scan to fill.
+    let mut fills: Vec<(String, String)> = Vec::new();
+    for n in &found {
+        let Some((col, from)) = &n.implied_filter else {
+            continue;
+        };
+        let Some(source) = found.iter().find(|m| alias_of(m) == Some(from.as_str())) else {
+            continue;
+        };
+        let Some((_, text)) = source.details.iter().find(|(k, _)| k == "Filter") else {
+            continue;
+        };
+        let Some(rhs) = text
+            .strip_prefix('(')
+            .and_then(|t| t.split_once(" = "))
+            .map(|(_, r)| r)
+        else {
+            continue;
+        };
+        if rhs.contains(" AND ") || rhs.contains(" = ") {
+            continue;
+        }
+        if let Some(target) = alias_of(n) {
+            fills.push((target.to_string(), format!("({col} = {rhs}")));
+        }
+    }
+    fn fill(n: &mut PlanNode, target: &str, text: &str) {
+        if n.children.is_empty() && n.implied_filter.is_some() && alias_of(n) == Some(target) {
+            // The class's equality is ANDed after the scan's own quals, in
+            // one Filter, as `order_qual_clauses` leaves them.
+            match n.details.iter_mut().find(|(k, _)| k == "Filter") {
+                Some((_, own)) => {
+                    *own = match own.strip_prefix("((").and_then(|t| t.strip_suffix("))")) {
+                        Some(inner) if inner.contains(") AND (") => {
+                            format!("(({inner}) AND {text})")
+                        }
+                        _ => format!("({own} AND {text})"),
+                    };
+                }
+                None => n.details.push(("Filter".into(), text.to_string())),
+            }
+            n.implied_filter = None;
+        }
+        for c in &mut n.children {
+            fill(c, target, text);
+        }
+    }
+    for (target, text) in fills {
+        fill(root, &target, &text);
+    }
+}
+
+/// Make a narrow-path `Hash Join` whose clause an equivalence class
+/// replaced (RP-363) the Nested Loop over the two scans it is: the Hash
+/// removed, the ON's condition not printed, and each scan named in
+/// `implied` (`(alias, key column)`) filtered by the constant too.
+pub(crate) fn implied_nest_loop(root: &mut PlanNode, implied: &[(String, String)], from: &str) {
+    if root.children.len() != 2 || root.children[1].name != "Hash" {
+        return;
+    }
+    let mut hash = root.children.pop().expect("two children");
+    let right = hash.children.pop().expect("one child");
+    root.children.push(right);
+    root.name = "Nested Loop".into();
+    root.skip_cond = true;
+    root.inner_unique = false;
+    root.unique_probe = None;
+    for c in &mut root.children {
+        let alias = c
+            .props
+            .iter()
+            .find(|(k, _)| k == "Alias")
+            .or_else(|| c.props.iter().find(|(k, _)| k == "Relation Name"))
+            .map(|(_, v)| v.clone());
+        if let Some((_, col)) = implied.iter().find(|(a, _)| Some(a) == alias.as_ref()) {
+            c.implied_filter = Some((col.clone(), from.to_string()));
+        }
+    }
 }
 
 /// Place a joined SELECT's WHERE conjuncts: one naming a single relation
@@ -1404,6 +1515,40 @@ mod setop_quals_tests {
 #[cfg(test)]
 mod join_type_tests {
     use super::*;
+
+    /// An equivalence class's filter (RP-363) copies the other scan's
+    /// constant onto this scan's key, ANDed after its own quals.
+    #[test]
+    fn implied_filters_and_after_own_quals() {
+        let scan = |alias: &str, filter: Option<&str>, implied: Option<(&str, &str)>| {
+            let mut n = PlanNode::new(format!("Seq Scan on {alias}"));
+            n.props.push(("Relation Name".into(), alias.into()));
+            if let Some(f) = filter {
+                n.details.push(("Filter".into(), f.into()));
+            }
+            n.implied_filter = implied.map(|(c, f)| (c.into(), f.into()));
+            n
+        };
+        let mut root = PlanNode::new("Nested Loop");
+        root.children
+            .push(scan("e", Some("(b = 'v2'::text)"), None));
+        root.children
+            .push(scan("k", Some("(a < 500)"), Some(("c", "e"))));
+        apply_implied_filters(&mut root);
+        assert_eq!(
+            root.children[1].details,
+            vec![(
+                "Filter".to_string(),
+                "((a < 500) AND (c = 'v2'::text))".to_string()
+            )]
+        );
+        let mut root = PlanNode::new("Nested Loop");
+        root.children
+            .push(scan("e", Some("(b = 'v2'::text)"), None));
+        root.children.push(scan("k", None, Some(("b", "e"))));
+        apply_implied_filters(&mut root);
+        assert_eq!(root.children[1].details[0].1, "(b = 'v2'::text)");
+    }
 
     /// A swapped hash join's `Hash Cond` is written outer side first
     /// (RP-359); anything but one plain equality is left as it was.

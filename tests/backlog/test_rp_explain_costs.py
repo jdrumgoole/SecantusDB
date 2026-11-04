@@ -966,7 +966,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a projected LEFT join reduced by its WHERE": (
-        "RP-363",
+        "RP-364",
         _NULLS,
         "explain select e.a from e left join k on e.b = k.b where k.a = 3",
         [
@@ -976,6 +976,20 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=17.50..17.50 rows=1 width=3)",
             "        ->  Seq Scan on k  (cost=0.00..17.50 rows=1 width=3)",
             "              Filter: (a = 3)",
+        ],
+    ),
+    "a projected LEFT join whose WHERE fixes the outer key": (
+        "RP-364",
+        _NULLS,
+        "explain select e.a from e left join k on e.b = k.b where e.b = 'v1'",
+        [
+            "Hash Right Join  (cost=18.75..197.48 rows=14300 width=4)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..17.50 rows=143 width=3)",
+            "        Filter: (b = 'v1'::text)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v1'::text)",
         ],
     ),
     "insert": (
@@ -1382,6 +1396,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-360",
         "RP-361",
         "RP-362",
+        "RP-363",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

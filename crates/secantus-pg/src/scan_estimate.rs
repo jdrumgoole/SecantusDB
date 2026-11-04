@@ -624,41 +624,11 @@ impl PgHandler {
                 return None;
             }
         }
-        // A WHERE on a LEFT join's nullable side is strict, so PostgreSQL
-        // reduces the join to an inner one (`reduce_outer_joins`).
-        if j.left_join && j.filter.iter().any(|p| p.alias == j.right.1) {
-            return None;
-        }
-        let indexes = self.index_relations();
-        let side_filter = |table: &str, alias: &str| -> Option<Document> {
-            use secantus_pgplan::JoinOp;
-            let def = self.lookup(table)?;
-            let mut clauses = Vec::new();
-            // A WHERE over a table with an index may be an index scan's,
-            // which this estimate does not weigh.
-            if j.filter.iter().any(|p| p.alias == alias)
-                && indexes.iter().any(|ix| ix.table.name == table)
-            {
-                return None;
-            }
-            for pred in j.filter.iter().filter(|p| p.alias == alias) {
-                let op = match pred.op {
-                    JoinOp::Eq => "$eq",
-                    JoinOp::Gt => "$gt",
-                    JoinOp::Ge => "$gte",
-                    JoinOp::Lt => "$lt",
-                    JoinOp::Le => "$lte",
-                    JoinOp::NotTrue => return None,
-                };
-                let field = def.field_of(&pred.col)?;
-                clauses.push(bson::doc! { field: { op: pred.value.clone() } });
-            }
-            Some(match clauses.len() {
-                0 => Document::new(),
-                1 => clauses.pop().expect("one clause"),
-                _ => bson::doc! { "$and": clauses },
-            })
-        };
+        // A WHERE on a LEFT join's nullable side never reaches this path:
+        // the narrow planner refuses it, and the general one plans it.
+        let left_join = j.left_join;
+        let side_filter =
+            |table: &str, alias: &str| self.narrow_side_filter(&j.filter, table, alias);
         let side = |(table, alias): &(String, String)| -> Option<HashSide> {
             let key = if a.0 == *alias {
                 &a.1
@@ -690,7 +660,7 @@ impl PgHandler {
         if j.left.1 == j.right.1 {
             return None;
         }
-        hash_join_of(side(&j.left)?, side(&j.right)?, j.left_join)
+        hash_join_of(side(&j.left)?, side(&j.right)?, left_join)
     }
 
     /// [`Self::nest_loop_estimate`] for a cross join planned on the narrow
@@ -749,6 +719,136 @@ impl PgHandler {
         let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, 0.0);
         let rows = costsize::clamp_row_est(a.2 * b.2);
         Some((plan, a, b, (plan.startup, plan.total, rows, a.3 + b.3)))
+    }
+
+    /// One side's WHERE predicates as its scan's filter (RP-362): the
+    /// predicates naming `alias`, ANDed. `None` for a predicate this does
+    /// not model (`NOT col`) or a filtered table with an index, which an
+    /// index scan may serve.
+    fn narrow_side_filter(
+        &self,
+        filter: &[secantus_pgplan::JoinPred],
+        table: &str,
+        alias: &str,
+    ) -> Option<Document> {
+        let indexes = self.index_relations();
+
+        use secantus_pgplan::JoinOp;
+        let def = self.lookup(table)?;
+        let mut clauses = Vec::new();
+        // A WHERE over a table with an index may be an index scan's,
+        // which this estimate does not weigh.
+        if filter.iter().any(|p| p.alias == alias)
+            && indexes.iter().any(|ix| ix.table.name == table)
+        {
+            return None;
+        }
+        for pred in filter.iter().filter(|p| p.alias == alias) {
+            let op = match pred.op {
+                JoinOp::Eq => "$eq",
+                JoinOp::Gt => "$gt",
+                JoinOp::Ge => "$gte",
+                JoinOp::Lt => "$lt",
+                JoinOp::Le => "$lte",
+                JoinOp::NotTrue => return None,
+            };
+            let field = def.field_of(&pred.col)?;
+            clauses.push(bson::doc! { field: { op: pred.value.clone() } });
+        }
+        Some(match clauses.len() {
+            0 => Document::new(),
+            1 => clauses.pop().expect("one clause"),
+            _ => bson::doc! { "$and": clauses },
+        })
+    }
+
+    /// The Nested Loop of a narrow-path inner join whose WHERE fixes a join
+    /// key to a constant (RP-363): the constant is in the keys' equivalence
+    /// class, so each side is filtered by it
+    /// (`generate_base_implied_equalities_const`) and no join clause is
+    /// left. Each side's sequential scan reads the columns the select list
+    /// and the ON take from it; the plan is `cheapest_nest_loop`'s. Also
+    /// returns the filters the class adds, `(alias, column)`.
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn join_select_implied_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(
+        secantus_pgplan::joincost::NestLoopPlan,
+        Estimate,
+        Estimate,
+        Estimate,
+        Vec<(String, String)>,
+    )> {
+        let j = sel.join.as_ref()?;
+        if sel.sub.is_some()
+            || sel.series.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || !sel.filter.is_empty()
+            || sel.residual.is_some()
+            || j.left_join
+            || j.left_sub.is_some()
+            || j.right_sub.is_some()
+            || j.order.is_some()
+            || j.exprs.iter().any(Option::is_some)
+            || j.left.1 == j.right.1
+        {
+            return None;
+        }
+        let (a, b) = j.on.as_ref()?;
+        let (implied, by) = self.narrow_with_implied(j)?;
+        if !matches!(by, crate::NarrowImplied::NoJoinClause) {
+            return None;
+        }
+        let side = |(table, alias): &(String, String)| -> Option<(Estimate, i64)> {
+            let key = if a.0 == *alias {
+                &a.1
+            } else if b.0 == *alias {
+                &b.1
+            } else {
+                return None;
+            };
+            let def = self.lookup(table)?;
+            let above: Vec<String> = j
+                .columns
+                .iter()
+                .filter(|(_, side, _)| side == alias)
+                .map(|(_, _, c)| def.field_of(c))
+                .collect::<Option<_>>()?;
+            let mut read = above.clone();
+            let field = def.field_of(key)?;
+            if !read.contains(&field) {
+                read.push(field);
+            }
+            let filter = self.narrow_side_filter(&implied.filter, table, alias)?;
+            let (scan, None) = self.scan_estimate(table, &filter, &read)? else {
+                return None;
+            };
+            let (width, None) = self.scan_estimate(table, &Document::new(), &above)? else {
+                return None;
+            };
+            Some((scan, width.3))
+        };
+        let (sa, a_above) = side(&j.left)?;
+        let (sb, b_above) = side(&j.right)?;
+        let plan = secantus_pgplan::joincost::cheapest_nest_loop(sa, sb, 0.0);
+        let rows = costsize::clamp_row_est(sa.2 * sb.2);
+        let added = implied.filter[j.filter.len()..]
+            .iter()
+            .map(|p| (p.alias.clone(), p.col.clone()))
+            .collect();
+        Some((
+            plan,
+            sa,
+            sb,
+            (plan.startup, plan.total, rows, a_above + b_above),
+            added,
+        ))
     }
 
     /// One table of a hash join priced by `cost_hashjoin` (RP-330): its

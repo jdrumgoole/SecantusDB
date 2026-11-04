@@ -40847,6 +40847,27 @@ impl PgHandler {
                         }
                     }
                 }
+                // A narrow-path inner join whose WHERE fixes a join key
+                // (RP-363) is a Nested Loop of the two filtered scans: the
+                // equivalence class with the constant replaced its clause.
+                if let Statement::Select(sel) = inner.as_ref() {
+                    if let Some(j) = &sel.join {
+                        if tree.name == "Hash Join" {
+                            if let Some((plan, a, b, join, implied)) =
+                                self.join_select_implied_estimate(sel)
+                            {
+                                let from = j
+                                    .filter
+                                    .iter()
+                                    .find(|p| !implied.iter().any(|(al, _)| *al == p.alias))
+                                    .map(|p| p.alias.clone())
+                                    .unwrap_or_default();
+                                explain::implied_nest_loop(&mut tree, &implied, &from);
+                                explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                            }
+                        }
+                    }
+                }
                 // An inner Hash Join of two tables' sequential scans on one
                 // column equality, both analysed (RP-330), planned as joined
                 // rows or on the narrow two-table path (RP-361):
@@ -41499,6 +41520,7 @@ impl PgHandler {
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 explain::attach_join_conds(&mut tree, &options.join_conds);
                 explain::attach_join_where(&mut tree, &options.join_where);
+                explain::apply_implied_filters(&mut tree);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.
                 let actual = if options.analyze {
