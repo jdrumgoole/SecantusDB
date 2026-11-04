@@ -1946,13 +1946,13 @@ def test_a_catalog_columns_correlation_follows_the_heap(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_an_array_column(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster): a plain
-    ANALYZE measures the catalogs' array columns too, so after a table
-    created `with (fillfactor=50)` `pg_class.reloptions` (`text[]`) has a
+    ANALYZE measured the catalogs' array columns too, so after a table
+    created `with (fillfactor=50)` `pg_class.reloptions` (`text[]`) had a
     second distinct value and a smaller null fraction than `initdb`'s
-    0.99268293 / 1."""
+    0.99268293 / 1, where this server kept `initdb`'s row."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_a")
         c.execute("create database rp313_a")
@@ -1964,6 +1964,142 @@ def test_a_database_wide_analyze_measures_an_array_column(rust_pg: Any) -> None:
             " where tablename = 'pg_class' and attname = 'reloptions'"
         ).fetchone()
     assert row == (0.99026763, 2.0, '{"{security_barrier=true}"}')
+
+
+@pytest.mark.backlog_fixed("RP-313")
+def test_a_database_wide_analyze_measures_array_elements(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster):
+    `compute_array_stats` gives `pg_class.reloptions` its element slots
+    over the catalog's rows as they stand -- the three system views
+    `system_views.sql` creates `WITH (security_barrier)` and the new table
+    -- and its width is the arrays' own (`VARSIZE`, 4-byte element
+    headers); here the column kept `initdb`'s row."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_e")
+        c.execute("create database rp313_e")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_e", autocommit=True) as c:
+        views = c.execute(
+            "select relname, reloptions from pg_class where reloptions is not null order by 1"
+        ).fetchall()
+        c.execute("create table zz_opt (a int) with (fillfactor=50)")
+        c.execute("analyze")
+        row = c.execute(
+            "select avg_width, correlation, most_common_elems::text,"
+            " most_common_elem_freqs::text, array_length(elem_count_histogram, 1),"
+            " elem_count_histogram[101] from pg_stats"
+            " where tablename = 'pg_class' and attname = 'reloptions'"
+        ).fetchone()
+        slots = c.execute(
+            "select stakind1, stakind2, stakind3, stakind4, staop1, staop2, staop3,"
+            " staop4, stacoll1, stacoll2, stacoll3, stacoll4 from pg_statistic"
+            " where starelid = 'pg_class'::regclass and staattnum = 32"
+        ).fetchone()
+    assert views == [
+        ("pg_stats", ["security_barrier=true"]),
+        ("pg_stats_ext", ["security_barrier=true"]),
+        ("pg_stats_ext_exprs", ["security_barrier=true"]),
+    ]
+    assert row == (
+        47,
+        1.0,
+        "{fillfactor=50,security_barrier=true}",
+        "{0.25,0.75,0.25,0.75,0}",
+        101,
+        1.0,
+    )
+    assert slots == (1, 3, 4, 5, 1070, 1072, 98, 98, 950, 950, 950, 950)
+
+
+@pytest.mark.backlog_fixed("RP-313")
+def test_an_analyzed_array_column_is_estimated(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a private cluster): ANALYZE of a table's `int4[]`
+    and `text[]` columns records `array_typanalyze`'s statistics, and the
+    planner estimates `=`, `<` and `<>` on them from the most common
+    values (`array_eq` / `array_lt`); here the columns had no statistics,
+    and any filter on them printed zeros."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_u")
+        c.execute("create database rp313_u")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_u", autocommit=True) as c:
+        c.execute("create table ue (b int4[], t text[])")
+        c.execute(
+            "insert into ue select array[i % 3, 1], array['x' || (i % 4)]"
+            " from generate_series(1, 50) i"
+        )
+        c.execute("analyze ue")
+        stats = c.execute(
+            "select attname, null_frac, avg_width, n_distinct, most_common_vals::text,"
+            " most_common_freqs::text, correlation, most_common_elems::text,"
+            " most_common_elem_freqs::text, elem_count_histogram[101]"
+            " from pg_stats where tablename = 'ue' order by attname"
+        ).fetchall()
+        plans = [
+            [r[0] for r in c.execute("explain select * from ue where " + w)]
+            for w in ("b = '{1,1}'", "b < '{1,1}'", "b <> '{1,1}'", "t = '{x1}'")
+        ]
+    assert stats == [
+        (
+            "b",
+            0.0,
+            29,
+            3.0,
+            '{"{1,1}","{2,1}","{0,1}"}',
+            "{0.34,0.34,0.32}",
+            0.3469388,
+            "{0,1,2}",
+            "{0.32,1,0.34,0.32,1,0}",
+            1.66,
+        ),
+        (
+            "t",
+            0.0,
+            29,
+            4.0,
+            '{"{x1}","{x2}","{x0}","{x3}"}',
+            "{0.26,0.26,0.24,0.24}",
+            0.23591837,
+            "{x0,x1,x2,x3}",
+            "{0.24,0.26,0.26,0.24,0.24,0.26,0}",
+            1.0,
+        ),
+    ]
+    assert plans == [
+        [
+            "Seq Scan on ue  (cost=0.00..1.62 rows=17 width=58)",
+            "  Filter: (b = '{1,1}'::integer[])",
+        ],
+        [
+            "Seq Scan on ue  (cost=0.00..1.62 rows=16 width=58)",
+            "  Filter: (b < '{1,1}'::integer[])",
+        ],
+        [
+            "Seq Scan on ue  (cost=0.00..1.62 rows=33 width=58)",
+            "  Filter: (b <> '{1,1}'::integer[])",
+        ],
+        ["Seq Scan on ue  (cost=0.00..1.62 rows=13 width=58)", "  Filter: (t = '{x1}'::text[])"],
+    ]
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_an_aclitem_array(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster): a plain
+    ANALYZE re-measures `pg_class.relacl` (`aclitem[]`, which has `=` but
+    no `<`: `compute_distinct_stats`), so after a GRANT on a new table its
+    null fraction and frequencies follow the catalog's rows; here the
+    column keeps `initdb`'s 0.5097561 and
+    {0.45365855,0.029268293,0.004878049,0.0024390244}."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_b")
+        c.execute("create database rp313_b")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_b", autocommit=True) as c:
+        c.execute("create table zz_acl (a int)")
+        c.execute("grant select on zz_acl to public")
+        c.execute("analyze")
+        row = c.execute(
+            "select null_frac, n_distinct, most_common_freqs::text from pg_stats"
+            " where tablename = 'pg_class' and attname = 'relacl'"
+        ).fetchone()
+    assert row == (0.50851583, 4.0, "{0.45498782,0.02919708,0.00486618,0.00243309}")
 
 
 @pytest.mark.backlog_fixed("RP-314")
