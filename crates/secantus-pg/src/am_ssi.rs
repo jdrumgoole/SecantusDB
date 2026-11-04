@@ -422,9 +422,9 @@ fn gin_keys(ops: &ElemOps, v: Option<&Bson>) -> Vec<GinKey> {
 /// The model only mirrors the write: an error evaluating the predicate is
 /// raised by the write path itself, which evaluates it too.
 fn gin_admits(s: &GinShape, row: &Document) -> bool {
-    s.predicate.as_ref().map_or(true, |p| {
-        secantus_pgplan::apply_row_expr(p, row).ok() == Some(Bson::Boolean(true))
-    })
+    s.predicate
+        .as_ref()
+        .is_none_or(|p| secantus_pgplan::apply_row_expr(p, row).ok() == Some(Bson::Boolean(true)))
 }
 
 fn gist_key(v: Option<&Bson>) -> gist_index::Key {
