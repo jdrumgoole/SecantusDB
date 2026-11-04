@@ -682,7 +682,7 @@ pub(crate) fn price_hash_join(
     join: crate::scan_estimate::Estimate,
     swap: bool,
 ) {
-    if root.name != "Hash Join" || root.children.len() != 2 {
+    if !matches!(root.name.as_str(), "Hash Join" | "Hash Left Join") || root.children.len() != 2 {
         return;
     }
     if root.children[1].name != "Hash" || root.children[1].children.len() != 1 {
@@ -696,6 +696,11 @@ pub(crate) fn price_hash_join(
         root.children.push(right);
         root.children.push(hash);
         root.commute_cond = true;
+        // A LEFT join hashing its preserved side is the right join of the
+        // two the other way round (RP-362).
+        if root.name == "Hash Left Join" {
+            root.name = "Hash Right Join".into();
+        }
         // The hashed side is now the left table, not proven unique on
         // the key (a unique key is not priced).
         root.inner_unique = false;

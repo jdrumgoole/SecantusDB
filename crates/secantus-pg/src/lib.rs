@@ -40851,7 +40851,7 @@ impl PgHandler {
                 // column equality, both analysed (RP-330), planned as joined
                 // rows or on the narrow two-table path (RP-361):
                 // `cost_hashjoin` with `eqjoinsel` over their MCV lists.
-                if tree.name == "Hash Join"
+                if matches!(tree.name.as_str(), "Hash Join" | "Hash Left Join")
                     && tree.children.len() == 2
                     && tree.children[0].children.is_empty()
                     && tree.children[0].name.starts_with("Seq Scan on ")
@@ -40884,7 +40884,10 @@ impl PgHandler {
                         .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((plan, a, b, join)) = self.nest_loop_estimate(sel) {
+                        if let Some((plan, a, b, join)) = self
+                            .nest_loop_estimate(sel)
+                            .or_else(|| self.join_select_nest_loop_estimate(sel))
+                        {
                             explain::price_nest_loop(&mut tree, &plan, a, b, join);
                         }
                     }
