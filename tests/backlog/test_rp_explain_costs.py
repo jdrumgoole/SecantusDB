@@ -966,7 +966,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a projected LEFT join reduced by its WHERE": (
-        "RP-364",
+        "RP-365",
         _NULLS,
         "explain select e.a from e left join k on e.b = k.b where k.a = 3",
         [
@@ -990,6 +990,23 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
             "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
             "              Filter: (b = 'v1'::text)",
+        ],
+    ),
+    "a projected join PostgreSQL merges": (
+        "RP-366",
+        _SKEWED,
+        "explain select e.a from e join k on e.b = k.b where e.a > 10 and k.a <= 400",
+        [
+            "Merge Join  (cost=101.55..148.70 rows=3208 width=4)",
+            "  Merge Cond: (k.b = e.b)",
+            "  ->  Sort  (cost=34.79..35.79 rows=400 width=3)",
+            "        Sort Key: k.b",
+            "        ->  Seq Scan on k  (cost=0.00..17.50 rows=400 width=3)",
+            "              Filter: (a <= 400)",
+            "  ->  Sort  (cost=66.76..69.23 rows=990 width=6)",
+            "        Sort Key: e.b",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=990 width=6)",
+            "              Filter: (a > 10)",
         ],
     ),
     "insert": (
@@ -1397,6 +1414,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-361",
         "RP-362",
         "RP-363",
+        "RP-364",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

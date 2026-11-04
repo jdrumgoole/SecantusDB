@@ -40,9 +40,9 @@ pub(crate) struct PlanNode {
     /// (RP-363): the ON's condition is not printed on it.
     pub skip_cond: bool,
     /// A scan the class filters by the constant too (RP-363): `(own key
-    /// column, the alias whose WHERE fixed the other key)`. Its `Filter`
-    /// is the other scan's, over this column.
-    pub implied_filter: Option<(String, String)>,
+    /// column, (alias, key column) whose WHERE fixed the other key)`. Its
+    /// `Filter` takes the other scan's constant, over this column.
+    pub implied_filter: Option<(String, (String, String))>,
     /// Under ANALYZE, an index-only scan's `Heap Fetches`
     /// (`ioss_HeapFetches`), printed after its quals (RP-360).
     pub heap_fetches: Option<usize>,
@@ -1298,85 +1298,124 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
     walk(root, conds, &mut next);
 }
 
-/// Give each scan an equivalence class filters (RP-363) the constant its
-/// other side's WHERE compares the other key with: that scan's `Filter`,
-/// one equality, over this scan's key column. A filter of several
-/// conjuncts is left as it is.
+/// Give each scan an equivalence class filters (RP-363, RP-364) the
+/// constant the other side's WHERE compares the other key with. The class
+/// re-derives both equalities (`generate_base_implied_equalities_const`),
+/// so on each side the key's equality comes after the scan's own quals,
+/// all in one `Filter`. A filter that is not a plain AND of
+/// parenthesised conjuncts is left as it is.
 pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
-    fn scans<'a>(n: &'a PlanNode, out: &mut Vec<&'a PlanNode>) {
-        if n.children.is_empty() {
-            out.push(n);
-        }
-        for c in &n.children {
-            scans(c, out);
-        }
-    }
-    fn alias_of(n: &PlanNode) -> Option<&str> {
+    fn alias_of(n: &PlanNode) -> Option<String> {
         n.props
             .iter()
             .find(|(k, _)| k == "Alias")
             .or_else(|| n.props.iter().find(|(k, _)| k == "Relation Name"))
-            .map(|(_, v)| v.as_str())
+            .map(|(_, v)| v.clone())
     }
-    let mut found = Vec::new();
-    scans(root, &mut found);
-    // (target alias, filter text) for each scan to fill.
-    let mut fills: Vec<(String, String)> = Vec::new();
-    for n in &found {
-        let Some((col, from)) = &n.implied_filter else {
+    // The conjuncts of a printed Filter, each parenthesised.
+    fn conjuncts(text: &str) -> Option<Vec<String>> {
+        if let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+            if inner.starts_with('(') && inner.ends_with(')') && inner.contains(") AND (") {
+                return Some(inner.split(" AND ").map(str::to_string).collect());
+            }
+        }
+        (text.starts_with('(') && text.ends_with(')') && !text.contains(" AND "))
+            .then(|| vec![text.to_string()])
+    }
+    fn render(parts: &[String]) -> String {
+        if parts.len() == 1 {
+            parts[0].clone()
+        } else {
+            format!("({})", parts.join(" AND "))
+        }
+    }
+    let mut found: Vec<(
+        Option<String>,
+        Option<(String, (String, String))>,
+        Option<String>,
+    )> = Vec::new();
+    fn collect(
+        n: &PlanNode,
+        out: &mut Vec<(
+            Option<String>,
+            Option<(String, (String, String))>,
+            Option<String>,
+        )>,
+    ) {
+        if n.children.is_empty() {
+            let filter = n
+                .details
+                .iter()
+                .find(|(k, _)| k == "Filter")
+                .map(|(_, v)| v.clone());
+            out.push((alias_of(n), n.implied_filter.clone(), filter));
+        }
+        for c in &n.children {
+            collect(c, out);
+        }
+    }
+    collect(root, &mut found);
+    // The new Filter text for each alias.
+    let mut texts: Vec<(String, String)> = Vec::new();
+    for (alias, implied, filter) in &found {
+        let (Some(alias), Some((own_col, (from_alias, from_col)))) = (alias, implied) else {
             continue;
         };
-        let Some(source) = found.iter().find(|m| alias_of(m) == Some(from.as_str())) else {
-            continue;
-        };
-        let Some((_, text)) = source.details.iter().find(|(k, _)| k == "Filter") else {
-            continue;
-        };
-        let Some(rhs) = text
-            .strip_prefix('(')
-            .and_then(|t| t.split_once(" = "))
-            .map(|(_, r)| r)
+        let Some((_, _, Some(src))) = found
+            .iter()
+            .find(|(a, _, _)| a.as_deref() == Some(from_alias))
         else {
             continue;
         };
-        if rhs.contains(" AND ") || rhs.contains(" = ") {
+        let Some(mut src_parts) = conjuncts(src) else {
             continue;
-        }
-        if let Some(target) = alias_of(n) {
-            fills.push((target.to_string(), format!("({col} = {rhs}")));
-        }
+        };
+        let head = format!("({from_col} = ");
+        let Some(at) = src_parts.iter().position(|p| p.starts_with(&head)) else {
+            continue;
+        };
+        let key = src_parts.remove(at);
+        let rhs = key[head.len()..].to_string();
+        src_parts.push(key);
+        texts.push((from_alias.clone(), render(&src_parts)));
+        let mut own = match filter {
+            Some(f) => match conjuncts(f) {
+                Some(p) => p,
+                None => continue,
+            },
+            None => Vec::new(),
+        };
+        own.push(format!("({own_col} = {rhs}"));
+        texts.push((alias.clone(), render(&own)));
     }
-    fn fill(n: &mut PlanNode, target: &str, text: &str) {
-        if n.children.is_empty() && n.implied_filter.is_some() && alias_of(n) == Some(target) {
-            // The class's equality is ANDed after the scan's own quals, in
-            // one Filter, as `order_qual_clauses` leaves them.
-            match n.details.iter_mut().find(|(k, _)| k == "Filter") {
-                Some((_, own)) => {
-                    *own = match own.strip_prefix("((").and_then(|t| t.strip_suffix("))")) {
-                        Some(inner) if inner.contains(") AND (") => {
-                            format!("(({inner}) AND {text})")
-                        }
-                        _ => format!("({own} AND {text})"),
-                    };
+    fn apply(n: &mut PlanNode, texts: &[(String, String)]) {
+        if n.children.is_empty() {
+            if let Some(alias) = alias_of(n) {
+                if let Some((_, text)) = texts.iter().find(|(a, _)| *a == alias) {
+                    match n.details.iter_mut().find(|(k, _)| k == "Filter") {
+                        Some((_, f)) => *f = text.clone(),
+                        None => n.details.push(("Filter".into(), text.clone())),
+                    }
                 }
-                None => n.details.push(("Filter".into(), text.to_string())),
             }
             n.implied_filter = None;
         }
         for c in &mut n.children {
-            fill(c, target, text);
+            apply(c, texts);
         }
     }
-    for (target, text) in fills {
-        fill(root, &target, &text);
-    }
+    apply(root, &texts);
 }
 
 /// Make a narrow-path `Hash Join` whose clause an equivalence class
 /// replaced (RP-363) the Nested Loop over the two scans it is: the Hash
 /// removed, the ON's condition not printed, and each scan named in
 /// `implied` (`(alias, key column)`) filtered by the constant too.
-pub(crate) fn implied_nest_loop(root: &mut PlanNode, implied: &[(String, String)], from: &str) {
+pub(crate) fn implied_nest_loop(
+    root: &mut PlanNode,
+    implied: &[(String, String)],
+    from: &(String, String),
+) {
     if root.children.len() != 2 || root.children[1].name != "Hash" {
         return;
     }
@@ -1387,16 +1426,31 @@ pub(crate) fn implied_nest_loop(root: &mut PlanNode, implied: &[(String, String)
     root.skip_cond = true;
     root.inner_unique = false;
     root.unique_probe = None;
-    for c in &mut root.children {
-        let alias = c
+    mark_implied_filters(root, implied, from);
+}
+
+/// Mark the scans (anywhere under `root`) whose alias `implied` names
+/// (`(alias, key column)`) to take `from`'s constant as a Filter too
+/// ([`apply_implied_filters`], RP-363, RP-364).
+pub(crate) fn mark_implied_filters(
+    root: &mut PlanNode,
+    implied: &[(String, String)],
+    from: &(String, String),
+) {
+    if root.children.is_empty() {
+        let alias = root
             .props
             .iter()
             .find(|(k, _)| k == "Alias")
-            .or_else(|| c.props.iter().find(|(k, _)| k == "Relation Name"))
+            .or_else(|| root.props.iter().find(|(k, _)| k == "Relation Name"))
             .map(|(_, v)| v.clone());
         if let Some((_, col)) = implied.iter().find(|(a, _)| Some(a) == alias.as_ref()) {
-            c.implied_filter = Some((col.clone(), from.to_string()));
+            root.implied_filter = Some((col.clone(), from.clone()));
         }
+        return;
+    }
+    for c in &mut root.children {
+        mark_implied_filters(c, implied, from);
     }
 }
 
@@ -1526,7 +1580,7 @@ mod join_type_tests {
             if let Some(f) = filter {
                 n.details.push(("Filter".into(), f.into()));
             }
-            n.implied_filter = implied.map(|(c, f)| (c.into(), f.into()));
+            n.implied_filter = implied.map(|(c, f)| (c.into(), (f.into(), "b".into())));
             n
         };
         let mut root = PlanNode::new("Nested Loop");
