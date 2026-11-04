@@ -1007,16 +1007,6 @@ tests regression tests:
   slept to its end; a row streamed after the statement's hooks are gone
   is evaluated under a cancel hook now (`tests/backlog/test_rp202_cancel.py`).
 
-- [ ] **A seven-relation join to a large DISTINCT subquery on an
-      expression key exhausts memory**: `element_types`' query with its row
-      IN written as a join to `(SELECT DISTINCT ...) "ANY_subquery"` (the
-      shape PostgreSQL's `convert_ANY_sublink_to_join` makes of it) built
-      about 5 GB of intermediate rows and the server was killed after 55 s;
-      PostgreSQL 15.19 answers it in milliseconds with a hash join over the
-      unique-ified inner. Found while working RP-131; the statement is
-      `tests/backlog/rp306_element_types_semijoin.sql`. No gap test yet: run as one, it would exhaust
-      the CI runner's memory, so the test must first bound the server.
-      Backlog-ID: RP-306
       Verify: none -- reproducing it exhausts memory; a bounded gap test is still to be written
 - [ ] **OPEN — a cancel sent during a prepared statement was lost once in
       CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
@@ -1532,7 +1522,10 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
         statement is planned. PostgreSQL pulls it up
         (`convert_ANY_sublink_to_join`) and hash-joins the unique-ified
         inner (Unique over Sort); here that needs a semi-join in `joins` /
-        `join_search` (see RP-306). Either way `element_types` costs at
+        `join_search`. Since RP-306 the pulled-up form, a join to
+        `(SELECT DISTINCT ...)`, keys on the domain columns and answers
+        (about 6 s in a debug build), so it is no longer refused by
+        memory. Either way `element_types` costs at
         least `data_type_privileges`;
       - each view layer still materialises documents
         (`materialise_sub_cells`, `lateral_rows`): building BSON documents
