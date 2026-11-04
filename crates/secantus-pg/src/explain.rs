@@ -88,41 +88,27 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
                 node.details.push(("Filter".into(), "(...)".into()));
             }
             if !sel.windows.is_empty() {
-                // One window with PARTITION BY or ORDER BY reads its rows
-                // through a Sort by the partition columns, then the order
-                // columns (RP-347), as PostgreSQL's planner puts one below
-                // the WindowAgg. Several distinct windows stack WindowAggs
-                // and Sorts there; that tree is not built yet.
-                let first = &sel.windows[0];
-                let keys: Vec<&secantus_pgplan::OrderKey> =
-                    first.partition_by.iter().chain(&first.order_by).collect();
-                let one_window = sel.windows.iter().all(|w| {
-                    w.partition_by == first.partition_by
-                        && w.order_by == first.order_by
-                        && w.frame == first.frame
-                });
-                if one_window && !keys.is_empty() && keys.iter().all(|k| k.expr.is_none()) {
-                    let mut sort = PlanNode::over("Sort", node);
-                    let shown: Vec<String> = keys
-                        .iter()
-                        .map(|k| {
-                            let name = display_alias(&k.field);
-                            match (k.ascending, k.nulls) {
-                                (true, secantus_pgplan::Nulls::Last) => name,
-                                (true, secantus_pgplan::Nulls::First) => {
-                                    format!("{name} NULLS FIRST")
-                                }
-                                (false, secantus_pgplan::Nulls::First) => format!("{name} DESC"),
-                                (false, secantus_pgplan::Nulls::Last) => {
-                                    format!("{name} DESC NULLS LAST")
-                                }
+                // Each distinct window is a WindowAgg, stacked in the order
+                // PostgreSQL's `select_active_windows` gives them, each over
+                // a Sort by its partition then order columns when the rows
+                // below are not already in that order (RP-347, RP-355). A
+                // stack this server cannot order as PostgreSQL does prints
+                // one WindowAgg.
+                match window_stack(sel) {
+                    Some(steps) => {
+                        for step in steps {
+                            if step.sort {
+                                let mut sort = PlanNode::over("Sort", node);
+                                let shown: Vec<String> =
+                                    step.keys.iter().map(|k| sort_key_text(k)).collect();
+                                sort.details.push(("Sort Key".into(), shown.join(", ")));
+                                node = sort;
                             }
-                        })
-                        .collect();
-                    sort.details.push(("Sort Key".into(), shown.join(", ")));
-                    node = sort;
+                            node = PlanNode::over("WindowAgg", node);
+                        }
+                    }
+                    None => node = PlanNode::over("WindowAgg", node),
                 }
-                node = PlanNode::over("WindowAgg", node);
             }
             if !sel.order.is_empty() {
                 let mut sort = PlanNode::over("Sort", node);
@@ -329,6 +315,119 @@ fn constant_equalities(filter: &Document, out: &mut Vec<String>) {
             out.push(k.clone());
         }
     }
+}
+/// A window's sort key as EXPLAIN's `Sort Key` prints it.
+fn sort_key_text(k: &secantus_pgplan::OrderKey) -> String {
+    let name = display_alias(&k.field);
+    match (k.ascending, k.nulls) {
+        (true, secantus_pgplan::Nulls::Last) => name,
+        (true, secantus_pgplan::Nulls::First) => format!("{name} NULLS FIRST"),
+        (false, secantus_pgplan::Nulls::First) => format!("{name} DESC"),
+        (false, secantus_pgplan::Nulls::Last) => format!("{name} DESC NULLS LAST"),
+    }
+}
+
+/// One WindowAgg of a SELECT's stack: the window functions it computes
+/// (indices into `Select::windows`), its window's partition then order
+/// columns, and whether a Sort by them sits below it.
+pub(crate) struct WindowStep<'a> {
+    pub(crate) funcs: Vec<usize>,
+    pub(crate) keys: Vec<&'a secantus_pgplan::OrderKey>,
+    pub(crate) sort: bool,
+}
+
+/// A SELECT's WindowAggs, bottom first, as PostgreSQL 15 stacks them
+/// (RP-355). Functions over identical windows share one WindowAgg
+/// (`transformWindowFuncCall` reuses an identical WindowClause).
+/// `select_active_windows` orders the windows by `common_prefix_cmp`:
+/// position by position, the higher `tleSortGroupRef` first (refs number
+/// the key columns in order of first appearance, each window's partition
+/// columns then its order columns), and a longer list before its prefix.
+/// `create_one_window_path` then sorts below a window only when the rows
+/// are not already in its order.
+///
+/// `None` where this server does not reproduce PostgreSQL's order: a
+/// computed key, a column repeated within one window, the same column at
+/// one position under two directions (the comparator then falls to the
+/// sort operators' oids), two windows with the same keys and different
+/// frames (an unstable tie), and a window sharing only a prefix of the
+/// order below it (an Incremental Sort).
+pub(crate) fn window_stack(sel: &secantus_pgplan::Select) -> Option<Vec<WindowStep<'_>>> {
+    let mut steps: Vec<WindowStep<'_>> = Vec::new();
+    for (i, w) in sel.windows.iter().enumerate() {
+        let same = steps.iter_mut().find(|s| {
+            let f = &sel.windows[s.funcs[0]];
+            f.partition_by == w.partition_by && f.order_by == w.order_by && f.frame == w.frame
+        });
+        match same {
+            Some(s) => s.funcs.push(i),
+            None => steps.push(WindowStep {
+                funcs: vec![i],
+                keys: w.partition_by.iter().chain(&w.order_by).collect(),
+                sort: false,
+            }),
+        }
+    }
+    if steps.len() == 1 {
+        // One window: a Sort below it whenever it has keys (RP-347).
+        let s = &mut steps[0];
+        s.sort = !s.keys.is_empty() && s.keys.iter().all(|k| k.expr.is_none());
+        return Some(steps);
+    }
+    let mut refs: Vec<&str> = Vec::new();
+    for s in &steps {
+        for (j, k) in s.keys.iter().enumerate() {
+            if k.expr.is_some() || s.keys[..j].iter().any(|p| p.field == k.field) {
+                return None;
+            }
+            if !refs.contains(&k.field.as_str()) {
+                refs.push(&k.field);
+            }
+        }
+    }
+    let rank = |k: &secantus_pgplan::OrderKey| refs.iter().position(|f| *f == k.field);
+    let same_order = |a: &secantus_pgplan::OrderKey, b: &secantus_pgplan::OrderKey| {
+        a.field == b.field && a.ascending == b.ascending && a.nulls == b.nulls
+    };
+    // The comparator's ties this server cannot break as PostgreSQL does.
+    for (x, a) in steps.iter().enumerate() {
+        for b in &steps[x + 1..] {
+            let common = a
+                .keys
+                .iter()
+                .zip(&b.keys)
+                .take_while(|(p, q)| p.field == q.field);
+            if common.clone().any(|(p, q)| !same_order(p, q)) {
+                return None;
+            }
+            if common.count() == a.keys.len() && a.keys.len() == b.keys.len() {
+                return None;
+            }
+        }
+    }
+    steps.sort_by(|a, b| {
+        for (p, q) in a.keys.iter().zip(&b.keys) {
+            match rank(q).cmp(&rank(p)) {
+                std::cmp::Ordering::Equal => {}
+                o => return o,
+            }
+        }
+        b.keys.len().cmp(&a.keys.len())
+    });
+    let mut order: Vec<&secantus_pgplan::OrderKey> = Vec::new();
+    for s in &mut steps {
+        let held =
+            s.keys.len() <= order.len() && s.keys.iter().zip(&order).all(|(p, q)| same_order(p, q));
+        if held {
+            continue;
+        }
+        if !s.keys.is_empty() && !order.is_empty() && same_order(s.keys[0], order[0]) {
+            return None;
+        }
+        s.sort = true;
+        order = s.keys.clone();
+    }
+    Some(steps)
 }
 
 /// A join's key names are `alias<US>column`; a plan names only the alias.
