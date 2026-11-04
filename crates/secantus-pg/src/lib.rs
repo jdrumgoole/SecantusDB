@@ -1045,7 +1045,9 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                         out.push(WhereClause::Cmp(field.to_string(), op, operand.clone()));
                     }
                 }
-                (_, Bson::Document(_) | Bson::Array(_)) => return None,
+                (_, Bson::Document(_)) => return None,
+                // An array is an array column's `=` (`stats_key` keys it
+                // only for one).
                 (field, v) => out.push(WhereClause::Cmp(field.to_string(), Op::Eq, v.clone())),
             }
         }
@@ -8553,8 +8555,13 @@ impl PgHandler {
             let numeric = matches!(base, "int2" | "int4" | "int8" | "oid");
             // `name` and `"char"` always compare as bytes; a text column in
             // its own or the database's collation.
-            let ordered = match base {
+            // An array's key orders as `array_cmp` does when its elements'
+            // keys order as theirs: an integer's too (whose keys only an
+            // array's histogram, never interpolated, would compare).
+            let elem = statistic::array_element(base);
+            let ordered = match elem.unwrap_or(base) {
                 "name" | "char" | "\"char\"" => true,
+                "int2" | "int4" | "int8" | "oid" => elem.is_some(),
                 "text" | "varchar" | "character varying" => match c.extra.get_str("collation") {
                     Ok(coll) if coll.trim_matches('"') != "default" => {
                         bytewise(coll.trim_matches('"'))
@@ -8823,6 +8830,21 @@ impl PgHandler {
     /// (`colstats`): an integer's `int_key`, a string's bytes, a bool's
     /// byte. `None` for another type or a value not of it.
     fn stats_key(base: &str, v: &Bson) -> Option<Vec<u8>> {
+        // An array's, as ANALYZE keys it (`statistic::array_key`).
+        if let Some(elem) = statistic::array_element(base) {
+            let Bson::Array(items) = v else {
+                return None;
+            };
+            let keys = items
+                .iter()
+                .map(|x| match x {
+                    Bson::Null => Some(None),
+                    Bson::Array(_) => None,
+                    x => Self::stats_key(elem, x).map(Some),
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(statistic::array_key(&keys));
+        }
         match (base, v) {
             ("int2" | "int4" | "int8", Bson::Int32(n)) => {
                 Some(secantus_pgplan::colstats::int_key(i64::from(*n)))
@@ -16579,6 +16601,29 @@ impl PgHandler {
                 if let Some(c) = slots.correlation {
                     entry.insert("correlation", f64::from(c));
                 }
+                // `compute_array_stats`' element slots, over the arrays the
+                // scalar stats compared.
+                if statistic::array_element(&c.pg_type).is_some() {
+                    let arrays: Vec<Vec<Option<Vec<u8>>>> = values
+                        .iter()
+                        .flatten()
+                        .filter_map(|(k, _)| statistic::array_key_elements(k))
+                        .collect();
+                    if let Some((mcelem, tail, dechist)) =
+                        statistic::array_element_stats(&arrays, target)
+                    {
+                        let mcelem: Vec<Bson> = mcelem
+                            .iter()
+                            .map(|(k, f)| Bson::Array(vec![bin(k), Bson::Double(f64::from(*f))]))
+                            .collect();
+                        let num = |v: &[f32]| -> Vec<Bson> {
+                            v.iter().map(|x| Bson::Double(f64::from(*x))).collect()
+                        };
+                        entry.insert("mcelem", mcelem);
+                        entry.insert("mcelem_tail", num(&tail));
+                        entry.insert("dechist", num(&dechist));
+                    }
+                }
             }
             None => {
                 entry.insert("unmodelled", true);
@@ -16642,6 +16687,53 @@ impl PgHandler {
             };
             (len + 4 <= 1024).then(|| Some((bytes.to_vec(), size)))
         };
+        // An array (`array_typanalyze`): its key orders as `array_cmp`,
+        // and its size is the array's own, whose elements keep their
+        // 4-byte headers.
+        if let Some(e) = statistic::element_column(c) {
+            let Bson::Array(items) = v else {
+                return None;
+            };
+            let elem_type = statistic::array_element(&c.pg_type)?;
+            let mut keys = Vec::with_capacity(items.len());
+            let mut sizes = Vec::with_capacity(items.len());
+            for item in items {
+                // A multi-dimensional array is not modelled.
+                if matches!(item, Bson::Array(_)) {
+                    return None;
+                }
+                match Self::analyze_sample(&e, Some(item), true)? {
+                    None => {
+                        keys.push(None);
+                        sizes.push(None);
+                    }
+                    Some((k, size)) => {
+                        // A fixed-width element is its `typlen`.
+                        let size = if size == 0 {
+                            secantus_pgplan::pgtypes::oid_of_name(elem_type)
+                                .and_then(|oid| pg_type_facts::builtin(oid, "typlen"))
+                                .and_then(|v| match v {
+                                    Bson::Int32(n) => usize::try_from(n).ok(),
+                                    Bson::Int64(n) => usize::try_from(n).ok(),
+                                    _ => None,
+                                })?
+                        } else {
+                            size
+                        };
+                        keys.push(Some(k));
+                        sizes.push(Some(size));
+                    }
+                }
+            }
+            // Stored with a 1-byte header when it fits one, as any varlena.
+            let size = statistic::array_datum_size(elem_type, &sizes);
+            let stored = if size - 4 < 127 && !computed {
+                size - 3
+            } else {
+                size
+            };
+            return (size <= 1024).then(|| Some((statistic::array_key(&keys), stored)));
+        }
         match (c.pg_type.trim_start_matches("pg_catalog."), v) {
             ("int2" | "int4" | "int8", Bson::Int32(n)) => {
                 Some(Some((secantus_pgplan::colstats::int_key(i64::from(*n)), 0)))

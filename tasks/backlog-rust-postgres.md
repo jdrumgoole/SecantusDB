@@ -1337,20 +1337,22 @@ a regression test.
       Verify: tests/backlog/test_rp_catalog_reads.py::test_the_first_backend_after_a_start
 - [ ] **A database-wide ANALYZE measures only some catalog columns.** Since
       RP-311 each database holds `initdb`'s `pg_statistic` rows for the
-      built-in catalogs. Since 2026-11-02 a plain `ANALYZE` (or `VACUUM
-      ANALYZE`) re-measures the catalog columns of a type whose statistics
-      are modelled (`oid`, the integers, `bool`, `float4` / `float8`,
-      `text`, and since 2026-11-04 `name` and `"char"`), over the
+      built-in catalogs. A plain `ANALYZE` (or `VACUUM ANALYZE`)
+      re-measures the catalog columns of a type whose statistics are
+      modelled (`oid`, the integers, `bool`, `float4` / `float8`, `text`,
+      `name`, `"char"`, and since 2026-11-04 the one-dimensional arrays of
+      those, with `compute_array_stats`' element slots), over the
       catalog's rows as they stand, and their rows replace `initdb`'s. The
       other columns keep `initdb`'s rows, where PostgreSQL 15.19 measures
-      them too: the `reg*` types, the arrays (after a table created `with
-      (fillfactor=50)`, `pg_class.reloptions` gains a second distinct
-      value), `aclitem[]` and `pg_node_tree`. Not modelled either: the measured catalogs'
-      `relpages` / `reltuples` in `pg_class`, and the row order of the
-      replaced `pg_statistic` rows (an update moves PostgreSQL's) (found
-      while working RP-311).
+      them too: the `reg*` types, `aclitem[]` (`=` but no `<`, so
+      `compute_distinct_stats`: after a GRANT on a new table,
+      `pg_class.relacl`'s null fraction moves), `int2vector` /
+      `oidvector` and `pg_node_tree`. Not modelled either: the measured
+      catalogs' `relpages` / `reltuples` in `pg_class`, and the row order
+      of the replaced `pg_statistic` rows (an update moves PostgreSQL's)
+      (found while working RP-311).
       Backlog-ID: RP-313
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_an_array_column
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_an_aclitem_array
 - [ ] **A database-wide ANALYZE's correlation of a catalog column is not
       PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
       with the rows' heap order; here the catalog's rows are walked in this
@@ -1363,6 +1365,19 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
+- [ ] **EXPLAIN of an array operator prints `Filter: (...)` and zeros.**
+      Over `create table ud (a int[])`, PostgreSQL 15.19 prints `explain
+      select * from ud where a @> '{1}'` as `Seq Scan on ud
+      (cost=0.00..27.00 rows=7 width=32)` with `Filter: (a @> '{1}'::integer[])`
+      (`arraycontsel`'s default without statistics; `&&` the same), and
+      `1 = any(a)` with `Filter: (1 = ANY (a))` (cost 40.60). Here each is
+      `cost=0.00..0.00 rows=0 width=0` with the filter printed as `(...)`,
+      and the `ANY` form prints a second `Filter:` line. After an ANALYZE
+      PostgreSQL reads the column's MCELEM / DECHIST slots
+      (`mcelem_array_selec`), which this server now records (found while
+      working RP-313).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an array containment]
+      Backlog-ID: RP-367
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),

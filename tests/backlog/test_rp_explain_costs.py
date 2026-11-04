@@ -692,6 +692,16 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: (a = ANY ('{1,NULL,3}'::integer[]))",
         ],
     ),
+    # ----------------------------- RP-367 an array operator's filter
+    "an array containment": (
+        "RP-367",
+        ["create table ud (a int[])"],
+        "explain select * from ud where a @> '{1}'",
+        [
+            "Seq Scan on ud  (cost=0.00..27.00 rows=7 width=32)",
+            "  Filter: (a @> '{1}'::integer[])",
+        ],
+    ),
     # ----------------------------- RP-350 a column equal to two constants
     "a column equal to two constants": (
         "RP-350",

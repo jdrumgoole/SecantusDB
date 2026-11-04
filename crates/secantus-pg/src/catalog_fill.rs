@@ -1294,6 +1294,17 @@ impl PgHandler {
                                 })
                             }
                             "relacl" => self.relation_acl(&relname, &kind),
+                            // `system_views.sql` creates these three
+                            // `WITH (security_barrier)`.
+                            "reloptions"
+                                if kind == "v"
+                                    && matches!(
+                                        relname.as_str(),
+                                        "pg_stats" | "pg_stats_ext" | "pg_stats_ext_exprs"
+                                    ) =>
+                            {
+                                Bson::Array(vec![Bson::String("security_barrier=true".into())])
+                            }
                             "reloptions" => Bson::Null,
                             _ => Bson::Int64(0),
                         }

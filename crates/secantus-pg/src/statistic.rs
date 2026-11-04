@@ -21,6 +21,8 @@ use super::*;
 const MCV: i32 = 1;
 const HISTOGRAM: i32 = 2;
 const CORRELATION: i32 = 3;
+const MCELEM: i32 = 4;
+const DECHIST: i32 = 5;
 const DEFAULT_COLLATION: i64 = 100;
 const C_COLLATION: i64 = 950;
 
@@ -33,6 +35,13 @@ pub(crate) const CATALOG_STATISTICS: &str = "\u{0}catalogs";
 /// is not collatable): the database's default for `text` and `bpchar`, and
 /// `C` (950) for `name`, whose `typcollation` it is.
 pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
+    // An array of a type whose `=` and `<` are modelled: `array_eq` and
+    // `array_lt` (`array_typanalyze`'s scalar stats), under the element's
+    // collation.
+    if let Some(elem) = array_element(pg_type) {
+        let (_, _, coll) = operators(elem)?;
+        return Some((1070, 1072, coll));
+    }
     Some(match pg_type.trim_start_matches("pg_catalog.") {
         "int2" => (94, 95, 0),
         "int4" => (96, 97, 0),
@@ -49,8 +58,236 @@ pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
     })
 }
 
+/// The element type of a one-dimensional array type (`text[]`, `_text`);
+/// `None` for any other type.
+pub(crate) fn array_element(pg_type: &str) -> Option<&str> {
+    let t = pg_type.trim_start_matches("pg_catalog.");
+    let elem = t
+        .strip_suffix("[]")
+        .or_else(|| t.strip_prefix('_'))?
+        .trim_start_matches("pg_catalog.");
+    (!elem.is_empty() && !elem.ends_with("[]")).then_some(elem)
+}
+
+/// An array's element as a column of its own, which ANALYZE samples it as.
+pub(crate) fn element_column(c: &secantus_pgcatalog::Column) -> Option<secantus_pgcatalog::Column> {
+    Some(secantus_pgcatalog::Column::new(
+        &c.name,
+        array_element(&c.pg_type)?,
+        false,
+    ))
+}
+
+/// An array's key, ordered as `array_cmp` orders arrays: element by
+/// element (each its own type's key, NUL-escaped), a NULL element after
+/// every value, and an array that is a prefix of another before it.
+pub(crate) fn array_key(elements: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let mut key = Vec::new();
+    for e in elements {
+        match e {
+            Some(k) => {
+                key.push(1);
+                for &b in k {
+                    key.push(b);
+                    if b == 0 {
+                        key.push(0xFF);
+                    }
+                }
+                key.extend([0, 0]);
+            }
+            None => key.push(2),
+        }
+    }
+    key.push(0);
+    key
+}
+
+/// The element keys `array_key` joined.
+pub(crate) fn array_key_elements(key: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    loop {
+        match *key.get(i)? {
+            0 => return (i + 1 == key.len()).then_some(out),
+            2 => {
+                out.push(None);
+                i += 1;
+            }
+            1 => {
+                i += 1;
+                let mut k = Vec::new();
+                loop {
+                    let b = *key.get(i)?;
+                    if b == 0 {
+                        let next = *key.get(i + 1)?;
+                        i += 2;
+                        if next == 0 {
+                            break;
+                        }
+                        k.push(0);
+                    } else {
+                        k.push(b);
+                        i += 1;
+                    }
+                }
+                out.push(Some(k));
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// An array's datum size, its 4-byte header included (`VARSIZE` of a
+/// one-dimensional array as `construct_md_array` builds it, whose
+/// elements keep 4-byte headers): the header and dimensions, a null
+/// bitmap when an element is NULL, `MAXALIGN`ed, then each element padded
+/// to its `typalign`.
+/// `sizes` holds each non-null element's size, `None` for a NULL.
+pub(crate) fn array_datum_size(elem_type: &str, sizes: &[Option<usize>]) -> usize {
+    if sizes.is_empty() {
+        return 16;
+    }
+    let maxalign = |n: usize| n.div_ceil(8) * 8;
+    let nulls = sizes.iter().any(Option::is_none);
+    let overhead = if nulls {
+        maxalign(16 + 8 + sizes.len().div_ceil(8))
+    } else {
+        maxalign(16 + 8)
+    };
+    let align = match elem_type {
+        "int2" => 2,
+        "int8" | "float8" => 8,
+        "bool" | "name" | secantus_pgplan::QUOTED_CHAR => 1,
+        _ => 4,
+    };
+    let mut off = 0usize;
+    // `construct_md_array` aligns after each element, the last too.
+    for s in sizes.iter().flatten() {
+        off = (off + s).div_ceil(align) * align;
+    }
+    overhead + off
+}
+
+/// The most common elements and their frequencies, MCELEM's three extra
+/// numbers (least and greatest frequency, NULL-element frequency; empty
+/// with no common element), and DECHIST's numbers.
+pub(crate) type ArrayElementStats = (Vec<(Vec<u8>, f32)>, Vec<f32>, Vec<f32>);
+
+/// `compute_array_stats`' element slots of an array column: the most
+/// common elements (`STATISTIC_KIND_MCELEM`, each element counted once
+/// per array, by Lossy Counting) with their frequencies followed by the
+/// least and greatest of them and the frequency of a NULL element, and
+/// the histogram of distinct-element counts (`STATISTIC_KIND_DECHIST`)
+/// followed by their average. `arrays` holds each non-null array's
+/// elements' keys; `None` with no array to analyse.
+pub(crate) fn array_element_stats(
+    arrays: &[Vec<Option<Vec<u8>>>],
+    target: usize,
+) -> Option<ArrayElementStats> {
+    if arrays.is_empty() {
+        return None;
+    }
+    let mut num_mcelem = target * 10;
+    let bucket_width = (num_mcelem * 1000 / 7).max(1) as i64;
+    // element key -> (frequency, delta, last array)
+    let mut tracked: HashMap<Vec<u8>, (i64, i64, usize)> = HashMap::new();
+    let mut counts: HashMap<i64, i64> = HashMap::new();
+    let (mut b_current, mut element_no, mut null_elem_cnt) = (1i64, 0i64, 0i64);
+    for (array_no, elements) in arrays.iter().enumerate() {
+        let prev = element_no;
+        let mut null_present = false;
+        for e in elements {
+            let Some(k) = e else {
+                null_present = true;
+                continue;
+            };
+            match tracked.get_mut(k) {
+                Some(item) => {
+                    if item.2 == array_no {
+                        continue;
+                    }
+                    item.0 += 1;
+                    item.2 = array_no;
+                }
+                None => {
+                    tracked.insert(k.clone(), (1, b_current - 1, array_no));
+                }
+            }
+            element_no += 1;
+            if element_no % bucket_width == 0 {
+                // prune_element_hashtable
+                tracked.retain(|_, item| item.0 + item.1 > b_current);
+                b_current += 1;
+            }
+        }
+        if null_present {
+            null_elem_cnt += 1;
+        }
+        *counts.entry(element_no - prev).or_insert(0) += 1;
+    }
+    let nonnull = arrays.len() as f64;
+    let cutoff = 9 * element_no / bucket_width;
+    let mut items: Vec<(Vec<u8>, i64)> = tracked
+        .into_iter()
+        .filter(|(_, item)| item.0 > cutoff)
+        .map(|(k, item)| (k, item.0))
+        .collect();
+    let mut minfreq = items.iter().map(|i| i.1).min().unwrap_or(element_no);
+    let maxfreq = items.iter().map(|i| i.1).max().unwrap_or(0);
+    if num_mcelem < items.len() {
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        items.truncate(num_mcelem);
+        minfreq = items.last().map_or(minfreq, |i| i.1);
+    } else {
+        num_mcelem = items.len();
+    }
+    let mut mcelem = Vec::new();
+    let mut tail = Vec::new();
+    if num_mcelem > 0 {
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        mcelem = items
+            .into_iter()
+            .map(|(k, f)| (k, (f as f64 / nonnull) as f32))
+            .collect();
+        tail = vec![
+            (minfreq as f64 / nonnull) as f32,
+            (maxfreq as f64 / nonnull) as f32,
+            (null_elem_cnt as f64 / nonnull) as f32,
+        ];
+    }
+    // The distinct-element count histogram.
+    let num_hist = target.max(2) as i64;
+    let mut sorted: Vec<(i64, i64)> = counts.into_iter().collect();
+    sorted.sort_unstable();
+    let delta = arrays.len() as i64 - 1;
+    let mut j = 0usize;
+    let mut frac = sorted[0].1 * (num_hist - 1);
+    let mut hist = Vec::with_capacity(num_hist as usize + 1);
+    for _ in 0..num_hist {
+        while frac <= 0 {
+            j += 1;
+            frac += sorted[j].1 * (num_hist - 1);
+        }
+        hist.push(sorted[j].0 as f32);
+        frac -= delta;
+    }
+    hist.push((element_no as f64 / nonnull) as f32);
+    Some((mcelem, tail, hist))
+}
+
 /// A key `analyze_sample` made, as the column's value again.
 pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bson> {
+    // An array prints as its text, which the slot's array quotes.
+    if let Some(e) = element_column(c) {
+        let items = array_key_elements(key)?
+            .iter()
+            .map(|k| match k {
+                Some(k) => value_of(k, &e),
+                None => Some(Bson::Null),
+            })
+            .collect::<Option<Vec<_>>>()?;
+        return Some(Bson::String(secantus_pgplan::render_array(&items)));
+    }
     Some(match c.pg_type.trim_start_matches("pg_catalog.") {
         "int2" | "int4" => Bson::Int32(secantus_pgplan::colstats::int_of_key(key)? as i32),
         "int8" | "oid" => Bson::Int64(secantus_pgplan::colstats::int_of_key(key)?),
@@ -285,7 +522,8 @@ impl PgHandler {
                 }
                 let f = c.field();
                 let values: Vec<Option<&Bson>> = docs.iter().map(|d| d.get(&f)).collect();
-                let entry = Self::stats_entry(c, &values, target, false, totalrows);
+                let mut entry = Self::stats_entry(c, &values, target, false, totalrows);
+                entry.insert("catalog", true);
                 if !entry.get_bool("unmodelled").unwrap_or(false) {
                     columns.insert(format!("{rel}:{attnum}"), entry);
                 }
@@ -313,6 +551,12 @@ impl PgHandler {
             return None;
         }
         let (eq, lt, coll) = operators(&c.pg_type)?;
+        // A catalog's collatable column is `C` (its `attcollation`).
+        let coll = if coll != 0 && entry.get_bool("catalog").unwrap_or(false) {
+            C_COLLATION
+        } else {
+            coll
+        };
         let mut d = Document::new();
         d.insert(f("starelid"), Bson::Int64(rel));
         d.insert(f("staattnum"), Bson::Int32(i32::from(attnum)));
@@ -366,6 +610,33 @@ impl PgHandler {
                     Bson::Array(vec![Bson::Double(f64::from(corr))]),
                     Bson::Null,
                 ));
+            }
+        }
+        // `compute_array_stats`' slots, under the element's `=`.
+        if let (Some(e), Some((elem_eq, _, _))) = (
+            element_column(c),
+            array_element(&c.pg_type).and_then(operators),
+        ) {
+            let nums =
+                |name: &str| -> Option<Vec<Bson>> { Some(entry.get_array(name).ok()?.to_vec()) };
+            if let (Ok(mcelem), Some(tail)) = (entry.get_array("mcelem"), nums("mcelem_tail")) {
+                if !mcelem.is_empty() {
+                    let mut values = Vec::new();
+                    let mut numbers = Vec::new();
+                    for m in mcelem {
+                        let pair = m.as_array()?;
+                        let Some(Bson::Binary(k)) = pair.first() else {
+                            return None;
+                        };
+                        values.push(value_of(&k.bytes, &e)?);
+                        numbers.push(pair.get(1)?.clone());
+                    }
+                    numbers.extend(tail);
+                    slots.push((MCELEM, elem_eq, Bson::Array(numbers), Bson::Array(values)));
+                }
+            }
+            if let Some(hist) = nums("dechist") {
+                slots.push((DECHIST, elem_eq, Bson::Array(hist), Bson::Null));
             }
         }
         for n in 1..=5usize {
@@ -443,5 +714,77 @@ impl PgHandler {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod array_tests {
+    use super::*;
+
+    fn key(items: &[Option<&str>]) -> Vec<u8> {
+        array_key(
+            &items
+                .iter()
+                .map(|i| i.map(|s| s.as_bytes().to_vec()))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// `array_cmp`: element by element, a prefix first, NULL after values.
+    #[test]
+    fn array_keys_order_as_array_cmp() {
+        let ordered = [
+            key(&[]),
+            key(&[Some("a")]),
+            key(&[Some("a"), Some("")]),
+            key(&[Some("a"), Some("b")]),
+            key(&[Some("a"), None]),
+            key(&[Some("a\0")]),
+            key(&[Some("b")]),
+            key(&[None]),
+        ];
+        for pair in ordered.windows(2) {
+            assert!(pair[0] < pair[1], "{pair:?}");
+        }
+        for k in &ordered {
+            assert_eq!(array_key(&array_key_elements(k).unwrap()), *k);
+        }
+    }
+
+    /// `construct_md_array` pads after each element; a NULL adds a bitmap.
+    #[test]
+    fn array_datum_sizes() {
+        assert_eq!(array_datum_size("text", &[]), 16);
+        assert_eq!(array_datum_size("text", &[Some(4 + 13)]), 44);
+        assert_eq!(array_datum_size("text", &[Some(5), None]), 40);
+        assert_eq!(array_datum_size("int4", &[Some(4), Some(4)]), 32);
+    }
+
+    /// `compute_array_stats`: each element once per array, DECHIST over
+    /// the distinct counts and their average.
+    #[test]
+    fn array_element_slots() {
+        let arrays = vec![
+            vec![
+                Some(b"x".to_vec()),
+                Some(b"y".to_vec()),
+                Some(b"x".to_vec()),
+            ],
+            vec![Some(b"x".to_vec()), None],
+            vec![],
+            vec![Some(b"f".to_vec())],
+        ];
+        let (mcelem, tail, hist) = array_element_stats(&arrays, 100).unwrap();
+        assert_eq!(
+            mcelem,
+            vec![
+                (b"f".to_vec(), 0.25),
+                (b"x".to_vec(), 0.5),
+                (b"y".to_vec(), 0.25)
+            ]
+        );
+        assert_eq!(tail, vec![0.25, 0.5, 0.25]);
+        assert_eq!(hist.len(), 101);
+        assert_eq!((hist[0], hist[99], hist[100]), (0.0, 2.0, 1.0));
     }
 }
