@@ -904,6 +904,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "hash join reading one side's column": (
+        "RP-361",
+        _ANALYSED,
+        "explain select e.a from e join k on e.b = k.b",
+        [
+            "Hash Join  (cost=27.50..1170.00 rows=100000 width=4)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=3)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1303,6 +1315,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-351",
         "RP-352",
         "RP-355",
+        "RP-359",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
