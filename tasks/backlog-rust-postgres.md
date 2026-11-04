@@ -1343,23 +1343,17 @@ a regression test.
       while working RP-311).
       Backlog-ID: RP-313
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_name_column
-- [ ] **EXPLAIN prints no estimate for a window function under FILTER,
-      over an expression, or for stacked windows.** Since RP-351 a
-      WindowAgg prices any built-in window function or aggregate whose
-      argument is a plain column (a `Var`, free in `cost_qual_eval`).
-      PostgreSQL 15.19 adds the FILTER clause's and an expression
-      argument's `cost_qual_eval` per row: `explain select a, sum(a)
-      filter (where a > 5) over () from e` and `explain select a,
-      sum(a+1) over () from e` are both `WindowAgg (cost=0.00..30.00
-      rows=1000 width=12)`; here both print zeros. Several distinct
-      windows in one SELECT are stacked WindowAggs, each over its own
-      Sort (`select a, row_number() over (order by a), rank() over (order
-      by b) from e` is a WindowAgg (132.16..149.66) over a Sort by `a` over
-      a WindowAgg over a Sort by `b`); here one WindowAgg is printed, with
-      zeros (found while working RP-351, measured on a fresh private
-      cluster).
-      Backlog-ID: RP-352
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate under a filter clause], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate of an expression], tests/backlog/test_rp_explain_costs.py::test_plan[two windows stacked]
+- [ ] **EXPLAIN prints one WindowAgg, with zeros, for stacked windows.**
+      Several distinct windows in one SELECT are stacked WindowAggs, each
+      over its own Sort: PostgreSQL 15.19 plans `explain select a,
+      row_number() over (order by a), rank() over (order by b) from e` as a
+      WindowAgg (132.16..149.66 rows=1000 width=23) over a Sort by `a` over
+      a WindowAgg (64.83..82.33) over a Sort by `b` over the Seq Scan
+      (`select_active_windows` orders them; the top Sort also sets the row
+      order). Here one WindowAgg is printed, with zeros (found while working
+      RP-351, measured on a fresh private cluster; split from RP-352).
+      Backlog-ID: RP-355
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[two windows stacked]
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),

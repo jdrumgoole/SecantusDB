@@ -394,7 +394,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "two windows stacked": (
-        "RP-352",
+        "RP-355",
         _ANALYSED,
         "explain select a, row_number() over (order by a), rank() over (order by b) from e",
         [
@@ -1185,6 +1185,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-349",
         "RP-350",
         "RP-351",
+        "RP-352",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

@@ -1479,13 +1479,22 @@ mod agg_tests {
 /// built-in window function and aggregate has `procost` 1, and an argument
 /// that is a plain column is a `Var`, which costs nothing to evaluate; each
 /// result widens the row by its type's `get_typavgwidth`.
-pub(crate) fn window_agg_estimate(input: Estimate, results: &[&str], key_cols: usize) -> Estimate {
+///
+/// `arg_ops` is the operators the functions' arguments and FILTER clauses
+/// evaluate per row, together (RP-352): `cost_windowagg` adds each one's
+/// `cost_qual_eval_node` to the function's per-row cost.
+pub(crate) fn window_agg_estimate(
+    input: Estimate,
+    results: &[&str],
+    arg_ops: u32,
+    key_cols: usize,
+) -> Estimate {
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const CPU_TUPLE_COST: f64 = 0.01;
     let (startup, in_total, rows, width) = input;
     let n = results.len();
     let total = in_total
-        + CPU_OPERATOR_COST * n as f64 * rows
+        + CPU_OPERATOR_COST * (n as f64 + f64::from(arg_ops)) * rows
         + CPU_OPERATOR_COST * key_cols as f64 * rows
         + CPU_TUPLE_COST * rows;
     let widened: i64 = results.iter().map(|t| type_width(t, -1)).sum();
@@ -1497,11 +1506,24 @@ mod window_tests {
     use super::window_agg_estimate;
 
     #[test]
+    fn a_filter_clause_costs_its_operators_per_row() {
+        // PostgreSQL 15.19: `select a, sum(a) filter (where a > 5) over ()
+        // from e` over a Seq Scan of (0.00..15.00 rows=1000 width=4) is
+        // (0.00..30.00 rows=1000 width=12): the `>` is one more
+        // `cpu_operator_cost` a row (RP-352).
+        let (s, t, r, w) = window_agg_estimate((0.0, 15.0, 1000.0, 4), &["int8"], 1, 0);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("0.00".into(), "30.00".into(), 1000.0, 12)
+        );
+    }
+
+    #[test]
     fn a_lag_widens_the_row_by_its_argument_type() {
         // PostgreSQL 15.19: `select a, lag(a) over (order by a) from e`
         // over a Sort of (64.83..67.33 rows=1000 width=4) is
         // (64.83..82.33 rows=1000 width=8): lag's result is int4 (RP-351).
-        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), &["int4"], 1);
+        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), &["int4"], 0, 1);
         assert_eq!(
             (format!("{s:.2}"), format!("{t:.2}"), r, w),
             ("64.83".into(), "82.33".into(), 1000.0, 8)
@@ -1513,7 +1535,7 @@ mod window_tests {
         // PostgreSQL 15.19: `select a, row_number() over (order by a) from e`
         // over a Sort of (64.83..67.33 rows=1000 width=4) is
         // (64.83..82.33 rows=1000 width=12) (RP-347).
-        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), &["int8"], 1);
+        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), &["int8"], 0, 1);
         assert_eq!(
             (format!("{s:.2}"), format!("{t:.2}"), r, w),
             ("64.83".into(), "82.33".into(), 1000.0, 12)
@@ -1525,7 +1547,7 @@ mod window_tests {
         // PostgreSQL 15.19: `select a, row_number() over () from e` over a
         // Seq Scan of (0.00..15.00 rows=1000 width=4) is
         // (0.00..27.50 rows=1000 width=12).
-        let (s, t, r, w) = window_agg_estimate((0.0, 15.0, 1000.0, 4), &["int8"], 0);
+        let (s, t, r, w) = window_agg_estimate((0.0, 15.0, 1000.0, 4), &["int8"], 0, 0);
         assert_eq!(
             (format!("{s:.2}"), format!("{t:.2}"), r, w),
             ("0.00".into(), "27.50".into(), 1000.0, 12)
@@ -1639,6 +1661,71 @@ fn row_expr_ops(n: &pg_query::protobuf::Node, nparams: usize) -> Option<(u32, bo
         }
         _ => None,
     }
+}
+
+/// The stored fields a row expression reads: the `ParamRef`s past the
+/// statement's parameters, which `row_column_expr` binds to `fields`. Walks
+/// only the nodes `row_expr_ops` prices.
+fn row_expr_reads(
+    n: &pg_query::protobuf::Node,
+    nparams: usize,
+    fields: &[secantus_pgplan::RowField],
+    out: &mut Vec<String>,
+) -> Option<()> {
+    use pg_query::protobuf::node::Node as N;
+    match n.node.as_ref()? {
+        N::AConst(_) => Some(()),
+        N::ParamRef(p) => {
+            let i = usize::try_from(p.number).ok()?;
+            if i > nparams {
+                let (_, field, _) = fields.get(i - nparams - 1)?;
+                if !out.contains(field) {
+                    out.push(field.clone());
+                }
+            }
+            Some(())
+        }
+        N::AExpr(e) => {
+            for side in [e.lexpr.as_deref(), e.rexpr.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                row_expr_reads(side, nparams, fields, out)?;
+            }
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// `cost_qual_eval_node`'s per-row cost, in operators, of an expression a
+/// window function evaluates per input row -- its argument or its FILTER
+/// (RP-352) -- and the stored fields it reads, which the scan below the
+/// WindowAgg returns. `None` for an expression not priced here (see
+/// `row_expr_ops`), or one over a type not built in.
+pub(crate) fn column_expr_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(u32, Vec<String>)> {
+    let secantus_pgplan::ColumnExpr::Row {
+        expr,
+        fields,
+        params,
+        result_type,
+        ..
+    } = e
+    else {
+        return None;
+    };
+    let mut read = Vec::new();
+    row_expr_reads(expr, params.len(), fields, &mut read)?;
+    let builtin = |t: &str| secantus_pgplan::pgtypes::oid_of_name(t).is_some_and(|oid| oid < 10000);
+    if !builtin(result_type)
+        || read
+            .iter()
+            .any(|r| !fields.iter().any(|(_, f, t)| f == r && builtin(t)))
+    {
+        return None;
+    }
+    let (ops, _) = row_expr_ops(expr, params.len())?;
+    Some((ops, read))
 }
 
 /// A select list's cost and width beside its plain columns (RP-333):

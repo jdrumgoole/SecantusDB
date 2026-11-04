@@ -40879,7 +40879,7 @@ impl PgHandler {
                             .iter()
                             .any(|ix| ix.table.name == sel.table);
                         let ranking = sel.windows.iter().all(|w| {
-                            priced_window_func(w)
+                            priced_window_func(w).is_some()
                                 && w.partition_by.is_empty()
                                 && w.order_by.is_empty()
                         });
@@ -40901,14 +40901,18 @@ impl PgHandler {
                             && (sel.filter.is_empty() || !indexed)
                         {
                             // The scan returns the select list's columns and
-                            // the functions' argument columns, each once.
+                            // the columns the functions' arguments and
+                            // FILTERs read, each once.
+                            let priced: Vec<(u32, Vec<String>)> =
+                                sel.windows.iter().filter_map(priced_window_func).collect();
+                            let arg_ops: u32 = priced.iter().map(|(o, _)| o).sum();
                             let mut fields: Vec<String> = Vec::new();
                             for f in sel
                                 .columns
                                 .iter()
                                 .map(|(_, f)| f.clone())
                                 .filter(|f| !is_window(f))
-                                .chain(sel.windows.iter().filter_map(|w| w.arg_field.clone()))
+                                .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned()))
                             {
                                 if !fields.contains(&f) {
                                     fields.push(f);
@@ -40925,6 +40929,7 @@ impl PgHandler {
                                 tree.estimate = Some(scan_estimate::window_agg_estimate(
                                     (s0, t0, r0, out),
                                     &results,
+                                    arg_ops,
                                     0,
                                 ));
                             }
@@ -40962,7 +40967,7 @@ impl PgHandler {
                             .all(|i| keys[..i].iter().all(|k| k.field != keys[i].field));
                         let one_window = sel.windows.iter().all(|w| {
                             let f = first.expect("windows is not empty here");
-                            priced_window_func(w)
+                            priced_window_func(w).is_some()
                                 && w.partition_by == f.partition_by
                                 && w.order_by == f.order_by
                                 && w.frame == f.frame
@@ -40986,8 +40991,12 @@ impl PgHandler {
                             && sel.columns.iter().filter(|(_, f)| is_window(f)).count()
                                 == sel.windows.len()
                         {
-                            // The scan returns the select list's columns and
-                            // the window's keys, each once.
+                            // The scan returns the select list's columns, the
+                            // columns the functions' arguments and FILTERs
+                            // read, and the window's keys, each once.
+                            let priced: Vec<(u32, Vec<String>)> =
+                                sel.windows.iter().filter_map(priced_window_func).collect();
+                            let arg_ops: u32 = priced.iter().map(|(o, _)| o).sum();
                             let mut fields: Vec<String> = Vec::new();
                             for f in sel
                                 .columns
@@ -40995,7 +41004,7 @@ impl PgHandler {
                                 .map(|(_, f)| f.as_str())
                                 .filter(|f| !is_window(f))
                                 .map(str::to_string)
-                                .chain(sel.windows.iter().filter_map(|w| w.arg_field.clone()))
+                                .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned()))
                                 .chain(keys.iter().map(|k| k.field.clone()))
                             {
                                 if !fields.contains(&f) {
@@ -41018,6 +41027,7 @@ impl PgHandler {
                                 tree.estimate = Some(scan_estimate::window_agg_estimate(
                                     (s0, t0, r0, out),
                                     &results,
+                                    arg_ops,
                                     keys.len(),
                                 ));
                             }
@@ -54579,13 +54589,29 @@ impl ComputedUnique {
 pub(crate) type IndexSizer<'a> = dyn Fn(&[String], i64) -> Option<(f64, u32)> + 'a;
 
 /// A window function whose `cost_windowagg` share EXPLAIN can price
-/// (RP-351): a built-in (every one has `procost` 1) with no FILTER, whose
-/// argument, if it has one, is a plain column -- a `Var`, free to evaluate.
-/// Extra arguments are literals (`lag`'s offset, `ntile`'s count), which
-/// are free too.
-fn priced_window_func(w: &secantus_pgplan::WindowItem) -> bool {
-    w.func != secantus_pgplan::WindowFunc::User
-        && w.filter.is_none()
-        && (w.arg.is_none() || w.arg_field.is_some())
-        && !w.result_type.is_empty()
+/// (RP-351, RP-352): a built-in (every one has `procost` 1) whose argument
+/// and FILTER, where it has them, are a plain column -- a `Var`, free to
+/// evaluate -- or an expression `column_expr_cost` prices. Extra arguments
+/// are literals (`lag`'s offset, `ntile`'s count), which are free too.
+/// `Some((operators per row, fields the scan returns for it))`.
+fn priced_window_func(w: &secantus_pgplan::WindowItem) -> Option<(u32, Vec<String>)> {
+    if w.func == secantus_pgplan::WindowFunc::User || w.result_type.is_empty() {
+        return None;
+    }
+    let (mut ops, mut fields) = (0, Vec::new());
+    match (&w.arg, &w.arg_field) {
+        (None, _) => {}
+        (Some(_), Some(f)) => fields.push(f.clone()),
+        (Some(e), None) => {
+            let (o, read) = scan_estimate::column_expr_cost(e)?;
+            ops += o;
+            fields.extend(read);
+        }
+    }
+    if let Some(e) = &w.filter {
+        let (o, read) = scan_estimate::column_expr_cost(e)?;
+        ops += o;
+        fields.extend(read);
+    }
+    Some((ops, fields))
 }
