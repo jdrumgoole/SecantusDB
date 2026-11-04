@@ -387,22 +387,20 @@ mod tests {
 
     #[test]
     fn without_statistics_each_element_is_the_default() {
+        // `Min(DEFAULT_CONTAIN_SEL, minfreq / 2)` with `minfreq` the float4
+        // `2 * 0.005`: the float4 half is the smaller.
+        let elem = f64::from(0.005f32);
         let one = [vec![1u8]];
         let s = arraycontsel(ArrayOp::Contains, &one, false, &ColumnStats::None);
-        assert_eq!(s, 0.005);
-        // `1 = ANY (a)` is `'{1}' <@ a`'s estimate; `= ALL` the contained
+        assert_eq!(s, elem);
+        // `1 = ANY (a)` is `a @> '{1}'`'s estimate; `= ALL` the contained
         // default; `<> ALL` one minus `= ANY`.
+        let none = ColumnStats::None;
+        assert_eq!(scalararraysel_containment(&[1], true, true, &none), elem);
+        assert_eq!(scalararraysel_containment(&[1], true, false, &none), 0.005);
         assert_eq!(
-            scalararraysel_containment(&[1], true, true, &ColumnStats::None),
-            0.005
-        );
-        assert_eq!(
-            scalararraysel_containment(&[1], true, false, &ColumnStats::None),
-            0.005
-        );
-        assert_eq!(
-            scalararraysel_containment(&[1], false, false, &ColumnStats::None),
-            0.995
+            scalararraysel_containment(&[1], false, false, &none),
+            1.0 - elem
         );
     }
 
@@ -422,7 +420,7 @@ mod tests {
         // An element not among them: half the least frequency, at most
         // the default.
         let s = arraycontsel(ArrayOp::Contains, &[vec![9]], false, &stats);
-        assert!((s - 0.005 * 0.5).abs() < 1e-12);
+        assert!((s - 0.005 * 0.5).abs() < 1e-9);
     }
 
     #[test]
