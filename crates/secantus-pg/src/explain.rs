@@ -257,6 +257,50 @@ pub(crate) fn resolve_inner_unique(n: &mut PlanNode, unique: &dyn Fn(&str, &[Str
     }
 }
 
+/// Whether a subquery's output is distinct on the output columns `fixed`
+/// marks (by position), as `query_is_distinct_for` decides it: a DISTINCT
+/// (or DISTINCT ON) whose every key is fixed, a GROUP BY whose every key
+/// is a fixed output, `GROUP BY ()` or an aggregate without GROUP BY (one
+/// row), or a UNION / INTERSECT / EXCEPT without ALL whose every output is
+/// fixed. `None` when the statement is none of those, which leaves a plain
+/// table scan to the unique-index check; `Some(false)` when it is one but
+/// a key is not fixed.
+fn query_is_distinct_for(plan: &Statement, fixed: &[bool]) -> Option<bool> {
+    use secantus_pgplan::{Distinct, OutputCol};
+    let is_fixed = |i: usize| fixed.get(i).copied().unwrap_or(false);
+    let all_fixed = || !fixed.is_empty() && fixed.iter().all(|&f| f);
+    match plan {
+        Statement::Select(s) => match &s.distinct {
+            Distinct::None => None,
+            Distinct::All => Some(all_fixed()),
+            // Each key a bare output column the join fixes.
+            Distinct::On(keys) => Some(keys.iter().all(|k| {
+                s.columns.iter().enumerate().any(|(i, (_, f))| {
+                    f == k && s.casts.get(i).is_none_or(Option::is_none) && is_fixed(i)
+                })
+            })),
+        },
+        Statement::Aggregate(a) => {
+            if a.distinct && all_fixed() {
+                return Some(true);
+            }
+            Some(match &a.grouping_sets {
+                // `GROUP BY ()` alone is one row; any other set is not
+                // proven.
+                Some(sets) => sets.len() == 1 && sets[0].is_empty(),
+                None if a.group_by.is_empty() => true,
+                None => (0..a.group_by.len()).all(|g| {
+                    a.select.iter().enumerate().any(|(i, (_, o))| {
+                        matches!(o, OutputCol::Group(x) if *x == g) && is_fixed(i)
+                    })
+                }),
+            })
+        }
+        Statement::SetOp(op) => Some(!op.all && all_fixed()),
+        _ => None,
+    }
+}
+
 /// Whether any join in the tree waits on [`resolve_inner_unique`].
 pub(crate) fn has_unique_probe(n: &PlanNode) -> bool {
     n.unique_probe.is_some() || n.children.iter().any(has_unique_probe)
@@ -340,6 +384,7 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
             right,
             equi,
             merged,
+            on,
             ..
         } => {
             let side = match kind {
@@ -357,7 +402,20 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
             // The inner side one table's plain scan: the fields its join
             // clauses fix, for `resolve_inner_unique`.
             if let JoinNode::Leaf { plan, columns, .. } = right.as_ref() {
-                if let Statement::Select(leaf) = plan.as_ref() {
+                // A subquery's DISTINCT, GROUP BY or set operation proves
+                // its output unique on the columns the join fixes
+                // (`rel_is_distinct_for`, RP-356).
+                let fixed_outputs: Vec<bool> = columns
+                    .iter()
+                    .map(|(c, _)| {
+                        equi.iter().any(|(_, r)| r == c) || merged.iter().any(|(_, _, r)| r == c)
+                    })
+                    .collect();
+                if let Some(unique) = query_is_distinct_for(plan, &fixed_outputs) {
+                    // No join clause at all is never unique
+                    // (`innerrel_is_unique` returns false first).
+                    n.inner_unique = unique && (on.is_some() || fixed_outputs.iter().any(|&f| f));
+                } else if let Statement::Select(leaf) = plan.as_ref() {
                     if leaf.sub.is_none()
                         && leaf.join.is_none()
                         && leaf.series.is_none()

@@ -13,6 +13,6 @@ rather than the text format's `Hash Left Join`.
   relation: true when one of the inner table's unique indexes -- immediate,
   without a WHERE, on plain columns -- has every key column fixed by the
   join's equalities or a constant. A DISTINCT or GROUP BY subquery on the
-  inner side is not proven unique yet (RP-355).
+  inner side is not proven unique yet (RP-356).
 
 Fixes RP-353 (tests/backlog/test_rp_explain_join_json.py::test_a_join_node_names_its_join_type)

@@ -1,4 +1,4 @@
-"""EXPLAIN (FORMAT JSON) of a join on the Rust PG server (RP-353, fixed).
+"""EXPLAIN (FORMAT JSON) of a join on the Rust PG server (RP-353, RP-356, fixed).
 
 PostgreSQL 15.19 gives every join node a `Join Type` and an `Inner Unique`
 (`ExplainNode`), measured on a freshly initdb'd cluster: for
@@ -81,18 +81,58 @@ def test_inner_unique_follows_the_inner_tables_unique_index(
     assert (plan["Join Type"], plan["Inner Unique"]) == (join_type, unique)
 
 
-@pytest.mark.backlog("RP-355")
-def test_a_distinct_subquery_inner_side_is_unique(rust_pg: Any) -> None:
-    """PostgreSQL 15.19 proves a DISTINCT subquery's output unique on its
-    columns (`rel_is_distinct_for`): `r join (select distinct x from r) s on
-    r.x = s.x` is a Hash Join with `Inner Unique: true`."""
+# (subquery join, Join Type, Inner Unique) of the top join node, PostgreSQL
+# 15.19 (measured 2026-11-04 on port 5415, `create table r (x int, y int)`):
+# `query_is_distinct_for` proves a DISTINCT, DISTINCT ON, GROUP BY, plain
+# aggregate or UNION subquery unique when the join fixes every key.
+_DISTINCT_CASES = [
+    ("select * from r join (select distinct x from r) s on r.x = s.x", "Inner", True),
+    ("select * from r join (select distinct x, y from r) s on r.x = s.x", "Inner", False),
+    (
+        "select * from r join (select distinct x, y from r) s on r.x = s.x and r.y = s.y",
+        "Inner",
+        True,
+    ),
+    (
+        "select * from r join (select distinct on (x) x, y from r order by x, y) s on r.x = s.x",
+        "Inner",
+        True,
+    ),
+    ("select * from r join (select x, count(*) c from r group by x) s on r.x = s.x", "Inner", True),
+    (
+        "select * from r join (select x, y, count(*) c from r group by x, y) s on r.x = s.x",
+        "Inner",
+        False,
+    ),
+    ("select * from r join (select max(x) m from r) s on r.x = s.m", "Inner", True),
+    ("select * from r join (select x from r union select y from r) s on r.x = s.x", "Inner", True),
+    (
+        "select * from r join (select x from r union all select y from r) s on r.x = s.x",
+        "Inner",
+        False,
+    ),
+    ("select * from r left join (select distinct x from r) s on r.x = s.x", "Left", True),
+    ("select * from r join (select x from r) s on r.x = s.x", "Inner", False),
+]
+
+
+def _top_join(plan: dict[str, Any]) -> dict[str, Any]:
+    return plan if "Join Type" in plan else _top_join(plan["Plans"][0])
+
+
+@pytest.mark.backlog_fixed("RP-356")
+@pytest.mark.parametrize(("sql", "join_type", "unique"), _DISTINCT_CASES)
+def test_a_distinct_subquery_inner_side_is_unique(
+    rust_pg: Any, sql: str, join_type: str, unique: bool
+) -> None:
+    """PostgreSQL 15.19 proves a subquery's output unique on the columns a
+    join fixes (`rel_is_distinct_for`); the server printed `Inner Unique:
+    false` for every subquery, and now decides it the same way."""
     with psycopg.connect(fresh_db(_dsn(rust_pg))) as c:
         try:
-            c.execute("create table r (x int)")
-            plan = c.execute(
-                "explain (format json, costs off) select * from r"
-                " join (select distinct x from r) s on r.x = s.x"
-            ).fetchone()[0][0]["Plan"]
+            c.execute("create table r (x int, y int)")
+            plan = c.execute(f"explain (format json, costs off) {sql}").fetchone()[0][0]["Plan"]
         finally:
             c.rollback()
-    assert (plan["Join Type"], plan["Inner Unique"]) == ("Inner", True)
+    top = _top_join(plan)
+    assert (top["Join Type"], top["Inner Unique"]) == (join_type, unique)
