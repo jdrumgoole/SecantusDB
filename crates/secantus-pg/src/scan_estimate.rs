@@ -781,7 +781,7 @@ impl PgHandler {
     pub(crate) fn join_select_left_implied(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Vec<(String, String)>, (String, String))> {
+    ) -> Option<LeftImplied> {
         let j = sel.join.as_ref()?;
         if !j.left_join {
             return None;
@@ -2576,3 +2576,8 @@ fn hash_join_of(
         (b.scan, a.scan, (l_startup, l_total, rows, width), true)
     })
 }
+
+/// The filters an equivalence class adds to a LEFT join whose WHERE fixes
+/// its outer key, `(alias, column)` each, and that outer key `(alias,
+/// column)` (RP-364).
+pub(crate) type LeftImplied = (Vec<(String, String)>, (String, String));

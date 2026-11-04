@@ -42,7 +42,7 @@ pub(crate) struct PlanNode {
     /// A scan the class filters by the constant too (RP-363): `(own key
     /// column, (alias, key column) whose WHERE fixed the other key)`. Its
     /// `Filter` takes the other scan's constant, over this column.
-    pub implied_filter: Option<(String, (String, String))>,
+    pub implied_filter: Option<ImpliedFilter>,
     /// Under ANALYZE, an index-only scan's `Heap Fetches`
     /// (`ioss_HeapFetches`), printed after its quals (RP-360).
     pub heap_fetches: Option<usize>,
@@ -1304,6 +1304,13 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
 /// so on each side the key's equality comes after the scan's own quals,
 /// all in one `Filter`. A filter that is not a plain AND of
 /// parenthesised conjuncts is left as it is.
+/// `(own key column, (alias, key column) whose WHERE fixed the other
+/// key)`: a scan an equivalence class filters by a constant (RP-363).
+pub(crate) type ImpliedFilter = (String, (String, String));
+
+/// A leaf's alias, its implied filter, and its printed `Filter`.
+type LeafFilters = (Option<String>, Option<ImpliedFilter>, Option<String>);
+
 pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
     fn alias_of(n: &PlanNode) -> Option<String> {
         n.props
@@ -1329,19 +1336,8 @@ pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
             format!("({})", parts.join(" AND "))
         }
     }
-    let mut found: Vec<(
-        Option<String>,
-        Option<(String, (String, String))>,
-        Option<String>,
-    )> = Vec::new();
-    fn collect(
-        n: &PlanNode,
-        out: &mut Vec<(
-            Option<String>,
-            Option<(String, (String, String))>,
-            Option<String>,
-        )>,
-    ) {
+    let mut found: Vec<LeafFilters> = Vec::new();
+    fn collect(n: &PlanNode, out: &mut Vec<LeafFilters>) {
         if n.children.is_empty() {
             let filter = n
                 .details
