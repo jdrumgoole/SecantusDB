@@ -1716,8 +1716,7 @@ pub(crate) fn column_expr_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(u32, 
     };
     let mut read = Vec::new();
     row_expr_reads(expr, params.len(), fields, &mut read)?;
-    let builtin =
-        |t: &str| secantus_pgplan::pgtypes::oid_of_name(t).is_some_and(|oid| oid < 10000);
+    let builtin = |t: &str| secantus_pgplan::pgtypes::oid_of_name(t).is_some_and(|oid| oid < 10000);
     if !builtin(result_type)
         || read
             .iter()
