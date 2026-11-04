@@ -5,7 +5,8 @@
 //! rows and width are PostgreSQL's estimate where the cost model prices
 //! that node (a single relation's Seq Scan, `scan_estimate.rs`, RP-314; a
 //! select with no FROM, a `Result`, RP-325 and RP-340; an INSERT,
-//! UPDATE or DELETE, RP-331);
+//! UPDATE or DELETE, RP-331; a Nested Loop of two Seq Scans with its
+//! Materialize, RP-329);
 //! every other node still prints zeros, each kind its own backlog item.
 
 use bson::Document;

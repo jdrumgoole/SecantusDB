@@ -742,6 +742,54 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (a > 5)",
         ],
     ),
+    # ------------------- RP-354 the nested loops RP-329 leaves at zeros
+    "nested loop into an index": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e, k where e.a < k.a",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+        ],
+    ),
+    "nested loop on an ON's inequality": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join k on e.a <> k.a",
+        [
+            "Nested Loop  (cost=0.00..15032.50 rows=999000 width=14)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop with a not-equal filter": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e, e e2 where e.a < e2.a and e.b <> e2.b",
+        [
+            "Nested Loop  (cost=0.00..17532.50 rows=300000 width=14)",
+            "  Join Filter: ((e.a < e2.a) AND (e.b <> e2.b))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a < e2.a",
+        [
+            "Nested Loop Left Join  (cost=0.00..15032.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "hash join": (
         "RP-330",
         _ANALYSED,
