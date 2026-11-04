@@ -15,4 +15,4 @@ six relations until the server was killed.
   it as PostgreSQL's equivalence classes do. The query answers 278 rows,
   as PostgreSQL 15.19 does in a fresh cluster.
 
-Fixes RP-306 (tests/backlog/test_rp306_semijoin.py::test_element_types_semijoin_answers)
+Fixes RP-306 (tests/backlog/test_rp_semijoin_keys.py::test_element_types_semijoin_answers)
