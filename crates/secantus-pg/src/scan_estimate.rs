@@ -1360,15 +1360,22 @@ mod agg_tests {
 ///
 /// `key_cols` is the window's partition plus order columns (RP-347), each
 /// compared once per input row at `cpu_operator_cost`.
-pub(crate) fn window_agg_estimate(input: Estimate, n: usize, key_cols: usize) -> Estimate {
+///
+/// `results` is each window function's result type (RP-351): every
+/// built-in window function and aggregate has `procost` 1, and an argument
+/// that is a plain column is a `Var`, which costs nothing to evaluate; each
+/// result widens the row by its type's `get_typavgwidth`.
+pub(crate) fn window_agg_estimate(input: Estimate, results: &[&str], key_cols: usize) -> Estimate {
     const CPU_OPERATOR_COST: f64 = 0.0025;
     const CPU_TUPLE_COST: f64 = 0.01;
     let (startup, in_total, rows, width) = input;
+    let n = results.len();
     let total = in_total
         + CPU_OPERATOR_COST * n as f64 * rows
         + CPU_OPERATOR_COST * key_cols as f64 * rows
         + CPU_TUPLE_COST * rows;
-    (startup, total, rows, width + 8 * n as i64)
+    let widened: i64 = results.iter().map(|t| type_width(t, -1)).sum();
+    (startup, total, rows, width + widened)
 }
 
 #[cfg(test)]
@@ -1376,11 +1383,23 @@ mod window_tests {
     use super::window_agg_estimate;
 
     #[test]
+    fn a_lag_widens_the_row_by_its_argument_type() {
+        // PostgreSQL 15.19: `select a, lag(a) over (order by a) from e`
+        // over a Sort of (64.83..67.33 rows=1000 width=4) is
+        // (64.83..82.33 rows=1000 width=8): lag's result is int4 (RP-351).
+        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), &["int4"], 1);
+        assert_eq!(
+            (format!("{s:.2}"), format!("{t:.2}"), r, w),
+            ("64.83".into(), "82.33".into(), 1000.0, 8)
+        );
+    }
+
+    #[test]
     fn an_ordered_window_compares_its_key_once_per_row() {
         // PostgreSQL 15.19: `select a, row_number() over (order by a) from e`
         // over a Sort of (64.83..67.33 rows=1000 width=4) is
         // (64.83..82.33 rows=1000 width=12) (RP-347).
-        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), 1, 1);
+        let (s, t, r, w) = window_agg_estimate((64.83, 67.33, 1000.0, 4), &["int8"], 1);
         assert_eq!(
             (format!("{s:.2}"), format!("{t:.2}"), r, w),
             ("64.83".into(), "82.33".into(), 1000.0, 12)
@@ -1392,7 +1411,7 @@ mod window_tests {
         // PostgreSQL 15.19: `select a, row_number() over () from e` over a
         // Seq Scan of (0.00..15.00 rows=1000 width=4) is
         // (0.00..27.50 rows=1000 width=12).
-        let (s, t, r, w) = window_agg_estimate((0.0, 15.0, 1000.0, 4), 1, 0);
+        let (s, t, r, w) = window_agg_estimate((0.0, 15.0, 1000.0, 4), &["int8"], 0);
         assert_eq!(
             (format!("{s:.2}"), format!("{t:.2}"), r, w),
             ("0.00".into(), "27.50".into(), 1000.0, 12)

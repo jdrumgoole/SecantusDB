@@ -2990,6 +2990,36 @@ impl RoleInfo {
 pub(crate) type RangeConstructor = (i64, String, Vec<i64>, i64, i64, &'static str, bool);
 
 impl PgHandler {
+    /// The width of the row a WindowAgg passes up (RP-351): its target
+    /// list is the select list's columns, the window's PARTITION BY and
+    /// ORDER BY columns (kept for the comparisons), and the functions'
+    /// results -- but not a column only a function's argument reads, which
+    /// the scan below returns and the WindowAgg consumes. The results' widths
+    /// are added by `window_agg_estimate`.
+    fn window_output_width(
+        &self,
+        sel: &secantus_pgplan::Select,
+        keys: &[&secantus_pgplan::OrderKey],
+    ) -> Option<i64> {
+        let is_window = |f: &str| sel.windows.iter().any(|w| w.field == f);
+        let mut fields: Vec<String> = Vec::new();
+        for f in sel
+            .columns
+            .iter()
+            .map(|(_, f)| f.clone())
+            .filter(|f| !is_window(f))
+            .chain(keys.iter().map(|k| k.field.clone()))
+        {
+            if !fields.contains(&f) {
+                fields.push(f);
+            }
+        }
+        match self.scan_estimate(&sel.table, &sel.filter, &fields)? {
+            ((_, _, _, width), None) => Some(width),
+            _ => None,
+        }
+    }
+
     /// Where the `CREATE ROLE` records live: the cluster-wide namespace.
     const ROLE_COLLECTION: &'static str = "roles";
 
@@ -40831,14 +40861,7 @@ impl PgHandler {
                             .iter()
                             .any(|ix| ix.table.name == sel.table);
                         let ranking = sel.windows.iter().all(|w| {
-                            matches!(
-                                w.func,
-                                secantus_pgplan::WindowFunc::RowNumber
-                                    | secantus_pgplan::WindowFunc::Rank
-                                    | secantus_pgplan::WindowFunc::DenseRank
-                            ) && w.arg.is_none()
-                                && w.args.is_empty()
-                                && w.filter.is_none()
+                            priced_window_func(w)
                                 && w.partition_by.is_empty()
                                 && w.order_by.is_empty()
                         });
@@ -40859,19 +40882,31 @@ impl PgHandler {
                                 == sel.windows.len()
                             && (sel.filter.is_empty() || !indexed)
                         {
-                            let fields: Vec<String> = sel
+                            // The scan returns the select list's columns and
+                            // the functions' argument columns, each once.
+                            let mut fields: Vec<String> = Vec::new();
+                            for f in sel
                                 .columns
                                 .iter()
-                                .filter(|(_, f)| !is_window(f))
                                 .map(|(_, f)| f.clone())
-                                .collect();
-                            if let Some((estimate, None)) =
-                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                                .filter(|f| !is_window(f))
+                                .chain(sel.windows.iter().filter_map(|w| w.arg_field.clone()))
                             {
+                                if !fields.contains(&f) {
+                                    fields.push(f);
+                                }
+                            }
+                            let results: Vec<&str> =
+                                sel.windows.iter().map(|w| w.result_type.as_str()).collect();
+                            if let (Some((estimate, None)), Some(out)) = (
+                                self.scan_estimate(&sel.table, &sel.filter, &fields),
+                                self.window_output_width(sel, &[]),
+                            ) {
                                 tree.children[0].estimate = Some(estimate);
+                                let (s0, t0, r0, _) = estimate;
                                 tree.estimate = Some(scan_estimate::window_agg_estimate(
-                                    estimate,
-                                    sel.windows.len(),
+                                    (s0, t0, r0, out),
+                                    &results,
                                     0,
                                 ));
                             }
@@ -40909,14 +40944,7 @@ impl PgHandler {
                             .all(|i| keys[..i].iter().all(|k| k.field != keys[i].field));
                         let one_window = sel.windows.iter().all(|w| {
                             let f = first.expect("windows is not empty here");
-                            matches!(
-                                w.func,
-                                secantus_pgplan::WindowFunc::RowNumber
-                                    | secantus_pgplan::WindowFunc::Rank
-                                    | secantus_pgplan::WindowFunc::DenseRank
-                            ) && w.arg.is_none()
-                                && w.args.is_empty()
-                                && w.filter.is_none()
+                            priced_window_func(w)
                                 && w.partition_by == f.partition_by
                                 && w.order_by == f.order_by
                                 && w.frame == f.frame
@@ -40948,24 +40976,30 @@ impl PgHandler {
                                 .iter()
                                 .map(|(_, f)| f.as_str())
                                 .filter(|f| !is_window(f))
-                                .chain(keys.iter().map(|k| k.field.as_str()))
+                                .map(str::to_string)
+                                .chain(sel.windows.iter().filter_map(|w| w.arg_field.clone()))
+                                .chain(keys.iter().map(|k| k.field.clone()))
                             {
-                                if !fields.iter().any(|g| g == f) {
-                                    fields.push(f.to_string());
+                                if !fields.contains(&f) {
+                                    fields.push(f);
                                 }
                             }
-                            if let Some((estimate, None)) =
-                                self.scan_estimate(&sel.table, &sel.filter, &fields)
-                            {
+                            let results: Vec<&str> =
+                                sel.windows.iter().map(|w| w.result_type.as_str()).collect();
+                            if let (Some((estimate, None)), Some(out)) = (
+                                self.scan_estimate(&sel.table, &sel.filter, &fields),
+                                self.window_output_width(sel, &keys),
+                            ) {
                                 let sorted = scan_estimate::sort_estimate(
                                     estimate,
                                     self.kb_setting("work_mem", 4096),
                                 );
                                 tree.children[0].children[0].estimate = Some(estimate);
                                 tree.children[0].estimate = Some(sorted);
+                                let (s0, t0, r0, _) = sorted;
                                 tree.estimate = Some(scan_estimate::window_agg_estimate(
-                                    sorted,
-                                    sel.windows.len(),
+                                    (s0, t0, r0, out),
+                                    &results,
                                     keys.len(),
                                 ));
                             }
@@ -54525,3 +54559,15 @@ impl ComputedUnique {
 /// Sizes an index for the planner from its key fields and their width:
 /// its pages and height, or `None` when it cannot tell (RP-297).
 pub(crate) type IndexSizer<'a> = dyn Fn(&[String], i64) -> Option<(f64, u32)> + 'a;
+
+/// A window function whose `cost_windowagg` share EXPLAIN can price
+/// (RP-351): a built-in (every one has `procost` 1) with no FILTER, whose
+/// argument, if it has one, is a plain column -- a `Var`, free to evaluate.
+/// Extra arguments are literals (`lag`'s offset, `ntile`'s count), which
+/// are free too.
+fn priced_window_func(w: &secantus_pgplan::WindowItem) -> bool {
+    w.func != secantus_pgplan::WindowFunc::User
+        && w.filter.is_none()
+        && (w.arg.is_none() || w.arg_field.is_some())
+        && !w.result_type.is_empty()
+}
