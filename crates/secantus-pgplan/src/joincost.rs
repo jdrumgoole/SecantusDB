@@ -444,6 +444,73 @@ fn nest_loop_with(outer: &JoinSide, inner: &JoinSide, materialized: bool, qual: 
     (startup, startup + run)
 }
 
+/// The nested loop `add_paths_to_joinrel` keeps for an inner join of two
+/// unparameterized scans with no clause to hash or merge on (RP-329): its
+/// outer side, whether its inner is a Material node, and its cost.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NestLoopPlan {
+    pub b_outer: bool,
+    pub materialized: bool,
+    pub startup: f64,
+    pub total: f64,
+    /// The Material node's `(startup, total)`, when there is one.
+    pub material: Option<(f64, f64)>,
+}
+
+/// `populate_joinrel_with_paths` for `a` and `b` (each `(startup, total,
+/// rows, width)`, a plain scan) joined by nothing a hash or merge join
+/// can use: `a` outer then `b`, each `match_unsorted_outer`'s nested loop
+/// over the inner's cheapest path and then over a Material of it
+/// (`cost_material`, `cost_rescan`), every pair paying `qual`, the join
+/// filters' cost a tuple; the cheapest `add_path` keeps (`set_cheapest`).
+pub fn cheapest_nest_loop(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+) -> NestLoopPlan {
+    let mut paths: Vec<JoinPath> = Vec::new();
+    let mut materials = [(0.0, 0.0); 2];
+    for b_outer in [false, true] {
+        let (o, i) = if b_outer { (b, a) } else { (a, b) };
+        let outer = InPath::scan(o.0, o.1, o.2, None);
+        let inner = InPath::scan(i.0, i.1, i.2, None);
+        let mat = material(&inner, i.3);
+        materials[usize::from(b_outer)] = (mat.startup, mat.total);
+        for (materialized, inner) in [(false, &inner), (true, &mat)] {
+            let (startup, total) = nestloop_cost(&outer, inner, None, false, qual);
+            add_path(
+                &mut paths,
+                JoinPath {
+                    startup,
+                    total,
+                    keyed: false,
+                    class: 0,
+                    method: JoinMethod::Other,
+                    // The pair it was built from: which side is outer, and
+                    // whether its inner is materialised.
+                    combo: usize::from(b_outer) * 2 + usize::from(materialized),
+                    a_path: DEFAULT_INPUT,
+                    b_path: DEFAULT_INPUT,
+                    rows: 0.0,
+                    req_outer: 0,
+                    rescan: (startup, total),
+                },
+                false,
+            );
+        }
+    }
+    let best = paths[0];
+    let b_outer = best.combo >= 2;
+    let materialized = best.combo % 2 == 1;
+    NestLoopPlan {
+        b_outer,
+        materialized,
+        startup: best.startup,
+        total: best.total,
+        material: materialized.then_some(materials[usize::from(b_outer)]),
+    }
+}
+
 /// A merge join, each side read in key order -- by its `ordered` index scan
 /// when `by_index`, else sorted from its cheapest scan: `(startup, total)`.
 /// No statistics: the merge reads both inputs whole (`mergejoinscansel`).
@@ -2163,6 +2230,33 @@ mod tests {
         assert_eq!(hash_batch(1 << 18, 262_144, 2), 1);
         assert_eq!(hash_batch((1 << 18) - 1, 262_144, 2), 0);
         assert_eq!(hash_batch(u32::MAX, 1024, 1), 0);
+    }
+
+    #[test]
+    fn a_cross_nest_loop_is_priced_and_ordered_as_postgres_does() {
+        // PostgreSQL 15.19, two analysed 1,000-row tables (width 7) joined
+        // by one `<`: a Nested Loop (0.00..15032.50) over a Material of the
+        // second (0.00..20.00); with equal costs the first order stays.
+        let e = (0.0, 15.0, 1000.0, 7);
+        let p = cheapest_nest_loop(e, e, CPU_OPERATOR_COST);
+        assert!(!p.b_outer && p.materialized, "{p:?}");
+        assert!(close(p.total, 15032.50), "{p:?}");
+        assert_eq!(p.material, Some((0.0, 20.0)));
+        // `FROM zs, e` (zs 10 rows, width 6): e is the cheaper outer
+        // side, zs materialised (0.00..1.15), the join 0.00..166.12.
+        let zs = (0.0, 1.10, 10.0, 6);
+        let p = cheapest_nest_loop(zs, e, CPU_OPERATOR_COST);
+        assert!(p.b_outer && p.materialized, "{p:?}");
+        assert!(close(p.total, 166.12), "{p:?}");
+        assert!(close(p.material.unwrap().1, 1.15), "{p:?}");
+        // One outer row: rescanning the inner costs nothing more, so the
+        // plain scan is cheaper than materialising it.
+        let one = (0.0, 1.01, 1.0, 4);
+        let p = cheapest_nest_loop(one, e, 0.0);
+        assert!(
+            !p.b_outer && !p.materialized && p.material.is_none(),
+            "{p:?}"
+        );
     }
 
     #[test]

@@ -10060,9 +10060,18 @@ fn plan_explain(
                 lookup,
                 view_sql: &none,
             };
-            options.join_where = if s.from_clause.len() == 1
-                && matches!(s.from_clause[0].node.as_ref(), Some(N::JoinExpr(_)))
-            {
+            // A JOIN, or a comma list of plain relations (`FROM a, b`,
+            // RP-329), whose WHERE's conjuncts over both are join quals.
+            let joined = match s.from_clause.as_slice() {
+                [one] => matches!(one.node.as_ref(), Some(N::JoinExpr(_))),
+                many => {
+                    many.len() > 1
+                        && many
+                            .iter()
+                            .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))))
+                }
+            };
+            options.join_where = if joined {
                 ruleutils::join_where(s, &cat).unwrap_or_default()
             } else {
                 Vec::new()

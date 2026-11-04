@@ -1360,18 +1360,29 @@ a regression test.
       cluster).
       Backlog-ID: RP-352
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate under a filter clause], tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate of an expression], tests/backlog/test_rp_explain_costs.py::test_plan[two windows stacked]
-- [ ] **EXPLAIN prints no estimate for a Nested Loop, nor its Join Filter and Materialize.**
-      `explain select * from e, e e2 where e.a < e2.a` is `Nested Loop
-      (cost=0.00..15032.50 rows=333333 width=14)` with `Join Filter:
-      (e.a < e2.a)` and a `Materialize` over the inner Seq Scan
-      (`cost_nestloop`, `cost_material`); here neither line nor the
-      Materialize is printed. PostgreSQL 15.19 prices it (`costsize.c`);
-      here it prints `cost=0.00..0.00 rows=0 width=0`. Since RP-314 a
-      plan that is one relation's Seq Scan prints the estimate; the
-      scenario's expected plan is PostgreSQL's, measured on a fresh
-      cluster.
-      Backlog-ID: RP-329
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop]
+- [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
+      a Nested Loop of two tables' sequential scans, `FROM a, b` joined
+      only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),
+      over tables with no index, prints `cost_nestloop`'s estimate, its
+      outer side and Materialize as PostgreSQL 15.19 picks them. Every
+      other nested loop still prints zeros: a table with an index, whose
+      parameterized inner Index Scan may win (`explain select * from e, k
+      where e.a < k.a` is `Nested Loop (cost=0.28..9487.50 rows=333333
+      width=14)` over `Index Scan using k_pkey on k` with `Index Cond: (a
+      > e.a)`); a `<>` filter (`neqjoinsel` over the columns' statistics:
+      rows=300000 with `e.b <> e2.b` added); a JOIN ... ON's condition,
+      inner or LEFT; and a join of three or more relations (found while
+      working RP-329).
+      Backlog-ID: RP-354
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
+- [ ] **EXPLAIN (FORMAT JSON) gives a join node no `Join Type` or
+      `Inner Unique`.** PostgreSQL 15.19 prints both on every join node
+      (`ExplainNode`), `"Join Type": "Inner"` after `Async Capable` and
+      `"Inner Unique": false` after `Plan Width` for `explain (format json)
+      select * from e, e e2 where e.a < e2.a`; here the Nested Loop has
+      neither (found while working RP-329).
+      Backlog-ID: RP-353
+      Verify: tests/backlog/test_rp_explain_join_json.py::test_a_join_node_names_its_join_type
 - [ ] **EXPLAIN prints no estimate for a Hash Join or its Hash.**
       `explain select * from e join k on e.b = k.b` is `Hash Join
       (cost=27.50..1170.00 rows=100000 width=14)` over `Hash

@@ -41,6 +41,14 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# Those, a ten-row table analysed and one never analysed (RP-329).
+_ANALYSED_SMALL = _ANALYSED + [
+    "create table zs (a int, b text)",
+    "insert into zs select g, 'x' from generate_series(1, 10) g",
+    "analyze zs",
+    "create table zu (a int, b text)",
+]
+
 # A table with a defaulted varchar column, analysed (RP-331).
 _EC = [
     "create table e (a int, b text, c varchar(10) default 'z')",
@@ -686,6 +694,102 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "nested loop, the smaller side materialised": (
+        "RP-329",
+        _ANALYSED_SMALL,
+        "explain select * from zs, e where e.a < zs.a",
+        [
+            "Nested Loop  (cost=0.00..166.12 rows=3333 width=13)",
+            "  Join Filter: (e.a < zs.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..1.15 rows=10 width=6)",
+            "        ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=6)",
+        ],
+    ),
+    "nested loop, a cross join": (
+        "RP-329",
+        _ANALYSED_SMALL,
+        "explain select * from e, zu",
+        [
+            "Nested Loop  (cost=0.00..15915.20 rows=1270000 width=43)",
+            "  ->  Seq Scan on zu  (cost=0.00..22.70 rows=1270 width=36)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop, the columns it reads": (
+        "RP-329",
+        _ANALYSED,
+        "explain select e.a from e, e e2 where e.a < e2.a",
+        [
+            "Nested Loop  (cost=0.00..15032.50 rows=333333 width=4)",
+            "  Join Filter: (e.a < e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=4)",
+        ],
+    ),
+    "nested loop, a filtered side": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, e e2 where e.a < e2.a and e.a > 5",
+        [
+            "Nested Loop  (cost=0.00..14959.99 rows=331667 width=14)",
+            "  Join Filter: (e.a < e2.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..22.48 rows=995 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=995 width=7)",
+            "              Filter: (a > 5)",
+        ],
+    ),
+    # ------------------- RP-354 the nested loops RP-329 leaves at zeros
+    "nested loop into an index": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e, k where e.a < k.a",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+        ],
+    ),
+    "nested loop on an ON's inequality": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e join k on e.a <> k.a",
+        [
+            "Nested Loop  (cost=0.00..15032.50 rows=999000 width=14)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop with a not-equal filter": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e, e e2 where e.a < e2.a and e.b <> e2.b",
+        [
+            "Nested Loop  (cost=0.00..17532.50 rows=300000 width=14)",
+            "  Join Filter: ((e.a < e2.a) AND (e.b <> e2.b))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a < e2.a",
+        [
+            "Nested Loop Left Join  (cost=0.00..15032.50 rows=333333 width=14)",
+            "  Join Filter: (e.a < e2.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "hash join": (
         "RP-330",
         _ANALYSED,
@@ -1066,6 +1170,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-326",
         "RP-327",
         "RP-328",
+        "RP-329",
         "RP-331",
         "RP-332",
         "RP-333",
