@@ -40795,6 +40795,24 @@ impl PgHandler {
                         }
                     }
                 }
+                // A Nested Loop of two tables' sequential scans with no
+                // clause to hash or merge on (RP-329): `cost_nestloop` over
+                // each side's Seq Scan, the inner materialised when that
+                // is cheaper, the outer the cheaper order's.
+                if tree.name == "Nested Loop"
+                    && tree.details.is_empty()
+                    && tree.children.len() == 2
+                    && tree
+                        .children
+                        .iter()
+                        .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
+                {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if let Some((plan, a, b, join)) = self.nest_loop_estimate(sel) {
+                            explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                        }
+                    }
+                }
                 // A Limit straight over one relation's sequential scan
                 // (RP-319): the scan's estimate, then
                 // `adjust_limit_rows_costs`. Only where the Seq Scan is the

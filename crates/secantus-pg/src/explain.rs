@@ -285,6 +285,43 @@ fn join_tree(node: &JoinNode, scan: &ScanChooser<'_>) -> PlanNode {
     }
 }
 
+/// Give a `Nested Loop` over two scans the plan the cost model chose
+/// (RP-329): its estimate and its inputs', the outer side first, and the
+/// inner read through a `Materialize` when that is the cheaper path.
+/// `a` and `b` are the scans in the order the join tree lists them.
+pub(crate) fn price_nest_loop(
+    root: &mut PlanNode,
+    plan: &secantus_pgplan::joincost::NestLoopPlan,
+    a: crate::scan_estimate::Estimate,
+    b: crate::scan_estimate::Estimate,
+    join: crate::scan_estimate::Estimate,
+) {
+    if root.name != "Nested Loop" || root.children.len() != 2 {
+        return;
+    }
+    let mut right = root.children.pop().expect("two children");
+    let mut left = root.children.pop().expect("two children");
+    left.estimate = Some(a);
+    right.estimate = Some(b);
+    let (outer, inner) = if plan.b_outer {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    let inner = match plan.material {
+        Some((startup, total)) => {
+            let (_, _, rows, width) = inner.estimate.expect("priced");
+            let mut m = PlanNode::over("Materialize", inner);
+            m.estimate = Some((startup, total, rows, width));
+            m
+        }
+        None => inner,
+    };
+    root.children.push(outer);
+    root.children.push(inner);
+    root.estimate = Some(join);
+}
+
 /// A node's estimate, zeros where it has none; `+ 0.0` turns the `-0.0` an
 /// empty sum is into the `0.00` PostgreSQL prints.
 fn estimate_of(n: &PlanNode) -> (f64, f64, f64, i64) {

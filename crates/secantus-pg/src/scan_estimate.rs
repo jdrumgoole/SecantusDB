@@ -342,6 +342,113 @@ impl PgHandler {
         Some((children.into_iter().map(|(e, _)| e).collect(), estimate))
     }
 
+    /// A Nested Loop joining two tables' sequential scans with nothing to
+    /// hash or merge on (RP-329): `FROM a, b`, its WHERE's conjuncts over
+    /// both tables only `<`, `<=`, `>`, `>=` (`DEFAULT_INEQ_SEL` each, as
+    /// `clauselist_selectivity` multiplies them). Each side is
+    /// `cost_seqscan` of the columns the join reads from it
+    /// (`build_base_rel_tlists`), the join's width the columns read above
+    /// it (`build_joinrel_tlist`), and the plan
+    /// [`joincost::cheapest_nest_loop`]'s. `None` -- zeros -- where a table
+    /// has an index (a parameterized inner index scan may win, which is
+    /// not modelled here) or anything else sits in the plan.
+    pub(crate) fn nest_loop_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(secantus_pgplan::joincost::NestLoopPlan, Estimate, Estimate, Estimate)> {
+        use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode, JoinRows};
+        use secantus_pgplan::Statement;
+        let sub = sel.sub.as_ref()?;
+        let Statement::JoinRows(j) = sub.plan.as_ref() else {
+            return None;
+        };
+        if sel.series.is_some()
+            || sel.join.is_some()
+            || !sel.windows.is_empty()
+            || !sel.order.is_empty()
+            || sel.limit.is_some()
+            || sel.offset != 0
+            || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
+            || sel.with_ties
+            || sel.casts.iter().any(Option::is_some)
+            || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
+            || j.where_spans_equality
+            || j.where_span_aliases.len() != j.where_filters.len()
+            || j.where_filters.iter().any(|f| f.kind != FilterKind::Inequality)
+        {
+            return None;
+        }
+        let JoinNode::Join {
+            kind: JoinKind::Inner,
+            left,
+            right,
+            on: None,
+            equi,
+            merged,
+            expr_keys,
+            ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        if !equi.is_empty() || !merged.is_empty() || !expr_keys.is_empty() {
+            return None;
+        }
+        let indexes = self.index_relations();
+        let project = j.project.as_deref();
+        let side = |node: &JoinNode| -> Option<(Estimate, i64)> {
+            let JoinNode::Leaf { plan, columns, .. } = node else {
+                return None;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            if leaf.residual.is_some()
+                || leaf.sub.is_some()
+                || leaf.series.is_some()
+                || leaf.join.is_some()
+                || !leaf.windows.is_empty()
+                || !leaf.order.is_empty()
+                || leaf.limit.is_some()
+                || leaf.offset != 0
+                || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
+                || leaf.casts.iter().any(Option::is_some)
+                || indexes.iter().any(|ix| ix.table.name == leaf.table)
+            {
+                return None;
+            }
+            let read: Vec<String> = columns
+                .iter()
+                .filter(|(key, _)| JoinRows::carries(project, key))
+                .map(|(_, f)| f.clone())
+                .collect();
+            let above: Vec<String> = columns
+                .iter()
+                .filter(|(key, _)| j.needed.contains(key) || project.is_none())
+                .map(|(_, f)| f.clone())
+                .collect();
+            let (scan, None) = self.scan_estimate(&leaf.table, &leaf.filter, &read)? else {
+                return None;
+            };
+            let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
+                return None;
+            };
+            Some((scan, width.3))
+        };
+        let (a, a_above) = side(left)?;
+        let (b, b_above) = side(right)?;
+        let qual: f64 = j
+            .where_filters
+            .iter()
+            .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
+            .sum();
+        let sel_factor = (1.0_f64 / 3.0).powi(j.where_filters.len() as i32);
+        let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, qual);
+        let rows = costsize::clamp_row_est(a.2 * b.2 * sel_factor);
+        let join = (plan.startup, plan.total, rows, a_above + b_above);
+        Some((plan, a, b, join))
+    }
+
     /// The Seq Scan's and the Limit's estimates of a LIMIT straight over
     /// one relation's sequential scan (RP-319): the scan's estimate, then
     /// `adjust_limit_rows_costs`. Only where the Seq Scan is the path
