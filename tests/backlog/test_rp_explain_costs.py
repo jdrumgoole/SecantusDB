@@ -1230,6 +1230,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Index Cond: (attrelid = '1259'::oid)",
         ],
     ),
+    "an index-only scan's heap fetches": (
+        "RP-360",
+        [],
+        "explain (analyze, timing off, summary off)"
+        " select attname from pg_attribute where attrelid = 1259",
+        [
+            "Index Only Scan using pg_attribute_relid_attnam_index on pg_attribute"
+            "  (cost=0.28..4.96 rows=39 width=64) (actual rows=39 loops=1)",
+            "  Index Cond: (attrelid = '1259'::oid)",
+            "  Heap Fetches: 0",
+        ],
+    ),
     "a catalog read by a bitmap": (
         "RP-338",
         ["set local enable_indexscan = off"],
@@ -1279,6 +1291,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-333",
         "RP-334",
         "RP-335",
+        "RP-337",
         "RP-340",
         "RP-341",
         "RP-342",

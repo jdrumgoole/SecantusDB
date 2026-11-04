@@ -17,9 +17,29 @@ use secantus_pgplan::{colstats, costsize, hashagg};
 /// A plan node's `(startup cost, total cost, rows, width)`.
 pub(crate) type Estimate = (f64, f64, f64, i64);
 
-/// A scan's estimate, and the index it reads when the cheapest path is a
-/// plain index scan (`None` for a sequential scan).
-pub(crate) type ScanEstimate = (Estimate, Option<String>);
+/// A scan's estimate, and the index it reads when the cheapest path is an
+/// index scan (`None` for a sequential scan).
+pub(crate) type ScanEstimate = (Estimate, Option<ScanIndex>);
+
+/// The index an index scan reads, and whether the scan is index-only (the
+/// index holds every column the statement reads, `check_index_only`).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ScanIndex {
+    pub name: String,
+    pub only: bool,
+}
+
+impl ScanIndex {
+    /// The plan node's name, as `ExplainNode` prints it.
+    pub(crate) fn node_name(&self, table: &str) -> String {
+        let kind = if self.only {
+            "Index Only Scan"
+        } else {
+            "Index Scan"
+        };
+        format!("{kind} using {} on {table}", self.name)
+    }
+}
 
 /// One of PostgreSQL's own B-tree indexes on a catalog: its oid, name,
 /// key columns (stored fields, in order) and uniqueness.
@@ -1084,10 +1104,12 @@ impl PgHandler {
     /// index's paths (`create_index_paths`): a plain index scan
     /// (`cost_index` over `btcostestimate`, the index's `initdb` pages and
     /// height) and a bitmap heap scan, kept over the sequential scan when
-    /// cheaper (`set_cheapest`). Not priced: a range on an indexed column
+    /// cheaper (`set_cheapest`). An index holding every column read is
+    /// scanned index-only, its heap fetches cut by the heap's all-visible
+    /// fraction (RP-337). Not priced: a range on an indexed column
     /// (`get_actual_variable_range` reads the index), a clause on an
-    /// index's later column, an index holding every column read (an
-    /// index-only scan), an `OR` over indexed columns (a BitmapOr), and a
+    /// index's later column, an `OR` over indexed columns (a BitmapOr),
+    /// two indexes on different leading columns (a BitmapAnd), and a
     /// bitmap heap scan winning (its node is not built).
     fn catalog_scan(
         &self,
@@ -1103,7 +1125,7 @@ impl PgHandler {
                 .flatten()
         })?;
         let blocks = catalog_heap::initdb_heaps().get(&oid)?.blocks;
-        let (relpages, reltuples, _) = catalog_meta::initdb_class_size(oid)?;
+        let (relpages, reltuples, allvisible) = catalog_meta::initdb_class_size(oid)?;
         let def = Self::virtual_table(name)?;
         // Each column's `pg_statistic` row, its slots keyed as `colstats`
         // compares them; a column of a type whose order is not modelled
@@ -1238,13 +1260,32 @@ impl PgHandler {
                 .quals
                 .iter()
                 .any(|(f, q)| f == lead && matches!(q, costsize::Qual::Range(_)));
-            let covering = fields
-                .iter()
-                .chain(named.iter())
-                .all(|f| ix.columns.contains(f));
-            if later || ranged || covering || !w.bitmap_ors.is_empty() {
+            // `check_index_only`, which `enable_indexonlyscan = off` skips.
+            let covering = !self.setting_is("enable_indexonlyscan", "off")
+                && fields
+                    .iter()
+                    .chain(named.iter())
+                    .all(|f| ix.columns.contains(f));
+            if later || ranged || !w.bitmap_ors.is_empty() {
                 return None;
             }
+            // An index holding every column read is scanned index-only,
+            // its heap fetches cut to the pages not all-visible
+            // (`cost_index` over `estimate_rel_size`'s `allvisfrac`:
+            // `relallvisible` over the heap's actual blocks).
+            let visible = if covering {
+                let allvisible = f64::from(allvisible);
+                let blocks = f64::from(blocks);
+                if allvisible == 0.0 || blocks <= 0.0 {
+                    0.0
+                } else if allvisible >= blocks {
+                    1.0
+                } else {
+                    allvisible / blocks
+                }
+            } else {
+                0.0
+            };
             let (ipages, height) = catalog_btree::initdb_index_size(ix.oid)?;
             let c = stats
                 .get(lead)
@@ -1259,19 +1300,26 @@ impl PgHandler {
                     height,
                     columns: ix.columns.clone(),
                     correlation: if ix.columns.len() > 1 { c * 0.75 } else { c },
-                    visible: 0.0,
+                    visible,
                     tuples: None,
                     predicate: None,
                     hash: false,
                 },
+                covering,
             ));
         }
         // Two indexes' bitmap paths may be ANDed (`choose_bitmap_and`),
-        // which is not costed here.
-        if indexes.len() > 1 {
+        // which is not costed here -- unless every index serves the same
+        // clauses (each is used only on its leading column, above): an
+        // index whose clauses an earlier one already covers is skipped as
+        // redundant, so the bitmap is the cheapest single index's.
+        if indexes
+            .iter()
+            .any(|(_, ix, _)| ix.field != indexes[0].1.field)
+        {
             return None;
         }
-        let paths: Vec<costsize::Index> = indexes.iter().map(|(_, ix)| ix.clone()).collect();
+        let paths: Vec<costsize::Index> = indexes.iter().map(|(_, ix, _)| ix.clone()).collect();
         let colsel =
             |f: &str| costsize::ColSel::Given(w.index_selectivity.get(f).copied().unwrap_or(1.0));
         // `set_cheapest` over every path, `disable_cost` added to the
@@ -1285,6 +1333,8 @@ impl PgHandler {
             let disabled = match kind {
                 costsize::ScanKind::Seq => off("enable_seqscan"),
                 costsize::ScanKind::Bitmap(_) => off("enable_bitmapscan"),
+                // `cost_index` disables an index-only scan with the plain
+                // one; `enable_indexonlyscan` only stops it being built.
                 costsize::ScanKind::Index(_) => off("enable_indexscan"),
             };
             if disabled {
@@ -1298,7 +1348,13 @@ impl PgHandler {
         let (kind, (startup, total)) = best?;
         let index = match kind {
             costsize::ScanKind::Seq => None,
-            costsize::ScanKind::Index(i) => Some(indexes.get(i)?.0.clone()),
+            costsize::ScanKind::Index(i) => {
+                let (name, _, only) = indexes.get(i)?;
+                Some(ScanIndex {
+                    name: name.clone(),
+                    only: *only,
+                })
+            }
             // A bitmap heap scan, whose node is not built here.
             costsize::ScanKind::Bitmap(_) => return None,
         };
