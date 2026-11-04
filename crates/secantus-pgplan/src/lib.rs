@@ -24522,13 +24522,12 @@ fn plan_join_select(
             // `NULLS LAST` descending goes to the general join planner, whose
             // Sort honours it: here the clause was dropped, and a LEFT
             // join's NULL-extended rows came out at the wrong end.
-            let default_nulls =
-                match pg_query::protobuf::SortByNulls::try_from(sb.sortby_nulls) {
-                    Ok(pg_query::protobuf::SortByNulls::SortbyNullsDefault) => true,
-                    Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => ascending,
-                    Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => !ascending,
-                    _ => false,
-                };
+            let default_nulls = match pg_query::protobuf::SortByNulls::try_from(sb.sortby_nulls) {
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsDefault) => true,
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsLast) => ascending,
+                Ok(pg_query::protobuf::SortByNulls::SortbyNullsFirst) => !ascending,
+                _ => false,
+            };
             if !default_nulls {
                 return Err(Error::Unsupported(
                     "an ORDER BY with its NULLs against its direction's default".into(),

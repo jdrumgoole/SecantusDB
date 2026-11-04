@@ -1263,11 +1263,27 @@ mod tests {
             (None, 3, "u3"),
             (None, 0, "u0"),
         ]);
-        let out = merge_right_fill(built.clone(), "o", "i", true);
+        let out = merge_right_fill(built.clone(), "o", "i", true, false);
         assert_eq!(tags(&out), ["m5", "u4", "m3", "u3", "m1", "u0"]);
         let asc: Vec<Document> = built.into_iter().rev().collect();
         let asc = [&asc[3..], &asc[..3]].concat();
-        let out = merge_right_fill(asc, "o", "i", false);
+        let out = merge_right_fill(asc, "o", "i", false, false);
         assert_eq!(tags(&out), ["u0", "m1", "m3", "u3", "u4", "m5"]);
+    }
+
+    /// Under an ascending ORDER BY with its NULLs first, a merge right join
+    /// sorted NULLS FIRST passes an unmatched inner row whose key is NULL
+    /// before every matched row, and after them when NULLs sort last.
+    #[test]
+    fn an_ascending_nulls_first_merge_right_join_fills_a_null_key_first() {
+        let built = vec![
+            doc! { "o": 1, "i": 1, "t": "m1" },
+            doc! { "o": 3, "i": 3, "t": "m3" },
+            doc! { "o": Bson::Null, "i": Bson::Null, "t": "uN" },
+        ];
+        let out = merge_right_fill(built.clone(), "o", "i", false, true);
+        assert_eq!(tags(&out), ["uN", "m1", "m3"]);
+        let out = merge_right_fill(built, "o", "i", false, false);
+        assert_eq!(tags(&out), ["m1", "m3", "uN"]);
     }
 }
