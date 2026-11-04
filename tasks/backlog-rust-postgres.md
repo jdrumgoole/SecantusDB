@@ -1375,14 +1375,15 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN (FORMAT JSON) gives a join node no `Join Type` or
-      `Inner Unique`.** PostgreSQL 15.19 prints both on every join node
-      (`ExplainNode`), `"Join Type": "Inner"` after `Async Capable` and
-      `"Inner Unique": false` after `Plan Width` for `explain (format json)
-      select * from e, e e2 where e.a < e2.a`; here the Nested Loop has
-      neither (found while working RP-329).
-      Backlog-ID: RP-353
-      Verify: tests/backlog/test_rp_explain_join_json.py::test_a_join_node_names_its_join_type
+- [ ] **A join's inner DISTINCT or GROUP BY subquery is not proven
+      unique.** `explain (format json) select * from r join (select
+      distinct x from r) s on r.x = s.x` is a Hash Join with `"Inner
+      Unique": true` on PostgreSQL 15.19 (`rel_is_distinct_for` over a
+      subquery's DISTINCT / GROUP BY / set operation); here only a base
+      table's unique index proves it, so it prints `false` (found while
+      working RP-353).
+      Backlog-ID: RP-355
+      Verify: tests/backlog/test_rp_explain_join_json.py::test_a_distinct_subquery_inner_side_is_unique
 - [ ] **EXPLAIN prints no estimate for a Hash Join or its Hash.**
       `explain select * from e join k on e.b = k.b` is `Hash Join
       (cost=27.50..1170.00 rows=100000 width=14)` over `Hash
