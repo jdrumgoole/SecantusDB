@@ -1486,7 +1486,9 @@ and most of RP-193 in batch 48; their tests there are regression tests.
       FROM t` takes 1.3 s (1.6 s before `system_relation_columns` was
       built once). PostgreSQL 15.19 takes about a millisecond. On a loaded CI
       runner, `test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
-      went past its client's 10 s socket timeout twice on PR #2265. The
+      went past its client's 10 s socket timeout twice on PR #2265, and
+      again on PR #2332's `pg-oracle (server)` job (2026-11-04; that PR
+      changes EXPLAIN only, and locally the test took 3.5 s). The
       snapshot should hold only what the view's tree references, or be kept
       up to date as DDL changes the catalogs.
       Backlog-ID: RP-336
