@@ -1371,21 +1371,24 @@ a regression test.
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
-      a Nested Loop of two tables' sequential scans, `FROM a, b` joined
-      only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),
-      over tables with no index, prints `cost_nestloop`'s estimate, its
-      outer side and Materialize as PostgreSQL 15.19 picks them. Every
-      other nested loop still prints zeros: a table with an index, whose
-      parameterized inner Index Scan may win (`explain select * from e, k
-      where e.a < k.a` is `Nested Loop (cost=0.28..9487.50 rows=333333
-      width=14)` over `Index Scan using k_pkey on k` with `Index Cond: (a
-      > e.a)`); a JOIN ... ON's condition, inner or LEFT (`e join k on
-      e.a <> k.a`, a `<>` beside an indexed table, is `rows=999000`); and
-      a join of three or more relations (found while working RP-329). A
-      comma join's `<>` conjunct over unindexed tables is priced since
-      2026-11-05 (`neqjoinsel`).
+      a Nested Loop of two tables' sequential scans joined only by `<`,
+      `<=`, `>`, `>=` or `<>` conjuncts (or by none) prints
+      `cost_nestloop`'s estimate, its outer side and Materialize as
+      PostgreSQL 15.19 picks them: a comma join's WHERE, and since
+      2026-11-05 an inner or LEFT `JOIN ... ON` (a LEFT join keeps its
+      nullable side inner and never estimates fewer rows than its outer),
+      over a table with an index too when no clause could be its Index
+      Cond (a `<>`). Every other nested loop still prints zeros: an
+      inequality beside a table with an index, whose parameterized inner
+      Index Scan may win (`explain select * from e, k where e.a < k.a` is
+      `Nested Loop (cost=0.28..9487.50 rows=333333 width=14)` over `Index
+      Scan using k_pkey on k` with `Index Cond: (a > e.a)`); an ON
+      conjunct over one side only (`e left join e e2 on e.a <> e2.a and
+      e.a > 990` is `rows=9990`, its `e.a > 990` a LEFT join's join filter
+      estimated from `e.a`'s statistics); a LEFT join with a WHERE; and a
+      join of three or more relations (found while working RP-329).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join, a one-sided ON conjunct]
 - [ ] **EXPLAIN of a join on a unique key is unpriced.** `explain select
       * from e join k on e.a = k.a` (k's primary key on `a`) is, on
       PostgreSQL 15.19, `Hash Join (cost=27.50..45.14 rows=1000 width=14)`

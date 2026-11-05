@@ -639,7 +639,9 @@ pub(crate) fn price_nest_loop(
     b: crate::scan_estimate::Estimate,
     join: crate::scan_estimate::Estimate,
 ) {
-    if root.name != "Nested Loop" || root.children.len() != 2 {
+    if !matches!(root.name.as_str(), "Nested Loop" | "Nested Loop Left Join")
+        || root.children.len() != 2
+    {
         return;
     }
     let mut right = root.children.pop().expect("two children");

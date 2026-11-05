@@ -41142,7 +41142,7 @@ impl PgHandler {
                 // clause to hash or merge on (RP-329): `cost_nestloop` over
                 // each side's Seq Scan, the inner materialised when that
                 // is cheaper, the outer the cheaper order's.
-                if tree.name == "Nested Loop"
+                if matches!(tree.name.as_str(), "Nested Loop" | "Nested Loop Left Join")
                     && tree.details.is_empty()
                     && tree.children.len() == 2
                     && tree

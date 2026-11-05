@@ -797,9 +797,30 @@ pub fn cheapest_nest_loop_semi(
     qual: f64,
     unique: [Option<(f64, f64)>; 2],
 ) -> NestLoopPlan {
+    nest_loop_paths(a, b, qual, unique, &[false, true])
+}
+
+/// [`cheapest_nest_loop`] of a LEFT join, `a` its outer side: a nested
+/// loop runs only with the nullable side inner (`match_unsorted_outer` is
+/// never called for `JOIN_RIGHT`), so only `a` outer is weighed (RP-354).
+pub fn cheapest_nest_loop_left(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+) -> NestLoopPlan {
+    nest_loop_paths(a, b, qual, [None, None], &[false])
+}
+
+fn nest_loop_paths(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+    unique: [Option<(f64, f64)>; 2],
+    orders: &[bool],
+) -> NestLoopPlan {
     let mut paths: Vec<JoinPath> = Vec::new();
     let mut materials = [(0.0, 0.0); 2];
-    for b_outer in [false, true] {
+    for &b_outer in orders {
         let (o, i) = if b_outer { (b, a) } else { (a, b) };
         let outer = InPath::scan(o.0, o.1, o.2, None);
         let inner = InPath::scan(i.0, i.1, i.2, None);
@@ -2673,6 +2694,19 @@ mod tests {
         assert_eq!(hash_batch(1 << 18, 262_144, 2), 1);
         assert_eq!(hash_batch((1 << 18) - 1, 262_144, 2), 0);
         assert_eq!(hash_batch(u32::MAX, 1024, 1), 0);
+    }
+
+    #[test]
+    fn a_left_nest_loop_keeps_its_outer_side() {
+        // PostgreSQL 15.19, `zs left join e on e.a < zs.a`: e outer would be
+        // cheaper (166.12), but a LEFT join's nested loop keeps zs outer,
+        // e materialised (0.00..20.00), the join 0.00..168.60 (RP-354).
+        let e = (0.0, 15.0, 1000.0, 7);
+        let zs = (0.0, 1.10, 10.0, 6);
+        let p = cheapest_nest_loop_left(zs, e, CPU_OPERATOR_COST);
+        assert!(!p.b_outer && p.materialized, "{p:?}");
+        assert!(close(p.total, 168.60), "{p:?}");
+        assert_eq!(p.material, Some((0.0, 20.0)));
     }
 
     #[test]
