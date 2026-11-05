@@ -26,11 +26,12 @@ them. Use a PRIVATE PostgreSQL 15 cluster (the probe creates tables), e.g.
     PROBE_PG="host=127.0.0.1 port=25917 user=postgres dbname=postgres" \
     PROBE_SERVER="host=127.0.0.1 port=25918 user=postgres dbname=postgres" \
     python tools/probes/pg_join_order_matrix.py [--filter SUBSTR] [--out DIR] \
-        [--desc | --nulls-first]
+        [--desc | --nulls-first | --desc-nulls-last]
 
 `--desc` makes every ORDER BY descending (`DESC`, its NULLs first), and
 `--nulls-first` ascending with its NULLs first (`NULLS FIRST`, against the
-direction's default); give each its own `--out` directory, as the
+direction's default), and `--desc-nulls-last` descending with its NULLs last
+(`DESC NULLS LAST`, against that default too); give each its own `--out` directory, as the
 reference's cache is per matrix.
 
 The reference's answers are cached in `DIR/matrix_pg.json` (`--pg`
@@ -54,6 +55,7 @@ import psycopg
 
 DESC = False
 NULLS_FIRST = False
+DESC_NULLS_LAST = False
 
 MODS = [(7, 5), (5, 3), (3, 4), (4, 6), (6, 5)]
 
@@ -156,7 +158,11 @@ def run(dsn: str, flt: str | None) -> dict:
         ]
         if not keyed:
             continue
-        if DESC:
+        if DESC_NULLS_LAST:
+            keyed = [
+                (k, re.sub(r"order by (\S+)", r"order by \1 desc nulls last", q)) for k, q in keyed
+            ]
+        elif DESC:
             keyed = [(k, re.sub(r"order by (\S+)", r"order by \1 desc", q)) for k, q in keyed]
         elif NULLS_FIRST:
             keyed = [
@@ -174,10 +180,11 @@ def run(dsn: str, flt: str | None) -> dict:
 
 
 def main() -> None:
-    global DESC, NULLS_FIRST
+    global DESC, NULLS_FIRST, DESC_NULLS_LAST
     args = sys.argv[1:]
     DESC = "--desc" in args
     NULLS_FIRST = "--nulls-first" in args
+    DESC_NULLS_LAST = "--desc-nulls-last" in args
     flt = args[args.index("--filter") + 1] if "--filter" in args else None
     out = pathlib.Path(args[args.index("--out") + 1] if "--out" in args else ".")
     out.mkdir(parents=True, exist_ok=True)

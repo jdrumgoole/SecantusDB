@@ -35934,19 +35934,21 @@ impl PgHandler {
                 // that the join's rows are the ones the LIMIT counts.
                 // With an ORDER BY of one plain column, ascending with its
                 // NULLs last or descending with them first (each the other's
-                // exact reverse), or ascending with its NULLs first, the
-                // search plans the join for the LIMIT and says whether its
-                // plan needs the Sort.
+                // exact reverse), or with its NULLs against the direction's
+                // default (ascending NULLS FIRST, descending NULLS LAST),
+                // the search plans the join for the LIMIT and says whether
+                // its plan needs the Sort.
                 let join_order = match sel.order.as_slice() {
-                    [k] if (k.ascending || matches!(k.nulls, secantus_pgplan::Nulls::First))
-                        && k.expr.is_none()
+                    [k] if k.expr.is_none()
                         && !k.jsonb
                         && sel.distinct == secantus_pgplan::Distinct::None
                         && !sel.with_ties
                         && sel.lock_clauses.is_empty() =>
                     {
+                        // NULLs against the default: first in the ascending
+                        // comparator a descending order reverses.
                         let nulls_first = matches!(k.nulls, secantus_pgplan::Nulls::First);
-                        Some((k.field.clone(), !k.ascending, k.ascending && nulls_first))
+                        Some((k.field.clone(), !k.ascending, k.ascending == nulls_first))
                     }
                     _ => None,
                 };
