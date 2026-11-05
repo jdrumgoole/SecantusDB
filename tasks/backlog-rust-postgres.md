@@ -675,12 +675,15 @@ one beside it.
     226 before). Since 2026-11-04 an ascending ORDER BY with its NULLs
     first is searched too: an index scan's forward order (NULLS LAST) is
     of use for merging only, and a merge on the ORDER BY's class sorts
-    NULLS FIRST. Declined still: a DESC NULLS LAST ORDER BY (joined whole
-    and sorted, so its ties come out in another order), an ORDER BY of
-    several columns, and a two-table join with a subquery side.
+    NULLS FIRST. Since 2026-11-05 a DESC NULLS LAST is searched the same
+    way, its merge sorting both sides descending with NULLs last. Declined
+    still: an ORDER BY of several columns (joined whole and sorted, so its
+    ties come out in another order: `t0 JOIN t1 ON t0.b = t1.a ORDER BY
+    t1.a, t0.c LIMIT 5` over two 3,000-row tables), and a two-table join
+    with a subquery side.
   - Sorts that spill to disk runs are not PostgreSQL's merge.
   Backlog-ID: RP-028
-  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_descending_nulls_last_order_by_keeps_its_ties
+  Verify: tests/backlog/test_rust_postgres_gaps.py::test_a_two_column_order_by_over_a_join_keeps_its_ties
 
 - [ ] **OPEN — RUST pgserver on LINUX: psycopg's timing tests fail in CI
       and pass on macOS (first measured 2026-10-12).** No Linux lane ran

@@ -2665,13 +2665,13 @@ def test_an_ascending_nulls_first_order_by_keeps_its_ties(pg: Any) -> None:
     )
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
     t0.b = t1.a ORDER BY t1.a DESC NULLS LAST LIMIT 5` leaves its ties as
     t0's rows 2141, 2939, 860, 1763, 433, as a plain DESC does: a bounded
-    Sort over the hash join. The join search declines a DESC NULLS LAST,
-    so this joins whole and sorts: 1280, 1728, 1448, 1721, 1273."""
+    Sort over the hash join. The join search declined a DESC NULLS LAST,
+    so this joined whole and sorted: 1280, 1728, 1448, 1721, 1273."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_l", 2, 3000)
@@ -2686,6 +2686,53 @@ def test_a_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> None:
     assert got == (
         "ok",
         [(2141, 6), (2939, 6), (860, 6), (1763, 6), (433, 6)],
+    )
+
+
+@pytest.mark.backlog_fixed("RP-028")
+def test_a_left_join_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 LEFT JOIN
+    t1 ON t0.b = t1.a ORDER BY t1.a DESC NULLS LAST LIMIT 5` leaves its ties
+    as t0's rows 1280, 1728, 1448, 1721, 1273 (measured on a private
+    cluster with the DESC NULLS LAST search in place)."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_q", 2, 3000)
+        got = pg_answer(
+            pg,
+            "select rp028_q0.a, rp028_q1.a from rp028_q0"
+            " left join rp028_q1 on rp028_q0.b = rp028_q1.a"
+            " order by rp028_q1.a desc nulls last limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(1280, 6), (1728, 6), (1448, 6), (1721, 6), (1273, 6)],
+    )
+
+
+@pytest.mark.backlog("RP-028")
+def test_a_two_column_order_by_over_a_join_keeps_its_ties(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
+    t0.b = t1.a ORDER BY t1.a, t0.c LIMIT 5` leaves its ties (every row
+    t1.a = 1, t0.c = 0) as t0's rows 1310, 1695, 2815, 1660, 190. The join
+    search declines an ORDER BY of several columns, so this joins whole and
+    sorts: 190, 1310, 1695, 2815, 1660."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_m", 2, 3000)
+        got = pg_answer(
+            pg,
+            "select rp028_m0.a, rp028_m1.a from rp028_m0"
+            " join rp028_m1 on rp028_m0.b = rp028_m1.a"
+            " order by rp028_m1.a, rp028_m0.c limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(1310, 1), (1695, 1), (2815, 1), (1660, 1), (190, 1)],
     )
 
 

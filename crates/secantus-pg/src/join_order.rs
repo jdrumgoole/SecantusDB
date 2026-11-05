@@ -202,10 +202,12 @@ struct Search {
     /// from merge joins on it, whose Sorts take the query's direction
     /// (`select_outer_pathkeys_for_merge`, `make_inner_pathkeys_for_merge`).
     order_desc: bool,
-    /// That ORDER BY is ascending with its NULLs first, against the
-    /// direction's default. No index scan returns that order (its forward
-    /// scan's is NULLS LAST, of use for merging only), and a merge join on
-    /// the class sorts both sides in it (`select_outer_pathkeys_for_merge`
+    /// That ORDER BY's NULLs are against the direction's default: ASC NULLS
+    /// FIRST, or DESC NULLS LAST with `order_desc` (NULLs first in the
+    /// ascending comparator a descending order reverses). No index scan
+    /// returns that order (its forward scan's is ASC NULLS LAST, of use for
+    /// merging only; its backward one's DESC NULLS FIRST), and a merge join
+    /// on the class sorts both sides in it (`select_outer_pathkeys_for_merge`
     /// takes the query's pathkey, its `nulls_first` included).
     order_nulls_first: bool,
     /// Each edge's outer join (`Search::edges` order): the preserved table
@@ -1942,11 +1944,12 @@ impl PgHandler {
                         // no useful pathkeys (`truncate_useless_pathkeys`):
                         // the backward scan, in the query's order at the
                         // same cost, replaces it.
-                        // Ascending, NULLs first: the forward scan's order
-                        // (NULLS LAST) is of use for merging only, and a
-                        // backward scan is the wrong direction for merging
-                        // and of no use for the ORDER BY (`build_index_paths`
-                        // keeps none).
+                        // NULLs against the default (ASC NULLS FIRST, DESC
+                        // NULLS LAST): the forward scan's order (ASC NULLS
+                        // LAST) is of use for merging only, and a backward
+                        // scan (DESC NULLS FIRST) is the wrong direction for
+                        // merging and of no use for the ORDER BY
+                        // (`build_index_paths` keeps none).
                         if search.order_nulls_first {
                             let c = list[i].0.class.unwrap_or(ORDER_CLASS);
                             list[i].0.class = Some(secantus_pgplan::joincost::asc_keys(c));

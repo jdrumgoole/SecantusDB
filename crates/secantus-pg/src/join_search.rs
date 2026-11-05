@@ -207,8 +207,10 @@ pub(crate) struct Step {
     /// sides sorted descending (`select_outer_pathkeys_for_merge` takes
     /// the query's pathkeys' direction for the merge's).
     pub(crate) desc: bool,
-    /// A merge join on the ORDER BY's class under an ascending ORDER BY
-    /// with its NULLs first: both sides sorted ascending, NULLs first
+    /// A merge join on the ORDER BY's class under an ORDER BY with its
+    /// NULLs against the direction's default: both sides sorted with NULLs
+    /// first in the ascending comparator, which `desc` reverses -- ASC
+    /// NULLS FIRST, or DESC NULLS LAST with `desc`
     /// (`select_outer_pathkeys_for_merge` takes the query's pathkey).
     pub(crate) nulls_first: bool,
 }
@@ -1285,5 +1287,21 @@ mod tests {
         assert_eq!(tags(&out), ["uN", "m1", "m3"]);
         let out = merge_right_fill(built, "o", "i", false, false);
         assert_eq!(tags(&out), ["m1", "m3", "uN"]);
+    }
+
+    /// Under a DESC NULLS LAST ORDER BY a merge right join sorted that way
+    /// passes an unmatched inner row whose key is NULL after every matched
+    /// row, and first under a plain DESC (NULLS FIRST).
+    #[test]
+    fn a_descending_nulls_last_merge_right_join_fills_a_null_key_last() {
+        let built = vec![
+            doc! { "o": 3, "i": 3, "t": "m3" },
+            doc! { "o": 1, "i": 1, "t": "m1" },
+            doc! { "o": Bson::Null, "i": Bson::Null, "t": "uN" },
+        ];
+        let out = merge_right_fill(built.clone(), "o", "i", true, true);
+        assert_eq!(tags(&out), ["m3", "m1", "uN"]);
+        let out = merge_right_fill(built, "o", "i", true, false);
+        assert_eq!(tags(&out), ["uN", "m3", "m1"]);
     }
 }
