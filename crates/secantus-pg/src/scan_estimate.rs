@@ -1380,8 +1380,7 @@ impl PgHandler {
     /// cost model sizes it and read in its leading column's correlation.
     /// `None` -- the node prints zeros -- where another path is cheaper or
     /// the scan is one the model does not price: a table never analysed, a
-    /// clause on a later key column, a range on the leading one (its ends
-    /// are read from the index, `get_actual_variable_range`), an index
+    /// clause on a later key column, an index
     /// holding every column read (an index-only scan), an `OR`, or more
     /// than one index a clause serves (`choose_bitmap_and`).
     pub(crate) fn index_scan_estimate(
@@ -1423,15 +1422,14 @@ impl PgHandler {
             if !named.contains(&lead) || named.iter().any(|f| ix.columns[1..].contains(f)) {
                 return None;
             }
-            let ranged = w
-                .quals
-                .iter()
-                .any(|(f, q)| *f == lead && matches!(q, costsize::Qual::Range(_)));
+            // A range on the leading column is priced too (RP-371): its
+            // selectivity reads the column's current ends from the index
+            // (`get_actual_variable_range`, in `analyzed_where`).
             let covering = fields
                 .iter()
                 .chain(named.iter())
                 .all(|f| ix.columns.contains(f));
-            if ranged || covering {
+            if covering {
                 return None;
             }
             let c = correlations.get(&lead).copied().flatten()?;
