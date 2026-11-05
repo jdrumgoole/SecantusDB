@@ -10083,7 +10083,12 @@ fn plan_explain(
             } else {
                 Vec::new()
             };
-            ruleutils::join_conditions(s, &cat).unwrap_or_default()
+            let conds = ruleutils::join_conditions(s, &cat).unwrap_or_default();
+            if conds.is_empty() && joined {
+                ruleutils::comma_join_conds(s, &mut options.join_where)
+            } else {
+                conds
+            }
         }
         _ => Vec::new(),
     };

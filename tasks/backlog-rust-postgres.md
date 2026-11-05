@@ -1408,16 +1408,37 @@ a regression test.
       working RP-369).
       Backlog-ID: RP-371
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join whose index-scan side reads a key range], tests/backlog/test_rp_explain_costs.py::test_plan[a key fixed by a constant over an index-scan side]
-- [ ] **EXPLAIN of a comma join's equality prints it as a `Join Filter`
-      of the Hash Join.** `explain select * from e, k where e.b = k.b and
-      k.a = 5` prints `Hash Join (cost=0.00..0.00 rows=0 width=0)` with
-      `Join Filter: (e.b = k.b)`, where PostgreSQL 15.19 prints `Hash
-      Cond: (e.b = k.b)` and the costs `JOIN ... ON` gets since RP-369
-      (`Hash Join (cost=8.30..27.04 rows=100 width=14)`): the WHERE's
-      join clause is the hash clause, as an ON's is. Measured on a
-      private 15.19 cluster (found while working RP-369).
-      Backlog-ID: RP-372
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a comma join's equality over an index-scan side]
+- [ ] **EXPLAIN prints a join clause written inner side first as
+      written.** `explain select * from e join k on k.b = e.b` (or `from
+      e, k where k.b = e.b`) prints `Hash Cond: (k.b = e.b)`, where
+      PostgreSQL 15.19 prints `Hash Cond: (e.b = k.b)`: the hash clause's
+      outer operand comes first (`get_switched_clauses`, as a hash join's
+      clauses are commuted to outer = inner). Measured on a private 15.19
+      cluster (found while working RP-372).
+      Backlog-ID: RP-373
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join clause written inner side first]
+- [ ] **EXPLAIN of a hash join on two or more equalities is unpriced.**
+      `explain select * from e, k where e.b = k.b and e.a = k.a` (or the
+      same as `JOIN ... ON`) prints `Hash Cond: ((e.b = k.b) AND (e.a =
+      k.a))` with zeros, where PostgreSQL 15.19 prints `Hash Join
+      (cost=30.00..50.25 rows=100 width=14)` and the sides' Seq Scan
+      costs: `hash_join_estimate` takes a single key only, where
+      `cost_hashjoin` multiplies the clauses' selectivities and buckets
+      on the first's statistics. Measured on a private 15.19 cluster
+      (found while working RP-372).
+      Backlog-ID: RP-374
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a comma join's two equalities]
+- [ ] **EXPLAIN puts a join's inequality into its `Hash Cond`.** `explain
+      select * from e join k on e.b = k.b and e.a < k.a` prints `Hash
+      Cond: ((e.b = k.b) AND (e.a < k.a))` with zeros (the comma form,
+      `from e, k where ...`, a `Join Filter` of both), where PostgreSQL
+      15.19 prints `Hash Join (cost=27.50..1420.00 rows=33333 width=14)`
+      with `Hash Cond: (e.b = k.b)` and `Join Filter: (e.a < k.a)`: only
+      the hashable equality is the hash clause (`hash_inner_and_outer`),
+      the rest the join's `joinqual`. Measured on a private 15.19 cluster
+      (found while working RP-372).
+      Backlog-ID: RP-375
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's equality with an inequality beside it]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
       index path.** Over an analysed table PostgreSQL 15.19's
       `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`

@@ -4126,6 +4126,64 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
     Some(out)
 }
 
+/// A comma join of two relations (`FROM e, k`, RP-372): its WHERE's
+/// equalities between a column of each, taken out of `quals` (as
+/// [`join_where`] listed them, one per conjunct) and returned as the one
+/// join's condition, ANDed. PostgreSQL makes an inner join's WHERE and ON
+/// quals one list (`deconstruct_jointree`), so the equality is the hash or
+/// merge clause an ON's would be. Empty -- `quals` untouched -- for any
+/// other FROM, or when a conjunct over both relations is not such an
+/// equality.
+pub fn comma_join_conds(
+    s: &pg_query::protobuf::SelectStmt,
+    quals: &mut Vec<JoinQual>,
+) -> Vec<String> {
+    let two = s.from_clause.len() == 2
+        && s.from_clause
+            .iter()
+            .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))));
+    let Some(w) = s.where_clause.as_deref().filter(|_| two) else {
+        return Vec::new();
+    };
+    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    let mut parts = Vec::new();
+    flatten(w, &mut parts);
+    if parts.len() != quals.len() {
+        return Vec::new();
+    }
+    let column_equality = |n: &Node| {
+        matches!(n.node.as_ref(), Some(N::AExpr(a))
+        if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+            && matches!(a.name.as_slice(), [one]
+                if matches!(one.node.as_ref(), Some(N::String(op)) if op.sval == "="))
+            && [a.lexpr.as_deref(), a.rexpr.as_deref()].iter().all(|x| {
+                matches!(x.and_then(|x| x.node.as_ref()), Some(N::ColumnRef(_)))
+            }))
+    };
+    let spanning: Vec<usize> = (0..parts.len()).filter(|i| quals[*i].1.is_none()).collect();
+    if spanning.is_empty() || !spanning.iter().all(|i| column_equality(parts[*i])) {
+        return Vec::new();
+    }
+    let mut texts = Vec::new();
+    for i in spanning.into_iter().rev() {
+        texts.push(quals.remove(i).0);
+    }
+    texts.reverse();
+    match texts.as_slice() {
+        [one] => vec![one.clone()],
+        many => vec![format!("({})", many.join(" AND "))],
+    }
+}
+
 /// A joined SELECT's WHERE conjunct for EXPLAIN: its text, the relation
 /// whose scan it filters (`None`: the top join's), and the column an index
 /// scan there could take it on (RP-369).
@@ -4503,5 +4561,56 @@ mod folded_casts {
             let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
             assert_eq!(got[0].0, want, "{sql}");
         }
+    }
+}
+
+#[cfg(test)]
+mod comma_join_conds_tests {
+    use super::*;
+
+    fn stmt(sql: &str) -> pg_query::protobuf::SelectStmt {
+        let p = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+        else {
+            panic!("{sql}")
+        };
+        (**s).clone()
+    }
+
+    fn q(text: &str, home: Option<&str>) -> JoinQual {
+        (text.to_string(), home.map(str::to_string), None)
+    }
+
+    #[test]
+    fn a_comma_joins_equalities_become_its_join_condition() {
+        // RP-372: `FROM e, k WHERE e.b = k.b AND k.a = 5` -- the equality
+        // is the join's clause, the constant stays on k's scan.
+        let s = stmt("select * from e, k where e.b = k.b and k.a = 5");
+        let mut quals = vec![q("(e.b = k.b)", None), q("(a = 5)", Some("k"))];
+        assert_eq!(comma_join_conds(&s, &mut quals), vec!["(e.b = k.b)"]);
+        assert_eq!(quals, vec![q("(a = 5)", Some("k"))]);
+        // Two equalities are one condition, ANDed, as an ON's prints.
+        let s = stmt("select * from e, k where e.b = k.b and e.a = k.a");
+        let mut quals = vec![q("(e.b = k.b)", None), q("(e.a = k.a)", None)];
+        assert_eq!(
+            comma_join_conds(&s, &mut quals),
+            vec!["((e.b = k.b) AND (e.a = k.a))"]
+        );
+        assert!(quals.is_empty());
+    }
+
+    #[test]
+    fn anything_else_is_left_as_the_join_filter() {
+        // An inequality over both tables: no clause is moved.
+        let s = stmt("select * from e, k where e.b = k.b and e.a < k.a");
+        let mut quals = vec![q("(e.b = k.b)", None), q("(e.a < k.a)", None)];
+        let before = quals.clone();
+        assert!(comma_join_conds(&s, &mut quals).is_empty());
+        assert_eq!(quals, before);
+        // Three relations: more than one join node to place it on.
+        let s = stmt("select * from e, k, m where e.b = k.b");
+        let mut quals = vec![q("(e.b = k.b)", None)];
+        assert!(comma_join_conds(&s, &mut quals).is_empty());
+        assert_eq!(quals.len(), 1);
     }
 }

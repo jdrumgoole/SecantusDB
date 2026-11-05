@@ -1329,6 +1329,55 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Index Cond: (a = 5)",
         ],
     ),
+    "a comma join's equality over two sequential scans": (
+        "RP-372",
+        _ANALYSED,
+        "explain select e.a from e, k where e.b = k.b",
+        [
+            "Hash Join  (cost=27.50..1170.00 rows=100000 width=4)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=3)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=3)",
+        ],
+    ),
+    "a comma join's two equalities": (
+        "RP-374",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and e.a = k.a",
+        [
+            "Hash Join  (cost=30.00..50.25 rows=100 width=14)",
+            "  Hash Cond: ((e.b = k.b) AND (e.a = k.a))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join clause written inner side first": (
+        "RP-373",
+        _ANALYSED,
+        "explain select * from e join k on k.b = e.b",
+        [
+            "Hash Join  (cost=27.50..1170.00 rows=100000 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join's equality with an inequality beside it": (
+        "RP-375",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b and e.a < k.a",
+        [
+            "Hash Join  (cost=27.50..1420.00 rows=33333 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1741,6 +1790,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-368",
         "RP-369",
         "RP-370",
+        "RP-372",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
