@@ -1416,7 +1416,7 @@ a regression test.
       leads with, which a merge can read presorted, without a Sort; and the
       parameterized inner index scan of a nested loop (see RP-354). Found
       while working RP-366.
-      Backlog-ID: RP-368
+      Backlog-ID: RP-369
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join whose filtered side is an index scan]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
       index path.** Over an analysed table PostgreSQL 15.19's

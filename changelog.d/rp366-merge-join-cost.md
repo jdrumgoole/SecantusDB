@@ -21,6 +21,6 @@ printed a priced `Hash Join` whose numbers PostgreSQL never prints.
   through `add_path` in `add_paths_to_joinrel`'s order, and `set_cheapest`
   picks among what survives.
 - Not weighed: a merge reading an index-presorted input, or a side an
-  index scan could serve. Those still print zeros (RP-368).
+  index scan could serve. Those still print zeros (RP-369).
   Fixes RP-366 (tests/backlog/test_rp_explain_costs.py::test_plan[a projected join PostgreSQL merges],
   with `[a LEFT join PostgreSQL merges]`)

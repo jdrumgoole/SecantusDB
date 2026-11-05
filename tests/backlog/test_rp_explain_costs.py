@@ -1150,7 +1150,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a join whose filtered side is an index scan": (
-        "RP-368",
+        "RP-369",
         _ANALYSED,
         "explain select * from e join k on e.b = k.b where k.a = 5",
         [
