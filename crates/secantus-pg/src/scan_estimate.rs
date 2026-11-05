@@ -2926,9 +2926,7 @@ fn key_constant(filter: &Document, field: &str) -> Option<Option<bson::Bson>> {
         }
     }
     walk(filter, field, &mut found, &mut other);
-    let Some(first) = found.first() else {
-        return None;
-    };
+    let first = found.first()?;
     let same = found
         .iter()
         .all(|v| secantus_pgplan::compare_values(v, first) == Some(std::cmp::Ordering::Equal));
