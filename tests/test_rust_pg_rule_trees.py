@@ -115,3 +115,23 @@ def test_user_rules_are_postgresql_15s(dsn: str) -> None:
         if got != want[name]:
             wrong[name] = got
     assert not wrong, f"{len(wrong)} of {len(want)} scenarios differ: {sorted(wrong)}"
+
+
+def test_user_objects_made_after_a_first_view_reach_its_tree(dsn: str) -> None:
+    """A view's tree resolves a function and a table created after an
+    earlier CREATE VIEW (RP-336): only PostgreSQL's own catalog rows are
+    read once per process, the user's are read on every CREATE VIEW."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("create table t (a int)")
+        c.execute("create view v1 as select a from t")
+        c.execute("create function plus1(int) returns int language sql as 'select $1 + 1'")
+        c.execute("create table u (b int)")
+        c.execute("create view v2 as select plus1(b) as c from u")
+        fn = c.execute("select 'plus1'::regproc::oid").fetchone()[0]
+        rel = c.execute("select 'u'::regclass::oid").fetchone()[0]
+        (action,) = c.execute(
+            "select ev_action from pg_rewrite where ev_class = 'v2'::regclass"
+        ).fetchone()
+    assert action is not None
+    assert f":funcid {fn} " in action
+    assert f":relid {rel} " in action

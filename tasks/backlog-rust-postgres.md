@@ -1502,9 +1502,16 @@ and most of RP-193 in batch 48; their tests there are regression tests.
       runner, `test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
       went past its client's 10 s socket timeout twice on PR #2265, and
       again on PR #2332's `pg-oracle (server)` job (2026-11-04; that PR
-      changes EXPLAIN only, and locally the test took 3.5 s). The
-      snapshot should hold only what the view's tree references, or be kept
-      up to date as DDL changes the catalogs.
+      changes EXPLAIN only, and locally the test took 3.5 s).
+      Since 2026-11-05 PostgreSQL's own rows (oid below 16384) are read
+      once per process and only the user's on each call: 0.5 s in a debug
+      build (1.3 s before). What is left is the user rows' reads, each
+      through a virtual catalog that builds its system rows too before the
+      `>= 16384` filter, cold after every DDL (`pg_attribute` 0.39 s of it),
+      and a CREATE VIEW reads them twice (`statement_rule_refusal`, then
+      `statement_rule_trees`). The snapshot should hold only what the view's
+      tree references, as `SearchSysCache` looks rows up one by one, or be
+      kept up to date as DDL changes the catalogs.
       Backlog-ID: RP-336
       Verify: none -- a wall-clock cost; a timing assertion would flake, so the measurement above is the evidence
 - [ ] **OPEN -- `pgbench -i -s 1` took over 120 s once in CI.**
