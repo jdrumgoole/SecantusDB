@@ -1053,9 +1053,11 @@ tests regression tests:
       A seventh on 2026-11-04, `tools/backlog.py verify --regressions` on
       the RP-366 branch (EXPLAIN costing only; load average about 19 from
       parallel sessions): `[2.5]` answered `ok`; four runs of all three
-      delays alone after it passed at load 14. Every sighting so far is
-      under load, none on an idle machine, and none on a branch touching
-      the wire or cancel code.
+      delays alone after it passed at load 14. An eighth on 2026-11-05 in
+      CI: `main`'s `pg-oracle (server)` job on PR #2356's merge commit
+      (run 42084287135; EXPLAIN costing only): `[2.5]` answered `ok`.
+      Every sighting so far is under load, none on an idle machine, and
+      none on a branch touching the wire or cancel code.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
@@ -1502,6 +1504,21 @@ and most of RP-193 in batch 48; their tests there are regression tests.
       up to date as DDL changes the catalogs.
       Backlog-ID: RP-336
       Verify: none -- a wall-clock cost; a timing assertion would flake, so the measurement above is the evidence
+- [ ] **OPEN -- `pgbench -i -s 1` took over 120 s once in CI.**
+      `tests/backlog/test_rp_found_2026_10_20.py::test_client_tools`
+      (RP-071's regression test) failed on PR #2356's `pg-oracle (server)`
+      job (run 42077464172, job 127421380691; EXPLAIN costing only):
+      `pgbench -i -s 1` against the server hit the test's 120 s
+      `TimeoutExpired`. The runner was slow throughout (installing
+      PostgreSQL 15 took about 19 minutes; the backlog step ran 996 s
+      against 580-654 s on `main`'s runs of the same day), and the same
+      test passed on `main`'s next run. Locally (macOS, release build,
+      idle) the whole test takes 27 s. Not diagnosed: which phase of
+      `pgbench -i` (the 100,000-row COPY, VACUUM, the primary keys) used
+      the time is not in the log, so the next step is the server's log of
+      a slow run with each statement's duration.
+      Backlog-ID: RP-380
+      Verify: none -- seen once in CI; a timing that does not fail on demand
 
 ## Found by batch 34 (2026-10-23)
 
