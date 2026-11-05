@@ -530,7 +530,7 @@ impl PgHandler {
     /// the Hash node is its input's total. `None` -- zeros -- for any
     /// other shape.
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
-        let (a, b, more, filter) = self.joined_sides(sel)?;
+        let (a, b, more, filter, left_join) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as
         // that scan's filter, through an index where that is the cheaper
         // path (RP-369, in `hash_side`). Not where it names the join key: a
@@ -546,15 +546,16 @@ impl PgHandler {
             .iter()
             .map(|(l, r)| Some((priced(l)?, priced(r)?)))
             .collect::<Option<_>>()?;
-        hash_join_of(priced(&a)?, priced(&b)?, &more, false, false, filter)
+        hash_join_of(priced(&a)?, priced(&b)?, &more, left_join, false, filter)
     }
 
     /// The two sides of an inner join of two stored tables planned as
     /// joined rows, on its first equality and then each further one: each
     /// side's table, its scan's filter (its own WHERE and the conjuncts
     /// pushed down to it), its key's stored field, and the fields its scan
-    /// reads and carries above the join, and the ON's join filter (see
-    /// [`JoinFilterCost`]). `None` for any other shape
+    /// reads and carries above the join, the ON's join filter (see
+    /// [`JoinFilterCost`]), and whether it is a LEFT join (RP-379), whose
+    /// left table is preserved. `None` for any other shape
     /// ([`Self::hash_join_estimate`] lists them).
     #[allow(clippy::type_complexity)]
     fn joined_sides(
@@ -565,6 +566,7 @@ impl PgHandler {
         JoinedSide,
         Vec<(JoinedSide, JoinedSide)>,
         JoinFilterCost,
+        bool,
     )> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
@@ -586,7 +588,7 @@ impl PgHandler {
             return None;
         }
         let JoinNode::Join {
-            kind: JoinKind::Inner,
+            kind: kind @ (JoinKind::Inner | JoinKind::Left),
             left,
             right,
             on,
@@ -600,22 +602,31 @@ impl PgHandler {
         else {
             return None;
         };
+        let left_join = *kind == JoinKind::Left;
+        // A LEFT join's WHERE is applied above it, where a conjunct on the
+        // nullable side can reduce it to an inner join
+        // (`reduce_outer_joins`): only one with no WHERE is priced
+        // (RP-379).
+        if left_join && (!sel.filter.is_empty() || sel.residual.is_some()) {
+            return None;
+        }
         // An ON's conjuncts beside its equalities are the join's filter,
         // checked on each pair the hash clauses match (RP-375). Priced
         // where each is `<`, `<=`, `>` or `>=` between the two tables
-        // (`DEFAULT_INEQ_SEL`); any other stays unpriced.
-        if *on_other
-            && (on_filters.is_empty()
-                || on_filters.iter().any(|f| {
-                    f.kind != secantus_pgplan::joins::FilterKind::Inequality || f.aliases.len() != 2
-                }))
-        {
+        // (`DEFAULT_INEQ_SEL`) or a `<>` between two of their columns
+        // (`neqjoinsel`, RP-379); any other stays unpriced.
+        let priced_kind = |f: &secantus_pgplan::joins::JoinFilter| {
+            f.aliases.len() == 2
+                && matches!(
+                    f.kind,
+                    secantus_pgplan::joins::FilterKind::Inequality
+                        | secantus_pgplan::joins::FilterKind::NotEqual(..)
+                )
+        };
+        if *on_other && (on_filters.is_empty() || !on_filters.iter().all(priced_kind)) {
             return None;
         }
-        let filter = JoinFilterCost {
-            count: on_filters.len(),
-            ops: on_filters.iter().map(|f| f.ops).sum(),
-        };
+        let on_filters: Vec<&secantus_pgplan::joins::JoinFilter> = on_filters.iter().collect();
         let ((left_key, right_key), rest) = equi.split_first()?;
         // The join clauses are an ON's, or -- a comma join, `FROM e, k
         // WHERE e.b = k.b` -- the WHERE's conjuncts over both tables, those
@@ -632,22 +643,26 @@ impl PgHandler {
         let comma_filters: Vec<&secantus_pgplan::joins::JoinFilter> = j
             .where_filters
             .iter()
-            .filter(|f| f.kind == secantus_pgplan::joins::FilterKind::Inequality)
+            .filter(|f| {
+                matches!(
+                    f.kind,
+                    secantus_pgplan::joins::FilterKind::Inequality
+                        | secantus_pgplan::joins::FilterKind::NotEqual(..)
+                )
+            })
             .collect();
         let comma_clause = on.is_none()
+            && !left_join
             && j.where_spans_equality
             && j.where_filters.len() == equi.len() + comma_filters.len()
             && j.where_span_aliases.len() == j.where_filters.len()
             && comma_filters.iter().all(|f| f.aliases.len() == 2)
             && j.where_equalities.len() == equi.len()
             && j.where_equalities.iter().all(same_pair);
-        let filter = if comma_clause && !comma_filters.is_empty() {
-            JoinFilterCost {
-                count: comma_filters.len(),
-                ops: comma_filters.iter().map(|f| f.ops).sum(),
-            }
+        let filters = if comma_clause && !comma_filters.is_empty() {
+            comma_filters
         } else {
-            filter
+            on_filters
         };
         if !comma_clause && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
         {
@@ -657,7 +672,7 @@ impl PgHandler {
         // as the select's residual; those are the join clauses, not a
         // filter.
         if let Some(residual) = &sel.residual {
-            if !comma_clause || !is_key_equality(residual, equi, filter.count) {
+            if !comma_clause || !is_key_equality(residual, equi, filters.len()) {
                 return None;
             }
         }
@@ -767,7 +782,49 @@ impl PgHandler {
             .iter()
             .map(|(l, r)| Some((side(left, l)?, side(right, r)?)))
             .collect::<Option<_>>()?;
-        Some((a, b, more, filter))
+        // `clauselist_selectivity` over the join filter: the product of
+        // its conjuncts'. An inequality is `DEFAULT_INEQ_SEL`; a `<>` is
+        // `neqjoinsel`, one minus `eqjoinsel` over the two columns'
+        // statistics (`eqjoinsel_inner` for an inner or a LEFT join), and
+        // stays unpriced where either column was never analysed.
+        let mut selectivity = 1.0_f64;
+        for f in &filters {
+            selectivity *= match &f.kind {
+                secantus_pgplan::joins::FilterKind::NotEqual(l, r) => {
+                    let stats = |k: &str| {
+                        let s = side(left, k).or_else(|| side(right, k))?;
+                        self.hash_side(
+                            &s.table,
+                            &Document::new(),
+                            &s.field,
+                            std::slice::from_ref(&s.field),
+                            &[],
+                        )
+                    };
+                    let (x, y) = (stats(l)?, stats(r)?);
+                    if x.pg_type != y.pg_type {
+                        return None;
+                    }
+                    fn key(s: &HashSide) -> secantus_pgplan::joincost::KeyStats<'_> {
+                        secantus_pgplan::joincost::KeyStats {
+                            ndistinct: s.stats.0,
+                            default_ndistinct: false,
+                            null_frac: s.stats.1,
+                            mcv: &s.stats.2,
+                        }
+                    }
+                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
+                    1.0 - eq.clamp(0.0, 1.0)
+                }
+                _ => 1.0 / 3.0,
+            };
+        }
+        let filter = JoinFilterCost {
+            count: filters.len(),
+            ops: filters.iter().map(|f| f.ops).sum(),
+            selectivity,
+        };
+        Some((a, b, more, filter, left_join))
     }
 
     /// The Nested Loop of an inner join planned as joined rows whose WHERE
@@ -793,8 +850,8 @@ impl PgHandler {
         (String, String),
         [Option<String>; 2],
     )> {
-        let (mut a, mut b, more, filter) = self.joined_sides(sel)?;
-        if !more.is_empty() || a.table == b.table || filter.count != 0 {
+        let (mut a, mut b, more, filter, left_join) = self.joined_sides(sel)?;
+        if !more.is_empty() || a.table == b.table || filter.count != 0 || left_join {
             return None;
         }
         let column = |p: &JoinedSide| {
@@ -3283,7 +3340,7 @@ fn hash_join_of(
     filter: JoinFilterCost,
 ) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
-    if (filter.count != 0 && (left_join || redundant))
+    if (filter.count != 0 && redundant)
         || a.pg_type != b.pg_type
         || more.len() > 3
         || more.iter().any(|(x, y)| x.pg_type != y.pg_type)
@@ -3367,12 +3424,12 @@ fn hash_join_of(
     // The join filter (RP-375): `final_cost_hashjoin` and
     // `final_cost_mergejoin` charge its `qp_qual_cost` on each pair the
     // join clauses match (`approx_tuple_count`), and each inequality
-    // scales the join's rows by `DEFAULT_INEQ_SEL`.
+    // scales the join's rows by its selectivity (RP-379: a `<>` by
+    // `neqjoinsel`'s).
     let matched = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
     let filter_qual = filter.ops as f64 * costsize::CPU_OPERATOR_COST * matched;
     let (total, l_total) = (total + filter_qual, l_total + filter_qual);
-    let mut rows =
-        outer.rows * inner.rows * selectivity * (1.0_f64 / 3.0).powi(filter.count as i32);
+    let mut rows = outer.rows * inner.rows * selectivity * filter.selectivity;
     if left_join {
         rows = rows.max(outer.rows);
     }
@@ -3532,13 +3589,25 @@ fn hash_join_of(
 /// A priced two-table join: the printed outer scan's, the inner scan's and
 /// the join's estimates, the path, and the index each scan reads (outer,
 /// inner), `None` for a Seq Scan (RP-369).
-/// An ON's conjuncts beside its join clauses, each an inequality between
-/// the two tables (RP-375): how many, and the operators they evaluate on
-/// each matched pair (`cost_qual_eval`).
-#[derive(Debug, Clone, Copy, Default)]
+/// An ON's conjuncts beside its join clauses, each an inequality or a
+/// `<>` between the two tables (RP-375, RP-379): how many, the operators
+/// they evaluate on each matched pair (`cost_qual_eval`), and their
+/// selectivity (`clauselist_selectivity`).
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct JoinFilterCost {
     pub(crate) count: usize,
     pub(crate) ops: usize,
+    pub(crate) selectivity: f64,
+}
+
+impl Default for JoinFilterCost {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            ops: 0,
+            selectivity: 1.0,
+        }
+    }
 }
 
 pub(crate) type JoinEstimate = (Estimate, Estimate, Estimate, JoinPick, [Option<String>; 2]);
