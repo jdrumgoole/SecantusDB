@@ -407,7 +407,7 @@ impl PgHandler {
             || j.where_span_aliases.len() != j.where_filters.len()
             || j.where_filters
                 .iter()
-                .any(|f| f.kind != FilterKind::Inequality)
+                .any(|f| !matches!(f.kind, FilterKind::Inequality | FilterKind::NotEqual(..)))
         {
             return None;
         }
@@ -429,7 +429,9 @@ impl PgHandler {
         }
         let indexes = self.index_relations();
         let project = j.project.as_deref();
-        let side = |node: &JoinNode| -> Option<(Estimate, i64)> {
+        // Each joined key's table and field, for `neqjoinsel`.
+        let mut key_columns: Vec<(String, String, String)> = Vec::new();
+        let mut side = |node: &JoinNode| -> Option<(Estimate, i64)> {
             let JoinNode::Leaf { plan, columns, .. } = node else {
                 return None;
             };
@@ -466,6 +468,11 @@ impl PgHandler {
             let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
                 return None;
             };
+            key_columns.extend(
+                columns
+                    .iter()
+                    .map(|(key, f)| (key.clone(), leaf.table.clone(), f.clone())),
+            );
             Some((scan, width.3))
         };
         let (a, a_above) = side(left)?;
@@ -475,7 +482,37 @@ impl PgHandler {
             .iter()
             .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
             .sum();
-        let sel_factor = (1.0_f64 / 3.0).powi(j.where_filters.len() as i32);
+        // `clauselist_selectivity`: the conjuncts' product, in order. A
+        // `<>` (or IS DISTINCT FROM) is `neqjoinsel`, one minus
+        // `eqjoinsel` over the two columns' statistics; one never
+        // analysed is not modelled here.
+        let mut sel_factor = 1.0_f64;
+        for f in &j.where_filters {
+            sel_factor *= match &f.kind {
+                FilterKind::Inequality => 1.0 / 3.0,
+                FilterKind::NotEqual(l, r) => {
+                    let stats = |k: &str| {
+                        let (_, table, field) = key_columns.iter().find(|(c, _, _)| c == k)?;
+                        self.analysed_key(table, field)
+                    };
+                    let (x, y) = (stats(l)?, stats(r)?);
+                    if x.column.pg_type != y.column.pg_type {
+                        return None;
+                    }
+                    fn key(s: &AnalysedKey) -> secantus_pgplan::joincost::KeyStats<'_> {
+                        secantus_pgplan::joincost::KeyStats {
+                            ndistinct: s.ndistinct,
+                            default_ndistinct: false,
+                            null_frac: s.null_frac,
+                            mcv: &s.mcv,
+                        }
+                    }
+                    let eq = secantus_pgplan::joincost::eqjoinsel_inner(&key(&x), &key(&y));
+                    1.0 - eq.clamp(0.0, 1.0)
+                }
+                _ => return None,
+            };
+        }
         let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, qual);
         let rows = costsize::clamp_row_est(a.2 * b.2 * sel_factor);
         let join = (plan.startup, plan.total, rows, a_above + b_above);
@@ -1196,6 +1233,50 @@ impl PgHandler {
     /// scan's estimate reading `read`, the width of `above` (the columns
     /// it carries above the join), and its key `field`'s statistics.
     /// `None` where the key column is not analysed.
+    /// One analysed column's statistics as `eqjoinsel` reads them
+    /// (`get_variable_numdistinct`, its null fraction and MCV list).
+    /// `None` where the column was never measured or its distinct count is
+    /// the 200 default, which the estimates here do not model.
+    fn analysed_key(&self, table: &str, field: &str) -> Option<AnalysedKey> {
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        let column = pt.def.columns.iter().find(|c| c.field() == field)?.clone();
+        let analysed = pt.analyzed.as_ref()?.get(field)?.as_ref()?;
+        let (stats, slots) = (analysed.stats, analysed.slots.clone());
+        let unique = pt.unique.iter().any(|u| u == field);
+        // `get_variable_numdistinct`: a unique column's distinct count
+        // is its non-null rows; a negative `stadistinct` is a fraction
+        // of the rows; none measured is the 200 default.
+        let null_frac = f64::from(stats.null_frac);
+        let stadistinct = if unique {
+            -(1.0 - null_frac)
+        } else {
+            f64::from(stats.distinct)
+        };
+        let nd = if stadistinct > 0.0 {
+            stadistinct
+        } else if stadistinct < 0.0 {
+            -stadistinct * pt.tuples
+        } else {
+            return None;
+        };
+        let ndistinct = costsize::clamp_row_est(nd.min(pt.tuples.max(1.0)));
+        let mcv = slots.as_ref().map(|s| s.mcv.clone()).unwrap_or_default();
+        Some(AnalysedKey {
+            tuples: pt.tuples,
+            column,
+            stats,
+            slots,
+            unique,
+            ndistinct,
+            null_frac,
+            mcv,
+        })
+    }
+
     fn hash_side(
         &self,
         table: &str,
@@ -1238,37 +1319,10 @@ impl PgHandler {
         let (width, None) = self.scan_estimate(table, &Document::new(), above)? else {
             return None;
         };
-        let count = self
-            .storage
-            .count_matching(self.db(), table, &Document::new(), None)
-            .ok()?;
-        let pt = self.planner_table(table, count)?;
-        let col = pt.def.columns.iter().find(|c| c.field() == field)?;
-        let analysed = pt.analyzed.as_ref()?.get(field)?.as_ref()?;
-        let unique = pt.unique.iter().any(|u| u == field);
-        // `get_variable_numdistinct`: a unique column's distinct count
-        // is its non-null rows; a negative `stadistinct` is a fraction
-        // of the rows; none measured is the 200 default, which the
-        // estimate below does not model.
-        let null_frac = f64::from(analysed.stats.null_frac);
-        let stadistinct = if unique {
-            -(1.0 - null_frac)
-        } else {
-            f64::from(analysed.stats.distinct)
-        };
-        let nd = if stadistinct > 0.0 {
-            stadistinct
-        } else if stadistinct < 0.0 {
-            -stadistinct * pt.tuples
-        } else {
-            return None;
-        };
-        let nd = costsize::clamp_row_est(nd.min(pt.tuples.max(1.0)));
-        let mcv = analysed
-            .slots
-            .as_ref()
-            .map(|s| s.mcv.clone())
-            .unwrap_or_default();
+        let key = self.analysed_key(table, field)?;
+        let col = &key.column;
+        let (nd, null_frac, mcv) = (key.ndistinct, key.null_frac, key.mcv.clone());
+        let unique = key.unique;
         let (numeric, ordered) = self.column_key_order(col);
         // `innerrel_is_unique` from the side's own restriction: its WHERE
         // fixes every key column of a unique index to a constant, so the
@@ -1306,8 +1360,8 @@ impl PgHandler {
             pg_type: col.pg_type.clone(),
             stats: (nd, null_frac, mcv),
             unique,
-            tuples: pt.tuples,
-            column: analysed.slots.clone().map(|sl| (analysed.stats, sl)),
+            tuples: key.tuples,
+            column: key.slots.clone().map(|sl| (key.stats, sl)),
             numeric,
             ordered,
             key_indexed,
@@ -3190,6 +3244,18 @@ struct HashSide {
     /// A B-tree index leads with the key: a merge could read it presorted,
     /// which is not modelled.
     key_indexed: bool,
+}
+
+/// One analysed column's statistics (`PgHandler::analysed_key`).
+struct AnalysedKey {
+    tuples: f64,
+    column: secantus_pgcatalog::Column,
+    stats: secantus_pgplan::hashagg::ColumnStats,
+    slots: Option<secantus_pgplan::colstats::Slots>,
+    unique: bool,
+    ndistinct: f64,
+    null_frac: f64,
+    mcv: Vec<(Vec<u8>, f32)>,
 }
 
 /// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's

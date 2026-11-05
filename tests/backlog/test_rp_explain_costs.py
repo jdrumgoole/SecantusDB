@@ -1030,8 +1030,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    # Split from RP-354 and fixed: a `<>` conjunct is `neqjoinsel`, one
+    # minus `eqjoinsel_inner` over the two columns' MCV lists.
     "nested loop with a not-equal filter": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e, e e2 where e.a < e2.a and e.b <> e2.b",
         [

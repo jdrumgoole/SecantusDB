@@ -1377,12 +1377,13 @@ a regression test.
       parameterized inner Index Scan may win (`explain select * from e, k
       where e.a < k.a` is `Nested Loop (cost=0.28..9487.50 rows=333333
       width=14)` over `Index Scan using k_pkey on k` with `Index Cond: (a
-      > e.a)`); a `<>` filter (`neqjoinsel` over the columns' statistics:
-      rows=300000 with `e.b <> e2.b` added); a JOIN ... ON's condition,
-      inner or LEFT; and a join of three or more relations (found while
-      working RP-329).
+      > e.a)`); a JOIN ... ON's condition, inner or LEFT (`e join k on
+      e.a <> k.a`, a `<>` beside an indexed table, is `rows=999000`); and
+      a join of three or more relations (found while working RP-329). A
+      comma join's `<>` conjunct over unindexed tables is priced since
+      2026-11-05 (`neqjoinsel`).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
 - [ ] **EXPLAIN of a join on a unique key is unpriced.** `explain select
       * from e join k on e.a = k.a` (k's primary key on `a`) is, on
       PostgreSQL 15.19, `Hash Join (cost=27.50..45.14 rows=1000 width=14)`
