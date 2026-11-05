@@ -1410,21 +1410,32 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a key a B-tree leads with], tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key with the other side filtered]
       Backlog-ID: RP-377
 
-- [ ] **EXPLAIN of a user table still shows a Seq Scan, or zeros, for
-      three index paths PostgreSQL picks.** Since RP-339 one analysed
-      table's scan is PostgreSQL 15.19's `set_cheapest` choice of a Seq
-      Scan, an Index Scan or a Bitmap Heap Scan over one index. Not yet:
-      an `OR` of indexed clauses (`where a = 5 or a = 6` is a BitmapOr of
-      two Bitmap Index Scans on `k_pkey`, cost 8.57..12.80, here a Seq
-      Scan); an index-only scan (`select a + 1 from k where a = 5` is an
-      `Index Only Scan using k_pkey`, here an Index Scan with zeros: no
-      index-only path is priced for a user table); and clauses on two
-      columns of one composite index (`where a = 7 and b = 7` over `n_ab`
-      is an Index Scan with both in its Index Cond, here a Seq Scan, as
-      `btcostestimate`'s bound quals on a later column are not priced).
-      Measured on a private 15.19 cluster (found while working RP-339).
-      Backlog-ID: RP-378
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bitmap or of a key's two equalities], tests/backlog/test_rp_explain_costs.py::test_plan[an index-only scan under a computed select list], tests/backlog/test_rp_explain_costs.py::test_plan[an index scan of a composite index's two columns]
+- [ ] **EXPLAIN prints zeros for a Sort, Aggregate or Limit over a user
+      table's index path.** Since RP-339 and RP-378 one analysed table's
+      scan alone is PostgreSQL 15.19's `set_cheapest` choice, but a node
+      over it keeps the storage planner's path, unpriced: `explain select
+      * from n where b = 7 order by a` is `Sort (cost=37.63..37.88
+      rows=100 width=11)` over a Bitmap Heap Scan on `n_b`, here a Sort of
+      zeros over an `Index Scan using n_b`; `explain select * from k where
+      a = 5 limit 1` is `Limit (cost=0.28..8.29 rows=1 width=7)`, here
+      zeros; so are `count(*)` over either (an Aggregate over the scan,
+      `k`'s an Index Only Scan). Measured on a private 15.19 cluster
+      (found while working RP-378).
+      Backlog-ID: RP-382
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort over a user table's bitmap scan], tests/backlog/test_rp_explain_costs.py::test_plan[a limit over a user table's index scan]
+- [ ] **EXPLAIN ANALYZE of a user table's index-only or bitmap scan leaves
+      out its counters.** PostgreSQL 15.19 prints an Index Only Scan's
+      `Heap Fetches` (one per index tuple whose heap page the visibility
+      map does not mark all-visible: `Heap Fetches: 1` for `select a from
+      k where a = 5` before any VACUUM), an index scan's `Rows Removed by
+      Filter`, a Bitmap Heap Scan's `Heap Blocks: exact=27` and its Bitmap
+      Index Scans' and BitmapOr's own `actual rows`; here none of them
+      (`Heap Fetches` is modelled for catalogs only, RP-360). A user
+      table's visibility map is not modelled page by page, so after a
+      VACUUM which pages a later write cleared is not known (found while
+      working RP-378).
+      Backlog-ID: RP-383
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a user table's index-only scan], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a user table's bitmap scan]
 
 ## Found by batch 54 (2026-10-24)
 

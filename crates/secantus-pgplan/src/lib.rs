@@ -3550,6 +3550,10 @@ pub struct ExplainOptions {
     /// `Filter` print it: each AND conjunct's text and, for an index-usable
     /// one, the column it constrains.
     pub scan_quals: Vec<(String, Option<String>)>,
+    /// Each of `scan_quals`' `OR` conjuncts, by its text: per arm, that
+    /// arm's conjuncts as `scan_quals` holds them, for a BitmapOr's Bitmap
+    /// Index Scans (RP-378).
+    pub scan_or_arms: ruleutils::OrArms,
     /// A single-relation statement's top-level `col IN (...)` conjuncts:
     /// each column's stored field and the list's length, NULL elements
     /// included. The lowered filter drops the NULLs, which select nothing,
@@ -9978,6 +9982,7 @@ fn plan_explain(
         summary: false,
         format: "text".into(),
         scan_quals: Vec::new(),
+        scan_or_arms: Vec::new(),
         scan_in_lengths: Vec::new(),
         scan_array_quals: None,
         setop_quals: Vec::new(),
@@ -10061,6 +10066,7 @@ fn plan_explain(
         }
     }
     let scan_quals = explain_scan_quals(&query, lookup).unwrap_or_default();
+    let scan_or_arms = explain_scan_or_arms(&query, lookup).unwrap_or_default();
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     options.scan_array_quals = explain_scan_array_quals(&query, lookup);
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
@@ -10107,6 +10113,7 @@ fn plan_explain(
         planning_without_running(|| plan_node(query, lookup, params))?
     };
     options.scan_quals = scan_quals;
+    options.scan_or_arms = scan_or_arms;
     options.setop_quals = setop_quals;
     options.join_conds = join_conds;
     options.join_cond_splits = join_cond_splits;
@@ -44188,12 +44195,20 @@ fn reduce_const_classes(query: &mut N, lookup: &dyn Fn(&str) -> Option<TableDef>
     Some(gates)
 }
 
-/// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
-fn explain_scan_quals(
+/// A statement over ONE relation: its WHERE's `OR` conjuncts' arms for
+/// EXPLAIN (RP-378).
+fn explain_scan_or_arms(
     query: &N,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
-) -> Option<Vec<(String, Option<String>)>> {
-    let (table, where_clause) = match query {
+) -> Option<ruleutils::OrArms> {
+    let (table, where_clause) = scan_where(query)?;
+    let def = lookup(&table)?;
+    ruleutils::explain_or_arms(where_clause, &def)
+}
+
+/// A statement over ONE relation: its relation and WHERE.
+fn scan_where(query: &N) -> Option<(String, &pg_query::protobuf::Node)> {
+    Some(match query {
         N::SelectStmt(s) => {
             let [item] = s.from_clause.as_slice() else {
                 return None;
@@ -44212,7 +44227,15 @@ fn explain_scan_quals(
             d.where_clause.as_deref()?,
         ),
         _ => return None,
-    };
+    })
+}
+
+/// A statement over ONE relation: its WHERE's conjuncts for EXPLAIN.
+fn explain_scan_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<(String, Option<String>)>> {
+    let (table, where_clause) = scan_where(query)?;
     let def = lookup(&table)?;
     ruleutils::explain_conjuncts(where_clause, &def)
 }

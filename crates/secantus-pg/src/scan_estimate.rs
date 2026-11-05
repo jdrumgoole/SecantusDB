@@ -28,8 +28,11 @@ pub(crate) struct ScanIndex {
     pub name: String,
     pub only: bool,
     /// A bitmap heap scan over the index: its Bitmap Index Scan's
-    /// estimate (RP-338).
+    /// estimate (RP-338), or with `or_arms` its BitmapOr's.
     pub bitmap: Option<Estimate>,
+    /// A BitmapOr's arms (RP-378): each one Bitmap Index Scan, its index
+    /// and estimate. Empty for any other scan.
+    pub or_arms: Vec<(String, Estimate)>,
 }
 
 impl ScanIndex {
@@ -1707,8 +1710,21 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<ScanEstimate> {
+        self.scan_estimate_reading(table, filter, fields, &[])
+    }
+
+    /// [`Self::scan_estimate`] of a statement that also reads `reads`
+    /// (the columns a computed select list reads), which an index-only
+    /// scan's index must hold too (RP-378).
+    pub(crate) fn scan_estimate_reading(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        reads: &[String],
+    ) -> Option<ScanEstimate> {
         if self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
-            if let Some(chosen) = self.user_index_path(table, filter, fields) {
+            if let Some(chosen) = self.user_index_path(table, filter, fields, reads) {
                 return Some(chosen);
             }
             Some((self.user_seq_scan(table, filter, fields)?, None))
@@ -1878,24 +1894,42 @@ impl PgHandler {
         Some((startup, total, rows, width))
     }
 
-    /// The index path `set_cheapest` keeps for one user table's scan, over
-    /// its sequential scan, when that is cheaper (RP-339): a plain Index
-    /// Scan (`cost_index` over `btcostestimate`) or a Bitmap Heap Scan over
-    /// one index's Bitmap Index Scan (`create_bitmap_subplan`), each index
-    /// whose leading column a clause names opening both paths
+    /// The path `set_cheapest` keeps for one user table's scan, when it is
+    /// an index path (RP-339, RP-378): each index a clause reaches opens a
+    /// plain Index Scan (`cost_index` over `btcostestimate`, its quals on
+    /// later key columns index quals too), an Index Only Scan instead where
+    /// the index holds every column the statement reads (`check_index_only`;
+    /// `reads` adds the columns a computed select list reads), and one
+    /// Bitmap Heap Scan over `choose_bitmap_and`'s pick of every bitmap
+    /// path: each index's Bitmap Index Scan and each `OR` whose arms an
+    /// index serves (`generate_bitmap_or_paths`, a BitmapOr)
     /// (`create_index_paths`). `None` -- the caller prices the sequential
     /// scan -- where the sequential scan wins, or where the choice is one
-    /// this model does not price: a table never analysed, an `OR` (a
-    /// BitmapOr), two indexes on different leading columns (a BitmapAnd), a
-    /// partial index, an index holding every column read (an index-only
-    /// scan), or an index the clauses reach only past its leading column
-    /// with no index that leads with them (PostgreSQL prices a full-index
-    /// path for it, not modelled).
+    /// this model does not print or price: a table never analysed, a
+    /// chosen BitmapAnd, a BitmapOr arm that is not one index's scan of
+    /// the whole arm, a partial index, or an index the clauses reach only
+    /// past its leading column with no index that leads with them
+    /// (PostgreSQL prices a full-index path for it, not modelled).
+    /// [`Self::user_index_path`] for a user table, `None` for a catalog.
+    pub(crate) fn user_index_path_reading(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        reads: &[String],
+    ) -> Option<ScanEstimate> {
+        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            return None;
+        }
+        self.user_index_path(table, filter, fields, reads)
+    }
+
     fn user_index_path(
         &self,
         table: &str,
         filter: &Document,
         fields: &[String],
+        reads: &[String],
     ) -> Option<ScanEstimate> {
         if filter.is_empty() {
             return None;
@@ -1914,9 +1948,6 @@ impl PgHandler {
         let w = self.analyzed_where(
             table, &pt.def, &pt.unique, stats, pt.tuples, filter, &indexes,
         )?;
-        if !w.bitmap_ors.is_empty() {
-            return None;
-        }
         let mut named = Vec::new();
         filter_fields(filter, &mut named)?;
         // Each index's name, by its key fields.
@@ -1937,9 +1968,14 @@ impl PgHandler {
                 })
                 .map(|r| r.name.clone())
         };
+        let index_sel = |f: &str| w.index_selectivity.get(f).copied();
         let correlations = Self::stats_correlations(&pt.def, stats);
         let leads: Vec<String> = indexes.iter().map(|ix| ix.field.clone()).collect();
+        // The columns the scan reads: its output, its WHERE, and what a
+        // computed select list reads.
+        let read: Vec<&String> = fields.iter().chain(named.iter()).chain(reads).collect();
         let mut serving: Vec<(String, costsize::Index)> = Vec::new();
+        let mut index_only: Vec<bool> = Vec::new();
         for ix in &mut indexes {
             if !named.iter().any(|f| ix.columns.contains(f)) {
                 continue;
@@ -1963,15 +1999,20 @@ impl PgHandler {
                 }
                 return None;
             }
-            if named.iter().any(|f| ix.columns[1..].contains(f)) {
-                return None;
-            }
-            let covering = fields
+            // The quals on its later key columns are index quals too.
+            ix.later = ix.columns[1..]
                 .iter()
-                .chain(named.iter())
-                .all(|f| ix.columns.contains(f));
-            if covering {
-                return None;
+                .filter(|f| named.contains(f))
+                .map(|f| (f.clone(), index_sel(f).unwrap_or(1.0)))
+                .collect();
+            // An index holding every column read is scanned index-only,
+            // skipping the heap pages the visibility map marks.
+            // `check_index_only`, which `enable_indexonlyscan = off` stops:
+            // the path is then a plain index scan.
+            let only = !self.setting_is("enable_indexonlyscan", "off")
+                && read.iter().all(|f| ix.columns.contains(f));
+            if only {
+                ix.visible = pt.allvisfrac;
             }
             let c = correlations.get(&lead).copied().flatten()?;
             ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
@@ -1985,9 +2026,10 @@ impl PgHandler {
             // storage's own `_id` index: one relation in PostgreSQL.
             if !serving.iter().any(|(_, s)| s.columns == ix.columns) {
                 serving.push((name_of(&ix.columns)?, ix.clone()));
+                index_only.push(only);
             }
         }
-        if serving.is_empty() || serving.iter().any(|(_, s)| s.field != serving[0].1.field) {
+        if serving.is_empty() {
             return None;
         }
         let rows = costsize::clamp_row_est(pt.tuples * w.selectivity);
@@ -1995,47 +2037,204 @@ impl PgHandler {
             pages: pt.pages,
             tuples: pt.tuples,
         };
-        let paths: Vec<costsize::Index> = serving.iter().map(|(_, ix)| ix.clone()).collect();
-        let colsel =
-            |f: &str| costsize::ColSel::Given(w.index_selectivity.get(f).copied().unwrap_or(1.0));
+        let colsel = |f: &str| costsize::ColSel::Given(index_sel(f).unwrap_or(1.0));
+        let quals = with_in_lengths(w.quals.clone());
+        // An index-only scan reads `visible` of the heap's pages less; a
+        // bitmap scan never is one.
+        let plain = |ix: &costsize::Index| costsize::Index {
+            visible: 0.0,
+            ..ix.clone()
+        };
+        let scan_cost = |ix: &costsize::Index| {
+            costsize::scan_paths(&rel, std::slice::from_ref(ix), &quals, &colsel, rows)
+                .into_iter()
+                .find_map(|(k, c)| matches!(k, costsize::ScanKind::Index(_)).then_some(c))
+        };
+        // Each index's bitmap path over its index quals (the clauses they
+        // are, by position, for `choose_bitmap_and`).
+        let clauses_of = |ix: &costsize::Index| -> Vec<usize> {
+            quals
+                .iter()
+                .enumerate()
+                .filter(|(_, (f, q))| ix.index_qual(f, q))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let bitmap_path = |ix: &costsize::Index| {
+            costsize::bitmap_index_path(
+                &rel,
+                &plain(ix),
+                &quals,
+                colsel(&ix.field),
+                rows,
+                clauses_of(ix),
+            )
+        };
+        let singles: Vec<Option<costsize::BitmapPath>> =
+            serving.iter().map(|(_, ix)| bitmap_path(ix)).collect();
+        let mut bitmaps: Vec<costsize::BitmapPath> = singles.iter().flatten().cloned().collect();
+        // Each index's scan of one `OR` arm: its quals on the index's key
+        // columns, the leading column's selectivity, and the later
+        // columns' (`build_paths_for_OR` over the arm's clauses).
+        let arm_scan = |ix: &costsize::Index,
+                        arm: &[crate::IndexQuals]|
+         -> Option<(
+            costsize::Index,
+            Vec<(String, costsize::Qual)>,
+            f64,
+            Vec<usize>,
+        )> {
+            let lead = arm.iter().find(|s| s.field == ix.field)?;
+            let mut quals = lead.quals.clone();
+            let mut clauses = lead.clauses.clone();
+            let mut later = Vec::new();
+            for s in arm {
+                if s.field != ix.field && ix.columns[1..].contains(&s.field) {
+                    quals.extend(s.quals.iter().cloned());
+                    clauses.extend(s.clauses.iter().copied());
+                    later.push((s.field.clone(), s.selectivity));
+                }
+            }
+            clauses.sort_unstable();
+            clauses.dedup();
+            let ix = costsize::Index { later, ..plain(ix) };
+            Some((ix, quals, lead.selectivity, clauses))
+        };
+        // Each BitmapOr, and per arm the index whose scan it is (`None`
+        // where the arm's pick is not one index's scan).
+        let mut ors: Vec<(costsize::BitmapPath, Vec<Option<usize>>)> = Vec::new();
+        for (_, arms) in &w.bitmap_ors {
+            let mut chosen = Vec::with_capacity(arms.len());
+            let mut arm_index = Vec::with_capacity(arms.len());
+            for arm in arms {
+                let mut paths = Vec::new();
+                let mut owners = Vec::new();
+                for (i, (_, ix)) in serving.iter().enumerate() {
+                    let Some((aix, aquals, asel, clauses)) = arm_scan(ix, arm) else {
+                        continue;
+                    };
+                    paths.push(costsize::bitmap_index_path(
+                        &rel,
+                        &aix,
+                        &aquals,
+                        costsize::ColSel::Given(asel),
+                        rows,
+                        clauses,
+                    )?);
+                    owners.push(i);
+                }
+                let pick = costsize::choose_bitmap_and(&rel, &paths, &quals)?;
+                arm_index.push(
+                    pick.index
+                        .then(|| paths.iter().position(|p| *p == pick).map(|j| owners[j]))
+                        .flatten(),
+                );
+                chosen.push(pick);
+            }
+            let pos = ors.len();
+            let or = costsize::bitmap_or_path(&chosen, w.bitmap_ors[pos].0);
+            bitmaps.push(or.clone());
+            ors.push((or, arm_index));
+        }
+        let bitmap = if bitmaps.is_empty() {
+            None
+        } else {
+            Some(costsize::choose_bitmap_and(&rel, &bitmaps, &quals)?)
+        };
         // `set_cheapest` over every path, `disable_cost` added to a kind an
         // `enable_*` setting turns off.
         const DISABLE_COST: f64 = 1.0e10;
         let off = |name: &str| self.setting_is(name, "off");
-        let quals = with_in_lengths(w.quals.clone());
-        let mut best: Option<(costsize::ScanKind, (f64, f64))> = None;
-        for (kind, (mut startup, mut total)) in
-            costsize::scan_paths(&rel, &paths, &quals, &colsel, rows)
-        {
-            let disabled = match kind {
-                costsize::ScanKind::Seq => off("enable_seqscan"),
-                costsize::ScanKind::Bitmap(_) => off("enable_bitmapscan"),
-                costsize::ScanKind::Index(_) => off("enable_indexscan"),
-            };
-            if disabled {
-                startup += DISABLE_COST;
-                total += DISABLE_COST;
+        let disable = |(s, t): (f64, f64), on: bool| {
+            if on {
+                (s, t)
+            } else {
+                (s + DISABLE_COST, t + DISABLE_COST)
             }
-            if best.is_none_or(|(_, (bs, bt))| total < bt || (total == bt && startup < bs)) {
-                best = Some((kind, (startup, total)));
+        };
+        enum Pick {
+            Seq,
+            Bitmap,
+            Index(usize),
+        }
+        let mut best = (
+            Pick::Seq,
+            disable(
+                costsize::seq_scan_path(&rel, &quals),
+                !off("enable_seqscan"),
+            ),
+        );
+        let mut consider = |pick: Pick, (s, t): (f64, f64)| {
+            let (bs, bt) = best.1;
+            if t < bt || (t == bt && s < bs) {
+                best = (pick, (s, t));
+            }
+        };
+        if let Some(b) = &bitmap {
+            consider(
+                Pick::Bitmap,
+                disable(
+                    costsize::bitmap_heap(&rel, b, &quals),
+                    !off("enable_bitmapscan"),
+                ),
+            );
+        }
+        for (i, (_, ix)) in serving.iter().enumerate() {
+            if let Some(c) = scan_cost(ix) {
+                consider(Pick::Index(i), disable(c, !off("enable_indexscan")));
             }
         }
-        let (kind, (startup, total)) = best?;
-        let index = match kind {
-            costsize::ScanKind::Seq => return None,
-            costsize::ScanKind::Index(i) => ScanIndex {
+        let (pick, (startup, total)) = best;
+        let index = match pick {
+            Pick::Seq => return None,
+            Pick::Index(i) => ScanIndex {
                 name: serving.get(i)?.0.clone(),
-                only: false,
+                only: index_only[i],
                 bitmap: None,
+                or_arms: Vec::new(),
             },
-            costsize::ScanKind::Bitmap(i) => {
-                let (name, ix) = serving.get(i)?;
-                let (itotal, isel) =
-                    costsize::bitmap_index_scan(&rel, ix, &quals, colsel(&ix.field))?;
-                ScanIndex {
-                    name: name.clone(),
-                    only: false,
-                    bitmap: Some((0.0, itotal, costsize::clamp_row_est(isel * pt.tuples), 0)),
+            Pick::Bitmap => {
+                let b = bitmap?;
+                if let Some(i) = singles.iter().position(|p| p.as_ref() == Some(&b)) {
+                    let (name, ix) = serving.get(i)?;
+                    let (itotal, isel) =
+                        costsize::bitmap_index_scan(&rel, &plain(ix), &quals, colsel(&ix.field))?;
+                    ScanIndex {
+                        name: name.clone(),
+                        only: false,
+                        bitmap: Some((0.0, itotal, costsize::clamp_row_est(isel * pt.tuples), 0)),
+                        or_arms: Vec::new(),
+                    }
+                } else {
+                    // A BitmapOr of one index scan per arm; anything else
+                    // (a BitmapAnd) is not printed here.
+                    let (k, (or, owners)) = ors.iter().enumerate().find(|(_, (or, _))| *or == b)?;
+                    let mut arms = Vec::with_capacity(owners.len());
+                    for (owner, arm) in owners.iter().zip(&w.bitmap_ors.get(k)?.1) {
+                        let (name, ix) = serving.get((*owner)?)?;
+                        let (aix, aquals, asel, _) = arm_scan(ix, arm)?;
+                        let (itotal, isel) = costsize::bitmap_index_scan(
+                            &rel,
+                            &aix,
+                            &aquals,
+                            costsize::ColSel::Given(asel),
+                        )?;
+                        arms.push((
+                            name.clone(),
+                            (0.0, itotal, costsize::clamp_row_est(isel * pt.tuples), 0),
+                        ));
+                    }
+                    ScanIndex {
+                        name: String::new(),
+                        only: false,
+                        bitmap: Some((
+                            or.cost,
+                            or.cost,
+                            costsize::clamp_row_est(or.selectivity * pt.tuples),
+                            0,
+                        )),
+                        or_arms: arms,
+                    }
                 }
             }
         };
@@ -2411,6 +2610,7 @@ impl PgHandler {
                     tuples: None,
                     predicate: None,
                     hash: false,
+                    later: Vec::new(),
                 },
                 covering,
             ));
@@ -2461,6 +2661,7 @@ impl PgHandler {
                     name: name.clone(),
                     only: *only,
                     bitmap: None,
+                    or_arms: Vec::new(),
                 })
             }
             // A bitmap heap scan over one index (`create_bitmap_subplan`):
@@ -2474,6 +2675,7 @@ impl PgHandler {
                     name: name.clone(),
                     only: false,
                     bitmap: Some((0.0, itotal, costsize::clamp_row_est(isel * tuples), 0)),
+                    or_arms: Vec::new(),
                 })
             }
         };
@@ -3117,6 +3319,22 @@ pub(crate) fn column_expr_cost(e: &secantus_pgplan::ColumnExpr) -> Option<(u32, 
 /// `set_pathtarget_cost_width` sets them -- an expression's width is its
 /// type's `get_typavgwidth` -- and the plain columns' stored fields, whose
 /// widths the scan measures. `None` where an entry is not priced.
+/// The stored fields a computed select list reads (RP-378): an index-only
+/// scan's index must hold them too.
+pub(crate) fn computed_reads(sel: &secantus_pgplan::Select) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in sel.casts.iter().flatten() {
+        if let secantus_pgplan::ColumnExpr::Row { fields, .. } = c {
+            for (_, f, _) in fields {
+                if !out.contains(f) {
+                    out.push(f.clone());
+                }
+            }
+        }
+    }
+    out
+}
+
 pub(crate) fn target_cost(sel: &secantus_pgplan::Select) -> Option<(f64, i64, Vec<String>)> {
     use secantus_pgplan::ColumnExpr;
     const CPU_OPERATOR_COST: f64 = 0.0025;
