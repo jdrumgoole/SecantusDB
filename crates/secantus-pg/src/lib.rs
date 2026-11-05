@@ -41048,6 +41048,27 @@ impl PgHandler {
                         }
                     }
                 }
+                // The same, planned as joined rows (RP-376): a Nested Loop
+                // of the two filtered scans, a side read through its index
+                // where `set_cheapest` keeps that path.
+                if tree.name == "Hash Join" {
+                    if let Statement::Select(sel) = inner.as_ref() {
+                        if let Some((plan, a, b, join, implied, from, indexes)) =
+                            self.joined_implied_estimate(sel)
+                        {
+                            explain::implied_nest_loop(&mut tree, &implied, &from);
+                            explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                            // Outer then inner, as the scans now sit.
+                            let [a_index, b_index] = indexes;
+                            let in_order = if plan.b_outer {
+                                [b_index, a_index]
+                            } else {
+                                [a_index, b_index]
+                            };
+                            explain::name_index_scans(&mut tree, &in_order);
+                        }
+                    }
+                }
                 // An inner Hash Join of two tables' sequential scans on one
                 // column equality, both analysed (RP-330), planned as joined
                 // rows or on the narrow two-table path (RP-361):
