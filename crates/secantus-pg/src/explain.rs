@@ -750,6 +750,44 @@ pub(crate) fn price_merge_join(
     root.estimate = Some(join);
 }
 
+/// Whether a hash join's one-equality `Hash Cond` must be commuted so
+/// its outer side's operand comes first (RP-373): `create_hashjoin_plan`
+/// runs `get_switched_clauses`, which commutes every clause whose left
+/// operand is not from the outer relation. `None` when the clause is not
+/// one equality of two qualified columns, or neither operand names a
+/// relation scanned under the outer child.
+fn outer_first(n: &PlanNode, c: &str) -> Option<bool> {
+    if !(n.name.starts_with("Hash") && n.name.ends_with("Join")) || n.children.is_empty() {
+        return None;
+    }
+    let inner = c.strip_prefix('(')?.strip_suffix(')')?;
+    let (a, b) = inner.split_once(" = ")?;
+    if b.contains(" = ") {
+        return None;
+    }
+    let qual = |o: &str| o.split_once('.').map(|(q, _)| q.to_string());
+    let (qa, qb) = (qual(a)?, qual(b)?);
+    let mut outer = Vec::new();
+    relation_names(&n.children[0], &mut outer);
+    match (outer.contains(&qa), outer.contains(&qb)) {
+        (false, true) => Some(true),
+        (true, false) => Some(false),
+        _ => None,
+    }
+}
+
+/// The names a subtree's scans go by in a qualified column: each scan's
+/// alias, or its relation's name when it has none.
+fn relation_names(n: &PlanNode, out: &mut Vec<String>) {
+    let prop = |k: &str| n.props.iter().find(|(p, _)| p == k).map(|(_, v)| v.clone());
+    if let Some(name) = prop("Alias").or_else(|| prop("Relation Name")) {
+        out.push(name);
+    }
+    for c in &n.children {
+        relation_names(c, out);
+    }
+}
+
 /// `(a = b)` as `(b = a)`: one equality of two operands, neither holding
 /// an ` = ` of its own; `None` for anything else.
 fn commute_equality(c: &str) -> Option<String> {
@@ -1413,10 +1451,11 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
         };
         if let Some(c) = conds.get(*next) {
             if !c.is_empty() && !n.skip_cond {
-                let c = if n.commute_cond {
-                    commute_equality(c).unwrap_or_else(|| c.clone())
-                } else {
-                    c.clone()
+                let c = match outer_first(n, c) {
+                    Some(true) => commute_equality(c).unwrap_or_else(|| c.clone()),
+                    Some(false) => c.clone(),
+                    None if n.commute_cond => commute_equality(c).unwrap_or_else(|| c.clone()),
+                    None => c.clone(),
                 };
                 n.details.insert(0, (label.into(), c));
             }
@@ -1764,6 +1803,27 @@ mod join_type_tests {
         );
         assert_eq!(commute_equality("((e.a = k.a) AND (e.b = k.b))"), None);
         assert_eq!(commute_equality("e.b = k.b"), None);
+    }
+
+    /// A `Hash Cond` written inner side first is printed outer side
+    /// first, as `get_switched_clauses` commutes it (RP-373).
+    #[test]
+    fn a_hash_cond_is_written_outer_side_first() {
+        let rel = |name: &str| {
+            let mut n = PlanNode::new(format!("Seq Scan on {name}"));
+            n.props.push(("Relation Name".into(), name.to_string()));
+            n
+        };
+        let mut root = PlanNode::new("Hash Join");
+        root.children.push(rel("e"));
+        root.children.push(PlanNode::over("Hash", rel("k")));
+        attach_join_conds(&mut root, &["(k.b = e.b)".to_string()]);
+        assert_eq!(root.details[0].1, "(e.b = k.b)");
+        let mut root = PlanNode::new("Hash Join");
+        root.children.push(rel("e"));
+        root.children.push(PlanNode::over("Hash", rel("k")));
+        attach_join_conds(&mut root, &["(e.b = k.b)".to_string()]);
+        assert_eq!(root.details[0].1, "(e.b = k.b)");
     }
 
     #[test]
