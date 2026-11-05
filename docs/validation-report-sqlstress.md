@@ -2,7 +2,7 @@
 
 - SecantusDB (Python server) 0.7.0b3
 - pgbench TPC-B (simple / extended / prepared) + select-only + psql catalog smoke
-- generated: 2026-10-15 22:24 UTC
+- generated: 2026-10-19 06:36 UTC
 
 **0/6 lanes clean.** Any error or dropped connection is a bug;
 tps figures are smoke-level indicators, not benchmarks.
