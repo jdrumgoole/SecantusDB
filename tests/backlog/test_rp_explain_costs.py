@@ -1672,6 +1672,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-366",
         "RP-367",
         "RP-368",
+        "RP-370",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

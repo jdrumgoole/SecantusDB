@@ -1371,14 +1371,6 @@ a regression test.
       frequencies match (found while working RP-313).
       Verify: tests/backlog/test_rp_catalog_reads.py::test_a_catalog_columns_correlation_follows_the_heap
       Backlog-ID: RP-358
-- [ ] **EXPLAIN deparses a cast constant as a cast of an expression.**
-      `explain select * from ud where 1::bigint = any(a)` (`a int[]`) prints
-      `Filter: ((1)::bigint = ANY (a))`; PostgreSQL 15.19 folds the cast
-      into a `bigint` Const (`eval_const_expressions`) and prints
-      `Filter: ('1'::bigint = ANY (a))`. The cost line already matches
-      (found while working RP-368).
-      Backlog-ID: RP-370
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a cross-type constant equal to ANY of an array column]
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
       only by `<`, `<=`, `>`, `>=` conjuncts of its WHERE (or by none),
