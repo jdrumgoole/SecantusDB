@@ -1426,6 +1426,44 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Filter: (b = 'v3'::text)",
         ],
     ),
+    "a join on a unique key whose indexed side is filtered": (
+        "RP-381",
+        _ANALYSED,
+        "explain select * from e join k on e.a = k.a where k.b = 'v3'",
+        [
+            "Hash Join  (cost=18.75..36.39 rows=100 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
+    "a left join on a unique key": (
+        "RP-381",
+        _ANALYSED,
+        "explain select * from e left join k on e.a = k.a",
+        [
+            "Hash Left Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join on a unique key with a join filter": (
+        "RP-381",
+        _ANALYSED,
+        "explain select * from e join k on e.a = k.a and e.b < k.b",
+        [
+            "Hash Join  (cost=27.50..45.12 rows=333 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  Join Filter: (e.b < k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "a comma join's equality over an index-scan side": (
         "RP-372",
         _ANALYSED,
@@ -2164,6 +2202,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-374",
         "RP-375",
         "RP-376",
+        "RP-377",
         "RP-378",
         "RP-379",
     )
