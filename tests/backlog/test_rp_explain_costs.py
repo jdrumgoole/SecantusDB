@@ -52,6 +52,22 @@ _ANALYSED_SMALL = _ANALYSED + [
 # Two analysed tables joined on b: one whose b is mostly one value (its
 # first MCV 0.6), and one whose b is a quarter NULL against seven values
 # (RP-330).
+# An array column ANALYZE measured: common elements, NULL arrays and NULL
+# elements (RP-368).
+_UD_ANALYSED = [
+    "create table ud (a int[])",
+    "insert into ud select array[i % 10, i % 7] from generate_series(1, 1000) i",
+    "insert into ud select null from generate_series(1, 100)",
+    "insert into ud select array[i, null] from generate_series(1, 50) i",
+    "analyze ud",
+]
+_UD_TEXTS = [
+    "create table ud (a text[])",
+    "insert into ud select array['x' || (i % 30), 'y' || (i % 3), 'z']"
+    " from generate_series(1, 2000) i",
+    "analyze ud",
+]
+
 _SKEWED = [
     "create table e (a int, b text)",
     "insert into e select g, case when g < 600 then 'x' else 'v' || (g % 50) end"
@@ -788,6 +804,90 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         [
             "Seq Scan on ud  (cost=0.00..20.50 rows=228 width=29)",
             "  Filter: (a @> '{1}'::integer[])",
+        ],
+    ),
+    "a constant unequal to ALL of an array column": (
+        "RP-368",
+        ["create table ud (a int[])"],
+        "explain select * from ud where 1 <> all(a)",
+        ["Seq Scan on ud  (cost=0.00..40.60 rows=1353 width=32)", "  Filter: (1 <> ALL (a))"],
+    ),
+    "a constant less than ANY of an array column": (
+        "RP-368",
+        ["create table ud (a int[])"],
+        "explain select * from ud where 1 < any(a)",
+        ["Seq Scan on ud  (cost=0.00..40.60 rows=1336 width=32)", "  Filter: (1 < ANY (a))"],
+    ),
+    "a cross-type constant equal to ANY of an array column": (
+        "RP-369",
+        ["create table ud (a int[])"],
+        "explain select * from ud where 1::bigint = any(a)",
+        [
+            "Seq Scan on ud  (cost=0.00..40.60 rows=66 width=32)",
+            "  Filter: ('1'::bigint = ANY (a))",
+        ],
+    ),
+    "a constant equal to ANY of an analysed array column": (
+        "RP-368",
+        _UD_ANALYSED,
+        "explain select * from ud where 1 = any(a)",
+        ["Seq Scan on ud  (cost=0.00..34.88 rows=229 width=29)", "  Filter: (1 = ANY (a))"],
+    ),
+    "a constant equal to ALL of an analysed array column": (
+        "RP-368",
+        _UD_ANALYSED,
+        "explain select * from ud where 1 = all(a)",
+        ["Seq Scan on ud  (cost=0.00..34.88 rows=18 width=29)", "  Filter: (1 = ALL (a))"],
+    ),
+    "a constant unequal to ANY of an analysed array column": (
+        "RP-368",
+        _UD_ANALYSED,
+        "explain select * from ud where 1 <> any(a)",
+        ["Seq Scan on ud  (cost=0.00..34.88 rows=1132 width=29)", "  Filter: (1 <> ANY (a))"],
+    ),
+    "an analysed array overlap": (
+        "RP-368",
+        _UD_ANALYSED,
+        "explain select * from ud where a && '{1,99}'",
+        [
+            "Seq Scan on ud  (cost=0.00..23.38 rows=229 width=29)",
+            "  Filter: (a && '{1,99}'::integer[])",
+        ],
+    ),
+    "an analysed array contained by a constant": (
+        "RP-368",
+        _UD_ANALYSED,
+        "explain select * from ud where a <@ '{1,2,3}'",
+        [
+            "Seq Scan on ud  (cost=0.00..23.38 rows=137 width=29)",
+            "  Filter: (a <@ '{1,2,3}'::integer[])",
+        ],
+    ),
+    "an analysed array contained by every common element": (
+        "RP-368",
+        _UD_ANALYSED,
+        "explain select * from ud where a <@ '{0,1,2,3,4,5,6,7,8,9}'",
+        [
+            "Seq Scan on ud  (cost=0.00..23.38 rows=965 width=29)",
+            "  Filter: (a <@ '{0,1,2,3,4,5,6,7,8,9}'::integer[])",
+        ],
+    ),
+    "an analysed text array containment": (
+        "RP-368",
+        _UD_TEXTS,
+        "explain select * from ud where a @> '{x1,y2}'",
+        [
+            "Seq Scan on ud  (cost=0.00..44.00 rows=22 width=45)",
+            "  Filter: (a @> '{x1,y2}'::text[])",
+        ],
+    ),
+    "an analysed text array contained by a constant": (
+        "RP-368",
+        _UD_TEXTS,
+        "explain select * from ud where a <@ '{x1,y1,y2,z}'",
+        [
+            "Seq Scan on ud  (cost=0.00..44.00 rows=202 width=45)",
+            "  Filter: (a <@ '{x1,y1,y2,z}'::text[])",
         ],
     ),
     # ----------------------------- RP-350 a column equal to two constants
@@ -1571,6 +1671,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-365",
         "RP-366",
         "RP-367",
+        "RP-368",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
