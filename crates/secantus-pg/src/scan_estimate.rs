@@ -508,9 +508,6 @@ impl PgHandler {
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
             || sel.casts.iter().any(Option::is_some)
-            || sel.residual.is_some()
-            || !j.where_filters.is_empty()
-            || j.where_spans_equality
             || !j.where_modelled
         {
             return None;
@@ -519,7 +516,7 @@ impl PgHandler {
             kind: JoinKind::Inner,
             left,
             right,
-            on: Some(_),
+            on,
             on_other: false,
             equi,
             merged,
@@ -532,6 +529,28 @@ impl PgHandler {
         let [(left_key, right_key)] = equi.as_slice() else {
             return None;
         };
+        // The join clause is an ON's, or -- a comma join, `FROM e, k WHERE
+        // e.b = k.b` -- the WHERE's one conjunct over both tables, that
+        // same equality: PostgreSQL makes an inner join's WHERE and ON
+        // quals one list (`deconstruct_jointree`), so both plan alike
+        // (RP-372). Any other conjunct over both tables stays unpriced.
+        let comma_clause = on.is_none()
+            && j.where_spans_equality
+            && j.where_filters.len() == 1
+            && j.where_span_aliases.len() == 1
+            && matches!(j.where_equalities.as_slice(), [(l, r)]
+                if (l == left_key && r == right_key) || (l == right_key && r == left_key));
+        if !comma_clause && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
+        {
+            return None;
+        }
+        // The executor re-checks a comma join's equality above the join as
+        // the select's residual; that is the join clause, not a filter.
+        if let Some(residual) = &sel.residual {
+            if !comma_clause || !is_key_equality(residual, left_key, right_key) {
+                return None;
+            }
+        }
         if !merged.is_empty() || !expr_keys.is_empty() {
             return None;
         }
@@ -2961,6 +2980,45 @@ fn filter_names(filter: &Document, field: &str) -> bool {
                 _ => false,
             }
     })
+}
+
+/// `residual` is the equality `left = right` of two joined keys, either
+/// way round, and nothing else: the select-level re-check of a comma
+/// join's clause (RP-372).
+fn is_key_equality(residual: &secantus_pgplan::ColumnExpr, left: &str, right: &str) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    let secantus_pgplan::ColumnExpr::Row {
+        expr,
+        fields,
+        params,
+        ..
+    } = residual
+    else {
+        return false;
+    };
+    let Some(N::AExpr(e)) = expr.node.as_ref() else {
+        return false;
+    };
+    let op_is_eq = matches!(e.name.as_slice(), [one]
+        if matches!(one.node.as_ref(), Some(N::String(s)) if s.sval == "="));
+    let param = |x: Option<&pg_query::protobuf::Node>| match x.and_then(|x| x.node.as_ref()) {
+        Some(N::ParamRef(p)) => usize::try_from(p.number).ok(),
+        _ => None,
+    };
+    let (Some(l), Some(r)) = (param(e.lexpr.as_deref()), param(e.rexpr.as_deref())) else {
+        return false;
+    };
+    let key = |n: usize| {
+        n.checked_sub(1)
+            .and_then(|i| fields.get(i))
+            .map(|f| f.0.as_str())
+    };
+    let pair = (key(l), key(r));
+    e.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+        && op_is_eq
+        && params.is_empty()
+        && fields.len() == 2
+        && (pair == (Some(left), Some(right)) || pair == (Some(right), Some(left)))
 }
 
 /// A joined rows' filter as its top-level conjuncts, each one joined-row
