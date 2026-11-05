@@ -2080,14 +2080,16 @@ def test_an_analyzed_array_column_is_estimated(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_an_aclitem_array(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster): a plain
     ANALYZE re-measures `pg_class.relacl` (`aclitem[]`, which has `=` but
     no `<`: `compute_distinct_stats`), so after a GRANT on a new table its
-    null fraction and frequencies follow the catalog's rows; here the
-    column keeps `initdb`'s 0.5097561 and
-    {0.45365855,0.029268293,0.004878049,0.0024390244}."""
+    null fraction and frequencies follow the catalog's rows. The column
+    kept `initdb`'s 0.5097561 and
+    {0.45365855,0.029268293,0.004878049,0.0024390244}; and seven
+    `information_schema` relations carried a PUBLIC grant initdb does not
+    give them."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_b")
         c.execute("create database rp313_b")
@@ -2100,6 +2102,31 @@ def test_a_database_wide_analyze_measures_an_aclitem_array(rust_pg: Any) -> None
             " where tablename = 'pg_class' and attname = 'relacl'"
         ).fetchone()
     assert row == (0.50851583, 4.0, "{0.45498782,0.02919708,0.00486618,0.00243309}")
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_a_regproc_column(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster, after one
+    CREATE TABLE): a plain ANALYZE re-measures `pg_type.typinput`
+    (`regproc`, which sorts under `oid`'s B-tree opclass), so its distinct
+    count and frequencies follow the two new `pg_type` rows; here the
+    column keeps `initdb`'s row. (Its correlation follows the heap's order,
+    RP-358.)"""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_c")
+        c.execute("create database rp313_c")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_c", autocommit=True) as c:
+        c.execute("create table zz_reg (a int)")
+        c.execute("analyze")
+        row = c.execute(
+            "select null_frac, n_distinct, most_common_freqs::text from pg_stats"
+            " where tablename = 'pg_type' and attname = 'typinput'"
+        ).fetchone()
+    assert row == (
+        0.0,
+        -0.15986949,
+        "{0.47634584,0.3425775,0.009787928,0.009787928,0.008156607,0.0032626428}",
+    )
 
 
 @pytest.mark.backlog_fixed("RP-314")

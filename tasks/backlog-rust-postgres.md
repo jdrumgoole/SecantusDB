@@ -1348,17 +1348,18 @@ a regression test.
       modelled (`oid`, the integers, `bool`, `float4` / `float8`, `text`,
       `name`, `"char"`, and since 2026-11-04 the one-dimensional arrays of
       those, with `compute_array_stats`' element slots), over the
-      catalog's rows as they stand, and their rows replace `initdb`'s. The
-      other columns keep `initdb`'s rows, where PostgreSQL 15.19 measures
-      them too: the `reg*` types, `aclitem[]` (`=` but no `<`, so
-      `compute_distinct_stats`: after a GRANT on a new table,
-      `pg_class.relacl`'s null fraction moves), `int2vector` /
-      `oidvector` and `pg_node_tree`. Not modelled either: the measured
+      catalog's rows as they stand, and their rows replace `initdb`'s;
+      since 2026-11-05 so does `aclitem[]` (`=` but no `<`:
+      `compute_distinct_stats`). The other columns keep `initdb`'s rows,
+      where PostgreSQL 15.19 measures them too: the `reg*` types (after a
+      CREATE TABLE, `pg_type.typinput`'s distinct count and frequencies
+      move), `int2vector` / `oidvector` and `pg_node_tree`. Not modelled
+      either: the measured
       catalogs' `relpages` / `reltuples` in `pg_class`, and the row order
       of the replaced `pg_statistic` rows (an update moves PostgreSQL's)
       (found while working RP-311).
       Backlog-ID: RP-313
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_an_aclitem_array
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_a_regproc_column
 - [ ] **A database-wide ANALYZE's correlation of a catalog column is not
       PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
       with the rows' heap order; here the catalog's rows are walked in this

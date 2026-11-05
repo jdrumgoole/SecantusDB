@@ -241,6 +241,23 @@ fn system_relacl(relname: &str, nsp: &str, kind: &str) -> Bson {
     if !matches!(kind, "r" | "v") || nsp == "pg_toast" {
         return Bson::Null;
     }
+    // `information_schema.sql` grants SELECT to PUBLIC on each view and
+    // table it documents, but not on its helper views, `sql_parts` or
+    // `transforms`, which keep no ACL at all.
+    if nsp == "information_schema"
+        && matches!(
+            relname,
+            "_pg_foreign_data_wrappers"
+                | "_pg_foreign_servers"
+                | "_pg_foreign_table_columns"
+                | "_pg_foreign_tables"
+                | "_pg_user_mappings"
+                | "sql_parts"
+                | "transforms"
+        )
+    {
+        return Bson::Null;
+    }
     let owner = "postgres=arwdDxt/postgres";
     let items: Vec<String> = match relname {
         "pg_authid"
