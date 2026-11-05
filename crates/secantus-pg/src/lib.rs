@@ -40994,6 +40994,26 @@ impl PgHandler {
                                             )?,
                                             None,
                                         ),
+                                        // A user table whose cheapest path is an
+                                        // index keeps its priced sequential
+                                        // scan here, as before RP-339.
+                                        None if computed => {
+                                            match self.scan_estimate(
+                                                &sel.table,
+                                                &sel.filter,
+                                                &fields,
+                                            )? {
+                                                (_, Some(_)) => (
+                                                    self.user_seq_scan(
+                                                        &sel.table,
+                                                        &sel.filter,
+                                                        &fields,
+                                                    )?,
+                                                    None,
+                                                ),
+                                                plain => plain,
+                                            }
+                                        }
                                         None => {
                                             self.scan_estimate(&sel.table, &sel.filter, &fields)?
                                         }

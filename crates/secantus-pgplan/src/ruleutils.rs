@@ -3815,10 +3815,38 @@ pub fn explain_conjuncts(
 }
 
 /// The column an index-usable conjunct constrains: `column op constant`
-/// (either way round) of a B-tree comparison operator; `None` for any
-/// other conjunct.
+/// (either way round) of a B-tree comparison operator, `column BETWEEN
+/// constant AND constant` (two such clauses once the parser expands it)
+/// and `column IN (constants)` (a `ScalarArrayOpExpr`, which a B-tree
+/// index serves); `None` for any other conjunct.
 fn qual_column(p: &Node) -> Option<String> {
+    let column = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+        Some(N::ColumnRef(c)) => names(&c.fields).pop(),
+        _ => None,
+    };
+    let constant = |n: &Node| {
+        matches!(
+            n.node.as_ref(),
+            Some(N::AConst(_) | N::TypeCast(_) | N::ParamRef(_))
+        )
+    };
+    let constants = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+        Some(N::List(l)) => !l.items.is_empty() && l.items.iter().all(constant),
+        _ => false,
+    };
     match p.node.as_ref() {
+        Some(N::AExpr(e))
+            if e.kind == AExprKind::AexprBetween as i32 && constants(e.rexpr.as_deref()) =>
+        {
+            column(e.lexpr.as_deref())
+        }
+        Some(N::AExpr(e))
+            if e.kind == AExprKind::AexprIn as i32
+                && crate::operator_name(e).ok() == Some("=")
+                && constants(e.rexpr.as_deref()) =>
+        {
+            column(e.lexpr.as_deref())
+        }
         Some(N::AExpr(e))
             if e.kind == AExprKind::AexprOp as i32
                 && matches!(
@@ -4525,6 +4553,34 @@ mod array_quals {
             };
             let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
             assert_eq!(got, vec![(want.to_string(), None)], "{sql}");
+        }
+    }
+}
+#[cfg(test)]
+mod index_qual_columns {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    /// A BETWEEN of constants and an IN list of constants constrain their
+    /// column for an index, as PostgreSQL 15.19 prints them in an `Index
+    /// Cond` (RP-339); a NOT IN or a symmetric BETWEEN does not.
+    #[test]
+    fn between_and_in_name_their_column() {
+        let def = TableDef::new("k", vec![Column::new("a", "int4", false)]);
+        for (sql, want) in [
+            ("a between 10 and 20", Some("a")),
+            ("a in (1, 2, 3)", Some("a")),
+            ("a not in (1, 2)", None),
+            ("a between symmetric 20 and 10", None),
+            ("a < 3", Some("a")),
+        ] {
+            let p = pg_query::parse(&format!("select * from k where {sql}")).unwrap();
+            let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+            else {
+                panic!()
+            };
+            let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
+            assert_eq!(got[0].1.as_deref(), want, "{sql}");
         }
     }
 }
