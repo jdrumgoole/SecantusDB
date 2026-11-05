@@ -1262,6 +1262,73 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Index Cond: (a = 5)",
         ],
     ),
+    # The same side under a narrower select list, and under a LEFT join
+    # the WHERE reduces to an inner one (RP-369).
+    "a join's index-scan side of the columns read": (
+        "RP-369",
+        _ANALYSED,
+        "explain select e.a from e join k on e.b = k.b where k.a = 5",
+        [
+            "Hash Join  (cost=8.30..27.04 rows=100 width=4)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.29..8.29 rows=1 width=3)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=3)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
+    "a reduced left join's index-scan side": (
+        "RP-369",
+        _ANALYSED,
+        "explain select * from e left join k on e.b = k.b where k.a = 5",
+        [
+            "Hash Join  (cost=8.30..27.04 rows=100 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.29..8.29 rows=1 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
+    "a join whose index-scan side reads a key range": (
+        "RP-371",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b where k.a < 5",
+        [
+            "Hash Join  (cost=8.40..34.90 rows=400 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.35..8.35 rows=4 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.35 rows=4 width=7)",
+            "              Index Cond: (a < 5)",
+        ],
+    ),
+    "a key fixed by a constant over an index-scan side": (
+        "RP-371",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b where k.a = 5 and k.b = 'v5'",
+        [
+            "Nested Loop  (cost=0.28..26.79 rows=100 width=14)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+            "        Filter: (b = 'v5'::text)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Filter: (b = 'v5'::text)",
+        ],
+    ),
+    "a comma join's equality over an index-scan side": (
+        "RP-372",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and k.a = 5",
+        [
+            "Hash Join  (cost=8.30..27.04 rows=100 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=8.29..8.29 rows=1 width=7)",
+            "        ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "              Index Cond: (a = 5)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1672,6 +1739,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-366",
         "RP-367",
         "RP-368",
+        "RP-369",
         "RP-370",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

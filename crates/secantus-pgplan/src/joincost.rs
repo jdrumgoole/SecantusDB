@@ -772,6 +772,18 @@ pub fn cheapest_nest_loop(
     b: (f64, f64, f64, i64),
     qual: f64,
 ) -> NestLoopPlan {
+    cheapest_nest_loop_semi(a, b, qual, [None, None])
+}
+
+/// [`cheapest_nest_loop`] where `a` or `b` may be `inner_unique` as the
+/// inner side: `unique[0]` for `a` inner, `unique[1]` for `b`, each the
+/// semi-join factors `(match fraction, match count)` (RP-369).
+pub fn cheapest_nest_loop_semi(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+    unique: [Option<(f64, f64)>; 2],
+) -> NestLoopPlan {
     let mut paths: Vec<JoinPath> = Vec::new();
     let mut materials = [(0.0, 0.0); 2];
     for b_outer in [false, true] {
@@ -781,7 +793,8 @@ pub fn cheapest_nest_loop(
         let mat = material(&inner, i.3);
         materials[usize::from(b_outer)] = (mat.startup, mat.total);
         for (materialized, inner) in [(false, &inner), (true, &mat)] {
-            let (startup, total) = nestloop_cost(&outer, inner, None, false, qual);
+            let semi = unique[usize::from(!b_outer)];
+            let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
             add_path(
                 &mut paths,
                 JoinPath {
@@ -2630,6 +2643,28 @@ mod tests {
             !p.b_outer && !p.materialized && p.material.is_none(),
             "{p:?}"
         );
+    }
+
+    #[test]
+    fn an_inner_unique_side_stops_a_nest_loop_at_its_match() {
+        // RP-369's join: e (1,000 rows) and k cut to one row by its
+        // primary key. The cheapest loop has k outer, reading e once:
+        // 0.28 + 8.01 + 15.00 + 1,000 pairs x (0.01 + 0.0025) = 35.79,
+        // above the 27.04 Hash Join PostgreSQL 15.19 keeps.
+        let e = (0.0, 15.0, 1000.0, 7);
+        let k = (0.28, 8.29, 1.0, 7);
+        let plain = cheapest_nest_loop(e, k, CPU_OPERATOR_COST);
+        assert!(plain.b_outer && close(plain.total, 35.79), "{plain:?}");
+        // k `inner_unique` (each outer row stops at its first match) can
+        // only make the e-outer loops cheaper, never the plan dearer.
+        let semi = cheapest_nest_loop_semi(e, k, CPU_OPERATOR_COST, [None, Some((0.1, 1.0))]);
+        assert!(semi.total <= plain.total, "{semi:?} {plain:?}");
+        // With one row inner and many outer, the semi-join factors cut
+        // the pairs read: 1,000 outer rows over a 50-row inner side.
+        let wide = (0.0, 1.5, 50.0, 7);
+        let base = cheapest_nest_loop_semi(e, wide, CPU_OPERATOR_COST, [None, None]);
+        let uniq = cheapest_nest_loop_semi(e, wide, CPU_OPERATOR_COST, [None, Some((0.1, 50.0))]);
+        assert!(uniq.total < base.total, "{uniq:?} {base:?}");
     }
 
     #[test]

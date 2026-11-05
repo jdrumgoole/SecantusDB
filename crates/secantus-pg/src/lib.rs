@@ -41020,19 +41020,21 @@ impl PgHandler {
                 // column equality, both analysed (RP-330), planned as joined
                 // rows or on the narrow two-table path (RP-361):
                 // `cost_hashjoin` with `eqjoinsel` over their MCV lists.
+                // A side the storage planner reads through an index is
+                // priced too, as the path PostgreSQL keeps (RP-369).
+                let plain_scan =
+                    |n: &str| n.starts_with("Seq Scan on ") || n.starts_with("Index Scan using ");
                 if matches!(tree.name.as_str(), "Hash Join" | "Hash Left Join")
                     && tree.children.len() == 2
                     && tree.children[0].children.is_empty()
-                    && tree.children[0].name.starts_with("Seq Scan on ")
+                    && plain_scan(&tree.children[0].name)
                     && tree.children[1].name == "Hash"
                     && tree.children[1].children.len() == 1
                     && tree.children[1].children[0].children.is_empty()
-                    && tree.children[1].children[0]
-                        .name
-                        .starts_with("Seq Scan on ")
+                    && plain_scan(&tree.children[1].children[0].name)
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((a, b, join, pick)) = self
+                        if let Some((a, b, join, pick, indexes)) = self
                             .hash_join_estimate(sel)
                             .or_else(|| self.join_select_hash_estimate(sel))
                         {
@@ -41055,6 +41057,10 @@ impl PgHandler {
                                         );
                                     }
                                 }
+                            }
+                            // A side read through its index (RP-369).
+                            if tree.estimate.is_some() {
+                                explain::name_index_scans(&mut tree, &indexes);
                             }
                         }
                     }
@@ -41686,7 +41692,7 @@ impl PgHandler {
                 explain::gate_scan(&mut tree, options.one_time_false);
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 explain::attach_join_conds(&mut tree, &options.join_conds);
-                explain::attach_join_where(&mut tree, &options.join_where);
+                explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::apply_implied_filters(&mut tree);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.

@@ -310,7 +310,7 @@ pub(crate) fn has_unique_probe(n: &PlanNode) -> bool {
 
 /// The fields of a leaf table's rows that a scan filter fixes to a
 /// constant: `{f: v}` or `{f: {$eq: v}}` at the top level, or under `$and`.
-fn constant_equalities(filter: &Document, out: &mut Vec<String>) {
+pub(crate) fn constant_equalities(filter: &Document, out: &mut Vec<String>) {
     for (k, v) in filter {
         if k == "$and" {
             if let bson::Bson::Array(a) = v {
@@ -806,6 +806,48 @@ pub(crate) fn price_hash_join(
     hash.children[0].estimate = Some(inner);
     hash.estimate = Some((inner.1, inner.1, inner.2, inner.3));
     root.estimate = Some(join);
+}
+
+/// Name a priced join's two scans, outer then inner, after the index each
+/// reads (RP-369): `Index Scan using <index> on <table>`, its `Index Name`
+/// first among its properties, as [`table_scan`] builds one; a `None`
+/// is the Seq Scan the cost model priced.
+pub(crate) fn name_index_scans(root: &mut PlanNode, indexes: &[Option<String>; 2]) {
+    fn leaves<'a>(n: &'a mut PlanNode, out: &mut Vec<&'a mut PlanNode>) {
+        if n.children.is_empty() {
+            out.push(n);
+        } else {
+            for c in &mut n.children {
+                leaves(c, out);
+            }
+        }
+    }
+    let mut scans = Vec::new();
+    leaves(root, &mut scans);
+    if scans.len() != 2 {
+        return;
+    }
+    for (scan, index) in scans.into_iter().zip(indexes) {
+        let table = match scan.name.strip_prefix("Seq Scan on ") {
+            Some(t) => t.to_string(),
+            None => match scan
+                .name
+                .strip_prefix("Index Scan using ")
+                .and_then(|r| r.split_once(" on "))
+            {
+                Some((_, t)) => t.to_string(),
+                None => continue,
+            },
+        };
+        scan.props.retain(|(k, _)| k != "Index Name");
+        match index {
+            Some(index) => {
+                scan.name = format!("Index Scan using {index} on {table}");
+                scan.props.insert(0, ("Index Name".into(), index.clone()));
+            }
+            None => scan.name = format!("Seq Scan on {table}"),
+        }
+    }
 }
 
 /// A node's estimate, zeros where it has none; `+ 0.0` turns the `-0.0` an
@@ -1543,7 +1585,11 @@ pub(crate) fn mark_implied_filters(
 /// Place a joined SELECT's WHERE conjuncts: one naming a single relation
 /// that no outer join null-extends filters that relation's scan; any other
 /// filters the top join.
-pub(crate) fn attach_join_where(root: &mut PlanNode, quals: &[(String, Option<String>)]) {
+pub(crate) fn attach_join_where(
+    root: &mut PlanNode,
+    quals: &[(String, Option<String>, Option<String>)],
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) {
     if quals.is_empty() {
         return;
     }
@@ -1580,19 +1626,31 @@ pub(crate) fn attach_join_where(root: &mut PlanNode, quals: &[(String, Option<St
             ),
         }
     };
-    let mut homes: Vec<(Option<String>, Vec<&String>)> = Vec::new();
-    for (text, home) in quals {
-        match homes.iter_mut().find(|(h, _)| h == home) {
-            Some((_, v)) => v.push(text),
-            None => homes.push((home.clone(), vec![text])),
-        }
+    let mut homes: Vec<(Option<String>, Vec<&String>, Vec<(String, Option<String>)>)> = Vec::new();
+    for (text, home, column) in quals {
+        let i = match homes.iter().position(|(h, _, _)| h == home) {
+            Some(i) => i,
+            None => {
+                homes.push((home.clone(), Vec::new(), Vec::new()));
+                homes.len() - 1
+            }
+        };
+        homes[i].1.push(text);
+        homes[i].2.push((text.clone(), column.clone()));
     }
-    for (home, parts) in homes {
+    for (home, parts, with_columns) in homes {
         let target = match &home {
             Some(rel) => scan_for(root, rel),
             None => top_join(root),
         };
         if let Some(n) = target {
+            // An index scan takes the conjuncts on its key columns as its
+            // `Index Cond`, the rest as its `Filter`, as a lone scan does
+            // (RP-369).
+            if home.is_some() && n.props.iter().any(|(k, _)| k == "Index Name") {
+                quals_on_scan(n, &with_columns, index_columns);
+                continue;
+            }
             // Over an inner join a WHERE conjunct is a join qual.
             let inner = home.is_none()
                 && (n.name == "Hash Join" || n.name == "Nested Loop" || n.name == "Merge Join");

@@ -492,10 +492,7 @@ impl PgHandler {
     /// the join's estimates, and whether the left table is the hashed one;
     /// the Hash node is its input's total. `None` -- zeros -- for any
     /// other shape.
-    pub(crate) fn hash_join_estimate(
-        &self,
-        sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate, JoinPick)> {
+    pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -539,7 +536,6 @@ impl PgHandler {
             return None;
         }
         let project = j.project.as_deref();
-        let indexes = self.index_relations();
         // The WHERE conjuncts still above the join, each over one table's
         // joined keys: PostgreSQL pushes each down to that table's scan
         // (`distribute_qual_to_rels`), as it does a reduced LEFT join's
@@ -606,14 +602,11 @@ impl PgHandler {
                 _ => bson::doc! { "$and": clauses },
             };
             // A WHERE conjunct pushed into this side's scan (RP-365) is
-            // priced as that scan's filter. Not where an index could serve
-            // it (an index scan may win, not weighed here), nor where it
-            // names the join key: a constant there joins the key's
-            // equivalence class, which leaves no join clause (RP-363).
-            if !scan_filter.is_empty()
-                && (indexes.iter().any(|ix| ix.table.name == leaf.table)
-                    || filter_names(&scan_filter, &field))
-            {
+            // priced as that scan's filter, through an index where that is
+            // the cheaper path (RP-369, in `hash_side`). Not where it names
+            // the join key: a constant there joins the key's equivalence
+            // class, which leaves no join clause (RP-363).
+            if !scan_filter.is_empty() && filter_names(&scan_filter, &field) {
                 return None;
             }
             let above: Vec<String> = columns
@@ -651,7 +644,7 @@ impl PgHandler {
     pub(crate) fn join_select_hash_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate, JoinPick)> {
+    ) -> Option<JoinEstimate> {
         let j = sel.join.as_ref()?;
         if sel.sub.is_some()
             || sel.series.is_some()
@@ -696,7 +689,7 @@ impl PgHandler {
         // the narrow planner refuses it, and the general one plans it.
         let left_join = j.left_join;
         let side_filter =
-            |table: &str, alias: &str| self.narrow_side_filter(&filters, table, alias);
+            |table: &str, alias: &str| self.narrow_side_filter(&filters, table, alias, true);
         let side = |(table, alias): &(String, String)| -> Option<HashSide> {
             let key = if a.0 == *alias {
                 &a.1
@@ -791,23 +784,26 @@ impl PgHandler {
 
     /// One side's WHERE predicates as its scan's filter (RP-362): the
     /// predicates naming `alias`, ANDed. `None` for a predicate this does
-    /// not model (`NOT col`) or a filtered table with an index, which an
+    /// not model (`NOT col`), or, unless `indexed` (the caller weighs the
+    /// index paths, RP-369), a filtered table with an index, which an
     /// index scan may serve.
     fn narrow_side_filter(
         &self,
         filter: &[secantus_pgplan::JoinPred],
         table: &str,
         alias: &str,
+        indexed: bool,
     ) -> Option<Document> {
-        let indexes = self.index_relations();
-
         use secantus_pgplan::JoinOp;
         let def = self.lookup(table)?;
         let mut clauses = Vec::new();
-        // A WHERE over a table with an index may be an index scan's,
-        // which this estimate does not weigh.
-        if filter.iter().any(|p| p.alias == alias)
-            && indexes.iter().any(|ix| ix.table.name == table)
+        // A WHERE over a table with an index may be an index scan's.
+        if !indexed
+            && filter.iter().any(|p| p.alias == alias)
+            && self
+                .index_relations()
+                .iter()
+                .any(|ix| ix.table.name == table)
         {
             return None;
         }
@@ -922,7 +918,7 @@ impl PgHandler {
             if !read.contains(&field) {
                 read.push(field);
             }
-            let filter = self.narrow_side_filter(&implied.filter, table, alias)?;
+            let filter = self.narrow_side_filter(&implied.filter, table, alias, false)?;
             let (scan, None) = self.scan_estimate(table, &filter, &read)? else {
                 return None;
             };
@@ -960,8 +956,36 @@ impl PgHandler {
         read: &[String],
         above: &[String],
     ) -> Option<HashSide> {
-        let (scan, None) = self.scan_estimate(table, filter, read)? else {
-            return None;
+        let indexes = self.index_relations();
+        let indexed = indexes.iter().any(|ix| ix.table.name == table);
+        // A filtered side over a table with an index is read through the
+        // index where `set_cheapest` keeps that path (RP-369): `cost_index`
+        // as a lone scan of the table prices it. Where the comparison is
+        // not modelled -- or a sequential scan may win, which
+        // `index_scan_estimate` does not tell apart -- the side is not
+        // priced.
+        let (scan, index) = if !filter.is_empty() && indexed {
+            let mut found = None;
+            for ix in indexes.iter().filter(|ix| ix.table.name == table) {
+                let key: Option<Vec<String>> = ix
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        let i = usize::try_from(*k).ok()?.checked_sub(1)?;
+                        Some(ix.table.columns.get(i)?.field())
+                    })
+                    .collect();
+                if let Some(est) = self.index_scan_estimate(table, filter, read, &key?) {
+                    found = Some((est, Some(ix.name.clone())));
+                    break;
+                }
+            }
+            found?
+        } else {
+            let (scan, None) = self.scan_estimate(table, filter, read)? else {
+                return None;
+            };
+            (scan, None)
         };
         let (width, None) = self.scan_estimate(table, &Document::new(), above)? else {
             return None;
@@ -998,7 +1022,26 @@ impl PgHandler {
             .map(|s| s.mcv.clone())
             .unwrap_or_default();
         let (numeric, ordered) = self.column_key_order(col);
-        let key_indexed = self.index_relations().iter().any(|ix| {
+        // `innerrel_is_unique` from the side's own restriction: its WHERE
+        // fixes every key column of a unique index to a constant, so the
+        // scan returns at most one row and the join is `inner_unique`
+        // with this side inner (RP-369).
+        let mut fixed = Vec::new();
+        crate::explain::constant_equalities(filter, &mut fixed);
+        let one_row = indexes.iter().any(|ix| {
+            ix.table.name == table
+                && ix.unique
+                && !ix.exclusion
+                && !ix.keys.is_empty()
+                && ix.keys.iter().all(|k| {
+                    usize::try_from(*k)
+                        .ok()
+                        .and_then(|k| k.checked_sub(1))
+                        .and_then(|i| ix.table.columns.get(i))
+                        .is_some_and(|c| fixed.contains(&c.field()))
+                })
+        });
+        let key_indexed = indexes.iter().any(|ix| {
             ix.table.name == table
                 && ix
                     .keys
@@ -1009,6 +1052,8 @@ impl PgHandler {
         });
         Some(HashSide {
             scan,
+            index,
+            one_row,
             above: width.3,
             pg_type: col.pg_type.clone(),
             stats: (nd, null_frac, mcv),
@@ -2641,6 +2686,11 @@ fn with_in_lengths(mut quals: Vec<(String, costsize::Qual)>) -> Vec<(String, cos
 /// the table's tuples.
 struct HashSide {
     scan: Estimate,
+    /// The index the scan reads, when it is an Index Scan (RP-369).
+    index: Option<String>,
+    /// Its WHERE fixes a unique index's columns: at most one row, so a
+    /// join with it inner is `inner_unique` (RP-369).
+    one_row: bool,
     above: i64,
     pg_type: String,
     stats: (f64, f64, Vec<(Vec<u8>, f32)>),
@@ -2674,7 +2724,7 @@ fn hash_join_of(
     b: HashSide,
     left_join: bool,
     redundant: bool,
-) -> Option<(Estimate, Estimate, Estimate, JoinPick)> {
+) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     if a.pg_type != b.pg_type {
         return None;
@@ -2708,12 +2758,23 @@ fn hash_join_of(
         width: Some(s.scan.3),
         extra: joincost::ExtraKeys::default(),
     };
-    let (outer, inner) = (join_side(&a), join_side(&b));
     // A side unique on the key is `inner_unique` when hashed, and
     // PostgreSQL may then prefer another plan; not modelled here.
-    if outer.unique || inner.unique {
+    if a.unique || b.unique {
         return None;
     }
+    // A side its own WHERE cuts to one row is `inner_unique` as the inner
+    // side of any path (RP-369): `unique` is read only on the inner one.
+    let (outer, inner) = (
+        JoinSide {
+            unique: a.one_row,
+            ..join_side(&a)
+        },
+        JoinSide {
+            unique: b.one_row,
+            ..join_side(&b)
+        },
+    );
     let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &kb);
     // PostgreSQL builds the path hashing the right relation first
     // (`add_paths_to_joinrel` with the left one outer) and then the
@@ -2833,17 +2894,39 @@ fn hash_join_of(
             best
         }
     })?;
+    // `match_unsorted_outer`'s nested loops are paths too, each pair
+    // paying the join clause (`cpu_operator_cost` for its `=`). Over two
+    // whole sequential scans they never come near; a side an index scan
+    // cuts to a few rows (RP-369) can. Where one wins, or comes within
+    // the fuzz factor, the plan is not this one: not priced.
+    // The semi-join factors of an `inner_unique` inner side, as the hash
+    // path's (`compute_semi_anti_join_factors` over the join clause).
+    let semi = |s: &HashSide| s.one_row.then(|| (selectivity, s.scan.2.max(1.0)));
+    let nest = joincost::cheapest_nest_loop_semi(
+        a.scan,
+        b.scan,
+        costsize::CPU_OPERATOR_COST,
+        [semi(&a), semi(&b)],
+    );
+    if nest.total <= t0 * 1.01 {
+        return None;
+    }
     let b_first = matches!(
         pick,
         JoinPick::Hash { swap: true } | JoinPick::Merge { b_outer: true, .. }
     );
-    let (o, i) = if b_first {
-        (b.scan, a.scan)
+    let (o, i, indexes) = if b_first {
+        (b.scan, a.scan, [b.index, a.index])
     } else {
-        (a.scan, b.scan)
+        (a.scan, b.scan, [a.index, b.index])
     };
-    Some((o, i, (s0, t0, rows, width), pick))
+    Some((o, i, (s0, t0, rows, width), pick, indexes))
 }
+
+/// A priced two-table join: the printed outer scan's, the inner scan's and
+/// the join's estimates, the path, and the index each scan reads (outer,
+/// inner), `None` for a Seq Scan (RP-369).
+pub(crate) type JoinEstimate = (Estimate, Estimate, Estimate, JoinPick, [Option<String>; 2]);
 
 /// The path a priced two-table join takes (RP-330 to RP-366): a hash join,
 /// the left table hashed with `swap`; or a merge join of both sorted
