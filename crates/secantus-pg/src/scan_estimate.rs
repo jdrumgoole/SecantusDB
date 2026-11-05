@@ -526,28 +526,32 @@ impl PgHandler {
         else {
             return None;
         };
-        let [(left_key, right_key)] = equi.as_slice() else {
-            return None;
-        };
-        // The join clause is an ON's, or -- a comma join, `FROM e, k WHERE
-        // e.b = k.b` -- the WHERE's one conjunct over both tables, that
-        // same equality: PostgreSQL makes an inner join's WHERE and ON
+        let ((left_key, right_key), rest) = equi.split_first()?;
+        // The join clauses are an ON's, or -- a comma join, `FROM e, k
+        // WHERE e.b = k.b` -- the WHERE's conjuncts over both tables, those
+        // same equalities: PostgreSQL makes an inner join's WHERE and ON
         // quals one list (`deconstruct_jointree`), so both plan alike
-        // (RP-372). Any other conjunct over both tables stays unpriced.
+        // (RP-372; several equalities, RP-374). Any other conjunct over
+        // both tables stays unpriced.
+        let same_pair = |(l, r): &(String, String)| {
+            equi.iter()
+                .any(|(a, b)| (l == a && r == b) || (l == b && r == a))
+        };
         let comma_clause = on.is_none()
             && j.where_spans_equality
-            && j.where_filters.len() == 1
-            && j.where_span_aliases.len() == 1
-            && matches!(j.where_equalities.as_slice(), [(l, r)]
-                if (l == left_key && r == right_key) || (l == right_key && r == left_key));
+            && j.where_filters.len() == equi.len()
+            && j.where_span_aliases.len() == equi.len()
+            && j.where_equalities.len() == equi.len()
+            && j.where_equalities.iter().all(same_pair);
         if !comma_clause && (on.is_none() || !j.where_filters.is_empty() || j.where_spans_equality)
         {
             return None;
         }
-        // The executor re-checks a comma join's equality above the join as
-        // the select's residual; that is the join clause, not a filter.
+        // The executor re-checks a comma join's equalities above the join
+        // as the select's residual; those are the join clauses, not a
+        // filter.
         if let Some(residual) = &sel.residual {
-            if !comma_clause || !is_key_equality(residual, left_key, right_key) {
+            if !comma_clause || !is_key_equality(residual, equi) {
                 return None;
             }
         }
@@ -653,7 +657,11 @@ impl PgHandler {
         };
         let a = side(left, left_key)?;
         let b = side(right, right_key)?;
-        hash_join_of(a, b, false, false)
+        let more: Vec<(HashSide, HashSide)> = rest
+            .iter()
+            .map(|(l, r)| Some((side(left, l)?, side(right, r)?)))
+            .collect::<Option<_>>()?;
+        hash_join_of(a, b, &more, false, false)
     }
 
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
@@ -740,7 +748,7 @@ impl PgHandler {
         if j.left.1 == j.right.1 {
             return None;
         }
-        hash_join_of(side(&j.left)?, side(&j.right)?, left_join, redundant)
+        hash_join_of(side(&j.left)?, side(&j.right)?, &[], left_join, redundant)
     }
 
     /// [`Self::nest_loop_estimate`] for a cross join planned on the narrow
@@ -2736,16 +2744,28 @@ struct HashSide {
 /// constant already enforces on both sides, so its selectivity is 1
 /// (`clause_selectivity` of a clause whose `norm_selec` is above 1,
 /// RP-364).
+/// `more` holds the further equality clauses of a join on several (RP-374),
+/// each as its two sides' key columns (`a`'s, `b`'s): `cost_hashjoin`
+/// multiplies the clauses' selectivities (`clauselist_selectivity`), pays
+/// each clause per built and per probed row, and buckets on the smallest
+/// of their `estimate_hash_bucket_stats`; a side is `inner_unique` where
+/// any one of its keys is unique.
 fn hash_join_of(
     a: HashSide,
     b: HashSide,
+    more: &[(HashSide, HashSide)],
     left_join: bool,
     redundant: bool,
 ) -> Option<JoinEstimate> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
-    if a.pg_type != b.pg_type {
+    if a.pg_type != b.pg_type
+        || more.len() > 3
+        || more.iter().any(|(x, y)| x.pg_type != y.pg_type)
+        || (!more.is_empty() && (left_join || redundant))
+    {
         return None;
     }
+    let multi = !more.is_empty();
     fn key(s: &HashSide) -> KeyStats<'_> {
         KeyStats {
             ndistinct: s.stats.0,
@@ -2755,11 +2775,28 @@ fn hash_join_of(
         }
     }
     let (ka, kb) = (key(&a), key(&b));
-    let selectivity = if redundant {
+    let mut selectivity = if redundant {
         1.0
     } else {
         joincost::eqjoinsel_inner(&ka, &kb)
     };
+    for (x, y) in more {
+        selectivity *= joincost::eqjoinsel_inner(&key(x), &key(y));
+    }
+    let keys_a: Vec<KeyStats<'_>> = std::iter::once(key(&a))
+        .chain(more.iter().map(|(x, _)| key(x)))
+        .collect();
+    let keys_b: Vec<KeyStats<'_>> = std::iter::once(key(&b))
+        .chain(more.iter().map(|(_, y)| key(y)))
+        .collect();
+    let extra = joincost::ExtraKeys {
+        n: more.len(),
+        ..joincost::ExtraKeys::default()
+    };
+    // `innerrel_is_unique` over the join's clauses: one of them on a
+    // unique column of the side makes it `inner_unique` when hashed.
+    let unique_a = multi && (a.unique || more.iter().any(|(x, _)| x.unique));
+    let unique_b = multi && (b.unique || more.iter().any(|(_, y)| y.unique));
     let join_side = |s: &HashSide| JoinSide {
         rows: s.scan.2,
         tuples: s.tuples,
@@ -2773,26 +2810,26 @@ fn hash_join_of(
         key_ops: 0.0,
         rel_rows: s.scan.2,
         width: Some(s.scan.3),
-        extra: joincost::ExtraKeys::default(),
+        extra,
     };
-    // A side unique on the key is `inner_unique` when hashed, and
+    // A side unique on its one key is `inner_unique` when hashed, and
     // PostgreSQL may then prefer another plan; not modelled here.
-    if a.unique || b.unique {
+    if !multi && (a.unique || b.unique) {
         return None;
     }
     // A side its own WHERE cuts to one row is `inner_unique` as the inner
     // side of any path (RP-369): `unique` is read only on the inner one.
     let (outer, inner) = (
         JoinSide {
-            unique: a.one_row,
+            unique: a.one_row || unique_a,
             ..join_side(&a)
         },
         JoinSide {
-            unique: b.one_row,
+            unique: b.one_row || unique_b,
             ..join_side(&b)
         },
     );
-    let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &kb);
+    let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &keys_b);
     // PostgreSQL builds the path hashing the right relation first
     // (`add_paths_to_joinrel` with the left one outer) and then the
     // other way round; `add_path` keeps the second only when it is
@@ -2800,7 +2837,7 @@ fn hash_join_of(
     // 1.01), and `set_cheapest` then takes the cheaper total. The
     // plan printed follows it: with `swap`, the left table hashed
     // (RP-359).
-    let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
+    let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &keys_a);
     let mut rows = outer.rows * inner.rows * selectivity;
     if left_join {
         rows = rows.max(outer.rows);
@@ -2811,7 +2848,9 @@ fn hash_join_of(
     // clause's tuples `approx_tuple_count`'s (the hash join's too). Not
     // where a redundant clause is the only one (its merge is not
     // modelled), nor where an index leads with a key (a presorted input).
-    let merges = if redundant || a.key_indexed || b.key_indexed {
+    // A merge on several clauses sorts on all their keys, whose
+    // `mergejoinscansel` and sort are not modelled: it is not compared.
+    let merges = if redundant || multi || a.key_indexed || b.key_indexed {
         None
     } else {
         fn column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
@@ -2918,12 +2957,14 @@ fn hash_join_of(
     // the fuzz factor, the plan is not this one: not priced.
     // The semi-join factors of an `inner_unique` inner side, as the hash
     // path's (`compute_semi_anti_join_factors` over the join clause).
-    let semi = |s: &HashSide| s.one_row.then(|| (selectivity, s.scan.2.max(1.0)));
+    let semi = |s: &HashSide, unique: bool| {
+        (s.one_row || unique).then(|| (selectivity, s.scan.2.max(1.0)))
+    };
     let nest = joincost::cheapest_nest_loop_semi(
         a.scan,
         b.scan,
-        costsize::CPU_OPERATOR_COST,
-        [semi(&a), semi(&b)],
+        costsize::CPU_OPERATOR_COST * (1.0 + more.len() as f64),
+        [semi(&a, unique_a), semi(&b, unique_b)],
     );
     if nest.total <= t0 * 1.01 {
         return None;
@@ -2983,7 +3024,7 @@ fn filter_names(filter: &Document, field: &str) -> bool {
 /// `residual` is the equality `left = right` of two joined keys, either
 /// way round, and nothing else: the select-level re-check of a comma
 /// join's clause (RP-372).
-fn is_key_equality(residual: &secantus_pgplan::ColumnExpr, left: &str, right: &str) -> bool {
+fn is_key_equality(residual: &secantus_pgplan::ColumnExpr, pairs: &[(String, String)]) -> bool {
     use pg_query::protobuf::node::Node as N;
     let secantus_pgplan::ColumnExpr::Row {
         expr,
@@ -2994,29 +3035,54 @@ fn is_key_equality(residual: &secantus_pgplan::ColumnExpr, left: &str, right: &s
     else {
         return false;
     };
-    let Some(N::AExpr(e)) = expr.node.as_ref() else {
-        return false;
-    };
-    let op_is_eq = matches!(e.name.as_slice(), [one]
-        if matches!(one.node.as_ref(), Some(N::String(s)) if s.sval == "="));
     let param = |x: Option<&pg_query::protobuf::Node>| match x.and_then(|x| x.node.as_ref()) {
         Some(N::ParamRef(p)) => usize::try_from(p.number).ok(),
         _ => None,
-    };
-    let (Some(l), Some(r)) = (param(e.lexpr.as_deref()), param(e.rexpr.as_deref())) else {
-        return false;
     };
     let key = |n: usize| {
         n.checked_sub(1)
             .and_then(|i| fields.get(i))
             .map(|f| f.0.as_str())
     };
-    let pair = (key(l), key(r));
-    e.kind == pg_query::protobuf::AExprKind::AexprOp as i32
-        && op_is_eq
-        && params.is_empty()
-        && fields.len() == 2
-        && (pair == (Some(left), Some(right)) || pair == (Some(right), Some(left)))
+    // One `=` of two joined keys: the pair it names.
+    let equality = |node: &pg_query::protobuf::Node| -> Option<(&str, &str)> {
+        let Some(N::AExpr(e)) = node.node.as_ref() else {
+            return None;
+        };
+        let op_is_eq = matches!(e.name.as_slice(), [one]
+            if matches!(one.node.as_ref(), Some(N::String(s)) if s.sval == "="));
+        if e.kind != pg_query::protobuf::AExprKind::AexprOp as i32 || !op_is_eq {
+            return None;
+        }
+        Some((
+            key(param(e.lexpr.as_deref())?)?,
+            key(param(e.rexpr.as_deref())?)?,
+        ))
+    };
+    // The residual is the one equality, or an AND of one per pair (RP-374).
+    let found: Option<Vec<(&str, &str)>> = match expr.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == pg_query::protobuf::BoolExprType::AndExpr as i32 => {
+            b.args.iter().map(equality).collect()
+        }
+        _ => equality(expr).map(|p| vec![p]),
+    };
+    let Some(found) = found else {
+        return false;
+    };
+    let mut keys: Vec<&str> = pairs
+        .iter()
+        .flat_map(|(l, r)| [l.as_str(), r.as_str()])
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    params.is_empty()
+        && fields.len() == keys.len()
+        && found.len() == pairs.len()
+        && pairs.iter().all(|(l, r)| {
+            found.iter().any(|&(x, y)| {
+                (x, y) == (l.as_str(), r.as_str()) || (x, y) == (r.as_str(), l.as_str())
+            })
+        })
 }
 
 /// A joined rows' filter as its top-level conjuncts, each one joined-row

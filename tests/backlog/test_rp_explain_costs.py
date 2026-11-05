@@ -1353,6 +1353,18 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "a JOIN ON's two equalities": (
+        "RP-374",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b and e.a = k.a",
+        [
+            "Hash Join  (cost=30.00..50.25 rows=100 width=14)",
+            "  Hash Cond: ((e.b = k.b) AND (e.a = k.a))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "a join clause written inner side first": (
         "RP-373",
         _ANALYSED,
@@ -1793,6 +1805,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-371",
         "RP-372",
         "RP-373",
+        "RP-374",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

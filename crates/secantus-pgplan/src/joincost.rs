@@ -343,7 +343,7 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
 /// the hash clause passes (`final_cost_hashjoin`'s `qp_qual_cost` over
 /// `hashjointuples`).
 fn hash_join_qp(outer: &JoinSide, inner: &JoinSide, qp: f64) -> (f64, f64) {
-    hash_join_core(outer, inner, qp, join_selectivity(outer, inner), None)
+    hash_join_core(outer, inner, qp, join_selectivity(outer, inner), &[])
 }
 
 /// One join key's statistics as `eqjoinsel` and
@@ -431,17 +431,19 @@ pub fn eqjoinsel_inner(k1: &KeyStats<'_>, k2: &KeyStats<'_>) -> f64 {
     }
 }
 
-/// A hash join with `inner` hashed whose clause's selectivity is `sel`
-/// and whose inner key's statistics are `inner_key`
-/// (`estimate_hash_bucket_stats` with the column's null fraction and its
-/// first MCV's frequency, RP-330): `(startup, total)`.
+/// A hash join with `inner` hashed whose clauses' selectivity is `sel`
+/// and whose inner keys' statistics are `inner_keys`, one per hash clause
+/// in clause order (`estimate_hash_bucket_stats` with each column's null
+/// fraction and its first MCV's frequency, RP-330; several clauses,
+/// RP-374): `(startup, total)`. The sides' `extra.n` must be one less than
+/// the clauses.
 pub fn hash_join_stats(
     outer: &JoinSide,
     inner: &JoinSide,
     sel: f64,
-    inner_key: &KeyStats<'_>,
+    inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
-    hash_join_core(outer, inner, 0.0, sel, Some(inner_key))
+    hash_join_core(outer, inner, 0.0, sel, inner_keys)
 }
 
 fn hash_join_core(
@@ -449,15 +451,18 @@ fn hash_join_core(
     inner: &JoinSide,
     qp: f64,
     sel: f64,
-    inner_key: Option<&KeyStats<'_>>,
+    inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
     let mut run = outer.scan.1 - outer.scan.0;
-    startup += (CPU_OPERATOR_COST + CPU_TUPLE_COST) * inner.rows;
+    // `initial_cost_hashjoin`: each hash clause is evaluated once per
+    // inner row to build and once per outer row to probe (RP-374).
+    let clauses = 1.0 + outer.extra.n as f64;
+    startup += (CPU_OPERATOR_COST * clauses + CPU_TUPLE_COST) * inner.rows;
     // PostgreSQL on arm64 contracts `run_cost += a * b` into a fused
     // multiply-add (`initial_cost_hashjoin`, `final_cost_hashjoin`), which
     // decides the last printed digit (RP-364).
-    run = CPU_OPERATOR_COST.mul_add(outer.rows, run);
+    run = (CPU_OPERATOR_COST * clauses).mul_add(outer.rows, run);
     // ExecChooseHashTableSize; a side whose width is not known is priced
     // as one batch of a power of two at least the rows, at least 1,024.
     let (nbuckets, nbatch) = match inner.width {
@@ -496,12 +501,25 @@ fn hash_join_core(
         };
         f.clamp(1.0e-6, 1.0)
     };
-    let mut bucketsize = match inner_key {
-        // `estimate_hash_bucket_stats` with statistics: a bucket's
-        // fraction scaled up by how much more common the first MCV is
-        // than the average value; and `final_cost_hashjoin` disables a
-        // hash join whose most common value alone overflows `hash_mem`.
-        Some(k) => {
+    let bucketsize = if inner_keys.is_empty() {
+        let mut b = bucket_of(inner.ndistinct, inner.default_ndistinct);
+        for i in 0..inner.extra.n {
+            b = b.min(bucket_of(
+                inner.extra.ndistinct[i],
+                inner.extra.default_ndistinct[i],
+            ));
+        }
+        b
+    } else {
+        // `estimate_hash_bucket_stats` with statistics, per hash clause: a
+        // bucket's fraction scaled up by how much more common the first
+        // MCV is than the average value. `final_cost_hashjoin` keeps the
+        // smallest bucket fraction and the smallest MCV frequency of the
+        // clauses, and disables a hash join whose most common value alone
+        // overflows `hash_mem` (RP-374).
+        let mut bucket = 1.0_f64;
+        let mut mcv_min = 1.0_f64;
+        for k in inner_keys {
             let mut f = bucket_of(k.ndistinct, k.default_ndistinct);
             let mcv_freq = k.mcv.first().map_or(0.0, |m| f64::from(m.1));
             if !k.default_ndistinct {
@@ -513,21 +531,16 @@ fn hash_join_core(
                     f = (f * mcv_freq / avgfreq).clamp(1.0e-6, 1.0);
                 }
             }
-            let mcv_rows = clamp_row_est(inner.rows * mcv_freq);
-            let bytes = mcv_rows * (maxalign(inner.width.unwrap_or(0).max(0) as u64) + 24) as f64;
-            if bytes > HASH_MEM_BYTES as f64 {
-                startup += DISABLE_COST;
-            }
-            f
+            bucket = bucket.min(f);
+            mcv_min = mcv_min.min(mcv_freq);
         }
-        None => bucket_of(inner.ndistinct, inner.default_ndistinct),
+        let mcv_rows = clamp_row_est(inner.rows * mcv_min);
+        let bytes = mcv_rows * (maxalign(inner.width.unwrap_or(0).max(0) as u64) + 24) as f64;
+        if bytes > HASH_MEM_BYTES as f64 {
+            startup += DISABLE_COST;
+        }
+        bucket
     };
-    for i in 0..inner.extra.n {
-        bucketsize = bucketsize.min(bucket_of(
-            inner.extra.ndistinct[i],
-            inner.extra.default_ndistinct[i],
-        ));
-    }
     let tuples = if inner.unique {
         let match_frac = sel;
         let match_count = (sel * inner.rows / sel).max(1.0);
@@ -2476,6 +2489,50 @@ pub fn limit_choice(paths: &[JoinChoice], rows: f64, count: f64, offset: f64) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `cost_hashjoin` on two clauses (RP-374): each clause is paid per
+    /// built and per probed row, and the bucket is the smaller clause's.
+    /// Over two 1,000-row scans costing 15 each, joined on a ten-valued
+    /// column and on one unique to the hashed side (`inner_unique`, the
+    /// clauses' selectivity 0.1 x 0.001), PostgreSQL 15.19 prints
+    /// `Hash Join (cost=30.00..50.25 rows=100 width=14)`.
+    #[test]
+    fn a_hash_join_on_two_clauses_pays_each_and_buckets_on_the_smaller() {
+        let mcv: Vec<(Vec<u8>, f32)> = (0..10).map(|v| (vec![v], 0.1f32)).collect();
+        let b = KeyStats {
+            ndistinct: 10.0,
+            default_ndistinct: false,
+            null_frac: 0.0,
+            mcv: &mcv,
+        };
+        let a = KeyStats {
+            ndistinct: 1000.0,
+            default_ndistinct: false,
+            null_frac: 0.0,
+            mcv: &[],
+        };
+        let side = |unique: bool| JoinSide {
+            rows: 1000.0,
+            tuples: 1000.0,
+            scan: (0.0, 15.0),
+            startup_scan: (0.0, 15.0),
+            ordered: None,
+            scan_ordered: false,
+            unique,
+            ndistinct: 10.0,
+            default_ndistinct: false,
+            key_ops: 0.0,
+            rel_rows: 1000.0,
+            width: Some(7),
+            extra: ExtraKeys {
+                n: 1,
+                ..ExtraKeys::default()
+            },
+        };
+        let (startup, total) = hash_join_stats(&side(false), &side(true), 0.1 * 0.001, &[b, a]);
+        assert!((startup - 30.0).abs() < 1e-9, "{startup}");
+        assert!((total - 50.25).abs() < 1e-9, "{total}");
+    }
 
     /// `mergejoinscansel` (RP-366): over two integer columns whose values
     /// are all most common values, the left `1..=10` and the right

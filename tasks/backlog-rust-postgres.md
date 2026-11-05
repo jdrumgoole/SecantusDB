@@ -1405,17 +1405,6 @@ a regression test.
       (found while working RP-369; split from RP-371).
       Backlog-ID: RP-376
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a key fixed by a constant over an index-scan side]
-- [ ] **EXPLAIN of a hash join on two or more equalities is unpriced.**
-      `explain select * from e, k where e.b = k.b and e.a = k.a` (or the
-      same as `JOIN ... ON`) prints `Hash Cond: ((e.b = k.b) AND (e.a =
-      k.a))` with zeros, where PostgreSQL 15.19 prints `Hash Join
-      (cost=30.00..50.25 rows=100 width=14)` and the sides' Seq Scan
-      costs: `hash_join_estimate` takes a single key only, where
-      `cost_hashjoin` multiplies the clauses' selectivities and buckets
-      on the first's statistics. Measured on a private 15.19 cluster
-      (found while working RP-372).
-      Backlog-ID: RP-374
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a comma join's two equalities]
 - [ ] **EXPLAIN puts a join's inequality into its `Hash Cond`.** `explain
       select * from e join k on e.b = k.b and e.a < k.a` prints `Hash
       Cond: ((e.b = k.b) AND (e.a < k.a))` with zeros (the comma form,
