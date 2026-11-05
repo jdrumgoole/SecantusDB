@@ -1304,7 +1304,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     "a key fixed by a constant over an index-scan side": (
-        "RP-371",
+        "RP-376",
         _ANALYSED,
         "explain select * from e join k on e.b = k.b where k.a = 5 and k.b = 'v5'",
         [
@@ -1790,6 +1790,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-368",
         "RP-369",
         "RP-370",
+        "RP-371",
         "RP-372",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

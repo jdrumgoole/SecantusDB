@@ -475,11 +475,15 @@ fn index_scan_loops(
             .filter(|(f, q)| f != &index.field || !q.indexable())
             .map(|(_, q)| q)
     };
-    let qs = qual_startup(others());
-    Some((
-        startup + qs,
-        index_total + qs + io + (CPU_TUPLE_COST + qual_cost(others())) * tuples_fetched,
-    ))
+    // Summed in `cost_index`'s order: the index's run cost, then the heap
+    // I/O, then the per-tuple CPU, onto the startup -- floating point, so
+    // the order moves the last digit EXPLAIN prints (RP-371: `8.345` is
+    // `8.35` this way and `8.34` adding onto the index's total).
+    let startup_cost = startup + qual_startup(others());
+    let mut run_cost = index_total - startup;
+    run_cost += io;
+    run_cost += (CPU_TUPLE_COST + qual_cost(others())) * tuples_fetched;
+    Some((startup_cost, startup_cost + run_cost))
 }
 
 /// A scan of `index` inside a nested loop, parameterized by the outer row:
@@ -1292,6 +1296,31 @@ mod tests {
     /// widths). `where val2 = 1`: Bitmap Index Scan (0.00..4.31 rows=33),
     /// Bitmap Heap Scan (4.32..55.10); `where val2 = 1 and id = 10`: Index
     /// Scan (0.14..8.16 rows=1).
+    /// `explain select * from k where a < 5` over 1,000 analysed rows of
+    /// `(a int primary key, b text)` on PostgreSQL 15.19: `Index Scan using
+    /// k_pkey on k (cost=0.28..8.35 rows=4 width=7)`. The total is 8.345 to
+    /// the last bits, so it prints 8.35 only summed in `cost_index`'s order
+    /// (RP-371); added onto the index's total it is 8.3449... and prints
+    /// 8.34.
+    #[test]
+    fn an_index_scan_sums_its_costs_in_cost_index_order() {
+        let rel = Rel {
+            pages: 5.0,
+            tuples: 1000.0,
+        };
+        let ix = Index {
+            field: "a".into(),
+            columns: vec!["a".into()],
+            pages: 5.0,
+            height: 1,
+            correlation: 1.0,
+            ..pkey()
+        };
+        let quals = q(bson::doc! {"a": {"$lt": 5}});
+        let (s, t) = index_scan_cost(&rel, &ix, &quals, ColSel::Given(0.004)).unwrap();
+        assert_eq!(format!("{s:.2}..{t:.2}"), "0.28..8.35");
+    }
+
     #[test]
     fn a_partial_index_costs_as_postgres_does() {
         let rel = Rel {

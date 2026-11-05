@@ -1387,27 +1387,24 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN of a join whose side an index could serve is unpriced,
-      except an equality.** Since RP-369 a two-table hash or merge join
-      whose WHERE fixes a column of the side's index to a constant prices
-      that side's `Index Scan` (`cost_index`, `inner_unique` when the
-      constant fixes a unique index). Still zeros: a range on the index's
-      column, whose ends `get_actual_variable_range` reads from the index
-      (`explain select * from e join k on e.b = k.b where k.a < 5` is, on
-      PostgreSQL 15.19, `Hash Join (cost=8.40..34.90 rows=400 width=14)`
-      over a Hash of `Index Scan using k_pkey on k (cost=0.28..8.35 rows=4
-      width=7)` with `Index Cond: (a < 5)`; here a `Seq Scan` with a
-      Filter); a WHERE that also fixes the join key, which leaves no join
-      clause (RP-363's Nested Loop), over a table with an index: `where
-      k.a = 5 and k.b = 'v5'` is `Nested Loop (cost=0.28..26.79 rows=100
-      width=14)` over the Index Scan with `Index Cond: (a = 5)` and
-      `Filter: (b = 'v5'::text)`, where this server prints a `Hash Join`;
-      a join key a B-tree leads with, which a merge can read presorted,
-      without a Sort; and the parameterized inner index scan of a nested
-      loop (see RP-354). Measured on a private 15.19 cluster (found while
-      working RP-369).
-      Backlog-ID: RP-371
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join whose index-scan side reads a key range], tests/backlog/test_rp_explain_costs.py::test_plan[a key fixed by a constant over an index-scan side]
+- [ ] **EXPLAIN of a join whose WHERE fixes the join key, over a table
+      with an index, is unpriced.** Since RP-369 and RP-371 a two-table
+      hash or merge join prices a side's `Index Scan` under an equality or
+      a range on the index's column. Still zeros: a WHERE that also fixes
+      the join key, which leaves no join clause (RP-363's Nested Loop),
+      over a table with an index: `explain select * from e join k on e.b
+      = k.b where k.a = 5 and k.b = 'v5'` is, on PostgreSQL 15.19,
+      `Nested Loop (cost=0.28..26.79 rows=100 width=14)` over the Index
+      Scan with `Index Cond: (a = 5)` and `Filter: (b = 'v5'::text)`,
+      where this server prints a `Hash Join`. Such a join is planned as
+      joined rows, not on the narrow two-table path RP-363 prices, and
+      `hash_join_estimate` refuses a side filter that names the join key.
+      Also open: a join key a B-tree leads with, which a merge can read
+      presorted, without a Sort; and the parameterized inner index scan
+      of a nested loop (see RP-354). Measured on a private 15.19 cluster
+      (found while working RP-369; split from RP-371).
+      Backlog-ID: RP-376
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a key fixed by a constant over an index-scan side]
 - [ ] **EXPLAIN prints a join clause written inner side first as
       written.** `explain select * from e join k on k.b = e.b` (or `from
       e, k where k.b = e.b`) prints `Hash Cond: (k.b = e.b)`, where
