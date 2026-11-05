@@ -204,33 +204,32 @@ SCENARIOS: dict[str, list[str]] = {
     ],
 }
 
+# A built-in catalog's first scan in a session builds its descriptors and
+# reads its planner statistics; the reg* input functions look a name up,
+# and an operator's oid scan meets its casts and types (RP-316).
+FIRST_READS = "a built-in catalog's first reads"
+FIRST_READS_STEPS: list[str] = [
+    "a|",
+    "mark",
+    "a|select count(*) from pg_am",
+    "mark",
+    "a|select 'int4'::regtype::oid",
+    "mark",
+    "a|select oprname from pg_operator where oid = 96",
+    "mark",
+    "a|select 'pg_class'::regclass::oid",
+    "mark",
+    "a|select 'now'::text::regproc::oid",
+    "mark",
+    "a|select count(*) from pg_namespace",
+    "mark",
+    "a|select 'pg_catalog'::regnamespace::oid",
+    "mark",
+]
+
 # The open items' gap tests: what PostgreSQL 15.19 reads for statements
 # this model does not walk.
 GAPS: dict[str, tuple[str, list[str]]] = {
-    # A built-in catalog's first scan in a session builds its descriptors
-    # and reads its planner statistics; the reg* input functions look a
-    # name up, and an operator's oid scan meets its casts and types.
-    "a built-in catalog's first reads": (
-        "RP-316",
-        [
-            "a|",
-            "mark",
-            "a|select count(*) from pg_am",
-            "mark",
-            "a|select 'int4'::regtype::oid",
-            "mark",
-            "a|select oprname from pg_operator where oid = 96",
-            "mark",
-            "a|select 'pg_class'::regclass::oid",
-            "mark",
-            "a|select 'now'::text::regproc::oid",
-            "mark",
-            "a|select count(*) from pg_namespace",
-            "mark",
-            "a|select 'pg_catalog'::regnamespace::oid",
-            "mark",
-        ],
-    ),
     # ALTER TABLE's own reads: the target's descriptor and indexes, the
     # event trigger cache, pg_depend and friends for DROP COLUMN.
     "an ALTER TABLE's own catalog reads": (
@@ -1512,13 +1511,28 @@ TYPE_AND_PROC_LOOKUPS = ("pg_type_oid_index", "pg_proc_oid_index")
 def test_a_catalog_scans_types_and_an_io_coercions_functions(rust_pg: Any) -> None:
     """RP-316 (slice): a scan under an aggregate looked up none of its row's
     column types, and an I/O coercion's folding fetched no functions."""
-    name = "a built-in catalog's first reads"
-    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][1]})[name]
+    name = FIRST_READS
+    got = catalog_reads(_dsn(rust_pg), {name: FIRST_READS_STEPS})[name]
 
     def only(segments: list[dict[str, list[int]]]) -> list[dict[str, list[int]]]:
         return [{k: v for k, v in seg.items() if k in TYPE_AND_PROC_LOOKUPS} for seg in segments]
 
     assert only(got) == only(EXPECTED_GAPS[name])
+
+
+@pytest.mark.backlog_fixed("RP-316")
+def test_a_built_in_catalogs_first_reads(rust_pg: Any) -> None:
+    """RP-316: a new session's first reads of a built-in catalog were not
+    PostgreSQL's -- `pg_am`'s two indexes were taken as held by the init
+    file (`CatalogCacheInitializeCache` never opens them, as `touch_index`
+    is false for `AMOID` / `AMNAME`); a `count(*)`, which an index-only
+    scan of any B-tree can answer, read no index's leading-column
+    statistics for `btcostestimate`; and an implicit coercion took the
+    I/O path to a string type, which `find_coercion_pathway` allows only
+    from `COERCION_ASSIGNMENT`, so `oid = 96` checked three operator
+    candidates' right side PostgreSQL rejects on the left."""
+    got = catalog_reads(_dsn(rust_pg), {FIRST_READS: FIRST_READS_STEPS})[FIRST_READS]
+    assert got == EXPECTED_GAPS[FIRST_READS]
 
 
 def catalog_blocks(dsn: str) -> list[dict[str, int]]:

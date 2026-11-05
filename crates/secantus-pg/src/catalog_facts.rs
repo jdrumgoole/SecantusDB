@@ -172,6 +172,14 @@ const IN_INIT_FILE: &[i64] = &[
     3592, 2701, 2671, 3593,
 ];
 
+/// The two indexes `RelationSupportsSysCache` names that the init file
+/// does not hold: `CatalogCacheInitializeCache` opens a cache's index only
+/// when `touch_index`, which is false for `AMOID` and `AMNAME` (their
+/// catcaches scan `pg_am` sequentially), so `InitCatalogCachePhase2`
+/// never builds `pg_am_name_index` or `pg_am_oid_index` and a backend's
+/// first plan over `pg_am` builds both.
+const NOT_IN_INIT_FILE: &[i64] = &[2651, 2652];
+
 /// The catalogs `initdb` leaves empty in PostgreSQL 15.19, so its VACUUM
 /// leaves them `relpages` 0 and its ANALYZE gives them no statistics.
 const EMPTY_AT_INITDB: &[&str] = &[
@@ -421,7 +429,7 @@ fn load() -> Builtin {
             shared: *shared == "1",
             relam: relam.parse().unwrap_or(0),
             tablespace: tablespace.parse().unwrap_or(0),
-            in_init_file: in_init.contains(&oid),
+            in_init_file: in_init.contains(&oid) && !NOT_IN_INIT_FILE.contains(&oid),
             analyzed,
             has_stats: analyzed && *relname != "pg_statistic",
         };
@@ -479,6 +487,10 @@ mod tests {
         let class = &b.relations[&1259];
         assert!(class.in_init_file && class.analyzed);
         assert!(!b.relations[&2678].in_init_file);
+        // `pg_am`'s indexes: named by `RelationSupportsSysCache`, never
+        // opened by `CatalogCacheInitializeCache` (RP-316).
+        assert!(b.relations[&2601].in_init_file);
+        assert!(!b.relations[&2651].in_init_file && !b.relations[&2652].in_init_file);
         assert_eq!(b.indexes_of.get(&1259).map(Vec::len), Some(3));
         assert!(is_shared_relation(1262) && !is_shared_relation(1259));
     }
