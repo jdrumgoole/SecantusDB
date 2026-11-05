@@ -1402,19 +1402,6 @@ a regression test.
       (found while working RP-372).
       Backlog-ID: RP-375
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's equality with an inequality beside it]
-- [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
-      index path.** Over an analysed table PostgreSQL 15.19's
-      `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`
-      (the key's Index Cond and a Filter), for a range on the key
-      (`a < 3`) and for a composite index's leading column, and a Bitmap
-      Heap Scan over a secondary index (`n_b`, 100 of 5,000 rows); here
-      the node is what the storage planner chose -- a `Seq Scan` printed
-      with the sequential scan's cost. RP-317 prices the Index Scan when
-      the storage planner already chose it; the node choice itself is
-      PostgreSQL's cost comparison (found while working RP-317, measured
-      on a fresh private cluster).
-      Backlog-ID: RP-339
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an index scan with a filter]
 
 ## Found by batch 54 (2026-10-24)
 

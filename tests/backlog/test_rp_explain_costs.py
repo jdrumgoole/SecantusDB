@@ -1500,7 +1500,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain select 1 + 2, a from e",
         ["Seq Scan on e  (cost=0.00..15.00 rows=1000 width=8)"],
     ),
-    # ---------------------- RP-339 a user table's index path, chosen
+    # ------------- RP-339 a user table's index path, chosen (fixed)
     "an index scan with a filter": (
         "RP-339",
         _ANALYSED,
@@ -1779,6 +1779,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-335",
         "RP-337",
         "RP-338",
+        "RP-339",
         "RP-340",
         "RP-341",
         "RP-342",
