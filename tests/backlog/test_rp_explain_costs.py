@@ -1018,8 +1018,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a > e.a)",
         ],
     ),
+    # Split from RP-354 and fixed: a JOIN ... ON's conjuncts are the join's
+    # clauses, and a `<>` cannot be an indexed side's Index Cond, so an
+    # indexed table's plain Seq Scan is the inner PostgreSQL weighs.
     "nested loop on an ON's inequality": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e join k on e.a <> k.a",
         [
@@ -1044,8 +1047,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    # Split from RP-354 and fixed: a LEFT join's nested loop keeps its
+    # nullable side inner, and its rows are never fewer than the outer's.
     "nested loop left join": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a < e2.a",
         [
@@ -1054,6 +1059,45 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
             "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # A LEFT join's ON conjunct over its outer side alone stays a join
+    # filter, estimated from that column's statistics.
+    "nested loop left join with a one-sided ON conjunct": (
+        "RP-354",
+        _ANALYSED,
+        "explain select * from e left join e e2 on e.a <> e2.a and e.a > 990",
+        [
+            "Nested Loop Left Join  (cost=0.00..17532.50 rows=9990 width=14)",
+            "  Join Filter: ((e.a <> e2.a) AND (e.a > 990))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e e2  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # The cheaper order would put e outer; a LEFT join cannot.
+    "nested loop left join, the smaller side outer": (
+        "RP-329",
+        _ANALYSED_SMALL,
+        "explain select * from zs left join e on e.a < zs.a",
+        [
+            "Nested Loop Left Join  (cost=0.00..168.60 rows=3333 width=13)",
+            "  Join Filter: (e.a < zs.a)",
+            "  ->  Seq Scan on zs  (cost=0.00..1.10 rows=10 width=6)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "nested loop left join into a primary key's table": (
+        "RP-329",
+        _ANALYSED,
+        "explain select k.a from e left join k on e.a <> k.a",
+        [
+            "Nested Loop Left Join  (cost=0.00..15032.50 rows=999000 width=4)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Materialize  (cost=0.00..20.00 rows=1000 width=4)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=4)",
         ],
     ),
     "hash join": (

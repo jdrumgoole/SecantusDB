@@ -405,17 +405,15 @@ impl PgHandler {
             || ((!sel.filter.is_empty() || sel.residual.is_some()) && !j.where_modelled)
             || j.where_spans_equality
             || j.where_span_aliases.len() != j.where_filters.len()
-            || j.where_filters
-                .iter()
-                .any(|f| !matches!(f.kind, FilterKind::Inequality | FilterKind::NotEqual(..)))
         {
             return None;
         }
         let JoinNode::Join {
-            kind: JoinKind::Inner,
+            kind,
             left,
             right,
-            on: None,
+            on,
+            on_filters,
             equi,
             merged,
             expr_keys,
@@ -427,12 +425,47 @@ impl PgHandler {
         if !equi.is_empty() || !merged.is_empty() || !expr_keys.is_empty() {
             return None;
         }
+        // An outer join's ON is its join clause and its WHERE filters the
+        // joined rows; only a LEFT join with no WHERE is modelled (RP-354).
+        let left_join = match kind {
+            JoinKind::Inner => false,
+            JoinKind::Left => {
+                if !j.where_filters.is_empty() || !sel.filter.is_empty() || sel.residual.is_some() {
+                    return None;
+                }
+                true
+            }
+            _ => return None,
+        };
+        // The join's clauses: an ON's conjuncts (RP-354), then the
+        // WHERE's; `distribute_qual_to_rels` puts both on the join.
+        let filters: Vec<&secantus_pgplan::joins::JoinFilter> = on_filters
+            .iter()
+            .filter(|_| on.is_some())
+            .chain(j.where_filters.iter())
+            .collect();
+        // An ON conjunct reading one side only is that side's restriction
+        // (an inner join's is pushed to its scan; a LEFT join's stays a
+        // join filter, `clause_selectivity` over its statistics), which is
+        // not modelled here.
+        if filters.iter().any(|f| {
+            !matches!(f.kind, FilterKind::Inequality | FilterKind::NotEqual(..))
+                || f.aliases.len() < 2
+        }) {
+            return None;
+        }
+        // A `<`, `<=`, `>` or `>=` between the sides could be an indexed
+        // side's parameterized Index Cond (RP-354's "into an index"), which
+        // is not priced here; a `<>` never is one (no B-tree strategy).
+        let any_inequality = filters
+            .iter()
+            .any(|f| matches!(f.kind, FilterKind::Inequality));
         let indexes = self.index_relations();
         let project = j.project.as_deref();
         // Each joined key's table and field, for `neqjoinsel`.
         let mut key_columns: Vec<(String, String, String)> = Vec::new();
         let mut side = |node: &JoinNode| -> Option<(Estimate, i64)> {
-            let JoinNode::Leaf { plan, columns, .. } = node else {
+            let JoinNode::Leaf { plan, def, columns } = node else {
                 return None;
             };
             let Statement::Select(leaf) = plan.as_ref() else {
@@ -448,37 +481,44 @@ impl PgHandler {
                 || leaf.offset != 0
                 || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
                 || leaf.casts.iter().any(Option::is_some)
-                || indexes.iter().any(|ix| ix.table.name == leaf.table)
+                // An indexed table's own filter may be an index scan's, and
+                // an inequality join clause its parameterized one.
+                || (indexes.iter().any(|ix| ix.table.name == leaf.table)
+                    && (any_inequality || !leaf.filter.is_empty()))
             {
                 return None;
             }
+            // A leaf row's field as the table stores it: a primary key's
+            // column is the stored `_id`.
+            let table = self.lookup(&leaf.table)?;
+            let stored = |f: &str| -> Option<String> {
+                let c = def.columns.iter().find(|c| c.field() == f)?;
+                table.field_of(&c.name)
+            };
             let read: Vec<String> = columns
                 .iter()
                 .filter(|(key, _)| JoinRows::carries(project, key))
-                .map(|(_, f)| f.clone())
-                .collect();
+                .map(|(_, f)| stored(f))
+                .collect::<Option<_>>()?;
             let above: Vec<String> = columns
                 .iter()
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
-                .map(|(_, f)| f.clone())
-                .collect();
+                .map(|(_, f)| stored(f))
+                .collect::<Option<_>>()?;
             let (scan, None) = self.scan_estimate(&leaf.table, &leaf.filter, &read)? else {
                 return None;
             };
             let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
                 return None;
             };
-            key_columns.extend(
-                columns
-                    .iter()
-                    .map(|(key, f)| (key.clone(), leaf.table.clone(), f.clone())),
-            );
+            for (key, f) in columns {
+                key_columns.push((key.clone(), leaf.table.clone(), stored(f)?));
+            }
             Some((scan, width.3))
         };
         let (a, a_above) = side(left)?;
         let (b, b_above) = side(right)?;
-        let qual: f64 = j
-            .where_filters
+        let qual: f64 = filters
             .iter()
             .map(|f| f.ops as f64 * costsize::CPU_OPERATOR_COST)
             .sum();
@@ -487,7 +527,7 @@ impl PgHandler {
         // `eqjoinsel` over the two columns' statistics; one never
         // analysed is not modelled here.
         let mut sel_factor = 1.0_f64;
-        for f in &j.where_filters {
+        for f in &filters {
             sel_factor *= match &f.kind {
                 FilterKind::Inequality => 1.0 / 3.0,
                 FilterKind::NotEqual(l, r) => {
@@ -513,8 +553,16 @@ impl PgHandler {
                 _ => return None,
             };
         }
-        let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, qual);
-        let rows = costsize::clamp_row_est(a.2 * b.2 * sel_factor);
+        let (plan, rows) = if left_join {
+            // `calc_joinrel_size_estimate`'s JOIN_LEFT: never fewer rows
+            // than the outer side.
+            let plan = secantus_pgplan::joincost::cheapest_nest_loop_left(a, b, qual);
+            (plan, (a.2 * b.2 * sel_factor).max(a.2))
+        } else {
+            let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, qual);
+            (plan, a.2 * b.2 * sel_factor)
+        };
+        let rows = costsize::clamp_row_est(rows);
         let join = (plan.startup, plan.total, rows, a_above + b_above);
         Some((plan, a, b, join))
     }
