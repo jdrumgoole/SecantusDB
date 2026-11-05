@@ -16808,6 +16808,13 @@ impl PgHandler {
                 0,
             ))),
             ("oid", Bson::Int64(n)) => Some(Some((secantus_pgplan::colstats::int_key(*n), 0))),
+            // A `reg*` value is its oid, compared and sorted as `oid`
+            // (`oid_ops`); one held as a name that resolved to no oid is
+            // not modelled.
+            (t, v) if secantus_pgplan::regobj::is_kind(t) => {
+                let (_, oid) = secantus_pgplan::regobj::from_bson(v)?;
+                Some(Some((secantus_pgplan::colstats::int_key(oid), 0)))
+            }
             ("bool", Bson::Boolean(b)) => Some(Some((vec![u8::from(*b)], 0))),
             // `aclitemeq` compares grantee, grantor and privileges, which
             // the item's text spells out one way; `aclitem` is fixed-width.

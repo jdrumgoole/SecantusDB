@@ -7,7 +7,7 @@
 //!
 //! Only the columns whose type's equality ANALYZE models here have a row
 //! (`analyze_sample`): integers, booleans, floats, `text` / `varchar`,
-//! `char(n)`, `name` and `"char"`; a table larger than ANALYZE's sample has relation statistics
+//! `char(n)`, `name`, `"char"` and the `reg*` types; a table larger than ANALYZE's sample has relation statistics
 //! only.
 //!
 //! The built-in catalogs' rows are the ones PostgreSQL 15.19's `initdb`
@@ -50,6 +50,10 @@ pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
         "float8" => (670, 672, 0),
         "bool" => (91, 58, 0),
         "oid" => (607, 609, 0),
+        // A `reg*` type has no opclass of its own: `GetDefaultOpClass` takes
+        // `oid_ops`, as the type is binary-coercible to `oid` (so `initdb`'s
+        // rows for `pg_type.typinput` carry `oideq` and `oidlt`).
+        t if secantus_pgplan::regobj::is_kind(t) => (607, 609, 0),
         "text" | "varchar" | "character varying" => (98, 664, DEFAULT_COLLATION),
         "bpchar" | "character" => (1054, 1058, DEFAULT_COLLATION),
         "name" => (93, 660, C_COLLATION),
@@ -301,6 +305,9 @@ pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bso
     Some(match c.pg_type.trim_start_matches("pg_catalog.") {
         "int2" | "int4" => Bson::Int32(secantus_pgplan::colstats::int_of_key(key)? as i32),
         "int8" | "oid" => Bson::Int64(secantus_pgplan::colstats::int_of_key(key)?),
+        t if secantus_pgplan::regobj::is_kind(t) => {
+            secantus_pgplan::regobj::value(t, secantus_pgplan::colstats::int_of_key(key)?)
+        }
         "float4" | "float8" => {
             Bson::Double(f64::from_bits(u64::from_be_bytes(key.try_into().ok()?)))
         }
