@@ -3561,6 +3561,10 @@ pub struct ExplainOptions {
     pub scan_array_quals: Option<Vec<ArrayQual>>,
     /// Each JOIN's ON condition, post-order, as its join node prints it.
     pub join_conds: Vec<String>,
+    /// Each of `join_conds` as a hash or merge join prints it when the ON
+    /// mixes join-key equalities with other conjuncts: `(Hash Cond, Join
+    /// Filter)` (RP-375); `None` otherwise.
+    pub join_cond_splits: Vec<Option<(String, String)>>,
     /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
     /// it filters (`None`: the top join's filter) and the column an index
     /// scan there could take it on (RP-369).
@@ -9978,6 +9982,7 @@ fn plan_explain(
         scan_array_quals: None,
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
+        join_cond_splits: Vec::new(),
         join_where: Vec::new(),
         subquery_quals: Vec::new(),
         one_time_false: 0,
@@ -10060,6 +10065,7 @@ fn plan_explain(
     options.scan_array_quals = explain_scan_array_quals(&query, lookup);
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
+    let mut join_cond_splits = Vec::new();
     let join_conds = match &query {
         N::SelectStmt(s) => {
             let none = |_: &str| None;
@@ -10083,7 +10089,9 @@ fn plan_explain(
             } else {
                 Vec::new()
             };
-            let conds = ruleutils::join_conditions(s, &cat).unwrap_or_default();
+            let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
+            let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
+            join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
             if conds.is_empty() && joined {
                 ruleutils::comma_join_conds(s, &mut options.join_where)
             } else {
@@ -10101,6 +10109,7 @@ fn plan_explain(
     options.scan_quals = scan_quals;
     options.setop_quals = setop_quals;
     options.join_conds = join_conds;
+    options.join_cond_splits = join_cond_splits;
     if !matches!(
         inner,
         Statement::Select(_)

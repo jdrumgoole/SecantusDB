@@ -1434,11 +1434,23 @@ pub(crate) fn bitmap_index_scan(index: &str, estimate: crate::scan_estimate::Est
 
 /// Put each join's ON condition on its join node (post-order, as
 /// `join_conditions` lists them): `Hash Cond` on a hash join, `Join Filter`
-/// on a nested loop.
-pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
-    fn walk(n: &mut PlanNode, conds: &[String], next: &mut usize) {
+/// on a nested loop. A hash or merge join whose ON also holds conjuncts
+/// that are not join-key equalities (`splits`) takes only the equalities
+/// as its `Hash Cond` / `Merge Cond` and the rest as its `Join Filter`
+/// (RP-375).
+pub(crate) fn attach_join_conds(
+    root: &mut PlanNode,
+    conds: &[String],
+    splits: &[Option<(String, String)>],
+) {
+    fn walk(
+        n: &mut PlanNode,
+        conds: &[String],
+        splits: &[Option<(String, String)>],
+        next: &mut usize,
+    ) {
         for c in &mut n.children {
-            walk(c, conds, next);
+            walk(c, conds, splits, next);
         }
         let label = if n.name.starts_with("Hash") && n.name.ends_with("Join") {
             "Hash Cond"
@@ -1449,6 +1461,22 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
         } else {
             return;
         };
+        let split = splits.get(*next).and_then(Option::as_ref);
+        if let (Some((hash, rest)), "Hash Cond" | "Merge Cond") = (split, label) {
+            if !n.skip_cond {
+                let c = match outer_first(n, hash) {
+                    Some(true) => commute_equality(hash).unwrap_or_else(|| hash.clone()),
+                    None if n.commute_cond => {
+                        commute_equality(hash).unwrap_or_else(|| hash.clone())
+                    }
+                    _ => hash.clone(),
+                };
+                n.details.insert(0, ("Join Filter".into(), rest.clone()));
+                n.details.insert(0, (label.into(), c));
+            }
+            *next += 1;
+            return;
+        }
         if let Some(c) = conds.get(*next) {
             if !c.is_empty() && !n.skip_cond {
                 let c = match outer_first(n, c) {
@@ -1466,7 +1494,7 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
         return;
     }
     let mut next = 0;
-    walk(root, conds, &mut next);
+    walk(root, conds, splits, &mut next);
 }
 
 /// Give each scan an equivalence class filters (RP-363, RP-364) the
@@ -1817,12 +1845,12 @@ mod join_type_tests {
         let mut root = PlanNode::new("Hash Join");
         root.children.push(rel("e"));
         root.children.push(PlanNode::over("Hash", rel("k")));
-        attach_join_conds(&mut root, &["(k.b = e.b)".to_string()]);
+        attach_join_conds(&mut root, &["(k.b = e.b)".to_string()], &[]);
         assert_eq!(root.details[0].1, "(e.b = k.b)");
         let mut root = PlanNode::new("Hash Join");
         root.children.push(rel("e"));
         root.children.push(PlanNode::over("Hash", rel("k")));
-        attach_join_conds(&mut root, &["(e.b = k.b)".to_string()]);
+        attach_join_conds(&mut root, &["(e.b = k.b)".to_string()], &[]);
         assert_eq!(root.details[0].1, "(e.b = k.b)");
     }
 
@@ -1937,6 +1965,7 @@ mod heap_fetches_tests {
             scan_array_quals: None,
             setop_quals: Vec::new(),
             join_conds: Vec::new(),
+            join_cond_splits: Vec::new(),
             join_where: Vec::new(),
             subquery_quals: Vec::new(),
             one_time_false: 0,
