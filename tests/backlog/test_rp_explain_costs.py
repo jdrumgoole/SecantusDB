@@ -1872,6 +1872,75 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (a = 5)",
         ],
     ),
+    "a count over a user table's bitmap scan": (
+        "RP-382",
+        _N,
+        "explain select count(*) from n where b = 7",
+        [
+            "Aggregate  (cost=34.56..34.57 rows=1 width=8)",
+            "  ->  Bitmap Heap Scan on n  (cost=5.06..34.31 rows=100 width=0)",
+            "        Recheck Cond: (b = 7)",
+            "        ->  Bitmap Index Scan on n_b  (cost=0.00..5.03 rows=100 width=0)",
+            "              Index Cond: (b = 7)",
+        ],
+    ),
+    "a count over a user table's index-only scan": (
+        "RP-382",
+        _ANALYSED,
+        "explain select count(*) from k where a = 5",
+        [
+            "Aggregate  (cost=8.29..8.30 rows=1 width=8)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=0)",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
+    # A LIMIT of a twentieth of the rows: the Seq Scan starts cheaper
+    # (`get_cheapest_fractional_path`), not the cheapest-total bitmap scan.
+    "a limit that reads a fraction of an indexed table": (
+        "RP-382",
+        _N,
+        "explain select * from n where b = 7 limit 5",
+        [
+            "Limit  (cost=0.00..4.53 rows=5 width=11)",
+            "  ->  Seq Scan on n  (cost=0.00..90.50 rows=100 width=11)",
+            "        Filter: (b = 7)",
+        ],
+    ),
+    "a limit above an index scan's rows": (
+        "RP-382",
+        _ANALYSED,
+        "explain select * from k where a < 50 limit 100",
+        [
+            "Limit  (cost=0.28..9.13 rows=49 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..9.13 rows=49 width=7)",
+            "        Index Cond: (a < 50)",
+        ],
+    ),
+    # n_ab gives the order, but sorting the bitmap scan is cheaper.
+    "a sort an index could give, cheaper sorted": (
+        "RP-382",
+        _N,
+        "explain select * from n where a < 100 order by a",
+        [
+            "Sort  (cost=37.57..37.82 rows=99 width=11)",
+            "  Sort Key: a",
+            "  ->  Bitmap Heap Scan on n  (cost=5.05..34.29 rows=99 width=11)",
+            "        Recheck Cond: (a < 100)",
+            "        ->  Bitmap Index Scan on n_ab  (cost=0.00..5.02 rows=99 width=0)",
+            "              Index Cond: (a < 100)",
+        ],
+    ),
+    "a sort over a user table's index scan": (
+        "RP-382",
+        _ANALYSED,
+        "explain select * from k where a = 5 order by b",
+        [
+            "Sort  (cost=8.30..8.31 rows=1 width=7)",
+            "  Sort Key: b",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
     "analyze of a user table's index-only scan": (
         "RP-383",
@@ -2166,6 +2235,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-376",
         "RP-378",
         "RP-379",
+        "RP-382",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

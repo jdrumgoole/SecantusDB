@@ -41132,14 +41132,17 @@ impl PgHandler {
                 // index could serve (`get_cheapest_fractional_path` may
                 // prefer a cheaper-to-start index scan) and no ORDER BY,
                 // DISTINCT or other node between them.
+                // Over an indexed table with a WHERE, the scan is
+                // `get_cheapest_fractional_path`'s (RP-382).
                 if tree.name == "Limit"
                     && tree.details.is_empty()
                     && tree.children.len() == 1
                     && tree.children[0].children.is_empty()
-                    && tree.children[0].name.starts_with("Seq Scan on ")
+                    && explain::is_relation_scan(&tree.children[0].name)
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((scan, limit)) = self.limit_scan_estimate(sel) {
+                        if let Some((scan, index, limit)) = self.limit_scan_estimate(sel) {
+                            explain::scan_path_node(&mut tree.children[0], index, &sel.table);
                             tree.children[0].estimate = Some(scan);
                             tree.estimate = Some(limit);
                         }
@@ -41387,23 +41390,32 @@ impl PgHandler {
                         }
                     }
                 }
-                // A Sort straight over one relation's sequential scan
-                // (RP-318): the scan's estimate, then `cost_sort`. Only on a
-                // table with no index, where the Seq Scan is the only path
-                // PostgreSQL can sort (an index may give the order instead),
-                // and by stored columns the select list returns (a
-                // resjunk or computed key widens the sorted row).
+                // A Sort straight over one relation's scan (RP-318): the
+                // scan's estimate, then `cost_sort`, by stored columns the
+                // select list returns (a resjunk or computed key widens
+                // the sorted row). Over an indexed table with a WHERE
+                // (RP-382) the cheapest path's, where `create_ordered_paths`
+                // keeps that Sort over every index scan already in the
+                // ORDER BY's order.
                 if tree.name == "Sort"
                     && tree.children.len() == 1
                     && tree.children[0].children.is_empty()
-                    && tree.children[0].name.starts_with("Seq Scan on ")
+                    && explain::is_relation_scan(&tree.children[0].name)
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        let indexed = self
-                            .index_relations()
-                            .iter()
-                            .any(|ix| ix.table.name == sel.table);
-                        if !indexed
+                        // Every key one way with its default NULLS, the
+                        // order a B-tree gives forwards or backwards.
+                        let one_way = sel.order.iter().all(|k| {
+                            use secantus_pgplan::Nulls;
+                            k.ascending == sel.order[0].ascending
+                                && k.nulls
+                                    == if k.ascending {
+                                        Nulls::Last
+                                    } else {
+                                        Nulls::First
+                                    }
+                        });
+                        if one_way
                             && sel.residual.is_none()
                             && sel.sub.is_none()
                             && sel.series.is_none()
@@ -41420,14 +41432,29 @@ impl PgHandler {
                         {
                             let fields: Vec<String> =
                                 sel.columns.iter().map(|(_, f)| f.clone()).collect();
-                            if let Some((estimate, None)) =
-                                self.scan_estimate(&sel.table, &sel.filter, &fields)
+                            let want = scan_estimate::PathWant {
+                                limit: None,
+                                order: sel.order.iter().map(|k| k.field.clone()).collect(),
+                            };
+                            if let Some((estimate, index, ordered)) =
+                                self.upper_scan(&sel.table, &sel.filter, &fields, &want)
                             {
-                                tree.children[0].estimate = Some(estimate);
-                                tree.estimate = Some(scan_estimate::sort_estimate(
+                                let sort = scan_estimate::sort_estimate(
                                     estimate,
                                     self.kb_setting("work_mem", 4096),
-                                ));
+                                );
+                                if !ordered
+                                    .iter()
+                                    .any(|o| scan_estimate::presorted_wins(*o, sort))
+                                {
+                                    explain::scan_path_node(
+                                        &mut tree.children[0],
+                                        index,
+                                        &sel.table,
+                                    );
+                                    tree.children[0].estimate = Some(estimate);
+                                    tree.estimate = Some(sort);
+                                }
                             }
                         }
                     }
@@ -41506,20 +41533,16 @@ impl PgHandler {
                 // sequential scan (RP-321): the scan's estimate, then
                 // `cost_agg` (AGG_PLAIN). Only `count(*)` / `count(col)`,
                 // whose transition function (`int8inc`, `int8inc_any`) is one
-                // `cpu_operator_cost` a row and whose result is an int8; and
-                // only where the Seq Scan is the path PostgreSQL keeps (no
-                // clause an index could serve).
+                // `cpu_operator_cost` a row and whose result is an int8;
+                // over the cheapest path, an index's where a WHERE reaches
+                // one (RP-382).
                 if tree.name == "Aggregate"
                     && tree.details.is_empty()
                     && tree.children.len() == 1
                     && tree.children[0].children.is_empty()
-                    && tree.children[0].name.starts_with("Seq Scan on ")
+                    && explain::is_relation_scan(&tree.children[0].name)
                 {
                     if let Statement::Aggregate(agg) = inner.as_ref() {
-                        let indexed = self
-                            .index_relations()
-                            .iter()
-                            .any(|ix| ix.table.name == agg.table);
                         let counts = !agg.items.is_empty()
                             && agg.items.iter().all(|it| {
                                 matches!(
@@ -41553,7 +41576,6 @@ impl PgHandler {
                                 .iter()
                                 .enumerate()
                                 .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
-                            && (agg.filter.is_empty() || !indexed)
                         {
                             let mut fields: Vec<String> = Vec::new();
                             for f in agg.items.iter().filter_map(|it| it.field.clone()) {
@@ -41561,9 +41583,13 @@ impl PgHandler {
                                     fields.push(f);
                                 }
                             }
-                            if let Some((estimate, None)) =
-                                self.scan_estimate(&agg.table, &agg.filter, &fields)
-                            {
+                            if let Some((estimate, index, _)) = self.upper_scan(
+                                &agg.table,
+                                &agg.filter,
+                                &fields,
+                                &scan_estimate::PathWant::default(),
+                            ) {
+                                explain::scan_path_node(&mut tree.children[0], index, &agg.table);
                                 tree.children[0].estimate = Some(estimate);
                                 tree.estimate = Some(scan_estimate::count_agg_estimate(
                                     estimate,

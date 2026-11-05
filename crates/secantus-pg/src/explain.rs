@@ -1544,6 +1544,33 @@ pub(crate) fn index_path_node(
     }
 }
 
+/// Make `tree`, one relation's scan under a Sort, a Limit or an
+/// Aggregate, the path chosen for it (RP-382): `index`'s, or with none
+/// the relation's Seq Scan.
+pub(crate) fn scan_path_node(
+    tree: &mut PlanNode,
+    index: Option<crate::scan_estimate::ScanIndex>,
+    table: &str,
+) {
+    match index {
+        Some(index) => index_path_node(tree, index, table),
+        None => {
+            tree.name = format!("Seq Scan on {table}");
+            tree.props.retain(|(k, _)| k != "Index Name");
+            tree.children.clear();
+        }
+    }
+}
+
+/// Whether `name` is one relation's scan node the storage planner prints
+/// under a Sort, a Limit or an Aggregate: a Seq Scan or an index scan,
+/// which the cost model may replace (RP-382).
+pub(crate) fn is_relation_scan(name: &str) -> bool {
+    name.starts_with("Seq Scan on ")
+        || name.starts_with("Index Scan using ")
+        || name.starts_with("Index Only Scan using ")
+}
+
 /// The Bitmap Index Scan under a Bitmap Heap Scan (RP-338): it names its
 /// index and no relation, and prints `estimate`, width 0.
 pub(crate) fn bitmap_index_scan(index: &str, estimate: crate::scan_estimate::Estimate) -> PlanNode {
