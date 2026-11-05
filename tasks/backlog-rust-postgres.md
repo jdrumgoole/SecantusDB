@@ -1405,15 +1405,6 @@ a regression test.
       (found while working RP-369; split from RP-371).
       Backlog-ID: RP-376
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a key fixed by a constant over an index-scan side]
-- [ ] **EXPLAIN prints a join clause written inner side first as
-      written.** `explain select * from e join k on k.b = e.b` (or `from
-      e, k where k.b = e.b`) prints `Hash Cond: (k.b = e.b)`, where
-      PostgreSQL 15.19 prints `Hash Cond: (e.b = k.b)`: the hash clause's
-      outer operand comes first (`get_switched_clauses`, as a hash join's
-      clauses are commuted to outer = inner). Measured on a private 15.19
-      cluster (found while working RP-372).
-      Backlog-ID: RP-373
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join clause written inner side first]
 - [ ] **EXPLAIN of a hash join on two or more equalities is unpriced.**
       `explain select * from e, k where e.b = k.b and e.a = k.a` (or the
       same as `JOIN ... ON`) prints `Hash Cond: ((e.b = k.b) AND (e.a =
