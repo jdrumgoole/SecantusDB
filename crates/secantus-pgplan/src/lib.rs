@@ -3564,7 +3564,7 @@ pub struct ExplainOptions {
     /// A joined SELECT's WHERE conjuncts, each with the relation whose scan
     /// it filters (`None`: the top join's filter) and the column an index
     /// scan there could take it on (RP-369).
-    pub join_where: Vec<(String, Option<String>, Option<String>)>,
+    pub join_where: Vec<ruleutils::JoinQual>,
     /// A set operation's arms, left to right: each single-relation arm's
     /// WHERE conjuncts, as `scan_quals` holds one statement's. Empty unless
     /// every arm reads one relation.

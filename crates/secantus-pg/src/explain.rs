@@ -1587,7 +1587,7 @@ pub(crate) fn mark_implied_filters(
 /// filters the top join.
 pub(crate) fn attach_join_where(
     root: &mut PlanNode,
-    quals: &[(String, Option<String>, Option<String>)],
+    quals: &[secantus_pgplan::ruleutils::JoinQual],
     index_columns: &dyn Fn(&str) -> Vec<String>,
 ) {
     if quals.is_empty() {
@@ -1626,7 +1626,13 @@ pub(crate) fn attach_join_where(
             ),
         }
     };
-    let mut homes: Vec<(Option<String>, Vec<&String>, Vec<(String, Option<String>)>)> = Vec::new();
+    // Per home: its conjuncts' texts, and each with its column.
+    type Home<'q> = (
+        Option<String>,
+        Vec<&'q String>,
+        Vec<(String, Option<String>)>,
+    );
+    let mut homes: Vec<Home<'_>> = Vec::new();
     for (text, home, column) in quals {
         let i = match homes.iter().position(|(h, _, _)| h == home) {
             Some(i) => i,

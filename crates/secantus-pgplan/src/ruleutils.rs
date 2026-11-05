@@ -3979,10 +3979,7 @@ pub fn join_conditions(
 /// down to the relation's scan; any other stays on the join), and, for a
 /// pushed-down `column op constant`, the column, which an index scan of
 /// the relation may take as its `Index Cond` (RP-369).
-pub fn join_where(
-    s: &pg_query::protobuf::SelectStmt,
-    cat: &Catalog<'_>,
-) -> Option<Vec<(String, Option<String>, Option<String>)>> {
+pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Option<Vec<JoinQual>> {
     let w = s.where_clause.as_deref()?;
     let mut p = Printer::new(cat, 0);
     let mut rtes = Vec::new();
@@ -4128,6 +4125,11 @@ pub fn join_where(
     }
     Some(out)
 }
+
+/// A joined SELECT's WHERE conjunct for EXPLAIN: its text, the relation
+/// whose scan it filters (`None`: the top join's), and the column an index
+/// scan there could take it on (RP-369).
+pub type JoinQual = (String, Option<String>, Option<String>);
 
 /// An expression node over one table, printed as `pg_get_expr` does.
 pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
