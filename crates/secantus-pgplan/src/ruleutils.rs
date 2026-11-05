@@ -3975,11 +3975,112 @@ pub fn join_conditions(
     s: &pg_query::protobuf::SelectStmt,
     cat: &Catalog<'_>,
 ) -> Option<Vec<String>> {
+    Some(
+        join_conditions_split(s, cat)?
+            .into_iter()
+            .map(|(c, _)| c)
+            .collect(),
+    )
+}
+
+/// [`join_conditions`], each with its split for a hash or merge join: an
+/// ON that ANDs an equality between the join's two sides with conjuncts
+/// that are not one gives `Some((join clauses, the rest))`. Only the
+/// equalities are the hash (or merge) clauses (`hash_inner_and_outer`,
+/// `select_mergejoin_clauses`); the rest is the join's `joinqual`, printed
+/// as its `Join Filter` (RP-375). `None` where the ON is all one or the
+/// other.
+#[allow(clippy::type_complexity)]
+pub fn join_conditions_split(
+    s: &pg_query::protobuf::SelectStmt,
+    cat: &Catalog<'_>,
+) -> Option<Vec<(String, Option<(String, String)>)>> {
     let mut p = Printer::new(cat, 0);
     let mut rtes = Vec::new();
     p.collect_rtes(&s.from_clause, &mut rtes)?;
     p.scopes.push(rtes);
-    fn walk(p: &mut Printer<'_>, n: &Node, out: &mut Vec<String>) -> Option<()> {
+    // The names a FROM item's relations go by.
+    fn refnames(n: &Node, out: &mut Vec<String>) {
+        match n.node.as_ref() {
+            Some(N::RangeVar(r)) => out.push(
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone()),
+            ),
+            Some(N::RangeSubselect(r)) => {
+                if let Some(a) = r.alias.as_ref() {
+                    out.push(a.aliasname.clone());
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    refnames(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    // The relations an expression's columns belong to; `None` when one
+    // does not resolve.
+    fn rels_of(p: &Printer<'_>, n: &Node) -> Option<Vec<String>> {
+        let mut rels: Vec<String> = Vec::new();
+        let mut ok = true;
+        let mut copy = n.clone();
+        crate::walk_expr(&mut copy, &mut |x| {
+            if let Some(N::ColumnRef(c)) = x.node.as_ref() {
+                match p.resolve(&names(&c.fields)) {
+                    Some((rel, _, _)) => {
+                        if !rels.contains(&rel) {
+                            rels.push(rel);
+                        }
+                    }
+                    None => ok = false,
+                }
+            }
+            Ok(())
+        })
+        .ok()?;
+        ok.then_some(rels)
+    }
+    // `left op right` with `=`, one operand over the join's left side
+    // only and the other over its right side only: a hashable clause
+    // (`clause_sides_match_join`).
+    fn hashable(p: &Printer<'_>, c: &Node, left: &[String], right: &[String]) -> bool {
+        let Some(N::AExpr(a)) = c.node.as_ref() else {
+            return false;
+        };
+        let is_eq = a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+            && matches!(
+                a.name.as_slice(),
+                [one] if matches!(one.node.as_ref(), Some(N::String(op)) if op.sval == "=")
+            );
+        if !is_eq {
+            return false;
+        }
+        let (Some(l), Some(r)) = (a.lexpr.as_deref(), a.rexpr.as_deref()) else {
+            return false;
+        };
+        let (Some(lr), Some(rr)) = (rels_of(p, l), rels_of(p, r)) else {
+            return false;
+        };
+        let within = |rels: &[String], side: &[String]| {
+            !rels.is_empty() && rels.iter().all(|x| side.contains(x))
+        };
+        (within(&lr, left) && within(&rr, right)) || (within(&lr, right) && within(&rr, left))
+    }
+    type Out = Vec<(String, Option<(String, String)>)>;
+    fn walk(p: &mut Printer<'_>, n: &Node, out: &mut Out) -> Option<()> {
         if let Some(N::JoinExpr(j)) = n.node.as_ref() {
             walk(p, j.larg.as_deref()?, out)?;
             walk(p, j.rarg.as_deref()?, out)?;
@@ -3987,9 +4088,37 @@ pub fn join_conditions(
                 Some(q) => {
                     p.buf.clear();
                     p.expr(q)?;
-                    out.push(std::mem::take(&mut p.buf));
+                    let whole = std::mem::take(&mut p.buf);
+                    let (mut left, mut right) = (Vec::new(), Vec::new());
+                    refnames(j.larg.as_deref()?, &mut left);
+                    refnames(j.rarg.as_deref()?, &mut right);
+                    let mut parts = Vec::new();
+                    flatten(q, &mut parts);
+                    let mut hash = Vec::new();
+                    let mut rest: Vec<(usize, String)> = Vec::new();
+                    for part in parts {
+                        p.buf.clear();
+                        p.expr(part)?;
+                        let text = std::mem::take(&mut p.buf);
+                        if hashable(p, part, &left, &right) {
+                            hash.push(text);
+                        } else {
+                            rest.push((qual_operators(part), text));
+                        }
+                    }
+                    // `order_qual_clauses`: the join filter cheapest first,
+                    // a stable sort by each clause's operators.
+                    rest.sort_by_key(|(ops, _)| *ops);
+                    let rest: Vec<String> = rest.into_iter().map(|(_, t)| t).collect();
+                    let and = |v: &[String]| match v {
+                        [one] => one.clone(),
+                        many => format!("({})", many.join(" AND ")),
+                    };
+                    let split =
+                        (!hash.is_empty() && !rest.is_empty()).then(|| (and(&hash), and(&rest)));
+                    out.push((whole, split));
                 }
-                None => out.push(String::new()),
+                None => out.push((String::new(), None)),
             }
         }
         Some(())
@@ -4197,9 +4326,27 @@ pub fn comma_join_conds(
                 matches!(x.and_then(|x| x.node.as_ref()), Some(N::ColumnRef(_)))
             }))
     };
-    let spanning: Vec<usize> = (0..parts.len()).filter(|i| quals[*i].1.is_none()).collect();
-    if spanning.is_empty() || !spanning.iter().all(|i| column_equality(parts[*i])) {
+    // The equalities between the two tables are the join clauses; any
+    // other conjunct over both stays in `quals`, the join's `Join Filter`
+    // (`hash_inner_and_outer` hashes only the equalities, RP-375).
+    let spanning: Vec<usize> = (0..parts.len())
+        .filter(|i| quals[*i].1.is_none() && column_equality(parts[*i]))
+        .collect();
+    if spanning.is_empty() {
         return Vec::new();
+    }
+    // `order_qual_clauses`: the conjuncts left on the join, its `Join
+    // Filter`, cheapest first (a stable sort by their operators).
+    let mut rest: Vec<(usize, usize)> = (0..parts.len())
+        .filter(|i| quals[*i].1.is_none() && !spanning.contains(i))
+        .map(|i| (i, qual_operators(parts[i])))
+        .collect();
+    let slots: Vec<usize> = rest.iter().map(|(i, _)| *i).collect();
+    rest.sort_by_key(|(_, ops)| *ops);
+    let originals: Vec<JoinQual> = slots.iter().map(|i| quals[*i].clone()).collect();
+    for (slot, (from, _)) in slots.iter().zip(&rest) {
+        let k = slots.iter().position(|x| x == from).unwrap_or(0);
+        quals[*slot] = originals[k].clone();
     }
     let mut texts = Vec::new();
     for i in spanning.into_iter().rev() {
@@ -4210,6 +4357,24 @@ pub fn comma_join_conds(
         [one] => vec![one.clone()],
         many => vec![format!("({})", many.join(" AND "))],
     }
+}
+
+/// The operators a clause evaluates (`cost_qual_eval`, each one
+/// `cpu_operator_cost`).
+fn qual_operators(n: &Node) -> usize {
+    let mut count = 0;
+    let mut copy = n.clone();
+    let _ = crate::walk_expr(&mut copy, &mut |x| {
+        if let Some(N::AExpr(a)) = x.node.as_ref() {
+            if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
+                || a.kind == pg_query::protobuf::AExprKind::AexprDistinct as i32
+            {
+                count += 1;
+            }
+        }
+        Ok(())
+    });
+    count
 }
 
 /// A joined SELECT's WHERE conjunct for EXPLAIN: its text, the relation
@@ -4657,9 +4822,27 @@ mod comma_join_conds_tests {
 
     #[test]
     fn anything_else_is_left_as_the_join_filter() {
-        // An inequality over both tables: no clause is moved.
+        // RP-375: an inequality over both tables stays the join's filter;
+        // only the equality is its clause.
         let s = stmt("select * from e, k where e.b = k.b and e.a < k.a");
         let mut quals = vec![q("(e.b = k.b)", None), q("(e.a < k.a)", None)];
+        assert_eq!(comma_join_conds(&s, &mut quals), vec!["(e.b = k.b)"]);
+        assert_eq!(quals, vec![q("(e.a < k.a)", None)]);
+        // The filter is ordered cheapest first (`order_qual_clauses`).
+        let s = stmt("select * from e, k where e.b = k.b and e.a + 1 < k.a and e.a > k.a");
+        let mut quals = vec![
+            q("(e.b = k.b)", None),
+            q("((e.a + 1) < k.a)", None),
+            q("(e.a > k.a)", None),
+        ];
+        assert_eq!(comma_join_conds(&s, &mut quals), vec!["(e.b = k.b)"]);
+        assert_eq!(
+            quals,
+            vec![q("(e.a > k.a)", None), q("((e.a + 1) < k.a)", None)]
+        );
+        // No equality over both tables: no clause is moved.
+        let s = stmt("select * from e, k where e.a < k.a");
+        let mut quals = vec![q("(e.a < k.a)", None)];
         let before = quals.clone();
         assert!(comma_join_conds(&s, &mut quals).is_empty());
         assert_eq!(quals, before);

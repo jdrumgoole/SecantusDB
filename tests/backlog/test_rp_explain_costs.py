@@ -1454,6 +1454,75 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    # The comma form plans alike: PostgreSQL makes an inner join's WHERE
+    # and ON quals one list (RP-375).
+    "a comma join's equality with an inequality beside it": (
+        "RP-375",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and e.a < k.a",
+        [
+            "Hash Join  (cost=27.50..1420.00 rows=33333 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # Two inequalities, one over an expression: each scales the rows by
+    # DEFAULT_INEQ_SEL, and each operator is paid on every matched pair.
+    "a join's equality with two inequalities beside it": (
+        "RP-375",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b and e.a + 1 < k.a and e.a > k.a",
+        [
+            "Hash Join  (cost=27.50..1920.00 rows=11111 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  Join Filter: ((e.a > k.a) AND ((e.a + 1) < k.a))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a comma join's equality with two inequalities beside it": (
+        "RP-375",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and e.a + 1 < k.a and e.a > k.a",
+        [
+            "Hash Join  (cost=27.50..1920.00 rows=11111 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  Join Filter: ((e.a > k.a) AND ((e.a + 1) < k.a))",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a LEFT join's equality with an inequality beside it": (
+        "RP-379",
+        _ANALYSED,
+        "explain select * from e left join k on e.b = k.b and e.a < k.a",
+        [
+            "Hash Left Join  (cost=27.50..1420.00 rows=33333 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  Join Filter: (e.a < k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    "a join's equality with a not-equal beside it": (
+        "RP-379",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b and e.a <> k.a",
+        [
+            "Hash Join  (cost=27.50..1420.00 rows=99900 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  Join Filter: (e.a <> k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "insert": (
         "RP-331",
         _ANALYSED,
@@ -1904,6 +1973,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-372",
         "RP-373",
         "RP-374",
+        "RP-375",
         "RP-376",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

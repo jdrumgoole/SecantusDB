@@ -75,6 +75,10 @@ pub enum JoinNode {
         /// equalities (`equi`, `expr_keys`): a FULL join's merge or hash
         /// then checks it as a join filter, which is not modelled.
         on_other: bool,
+        /// The ON's conjuncts that are not one of its equalities (`equi`,
+        /// `expr_keys`), each with how it is estimated: the join filter a
+        /// hash or merge join checks on each matched pair (RP-375).
+        on_filters: Vec<JoinFilter>,
         /// `(left key, right key)` column equalities that are conjuncts of
         /// the ON: candidates are found by hashing on them, and `on` still
         /// decides each pair.
@@ -592,6 +596,7 @@ fn build_tree(
                 on: None,
                 on_aliases: Vec::new(),
                 on_other: false,
+                on_filters: Vec::new(),
                 // The WHERE still decides every row; these only narrow the
                 // candidates a left row is paired with.
                 equi: crate::join_order::pairs_between(&equalities, &joined, i),
@@ -1772,6 +1777,7 @@ fn build_join(
     let mut expr_keys = Vec::new();
     let mut on_aliases = Vec::new();
     let mut on_other = false;
+    let mut on_filters = Vec::new();
     let on = match j.quals.as_deref() {
         None if merged.is_empty() => None,
         None => {
@@ -1831,6 +1837,23 @@ fn build_join(
                 _ => 1,
             };
             on_other = conjuncts > equi.len() - merged.len() + expr_keys.len();
+            if on_other {
+                let mut parts = Vec::new();
+                split_and(&q, &mut parts);
+                for c in parts {
+                    if !equalities(c, &left_keys, &right_keys).is_empty()
+                        || !expr_equalities(c, &left_keys, &right_keys).is_empty()
+                    {
+                        continue;
+                    }
+                    on_filters.push(JoinFilter {
+                        aliases: key_aliases(c),
+                        expr: on_expr(c, &side_scope, params)?,
+                        kind: filter_kind(c),
+                        ops: operator_count(c),
+                    });
+                }
+            }
             Some(on_expr(&q, &side_scope, params)?)
         }
     };
@@ -1878,6 +1901,7 @@ fn build_join(
             expr_keys,
             on_aliases,
             on_other,
+            on_filters,
             left_keys,
             right_keys,
         },

@@ -1403,17 +1403,18 @@ a regression test.
       private 15.19 cluster (split from RP-376; cause found 2026-11-05).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a key a B-tree leads with], tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key with the other side filtered]
       Backlog-ID: RP-377
-- [ ] **EXPLAIN puts a join's inequality into its `Hash Cond`.** `explain
-      select * from e join k on e.b = k.b and e.a < k.a` prints `Hash
-      Cond: ((e.b = k.b) AND (e.a < k.a))` with zeros (the comma form,
-      `from e, k where ...`, a `Join Filter` of both), where PostgreSQL
-      15.19 prints `Hash Join (cost=27.50..1420.00 rows=33333 width=14)`
-      with `Hash Cond: (e.b = k.b)` and `Join Filter: (e.a < k.a)`: only
-      the hashable equality is the hash clause (`hash_inner_and_outer`),
-      the rest the join's `joinqual`. Measured on a private 15.19 cluster
-      (found while working RP-372).
-      Backlog-ID: RP-375
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's equality with an inequality beside it]
+- [ ] **EXPLAIN of a hash join's filter beside its equality is unpriced
+      for a LEFT join or a `<>`.** Since RP-375 an inner join's ON (or
+      comma WHERE) that ANDs a column equality with `<`, `<=`, `>`, `>=`
+      conjuncts prints `Hash Cond` and `Join Filter` as PostgreSQL 15.19
+      does, priced. The same split with zeros: a LEFT join (`explain select
+      * from e left join k on e.b = k.b and e.a < k.a` is `Hash Left Join
+      (cost=27.50..1420.00 rows=33333 width=14)`), and a `<>` filter
+      (`... on e.b = k.b and e.a <> k.a` is rows=99900, `neqjoinsel` over
+      the columns' statistics). Measured on a private 15.19 cluster (found
+      while working RP-375).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a LEFT join's equality with an inequality beside it], tests/backlog/test_rp_explain_costs.py::test_plan[a join's equality with a not-equal beside it]
+      Backlog-ID: RP-379
 
 - [ ] **EXPLAIN of a user table still shows a Seq Scan, or zeros, for
       three index paths PostgreSQL picks.** Since RP-339 one analysed

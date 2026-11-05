@@ -41764,7 +41764,11 @@ impl PgHandler {
                 explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
                 explain::gate_scan(&mut tree, options.one_time_false);
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
-                explain::attach_join_conds(&mut tree, &options.join_conds);
+                explain::attach_join_conds(
+                    &mut tree,
+                    &options.join_conds,
+                    &options.join_cond_splits,
+                );
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
                 explain::apply_implied_filters(&mut tree);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
