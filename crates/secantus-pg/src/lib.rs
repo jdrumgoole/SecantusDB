@@ -16590,7 +16590,23 @@ impl PgHandler {
                         totalrows,
                     },
                 );
-                let slots = secantus_pgplan::colstats::scalar_slots_of(&values, target, sample);
+                // A type with `=` but no `<` takes `compute_distinct_stats`,
+                // which sets its own `stadistinct` and keeps only most common
+                // values.
+                let slots = if statistic::operators(&c.pg_type).is_none()
+                    && statistic::equality_only(&c.pg_type).is_some()
+                {
+                    let (slots, distinct) = secantus_pgplan::colstats::distinct_slots_of(
+                        &values,
+                        target,
+                        f64::from(s.null_frac),
+                        totalrows,
+                    );
+                    entry.insert("distinct", f64::from(distinct));
+                    slots
+                } else {
+                    secantus_pgplan::colstats::scalar_slots_of(&values, target, sample)
+                };
                 let bin = |k: &[u8]| {
                     Bson::Binary(bson::Binary {
                         subtype: bson::spec::BinarySubtype::Generic,
@@ -16611,7 +16627,11 @@ impl PgHandler {
                 }
                 // `compute_array_stats`' element slots, over the arrays the
                 // scalar stats compared.
-                if statistic::array_element(&c.pg_type).is_some() {
+                // (`array_typanalyze` leaves an element type without `<` to
+                // the standard statistics.)
+                if statistic::array_element(&c.pg_type).is_some()
+                    && statistic::operators(&c.pg_type).is_some()
+                {
                     let arrays: Vec<Vec<Option<Vec<u8>>>> = values
                         .iter()
                         .flatten()
@@ -16789,6 +16809,9 @@ impl PgHandler {
             ))),
             ("oid", Bson::Int64(n)) => Some(Some((secantus_pgplan::colstats::int_key(*n), 0))),
             ("bool", Bson::Boolean(b)) => Some(Some((vec![u8::from(*b)], 0))),
+            // `aclitemeq` compares grantee, grantor and privileges, which
+            // the item's text spells out one way; `aclitem` is fixed-width.
+            ("aclitem", Bson::String(s)) => Some(Some((s.as_bytes().to_vec(), 0))),
             // `float8eq`: -0 equals 0, and NaN equals NaN.
             ("float4" | "float8", Bson::Double(x)) => {
                 let x = if *x == 0.0 {

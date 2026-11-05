@@ -112,6 +112,121 @@ fn analyze_mcv_list(counts: &[usize], samplerows: f64, s: Sample) -> usize {
     num_mcv
 }
 
+/// `compute_distinct_stats` (PostgreSQL 15.19's `analyze.c`), for a type
+/// with `=` but no `<` (`aclitem[]`): the values are counted in its track
+/// list of at most `2 * target` entries, in sample order -- a match moves
+/// up past every entry it now outnumbers, a new value goes in at the head
+/// of the count-1 entries (pushing the last one out of a full list). The
+/// returned `stadistinct` is the one this function sets; the slots hold
+/// only the most common values, as `compute_distinct_stats` has no `<` for
+/// a histogram or a correlation. `values` holds every `None`-free key in
+/// heap order, and `samplerows` / `totalrows` are the sample and the table.
+pub fn distinct_slots_of(
+    values: &[Sampled],
+    target: usize,
+    null_frac: f64,
+    totalrows: f64,
+) -> (Slots, f32) {
+    let samplerows = values.len() as f64;
+    let track_max = 2 * target;
+    let mut track: Vec<(&[u8], usize)> = Vec::new();
+    let mut nonnull_cnt = 0usize;
+    for (key, _) in values.iter().flatten() {
+        nonnull_cnt += 1;
+        let mut firstcount1 = track.len();
+        let mut found = None;
+        for (j, (k, count)) in track.iter().enumerate() {
+            if *k == key.as_slice() {
+                found = Some(j);
+                break;
+            }
+            if j < firstcount1 && *count == 1 {
+                firstcount1 = j;
+            }
+        }
+        match found {
+            Some(mut j) => {
+                track[j].1 += 1;
+                while j > 0 && track[j].1 > track[j - 1].1 {
+                    track.swap(j, j - 1);
+                    j -= 1;
+                }
+            }
+            None => {
+                if track.len() < track_max {
+                    track.push((key.as_slice(), 1));
+                }
+                let last = track.len() - 1;
+                if firstcount1 < track.len() {
+                    for j in (firstcount1 + 1..=last).rev() {
+                        track[j] = track[j - 1];
+                    }
+                    track[firstcount1] = (key.as_slice(), 1);
+                }
+            }
+        }
+    }
+    if nonnull_cnt == 0 {
+        return (Slots::default(), 0.0);
+    }
+    let nmultiple = track.iter().filter(|t| t.1 > 1).count();
+    let summultiple: usize = track.iter().filter(|t| t.1 > 1).map(|t| t.1).sum();
+    let mut stadistinct: f64 = if nmultiple == 0 {
+        -(1.0 - null_frac)
+    } else if track.len() < track_max && nmultiple == track.len() {
+        track.len() as f64
+    } else {
+        // Haas and Stokes' Duj1, clamped to [d, N].
+        let f1 = (nonnull_cnt - summultiple) as f64;
+        let d = f1 + nmultiple as f64;
+        let n = nonnull_cnt as f64;
+        let big_n = totalrows * (1.0 - null_frac);
+        let mut x = if big_n > 0.0 {
+            (n * d) / ((n - f1) + f1 * n / big_n)
+        } else {
+            0.0
+        };
+        x = x.max(d).min(big_n);
+        (x + 0.5).floor()
+    };
+    if stadistinct > 0.1 * totalrows {
+        stadistinct = -(stadistinct / totalrows);
+    }
+    // float4 as pg_statistic stores it.
+    let stadistinct = stadistinct as f32;
+    let mut num_mcv = target;
+    if track.len() < track_max && stadistinct > 0.0 && track.len() <= num_mcv {
+        num_mcv = track.len();
+    } else {
+        num_mcv = num_mcv.min(track.len());
+        if num_mcv > 0 {
+            let counts: Vec<usize> = track[..num_mcv].iter().map(|t| t.1).collect();
+            num_mcv = analyze_mcv_list(
+                &counts,
+                samplerows,
+                Sample {
+                    stadistinct: f64::from(stadistinct),
+                    null_frac,
+                    totalrows,
+                },
+            );
+        }
+    }
+    let mcv = track[..num_mcv]
+        .iter()
+        .map(|(k, c)| (k.to_vec(), (*c as f64 / samplerows) as f32))
+        .collect();
+    (
+        Slots {
+            mcv,
+            histogram: Vec::new(),
+            correlation: None,
+            mcv_complete: nmultiple <= num_mcv,
+        },
+        stadistinct,
+    )
+}
+
 /// `scalar_slots` over a sample smaller than its table (`sample`): the
 /// most common values are those `analyze_mcv_list` keeps, unless every
 /// distinct value was seen more than once and fits the list.
@@ -556,6 +671,25 @@ pub fn clauselist_with(clauses: &[(&Column, Op, Vec<u8>)], others: &[f64]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_stats_follow_the_track_list() {
+        // A new value goes in at the head of the count-1 entries, so 6
+        // overtakes 5 and an equal count does not move 5 back up.
+        let (slots, distinct) = distinct_slots_of(&ints([5, 6, 6, 5].into_iter()), 10, 0.0, 4.0);
+        assert_eq!(distinct, -0.5);
+        assert_eq!(slots.mcv, vec![(int_key(6), 0.5), (int_key(5), 0.5)]);
+        // One singleton: Duj1 gives 3, over a tenth of the rows.
+        let mut values = ints([1, 2, 2, 3, 3, 3].into_iter());
+        values.push(None);
+        let (slots, distinct) = distinct_slots_of(&values, 10, 1.0 / 7.0, 7.0);
+        assert_eq!(distinct, (-3.0f64 / 7.0) as f32);
+        assert_eq!(
+            slots.mcv.iter().map(|m| m.0.clone()).collect::<Vec<_>>(),
+            keys(&[3, 2, 1])
+        );
+        assert!(slots.histogram.is_empty() && slots.correlation.is_none());
+    }
 
     fn ints(vals: impl Iterator<Item = i64>) -> Vec<Sampled> {
         vals.map(|n| Some((int_key(n), 0))).collect()

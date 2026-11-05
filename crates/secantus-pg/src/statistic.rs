@@ -58,6 +58,16 @@ pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
     })
 }
 
+/// The `=` of a type with no `<` whose statistics are modelled
+/// (`compute_distinct_stats`): `aclitem[]`'s `array_eq`, as `aclitem` has
+/// `aclitemeq` and a hash opclass but no B-tree one.
+pub(crate) fn equality_only(pg_type: &str) -> Option<i64> {
+    match pg_type.trim_start_matches("pg_catalog.") {
+        "aclitem[]" | "_aclitem" | "pg_catalog.aclitem[]" => Some(1070),
+        _ => None,
+    }
+}
+
 /// The element type of a one-dimensional array type (`text[]`, `_text`);
 /// `None` for any other type.
 pub(crate) fn array_element(pg_type: &str) -> Option<&str> {
@@ -295,6 +305,7 @@ pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bso
             Bson::Double(f64::from_bits(u64::from_be_bytes(key.try_into().ok()?)))
         }
         "bool" => Bson::Boolean(*key.first()? != 0),
+        "aclitem" => Bson::String(String::from_utf8(key.to_vec()).ok()?),
         "text" | "varchar" | "character varying" | "name" | secantus_pgplan::QUOTED_CHAR => {
             Bson::String(String::from_utf8(key.to_vec()).ok()?)
         }
@@ -517,7 +528,7 @@ impl PgHandler {
                 let Some(c) = attnames.get(&(rel, attnum)).and_then(|n| def.column(n)) else {
                     continue;
                 };
-                if operators(&c.pg_type).is_none() {
+                if operators(&c.pg_type).is_none() && equality_only(&c.pg_type).is_none() {
                     continue;
                 }
                 let f = c.field();
@@ -550,7 +561,8 @@ impl PgHandler {
         if entry.get_bool("unmodelled").unwrap_or(false) {
             return None;
         }
-        let (eq, lt, coll) = operators(&c.pg_type)?;
+        let (eq, lt, coll) =
+            operators(&c.pg_type).or_else(|| Some((equality_only(&c.pg_type)?, 0, 0)))?;
         // A catalog's collatable column is `C` (its `attcollation`).
         let coll = if coll != 0 && entry.get_bool("catalog").unwrap_or(false) {
             C_COLLATION
