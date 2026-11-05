@@ -819,7 +819,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ["Seq Scan on ud  (cost=0.00..40.60 rows=1336 width=32)", "  Filter: (1 < ANY (a))"],
     ),
     "a cross-type constant equal to ANY of an array column": (
-        "RP-369",
+        "RP-370",
         ["create table ud (a int[])"],
         "explain select * from ud where 1::bigint = any(a)",
         [

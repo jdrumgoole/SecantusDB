@@ -18,4 +18,4 @@ slots, with the null fraction applied.
 
 #### Found
 
-- RP-369: a cast constant (`1::bigint`) in a Filter deparses as `(1)::bigint`.
+- RP-370: a cast constant (`1::bigint`) in a Filter deparses as `(1)::bigint`.

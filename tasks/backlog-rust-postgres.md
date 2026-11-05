@@ -1377,7 +1377,7 @@ a regression test.
       into a `bigint` Const (`eval_const_expressions`) and prints
       `Filter: ('1'::bigint = ANY (a))`. The cost line already matches
       (found while working RP-368).
-      Backlog-ID: RP-369
+      Backlog-ID: RP-370
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a cross-type constant equal to ANY of an array column]
 - [ ] **EXPLAIN prints no estimate for most Nested Loops.** Since RP-329
       a Nested Loop of two tables' sequential scans, `FROM a, b` joined
