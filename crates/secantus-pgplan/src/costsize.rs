@@ -62,7 +62,7 @@ const HASHED_SAOP: usize = 9;
 
 impl Qual {
     /// An index qual on its column (`match_clause_to_indexcol`).
-    fn indexable(&self) -> bool {
+    pub fn indexable(&self) -> bool {
         !matches!(self, Qual::Ne | Qual::Filter(_) | Qual::NotIn(_))
     }
 }
@@ -231,6 +231,23 @@ pub struct Index {
     /// A hash index (`hashcostestimate`, which is `genericcostestimate`):
     /// only `=` and `IN` serve it, and it has no B-tree descent to cost.
     pub hash: bool,
+    /// The selectivity of the quals on each of its later key columns, by
+    /// stored field (RP-378): each such qual is an index qual too
+    /// (`match_clause_to_index` matches every key column), and those on
+    /// the columns after a leading run of `=` bound the scan
+    /// (`btcostestimate`'s `indexBoundQuals`). Empty: only the leading
+    /// column's quals are index quals, as before.
+    pub later: Vec<(String, f64)>,
+}
+
+impl Index {
+    /// Whether `(field, qual)` is one of this index's index quals.
+    pub fn index_qual(&self, field: &str, q: &Qual) -> bool {
+        if self.hash {
+            return field == self.field && matches!(q, Qual::Eq | Qual::In(..));
+        }
+        q.indexable() && (field == self.field || self.later.iter().any(|(f, _)| f == field))
+    }
 }
 
 /// How the quals on an index's leading column are estimated: with no
@@ -303,8 +320,43 @@ fn index_cost_loops(
     if iq.is_empty() && !full && index.predicate.is_none() {
         return None;
     }
-    let sel = colsel.of(&iq) * index.predicate.unwrap_or(1.0);
+    // `btcostestimate`: the later key columns' quals are index quals too;
+    // those on each column after a leading run of columns with an `=` (a
+    // `ScalarArrayOpExpr` of `=` is one) bound the scan, and only they
+    // count towards the index tuples it reads.
+    let lead_sel = colsel.of(&iq);
+    let (mut bound_sel, mut all_sel) = (lead_sel, lead_sel);
+    let mut later_quals: Vec<&Qual> = Vec::new();
+    if !index.hash && !index.later.is_empty() {
+        let eq = |qs: &[&Qual]| qs.iter().any(|q| matches!(q, Qual::Eq | Qual::In(..)));
+        let mut bounding = eq(&iq);
+        for column in index.columns.iter().skip(1) {
+            let cq: Vec<&Qual> = quals
+                .iter()
+                .filter(|(f, q)| f == column && q.indexable())
+                .map(|(_, q)| q)
+                .collect();
+            if cq.is_empty() {
+                bounding = false;
+                continue;
+            }
+            let s = index
+                .later
+                .iter()
+                .find(|(f, _)| f == column)
+                .map_or(1.0, |(_, s)| *s);
+            all_sel *= s;
+            if bounding {
+                bound_sel *= s;
+                bounding = eq(&cq);
+            }
+            later_quals.extend(cq);
+        }
+    }
+    let sel = all_sel * index.predicate.unwrap_or(1.0);
+    let bound_sel = bound_sel * index.predicate.unwrap_or(1.0);
     let itup = index.tuples.unwrap_or(rel.tuples);
+    let iq: Vec<&Qual> = iq.into_iter().chain(later_quals).collect();
     let mut num_sa = 1.0;
     for q in &iq {
         if let Qual::In(n, _) = q {
@@ -319,7 +371,7 @@ fn index_cost_loops(
     let mut nit = if unique_eq {
         1.0
     } else {
-        (sel * rel.tuples / num_sa).round()
+        (bound_sel * rel.tuples / num_sa).round()
     };
     nit = nit.min(itup).max(1.0);
     let index_pages = if index.pages > 1.0 && itup > 1.0 {
@@ -472,7 +524,7 @@ fn index_scan_loops(
     let others = || {
         quals
             .iter()
-            .filter(|(f, q)| f != &index.field || !q.indexable())
+            .filter(|(f, q)| !index.index_qual(f, q))
             .map(|(_, q)| q)
     };
     // Summed in `cost_index`'s order: the index's run cost, then the heap
@@ -1238,6 +1290,71 @@ pub fn index_scan_over(
 }
 
 #[cfg(test)]
+mod composite_index_tests {
+    use super::*;
+
+    /// `create table n (a int, b int, c text)` of 5,000 rows (28 pages),
+    /// `a` distinct and in heap order, `b` 50 values, and `n_ab` on
+    /// `(a, b)` (16 pages, one level under its root), as PostgreSQL 15.19
+    /// measures them.
+    fn n_ab(later: Vec<(String, f64)>) -> Index {
+        Index {
+            field: "a".into(),
+            unique: false,
+            pages: 16.0,
+            height: 1,
+            columns: vec!["a".into(), "b".into()],
+            correlation: 0.75,
+            visible: 0.0,
+            tuples: None,
+            predicate: None,
+            hash: false,
+            later,
+        }
+    }
+
+    /// `where a = 7 and b = 7` over `n_ab`: both are index quals, and the
+    /// `=` on `a` lets `b`'s bound the scan (`btcostestimate`), so the
+    /// index scan is PostgreSQL 15.19's `cost=0.28..8.30` (RP-378).
+    #[test]
+    fn a_later_columns_equality_bounds_the_scan() {
+        let rel = Rel {
+            pages: 28.0,
+            tuples: 5000.0,
+        };
+        let quals = vec![("a".to_string(), Qual::Eq), ("b".to_string(), Qual::Eq)];
+        let (startup, total) = index_scan_cost(
+            &rel,
+            &n_ab(vec![("b".into(), 0.02)]),
+            &quals,
+            ColSel::Given(0.0002),
+        )
+        .unwrap();
+        assert_eq!(format!("{startup:.2}..{total:.2}"), "0.28..8.30");
+    }
+
+    /// A range on the leading column stops the bound: a later column's
+    /// equality is still an index qual, but no longer narrows the index
+    /// tuples read.
+    #[test]
+    fn a_leading_range_stops_the_bound() {
+        let rel = Rel {
+            pages: 28.0,
+            tuples: 5000.0,
+        };
+        let range = vec![
+            ("a".to_string(), Qual::Range(false)),
+            ("b".to_string(), Qual::Eq),
+        ];
+        let eq = vec![("a".to_string(), Qual::Eq), ("b".to_string(), Qual::Eq)];
+        let ix = n_ab(vec![("b".into(), 0.02)]);
+        let (_, ranged, _) = index_cost(&rel, &ix, &range, ColSel::Given(0.1), false).unwrap();
+        let (_, bounded, _) = index_cost(&rel, &ix, &eq, ColSel::Given(0.1), false).unwrap();
+        assert!(ranged > bounded);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1284,6 +1401,7 @@ mod tests {
             tuples: None,
             predicate: None,
             hash: false,
+            later: Vec::new(),
         }
     }
     fn q(filter: Document) -> Vec<(String, Qual)> {

@@ -3814,6 +3814,45 @@ pub fn explain_conjuncts(
         .map(|printed| qual_order(&parts, printed))
 }
 
+/// Each top-level `OR` conjunct of a WHERE, by the text
+/// [`explain_conjuncts`] prints for it, with per arm that arm's conjuncts
+/// as [`explain_conjuncts`] prints them (RP-378).
+pub type OrArms = Vec<(String, Vec<Vec<(String, Option<String>)>>)>;
+
+/// A single-relation WHERE's [`OrArms`]; `None` for a shape the printer
+/// does not know.
+pub fn explain_or_arms(where_clause: &Node, def: &TableDef) -> Option<OrArms> {
+    let mut parts = Vec::new();
+    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+                for a in &b.args {
+                    flatten(a, out);
+                }
+            }
+            _ => out.push(n),
+        }
+    }
+    flatten(where_clause, &mut parts);
+    let mut out = Vec::new();
+    for p in parts {
+        let Some(N::BoolExpr(b)) = p.node.as_ref() else {
+            continue;
+        };
+        if b.boolop != BoolExprType::OrExpr as i32 {
+            continue;
+        }
+        let text = expr_node_planned(p, def)?;
+        let arms = b
+            .args
+            .iter()
+            .map(|a| explain_conjuncts(a, def))
+            .collect::<Option<Vec<_>>>()?;
+        out.push((text, arms));
+    }
+    Some(out)
+}
+
 /// The column an index-usable conjunct constrains: `column op constant`
 /// (either way round) of a B-tree comparison operator, `column BETWEEN
 /// constant AND constant` (two such clauses once the parser expands it)

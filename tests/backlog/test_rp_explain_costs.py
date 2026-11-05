@@ -1791,6 +1791,110 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Index Cond: ((a = 7) AND (b = 7))",
         ],
     ),
+    # RP-378's regression scenarios, measured on a private 15.19 cluster.
+    "a bitmap or whose arm holds a clause no index serves": (
+        "RP-378",
+        _ANALYSED,
+        "explain select * from k where (a = 5 and b = 'v1') or a = 6",
+        [
+            "Bitmap Heap Scan on k  (cost=8.57..12.81 rows=1 width=7)",
+            "  Recheck Cond: ((a = 5) OR (a = 6))",
+            "  Filter: (((a = 5) AND (b = 'v1'::text)) OR (a = 6))",
+            "  ->  BitmapOr  (cost=8.57..8.57 rows=2 width=0)",
+            "        ->  Bitmap Index Scan on k_pkey  (cost=0.00..4.28 rows=1 width=0)",
+            "              Index Cond: (a = 5)",
+            "        ->  Bitmap Index Scan on k_pkey  (cost=0.00..4.28 rows=1 width=0)",
+            "              Index Cond: (a = 6)",
+        ],
+    ),
+    "a bitmap or with an arm on a composite index's two columns": (
+        "RP-378",
+        _N,
+        "explain select * from n where (a = 7 and b = 7) or a = 9",
+        [
+            "Bitmap Heap Scan on n  (cost=8.58..12.60 rows=1 width=11)",
+            "  Recheck Cond: (((a = 7) AND (b = 7)) OR (a = 9))",
+            "  ->  BitmapOr  (cost=8.58..8.58 rows=1 width=0)",
+            "        ->  Bitmap Index Scan on n_ab  (cost=0.00..4.29 rows=1 width=0)",
+            "              Index Cond: ((a = 7) AND (b = 7))",
+            "        ->  Bitmap Index Scan on n_ab  (cost=0.00..4.29 rows=1 width=0)",
+            "              Index Cond: (a = 9)",
+        ],
+    ),
+    "a composite index's in list and a later equality": (
+        "RP-378",
+        _N,
+        "explain select * from n where a in (1, 2, 3) and b = 2",
+        [
+            "Index Scan using n_ab on n  (cost=0.28..16.89 rows=1 width=11)",
+            "  Index Cond: ((a = ANY ('{1,2,3}'::integer[])) AND (b = 2))",
+        ],
+    ),
+    "a composite index's later range, in key order": (
+        "RP-378",
+        _N,
+        "explain select * from n where a = 7 and b > 3",
+        [
+            "Index Scan using n_ab on n  (cost=0.28..8.30 rows=1 width=11)",
+            "  Index Cond: ((a = 7) AND (b > 3))",
+        ],
+    ),
+    "an index-only scan turned off": (
+        "RP-378",
+        _ANALYSED + ["set enable_indexonlyscan = off"],
+        "explain select a from k where a = 5",
+        [
+            "Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "  Index Cond: (a = 5)",
+        ],
+    ),
+    # ------------- RP-382 a node over a user table's index path, unpriced
+    "a sort over a user table's bitmap scan": (
+        "RP-382",
+        _N,
+        "explain select * from n where b = 7 order by a",
+        [
+            "Sort  (cost=37.63..37.88 rows=100 width=11)",
+            "  Sort Key: a",
+            "  ->  Bitmap Heap Scan on n  (cost=5.06..34.31 rows=100 width=11)",
+            "        Recheck Cond: (b = 7)",
+            "        ->  Bitmap Index Scan on n_b  (cost=0.00..5.03 rows=100 width=0)",
+            "              Index Cond: (b = 7)",
+        ],
+    ),
+    "a limit over a user table's index scan": (
+        "RP-382",
+        _ANALYSED,
+        "explain select * from k where a = 5 limit 1",
+        [
+            "Limit  (cost=0.28..8.29 rows=1 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+        ],
+    ),
+    # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
+    "analyze of a user table's index-only scan": (
+        "RP-383",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off) select a from k where a = 5",
+        [
+            "Index Only Scan using k_pkey on k (actual rows=1 loops=1)",
+            "  Index Cond: (a = 5)",
+            "  Heap Fetches: 1",
+        ],
+    ),
+    "analyze of a user table's bitmap scan": (
+        "RP-383",
+        _N,
+        "explain (analyze, costs off, timing off, summary off) select * from n where b = 7",
+        [
+            "Bitmap Heap Scan on n (actual rows=100 loops=1)",
+            "  Recheck Cond: (b = 7)",
+            "  Heap Blocks: exact=27",
+            "  ->  Bitmap Index Scan on n_b (actual rows=100 loops=1)",
+            "        Index Cond: (b = 7)",
+        ],
+    ),
     # --------------------------------- RP-334 / RP-335 a catalog's index
     "a catalog read by its index": (
         "RP-334",
@@ -2060,6 +2164,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-374",
         "RP-375",
         "RP-376",
+        "RP-378",
         "RP-379",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

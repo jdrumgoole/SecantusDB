@@ -896,7 +896,7 @@ struct MeasuredWhere {
 
 /// A bitmap index scan's quals on one column: the column, its quals, their
 /// selectivity, and the clauses they are (by position in their list).
-struct IndexQuals {
+pub(crate) struct IndexQuals {
     field: String,
     quals: Vec<(String, secantus_pgplan::costsize::Qual)>,
     selectivity: f64,
@@ -9346,6 +9346,7 @@ impl PgHandler {
                 tuples: None,
                 predicate: None,
                 hash: false,
+                later: Vec::new(),
             });
         };
         let pk: Vec<String> = def
@@ -40981,10 +40982,6 @@ impl PgHandler {
                             // A computed select-list entry is evaluated per
                             // output row (`cost_seqscan`'s target cost) and
                             // is its type's width (RP-333).
-                            // An index path is chosen by the columns it
-                            // holds, and an expression's reads are not
-                            // counted there: priced only as a Seq Scan.
-                            let computed = sel.casts.iter().any(Option::is_some);
                             let priced = scan_estimate::target_cost(sel).and_then(
                                 |(cost, width, fields)| {
                                     let (est, index) = match array_quals {
@@ -40994,33 +40991,15 @@ impl PgHandler {
                                             )?,
                                             None,
                                         ),
-                                        // A user table whose cheapest path is an
-                                        // index keeps its priced sequential
-                                        // scan here, as before RP-339.
-                                        None if computed => {
-                                            match self.scan_estimate(
-                                                &sel.table,
-                                                &sel.filter,
-                                                &fields,
-                                            )? {
-                                                (_, Some(_)) => (
-                                                    self.user_seq_scan(
-                                                        &sel.table,
-                                                        &sel.filter,
-                                                        &fields,
-                                                    )?,
-                                                    None,
-                                                ),
-                                                plain => plain,
-                                            }
-                                        }
-                                        None => {
-                                            self.scan_estimate(&sel.table, &sel.filter, &fields)?
-                                        }
+                                        // A computed select list's reads count
+                                        // towards an index-only scan (RP-378).
+                                        None => self.scan_estimate_reading(
+                                            &sel.table,
+                                            &sel.filter,
+                                            &fields,
+                                            &scan_estimate::computed_reads(sel),
+                                        )?,
                                     };
-                                    if computed && index.is_some() {
-                                        return None;
-                                    }
                                     let (startup, total, rows, w) = est;
                                     Some(((startup, total + cost * rows, rows, w + width), index))
                                 },
@@ -41028,20 +41007,7 @@ impl PgHandler {
                             if let Some((estimate, index)) = priced {
                                 tree.estimate = Some(estimate);
                                 if let Some(index) = index {
-                                    tree.name = index.node_name(&sel.table);
-                                    match index.bitmap {
-                                        // A Bitmap Heap Scan over its index's
-                                        // Bitmap Index Scan (RP-338).
-                                        Some(child) => {
-                                            tree.children.push(explain::bitmap_index_scan(
-                                                &index.name,
-                                                child,
-                                            ));
-                                        }
-                                        None => {
-                                            tree.props.insert(0, ("Index Name".into(), index.name))
-                                        }
-                                    }
+                                    explain::index_path_node(&mut tree, index, &sel.table);
                                 }
                             }
                         }
@@ -41745,6 +41711,30 @@ impl PgHandler {
                             tree.estimate =
                                 self.index_scan_estimate(&sel.table, &sel.filter, &fields, &key);
                         }
+                        // The path `set_cheapest` keeps among every index
+                        // path, where it is one (RP-378): an index-only
+                        // scan, another index, a bitmap scan.
+                        if sel.residual.is_none()
+                            && sel.sub.is_none()
+                            && sel.series.is_none()
+                            && sel.join.is_none()
+                            && sel.windows.is_empty()
+                        {
+                            if let Some((cost, width, fields)) = scan_estimate::target_cost(sel) {
+                                if let Some(((startup, total, rows, w), Some(index))) = self
+                                    .user_index_path_reading(
+                                        &sel.table,
+                                        &sel.filter,
+                                        &fields,
+                                        &scan_estimate::computed_reads(sel),
+                                    )
+                                {
+                                    tree.estimate =
+                                        Some((startup, total + cost * rows, rows, w + width));
+                                    explain::index_path_node(&mut tree, index, &sel.table);
+                                }
+                            }
+                        }
                     }
                 }
                 let relations = self.index_relations();
@@ -41761,7 +41751,12 @@ impl PgHandler {
                         })
                         .unwrap_or_else(|| scan_estimate::catalog_index_columns(name))
                 };
-                explain::attach_scan_quals(&mut tree, &options.scan_quals, &index_columns);
+                explain::attach_scan_quals(
+                    &mut tree,
+                    &options.scan_quals,
+                    &options.scan_or_arms,
+                    &index_columns,
+                );
                 explain::gate_scan(&mut tree, options.one_time_false);
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 explain::attach_join_conds(

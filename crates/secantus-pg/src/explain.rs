@@ -1062,7 +1062,9 @@ fn structured(
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
-                    let rel = if node_type == "Append" {
+                    // ExplainNode's `Member` plans: an Append's, and a
+                    // BitmapOr's / BitmapAnd's (RP-378).
+                    let rel = if matches!(node_type.as_str(), "Append" | "BitmapOr" | "BitmapAnd") {
                         "Member"
                     } else if node_type == "Subquery Scan" {
                         "Subquery"
@@ -1275,6 +1277,7 @@ mod serde_json_lite {
 pub(crate) fn attach_scan_quals(
     root: &mut PlanNode,
     quals: &[(String, Option<String>)],
+    or_arms: &secantus_pgplan::ruleutils::OrArms,
     index_columns: &dyn Fn(&str) -> Vec<String>,
 ) {
     if quals.is_empty() {
@@ -1294,7 +1297,92 @@ pub(crate) fn attach_scan_quals(
     let [scan] = found.as_mut_slice() else {
         return;
     };
-    quals_on_scan(scan, quals, index_columns);
+    if !or_quals_on_scan(scan, quals, or_arms, index_columns) {
+        quals_on_scan(scan, quals, index_columns);
+    }
+}
+
+/// A Bitmap Heap Scan over a BitmapOr (RP-378), as
+/// `create_bitmap_scan_plan` prints it: each arm's Bitmap Index Scan takes
+/// that arm's conjuncts on its index's columns as its `Index Cond`; the
+/// heap rechecks the `OR` of those (`Recheck Cond`), and filters on every
+/// other conjunct and, where an arm held more than its index conditions,
+/// the whole `OR` (`Filter`). `false` for any other scan.
+fn or_quals_on_scan(
+    scan: &mut PlanNode,
+    quals: &[(String, Option<String>)],
+    or_arms: &secantus_pgplan::ruleutils::OrArms,
+    index_columns: &dyn Fn(&str) -> Vec<String>,
+) -> bool {
+    if !scan.name.starts_with("Bitmap Heap Scan on ")
+        || !scan.children.first().is_some_and(|c| c.name == "BitmapOr")
+    {
+        return false;
+    }
+    let children = scan.children[0].children.len();
+    let Some((at, arms)) = quals.iter().enumerate().find_map(|(i, (text, _))| {
+        or_arms
+            .iter()
+            .find(|(t, a)| t == text && a.len() == children)
+            .map(|(_, a)| (i, a))
+    }) else {
+        return false;
+    };
+    let join = |parts: &[&String]| -> String {
+        match parts {
+            [one] => (*one).clone(),
+            many => format!(
+                "({})",
+                many.iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            ),
+        }
+    };
+    let mut whole = true;
+    let mut conds = Vec::with_capacity(children);
+    for (child, arm) in scan.children[0].children.iter_mut().zip(arms) {
+        let keys = child
+            .props
+            .iter()
+            .find(|(k, _)| k == "Index Name")
+            .map(|(_, v)| index_columns(v))
+            .unwrap_or_default();
+        let mut keyed: Vec<(usize, &String)> = arm
+            .iter()
+            .filter_map(|(text, col)| {
+                Some((keys.iter().position(|k| Some(k) == col.as_ref())?, text))
+            })
+            .collect();
+        if keyed.is_empty() {
+            return false;
+        }
+        whole &= keyed.len() == arm.len();
+        keyed.sort_by_key(|(at, _)| *at);
+        let cond = join(&keyed.iter().map(|(_, t)| *t).collect::<Vec<_>>());
+        child.details.push(("Index Cond".into(), cond.clone()));
+        conds.push(cond);
+    }
+    let (text, _) = &quals[at];
+    let recheck = if whole {
+        text.clone()
+    } else {
+        format!("({})", conds.join(" OR "))
+    };
+    scan.details
+        .retain(|(k, v)| !(k == "Filter" && v == "(...)"));
+    scan.details.push(("Recheck Cond".into(), recheck));
+    let filter: Vec<&String> = quals
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at || !whole)
+        .map(|(_, (t, _))| t)
+        .collect();
+    if !filter.is_empty() {
+        scan.details.push(("Filter".into(), join(&filter)));
+    }
+    true
 }
 
 /// Gate a single-relation plan's scan with the `false` pseudoconstants its
@@ -1386,13 +1474,18 @@ fn quals_on_scan(
     let (cond, filter): (Vec<&String>, Vec<&String>) = {
         let mut cond = Vec::new();
         let mut filter = Vec::new();
+        let mut keyed: Vec<(usize, &String)> = Vec::new();
         for (text, col) in quals {
-            if col.as_ref().is_some_and(|c| keys.contains(c)) {
-                cond.push(text);
-            } else {
-                filter.push(text);
+            match col.as_ref().and_then(|c| keys.iter().position(|k| k == c)) {
+                Some(at) => keyed.push((at, text)),
+                None => filter.push(text),
             }
         }
+        // In the index's column order (`fix_indexqual_references` keeps
+        // the path's index clauses, which `match_clauses_to_index` lists
+        // column by column).
+        keyed.sort_by_key(|(at, _)| *at);
+        cond.extend(keyed.into_iter().map(|(_, t)| t));
         (cond, filter)
     };
     let join = |parts: &[&String]| -> String {
@@ -1422,6 +1515,32 @@ fn quals_on_scan(
     }
     if !filter.is_empty() {
         scan.details.push(("Filter".into(), join(&filter)));
+    }
+}
+
+/// Make `tree`, one relation's scan, the index path `index` names: an
+/// Index Scan or Index Only Scan naming its index, or a Bitmap Heap Scan
+/// over one Bitmap Index Scan (RP-338) or over a BitmapOr of one per arm
+/// (RP-378).
+pub(crate) fn index_path_node(
+    tree: &mut PlanNode,
+    index: crate::scan_estimate::ScanIndex,
+    table: &str,
+) {
+    tree.name = index.node_name(table);
+    tree.props.retain(|(k, _)| k != "Index Name");
+    tree.children.clear();
+    match index.bitmap {
+        Some(child) if !index.or_arms.is_empty() => {
+            let mut or = PlanNode::new("BitmapOr");
+            or.estimate = Some(child);
+            for (name, estimate) in index.or_arms {
+                or.children.push(bitmap_index_scan(&name, estimate));
+            }
+            tree.children.push(or);
+        }
+        Some(child) => tree.children.push(bitmap_index_scan(&index.name, child)),
+        None => tree.props.insert(0, ("Index Name".into(), index.name)),
     }
 }
 
@@ -1900,6 +2019,51 @@ fn is_scan_name(name: &str) -> bool {
 mod bitmap_scan_tests {
     use super::*;
 
+    /// A BitmapOr's arms each take their own conjuncts on their index as
+    /// `Index Cond`; an arm holding a clause no index serves leaves the
+    /// whole `OR` a `Filter` and the heap rechecks only the index
+    /// conditions, as PostgreSQL 15.19 prints `where (a = 5 and b = 'v1')
+    /// or a = 6` (RP-378).
+    #[test]
+    fn a_bitmap_or_puts_each_arms_conditions_on_its_index_scan() {
+        let mut heap = PlanNode::new("Bitmap Heap Scan on k");
+        let mut or = PlanNode::new("BitmapOr");
+        or.children
+            .push(bitmap_index_scan("k_pkey", (0.0, 4.28, 1.0, 0)));
+        or.children
+            .push(bitmap_index_scan("k_pkey", (0.0, 4.28, 1.0, 0)));
+        heap.children.push(or);
+        let text = "(((a = 5) AND (b = 'v1'::text)) OR (a = 6))".to_string();
+        let quals = vec![(text.clone(), None)];
+        let arms = vec![(
+            text.clone(),
+            vec![
+                vec![
+                    ("(a = 5)".to_string(), Some("a".to_string())),
+                    ("(b = 'v1'::text)".to_string(), Some("b".to_string())),
+                ],
+                vec![("(a = 6)".to_string(), Some("a".to_string()))],
+            ],
+        )];
+        attach_scan_quals(&mut heap, &quals, &arms, &|_| vec!["a".into()]);
+        assert_eq!(
+            heap.details,
+            vec![
+                (
+                    "Recheck Cond".to_string(),
+                    "((a = 5) OR (a = 6))".to_string()
+                ),
+                ("Filter".to_string(), text),
+            ]
+        );
+        let conds: Vec<&str> = heap.children[0]
+            .children
+            .iter()
+            .map(|c| c.details[0].1.as_str())
+            .collect();
+        assert_eq!(conds, ["(a = 5)", "(a = 6)"]);
+    }
+
     /// A Bitmap Heap Scan rechecks its index quals and its Bitmap Index
     /// Scan holds them as its Index Cond; a qual on another column stays
     /// the heap's Filter (RP-338).
@@ -1920,7 +2084,7 @@ mod bitmap_scan_tests {
                 Some("relkind".to_string()),
             ),
         ];
-        attach_scan_quals(&mut heap, &quals, &|_| {
+        attach_scan_quals(&mut heap, &quals, &Vec::new(), &|_| {
             vec!["relname".into(), "relnamespace".into()]
         });
         assert_eq!(
@@ -1963,6 +2127,7 @@ mod heap_fetches_tests {
             summary: false,
             format: format.into(),
             scan_quals: Vec::new(),
+            scan_or_arms: Vec::new(),
             scan_in_lengths: Vec::new(),
             scan_array_quals: None,
             setop_quals: Vec::new(),

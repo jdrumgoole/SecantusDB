@@ -551,6 +551,7 @@ impl PgHandler {
                 tuples: None,
                 predicate: None,
                 hash: true,
+                later: Vec::new(),
             });
         }
         // `disable_cost`, added to a path's startup when its kind is off.
@@ -729,6 +730,7 @@ impl PgHandler {
                     tuples: Some(tuples),
                     predicate: Some(selectivity),
                     hash: false,
+                    later: Vec::new(),
                 },
                 shape,
             ));
