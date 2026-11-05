@@ -31388,7 +31388,7 @@ impl PgHandler {
                 if matches!(info.code.as_str(), "57014" | "57P01" | "25P02")
         );
         if analysed {
-            self.catalog_reads(query);
+            self.catalog_reads(query, &effects.pre);
         }
         self.catalog_reads_done(effects, result.is_ok());
         if let Err(PgWireError::UserError(info)) = &result {

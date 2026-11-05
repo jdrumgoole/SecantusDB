@@ -73,6 +73,8 @@ pub(crate) struct Rel {
     pub checks: i64,
     /// A view's definition: its rule.
     pub view: Option<String>,
+    /// `reltoastrelid` is set: the table has a TOAST table.
+    pub toast: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -109,6 +111,28 @@ pub(crate) struct TypeOps {
 
 /// The database's default tablespace (`MyDatabaseTableSpace`).
 const DEFAULT_TABLESPACE: i64 = 1663;
+
+/// `pg_event_trigger` and its name index.
+const EVENT_TRIGGER: i64 = 3466;
+const EVENT_TRIGGER_NAME_INDEX: i64 = 3467;
+const RELATION_RELATION: i64 = 1259;
+const ATTRIBUTE_RELATION: i64 = 1249;
+const DEPEND_RELATION: i64 = 2608;
+const DEPEND_DEPENDER_INDEX: i64 = 2673;
+const DEPEND_REFERENCE_INDEX: i64 = 2674;
+const SHDEPEND_RELATION: i64 = 1214;
+const SHDEPEND_DEPENDER_INDEX: i64 = 1232;
+const DESCRIPTION_RELATION: i64 = 2609;
+const DESCRIPTION_INDEX: i64 = 2675;
+const SECLABEL_RELATION: i64 = 3596;
+const SECLABEL_INDEX: i64 = 3597;
+const INIT_PRIVS_RELATION: i64 = 3394;
+const INIT_PRIVS_INDEX: i64 = 3395;
+const STATISTIC_RELATION: i64 = 2619;
+const STATISTIC_INDEX: i64 = 2696;
+/// `FirstUnpinnedObjectId`: `isObjectPinned` below it, so no dependency
+/// on such an object is recorded.
+const FIRST_UNPINNED_OBJECT_ID: i64 = 12000;
 
 /// How deep an expression is walked.
 const MAX_DEPTH: u32 = 400;
@@ -178,6 +202,9 @@ pub(crate) struct Model<'a> {
     /// walked (`inline_function`'s `active_fns`).
     depth: u32,
     active_fns: Vec<i64>,
+    /// The relations a DDL statement changes, as they stood before it ran
+    /// (the walk runs after it).
+    pre: Vec<Rel>,
 }
 
 fn names_of(nodes: &[pb::Node]) -> Vec<String> {
@@ -219,6 +246,7 @@ impl<'a> Model<'a> {
             silent: 0,
             depth: 0,
             active_fns: Vec::new(),
+            pre: Vec::new(),
         }
     }
 
@@ -990,6 +1018,7 @@ impl<'a> Model<'a> {
             }
             N::InsertStmt(i) => self.insert(i),
             N::CreateStmt(c) => self.create_table(c),
+            N::AlterTableStmt(a) => self.alter_table(a),
             N::UpdateStmt(u) => {
                 self.update_or_delete(u.relation.as_ref(), &u.target_list, node(&u.where_clause))
             }
@@ -1046,6 +1075,267 @@ impl<'a> Model<'a> {
             vec![K::N(format!("_{name}")), K::O(nsp)],
             |_| false,
         );
+    }
+
+    /// `evtcache.c`'s `EventCacheLookup`: the first DDL of a backend builds
+    /// the event trigger cache, an ordered scan of all of
+    /// `pg_event_trigger_evtname_index`.
+    fn event_cache(&mut self) {
+        if self.be.event_cache {
+            return;
+        }
+        self.be.event_cache = true;
+        self.open_catalog(EVENT_TRIGGER);
+        self.open_catalog_index(EVENT_TRIGGER_NAME_INDEX);
+        let n = self
+            .h
+            .virtual_rows_for("pg_event_trigger")
+            .map_or(0, |r| r.len() as i64);
+        self.ct.index(EVENT_TRIGGER_NAME_INDEX, Vec::new(), n);
+    }
+
+    /// `CatalogOpenIndexes` for an insert into or update of a catalog: its
+    /// index list and each index's descriptor.
+    fn catalog_indexes(&mut self, oid: i64) {
+        let Some(rel) = self.catalog_rel(oid) else {
+            return;
+        };
+        self.open_relation(&rel);
+        self.index_list(&rel);
+        for ix in rel.indexes.clone() {
+            self.open_index(&ix);
+        }
+    }
+
+    /// A catalog scanned through one of its indexes, uncached
+    /// (`systable_beginscan`): its descriptor and the index's, then the
+    /// scan.
+    fn catalog_scan(&mut self, heap: i64, index: i64, key: Key, rows: i64) {
+        self.open_catalog(heap);
+        self.open_catalog_index(index);
+        self.ct.index_key(index, &key, rows);
+    }
+
+    /// ALTER TABLE ... ADD COLUMN / DROP COLUMN as `ProcessUtilitySlow`,
+    /// `AlterTable` and `tablecmds.c` read the catalogs for them. A
+    /// subcommand of another kind, a column with constraints or a default,
+    /// one dependent objects hang from, a new TOAST table, or a role that
+    /// is not a superuser (whose permission checks read the role caches)
+    /// stops the walk where it is: what follows is not walked (RP-290).
+    fn alter_table(&mut self, a: &pb::AlterTableStmt) {
+        if a.objtype != pb::ObjectType::ObjectTable as i32 || !self.superuser {
+            return;
+        }
+        let Some(rv) = a.relation.as_ref() else {
+            return;
+        };
+        // `EventTriggerBeginCompleteQuery`.
+        self.event_cache();
+        // `AlterTableLookupRelation`: the name along the path, then
+        // `RangeVarCallbackForAlterRelation`'s pg_class row.
+        let spaces = if rv.schemaname.is_empty() {
+            self.active_path()
+        } else {
+            match self.explicit_namespace(&rv.schemaname) {
+                Some(n) => vec![n],
+                None => return,
+            }
+        };
+        let mut target = None;
+        for nsp in spaces {
+            let rel = self
+                .pre
+                .iter()
+                .find(|r| r.nsp == nsp && r.name == rv.relname)
+                .cloned();
+            let key = vec![K::N(rv.relname.clone()), K::O(nsp)];
+            self.search(Cache::RelNameNsp, key, |_| rel.is_some());
+            if rel.is_some() {
+                target = rel;
+                break;
+            }
+        }
+        let Some(mut rel) = target else {
+            return;
+        };
+        if rel.kind != 'r' {
+            return;
+        }
+        self.search(Cache::RelOid, vec![K::O(rel.oid)], |_| true);
+        // `AlterTable`'s `relation_open`.
+        self.open_relation(&rel);
+        for c in &a.cmds {
+            let Some(N::AlterTableCmd(cmd)) = c.node.as_ref() else {
+                return;
+            };
+            let next = if cmd.subtype == pb::AlterTableType::AtAddColumn as i32 {
+                self.add_column(&rel, cmd)
+            } else if cmd.subtype == pb::AlterTableType::AtDropColumn as i32 {
+                self.drop_column(&rel, cmd)
+            } else {
+                None
+            };
+            match next {
+                Some(r) => rel = r,
+                None => return,
+            }
+        }
+    }
+
+    /// `ATParseTransformCmd` and `ATExecAddColumn`; the relation as the
+    /// column leaves it.
+    fn add_column(&mut self, rel: &Rel, cmd: &pb::AlterTableCmd) -> Option<Rel> {
+        let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) else {
+            return None;
+        };
+        // `ATParseTransformCmd` names the relation by its schema.
+        self.search(Cache::NamespaceOid, vec![K::O(rel.nsp)], |_| true);
+        // `transformColumnType`.
+        let tn = cd.type_name.as_ref()?;
+        let serial = names_of(&tn.names).len() == 1
+            && matches!(
+                names_of(&tn.names)[0].as_str(),
+                "smallserial" | "serial2" | "serial" | "serial4" | "bigserial" | "serial8"
+            );
+        if serial || tn.pct_type || cd.coll_clause.is_some() {
+            return None;
+        }
+        let typ = self.type_name(tn)?;
+        // `check_for_column_name_collision`.
+        self.search(
+            Cache::AttName,
+            vec![K::O(rel.oid), K::N(cd.colname.clone())],
+            |_| false,
+        );
+        if !cd.constraints.is_empty() || cd.raw_default.is_some() || !cd.identity.is_empty() {
+            return None;
+        }
+        let t = builtin().types.get(&typ)?;
+        if t.typtype == 'd' {
+            // `DomainHasConstraints`, and a domain's default.
+            return None;
+        }
+        // `InsertPgAttributeTuples`, then the `relnatts` update of the
+        // table's pg_class row.
+        self.catalog_indexes(ATTRIBUTE_RELATION);
+        self.catalog_indexes(RELATION_RELATION);
+        // `CommandCounterIncrement`: the open relation is rebuilt with its
+        // new column.
+        let attnum = rel.natts + 1;
+        self.be.command_counter(&[
+            Inval::Rel(rel.oid),
+            Inval::Cat(Cache::RelOid, vec![K::O(rel.oid)]),
+            Inval::Cat(
+                Cache::RelNameNsp,
+                vec![K::N(rel.name.clone()), K::O(rel.nsp)],
+            ),
+            Inval::Cat(Cache::AttNum, vec![K::O(rel.oid), K::O(attnum)]),
+            Inval::Cat(
+                Cache::AttName,
+                vec![K::O(rel.oid), K::N(cd.colname.clone())],
+            ),
+        ]);
+        let mut next = rel.clone();
+        next.natts = attnum;
+        next.columns.push((attnum, cd.colname.clone(), typ));
+        self.open_relation(&next);
+        // `add_column_datatype_dependency`: `recordMultipleDependencies`
+        // opens pg_depend before it skips a pinned type, and inserts (with
+        // its indexes) only for one that is not.
+        self.open_catalog(DEPEND_RELATION);
+        if typ >= FIRST_UNPINNED_OBJECT_ID {
+            self.catalog_indexes(DEPEND_RELATION);
+        }
+        // `find_inheritance_children`: `has_subclass`.
+        self.search(Cache::RelOid, vec![K::O(rel.oid)], |_| true);
+        // `AlterTableCreateToastTable`: a table that now needs a TOAST
+        // table gets one.
+        let toast = self
+            .h
+            .cr_relation_in(rel.nsp, &rel.name)
+            .is_some_and(|r| r.toast);
+        if toast && !rel.toast {
+            return None;
+        }
+        next.toast = toast;
+        Some(next)
+    }
+
+    /// `ATExecDropColumn` and `performMultipleDeletions` of the column;
+    /// the relation as the drop leaves it.
+    fn drop_column(&mut self, rel: &Rel, cmd: &pb::AlterTableCmd) -> Option<Rel> {
+        // `SearchSysCacheAttName`.
+        let col = rel.columns.iter().find(|c| c.1 == cmd.name).cloned();
+        self.search(
+            Cache::AttName,
+            vec![K::O(rel.oid), K::N(cmd.name.clone())],
+            |_| col.is_some(),
+        );
+        let (att, _, typ) = col?;
+        // Objects that depend on the column (an index, a default, a
+        // constraint) and a type it depends on are not walked.
+        if rel
+            .indexes
+            .iter()
+            .any(|ix| ix.keys.contains(&att) || ix.keys.contains(&0))
+            || rel.defaults > 0
+            || rel.checks > 0
+            || typ >= FIRST_UNPINNED_OBJECT_ID
+        {
+            return None;
+        }
+        // `find_inheritance_children`: `has_subclass`.
+        self.search(Cache::RelOid, vec![K::O(rel.oid)], |_| true);
+        // `findDependentObjects`: what the column depends on, then what
+        // depends on it.
+        let obj = vec![K::O(RELATION_RELATION), K::O(rel.oid), K::O(att)];
+        self.catalog_scan(DEPEND_RELATION, DEPEND_DEPENDER_INDEX, obj.clone(), 0);
+        self.catalog_scan(DEPEND_RELATION, DEPEND_REFERENCE_INDEX, obj.clone(), 0);
+        // `RemoveAttributeById`: the column's row, renamed and marked
+        // dropped (a non-HOT update: its old index entries are dead), and
+        // its statistics.
+        self.search(Cache::AttNum, vec![K::O(rel.oid), K::O(att)], |_| true);
+        self.catalog_indexes(ATTRIBUTE_RELATION);
+        self.ct.own_dead(2659, vec![K::O(rel.oid), K::O(att)]);
+        self.ct
+            .own_dead(2658, vec![K::O(rel.oid), K::N(cmd.name.clone())]);
+        let measured = i64::from(rel.stats.contains(&att));
+        self.catalog_scan(
+            STATISTIC_RELATION,
+            STATISTIC_INDEX,
+            vec![K::O(rel.oid), K::O(att)],
+            measured,
+        );
+        // `deleteOneObject`: the column's own dependency records, shared
+        // dependencies, comments, security labels and initial privileges.
+        self.catalog_scan(DEPEND_RELATION, DEPEND_DEPENDER_INDEX, obj, 0);
+        let db = self.h.stats().db;
+        self.catalog_scan(
+            SHDEPEND_RELATION,
+            SHDEPEND_DEPENDER_INDEX,
+            vec![K::O(db), K::O(RELATION_RELATION), K::O(rel.oid), K::O(att)],
+            0,
+        );
+        let described = vec![K::O(rel.oid), K::O(RELATION_RELATION), K::O(att)];
+        self.catalog_scan(
+            DESCRIPTION_RELATION,
+            DESCRIPTION_INDEX,
+            described.clone(),
+            0,
+        );
+        self.catalog_scan(SECLABEL_RELATION, SECLABEL_INDEX, described.clone(), 0);
+        self.catalog_scan(INIT_PRIVS_RELATION, INIT_PRIVS_INDEX, described, 0);
+        // `CommandCounterIncrement`: the open relation is rebuilt.
+        self.be.command_counter(&[
+            Inval::Rel(rel.oid),
+            Inval::Cat(Cache::AttNum, vec![K::O(rel.oid), K::O(att)]),
+            Inval::Cat(Cache::AttName, vec![K::O(rel.oid), K::N(cmd.name.clone())]),
+        ]);
+        let mut next = rel.clone();
+        next.columns.retain(|c| c.0 != att);
+        next.stats.remove(&att);
+        self.open_relation(&next);
+        Some(next)
     }
 
     /// An INSERT: the target's descriptor, each value coerced to its
@@ -2691,6 +2981,7 @@ impl PgHandler {
                 defaults,
                 checks: def.check_constraints.len() as i64,
                 view: None,
+                toast: PgHandler::needs_toast(def),
             });
         }
         None
@@ -3038,6 +3329,25 @@ impl PgHandler {
                 let (invals, dead) = ddl_effects(self, stmt);
                 effects.invals.extend(invals);
                 effects.dead.extend(dead);
+                if let N::AlterTableStmt(a) = stmt {
+                    if let Some(rv) = a.relation.as_ref() {
+                        // Unqualified: the name in every schema, for the
+                        // walk to take the first along its path.
+                        let spaces: Vec<i64> = if rv.schemaname.is_empty() {
+                            let mut v = vec![PG_CATALOG, PUBLIC];
+                            v.extend(self.namespaces().into_iter().map(|(_, o)| o));
+                            v.dedup();
+                            v
+                        } else {
+                            self.cr_namespace_oid(&rv.schemaname).into_iter().collect()
+                        };
+                        for nsp in spaces {
+                            if let Some(rel) = self.cr_relation_in(nsp, &rv.relname) {
+                                effects.pre.push(rel);
+                            }
+                        }
+                    }
+                }
             }
         }
         effects
@@ -3047,7 +3357,7 @@ impl PgHandler {
     /// catalog facts are read in the session's state as the statement left
     /// it, never ahead of what the statement itself sets up (a catalog read
     /// before the statement ran once cached rows it then answered from).
-    pub(crate) fn catalog_reads(&self, sql: &str) {
+    pub(crate) fn catalog_reads(&self, sql: &str, pre: &[Rel]) {
         let (store, pid) = self.catcache_ids();
         // A statement this long is not parsed a second time to be walked:
         // its catalog reads go uncounted (RP-290).
@@ -3099,6 +3409,7 @@ impl PgHandler {
                 continue;
             };
             let mut m = Model::new(self, &mut be, self.catcache_counter());
+            m.pre = pre.to_vec();
             m.statement(stmt);
             let made = m.ct.take_scans();
             scans.extend(std::mem::take(&mut m.exec));
@@ -3145,6 +3456,8 @@ impl PgHandler {
 pub(crate) struct Effects {
     pub(crate) invals: Vec<Inval>,
     pub(crate) dead: Vec<(i64, Key)>,
+    /// The relations an ALTER TABLE changes, as they stand before it.
+    pub(crate) pre: Vec<Rel>,
 }
 
 /// A statement's text with each literal replaced by a representative of
@@ -3309,6 +3622,13 @@ pub(crate) fn ddl_effects(h: &PgHandler, stmt: &N) -> (Vec<Inval>, Vec<(i64, Key
                         Cache::AttNum,
                         vec![K::O(rel.oid), K::O(rel.natts + 1)],
                     ));
+                    // The name's negative entry, left by the collision check.
+                    if let Some(N::ColumnDef(cd)) = cmd.def.as_ref().and_then(|d| d.node.as_ref()) {
+                        out.push(Inval::Cat(
+                            Cache::AttName,
+                            vec![K::O(rel.oid), K::N(cd.colname.clone())],
+                        ));
+                    }
                 } else if cmd.subtype == pb::AlterTableType::AtDropColumn as i32 {
                     if let Some((att, _, _)) = rel.columns.iter().find(|c| c.1 == cmd.name) {
                         out.push(Inval::Cat(Cache::AttNum, vec![K::O(rel.oid), K::O(*att)]));
