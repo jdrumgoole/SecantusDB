@@ -21,6 +21,16 @@ pub(crate) type Estimate = (f64, f64, f64, i64);
 /// index scan (`None` for a sequential scan).
 pub(crate) type ScanEstimate = (Estimate, Option<ScanIndex>);
 
+/// One index's scan of a BitmapOr arm (RP-378): the index with the arm's
+/// later-column selectivities, the arm's quals on it, the leading column's
+/// selectivity, and the clauses those quals are (by position).
+type ArmScan = (
+    secantus_pgplan::costsize::Index,
+    Vec<(String, secantus_pgplan::costsize::Qual)>,
+    f64,
+    Vec<usize>,
+);
+
 /// The index an index scan reads, and whether the scan is index-only (the
 /// index holds every column the statement reads, `check_index_only`).
 #[derive(Debug, Clone, PartialEq)]
@@ -2076,14 +2086,7 @@ impl PgHandler {
         // Each index's scan of one `OR` arm: its quals on the index's key
         // columns, the leading column's selectivity, and the later
         // columns' (`build_paths_for_OR` over the arm's clauses).
-        let arm_scan = |ix: &costsize::Index,
-                        arm: &[crate::IndexQuals]|
-         -> Option<(
-            costsize::Index,
-            Vec<(String, costsize::Qual)>,
-            f64,
-            Vec<usize>,
-        )> {
+        let arm_scan = |ix: &costsize::Index, arm: &[crate::IndexQuals]| -> Option<ArmScan> {
             let lead = arm.iter().find(|s| s.field == ix.field)?;
             let mut quals = lead.quals.clone();
             let mut clauses = lead.clauses.clone();
