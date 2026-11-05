@@ -1316,21 +1316,6 @@ a regression test.
       still reads as all-visible.
       Backlog-ID: RP-291
       Verify: tests/backlog/test_rp_catalog_reads.py::test_catalog_blocks
-- [ ] **A built-in catalog's first reads in a session are not
-      PostgreSQL's** (found while building RP-291's heap slice). Measured
-      on 15.19 against a new session: `select count(*) from pg_am` builds
-      the table's index descriptors (`pg_opclass`, `pg_amop`, `pg_amproc`,
-      eight `pg_attribute` scans where this server makes four, five
-      `pg_class` and four `pg_index` oid lookups where it makes three and
-      two) and reads its planner statistics (`pg_statistic`, since RP-311
-      gave the catalogs theirs), as does `select count(*) from
-      pg_namespace`; and a `pg_operator` lookup by oid makes three
-      `pg_cast` scans too many and one `pg_amop_fam_strat_index` scan
-      PostgreSQL does not. (The reg* input functions' name lookups, the
-      scan's row type under an aggregate and the folding of
-      `'now'::text::regproc` were earlier slices.)
-      Backlog-ID: RP-316
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a built-in catalog's first reads]
 - [ ] **The first backend after a start is counted as a warm one.**
       PostgreSQL serves it without the relcache init files (about 245
       `pg_attribute` index scans, `pg_class` heap scans, ...); the model

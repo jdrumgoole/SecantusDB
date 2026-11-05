@@ -190,6 +190,11 @@ fn names_of(nodes: &[pb::Node]) -> Vec<String> {
         .collect()
 }
 
+/// `CoercionContext` (`primnodes.h`), in its order.
+const COERCION_IMPLICIT: u8 = 0;
+const COERCION_ASSIGNMENT: u8 = 1;
+const COERCION_EXPLICIT: u8 = 2;
+
 fn node(n: &Option<Box<pb::Node>>) -> Option<&N> {
     n.as_ref().and_then(|b| b.node.as_ref())
 }
@@ -660,8 +665,17 @@ impl<'a> Model<'a> {
                 );
                 matches |= member;
             }
-            if !matches {
+            // `build_index_paths` also costs a B-tree no clause matches when
+            // it can return every column the query reads
+            // (`check_index_only`): a `count(*)` reads none.
+            let covering = needs.all.iter().all(|a| ix.keys.contains(a));
+            if !matches && !(covering && ix.am == BTREE_AM) {
                 continue;
+            }
+            if ix.am == BTREE_AM {
+                // `btcostestimate`: the leading column's statistics, for
+                // the correlation.
+                self.statistic(rel, lead);
             }
             if rel.stats.contains(&lead) {
                 if let Some(o) = ix.classes.first().and_then(|c| self.h.cr_opclass(*c)) {
@@ -672,7 +686,9 @@ impl<'a> Model<'a> {
                     self.search(Cache::AmopStrategy, key, |_| found);
                 }
             }
-            let covering = needs.all.iter().all(|a| ix.keys.contains(a));
+            if !matches {
+                continue;
+            }
             if used.is_none() {
                 used = Some((ix.clone(), covering));
             }
@@ -1053,7 +1069,7 @@ impl<'a> Model<'a> {
         if let Some(N::SelectStmt(sel)) = node(&i.select_stmt) {
             let types = self.select(sel, false);
             for (t, (_, _, ct)) in types.iter().zip(&cols) {
-                self.coerce(*t, *ct, false);
+                self.coerce(*t, *ct, COERCION_ASSIGNMENT);
             }
         }
         self.search(Cache::RelOid, vec![K::O(rel.oid)], |_| true);
@@ -1096,7 +1112,7 @@ impl<'a> Model<'a> {
             let Some(v) = node(&rt.val) else { continue };
             let typ = self.expr(v, &scope, true);
             if let Some((_, _, ct)) = rel.columns.iter().find(|c| c.1 == rt.name).cloned() {
-                self.coerce(typ, ct, false);
+                self.coerce(typ, ct, COERCION_ASSIGNMENT);
             }
         }
         if let Some(w) = quals {
@@ -1230,7 +1246,7 @@ impl<'a> Model<'a> {
             .flatten()
         {
             let t = self.expr(l, &scope, true);
-            self.coerce(t, INT8, false);
+            self.coerce(t, INT8, COERCION_IMPLICIT);
         }
         // The planner, per base relation (a view became its query).
         for (_, rel) in scope.rels.clone() {
@@ -1453,7 +1469,7 @@ impl<'a> Model<'a> {
                 else {
                     return UNKNOWN;
                 };
-                self.coerce(input, target, true);
+                self.coerce(input, target, COERCION_EXPLICIT);
                 self.io_coercion(input, target, node(&tc.arg).is_some_and(is_constant));
                 if let Some(text) = node(&tc.arg).and_then(string_literal) {
                     // The reg* input function runs on the literal: at
@@ -1561,8 +1577,8 @@ impl<'a> Model<'a> {
         // `make_op`: the function's retset, the arguments coerced to the
         // operator's, the node's type for its collation.
         self.proc_oid(op.code);
-        self.coerce(lt, op.left, false);
-        self.coerce(rt, op.right, false);
+        self.coerce(lt, op.left, COERCION_IMPLICIT);
+        self.coerce(rt, op.right, COERCION_IMPLICIT);
         self.ptype(op.result);
         // A restriction `column op constant` the planner estimates.
         if !in_target {
@@ -1600,8 +1616,8 @@ impl<'a> Model<'a> {
                 return UNKNOWN;
             };
             self.proc_oid(op.code);
-            self.coerce(lt, op.left, false);
-            self.coerce(rt, op.right, false);
+            self.coerce(lt, op.left, COERCION_IMPLICIT);
+            self.coerce(rt, op.right, COERCION_IMPLICIT);
             self.ptype(op.result);
             return BOOL;
         }
@@ -1609,7 +1625,7 @@ impl<'a> Model<'a> {
         self.ptype(common);
         let array = builtin().types.get(&common).map_or(0, |t| t.array);
         for t in &types {
-            self.coerce(*t, common, false);
+            self.coerce(*t, common, COERCION_IMPLICIT);
         }
         let Some(op) = self.parser(|m| m.oper(&name, lt, common)) else {
             return BOOL;
@@ -1619,7 +1635,7 @@ impl<'a> Model<'a> {
         // node's types for their collations.
         self.proc_oid(op.code);
         self.ptype(op.right);
-        self.coerce(lt, op.left, false);
+        self.coerce(lt, op.left, COERCION_IMPLICIT);
         self.ptype(array);
         self.ptype(BOOL);
         // `convert_saop_to_hashed_saop`: `get_op_hash_functions`.
@@ -1885,7 +1901,7 @@ impl<'a> Model<'a> {
             }
         }
         for (a, d) in argv.iter().zip(p.args.iter()) {
-            self.coerce(*a, *d, false);
+            self.coerce(*a, *d, COERCION_IMPLICIT);
         }
         self.ptype(p.ret);
         // A SQL function's body is parsed when the planner inlines it, or
@@ -2259,15 +2275,17 @@ impl<'a> Model<'a> {
             if i == t || *t == cf::ANY || cf::is_polymorphic(*t) || *i == UNKNOWN {
                 continue;
             }
-            if !self.coercion_pathway(*t, *i, false) {
+            if !self.coercion_pathway(*t, *i, COERCION_IMPLICIT) {
                 return false;
             }
         }
         true
     }
 
-    /// `find_coercion_pathway`: the base types, then `pg_cast`.
-    fn coercion_pathway(&mut self, target: i64, source: i64, explicit: bool) -> bool {
+    /// `find_coercion_pathway`: the base types, then `pg_cast`, in the
+    /// coercion context `ccontext` ([`COERCION_IMPLICIT`],
+    /// [`COERCION_ASSIGNMENT`] or [`COERCION_EXPLICIT`]).
+    fn coercion_pathway(&mut self, target: i64, source: i64, ccontext: u8) -> bool {
         self.ptype(target);
         self.ptype(source);
         let t = self.h.cr_base_type(target);
@@ -2281,13 +2299,19 @@ impl<'a> Model<'a> {
         });
         match cast {
             Some((_, context, _)) => {
-                context == 'i' || (explicit && context == 'e') || (explicit && context == 'a')
+                let needs = match context {
+                    'i' => COERCION_IMPLICIT,
+                    'a' => COERCION_ASSIGNMENT,
+                    _ => COERCION_EXPLICIT,
+                };
+                ccontext >= needs
             }
+            // CoerceViaIO to a string type in an assignment or explicit
+            // cast, from one only in an explicit cast; an implicit
+            // coercion has no I/O path, so the category is not asked.
             None => {
-                // CoerceViaIO to or from a string type.
-                let tc = self.category(t).0;
-                let sc = self.category(s).0;
-                tc == 'S' || (explicit && sc == 'S')
+                (ccontext >= COERCION_ASSIGNMENT && self.category(t).0 == 'S')
+                    || (ccontext >= COERCION_EXPLICIT && self.category(s).0 == 'S')
             }
         }
     }
@@ -2332,7 +2356,7 @@ impl<'a> Model<'a> {
 
     /// `coerce_type`: an untyped literal takes the target's input function;
     /// anything else goes through `pg_cast`.
-    fn coerce(&mut self, input: i64, target: i64, explicit: bool) {
+    fn coerce(&mut self, input: i64, target: i64, ccontext: u8) {
         if input == target || target == cf::ANY || cf::is_polymorphic(target) || target == 0 {
             return;
         }
@@ -2340,7 +2364,7 @@ impl<'a> Model<'a> {
             self.ptype(target);
             return;
         }
-        if self.parser(|m| m.coercion_pathway(target, input, explicit)) {
+        if self.parser(|m| m.coercion_pathway(target, input, ccontext)) {
             if let Some((func, _, _)) = self.h.cr_cast(input, target) {
                 if func != 0 {
                     // `build_coercion_expression`.
