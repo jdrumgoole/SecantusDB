@@ -665,6 +665,91 @@ pub(crate) fn price_nest_loop(
     root.estimate = Some(join);
 }
 
+/// A two-table join's keys as a Sort Key prints them, `(left, right)`:
+/// `alias.column` each (RP-366). From the narrow path's ON or the joined
+/// rows' one equality; `None` for anything else.
+pub(crate) fn join_key_texts(sel: &secantus_pgplan::Select) -> Option<(String, String)> {
+    if let Some(j) = &sel.join {
+        let (x, y) = j.on.as_ref()?;
+        let (l, r) = if x.0 == j.left.1 { (x, y) } else { (y, x) };
+        return Some((format!("{}.{}", l.0, l.1), format!("{}.{}", r.0, r.1)));
+    }
+    let sub = sel.sub.as_ref()?;
+    let Statement::JoinRows(rows) = sub.plan.as_ref() else {
+        return None;
+    };
+    let JoinNode::Join { equi, .. } = &rows.tree else {
+        return None;
+    };
+    let [(l, r)] = equi.as_slice() else {
+        return None;
+    };
+    let dotted = |k: &str| k.replace(secantus_pgplan::joins::SEP, ".");
+    Some((dotted(l), dotted(r)))
+}
+
+/// Make the `Hash Join` this server drew the merge join PostgreSQL keeps
+/// (RP-366): each input under a `Sort` on its key, the inner read through
+/// a `Materialize` when the plan says so, and the join's, Sorts' and scans'
+/// estimates. `b_outer` puts the right table outer (a LEFT join then the
+/// `Merge Right Join` of the two the other way round); `outer` and `inner`
+/// are the scans' estimates in that order; `keys` are the left and right
+/// tables' key texts.
+pub(crate) fn price_merge_join(
+    root: &mut PlanNode,
+    outer: crate::scan_estimate::Estimate,
+    inner: crate::scan_estimate::Estimate,
+    join: crate::scan_estimate::Estimate,
+    plan: &secantus_pgplan::joincost::MergePlan,
+    b_outer: bool,
+    keys: &(String, String),
+) {
+    let kind = match root.name.as_str() {
+        "Hash Join" => "Merge Join",
+        "Hash Left Join" if b_outer => "Merge Right Join",
+        "Hash Left Join" => "Merge Left Join",
+        _ => return,
+    };
+    if root.children.len() != 2
+        || root.children[1].name != "Hash"
+        || root.children[1].children.len() != 1
+    {
+        return;
+    }
+    let mut hash = root.children.pop().expect("two children");
+    let right = hash.children.pop().expect("one child");
+    let left = root.children.pop().expect("two children");
+    let (mut o, mut i, okey, ikey) = if b_outer {
+        (right, left, &keys.1, &keys.0)
+    } else {
+        (left, right, &keys.0, &keys.1)
+    };
+    o.estimate = Some(outer);
+    i.estimate = Some(inner);
+    let mut osort = PlanNode::over("Sort", o);
+    osort.details.push(("Sort Key".into(), okey.clone()));
+    osort.estimate = Some((plan.outer_sort.0, plan.outer_sort.1, outer.2, outer.3));
+    let mut isort = PlanNode::over("Sort", i);
+    isort.details.push(("Sort Key".into(), ikey.clone()));
+    isort.estimate = Some((plan.inner_sort.0, plan.inner_sort.1, inner.2, inner.3));
+    let inner_node = match plan.material {
+        Some((s, t)) => {
+            let mut m = PlanNode::over("Materialize", isort);
+            m.estimate = Some((s, t, inner.2, inner.3));
+            m
+        }
+        None => isort,
+    };
+    root.children.push(osort);
+    root.children.push(inner_node);
+    root.name = kind.into();
+    root.commute_cond = b_outer;
+    if b_outer {
+        root.inner_unique = false;
+    }
+    root.estimate = Some(join);
+}
+
 /// `(a = b)` as `(b = a)`: one equality of two operands, neither holding
 /// an ` = ` of its own; `None` for anything else.
 fn commute_equality(c: &str) -> Option<String> {
@@ -1277,6 +1362,8 @@ pub(crate) fn attach_join_conds(root: &mut PlanNode, conds: &[String]) {
         }
         let label = if n.name.starts_with("Hash") && n.name.ends_with("Join") {
             "Hash Cond"
+        } else if n.name.starts_with("Merge") && n.name.ends_with("Join") {
+            "Merge Cond"
         } else if n.name.starts_with("Nested Loop") {
             "Join Filter"
         } else {

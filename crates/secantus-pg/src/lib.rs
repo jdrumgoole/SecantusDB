@@ -8090,6 +8090,37 @@ impl PgHandler {
         })
     }
 
+    /// How a column's statistics keys order (`colstats::Column`): whether
+    /// they are integers (`convert_to_scalar`), and whether they order
+    /// bytewise as the column compares -- `name` and `"char"` always, a
+    /// string in a collation that compares by bytes (`C`, `POSIX`,
+    /// `C.UTF-8`, its own or the database's), which is how `stats_key`
+    /// orders them.
+    pub(crate) fn column_key_order(&self, c: &secantus_pgcatalog::Column) -> (bool, bool) {
+        let bytewise = |collation: &str| matches!(collation, "C" | "POSIX" | "C.UTF-8");
+        let base = c.pg_type.trim_start_matches("pg_catalog.");
+        let numeric = matches!(base, "int2" | "int4" | "int8" | "oid");
+        // An array's key orders as `array_cmp` does when its elements'
+        // keys order as theirs: an integer's too (whose keys only an
+        // array's histogram, never interpolated, would compare).
+        let elem = statistic::array_element(base);
+        let ordered = match elem.unwrap_or(base) {
+            "name" | "char" | "\"char\"" => true,
+            "int2" | "int4" | "int8" | "oid" => elem.is_some(),
+            "text" | "varchar" | "character varying" => match c.extra.get_str("collation") {
+                Ok(coll) if coll.trim_matches('"') != "default" => bytewise(coll.trim_matches('"')),
+                _ => self
+                    .databases
+                    .lookup(&self.storage, self.db())
+                    .ok()
+                    .flatten()
+                    .is_some_and(|info| bytewise(&info.collate)),
+            },
+            _ => false,
+        };
+        (numeric, ordered)
+    }
+
     /// One side of a join on `key` of `table`, as the planner prices it
     /// (`joincost::JoinSide`); `None` when the table is not one the model
     /// prices. A key that is an expression (`JoinKey::Expr`) has no
@@ -8538,38 +8569,10 @@ impl PgHandler {
         };
         let mut columns = Vec::with_capacity(fields.len());
         let mut bases = Vec::with_capacity(fields.len());
-        // A collation that compares strings by their bytes, which is how
-        // `stats_key` orders them (`C.UTF-8` by code point, the same order
-        // in UTF-8).
-        let bytewise = |collation: &str| matches!(collation, "C" | "POSIX" | "C.UTF-8");
-        let db_bytewise = || {
-            self.databases
-                .lookup(&self.storage, self.db())
-                .ok()
-                .flatten()
-                .is_some_and(|info| bytewise(&info.collate))
-        };
         for f in &fields {
             let c = def.columns.iter().find(|c| c.field() == *f)?;
             let base = c.pg_type.trim_start_matches("pg_catalog.");
-            let numeric = matches!(base, "int2" | "int4" | "int8" | "oid");
-            // `name` and `"char"` always compare as bytes; a text column in
-            // its own or the database's collation.
-            // An array's key orders as `array_cmp` does when its elements'
-            // keys order as theirs: an integer's too (whose keys only an
-            // array's histogram, never interpolated, would compare).
-            let elem = statistic::array_element(base);
-            let ordered = match elem.unwrap_or(base) {
-                "name" | "char" | "\"char\"" => true,
-                "int2" | "int4" | "int8" | "oid" => elem.is_some(),
-                "text" | "varchar" | "character varying" => match c.extra.get_str("collation") {
-                    Ok(coll) if coll.trim_matches('"') != "default" => {
-                        bytewise(coll.trim_matches('"'))
-                    }
-                    _ => db_bytewise(),
-                },
-                _ => false,
-            };
+            let (numeric, ordered) = self.column_key_order(c);
             let measured = match stats.get(*f) {
                 Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
                 Some(None) => return None,
@@ -40991,7 +40994,7 @@ impl PgHandler {
                         .starts_with("Seq Scan on ")
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((a, b, join, swap)) = self
+                        if let Some((a, b, join, pick)) = self
                             .hash_join_estimate(sel)
                             .or_else(|| self.join_select_hash_estimate(sel))
                         {
@@ -41001,7 +41004,20 @@ impl PgHandler {
                             if let Some((implied, from)) = self.join_select_left_implied(sel) {
                                 explain::mark_implied_filters(&mut tree, &implied, &from);
                             }
-                            explain::price_hash_join(&mut tree, a, b, join, swap);
+                            match pick {
+                                scan_estimate::JoinPick::Hash { swap } => {
+                                    explain::price_hash_join(&mut tree, a, b, join, swap)
+                                }
+                                // The merge path PostgreSQL keeps (RP-366):
+                                // both inputs sorted on the join keys.
+                                scan_estimate::JoinPick::Merge { b_outer, plan } => {
+                                    if let Some(keys) = explain::join_key_texts(sel) {
+                                        explain::price_merge_join(
+                                            &mut tree, a, b, join, &plan, b_outer, &keys,
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                 }

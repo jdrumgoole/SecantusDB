@@ -1040,6 +1040,12 @@ tests regression tests:
       A sixth on 2026-11-04 in CI: PR #2331's `pg-oracle (server)` job
       (run 41889009200, job 126781059052; the RP-364 branch, EXPLAIN
       costing and narrow-join planning only): `[2.5]` answered `ok`.
+      A seventh on 2026-11-04, `tools/backlog.py verify --regressions` on
+      the RP-366 branch (EXPLAIN costing only; load average about 19 from
+      parallel sessions): `[2.5]` answered `ok`; four runs of all three
+      delays alone after it passed at load 14. Every sighting so far is
+      under load, none on an idle machine, and none on a branch touching
+      the wire or cancel code.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
@@ -1397,26 +1403,21 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN prints a priced Hash Join where PostgreSQL merges.** The
-      analysed-table hash-join estimates (RP-330 to RP-364) weigh the two
-      hash orders but no merge join, so where PostgreSQL's merge path is
-      cheaper this server prints a Hash Join with numbers PostgreSQL never
-      prints. Over `e.b` mostly one value (first MCV 0.6) and `k.b` ten,
-      `explain select e.a from e join k on e.b = k.b where e.a > 10 and
-      k.a <= 400` is, on 15.19, `Merge Join (cost=101.55..148.70 rows=3208
-      width=4)` over a `Sort` of each filtered scan; here it is `Hash Join
-      (cost=22.50..198.31 ...)`. The skew makes the hash table's buckets
-      long, and the merge path's cost needs `mergejoinscansel` over the
-      keys' statistics (`get_variable_range` from the histogram or MCV
-      bounds), which `joincost::merge_join` does not model (it reads both
-      inputs whole). Until it does, the hash estimate should be checked
-      against it. Found while working RP-364; the row estimate (3208) is
-      already right. Nor do they weigh an index scan of a filtered side:
-      a WHERE over a table with an index leaves the join unpriced (zeros,
-      not a wrong number) on both join paths (RP-365; see RP-354 for the
-      parameterized inner index scan).
-      Backlog-ID: RP-366
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a projected join PostgreSQL merges]
+- [ ] **EXPLAIN of a join whose side an index could serve is unpriced.**
+      The analysed-table join estimates (RP-330 to RP-366) weigh the hash
+      and merge paths over sequential scans only, so where an index could
+      serve a side they print zeros rather than risk a wrong plan: a WHERE
+      on an indexed column, which PostgreSQL 15.19 may read through an
+      `Index Scan` (`explain select * from e join k on e.b = k.b where k.a =
+      5`, `k.a` the primary key, is `Hash Join (cost=8.30..27.04 rows=100
+      width=14)` over a Hash of `Index Scan using k_pkey on k
+      (cost=0.28..8.29 rows=1 width=7)` with `Index Cond: (a = 5)`; here
+      the scan prints `Filter: (a = 5)` and zeros); a join key a B-tree
+      leads with, which a merge can read presorted, without a Sort; and the
+      parameterized inner index scan of a nested loop (see RP-354). Found
+      while working RP-366.
+      Backlog-ID: RP-369
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join whose filtered side is an index scan]
 - [ ] **EXPLAIN shows a user table's Seq Scan where PostgreSQL picks an
       index path.** Over an analysed table PostgreSQL 15.19's
       `set_cheapest` keeps an Index Scan for `where a = 5 and b = 'v5'`

@@ -495,7 +495,7 @@ impl PgHandler {
     pub(crate) fn hash_join_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate, bool)> {
+    ) -> Option<(Estimate, Estimate, Estimate, JoinPick)> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -651,7 +651,7 @@ impl PgHandler {
     pub(crate) fn join_select_hash_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate, Estimate, bool)> {
+    ) -> Option<(Estimate, Estimate, Estimate, JoinPick)> {
         let j = sel.join.as_ref()?;
         if sel.sub.is_some()
             || sel.series.is_some()
@@ -997,6 +997,16 @@ impl PgHandler {
             .as_ref()
             .map(|s| s.mcv.clone())
             .unwrap_or_default();
+        let (numeric, ordered) = self.column_key_order(col);
+        let key_indexed = self.index_relations().iter().any(|ix| {
+            ix.table.name == table
+                && ix
+                    .keys
+                    .first()
+                    .and_then(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                    .and_then(|i| ix.table.columns.get(i))
+                    .is_some_and(|c| c.field() == field)
+        });
         Some(HashSide {
             scan,
             above: width.3,
@@ -1004,6 +1014,10 @@ impl PgHandler {
             stats: (nd, null_frac, mcv),
             unique,
             tuples: pt.tuples,
+            column: analysed.slots.clone().map(|sl| (analysed.stats, sl)),
+            numeric,
+            ordered,
+            key_indexed,
         })
     }
 
@@ -2567,6 +2581,17 @@ struct HashSide {
     stats: (f64, f64, Vec<(Vec<u8>, f32)>),
     unique: bool,
     tuples: f64,
+    /// The key column's statistics and how its keys order, for the merge
+    /// path's `mergejoinscansel` (RP-366).
+    column: Option<(
+        secantus_pgplan::hashagg::ColumnStats,
+        secantus_pgplan::colstats::Slots,
+    )>,
+    numeric: bool,
+    ordered: bool,
+    /// A B-tree index leads with the key: a merge could read it presorted,
+    /// which is not modelled.
+    key_indexed: bool,
 }
 
 /// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's
@@ -2584,7 +2609,7 @@ fn hash_join_of(
     b: HashSide,
     left_join: bool,
     redundant: bool,
-) -> Option<(Estimate, Estimate, Estimate, bool)> {
+) -> Option<(Estimate, Estimate, Estimate, JoinPick)> {
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     if a.pg_type != b.pg_type {
         return None;
@@ -2633,40 +2658,140 @@ fn hash_join_of(
     // plan printed follows it: with `swap`, the left table hashed
     // (RP-359).
     let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &ka);
-    // `add_path` of the swapped path against the first:
-    // `compare_path_costs_fuzzily` with the 1.01 fuzz -- total first, the
-    // startup deciding only between fuzzily equal totals (startup costs
-    // are not considered with no LIMIT) -- and, when fuzzily equal, the
-    // same comparison with a 1.0000000001 fuzz (RP-364).
-    let swap_better = |fuzz: f64| -> Option<bool> {
-        if l_total > total * fuzz {
-            Some(false)
-        } else if total > l_total * fuzz {
-            Some(true)
-        } else if l_startup > startup * fuzz {
-            Some(false)
-        } else if startup > l_startup * fuzz {
-            Some(true)
-        } else {
-            None
-        }
-    };
-    let swapped = match swap_better(1.01) {
-        Some(better) => better,
-        None => swap_better(1.000_000_000_1) == Some(true),
-    };
-    let right_kept = !swapped;
     let mut rows = outer.rows * inner.rows * selectivity;
     if left_join {
         rows = rows.max(outer.rows);
     }
     let rows = costsize::clamp_row_est(rows);
     let width = a.above + b.above;
-    Some(if right_kept {
-        (a.scan, b.scan, (startup, total, rows, width), false)
+    // The merge paths (RP-366): each side sorted from its scan, the
+    // clause's tuples `approx_tuple_count`'s (the hash join's too). Not
+    // where a redundant clause is the only one (its merge is not
+    // modelled), nor where an index leads with a key (a presorted input).
+    let merges = if redundant || a.key_indexed || b.key_indexed {
+        None
     } else {
-        (b.scan, a.scan, (l_startup, l_total, rows, width), true)
-    })
+        fn column(s: &HashSide) -> Option<secantus_pgplan::colstats::Column<'_>> {
+            let (stats, slots) = s.column.as_ref()?;
+            Some(secantus_pgplan::colstats::Column {
+                stats: Some((*stats, slots)),
+                unique: s.unique,
+                boolean: false,
+                numeric: s.numeric,
+                ordered: s.ordered,
+                actual: None,
+                tuples: s.tuples,
+            })
+        }
+        let (ca, cb) = (column(&a)?, column(&b)?);
+        let (mut ls, mut le, rs, re) = joincost::mergejoinscansel(&ca, &cb)?;
+        // `initial_cost_mergejoin`: an outer join reads its preserved
+        // input whole -- the LEFT join's left table, outer in the `JOIN_LEFT`
+        // path and inner in the `JOIN_RIGHT` one.
+        if left_join {
+            ls = 0.0;
+            le = 1.0;
+        }
+        let tuples = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
+        Some((
+            joincost::merge_join_sorted(&outer, &inner, (ls, le, rs, re), tuples),
+            joincost::merge_join_sorted(&inner, &outer, (rs, re, ls, le), tuples),
+        ))
+    };
+    // `add_paths_to_joinrel` with the left relation outer, then the other
+    // way round: each time the merge path (`sort_inner_and_outer`) before
+    // the hash path (`hash_inner_and_outer`), each through `add_path`
+    // (`compare_path_costs_fuzzily` with the 1.01 fuzz -- total first, the
+    // startup deciding only between fuzzily equal totals, startup costs not
+    // being considered with no LIMIT -- and between fuzzily equal paths a
+    // 1.0000000001 fuzz, RP-364); then `set_cheapest` takes the cheapest
+    // total, a tie the cheaper startup.
+    let mut candidates: Vec<(JoinPick, (f64, f64))> = Vec::new();
+    if let Some((m_a, _)) = merges {
+        candidates.push((
+            JoinPick::Merge {
+                b_outer: false,
+                plan: m_a,
+            },
+            (m_a.startup, m_a.total),
+        ));
+    }
+    candidates.push((JoinPick::Hash { swap: false }, (startup, total)));
+    if let Some((_, m_b)) = merges {
+        candidates.push((
+            JoinPick::Merge {
+                b_outer: true,
+                plan: m_b,
+            },
+            (m_b.startup, m_b.total),
+        ));
+    }
+    candidates.push((JoinPick::Hash { swap: true }, (l_startup, l_total)));
+    let better = |new: (f64, f64), old: (f64, f64), fuzz: f64| -> Option<bool> {
+        if new.1 > old.1 * fuzz {
+            Some(false)
+        } else if old.1 > new.1 * fuzz {
+            Some(true)
+        } else if new.0 > old.0 * fuzz {
+            Some(false)
+        } else if old.0 > new.0 * fuzz {
+            Some(true)
+        } else {
+            None
+        }
+    };
+    let mut kept: Vec<(JoinPick, (f64, f64))> = Vec::new();
+    for (pick, cost) in candidates {
+        // Against each kept path in turn: a better new path removes it, a
+        // worse one is rejected.
+        let mut accept = true;
+        while let Some(old) = kept.first() {
+            let wins = match better(cost, old.1, 1.01) {
+                Some(w) => w,
+                None => better(cost, old.1, 1.000_000_000_1) == Some(true),
+            };
+            if wins {
+                kept.remove(0);
+            } else {
+                accept = false;
+                break;
+            }
+        }
+        if accept {
+            kept.push((pick, cost));
+        }
+    }
+    let (pick, (s0, t0)) = kept.into_iter().reduce(|best, c| {
+        if c.1 .1 < best.1 .1 || (c.1 .1 == best.1 .1 && c.1 .0 < best.1 .0) {
+            c
+        } else {
+            best
+        }
+    })?;
+    let b_first = matches!(
+        pick,
+        JoinPick::Hash { swap: true } | JoinPick::Merge { b_outer: true, .. }
+    );
+    let (o, i) = if b_first {
+        (b.scan, a.scan)
+    } else {
+        (a.scan, b.scan)
+    };
+    Some((o, i, (s0, t0, rows, width), pick))
+}
+
+/// The path a priced two-table join takes (RP-330 to RP-366): a hash join,
+/// the left table hashed with `swap`; or a merge join of both sorted
+/// inputs, the right table outer with `b_outer`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum JoinPick {
+    Hash {
+        swap: bool,
+    },
+    Merge {
+        b_outer: bool,
+        plan: secantus_pgplan::joincost::MergePlan,
+    },
 }
 
 /// The filters an equivalence class adds to a LEFT join whose WHERE fixes
