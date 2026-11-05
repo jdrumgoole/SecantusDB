@@ -1388,7 +1388,7 @@ a regression test.
       estimated from `e.a`'s statistics); a LEFT join with a WHERE; and a
       join of three or more relations (found while working RP-329).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join, a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
 - [ ] **EXPLAIN of a join on a unique key is unpriced.** `explain select
       * from e join k on e.a = k.a` (k's primary key on `a`) is, on
       PostgreSQL 15.19, `Hash Join (cost=27.50..45.14 rows=1000 width=14)`

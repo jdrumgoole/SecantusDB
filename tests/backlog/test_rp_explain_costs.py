@@ -1063,7 +1063,7 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # A LEFT join's ON conjunct over its outer side alone stays a join
     # filter, estimated from that column's statistics.
-    "nested loop left join, a one-sided ON conjunct": (
+    "nested loop left join with a one-sided ON conjunct": (
         "RP-354",
         _ANALYSED,
         "explain select * from e left join e e2 on e.a <> e2.a and e.a > 990",
