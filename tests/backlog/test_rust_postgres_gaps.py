@@ -2713,6 +2713,33 @@ def test_a_left_join_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> N
 
 
 @pytest.mark.backlog("RP-028")
+def test_a_left_join_descending_nulls_last_over_an_index_reads_it_backward(pg: Any) -> None:
+    """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
+    t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC NULLS LAST
+    LIMIT 5` is a Sort over a Merge Right Join reading `Index Only Scan
+    Backward` on t1 (`right_merge_direction` weighs only the direction, so
+    the backward scan's DESC NULLS FIRST is of use for merging), its ties
+    t0's rows 2939, 860, 1763, 433, 2141. The search gives a DESC NULLS
+    LAST no pathkey for that backward scan: 1280, 1728, 1448, 1721, 1273."""
+    pg.execute("begin")
+    try:
+        _rp028_tables(pg, "rp028_i", 2, 3000)
+        pg.execute("create index on rp028_i1 (a)")
+        got = pg_answer(
+            pg,
+            "select rp028_i0.a, rp028_i1.a from rp028_i0"
+            " left join rp028_i1 on rp028_i0.b = rp028_i1.a"
+            " order by rp028_i1.a desc nulls last limit 5",
+        )
+    finally:
+        pg.execute("rollback")
+    assert got == (
+        "ok",
+        [(2939, 6), (860, 6), (1763, 6), (433, 6), (2141, 6)],
+    )
+
+
+@pytest.mark.backlog("RP-028")
 def test_a_two_column_order_by_over_a_join_keeps_its_ties(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed: `t0 JOIN t1 ON
     t0.b = t1.a ORDER BY t1.a, t0.c LIMIT 5` leaves its ties (every row
