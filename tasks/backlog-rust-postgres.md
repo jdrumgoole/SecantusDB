@@ -1383,16 +1383,25 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN of a join on a key a B-tree leads with is unpriced.**
-      `hash_join_estimate` refuses a join whose key an index leads with
-      (`key_indexed`): a merge could read that index presorted, without a
-      Sort, which the cost comparison does not model. `explain select *
-      from e join k on e.a = k.a` (k's primary key on `a`) is, on
+- [ ] **EXPLAIN of a join on a unique key is unpriced.** `explain select
+      * from e join k on e.a = k.a` (k's primary key on `a`) is, on
       PostgreSQL 15.19, `Hash Join (cost=27.50..45.14 rows=1000 width=14)`
-      over the two Seq Scans; here zeros. The parameterized inner index
-      scan of a nested loop is RP-354. Measured on a private 15.19 cluster
-      (split from RP-376).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a key a B-tree leads with]
+      over the two Seq Scans, k hashed; here zeros. The refusal is
+      `hash_join_of`'s `!multi && (a.unique || b.unique)`, not the index:
+      a join on a non-unique key an index leads with (`create index on
+      f (a)`) is priced and matches. A side unique on its one key is
+      `inner_unique` when hashed, and PostgreSQL then weighs two more
+      paths the estimate does not price: a Merge Join reading `k_pkey`
+      presorted (`Index Scan using k_pkey on k (cost=0.28..43.27)`, the
+      join 65.10..125.60) and a Nested Loop probing it (`Index Cond: (a =
+      e.a)`, 0.28..347.44); with `where e.b = 'v3'` the hash join is
+      18.75..38.50 against the merge's 21.10..68.10. Pricing them faithfully
+      needs the whole-index and parameterized scans the LIMIT join search
+      builds (`limit_base_paths`, `joincost::merge_join` with `ordered`
+      inputs) brought into this estimate -- a slice of its own; the
+      parameterized nested loop is shared with RP-354. Measured on a
+      private 15.19 cluster (split from RP-376; cause found 2026-11-05).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a key a B-tree leads with], tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key with the other side filtered]
       Backlog-ID: RP-377
 - [ ] **EXPLAIN puts a join's inequality into its `Hash Cond`.** `explain
       select * from e join k on e.b = k.b and e.a < k.a` prints `Hash

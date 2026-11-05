@@ -1367,6 +1367,19 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
         ],
     ),
+    "a join on a unique key with the other side filtered": (
+        "RP-377",
+        _ANALYSED,
+        "explain select * from e join k on e.a = k.a where e.b = 'v3'",
+        [
+            "Hash Join  (cost=18.75..38.50 rows=100 width=14)",
+            "  Hash Cond: (k.a = e.a)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=100 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v3'::text)",
+        ],
+    ),
     "a comma join's equality over an index-scan side": (
         "RP-372",
         _ANALYSED,
