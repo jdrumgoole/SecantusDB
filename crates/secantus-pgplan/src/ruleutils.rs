@@ -1082,6 +1082,22 @@ impl<'a> Printer<'a> {
                 if own == target && typmod < 0 {
                     return self.expr(arg);
                 }
+                // `eval_const_expressions` runs a cast of a constant and
+                // leaves a Const of the target type, which `get_const_expr`
+                // prints in that type's output form: `1::bigint` is the
+                // constant `'1'::bigint`, not `(1)::bigint` (RP-370).
+                if self.fold_consts && typmod < 0 {
+                    if let Some(text) = folded_numeric_cast(arg, &target) {
+                        match target.as_str() {
+                            "int4" => self.const_number(&text, &target),
+                            _ => self.buf.push_str(&format!(
+                                "{}::{label}",
+                                crate::scalar::quote_literal(&text)
+                            )),
+                        }
+                        return Some(());
+                    }
+                }
                 if self.pretty {
                     self.child(arg, "", Parent::Cast)?;
                     self.buf.push_str(&format!("::{label}"));
@@ -4117,6 +4133,30 @@ pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
 /// space, a brace, a comma, a quote or a backslash). `None` for an element
 /// that is not a bare literal, or a type whose output is not reproduced
 /// here.
+/// The output text of an integer constant cast to `target`, as
+/// `eval_const_expressions` folds it (RP-370). `None` for any other shape,
+/// which then prints unfolded: a non-integer constant, a target this does
+/// not reproduce, or a value out of the target's range (PostgreSQL raises
+/// that while planning).
+fn folded_numeric_cast(arg: &Node, target: &str) -> Option<String> {
+    let Some(N::AConst(c)) = arg.node.as_ref() else {
+        return None;
+    };
+    let v: i128 = match c.val.as_ref()? {
+        Val::Ival(i) => i.ival.into(),
+        Val::Fval(f) => f.fval.parse().ok()?,
+        _ => return None,
+    };
+    let fits = match target {
+        "int2" => i16::try_from(v).is_ok(),
+        "int4" => i32::try_from(v).is_ok(),
+        "int8" => i64::try_from(v).is_ok(),
+        "numeric" | "text" => true,
+        _ => false,
+    };
+    fits.then(|| v.to_string())
+}
+
 fn folded_array_literal(items: &[Node], elem: &str) -> Option<String> {
     let mut out = String::from("{");
     for (i, item) in items.iter().enumerate() {
@@ -4416,6 +4456,41 @@ mod array_quals {
             };
             let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
             assert_eq!(got, vec![(want.to_string(), None)], "{sql}");
+        }
+    }
+}
+#[cfg(test)]
+mod folded_casts {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    /// A cast of an integer constant prints as the folded constant of the
+    /// target type, as PostgreSQL 15.19's EXPLAIN does (RP-370).
+    #[test]
+    fn a_cast_constant_prints_folded() {
+        let def = TableDef::new(
+            "ud",
+            vec![
+                Column::new("a", "int4[]", false),
+                Column::new("p", "int4", false),
+                Column::new("n", "text", false),
+            ],
+        );
+        for (sql, want) in [
+            ("1::bigint = any(a)", "('1'::bigint = ANY (a))"),
+            ("p = 1::int2", "(p = '1'::smallint)"),
+            ("p::bigint = 1::bigint", "((p)::bigint = '1'::bigint)"),
+            ("p::numeric = 1::numeric", "((p)::numeric = '1'::numeric)"),
+            ("n = 1::text", "(n = '1'::text)"),
+            ("p = 7::int4", "(p = 7)"),
+        ] {
+            let p = pg_query::parse(&format!("select * from ud where {sql}")).unwrap();
+            let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+            else {
+                panic!()
+            };
+            let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
+            assert_eq!(got[0].0, want, "{sql}");
         }
     }
 }
