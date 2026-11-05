@@ -1316,6 +1316,57 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (b = 'v5'::text)",
         ],
     ),
+    "a key fixed by a constant over an indexed table's sequential scan": (
+        "RP-376",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b where k.b = 'v5'",
+        [
+            "Nested Loop  (cost=0.00..160.25 rows=10000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Filter: (b = 'v5'::text)",
+            "  ->  Materialize  (cost=0.00..18.00 rows=100 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..17.50 rows=100 width=7)",
+            "              Filter: (b = 'v5'::text)",
+        ],
+    ),
+    "a key fixed on the other side of an index-scan side": (
+        "RP-376",
+        _ANALYSED,
+        "explain select * from e join k on e.b = k.b where e.b = 'v5' and k.a = 5",
+        [
+            "Nested Loop  (cost=0.28..26.79 rows=100 width=14)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+            "        Filter: (b = 'v5'::text)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Filter: (b = 'v5'::text)",
+        ],
+    ),
+    "a comma join's key fixed over an index-scan side": (
+        "RP-376",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and k.a = 5 and k.b = 'v5'",
+        [
+            "Nested Loop  (cost=0.28..26.79 rows=100 width=14)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
+            "        Index Cond: (a = 5)",
+            "        Filter: (b = 'v5'::text)",
+            "  ->  Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "        Filter: (b = 'v5'::text)",
+        ],
+    ),
+    "a join on a key a B-tree leads with": (
+        "RP-377",
+        _ANALYSED,
+        "explain select * from e join k on e.a = k.a",
+        [
+            "Hash Join  (cost=27.50..45.14 rows=1000 width=14)",
+            "  Hash Cond: (e.a = k.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
     "a comma join's equality over an index-scan side": (
         "RP-372",
         _ANALYSED,
@@ -1806,6 +1857,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-372",
         "RP-373",
         "RP-374",
+        "RP-376",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

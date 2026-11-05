@@ -1373,24 +1373,17 @@ a regression test.
       working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop on an ON's inequality], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop with a not-equal filter], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join]
-- [ ] **EXPLAIN of a join whose WHERE fixes the join key, over a table
-      with an index, is unpriced.** Since RP-369 and RP-371 a two-table
-      hash or merge join prices a side's `Index Scan` under an equality or
-      a range on the index's column. Still zeros: a WHERE that also fixes
-      the join key, which leaves no join clause (RP-363's Nested Loop),
-      over a table with an index: `explain select * from e join k on e.b
-      = k.b where k.a = 5 and k.b = 'v5'` is, on PostgreSQL 15.19,
-      `Nested Loop (cost=0.28..26.79 rows=100 width=14)` over the Index
-      Scan with `Index Cond: (a = 5)` and `Filter: (b = 'v5'::text)`,
-      where this server prints a `Hash Join`. Such a join is planned as
-      joined rows, not on the narrow two-table path RP-363 prices, and
-      `hash_join_estimate` refuses a side filter that names the join key.
-      Also open: a join key a B-tree leads with, which a merge can read
-      presorted, without a Sort; and the parameterized inner index scan
-      of a nested loop (see RP-354). Measured on a private 15.19 cluster
-      (found while working RP-369; split from RP-371).
-      Backlog-ID: RP-376
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a key fixed by a constant over an index-scan side]
+- [ ] **EXPLAIN of a join on a key a B-tree leads with is unpriced.**
+      `hash_join_estimate` refuses a join whose key an index leads with
+      (`key_indexed`): a merge could read that index presorted, without a
+      Sort, which the cost comparison does not model. `explain select *
+      from e join k on e.a = k.a` (k's primary key on `a`) is, on
+      PostgreSQL 15.19, `Hash Join (cost=27.50..45.14 rows=1000 width=14)`
+      over the two Seq Scans; here zeros. The parameterized inner index
+      scan of a nested loop is RP-354. Measured on a private 15.19 cluster
+      (split from RP-376).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a key a B-tree leads with]
+      Backlog-ID: RP-377
 - [ ] **EXPLAIN puts a join's inequality into its `Hash Cond`.** `explain
       select * from e join k on e.b = k.b and e.a < k.a` prints `Hash
       Cond: ((e.b = k.b) AND (e.a < k.a))` with zeros (the comma form,

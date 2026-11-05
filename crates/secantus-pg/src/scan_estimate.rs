@@ -493,6 +493,36 @@ impl PgHandler {
     /// the Hash node is its input's total. `None` -- zeros -- for any
     /// other shape.
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
+        let (a, b, more) = self.joined_sides(sel)?;
+        // A WHERE conjunct pushed into a side's scan (RP-365) is priced as
+        // that scan's filter, through an index where that is the cheaper
+        // path (RP-369, in `hash_side`). Not where it names the join key: a
+        // constant there joins the key's equivalence class, which leaves no
+        // join clause (RP-363; joined rows, [`Self::joined_implied_estimate`]).
+        let priced = |p: &JoinedSide| {
+            if !p.filter.is_empty() && filter_names(&p.filter, &p.field) {
+                return None;
+            }
+            self.hash_side(&p.table, &p.filter, &p.field, &p.read, &p.above)
+        };
+        let more: Vec<(HashSide, HashSide)> = more
+            .iter()
+            .map(|(l, r)| Some((priced(l)?, priced(r)?)))
+            .collect::<Option<_>>()?;
+        hash_join_of(priced(&a)?, priced(&b)?, &more, false, false)
+    }
+
+    /// The two sides of an inner join of two stored tables planned as
+    /// joined rows, on its first equality and then each further one: each
+    /// side's table, its scan's filter (its own WHERE and the conjuncts
+    /// pushed down to it), its key's stored field, and the fields its scan
+    /// reads and carries above the join. `None` for any other shape
+    /// ([`Self::hash_join_estimate`] lists them).
+    #[allow(clippy::type_complexity)]
+    fn joined_sides(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(JoinedSide, JoinedSide, Vec<(JoinedSide, JoinedSide)>)> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
         let sub = sel.sub.as_ref()?;
@@ -567,7 +597,7 @@ impl PgHandler {
         // A side: its scan's estimate, the width it carries above the
         // join, its key column's statistics and type, and its planner
         // table.
-        let side = |node: &JoinNode, key: &str| -> Option<HashSide> {
+        let side = |node: &JoinNode, key: &str| -> Option<JoinedSide> {
             let JoinNode::Leaf { plan, columns, .. } = node else {
                 return None;
             };
@@ -609,7 +639,7 @@ impl PgHandler {
                 let field = stored(f)?;
                 // The planner pushes such a conjunct into the scan and
                 // keeps it above as well; count it once.
-                if leaf.filter.get(&field) == Some(v) {
+                if leaf.filter.get(&field) == Some(v) || conjunct_in(&leaf.filter, &field, v) {
                     continue;
                 }
                 let mut d = Document::new();
@@ -624,14 +654,6 @@ impl PgHandler {
                 },
                 _ => bson::doc! { "$and": clauses },
             };
-            // A WHERE conjunct pushed into this side's scan (RP-365) is
-            // priced as that scan's filter, through an index where that is
-            // the cheaper path (RP-369, in `hash_side`). Not where it names
-            // the join key: a constant there joins the key's equivalence
-            // class, which leaves no join clause (RP-363).
-            if !scan_filter.is_empty() && filter_names(&scan_filter, &field) {
-                return None;
-            }
             let above: Vec<String> = columns
                 .iter()
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
@@ -653,15 +675,168 @@ impl PgHandler {
                 }
                 r
             };
-            self.hash_side(&leaf.table, &scan_filter, &field, &read, &above)
+            Some(JoinedSide {
+                key: key.to_string(),
+                table: leaf.table.clone(),
+                alias: key.split(secantus_pgplan::joins::SEP).next()?.to_string(),
+                filter: scan_filter,
+                field,
+                read,
+                above,
+            })
         };
         let a = side(left, left_key)?;
         let b = side(right, right_key)?;
-        let more: Vec<(HashSide, HashSide)> = rest
+        let more: Vec<(JoinedSide, JoinedSide)> = rest
             .iter()
             .map(|(l, r)| Some((side(left, l)?, side(right, r)?)))
             .collect::<Option<_>>()?;
-        hash_join_of(a, b, &more, false, false)
+        Some((a, b, more))
+    }
+
+    /// The Nested Loop of an inner join planned as joined rows whose WHERE
+    /// fixes a join key to a constant (RP-376; RP-363 on the narrow path):
+    /// the constant joins the keys' equivalence class, so each side is
+    /// filtered by it (`generate_base_implied_equalities_const`) and no
+    /// join clause is left. Each side is read through an index where
+    /// `set_cheapest` keeps that path, else by its sequential scan; the
+    /// plan is `cheapest_nest_loop`'s. Returns the plan, the left and right
+    /// scans' and the join's estimates, the filters the class adds
+    /// (`(alias, column)`), the outer key the WHERE fixed and the index
+    /// each side reads (left, right).
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn joined_implied_estimate(
+        &self,
+        sel: &secantus_pgplan::Select,
+    ) -> Option<(
+        secantus_pgplan::joincost::NestLoopPlan,
+        Estimate,
+        Estimate,
+        Estimate,
+        Vec<(String, String)>,
+        (String, String),
+        [Option<String>; 2],
+    )> {
+        let (mut a, mut b, more) = self.joined_sides(sel)?;
+        if !more.is_empty() || a.table == b.table {
+            return None;
+        }
+        let column = |p: &JoinedSide| {
+            let def = self.lookup(&p.table)?;
+            def.columns.iter().find(|c| c.field() == p.field).cloned()
+        };
+        let (ca, cb) = (column(&a)?, column(&b)?);
+        if ca.pg_type != cb.pg_type {
+            return None;
+        }
+        // The constant: one equality to it on either key, every such
+        // equality the same value, never NULL.
+        let (va, vb) = (
+            key_constant(&a.filter, &a.field),
+            key_constant(&b.filter, &b.field),
+        );
+        let value = match (&va, &vb) {
+            (Some(Some(x)), Some(Some(y))) => {
+                if secantus_pgplan::compare_values(x, y) != Some(std::cmp::Ordering::Equal) {
+                    return None;
+                }
+                x.clone()
+            }
+            (Some(Some(x)), None) | (None, Some(Some(x))) => x.clone(),
+            _ => return None,
+        };
+        // The side whose WHERE wrote the equality prints it; the class
+        // adds it to the other (the scans' filters already hold it).
+        let written = joined_conjuncts(&sel.filter)?;
+        let wrote = |p: &JoinedSide| {
+            written.iter().any(|(k, v)| {
+                *k == p.key
+                    && secantus_pgplan::compare_values(v, &value) == Some(std::cmp::Ordering::Equal)
+            })
+        };
+        let (wa, wb) = (wrote(&a), wrote(&b));
+        let from = match (wa, wb) {
+            (true, _) => (a.alias.clone(), ca.name.clone()),
+            (false, true) => (b.alias.clone(), cb.name.clone()),
+            (false, false) => return None,
+        };
+        let mut added = Vec::new();
+        for (p, c, has, w) in [
+            (&mut a, &ca, va.is_some(), wa),
+            (&mut b, &cb, vb.is_some(), wb),
+        ] {
+            if !w {
+                added.push((p.alias.clone(), c.name.clone()));
+            }
+            if has {
+                continue;
+            }
+            let mut eq = Document::new();
+            eq.insert(p.field.clone(), value.clone());
+            p.filter = if p.filter.is_empty() {
+                eq
+            } else {
+                bson::doc! { "$and": [bson::Bson::Document(std::mem::take(&mut p.filter)), eq] }
+            };
+        }
+        let (sa, ia) = self.cheapest_filtered_scan(&a.table, &a.filter, &a.read)?;
+        let (sb, ib) = self.cheapest_filtered_scan(&b.table, &b.filter, &b.read)?;
+        let width =
+            |p: &JoinedSide| match self.scan_estimate(&p.table, &Document::new(), &p.above)? {
+                (w, None) => Some(w.3),
+                _ => None,
+            };
+        let plan = secantus_pgplan::joincost::cheapest_nest_loop(sa, sb, 0.0);
+        let rows = costsize::clamp_row_est(sa.2 * sb.2);
+        Some((
+            plan,
+            sa,
+            sb,
+            (plan.startup, plan.total, rows, width(&a)? + width(&b)?),
+            added,
+            from,
+            [ia, ib],
+        ))
+    }
+
+    /// A filtered scan of user table `table` reading `read`: through an
+    /// index where `set_cheapest` keeps that path (`index_scan_estimate`,
+    /// RP-376), else its sequential scan -- only where no index leads with
+    /// a filtered column, as a path the model does not price may win
+    /// there. Returns the estimate and the index read, `None` for a Seq
+    /// Scan.
+    fn cheapest_filtered_scan(
+        &self,
+        table: &str,
+        filter: &Document,
+        read: &[String],
+    ) -> Option<(Estimate, Option<String>)> {
+        if !filter.is_empty() {
+            for ix in self
+                .index_relations()
+                .iter()
+                .filter(|ix| ix.table.name == table)
+            {
+                let key: Vec<String> = ix
+                    .keys
+                    .iter()
+                    .map(|k| {
+                        let i = usize::try_from(*k).ok()?.checked_sub(1)?;
+                        Some(ix.table.columns.get(i)?.field())
+                    })
+                    .collect::<Option<_>>()?;
+                if let Some(est) = self.index_scan_estimate(table, filter, read, &key) {
+                    return Some((est, Some(ix.name.clone())));
+                }
+                if key.first().is_some_and(|lead| filter_names(filter, lead)) {
+                    return None;
+                }
+            }
+        }
+        match self.scan_estimate(table, filter, read)? {
+            (s, None) => Some((s, None)),
+            _ => None,
+        }
     }
 
     /// [`Self::hash_join_estimate`] for a two-table inner join planned on
@@ -2709,6 +2884,72 @@ fn with_in_lengths(mut quals: Vec<(String, costsize::Qual)>) -> Vec<(String, cos
 /// carries above the join, its key column's type and statistics
 /// (distinct count, null fraction, MCVs), whether the key is unique, and
 /// the table's tuples.
+/// One side of a two-table join planned as joined rows
+/// ([`PgHandler::joined_sides`]).
+struct JoinedSide {
+    /// Its join key, as the joined rows name it (`alias` SEP `column`).
+    key: String,
+    table: String,
+    alias: String,
+    /// Its scan's filter, over stored fields.
+    filter: Document,
+    /// Its join key's stored field.
+    field: String,
+    /// The fields its scan reads, and those it carries above the join.
+    read: Vec<String>,
+    above: Vec<String>,
+}
+
+/// The constant `filter` sets stored field `field` equal to, at its top
+/// level or in a top-level `$and`: `None` where it sets none, `Some(None)`
+/// where it sets several, NULL or one only a non-equality reaches.
+fn key_constant(filter: &Document, field: &str) -> Option<Option<bson::Bson>> {
+    let mut found: Vec<&bson::Bson> = Vec::new();
+    let mut other = false;
+    fn walk<'a>(d: &'a Document, field: &str, found: &mut Vec<&'a bson::Bson>, other: &mut bool) {
+        for (k, v) in d {
+            if k == "$and" {
+                if let bson::Bson::Array(a) = v {
+                    for x in a.iter().filter_map(bson::Bson::as_document) {
+                        walk(x, field, found, other);
+                    }
+                }
+            } else if k == field {
+                match v {
+                    bson::Bson::Document(op) if op.len() == 1 && op.contains_key("$eq") => {
+                        found.push(op.get("$eq").expect("checked"));
+                    }
+                    bson::Bson::Document(_) | bson::Bson::RegularExpression(_) => *other = true,
+                    v => found.push(v),
+                }
+            }
+        }
+    }
+    walk(filter, field, &mut found, &mut other);
+    let Some(first) = found.first() else {
+        return None;
+    };
+    let same = found
+        .iter()
+        .all(|v| secantus_pgplan::compare_values(v, first) == Some(std::cmp::Ordering::Equal));
+    if other || !same || matches!(first, bson::Bson::Null) {
+        return Some(None);
+    }
+    Some(Some((*first).clone()))
+}
+
+/// `filter` holds `{field: v}` as one of its top-level `$and` conjuncts:
+/// a WHERE conjunct the planner already pushed into a scan.
+fn conjunct_in(filter: &Document, field: &str, v: &bson::Bson) -> bool {
+    let Ok(items) = filter.get_array("$and") else {
+        return false;
+    };
+    items
+        .iter()
+        .filter_map(bson::Bson::as_document)
+        .any(|d| d.len() == 1 && d.get(field) == Some(v))
+}
+
 struct HashSide {
     scan: Estimate,
     /// The index the scan reads, when it is an Index Scan (RP-369).
