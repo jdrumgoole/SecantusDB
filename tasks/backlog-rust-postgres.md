@@ -1040,6 +1040,12 @@ tests regression tests:
       A sixth on 2026-11-04 in CI: PR #2331's `pg-oracle (server)` job
       (run 41889009200, job 126781059052; the RP-364 branch, EXPLAIN
       costing and narrow-join planning only): `[2.5]` answered `ok`.
+      A seventh on 2026-11-04, `tools/backlog.py verify --regressions` on
+      the RP-366 branch (EXPLAIN costing only; load average about 19 from
+      parallel sessions): `[2.5]` answered `ok`; four runs of all three
+      delays alone after it passed at load 14. Every sighting so far is
+      under load, none on an idle machine, and none on a branch touching
+      the wire or cancel code.
       Backlog-ID: RP-303
       Verify: none -- seen once in CI; does not fail on demand
 
