@@ -83,20 +83,60 @@ fn array_items(v: &Option<String>) -> Option<Vec<String>> {
 }
 
 impl PgHandler {
-    /// The catalog rows an analysis reads. `system_only` keeps PostgreSQL's
-    /// own objects (oid below 16384), what `initdb` saw.
-    pub(crate) fn rule_catalog_data(&self, system_only: bool) -> PgWireResult<CatalogData> {
-        let keep = |o: u32| !system_only || o < 16384;
+    /// The catalog rows an analysis reads: PostgreSQL's own objects (oid
+    /// below 16384, what `initdb` saw) read once per process, and the
+    /// user's read on each call. Reading every catalog in full made each
+    /// `CREATE VIEW` take over a second (RP-336). `pg_namespace` is read
+    /// whole each time, since `public` (oid 2200) can be renamed or dropped.
+    pub(crate) fn rule_catalog(&self) -> PgWireResult<CatalogData> {
+        static SYSTEM: OnceLock<CatalogData> = OnceLock::new();
+        let system = match SYSTEM.get() {
+            Some(s) => s,
+            None => {
+                let s = self.rule_catalog_data(true)?;
+                SYSTEM.get_or_init(|| s)
+            }
+        };
+        let user = self.rule_catalog_data(false)?;
+        let mut d = system.clone();
+        d.namespaces = user.namespaces;
+        d.relations.extend(user.relations);
+        d.attributes.extend(user.attributes);
+        d.types.extend(user.types);
+        d.procs.extend(user.procs);
+        d.operators.extend(user.operators);
+        d.casts.extend(user.casts);
+        d.aggregates.extend(user.aggregates);
+        d.opclasses.extend(user.opclasses);
+        d.amops.extend(user.amops);
+        d.amprocs.extend(user.amprocs);
+        d.collations.extend(user.collations);
+        d.ranges.extend(user.ranges);
+        d.inherits.extend(user.inherits);
+        d.constraints.extend(user.constraints);
+        d.database = user.database;
+        d.encoding = user.encoding;
+        Ok(d)
+    }
+
+    /// One half of [`Self::rule_catalog`]'s rows: `system` keeps
+    /// PostgreSQL's own objects (oid below 16384), otherwise the user's,
+    /// with every namespace.
+    pub(crate) fn rule_catalog_data(&self, system: bool) -> PgWireResult<CatalogData> {
+        let op = if system { "<" } else { ">=" };
+        let keep = |o: u32| (o < 16384) == system;
         let mut d = CatalogData::default();
         for r in text_rows(self, "select oid::text, nspname::text from pg_namespace")? {
-            if keep(oid(&r[0])) {
+            if !system || oid(&r[0]) < 16384 {
                 d.namespaces.push((oid(&r[0]), string(&r[1])));
             }
         }
         for r in text_rows(
             self,
-            "select oid::text, relname::text, relnamespace::text, relkind::text, \
-             reltype::text, reloftype::text from pg_class",
+            &format!(
+                "select oid::text, relname::text, relnamespace::text, relkind::text, \
+             reltype::text, reloftype::text from pg_class where oid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.relations.push(RelRow {
@@ -111,8 +151,8 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select attrelid::text, attnum::text, attname::text, atttypid::text, \
-             atttypmod::text, attcollation::text, attisdropped::text from pg_attribute",
+            &format!("select attrelid::text, attnum::text, attname::text, atttypid::text, \
+             atttypmod::text, attcollation::text, attisdropped::text from pg_attribute where attrelid {op} 16384"),
         )? {
             if keep(oid(&r[0])) {
                 d.attributes.push(AttRow {
@@ -128,11 +168,13 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select oid::text, typname::text, typnamespace::text, typlen::text, \
+            &format!(
+                "select oid::text, typname::text, typnamespace::text, typlen::text, \
              typbyval::text, typalign::text, typtype::text, typcategory::text, \
              typispreferred::text, typisdefined::text, typrelid::text, typelem::text, \
              typarray::text, typbasetype::text, typtypmod::text, typcollation::text, \
-             typsubscript::oid::text from pg_type",
+             typsubscript::oid::text from pg_type where oid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.types.push(TypeRow {
@@ -158,10 +200,10 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select oid::text, proname::text, pronamespace::text, prokind::text, \
+            &format!("select oid::text, proname::text, pronamespace::text, prokind::text, \
              proretset::text, prorettype::text, pronargs::text, pronargdefaults::text, \
              proargtypes::text, proallargtypes::text, proargmodes::text, \
-             proargnames::text, provariadic::text, proargdefaults::text from pg_proc",
+             proargnames::text, provariadic::text, proargdefaults::text from pg_proc where oid {op} 16384"),
         )? {
             if keep(oid(&r[0])) {
                 let argtypes = r[8]
@@ -192,9 +234,11 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select oid::text, oprname::text, oprnamespace::text, oprkind::text, \
+            &format!(
+                "select oid::text, oprname::text, oprnamespace::text, oprkind::text, \
              oprleft::text, oprright::text, oprresult::text, oprcode::oid::text, \
-             oprcom::text, oprnegate::text from pg_operator",
+             oprcom::text, oprnegate::text from pg_operator where oid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.operators.push(OperRow {
@@ -213,8 +257,10 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select oid::text, castsource::text, casttarget::text, castfunc::text, \
-             castcontext::text, castmethod::text from pg_cast",
+            &format!(
+                "select oid::text, castsource::text, casttarget::text, castfunc::text, \
+             castcontext::text, castmethod::text from pg_cast where oid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.casts.push(CastRow {
@@ -228,8 +274,10 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select aggfnoid::oid::text, aggkind::text, aggnumdirectargs::text, \
-             aggtranstype::text from pg_aggregate",
+            &format!(
+                "select aggfnoid::oid::text, aggkind::text, aggnumdirectargs::text, \
+             aggtranstype::text from pg_aggregate where aggfnoid::oid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.aggregates.push(AggRow {
@@ -242,8 +290,8 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select oid::text, opcmethod::text, opcfamily::text, opcintype::text, \
-             opcdefault::text, opcname::text, opcnamespace::text from pg_opclass",
+            &format!("select oid::text, opcmethod::text, opcfamily::text, opcintype::text, \
+             opcdefault::text, opcname::text, opcnamespace::text from pg_opclass where oid {op} 16384"),
         )? {
             if keep(oid(&r[0])) {
                 d.opclasses.push(OpclassRow {
@@ -259,9 +307,11 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select amopfamily::text, amoplefttype::text, amoprighttype::text, \
+            &format!(
+                "select amopfamily::text, amoplefttype::text, amoprighttype::text, \
              amopstrategy::text, amoppurpose::text, amopopr::text, amopmethod::text \
-             from pg_amop",
+             from pg_amop where amopfamily {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.amops.push(AmopRow {
@@ -277,8 +327,10 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select amprocfamily::text, amproclefttype::text, amprocrighttype::text, \
-             amprocnum::text, amproc::oid::text from pg_amproc",
+            &format!(
+                "select amprocfamily::text, amproclefttype::text, amprocrighttype::text, \
+             amprocnum::text, amproc::oid::text from pg_amproc where amprocfamily {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.amprocs.push(AmprocRow {
@@ -294,8 +346,8 @@ impl PgHandler {
         // (primary keys) and ON CONFLICT ON CONSTRAINT.
         for r in text_rows(
             self,
-            "select conrelid::text, oid::text, conkey::text, condeferrable::text, \
-             conname::text, contype::text from pg_constraint where conrelid <> 0",
+            &format!("select conrelid::text, oid::text, conkey::text, condeferrable::text, \
+             conname::text, contype::text from pg_constraint where conrelid <> 0 and conrelid {op} 16384"),
         )? {
             if keep(oid(&r[0])) {
                 let cols = array_items(&r[2])
@@ -315,8 +367,10 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select oid::text, collname::text, collnamespace::text, collencoding::text \
-             from pg_collation",
+            &format!(
+                "select oid::text, collname::text, collnamespace::text, collencoding::text \
+             from pg_collation where oid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.collations.push(CollRow {
@@ -329,8 +383,10 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select rngtypid::text, rngsubtype::text, rngmultitypid::text, rngcollation::text \
-             from pg_range",
+            &format!(
+                "select rngtypid::text, rngsubtype::text, rngmultitypid::text, rngcollation::text \
+             from pg_range where rngtypid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.ranges.push(RangeRow {
@@ -343,7 +399,9 @@ impl PgHandler {
         }
         for r in text_rows(
             self,
-            "select inhrelid::text, inhparent::text from pg_inherits",
+            &format!(
+                "select inhrelid::text, inhparent::text from pg_inherits where inhrelid {op} 16384"
+            ),
         )? {
             if keep(oid(&r[0])) {
                 d.inherits.push((oid(&r[0]), oid(&r[1])));
@@ -526,7 +584,7 @@ impl PgHandler {
         if !recursive {
             return Ok(());
         }
-        let Ok(data) = self.rule_catalog_data(false) else {
+        let Ok(data) = self.rule_catalog() else {
             return Ok(());
         };
         let cat = Catalog::new(data);
@@ -601,7 +659,7 @@ impl PgHandler {
                 })?
         };
         let data = self
-            .rule_catalog_data(false)
+            .rule_catalog()
             .map_err(|e| TreeError::NoTree(format!("{e:?}")))?;
         let cat = Catalog::new(data);
         let ctx = secantus_pgplan::nodetostring::AnalysisContext {
