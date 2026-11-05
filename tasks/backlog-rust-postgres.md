@@ -1403,6 +1403,22 @@ a regression test.
       Backlog-ID: RP-375
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's equality with an inequality beside it]
 
+- [ ] **EXPLAIN of a user table still shows a Seq Scan, or zeros, for
+      three index paths PostgreSQL picks.** Since RP-339 one analysed
+      table's scan is PostgreSQL 15.19's `set_cheapest` choice of a Seq
+      Scan, an Index Scan or a Bitmap Heap Scan over one index. Not yet:
+      an `OR` of indexed clauses (`where a = 5 or a = 6` is a BitmapOr of
+      two Bitmap Index Scans on `k_pkey`, cost 8.57..12.80, here a Seq
+      Scan); an index-only scan (`select a + 1 from k where a = 5` is an
+      `Index Only Scan using k_pkey`, here an Index Scan with zeros: no
+      index-only path is priced for a user table); and clauses on two
+      columns of one composite index (`where a = 7 and b = 7` over `n_ab`
+      is an Index Scan with both in its Index Cond, here a Seq Scan, as
+      `btcostestimate`'s bound quals on a later column are not priced).
+      Measured on a private 15.19 cluster (found while working RP-339).
+      Backlog-ID: RP-378
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a bitmap or of a key's two equalities], tests/backlog/test_rp_explain_costs.py::test_plan[an index-only scan under a computed select list], tests/backlog/test_rp_explain_costs.py::test_plan[an index scan of a composite index's two columns]
+
 ## Found by batch 54 (2026-10-24)
 
 Found while building `pg_identify_object` and its siblings (RP-199), and

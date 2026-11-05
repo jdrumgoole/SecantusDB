@@ -1540,6 +1540,39 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (b = 7)",
         ],
     ),
+    # ------------- RP-378 a user table's index paths not yet chosen
+    "a bitmap or of a key's two equalities": (
+        "RP-378",
+        _ANALYSED,
+        "explain select * from k where a = 5 or a = 6",
+        [
+            "Bitmap Heap Scan on k  (cost=8.57..12.80 rows=2 width=7)",
+            "  Recheck Cond: ((a = 5) OR (a = 6))",
+            "  ->  BitmapOr  (cost=8.57..8.57 rows=2 width=0)",
+            "        ->  Bitmap Index Scan on k_pkey  (cost=0.00..4.28 rows=1 width=0)",
+            "              Index Cond: (a = 5)",
+            "        ->  Bitmap Index Scan on k_pkey  (cost=0.00..4.28 rows=1 width=0)",
+            "              Index Cond: (a = 6)",
+        ],
+    ),
+    "an index-only scan under a computed select list": (
+        "RP-378",
+        _ANALYSED,
+        "explain select a + 1 from k where a = 5",
+        [
+            "Index Only Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=4)",
+            "  Index Cond: (a = 5)",
+        ],
+    ),
+    "an index scan of a composite index's two columns": (
+        "RP-378",
+        _N,
+        "explain select * from n where a = 7 and b = 7",
+        [
+            "Index Scan using n_ab on n  (cost=0.28..8.30 rows=1 width=11)",
+            "  Index Cond: ((a = 7) AND (b = 7))",
+        ],
+    ),
     # --------------------------------- RP-334 / RP-335 a catalog's index
     "a catalog read by its index": (
         "RP-334",
