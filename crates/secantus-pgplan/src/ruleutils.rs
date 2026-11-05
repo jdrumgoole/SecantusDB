@@ -3808,39 +3808,45 @@ pub fn explain_conjuncts(
         .copied()
         .map(|p| {
             let text = expr_node_planned(p, def)?;
-            let column = match p.node.as_ref() {
-                Some(N::AExpr(e))
-                    if e.kind == AExprKind::AexprOp as i32
-                        && matches!(
-                            crate::operator_name(e).ok(),
-                            Some("=" | "<" | "<=" | ">" | ">=")
-                        ) =>
-                {
-                    let col = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
-                        Some(N::ColumnRef(c)) => names(&c.fields).pop(),
-                        _ => None,
-                    };
-                    let konst = |n: Option<&Node>| {
-                        matches!(
-                            n.and_then(|n| n.node.as_ref()),
-                            Some(N::AConst(_) | N::TypeCast(_) | N::ParamRef(_))
-                        )
-                    };
-                    let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
-                    if konst(r) {
-                        col(l)
-                    } else if konst(l) {
-                        col(r)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            Some((text, column))
+            Some((text, qual_column(p)))
         })
         .collect::<Option<Vec<_>>>()
         .map(|printed| qual_order(&parts, printed))
+}
+
+/// The column an index-usable conjunct constrains: `column op constant`
+/// (either way round) of a B-tree comparison operator; `None` for any
+/// other conjunct.
+fn qual_column(p: &Node) -> Option<String> {
+    match p.node.as_ref() {
+        Some(N::AExpr(e))
+            if e.kind == AExprKind::AexprOp as i32
+                && matches!(
+                    crate::operator_name(e).ok(),
+                    Some("=" | "<" | "<=" | ">" | ">=")
+                ) =>
+        {
+            let col = |n: Option<&Node>| match n.and_then(|n| n.node.as_ref()) {
+                Some(N::ColumnRef(c)) => names(&c.fields).pop(),
+                _ => None,
+            };
+            let konst = |n: Option<&Node>| {
+                matches!(
+                    n.and_then(|n| n.node.as_ref()),
+                    Some(N::AConst(_) | N::TypeCast(_) | N::ParamRef(_))
+                )
+            };
+            let (l, r) = (e.lexpr.as_deref(), e.rexpr.as_deref());
+            if konst(r) {
+                col(l)
+            } else if konst(l) {
+                col(r)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The order PostgreSQL 15's planner leaves a scan's quals in (RP-348). A
@@ -3970,11 +3976,10 @@ pub fn join_conditions(
 /// A joined SELECT's WHERE as EXPLAIN places it: each AND conjunct printed
 /// qualified, with the relation it belongs to when it names exactly one
 /// relation that no outer join makes nullable (PostgreSQL pushes that one
-/// down to the relation's scan; any other stays on the join).
-pub fn join_where(
-    s: &pg_query::protobuf::SelectStmt,
-    cat: &Catalog<'_>,
-) -> Option<Vec<(String, Option<String>)>> {
+/// down to the relation's scan; any other stays on the join), and, for a
+/// pushed-down `column op constant`, the column, which an index scan of
+/// the relation may take as its `Index Cond` (RP-369).
+pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Option<Vec<JoinQual>> {
     let w = s.where_clause.as_deref()?;
     let mut p = Printer::new(cat, 0);
     let mut rtes = Vec::new();
@@ -4115,10 +4120,16 @@ pub fn join_where(
         } else {
             text
         };
-        out.push((text, home));
+        let column = home.as_ref().and_then(|_| qual_column(part));
+        out.push((text, home, column));
     }
     Some(out)
 }
+
+/// A joined SELECT's WHERE conjunct for EXPLAIN: its text, the relation
+/// whose scan it filters (`None`: the top join's), and the column an index
+/// scan there could take it on (RP-369).
+pub type JoinQual = (String, Option<String>, Option<String>);
 
 /// An expression node over one table, printed as `pg_get_expr` does.
 pub fn expr_node_def(n: &Node, def: &TableDef) -> Option<String> {
