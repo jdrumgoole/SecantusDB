@@ -2118,13 +2118,13 @@ def test_a_database_wide_analyze_measures_an_aclitem_array(rust_pg: Any) -> None
     assert row == (0.50851583, 4.0, "{0.45498782,0.02919708,0.00486618,0.00243309}")
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_a_regproc_column(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster, after one
     CREATE TABLE): a plain ANALYZE re-measures `pg_type.typinput`
     (`regproc`, which sorts under `oid`'s B-tree opclass), so its distinct
-    count and frequencies follow the two new `pg_type` rows; here the
-    column keeps `initdb`'s row. (Its correlation follows the heap's order,
+    count and frequencies follow the two new `pg_type` rows; the column
+    kept `initdb`'s row. (Its correlation follows the heap's order,
     RP-358.)"""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_c")
@@ -2140,6 +2140,32 @@ def test_a_database_wide_analyze_measures_a_regproc_column(rust_pg: Any) -> None
         0.0,
         -0.15986949,
         "{0.47634584,0.3425775,0.009787928,0.009787928,0.008156607,0.0032626428}",
+    )
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_an_int2vector_column(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster, measured on
+    two new clusters): after a CREATE TABLE with a primary key, a plain
+    ANALYZE re-measures `pg_index.indkey` (`int2vector`, which has
+    `int2vectoreq` but no `<`: `compute_distinct_stats`), so its
+    frequencies follow the new index's row; here the column keeps
+    `initdb`'s row."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_d")
+        c.execute("create database rp313_d")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_d", autocommit=True) as c:
+        c.execute("create table zz_vec (a int primary key)")
+        c.execute("analyze")
+        row = c.execute(
+            "select null_frac, n_distinct, most_common_freqs::text from pg_stats"
+            " where tablename = 'pg_index' and attname = 'indkey'"
+        ).fetchone()
+    assert row == (
+        0.0,
+        -0.1595092,
+        "{0.3006135,0.2822086,0.10429448,0.0797546,0.036809817,0.024539877,"
+        "0.018404908,0.018404908,0.012269938,0.012269938,0.012269938,0.012269938}",
     )
 
 
