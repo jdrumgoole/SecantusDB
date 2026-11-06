@@ -1419,16 +1419,6 @@ a regression test.
       private 15.19 cluster (found while working RP-383).
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index scan's filter], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
-- [ ] **EXPLAIN shows a Seq Scan of a table VACUUM saw shrink.** After
-      `vacuum analyze k` (`k (a int primary key, b text)`, 1,000 rows),
-      `delete from k where a = 7` and `vacuum k`, PostgreSQL 15.19 keeps
-      `Index Only Scan using k_pkey on k` for `select a from k where a <
-      10`; here a `Seq Scan`, as `record_vacuum` marks a heap with fewer
-      rows than the last VACUUM saw as unmodelled and the path model
-      declines it (RP-196's "rows removed, which is not modelled").
-      Measured on a private 15.19 cluster (found while working RP-383).
-      Backlog-ID: RP-385
-      Verify: tests/backlog/test_rp_explain_costs.py::test_an_index_only_scan_after_a_delete_and_vacuum
 
 ## Found by batch 54 (2026-10-24)
 

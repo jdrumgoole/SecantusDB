@@ -9169,6 +9169,12 @@ impl PgHandler {
         previous: Option<&Document>,
         rows: usize,
     ) -> Option<i64> {
+        // A modelled heap's own visibility map (RP-385).
+        if self.has_heap(table) {
+            return self
+                .with_heap_read(table, |h| i64::from(h.visible_count()))
+                .ok();
+        }
         let Some((vrows, vpages)) = previous.and_then(|d| {
             Some((
                 d.get_i64("vacuum_rows").ok()?,
@@ -9217,11 +9223,11 @@ impl PgHandler {
     }
 
     /// VACUUM of `table` (not FULL): `pg_class`'s `relpages`, `reltuples` and
-    /// `relallvisible` (`vac_update_relstats`) -- every page all-visible,
-    /// as nothing else is running -- and what it saw, for the visibility
-    /// map's count later (`visible_pages`); ANALYZE's statistics stay. A heap
-    /// not modelled, or one holding fewer rows than a previous VACUUM saw
-    /// (rows removed, which is not modelled), is recorded as unmodelled.
+    /// `relallvisible` (`vac_update_relstats`) -- a modelled heap's
+    /// visibility-map count, else every page -- and what it saw, for the
+    /// visibility map's count later (`visible_pages`); ANALYZE's statistics
+    /// stay. A heap not modelled, or a row-count estimate holding fewer rows
+    /// than a previous VACUUM saw, is recorded as unmodelled.
     fn record_vacuum(&self, table: &str) -> PgWireResult<()> {
         let Some(def) = self.lookup(table) else {
             return Ok(());
@@ -9232,12 +9238,23 @@ impl PgHandler {
             None => self.table_docs(table)?.len(),
         };
         let previous = self.relstats(table);
-        let shrunk = previous
-            .as_ref()
-            .and_then(|d| d.get_i64("vacuum_rows").ok())
-            .is_some_and(|v| (rows as i64) < v);
+        // A modelled heap (`heap.rs`) keeps its pages' visibility-map bits
+        // whatever rows left it (RP-385); only the estimate built from row
+        // counts cannot follow a heap that shrank.
+        let heap = self.has_heap(table);
+        let shrunk = !heap
+            && previous
+                .as_ref()
+                .and_then(|d| d.get_i64("vacuum_rows").ok())
+                .is_some_and(|v| (rows as i64) < v);
         let Some(pages) = self.measured_pages(table, &def) else {
             return self.record_relstats(table, true);
+        };
+        let visible = if heap {
+            self.with_heap_read(table, |h| i64::from(h.visible_count()))
+                .unwrap_or(pages as i64)
+        } else {
+            pages as i64
         };
         // What the planner's model cannot price -- rows it does not size,
         // a heap rows have left -- it declines; `pg_class` still shows the
@@ -9251,7 +9268,7 @@ impl PgHandler {
             "_id": table,
             "reltuples": rows as i64,
             "relpages": pages as i64,
-            "relallvisible": pages as i64,
+            "relallvisible": visible,
             "vacuum_rows": rows as i64,
             "vacuum_pages": pages as i64,
             "statistics": statistics,
