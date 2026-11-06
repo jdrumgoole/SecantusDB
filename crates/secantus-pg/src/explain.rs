@@ -696,7 +696,12 @@ pub(crate) fn param_index_inner(root: &mut PlanNode, p: &crate::scan_estimate::P
     let Some(table) = inner.name.strip_prefix("Seq Scan on ") else {
         return;
     };
-    inner.name = format!("Index Scan using {} on {table}", p.index);
+    let kind = if p.index_only {
+        "Index Only Scan"
+    } else {
+        "Index Scan"
+    };
+    inner.name = format!("{kind} using {} on {table}", p.index);
     inner.props.retain(|(k, _)| k != "Index Name");
     inner
         .props
@@ -2245,6 +2250,7 @@ mod join_type_tests {
                 index: "k_pkey".into(),
                 alias: "k".into(),
                 column: "a".into(),
+                index_only: false,
             },
         );
         root.details.push((
@@ -2261,6 +2267,20 @@ mod join_type_tests {
                 ("Filter".to_string(), "(e.b <> b)".to_string()),
             ]
         );
+        // An inner whose index holds every column read is index-only.
+        let mut root = PlanNode::new("Nested Loop");
+        root.children.push(rel("e"));
+        root.children.push(rel("k"));
+        param_index_inner(
+            &mut root,
+            &crate::scan_estimate::ParamScan {
+                index: "k_pkey".into(),
+                alias: "k".into(),
+                column: "a".into(),
+                index_only: true,
+            },
+        );
+        assert_eq!(root.children[1].name, "Index Only Scan using k_pkey on k");
     }
 
     #[test]
