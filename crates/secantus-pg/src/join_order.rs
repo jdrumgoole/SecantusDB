@@ -1275,13 +1275,10 @@ impl PgHandler {
             let useful = move |c: usize| {
                 // A class's ascending order under a descending ORDER BY on
                 // it is of use for merging only.
-                let asc = c != secantus_pgplan::joincost::USELESS_KEYS
-                    && c & secantus_pgplan::joincost::ASC_KEYS != 0;
-                let c = if asc {
-                    c & !secantus_pgplan::joincost::ASC_KEYS
-                } else {
-                    c
-                };
+                let flags =
+                    secantus_pgplan::joincost::ASC_KEYS | secantus_pgplan::joincost::BACK_KEYS;
+                let asc = c != secantus_pgplan::joincost::USELESS_KEYS && c & flags != 0;
+                let c = if asc { c & !flags } else { c };
                 if (!asc && Some(c) == order_class) || outer_reads.contains(&c) {
                     true
                 } else if let Some(k) = class_index(c) {
@@ -1576,7 +1573,18 @@ impl PgHandler {
                         && c & secantus_pgplan::joincost::ASC_KEYS != 0
                 })
         };
+        // A backward scan under a DESC NULLS LAST ORDER BY merges descending
+        // with its NULLs first (its pathkey), and is not the ORDER BY's.
+        let back_input = |rel: usize, pick: Pick, sorted: bool| {
+            sorted
+                && search.path_class(rel, pick).is_some_and(|c| {
+                    c != secantus_pgplan::joincost::USELESS_KEYS
+                        && c & secantus_pgplan::joincost::BACK_KEYS != 0
+                })
+        };
+        let back = back_input(built.a, a_pick, a_sorted) || back_input(built.b, b_pick, b_sorted);
         let merge_in_order = (search.order_desc || search.order_nulls_first)
+            && !back
             && !asc_input(built.a, a_pick, a_sorted)
             && !asc_input(built.b, b_pick, b_sorted)
             && matches!(
@@ -1646,7 +1654,7 @@ impl PgHandler {
                     .iter()
                     .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
                     .collect(),
-                desc: merge_in_order && search.order_desc,
+                desc: (merge_in_order && search.order_desc) || back,
                 nulls_first: merge_in_order && search.order_nulls_first,
             };
             let on = clause.on.and_then(|i| chain.ons.get(i).copied().flatten());
@@ -1748,7 +1756,7 @@ impl PgHandler {
                 .iter()
                 .map(|(ak, _, bk, _)| (ak.clone(), bk.clone()))
                 .collect(),
-            desc: merge_in_order && search.order_desc,
+            desc: (merge_in_order && search.order_desc) || back,
             nulls_first: merge_in_order && search.order_nulls_first,
         };
         let type_of = |key: &str| chain.leaves.iter().find_map(|n| leaf_key_type(n, key));
@@ -1950,6 +1958,18 @@ impl PgHandler {
                         // scan (DESC NULLS FIRST) is the wrong direction for
                         // merging and of no use for the ORDER BY
                         // (`build_index_paths` keeps none).
+                        // A DESC NULLS LAST ORDER BY of a key no clause
+                        // reads: the forward scan's ascending order is the
+                        // wrong direction for merging, and the backward
+                        // scan's DESC NULLS FIRST the right one, though
+                        // not the ORDER BY's own pathkey.
+                        if search.order_nulls_first && search.order_desc && unread {
+                            let c = list[i].0.class.unwrap_or(ORDER_CLASS);
+                            list[i].0.class = Some(secantus_pgplan::joincost::back_keys(c));
+                            base_backward[t][i] = true;
+                            i += 1;
+                            continue;
+                        }
                         if search.order_nulls_first {
                             let c = list[i].0.class.unwrap_or(ORDER_CLASS);
                             list[i].0.class = Some(secantus_pgplan::joincost::asc_keys(c));
