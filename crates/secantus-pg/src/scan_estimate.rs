@@ -1470,6 +1470,11 @@ impl PgHandler {
                     .and_then(|i| ix.table.columns.get(i))
                     .is_some_and(|c| c.field() == field)
         });
+        let key_index = if key_indexed && index.is_none() {
+            self.key_index(table, filter, field, &key, scan.2)
+        } else {
+            None
+        };
         Some(HashSide {
             scan,
             index,
@@ -1483,6 +1488,72 @@ impl PgHandler {
             numeric,
             ordered,
             key_indexed,
+            key_index,
+        })
+    }
+
+    /// The join key `field`'s index over analysed table `table`, scanned
+    /// with `filter` (RP-377): the one plain B-tree leading with it, sized
+    /// and correlated as [`Self::index_scan_estimate`] does. `None` where
+    /// another index leads with it, reads it past its first column or
+    /// serves a WHERE column, or the index is partial or a hash.
+    fn key_index(
+        &self,
+        table: &str,
+        filter: &Document,
+        field: &str,
+        key: &AnalysedKey,
+        rows: f64,
+    ) -> Option<KeyIndex> {
+        let count = self
+            .storage
+            .count_matching(self.db(), table, &Document::new(), None)
+            .ok()?;
+        let pt = self.planner_table(table, count)?;
+        let stats = pt.analyzed.as_ref()?;
+        let quals = costsize::conjuncts(filter)?;
+        let mut indexes = self.cost_indexes(table, &pt.def, count as u64);
+        let correlations = Self::stats_correlations(&pt.def, stats);
+        let mut found: Option<costsize::Index> = None;
+        for ix in &mut indexes {
+            if quals.iter().any(|(f, _)| ix.columns.contains(f))
+                || ix.columns[1..].iter().any(|c| c == field)
+            {
+                return None;
+            }
+            if ix.field != field {
+                continue;
+            }
+            if ix.hash || ix.predicate.is_some() || ix.tuples.is_some() {
+                return None;
+            }
+            // The primary key is listed both as the SQL key and as the
+            // storage's own `_id` index: one relation in PostgreSQL.
+            if let Some(f) = &found {
+                if f.columns == ix.columns {
+                    continue;
+                }
+                return None;
+            }
+            let c = correlations.get(field).copied().flatten()?;
+            ix.correlation = if ix.columns.len() > 1 { c * 0.75 } else { c };
+            if !ix.unique {
+                if let Some(Some((pages, height))) = self.dedup_index_size(table, ix) {
+                    ix.pages = pages;
+                    ix.height = height;
+                }
+            }
+            found = Some(ix.clone());
+        }
+        Some(KeyIndex {
+            rel: costsize::Rel {
+                pages: pt.pages,
+                tuples: pt.tuples,
+            },
+            index: found?,
+            quals,
+            ndistinct: key.ndistinct,
+            where_sel: rows / pt.tuples.max(1.0),
         })
     }
 
@@ -3570,6 +3641,32 @@ struct HashSide {
     /// A B-tree index leads with the key: a merge could read it presorted,
     /// which is not modelled.
     key_indexed: bool,
+    /// That index, as `cost_index` sizes it over the analysed table, for
+    /// the whole-index and parameterized scans a join on a unique key
+    /// weighs (RP-377). `None` where it is not one plain B-tree.
+    key_index: Option<KeyIndex>,
+}
+
+/// A join key's B-tree index over an analysed table (RP-377): the table
+/// and index as `cost_index` reads them, the side's own WHERE quals (each
+/// checked on every row fetched), its key's distinct count and the
+/// table's rows its WHERE keeps.
+struct KeyIndex {
+    rel: secantus_pgplan::costsize::Rel,
+    index: secantus_pgplan::costsize::Index,
+    quals: Vec<(String, secantus_pgplan::costsize::Qual)>,
+    ndistinct: f64,
+    /// `scan.2 / tuples`: the WHERE's selectivity.
+    where_sel: f64,
+}
+
+impl HashSide {
+    /// Its key column's average width, for a Memoize keyed on it.
+    fn key_index_width(&self) -> Option<i64> {
+        self.column
+            .as_ref()
+            .map(|(stats, _)| i64::from(stats.width))
+    }
 }
 
 /// One analysed column's statistics (`PgHandler::analysed_key`).
@@ -3647,8 +3744,8 @@ fn hash_join_of(
     };
     // `innerrel_is_unique` over the join's clauses: one of them on a
     // unique column of the side makes it `inner_unique` when hashed.
-    let unique_a = multi && (a.unique || more.iter().any(|(x, _)| x.unique));
-    let unique_b = multi && (b.unique || more.iter().any(|(_, y)| y.unique));
+    let unique_a = a.unique || more.iter().any(|(x, _)| x.unique);
+    let unique_b = b.unique || more.iter().any(|(_, y)| y.unique);
     let join_side = |s: &HashSide| JoinSide {
         rows: s.scan.2,
         tuples: s.tuples,
@@ -3665,8 +3762,11 @@ fn hash_join_of(
         extra,
     };
     // A side unique on its one key is `inner_unique` when hashed, and
-    // PostgreSQL may then prefer another plan; not modelled here.
-    if !multi && (a.unique || b.unique) {
+    // PostgreSQL then weighs a merge join reading its index presorted and a
+    // nested loop probing it (RP-377): priced below over each side's
+    // pathlist. An outer join or a join filter there is not modelled.
+    let unique_key = !multi && (a.unique || b.unique);
+    if unique_key && (left_join || redundant || filter.count != 0) {
         return None;
     }
     // A side its own WHERE cuts to one row is `inner_unique` as the inner
@@ -3843,6 +3943,12 @@ fn hash_join_of(
     if nest.total <= t0 * 1.01 {
         return None;
     }
+    if unique_key {
+        let other = unique_key_other_paths(&a, &b, &outer, &inner, rows)?;
+        if other <= t0 * 1.01 {
+            return None;
+        }
+    }
     let b_first = matches!(
         pick,
         JoinPick::Hash { swap: true } | JoinPick::Merge { b_outer: true, .. }
@@ -3853,6 +3959,123 @@ fn hash_join_of(
         (a.scan, b.scan, [a.index, b.index])
     };
     Some((o, i, (s0, t0, rows, width), pick, indexes))
+}
+
+/// The cheapest total of the merge joins and nested loops PostgreSQL's
+/// `add_paths_to_joinrel` builds for `a` joined to `b` on one key, unique
+/// on a side (RP-377): each side's pathlist as `set_base_rel_pathlists`
+/// makes it -- its cheapest unparameterized scan, and for a side whose key
+/// a B-tree leads with, that index read whole in the key's order and probed
+/// by the other side's key (an index scan and a bitmap heap scan,
+/// `get_loop_count` the other side's rows) -- through
+/// `JoinRel::add_paths_general` with no hash path. `None` where a side's
+/// key index is not modelled, or no such path is built.
+fn unique_key_other_paths(
+    a: &HashSide,
+    b: &HashSide,
+    side_a: &secantus_pgplan::joincost::JoinSide,
+    side_b: &secantus_pgplan::joincost::JoinSide,
+    rows: f64,
+) -> Option<f64> {
+    use secantus_pgplan::joincost::{base_pathlist, InPath, JoinRel, MemoKey, RelPaths};
+    // The join clause's own class (an edge's, `Search`'s numbering).
+    const CLASS: usize = 2;
+    let paths = |s: &HashSide, other: &HashSide, other_bit: u32| -> Option<Vec<InPath>> {
+        let mut out = vec![InPath::scan(s.scan.0, s.scan.1, s.scan.2, None)];
+        if !s.key_indexed {
+            return Some(out);
+        }
+        let k = s.key_index.as_ref()?;
+        let other_key = other.key_index_width()?;
+        let (st, tt) = costsize::ordered_index_scan_with(
+            &k.rel,
+            &k.index,
+            &k.quals,
+            costsize::ColSel::Ndistinct(k.ndistinct),
+        );
+        out.push(InPath::scan(st, tt, s.scan.2, Some(CLASS)));
+        // `get_parameterized_baserel_size`: the WHERE's selectivity and the
+        // clause's (`var_eq_non_const`), at most the rows.
+        let ppi_rows = costsize::clamp_row_est(k.rel.tuples * k.where_sel / k.ndistinct.max(1.0))
+            .min(s.scan.2);
+        let memo_key = MemoKey {
+            ndistinct: other.stats.0,
+            default: false,
+            tuples: other.tuples,
+            rel_rows: other.scan.2,
+            width: other_key,
+        };
+        let param = |(startup, total): (f64, f64)| InPath {
+            startup,
+            total,
+            class: None,
+            rows: ppi_rows,
+            req_outer: other_bit,
+            rescan: (startup, total),
+            indexed: true,
+            memo_key: Some(memo_key),
+        };
+        let loops = other.scan.2;
+        out.push(param(costsize::param_index_scan(
+            &k.rel,
+            &k.index,
+            &k.quals,
+            k.ndistinct,
+            loops,
+        )?));
+        out.push(param(costsize::param_bitmap_heap_scan(
+            &k.rel,
+            &k.index,
+            &k.quals,
+            k.ndistinct,
+            loops,
+            ppi_rows,
+        )?));
+        Some(out)
+    };
+    let (pa, pb) = (paths(a, b, 2)?, paths(b, a, 1)?);
+    let (ka, ta, sa) = base_pathlist(&pa, false)?;
+    let (kb, tb, sb) = base_pathlist(&pb, false)?;
+    let pa: Vec<InPath> = ka.iter().map(|&i| pa[i]).collect();
+    let pb: Vec<InPath> = kb.iter().map(|&i| pb[i]).collect();
+    fn rel_paths<'p>(
+        side: &secantus_pgplan::joincost::JoinSide,
+        paths: &'p [InPath],
+        (cheapest_total, cheapest_startup): (usize, usize),
+        s: &HashSide,
+        bit: u32,
+    ) -> RelPaths<'p> {
+        RelPaths {
+            side: *side,
+            paths,
+            cheapest_total,
+            cheapest_startup,
+            set: bit,
+            width: s.scan.3,
+            unique: side.unique,
+            key_table: bit,
+        }
+    }
+    let ra = rel_paths(side_a, &pa, (ta, sa), a, 1);
+    let rb = rel_paths(side_b, &pb, (tb, sb), b, 2);
+    let mut rel = JoinRel::without_hash(false);
+    rel.add_paths_general(
+        0,
+        Some(CLASS),
+        Some(CLASS),
+        (false, false),
+        &|_| false,
+        &ra,
+        &rb,
+        false,
+        rows,
+        0,
+    );
+    rel.pathlist()
+        .iter()
+        .filter(|p| p.req_outer == 0)
+        .map(|p| p.total)
+        .reduce(f64::min)
 }
 
 /// A priced two-table join: the printed outer scan's, the inner scan's and

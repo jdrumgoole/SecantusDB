@@ -1323,9 +1323,20 @@ pub struct JoinRel {
     /// Each parameterization's rows, as the first pair of input paths to
     /// make it sized them (`ParamPathInfo::ppi_rows`).
     ppi_rows: Vec<(u32, f64)>,
+    /// `add_paths_general` adds no hash join: the merge joins and nested
+    /// loops a hash join priced elsewhere is weighed against (RP-377).
+    no_hash: bool,
 }
 
 impl JoinRel {
+    /// A relation whose `add_paths_general` adds no hash join path.
+    pub fn without_hash(startup_counts: bool) -> JoinRel {
+        JoinRel {
+            no_hash: true,
+            ..JoinRel::new(startup_counts)
+        }
+    }
+
     /// `startup_counts`: the query has a LIMIT (`consider_startup`).
     pub fn new(startup_counts: bool) -> JoinRel {
         JoinRel {
@@ -1334,6 +1345,7 @@ impl JoinRel {
             extra: 0.0,
             filter: 0.0,
             ppi_rows: Vec::new(),
+            no_hash: false,
         }
     }
 
@@ -1989,6 +2001,7 @@ impl JoinRel {
         param_source: u32,
     ) {
         let startup_counts = self.startup_counts;
+        let no_hash = self.no_hash;
         let extra = self.extra;
         let qp = self.filter;
         let ppi = &mut self.ppi_rows;
@@ -2221,6 +2234,9 @@ impl JoinRel {
             } else {
                 JoinMethod::HashOuterA
             };
+            if no_hash {
+                continue;
+            }
             let cso = outer.cheapest_startup;
             let mut pairs = vec![(cso, ict)];
             for &o in &outer.parameterized() {
