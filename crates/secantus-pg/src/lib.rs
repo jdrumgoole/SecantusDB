@@ -915,6 +915,10 @@ enum WhereClause {
     Null(String, bool),
     /// `col NOT IN (...)` of these constants.
     NotIn(String, Vec<Bson>),
+    /// `col LIKE pattern` (`ILIKE` when the first flag is set; `NOT` when
+    /// the second is), its pattern read from the EXPLAIN's own
+    /// (`scan_estimate::explain_pattern`).
+    Pattern(String, String, bool, bool),
     /// An `OR` of conjunctions.
     Or(Vec<Vec<WhereClause>>),
 }
@@ -1015,6 +1019,19 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                 }
                 (k, _) if k.starts_with('$') => return None,
                 (field, Bson::Null) => out.push(WhereClause::Null(field.to_string(), true)),
+                (field, Bson::Document(ops)) if ops.contains_key("$regex") => {
+                    out.push(pattern_clause(field, ops, false)?);
+                }
+                (field, Bson::Document(ops))
+                    if ops.len() == 2
+                        && ops.get("$ne") == Some(&Bson::Null)
+                        && ops
+                            .get_document("$not")
+                            .is_ok_and(|d| d.contains_key("$regex")) =>
+                {
+                    guards.push(field.to_string());
+                    out.push(pattern_clause(field, ops.get_document("$not").ok()?, true)?);
+                }
                 (field, Bson::Document(ops)) if ops.keys().any(|k| k.starts_with('$')) => {
                     for (op, operand) in ops {
                         if op == "$ne" && operand == &Bson::Null {
@@ -1069,7 +1086,13 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
         let ne = out
             .iter()
             .filter(|c| {
-                matches!(c, WhereClause::Cmp(g, Op::Ne, _) | WhereClause::NotIn(g, _) if g == f)
+                matches!(
+                    c,
+                    WhereClause::Cmp(g, Op::Ne, _)
+                    | WhereClause::NotIn(g, _)
+                    | WhereClause::Pattern(g, _, _, true)
+                    if g == f
+                )
             })
             .count();
         extra.extend(std::iter::repeat_n(
@@ -1079,6 +1102,28 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
     }
     out.extend(extra);
     Some(out)
+}
+
+/// A lowered pattern match (`{$regex, $options}`) on `field` as the LIKE or
+/// ILIKE its EXPLAIN holds; `None` for any other regex.
+fn pattern_clause(field: &str, spec: &Document, negated: bool) -> Option<WhereClause> {
+    let regex = spec.get_str("$regex").ok()?;
+    let insensitive = match spec.get("$options") {
+        None => false,
+        Some(Bson::String(o)) if o == "i" => true,
+        Some(_) => return None,
+    };
+    if spec.keys().any(|k| k != "$regex" && k != "$options") {
+        return None;
+    }
+    let (pattern, insensitive) =
+        scan_estimate::explain_pattern(field, regex, insensitive, negated)?;
+    Some(WhereClause::Pattern(
+        field.to_string(),
+        pattern,
+        insensitive,
+        negated,
+    ))
 }
 
 /// What a grouping asks of the planner beyond its keys, for the choice
@@ -8092,6 +8137,21 @@ impl PgHandler {
         })
     }
 
+    /// Whether a column's collation, its own or the database's, is `C` or
+    /// `POSIX` (`lc_collate_is_c`; `C.UTF-8` is not).
+    pub(crate) fn column_is_c_collation(&self, c: &secantus_pgcatalog::Column) -> bool {
+        let is_c = |collation: &str| matches!(collation, "C" | "POSIX");
+        match c.extra.get_str("collation") {
+            Ok(coll) if coll.trim_matches('"') != "default" => is_c(coll.trim_matches('"')),
+            _ => self
+                .databases
+                .lookup(&self.storage, self.db())
+                .ok()
+                .flatten()
+                .is_some_and(|info| is_c(&info.collate)),
+        }
+    }
+
     /// How a column's statistics keys order (`colstats::Column`): whether
     /// they are integers (`convert_to_scalar`), and whether they order
     /// bytewise as the column compares -- `name` and `"char"` always, a
@@ -8550,7 +8610,8 @@ impl PgHandler {
                     WhereClause::Cmp(f, ..)
                     | WhereClause::In(f, _)
                     | WhereClause::NotIn(f, _)
-                    | WhereClause::Null(f, _) => {
+                    | WhereClause::Null(f, _)
+                    | WhereClause::Pattern(f, ..) => {
                         if !out.contains(&f.as_str()) {
                             out.push(f);
                         }
@@ -8575,6 +8636,22 @@ impl PgHandler {
             let c = def.columns.iter().find(|c| c.field() == *f)?;
             let base = c.pg_type.trim_start_matches("pg_catalog.");
             let (numeric, ordered) = self.column_key_order(c);
+            let string = matches!(
+                base,
+                "text" | "varchar" | "character varying" | "name" | "char" | "\"char\""
+            );
+            let c_collation = self.column_is_c_collation(c);
+            // A pattern over a column an index holds is also an index path
+            // in the `C` collation (`match_pattern_prefix`'s range over the
+            // fixed prefix), which is not modelled.
+            if c_collation
+                && indexed(f)
+                && clauses
+                    .iter()
+                    .any(|w| matches!(w, WhereClause::Pattern(g, ..) if g == f))
+            {
+                return None;
+            }
             let measured = match stats.get(*f) {
                 Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
                 Some(None) => return None,
@@ -8582,22 +8659,25 @@ impl PgHandler {
             };
             // `get_actual_variable_range`: the current extremes, read from a
             // B-tree index that leads with the column.
-            let actual = (numeric && indexes.iter().any(|ix| ix.field == *f))
-                .then(|| {
-                    let mut keys: Vec<Vec<u8>> = docs
-                        .iter()
-                        .filter_map(|d| Self::stats_key(base, d.get(*f)?))
-                        .collect();
-                    keys.sort();
-                    Some((keys.first()?.clone(), keys.last()?.clone()))
-                })
-                .flatten();
+            let actual = ((numeric || (string && ordered))
+                && indexes.iter().any(|ix| ix.field == *f))
+            .then(|| {
+                let mut keys: Vec<Vec<u8>> = docs
+                    .iter()
+                    .filter_map(|d| Self::stats_key(base, d.get(*f)?))
+                    .collect();
+                keys.sort();
+                Some((keys.first()?.clone(), keys.last()?.clone()))
+            })
+            .flatten();
             columns.push(colstats::Column {
                 stats: measured,
                 unique: unique.iter().any(|u| u == f),
                 boolean: base == "bool",
                 numeric,
                 ordered,
+                string,
+                c_collation,
                 actual,
                 tuples,
             });
@@ -8666,6 +8746,13 @@ impl PgHandler {
                     }
                     WhereClause::Null(f, is_null) => {
                         others.push(columns[at(f)?].null_sel(*is_null));
+                    }
+                    WhereClause::Pattern(f, pattern, insensitive, negated) => {
+                        others.push(columns[at(f)?].pattern_sel(
+                            pattern,
+                            *insensitive,
+                            *negated,
+                        )?);
                     }
                     WhereClause::Or(arms) => {
                         let sels: Vec<f64> = arms
@@ -8773,6 +8860,8 @@ impl PgHandler {
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) if v.len() >= 9 => None,
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) => Some(v.len() as f64 * 0.5),
                     WhereClause::Null(..) => Some(0.0),
+                    // `textlike` and its kin, `procost` 1.
+                    WhereClause::Pattern(..) => Some(1.0),
                     WhereClause::Or(arms) => arms.iter().map(|a| ops(a)).sum(),
                 })
                 .sum()
@@ -8783,6 +8872,7 @@ impl PgHandler {
                 Some(match c {
                     WhereClause::Cmp(f, Op::Ne, _) => (f.clone(), Qual::Ne),
                     WhereClause::NotIn(f, v) => (f.clone(), Qual::NotIn(v.len())),
+                    WhereClause::Pattern(f, ..) => (f.clone(), Qual::Filter(1.0)),
                     WhereClause::Or(arms) => (
                         String::new(),
                         Qual::Filter(arms.iter().map(|a| ops(a)).sum::<Option<f64>>()?),
@@ -41035,6 +41125,7 @@ impl PgHandler {
             ))),
             Statement::Explain { inner, options } => {
                 let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
+                let _patterns = scan_estimate::explain_patterns(&options.scan_patterns);
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
@@ -41158,7 +41249,13 @@ impl PgHandler {
                             .scan_array_quals
                             .as_deref()
                             .filter(|_| sel.residual.is_some() && sel.filter.is_empty());
-                        if (sel.residual.is_none() || array_quals.is_some())
+                        // A comparison of an expression with a constant runs
+                        // per row too, estimated with no statistics (RP-404).
+                        let expr_quals = options
+                            .scan_expr_quals
+                            .as_deref()
+                            .filter(|_| sel.residual.is_some() && array_quals.is_none());
+                        if (sel.residual.is_none() || array_quals.is_some() || expr_quals.is_some())
                             && sel.sub.is_none()
                             && sel.series.is_none()
                             && sel.join.is_none()
@@ -41169,16 +41266,26 @@ impl PgHandler {
                             // is its type's width (RP-333).
                             let priced = scan_estimate::target_cost(sel).and_then(
                                 |(cost, width, fields)| {
-                                    let (est, index) = match array_quals {
-                                        Some(quals) => (
+                                    let (est, index) = match (array_quals, expr_quals) {
+                                        (Some(quals), _) => (
                                             self.array_qual_scan_estimate(
                                                 &sel.table, quals, &fields,
                                             )?,
                                             None,
                                         ),
+                                        (None, Some(exprs)) => (
+                                            self.residual_scan_estimate(
+                                                &sel.table,
+                                                &sel.filter,
+                                                exprs,
+                                                &fields,
+                                                &scan_estimate::computed_reads(sel),
+                                            )?,
+                                            None,
+                                        ),
                                         // A computed select list's reads count
                                         // towards an index-only scan (RP-378).
-                                        None => self.scan_estimate_reading(
+                                        (None, None) => self.scan_estimate_reading(
                                             &sel.table,
                                             &sel.filter,
                                             &fields,

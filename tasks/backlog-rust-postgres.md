@@ -1479,16 +1479,27 @@ a regression test.
       private 15.19 cluster (found while working RP-388).
       Backlog-ID: RP-402
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
-- [ ] **EXPLAIN prints no estimate for a scan filtered by an expression
-      or a LIKE.** PostgreSQL 15.19 prices `select * from e where a + 1 >
-      996` at `rows=333` (`scalarineqsel`'s default 1/3 for an expression
-      it has no statistics for) and `select * from s where c like 'x%'`
-      at `rows=30` (`patternsel`: the prefix `x`'s range selectivity over
-      the column's histogram); here both print `cost=0.00..0.00 rows=0
-      width=0`, and so does every join over such a scan. Measured on a
-      private 15.19 cluster (found while working RP-403).
-      Backlog-ID: RP-404
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by a LIKE prefix]
+- [ ] **EXPLAIN prints no estimate for a scan filtered by a function
+      call, a pattern over an expression, a LIKE over a table never
+      analysed, or a regex.** Since RP-404 a comparison of integer or text
+      arithmetic with a constant, and a LIKE / ILIKE of an analysed string
+      column, are estimated as PostgreSQL 15.19 estimates them. Still
+      zeros: `select * from e where abs(a) > 5` (PostgreSQL `rows=333`,
+      `cost=0.00..20.00`: `abs` is one function of `procost` 1, which is
+      not modelled for any function), `lower(b) like 'v%'` (`rows=5`,
+      `patternsel` with no statistics), `select * from zu where c like
+      'x%'` over a table never analysed (`rows=6`, `cost=0.00..25.88`), and
+      the regex operators: `c ~ '^xx'` over thirty analysed strings is
+      `rows=30`, whose fixed prefix `regex_fixed_prefix` reads from the
+      compiled regex, and `c ~ 'w01'` over a thousand is `rows=101`. Only
+      a single relation's scan is estimated so: a join over such a scan
+      prints zeros throughout (`e join s on s.a = e.a where s.c like
+      'xxx%'` is PostgreSQL's `Hash Join (cost=1.74..20.78 rows=29
+      width=27)`; `where e.a + 1 > 996` instead, `cost=1.68..23.02
+      rows=10`). Measured on a private 15.19 cluster (found while working
+      RP-404).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an anchored regex match], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an unanchored regex match]
+      Backlog-ID: RP-413
 - [ ] **A lone scan's Filter does not put an expression's conjunct
       after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
       first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
