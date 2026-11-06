@@ -40,7 +40,7 @@ pub mod out;
 mod parse;
 mod relation;
 pub mod system;
-mod target;
+pub(crate) mod target;
 #[cfg(test)]
 mod tests;
 mod types;

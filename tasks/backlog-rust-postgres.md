@@ -1517,16 +1517,6 @@ a regression test.
       cluster (found while working RP-405).
       Backlog-ID: RP-407
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's coerced constant is folded]
-- [ ] **A column that does not exist gets no HINT.** PostgreSQL 15.19's
-      `errorMissingColumn` names the closest column in the FROM
-      (`searchRangeTableForCol`, a Levenshtein distance over every range
-      table entry): `select s.b from e, s` is 42703 `column s.b does not
-      exist` with `HINT: Perhaps you meant to reference the column
-      "e.b".`, and so is a misspelt `select bb from e`. Here the 42703's
-      message is the same and there is no HINT. Measured on a private
-      15.19 cluster (found while working RP-405).
-      Backlog-ID: RP-408
-      Verify: tests/backlog/test_rp_column_hint.py::test_missing_column_hint
 - [ ] **A comparison with a NULL constant still scans, and alone prints an
       index the table does not have.** PostgreSQL 15.19 folds a strict
       operator over a NULL constant to NULL (`eval_const_expressions`)
@@ -1578,6 +1568,57 @@ a regression test.
       working RP-399).
       Backlog-ID: RP-412
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators]
+- [ ] **A function in FROM leaves a missing column with no HINT.** Since
+      RP-408 a 42703 carries PostgreSQL's `errorMissingColumn` hint, but
+      only when every range table entry in reach has columns this server
+      can tell: a function in FROM has the columns of its result type,
+      which the hint's search does not know, so it gives none.
+      PostgreSQL 15.19: `select * from generate_series(1,2) g where gg =
+      1` hints `Perhaps you meant to reference the column "g.g".`, and
+      `select * from e, generate_series(1, 2) g where bb = 1` hints
+      `"e.b"`; here neither has a HINT. Measured on a private 15.19
+      cluster (found while working RP-408).
+      Backlog-ID: RP-413
+      Verify: tests/backlog/test_rp_column_errors.py::test_function_in_from_hint
+- [ ] **A missing column's 42703 names the wrong reference, or drops its
+      qualifier.** PostgreSQL 15.19 reports the first missing column in
+      the order it analyses the statement, by the name as written and at
+      its first token. Here: `select * from e, k where k.bcc = 1 and e.bb =
+      2` reports `column e.bb does not exist` at 40 (PostgreSQL `column
+      k.bcc does not exist` at 26); a third table's `join k on k.bcc = 1`
+      reports `column "bcc"` at the name's own token; an UPDATE's or
+      DELETE's alias is dropped (`update e x set a = 1 where x.bb = 1` is
+      `column "bb"` at 30, PostgreSQL `column x.bb` at 28);
+      `public.e.bb` is positioned at 15, not 8; and `on conflict (a) do
+      update set b = excluded.bb` reports this server's internal name,
+      `column "__excluded__.bb" does not exist`, with no position
+      (PostgreSQL `column excluded.bb does not exist` at 65). Each loses
+      its HINT too, as the hint is found from the reference at the
+      error's position. Measured on a private 15.19 cluster with `e(a
+      int, b text)`, `s(a int, c text)`, `k(a int, b text, bc int)`
+      (found while working RP-408).
+      Backlog-ID: RP-414
+      Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
+- [ ] **A column reference in an INSERT's VALUES is refused as a gap.**
+      `insert into e values (bb)` and `insert into e values (1, 'x'), (bb,
+      'y')` answer `0A000 ColumnRef is not supported yet`; PostgreSQL
+      15.19 analyses VALUES in the INSERT's own level, where the target
+      is in the range table but not visible, and answers `42703 column
+      "bb" does not exist` (HINT `Perhaps you meant to reference the
+      column "e.b".`). A client matching on the class reads a missing
+      feature where it made a mistake. Measured on a private 15.19
+      cluster (found while working RP-408).
+      Backlog-ID: RP-415
+      Verify: tests/backlog/test_rp_column_errors.py::test_insert_values_column_reference
+- [ ] **A join's ON after a comma item is not type-checked.** `select *
+      from e, s join k on b = k.a` (`k.b text`, `k.a int`) returns rows
+      here; PostgreSQL 15.19 refuses it, `42883 operator does not exist:
+      text = integer`, as this server does for the same ON without the
+      comma item before it (`select * from s join k on b = k.a`). A
+      confident answer to a statement PostgreSQL rejects. Measured on a
+      private 15.19 cluster (found while working RP-408).
+      Backlog-ID: RP-416
+      Verify: tests/backlog/test_rp_column_errors.py::test_join_on_after_comma_item_is_type_checked
 
 ## Found by batch 54 (2026-10-24)
 

@@ -6543,7 +6543,7 @@ impl PgHandler {
                 let e = PgWireError::UserError(info);
                 let map = self.string_map(sql);
                 Err(Self::restore_position(
-                    Self::syntax_positioned(e, sql),
+                    self.column_hinted(Self::syntax_positioned(e, sql), sql),
                     map.as_ref(),
                 ))
             }
@@ -24340,6 +24340,41 @@ impl PgHandler {
         out
     }
 
+    /// A missing column's 42703, with the HINT PostgreSQL's
+    /// `errorMissingColumn` gives it from the statement's range tables
+    /// (RP-408). `sql` is the text the error's position counts in.
+    fn column_hinted(&self, mut e: PgWireError, sql: &str) -> PgWireError {
+        if let PgWireError::UserError(info) = &mut e {
+            if info.code == "42703" && info.hint.is_none() {
+                if let Some(position) = info.position.as_deref().and_then(|p| p.parse().ok()) {
+                    // A table's columns, or a view's as its catalog row
+                    // records them.
+                    let columns = |n: &str| {
+                        self.lookup(n)
+                            .map(|def| def.columns.into_iter().map(|c| c.name).collect())
+                            .or_else(|| {
+                                let doc = self.view_doc(n)?;
+                                let row = doc.get_array("row_fields").ok()?;
+                                row.iter()
+                                    .map(|f| match f {
+                                        Bson::Array(f) => f.first()?.as_str().map(str::to_string),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            })
+                    };
+                    info.hint = secantus_pgplan::missing_column_hint(
+                        sql,
+                        position,
+                        &info.message,
+                        &columns,
+                    );
+                }
+            }
+        }
+        e
+    }
+
     /// `positioned`, for an error found while describing a prepared
     /// statement: PostgreSQL positions it as it does from a simple query
     /// (a syntax error, an unknown column or relation, a grouping error), but
@@ -31753,7 +31788,12 @@ impl PgHandler {
                     })
                     .collect()
             })
-            .map_err(|e| Self::restore_position(Self::positioned(e, query), map.as_ref()))
+            .map_err(|e| {
+                Self::restore_position(
+                    self.column_hinted(Self::positioned(e, query), query),
+                    map.as_ref(),
+                )
+            })
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -32150,7 +32190,7 @@ impl PgHandler {
             }
         }
         let stmt = planned
-            .map_err(|e| Self::err_in(&e, sql))
+            .map_err(|e| self.column_hinted(Self::err_in(&e, sql), sql))
             .inspect_err(|_| self.note_failure())?;
         // A portal or cursor of the block still streaming reads the snapshot
         // of the statement that opened it: its rest is read NOW, before this
@@ -52335,7 +52375,10 @@ impl ExtendedQueryHandler for PgHandler {
             .map_err(|e| {
                 let map = self.string_map(&target.statement.sql);
                 Self::restore_position(
-                    Self::syntax_positioned(e, &target.statement.sql),
+                    self.column_hinted(
+                        Self::syntax_positioned(e, &target.statement.sql),
+                        &target.statement.sql,
+                    ),
                     map.as_ref(),
                 )
             })?;
@@ -52648,7 +52691,10 @@ impl ExtendedQueryHandler for PgHandler {
             .map_err(|e| {
                 let map = self.string_map(&target.statement.statement.sql);
                 Self::restore_position(
-                    Self::syntax_positioned(e, &target.statement.statement.sql),
+                    self.column_hinted(
+                        Self::syntax_positioned(e, &target.statement.statement.sql),
+                        &target.statement.statement.sql,
+                    ),
                     map.as_ref(),
                 )
             })?;
