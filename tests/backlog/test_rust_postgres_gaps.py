@@ -2712,15 +2712,17 @@ def test_a_left_join_descending_nulls_last_order_by_keeps_its_ties(pg: Any) -> N
     )
 
 
-@pytest.mark.backlog("RP-028")
+@pytest.mark.backlog_fixed("RP-028")
 def test_a_left_join_descending_nulls_last_over_an_index_reads_it_backward(pg: Any) -> None:
     """PostgreSQL 15.19, two 3,000-row tables never analysed, an index on
     t1.a: `t0 LEFT JOIN t1 ON t0.b = t1.a ORDER BY t1.a DESC NULLS LAST
     LIMIT 5` is a Sort over a Merge Right Join reading `Index Only Scan
     Backward` on t1 (`right_merge_direction` weighs only the direction, so
     the backward scan's DESC NULLS FIRST is of use for merging), its ties
-    t0's rows 2939, 860, 1763, 433, 2141. The search gives a DESC NULLS
-    LAST no pathkey for that backward scan: 1280, 1728, 1448, 1721, 1273."""
+    t0's rows 2939, 860, 1763, 433, 2141. The search gave a DESC NULLS
+    LAST no pathkey for that backward scan (1280, 1728, 1448, 1721, 1273);
+    it now merges on it, DESC NULLS FIRST, as a pathkey of use for merging
+    only."""
     pg.execute("begin")
     try:
         _rp028_tables(pg, "rp028_i", 2, 3000)

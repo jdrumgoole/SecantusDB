@@ -1376,6 +1376,17 @@ pub fn asc_keys(class: usize) -> usize {
     class | ASC_KEYS
 }
 
+/// The flag that marks a backward index scan's order under a descending
+/// ORDER BY whose NULLs are last: the scan's DESC NULLS FIRST is the right
+/// direction for merging (`right_merge_direction` weighs the direction only)
+/// but is not the ORDER BY's pathkey, so it is of use for merging only.
+pub const BACK_KEYS: usize = 1 << 23;
+
+/// Class `class`'s backward index scan under a DESC NULLS LAST ORDER BY.
+pub fn back_keys(class: usize) -> usize {
+    class | BACK_KEYS
+}
+
 /// One join relation's paths (`RelOptInfo::pathlist`), as `add_path` keeps
 /// them across every pair of inputs it can be built from.
 #[derive(Debug, Clone)]
@@ -2263,15 +2274,20 @@ impl JoinRel {
                 // presorted the same way (`find_mergeclauses_for_outer_pathkeys`,
                 // `make_inner_pathkeys_for_merge`).
                 let req = op.req_outer | inner.paths[ict].req_outer;
-                let asc =
-                    o_class.is_some_and(|c| op.class == Some(asc_keys(c))) && op.req_outer == 0;
+                let flagged = if o_class.is_some_and(|c| op.class == Some(back_keys(c))) {
+                    Some(back_keys as fn(usize) -> usize)
+                } else if o_class.is_some_and(|c| op.class == Some(asc_keys(c))) {
+                    Some(asc_keys as fn(usize) -> usize)
+                } else {
+                    None
+                };
+                let asc = flagged.is_some() && op.req_outer == 0;
                 if !sensible(req) || !(asc || outer.sorted_on(oi, o_class)) {
                     continue;
                 }
-                let (o_order, i_order) = if asc {
-                    (o_class.map(asc_keys), i_class.map(asc_keys))
-                } else {
-                    (o_class, i_class)
+                let (o_order, i_order) = match flagged {
+                    Some(flag) if asc => (o_class.map(flag), i_class.map(flag)),
+                    _ => (o_class, i_class),
                 };
                 let merge_order = if right { None } else { o_order };
                 let is = if asc {
@@ -3008,6 +3024,16 @@ mod tests {
                 b_by_index: false
             }
         );
+    }
+
+    #[test]
+    fn a_backward_scans_order_is_its_own_pathkey_list() {
+        // Under a DESC NULLS LAST ORDER BY the backward scan's DESC NULLS
+        // FIRST is neither the class's own order nor the forward scan's.
+        let c = 1 << 20;
+        assert_ne!(back_keys(c), asc_keys(c));
+        assert_ne!(back_keys(c), c);
+        assert_eq!(back_keys(c) & !BACK_KEYS, c);
     }
 
     #[test]
