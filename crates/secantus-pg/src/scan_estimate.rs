@@ -744,8 +744,7 @@ impl PgHandler {
         let Some(key) = self.analysed_key(&leaf.table, &field) else {
             return ParamFound::Unmodelled;
         };
-        let Some(mut ki) =
-            self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
+        let Some(mut ki) = self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
         else {
             return ParamFound::Unmodelled;
         };
