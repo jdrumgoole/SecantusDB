@@ -45,6 +45,31 @@ pub(crate) struct ScanIndex {
     pub or_arms: Vec<(String, Estimate)>,
 }
 
+/// [`PgHandler::upper_scan`]'s answer: the scan's estimate, its index
+/// path (none for the Seq Scan) and the presorted index scans'
+/// `(startup, total)`.
+pub(crate) type UpperScan = (Estimate, Option<ScanIndex>, Vec<(f64, f64)>);
+
+/// What a node over a user table's scan asks of it (RP-382).
+#[derive(Debug, Default)]
+pub(crate) struct PathWant {
+    /// A LIMIT's rows (its count plus its OFFSET): the path is
+    /// `get_cheapest_fractional_path`'s.
+    pub limit: Option<f64>,
+    /// An ORDER BY's stored fields, in order and one direction: the index
+    /// scans that return them in that order are priced too.
+    pub order: Vec<String>,
+}
+
+/// A user table's chosen scan and its presorted alternatives (RP-382).
+#[derive(Debug)]
+pub(crate) struct UserPath {
+    /// The path chosen; `None` from `user_paths` is the sequential scan.
+    pub chosen: Option<ScanEstimate>,
+    /// Each index scan in the ORDER BY's order: `(startup, total)`.
+    pub ordered: Vec<(f64, f64)>,
+}
+
 impl ScanIndex {
     /// The plan node's name, as `ExplainNode` prints it.
     pub(crate) fn node_name(&self, table: &str) -> String {
@@ -1566,11 +1591,7 @@ impl PgHandler {
     pub(crate) fn limit_scan_estimate(
         &self,
         sel: &secantus_pgplan::Select,
-    ) -> Option<(Estimate, Estimate)> {
-        let indexed = self
-            .index_relations()
-            .iter()
-            .any(|ix| ix.table.name == sel.table);
+    ) -> Option<(Estimate, Option<ScanIndex>, Estimate)> {
         if sel.residual.is_some()
             || sel.sub.is_some()
             || sel.series.is_some()
@@ -1580,18 +1601,50 @@ impl PgHandler {
             || !matches!(sel.distinct, secantus_pgplan::Distinct::None)
             || sel.with_ties
             || sel.casts.iter().any(Option::is_some)
-            || (!sel.filter.is_empty() && indexed)
         {
             return None;
         }
         let fields: Vec<String> = sel.columns.iter().map(|(_, f)| f.clone()).collect();
-        let (estimate, None) = self.scan_estimate(&sel.table, &sel.filter, &fields)? else {
-            return None;
-        };
         // `preprocess_limit`: a constant LIMIT of 0 or less is estimated
         // as one row.
         let count = sel.limit.map_or(0, |n| n.max(1));
-        Some((estimate, limit_estimate(estimate, sel.offset, count)))
+        // The scan is `get_cheapest_fractional_path`'s for the rows the
+        // LIMIT and OFFSET read (RP-382).
+        let want = PathWant {
+            limit: Some((count + sel.offset.max(0)) as f64),
+            order: Vec::new(),
+        };
+        let (estimate, index, _) = self.upper_scan(&sel.table, &sel.filter, &fields, &want)?;
+        Some((estimate, index, limit_estimate(estimate, sel.offset, count)))
+    }
+
+    /// One table's scan under a Sort, a Limit or an Aggregate (RP-382):
+    /// a table with no index, or none a WHERE reaches, its sequential scan
+    /// ([`Self::scan_estimate`]); an indexed one with a WHERE, the path
+    /// PostgreSQL keeps for `want` ([`Self::user_upper_path`]), and the
+    /// index scans already in an ORDER BY's order. `None` where that is
+    /// not modelled: an ORDER BY over an indexed table with no WHERE (a
+    /// whole-index scan may give its order).
+    pub(crate) fn upper_scan(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        want: &PathWant,
+    ) -> Option<UpperScan> {
+        let indexed = self
+            .index_relations()
+            .iter()
+            .any(|ix| ix.table.name == table);
+        if !indexed || (filter.is_empty() && want.order.is_empty()) {
+            let (estimate, None) = self.scan_estimate(table, filter, fields)? else {
+                return None;
+            };
+            return Some((estimate, None, Vec::new()));
+        }
+        let path = self.user_upper_path(table, filter, fields, want)?;
+        let (estimate, index) = path.chosen?;
+        Some((estimate, index, path.ordered))
     }
 
     /// The Seq Scan's, the Limit's and the Subquery Scan's estimates of a
@@ -1631,7 +1684,10 @@ impl PgHandler {
         {
             return None;
         }
-        let (scan, limit) = self.limit_scan_estimate(isel)?;
+        // Priced over the sequential scan only.
+        let (scan, None, limit) = self.limit_scan_estimate(isel)? else {
+            return None;
+        };
         if !self
             .all_table_defs()
             .ok()?
@@ -2012,6 +2068,40 @@ impl PgHandler {
         fields: &[String],
         reads: &[String],
     ) -> Option<ScanEstimate> {
+        self.user_paths(table, filter, fields, reads, &PathWant::default())?
+            .chosen
+    }
+
+    /// The scan of a user table, indexed and filtered, under a Sort, a
+    /// Limit or an Aggregate (RP-382): `want` says which. `None` where
+    /// the choice is not modelled (as [`Self::user_index_path`] lists, or
+    /// an order an index gives only past an equality on its earlier
+    /// columns, or only in part -- an Incremental Sort).
+    pub(crate) fn user_upper_path(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        want: &PathWant,
+    ) -> Option<UserPath> {
+        if !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            return None;
+        }
+        let mut path = self.user_paths(table, filter, fields, &[], want)?;
+        if path.chosen.is_none() {
+            path.chosen = Some((self.user_seq_scan(table, filter, fields)?, None));
+        }
+        Some(path)
+    }
+
+    fn user_paths(
+        &self,
+        table: &str,
+        filter: &Document,
+        fields: &[String],
+        reads: &[String],
+        want: &PathWant,
+    ) -> Option<UserPath> {
         if filter.is_empty() {
             return None;
         }
@@ -2057,7 +2147,62 @@ impl PgHandler {
         let read: Vec<&String> = fields.iter().chain(named.iter()).chain(reads).collect();
         let mut serving: Vec<(String, costsize::Index)> = Vec::new();
         let mut index_only: Vec<bool> = Vec::new();
+        // The indexes whose order is the ORDER BY's (`pathkeys_useful`):
+        // each scanned whole or through its quals, for that order.
+        let mut presorted: Vec<costsize::Index> = Vec::new();
         for ix in &mut indexes {
+            if let Some(first) = want.order.first() {
+                match ix.columns.iter().position(|c| c == first) {
+                    // Its leading column, then the rest of the keys in
+                    // turn; leading with the first key alone would be an
+                    // Incremental Sort, not modelled.
+                    Some(0) => {
+                        if ix.hash || ix.predicate.is_some() || ix.tuples.is_some() {
+                            return None;
+                        }
+                        if want.order.len() > ix.columns.len()
+                            || want.order.iter().zip(&ix.columns).any(|(o, c)| o != c)
+                        {
+                            return None;
+                        }
+                        let mut ordered = ix.clone();
+                        ordered.later = ordered.columns[1..]
+                            .iter()
+                            .filter(|f| named.contains(f))
+                            .map(|f| (f.clone(), index_sel(f).unwrap_or(1.0)))
+                            .collect();
+                        if !self.setting_is("enable_indexonlyscan", "off")
+                            && read.iter().all(|f| ordered.columns.contains(f))
+                        {
+                            ordered.visible = pt.allvisfrac;
+                        }
+                        let lead = ordered.columns.first()?.clone();
+                        let c = correlations.get(&lead).copied().flatten()?;
+                        ordered.correlation = if ordered.columns.len() > 1 {
+                            c * 0.75
+                        } else {
+                            c
+                        };
+                        if !ordered.unique {
+                            if let Some(Some((pages, height))) =
+                                self.dedup_index_size(table, &ordered)
+                            {
+                                ordered.pages = pages;
+                                ordered.height = height;
+                            }
+                        }
+                        if !presorted.iter().any(|p| p.columns == ordered.columns) {
+                            presorted.push(ordered);
+                        }
+                    }
+                    // Past earlier columns an equality may fix
+                    // (`pathkeys` dropping constants): not modelled.
+                    Some(at) if ix.columns[..at].iter().all(|c| named.contains(c)) => {
+                        return None;
+                    }
+                    _ => {}
+                }
+            }
             if !named.iter().any(|f| ix.columns.contains(f)) {
                 continue;
             }
@@ -2109,9 +2254,6 @@ impl PgHandler {
                 serving.push((name_of(&ix.columns)?, ix.clone()));
                 index_only.push(only);
             }
-        }
-        if serving.is_empty() {
-            return None;
         }
         let rows = costsize::clamp_row_est(pt.tuples * w.selectivity);
         let rel = costsize::Rel {
@@ -2238,9 +2380,24 @@ impl PgHandler {
                 !off("enable_seqscan"),
             ),
         );
+        // Under a LIMIT, `get_cheapest_fractional_path`: the fraction of
+        // the rows it reads, each path's startup plus that share of the
+        // rest (`compare_fractional_path_costs`); a fraction outside
+        // (0, 1) is the cheapest total.
+        let fraction = want
+            .limit
+            .map(|n| n / rows)
+            .filter(|f| *f > 0.0 && *f < 1.0);
         let mut consider = |pick: Pick, (s, t): (f64, f64)| {
             let (bs, bt) = best.1;
-            if t < bt || (t == bt && s < bs) {
+            let better = match fraction {
+                Some(f) => {
+                    let (c, bc) = (s + f * (t - s), bs + f * (bt - bs));
+                    c < bc || (c == bc && (t < bt || (t == bt && s < bs)))
+                }
+                None => t < bt || (t == bt && s < bs),
+            };
+            if better {
                 best = (pick, (s, t));
             }
         };
@@ -2259,8 +2416,17 @@ impl PgHandler {
             }
         }
         let (pick, (startup, total)) = best;
+        let ordered: Vec<(f64, f64)> = presorted
+            .iter()
+            .map(|ix| costsize::ordered_index_scan_with(&rel, ix, &quals, colsel(&ix.field)))
+            .collect();
         let index = match pick {
-            Pick::Seq => return None,
+            Pick::Seq => {
+                return Some(UserPath {
+                    chosen: None,
+                    ordered,
+                })
+            }
             Pick::Index(i) => ScanIndex {
                 name: serving.get(i)?.0.clone(),
                 only: index_only[i],
@@ -2313,7 +2479,10 @@ impl PgHandler {
             }
         };
         let width = output_width(&pt.def, Some(stats), fields)?;
-        Some(((startup, total, rows, width), Some(index)))
+        Some(UserPath {
+            chosen: Some(((startup, total, rows, width), Some(index))),
+            ordered,
+        })
     }
 
     pub(crate) fn user_seq_scan(
@@ -2983,6 +3152,40 @@ mod unique_tests {
 }
 
 /// A plain Aggregate's estimate over its input's (RP-321), for `n` counts:
+/// Whether an index scan already in the ORDER BY's order, `(startup,
+/// total)`, is the path `create_ordered_paths` keeps over `sort`, the Sort
+/// of the cheapest path (RP-382): `add_path` compares their totals within
+/// `STD_FUZZ_FACTOR`, a tie going to the cheaper startup.
+pub(crate) fn presorted_wins((startup, total): (f64, f64), sort: Estimate) -> bool {
+    const STD_FUZZ_FACTOR: f64 = 1.01;
+    let (sort_startup, sort_total, _, _) = sort;
+    if total * STD_FUZZ_FACTOR < sort_total {
+        true
+    } else if sort_total * STD_FUZZ_FACTOR < total {
+        false
+    } else {
+        startup < sort_startup
+    }
+}
+
+#[cfg(test)]
+mod presorted_tests {
+    use super::presorted_wins;
+
+    /// PostgreSQL 15.19 sorts `n`'s bitmap scan (`Sort (cost=37.57..37.82)`)
+    /// rather than reading `n_ab` whole in its order, and an index scan
+    /// cheaper than the Sort by more than the fuzz wins (RP-382).
+    #[test]
+    fn the_cheaper_total_beyond_the_fuzz_keeps_its_path() {
+        let sort = (37.57, 37.82, 99.0, 11);
+        assert!(!presorted_wins((0.29, 211.0), sort));
+        assert!(presorted_wins((0.29, 30.0), sort));
+        // Within 1%: the cheaper startup.
+        assert!(presorted_wins((0.29, 37.9), sort));
+        assert!(!presorted_wins((40.0, 37.9), sort));
+    }
+}
+
 /// PostgreSQL 15's `cost_agg` with AGG_PLAIN (`costsize.c`). Each count's
 /// transition function costs one `cpu_operator_cost` per input row and
 /// none has a final function; the one output row costs `cpu_tuple_cost`.

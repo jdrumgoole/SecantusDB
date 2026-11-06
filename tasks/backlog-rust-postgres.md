@@ -1406,19 +1406,6 @@ a regression test.
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key whose indexed side is filtered], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a unique key], tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key with a join filter]
       Backlog-ID: RP-381
 
-- [ ] **EXPLAIN prints zeros for a Sort, Aggregate or Limit over a user
-      table's index path.** Since RP-339 and RP-378 one analysed table's
-      scan alone is PostgreSQL 15.19's `set_cheapest` choice, but a node
-      over it keeps the storage planner's path, unpriced: `explain select
-      * from n where b = 7 order by a` is `Sort (cost=37.63..37.88
-      rows=100 width=11)` over a Bitmap Heap Scan on `n_b`, here a Sort of
-      zeros over an `Index Scan using n_b`; `explain select * from k where
-      a = 5 limit 1` is `Limit (cost=0.28..8.29 rows=1 width=7)`, here
-      zeros; so are `count(*)` over either (an Aggregate over the scan,
-      `k`'s an Index Only Scan). Measured on a private 15.19 cluster
-      (found while working RP-378).
-      Backlog-ID: RP-382
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a sort over a user table's bitmap scan], tests/backlog/test_rp_explain_costs.py::test_plan[a limit over a user table's index scan]
 - [ ] **EXPLAIN ANALYZE of a user table's index-only or bitmap scan leaves
       out its counters.** PostgreSQL 15.19 prints an Index Only Scan's
       `Heap Fetches` (one per index tuple whose heap page the visibility
