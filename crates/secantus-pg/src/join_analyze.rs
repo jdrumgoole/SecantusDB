@@ -460,74 +460,45 @@ impl PgHandler {
         Some((kept, read))
     }
 
-    /// A LEFT join's Join Filter `(x.col op y.col)`, one column of each
-    /// side compared as numbers, run over every pair: the pairs it kept,
-    /// and the rows the join returns (each outer row's kept pairs, or its
-    /// one null-extended row). `None` for a filter of any other shape, or
-    /// a value this does not compare.
+    /// A LEFT join's Join Filter, run over every pair as `ExecNestLoop`'s
+    /// `ExecQual` runs it: the pairs it kept, and the rows the join
+    /// returns (each outer row's kept pairs, or its one null-extended
+    /// row). A pair counts as kept only where the qual is true; false and
+    /// NULL both reject it. `None` for a qual this cannot plan over the
+    /// two relations, or one that errors on a pair.
     fn left_filter_pairs(
         &self,
         cond: &str,
         outer: (&str, &str, &[Document]),
         inner: (&str, &str, &[Document]),
     ) -> Option<(usize, usize)> {
-        let body = cond.strip_prefix('(')?.strip_suffix(')')?;
-        let mut parts = body.split(' ');
-        let (Some(lhs), Some(op), Some(rhs), None) =
-            (parts.next(), parts.next(), parts.next(), parts.next())
-        else {
-            return None;
-        };
-        let (la, lc) = lhs.split_once('.')?;
-        let (ra, rc) = rhs.split_once('.')?;
-        // Written outer-first or inner-first; flip the operator for the
-        // second so it always reads `outer op inner`.
-        let (outer_col, inner_col, op) = if la == outer.1 && ra == inner.1 {
-            (lc, rc, op)
-        } else if la == inner.1 && ra == outer.1 {
-            let flipped = match op {
-                "<" => ">",
-                "<=" => ">=",
-                ">" => "<",
-                ">=" => "<=",
-                o => o,
-            };
-            (rc, lc, flipped)
-        } else {
-            return None;
-        };
-        if outer.1 == inner.1 {
-            return None;
-        }
-        let holds = |o: f64, i: f64| match op {
-            "=" => Some(o == i),
-            "<>" => Some(o != i),
-            "<" => Some(o < i),
-            "<=" => Some(o <= i),
-            ">" => Some(o > i),
-            ">=" => Some(o >= i),
-            _ => None,
-        };
-        let outer_field = self.defined_table(outer.0)?.field_of(outer_col)?;
-        let inner_field = self.defined_table(inner.0)?.field_of(inner_col)?;
-        // A NULL on either side makes the comparison NULL: the pair fails.
-        let values = |docs: &[Document], field: &str| -> Option<Vec<Option<f64>>> {
+        let outer_def = self.defined_table(outer.0)?;
+        let inner_def = self.defined_table(inner.0)?;
+        let qual = secantus_pgplan::plan_pair_expression(
+            cond,
+            (outer.1, &outer_def),
+            (inner.1, &inner_def),
+        )
+        .ok()?;
+        let prefixed = |docs: &[Document], prefix: &str| -> Vec<Document> {
             docs.iter()
-                .map(|d| match d.get(field) {
-                    None | Some(Bson::Null) => Some(None),
-                    v => number(v).map(Some),
+                .map(|d| {
+                    d.iter()
+                        .map(|(k, v)| (format!("{prefix}{k}"), v.clone()))
+                        .collect()
                 })
                 .collect()
         };
-        let outer_vals = values(outer.2, &outer_field)?;
-        let inner_vals = values(inner.2, &inner_field)?;
+        let outer_rows = prefixed(outer.2, secantus_pgplan::PAIR_OUTER_PREFIX);
+        let inner_rows = prefixed(inner.2, secantus_pgplan::PAIR_INNER_PREFIX);
         let (mut kept, mut joined) = (0usize, 0usize);
-        for o in &outer_vals {
+        for o in &outer_rows {
             let mut here = 0usize;
-            if let Some(o) = o {
-                for i in inner_vals.iter().flatten() {
-                    here += usize::from(holds(*o, *i)?);
-                }
+            for i in &inner_rows {
+                let mut pair = o.clone();
+                pair.extend(i.clone());
+                let holds = secantus_pgplan::apply_row_expr(&qual, &pair).ok()?;
+                here += usize::from(matches!(holds, Bson::Boolean(true)));
             }
             kept += here;
             joined += here.max(1);

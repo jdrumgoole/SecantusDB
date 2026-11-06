@@ -1462,18 +1462,20 @@ a regression test.
       parameterized inner index-only scan its `Heap Fetches`, a Hash its
       `Buckets / Batches / Memory Usage` line and a Nested Loop its `Rows
       Removed by Join Filter`, since RP-389 a LEFT Nested Loop's too
-      when its filter compares one numeric column of each side, and since
-      2026-11-06 a plain Nested Loop's Seq Scans their `Rows Removed by
-      Filter` (`select * from s join e on s.a < e.a where e.b = 'v1'`), as
-      PostgreSQL 15.19 counts them. Still unannotated: a LEFT join filter
-      of any other shape (`s left join e on s.a + 1 < e.a`: `Rows Removed
-      by Join Filter: 495`), a Hash Join or parameterized Nested Loop
-      whose scans have their own Filter, a Merge Join (its Sorts' `Sort
-      Method`), a hash table past `hash_mem` (several batches) and a join
-      with an inner-unique inner side. Measured on a private 15.19 cluster
-      (found while working RP-386).
+      (since 2026-11-06 a filter of any shape, evaluated per pair:
+      `s left join e on s.a + 1 < e.a` is `Rows Removed by Join Filter:
+      495`), and since 2026-11-06 a plain Nested Loop's Seq Scans their
+      `Rows Removed by Filter` (`select * from s join e on s.a < e.a where
+      e.b = 'v1'`), as PostgreSQL 15.19 counts them. Still unannotated: a
+      Hash Join or parameterized Nested Loop whose scans have their own
+      Filter (`s join e on s.a = e.a where e.b = 'v1' and s.a > 5`: `Seq
+      Scan on e (actual rows=100 loops=1)`, `Rows Removed by Filter:
+      900`), a LEFT join filter over a char(n) column, a Merge Join (its
+      Sorts' `Sort Method`), a hash table past `hash_mem` (several
+      batches) and a join with an inner-unique inner side. Measured on a
+      private 15.19 cluster (found while working RP-386).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a hash join over two filtered scans]
 - [ ] **An inner join nested in an outer join keeps its one-table ON
       conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
       join's ON conjunct over one table is that table's scan Filter, but
@@ -1494,6 +1496,18 @@ a regression test.
       cluster (found while working RP-392).
       Backlog-ID: RP-394
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join whose ON has a constant true conjunct]
+- [ ] **A LEFT join's ON conjunct over its nullable side alone stays in
+      its Join Filter.** PostgreSQL 15.19 pushes it down to the nullable
+      side's scan (`distribute_qual_to_rels`: a qual of the inner side of
+      an outer join that reads no other relation is evaluated below it):
+      `select * from s left join e on s.a * 40 > e.a and e.b = 'v3'` is
+      `Join Filter: ((s.a * 40) > e.a)` over a Materialized `Seq Scan on
+      e` with `Filter: (b = 'v3'::text)`, `actual rows=100`. Here the
+      Join Filter keeps both conjuncts and the scan reads every row. Its
+      rows are right. Measured on a private 15.19 cluster (found while
+      working RP-390).
+      Backlog-ID: RP-395
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter and a filtered inner]
 
 ## Found by batch 54 (2026-10-24)
 

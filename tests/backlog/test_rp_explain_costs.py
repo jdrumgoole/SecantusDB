@@ -2173,10 +2173,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Rows Removed by Filter: 20",
         ],
     ),
-    # A LEFT join's Join Filter over an expression of one side: still
-    # unannotated (RP-390's remainder).
+    # Split from RP-390 and fixed: a LEFT join's Join Filter of any shape,
+    # evaluated per pair as `ExecQual` runs it.
     "analyze of a left nested loop over an expression filter": (
-        "RP-390",
+        "RP-389",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s left join e on s.a + 1 < e.a",
@@ -2187,6 +2187,44 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Seq Scan on s (actual rows=30 loops=1)",
             "  ->  Materialize (actual rows=1000 loops=30)",
             "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # A LEFT join's ON conjunct over its nullable side alone is that side's
+    # scan Filter (`distribute_qual_to_rels`), not part of the Join Filter.
+    "analyze of a left nested loop over an expression filter and a filtered inner": (
+        "RP-395",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join e on s.a * 40 > e.a and e.b = 'v3'",
+        [
+            "Nested Loop Left Join (actual rows=1800 loops=1)",
+            "  Join Filter: ((s.a * 40) > e.a)",
+            "  Rows Removed by Join Filter: 1200",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=100 loops=30)",
+            "        ->  Seq Scan on e (actual rows=100 loops=1)",
+            "              Filter: (b = 'v3'::text)",
+            "              Rows Removed by Filter: 900",
+        ],
+    ),
+    # A Hash Join whose scans each have their own Filter: still
+    # unannotated (RP-390's remainder).
+    "analyze of a hash join over two filtered scans": (
+        "RP-390",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s join e on s.a = e.a where e.b = 'v1' and s.a > 5",
+        [
+            "Hash Join (actual rows=2 loops=1)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e (actual rows=100 loops=1)",
+            "        Filter: (b = 'v1'::text)",
+            "        Rows Removed by Filter: 900",
+            "  ->  Hash (actual rows=25 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 10kB",
+            "        ->  Seq Scan on s (actual rows=25 loops=1)",
+            "              Filter: (a > 5)",
+            "              Rows Removed by Filter: 5",
         ],
     ),
     # An inner join's ON conjunct over one table is that table's scan

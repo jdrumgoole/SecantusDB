@@ -11559,6 +11559,80 @@ pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnE
     row_column_expr(val, &fields, &[], &sample)
 }
 
+/// The field prefix `plan_pair_expression` gives the outer relation's
+/// columns; `PAIR_INNER_PREFIX` the inner's.
+pub const PAIR_OUTER_PREFIX: &str = "__pair_outer__.";
+/// See `PAIR_OUTER_PREFIX`.
+pub const PAIR_INNER_PREFIX: &str = "__pair_inner__.";
+
+/// Plan a join qual's text over two relations, each named by its alias
+/// (`(s.a + 1) < e.a`), as a row expression over one pair of rows: every
+/// `alias.col` becomes the column under `PAIR_OUTER_PREFIX` or
+/// `PAIR_INNER_PREFIX`, and `apply_row_expr` evaluates it over a document
+/// holding both rows' fields under those prefixes (as a nested loop's
+/// `ExecQual` sees its outer and inner tuple). An unqualified reference,
+/// or one to any other alias, is refused.
+pub fn plan_pair_expression(
+    expression: &str,
+    outer: (&str, &TableDef),
+    inner: (&str, &TableDef),
+) -> Result<ColumnExpr> {
+    if outer.0 == inner.0 {
+        return Err(Error::Unsupported("a join of one alias to itself".into()));
+    }
+    let N::SelectStmt(mut sel) = parse_one(&format!("SELECT {expression}"))? else {
+        return Err(Error::Parse("join qual is not an expression".into()));
+    };
+    let val = sel
+        .target_list
+        .first_mut()
+        .and_then(|t| match t.node.as_mut() {
+            Some(N::ResTarget(rt)) => rt.val.as_deref_mut(),
+            _ => None,
+        })
+        .ok_or_else(|| Error::Parse("join qual is not an expression".into()))?;
+    walk_column_refs(val, &mut |n, c| {
+        let name = |i: usize| match c.fields.get(i).and_then(|f| f.node.as_ref()) {
+            Some(N::String(st)) => Some(st.sval.clone()),
+            _ => None,
+        };
+        let (Some(alias), Some(column), 2) = (name(0), name(1), c.fields.len()) else {
+            return Err(Error::Unsupported("an unqualified join column".into()));
+        };
+        let prefix = if alias == outer.0 {
+            PAIR_OUTER_PREFIX
+        } else if alias == inner.0 {
+            PAIR_INNER_PREFIX
+        } else {
+            return Err(Error::Unsupported(format!("a column of {alias}")));
+        };
+        *n = N::ColumnRef(pg_query::protobuf::ColumnRef {
+            fields: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String {
+                    sval: format!("{prefix}{column}"),
+                })),
+            }],
+            location: c.location,
+        });
+        Ok(())
+    })?;
+    let mut fields: Vec<RowField> = Vec::new();
+    let mut sample = Document::new();
+    for (prefix, def) in [(PAIR_OUTER_PREFIX, outer.1), (PAIR_INNER_PREFIX, inner.1)] {
+        for c in def.columns.iter() {
+            // A char(n) column's width is keyed by its own field name, which
+            // the prefix hides: refuse rather than compare it unpadded.
+            if c.pg_type == "bpchar" {
+                return Err(Error::Unsupported("a char(n) column in a join qual".into()));
+            }
+            let field = format!("{prefix}{}", c.field());
+            sample.insert(field.clone(), sample_value_for_type(&c.pg_type));
+            fields.push((format!("{prefix}{}", c.name), field, c.pg_type.clone()));
+        }
+    }
+    row_column_expr(val, &fields, &[], &sample)
+}
+
 /// The unique constraints a table has, as (name, column set), PK included.
 ///
 /// The PK is not in `unique_constraints` — it is a `Column.pk` flag — so it is
