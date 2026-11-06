@@ -481,9 +481,10 @@ pub(crate) fn plan_join_source(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
-    // An inner join's ON conjunct over one table is that table's
-    // restriction, as a WHERE conjunct is (RP-391).
-    let hoisted = hoist_inner_on_conjuncts(s);
+    // A constant TRUE ON conjunct is folded away (RP-394), and an inner
+    // join's ON conjunct over one table is that table's restriction, as a
+    // WHERE conjunct is (RP-391).
+    let hoisted = prepare_on_quals(s);
     let s = hoisted.as_ref().unwrap_or(s);
     // A nested join (one inside a FROM subquery) plans with its own.
     let (pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
@@ -2508,6 +2509,80 @@ fn pushdown_filters(
     (pushed, nonnullable, ec, placed, moved)
 }
 
+/// `s` with its joins' ON clauses as the planner sees them, or `None` when
+/// that changes nothing: constant TRUE conjuncts folded away
+/// (`fold_constant_on_quals`, RP-394), then an inner join's one-table
+/// conjuncts moved into the WHERE (`hoist_inner_on_conjuncts`, RP-391).
+pub(crate) fn prepare_on_quals(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let folded = fold_constant_on_quals(s);
+    let base = folded.as_ref().unwrap_or(s);
+    hoist_inner_on_conjuncts(base).or(folded)
+}
+
+/// `s` with every literal TRUE argument of a join's ON dropped, or `None`
+/// when no ON has one (RP-394).
+///
+/// PostgreSQL's `eval_const_expressions` (`simplify_and_arguments`) drops a
+/// constant TRUE argument of an AND, and an ON that folds to TRUE alone
+/// leaves the join no qual at all: `s join e on true and s.a > 29` is a
+/// plain Nested Loop, and `s left join e on true` prints no Join Filter.
+/// Only the literal `true` is folded here; a constant expression PostgreSQL
+/// would also reduce to TRUE (`1 = 1`, `'t'::bool`) keeps its place.
+fn fold_constant_on_quals(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    fn is_true(n: &pg_query::protobuf::Node) -> bool {
+        matches!(
+            n.node.as_ref(),
+            Some(N::AConst(c)) if !c.isnull && matches!(
+                c.val,
+                Some(pg_query::protobuf::a_const::Val::Boolval(ref b)) if b.boolval
+            )
+        )
+    }
+    fn walk(item: &mut pg_query::protobuf::Node, changed: &mut bool) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            walk(side, changed);
+        }
+        let Some(quals) = j.quals.as_deref() else {
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        split_and(quals, &mut conjuncts);
+        if !conjuncts.iter().any(|c| is_true(c)) {
+            return;
+        }
+        let kept: Vec<pg_query::protobuf::Node> = conjuncts
+            .into_iter()
+            .filter(|c| !is_true(c))
+            .cloned()
+            .collect();
+        j.quals = and_of(kept).map(Box::new);
+        *changed = true;
+    }
+    if !s
+        .from_clause
+        .iter()
+        .any(|i| matches!(i.node.as_ref(), Some(N::JoinExpr(_))))
+    {
+        return None;
+    }
+    let mut out = s.clone();
+    let mut changed = false;
+    for item in &mut out.from_clause {
+        walk(item, &mut changed);
+    }
+    changed.then_some(out)
+}
+
 /// `s` with every ON conjunct of an inner join that reads one table only
 /// moved into its WHERE, or `None` when there is none (RP-391).
 ///
@@ -3309,6 +3384,41 @@ mod tests {
         // A subquery is not a one-table shape.
         assert_eq!(
             hoisted_where("select * from s join e on s.a < e.a and s.a in (select 1)"),
+            None
+        );
+    }
+
+    /// `sql` as `prepare_on_quals` leaves it, deparsed, or `None`.
+    fn prepared(sql: &str) -> Option<String> {
+        let mut parsed = pg_query::parse(sql).unwrap().protobuf;
+        let Some(N::SelectStmt(s)) = parsed.stmts[0].stmt.as_mut().and_then(|n| n.node.as_mut())
+        else {
+            panic!("a SELECT");
+        };
+        **s = prepare_on_quals(s)?;
+        Some(parsed.deparse().unwrap())
+    }
+
+    #[test]
+    fn a_constant_true_on_conjunct_is_folded_away() {
+        // RP-394: `eval_const_expressions` drops a TRUE argument of an AND.
+        assert_eq!(
+            prepared("select s.a, e.a from s join e on true and s.a > 29").as_deref(),
+            Some("SELECT s.a, e.a FROM s CROSS JOIN e WHERE s.a > 29")
+        );
+        assert_eq!(
+            prepared("select * from s join e on s.a < e.a and true").as_deref(),
+            Some("SELECT * FROM s JOIN e ON s.a < e.a")
+        );
+        // An outer join's ON folds too; its other conjuncts stay in it.
+        assert_eq!(
+            prepared("select * from s left join e on true and s.a < e.a").as_deref(),
+            Some("SELECT * FROM s LEFT JOIN e ON s.a < e.a")
+        );
+        // Neither false nor a constant expression is folded here.
+        assert_eq!(prepared("select * from s left join e on false"), None);
+        assert_eq!(
+            prepared("select * from s join e on 1 = 1 and s.a < e.a"),
             None
         );
     }

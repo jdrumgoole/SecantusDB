@@ -3623,3 +3623,27 @@ fn left_join_reduced_by_a_strict_where_on_its_nullable_side() {
         Some(false)
     );
 }
+
+/// A join qual over two aliases of the same column name: each reference
+/// reads its own side's row (RP-390).
+#[test]
+fn a_pair_expression_reads_each_sides_row() {
+    let s = TableDef::new("s", vec![Column::new("a", "int4", false)]);
+    let e = TableDef::new("e", vec![Column::new("a", "int4", false)]);
+    let qual = plan_pair_expression("((s.a + 1) < e.a)", ("s", &s), ("e", &e)).unwrap();
+    let pair = |o: i32, i: Option<i32>| {
+        let mut d = Document::new();
+        d.insert(format!("{PAIR_OUTER_PREFIX}{}", s.columns[0].field()), o);
+        d.insert(
+            format!("{PAIR_INNER_PREFIX}{}", e.columns[0].field()),
+            i.map_or(Bson::Null, Bson::Int32),
+        );
+        apply_row_expr(&qual, &d).unwrap()
+    };
+    assert_eq!(pair(1, Some(3)), Bson::Boolean(true));
+    assert_eq!(pair(2, Some(3)), Bson::Boolean(false));
+    assert_eq!(pair(2, None), Bson::Null);
+    // An unqualified column, or another alias, is refused.
+    assert!(plan_pair_expression("(a < e.a)", ("s", &s), ("e", &e)).is_err());
+    assert!(plan_pair_expression("(x.a < e.a)", ("s", &s), ("e", &e)).is_err());
+}
