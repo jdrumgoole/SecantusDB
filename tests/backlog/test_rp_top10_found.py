@@ -682,10 +682,10 @@ def test_a_partial_gin_index_has_its_pages(pg: Any) -> None:
     assert got == ("ok", [(8,)])
 
 
-@pytest.mark.backlog("RP-287")
+@pytest.mark.backlog_fixed("RP-287")
 def test_a_multi_column_gin_index_has_its_pages(pg: Any) -> None:
-    """A multi-column GIN index is not modelled page by page: PostgreSQL
-    15.19 sizes this one at 22 pages; here `pg_relation_size` reads 0."""
+    """A multi-column GIN index was not modelled page by page: PostgreSQL
+    15.19 sizes this one at 22 pages, where `pg_relation_size` read 0."""
     got = _in_block(
         pg,
         [
@@ -697,6 +697,77 @@ def test_a_multi_column_gin_index_has_its_pages(pg: Any) -> None:
         "select pg_relation_size('rp287_mg') / 8192",
     )
     assert got == ("ok", [(22,)])
+
+
+# Multi-column GIN shapes (each key tuple carries its column's attnum):
+# mixed opclasses, rows inserted after the build through the pending list
+# or straight into the entry tree, and a column that is sometimes NULL.
+# PostgreSQL 15.19's sizes.
+_RP287_MULTI = {
+    "array_jsonb": (
+        [
+            "create table rp287_mm (a int[], j jsonb)",
+            "insert into rp287_mm select array[g % 100], jsonb_build_object('k', g % 50)"
+            " from generate_series(1, 20000) g",
+            "create index rp287_mmg on rp287_mm using gin (a, j)",
+        ],
+        22,
+    ),
+    "pending": (
+        [
+            "create table rp287_mm (a int[], b int[])",
+            "create index rp287_mmg on rp287_mm using gin (a, b)",
+            "insert into rp287_mm select array[g % 100, g % 7], array[g % 13]"
+            " from generate_series(1, 20000) g",
+        ],
+        149,
+    ),
+    "nofastupdate": (
+        [
+            "create table rp287_mm (a int[], b int[])",
+            "create index rp287_mmg on rp287_mm using gin (a, b) with (fastupdate = off)",
+            "insert into rp287_mm select array[g % 100, g % 7], array[g % 13]"
+            " from generate_series(1, 20000) g",
+        ],
+        25,
+    ),
+    "text_nulls": (
+        [
+            "create table rp287_mm (t text[], b int[])",
+            "insert into rp287_mm select array['w' || (g % 500)],"
+            " case when g % 3 = 0 then null else array[g % 13] end"
+            " from generate_series(1, 20000) g",
+            "create index rp287_mmg on rp287_mm using gin (t, b)",
+        ],
+        19,
+    ),
+}
+
+
+@pytest.mark.backlog("RP-287")
+def test_an_expression_gin_index_has_its_pages(pg: Any) -> None:
+    """An expression GIN index is not modelled page by page: PostgreSQL
+    15.19 sizes this one at 20 pages; here `pg_relation_size` reads 0."""
+    got = _in_block(
+        pg,
+        [
+            "create table rp287_e (a int[])",
+            "insert into rp287_e select array[g % 100, g % 7] from generate_series(1, 20000) g",
+            "create index rp287_eg on rp287_e using gin ((a || array[0]))",
+        ],
+        "select pg_relation_size('rp287_eg') / 8192",
+    )
+    assert got == ("ok", [(20,)])
+
+
+@pytest.mark.backlog_fixed("RP-287")
+@pytest.mark.parametrize("case", list(_RP287_MULTI), ids=list(_RP287_MULTI))
+def test_multi_column_gin_index_shapes_have_their_pages(pg: Any, case: str) -> None:
+    """Multi-column GIN indexes over mixed opclasses, filled after the
+    build or holding NULL columns, size as PostgreSQL 15.19's do."""
+    statements, pages = _RP287_MULTI[case]
+    got = _in_block(pg, statements, "select pg_relation_size('rp287_mmg') / 8192")
+    assert got == ("ok", [(pages,)])
 
 
 @pytest.mark.backlog_fixed("RP-287")

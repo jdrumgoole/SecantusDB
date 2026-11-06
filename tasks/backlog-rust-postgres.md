@@ -1134,8 +1134,10 @@ batch, their tests regression tests:
         (`gin_extract_tsvector`) are modelled, its `extractQuery` and
         consistent functions are not;
       - point/box `~=`, polygon and circle containment;
-      - multi-column and expression GIN / GiST indexes, and a partial
-        GiST index; a partial GIN index's scan (`predicate_implied_by` is
+      - a multi-column GIN index's scan (since 2026-11-06 its pages are
+        modelled, each key tuple carrying its column's attnum);
+        multi-column GiST indexes, expression GIN / GiST indexes, and a
+        partial GiST index; a partial GIN index's scan (`predicate_implied_by` is
         not modelled, so it never serves one), though since 2026-11-04 its
         pages are modelled, built and inserted into only for the rows its
         predicate holds for;
@@ -1146,11 +1148,11 @@ batch, their tests regression tests:
         tuple can land on another page than in a given backend (15.19 gave
         the same layout on three runs).
       The size functions read the modelled indexes' pages (since RP-287's
-      first slice); an unmodelled one (a multi-column or expression GIN
-      index, or a btree_gin one) still reads 0 from
+      first slice); an unmodelled one (an expression GIN index, or a
+      btree_gin one) still reads 0 from
       `pg_relation_size`.
       Backlog-ID: RP-287
-      Verify: tests/backlog/test_rp_top10_found.py::test_a_multi_column_gin_index_has_its_pages
+      Verify: tests/backlog/test_rp_top10_found.py::test_an_expression_gin_index_has_its_pages
 
 
 
