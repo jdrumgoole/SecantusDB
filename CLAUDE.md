@@ -283,8 +283,10 @@ The backlog is the canonical list of commands that are stubbed, features with si
 
 **Working items unattended: `scripts/fix_one.sh -p postgres [RP-nnn]`** runs one
 `/fix-one` in a fresh headless session; `scripts/fix_many.sh -j 2 -i pg-batch
-postgres <n>` runs n of them in two lanes, each landing on the `pg-batch`
-integration branch after the local gate, then opens one PR to `main` for CI
+postgres <n>` runs n of them in two lanes (three when this is the machine's
+only session), each lane in its own reused worktree and each fix landing on
+the `pg-batch` integration branch after the local `gate_pg.sh --fast`, then
+opens one PR to `main` for CI
 (start it through `scripts/detached_run.py`; the `fix-one` skill has the
 detail).
 

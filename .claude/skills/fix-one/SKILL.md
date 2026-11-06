@@ -24,6 +24,11 @@ batch's orchestrator opens and merges (Joe, 2026-11-06: a session spent
 ~40 of its 35-60 min waiting on CI). Where a step below says `origin/main`,
 read `origin/<branch>`; step 7 has the landing. Never push to `main`.
 
+**Lane mode: `lane <path>` in the arguments** (fix_many passes it with
+`-i`). Work in that existing worktree instead of creating one: it is the
+lane's, reused item after item so its cargo target and venv stay warm
+(step 2 has the switch, step 8 what to leave). Never remove it.
+
 One item, one branch, one PR, one merge, one teardown. Every step below
 points at the skill that owns its detail -- read that skill when you reach
 the step, do not work from memory.
@@ -70,6 +75,21 @@ git worktree add ../SecantusDB-<slug> -b <slug> origin/main
 cd ../SecantusDB-<slug> && git push -u origin <slug>   # the claim
 ```
 
+**Lane mode** replaces the `worktree add` line:
+
+```bash
+cd <lane path>
+git status --short                     # must be clean (ignored files aside)
+git fetch -q origin && git switch -C <slug> origin/<branch>
+git submodule update --init vendor/wiredtiger
+git push -u origin <slug>              # the claim
+```
+
+If the lane is not clean, a previous item left work behind: save it with
+`git diff HEAD > .scratch/lane-leftover-<date>.diff`, say so in your report,
+then `git reset --hard && git clean -fd` (never `-x`: that deletes the warm
+target and venv).
+
 Claimed elsewhere: pick another item, never share or touch their branch.
 
 ## 3. Reproduce before building (`backlog`, `differential-probe`)
@@ -77,7 +97,8 @@ Claimed elsewhere: pick another item, never share or touch their branch.
 Build from the worktree (`./inv rust-pgserver-build` / `./inv
 rust-binary-build`, `CARGO_BUILD_JOBS=3`), provision its venv with `./inv
 sync` (needs `git submodule update --init vendor/wiredtiger` first), then
-run the item's `Verify:` tests:
+run the item's `Verify:` tests. In a lane worktree both are incremental
+and take a minute or two; still run both, as the branch moved.
 
 ```bash
 .venv/bin/python -m pytest -o addopts= -m "backlog or backlog_fixed" <verify test>
@@ -124,6 +145,18 @@ with `gate=0|1`. It replaces `rust-gate` and the full pytest suite for a
 PG change: their extra cost is the MongoDB parity files, which CI no
 longer runs. Read every `.rc` that is not 0, and the log beside it.
 
+- **Integration mode: `scripts/gate_pg.sh --fast`.** It skips `pg-suites`
+  (20-27 of the gate's ~40 min), which CI's pg-oracle job runs on the
+  integration branch's PR before anything reaches `main`. Default mode
+  keeps the full gate: that PR's CI runs the same list, but a full local
+  run saves a wasted CI round.
+- The cheap checks (fmt, lint, ruff) run first and stop the gate when one
+  fails, in seconds. Fix and rerun.
+- **After a failure, rerun only what the fix can reach.** A format or lint
+  fix: `scripts/gate_pg.sh --only fmt` (or `lint`, `ruff-format`, ...;
+  comma-separated), and read its table of every step on record. A fix to
+  code or tests: the whole gate again (with `--fast` in integration mode).
+
 **RM backlog, or a change to the shared storage crates that the MongoDB
 server links:** the full list below.
 
@@ -155,9 +188,14 @@ git push origin HEAD:<branch>   # fast-forward only, never --force
 ```
 
 - One commit per item, so a red batch run can be bisected to it.
-- If the rebase moved anything (another lane landed first), rerun
-  `scripts/gate_pg.sh` before pushing; a rejected push means the same:
-  fetch, rebase, gate, push again.
+- If the rebase moved anything (another lane landed first), rerun the gate
+  (`--fast`) only when the rebase had a conflict or the commits it brought
+  in touch a file yours touches:
+  `git diff --name-only <old base> origin/<branch>` against
+  `git show --name-only --format= HEAD`. Otherwise push: the batch PR's CI
+  checks the commits together. A rejected push means the same: fetch,
+  rebase, the same overlap test, push again. (A session gated three times
+  for other lanes' unrelated commits, 150 min, on 2026-11-06.)
 - Check the landing: `git log origin/<branch> --oneline -1` is your commit.
   Report `landed on <branch> at <sha>` (no PR number). Then step 8.
 
@@ -181,7 +219,12 @@ git push && gh pr create --base main --title "..." --body "... Fixes <ID> ..."
 
 Remove the worktree (in the background, it is large), then `git branch -D`
 and `git push origin --delete <slug>`, only after `MERGED` (integration
-mode: after your commit is on `origin/<branch>`). Delete what you
+mode: after your commit is on `origin/<branch>`).
+
+**Lane mode: keep the worktree.** `git switch --detach`, then delete the
+branch locally and on origin as above, stop the servers and private
+cluster you started, and remove `.scratch/gate` and your probe stores.
+Leave `target/` and `.venv`: the lane's next item builds on them. Delete what you
 put in `.scratch/`. Report: the item, what was wrong, the fix, the test that
 pins it, the PR number, and anything filed along the way.
 
