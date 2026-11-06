@@ -1284,14 +1284,20 @@ a regression test.
       statement's catalog scans are walked as PostgreSQL 15.19's syscache,
       relcache and planner make them (`catalog_reads.rs`, over the
       per-session caches in `catcache.rs`), but not for: DDL's own reads
-      (ALTER, DROP, CREATE INDEX; CREATE TABLE checks names only), the rule
+      (DROP, CREATE INDEX; CREATE TABLE checks names only; ALTER TABLE
+      only for a superuser's ADD COLUMN without a default, constraint,
+      collation, serial or domain type, and a DROP COLUMN no index,
+      default, constraint or non-pinned type is tied to -- every other
+      subcommand, a new TOAST table and the role caches a non-superuser's
+      permission checks read stop its walk, and a view that depends on a
+      dropped column is not seen: its pg_depend rows count as none), the rule
       queries of system views (`pg_stat_*`), psql's `\d` pattern query
       (regex prefix as an index condition, `pg_table_is_visible` per row,
       `get_actual_variable_range`), subqueries, CTEs, windows, PL/pgSQL
       bodies, and texts over 64 KiB. Measured: `\d` 91 counters match, 29
       differ; a `pg_stat_*` view 53 match, 61 differ.
       Backlog-ID: RP-290
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[an ALTER TABLE's own catalog reads], tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
+      Verify: tests/backlog/test_rp_catalog_reads.py::test_gap[a statistics view], tests/backlog/test_rp_catalog_reads.py::test_gap[psql's describe query]
 - [ ] **A catalog row added after `initdb` counts no heap block** in
       `pg_statio_sys_tables`. A catalog scan counts its index pages
       (`catalog_btree.rs`, from `pg15_catalog_indexes.txt`) and, since

@@ -211,6 +211,9 @@ pub(crate) struct Backend {
     pending_dead: Vec<(i64, Key)>,
     memo: HashMap<u64, Memo>,
     pub(crate) started: bool,
+    /// `evtcache.c`'s event trigger cache is built (`BuildEventTriggerCache`,
+    /// once per backend until a reset).
+    pub(crate) event_cache: bool,
     /// The B-tree indexes whose metapage this backend has cached
     /// (`rd_amcache`, which `_bt_getroot` fills on the index's first scan
     /// and a relation cache rebuild empties) (RP-291).
@@ -361,6 +364,7 @@ impl Backend {
                 self.pubdescs.clear();
                 self.typcache.clear();
                 self.search_path = None;
+                self.event_cache = false;
             }
         }
         // A namespace's change makes the search path recomputed
@@ -398,6 +402,10 @@ pub(crate) struct Counter {
     /// The catalog scans counted, in the order made, for the pages they
     /// read to be counted once the walk is done (RP-291).
     scans: std::cell::RefCell<Vec<PageScan>>,
+    /// Index entries the statement itself has left dead: every later scan
+    /// of the walk meets them, and none can kill them while the
+    /// transaction that made them is open.
+    own_dead: std::cell::RefCell<Vec<(i64, Key)>>,
 }
 
 /// A catalog scan whose pages are counted (RP-291).
@@ -417,7 +425,14 @@ impl Counter {
             stats,
             store,
             scans: Default::default(),
+            own_dead: Default::default(),
         }
+    }
+
+    /// The statement left `index`'s entry for `key` dead (a non-HOT update
+    /// of a catalog row, before its `CommandCounterIncrement`).
+    pub(crate) fn own_dead(&self, index: i64, key: Key) {
+        self.own_dead.borrow_mut().push((index, key));
     }
 
     /// An index scan of `index` for the rows whose leading key columns are
@@ -448,7 +463,13 @@ impl Counter {
     /// which it returns once and then marks killed (`_bt_killitems`), so
     /// that no later scan returns them.
     pub(crate) fn index_key(&self, index: i64, key: &Key, rows: i64) {
-        let dead = take_dead(self.store, index, key);
+        let own = self
+            .own_dead
+            .borrow()
+            .iter()
+            .filter(|(i, k)| *i == index && k.starts_with(key))
+            .count() as i64;
+        let dead = take_dead(self.store, index, key) + own;
         if let Some(s) = &self.stats {
             s.index_scan(index, rows + dead, rows);
             self.scans
@@ -578,6 +599,15 @@ impl Backend {
             self.apply(m);
         }
         self.pending.extend(msgs);
+    }
+
+    /// `CommandCounterIncrement` inside a statement: its own changes so far
+    /// reach this backend's caches; they are sent, and applied here again,
+    /// when its transaction ends.
+    pub(crate) fn command_counter(&mut self, msgs: &[Inval]) {
+        for m in msgs {
+            self.apply(m);
+        }
     }
 
     /// Catalog index entries this backend's change left dead: killable once

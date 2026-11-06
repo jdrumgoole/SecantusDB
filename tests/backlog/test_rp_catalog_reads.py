@@ -227,13 +227,17 @@ FIRST_READS_STEPS: list[str] = [
     "mark",
 ]
 
-# The open items' gap tests: what PostgreSQL 15.19 reads for statements
-# this model does not walk.
-GAPS: dict[str, tuple[str, list[str]]] = {
-    # ALTER TABLE's own reads: the target's descriptor and indexes, the
-    # event trigger cache, pg_depend and friends for DROP COLUMN.
+# The items' gap tests: what PostgreSQL 15.19 reads for statements this
+# model did not walk, each `(item, open, steps)`.
+GAPS: dict[str, tuple[str, bool, list[str]]] = {
+    # ALTER TABLE's own reads: the event trigger cache, the target's lookup
+    # and descriptor, ATParseTransformCmd's schema name, the column-name
+    # check, pg_class's and pg_attribute's index lists, the descriptor
+    # rebuilt at each CommandCounterIncrement, has_subclass; for DROP
+    # COLUMN, pg_depend and the other catalogs deleteOneObject scans.
     "an ALTER TABLE's own catalog reads": (
         "RP-290",
+        False,
         [
             "b|",
             "mark",
@@ -247,6 +251,7 @@ GAPS: dict[str, tuple[str, list[str]]] = {
     # pg_namespace, grouped.
     "a statistics view": (
         "RP-290",
+        True,
         [
             "a|",
             "mark",
@@ -258,6 +263,7 @@ GAPS: dict[str, tuple[str, list[str]]] = {
     # index condition, pg_table_is_visible per row, the join's sort.
     "psql's describe query": (
         "RP-290",
+        True,
         [
             "a|",
             "mark",
@@ -269,11 +275,6 @@ GAPS: dict[str, tuple[str, list[str]]] = {
         ],
     ),
 }
-
-# Segments whose reads a statement this model does not walk makes: the
-# ALTER TABLEs' own catalog reads (RP-290, open). Left out of the
-# comparison, by index.
-UNMODELLED = {"DDL in another session": {2, 4}}
 
 
 def _connect(dsn: str, session: str) -> Any:
@@ -371,11 +372,6 @@ def catalog_reads(
         with _connect(dsn, "teardown") as c:
             for s in TEARDOWN:
                 c.execute(s)
-
-
-def _comparable(name: str, segments: list[Any]) -> list[Any]:
-    skip = UNMODELLED.get(name, set())
-    return [s for i, s in enumerate(segments) if i not in skip]
 
 
 EXPECTED: dict[str, Any] = {
@@ -1419,16 +1415,121 @@ EXPECTED_GAPS: dict[str, Any] = {
 def test_catalog_reads(rust_pg: Any) -> None:
     got = catalog_reads(_dsn(rust_pg))
     for name in SCENARIOS:
-        assert (name, _comparable(name, got[name])) == (name, _comparable(name, EXPECTED[name]))
+        assert (name, got[name]) == (name, EXPECTED[name])
 
 
 @pytest.mark.parametrize(
     "name",
-    [pytest.param(n, marks=pytest.mark.backlog(item), id=n) for n, (item, _) in GAPS.items()],
+    [
+        pytest.param(
+            n,
+            marks=pytest.mark.backlog(item) if is_open else pytest.mark.backlog_fixed(item),
+            id=n,
+        )
+        for n, (item, is_open, _) in GAPS.items()
+    ],
 )
 def test_gap(name: str, rust_pg: Any) -> None:
-    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][1]})
+    got = catalog_reads(_dsn(rust_pg), {name: GAPS[name][2]})
     assert got[name] == EXPECTED_GAPS[name]
+
+
+# ALTER TABLE on a table with no index, twice each way in one session: the
+# first ADD builds what any first DDL of a backend builds (pg_depend's
+# descriptor, opened even for a pinned type; pg_class's and pg_attribute's
+# index lists); the second reads the table's name and row again (the first
+# changed its pg_class row) and rebuilds its descriptor twice; a DROP meets
+# the earlier DROP's dead pg_attribute entry once, killing it, and its own
+# twice. Measured on PostgreSQL 15.19 (RP-290).
+ALTER_TWICE_STEPS = [
+    "b|",
+    "mark",
+    "b|alter table rpc_p add column w int",
+    "mark",
+    "b|alter table rpc_p add column w2 text",
+    "mark",
+    "b|alter table rpc_p drop column w2",
+    "mark",
+    "b|alter table rpc_p drop column w",
+    "mark",
+]
+
+EXPECTED_ALTER_TWICE: list[dict[str, list[int]]] = [
+    {
+        "pg_am": [1, 1, 0],
+        "pg_amproc_fam_proc_index": [1, 3, 3],
+        "pg_attribute_relid_attnum_index": [4, 7, 7],
+        "pg_authid_oid_index": [1, 1, 1],
+        "pg_authid_rolname_index": [1, 1, 1],
+        "pg_class_oid_index": [2, 2, 2],
+        "pg_database_datname_index": [1, 1, 1],
+        "pg_database_oid_index": [2, 2, 2],
+        "pg_db_role_setting_databaseid_rol_index": [4, 0, 0],
+        "pg_index_indexrelid_index": [1, 1, 1],
+        "pg_namespace_nspname_index": [2, 1, 1],
+        "pg_opclass_oid_index": [1, 1, 1],
+        "pg_proc_oid_index": [1, 1, 1],
+        "pg_proc_proname_args_nsp_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+    },
+    {
+        "pg_am": [1, 1, 0],
+        "pg_attribute_relid_attnam_index": [1, 0, 0],
+        "pg_attribute_relid_attnum_index": [8, 18, 18],
+        "pg_class_oid_index": [7, 7, 7],
+        "pg_class_relname_nsp_index": [2, 1, 1],
+        "pg_event_trigger_evtname_index": [1, 0, 0],
+        "pg_index_indexrelid_index": [2, 2, 2],
+        "pg_index_indrelid_index": [2, 5, 5],
+        "pg_namespace_nspname_index": [1, 1, 1],
+        "pg_namespace_oid_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+        "pg_type_typname_nsp_index": [1, 1, 1],
+    },
+    {
+        "pg_attribute_relid_attnam_index": [1, 0, 0],
+        "pg_attribute_relid_attnum_index": [2, 7, 7],
+        "pg_class_oid_index": [4, 4, 4],
+        "pg_class_relname_nsp_index": [1, 1, 1],
+        "pg_type_oid_index": [1, 1, 1],
+        "pg_type_typname_nsp_index": [1, 1, 1],
+    },
+    {
+        "pg_amproc_fam_proc_index": [2, 7, 7],
+        "pg_attribute_relid_attnam_index": [1, 1, 1],
+        "pg_attribute_relid_attnum_index": [33, 71, 70],
+        "pg_class_oid_index": [13, 13, 13],
+        "pg_class_relname_nsp_index": [1, 1, 1],
+        "pg_depend_depender_index": [2, 0, 0],
+        "pg_depend_reference_index": [1, 0, 0],
+        "pg_description_o_c_o_index": [1, 0, 0],
+        "pg_index_indexrelid_index": [6, 6, 6],
+        "pg_init_privs_o_c_o_index": [1, 0, 0],
+        "pg_opclass_oid_index": [2, 2, 2],
+        "pg_seclabel_object_index": [1, 0, 0],
+        "pg_shdepend_depender_index": [1, 0, 0],
+        "pg_statistic_relid_att_inh_index": [1, 0, 0],
+    },
+    {
+        "pg_attribute_relid_attnam_index": [1, 1, 1],
+        "pg_attribute_relid_attnum_index": [3, 11, 9],
+        "pg_class_oid_index": [2, 2, 2],
+        "pg_depend_depender_index": [2, 0, 0],
+        "pg_depend_reference_index": [1, 0, 0],
+        "pg_description_o_c_o_index": [1, 0, 0],
+        "pg_init_privs_o_c_o_index": [1, 0, 0],
+        "pg_seclabel_object_index": [1, 0, 0],
+        "pg_shdepend_depender_index": [1, 0, 0],
+        "pg_statistic_relid_att_inh_index": [1, 0, 0],
+    },
+    {},
+]
+
+
+@pytest.mark.backlog_fixed("RP-290")
+def test_an_alter_table_twice_each_way(rust_pg: Any) -> None:
+    got = catalog_reads(_dsn(rust_pg), {"alter": ALTER_TWICE_STEPS})["alter"]
+    assert got == EXPECTED_ALTER_TWICE
 
 
 # The reg* input functions' name lookups (`regproc.c`), each statement in
@@ -2319,7 +2420,7 @@ if __name__ == "__main__" and sys.argv[2:] == ["heap"]:
 elif __name__ == "__main__":
     measured = catalog_reads(sys.argv[1])
     print("EXPECTED: dict[str, Any] = " + pprint.pformat(measured, width=100, sort_dicts=False))
-    gaps = {n: catalog_reads(sys.argv[1], {n: steps})[n] for n, (_, steps) in GAPS.items()}
+    gaps = {n: catalog_reads(sys.argv[1], {n: steps})[n] for n, (_, _, steps) in GAPS.items()}
     print("EXPECTED_GAPS: dict[str, Any] = " + pprint.pformat(gaps, width=100, sort_dicts=False))
     print(
         "EXPECTED_FOUND: dict[str, Any] = "
