@@ -4,6 +4,14 @@
 #
 #   scripts/fix_many.sh postgres 10        # ten items, two lanes
 #   scripts/fix_many.sh -j 1 postgres 4    # one at a time
+#   scripts/fix_many.sh -i pg-batch postgres 8   # land on pg-batch, not main
+#
+# -i BRANCH (integration mode): each session gates locally and pushes its
+# fix to BRANCH, with no PR and no CI wait (fix-one skill, "Integration
+# mode"). BRANCH is created from origin/main if it does not exist. At the
+# end the batch opens (or reuses) one PR from BRANCH to main and prints its
+# number; CI on that PR is the check for the whole batch, and its merge
+# (rebase, keeping one commit per item) is done by whoever runs the batch.
 #
 # Two lanes because CLAUDE.md allows two building agents per session (four
 # machine-wide); a lane spends most of its time waiting on CI, so two lanes
@@ -23,17 +31,30 @@
 set -uo pipefail
 
 jobs=2
-if [[ "${1:-}" == "-j" ]]; then
-    jobs=$2
+into=
+while [[ "${1:-}" == -* ]]; do
+    case "$1" in
+        -j) jobs=$2 ;;
+        -i) into=$2 ;;
+        *) echo "unknown option $1" >&2; exit 2 ;;
+    esac
     shift 2
-fi
-backlog=${1:?usage: $0 [-j N] <postgres|mongodb> <count>}
-count=${2:?usage: $0 [-j N] <postgres|mongodb> <count>}
+done
+backlog=${1:?usage: $0 [-j N] [-i BRANCH] <postgres|mongodb> <count>}
+count=${2:?usage: $0 [-j N] [-i BRANCH] <postgres|mongodb> <count>}
 
 cd "$(dirname "$0")/.."
 out=.scratch/fix_many
 mkdir -p "$out"
 rm -f "$out/STOP"
+
+if [[ -n $into ]]; then
+    [[ $into == main ]] && { echo "-i main: use the default mode" >&2; exit 2; }
+    git fetch -q origin
+    if ! git ls-remote --exit-code --heads origin "$into" >/dev/null; then
+        git push -q origin "origin/main:refs/heads/$into" || exit 1
+    fi
+fi
 
 run() {
     local n=$1
@@ -46,10 +67,10 @@ run() {
     # (scripts/wait_for_load.sh has the 2026-11-02 numbers).
     scripts/wait_for_load.sh "fix_many item $n" 2>>"$out/summary.txt"
     [[ -e $out/STOP ]] && return 0
-    scripts/fix_one.sh -p "$backlog" >"$out/$n.log" 2>&1
+    scripts/fix_one.sh -p "$backlog" ${into:+into "$into"} >"$out/$n.log" 2>&1
     local rc=$?
     local pr
-    pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+' "$out/$n.log" | tail -1)
+    pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at [0-9a-f]+' "$out/$n.log" | tail -1)
     echo "$(date '+%F %T') item $n exit $rc ${pr:-no PR}" >>"$out/summary.txt"
     if [[ $rc -ne 0 ]]; then
         echo "$n" >"$out/STOP"
@@ -57,7 +78,21 @@ run() {
     fi
 }
 export -f run
-export backlog jobs out
+export backlog jobs out into
 
 seq 1 "$count" | xargs -P "$jobs" -I{} bash -c 'run {}'
+if [[ -n $into ]]; then
+    git fetch -q origin
+    ahead=$(git rev-list --count "origin/main..origin/$into")
+    if [[ $ahead -gt 0 ]]; then
+        pr=$(gh pr list --head "$into" --base main --state open --json number -q '.[0].number')
+        if [[ -z $pr ]]; then
+            url=$(gh pr create --base main --head "$into" \
+                --title "Rust PG server: fix-one batch ($ahead items, $into)" \
+                --body "$(git log --format='- %s' "origin/main..origin/$into")") || exit 1
+            pr=${url##*/}
+        fi
+        echo "$(date '+%F %T') batch PR #$pr ($ahead commits from $into)" >>"$out/summary.txt"
+    fi
+fi
 echo "$(date '+%F %T') DONE" >>"$out/summary.txt"
