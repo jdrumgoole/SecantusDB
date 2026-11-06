@@ -1720,7 +1720,12 @@ and most of RP-193 in batch 48; their tests there are regression tests.
       idle) the whole test takes 27 s. Not diagnosed: which phase of
       `pgbench -i` (the 100,000-row COPY, VACUUM, the primary keys) used
       the time is not in the log, so the next step is the server's log of
-      a slow run with each statement's duration.
+      a slow run with each statement's duration. Seen a second time on
+      PR #2397's `pg-oracle (backlog)` job (run on commit 05d7a19c, RP-404
+      and RP-408; 2026-11-06): pgbench had printed `creating tables...` when
+      the 120 s ran out, and that job's backlog step took 1102 s against
+      476 s on PR #2395's. Locally, a debug build of the same commit runs
+      `pgbench -i -s 1` in 22 s, as does the commit before it.
       Backlog-ID: RP-380
       Verify: none -- seen once in CI; a timing that does not fail on demand
 

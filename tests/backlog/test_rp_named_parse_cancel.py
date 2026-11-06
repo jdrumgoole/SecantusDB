@@ -74,13 +74,33 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
         sent["at"] = time.monotonic()
         pg.cancel()
 
-    timer = threading.Timer(delay, cancel)
-    t0 = time.monotonic()
-    timer.start()
-    result = pgconn.prepare(b"rp303_target", _sql(n + 1, size))
-    answered = time.monotonic()
-    timer.join()
-    assert sent["at"] < answered, "the cancel left after the Parse answered"
+    # On a slow CI runner the target Parse has answered BEFORE a cancel aimed
+    # at the middle of the calibrated window left (PR #2397: 0.27 s before).
+    # Such a trial tests nothing -- the cancel never met the Parse -- so it
+    # is aimed again, at the middle of the window that Parse showed. A cancel
+    # that leaves in time and is lost still fails below.
+    window_end = named
+    missed = []
+    for attempt in range(3):
+        target = b"rp303_target_%d" % attempt
+        timer = threading.Timer(delay, cancel)
+        t0 = time.monotonic()
+        timer.start()
+        result = pgconn.prepare(target, _sql(n := n + 1, size))
+        answered = time.monotonic()
+        timer.join()
+        if sent["at"] < answered:
+            break
+        window_end = answered - t0
+        missed.append(f"aimed at {delay:.3f}s, the Parse answered at {window_end:.3f}s")
+        delay = (unnamed + window_end) / 2
+        # The late cancel reaches an idle session, where PostgreSQL ignores
+        # it. A pause and a round trip let it arrive before the next trial,
+        # so it cannot cancel that trial's Parse and pass for its own.
+        time.sleep(0.5)
+        pgconn.exec_(b"select 1")
+    else:
+        pytest.fail(f"no cancel left before its Parse answered: {missed}")
     assert result.status == pq.ExecStatus.FATAL_ERROR, (
         f"the Parse answered {pq.ExecStatus(result.status).name} "
         f"{answered - sent['at']:.3f}s after the cancel was sent"
@@ -89,9 +109,10 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
     assert answered - sent["at"] < 0.5, (
         f"cancel honoured {answered - sent['at']:.2f}s after it was sent"
     )
-    assert answered - t0 < named, "the Parse was not cut short"
+    assert answered - t0 < window_end, "the Parse was not cut short"
     # The cancelled Parse stored nothing, as PostgreSQL's does not.
     row = pg.execute(
-        "select count(*) from pg_prepared_statements where name = 'rp303_target'"
+        "select count(*) from pg_prepared_statements where name = %s",
+        (target.decode(),),
     ).fetchone()
     assert row == (0,)
