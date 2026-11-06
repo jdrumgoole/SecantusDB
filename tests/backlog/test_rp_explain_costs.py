@@ -2119,6 +2119,38 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e (actual rows=1000 loops=1)",
         ],
     ),
+    # Written inner side first: the filter is still run as PostgreSQL wrote it.
+    "analyze of a left nested loop's join filter, inner side first": (
+        "RP-389",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join e on e.a > s.a",
+        [
+            "Nested Loop Left Join (actual rows=29535 loops=1)",
+            "  Join Filter: (e.a > s.a)",
+            "  Rows Removed by Join Filter: 465",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=1000 loops=30)",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # ------------- RP-390 a join over a scan with its own Filter
+    "analyze of a nested loop over a filtered scan": (
+        "RP-390",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s join e on s.a < e.a where e.b = 'v1'",
+        [
+            "Nested Loop (actual rows=2940 loops=1)",
+            "  Join Filter: (s.a < e.a)",
+            "  Rows Removed by Join Filter: 60",
+            "  ->  Seq Scan on e (actual rows=100 loops=1)",
+            "        Filter: (b = 'v1'::text)",
+            "        Rows Removed by Filter: 900",
+            "  ->  Materialize (actual rows=30 loops=100)",
+            "        ->  Seq Scan on s (actual rows=30 loops=1)",
+        ],
+    ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
     "analyze of a user table's index-only scan": (
         "RP-383",
@@ -2459,6 +2491,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-382",
         "RP-383",
         "RP-386",
+        "RP-389",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

@@ -1457,22 +1457,22 @@ a regression test.
       private 15.19 cluster (found while working RP-383).
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
-- [ ] **EXPLAIN ANALYZE of a LEFT Nested Loop with a Join Filter prints
-      no counts below it.** Since RP-386 a join's children print their
-      actual rows and loops, a parameterized inner index-only scan its
-      `Heap Fetches`, a Hash its `Buckets / Batches / Memory Usage` line
-      and an inner Nested Loop its `Rows Removed by Join Filter`, as
-      PostgreSQL 15.19 counts them. A LEFT join's filter is left out: its
-      null-extended rows hide how many pairs the filter rejected, which
-      needs the filter evaluated per pair (`select * from s left join e
-      on s.a < e.a`: `Rows Removed by Join Filter: 465`, the Materialize
-      `(actual rows=1000 loops=30)`). Also unannotated: a join whose scans
-      have their own quals, a Merge Join (its Sorts' `Sort Method`), a
-      hash table past `hash_mem` (several batches) and a join with an
-      inner-unique inner side. Measured on a private 15.19 cluster (found
-      while working RP-386).
-      Backlog-ID: RP-389
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop's join filter]
+- [ ] **EXPLAIN ANALYZE prints no counts below most other joins.** Since
+      RP-386 a join's children print their actual rows and loops, a
+      parameterized inner index-only scan its `Heap Fetches`, a Hash its
+      `Buckets / Batches / Memory Usage` line and a Nested Loop its `Rows
+      Removed by Join Filter`, and since RP-389 a LEFT Nested Loop's too
+      when its filter compares one numeric column of each side, as
+      PostgreSQL 15.19 counts them. Still unannotated: a join whose scans
+      have their own quals (`select * from s join e on s.a < e.a where e.b
+      = 'v1'`: `Rows Removed by Join Filter: 60`, the outer `Seq Scan on e
+      (actual rows=100 loops=1)` with `Rows Removed by Filter: 900`), a
+      LEFT join filter of any other shape, a Merge Join (its Sorts' `Sort
+      Method`), a hash table past `hash_mem` (several batches) and a join
+      with an inner-unique inner side. Measured on a private 15.19 cluster
+      (found while working RP-386).
+      Backlog-ID: RP-390
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a filtered scan]
 
 ## Found by batch 54 (2026-10-24)
 

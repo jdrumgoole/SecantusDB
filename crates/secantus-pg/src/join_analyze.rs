@@ -419,6 +419,81 @@ impl PgHandler {
         }
     }
 
+    /// A LEFT join's Join Filter `(x.col op y.col)`, one column of each
+    /// side compared as numbers, run over every pair: the pairs it kept,
+    /// and the rows the join returns (each outer row's kept pairs, or its
+    /// one null-extended row). `None` for a filter of any other shape, or
+    /// a value this does not compare.
+    fn left_filter_pairs(
+        &self,
+        cond: &str,
+        outer: (&str, &str, &[Document]),
+        inner: (&str, &str, &[Document]),
+    ) -> Option<(usize, usize)> {
+        let body = cond.strip_prefix('(')?.strip_suffix(')')?;
+        let mut parts = body.split(' ');
+        let (Some(lhs), Some(op), Some(rhs), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        let (la, lc) = lhs.split_once('.')?;
+        let (ra, rc) = rhs.split_once('.')?;
+        // Written outer-first or inner-first; flip the operator for the
+        // second so it always reads `outer op inner`.
+        let (outer_col, inner_col, op) = if la == outer.1 && ra == inner.1 {
+            (lc, rc, op)
+        } else if la == inner.1 && ra == outer.1 {
+            let flipped = match op {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                ">=" => "<=",
+                o => o,
+            };
+            (rc, lc, flipped)
+        } else {
+            return None;
+        };
+        if outer.1 == inner.1 {
+            return None;
+        }
+        let holds = |o: f64, i: f64| match op {
+            "=" => Some(o == i),
+            "<>" => Some(o != i),
+            "<" => Some(o < i),
+            "<=" => Some(o <= i),
+            ">" => Some(o > i),
+            ">=" => Some(o >= i),
+            _ => None,
+        };
+        let outer_field = self.defined_table(outer.0)?.field_of(outer_col)?;
+        let inner_field = self.defined_table(inner.0)?.field_of(inner_col)?;
+        // A NULL on either side makes the comparison NULL: the pair fails.
+        let values = |docs: &[Document], field: &str| -> Option<Vec<Option<f64>>> {
+            docs.iter()
+                .map(|d| match d.get(field) {
+                    None | Some(Bson::Null) => Some(None),
+                    v => number(v).map(Some),
+                })
+                .collect()
+        };
+        let outer_vals = values(outer.2, &outer_field)?;
+        let inner_vals = values(inner.2, &inner_field)?;
+        let (mut kept, mut joined) = (0usize, 0usize);
+        for o in &outer_vals {
+            let mut here = 0usize;
+            if let Some(o) = o {
+                for i in inner_vals.iter().flatten() {
+                    here += usize::from(holds(*o, *i)?);
+                }
+            }
+            kept += here;
+            joined += here.max(1);
+        }
+        Some((kept, joined))
+    }
+
     /// A Nested Loop of two unfiltered Seq Scans, the inner one under a
     /// Materialize or rescanned bare, its qual (if any) a Join Filter.
     fn analyze_plain_nest_loop(&self, tree: &mut PlanNode, actual: usize) {
@@ -430,12 +505,12 @@ impl PgHandler {
             [(label, _)] if label == "Join Filter" => true,
             _ => return,
         };
-        // A LEFT join's null-extended rows hide how many pairs its filter
-        // rejected.
-        if tree.name != "Nested Loop" && (filtered || tree.name != "Nested Loop Left Join") {
-            return;
-        }
-        let Some((outer_table, _)) = bare_seq_scan(&tree.children[0]) else {
+        let left = match tree.name.as_str() {
+            "Nested Loop" => false,
+            "Nested Loop Left Join" => true,
+            _ => return,
+        };
+        let Some((outer_table, outer_alias)) = bare_seq_scan(&tree.children[0]) else {
             return;
         };
         let inner = &tree.children[1];
@@ -448,7 +523,7 @@ impl PgHandler {
         } else {
             inner
         };
-        let Some((inner_table, _)) = bare_seq_scan(scan) else {
+        let Some((inner_table, inner_alias)) = bare_seq_scan(scan) else {
             return;
         };
         let (Ok(outer_docs), Ok(inner_docs)) =
@@ -461,18 +536,37 @@ impl PgHandler {
             return;
         }
         let pairs = n_outer * n_inner;
-        // Every pair, or those the filter kept.
-        let consistent = if filtered {
-            actual <= pairs
+        // The pairs the filter kept (`ExecNestLoop`'s `nfiltered1` counts
+        // the rest). An inner join returns exactly those; a LEFT join adds
+        // a null-extended row for each outer row that kept none, so its
+        // filter is evaluated per pair here to tell the two apart.
+        let kept = if !filtered {
+            if left || actual != pairs {
+                return;
+            }
+            pairs
+        } else if left {
+            let cond = tree.details[0].1.clone();
+            let Some((kept, joined)) = self.left_filter_pairs(
+                &cond,
+                (&outer_table, &outer_alias, &outer_docs),
+                (&inner_table, &inner_alias, &inner_docs),
+            ) else {
+                return;
+            };
+            if joined != actual {
+                return;
+            }
+            kept
         } else {
-            actual == pairs
+            if actual > pairs {
+                return;
+            }
+            actual
         };
-        if !consistent {
-            return;
-        }
         tree.children[0].actual_rows = Some(n_outer);
         if filtered {
-            tree.join_filter_removed = Some(pairs - actual);
+            tree.join_filter_removed = Some(pairs - kept);
         }
         let inner = &mut tree.children[1];
         inner.actual_rows = Some(n_inner);
