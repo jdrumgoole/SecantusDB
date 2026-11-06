@@ -8,6 +8,7 @@
 #   scripts/fix_one.sh mongodb RM-142      # a named item
 #   scripts/fix_one.sh pg hardest          # with a choice rule
 #   scripts/fix_one.sh -p postgres         # headless (claude -p): no questions
+#   scripts/fix_one.sh -p postgres into pg-batch   # land on pg-batch (fix-one, "Integration mode")
 #
 # Interactive is the default because the skill may stop to ask Joe for a
 # decision; `-p` runs it unattended and prints the final report.

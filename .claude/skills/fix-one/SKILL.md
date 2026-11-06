@@ -16,6 +16,14 @@ running: the work dies with the session (2026-11-01: a run ended mid-gate
 and left its fix uncommitted). Wait for each result before you stop, and
 commit as soon as the fix exists so nothing is lost.
 
+**Integration mode: `into <branch>` in the arguments** (`/fix-one postgres
+into pg-batch`; `scripts/fix_many.sh -i pg-batch` passes it). The fix lands
+on that integration branch instead of `main`, after the local gate and with
+no CI wait: CI runs once on the integration branch's PR to `main`, which the
+batch's orchestrator opens and merges (Joe, 2026-11-06: a session spent
+~40 of its 35-60 min waiting on CI). Where a step below says `origin/main`,
+read `origin/<branch>`; step 7 has the landing. Never push to `main`.
+
 One item, one branch, one PR, one merge, one teardown. Every step below
 points at the skill that owns its detail -- read that skill when you reach
 the step, do not work from memory.
@@ -57,6 +65,7 @@ git fetch -q
 git ls-remote --heads origin | grep -i <id>      # someone else's claim?
 gh pr list --state open                          # an open PR for it?
 git log origin/main --oneline -S'<ID>' | head    # closed already?
+# integration mode: also `git log origin/<branch> -S'<ID>'`, and base on it
 git worktree add ../SecantusDB-<slug> -b <slug> origin/main
 cd ../SecantusDB-<slug> && git push -u origin <slug>   # the claim
 ```
@@ -136,6 +145,22 @@ discount an error").
 
 ## 7. Commit, PR, CI, merge (`batch-worktree`, `ci-check`)
 
+**Integration mode** replaces this step's PR, CI and merge:
+
+```bash
+git status --short          # read it: no build output, no .scratch/
+git add <paths> && git commit -m "<server>: <headline> (<ID>)"
+git fetch -q origin <branch> && git rebase origin/<branch>
+git push origin HEAD:<branch>   # fast-forward only, never --force
+```
+
+- One commit per item, so a red batch run can be bisected to it.
+- If the rebase moved anything (another lane landed first), rerun
+  `scripts/gate_pg.sh` before pushing; a rejected push means the same:
+  fetch, rebase, gate, push again.
+- Check the landing: `git log origin/<branch> --oneline -1` is your commit.
+  Report `landed on <branch> at <sha>` (no PR number). Then step 8.
+
 ```bash
 git status --short          # read it: no build output, no .scratch/
 git add <paths> && git commit -m "<server>: <headline> (<ID>)"
@@ -155,7 +180,8 @@ git push && gh pr create --base main --title "..." --body "... Fixes <ID> ..."
 ## 8. Tear down (same session)
 
 Remove the worktree (in the background, it is large), then `git branch -D`
-and `git push origin --delete <slug>`, only after `MERGED`. Delete what you
+and `git push origin --delete <slug>`, only after `MERGED` (integration
+mode: after your commit is on `origin/<branch>`). Delete what you
 put in `.scratch/`. Report: the item, what was wrong, the fix, the test that
 pins it, the PR number, and anything filed along the way.
 

@@ -1324,12 +1324,15 @@ jobs:
     # secantusd-rs, the cargo tests, the login and backlog comparisons.
     # `differential`: everything compared with PostgreSQL's answers, live
     # (the differential suite, against the service below) or recorded (the
-    # corpora and the other binary-only files). The split is by FILE: a file named in neither list runs
+    # corpora and the other binary-only files). `backlog`, split from
+    # `server` on 2026-11-06 when that shard took 35-40 min (its backlog
+    # step alone 17): the Rust PG backlog regression and gap tests against
+    # a PostgreSQL 15 it starts itself. The split is by FILE: a file named in neither list runs
     # nowhere, so a new suite joins one of them in the step below.
     strategy:
       fail-fast: false
       matrix:
-        shard: [server, differential]
+        shard: [server, backlog, differential]
     env:
       UV_PYTHON: "3.10"
       # The suites read this (tests/pg_oracle.py); without it they fall back to
@@ -1459,7 +1462,7 @@ jobs:
       # than not having them (a green summary that proves nothing). Same
       # reasoning as the secantusd-pg build above.
       - name: Build secantusd-rs (for the cross-protocol tests)
-        if: matrix.shard == 'server'
+        if: matrix.shard != 'differential'
         shell: bash
         run: |
           WT="$PWD/$(ls -d build/*/wt-build | head -1)"
@@ -1503,6 +1506,7 @@ jobs:
           "
 
       - name: Run the PostgreSQL-oracle suites
+        if: matrix.shard != 'backlog'
         # The Rust PostgreSQL server's suites, named one by one. This lane used
         # to start from every file importing ``pg_oracle``, but all of those
         # test the Python PostgreSQL server, which CI no longer tests (fully
@@ -1567,7 +1571,7 @@ jobs:
       # container above cannot be made to do. 15 because that is the major
       # the answers were measured against and the one the server reports.
       - name: Add the PostgreSQL apt repository
-        if: matrix.shard == 'server'
+        if: matrix.shard != 'differential'
         shell: bash
         run: |
           if ! grep -rqs apt.postgresql.org /etc/apt/sources.list /etc/apt/sources.list.d/; then
@@ -1585,7 +1589,7 @@ jobs:
           echo "create_main_cluster = false" | sudo tee -a /etc/postgresql-common/createcluster.conf
 
       - name: Install PostgreSQL 15
-        if: matrix.shard == 'server'
+        if: matrix.shard != 'differential'
         uses: ./.github/actions/apt-install
         with:
           packages: postgresql-15
@@ -1612,7 +1616,7 @@ jobs:
       # (the `pg15` fixture), which this step starts from the binaries above on
       # the port a developer box uses for it.
       - name: Start a PostgreSQL 15 reference
-        if: matrix.shard == 'server'
+        if: matrix.shard == 'backlog'
         shell: bash
         run: |
           B=/usr/lib/postgresql/15/bin
@@ -1623,7 +1627,7 @@ jobs:
           psql "host=127.0.0.1 port=5415 dbname=postgres user=postgres" -Atc 'show server_version'
 
       - name: Run the Rust PG backlog regression and gap tests
-        if: matrix.shard == 'server'
+        if: matrix.shard == 'backlog'
         shell: bash
         env:
           SECANTUS_PG_ORACLE_DSN_15: "host=127.0.0.1 port=5415 dbname=postgres user=postgres"
