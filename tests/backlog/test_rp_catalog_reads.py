@@ -2273,14 +2273,14 @@ def test_a_database_wide_analyze_measures_an_int2vector_column(rust_pg: Any) -> 
     )
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_an_oidvector_column(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster, measured on
     two new clusters): after a CREATE FUNCTION, a plain ANALYZE re-measures
     `pg_proc.proargtypes` (`oidvector`, under its own B-tree opclass
     `oidvector_ops`), so its distinct count and frequencies follow the new
     row (`initdb`'s are -0.18156597 and 0.051787917, 0.045930948,
-    0.04377312); here the column keeps `initdb`'s row."""
+    0.04377312); the column kept `initdb`'s row."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_o")
         c.execute("create database rp313_o")

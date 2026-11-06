@@ -16975,6 +16975,24 @@ impl PgHandler {
                 let size = 24 + 2 * keys.len();
                 (size <= 1024).then(|| Some((statistic::array_key(&keys), size)))
             }
+            // `oidvector_ops` (its own B-tree opclass, found before
+            // `array_ops`): `btoidvectorcmp` sorts by length first, then
+            // each oid unsigned, which a 4-byte big-endian length and
+            // 4-byte big-endian oids order as. Stored plain (`typstorage`
+            // 'p'), `OidVectorSize`: one dimension even when empty.
+            ("oidvector", Bson::Array(items)) => {
+                let mut key = u32::try_from(items.len()).ok()?.to_be_bytes().to_vec();
+                for v in items {
+                    let oid = match v {
+                        Bson::Int32(n) => *n as u32,
+                        Bson::Int64(n) => u32::try_from(*n).ok()?,
+                        _ => return None,
+                    };
+                    key.extend(oid.to_be_bytes());
+                }
+                let size = 24 + 4 * items.len();
+                (size <= 1024).then_some(Some((key, size)))
+            }
             // `float8eq`: -0 equals 0, and NaN equals NaN.
             ("float4" | "float8", Bson::Double(x)) => {
                 let x = if *x == 0.0 {

@@ -2135,8 +2135,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # ------------- RP-390 a join over a scan with its own Filter
+    # Split from RP-390 and fixed: a join's scans count the rows their
+    # Filter rejects (`nfiltered1`), and the join's counts are over the
+    # rows they kept.
     "analyze of a nested loop over a filtered scan": (
-        "RP-390",
+        "RP-386",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s join e on s.a < e.a where e.b = 'v1'",
@@ -2149,6 +2152,112 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Rows Removed by Filter: 900",
             "  ->  Materialize (actual rows=30 loops=100)",
             "        ->  Seq Scan on s (actual rows=30 loops=1)",
+        ],
+    ),
+    # Split from RP-390 and fixed: the Materialized inner's Filter too.
+    "analyze of a nested loop over two filtered scans": (
+        "RP-386",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s join e on s.a < e.a where e.b = 'v1' and s.a > 20",
+        [
+            "Nested Loop (actual rows=970 loops=1)",
+            "  Join Filter: (s.a < e.a)",
+            "  Rows Removed by Join Filter: 30",
+            "  ->  Seq Scan on e (actual rows=100 loops=1)",
+            "        Filter: (b = 'v1'::text)",
+            "        Rows Removed by Filter: 900",
+            "  ->  Materialize (actual rows=10 loops=100)",
+            "        ->  Seq Scan on s (actual rows=10 loops=1)",
+            "              Filter: (a > 20)",
+            "              Rows Removed by Filter: 20",
+        ],
+    ),
+    # A LEFT join's Join Filter over an expression of one side: still
+    # unannotated (RP-390's remainder).
+    "analyze of a left nested loop over an expression filter": (
+        "RP-390",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join e on s.a + 1 < e.a",
+        [
+            "Nested Loop Left Join (actual rows=29505 loops=1)",
+            "  Join Filter: ((s.a + 1) < e.a)",
+            "  Rows Removed by Join Filter: 495",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=1000 loops=30)",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # An inner join's ON conjunct over one table is that table's scan
+    # Filter (`distribute_qual_to_rels`), not part of the Join Filter.
+    "analyze of an inner join's one-table ON conjunct": (
+        "RP-391",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s join e on s.a < e.a and s.a > 25",
+        [
+            "Nested Loop (actual rows=4860 loops=1)",
+            "  Join Filter: (s.a < e.a)",
+            "  Rows Removed by Join Filter: 140",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Materialize (actual rows=5 loops=1000)",
+            "        ->  Seq Scan on s (actual rows=5 loops=1)",
+            "              Filter: (a > 25)",
+            "              Rows Removed by Filter: 25",
+        ],
+    ),
+    # Fixed: every ON conjunct over one table is its table's scan Filter,
+    # and the join was a plain cross product with no Join Filter.
+    "analyze of an inner join whose ON conjuncts each read one table": (
+        "RP-392",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s join e on s.a > 25 and e.a > 990",
+        [
+            "Nested Loop (actual rows=50 loops=1)",
+            "  ->  Seq Scan on e (actual rows=10 loops=1)",
+            "        Filter: (a > 990)",
+            "        Rows Removed by Filter: 990",
+            "  ->  Materialize (actual rows=5 loops=10)",
+            "        ->  Seq Scan on s (actual rows=5 loops=1)",
+            "              Filter: (a > 25)",
+            "              Rows Removed by Filter: 25",
+        ],
+    ),
+    # An inner join nested inside an outer join: its one-table ON conjunct
+    # is still its table's scan Filter (found while working RP-392).
+    "analyze of an inner join under an outer join with a one-table ON conjunct": (
+        "RP-393",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",
+        [
+            "Nested Loop Left Join (actual rows=60 loops=1)",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=2 loops=30)",
+            "        ->  Nested Loop (actual rows=2 loops=1)",
+            "              ->  Seq Scan on e (actual rows=2 loops=1)",
+            "                    Filter: (a > 998)",
+            "                    Rows Removed by Filter: 998",
+            "              ->  Index Scan using k_pkey on k (actual rows=1 loops=2)",
+            "                    Index Cond: (a = e.a)",
+        ],
+    ),
+    # A constant true conjunct of an ON is folded away
+    # (`eval_const_expressions`), not printed as a Join Filter (found while
+    # working RP-392).
+    "analyze of an inner join whose ON has a constant true conjunct": (
+        "RP-394",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select s.a, e.a from s join e on true and s.a > 29",
+        [
+            "Nested Loop (actual rows=1000 loops=1)",
+            "  ->  Seq Scan on s (actual rows=1 loops=1)",
+            "        Filter: (a > 29)",
+            "        Rows Removed by Filter: 29",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
         ],
     ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
@@ -2495,6 +2604,8 @@ def _marked(name: str, item: str) -> Any:
         "RP-383",
         "RP-386",
         "RP-389",
+        "RP-391",
+        "RP-392",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

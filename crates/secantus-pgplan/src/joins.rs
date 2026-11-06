@@ -481,6 +481,10 @@ pub(crate) fn plan_join_source(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<pg_query::protobuf::SelectStmt> {
+    // An inner join's ON conjunct over one table is that table's
+    // restriction, as a WHERE conjunct is (RP-391).
+    let hoisted = hoist_inner_on_conjuncts(s);
+    let s = hoisted.as_ref().unwrap_or(s);
     // A nested join (one inside a FROM subquery) plans with its own.
     let (pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
@@ -2504,6 +2508,92 @@ fn pushdown_filters(
     (pushed, nonnullable, ec, placed, moved)
 }
 
+/// `s` with every ON conjunct of an inner join that reads one table only
+/// moved into its WHERE, or `None` when there is none (RP-391).
+///
+/// PostgreSQL's `distribute_qual_to_rels` treats an inner join's qual the
+/// same wherever it was written: one over a single relation is that
+/// relation's restriction, run in its scan, and not a join clause. Only
+/// joins reached from the FROM through inner joins are taken: below an
+/// outer join an ON conjunct over the preserved side is not a filter of
+/// the joined rows. A conjunct qualifies on `single_alias`'s terms (every
+/// column qualified by one alias, built of immutable parts, no subquery),
+/// which is also the shape `pushdown_filters` copies into a scan. A join
+/// whose every ON conjunct reads one table is left with no ON, the shape
+/// of a CROSS JOIN: a plain Nested Loop with no Join Filter (RP-392).
+pub(crate) fn hoist_inner_on_conjuncts(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    fn walk(item: &mut pg_query::protobuf::Node, out: &mut Vec<pg_query::protobuf::Node>) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        if j.jointype != pg_query::protobuf::JoinType::JoinInner as i32 || j.is_natural {
+            return;
+        }
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            walk(side, out);
+        }
+        let Some(quals) = j.quals.as_deref() else {
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        split_and(quals, &mut conjuncts);
+        let (one, kept): (Vec<_>, Vec<_>) = conjuncts
+            .into_iter()
+            .partition(|c| single_alias(c, &|_| None).is_some());
+        if one.is_empty() {
+            return;
+        }
+        out.extend(one.into_iter().cloned());
+        let kept: Vec<pg_query::protobuf::Node> = kept.into_iter().cloned().collect();
+        j.quals = and_of(kept).map(Box::new);
+    }
+    if s.from_clause.iter().all(|i| {
+        !matches!(i.node.as_ref(), Some(N::JoinExpr(j))
+            if j.jointype == pg_query::protobuf::JoinType::JoinInner as i32)
+    }) {
+        return None;
+    }
+    let mut out = s.clone();
+    let mut hoisted = Vec::new();
+    for item in &mut out.from_clause {
+        walk(item, &mut hoisted);
+    }
+    if hoisted.is_empty() {
+        return None;
+    }
+    // The WHERE's own conjuncts first, then the hoisted ones in FROM order.
+    let mut all: Vec<pg_query::protobuf::Node> = Vec::new();
+    if let Some(w) = out.where_clause.as_deref() {
+        let mut c = Vec::new();
+        split_and(w, &mut c);
+        all.extend(c.into_iter().cloned());
+    }
+    all.extend(hoisted);
+    out.where_clause = and_of(all).map(Box::new);
+    Some(out)
+}
+
+/// The AND of `args`: `None` for none, the one itself for one.
+fn and_of(args: Vec<pg_query::protobuf::Node>) -> Option<pg_query::protobuf::Node> {
+    match args.len() {
+        0 => None,
+        1 => args.into_iter().next(),
+        _ => Some(pg_query::protobuf::Node {
+            node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+                args,
+                location: -1,
+                ..Default::default()
+            }))),
+        }),
+    }
+}
+
 /// The aliases of the FROM's table leaves that take a pushed filter: a
 /// table not renamed column by column (`build`'s `RangeVar` arm).
 fn filtered_leaves(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
@@ -3169,6 +3259,59 @@ fn pushed_filter(alias: &str) -> Option<pg_query::protobuf::Node> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The WHERE `hoist_inner_on_conjuncts` leaves `sql` with, deparsed.
+    fn hoisted_where(sql: &str) -> Option<String> {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("a SELECT");
+        };
+        let out = hoist_inner_on_conjuncts(s)?;
+        let w = out.where_clause?;
+        let mut template = pg_query::parse("select 1 where true").unwrap().protobuf;
+        if let Some(N::SelectStmt(t)) = template.stmts[0]
+            .stmt
+            .as_mut()
+            .and_then(|n| n.node.as_mut())
+        {
+            t.where_clause = Some(w);
+        }
+        let text = template.deparse().unwrap();
+        Some(text.trim_start_matches("SELECT 1 WHERE ").to_string())
+    }
+
+    #[test]
+    fn an_inner_joins_one_table_on_conjunct_joins_the_where() {
+        // RP-391: `distribute_qual_to_rels` makes it the table's restriction.
+        assert_eq!(
+            hoisted_where("select * from s join e on s.a < e.a and s.a > 25").as_deref(),
+            Some("s.a > 25")
+        );
+        assert_eq!(
+            hoisted_where("select * from s join e on s.a < e.a and e.b = 'x' where s.c = 1")
+                .as_deref(),
+            Some("s.c = 1 AND e.b = 'x'")
+        );
+        // RP-392: every conjunct over one table leaves the join no ON.
+        assert_eq!(
+            hoisted_where("select * from s join e on s.a > 25 and e.a > 1").as_deref(),
+            Some("s.a > 25 AND e.a > 1")
+        );
+        // Below an outer join the ON stays as written.
+        assert_eq!(
+            hoisted_where("select * from s left join e on s.a < e.a and s.a > 25"),
+            None
+        );
+        // A subquery is not a one-table shape.
+        assert_eq!(
+            hoisted_where("select * from s join e on s.a < e.a and s.a in (select 1)"),
+            None
+        );
+    }
 
     /// The aliases each WHERE conjunct of `sql` is pushed to.
     fn pushed_to(sql: &str) -> Vec<String> {

@@ -1394,16 +1394,16 @@ a regression test.
       since 2026-11-05 so do `aclitem[]` (`=` but no `<`:
       `compute_distinct_stats`) and the `reg*` types (under `oid`'s
       opclass), and since 2026-11-06 `int2vector` (an array to
-      `type_is_array`: `array_ops`). The other columns keep `initdb`'s
-      rows, where PostgreSQL 15.19 measures them too: `oidvector` (its own
-      `oidvector_ops`; after a CREATE FUNCTION, `pg_proc.proargtypes`'
-      distinct count and frequencies move) and `pg_node_tree`. Not modelled
+      `type_is_array`: `array_ops`) and `oidvector` (its own
+      `oidvector_ops`). The other columns keep `initdb`'s rows, where
+      PostgreSQL 15.19 measures them too: `pg_node_tree`. Not modelled
       either: the measured
       catalogs' `relpages` / `reltuples` in `pg_class`, and the row order
       of the replaced `pg_statistic` rows (an update moves PostgreSQL's)
       (found while working RP-311).
       Backlog-ID: RP-313
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_an_oidvector_column
+      Verify: none -- the `pg_node_tree` columns need `nodeToString`'s
+      text of each stored tree; no gap test until a probe pins one
 - [ ] **A database-wide ANALYZE's correlation of a catalog column is not
       PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
       with the rows' heap order; here the catalog's rows are walked in this
@@ -1461,18 +1461,39 @@ a regression test.
       RP-386 a join's children print their actual rows and loops, a
       parameterized inner index-only scan its `Heap Fetches`, a Hash its
       `Buckets / Batches / Memory Usage` line and a Nested Loop its `Rows
-      Removed by Join Filter`, and since RP-389 a LEFT Nested Loop's too
-      when its filter compares one numeric column of each side, as
-      PostgreSQL 15.19 counts them. Still unannotated: a join whose scans
-      have their own quals (`select * from s join e on s.a < e.a where e.b
-      = 'v1'`: `Rows Removed by Join Filter: 60`, the outer `Seq Scan on e
-      (actual rows=100 loops=1)` with `Rows Removed by Filter: 900`), a
-      LEFT join filter of any other shape, a Merge Join (its Sorts' `Sort
+      Removed by Join Filter`, since RP-389 a LEFT Nested Loop's too
+      when its filter compares one numeric column of each side, and since
+      2026-11-06 a plain Nested Loop's Seq Scans their `Rows Removed by
+      Filter` (`select * from s join e on s.a < e.a where e.b = 'v1'`), as
+      PostgreSQL 15.19 counts them. Still unannotated: a LEFT join filter
+      of any other shape (`s left join e on s.a + 1 < e.a`: `Rows Removed
+      by Join Filter: 495`), a Hash Join or parameterized Nested Loop
+      whose scans have their own Filter, a Merge Join (its Sorts' `Sort
       Method`), a hash table past `hash_mem` (several batches) and a join
       with an inner-unique inner side. Measured on a private 15.19 cluster
       (found while working RP-386).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a filtered scan]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter]
+- [ ] **An inner join nested in an outer join keeps its one-table ON
+      conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
+      join's ON conjunct over one table is that table's scan Filter, but
+      only for joins reached from the FROM through inner joins. PostgreSQL
+      15.19's `distribute_qual_to_rels` places an inner join's qual the
+      same below an outer join: `select * from s left join (e join k on
+      e.a > 998 and k.a = e.a) on true` runs `Filter: (a > 998)` on `Seq
+      Scan on e`; here the Hash Join keeps `Join Filter: (e.a > 998)`. Its
+      rows are right. Measured on a private 15.19 cluster (found while
+      working RP-392).
+      Backlog-ID: RP-393
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct]
+- [ ] **A constant `true` ON conjunct is printed as a Join Filter.**
+      PostgreSQL 15.19's `eval_const_expressions` drops a TRUE argument of
+      an AND, so `select s.a, e.a from s join e on true and s.a > 29` is a
+      plain Nested Loop; here it prints `Join Filter: true` (and so does a
+      LEFT JOIN `on true`). Its rows are right. Measured on a private 15.19
+      cluster (found while working RP-392).
+      Backlog-ID: RP-394
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join whose ON has a constant true conjunct]
 
 ## Found by batch 54 (2026-10-24)
 
