@@ -1853,25 +1853,114 @@ fn ema_alpha(spec: &Document) -> R<f64> {
     }
 }
 
-/// Per-slot exponential moving average over the sorted partition, mirroring
-/// `_compute_ema`: `ema[0] = input[0]`; `ema[i] = input[i]*alpha +
-/// ema[i-1]*(1-alpha)`. Same IEEE-double ops as the oracle → bit-for-bit match.
-fn ema_values(slots: &[usize], docs: &[Document], spec: &Document, vars: &Document) -> R<Vec<f64>> {
-    let alpha = ema_alpha(spec)?;
+/// Per-slot exponential moving average over the sorted partition:
+/// `ema[0] = input[0]`; `ema[i] = input[i]*alpha + ema[i-1]*(1-alpha)`.
+///
+/// Measured on mongod 8.2.11 and 8.2.1, 2026-11-06 (RM-225). Two things that
+/// are not obvious from the output:
+///
+/// - An input no number reads -- null, missing, a string, a bool, an array --
+///   is SKIPPED: the average does not move and the row answers the average as
+///   it stands, which is null before the first numeric input. Not an error,
+///   not a zero.
+/// - The average is carried in **Decimal128 throughout**, and printed as a
+///   double until a Decimal128 input appears; from that row on the decimal is
+///   what comes out, carrying the scale the decimal arithmetic accumulated.
+///   That is the only model that reproduces mongod's scales: `N: 3` over a
+///   7.0 average and a Decimal128 2.5 answers `4.75` (the average entered as
+///   `7.0`, exponent -1), while `alpha: 0.5` over the same data answers 30
+///   decimals (an `alpha` double converts at 15 significant digits, so the
+///   average has carried exponent -15 since the first row and the multiply
+///   takes it to -30). A double INPUT converts at 15 significant digits too,
+///   which is why `[Decimal128("1"), 4.0]` under `N: 3` answers
+///   `2.500000000000000`.
+///
+/// The double output path is unchanged IEEE arithmetic, so the common case
+/// stays bit-for-bit with the oracle; the decimal accumulator runs beside it.
+fn ema_values(
+    slots: &[usize],
+    docs: &[Document],
+    spec: &Document,
+    vars: &Document,
+) -> R<Vec<Bson>> {
+    ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
+    let alpha_dec = ema_alpha_decimal(spec)?;
+    let one_minus_dec = decimal::add(
+        &decimal::parse("1").ok_or(Fallback::Defer)?,
+        &decimal::neg(&alpha_dec),
+    )
+    .ok_or(Fallback::Defer)?;
     let input = spec.get("input").ok_or(Fallback::Defer)?;
     let mut out = Vec::with_capacity(slots.len());
     let mut prev: Option<f64> = None;
+    let mut prev_dec: Option<decimal::Dec> = None;
+    let mut decimal_out = false;
     for &i in slots {
         let v = expressions::evaluate(&docs[i], input, vars)?;
-        let x = as_number(&v).ok_or(Fallback::Defer)?; // non-numeric input -> defer
-        let ema = match prev {
-            None => x,
-            Some(p) => x * alpha + p * (1.0 - alpha),
-        };
-        out.push(ema);
-        prev = Some(ema);
+        // `as_number` does not read a Decimal128, so ask about the type first.
+        let decimal_in = matches!(v, Bson::Decimal128(_));
+        let numeric = decimal_in || as_number(&v).is_some();
+        if !numeric {
+            // The row answers the average unchanged -- null if there is not
+            // one yet.
+            out.push(match (&prev, &prev_dec, decimal_out) {
+                (_, Some(d), true) => decimal::to_bson(d).ok_or(Fallback::Defer)?,
+                (Some(p), _, false) => Bson::Double(*p),
+                _ => Bson::Null,
+            });
+            continue;
+        }
+        decimal_out |= decimal_in;
+        // The decimal accumulator, which every row advances.
+        let xd = decimal::from_bson(&v).ok_or(Fallback::Defer)?;
+        prev_dec = Some(match &prev_dec {
+            None => xd,
+            Some(p) => decimal::add(
+                &decimal::mul(&xd, &alpha_dec).ok_or(Fallback::Defer)?,
+                &decimal::mul(p, &one_minus_dec).ok_or(Fallback::Defer)?,
+            )
+            .ok_or(Fallback::Defer)?,
+        });
+        let avg = prev_dec.as_ref().expect("just set");
+        if decimal_out {
+            out.push(decimal::to_bson(avg).ok_or(Fallback::Defer)?);
+        } else {
+            // mongod's double answer is the DECIMAL average converted, not a
+            // double computation: `{N: 2}` over `[10, 0.1]` answers `3.4`,
+            // where the same steps in IEEE doubles answer
+            // `3.400000000000001` (14 of 1,170 swept shapes differed that way
+            // before this; 0 after -- 2026-11-06).
+            let d = decimal::to_string(avg)
+                .parse::<f64>()
+                .map_err(|_| Fallback::Defer)?;
+            prev = Some(d);
+            out.push(Bson::Double(d));
+        }
     }
     Ok(out)
+}
+
+/// The smoothing factor as mongod builds it for the decimal accumulator: `N`
+/// divides in Decimal128 (so `2/(N+1)` is exact when it terminates and 34
+/// digits when it does not), while an `alpha` double converts at 15
+/// significant digits. The two give different result scales, which is why the
+/// double [`ema_alpha`] cannot stand in here (measured 2026-11-06).
+fn ema_alpha_decimal(spec: &Document) -> R<decimal::Dec> {
+    if let Some(n) = spec.get("N") {
+        let n = match n {
+            Bson::Int32(n) if *n >= 1 => i64::from(*n),
+            Bson::Int64(n) if *n >= 1 => *n,
+            _ => return Err(Fallback::Defer),
+        };
+        let two = decimal::parse("2").ok_or(Fallback::Defer)?;
+        let denom = decimal::parse(&(n + 1).to_string()).ok_or(Fallback::Defer)?;
+        decimal::div(&two, &denom).ok_or(Fallback::Defer)
+    } else {
+        match spec.get("alpha") {
+            Some(a @ Bson::Double(_)) => decimal::from_bson(a).ok_or(Fallback::Defer),
+            _ => Err(Fallback::Defer),
+        }
+    }
 }
 
 /// Per-slot output vector for the prefix/gap-fill window operators, mirroring
@@ -1886,14 +1975,7 @@ fn window_vector(
     vars: &Document,
 ) -> R<Vec<Bson>> {
     match op {
-        "$expMovingAvg" => {
-            Ok(
-                ema_values(slots, docs, arg.as_document().ok_or(Fallback::Defer)?, vars)?
-                    .into_iter()
-                    .map(Bson::Double)
-                    .collect(),
-            )
-        }
+        "$expMovingAvg" => ema_values(slots, docs, arg.as_document().ok_or(Fallback::Defer)?, vars),
         "$locf" => locf_values(slots, docs, arg, vars),
         "$linearFill" => {
             linear_fill_values(slots, docs, arg, sort_field.ok_or(Fallback::Defer)?, vars)

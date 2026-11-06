@@ -17,6 +17,16 @@ with no `sortBy`, and the Rust server was refusing both. An empty `output` now
 passes the partition's documents through, and `$locf` carries its last
 observation forward in the partition's own order.
 
+`$expMovingAvg` is fixed in the same pass. It used to refuse a partition
+holding a null, a missing field, a string or a Decimal128 outright. mongod
+skips an input that is not a number — the average does not move, and the row
+answers the average as it stands — and it carries that average in Decimal128
+throughout, printing a double until a Decimal128 input arrives. Reproducing
+that model also corrected the plain double answers: mongod's `{N: 2}` over
+`[10, 0.1]` is `3.4`, where the same steps in IEEE doubles drift to
+`3.400000000000001`. A 1,170-case sweep against mongod 8.2.1 went from 14
+divergences to none.
+
 #### Fixed
 
 - `$setWindowFields` refusals carry mongod's code and message rather than a
@@ -28,3 +38,9 @@ observation forward in the partition's own order.
   tests/backlog/test_rm_found_2026_10_21.py::test_an_empty_output_passes_the_documents_through).
 - `$locf` no longer requires a `sortBy` (RM-368,
   tests/backlog/test_rm_found_2026_10_21.py::test_locf_needs_no_sort_by).
+- `$expMovingAvg` averages past a non-numeric input and makes the average
+  decimal at mongod's scale, and its double answers come from the decimal
+  average rather than IEEE steps. Fixes RM-225
+  (tests/backlog/test_rm_found_2026_10_21.py::test_exp_moving_avg_over_null_missing_and_decimal,
+  ::test_exp_moving_avg_with_an_alpha_over_a_decimal,
+  ::test_exp_moving_avg_doubles_come_from_the_decimal_average).

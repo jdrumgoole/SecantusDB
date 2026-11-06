@@ -40,15 +40,7 @@ _EMA_DOCS = [
 ]
 
 
-@pytest.mark.backlog("RM-225")
-@pytest.mark.parametrize("spec", [{"N": 2}, {"alpha": 0.75}], ids=["N", "alpha"])
-def test_exp_moving_avg_over_null_missing_and_decimal(
-    rust_mongo: Any, mongod: Any, spec: dict
-) -> None:
-    """mongod 8.2.11 averages over a null, a missing and a Decimal128 input
-    (the null and missing rows answer null and do not move the average; a
-    Decimal128 input turns the average decimal). The Rust server answers
-    2 "not supported by the Rust server" for all of it."""
+def _ema_answers(rust_mongo: Any, mongod: Any, spec: dict) -> tuple[str, str]:
     pipeline = [
         {
             "$setWindowFields": {
@@ -58,7 +50,77 @@ def test_exp_moving_avg_over_null_missing_and_decimal(
         },
         {"$sort": {"_id": 1}},
     ]
-    ours, theirs = _answers(rust_mongo, mongod, _EMA_DOCS, pipeline)
+    return _answers(rust_mongo, mongod, _EMA_DOCS, pipeline)
+
+
+@pytest.mark.backlog_fixed("RM-225")
+@pytest.mark.parametrize("spec", [{"N": 2}, {"N": 3}, {"N": 1}], ids=["N 2", "N 3", "N 1"])
+def test_exp_moving_avg_over_null_missing_and_decimal(
+    rust_mongo: Any, mongod: Any, spec: dict
+) -> None:
+    """mongod 8.2.11 averages past an input that is not a number: a null or
+    missing row answers the average UNCHANGED (null before the first numeric
+    row) and does not move it, and a Decimal128 input makes the average
+    decimal from that row on -- with mongod's own scale, which for an `N`
+    comes from dividing `2/(N+1)` in Decimal128. The Rust server answered
+    2 "not supported by the Rust server" for all of it (re-measured
+    2026-11-06: this test's older docstring said the null rows answer null,
+    which is true only of a LEADING one)."""
+    ours, theirs = _ema_answers(rust_mongo, mongod, spec)
+    assert ours == theirs
+
+
+@pytest.mark.backlog_fixed("RM-225")
+@pytest.mark.parametrize(
+    "spec",
+    [{"alpha": 0.75}, {"alpha": 0.5}, {"alpha": 0.001}, {"alpha": 0.999}],
+    ids=["0.75", "0.5", "0.001", "0.999"],
+)
+def test_exp_moving_avg_with_an_alpha_over_a_decimal(
+    rust_mongo: Any, mongod: Any, spec: dict
+) -> None:
+    """The smoothing factor given as `alpha` rather than `N` reaches the same
+    values but a different SCALE, because an `alpha` double converts into the
+    decimal accumulator at 15 significant digits while `N` divides exactly:
+    `alpha: 0.5` over this corpus answers 30 decimals where `N: 3` answers
+    two. Both are mongod's (measured 2026-11-06)."""
+    ours, theirs = _ema_answers(rust_mongo, mongod, spec)
+    assert ours == theirs
+
+
+#: Shapes from the 1,170-case sweep of 2026-11-06 that the pre-fix server got
+#: wrong in its DOUBLE answer -- mongod computes the average in Decimal128 and
+#: converts, so `{N: 2}` over `[10, 0.1]` answers `3.4` where the same steps
+#: in IEEE doubles answer `3.400000000000001`.
+_DOUBLE_SCALE_DOCS: list[tuple[str, dict, list]] = [
+    ("N 2 over 10 and 0.1", {"N": 2}, [10, 0.1]),
+    ("N 100 over 10 and 0.1", {"N": 100}, [10, 0.1]),
+    ("alpha 0.999 over 10 and 0.1", {"alpha": 0.999}, [10, 0.1]),
+    ("N 2 over a long and 10", {"N": 2}, [2**40, 10]),
+    ("alpha 0.1 over 4.0 and a long", {"alpha": 0.1}, [4.0, 2**40]),
+]
+
+
+@pytest.mark.backlog_fixed("RM-225")
+@pytest.mark.parametrize(
+    ("name", "spec", "xs"), _DOUBLE_SCALE_DOCS, ids=[n for n, _, _ in _DOUBLE_SCALE_DOCS]
+)
+def test_exp_moving_avg_doubles_come_from_the_decimal_average(
+    rust_mongo: Any, mongod: Any, name: str, spec: dict, xs: list
+) -> None:
+    """mongod's double answer is its Decimal128 average converted, not a
+    double computation, so it is free of the drift IEEE steps accumulate."""
+    docs = [{"_id": i, "x": x} for i, x in enumerate(xs, start=1)]
+    pipeline = [
+        {
+            "$setWindowFields": {
+                "sortBy": {"_id": 1},
+                "output": {"e": {"$expMovingAvg": {"input": "$x", **spec}}},
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+    ours, theirs = _answers(rust_mongo, mongod, docs, pipeline)
     assert ours == theirs
 
 

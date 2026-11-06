@@ -743,20 +743,6 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **`$expMovingAvg` refuses a null, missing or Decimal128 input.**
-      `ema_values` defers on any input `as_number` does not read, so a
-      partition with one such row answers code 2. mongod 8.2.11 averages
-      past them: a null or missing row answers the average UNCHANGED --
-      carried forward, not null, which this item said until it was re-probed
-      on 2026-11-06 -- and a Decimal128 input makes the average decimal from
-      that row on. The decimal arithmetic is the work here: the result's
-      scale is mongod's, and it differs with how the smoothing factor was
-      given (`N: 3` answers `3.75`, `alpha: 0.5` answers
-      `3.750000000000000000000000000000`, because `N` divides in Decimal128
-      while `alpha` converts a double), so matching it needs
-      `secantus_core::decimal`, not an f64 accumulator.
-      Backlog-ID: RM-225
-      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_exp_moving_avg_over_null_missing_and_decimal
 - [ ] **A multi-document write interrupted while it reads its candidates
       writes nothing, where mongod keeps what it wrote.** mongod tests and
       writes each document as its scan reaches it (a deleteMany a batch of
