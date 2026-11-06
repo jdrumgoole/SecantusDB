@@ -95,6 +95,7 @@ pub fn encode_multi_byte(canonical: &str, text: &str) -> std::result::Result<Vec
 pub mod bytea;
 pub mod cancel;
 pub mod catalog_stmts;
+mod const_quals;
 pub mod copy_opts;
 pub mod correlated;
 pub mod cursor_scroll;
@@ -3587,6 +3588,10 @@ pub struct ExplainOptions {
     /// class generates, which gate the scan as a `Result`'s
     /// `One-Time Filter` (RP-350). Zero when there are none.
     pub one_time_false: usize,
+    /// The WHERE folded to a constant FALSE or NULL: the relation is dummy,
+    /// and the plan is a `Result` with `One-Time Filter: false` where its
+    /// scan (or join) would be (RP-409).
+    pub dummy_relation: bool,
 }
 
 /// `CREATE [OR REPLACE] VIEW`.
@@ -10067,6 +10072,7 @@ fn plan_explain(
         join_where: Vec::new(),
         subquery_quals: Vec::new(),
         one_time_false: 0,
+        dummy_relation: false,
     };
     let (mut timing, mut summary) = (None, None);
     for o in &e.options {
@@ -10132,11 +10138,14 @@ fn plan_explain(
         .as_deref()
         .and_then(|q| q.node.clone())
         .ok_or_else(|| Error::Parse("EXPLAIN without a statement".into()))?;
+    // The WHERE's constants are simplified before anything is planned
+    // (`eval_const_expressions`, `canonicalize_qual`; RP-409).
+    options.dummy_relation = const_quals::simplify_statement(&mut query, lookup)?;
     // A column's equalities to constants become one equivalence class: the
     // scan keeps the first constant, each other distinct one is a `false`
     // gate (RP-350). Only planned, never run: under ANALYZE the statement
     // executes as written.
-    if !options.analyze {
+    if !options.analyze && !options.dummy_relation {
         if let Some(n) = reduce_const_classes(&mut query, lookup) {
             options.one_time_false = n;
         }

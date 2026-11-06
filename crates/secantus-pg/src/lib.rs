@@ -41039,11 +41039,21 @@ impl PgHandler {
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
                         secantus_storage::ExplainPlan::IxScan { index_name, .. } => {
-                            Some(if index_name == "_id_" {
-                                format!("{}_pkey", secantus_pgplan::schemas::split_key(table).1)
-                            } else {
-                                index_name
-                            })
+                            if index_name != "_id_" {
+                                return Some(index_name);
+                            }
+                            // A table with no primary key has no `_pkey`
+                            // index: its rows' `_id` is internal (RP-409).
+                            if self
+                                .lookup(table)
+                                .is_some_and(|def| !def.columns.iter().any(|c| c.pk))
+                            {
+                                return None;
+                            }
+                            Some(format!(
+                                "{}_pkey",
+                                secantus_pgplan::schemas::split_key(table).1
+                            ))
                         }
                         secantus_storage::ExplainPlan::CollScan
                         | secantus_storage::ExplainPlan::Or { .. } => None,
@@ -41966,6 +41976,9 @@ impl PgHandler {
                     &index_columns,
                 );
                 explain::gate_scan(&mut tree, options.one_time_false);
+                if options.dummy_relation {
+                    explain::dummy_relation(&mut tree);
+                }
                 explain::attach_setop_quals(&mut tree, &options.setop_quals, &index_columns);
                 explain::attach_join_conds(
                     &mut tree,

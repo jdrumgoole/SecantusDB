@@ -1516,19 +1516,6 @@ a regression test.
       15.19 cluster (found while working RP-405).
       Backlog-ID: RP-408
       Verify: tests/backlog/test_rp_column_hint.py::test_missing_column_hint
-- [ ] **A comparison with a NULL constant still scans, and alone prints an
-      index the table does not have.** PostgreSQL 15.19 folds a strict
-      operator over a NULL constant to NULL (`eval_const_expressions`)
-      and a NULL qual to a constant false: `select * from e where a =
-      null` (no index on `e`) is `Result` with `One-Time Filter: false`,
-      and so are `a < null`, `null = a`, `a = null::int` and `a between
-      null and 15 and b <> 'v3'`. Here the lone comparison prints `Index
-      Scan using e_pkey on e` with `Filter: (a = NULL::integer)`, an
-      index no catalog lists, and beside another conjunct a `Seq Scan`
-      with the comparison in its Filter. Its rows are right (none).
-      Measured on a private 15.19 cluster (found while working RP-399).
-      Backlog-ID: RP-409
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a comparison with a null constant is a false one-time filter], tests/backlog/test_rp_explain_costs.py::test_plan[a between with a null bound is a false one-time filter]
 - [ ] **A table whose only index is a composite one prices no scan of
       both its columns.** `create table t2 (a int, b int, c text)`, 5,000
       rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
@@ -1564,9 +1551,61 @@ a regression test.
       <= 55)))`. An AND that comes out is then flattened into the scan's
       quals, which can change the index conditions and the estimate. Its
       rows are right. Measured on a private 15.19 cluster (found while
-      working RP-399).
+      working RP-399). With a NULL arm the pushed-down AND is constant
+      false: `not (a > 1 or null)` is `Result` with `One-Time Filter:
+      false` there, a `Seq Scan` with `Filter: (NOT ((a > 1) OR
+      NULL::boolean))` here (found while working RP-409).
       Backlog-ID: RP-412
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators], tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or with a null arm is a false one-time filter]
+- [ ] **A WHERE that is not boolean answers rows instead of 42804.**
+      PostgreSQL 15.19's `coerce_to_boolean` refuses the clause at parse
+      analysis: `select count(*) from e where a::text` is 42804 `argument
+      of WHERE must be type boolean, not type text`, and `where null::int`
+      is the same for `integer`. Here both count 0. (`where 1` is refused
+      already.) Measured on a private 15.19 cluster (found while working
+      RP-409).
+      Verify: tests/backlog/test_rp_where_types.py::test_where_must_be_boolean
+      Backlog-ID: RP-413
+- [ ] **EXPLAIN plans a statement PostgreSQL refuses for an operator
+      type.** `explain select * from e where a = true` (an integer `a`) is
+      42883 `operator does not exist: integer = boolean` on PostgreSQL
+      15.19, as the SELECT alone is here too; EXPLAIN here prints `Seq
+      Scan on e` with no Filter at all. Measured on a private 15.19
+      cluster (found while working RP-409).
+      Verify: tests/backlog/test_rp_where_types.py::test_explain_checks_operator_types
+      Backlog-ID: RP-414
+- [ ] **A node above a dummy relation prints no estimate, and a dummy
+      join no width.** Since RP-409 a WHERE that folds to constant false
+      plans a `Result` with `One-Time Filter: false`, costing nothing, as
+      PostgreSQL 15.19 does. Above it PostgreSQL still prices each node:
+      `explain select count(*) from e where a = null` is `Aggregate
+      (cost=0.00..0.01 rows=1 width=8)`, here `cost=0.00..0.00 rows=0
+      width=0`; a Sort over it `cost=0.01..0.02 rows=0 width=36`. A dummy
+      join's Result keeps the join's width (`select * from e, k where e.a
+      = null` is `rows=0 width=14`) and so does an UPDATE's (`width=38`);
+      here `width=0`. Measured on a private 15.19 cluster (found while
+      working RP-409).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an aggregate over a dummy relation is priced], tests/backlog/test_rp_explain_costs.py::test_plan[a dummy join keeps its width]
+      Backlog-ID: RP-415
+- [ ] **A COALESCE's constant arguments print unfolded.** PostgreSQL
+      15.19's `eval_const_expressions` drops a COALESCE's NULL arguments
+      and stops at its first non-NULL constant: `select * from e where
+      coalesce(null, a) = 1` is `Filter: (COALESCE(a) = 1)`, and
+      `coalesce(1, a) = 1` folds to true, a `Seq Scan on e` with no Filter.
+      Here `(COALESCE(NULL::integer, a) = 1)` and `(COALESCE(1, a) = 1)`.
+      Its rows are right. Measured on a private 15.19 cluster (found while
+      working RP-409).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a coalesce drops its null arguments], tests/backlog/test_rp_explain_costs.py::test_plan[a coalesce of a constant first folds]
+      Backlog-ID: RP-416
+- [ ] **EXPLAIN of a plain FROM-subquery prints a Subquery Scan
+      PostgreSQL pulls up.** `pull_up_subqueries` merges a simple subquery
+      into its parent: `select * from (select * from e where a > 5) s` is
+      `Seq Scan on e` with `Filter: (a > 5)` on PostgreSQL 15.19; here
+      `Subquery Scan on s` over a `Seq Scan on e` that prints no Filter.
+      Its rows are right. Measured on a private 15.19 cluster (found while
+      working RP-409).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
+      Backlog-ID: RP-417
 
 ## Found by batch 54 (2026-10-24)
 

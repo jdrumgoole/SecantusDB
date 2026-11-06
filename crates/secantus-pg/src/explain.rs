@@ -1767,6 +1767,33 @@ pub(crate) fn gate_scan(root: &mut PlanNode, falses: usize) {
     scan.children.push(child);
 }
 
+/// A relation whose WHERE folded to constant FALSE or NULL is dummy
+/// (`relation_excluded_by_constraints`, RP-409): where its scan, or the join
+/// of its tables, would be, PostgreSQL prints a `Result` costing nothing
+/// whose `One-Time Filter` is `false`, with nothing under it. The topmost
+/// scan or join is replaced; the nodes above it (an Aggregate, a Sort, a
+/// ModifyTable) stay.
+pub(crate) fn dummy_relation(root: &mut PlanNode) {
+    fn relation(n: &PlanNode) -> bool {
+        is_scan_name(&n.name) || n.name.ends_with(" Join") || n.name == "Nested Loop"
+    }
+    fn find(n: &mut PlanNode) -> Option<&mut PlanNode> {
+        if relation(n) {
+            return Some(n);
+        }
+        n.children.iter_mut().find_map(find)
+    }
+    if let Some(node) = find(root) {
+        let mut result = PlanNode::new("Result");
+        // Under ANALYZE it ran once and returned nothing.
+        result.actual_rows = Some(0);
+        result
+            .details
+            .push(("One-Time Filter".into(), "false".into()));
+        *node = result;
+    }
+}
+
 /// Put a set operation's per-arm WHERE conjuncts on its scans, left to
 /// right, as PostgreSQL prints each arm's own `Filter` / `Index Cond`
 /// (RP-346). A plan whose scans do not pair one-to-one with the arms is
@@ -2579,6 +2606,7 @@ mod heap_fetches_tests {
             join_where: Vec::new(),
             subquery_quals: Vec::new(),
             one_time_false: 0,
+            dummy_relation: false,
         }
     }
 

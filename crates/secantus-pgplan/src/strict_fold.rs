@@ -20,7 +20,7 @@ const STRICT: &[&str] = &[
 /// Comparison operators: their folded NULL is a boolean.
 const COMPARISON: &[&str] = &["=", "<>", "!=", "<", "<=", ">", ">="];
 
-fn is_null_constant(n: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn is_null_constant(n: &pg_query::protobuf::Node) -> bool {
     match n.node.as_ref() {
         Some(N::AConst(c)) => c.isnull,
         Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(is_null_constant),
@@ -29,7 +29,7 @@ fn is_null_constant(n: &pg_query::protobuf::Node) -> bool {
 }
 
 /// `NULL::pg_catalog.bool`, the value and type a folded comparison has.
-fn null_bool() -> pg_query::protobuf::Node {
+pub(crate) fn null_bool() -> pg_query::protobuf::Node {
     let null = pg_query::protobuf::Node {
         node: Some(N::AConst(pg_query::protobuf::AConst {
             isnull: true,
@@ -73,7 +73,7 @@ fn strict_op(n: &pg_query::protobuf::Node) -> Option<&str> {
 
 /// Is `n` NULL by strictness alone: a NULL constant, or a strict operator
 /// with such an argument, however deep.
-fn null_through(n: &pg_query::protobuf::Node) -> bool {
+pub(crate) fn null_through(n: &pg_query::protobuf::Node) -> bool {
     if is_null_constant(n) {
         return true;
     }
@@ -91,7 +91,7 @@ fn null_through(n: &pg_query::protobuf::Node) -> bool {
 /// arithmetic node's type is its operands' (`pg_typeof(1 + NULL)` is
 /// integer), which a bare NULL would lose. An arithmetic node with a NULL
 /// operand is reached through the comparison above it (`c / 0 + NULL > 1`).
-fn fold(node: &mut pg_query::protobuf::Node) -> Result<bool> {
+pub(crate) fn fold_expr(node: &mut pg_query::protobuf::Node) -> Result<bool> {
     let mut changed = false;
     walk_expr(node, &mut |n| {
         if strict_op(n).is_some_and(|op| COMPARISON.contains(&op)) && null_through(n) {
@@ -124,7 +124,7 @@ pub(crate) fn fold_select(
             let root_is_operator = rt.val.as_deref().is_some_and(|v| strict_op(v).is_some());
             if let Some(v) = rt.val.as_deref_mut() {
                 // A folded root keeps the name the operator gave it.
-                if fold(v)? {
+                if fold_expr(v)? {
                     changed = true;
                     if root_is_operator && rt.name.is_empty() {
                         rt.name = "?column?".into();
@@ -140,7 +140,7 @@ pub(crate) fn fold_select(
     .into_iter()
     .flatten()
     {
-        changed |= fold(clause)?;
+        changed |= fold_expr(clause)?;
     }
     Ok(changed.then_some(out))
 }
