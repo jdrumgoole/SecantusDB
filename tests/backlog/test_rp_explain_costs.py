@@ -2256,6 +2256,138 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: ((a >= 15) AND (a <= 55) AND (b <> 'v3'::text))",
         ],
     ),
+    # RP-399's regression scenarios, measured on a private 15.19 cluster:
+    # a joined scan's BETWEEN is flat too, an index takes its two clauses
+    # as two Index Conds, and a BETWEEN over a LEFT join's nullable side
+    # proves it non-NULL as its two clauses do (`reduce_outer_joins`).
+    "a joined scan's between is two flat conjuncts": (
+        "RP-399",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s join e on s.a = e.a"
+        " where e.a between 15 and 55 and e.b <> 'v3'",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a >= 15) AND (a <= 55) AND (b <> 'v3'::text))",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    "a where between over a left join's nullable side makes it inner": (
+        "RP-399",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join e on s.a = e.a where e.a between 15 and 55",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a >= 15) AND (a <= 55))",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    "a composite index's between is two index conds": (
+        "RP-399",
+        _N,
+        "explain select * from n where a between 7 and 9 and b = 3",
+        [
+            "Index Scan using n_ab on n  (cost=0.28..8.33 rows=1 width=11)",
+            "  Index Cond: ((a >= 7) AND (a <= 9) AND (b = 3))",
+        ],
+    ),
+    "a composite index's second column between": (
+        "RP-399",
+        _N,
+        "explain (costs off) select * from n where a = 7 and b between 1 and 3",
+        [
+            "Index Scan using n_ab on n",
+            "  Index Cond: ((a = 7) AND (b >= 1) AND (b <= 3))",
+        ],
+    ),
+    # NOT BETWEEN is an OR, which costs its two operators: after a
+    # cheaper conjunct (`order_qual_clauses`; found while working RP-399).
+    "a scan filter's or after a cheaper conjunct": (
+        "RP-406",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where a not between 15 and 55 and b <> 'v3'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b <> 'v3'::text) AND ((a < 15) OR (a > 55)))",
+        ],
+    ),
+    # A strict operator over a NULL constant folds to NULL
+    # (`eval_const_expressions`), and a NULL qual is a constant false:
+    # no scan at all (found while working RP-399).
+    "a comparison with a null constant is a false one-time filter": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a = null",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "a between with a null bound is a false one-time filter": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a between null and 15 and b <> 'v3'",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    # A table whose only index is a composite one, its WHERE constraining
+    # both columns (found while working RP-399).
+    "a table's only index composite": (
+        "RP-410",
+        [
+            "create table t2 (a int, b int, c text)",
+            "insert into t2 select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",
+            "create index t2_ab on t2 (a, b)",
+            "analyze t2",
+        ],
+        "explain select * from t2 where a = 15 and b = 3",
+        [
+            "Index Scan using t2_ab on t2  (cost=0.28..8.30 rows=1 width=11)",
+            "  Index Cond: ((a = 15) AND (b = 3))",
+        ],
+    ),
+    # An IN or EXISTS subquery pulled up into a semi join
+    # (`convert_ANY_sublink_to_join`, `convert_EXISTS_sublink_to_join`;
+    # found while working RP-399).
+    "an in subquery is a hash semi join": (
+        "RP-411",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where a in (select a from s)",
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    "an exists subquery is a hash semi join": (
+        "RP-411",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where exists (select 1 from s where s.a = e.a)",
+        [
+            "Hash Semi Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # NOT is pushed through AND / OR onto the negator operators
+    # (`negate_clause`; found while working RP-399).
+    "a not over an or is the and of its negated arms": (
+        "RP-412",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where not (a > 15 or b = 'v3')",
+        ["Seq Scan on e", "  Filter: ((a <= 15) AND (b <> 'v3'::text))"],
+    ),
+    "a not over a between is the or of its negators": (
+        "RP-412",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where not (a between 15 and 55)",
+        ["Seq Scan on e", "  Filter: ((a < 15) OR (a > 55))"],
+    ),
     # A LEFT join on an indexed key is a Merge Right Join reading the
     # index in key order, its other side sorted (found while working
     # RP-395).
@@ -2975,6 +3107,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-394",
         "RP-395",
         "RP-396",
+        "RP-399",
         "RP-403",
         "RP-405",
     )

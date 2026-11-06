@@ -3100,6 +3100,15 @@ pub(crate) fn strict_aliases(
             _ => false,
         }
     }
+    // A BETWEEN is the AND of its two clauses (`transformAExprBetween`),
+    // and an AND proves non-NULL what either arm does
+    // (`find_nonnullable_rels`, RP-399).
+    if let Some(halves) = crate::ruleutils::between_clauses(n) {
+        return halves
+            .iter()
+            .flat_map(|h| strict_aliases(h, owner))
+            .collect();
+    }
     let mut out = Vec::new();
     let strict = match n.node.as_ref() {
         Some(N::AExpr(e))

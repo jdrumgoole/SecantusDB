@@ -3782,6 +3782,57 @@ pub fn rule_def(
     Some(out)
 }
 
+/// The clauses `transformAExprBetween` makes of `x BETWEEN lo AND hi`:
+/// `x >= lo` and `x <= hi`, under an AND that the planner flattens into the
+/// qual list beside the statement's other conjuncts, so EXPLAIN prints
+/// them as two quals (RP-399). `None` for any other node: NOT BETWEEN and
+/// the SYMMETRIC forms are an OR, which stays one clause.
+pub fn between_clauses(n: &Node) -> Option<[Node; 2]> {
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return None;
+    };
+    if e.kind != AExprKind::AexprBetween as i32 {
+        return None;
+    }
+    let Some(N::List(list)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) else {
+        return None;
+    };
+    let [lo, hi] = list.items.as_slice() else {
+        return None;
+    };
+    let clause = |op: &str, bound: &Node| Node {
+        node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+            kind: AExprKind::AexprOp as i32,
+            name: vec![Node {
+                node: Some(N::String(pg_query::protobuf::String {
+                    sval: op.to_string(),
+                })),
+            }],
+            lexpr: e.lexpr.clone(),
+            rexpr: Some(Box::new(bound.clone())),
+            location: e.location,
+        }))),
+    };
+    Some([clause(">=", lo), clause("<=", hi)])
+}
+
+/// A qual's conjuncts as the planner lists them: nested ANDs flattened
+/// (`make_ands_implicit` over an AND `eval_const_expressions` has
+/// flattened) and a BETWEEN as its two clauses ([`between_clauses`]).
+pub fn and_clauses<'n>(n: &'n Node, out: &mut Vec<std::borrow::Cow<'n, Node>>) {
+    match n.node.as_ref() {
+        Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
+            for a in &b.args {
+                and_clauses(a, out);
+            }
+        }
+        _ => match between_clauses(n) {
+            Some(halves) => out.extend(halves.map(std::borrow::Cow::Owned)),
+            None => out.push(std::borrow::Cow::Borrowed(n)),
+        },
+    }
+}
+
 /// A single-relation WHERE as EXPLAIN shows it: each top-level AND conjunct
 /// printed as ruleutils prints it (columns unqualified), with the column it
 /// compares to a constant when it is an index-usable shape
@@ -3792,21 +3843,11 @@ pub fn explain_conjuncts(
     def: &TableDef,
 ) -> Option<Vec<(String, Option<String>)>> {
     let mut parts = Vec::new();
-    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-        match n.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
-                for a in &b.args {
-                    flatten(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
-    flatten(where_clause, &mut parts);
+    and_clauses(where_clause, &mut parts);
     parts
         .iter()
-        .copied()
         .map(|p| {
+            let p: &Node = p;
             let text = expr_node_planned(p, def)?;
             Some((text, qual_column(p)))
         })
@@ -3823,19 +3864,10 @@ pub type OrArms = Vec<(String, Vec<Vec<(String, Option<String>)>>)>;
 /// does not know.
 pub fn explain_or_arms(where_clause: &Node, def: &TableDef) -> Option<OrArms> {
     let mut parts = Vec::new();
-    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-        match n.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
-                for a in &b.args {
-                    flatten(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
-    flatten(where_clause, &mut parts);
+    and_clauses(where_clause, &mut parts);
     let mut out = Vec::new();
-    for p in parts {
+    for p in &parts {
+        let p: &Node = p;
         let Some(N::BoolExpr(b)) = p.node.as_ref() else {
             continue;
         };
@@ -3927,7 +3959,7 @@ fn qual_column(p: &Node) -> Option<String> {
 /// column equal to two constants (a class whose clauses are generated
 /// otherwise).
 fn qual_order(
-    parts: &[&Node],
+    parts: &[std::borrow::Cow<'_, Node>],
     printed: Vec<(String, Option<String>)>,
 ) -> Vec<(String, Option<String>)> {
     use crate::costsize::CPU_OPERATOR_COST as OP;
@@ -4060,16 +4092,6 @@ pub fn join_conditions_split(
             _ => {}
         }
     }
-    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-        match n.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
-                for a in &b.args {
-                    flatten(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
     // The relations an expression's columns belong to; `None` when one
     // does not resolve.
     fn rels_of(p: &Printer<'_>, n: &Node) -> Option<Vec<String>> {
@@ -4132,10 +4154,11 @@ pub fn join_conditions_split(
                     refnames(j.larg.as_deref()?, &mut left);
                     refnames(j.rarg.as_deref()?, &mut right);
                     let mut parts = Vec::new();
-                    flatten(q, &mut parts);
+                    and_clauses(q, &mut parts);
                     let mut hash = Vec::new();
                     let mut rest: Vec<(usize, String)> = Vec::new();
-                    for part in parts {
+                    for part in &parts {
+                        let part: &Node = part;
                         p.buf.clear();
                         p.expr(part)?;
                         let text = std::mem::take(&mut p.buf);
@@ -4235,17 +4258,7 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
         }
     }
     let mut parts = Vec::new();
-    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-        match n.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
-                for a in &b.args {
-                    flatten(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
-    flatten(w, &mut parts);
+    and_clauses(w, &mut parts);
     // The relations a conjunct proves non-NULL, as the planner's own
     // `reduce_outer_joins` finds them (`joins::strict_aliases`), so the
     // printed plan reduces the joins the executed one does: a comparison
@@ -4267,7 +4280,8 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
         nullable(item, &nonnull, &mut nulls);
     }
     let mut out = Vec::new();
-    for part in parts {
+    for part in &parts {
+        let part: &Node = part;
         p.buf.clear();
         p.expr(part)?;
         let text = std::mem::take(&mut p.buf);
@@ -4324,18 +4338,8 @@ pub fn comma_join_conds(
         return Ok(Vec::new());
     };
     crate::cancel::check()?;
-    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-        match n.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
-                for a in &b.args {
-                    flatten(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
     let mut parts = Vec::new();
-    flatten(w, &mut parts);
+    and_clauses(w, &mut parts);
     if parts.len() != quals.len() {
         return Ok(Vec::new());
     }
@@ -4369,7 +4373,7 @@ pub fn comma_join_conds(
         .collect();
     let mut rest: Vec<(usize, JoinQual)> = Vec::with_capacity(slots.len());
     for i in &slots {
-        rest.push((qual_operators(parts[*i])?, std::mem::take(&mut quals[*i])));
+        rest.push((qual_operators(&parts[*i])?, std::mem::take(&mut quals[*i])));
     }
     rest.sort_by_key(|(ops, _)| *ops);
     for (slot, (_, qual)) in slots.iter().zip(rest) {
@@ -4507,17 +4511,7 @@ fn expr_node_planned(n: &Node, def: &TableDef) -> Option<String> {
 /// table holds more than one relation.
 pub fn explain_subquery_conjuncts(where_clause: &Node, def: &TableDef) -> Option<Vec<String>> {
     let mut parts = Vec::new();
-    fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
-        match n.node.as_ref() {
-            Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
-                for a in &b.args {
-                    flatten(a, out);
-                }
-            }
-            _ => out.push(n),
-        }
-    }
-    flatten(where_clause, &mut parts);
+    and_clauses(where_clause, &mut parts);
     let printed = parts
         .iter()
         .map(|p| Some((expr_node_printed_with(p, def, true, false)?, None)))
@@ -4778,6 +4772,58 @@ mod index_qual_columns {
             };
             let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
             assert_eq!(got[0].1.as_deref(), want, "{sql}");
+        }
+    }
+
+    /// A BETWEEN is two quals of the scan's one list, each constraining its
+    /// column, and a nested AND is flattened, as PostgreSQL 15.19 prints a
+    /// Filter; NOT BETWEEN and BETWEEN SYMMETRIC are each one OR (RP-399).
+    #[test]
+    fn a_between_is_two_quals() {
+        let def = TableDef::new(
+            "e",
+            vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+        );
+        let a = || Some("a".to_string());
+        for (sql, want) in [
+            (
+                "a between 15 and 55 and b <> 'v3'",
+                vec![
+                    ("(a >= 15)", a()),
+                    ("(a <= 55)", a()),
+                    ("(b <> 'v3'::text)", None),
+                ],
+            ),
+            (
+                "(a between 1 and 2 and a <> 9) and a < 5",
+                vec![
+                    ("(a >= 1)", a()),
+                    ("(a <= 2)", a()),
+                    ("(a <> 9)", None),
+                    ("(a < 5)", a()),
+                ],
+            ),
+            (
+                "a not between 1 and 2",
+                vec![("((a < 1) OR (a > 2))", None)],
+            ),
+            (
+                "a between symmetric 2 and 1",
+                vec![("(((a >= 2) AND (a <= 1)) OR ((a >= 1) AND (a <= 2)))", None)],
+            ),
+        ] {
+            let p = pg_query::parse(&format!("select * from e where {sql}")).unwrap();
+            let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+            else {
+                panic!()
+            };
+            let got = explain_conjuncts(s.where_clause.as_deref().unwrap(), &def).unwrap();
+            let want: Vec<(String, Option<String>)> =
+                want.into_iter().map(|(t, c)| (t.to_string(), c)).collect();
+            assert_eq!(got, want, "{sql}");
         }
     }
 }

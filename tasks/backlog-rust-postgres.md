@@ -1434,15 +1434,6 @@ a regression test.
       Measured on a private 15.19 cluster (found while working RP-395).
       Backlog-ID: RP-398
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a joined scan's filter puts its equality to a constant last]
-- [ ] **A scan's BETWEEN prints as a nested AND.** PostgreSQL 15.19
-      expands `a between 15 and 55` into two quals of the scan's one list:
-      `select * from e where a between 15 and 55 and b <> 'v3'` is
-      `Filter: ((a >= 15) AND (a <= 55) AND (b <> 'v3'::text))`; here
-      `(((a >= 15) AND (a <= 55)) AND (b <> 'v3'::text))`, alone or in a
-      join. Measured on a private 15.19 cluster (found while working
-      RP-395).
-      Backlog-ID: RP-399
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan's between is two flat conjuncts]
 - [ ] **A join whose WHERE equates a column to two constants still scans.**
       PostgreSQL 15.19 finds the equivalence class contradictory and plans
       no scan: `select * from s join e on s.a < e.a where e.b = 'v1' and
@@ -1496,9 +1487,15 @@ a regression test.
       ((a + 1) > 996))`, the expression's two operators after the
       column's one. Here the conjuncts are printed as written (a join's
       scan keeps the written order in other cases too, RP-398). Measured
-      on a private 15.19 cluster (found while working RP-403).
+      on a private 15.19 cluster (found while working RP-403). The same
+      for an OR, which costs its operators (`a not between 15 and 55 and b
+      <> 'v3'` is `Filter: ((b <> 'v3'::text) AND ((a < 15) OR (a >
+      55)))`), and for a coerced column (`a between 1 and 5.5 and b <>
+      'v3'` puts `((a)::numeric <= 5.5)` after `(b <> 'v3'::text)`, the
+      cast a function call); here both keep the written order (found while
+      working RP-399).
       Backlog-ID: RP-406
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's conjuncts in cost order]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's conjuncts in cost order], tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's or after a cheaper conjunct]
 - [ ] **A constant coerced to its operator's type prints unfolded.**
       PostgreSQL 15.19 folds the coercion of an integer literal compared
       with a numeric before it prints the qual
@@ -1519,6 +1516,57 @@ a regression test.
       15.19 cluster (found while working RP-405).
       Backlog-ID: RP-408
       Verify: tests/backlog/test_rp_column_hint.py::test_missing_column_hint
+- [ ] **A comparison with a NULL constant still scans, and alone prints an
+      index the table does not have.** PostgreSQL 15.19 folds a strict
+      operator over a NULL constant to NULL (`eval_const_expressions`)
+      and a NULL qual to a constant false: `select * from e where a =
+      null` (no index on `e`) is `Result` with `One-Time Filter: false`,
+      and so are `a < null`, `null = a`, `a = null::int` and `a between
+      null and 15 and b <> 'v3'`. Here the lone comparison prints `Index
+      Scan using e_pkey on e` with `Filter: (a = NULL::integer)`, an
+      index no catalog lists, and beside another conjunct a `Seq Scan`
+      with the comparison in its Filter. Its rows are right (none).
+      Measured on a private 15.19 cluster (found while working RP-399).
+      Backlog-ID: RP-409
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a comparison with a null constant is a false one-time filter], tests/backlog/test_rp_explain_costs.py::test_plan[a between with a null bound is a false one-time filter]
+- [ ] **A table whose only index is a composite one prices no scan of
+      both its columns.** `create table t2 (a int, b int, c text)`, 5,000
+      rows, `create index t2_ab on t2 (a, b)`, analysed: PostgreSQL 15.19
+      plans `select * from t2 where a = 15 and b = 3` as `Index Scan using
+      t2_ab on t2  (cost=0.28..8.30 rows=1 width=11)` with `Index Cond:
+      ((a = 15) AND (b = 3))`; here a `Seq Scan on t2  (cost=0.00..0.00
+      rows=0 width=0)`, no estimate at all. The same table with a second,
+      one-column index (`n` in the scenarios, `n_b` beside `n_ab`) is
+      planned as PostgreSQL plans it, and so is `where a = 15` alone. Its
+      rows are right; the order they come out in may not be. Measured on
+      a private 15.19 cluster (found while working RP-399).
+      Backlog-ID: RP-410
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a table's only index composite]
+- [ ] **EXPLAIN of an IN or EXISTS subquery prints `Filter: (...)`, not
+      PostgreSQL's semi join.** PostgreSQL 15.19 pulls `select * from e
+      where a in (select a from s)` and `... where exists (select 1 from s
+      where s.a = e.a)` up into a join (`convert_ANY_sublink_to_join`,
+      `convert_EXISTS_sublink_to_join`) and prints a `Hash Semi Join` on
+      `(e.a = s.a)` over `Seq Scan on e` and a Hash of `Seq Scan on s`;
+      here `Seq Scan on e` with `Filter: (...)`, and the subquery's own
+      scan, Filter included, is not printed. Related to the semi join
+      RP-131 names for `element_types`. Measured on a private 15.19
+      cluster (found while working RP-399).
+      Backlog-ID: RP-411
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an in subquery is a hash semi join], tests/backlog/test_rp_explain_costs.py::test_plan[an exists subquery is a hash semi join]
+- [ ] **A NOT over an AND, an OR or a BETWEEN prints as written, not
+      pushed onto its arms.** PostgreSQL 15.19's `negate_clause` (during
+      `eval_const_expressions`) applies De Morgan and replaces each
+      operator by its negator: `select * from e where not (a > 15 or b =
+      'v3')` is `Filter: ((a <= 15) AND (b <> 'v3'::text))` and `not (a
+      between 15 and 55)` is `Filter: ((a < 15) OR (a > 55))`; here
+      `(NOT ((a > 15) OR (b = 'v3'::text)))` and `(NOT ((a >= 15) AND (a
+      <= 55)))`. An AND that comes out is then flattened into the scan's
+      quals, which can change the index conditions and the estimate. Its
+      rows are right. Measured on a private 15.19 cluster (found while
+      working RP-399).
+      Backlog-ID: RP-412
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators]
 
 ## Found by batch 54 (2026-10-24)
 
