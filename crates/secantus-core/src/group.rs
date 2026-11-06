@@ -1924,6 +1924,13 @@ const ACCUMULATORS: &[&str] = &[
     "$accumulator",
 ];
 
+/// Whether `op` is one of mongod's `$group` accumulators. `$setWindowFields`
+/// asks, because a name that is not an accumulator at all is not a window
+/// function either and mongod says so by name (measured 8.2.11, 2026-11-06).
+pub(crate) fn is_accumulator(op: &str) -> bool {
+    ACCUMULATORS.contains(&op)
+}
+
 /// A number's value as a double -- int, long, double or Decimal128, and never
 /// a bool, which mongod's argument checks refuse (`buckets: true` is 40241;
 /// measured 8.2.11, 2026-10-23). A Decimal128 that is not a whole long reads

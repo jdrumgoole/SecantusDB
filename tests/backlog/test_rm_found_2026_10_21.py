@@ -40,15 +40,7 @@ _EMA_DOCS = [
 ]
 
 
-@pytest.mark.backlog("RM-225")
-@pytest.mark.parametrize("spec", [{"N": 2}, {"alpha": 0.75}], ids=["N", "alpha"])
-def test_exp_moving_avg_over_null_missing_and_decimal(
-    rust_mongo: Any, mongod: Any, spec: dict
-) -> None:
-    """mongod 8.2.11 averages over a null, a missing and a Decimal128 input
-    (the null and missing rows answer null and do not move the average; a
-    Decimal128 input turns the average decimal). The Rust server answers
-    2 "not supported by the Rust server" for all of it."""
+def _ema_answers(rust_mongo: Any, mongod: Any, spec: dict) -> tuple[str, str]:
     pipeline = [
         {
             "$setWindowFields": {
@@ -58,7 +50,77 @@ def test_exp_moving_avg_over_null_missing_and_decimal(
         },
         {"$sort": {"_id": 1}},
     ]
-    ours, theirs = _answers(rust_mongo, mongod, _EMA_DOCS, pipeline)
+    return _answers(rust_mongo, mongod, _EMA_DOCS, pipeline)
+
+
+@pytest.mark.backlog_fixed("RM-225")
+@pytest.mark.parametrize("spec", [{"N": 2}, {"N": 3}, {"N": 1}], ids=["N 2", "N 3", "N 1"])
+def test_exp_moving_avg_over_null_missing_and_decimal(
+    rust_mongo: Any, mongod: Any, spec: dict
+) -> None:
+    """mongod 8.2.11 averages past an input that is not a number: a null or
+    missing row answers the average UNCHANGED (null before the first numeric
+    row) and does not move it, and a Decimal128 input makes the average
+    decimal from that row on -- with mongod's own scale, which for an `N`
+    comes from dividing `2/(N+1)` in Decimal128. The Rust server answered
+    2 "not supported by the Rust server" for all of it (re-measured
+    2026-11-06: this test's older docstring said the null rows answer null,
+    which is true only of a LEADING one)."""
+    ours, theirs = _ema_answers(rust_mongo, mongod, spec)
+    assert ours == theirs
+
+
+@pytest.mark.backlog_fixed("RM-225")
+@pytest.mark.parametrize(
+    "spec",
+    [{"alpha": 0.75}, {"alpha": 0.5}, {"alpha": 0.001}, {"alpha": 0.999}],
+    ids=["0.75", "0.5", "0.001", "0.999"],
+)
+def test_exp_moving_avg_with_an_alpha_over_a_decimal(
+    rust_mongo: Any, mongod: Any, spec: dict
+) -> None:
+    """The smoothing factor given as `alpha` rather than `N` reaches the same
+    values but a different SCALE, because an `alpha` double converts into the
+    decimal accumulator at 15 significant digits while `N` divides exactly:
+    `alpha: 0.5` over this corpus answers 30 decimals where `N: 3` answers
+    two. Both are mongod's (measured 2026-11-06)."""
+    ours, theirs = _ema_answers(rust_mongo, mongod, spec)
+    assert ours == theirs
+
+
+#: Shapes from the 1,170-case sweep of 2026-11-06 that the pre-fix server got
+#: wrong in its DOUBLE answer -- mongod computes the average in Decimal128 and
+#: converts, so `{N: 2}` over `[10, 0.1]` answers `3.4` where the same steps
+#: in IEEE doubles answer `3.400000000000001`.
+_DOUBLE_SCALE_DOCS: list[tuple[str, dict, list]] = [
+    ("N 2 over 10 and 0.1", {"N": 2}, [10, 0.1]),
+    ("N 100 over 10 and 0.1", {"N": 100}, [10, 0.1]),
+    ("alpha 0.999 over 10 and 0.1", {"alpha": 0.999}, [10, 0.1]),
+    ("N 2 over a long and 10", {"N": 2}, [2**40, 10]),
+    ("alpha 0.1 over 4.0 and a long", {"alpha": 0.1}, [4.0, 2**40]),
+]
+
+
+@pytest.mark.backlog_fixed("RM-225")
+@pytest.mark.parametrize(
+    ("name", "spec", "xs"), _DOUBLE_SCALE_DOCS, ids=[n for n, _, _ in _DOUBLE_SCALE_DOCS]
+)
+def test_exp_moving_avg_doubles_come_from_the_decimal_average(
+    rust_mongo: Any, mongod: Any, name: str, spec: dict, xs: list
+) -> None:
+    """mongod's double answer is its Decimal128 average converted, not a
+    double computation, so it is free of the drift IEEE steps accumulate."""
+    docs = [{"_id": i, "x": x} for i, x in enumerate(xs, start=1)]
+    pipeline = [
+        {
+            "$setWindowFields": {
+                "sortBy": {"_id": 1},
+                "output": {"e": {"$expMovingAvg": {"input": "$x", **spec}}},
+            }
+        },
+        {"$sort": {"_id": 1}},
+    ]
+    ours, theirs = _answers(rust_mongo, mongod, docs, pipeline)
     assert ours == theirs
 
 
@@ -92,15 +154,124 @@ _BAD_SPECS = [
 ]
 
 
-@pytest.mark.backlog("RM-226")
-@pytest.mark.parametrize(("name", "stage"), _BAD_SPECS, ids=[n for n, _ in _BAD_SPECS])
+#: Shapes measured on 2026-11-06 while fixing RM-226, each with a code and
+#: message of mongod's own. The last two of `_BAD_SPECS` plus these: the
+#: precedence cases (a `window` on a spec that also lacks a `sortBy` names the
+#: window) and the `$group`-only accumulators mongod refuses by name.
+_MORE_BAD_SPECS: list[tuple[str, dict]] = [
+    (
+        "shift without a sortBy",
+        {"output": {"s": {"$shift": {"output": "$y", "by": 1}}}},
+    ),
+    (
+        "shift with a window and no sortBy",
+        {
+            "output": {
+                "s": {
+                    "$shift": {"output": "$y", "by": 1},
+                    "window": {"documents": ["unbounded", "current"]},
+                }
+            }
+        },
+    ),
+    (
+        "linearFill with two sort keys",
+        {"sortBy": {"a": 1, "b": 1}, "output": {"f": {"$linearFill": "$y"}}},
+    ),
+    (
+        "linearFill with a window",
+        {
+            "sortBy": {"a": 1},
+            "output": {
+                "f": {"$linearFill": "$y", "window": {"documents": ["unbounded", "current"]}}
+            },
+        },
+    ),
+    (
+        "locf with a window",
+        {
+            "sortBy": {"a": 1},
+            "output": {"f": {"$locf": "$y", "window": {"documents": ["unbounded", "current"]}}},
+        },
+    ),
+    (
+        "range bounds over a descending sortBy",
+        {"sortBy": {"a": -1}, "output": {"r": {"$sum": "$y", "window": {"range": [-1, 1]}}}},
+    ),
+    (
+        "two functions in one output field",
+        {"sortBy": {"a": 1}, "output": {"r": {"$sum": "$y", "$avg": "$y"}}},
+    ),
+    (
+        "an unknown window function",
+        {"sortBy": {"a": 1}, "output": {"r": {"$notAFunction": "$y"}}},
+    ),
+    (
+        "mergeObjects as a window function",
+        {"sortBy": {"a": 1}, "output": {"r": {"$mergeObjects": "$y"}}},
+    ),
+    ("a sortBy that is not a document", {"sortBy": "a", "output": {"r": {"$sum": "$y"}}}),
+]
+
+_ALL_BAD_SPECS = _BAD_SPECS + _MORE_BAD_SPECS
+
+
+@pytest.mark.backlog_fixed("RM-226")
+@pytest.mark.parametrize(("name", "stage"), _ALL_BAD_SPECS, ids=[n for n, _ in _ALL_BAD_SPECS])
 def test_window_spec_errors_carry_mongods_codes(
     rust_mongo: Any, mongod: Any, name: str, stage: dict
 ) -> None:
-    """mongod 8.2.11 refuses each spec with a code of its own: 605001,
-    9 ("$shift does not accept a 'window' field"), 5339902 and 5429414. The
-    Rust server answers 2 "not supported by the Rust server" for all four."""
+    """Each spec is refused with mongod's own code and message: 605001 and
+    5339902 and 8947401 at parse time, 5429414 from the executor, 14 for a
+    wrong-typed `sortBy`, and 9 for the rest. The Rust server answered
+    2 "not supported by the Rust server" for all of them."""
     ours, theirs = _answers(rust_mongo, mongod, _SPEC_DOCS, [{"$setWindowFields": stage}])
+    assert ours == theirs
+
+
+#: Out of insertion order on `a`, with a null and a missing `y`, so a
+#: carry-forward and an order difference both show.
+_ACCEPTED_DOCS = [
+    {"_id": 1, "a": 3, "y": 1},
+    {"_id": 2, "a": 1, "y": None},
+    {"_id": 3, "a": 2},
+    {"_id": 4, "a": 5, "y": 7},
+]
+
+
+@pytest.mark.backlog_fixed("RM-367")
+@pytest.mark.parametrize(
+    "stage",
+    [{"sortBy": {"a": 1}, "output": {}}, {"output": {}}],
+    ids=["with a sortBy", "without a sortBy"],
+)
+def test_an_empty_output_passes_the_documents_through(
+    rust_mongo: Any, mongod: Any, stage: dict
+) -> None:
+    """mongod 8.2.11 accepts an empty `output`: the documents come back
+    unchanged, in sortBy order when the stage has one and input order when it
+    does not (measured 2026-11-06). The Rust server refused the stage with
+    2 "not supported by the Rust server"."""
+    ours, theirs = _answers(rust_mongo, mongod, _ACCEPTED_DOCS, [{"$setWindowFields": stage}])
+    assert ours == theirs
+
+
+@pytest.mark.backlog_fixed("RM-368")
+@pytest.mark.parametrize(
+    "stage",
+    [
+        {"output": {"f": {"$locf": "$y"}}},
+        {"partitionBy": {"$mod": ["$a", 2]}, "output": {"f": {"$locf": "$y"}}},
+    ],
+    ids=["one partition", "partitioned"],
+)
+def test_locf_needs_no_sort_by(rust_mongo: Any, mongod: Any, stage: dict) -> None:
+    """`$locf` takes no `sortBy` on mongod 8.2.11: it carries the last
+    observation forward in the partition's own order, and a leading row with
+    nothing to carry answers null (measured 2026-11-06). The Rust server
+    required a `sortBy` and refused the stage with 2 "not supported by the
+    Rust server"."""
+    ours, theirs = _answers(rust_mongo, mongod, _ACCEPTED_DOCS, [{"$setWindowFields": stage}])
     assert ours == theirs
 
 

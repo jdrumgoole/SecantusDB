@@ -108,12 +108,25 @@ pub(crate) fn set_window_fields_each(
     let sort_by = match spec.get("sortBy") {
         None => None,
         Some(Bson::Document(d)) => Some(d),
-        Some(_) => return Err(Fallback::Defer),
+        // Measured 8.2.11, 2026-11-06: a non-document `sortBy` is refused by
+        // the command parser, naming the type it got.
+        Some(other) => {
+            return Err(Fallback::mongo(
+                14,
+                format!(
+                    "BSON field '$setWindowFields.sortBy' is the wrong type '{}', expected type 'object'",
+                    crate::query::bson_type_name(other)
+                ),
+            )
+            .bare())
+        }
     };
+    // An EMPTY `output` is accepted: mongod answers the partition's documents
+    // unchanged, in sortBy order when there is one (measured 8.2.11,
+    // 2026-11-06), so it runs the ordinary machinery with no output fields.
     let output = spec
         .get("output")
         .and_then(Bson::as_document)
-        .filter(|o| !o.is_empty())
         .ok_or(Fallback::Defer)?;
 
     // Compile the output fields: each is `{<$accumulator>: arg, window?: {...}}`.
@@ -133,7 +146,12 @@ pub(crate) fn set_window_fields_each(
                 continue;
             }
             if acc.is_some() {
-                return Err(Fallback::Defer); // more than one accumulator
+                // Measured 8.2.11, 2026-11-06.
+                return Err(Fallback::mongo(
+                    9,
+                    "Cannot specify two functions in window function spec",
+                )
+                .bare());
             }
             acc = Some((k, v));
         }
@@ -154,7 +172,15 @@ pub(crate) fn set_window_fields_each(
             // Position-based (like the rank funcs): requires a sortBy, no window,
             // and an `{output, by: <int>, default?}` spec.
             let spec = arg.as_document().ok_or(Fallback::Defer)?;
-            if window.is_some() || sort_by.is_none() || !spec.contains_key("output") {
+            // Measured 8.2.11, 2026-11-06: the `window` refusal comes first --
+            // a spec with both a window and no sortBy names the window.
+            if window.is_some() {
+                return Err(Fallback::mongo(9, "$shift does not accept a 'window' field").bare());
+            }
+            if sort_by.is_none() {
+                return Err(Fallback::mongo(9, "'$shift' requires a sortBy").bare());
+            }
+            if !spec.contains_key("output") {
                 return Err(Fallback::Defer);
             }
             if !matches!(spec.get("by"), Some(Bson::Int32(_)) | Some(Bson::Int64(_))) {
@@ -169,10 +195,22 @@ pub(crate) fn set_window_fields_each(
             ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
         } else if op == "$locf" || op == "$linearFill" {
             // Gap-fill over the sorted partition; `arg` is the input expression.
-            // No window; requires a sortBy ($linearFill also a numeric x-axis,
-            // checked when the vector is built).
-            if window.is_some() || sort_by.is_none() {
-                return Err(Fallback::Defer);
+            // No window ($linearFill's x-axis is checked when the vector is
+            // built). Measured 8.2.11, 2026-11-06: the `window` refusal comes
+            // before the sortBy one, and $linearFill -- unlike $locf -- needs a
+            // top-level sortBy of exactly one element.
+            if window.is_some() {
+                return Err(
+                    Fallback::mongo(9, format!("'window' field is not allowed in {op}")).bare(),
+                );
+            }
+            if op == "$linearFill" && sort_by.is_none_or(|sb| sb.len() != 1) {
+                return Err(Fallback::mongo(
+                    605001,
+                    "$linearFill must be specified with a top level sortBy expression with \
+                     exactly one element",
+                )
+                .bare());
             }
         } else if op == "$derivative" || op == "$integral" {
             // Window operators over the sortBy value (x) and input (y). Requires a
@@ -191,12 +229,18 @@ pub(crate) fn set_window_fields_each(
             }
         } else if COVARIANCE_OPS.contains(&op) {
             // `[x, y]`, evaluated per document; any window.
-        } else if op == "$mergeObjects" {
-            // $mergeObjects is a $group-only accumulator; mongod rejects it as a
-            // window function (FailedToParse) — defer so Python raises the code.
-            return Err(Fallback::Defer);
+        } else if op == "$mergeObjects" || op == "$accumulator" {
+            // $group-only accumulators. Measured 8.2.11, 2026-11-06: mongod
+            // refuses them as window functions by name, as it does an unknown
+            // one.
+            return Err(Fallback::mongo(9, format!("Unrecognized window function, {op}")).bare());
+        } else if !group::is_accumulator(op) {
+            // Not an accumulator at all, so not a window function either --
+            // mongod names it (measured 8.2.11, 2026-11-06: every accumulator
+            // but $mergeObjects and $accumulator IS a window function).
+            return Err(Fallback::mongo(9, format!("Unrecognized window function, {op}")).bare());
         } else {
-            group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
+            group::new_acc(op)?; // an accumulator this server cannot run yet → defer
         }
         compiled.push(OutField {
             field,
@@ -204,6 +248,35 @@ pub(crate) fn set_window_fields_each(
             arg,
             window,
         });
+    }
+
+    // Range-based bounds need one ascending sortBy field, and mongod says so
+    // before it reads a document: both refusals fire on an empty collection
+    // (measured 8.2.11, 2026-11-06).
+    if compiled
+        .iter()
+        .any(|c| c.window.is_some_and(|w| w.contains_key("range")))
+    {
+        match sort_by {
+            None => return Err(Fallback::Defer),
+            Some(sb) if sb.len() != 1 => {
+                return Err(Fallback::mongo(
+                    5339902,
+                    "Range-based bounds require sortBy a single field",
+                )
+                .bare())
+            }
+            Some(sb) => {
+                let (_, dir) = sb.iter().next().unwrap();
+                if !matches!(dir, Bson::Int32(1) | Bson::Int64(1)) {
+                    return Err(Fallback::mongo(
+                        8947401,
+                        "Range-based bounds require an ascending sortBy",
+                    )
+                    .bare());
+                }
+            }
+        }
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
@@ -292,6 +365,38 @@ pub(crate) fn set_window_fields_each(
         } else {
             None
         };
+        // A plain (unitless) range window reads its bounds off the sortBy
+        // value, and mongod refuses a non-numeric one per partition, naming
+        // the type it found: `Invalid range: Expected the sortBy field to be a
+        // number, but it was null` under the executor wrapper (measured 8.2.11,
+        // 2026-11-06 -- an empty collection answers nothing at all, so this is
+        // execution-time, not parse-time).
+        if range_vals.is_none()
+            && range_dates.is_none()
+            && compiled.iter().any(|c| {
+                c.window
+                    .is_some_and(|w| w.contains_key("range") && !w.contains_key("unit"))
+            })
+        {
+            if let Some(sb) = sort_by.filter(|sb| sb.len() == 1) {
+                let (field, _) = sb.iter().next().unwrap();
+                if let Some(bad) = slots
+                    .iter()
+                    .map(|&i| field_value(&docs[i], field))
+                    .find(|v| as_number(v).is_none())
+                {
+                    return Err(Fallback::mongo(
+                        5429414,
+                        format!(
+                            "Invalid range: Expected the sortBy field to be a number, but it \
+                             was {}",
+                            crate::query::bson_type_name(&bad)
+                        ),
+                    )
+                    .exec());
+                }
+            }
+        }
         // mongod's partition cache over this partition: held to its budget,
         // spilled or refused (RM-211).
         run_cache(
@@ -1748,25 +1853,114 @@ fn ema_alpha(spec: &Document) -> R<f64> {
     }
 }
 
-/// Per-slot exponential moving average over the sorted partition, mirroring
-/// `_compute_ema`: `ema[0] = input[0]`; `ema[i] = input[i]*alpha +
-/// ema[i-1]*(1-alpha)`. Same IEEE-double ops as the oracle → bit-for-bit match.
-fn ema_values(slots: &[usize], docs: &[Document], spec: &Document, vars: &Document) -> R<Vec<f64>> {
-    let alpha = ema_alpha(spec)?;
+/// Per-slot exponential moving average over the sorted partition:
+/// `ema[0] = input[0]`; `ema[i] = input[i]*alpha + ema[i-1]*(1-alpha)`.
+///
+/// Measured on mongod 8.2.11 and 8.2.1, 2026-11-06 (RM-225). Two things that
+/// are not obvious from the output:
+///
+/// - An input no number reads -- null, missing, a string, a bool, an array --
+///   is SKIPPED: the average does not move and the row answers the average as
+///   it stands, which is null before the first numeric input. Not an error,
+///   not a zero.
+/// - The average is carried in **Decimal128 throughout**, and printed as a
+///   double until a Decimal128 input appears; from that row on the decimal is
+///   what comes out, carrying the scale the decimal arithmetic accumulated.
+///   That is the only model that reproduces mongod's scales: `N: 3` over a
+///   7.0 average and a Decimal128 2.5 answers `4.75` (the average entered as
+///   `7.0`, exponent -1), while `alpha: 0.5` over the same data answers 30
+///   decimals (an `alpha` double converts at 15 significant digits, so the
+///   average has carried exponent -15 since the first row and the multiply
+///   takes it to -30). A double INPUT converts at 15 significant digits too,
+///   which is why `[Decimal128("1"), 4.0]` under `N: 3` answers
+///   `2.500000000000000`.
+///
+/// The double output path is unchanged IEEE arithmetic, so the common case
+/// stays bit-for-bit with the oracle; the decimal accumulator runs beside it.
+fn ema_values(
+    slots: &[usize],
+    docs: &[Document],
+    spec: &Document,
+    vars: &Document,
+) -> R<Vec<Bson>> {
+    ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
+    let alpha_dec = ema_alpha_decimal(spec)?;
+    let one_minus_dec = decimal::add(
+        &decimal::parse("1").ok_or(Fallback::Defer)?,
+        &decimal::neg(&alpha_dec),
+    )
+    .ok_or(Fallback::Defer)?;
     let input = spec.get("input").ok_or(Fallback::Defer)?;
     let mut out = Vec::with_capacity(slots.len());
     let mut prev: Option<f64> = None;
+    let mut prev_dec: Option<decimal::Dec> = None;
+    let mut decimal_out = false;
     for &i in slots {
         let v = expressions::evaluate(&docs[i], input, vars)?;
-        let x = as_number(&v).ok_or(Fallback::Defer)?; // non-numeric input -> defer
-        let ema = match prev {
-            None => x,
-            Some(p) => x * alpha + p * (1.0 - alpha),
-        };
-        out.push(ema);
-        prev = Some(ema);
+        // `as_number` does not read a Decimal128, so ask about the type first.
+        let decimal_in = matches!(v, Bson::Decimal128(_));
+        let numeric = decimal_in || as_number(&v).is_some();
+        if !numeric {
+            // The row answers the average unchanged -- null if there is not
+            // one yet.
+            out.push(match (&prev, &prev_dec, decimal_out) {
+                (_, Some(d), true) => decimal::to_bson(d).ok_or(Fallback::Defer)?,
+                (Some(p), _, false) => Bson::Double(*p),
+                _ => Bson::Null,
+            });
+            continue;
+        }
+        decimal_out |= decimal_in;
+        // The decimal accumulator, which every row advances.
+        let xd = decimal::from_bson(&v).ok_or(Fallback::Defer)?;
+        prev_dec = Some(match &prev_dec {
+            None => xd,
+            Some(p) => decimal::add(
+                &decimal::mul(&xd, &alpha_dec).ok_or(Fallback::Defer)?,
+                &decimal::mul(p, &one_minus_dec).ok_or(Fallback::Defer)?,
+            )
+            .ok_or(Fallback::Defer)?,
+        });
+        let avg = prev_dec.as_ref().expect("just set");
+        if decimal_out {
+            out.push(decimal::to_bson(avg).ok_or(Fallback::Defer)?);
+        } else {
+            // mongod's double answer is the DECIMAL average converted, not a
+            // double computation: `{N: 2}` over `[10, 0.1]` answers `3.4`,
+            // where the same steps in IEEE doubles answer
+            // `3.400000000000001` (14 of 1,170 swept shapes differed that way
+            // before this; 0 after -- 2026-11-06).
+            let d = decimal::to_string(avg)
+                .parse::<f64>()
+                .map_err(|_| Fallback::Defer)?;
+            prev = Some(d);
+            out.push(Bson::Double(d));
+        }
     }
     Ok(out)
+}
+
+/// The smoothing factor as mongod builds it for the decimal accumulator: `N`
+/// divides in Decimal128 (so `2/(N+1)` is exact when it terminates and 34
+/// digits when it does not), while an `alpha` double converts at 15
+/// significant digits. The two give different result scales, which is why the
+/// double [`ema_alpha`] cannot stand in here (measured 2026-11-06).
+fn ema_alpha_decimal(spec: &Document) -> R<decimal::Dec> {
+    if let Some(n) = spec.get("N") {
+        let n = match n {
+            Bson::Int32(n) if *n >= 1 => i64::from(*n),
+            Bson::Int64(n) if *n >= 1 => *n,
+            _ => return Err(Fallback::Defer),
+        };
+        let two = decimal::parse("2").ok_or(Fallback::Defer)?;
+        let denom = decimal::parse(&(n + 1).to_string()).ok_or(Fallback::Defer)?;
+        decimal::div(&two, &denom).ok_or(Fallback::Defer)
+    } else {
+        match spec.get("alpha") {
+            Some(a @ Bson::Double(_)) => decimal::from_bson(a).ok_or(Fallback::Defer),
+            _ => Err(Fallback::Defer),
+        }
+    }
 }
 
 /// Per-slot output vector for the prefix/gap-fill window operators, mirroring
@@ -1781,14 +1975,7 @@ fn window_vector(
     vars: &Document,
 ) -> R<Vec<Bson>> {
     match op {
-        "$expMovingAvg" => {
-            Ok(
-                ema_values(slots, docs, arg.as_document().ok_or(Fallback::Defer)?, vars)?
-                    .into_iter()
-                    .map(Bson::Double)
-                    .collect(),
-            )
-        }
+        "$expMovingAvg" => ema_values(slots, docs, arg.as_document().ok_or(Fallback::Defer)?, vars),
         "$locf" => locf_values(slots, docs, arg, vars),
         "$linearFill" => {
             linear_fill_values(slots, docs, arg, sort_field.ok_or(Fallback::Defer)?, vars)
