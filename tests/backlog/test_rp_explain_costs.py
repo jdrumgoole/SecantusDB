@@ -2359,6 +2359,35 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
+    # A join's equivalence classes drop a repeated conjunct
+    # (`process_equivalence` finds it redundant): the equality between the
+    # tables is one hash clause, priced once (found while working RP-388).
+    "comma join with a repeated join equality": (
+        "RP-402",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and e.b = k.b",
+        [
+            "Hash Join  (cost=27.50..1170.00 rows=100000 width=14)",
+            "  Hash Cond: (e.b = k.b)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=15.00..15.00 rows=1000 width=7)",
+            "        ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+        ],
+    ),
+    # ... and a repeated `column = constant` is one scan Filter.
+    "comma join with a repeated constant equality": (
+        "RP-402",
+        _ANALYSED,
+        "explain select * from e, k where e.b = k.b and e.a = 5 and e.a = 5",
+        [
+            "Hash Join  (cost=17.51..37.26 rows=100 width=14)",
+            "  Hash Cond: (k.b = e.b)",
+            "  ->  Seq Scan on k  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=17.50..17.50 rows=1 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=1 width=7)",
+            "              Filter: (a = 5)",
+        ],
+    ),
     # A constant true conjunct of an ON was printed as a Join Filter; it is
     # folded away, as `eval_const_expressions` does (found while working
     # RP-392, fixed).

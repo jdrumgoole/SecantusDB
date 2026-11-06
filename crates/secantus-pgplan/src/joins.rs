@@ -512,7 +512,8 @@ pub(crate) fn plan_join_source(
         return finish_join_source(s, tree, scope, params, &placed);
     }
     // The moved conjuncts ran in their leaves; the WHERE keeps the rest,
-    // and `placed` the rest's marks, in the same order.
+    // and `placed` the rest's marks, in the same order. `moved` is in WHERE
+    // order, so a binary search finds each (RP-388).
     let mut rest = s.clone();
     rest.where_clause = s.where_clause.as_deref().and_then(|w| {
         let mut conjuncts = Vec::new();
@@ -520,7 +521,7 @@ pub(crate) fn plan_join_source(
         let kept: Vec<pg_query::protobuf::Node> = conjuncts
             .into_iter()
             .enumerate()
-            .filter(|(i, _)| !moved.contains(i))
+            .filter(|(i, _)| moved.binary_search(i).is_err())
             .map(|(_, c)| c.clone())
             .collect();
         match kept.len() {
@@ -539,7 +540,7 @@ pub(crate) fn plan_join_source(
     let placed: Vec<bool> = placed
         .iter()
         .enumerate()
-        .filter(|(i, _)| !moved.contains(i))
+        .filter(|(i, _)| moved.binary_search(i).is_err())
         .map(|(_, p)| *p)
         .collect();
     finish_join_source(&rest, tree, scope, params, &placed)
@@ -2488,11 +2489,19 @@ fn pushdown_filters(
     let mut placed = vec![false; conjuncts.len()];
     let mut moved = Vec::new();
     let mut pushed: Vec<(String, pg_query::protobuf::Node)> = Vec::new();
+    // The conjuncts the classes absorbed, as a mark per conjunct: asked
+    // once per conjunct, a search of the list made planning quadratic in
+    // their number (RP-388).
+    let mut absorbed = vec![false; conjuncts.len()];
+    if let Some((_, list, _)) = ec.as_ref() {
+        for i in list {
+            if let Some(mark) = absorbed.get_mut(*i) {
+                *mark = true;
+            }
+        }
+    }
     for (i, c) in conjuncts.iter().enumerate() {
-        if ec
-            .as_ref()
-            .is_some_and(|(_, absorbed, _)| absorbed.contains(&i))
-        {
+        if absorbed[i] {
             placed[i] = true;
             continue;
         }

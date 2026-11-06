@@ -4142,7 +4142,9 @@ pub fn join_conditions_split(
                         if hashable(p, part, &left, &right) {
                             hash.push(text);
                         } else {
-                            rest.push((qual_operators(part), text));
+                            // A cancel stops the walk; it stays pending
+                            // for the statement's next cancellation point.
+                            rest.push((qual_operators(part).ok()?, text));
                         }
                     }
                     // `order_qual_clauses`: the join filter cheapest first,
@@ -4333,14 +4335,15 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
 pub fn comma_join_conds(
     s: &pg_query::protobuf::SelectStmt,
     quals: &mut Vec<JoinQual>,
-) -> Vec<String> {
+) -> crate::Result<Vec<String>> {
     let two = s.from_clause.len() == 2
         && s.from_clause
             .iter()
             .all(|n| matches!(n.node.as_ref(), Some(N::RangeVar(_))));
     let Some(w) = s.where_clause.as_deref().filter(|_| two) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    crate::cancel::check()?;
     fn flatten<'n>(n: &'n Node, out: &mut Vec<&'n Node>) {
         match n.node.as_ref() {
             Some(N::BoolExpr(b)) if b.boolop == BoolExprType::AndExpr as i32 => {
@@ -4354,7 +4357,7 @@ pub fn comma_join_conds(
     let mut parts = Vec::new();
     flatten(w, &mut parts);
     if parts.len() != quals.len() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let column_equality = |n: &Node| {
         matches!(n.node.as_ref(), Some(N::AExpr(a))
@@ -4367,43 +4370,53 @@ pub fn comma_join_conds(
     };
     // The equalities between the two tables are the join clauses; any
     // other conjunct over both stays in `quals`, the join's `Join Filter`
-    // (`hash_inner_and_outer` hashes only the equalities, RP-375).
-    let spanning: Vec<usize> = (0..parts.len())
-        .filter(|i| quals[*i].1.is_none() && column_equality(parts[*i]))
+    // (`hash_inner_and_outer` hashes only the equalities, RP-375). One
+    // pass classifies every conjunct, so the work stays linear in their
+    // number however the client interleaves them (RP-388).
+    let spanning: Vec<bool> = parts
+        .iter()
+        .zip(quals.iter())
+        .map(|(part, qual)| qual.1.is_none() && column_equality(part))
         .collect();
-    if spanning.is_empty() {
-        return Vec::new();
+    if !spanning.contains(&true) {
+        return Ok(Vec::new());
     }
     // `order_qual_clauses`: the conjuncts left on the join, its `Join
-    // Filter`, cheapest first (a stable sort by their operators).
-    let mut rest: Vec<(usize, usize)> = (0..parts.len())
-        .filter(|i| quals[*i].1.is_none() && !spanning.contains(i))
-        .map(|i| (i, qual_operators(parts[i])))
+    // Filter`, cheapest first (a stable sort by their operators), back in
+    // the positions they held.
+    let slots: Vec<usize> = (0..parts.len())
+        .filter(|i| quals[*i].1.is_none() && !spanning[*i])
         .collect();
-    let slots: Vec<usize> = rest.iter().map(|(i, _)| *i).collect();
-    rest.sort_by_key(|(_, ops)| *ops);
-    let originals: Vec<JoinQual> = slots.iter().map(|i| quals[*i].clone()).collect();
-    for (slot, (from, _)) in slots.iter().zip(&rest) {
-        let k = slots.iter().position(|x| x == from).unwrap_or(0);
-        quals[*slot] = originals[k].clone();
+    let mut rest: Vec<(usize, JoinQual)> = Vec::with_capacity(slots.len());
+    for i in &slots {
+        rest.push((qual_operators(parts[*i])?, std::mem::take(&mut quals[*i])));
+    }
+    rest.sort_by_key(|(ops, _)| *ops);
+    for (slot, (_, qual)) in slots.iter().zip(rest) {
+        quals[*slot] = qual;
     }
     let mut texts = Vec::new();
-    for i in spanning.into_iter().rev() {
-        texts.push(quals.remove(i).0);
+    let mut kept = Vec::with_capacity(quals.len());
+    for (qual, span) in std::mem::take(quals).into_iter().zip(spanning) {
+        if span {
+            texts.push(qual.0);
+        } else {
+            kept.push(qual);
+        }
     }
-    texts.reverse();
-    match texts.as_slice() {
+    *quals = kept;
+    Ok(match texts.as_slice() {
         [one] => vec![one.clone()],
         many => vec![format!("({})", many.join(" AND "))],
-    }
+    })
 }
 
 /// The operators a clause evaluates (`cost_qual_eval`, each one
 /// `cpu_operator_cost`).
-fn qual_operators(n: &Node) -> usize {
+fn qual_operators(n: &Node) -> crate::Result<usize> {
     let mut count = 0;
     let mut copy = n.clone();
-    let _ = crate::walk_expr(&mut copy, &mut |x| {
+    crate::walk_expr(&mut copy, &mut |x| {
         if let Some(N::AExpr(a)) = x.node.as_ref() {
             if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32
                 || a.kind == pg_query::protobuf::AExprKind::AexprDistinct as i32
@@ -4412,8 +4425,8 @@ fn qual_operators(n: &Node) -> usize {
             }
         }
         Ok(())
-    });
-    count
+    })?;
+    Ok(count)
 }
 
 /// A joined SELECT's WHERE conjunct for EXPLAIN: its text, the relation
@@ -4847,13 +4860,16 @@ mod comma_join_conds_tests {
         // is the join's clause, the constant stays on k's scan.
         let s = stmt("select * from e, k where e.b = k.b and k.a = 5");
         let mut quals = vec![q("(e.b = k.b)", None), q("(a = 5)", Some("k"))];
-        assert_eq!(comma_join_conds(&s, &mut quals), vec!["(e.b = k.b)"]);
+        assert_eq!(
+            comma_join_conds(&s, &mut quals).unwrap(),
+            vec!["(e.b = k.b)"]
+        );
         assert_eq!(quals, vec![q("(a = 5)", Some("k"))]);
         // Two equalities are one condition, ANDed, as an ON's prints.
         let s = stmt("select * from e, k where e.b = k.b and e.a = k.a");
         let mut quals = vec![q("(e.b = k.b)", None), q("(e.a = k.a)", None)];
         assert_eq!(
-            comma_join_conds(&s, &mut quals),
+            comma_join_conds(&s, &mut quals).unwrap(),
             vec!["((e.b = k.b) AND (e.a = k.a))"]
         );
         assert!(quals.is_empty());
@@ -4865,7 +4881,10 @@ mod comma_join_conds_tests {
         // only the equality is its clause.
         let s = stmt("select * from e, k where e.b = k.b and e.a < k.a");
         let mut quals = vec![q("(e.b = k.b)", None), q("(e.a < k.a)", None)];
-        assert_eq!(comma_join_conds(&s, &mut quals), vec!["(e.b = k.b)"]);
+        assert_eq!(
+            comma_join_conds(&s, &mut quals).unwrap(),
+            vec!["(e.b = k.b)"]
+        );
         assert_eq!(quals, vec![q("(e.a < k.a)", None)]);
         // The filter is ordered cheapest first (`order_qual_clauses`).
         let s = stmt("select * from e, k where e.b = k.b and e.a + 1 < k.a and e.a > k.a");
@@ -4874,7 +4893,10 @@ mod comma_join_conds_tests {
             q("((e.a + 1) < k.a)", None),
             q("(e.a > k.a)", None),
         ];
-        assert_eq!(comma_join_conds(&s, &mut quals), vec!["(e.b = k.b)"]);
+        assert_eq!(
+            comma_join_conds(&s, &mut quals).unwrap(),
+            vec!["(e.b = k.b)"]
+        );
         assert_eq!(
             quals,
             vec![q("(e.a > k.a)", None), q("((e.a + 1) < k.a)", None)]
@@ -4883,12 +4905,12 @@ mod comma_join_conds_tests {
         let s = stmt("select * from e, k where e.a < k.a");
         let mut quals = vec![q("(e.a < k.a)", None)];
         let before = quals.clone();
-        assert!(comma_join_conds(&s, &mut quals).is_empty());
+        assert!(comma_join_conds(&s, &mut quals).unwrap().is_empty());
         assert_eq!(quals, before);
         // Three relations: more than one join node to place it on.
         let s = stmt("select * from e, k, m where e.b = k.b");
         let mut quals = vec![q("(e.b = k.b)", None)];
-        assert!(comma_join_conds(&s, &mut quals).is_empty());
+        assert!(comma_join_conds(&s, &mut quals).unwrap().is_empty());
         assert_eq!(quals.len(), 1);
     }
 }
