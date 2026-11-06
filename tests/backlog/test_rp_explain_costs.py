@@ -2061,8 +2061,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # ----------------------- RP-384 what ANALYZE's scan counters still miss
+    # Split from RP-384 and fixed: an index scan's Filter counts the rows
+    # its Index Cond fetched and it rejected (`nfiltered1`).
     "analyze of an index scan's filter": (
-        "RP-384",
+        "RP-383",
         _ANALYSED,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from k where a < 30 and b = 'v5'",

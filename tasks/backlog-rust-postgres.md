@@ -1407,9 +1407,9 @@ a regression test.
       visibility map's bit (set by VACUUM, cleared by a write to the page),
       and an index-only scan prints its `Heap Fetches`, a Bitmap Heap Scan
       its `Heap Blocks: exact=` and its Bitmap Index Scan its own `actual
-      rows`, as PostgreSQL 15.19 does. Still missing: an index scan's
-      `Rows Removed by Filter` (`select * from k where a < 30 and b =
-      'v5'`: 26); any of those counters while the heap holds a dead
+      rows`, as PostgreSQL 15.19 does, and since 2026-11-06 an index
+      scan its `Rows Removed by Filter`. Still missing: any of those
+      counters while the heap holds a dead
       version, a dead line pointer or a HOT chain not yet vacuumed, whose
       index entries the scan visits too (`update k set b = 'z' where a =
       5`, then the index-only scan of `a = 5`: `Heap Fetches: 2`); a
@@ -1418,7 +1418,7 @@ a regression test.
       pages go lossy (`Heap Blocks: exact=... lossy=...`). Measured on a
       private 15.19 cluster (found while working RP-383).
       Backlog-ID: RP-384
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index scan's filter], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
 
 ## Found by batch 54 (2026-10-24)
 

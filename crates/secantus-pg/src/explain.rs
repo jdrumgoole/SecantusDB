@@ -56,6 +56,10 @@ pub(crate) struct PlanNode {
     /// Under ANALYZE, a child node's own `actual rows` (a Bitmap Index
     /// Scan's index tuples, RP-383); a child without one prints none.
     pub actual_rows: Option<usize>,
+    /// Under ANALYZE, an index scan's `Rows Removed by Filter` (its
+    /// `nfiltered1`): the rows its Index Cond fetched that its Filter
+    /// rejected (RP-384).
+    pub removed_by_filter: Option<usize>,
 }
 
 impl PlanNode {
@@ -72,6 +76,7 @@ impl PlanNode {
             heap_fetches: None,
             heap_blocks: None,
             actual_rows: None,
+            removed_by_filter: None,
             skip_cond: false,
             implied_filter: None,
             param_cond: None,
@@ -1129,6 +1134,16 @@ pub(crate) fn render_text(
         out.push(header);
         for (label, value) in &n.details {
             out.push(format!("{}{label}: {value}", " ".repeat(2 + 6 * depth)));
+            // `show_instrumentation_count`: the text format prints a
+            // non-zero count only.
+            if let (Some(r), Some(_), "Filter") = (n.removed_by_filter, actual, label.as_str()) {
+                if r > 0 {
+                    out.push(format!(
+                        "{}Rows Removed by Filter: {r}",
+                        " ".repeat(2 + 6 * depth)
+                    ));
+                }
+            }
         }
         if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
             out.push(format!("{}Heap Fetches: {n}", " ".repeat(2 + 6 * depth)));
@@ -1246,6 +1261,21 @@ fn structured(
                 Value::Str(v.clone())
             };
             fields.push((k.clone(), value));
+            // An index scan's counts after the qual each belongs to
+            // (`ExplainNode`'s T_IndexScan); the structured formats print
+            // a zero too (RP-384).
+            if let (Some(r), Some(_)) = (n.removed_by_filter, actual) {
+                match k.as_str() {
+                    "Index Cond" => fields.push((
+                        "Rows Removed by Index Recheck".into(),
+                        Value::Num("0".into()),
+                    )),
+                    "Filter" => {
+                        fields.push(("Rows Removed by Filter".into(), Value::Num(r.to_string())))
+                    }
+                    _ => {}
+                }
+            }
         }
         // An index-only scan's instrumentation after its quals; the
         // structured formats print a zero count too (`show_instrumentation_count`).
@@ -2456,5 +2486,32 @@ mod heap_fetches_tests {
         assert!(at("\"Actual Loops\"") < at("\"Index Cond\""));
         assert!(at("\"Index Cond\"") < at("\"Rows Removed by Index Recheck\": 0"));
         assert!(at("\"Rows Removed by Index Recheck\"") < at("\"Heap Fetches\": 0"));
+    }
+
+    #[test]
+    fn an_index_scans_filter_count_follows_its_filter() {
+        // PostgreSQL 15.19 (RP-384): text prints a non-zero count only;
+        // the structured formats print both counts, each after its qual.
+        let mut n = PlanNode::new("Index Scan using k_pkey on k");
+        n.details.push(("Index Cond".into(), "(a < 30)".into()));
+        n.details.push(("Filter".into(), "(b = 'v5'::text)".into()));
+        n.removed_by_filter = Some(26);
+        assert_eq!(
+            render_text(&n, &options("text"), Some(3)),
+            vec![
+                "Index Scan using k_pkey on k (actual rows=3 loops=1)",
+                "  Index Cond: (a < 30)",
+                "  Filter: (b = 'v5'::text)",
+                "  Rows Removed by Filter: 26",
+            ]
+        );
+        assert_eq!(render_text(&n, &options("text"), None).len(), 3);
+        n.removed_by_filter = Some(0);
+        assert_eq!(render_text(&n, &options("text"), Some(3)).len(), 3);
+        let json = render_json(&n, &options("json"), Some(3));
+        let at = |k: &str| json.find(k).unwrap_or_else(|| panic!("{k} in {json}"));
+        assert!(at("\"Index Cond\"") < at("\"Rows Removed by Index Recheck\": 0"));
+        assert!(at("\"Rows Removed by Index Recheck\"") < at("\"Filter\""));
+        assert!(at("\"Filter\"") < at("\"Rows Removed by Filter\": 0"));
     }
 }
