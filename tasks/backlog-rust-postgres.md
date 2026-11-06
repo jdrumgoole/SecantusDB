@@ -1461,18 +1461,30 @@ a regression test.
       RP-386 a join's children print their actual rows and loops, a
       parameterized inner index-only scan its `Heap Fetches`, a Hash its
       `Buckets / Batches / Memory Usage` line and a Nested Loop its `Rows
-      Removed by Join Filter`, and since RP-389 a LEFT Nested Loop's too
-      when its filter compares one numeric column of each side, as
-      PostgreSQL 15.19 counts them. Still unannotated: a join whose scans
-      have their own quals (`select * from s join e on s.a < e.a where e.b
-      = 'v1'`: `Rows Removed by Join Filter: 60`, the outer `Seq Scan on e
-      (actual rows=100 loops=1)` with `Rows Removed by Filter: 900`), a
-      LEFT join filter of any other shape, a Merge Join (its Sorts' `Sort
+      Removed by Join Filter`, since RP-389 a LEFT Nested Loop's too
+      when its filter compares one numeric column of each side, and since
+      2026-11-06 a plain Nested Loop's Seq Scans their `Rows Removed by
+      Filter` (`select * from s join e on s.a < e.a where e.b = 'v1'`), as
+      PostgreSQL 15.19 counts them. Still unannotated: a LEFT join filter
+      of any other shape (`s left join e on s.a + 1 < e.a`: `Rows Removed
+      by Join Filter: 495`), a Hash Join or parameterized Nested Loop
+      whose scans have their own Filter, a Merge Join (its Sorts' `Sort
       Method`), a hash table past `hash_mem` (several batches) and a join
       with an inner-unique inner side. Measured on a private 15.19 cluster
       (found while working RP-386).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop over a filtered scan]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter]
+- [ ] **An inner join's ON conjunct over one table stays in the Join
+      Filter.** PostgreSQL 15.19 pushes it into that table's scan
+      (`distribute_qual_to_rels`): `select * from s join e on s.a < e.a and
+      s.a > 25` is `Join Filter: (s.a < e.a)` over `Seq Scan on e` and a
+      Materialized `Seq Scan on s` with `Filter: (a > 25)`. Here the join
+      prints `Join Filter: ((s.a < e.a) AND (s.a > 25))` with `s` outer and
+      the bare `e` rescanned 30 times; its rows are right, the plan is
+      not. The same conjunct in a WHERE is pushed down. Measured on a
+      private 15.19 cluster (found while working RP-390).
+      Backlog-ID: RP-391
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join's one-table ON conjunct]
 
 ## Found by batch 54 (2026-10-24)
 

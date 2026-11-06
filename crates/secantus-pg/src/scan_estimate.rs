@@ -814,6 +814,91 @@ impl PgHandler {
     /// the join's estimates, and whether the left table is the hashed one;
     /// the Hash node is its input's total. `None` -- zeros -- for any
     /// other shape.
+    /// For EXPLAIN ANALYZE below a join (RP-390): the filter the scan of
+    /// `alias` runs, over its stored fields -- its leaf's own filter ANDed
+    /// with the WHERE conjuncts above the join that read only it, as
+    /// `distribute_qual_to_rels` pushes them down. `None` where the join
+    /// is not two plain table leaves, or a conjunct reads several tables
+    /// or is not a plain comparison.
+    pub(crate) fn join_leaf_scan_filter(
+        &self,
+        sel: &secantus_pgplan::Select,
+        alias: &str,
+    ) -> Option<Document> {
+        use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
+        use secantus_pgplan::Statement;
+        if sel.residual.is_some() || sel.join.is_some() {
+            return None;
+        }
+        let Statement::JoinRows(j) = sel.sub.as_ref()?.plan.as_ref() else {
+            return None;
+        };
+        if !j.where_modelled {
+            return None;
+        }
+        let JoinNode::Join {
+            kind, left, right, ..
+        } = &j.tree
+        else {
+            return None;
+        };
+        // A LEFT join's WHERE runs above it (`reduce_outer_joins`).
+        if *kind != JoinKind::Inner && !sel.filter.is_empty() {
+            return None;
+        }
+        let prefix = format!("{alias}{SEP}");
+        let (leaf, columns) = [left.as_ref(), right.as_ref()].into_iter().find_map(|n| {
+            let JoinNode::Leaf { plan, columns, .. } = n else {
+                return None;
+            };
+            let Statement::Select(leaf) = plan.as_ref() else {
+                return None;
+            };
+            columns
+                .iter()
+                .any(|(k, _)| k.starts_with(&prefix))
+                .then_some((leaf, columns))
+        })?;
+        if leaf.residual.is_some() || leaf.sub.is_some() || leaf.series.is_some() {
+            return None;
+        }
+        let stored = |name: &str| -> Option<String> {
+            leaf.columns
+                .iter()
+                .find(|(out, _)| out == name)
+                .map(|(_, f)| f.clone())
+        };
+        let mut clauses: Vec<bson::Bson> = Vec::new();
+        if !leaf.filter.is_empty() {
+            clauses.push(bson::Bson::Document(leaf.filter.clone()));
+        }
+        for (k, v) in joined_conjuncts(&sel.filter)? {
+            if !k.starts_with(&prefix) {
+                // Another table's: it must be some leaf's own column.
+                if !k.contains(SEP) {
+                    return None;
+                }
+                continue;
+            }
+            let (_, f) = columns.iter().find(|(ck, _)| *ck == k)?;
+            let field = stored(f)?;
+            if leaf.filter.get(&field) == Some(&v) || conjunct_in(&leaf.filter, &field, &v) {
+                continue;
+            }
+            let mut d = Document::new();
+            d.insert(field, v);
+            clauses.push(bson::Bson::Document(d));
+        }
+        Some(match clauses.len() {
+            0 => Document::new(),
+            1 => match clauses.pop() {
+                Some(bson::Bson::Document(d)) => d,
+                _ => return None,
+            },
+            _ => bson::doc! { "$and": clauses },
+        })
+    }
+
     /// For EXPLAIN ANALYZE of a hash join on one key (RP-386): the outer
     /// side's key field, the hashed side's, and the fields the hashed
     /// side's scan projects (its target list, in the order the planner

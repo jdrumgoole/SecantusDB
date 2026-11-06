@@ -40,6 +40,15 @@ fn bare_seq_scan(n: &PlanNode) -> Option<(String, String)> {
     leaf_relation(n)
 }
 
+/// A Seq Scan leaf with no quals, or with only a Filter (RP-390).
+fn filtered_seq_scan(n: &PlanNode) -> Option<(String, String)> {
+    match n.details.as_slice() {
+        [] => bare_seq_scan(n),
+        [(label, _)] if label == "Filter" && n.name.starts_with("Seq Scan on ") => leaf_relation(n),
+        _ => None,
+    }
+}
+
 /// A join key's value as a hash table compares it; `None` for NULL, and
 /// for a type this does not compare.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -160,7 +169,7 @@ impl PgHandler {
             if tree.children[1].param_cond.is_some() {
                 self.analyze_param_nest_loop(tree, actual);
             } else {
-                self.analyze_plain_nest_loop(tree, actual);
+                self.analyze_plain_nest_loop(tree, sel, actual);
             }
         }
     }
@@ -419,6 +428,38 @@ impl PgHandler {
         }
     }
 
+    /// The rows a join's Seq Scan of `table` returns, and the rows it
+    /// read: its table's, less those its Filter rejects. `None` where the
+    /// scan's filter cannot be found, or a row cannot be matched.
+    fn scan_rows(
+        &self,
+        sel: &secantus_pgplan::Select,
+        scan: &PlanNode,
+        table: &str,
+        alias: &str,
+    ) -> Option<(Vec<Document>, usize)> {
+        let docs = self.table_docs(table).ok()?;
+        let read = docs.len();
+        if scan.details.is_empty() {
+            return Some((docs, read));
+        }
+        let filter = self.join_leaf_scan_filter(sel, alias)?;
+        // A Filter the plan prints must be a filter this found.
+        if filter.is_empty() {
+            return None;
+        }
+        let empty = Document::new();
+        let in_sets = secantus_core::query::InSets::prepare(&filter);
+        let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
+        let mut kept = Vec::new();
+        for d in docs {
+            if secantus_core::query::matches(&d, &filter, &empty, None).ok()? {
+                kept.push(d);
+            }
+        }
+        Some((kept, read))
+    }
+
     /// A LEFT join's Join Filter `(x.col op y.col)`, one column of each
     /// side compared as numbers, run over every pair: the pairs it kept,
     /// and the rows the join returns (each outer row's kept pairs, or its
@@ -496,7 +537,12 @@ impl PgHandler {
 
     /// A Nested Loop of two unfiltered Seq Scans, the inner one under a
     /// Materialize or rescanned bare, its qual (if any) a Join Filter.
-    fn analyze_plain_nest_loop(&self, tree: &mut PlanNode, actual: usize) {
+    fn analyze_plain_nest_loop(
+        &self,
+        tree: &mut PlanNode,
+        sel: &secantus_pgplan::Select,
+        actual: usize,
+    ) {
         if tree.inner_unique {
             return;
         }
@@ -510,7 +556,7 @@ impl PgHandler {
             "Nested Loop Left Join" => true,
             _ => return,
         };
-        let Some((outer_table, outer_alias)) = bare_seq_scan(&tree.children[0]) else {
+        let Some((outer_table, outer_alias)) = filtered_seq_scan(&tree.children[0]) else {
             return;
         };
         let inner = &tree.children[1];
@@ -523,11 +569,17 @@ impl PgHandler {
         } else {
             inner
         };
-        let Some((inner_table, inner_alias)) = bare_seq_scan(scan) else {
+        let Some((inner_table, inner_alias)) = filtered_seq_scan(scan) else {
             return;
         };
-        let (Ok(outer_docs), Ok(inner_docs)) =
-            (self.table_docs(&outer_table), self.table_docs(&inner_table))
+        // Each scan's rows: those of its table its Filter keeps
+        // (`ExecScan`'s `nfiltered1` counts the rest, RP-390).
+        let Some((outer_docs, outer_read)) =
+            self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias)
+        else {
+            return;
+        };
+        let Some((inner_docs, inner_read)) = self.scan_rows(sel, scan, &inner_table, &inner_alias)
         else {
             return;
         };
@@ -564,6 +616,9 @@ impl PgHandler {
             }
             actual
         };
+        let removed =
+            |read: usize, kept: usize, n: &PlanNode| (!n.details.is_empty()).then(|| read - kept);
+        tree.children[0].removed_by_filter = removed(outer_read, n_outer, &tree.children[0]);
         tree.children[0].actual_rows = Some(n_outer);
         if filtered {
             tree.join_filter_removed = Some(pairs - kept);
@@ -573,7 +628,13 @@ impl PgHandler {
         inner.actual_loops = Some(n_outer);
         if material {
             // A Materialize reads its input once.
-            inner.children[0].actual_rows = Some(n_inner);
+            let scan = &mut inner.children[0];
+            scan.removed_by_filter = removed(inner_read, n_inner, scan);
+            scan.actual_rows = Some(n_inner);
+        } else {
+            // Rescanned bare, it filters its table on every loop: the
+            // per-loop count `ExplainNode` prints is one loop's.
+            inner.removed_by_filter = removed(inner_read, n_inner, inner);
         }
     }
 }
