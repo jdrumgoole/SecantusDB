@@ -26,12 +26,17 @@ from typing import Any
 import psycopg.pq as pq
 import pytest
 
-_LIST = ",".join(str(i) for i in range(200_000))
+# The list's length sets the window. 200,000 items gave a debug build
+# 0.65 s locally but 0.19 s on a CI runner (PR #2395), so the test doubles it
+# until the window is wide enough to aim at.
+_SIZES = (200_000, 400_000, 800_000)
+_WINDOW = 0.3
 
 
-def _sql(n: int) -> bytes:
+def _sql(n: int, size: int) -> bytes:
     # A different text each time: none is parsed from the planner's memo.
-    return f"explain select pg_sleep(3), {n} in ({_LIST})".encode()
+    items = ",".join(str(i) for i in range(size))
+    return f"explain select pg_sleep(3), {n} in ({items})".encode()
 
 
 @pytest.mark.backlog_fixed("RP-303")
@@ -44,17 +49,23 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
     `ParseComplete` and was lost."""
     pgconn = pg.pgconn
 
-    def timed(name: bytes, n: int) -> float:
+    def timed(name: bytes, n: int, size: int) -> float:
         t0 = time.monotonic()
-        result = pgconn.prepare(name, _sql(n))
+        result = pgconn.prepare(name, _sql(n, size))
         assert result.status == pq.ExecStatus.COMMAND_OK, result.error_message
         return time.monotonic() - t0
 
-    unnamed = min(timed(b"", n) for n in (1, 2))
-    named = min(timed(b"rp303_calibrate_%d" % n, n) for n in (3, 4))
-    # The row's own work, which the cancel must land in; a debug build
-    # measured 1.09 s and 1.74 s.
-    assert named - unnamed > 0.2, f"no window to aim at: {unnamed:.3f}s / {named:.3f}s"
+    n = 0
+    windows = []
+    for size in _SIZES:
+        unnamed = min(timed(b"", n := n + 1, size) for _ in range(2))
+        named = min(timed(b"rp303_calibrate_%d" % (n := n + 1), n, size) for _ in range(2))
+        windows.append(f"{size}: {unnamed:.3f}s / {named:.3f}s")
+        # The row's own work, which the cancel must land in; a debug build
+        # measured 1.09 s and 1.74 s at 200,000 items.
+        if named - unnamed > _WINDOW:
+            break
+    assert named - unnamed > _WINDOW, f"no window to aim at: {windows}"
     delay = (unnamed + named) / 2
 
     sent: dict[str, float] = {}
@@ -66,7 +77,7 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
     timer = threading.Timer(delay, cancel)
     t0 = time.monotonic()
     timer.start()
-    result = pgconn.prepare(b"rp303_target", _sql(5))
+    result = pgconn.prepare(b"rp303_target", _sql(n + 1, size))
     answered = time.monotonic()
     timer.join()
     assert sent["at"] < answered, "the cancel left after the Parse answered"

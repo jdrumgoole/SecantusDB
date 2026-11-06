@@ -3056,7 +3056,7 @@ fn equivalence_classes(
 /// The aliases a WHERE conjunct is false or NULL for when their columns are
 /// NULL (`find_nonnullable_rels`): a comparison's columns, under a cast or
 /// not, and an `IS NOT NULL`'s. Anything else proves nothing here.
-fn strict_aliases(
+pub(crate) fn strict_aliases(
     n: &pg_query::protobuf::Node,
     owner: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
