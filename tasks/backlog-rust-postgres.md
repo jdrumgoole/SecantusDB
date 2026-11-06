@@ -1474,17 +1474,18 @@ a regression test.
       (found while working RP-386).
       Backlog-ID: RP-390
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter]
-- [ ] **An inner join's ON conjunct over one table stays in the Join
-      Filter.** PostgreSQL 15.19 pushes it into that table's scan
-      (`distribute_qual_to_rels`): `select * from s join e on s.a < e.a and
-      s.a > 25` is `Join Filter: (s.a < e.a)` over `Seq Scan on e` and a
-      Materialized `Seq Scan on s` with `Filter: (a > 25)`. Here the join
-      prints `Join Filter: ((s.a < e.a) AND (s.a > 25))` with `s` outer and
-      the bare `e` rescanned 30 times; its rows are right, the plan is
-      not. The same conjunct in a WHERE is pushed down. Measured on a
-      private 15.19 cluster (found while working RP-390).
-      Backlog-ID: RP-391
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join's one-table ON conjunct]
+- [ ] **An inner join whose every ON conjunct reads one table keeps
+      them in its Join Filter.** Since RP-391 an inner join's one-table ON
+      conjunct is its table's scan Filter, but only while the ON keeps a
+      conjunct of its own; PostgreSQL 15.19 pushes every one
+      (`distribute_qual_to_rels`) and prints a plain Nested Loop with no
+      Join Filter: `select * from s join e on s.a > 25 and e.a > 990` is a
+      `Seq Scan on e` with `Filter: (a > 990)` under a Materialized `Seq
+      Scan on s` with `Filter: (a > 25)`. Here the ON stays whole, as the
+      join with no clause left (a cross join) is not modelled. Its rows
+      are right. Measured on PostgreSQL 15.19 (found while working RP-391).
+      Backlog-ID: RP-392
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join whose ON conjuncts each read one table]
 
 ## Found by batch 54 (2026-10-24)
 

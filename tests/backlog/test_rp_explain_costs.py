@@ -2207,6 +2207,24 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Rows Removed by Filter: 25",
         ],
     ),
+    # Every ON conjunct over one table: each is its table's scan Filter, and
+    # the join is a plain cross product with no Join Filter.
+    "analyze of an inner join whose ON conjuncts each read one table": (
+        "RP-392",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s join e on s.a > 25 and e.a > 990",
+        [
+            "Nested Loop (actual rows=50 loops=1)",
+            "  ->  Seq Scan on e (actual rows=10 loops=1)",
+            "        Filter: (a > 990)",
+            "        Rows Removed by Filter: 990",
+            "  ->  Materialize (actual rows=5 loops=10)",
+            "        ->  Seq Scan on s (actual rows=5 loops=1)",
+            "              Filter: (a > 25)",
+            "              Rows Removed by Filter: 25",
+        ],
+    ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
     "analyze of a user table's index-only scan": (
         "RP-383",
@@ -2551,6 +2569,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-383",
         "RP-386",
         "RP-389",
+        "RP-391",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
