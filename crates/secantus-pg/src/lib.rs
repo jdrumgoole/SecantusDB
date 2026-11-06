@@ -84,6 +84,7 @@ mod heap_page;
 mod heap_store;
 mod ident;
 mod info_columns;
+mod join_analyze;
 mod join_order;
 mod join_search;
 mod largeobjects;
@@ -41961,6 +41962,9 @@ impl PgHandler {
                             tree.children[0].actual_rows = Some(tuples);
                         }
                     }
+                    // A join's children: their rows, loops and counters
+                    // (RP-386).
+                    self.analyze_join_children(&mut tree, sel, rows);
                 }
                 let (ty, lines) = if options.format == "json" {
                     (

@@ -60,6 +60,55 @@ pub(crate) struct PlanNode {
     /// `nfiltered1`): the rows its Index Cond fetched that its Filter
     /// rejected (RP-384).
     pub removed_by_filter: Option<usize>,
+    /// Under ANALYZE, how many times a child ran (`nloops`), where it is
+    /// not once: a nested loop's inner side, rescanned per outer row
+    /// (RP-386). Its `actual_rows` is then the per-loop average.
+    pub actual_loops: Option<usize>,
+    /// Under ANALYZE, a join's `Rows Removed by Join Filter` (its
+    /// `nfiltered1`): the pairs its Join Filter rejected (RP-386).
+    pub join_filter_removed: Option<usize>,
+    /// Under ANALYZE, a Hash node's table as `show_hash_info` prints it
+    /// (RP-386).
+    pub hash_info: Option<HashInfo>,
+}
+
+/// A hash join's hash table after it was built (`HashInstrumentation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HashInfo {
+    pub buckets: usize,
+    pub original_buckets: usize,
+    pub batches: usize,
+    pub original_batches: usize,
+    /// `spacePeak`, in bytes.
+    pub peak_bytes: usize,
+}
+
+impl HashInfo {
+    /// `spacePeak` in kB, rounded up (`BYTES_TO_KILOBYTES`).
+    pub(crate) fn peak_kb(&self) -> usize {
+        self.peak_bytes.div_ceil(1024)
+    }
+
+    /// `show_hash_info`'s text line.
+    pub(crate) fn text(&self) -> String {
+        let kb = self.peak_kb();
+        if self.batches != self.original_batches {
+            format!(
+                "Buckets: {} (originally {})  Batches: {} (originally {})  Memory Usage: {kb}kB",
+                self.buckets, self.original_buckets, self.batches, self.original_batches
+            )
+        } else if self.buckets != self.original_buckets {
+            format!(
+                "Buckets: {} (originally {})  Batches: {}  Memory Usage: {kb}kB",
+                self.buckets, self.original_buckets, self.batches
+            )
+        } else {
+            format!(
+                "Buckets: {}  Batches: {}  Memory Usage: {kb}kB",
+                self.buckets, self.batches
+            )
+        }
+    }
 }
 
 impl PlanNode {
@@ -77,6 +126,9 @@ impl PlanNode {
             heap_blocks: None,
             actual_rows: None,
             removed_by_filter: None,
+            actual_loops: None,
+            join_filter_removed: None,
+            hash_info: None,
             skip_cond: false,
             implied_filter: None,
             param_cond: None,
@@ -1130,10 +1182,13 @@ pub(crate) fn render_text(
             header.push_str(&costs_text(n));
         }
         if let Some(rows) = actual {
+            let loops = n.actual_loops.unwrap_or(1);
             if options.timing {
-                header.push_str(&format!(" (actual time=0.000..0.000 rows={rows} loops=1)"));
+                header.push_str(&format!(
+                    " (actual time=0.000..0.000 rows={rows} loops={loops})"
+                ));
             } else {
-                header.push_str(&format!(" (actual rows={rows} loops=1)"));
+                header.push_str(&format!(" (actual rows={rows} loops={loops})"));
             }
         }
         out.push(header);
@@ -1149,6 +1204,16 @@ pub(crate) fn render_text(
                     ));
                 }
             }
+            if let (Some(r), Some(_), "Join Filter") =
+                (n.join_filter_removed, actual, label.as_str())
+            {
+                if r > 0 {
+                    out.push(format!(
+                        "{}Rows Removed by Join Filter: {r}",
+                        " ".repeat(2 + 6 * depth)
+                    ));
+                }
+            }
         }
         if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
             out.push(format!("{}Heap Fetches: {n}", " ".repeat(2 + 6 * depth)));
@@ -1158,6 +1223,9 @@ pub(crate) fn render_text(
                 "{}Heap Blocks: exact={n}",
                 " ".repeat(2 + 6 * depth)
             ));
+        }
+        if let (Some(h), Some(_)) = (n.hash_info, actual) {
+            out.push(format!("{}{}", " ".repeat(2 + 6 * depth), h.text()));
         }
         for c in &n.children {
             let a = actual.and(c.actual_rows);
@@ -1251,7 +1319,8 @@ fn structured(
                 fields.push(("Actual Total Time".into(), Value::Num("0.000".into())));
             }
             fields.push(("Actual Rows".into(), Value::Num(rows.to_string())));
-            fields.push(("Actual Loops".into(), Value::Num("1".into())));
+            let loops = n.actual_loops.unwrap_or(1);
+            fields.push(("Actual Loops".into(), Value::Num(loops.to_string())));
         }
         // Every join says whether its inner side is unique, before its
         // quals; the text format only under VERBOSE (`ExplainNode`).
@@ -1281,6 +1350,12 @@ fn structured(
                     _ => {}
                 }
             }
+            if let (Some(r), Some(_), "Join Filter") = (n.join_filter_removed, actual, k.as_str()) {
+                fields.push((
+                    "Rows Removed by Join Filter".into(),
+                    Value::Num(r.to_string()),
+                ));
+            }
         }
         // An index-only scan's instrumentation after its quals; the
         // structured formats print a zero count too (`show_instrumentation_count`).
@@ -1300,6 +1375,18 @@ fn structured(
             ));
             fields.push(("Exact Heap Blocks".into(), Value::Num(b.to_string())));
             fields.push(("Lossy Heap Blocks".into(), Value::Num("0".into())));
+        }
+        // A Hash node's table (`show_hash_info`), structured.
+        if let (Some(_), Some(h)) = (actual, n.hash_info) {
+            for (k, v) in [
+                ("Hash Buckets", h.buckets),
+                ("Original Hash Buckets", h.original_buckets),
+                ("Hash Batches", h.batches),
+                ("Original Hash Batches", h.original_batches),
+                ("Peak Memory Usage", h.peak_kb()),
+            ] {
+                fields.push((k.into(), Value::Num(v.to_string())));
+            }
         }
         if !n.children.is_empty() {
             let kids = n

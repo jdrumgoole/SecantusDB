@@ -326,9 +326,26 @@ pub(crate) fn tuple_len(def: &TableDef, doc: &Document) -> usize {
     let has_nulls = has_dropped || values.iter().any(|(_, v)| v.is_none());
     let bitmap = if has_nulls { natts.div_ceil(8) } else { 0 };
     let hoff = maxalign(23 + bitmap);
+    let (off, mut varlenas) = data_layout(&values);
+    let mut total = hoff + off;
+    // TOAST: the largest values go out of line until the tuple fits.
+    varlenas.sort_unstable_by(|a, b| b.cmp(a));
+    for v in varlenas {
+        if total <= TOAST_THRESHOLD {
+            break;
+        }
+        total = total - v + TOAST_POINTER;
+    }
+    maxalign(total)
+}
+
+/// `heap_compute_data_size` over `values` in order, a NULL taking no
+/// space: the data's length, and each 4-byte-headed varlena's size (the
+/// candidates TOAST moves out of line).
+fn data_layout(values: &[(&secantus_pgcatalog::Column, Option<&Bson>)]) -> (usize, Vec<usize>) {
     let mut varlenas: Vec<usize> = Vec::new();
     let mut off = 0usize;
-    for (c, v) in &values {
+    for (c, v) in values {
         let Some(v) = v else {
             continue;
         };
@@ -347,16 +364,45 @@ pub(crate) fn tuple_len(def: &TableDef, doc: &Document) -> usize {
             }
         }
     }
-    let mut total = hoff + off;
-    // TOAST: the largest values go out of line until the tuple fits.
-    varlenas.sort_unstable_by(|a, b| b.cmp(a));
-    for v in varlenas {
-        if total <= TOAST_THRESHOLD {
-            break;
-        }
-        total = total - v + TOAST_POINTER;
+    (off, varlenas)
+}
+
+/// The `t_len` `heap_form_minimal_tuple` gives the stored fields `fields`
+/// of a row of `def`, in that order (a scan's projected target list, as a
+/// Hash node stores it, RP-386): `SizeofMinimalTupleHeader` and a null
+/// bitmap, MAXALIGNed, then the data, unpadded. `None` for a row the heap
+/// stores toasted, whose projected datums this does not model, or a field
+/// `def` does not have.
+pub(crate) fn minimal_tuple_len(
+    def: &TableDef,
+    doc: &Document,
+    fields: &[String],
+) -> Option<usize> {
+    let all: Vec<(&secantus_pgcatalog::Column, Option<&Bson>)> = def
+        .columns
+        .iter()
+        .map(|c| (c, doc.get(c.field()).filter(|v| !matches!(v, Bson::Null))))
+        .collect();
+    let (whole, _) = data_layout(&all);
+    if maxalign(23 + def.columns.len().div_ceil(8)) + whole > TOAST_THRESHOLD {
+        return None;
     }
-    maxalign(total)
+    let values: Vec<(&secantus_pgcatalog::Column, Option<&Bson>)> = fields
+        .iter()
+        .map(|f| {
+            let c = def.columns.iter().find(|c| c.field() == *f)?;
+            Some((c, doc.get(f).filter(|v| !matches!(v, Bson::Null))))
+        })
+        .collect::<Option<_>>()?;
+    let has_nulls = values.iter().any(|(_, v)| v.is_none());
+    // `SizeofMinimalTupleHeader`: `offsetof(MinimalTupleData, t_bits)`.
+    let bitmap = if has_nulls {
+        values.len().div_ceil(8)
+    } else {
+        0
+    };
+    let (off, _) = data_layout(&values);
+    Some(maxalign(15 + bitmap) + off)
 }
 
 /// A column's type as a tuple lays it out: its name and typmod, and its
