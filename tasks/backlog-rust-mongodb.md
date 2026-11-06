@@ -1598,9 +1598,42 @@ What is left, all on the RUST MongoDB server:
 - [ ] **`explain` of `[$project, $limit, $match]` leaves the `$project`
       out of the stages after the read.** mongod 8.2.11 moves the `$limit`
       into the query and lists `$match` then `$project` behind it; this
-      server lists the `$match` alone (found 2026-10-24).
+      server lists the `$match` alone (found 2026-10-24). The cause, read
+      2026-11-06: `explain::shape::absorb` sets `shape.projection` and then
+      advances `taken` past the stage, so the stage never reaches
+      `shape.rest`. mongod keeps BOTH -- a `PROJECTION_SIMPLE` in the plan
+      and the `$project` in the stage list -- and does the same for a
+      `$skip` in that position. RM-369, RM-370 and RM-371 are the other
+      three divergences of this one shaping pass, measured in the same
+      probe; whoever works this should read all four together.
       Backlog-ID: RM-308
       Verify: tests/backlog/test_rm_found_2026_10_24.py::test_explain_lists_the_projection_a_limit_moved_past
+- [ ] **An inclusion projection's plan flags are booleans, not the ints the
+      user wrote.** `PROJECTION_SIMPLE`'s `transformBy` for
+      `{$project: {x: 1}}` is `{_id: 1, x: 1}` on mongod 8.2.11 and
+      `{_id: true, x: true}` here (measured 2026-11-06). A plain Python
+      comparison cannot see this -- `True == 1` -- so the test compares
+      canonical extended JSON; that is also why it went unnoticed.
+      Backlog-ID: RM-369
+      Verify: tests/backlog/test_rm_found_2026_10_24.py::test_an_inclusion_projection_keeps_its_int_flags_in_the_plan
+- [ ] **An exclusion projection is pushed into the plan, and mongod does not
+      push it.** The plan of `[{$project: {y: 0}}, {$limit: 3}, {$match}]` is
+      `LIMIT -> COLLSCAN` on mongod 8.2.11, with no projection stage at all;
+      this server emits a `PROJECTION_SIMPLE` with `{y: false, _id: true}`
+      (measured 2026-11-06). Same shaping pass as RM-308.
+      Backlog-ID: RM-370
+      Verify: tests/backlog/test_rm_found_2026_10_24.py::test_an_exclusion_projection_is_not_pushed_into_the_plan
+- [ ] **A `$limit` between a reshape and a `$match` stops the query taking
+      anything.** mongod 8.2.11 takes the limit regardless and reorders what
+      is left: `[{$addFields: {w: 1}}, {$limit: 3}, {$match: {x: 1}}]` reads
+      `LIMIT -> COLLSCAN` and lists `[$match, $addFields]`, the `$match`
+      moved ahead of the stage whose fields it does not read. This server
+      takes nothing (a bare `COLLSCAN`) and lists all three stages as
+      written, because `hoist::hoist_matches` requires every stage ahead of
+      the `$match` to be a match / reshape / project / sort and a `$limit`
+      is none of those (measured 2026-11-06). Same shaping pass as RM-308.
+      Backlog-ID: RM-371
+      Verify: tests/backlog/test_rm_found_2026_10_24.py::test_a_limit_between_a_reshape_and_a_match_is_still_taken
 - [ ] **`explain` of a sorted or filtered DISTINCT_SCAN `$group` lists no
       `rejectedPlans`.** mongod 8.2.11 tries each index that could answer
       it (with `$first` of `y` over `x_1`, `x_1_y_1` and `x_1_z_1`, after a
