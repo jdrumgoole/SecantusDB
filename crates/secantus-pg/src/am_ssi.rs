@@ -110,7 +110,7 @@ pub(crate) struct GistShape {
 
 #[derive(Debug, Clone)]
 pub(crate) enum AmShape {
-    Gin(GinShape),
+    Gin(Box<GinShape>),
     Gist(GistShape),
 }
 
@@ -799,8 +799,7 @@ impl crate::PgHandler {
         let mut by_table: HashMap<String, Vec<AmShape>> = HashMap::new();
         let mut stored_of: HashMap<String, Vec<Document>> = HashMap::new();
         for ix in self.index_relations() {
-            if ix.primary || ix.exclusion || ix.keys.is_empty() || ix.keys.iter().any(|k| *k <= 0)
-            {
+            if ix.primary || ix.exclusion || ix.keys.is_empty() || ix.keys.iter().any(|k| *k <= 0) {
                 continue;
             }
             let def = &ix.table;
@@ -925,7 +924,7 @@ impl crate::PgHandler {
                 if gin_cols.len() != cols.len() {
                     continue;
                 }
-                AmShape::Gin(GinShape {
+                AmShape::Gin(Box::new(GinShape {
                     oid: ix.oid,
                     name: ix.name.clone(),
                     field: gin_cols[0].0.clone(),
@@ -938,7 +937,7 @@ impl crate::PgHandler {
                     pending_limit_kb: reloption("gin_pending_list_limit")
                         .and_then(|v| v.parse().ok()),
                     predicate,
-                })
+                }))
             } else {
                 let opclass = match col.pg_type.as_str() {
                     "point" => Opclass::Point,
