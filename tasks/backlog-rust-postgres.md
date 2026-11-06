@@ -1384,17 +1384,21 @@ a regression test.
       2026-11-05 an inner or LEFT `JOIN ... ON` (a LEFT join keeps its
       nullable side inner and never estimates fewer rows than its outer),
       over a table with an index too when no clause could be its Index
-      Cond (a `<>`). Every other nested loop still prints zeros: an
-      inequality beside a table with an index, whose parameterized inner
-      Index Scan may win (`explain select * from e, k where e.a < k.a` is
-      `Nested Loop (cost=0.28..9487.50 rows=333333 width=14)` over `Index
-      Scan using k_pkey on k` with `Index Cond: (a > e.a)`); an ON
-      conjunct over one side only (`e left join e e2 on e.a <> e2.a and
+      Cond (a `<>`), and since 2026-11-06 the inner Index Scan
+      parameterized by an inequality between two keys, the join's other
+      clauses its Filter (`e.a < k.a`: `Index Scan using k_pkey on k` with
+      `Index Cond: (a > e.a)`). Every other nested loop still prints
+      zeros: that scan as an Index Only Scan (`select k.a from e, k where
+      e.a < k.a`), two bounds on the index column (`e.a < k.a and e.a >
+      k.a`, one `Index Cond` of both), a clause over an expression of the
+      inner side (`e.a < k.a + 1`, the scan's Filter), a key on a later
+      index column; an ON conjunct over one side only (`e left join e e2
+      on e.a <> e2.a and
       e.a > 990` is `rows=9990`, its `e.a > 990` a LEFT join's join filter
       estimated from `e.a`'s statistics); a LEFT join with a WHERE; and a
       join of three or more relations (found while working RP-329).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index-only scan], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
 
 - [ ] **EXPLAIN ANALYZE of a user table's index-only or bitmap scan leaves
       out its counters.** PostgreSQL 15.19 prints an Index Only Scan's

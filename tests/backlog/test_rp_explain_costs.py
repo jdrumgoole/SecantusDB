@@ -1007,14 +1007,72 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # ------------------- RP-354 the nested loops RP-329 leaves at zeros
+    # Split from RP-354 and fixed: an inequality between the sides is the
+    # indexed side's parameterized Index Cond (`DEFAULT_INEQ_SEL` a scan,
+    # `loop_count` the outer rows), written inner column first.
     "nested loop into an index": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select * from e, k where e.a < k.a",
         [
             "Nested Loop  (cost=0.28..9487.50 rows=333333 width=14)",
             "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=7)",
+            "        Index Cond: (a > e.a)",
+        ],
+    ),
+    # Split from RP-354 and fixed: the other join clauses move into the
+    # parameterized scan as its Filter (`join_clause_is_movable_into`), and
+    # cut its rows.
+    "nested loop into an index with a moved filter": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, k where k.a >= e.a and e.b <> k.b",
+        [
+            "Nested Loop  (cost=0.28..9990.00 rows=300000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=300 width=7)",
+            "        Index Cond: (a >= e.a)",
+            "        Filter: (e.b <> b)",
+        ],
+    ),
+    # Split from RP-354 and fixed: a LEFT join's nullable side is read
+    # through its index too, its ON's other clause the scan's Filter.
+    "nested loop left join into an index": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e left join k on e.a < k.a and e.b <> k.b",
+        [
+            "Nested Loop Left Join  (cost=0.28..9990.00 rows=300000 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..6.98 rows=300 width=7)",
+            "        Index Cond: (a > e.a)",
+            "        Filter: (e.b <> b)",
+        ],
+    ),
+    # Split from RP-354 and fixed: a `<>` the Index Cond implies is costed
+    # but not printed (`create_indexscan_plan`'s `predicate_implied_by`).
+    "nested loop into an index with an implied filter": (
+        "RP-329",
+        _ANALYSED,
+        "explain select * from e, k where e.a > k.a and e.a <> k.a and e.b <> k.b",
+        [
+            "Nested Loop  (cost=0.28..10822.50 rows=299700 width=14)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Index Scan using k_pkey on k  (cost=0.28..7.81 rows=300 width=7)",
+            "        Index Cond: (a < e.a)",
+            "        Filter: (e.b <> b)",
+        ],
+    ),
+    # Still open: the index holds every column read, an Index Only Scan.
+    "nested loop into an index-only scan": (
+        "RP-354",
+        _ANALYSED,
+        "explain select k.a from e, k where e.a < k.a",
+        [
+            "Nested Loop  (cost=0.28..9487.50 rows=333333 width=4)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=4)",
+            "  ->  Index Only Scan using k_pkey on k  (cost=0.28..6.14 rows=333 width=4)",
             "        Index Cond: (a > e.a)",
         ],
     ),

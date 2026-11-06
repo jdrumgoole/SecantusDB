@@ -790,6 +790,19 @@ pub struct NestLoopPlan {
     pub total: f64,
     /// The Material node's `(startup, total)`, when there is one.
     pub material: Option<(f64, f64)>,
+    /// Its inner side is the [`ParamInner`] scan (RP-354).
+    pub param: bool,
+}
+
+/// An inner side's index scan parameterized by the outer row (RP-354):
+/// its `(startup, total)` and rows a scan, and the join quals still left
+/// to check on each pair once its index qual is the scan's.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParamInner {
+    pub startup: f64,
+    pub total: f64,
+    pub rows: f64,
+    pub qual: f64,
 }
 
 /// `populate_joinrel_with_paths` for `a` and `b` (each `(startup, total,
@@ -804,6 +817,22 @@ pub fn cheapest_nest_loop(
     qual: f64,
 ) -> NestLoopPlan {
     cheapest_nest_loop_semi(a, b, qual, [None, None])
+}
+
+/// [`cheapest_nest_loop`], or of a LEFT join (`left`, `a` its outer side),
+/// where a side's index scan parameterized by the other's row may be the
+/// inner (`param[0]` for `b` inner, `param[1]` for `a`): each is weighed
+/// after the plain inner and before the Material of it, as
+/// `match_unsorted_outer` tries `cheapest_parameterized_paths` (RP-354).
+pub fn cheapest_nest_loop_param(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+    param: [Option<ParamInner>; 2],
+    left: bool,
+) -> NestLoopPlan {
+    let orders: &[bool] = if left { &[false] } else { &[false, true] };
+    nest_loop_paths_with(a, b, qual, [None, None], orders, param)
 }
 
 /// [`cheapest_nest_loop`] where `a` or `b` may be `inner_unique` as the
@@ -836,6 +865,17 @@ fn nest_loop_paths(
     unique: [Option<(f64, f64)>; 2],
     orders: &[bool],
 ) -> NestLoopPlan {
+    nest_loop_paths_with(a, b, qual, unique, orders, [None, None])
+}
+
+fn nest_loop_paths_with(
+    a: (f64, f64, f64, i64),
+    b: (f64, f64, f64, i64),
+    qual: f64,
+    unique: [Option<(f64, f64)>; 2],
+    orders: &[bool],
+    param: [Option<ParamInner>; 2],
+) -> NestLoopPlan {
     let mut paths: Vec<JoinPath> = Vec::new();
     let mut materials = [(0.0, 0.0); 2];
     for &b_outer in orders {
@@ -844,7 +884,17 @@ fn nest_loop_paths(
         let inner = InPath::scan(i.0, i.1, i.2, None);
         let mat = material(&inner, i.3);
         materials[usize::from(b_outer)] = (mat.startup, mat.total);
-        for (materialized, inner) in [(false, &inner), (true, &mat)] {
+        let param_inner = param[usize::from(b_outer)].map(|p| {
+            let mut path = InPath::scan(p.startup, p.total, p.rows, None);
+            path.indexed = true;
+            (path, p.qual)
+        });
+        let mut inners: Vec<(usize, &InPath, f64)> = vec![(0, &inner, qual)];
+        if let Some((path, q)) = &param_inner {
+            inners.push((2, path, *q));
+        }
+        inners.push((1, &mat, qual));
+        for (kind, inner, qual) in inners {
             let semi = unique[usize::from(!b_outer)];
             let (startup, total) = nestloop_cost(&outer, inner, semi, false, qual);
             add_path(
@@ -857,7 +907,9 @@ fn nest_loop_paths(
                     method: JoinMethod::Other,
                     // The pair it was built from: which side is outer, and
                     // whether its inner is materialised.
-                    combo: usize::from(b_outer) * 2 + usize::from(materialized),
+                    // and its inner: plain (0), materialised (1) or the
+                    // parameterized index scan (2).
+                    combo: usize::from(b_outer) * 3 + kind,
                     a_path: DEFAULT_INPUT,
                     b_path: DEFAULT_INPUT,
                     rows: 0.0,
@@ -869,14 +921,15 @@ fn nest_loop_paths(
         }
     }
     let best = paths[0];
-    let b_outer = best.combo >= 2;
-    let materialized = best.combo % 2 == 1;
+    let b_outer = best.combo >= 3;
+    let materialized = best.combo % 3 == 1;
     NestLoopPlan {
         b_outer,
         materialized,
         startup: best.startup,
         total: best.total,
         material: materialized.then_some(materials[usize::from(b_outer)]),
+        param: best.combo % 3 == 2,
     }
 }
 

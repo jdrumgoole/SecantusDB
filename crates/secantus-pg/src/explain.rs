@@ -46,6 +46,10 @@ pub(crate) struct PlanNode {
     /// Under ANALYZE, an index-only scan's `Heap Fetches`
     /// (`ioss_HeapFetches`), printed after its quals (RP-360).
     pub heap_fetches: Option<usize>,
+    /// A nested loop's inner index scan parameterized by the outer row
+    /// (RP-354): `(alias, column)` whose comparison with the outer side
+    /// is its `Index Cond`, taken from the join's filter.
+    pub param_cond: Option<(String, String)>,
 }
 
 impl PlanNode {
@@ -62,6 +66,7 @@ impl PlanNode {
             heap_fetches: None,
             skip_cond: false,
             implied_filter: None,
+            param_cond: None,
         }
     }
 
@@ -665,6 +670,186 @@ pub(crate) fn price_nest_loop(
     root.children.push(outer);
     root.children.push(inner);
     root.estimate = Some(join);
+}
+
+/// Make a priced `Nested Loop`'s inner scan the index scan parameterized
+/// by the outer row the cost model chose (RP-354): its name and index,
+/// and the column whose join clause [`move_param_conds`] makes its
+/// `Index Cond`.
+pub(crate) fn param_index_inner(root: &mut PlanNode, p: &crate::scan_estimate::ParamScan) {
+    let Some(inner) = root.children.get_mut(1) else {
+        return;
+    };
+    let Some(table) = inner.name.strip_prefix("Seq Scan on ") else {
+        return;
+    };
+    inner.name = format!("Index Scan using {} on {table}", p.index);
+    inner.props.retain(|(k, _)| k != "Index Name");
+    inner
+        .props
+        .insert(0, ("Index Name".into(), p.index.clone()));
+    inner.param_cond = Some((p.alias.clone(), p.column.clone()));
+}
+
+/// Move each nested loop's join clause that its inner index scan takes as
+/// a parameterized index qual from the join's `Join Filter` to the scan's
+/// `Index Cond`, written inner column first and unqualified, its operator
+/// commuted where the clause named the outer side first
+/// (`fix_indexqual_references`, RP-354). The other conjuncts stay the
+/// join's filter.
+pub(crate) fn move_param_conds(root: &mut PlanNode) {
+    for c in &mut root.children {
+        move_param_conds(c);
+    }
+    if !root.name.starts_with("Nested Loop") || root.children.len() != 2 {
+        return;
+    }
+    let Some((alias, column)) = root.children[1].param_cond.clone() else {
+        return;
+    };
+    let Some(at) = root.details.iter().position(|(k, _)| k == "Join Filter") else {
+        return;
+    };
+    let text = root.details[at].1.clone();
+    let conjuncts = split_conjuncts(&text);
+    let own = format!("{alias}.{column}");
+    let mut cond = None;
+    let mut rest = Vec::new();
+    for c in conjuncts {
+        if cond.is_none() {
+            if let Some(moved) = index_cond_text(&c, &own, &column) {
+                cond = Some(moved);
+                continue;
+            }
+        }
+        rest.push(c);
+    }
+    let Some(cond) = cond else {
+        return;
+    };
+    // The other join clauses move into the scan too
+    // (`join_clause_is_movable_into`): its `Filter`, its own columns
+    // unqualified.
+    root.details.remove(at);
+    let inner_cond = cond.clone();
+    let inner = &mut root.children[1];
+    inner.details.insert(0, ("Index Cond".into(), cond));
+    // A clause the index qual implies is not checked again
+    // (`create_indexscan_plan`'s `predicate_implied_by`), though it was
+    // costed: a strict `<` or `>` implies `<>` of the same two operands.
+    let implied = |c: &str| -> bool {
+        let operands = |t: &str, ops: &[&str]| -> Option<(String, String)> {
+            let body = t.strip_prefix('(')?.strip_suffix(')')?;
+            ops.iter().find_map(|op| {
+                let (l, r) = body.split_once(&format!(" {op} "))?;
+                Some((l.to_string(), r.to_string()))
+            })
+        };
+        let Some((cl, cr)) = operands(&inner_cond, &["<", ">"]) else {
+            return false;
+        };
+        matches!(operands(c, &["<>"]), Some((l, r)) if (l == cl && r == cr) || (l == cr && r == cl))
+    };
+    let rest: Vec<String> = rest
+        .iter()
+        .map(|c| unqualify(c, &alias))
+        .filter(|c| !implied(c))
+        .collect();
+    match rest.as_slice() {
+        [] => {}
+        [one] => inner.details.insert(1, ("Filter".into(), one.clone())),
+        many => inner
+            .details
+            .insert(1, ("Filter".into(), format!("({})", many.join(" AND ")))),
+    }
+}
+
+/// `text` with each `alias.` qualifier dropped, as a scan prints its own
+/// relation's columns.
+fn unqualify(text: &str, alias: &str) -> String {
+    let prefix = format!("{alias}.");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(&prefix) {
+        let boundary = rest[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !(c.is_alphanumeric() || c == '_' || c == '.' || c == '"'));
+        out.push_str(&rest[..at]);
+        if !boundary {
+            out.push_str(&prefix);
+        }
+        rest = &rest[at + prefix.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A `Join Filter`'s conjuncts: `((x) AND (y))` is `(x)` and `(y)`; one
+/// conjunct is itself.
+fn split_conjuncts(text: &str) -> Vec<String> {
+    let Some(body) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return vec![text.to_string()];
+    };
+    let mut parts = Vec::new();
+    let (mut depth, mut start) = (0i32, 0usize);
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b' ' if depth == 0 && body[i..].starts_with(" AND ") => {
+                parts.push(body[start..i].to_string());
+                i += 5;
+                start = i;
+                continue;
+            }
+            _ => {}
+        }
+        if depth < 0 {
+            return vec![text.to_string()];
+        }
+        i += 1;
+    }
+    parts.push(body[start..].to_string());
+    if parts.len() == 1 {
+        return vec![text.to_string()];
+    }
+    if parts.iter().all(|p| p.starts_with('(') && p.ends_with(')')) {
+        parts
+    } else {
+        vec![text.to_string()]
+    }
+}
+
+/// `(own op other)` or `(other op own)` as an index scan's `Index Cond`:
+/// `(column op other)`, the operator commuted for the second.
+fn index_cond_text(c: &str, own: &str, column: &str) -> Option<String> {
+    let body = c.strip_prefix('(')?.strip_suffix(')')?;
+    for op in ["<=", ">=", "<", ">"] {
+        let sep = format!(" {op} ");
+        let Some((l, r)) = body.split_once(&sep) else {
+            continue;
+        };
+        if r.contains(&sep) {
+            return None;
+        }
+        if l == own && r != own {
+            return Some(format!("({column} {op} {r})"));
+        }
+        if r == own && l != own {
+            let flipped = match op {
+                "<" => ">",
+                "<=" => ">=",
+                ">" => "<",
+                _ => "<=",
+            };
+            return Some(format!("({column} {flipped} {l})"));
+        }
+        return None;
+    }
+    None
 }
 
 /// A two-table join's keys as a Sort Key prints them, `(left, right)`:
@@ -1971,6 +2156,58 @@ mod join_type_tests {
 
     /// A swapped hash join's `Hash Cond` is written outer side first
     /// (RP-359); anything but one plain equality is left as it was.
+    /// A nested loop's parameterized inner takes the join clause on its
+    /// index column as its `Index Cond`, inner column first, and the
+    /// other clauses as its `Filter`, unqualified (RP-354).
+    #[test]
+    fn a_parameterized_inner_takes_its_join_clauses() {
+        assert_eq!(
+            index_cond_text("(e.a < k.a)", "k.a", "a").as_deref(),
+            Some("(a > e.a)")
+        );
+        assert_eq!(
+            index_cond_text("(k.a <= e.a)", "k.a", "a").as_deref(),
+            Some("(a <= e.a)")
+        );
+        assert_eq!(index_cond_text("(e.b <> k.a)", "k.a", "a"), None);
+        assert_eq!(
+            split_conjuncts("((e.a < k.a) AND (e.b <> k.b))"),
+            vec!["(e.a < k.a)".to_string(), "(e.b <> k.b)".to_string()]
+        );
+        assert_eq!(unqualify("(e.b <> k.b)", "k"), "(e.b <> b)");
+        assert_eq!(unqualify("(kk.b <> k.b)", "k"), "(kk.b <> b)");
+        let rel = |name: &str| {
+            let mut n = PlanNode::new(format!("Seq Scan on {name}"));
+            n.props.push(("Relation Name".into(), name.to_string()));
+            n
+        };
+        let mut root = PlanNode::new("Nested Loop");
+        root.children.push(rel("e"));
+        root.children.push(rel("k"));
+        param_index_inner(
+            &mut root,
+            &crate::scan_estimate::ParamScan {
+                index: "k_pkey".into(),
+                alias: "k".into(),
+                column: "a".into(),
+            },
+        );
+        root.details.push((
+            "Join Filter".into(),
+            "((e.a > k.a) AND (e.a <> k.a) AND (e.b <> k.b))".into(),
+        ));
+        move_param_conds(&mut root);
+        assert!(root.details.is_empty());
+        assert_eq!(root.children[1].name, "Index Scan using k_pkey on k");
+        assert_eq!(
+            root.children[1].details,
+            vec![
+                ("Index Cond".to_string(), "(a < e.a)".to_string()),
+                ("Filter".to_string(), "(e.b <> b)".to_string()),
+            ]
+        );
+    }
+
     #[test]
     fn commute_equality_swaps_one_equality() {
         assert_eq!(
