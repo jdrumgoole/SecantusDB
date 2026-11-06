@@ -898,44 +898,6 @@ one beside it.
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
 
-## Found by the security reviews (2026-11-06)
-
-- [ ] **EXPLAIN of a comma join takes time quadratic or worse in the number
-      of WHERE conjuncts.** GitHub issue #2346 (security review
-      2026-11-05, updated 2026-11-06). `EXPLAIN SELECT * FROM a, b WHERE
-      a.x = b.x AND b.y = 1 AND a.x = b.x AND b.y = 3 AND ...` (n
-      conjuncts, a cross-table equality alternating with a single-table
-      one) takes 0.17 s for 250, 0.87 s for 500 and 5.7 s for 1000 on the
-      Rust server (debug build, 2026-11-06): 35x the time for 4x the
-      conjuncts, where linear is 4x. PostgreSQL 15.19 plans 16,000 of them
-      in 0.24 s (3.7x for 8x). The statement itself is cheap: the same
-      `SELECT` runs in 0.29 s at n = 1000. PostgreSQL has no limit on the
-      number of conjuncts, so the fix is to make the planning linear, not
-      to refuse. The issue names three loops in `comma_join_conds`
-      (`crates/secantus-pgplan/src/ruleutils.rs`): `quals.remove(i)` per
-      cross-table equality (loop A), `spanning.contains(i)` per conjunct
-      (loop B) and `slots.iter().position(..)` per reordered conjunct
-      (loop C), and proposes one classification pass over `quals` and a
-      direct `sort_by_key` in place of the `slots` / `originals` round
-      trip, plus a `cancel::check()` at the head of the pass and
-      `qual_operators` propagating `walk_expr`'s `Result`.
-      **That fix will not close the item by itself.** A sample of the server
-      during the n = 1500 EXPLAIN puts the time in
-      `scan_estimate::conjunct_in` (`crates/secantus-pg/src/scan_estimate.rs`),
-      which scans the pushed `$and` of the scan's filter once per
-      single-table conjunct, and every shape with many single-table
-      conjuncts on one side of the join is as slow (`b.y = 1` repeated,
-      `b.y IS NOT NULL`, `b.y <> i`: 21 s at n = 1000). Loops B and C do not
-      show at a testable size: n cross-table equalities (loop B) cost 2.3 s
-      at 10,000 and 16.3 s at 40,000 (7.1x for 4x), and a cross-table
-      inequality per conjunct (loop C) 2.7 s and 13.2 s (4.9x), because
-      their steps are `usize` compares under a linear parse.
-      The gap test times the interleaved shape at n = 250 and n = 1000 and
-      asserts a ratio under 8x; it is the issue's own reproduction, and it
-      passes only when `conjunct_in`'s quadratic is fixed as well as loop A.
-      Backlog-ID: RP-388
-      Verify: tests/backlog/test_rp_explain_bounds.py::test_explain_comma_join_time_is_linear_in_conjuncts
-
 ## Found by a CI run (2026-11-01)
 
 - [ ] **OPEN — CI: three jobs ran out of disk; the one that left a log had
@@ -1550,6 +1512,18 @@ a regression test.
       while working RP-395).
       Backlog-ID: RP-401
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
+- [ ] **A join's equivalence classes keep a repeated conjunct.** A
+      one-table SELECT matches PostgreSQL 15.19 (`where a = 5 and a = 5` is
+      `Filter: (a = 5)`), a join does not. `select * from e, k where e.b =
+      k.b and e.b = k.b` prints `Hash Cond: ((e.b = k.b) AND (e.b = k.b))`
+      and prices both (`rows=10000`), where PostgreSQL's
+      `process_equivalence` finds the second redundant: `Hash Cond: (e.b =
+      k.b)`, `rows=100000`. A repeated `e.a = 5` is `Filter: ((a = 5) AND
+      (a = 5))` on e's scan, priced twice (`cost=0.00..20.00`; PostgreSQL
+      `Filter: (a = 5)` at `17.50`). The rows are right. Measured on a
+      private 15.19 cluster (found while working RP-388).
+      Backlog-ID: RP-402
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
 
 ## Found by batch 54 (2026-10-24)
 

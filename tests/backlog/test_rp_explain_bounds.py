@@ -16,8 +16,9 @@ PostgreSQL has no limit on the number of WHERE conjuncts, so the second item
 is about time: planning an EXPLAIN must scale with the number of conjuncts the
 client wrote. PostgreSQL 15.19 EXPLAINs a comma join of two tables with
 16,000 interleaved conjuncts in 0.24 s, and its time grows 3.7x for 8x the
-conjuncts. The Rust server takes 0.9 s for 500 and 5.9 s for 1000 (a debug
-build, 2026-11-06).
+conjuncts. The Rust server took 0.9 s for 500 and 5.9 s for 1000 (a debug
+build, 2026-11-06) until RP-388 was fixed; since, 0.22 s for 1000, and its
+time grows 2x for 2x up to 32,000.
 """
 
 from __future__ import annotations
@@ -122,12 +123,13 @@ def _explain_seconds(pg: Any, n: int) -> float:
     return time.perf_counter() - started
 
 
-@pytest.mark.backlog("RP-388")
+@pytest.mark.backlog_fixed("RP-388")
 def test_explain_comma_join_time_is_linear_in_conjuncts(pg: Any) -> None:
     """EXPLAIN of `FROM a, b WHERE <n interleaved conjuncts>`: four times the
     conjuncts must cost about four times the time. Linear is 4x and quadratic
-    16x; a ratio under 8x is generous slack for a loaded machine, and the Rust
-    server's is about 40x (n = 250 against n = 1000)."""
+    16x; a ratio under 8x is generous slack for a loaded machine. The Rust
+    server's was 25x to 40x (n = 250 against n = 1000) until RP-388 was
+    fixed, and is about 3x since."""
     pg.execute("create table a (x int, y int)")
     pg.execute("create table b (x int, y int)")
     try:

@@ -872,6 +872,7 @@ impl PgHandler {
         if !leaf.filter.is_empty() {
             clauses.push(bson::Bson::Document(leaf.filter.clone()));
         }
+        let pushed = PushedConjuncts::new(&leaf.filter);
         for (k, v) in joined_conjuncts(&sel.filter)? {
             if !k.starts_with(&prefix) {
                 // Another table's: it must be some leaf's own column.
@@ -882,7 +883,7 @@ impl PgHandler {
             }
             let (_, f) = columns.iter().find(|(ck, _)| *ck == k)?;
             let field = stored(f)?;
-            if leaf.filter.get(&field) == Some(&v) || conjunct_in(&leaf.filter, &field, &v) {
+            if pushed.holds(&field, &v) {
                 continue;
             }
             let mut d = Document::new();
@@ -976,6 +977,12 @@ impl PgHandler {
             }
             self.hash_side(&p.table, &p.filter, &p.field, &p.read, &p.above)
         };
+        // `hash_join_of` prices at most `MORE_HASH_CLAUSES` further
+        // clauses: past them, pricing each side's scan for nothing would
+        // cost a scan per clause the client wrote (RP-388).
+        if more.len() > MORE_HASH_CLAUSES {
+            return None;
+        }
         let more: Vec<(HashSide, HashSide)> = more
             .iter()
             .map(|(l, r)| Some((priced(l)?, priced(r)?)))
@@ -992,9 +999,9 @@ impl PgHandler {
     /// left table is preserved. `None` for any other shape
     /// ([`Self::hash_join_estimate`] lists them).
     #[allow(clippy::type_complexity)]
-    fn joined_sides(
+    fn joined_sides<'q>(
         &self,
-        sel: &secantus_pgplan::Select,
+        sel: &'q secantus_pgplan::Select,
     ) -> Option<(
         JoinedSide,
         JoinedSide,
@@ -1068,10 +1075,11 @@ impl PgHandler {
         // quals one list (`deconstruct_jointree`), so both plan alike
         // (RP-372; several equalities, RP-374). Any other conjunct over
         // both tables stays unpriced.
-        let same_pair = |(l, r): &(String, String)| {
-            equi.iter()
-                .any(|(a, b)| (l == a && r == b) || (l == b && r == a))
-        };
+        let pairs: std::collections::HashSet<(&str, &str)> = equi
+            .iter()
+            .flat_map(|(a, b)| [(a.as_str(), b.as_str()), (b.as_str(), a.as_str())])
+            .collect();
+        let same_pair = |(l, r): &(String, String)| pairs.contains(&(l.as_str(), r.as_str()));
         // Beside them, a comma join's WHERE may hold inequalities between
         // the two tables: its join filter, as an ON's (RP-375).
         let comma_filters: Vec<&secantus_pgplan::joins::JoinFilter> = j
@@ -1119,10 +1127,30 @@ impl PgHandler {
         // (`distribute_qual_to_rels`), as it does a reduced LEFT join's
         // (RP-365). `None` for any other shape of filter.
         let above_filter = joined_conjuncts(&sel.filter)?;
-        // A side: its scan's estimate, the width it carries above the
-        // join, its key column's statistics and type, and its planner
-        // table.
-        let side = |node: &JoinNode, key: &str| -> Option<JoinedSide> {
+        // A side's scan, whichever of its columns is the key: the scan's
+        // filter, ANDed from its own WHERE and this side's share of the
+        // conjuncts above the join, and the fields it carries above the
+        // join. Built once per table, however many equalities join the two
+        // (RP-388: built per equality, it made EXPLAIN quadratic in the
+        // conjuncts a client writes).
+        struct SideScan<'s> {
+            leaf: &'s secantus_pgplan::Select,
+            columns: &'s [(String, String)],
+            filter: std::rc::Rc<Document>,
+            above: Vec<String>,
+            /// The scan's target list where no WHERE conjunct is above
+            /// the join (`build_base_rel_tlists`).
+            carried: Option<Vec<String>>,
+        }
+        // The leaf's output names, as the stored fields they are (a
+        // primary key is stored as `_id`).
+        fn stored(leaf: &secantus_pgplan::Select, name: &str) -> Option<String> {
+            leaf.columns
+                .iter()
+                .find(|(out, _)| out == name)
+                .map(|(_, f)| f.clone())
+        }
+        let scan = |node: &'q JoinNode| -> Option<SideScan<'q>> {
             let JoinNode::Leaf { plan, columns, .. } = node else {
                 return None;
             };
@@ -1142,36 +1170,26 @@ impl PgHandler {
             {
                 return None;
             }
-            // The leaf's output names, as the stored fields they are
-            // (a primary key is stored as `_id`).
-            let stored = |name: &str| -> Option<String> {
-                leaf.columns
-                    .iter()
-                    .find(|(out, _)| out == name)
-                    .map(|(_, f)| f.clone())
-            };
-            let field = stored(&columns.iter().find(|(k, _)| k == key)?.1)?;
-            // This side's share of the conjuncts above the join, over its
-            // stored fields, ANDed with its own scan filter.
             let mut clauses: Vec<bson::Bson> = Vec::new();
             if !leaf.filter.is_empty() {
                 clauses.push(bson::Bson::Document(leaf.filter.clone()));
             }
+            let pushed = PushedConjuncts::new(&leaf.filter);
             for (k, v) in &above_filter {
                 let Some((_, f)) = columns.iter().find(|(ck, _)| ck == k) else {
                     continue;
                 };
-                let field = stored(f)?;
+                let field = stored(leaf, f)?;
                 // The planner pushes such a conjunct into the scan and
                 // keeps it above as well; count it once.
-                if leaf.filter.get(&field) == Some(v) || conjunct_in(&leaf.filter, &field, v) {
+                if pushed.holds(&field, v) {
                     continue;
                 }
                 let mut d = Document::new();
                 d.insert(field, v.clone());
                 clauses.push(bson::Bson::Document(d));
             }
-            let scan_filter = match clauses.len() {
+            let filter = match clauses.len() {
                 0 => Document::new(),
                 1 => match clauses.pop() {
                     Some(bson::Bson::Document(d)) => d,
@@ -1182,39 +1200,60 @@ impl PgHandler {
             let above: Vec<String> = columns
                 .iter()
                 .filter(|(key, _)| j.needed.contains(key) || project.is_none())
-                .map(|(_, f)| stored(f))
+                .map(|(_, f)| stored(leaf, f))
                 .collect::<Option<_>>()?;
-            // The scan's target list (`build_base_rel_tlists`): what the
-            // join and the rows above it read. A WHERE conjunct run in the
-            // scan adds nothing to it, unlike one left above the join.
-            let read: Vec<String> = if above_filter.is_empty() {
-                columns
-                    .iter()
-                    .filter(|(key, _)| JoinRows::carries(project, key))
-                    .map(|(_, f)| stored(f))
-                    .collect::<Option<_>>()?
+            // The scan's target list: what the join and the rows above it
+            // read. A WHERE conjunct run in the scan adds nothing to it,
+            // unlike one left above the join.
+            let carried = if above_filter.is_empty() {
+                Some(
+                    columns
+                        .iter()
+                        .filter(|(key, _)| JoinRows::carries(project, key))
+                        .map(|(_, f)| stored(leaf, f))
+                        .collect::<Option<_>>()?,
+                )
             } else {
-                let mut r = above.clone();
-                if !r.contains(&field) {
-                    r.push(field.clone());
+                None
+            };
+            Some(SideScan {
+                leaf,
+                columns,
+                filter: std::rc::Rc::new(filter),
+                above,
+                carried,
+            })
+        };
+        // A side: its scan, its key's stored field and the fields the scan
+        // reads.
+        let side = |s: &SideScan<'_>, key: &str| -> Option<JoinedSide> {
+            let field = stored(s.leaf, &s.columns.iter().find(|(k, _)| k == key)?.1)?;
+            let read = match &s.carried {
+                Some(carried) => carried.clone(),
+                None => {
+                    let mut r = s.above.clone();
+                    if !r.contains(&field) {
+                        r.push(field.clone());
+                    }
+                    r
                 }
-                r
             };
             Some(JoinedSide {
                 key: key.to_string(),
-                table: leaf.table.clone(),
+                table: s.leaf.table.clone(),
                 alias: key.split(secantus_pgplan::joins::SEP).next()?.to_string(),
-                filter: scan_filter,
+                filter: std::rc::Rc::clone(&s.filter),
                 field,
                 read,
-                above,
+                above: s.above.clone(),
             })
         };
-        let a = side(left, left_key)?;
-        let b = side(right, right_key)?;
+        let (left, right) = (scan(left)?, scan(right)?);
+        let a = side(&left, left_key)?;
+        let b = side(&right, right_key)?;
         let more: Vec<(JoinedSide, JoinedSide)> = rest
             .iter()
-            .map(|(l, r)| Some((side(left, l)?, side(right, r)?)))
+            .map(|(l, r)| Some((side(&left, l)?, side(&right, r)?)))
             .collect::<Option<_>>()?;
         // `clauselist_selectivity` over the join filter: the product of
         // its conjuncts'. An inequality is `DEFAULT_INEQ_SEL`; a `<>` is
@@ -1226,7 +1265,7 @@ impl PgHandler {
             selectivity *= match &f.kind {
                 secantus_pgplan::joins::FilterKind::NotEqual(l, r) => {
                     let stats = |k: &str| {
-                        let s = side(left, k).or_else(|| side(right, k))?;
+                        let s = side(&left, k).or_else(|| side(&right, k))?;
                         self.hash_side(
                             &s.table,
                             &Document::new(),
@@ -1340,11 +1379,12 @@ impl PgHandler {
             }
             let mut eq = Document::new();
             eq.insert(p.field.clone(), value.clone());
-            p.filter = if p.filter.is_empty() {
+            let own = std::rc::Rc::unwrap_or_clone(std::mem::take(&mut p.filter));
+            p.filter = std::rc::Rc::new(if own.is_empty() {
                 eq
             } else {
-                bson::doc! { "$and": [bson::Bson::Document(std::mem::take(&mut p.filter)), eq] }
-            };
+                bson::doc! { "$and": [bson::Bson::Document(own), eq] }
+            });
         }
         let (sa, ia) = self.cheapest_filtered_scan(&a.table, &a.filter, &a.read)?;
         let (sb, ib) = self.cheapest_filtered_scan(&b.table, &b.filter, &b.read)?;
@@ -4134,8 +4174,9 @@ struct JoinedSide {
     key: String,
     table: String,
     alias: String,
-    /// Its scan's filter, over stored fields.
-    filter: Document,
+    /// Its scan's filter, over stored fields, shared by every key of
+    /// its table.
+    filter: std::rc::Rc<Document>,
     /// Its join key's stored field.
     field: String,
     /// The fields its scan reads, and those it carries above the join.
@@ -4179,16 +4220,87 @@ fn key_constant(filter: &Document, field: &str) -> Option<Option<bson::Bson>> {
     Some(Some((*first).clone()))
 }
 
-/// `filter` holds `{field: v}` as one of its top-level `$and` conjuncts:
-/// a WHERE conjunct the planner already pushed into a scan.
-fn conjunct_in(filter: &Document, field: &str, v: &bson::Bson) -> bool {
-    let Ok(items) = filter.get_array("$and") else {
-        return false;
-    };
-    items
-        .iter()
-        .filter_map(bson::Bson::as_document)
-        .any(|d| d.len() == 1 && d.get(field) == Some(v))
+/// The WHERE conjuncts the planner already pushed into a scan: its filter
+/// itself, and the single-field conjuncts of its top-level `$and`, found
+/// by field and value in constant time. Scanning the `$and` once per
+/// conjunct above the join made EXPLAIN quadratic in the number of
+/// conjuncts a client writes (RP-388).
+struct PushedConjuncts<'f> {
+    filter: &'f Document,
+    by_key: HashMap<(&'f str, u64), Vec<&'f bson::Bson>>,
+}
+
+impl<'f> PushedConjuncts<'f> {
+    fn new(filter: &'f Document) -> Self {
+        let mut by_key: HashMap<(&'f str, u64), Vec<&'f bson::Bson>> = HashMap::new();
+        if let Ok(items) = filter.get_array("$and") {
+            for d in items.iter().filter_map(bson::Bson::as_document) {
+                if let (1, Some((field, v))) = (d.len(), d.iter().next()) {
+                    by_key
+                        .entry((field.as_str(), bson_value_hash(v)))
+                        .or_default()
+                        .push(v);
+                }
+            }
+        }
+        Self { filter, by_key }
+    }
+
+    /// `filter` is `{field: v}` itself, or holds it as one of its
+    /// top-level `$and` conjuncts.
+    fn holds(&self, field: &str, v: &bson::Bson) -> bool {
+        self.filter.get(field) == Some(v)
+            || self
+                .by_key
+                .get(&(field, bson_value_hash(v)))
+                .is_some_and(|found| found.contains(&v))
+    }
+}
+
+/// A hash of a BSON value that agrees with `Bson`'s `==`: values it calls
+/// equal hash alike (a document's fields in any order, as `IndexMap`
+/// compares them, and `-0.0` as `0.0`). Kinds it does not look into hash
+/// by kind alone, which is coarse but never wrong: `holds` compares the
+/// values a hash finds.
+fn bson_value_hash(v: &bson::Bson) -> u64 {
+    use std::hash::{Hash, Hasher};
+    fn feed(v: &bson::Bson, h: &mut std::hash::DefaultHasher) {
+        std::mem::discriminant(v).hash(h);
+        match v {
+            bson::Bson::Double(f) => (if *f == 0.0 { 0 } else { f.to_bits() }).hash(h),
+            bson::Bson::String(s) | bson::Bson::Symbol(s) | bson::Bson::JavaScriptCode(s) => {
+                s.hash(h)
+            }
+            bson::Bson::Int32(i) => i.hash(h),
+            bson::Bson::Int64(i) => i.hash(h),
+            bson::Bson::Boolean(b) => b.hash(h),
+            bson::Bson::DateTime(d) => d.timestamp_millis().hash(h),
+            bson::Bson::Decimal128(d) => d.bytes().hash(h),
+            bson::Bson::ObjectId(o) => o.hash(h),
+            bson::Bson::Binary(b) => b.bytes.hash(h),
+            bson::Bson::Array(items) => {
+                items.len().hash(h);
+                for item in items {
+                    feed(item, h);
+                }
+            }
+            bson::Bson::Document(d) => {
+                d.len().hash(h);
+                let mut fields: u64 = 0;
+                for (k, x) in d {
+                    let mut one = std::hash::DefaultHasher::new();
+                    k.hash(&mut one);
+                    feed(x, &mut one);
+                    fields = fields.wrapping_add(one.finish());
+                }
+                fields.hash(h);
+            }
+            _ => {}
+        }
+    }
+    let mut h = std::hash::DefaultHasher::new();
+    feed(v, &mut h);
+    h.finish()
 }
 
 struct HashSide {
@@ -4295,6 +4407,9 @@ struct AnalysedKey {
     mcv: Vec<(Vec<u8>, f32)>,
 }
 
+/// The most further equality clauses [`hash_join_of`] prices.
+const MORE_HASH_CLAUSES: usize = 3;
+
 /// `cost_hashjoin` over two priced sides, the hashed one PostgreSQL's
 /// `add_path` keeps (RP-330, RP-359): the printed outer scan's, the hashed
 /// scan's and the join's estimates, and whether the left table is hashed.
@@ -4322,7 +4437,7 @@ fn hash_join_of(
     use secantus_pgplan::joincost::{self, JoinSide, KeyStats};
     if (filter.count != 0 && redundant)
         || a.pg_type != b.pg_type
-        || more.len() > 3
+        || more.len() > MORE_HASH_CLAUSES
         || more.iter().any(|(x, y)| x.pg_type != y.pg_type)
         || (!more.is_empty() && (left_join || redundant))
     {
@@ -4872,4 +4987,37 @@ fn joined_conjuncts(filter: &Document) -> Option<Vec<(String, bson::Bson)>> {
         }
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod pushed_conjuncts_tests {
+    use super::*;
+
+    #[test]
+    fn a_pushed_conjunct_is_found_by_the_values_bson_calls_equal() {
+        // RP-388: the lookup that replaced a scan of the `$and` per
+        // conjunct must answer as `==` did.
+        let filter = bson::doc! { "$and": [
+            { "y": 1 },
+            { "y": { "$ne": 3 } },
+            { "z": -0.0 },
+            { "w": { "a": 1, "b": "x" } },
+            { "y": 2, "z": 2 },
+        ] };
+        let pushed = PushedConjuncts::new(&filter);
+        assert!(pushed.holds("y", &bson::Bson::Int32(1)));
+        assert!(!pushed.holds("y", &bson::Bson::Int64(1)));
+        assert!(!pushed.holds("z", &bson::Bson::Int32(1)));
+        assert!(pushed.holds("y", &bson::Bson::Document(bson::doc! { "$ne": 3 })));
+        assert!(!pushed.holds("y", &bson::Bson::Document(bson::doc! { "$ne": 4 })));
+        // `==` calls 0.0 and -0.0 equal, and fields in any order.
+        assert!(pushed.holds("z", &bson::Bson::Double(0.0)));
+        assert!(pushed.holds("w", &bson::Bson::Document(bson::doc! { "b": "x", "a": 1 })));
+        // A conjunct over two fields is not a single-field one.
+        assert!(!pushed.holds("y", &bson::Bson::Int32(2)));
+        // The filter itself, when it is the one conjunct.
+        let one = bson::doc! { "y": 5 };
+        assert!(PushedConjuncts::new(&one).holds("y", &bson::Bson::Int32(5)));
+        assert!(!PushedConjuncts::new(&one).holds("y", &bson::Bson::Int32(6)));
+    }
 }

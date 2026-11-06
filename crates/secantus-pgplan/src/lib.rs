@@ -10194,7 +10194,7 @@ fn plan_explain(
             let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
             join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
             if conds.is_empty() && joined {
-                ruleutils::comma_join_conds(s, &mut options.join_where)
+                ruleutils::comma_join_conds(s, &mut options.join_where)?
             } else {
                 conds
             }
