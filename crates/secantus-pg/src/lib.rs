@@ -52124,7 +52124,18 @@ impl ExtendedQueryHandler for PgHandler {
         // The message's own name, not `stmt.id`: the wire store files the
         // unnamed statement under its `DEFAULT_NAME` placeholder.
         if message.name.as_deref().is_some_and(|n| !n.is_empty()) {
-            let record = self.prepared_record(&stmt);
+            // Under the cancel hook, and a cancellation point after it: the
+            // record scans and describes the statement again, and a cancel
+            // that landed then was still pending when the Parse answered --
+            // the Sync closed the cycle, the Bind's first byte cleared it as
+            // stale, and the statement ran to its end (RP-303). PostgreSQL
+            // checks for interrupts throughout `exec_parse_message`, so a
+            // cancel there is the Parse's 57014, and nothing is stored.
+            let record = self.with_cancel_hook(|| self.prepared_record(&stmt));
+            if let Err(e) = self.check_cancel() {
+                self.note_failure();
+                return Err(e);
+            }
             let mut prepared = self.prepared.lock().unwrap_or_else(|e| e.into_inner());
             // Re-preparing a name replaces the earlier statement of that name
             // (PostgreSQL refuses it with 42P05; the wire store here replaces,

@@ -1017,52 +1017,6 @@ tests regression tests:
   is evaluated under a cancel hook now (`tests/backlog/test_rp202_cancel.py`).
 
       Verify: none -- reproducing it exhausts memory; a bounded gap test is still to be written
-- [ ] **OPEN — a cancel sent during a prepared statement was lost once in
-      CI (2026-10-27).** `tests/backlog/test_rp_batch53.py::test_a_cancel_during_a_prepared_statements_parse_is_honoured[2.5]`
-      (RP-215's regression test) failed on PR #2203's `pg-oracle (server)`
-      job (run 40479482747, attempt 1): the statement answered `ok` after
-      `pg_sleep(3)` ran to its end, where the cancel sent 2.5 s in should
-      have ended it with 57014. It recurred LOCALLY on 2026-11-02 (macOS
-      release build, under `scripts/gate_pg.sh`'s parallel load, the
-      RP-341 branch, which touches no wire or cancel code): `[2.5]`
-      answered `ok`; nine reruns idle passed. Attempt 2 of the same commit passed, and
-      locally (debug build, macOS) every delay from 0.25 to 4.0 s in
-      0.25 s steps answered 57014 within 0.05 s, four runs of the test
-      each passing. Not diagnosed. PostgreSQL itself drops a cancel that
-      lands while it waits for the next message (`DoingCommandRead`), so
-      one candidate is the gap between psycopg's Parse+Sync cycle and its
-      Bind cycle, which both servers would drop -- but that gap is a
-      client round trip, and no measurement shows the cancel landed there.
-      The next step is the server's log of a failing run with the cancel's
-      arrival and the message it landed in. Seen a second time on
-      2026-11-01, in `scripts/gate_pg.sh`'s backlog verify on macOS (debug
-      build, load average about 11 from the suites before it): the same
-      `ok` for `[2.5]`; five runs of the test alone after it passed. Load
-      is the common factor of both sightings. A fourth sighting on
-      2026-11-03, the same gate's backlog verify on the RP-331 branch
-      (EXPLAIN costing only; load average about 15): `[2.5]` answered `ok`;
-      six runs of all three delays alone after it passed at load 8.
-      A fifth on 2026-11-04, `tools/backlog.py verify --regressions` on
-      the RP-362 branch (EXPLAIN costing only; load average about 17 from
-      a parallel session's builds): `[2.5]` answered `ok`; four runs of all
-      three delays alone after it passed at load 8.
-      A sixth on 2026-11-04 in CI: PR #2331's `pg-oracle (server)` job
-      (run 41889009200, job 126781059052; the RP-364 branch, EXPLAIN
-      costing and narrow-join planning only): `[2.5]` answered `ok`.
-      A seventh on 2026-11-04, `tools/backlog.py verify --regressions` on
-      the RP-366 branch (EXPLAIN costing only; load average about 19 from
-      parallel sessions): `[2.5]` answered `ok`; four runs of all three
-      delays alone after it passed at load 14. An eighth on 2026-11-05 in
-      CI: `main`'s `pg-oracle (server)` job on PR #2356's merge commit
-      (run 42084287135; EXPLAIN costing only): `[2.5]` answered `ok`.
-      A ninth on 2026-11-06 in CI: `pg-oracle (backlog)` on commit e36ac1a4
-      (run 42267880688, job 128064449306; RP-390 and RP-394, EXPLAIN and
-      join planning only): `[2.5]` answered `ok`. A second run of the same
-      commit (run 42268061295, PR #2387) passed.
-      Every sighting so far is under load, none on an idle machine, and
-      none on a branch touching the wire or cancel code.
-      Backlog-ID: RP-303
-      Verify: none -- seen once in CI; does not fail on demand
 
 ## Found by batch 78 (2026-10-25)
 
