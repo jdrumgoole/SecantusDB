@@ -1492,18 +1492,64 @@ a regression test.
       working RP-392).
       Backlog-ID: RP-393
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct]
-- [ ] **A LEFT join's ON conjunct over its nullable side alone stays in
-      its Join Filter.** PostgreSQL 15.19 pushes it down to the nullable
-      side's scan (`distribute_qual_to_rels`: a qual of the inner side of
-      an outer join that reads no other relation is evaluated below it):
-      `select * from s left join e on s.a * 40 > e.a and e.b = 'v3'` is
-      `Join Filter: ((s.a * 40) > e.a)` over a Materialized `Seq Scan on
-      e` with `Filter: (b = 'v3'::text)`, `actual rows=100`. Here the
-      Join Filter keeps both conjuncts and the scan reads every row. Its
-      rows are right. Measured on a private 15.19 cluster (found while
-      working RP-390).
-      Backlog-ID: RP-395
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter and a filtered inner]
+- [ ] **A LEFT join's ON conjunct over a table inside an inner join on its
+      nullable side stays in its Join Filter.** Since RP-395 an outer
+      join's ON conjunct over its nullable side runs in that side's scan
+      when the side is one table. PostgreSQL 15.19's
+      `distribute_qual_to_rels` also pushes it through inner joins on that
+      side: `select * from s left join (e join k on e.a < k.a) on s.a = e.a
+      and k.b = 'v3'` is a `Hash Right Join` whose `Seq Scan on k` has
+      `Filter: (b = 'v3'::text)`; here the Hash Left Join keeps `Join
+      Filter: (k.b = 'v3'::text)` and no estimate. Its rows are right. Not
+      through a lower outer join's nullable side, where PostgreSQL keeps it
+      at the join too. Measured on a private 15.19 cluster (found while
+      working RP-395).
+      Backlog-ID: RP-397
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join's ON conjunct over a table of an inner join it null-extends]
+- [ ] **A joined scan's Filter keeps its conjuncts in written order.** A
+      lone scan prints them in PostgreSQL's order (`qual_order`, RP-348:
+      an equality to a constant after the rest, then by cost), but a
+      join's scan does not: `select * from s join e on s.a < e.a where e.b
+      = 'v3' and e.a > 5` prints `Filter: ((b = 'v3'::text) AND (a > 5))`,
+      where PostgreSQL 15.19 prints `((a > 5) AND (b = 'v3'::text))`. The
+      same for a LEFT join that the WHERE reduces to an inner one, whose
+      ON conjunct over the nullable side leads its scan's Filter (RP-395).
+      Measured on a private 15.19 cluster (found while working RP-395).
+      Backlog-ID: RP-398
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a joined scan's filter puts its equality to a constant last]
+- [ ] **A scan's BETWEEN prints as a nested AND.** PostgreSQL 15.19
+      expands `a between 15 and 55` into two quals of the scan's one list:
+      `select * from e where a between 15 and 55 and b <> 'v3'` is
+      `Filter: ((a >= 15) AND (a <= 55) AND (b <> 'v3'::text))`; here
+      `(((a >= 15) AND (a <= 55)) AND (b <> 'v3'::text))`, alone or in a
+      join. Measured on a private 15.19 cluster (found while working
+      RP-395).
+      Backlog-ID: RP-399
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan's between is two flat conjuncts]
+- [ ] **A join whose WHERE equates a column to two constants still scans.**
+      PostgreSQL 15.19 finds the equivalence class contradictory and plans
+      no scan: `select * from s join e on s.a < e.a where e.b = 'v1' and
+      e.b = 'v2'` is `Result` with `One-Time Filter: false`, and a LEFT
+      join's ON doing the same (`on s.a < e.a and e.b = 'v1' and e.b =
+      'v2'`) gates the nullable side's scan under a `Result`. Here a lone
+      scan does it (RP-350), but a join's scan prints `Filter: ((b =
+      'v1'::text) AND (b = 'v2'::text))`. Its rows are right. Measured on a
+      private 15.19 cluster (found while working RP-395).
+      Backlog-ID: RP-400
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join whose where equates a column to two constants]
+- [ ] **A LEFT join on an indexed key prints a Hash join where PostgreSQL
+      merges through the index.** `select * from s left join k on s.a =
+      k.a` (`k.a` the primary key) is, in PostgreSQL 15.19, a `Merge Right
+      Join` on `(k.a = s.a)` over `Index Scan using k_pkey on k` and a
+      Sort of `s` (cost 2.31..4.13); here a `Hash Right Join` over a `Seq
+      Scan on k` (cost 1.68..20.73), the same with a filter on `k`, and an
+      inner join of the two is a `Hash Join` where PostgreSQL's is a
+      `Merge Join`. The join search does not price a merge join whose
+      sorted input is an index scan. Its rows are right; the order they
+      come out in may not be. Measured on a private 15.19 cluster (found
+      while working RP-395).
+      Backlog-ID: RP-401
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a primary key merges through its index]
 
 ## Found by batch 54 (2026-10-24)
 

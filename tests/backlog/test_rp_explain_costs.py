@@ -2189,8 +2189,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e (actual rows=1000 loops=1)",
         ],
     ),
-    # A LEFT join's ON conjunct over its nullable side alone is that side's
-    # scan Filter (`distribute_qual_to_rels`), not part of the Join Filter.
+    # Fixed: a LEFT join's ON conjunct over its nullable side alone was
+    # part of its Join Filter; it is that side's scan Filter
+    # (`distribute_qual_to_rels`).
     "analyze of a left nested loop over an expression filter and a filtered inner": (
         "RP-395",
         _ANALYSED_THIRTY,
@@ -2205,6 +2206,82 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on e (actual rows=100 loops=1)",
             "              Filter: (b = 'v3'::text)",
             "              Rows Removed by Filter: 900",
+        ],
+    ),
+    # A LEFT join's ON conjunct over one table of an inner join on its
+    # nullable side is that table's scan Filter too (found while working
+    # RP-395).
+    "a left join's ON conjunct over a table of an inner join it null-extends": (
+        "RP-397",
+        _ANALYSED_THIRTY,
+        "explain (costs off)"
+        " select * from s left join (e join k on e.a < k.a) on s.a = e.a and k.b = 'v3'",
+        [
+            "Hash Right Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Nested Loop",
+            "        Join Filter: (e.a < k.a)",
+            "        ->  Seq Scan on e",
+            "        ->  Materialize",
+            "              ->  Seq Scan on k",
+            "                    Filter: (b = 'v3'::text)",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # A join's scan Filter in PostgreSQL's qual order: an equality to a
+    # constant after the rest (`generate_base_implied_equalities`), as a
+    # lone scan prints it (found while working RP-395).
+    "a joined scan's filter puts its equality to a constant last": (
+        "RP-398",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s join e on s.a < e.a where e.b = 'v3' and e.a > 5",
+        [
+            "Nested Loop",
+            "  Join Filter: (s.a < e.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a > 5) AND (b = 'v3'::text))",
+            "  ->  Materialize",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # BETWEEN is two quals of the scan's one list, printed flat (found
+    # while working RP-395).
+    "a scan's between is two flat conjuncts": (
+        "RP-399",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e where a between 15 and 55 and b <> 'v3'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((a >= 15) AND (a <= 55) AND (b <> 'v3'::text))",
+        ],
+    ),
+    # A LEFT join on an indexed key is a Merge Right Join reading the
+    # index in key order, its other side sorted (found while working
+    # RP-395).
+    "a left join on a primary key merges through its index": (
+        "RP-401",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s left join k on s.a = k.a",
+        [
+            "Merge Right Join",
+            "  Merge Cond: (k.a = s.a)",
+            "  ->  Index Scan using k_pkey on k",
+            "  ->  Sort",
+            "        Sort Key: s.a",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # Two different constants equal to one column of a joined table make
+    # the class contradictory: the whole join is a false One-Time Filter
+    # (found while working RP-395).
+    "a join whose where equates a column to two constants": (
+        "RP-400",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from s join e on s.a < e.a where e.b = 'v1' and e.b = 'v2'",
+        [
+            "Result",
+            "  One-Time Filter: false",
         ],
     ),
     # A Hash Join whose scans each have their own Filter: still
@@ -2685,6 +2762,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-391",
         "RP-392",
         "RP-394",
+        "RP-395",
         "RP-396",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
