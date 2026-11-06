@@ -1389,9 +1389,9 @@ a regression test.
       Cond (a `<>`), and since 2026-11-06 the inner Index Scan
       parameterized by an inequality between two keys, the join's other
       clauses its Filter (`e.a < k.a`: `Index Scan using k_pkey on k` with
-      `Index Cond: (a > e.a)`). Every other nested loop still prints
-      zeros: that scan as an Index Only Scan (`select k.a from e, k where
-      e.a < k.a`), two bounds on the index column (`e.a < k.a and e.a >
+      `Index Cond: (a > e.a)`), or Index Only Scan where the index holds
+      every column the side reads. Every other nested loop still prints
+      zeros: two bounds on the index column (`e.a < k.a and e.a >
       k.a`, one `Index Cond` of both), a clause over an expression of the
       inner side (`e.a < k.a + 1`, the scan's Filter), a key on a later
       index column; an ON conjunct over one side only (`e left join e e2
@@ -1400,7 +1400,7 @@ a regression test.
       estimated from `e.a`'s statistics); a LEFT join with a WHERE; and a
       join of three or more relations (found while working RP-329).
       Backlog-ID: RP-354
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index-only scan], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
 
 - [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
       left out.** Since RP-383 a user table's heap pages carry the
@@ -1419,6 +1419,17 @@ a regression test.
       private 15.19 cluster (found while working RP-383).
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
+- [ ] **EXPLAIN ANALYZE prints no actual rows below a join.** A Nested
+      Loop's or Hash Join's own `(actual rows=N loops=1)` is printed, but
+      its children carry none, so a parameterized inner scan shows neither
+      its `loops` (one per outer row) nor, as an Index Only Scan, its `Heap
+      Fetches`: `select k.a from e, k where e.a < k.a` is `Index Only Scan
+      using k_pkey on k (actual rows=500 loops=1000)` with `Heap Fetches:
+      499500` on PostgreSQL 15.19, and a Hash Join's `Hash` prints its
+      `Buckets: 1024  Batches: 1  Memory Usage: 47kB` line. Measured on a
+      private 15.19 cluster (found while working RP-354).
+      Backlog-ID: RP-386
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop's children], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a hash join's children]
 
 ## Found by batch 54 (2026-10-24)
 

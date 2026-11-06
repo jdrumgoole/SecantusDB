@@ -673,8 +673,8 @@ impl PgHandler {
     /// inner rows times every join clause's selectivity, as
     /// `get_parameterized_baserel_size` multiplies them; `inner_rows` is
     /// the plain scan's. [`ParamFound::Unmodelled`] where an index could serve
-    /// in a way not priced here: a later key column, two bounds, an
-    /// index-only read or a table never analysed.
+    /// in a way not priced here: a later key column, two bounds or a
+    /// table never analysed.
     fn param_index_inner(
         &self,
         leaf: &SideLeaf,
@@ -744,12 +744,18 @@ impl PgHandler {
         let Some(key) = self.analysed_key(&leaf.table, &field) else {
             return ParamFound::Unmodelled;
         };
-        let Some(ki) = self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
+        let Some(mut ki) = self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
         else {
             return ParamFound::Unmodelled;
         };
-        if leaf.read.iter().all(|f| ki.index.columns.contains(f)) {
-            return ParamFound::Unmodelled;
+        // An index holding every column the side reads is scanned
+        // index-only (`check_index_only`), its heap fetches cut by the
+        // visibility map's all-visible fraction (`cost_index`); with
+        // `enable_indexonlyscan` off it is a plain index scan.
+        let index_only = !self.setting_is("enable_indexonlyscan", "off")
+            && leaf.read.iter().all(|f| ki.index.columns.contains(f));
+        if index_only {
+            ki.index.visible = ki.allvisfrac;
         }
         let (_, column, op, ops) = clauses
             .iter()
@@ -793,6 +799,7 @@ impl PgHandler {
                 index: name,
                 alias,
                 column: column.clone(),
+                index_only,
             },
         )
     }
@@ -1792,6 +1799,7 @@ impl PgHandler {
             quals,
             ndistinct: key.ndistinct,
             where_sel: rows / pt.tuples.max(1.0),
+            allvisfrac: pt.allvisfrac,
         })
     }
 
@@ -4074,6 +4082,9 @@ struct KeyIndex {
     ndistinct: f64,
     /// `scan.2 / tuples`: the WHERE's selectivity.
     where_sel: f64,
+    /// The heap's all-visible fraction (`allvisfrac`), the pages an
+    /// index-only scan does not fetch.
+    allvisfrac: f64,
 }
 
 impl HashSide {
@@ -4102,6 +4113,8 @@ pub(crate) struct ParamScan {
     pub index: String,
     pub alias: String,
     pub column: String,
+    /// Read index-only: the index holds every column the side reads.
+    pub index_only: bool,
 }
 
 enum ParamFound {

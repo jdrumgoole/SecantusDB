@@ -1064,9 +1064,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (e.b <> b)",
         ],
     ),
-    # Still open: the index holds every column read, an Index Only Scan.
+    # Split from RP-354 and fixed: the index holds every column read, an
+    # Index Only Scan, its heap fetches cut by the all-visible fraction
+    # (none here: the table was never vacuumed).
     "nested loop into an index-only scan": (
-        "RP-354",
+        "RP-329",
         _ANALYSED,
         "explain select k.a from e, k where e.a < k.a",
         [
@@ -2035,6 +2037,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Sort Key: b",
             "  ->  Index Scan using k_pkey on k  (cost=0.28..8.29 rows=1 width=7)",
             "        Index Cond: (a = 5)",
+        ],
+    ),
+    # ------------- RP-386 EXPLAIN ANALYZE of a join's children
+    # A join's children print their own actual rows and loops, and a
+    # parameterized inner index-only scan its Heap Fetches.
+    "analyze of a nested loop's children": (
+        "RP-386",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select k.a from e, k where e.a < k.a",
+        [
+            "Nested Loop (actual rows=499500 loops=1)",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Index Only Scan using k_pkey on k (actual rows=500 loops=1000)",
+            "        Index Cond: (a > e.a)",
+            "        Heap Fetches: 499500",
+        ],
+    ),
+    "analyze of a hash join's children": (
+        "RP-386",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e join e e2 on e.a = e2.a",
+        [
+            "Hash Join (actual rows=1000 loops=1)",
+            "  Hash Cond: (e.a = e2.a)",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=1000 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
+            "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
         ],
     ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
