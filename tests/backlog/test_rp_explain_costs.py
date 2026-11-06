@@ -48,6 +48,19 @@ _ANALYSED_THIRTY = _ANALYSED + [
     "analyze s",
 ]
 
+# Those, two analysed text columns -- a thousand distinct values and fifty
+# of mixed case -- and a table never analysed (RP-404).
+_ANALYSED_STRINGS = _ANALYSED + [
+    "create table w (a int, c text)",
+    "insert into w select g, 'w' || lpad(g::text, 4, '0') from generate_series(1, 1000) g",
+    "create table m (a int, c text)",
+    "insert into m select g, chr(65 + g % 26) || chr(97 + (g * 7) % 26) || g"
+    " from generate_series(1, 50) g",
+    "create table zu (a int, c text)",
+    "analyze w",
+    "analyze m",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -2524,8 +2537,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
     ),
     # A scan Filter that is an expression or a LIKE: `scalarineqsel`'s
     # default 1/3 for an expression, `patternsel`'s prefix selectivity
-    # for `c like 'x%'`. Here the scan prints zeros (found while working
-    # RP-403).
+    # for `c like 'x%'`. The scan printed zeros (found while working
+    # RP-403; fixed by RP-404).
     "estimate of a scan filtered by an expression": (
         "RP-404",
         _ANALYSED,
@@ -2542,6 +2555,235 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         [
             "Seq Scan on s  (cost=0.00..1.38 rows=30 width=20)",
             "  Filter: (c ~~ 'x%'::text)",
+        ],
+    ),
+    # Comparisons of an expression with a constant, which have no statistics,
+    # and LIKE / ILIKE and text ranges read from a text column's statistics
+    # (`patternsel`, `convert_string_to_scalar`), measured on a private 15.19
+    # cluster in the C locale (fixed by RP-404).
+    "estimate of an equality to an expression": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where a + 1 = 5",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=5 width=7)",
+            "  Filter: ((a + 1) = 5)",
+        ],
+    ),
+    "estimate of an expression not equal to a constant": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where a * 2 <> 10",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=995 width=7)",
+            "  Filter: ((a * 2) <> 10)",
+        ],
+    ),
+    "estimate of two bounds on one expression": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where a + 1 < 10 and a + 1 > 5",
+        [
+            "Seq Scan on e  (cost=0.00..25.00 rows=5 width=7)",
+            "  Filter: (((a + 1) < 10) AND ((a + 1) > 5))",
+        ],
+    ),
+    "estimate of a constant compared with an expression": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where 996 < a + 1",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "  Filter: (996 < (a + 1))",
+        ],
+    ),
+    "estimate of an expression over a table never analysed": (
+        "RP-404",
+        _ANALYSED_STRINGS,
+        "explain select * from zu where a + 1 > 5",
+        [
+            "Seq Scan on zu  (cost=0.00..29.05 rows=423 width=36)",
+            "  Filter: ((a + 1) > 5)",
+        ],
+    ),
+    "estimate of a LIKE with a longer prefix": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c like 'xxx%'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=29 width=20)",
+            "  Filter: (c ~~ 'xxx%'::text)",
+        ],
+    ),
+    "estimate of a LIKE with no fixed prefix": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c like '%x'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=13 width=20)",
+            "  Filter: (c ~~ '%x'::text)",
+        ],
+    ),
+    "estimate of a NOT LIKE": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c not like 'x%'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=1 width=20)",
+            "  Filter: (c !~~ 'x%'::text)",
+        ],
+    ),
+    "estimate of a LIKE with no wildcard": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c like 'xxxxx'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=1 width=20)",
+            "  Filter: (c ~~ 'xxxxx'::text)",
+        ],
+    ),
+    "estimate of an ILIKE": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c ilike 'X%'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=30 width=20)",
+            "  Filter: (c ~~* 'X%'::text)",
+        ],
+    ),
+    "estimate of a range over a text histogram": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c > 'xxxx'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=27 width=20)",
+            "  Filter: (c > 'xxxx'::text)",
+        ],
+    ),
+    "estimate of a LIKE over most common values": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where b like 'v1%'",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=100 width=7)",
+            "  Filter: (b ~~ 'v1%'::text)",
+        ],
+    ),
+    "estimate of a NOT LIKE over most common values": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where b not like 'v1'",
+        [
+            "Seq Scan on e  (cost=0.00..17.50 rows=900 width=7)",
+            "  Filter: (b !~~ 'v1'::text)",
+        ],
+    ),
+    "estimate of a LIKE over a hundred-entry histogram": (
+        "RP-404",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c like 'w01%'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~~ 'w01%'::text)",
+        ],
+    ),
+    "estimate of a NOT LIKE over a hundred-entry histogram": (
+        "RP-404",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c not like 'w01%'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=899 width=10)",
+            "  Filter: (c !~~ 'w01%'::text)",
+        ],
+    ),
+    "estimate of a range inside a text histogram's bins": (
+        "RP-404",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c > 'w0500'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=500 width=10)",
+            "  Filter: (c > 'w0500'::text)",
+        ],
+    ),
+    "estimate of an ILIKE whose prefix stops at a letter": (
+        "RP-404",
+        _ANALYSED_STRINGS,
+        "explain select * from m where c ilike 'a%'",
+        [
+            "Seq Scan on m  (cost=0.00..1.62 rows=25 width=8)",
+            "  Filter: (c ~~* 'a%'::text)",
+        ],
+    ),
+    "estimate of a range over mixed-case text": (
+        "RP-404",
+        _ANALYSED_STRINGS,
+        "explain select * from m where c > 'M'",
+        [
+            "Seq Scan on m  (cost=0.00..1.62 rows=28 width=8)",
+            "  Filter: (c > 'M'::text)",
+        ],
+    ),
+    # What RP-404 left: a function call's cost (`procost`), a pattern over an
+    # expression (no statistics: `DEFAULT_MATCH_SEL`), a LIKE over a table
+    # never analysed, the regex operators (`regex_fixed_prefix`) and a join
+    # over such a scan, each printed with no estimate (found while working
+    # RP-404).
+    "estimate of a function call compared with a constant": (
+        "RP-423",
+        _ANALYSED,
+        "explain select * from e where abs(a) > 5",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "  Filter: (abs(a) > 5)",
+        ],
+    ),
+    "estimate of a LIKE over an expression": (
+        "RP-423",
+        _ANALYSED,
+        "explain select * from e where lower(b) like 'v%'",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=5 width=7)",
+            "  Filter: (lower(b) ~~ 'v%'::text)",
+        ],
+    ),
+    "estimate of a LIKE over a table never analysed": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from zu where c like 'x%'",
+        [
+            "Seq Scan on zu  (cost=0.00..25.88 rows=6 width=36)",
+            "  Filter: (c ~~ 'x%'::text)",
+        ],
+    ),
+    "estimate of a join over a scan filtered by a LIKE": (
+        "RP-423",
+        _ANALYSED_THIRTY,
+        "explain select * from e join s on s.a = e.a where s.c like 'xxx%'",
+        [
+            "Hash Join  (cost=1.74..20.78 rows=29 width=27)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e  (cost=0.00..15.00 rows=1000 width=7)",
+            "  ->  Hash  (cost=1.38..1.38 rows=29 width=20)",
+            "        ->  Seq Scan on s  (cost=0.00..1.38 rows=29 width=20)",
+            "              Filter: (c ~~ 'xxx%'::text)",
+        ],
+    ),
+    "estimate of an anchored regex match": (
+        "RP-423",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c ~ '^xx'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=30 width=20)",
+            "  Filter: (c ~ '^xx'::text)",
+        ],
+    ),
+    "estimate of an unanchored regex match": (
+        "RP-423",
+        _ANALYSED_STRINGS,
+        "explain select * from w where c ~ 'w01'",
+        [
+            "Seq Scan on w  (cost=0.00..18.50 rows=101 width=10)",
+            "  Filter: (c ~ 'w01'::text)",
         ],
     ),
     # A join's scan whose WHERE conjunct is an expression printed a
@@ -3109,6 +3351,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-396",
         "RP-399",
         "RP-403",
+        "RP-404",
         "RP-405",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog

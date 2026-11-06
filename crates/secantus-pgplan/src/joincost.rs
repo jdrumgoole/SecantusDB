@@ -2684,6 +2684,8 @@ mod tests {
             boolean: false,
             numeric: true,
             ordered: false,
+            string: false,
+            c_collation: false,
             actual: None,
             tuples: 1000.0,
         };
