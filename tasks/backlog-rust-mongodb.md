@@ -746,19 +746,17 @@ about forty such points; these are the ones measured.
 - [ ] **`$expMovingAvg` refuses a null, missing or Decimal128 input.**
       `ema_values` defers on any input `as_number` does not read, so a
       partition with one such row answers code 2. mongod 8.2.11 averages
-      past them: a null or missing row answers null and leaves the average
-      where it was, and a Decimal128 input makes the average decimal.
+      past them: a null or missing row answers the average UNCHANGED --
+      carried forward, not null, which this item said until it was re-probed
+      on 2026-11-06 -- and a Decimal128 input makes the average decimal from
+      that row on. The decimal arithmetic is the work here: the result's
+      scale is mongod's, and it differs with how the smoothing factor was
+      given (`N: 3` answers `3.75`, `alpha: 0.5` answers
+      `3.750000000000000000000000000000`, because `N` divides in Decimal128
+      while `alpha` converts a double), so matching it needs
+      `secantus_core::decimal`, not an f64 accumulator.
       Backlog-ID: RM-225
       Verify: tests/backlog/test_rm_found_2026_10_21.py::test_exp_moving_avg_over_null_missing_and_decimal
-- [ ] **Window specs mongod refuses answer code 2, not mongod's code.**
-      `$linearFill` without a one-field `sortBy` (mongod: 605001), `$shift`
-      with a `window` (9, "$shift does not accept a 'window' field"), range
-      bounds with a two-field `sortBy` (5339902) and a range window over a
-      null sort value (5429414, "Invalid range: Expected the sortBy field to
-      be a number, but it was null"). Each is a deferral where a refusal by
-      name (`Fallback::mongo(code, msg)`) belongs.
-      Backlog-ID: RM-226
-      Verify: tests/backlog/test_rm_found_2026_10_21.py::test_window_spec_errors_carry_mongods_codes
 - [ ] **A multi-document write interrupted while it reads its candidates
       writes nothing, where mongod keeps what it wrote.** mongod tests and
       writes each document as its scan reaches it (a deleteMany a batch of

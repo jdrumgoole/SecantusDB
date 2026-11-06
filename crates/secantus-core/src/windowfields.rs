@@ -108,12 +108,25 @@ pub(crate) fn set_window_fields_each(
     let sort_by = match spec.get("sortBy") {
         None => None,
         Some(Bson::Document(d)) => Some(d),
-        Some(_) => return Err(Fallback::Defer),
+        // Measured 8.2.11, 2026-11-06: a non-document `sortBy` is refused by
+        // the command parser, naming the type it got.
+        Some(other) => {
+            return Err(Fallback::mongo(
+                14,
+                format!(
+                    "BSON field '$setWindowFields.sortBy' is the wrong type '{}', expected type 'object'",
+                    crate::query::bson_type_name(other)
+                ),
+            )
+            .bare())
+        }
     };
+    // An EMPTY `output` is accepted: mongod answers the partition's documents
+    // unchanged, in sortBy order when there is one (measured 8.2.11,
+    // 2026-11-06), so it runs the ordinary machinery with no output fields.
     let output = spec
         .get("output")
         .and_then(Bson::as_document)
-        .filter(|o| !o.is_empty())
         .ok_or(Fallback::Defer)?;
 
     // Compile the output fields: each is `{<$accumulator>: arg, window?: {...}}`.
@@ -133,7 +146,12 @@ pub(crate) fn set_window_fields_each(
                 continue;
             }
             if acc.is_some() {
-                return Err(Fallback::Defer); // more than one accumulator
+                // Measured 8.2.11, 2026-11-06.
+                return Err(Fallback::mongo(
+                    9,
+                    "Cannot specify two functions in window function spec",
+                )
+                .bare());
             }
             acc = Some((k, v));
         }
@@ -154,7 +172,15 @@ pub(crate) fn set_window_fields_each(
             // Position-based (like the rank funcs): requires a sortBy, no window,
             // and an `{output, by: <int>, default?}` spec.
             let spec = arg.as_document().ok_or(Fallback::Defer)?;
-            if window.is_some() || sort_by.is_none() || !spec.contains_key("output") {
+            // Measured 8.2.11, 2026-11-06: the `window` refusal comes first --
+            // a spec with both a window and no sortBy names the window.
+            if window.is_some() {
+                return Err(Fallback::mongo(9, "$shift does not accept a 'window' field").bare());
+            }
+            if sort_by.is_none() {
+                return Err(Fallback::mongo(9, "'$shift' requires a sortBy").bare());
+            }
+            if !spec.contains_key("output") {
                 return Err(Fallback::Defer);
             }
             if !matches!(spec.get("by"), Some(Bson::Int32(_)) | Some(Bson::Int64(_))) {
@@ -169,10 +195,22 @@ pub(crate) fn set_window_fields_each(
             ema_alpha(spec)?; // validates exactly-one-of N/alpha and their ranges
         } else if op == "$locf" || op == "$linearFill" {
             // Gap-fill over the sorted partition; `arg` is the input expression.
-            // No window; requires a sortBy ($linearFill also a numeric x-axis,
-            // checked when the vector is built).
-            if window.is_some() || sort_by.is_none() {
-                return Err(Fallback::Defer);
+            // No window ($linearFill's x-axis is checked when the vector is
+            // built). Measured 8.2.11, 2026-11-06: the `window` refusal comes
+            // before the sortBy one, and $linearFill -- unlike $locf -- needs a
+            // top-level sortBy of exactly one element.
+            if window.is_some() {
+                return Err(
+                    Fallback::mongo(9, format!("'window' field is not allowed in {op}")).bare(),
+                );
+            }
+            if op == "$linearFill" && sort_by.is_none_or(|sb| sb.len() != 1) {
+                return Err(Fallback::mongo(
+                    605001,
+                    "$linearFill must be specified with a top level sortBy expression with \
+                     exactly one element",
+                )
+                .bare());
             }
         } else if op == "$derivative" || op == "$integral" {
             // Window operators over the sortBy value (x) and input (y). Requires a
@@ -191,12 +229,18 @@ pub(crate) fn set_window_fields_each(
             }
         } else if COVARIANCE_OPS.contains(&op) {
             // `[x, y]`, evaluated per document; any window.
-        } else if op == "$mergeObjects" {
-            // $mergeObjects is a $group-only accumulator; mongod rejects it as a
-            // window function (FailedToParse) — defer so Python raises the code.
-            return Err(Fallback::Defer);
+        } else if op == "$mergeObjects" || op == "$accumulator" {
+            // $group-only accumulators. Measured 8.2.11, 2026-11-06: mongod
+            // refuses them as window functions by name, as it does an unknown
+            // one.
+            return Err(Fallback::mongo(9, format!("Unrecognized window function, {op}")).bare());
+        } else if !group::is_accumulator(op) {
+            // Not an accumulator at all, so not a window function either --
+            // mongod names it (measured 8.2.11, 2026-11-06: every accumulator
+            // but $mergeObjects and $accumulator IS a window function).
+            return Err(Fallback::mongo(9, format!("Unrecognized window function, {op}")).bare());
         } else {
-            group::new_acc(op)?; // reject unsupported accumulator (incl. time-series) → defer
+            group::new_acc(op)?; // an accumulator this server cannot run yet → defer
         }
         compiled.push(OutField {
             field,
@@ -204,6 +248,35 @@ pub(crate) fn set_window_fields_each(
             arg,
             window,
         });
+    }
+
+    // Range-based bounds need one ascending sortBy field, and mongod says so
+    // before it reads a document: both refusals fire on an empty collection
+    // (measured 8.2.11, 2026-11-06).
+    if compiled
+        .iter()
+        .any(|c| c.window.is_some_and(|w| w.contains_key("range")))
+    {
+        match sort_by {
+            None => return Err(Fallback::Defer),
+            Some(sb) if sb.len() != 1 => {
+                return Err(Fallback::mongo(
+                    5339902,
+                    "Range-based bounds require sortBy a single field",
+                )
+                .bare())
+            }
+            Some(sb) => {
+                let (_, dir) = sb.iter().next().unwrap();
+                if !matches!(dir, Bson::Int32(1) | Bson::Int64(1)) {
+                    return Err(Fallback::mongo(
+                        8947401,
+                        "Range-based bounds require an ascending sortBy",
+                    )
+                    .bare());
+                }
+            }
+        }
     }
 
     let needs_rank = compiled.iter().any(|c| RANK_FUNCS.contains(&c.op));
@@ -292,6 +365,38 @@ pub(crate) fn set_window_fields_each(
         } else {
             None
         };
+        // A plain (unitless) range window reads its bounds off the sortBy
+        // value, and mongod refuses a non-numeric one per partition, naming
+        // the type it found: `Invalid range: Expected the sortBy field to be a
+        // number, but it was null` under the executor wrapper (measured 8.2.11,
+        // 2026-11-06 -- an empty collection answers nothing at all, so this is
+        // execution-time, not parse-time).
+        if range_vals.is_none()
+            && range_dates.is_none()
+            && compiled.iter().any(|c| {
+                c.window
+                    .is_some_and(|w| w.contains_key("range") && !w.contains_key("unit"))
+            })
+        {
+            if let Some(sb) = sort_by.filter(|sb| sb.len() == 1) {
+                let (field, _) = sb.iter().next().unwrap();
+                if let Some(bad) = slots
+                    .iter()
+                    .map(|&i| field_value(&docs[i], field))
+                    .find(|v| as_number(v).is_none())
+                {
+                    return Err(Fallback::mongo(
+                        5429414,
+                        format!(
+                            "Invalid range: Expected the sortBy field to be a number, but it \
+                             was {}",
+                            crate::query::bson_type_name(&bad)
+                        ),
+                    )
+                    .exec());
+                }
+            }
+        }
         // mongod's partition cache over this partition: held to its budget,
         // spilled or refused (RM-211).
         run_cache(

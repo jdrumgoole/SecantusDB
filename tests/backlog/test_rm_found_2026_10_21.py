@@ -92,15 +92,124 @@ _BAD_SPECS = [
 ]
 
 
-@pytest.mark.backlog("RM-226")
-@pytest.mark.parametrize(("name", "stage"), _BAD_SPECS, ids=[n for n, _ in _BAD_SPECS])
+#: Shapes measured on 2026-11-06 while fixing RM-226, each with a code and
+#: message of mongod's own. The last two of `_BAD_SPECS` plus these: the
+#: precedence cases (a `window` on a spec that also lacks a `sortBy` names the
+#: window) and the `$group`-only accumulators mongod refuses by name.
+_MORE_BAD_SPECS: list[tuple[str, dict]] = [
+    (
+        "shift without a sortBy",
+        {"output": {"s": {"$shift": {"output": "$y", "by": 1}}}},
+    ),
+    (
+        "shift with a window and no sortBy",
+        {
+            "output": {
+                "s": {
+                    "$shift": {"output": "$y", "by": 1},
+                    "window": {"documents": ["unbounded", "current"]},
+                }
+            }
+        },
+    ),
+    (
+        "linearFill with two sort keys",
+        {"sortBy": {"a": 1, "b": 1}, "output": {"f": {"$linearFill": "$y"}}},
+    ),
+    (
+        "linearFill with a window",
+        {
+            "sortBy": {"a": 1},
+            "output": {
+                "f": {"$linearFill": "$y", "window": {"documents": ["unbounded", "current"]}}
+            },
+        },
+    ),
+    (
+        "locf with a window",
+        {
+            "sortBy": {"a": 1},
+            "output": {"f": {"$locf": "$y", "window": {"documents": ["unbounded", "current"]}}},
+        },
+    ),
+    (
+        "range bounds over a descending sortBy",
+        {"sortBy": {"a": -1}, "output": {"r": {"$sum": "$y", "window": {"range": [-1, 1]}}}},
+    ),
+    (
+        "two functions in one output field",
+        {"sortBy": {"a": 1}, "output": {"r": {"$sum": "$y", "$avg": "$y"}}},
+    ),
+    (
+        "an unknown window function",
+        {"sortBy": {"a": 1}, "output": {"r": {"$notAFunction": "$y"}}},
+    ),
+    (
+        "mergeObjects as a window function",
+        {"sortBy": {"a": 1}, "output": {"r": {"$mergeObjects": "$y"}}},
+    ),
+    ("a sortBy that is not a document", {"sortBy": "a", "output": {"r": {"$sum": "$y"}}}),
+]
+
+_ALL_BAD_SPECS = _BAD_SPECS + _MORE_BAD_SPECS
+
+
+@pytest.mark.backlog_fixed("RM-226")
+@pytest.mark.parametrize(("name", "stage"), _ALL_BAD_SPECS, ids=[n for n, _ in _ALL_BAD_SPECS])
 def test_window_spec_errors_carry_mongods_codes(
     rust_mongo: Any, mongod: Any, name: str, stage: dict
 ) -> None:
-    """mongod 8.2.11 refuses each spec with a code of its own: 605001,
-    9 ("$shift does not accept a 'window' field"), 5339902 and 5429414. The
-    Rust server answers 2 "not supported by the Rust server" for all four."""
+    """Each spec is refused with mongod's own code and message: 605001 and
+    5339902 and 8947401 at parse time, 5429414 from the executor, 14 for a
+    wrong-typed `sortBy`, and 9 for the rest. The Rust server answered
+    2 "not supported by the Rust server" for all of them."""
     ours, theirs = _answers(rust_mongo, mongod, _SPEC_DOCS, [{"$setWindowFields": stage}])
+    assert ours == theirs
+
+
+#: Out of insertion order on `a`, with a null and a missing `y`, so a
+#: carry-forward and an order difference both show.
+_ACCEPTED_DOCS = [
+    {"_id": 1, "a": 3, "y": 1},
+    {"_id": 2, "a": 1, "y": None},
+    {"_id": 3, "a": 2},
+    {"_id": 4, "a": 5, "y": 7},
+]
+
+
+@pytest.mark.backlog_fixed("RM-367")
+@pytest.mark.parametrize(
+    "stage",
+    [{"sortBy": {"a": 1}, "output": {}}, {"output": {}}],
+    ids=["with a sortBy", "without a sortBy"],
+)
+def test_an_empty_output_passes_the_documents_through(
+    rust_mongo: Any, mongod: Any, stage: dict
+) -> None:
+    """mongod 8.2.11 accepts an empty `output`: the documents come back
+    unchanged, in sortBy order when the stage has one and input order when it
+    does not (measured 2026-11-06). The Rust server refused the stage with
+    2 "not supported by the Rust server"."""
+    ours, theirs = _answers(rust_mongo, mongod, _ACCEPTED_DOCS, [{"$setWindowFields": stage}])
+    assert ours == theirs
+
+
+@pytest.mark.backlog_fixed("RM-368")
+@pytest.mark.parametrize(
+    "stage",
+    [
+        {"output": {"f": {"$locf": "$y"}}},
+        {"partitionBy": {"$mod": ["$a", 2]}, "output": {"f": {"$locf": "$y"}}},
+    ],
+    ids=["one partition", "partitioned"],
+)
+def test_locf_needs_no_sort_by(rust_mongo: Any, mongod: Any, stage: dict) -> None:
+    """`$locf` takes no `sortBy` on mongod 8.2.11: it carries the last
+    observation forward in the partition's own order, and a leading row with
+    nothing to carry answers null (measured 2026-11-06). The Rust server
+    required a `sortBy` and refused the stage with 2 "not supported by the
+    Rust server"."""
+    ours, theirs = _answers(rust_mongo, mongod, _ACCEPTED_DOCS, [{"$setWindowFields": stage}])
     assert ours == theirs
 
 
