@@ -2284,10 +2284,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  One-Time Filter: false",
         ],
     ),
-    # A Hash Join whose scans each have their own Filter: still
-    # unannotated (RP-390's remainder).
+    # Split from RP-390 (as RP-403) and fixed: a Hash Join whose scans each have their
+    # own Filter, one of them a range on the join key, counts each scan's
+    # rows and Rows Removed by Filter as `ExecScan` does.
     "analyze of a hash join over two filtered scans": (
-        "RP-390",
+        "RP-403",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s join e on s.a = e.a where e.b = 'v1' and s.a > 5",
@@ -2302,6 +2303,141 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s (actual rows=25 loops=1)",
             "              Filter: (a > 5)",
             "              Rows Removed by Filter: 5",
+        ],
+    ),
+    "analyze of a hash join over a filtered hashed side": (
+        "RP-403",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from e e1 join e e2 on e1.a = e2.a where e1.b = 'v1'",
+        [
+            "Hash Join (actual rows=100 loops=1)",
+            "  Hash Cond: (e2.a = e1.a)",
+            "  ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=100 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 12kB",
+            "        ->  Seq Scan on e e1 (actual rows=100 loops=1)",
+            "              Filter: (b = 'v1'::text)",
+            "              Rows Removed by Filter: 900",
+        ],
+    ),
+    # A range on the join key restricts its scan and leaves the join
+    # clause in place (`distribute_restrictinfo_to_rels`); only an
+    # equality joins the key's equivalence class. The join was unpriced.
+    "hash join over a range on each side's key": (
+        "RP-403",
+        _ANALYSED,
+        "explain select * from e join e e2 on e.a = e2.a where e.a < 100 and e2.a > 50",
+        [
+            "Hash Join  (cost=18.74..40.74 rows=94 width=14)",
+            "  Hash Cond: (e2.a = e.a)",
+            "  ->  Seq Scan on e e2  (cost=0.00..17.50 rows=950 width=7)",
+            "        Filter: (a > 50)",
+            "  ->  Hash  (cost=17.50..17.50 rows=99 width=7)",
+            "        ->  Seq Scan on e  (cost=0.00..17.50 rows=99 width=7)",
+            "              Filter: (a < 100)",
+        ],
+    ),
+    # A parameterized Nested Loop over a filtered outer scan: a comma
+    # join's, whose WHERE also holds the join clause, and a JOIN's.
+    "analyze of a parameterized nested loop over a filtered scan": (
+        "RP-403",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select k.a from e, k where e.a < k.a and e.b = 'v1'",
+        [
+            "Nested Loop (actual rows=50400 loops=1)",
+            "  ->  Seq Scan on e (actual rows=100 loops=1)",
+            "        Filter: (b = 'v1'::text)",
+            "        Rows Removed by Filter: 900",
+            "  ->  Index Only Scan using k_pkey on k (actual rows=504 loops=100)",
+            "        Index Cond: (a > e.a)",
+            "        Heap Fetches: 50400",
+        ],
+    ),
+    "analyze of a parameterized nested loop under a join's WHERE": (
+        "RP-403",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select k.a from e join k on e.a < k.a where e.a > 990",
+        [
+            "Nested Loop (actual rows=45 loops=1)",
+            "  ->  Seq Scan on e (actual rows=10 loops=1)",
+            "        Filter: (a > 990)",
+            "        Rows Removed by Filter: 990",
+            "  ->  Index Only Scan using k_pkey on k (actual rows=4 loops=10)",
+            "        Index Cond: (a > e.a)",
+            "        Heap Fetches: 45",
+        ],
+    ),
+    # A LEFT join filter over a char(n) column: still unannotated (RP-390's
+    # remainder).
+    "analyze of a left nested loop over a char(n) join filter": (
+        "RP-390",
+        _ANALYSED_THIRTY
+        + [
+            "create table cc (a int, b char(4))",
+            "insert into cc select g, 'v' || (g % 10) from generate_series(1, 30) g",
+            "analyze cc",
+        ],
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from cc left join s on cc.b < s.c",
+        [
+            "Nested Loop Left Join (actual rows=900 loops=1)",
+            "  Join Filter: ((cc.b)::text < s.c)",
+            "  ->  Seq Scan on cc (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=30 loops=30)",
+            "        ->  Seq Scan on s (actual rows=30 loops=1)",
+        ],
+    ),
+    # A scan Filter that is an expression or a LIKE: `scalarineqsel`'s
+    # default 1/3 for an expression, `patternsel`'s prefix selectivity
+    # for `c like 'x%'`. Here the scan prints zeros (found while working
+    # RP-403).
+    "estimate of a scan filtered by an expression": (
+        "RP-404",
+        _ANALYSED,
+        "explain select * from e where a + 1 > 996",
+        [
+            "Seq Scan on e  (cost=0.00..20.00 rows=333 width=7)",
+            "  Filter: ((a + 1) > 996)",
+        ],
+    ),
+    "estimate of a scan filtered by a LIKE prefix": (
+        "RP-404",
+        _ANALYSED_THIRTY,
+        "explain select * from s where c like 'x%'",
+        [
+            "Seq Scan on s  (cost=0.00..1.38 rows=30 width=20)",
+            "  Filter: (c ~~ 'x%'::text)",
+        ],
+    ),
+    # A join's scan whose WHERE conjunct is an expression printed a
+    # `Filter: (...)` line above its real one (found while working RP-403).
+    "a join's scan filtered by an expression": (
+        "RP-405",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e left join s on s.a = e.a where e.a + 1 > 996",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a + 1) > 996)",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # A scan's Filter lists its conjuncts cheapest first
+    # (`order_qual_clauses`): the operator over a column before the one
+    # over an expression. Here they keep the WHERE's order (found while
+    # working RP-402).
+    "a scan filter's conjuncts in cost order": (
+        "RP-406",
+        _ANALYSED,
+        "explain (costs off) select * from e where a + 1 > 996 and b = 'v1'",
+        [
+            "Seq Scan on e",
+            "  Filter: ((b = 'v1'::text) AND ((a + 1) > 996))",
         ],
     ),
     # An inner join's ON conjunct over one table is that table's scan
@@ -2793,6 +2929,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-394",
         "RP-395",
         "RP-396",
+        "RP-403",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
