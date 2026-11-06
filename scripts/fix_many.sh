@@ -9,10 +9,9 @@
 # -i BRANCH (integration mode): each session gates locally and pushes its
 # fix to BRANCH, with no PR and no CI wait (fix-one skill, "Integration
 # mode"). BRANCH is created from origin/main if it does not exist. At the
-# end the batch opens (or reuses) one PR from BRANCH to main and prints its
-# number; CI on that PR is the check for the whole batch, and its merge
-# (a merge commit, pinned to the head CI passed) is done by whoever runs
-# the batch.
+# end nothing is opened here: run scripts/land_batch.sh BRANCH <this pid>
+# beside the batch. It lands BRANCH on main in snapshot PRs, each merged
+# after green CI.
 #
 # In integration mode each lane keeps ONE worktree, ../SecantusDB-lane<k>,
 # for every item it works: the session switches it to a new branch off
@@ -118,18 +117,7 @@ for k in $(seq 1 "$jobs"); do
 done
 wait
 
-if [[ -n $into ]]; then
-    git fetch -q origin
-    ahead=$(git rev-list --count "origin/main..origin/$into")
-    if [[ $ahead -gt 0 ]]; then
-        pr=$(gh pr list --head "$into" --base main --state open --json number -q '.[0].number')
-        if [[ -z $pr ]]; then
-            url=$(gh pr create --base main --head "$into" \
-                --title "Rust PG server: fix-one batch ($ahead items, $into)" \
-                --body "$(git log --format='- %s' "origin/main..origin/$into")") || exit 1
-            pr=${url##*/}
-        fi
-        echo "$(date '+%F %T') batch PR #$pr ($ahead commits from $into)" >>"$out/summary.txt"
-    fi
-fi
+# Integration mode opens no PR here: scripts/land_batch.sh <branch> <pid>
+# lands the branch in snapshots while the batch runs (a PR straight from
+# the branch had its CI cancelled by every lane's push).
 echo "$(date '+%F %T') DONE" >>"$out/summary.txt"
