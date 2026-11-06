@@ -16,6 +16,8 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 mod agg_hoist;
 mod agg_support;
+mod targetlist_size;
+pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
 pub mod colstats;
 pub mod costsize;
@@ -4999,6 +5001,8 @@ fn plan_node(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    // `checkTargetlistSize`, before any rewrite walks the list (RP-387).
+    targetlist_size::check(&node, lookup)?;
     let mut node = node;
     schemas::resolve_shadowed_calls(&mut node, lookup)?;
     collation::citext_operators(&mut node, lookup)?;
@@ -5056,6 +5060,14 @@ fn plan_node(
                     inherit::merge_parents(def, &parents, lookup)?;
                 }
                 partitions::key_types(def)?;
+                // `MergeAttributes`: the columns, inherited ones included
+                // (RP-387).
+                if def.columns.len() > MAX_HEAP_ATTRIBUTE_NUMBER as usize {
+                    return Err(Error::Sqlstate(
+                        "54011",
+                        format!("tables can have at most {MAX_HEAP_ATTRIBUTE_NUMBER} columns"),
+                    ));
+                }
             }
             Ok(st)
         }

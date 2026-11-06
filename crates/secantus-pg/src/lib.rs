@@ -3009,18 +3009,14 @@ impl PgHandler {
         keys: &[&secantus_pgplan::OrderKey],
     ) -> Option<i64> {
         let is_window = |f: &str| sel.windows.iter().any(|w| w.field == f);
-        let mut fields: Vec<String> = Vec::new();
-        for f in sel
-            .columns
-            .iter()
-            .map(|(_, f)| f.clone())
-            .filter(|f| !is_window(f))
-            .chain(keys.iter().map(|k| k.field.clone()))
-        {
-            if !fields.contains(&f) {
-                fields.push(f);
-            }
-        }
+        let fields = first_occurrences(
+            Vec::new(),
+            sel.columns
+                .iter()
+                .map(|(_, f)| f.clone())
+                .filter(|f| !is_window(f))
+                .chain(keys.iter().map(|k| k.field.clone())),
+        );
         match self.scan_estimate(&sel.table, &sel.filter, &fields)? {
             ((_, _, _, width), None) => Some(width),
             _ => None,
@@ -28735,6 +28731,18 @@ impl PgHandler {
                         ),
                     ))));
                 }
+                // `ATExecAddColumn`: the new column takes the next attnum,
+                // a dropped column's slot counted (RP-387).
+                if i32::from(def.natts()) + 1 > secantus_pgplan::MAX_HEAP_ATTRIBUTE_NUMBER {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "54011".into(), // too_many_columns
+                        format!(
+                            "tables can have at most {} columns",
+                            secantus_pgplan::MAX_HEAP_ATTRIBUTE_NUMBER
+                        ),
+                    ))));
+                }
                 // A NOT NULL column with no DEFAULT cannot be added to a table
                 // that already has rows: every one of them would violate it
                 // immediately, which is PostgreSQL's own refusal.
@@ -41329,18 +41337,14 @@ impl PgHandler {
                             let priced: Vec<(u32, Vec<String>)> =
                                 sel.windows.iter().filter_map(priced_window_func).collect();
                             let arg_ops: u32 = priced.iter().map(|(o, _)| o).sum();
-                            let mut fields: Vec<String> = Vec::new();
-                            for f in sel
-                                .columns
-                                .iter()
-                                .map(|(_, f)| f.clone())
-                                .filter(|f| !is_window(f))
-                                .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned()))
-                            {
-                                if !fields.contains(&f) {
-                                    fields.push(f);
-                                }
-                            }
+                            let fields = first_occurrences(
+                                Vec::new(),
+                                sel.columns
+                                    .iter()
+                                    .map(|(_, f)| f.clone())
+                                    .filter(|f| !is_window(f))
+                                    .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned())),
+                            );
                             let results: Vec<&str> =
                                 sel.windows.iter().map(|w| w.result_type.as_str()).collect();
                             if let (Some((estimate, None)), Some(out)) = (
@@ -41433,20 +41437,16 @@ impl PgHandler {
                             // read, and the windows' keys, each once.
                             let priced: Vec<(u32, Vec<String>)> =
                                 sel.windows.iter().filter_map(priced_window_func).collect();
-                            let mut fields: Vec<String> = Vec::new();
-                            for f in sel
-                                .columns
-                                .iter()
-                                .map(|(_, f)| f.as_str())
-                                .filter(|f| !is_window(f))
-                                .map(str::to_string)
-                                .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned()))
-                                .chain(all_keys.iter().map(|k| k.field.clone()))
-                            {
-                                if !fields.contains(&f) {
-                                    fields.push(f);
-                                }
-                            }
+                            let fields = first_occurrences(
+                                Vec::new(),
+                                sel.columns
+                                    .iter()
+                                    .map(|(_, f)| f.as_str())
+                                    .filter(|f| !is_window(f))
+                                    .map(str::to_string)
+                                    .chain(priced.iter().flat_map(|(_, f)| f.iter().cloned()))
+                                    .chain(all_keys.iter().map(|k| k.field.clone())),
+                            );
                             if let (Some((estimate, None)), Some(out)) = (
                                 self.scan_estimate(&sel.table, &sel.filter, &fields),
                                 self.window_output_width(sel, &all_keys),
@@ -41590,8 +41590,10 @@ impl PgHandler {
                             .any(|ix| ix.table.name == sel.table);
                         let fields: Vec<String> =
                             sel.columns.iter().map(|(_, f)| f.clone()).collect();
-                        let distinct_fields =
-                            (1..fields.len()).all(|i| !fields[..i].contains(&fields[i]));
+                        let distinct_fields = {
+                            let mut seen = std::collections::HashSet::new();
+                            fields.iter().all(|f| seen.insert(f))
+                        };
                         if !indexed
                             && distinct_fields
                             && sel.residual.is_none()
@@ -41685,12 +41687,10 @@ impl PgHandler {
                                 .enumerate()
                                 .all(|(i, (_, c))| *c == secantus_pgplan::OutputCol::Agg(i))
                         {
-                            let mut fields: Vec<String> = Vec::new();
-                            for f in agg.items.iter().filter_map(|it| it.field.clone()) {
-                                if !fields.contains(&f) {
-                                    fields.push(f);
-                                }
-                            }
+                            let fields = first_occurrences(
+                                Vec::new(),
+                                agg.items.iter().filter_map(|it| it.field.clone()),
+                            );
                             if let Some((estimate, index, _)) = self.upper_scan(
                                 &agg.table,
                                 &agg.filter,
@@ -41773,12 +41773,10 @@ impl PgHandler {
                             && agg.series.is_none()
                             && agg.join.is_none()
                         {
-                            let mut fields = keys.clone();
-                            for f in agg.items.iter().filter_map(|it| it.field.clone()) {
-                                if !fields.contains(&f) {
-                                    fields.push(f);
-                                }
-                            }
+                            let fields = first_occurrences(
+                                keys.clone(),
+                                agg.items.iter().filter_map(|it| it.field.clone()),
+                            );
                             if let (Some((scan, None)), Some((keyed, None)), Some(groups)) = (
                                 self.scan_estimate(&agg.table, &agg.filter, &fields),
                                 self.scan_estimate(&agg.table, &agg.filter, &keys),
@@ -55192,4 +55190,17 @@ fn priced_window_func(w: &secantus_pgplan::WindowItem) -> Option<(u32, Vec<Strin
         fields.extend(read);
     }
     Some((ops, fields))
+}
+
+/// `start`, then each of `more` not already held, in order: a field list's
+/// first occurrences, kept in time linear in the list (RP-387).
+fn first_occurrences(start: Vec<String>, more: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut seen: std::collections::HashSet<String> = start.iter().cloned().collect();
+    let mut fields = start;
+    for f in more {
+        if seen.insert(f.clone()) {
+            fields.push(f);
+        }
+    }
+    fields
 }

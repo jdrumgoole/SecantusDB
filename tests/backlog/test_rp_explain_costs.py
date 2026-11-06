@@ -2104,9 +2104,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s (actual rows=30 loops=1)",
         ],
     ),
-    # ------------- RP-387 a LEFT nested loop's Join Filter count
+    # ------------- RP-389 a LEFT nested loop's Join Filter count
     "analyze of a left nested loop's join filter": (
-        "RP-387",
+        "RP-389",
         _ANALYSED_THIRTY,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from s left join e on s.a < e.a",

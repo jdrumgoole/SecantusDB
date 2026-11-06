@@ -900,37 +900,6 @@ one beside it.
 
 ## Found by the security reviews (2026-11-06)
 
-- [ ] **The server accepts a table of more than 1600 columns and a target
-      list of more than 1664 entries; PostgreSQL refuses both with 54011,
-      and EXPLAIN's cost blocks go quadratic on the list.** GitHub issue
-      #2289 (security review 2026-11-03). PostgreSQL 15.19:
-      `CREATE TABLE` of 1601 columns fails `54011 tables can have at most
-      1600 columns`, and a SELECT or EXPLAIN whose target list has 1665
-      entries fails `54011 target lists can have at most 1664 entries`
-      (1600 and 1664 are accepted; a repeated column counts once per
-      entry). Measured 2026-11-06 on the Rust server (debug build): the
-      1601-column table is created, and `EXPLAIN SELECT count(c0), ...,
-      count(cN)` over 1665 entries plans (7.3 s) as does `EXPLAIN SELECT
-      DISTINCT ... ORDER BY ...` over 1665. Nothing bounds the list, so
-      the RP-320 block (`distinct_fields` in `crates/secantus-pg/src/lib.rs`)
-      and the RP-321 block (the `fields.contains(&f)` loop over
-      `agg.items`, now also at the grouped-aggregate block the issue's
-      2026-11-06 update names) dedup it with `Vec::contains`, O(n^2) in a
-      count the client sets, with no cancellation point inside.
-      The fix, most faithful first: refuse both limits where PostgreSQL does
-      -- `DefineRelation` for the 1600-column table (CREATE TABLE and ALTER
-      TABLE ADD COLUMN) and `checkTargetlistSize` in parse analysis for the
-      target list -- which also bounds n at 1664. Then, as defence in
-      depth, replace the `Vec::contains` dedups with a `HashSet` (the issue
-      proposes it).
-      The gap tests assert PostgreSQL's refusals; the dedup loops are not
-      timed (at the 1664 entries PostgreSQL permits, n^2 is 2.8 million
-      string comparisons).
-      Backlog-ID: RP-387
-      Verify: tests/backlog/test_rp_explain_bounds.py::test_create_table_over_1600_columns_is_refused,
-      tests/backlog/test_rp_explain_bounds.py::test_explain_count_target_list_over_1664_entries_is_refused,
-      tests/backlog/test_rp_explain_bounds.py::test_explain_distinct_order_by_over_1664_entries_is_refused
-
 - [ ] **EXPLAIN of a comma join takes time quadratic or worse in the number
       of WHERE conjuncts.** GitHub issue #2346 (security review
       2026-11-05, updated 2026-11-06). `EXPLAIN SELECT * FROM a, b WHERE
@@ -1501,7 +1470,7 @@ a regression test.
       hash table past `hash_mem` (several batches) and a join with an
       inner-unique inner side. Measured on a private 15.19 cluster (found
       while working RP-386).
-      Backlog-ID: RP-387
+      Backlog-ID: RP-389
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop's join filter]
 
 ## Found by batch 54 (2026-10-24)
