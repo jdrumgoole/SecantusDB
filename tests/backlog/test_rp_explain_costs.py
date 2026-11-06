@@ -2199,8 +2199,11 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Heap Fetches: 2",
         ],
     ),
+    # Split from RP-384 and fixed: a BitmapOr prints `actual rows=0`, each
+    # arm's Bitmap Index Scan its own tuples, and the heap scan the pages
+    # of their union.
     "analyze of a BitmapOr": (
-        "RP-384",
+        "RP-383",
         _N,
         "explain (analyze, costs off, timing off, summary off)"
         " select * from n where b = 7 or b = 9",

@@ -1446,17 +1446,17 @@ a regression test.
       and an index-only scan prints its `Heap Fetches`, a Bitmap Heap Scan
       its `Heap Blocks: exact=` and its Bitmap Index Scan its own `actual
       rows`, as PostgreSQL 15.19 does, and since 2026-11-06 an index
-      scan its `Rows Removed by Filter`. Still missing: any of those
+      scan its `Rows Removed by Filter`, and since 2026-11-06 a BitmapOr
+      its and its arms' actual rows. Still missing: any of those
       counters while the heap holds a dead
       version, a dead line pointer or a HOT chain not yet vacuumed, whose
       index entries the scan visits too (`update k set b = 'z' where a =
-      5`, then the index-only scan of `a = 5`: `Heap Fetches: 2`); a
-      BitmapOr's and its arms' actual rows (`BitmapOr (actual rows=0
-      loops=1)`, each arm's 100); and a bitmap past `work_mem`, whose
+      5`, then the index-only scan of `a = 5`: `Heap Fetches: 2`); and a
+      bitmap past `work_mem`, whose
       pages go lossy (`Heap Blocks: exact=... lossy=...`). Measured on a
       private 15.19 cluster (found while working RP-383).
       Backlog-ID: RP-384
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version]
 - [ ] **EXPLAIN ANALYZE prints no counts below most other joins.** Since
       RP-386 a join's children print their actual rows and loops, a
       parameterized inner index-only scan its `Heap Fetches`, a Hash its
