@@ -141,11 +141,15 @@ pub(crate) enum Cat {
     NullItem = 3,
 }
 
-/// An entry's key: its category, and its datum when that is `Norm`.
+/// An entry's key: its category, and its datum when that is `Norm`; in
+/// a multi-column index, the column it is a key of (`attnum`, 1-based,
+/// stored in the tuple as an `int2` before the key), 0 in a one-column
+/// index (`GinState.oneCol`, no attnum stored).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Key {
     pub(crate) cat: Cat,
     pub(crate) val: Bson,
+    pub(crate) att: u16,
 }
 
 impl Key {
@@ -153,6 +157,7 @@ impl Key {
         Key {
             cat: Cat::Norm,
             val,
+            att: 0,
         }
     }
 
@@ -160,31 +165,45 @@ impl Key {
         Key {
             cat,
             val: Bson::Null,
+            att: 0,
         }
+    }
+
+    /// This key as one of column `att`'s in a multi-column index.
+    pub(crate) fn of_att(mut self, att: u16) -> Key {
+        self.att = att;
+        self
     }
 }
 
-/// What the model needs of an index's one key column: its opclass's
-/// `compare` support function, and the sizes its keys take.
+/// What the model needs of an index's key columns: each opclass's
+/// `compare` support function, and the sizes its keys take. `att` is the
+/// key's column (`Key::att`: 0 in a one-column index).
 pub(crate) trait KeyOps {
-    /// The opclass's comparison of two normal keys.
-    fn cmp(&self, a: &Bson, b: &Bson) -> Ordering;
-    /// `index_form_tuple`'s (MAXALIGNed) size for a tuple of this key.
-    fn key_size(&self, v: &Bson) -> usize;
+    /// Column `att`'s opclass comparison of two normal keys.
+    fn cmp(&self, att: u16, a: &Bson, b: &Bson) -> Ordering;
+    /// `index_form_tuple`'s (MAXALIGNed) size for a tuple of this key: in
+    /// a multi-column index, the `int2` attnum and then the key, aligned
+    /// as its type is.
+    fn key_size(&self, att: u16, v: &Bson) -> usize;
     /// The palloc'd size of a by-reference key datum (`datumCopy`), or
     /// `None` for a by-value one.
-    fn datum_size(&self, v: &Bson) -> Option<usize>;
+    fn datum_size(&self, att: u16, v: &Bson) -> Option<usize>;
 }
 
-/// `ginCompareEntries`: by category, then by the opclass.
+/// `ginCompareAttEntries`: by column, then (`ginCompareEntries`) by
+/// category, then by the column's opclass.
 fn cmp_keys(ops: &dyn KeyOps, a: &Key, b: &Key) -> Ordering {
+    if a.att != b.att {
+        return a.att.cmp(&b.att);
+    }
     if a.cat != b.cat {
         return a.cat.cmp(&b.cat);
     }
     if a.cat != Cat::Norm {
         return Ordering::Equal;
     }
-    ops.cmp(&a.val, &b.val)
+    ops.cmp(a.att, &a.val, &b.val)
 }
 
 /// The size of a tuple of `key` before its posting list, and the posting
@@ -192,11 +211,15 @@ fn cmp_keys(ops: &dyn KeyOps, a: &Key, b: &Key) -> Ordering {
 /// null bitmap and a category byte after it.
 fn key_offset(ops: &dyn KeyOps, key: &Key) -> usize {
     if key.cat == Cat::Norm {
-        shortalign(ops.key_size(&key.val))
-    } else {
+        shortalign(ops.key_size(key.att, &key.val))
+    } else if key.att == 0 {
         // `IndexInfoFindDataOffset` with nulls is 16; the category byte
-        // follows it.
+        // follows it (`GinCategoryOffset`).
         shortalign(16 + 1)
+    } else {
+        // The 16 bytes, then the `int2` attnum: `index_form_tuple`'s
+        // MAXALIGNed 24 is more than the category byte's 19.
+        shortalign(maxalign(16 + 2).max(16 + 2 + 1))
     }
 }
 
@@ -428,7 +451,7 @@ impl Accum {
                 }
                 self.eas_used += 1;
                 if key.cat == Cat::Norm {
-                    if let Some(n) = ops.datum_size(&key.val) {
+                    if let Some(n) = ops.datum_size(key.att, &key.val) {
                         self.allocated += chunk_space(n);
                     }
                 }
@@ -438,8 +461,18 @@ impl Accum {
         }
     }
 
-    /// `ginInsertBAEntries`: the keys of one heap tuple, middle first.
+    /// The keys of one heap tuple, in column order: each column's run
+    /// through its own `ginInsertBAEntries` (`ginBuildCallback`'s loop
+    /// over the columns; `processPendingPage` breaks on a new attnum).
     fn insert_all(&mut self, ops: &dyn KeyOps, tid: Tid, keys: &[Key]) {
+        for run in keys.chunk_by(|a, b| a.att == b.att) {
+            self.insert_run(ops, tid, run);
+        }
+    }
+
+    /// `ginInsertBAEntries`: one column's keys of one heap tuple, middle
+    /// first.
+    fn insert_run(&mut self, ops: &dyn KeyOps, tid: Tid, keys: &[Key]) {
         let n = keys.len() as u32;
         if n == 0 {
             return;
@@ -1867,13 +1900,13 @@ mod tests {
     struct Int4;
 
     impl KeyOps for Int4 {
-        fn cmp(&self, a: &Bson, b: &Bson) -> Ordering {
+        fn cmp(&self, _: u16, a: &Bson, b: &Bson) -> Ordering {
             a.as_i32().cmp(&b.as_i32())
         }
-        fn key_size(&self, _: &Bson) -> usize {
+        fn key_size(&self, _: u16, _: &Bson) -> usize {
             16
         }
-        fn datum_size(&self, _: &Bson) -> Option<usize> {
+        fn datum_size(&self, _: u16, _: &Bson) -> Option<usize> {
             None
         }
     }
