@@ -95,6 +95,11 @@ pub(crate) struct Page {
     pub full: bool,
     /// `pd_prune_xid`: the oldest xmax a prune has not yet removed.
     pub prune_xid: Option<u64>,
+    /// The page's bit in the visibility map (`VISIBILITYMAP_ALL_VISIBLE`,
+    /// with `PD_ALL_VISIBLE`): set by VACUUM when every tuple on it is
+    /// visible to every snapshot, cleared by any insert, update or delete
+    /// that touches it (`heap_insert` / `heap_update` / `heap_delete`).
+    pub all_visible: bool,
     /// The line pointers that are not ordinary tuples (see the module doc).
     pub lps: BTreeMap<u16, Lp>,
 }
@@ -129,6 +134,7 @@ impl Page {
 
     /// `PageAddItem`: the first unused line pointer, else a new one.
     fn add(&mut self, len: u32) -> u16 {
+        self.all_visible = false;
         match self.first_unused() {
             Some(off) => {
                 self.lps.remove(&off);
@@ -404,6 +410,7 @@ impl Heap {
             id,
             committed: false,
         });
+        page.all_visible = false;
         match page.lps.get_mut(&off) {
             Some(Lp::Normal(t)) => t.xmax = xmax,
             Some(_) => return,
@@ -930,6 +937,14 @@ impl Heap {
                 }
             }
         }
+        // `lazy_scan_prune` / `lazy_vacuum_heap_page`: a page left with no
+        // dead line pointer, whose every tuple is live to every snapshot,
+        // is marked all-visible (a bypassed index pass leaves its dead
+        // items, and its pages unmarked).
+        for block in 0..rel_pages {
+            let visible = self.page_all_visible(block, horizon, running, &absent);
+            self.pages[block as usize].all_visible = visible;
+        }
         self.fsm.vacuum_range(0, rel_pages);
         let possibly_freeable = rel_pages - nonempty_pages;
         if truncate
@@ -954,6 +969,54 @@ impl Heap {
         // every backend's cached target block.
         self.targets.clear();
         index_pass
+    }
+
+    /// `heap_page_is_all_visible`: no dead line pointer on `block`, and
+    /// every tuple on it live, its inserter ended before `horizon`.
+    fn page_all_visible(
+        &self,
+        block: u32,
+        horizon: u64,
+        running: &dyn Fn(u64) -> bool,
+        absent: &dyn Fn(i64) -> bool,
+    ) -> bool {
+        let page = &self.pages[block as usize];
+        (1..=page.nlp).all(|o| {
+            let lp = page.lp(o);
+            match lp {
+                Some(Lp::Unused | Lp::Redirect(_)) => true,
+                Some(Lp::Dead) => false,
+                _ => {
+                    let ctid = tid(block, o);
+                    let young = self
+                        .inserting
+                        .get(&ctid)
+                        .is_some_and(|(x, _)| *x >= horizon || running(*x));
+                    !young && self.htsv(ctid, lp, horizon, running, absent) == Htsv::Live
+                }
+            }
+        })
+    }
+
+    /// Does any page hold a line pointer an index entry may still reach
+    /// that is not a live tuple's own: a dead or redirected one, a marked
+    /// or aborted version, a heap-only tuple? Until VACUUM's index pass
+    /// those entries are visited by an index scan too.
+    pub(crate) fn has_dead_entries(&self) -> bool {
+        self.pages.iter().any(|p| {
+            p.lps.values().any(|lp| match lp {
+                Lp::Unused => false,
+                Lp::Dead | Lp::Redirect(_) => true,
+                Lp::Normal(t) => t.xmax.is_some() || t.xmin_aborted || t.heap_only,
+            })
+        })
+    }
+
+    /// Is the visibility map's bit set for the page `ctid` is on?
+    pub(crate) fn all_visible(&self, ctid: i64) -> bool {
+        untid(ctid)
+            .and_then(|(b, _)| self.pages.get(b as usize))
+            .is_some_and(|p| p.all_visible)
     }
 
     /// `lazy_vacuum_heap_page`: dead line pointers made unused, the
@@ -1015,6 +1078,36 @@ mod tests {
         h.vacuum(900, &none, &live, false, true);
         assert_eq!(h.pages[0].lp(2), Some(&Lp::Redirect(4)));
         assert_eq!(h.insert(2, 802, 136), tid(0, 5));
+    }
+
+    /// The visibility map (RP-383): VACUUM marks a page whose tuples are
+    /// all visible to everyone, an insert or delete on it clears the mark,
+    /// and a tuple whose inserter still runs keeps it clear.
+    #[test]
+    fn vacuum_sets_and_writes_clear_the_all_visible_bit() {
+        let mut h = Heap::default();
+        for _ in 0..3 {
+            h.insert(1, 800, 136);
+        }
+        h.forget_ended(&none);
+        let mut live: HashMap<i64, u32> = (1..=3).map(|o| (tid(0, o), 136)).collect();
+        h.vacuum(900, &none, &live, true, true);
+        assert!(h.all_visible(tid(0, 1)));
+        let c = h.insert(1, 901, 136);
+        assert!(!h.all_visible(c));
+        live.insert(c, 136);
+        let running = |x: u64| x == 901;
+        h.vacuum(950, &running, &live, true, true);
+        assert!(
+            !h.all_visible(c),
+            "an insert still running is not visible to all"
+        );
+        h.forget_ended(&none);
+        h.vacuum(950, &none, &live, true, true);
+        assert!(h.all_visible(c));
+        h.delete(tid(0, 2), 136, 951, Bson::Int32(2));
+        assert!(!h.all_visible(tid(0, 1)));
+        assert!(h.has_dead_entries());
     }
 
     /// The same with the key indexed and changed: the old tuple dies and

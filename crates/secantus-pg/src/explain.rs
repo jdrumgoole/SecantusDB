@@ -50,6 +50,12 @@ pub(crate) struct PlanNode {
     /// (RP-354): `(alias, column)` whose comparison with the outer side
     /// is its `Index Cond`, taken from the join's filter.
     pub param_cond: Option<(String, String)>,
+    /// Under ANALYZE, a Bitmap Heap Scan's `Heap Blocks: exact=` (its
+    /// `exact_pages`): the heap pages its bitmap named (RP-383).
+    pub heap_blocks: Option<usize>,
+    /// Under ANALYZE, a child node's own `actual rows` (a Bitmap Index
+    /// Scan's index tuples, RP-383); a child without one prints none.
+    pub actual_rows: Option<usize>,
 }
 
 impl PlanNode {
@@ -64,6 +70,8 @@ impl PlanNode {
             unique_probe: None,
             commute_cond: false,
             heap_fetches: None,
+            heap_blocks: None,
+            actual_rows: None,
             skip_cond: false,
             implied_filter: None,
             param_cond: None,
@@ -1125,8 +1133,15 @@ pub(crate) fn render_text(
         if let (Some(n), Some(_)) = (n.heap_fetches, actual) {
             out.push(format!("{}Heap Fetches: {n}", " ".repeat(2 + 6 * depth)));
         }
+        if let (Some(n), Some(_)) = (n.heap_blocks, actual) {
+            out.push(format!(
+                "{}Heap Blocks: exact={n}",
+                " ".repeat(2 + 6 * depth)
+            ));
+        }
         for c in &n.children {
-            walk(c, depth + 1, options, None, out);
+            let a = actual.and(c.actual_rows);
+            walk(c, depth + 1, options, a, out);
         }
     }
     walk(root, 0, options, actual_rows, &mut out);
@@ -1241,6 +1256,16 @@ fn structured(
             ));
             fields.push(("Heap Fetches".into(), Value::Num(f.to_string())));
         }
+        // A bitmap heap scan's (`show_tidbitmap_info`), after its recheck
+        // count.
+        if let (Some(_), Some(b)) = (actual, n.heap_blocks) {
+            fields.push((
+                "Rows Removed by Index Recheck".into(),
+                Value::Num("0".into()),
+            ));
+            fields.push(("Exact Heap Blocks".into(), Value::Num(b.to_string())));
+            fields.push(("Lossy Heap Blocks".into(), Value::Num("0".into())));
+        }
         if !n.children.is_empty() {
             let kids = n
                 .children
@@ -1258,7 +1283,7 @@ fn structured(
                     } else {
                         "Inner"
                     };
-                    node(c, options, None, Some(rel))
+                    node(c, options, actual.and(c.actual_rows), Some(rel))
                 })
                 .collect();
             fields.push(("Plans".into(), Value::Arr(kids)));

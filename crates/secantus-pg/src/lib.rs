@@ -12019,6 +12019,67 @@ impl PgHandler {
     /// primary key (`<t>_pkey`, which storage keeps as `_id_`), each storage
     /// index (CREATE INDEX and every UNIQUE constraint), and an EXCLUDE
     /// constraint enforced row by row, which has no storage index.
+    /// What a scan of user table `table` through its B-tree `index` reaches
+    /// under `filter`'s quals on the index's columns (its index quals):
+    /// `(index tuples, of those on a page the visibility map leaves
+    /// unmarked, distinct heap pages)` -- an index-only scan's `Heap
+    /// Fetches`, a Bitmap Index Scan's rows and its heap scan's exact pages
+    /// (RP-383). `None` where the index tuples are not the live rows the
+    /// quals match: a heap still holding dead versions, dead line pointers or HOT
+    /// chains (their index entries are visited too), a qual not a plain conjunct of
+    /// column conditions, a table without a modelled heap.
+    fn user_index_tids(
+        &self,
+        table: &str,
+        index: &str,
+        filter: &Document,
+    ) -> Option<(usize, usize, usize)> {
+        if !self.has_heap(table)
+            || self
+                .with_heap_read(table, |h| h.has_dead_entries())
+                .unwrap_or(true)
+            || filter.keys().any(|k| k.starts_with('$'))
+        {
+            return None;
+        }
+        let relations = self.index_relations();
+        let ix = relations.iter().find(|ix| ix.name == index)?;
+        let columns: Vec<String> = ix
+            .keys
+            .iter()
+            .map(|k| {
+                let i = usize::try_from(*k).ok()?.checked_sub(1)?;
+                ix.table.field_of(&ix.table.columns.get(i)?.name)
+            })
+            .collect::<Option<_>>()?;
+        let quals: Document = filter
+            .iter()
+            .filter(|(k, _)| columns.contains(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if quals.is_empty() {
+            return None;
+        }
+        let empty = Document::new();
+        let mut ctids = Vec::new();
+        for d in self.table_docs(table).ok()? {
+            if secantus_core::query::matches(&d, &quals, &empty, None).ok()? {
+                ctids.push(heap::ctid_of(&d)?);
+            }
+        }
+        let visible = self
+            .with_heap_read(table, |h| {
+                ctids
+                    .iter()
+                    .map(|c| h.all_visible(*c))
+                    .collect::<Vec<bool>>()
+            })
+            .ok()?;
+        let not_visible = visible.iter().filter(|v| !**v).count();
+        let pages: std::collections::BTreeSet<i64> = ctids.iter().map(|c| c / 65536).collect();
+        Some((ctids.len(), not_visible, pages.len()))
+    }
+
     fn index_relations(&self) -> Vec<IndexRelation> {
         let mut out = Vec::new();
         let Ok(defs) = self.all_table_defs() else {
@@ -41822,7 +41883,26 @@ impl PgHandler {
                         .map(|(i, _)| i.to_string());
                     if let Some(index) = index.filter(|_| tree.children.is_empty()) {
                         tree.heap_fetches =
-                            self.catalog_heap_fetches(&sel.table, &index, &sel.filter, rows);
+                            match self.user_index_tids(&sel.table, &index, &sel.filter) {
+                                Some((_, not_visible, _)) => Some(not_visible),
+                                None => {
+                                    self.catalog_heap_fetches(&sel.table, &index, &sel.filter, rows)
+                                }
+                            };
+                    }
+                    // A bitmap scan's pages and its index scan's tuples (RP-383).
+                    let bitmap_index = (tree.name.starts_with("Bitmap Heap Scan on ")
+                        && tree.children.len() == 1)
+                        .then(|| tree.children[0].name.strip_prefix("Bitmap Index Scan on "))
+                        .flatten()
+                        .map(str::to_string);
+                    if let Some(index) = bitmap_index {
+                        if let Some((tuples, _, blocks)) =
+                            self.user_index_tids(&sel.table, &index, &sel.filter)
+                        {
+                            tree.heap_blocks = Some(blocks);
+                            tree.children[0].actual_rows = Some(tuples);
+                        }
                     }
                 }
                 let (ty, lines) = if options.format == "json" {
