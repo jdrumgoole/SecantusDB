@@ -2060,6 +2060,45 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Index Cond: (b = 7)",
         ],
     ),
+    # ----------------------- RP-384 what ANALYZE's scan counters still miss
+    "analyze of an index scan's filter": (
+        "RP-384",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from k where a < 30 and b = 'v5'",
+        [
+            "Index Scan using k_pkey on k (actual rows=3 loops=1)",
+            "  Index Cond: (a < 30)",
+            "  Filter: (b = 'v5'::text)",
+            "  Rows Removed by Filter: 26",
+        ],
+    ),
+    "analyze of an index-only scan over a dead version": (
+        "RP-384",
+        _ANALYSED + ["update k set b = 'z' where a = 5"],
+        "explain (analyze, costs off, timing off, summary off) select a from k where a = 5",
+        [
+            "Index Only Scan using k_pkey on k (actual rows=1 loops=1)",
+            "  Index Cond: (a = 5)",
+            "  Heap Fetches: 2",
+        ],
+    ),
+    "analyze of a BitmapOr": (
+        "RP-384",
+        _N,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from n where b = 7 or b = 9",
+        [
+            "Bitmap Heap Scan on n (actual rows=200 loops=1)",
+            "  Recheck Cond: ((b = 7) OR (b = 9))",
+            "  Heap Blocks: exact=27",
+            "  ->  BitmapOr (actual rows=0 loops=1)",
+            "        ->  Bitmap Index Scan on n_b (actual rows=100 loops=1)",
+            "              Index Cond: (b = 7)",
+            "        ->  Bitmap Index Scan on n_b (actual rows=100 loops=1)",
+            "              Index Cond: (b = 9)",
+        ],
+    ),
     # --------------------------------- RP-334 / RP-335 a catalog's index
     "a catalog read by its index": (
         "RP-334",
@@ -2334,6 +2373,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-379",
         "RP-381",
         "RP-382",
+        "RP-383",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
@@ -2350,6 +2390,91 @@ def fresh_db(dsn: str) -> str:
 def test_plan(name: str, rust_pg: Any) -> None:
     _, setup, query, expected = SCENARIOS[name]
     assert run(fresh_db(_dsn(rust_pg)), setup, query) == expected
+
+
+# Run in autocommit, as VACUUM cannot run in a transaction block.
+_VACUUMED = [
+    "create table k (a int primary key, b text)",
+    "insert into k select g, 'v' || (g % 10) from generate_series(1, 1000) g",
+    "create table n (a int, b int, c text)",
+    "insert into n select g, g % 50, 'x' || (g % 7) from generate_series(1, 5000) g",
+    "create index n_b on n (b)",
+    "vacuum analyze k",
+    "vacuum analyze n",
+]
+
+_ANALYZE = "explain (analyze, costs off, timing off, summary off) "
+
+
+def run_autocommit(dsn: str, steps: list[str]) -> list[list[str]]:
+    """Each statement's rows, in autocommit."""
+    out = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for s in steps:
+            cur = c.execute(s)
+            out.append([str(r[0]) for r in cur] if cur.description else [])
+    return out
+
+
+@pytest.mark.backlog_fixed("RP-383")
+def test_vacuum_sets_and_a_write_clears_the_visibility_map(rust_pg: Any) -> None:
+    """VACUUM marked every page all-visible, so an index-only scan fetched
+    no heap tuple; an insert cleared its page's bit, and a bitmap scan's
+    pages grew with it -- PostgreSQL 15.19's answers on a fresh cluster."""
+    steps = _VACUUMED + [
+        _ANALYZE + "select a from k where a < 300",
+        "insert into k values (1001, 'x')",
+        _ANALYZE + "select a from k where a < 300",
+        _ANALYZE + "select a from k where a > 990",
+        "insert into n values (5001, 7, 'y')",
+        _ANALYZE + "select * from n where b = 7",
+        "update k set b = 'z' where a = 5",
+        "vacuum k",
+        _ANALYZE + "select a from k where a = 5",
+    ]
+    got = run_autocommit(fresh_db(_dsn(rust_pg)), steps)
+    n = len(_VACUUMED)
+    fetches = "Heap Fetches: {}"
+    assert got[n] == [
+        "Index Only Scan using k_pkey on k (actual rows=299 loops=1)",
+        "  Index Cond: (a < 300)",
+        "  " + fetches.format(0),
+    ]
+    assert got[n + 2][-1] == "  " + fetches.format(0)
+    assert got[n + 3] == [
+        "Index Only Scan using k_pkey on k (actual rows=11 loops=1)",
+        "  Index Cond: (a > 990)",
+        "  " + fetches.format(11),
+    ]
+    assert got[n + 5] == [
+        "Bitmap Heap Scan on n (actual rows=101 loops=1)",
+        "  Recheck Cond: (b = 7)",
+        "  Heap Blocks: exact=28",
+        "  ->  Bitmap Index Scan on n_b (actual rows=101 loops=1)",
+        "        Index Cond: (b = 7)",
+    ]
+    assert got[n + 8] == [
+        "Index Only Scan using k_pkey on k (actual rows=1 loops=1)",
+        "  Index Cond: (a = 5)",
+        "  " + fetches.format(0),
+    ]
+
+
+@pytest.mark.backlog("RP-385")
+def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 keeps the index-only scan of a table VACUUM saw
+    shrink; this server prints a Seq Scan."""
+    steps = _VACUUMED + [
+        "delete from k where a = 7",
+        "vacuum k",
+        _ANALYZE + "select a from k where a < 10",
+    ]
+    got = run_autocommit(fresh_db(_dsn(rust_pg)), steps)
+    assert got[-1] == [
+        "Index Only Scan using k_pkey on k (actual rows=8 loops=1)",
+        "  Index Cond: (a < 10)",
+        "  Heap Fetches: 0",
+    ]
 
 
 if __name__ == "__main__":

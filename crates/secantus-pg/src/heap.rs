@@ -666,7 +666,11 @@ impl PgHandler {
 
     /// [`Self::with_heap`] for a look that changes nothing: the heap is not
     /// marked for the next checkpoint.
-    fn with_heap_read<T>(&self, table: &str, f: impl FnOnce(&mut Heap) -> T) -> PgWireResult<T> {
+    pub(crate) fn with_heap_read<T>(
+        &self,
+        table: &str,
+        f: impl FnOnce(&mut Heap) -> T,
+    ) -> PgWireResult<T> {
         self.heap_access(table, false, f)
     }
 

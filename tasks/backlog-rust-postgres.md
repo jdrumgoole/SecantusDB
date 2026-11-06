@@ -1400,19 +1400,33 @@ a regression test.
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index-only scan], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
 
-- [ ] **EXPLAIN ANALYZE of a user table's index-only or bitmap scan leaves
-      out its counters.** PostgreSQL 15.19 prints an Index Only Scan's
-      `Heap Fetches` (one per index tuple whose heap page the visibility
-      map does not mark all-visible: `Heap Fetches: 1` for `select a from
-      k where a = 5` before any VACUUM), an index scan's `Rows Removed by
-      Filter`, a Bitmap Heap Scan's `Heap Blocks: exact=27` and its Bitmap
-      Index Scans' and BitmapOr's own `actual rows`; here none of them
-      (`Heap Fetches` is modelled for catalogs only, RP-360). A user
-      table's visibility map is not modelled page by page, so after a
-      VACUUM which pages a later write cleared is not known (found while
-      working RP-378).
-      Backlog-ID: RP-383
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a user table's index-only scan], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a user table's bitmap scan]
+- [ ] **EXPLAIN ANALYZE's scan counters PostgreSQL prints that are still
+      left out.** Since RP-383 a user table's heap pages carry the
+      visibility map's bit (set by VACUUM, cleared by a write to the page),
+      and an index-only scan prints its `Heap Fetches`, a Bitmap Heap Scan
+      its `Heap Blocks: exact=` and its Bitmap Index Scan its own `actual
+      rows`, as PostgreSQL 15.19 does. Still missing: an index scan's
+      `Rows Removed by Filter` (`select * from k where a < 30 and b =
+      'v5'`: 26); any of those counters while the heap holds a dead
+      version, a dead line pointer or a HOT chain not yet vacuumed, whose
+      index entries the scan visits too (`update k set b = 'z' where a =
+      5`, then the index-only scan of `a = 5`: `Heap Fetches: 2`); a
+      BitmapOr's and its arms' actual rows (`BitmapOr (actual rows=0
+      loops=1)`, each arm's 100); and a bitmap past `work_mem`, whose
+      pages go lossy (`Heap Blocks: exact=... lossy=...`). Measured on a
+      private 15.19 cluster (found while working RP-383).
+      Backlog-ID: RP-384
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index scan's filter], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
+- [ ] **EXPLAIN shows a Seq Scan of a table VACUUM saw shrink.** After
+      `vacuum analyze k` (`k (a int primary key, b text)`, 1,000 rows),
+      `delete from k where a = 7` and `vacuum k`, PostgreSQL 15.19 keeps
+      `Index Only Scan using k_pkey on k` for `select a from k where a <
+      10`; here a `Seq Scan`, as `record_vacuum` marks a heap with fewer
+      rows than the last VACUUM saw as unmodelled and the path model
+      declines it (RP-196's "rows removed, which is not modelled").
+      Measured on a private 15.19 cluster (found while working RP-383).
+      Backlog-ID: RP-385
+      Verify: tests/backlog/test_rp_explain_costs.py::test_an_index_only_scan_after_a_delete_and_vacuum
 
 ## Found by batch 54 (2026-10-24)
 

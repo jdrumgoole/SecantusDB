@@ -93,6 +93,7 @@ pub(crate) fn heap_doc(oid: i64, heap: &Heap) -> Document {
                 "free": i(p.free),
                 "nlp": i(p.nlp),
                 "full": p.full,
+                "all_visible": p.all_visible,
                 "prune": p.prune_xid.map_or(Bson::Null, |x| Bson::Int64(x as i64)),
                 "lps": p.lps.iter().map(|(o, lp)| lp_doc(*o, lp)).collect::<Vec<_>>(),
             })
@@ -126,6 +127,7 @@ pub(crate) fn heap_from(d: &Document) -> Heap {
             free: p.get_i64("free").unwrap_or(0).try_into().unwrap_or(0),
             nlp: p.get_i64("nlp").unwrap_or(0).try_into().unwrap_or(0),
             full: p.get_bool("full").unwrap_or(false),
+            all_visible: p.get_bool("all_visible").unwrap_or(false),
             prune_xid: p.get_i64("prune").ok().map(|x| x as u64),
             ..Page::default()
         };
