@@ -1093,6 +1093,10 @@ tests regression tests:
       delays alone after it passed at load 14. An eighth on 2026-11-05 in
       CI: `main`'s `pg-oracle (server)` job on PR #2356's merge commit
       (run 42084287135; EXPLAIN costing only): `[2.5]` answered `ok`.
+      A ninth on 2026-11-06 in CI: `pg-oracle (backlog)` on commit e36ac1a4
+      (run 42267880688, job 128064449306; RP-390 and RP-394, EXPLAIN and
+      join planning only): `[2.5]` answered `ok`. A second run of the same
+      commit (run 42268061295, PR #2387) passed.
       Every sighting so far is under load, none on an idle machine, and
       none on a branch touching the wire or cancel code.
       Backlog-ID: RP-303
