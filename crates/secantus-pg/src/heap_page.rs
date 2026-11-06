@@ -1019,6 +1019,11 @@ impl Heap {
             .is_some_and(|p| p.all_visible)
     }
 
+    /// `visibilitymap_count`: the pages whose all-visible bit is set.
+    pub(crate) fn visible_count(&self) -> u32 {
+        self.pages.iter().filter(|p| p.all_visible).count() as u32
+    }
+
     /// `lazy_vacuum_heap_page`: dead line pointers made unused, the
     /// array's unused tail given back.
     fn vacuum_page(&mut self, block: u32) {

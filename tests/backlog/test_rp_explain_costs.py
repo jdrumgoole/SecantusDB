@@ -2460,10 +2460,11 @@ def test_vacuum_sets_and_a_write_clears_the_visibility_map(rust_pg: Any) -> None
     ]
 
 
-@pytest.mark.backlog("RP-385")
+@pytest.mark.backlog_fixed("RP-385")
 def test_an_index_only_scan_after_a_delete_and_vacuum(rust_pg: Any) -> None:
     """PostgreSQL 15.19 keeps the index-only scan of a table VACUUM saw
-    shrink; this server prints a Seq Scan."""
+    shrink; this server printed a Seq Scan, as VACUUM marked a heap that
+    lost rows as unmodelled."""
     steps = _VACUUMED + [
         "delete from k where a = 7",
         "vacuum k",
