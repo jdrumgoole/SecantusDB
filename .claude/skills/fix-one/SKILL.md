@@ -20,7 +20,7 @@ commit as soon as the fix exists so nothing is lost.
 into pg-batch`; `scripts/fix_many.sh -i pg-batch` passes it). The fix lands
 on that integration branch instead of `main`, after the local gate and with
 no CI wait: CI runs once on the integration branch's PR to `main`, which the
-batch's orchestrator opens and merges (Joe, 2026-11-06: a session spent
+batch's orchestrator lands in snapshots with `scripts/land_batch.sh` (Joe, 2026-11-06: a session spent
 ~40 of its 35-60 min waiting on CI). Where a step below says `origin/main`,
 read `origin/<branch>`; step 7 has the landing. Never push to `main`.
 

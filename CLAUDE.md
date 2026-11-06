@@ -286,7 +286,8 @@ The backlog is the canonical list of commands that are stubbed, features with si
 postgres <n>` runs n of them in two lanes (three when this is the machine's
 only session), each lane in its own reused worktree and each fix landing on
 the `pg-batch` integration branch after the local `gate_pg.sh --fast`, then
-opens one PR to `main` for CI
+`scripts/land_batch.sh pg-batch <batch pid>` lands that branch on `main` in
+snapshot PRs, each after green CI
 (start it through `scripts/detached_run.py`; the `fix-one` skill has the
 detail).
 
