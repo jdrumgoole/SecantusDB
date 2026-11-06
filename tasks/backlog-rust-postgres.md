@@ -1395,22 +1395,6 @@ a regression test.
       join of three or more relations (found while working RP-329).
       Backlog-ID: RP-354
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[nested loop into an index], tests/backlog/test_rp_explain_costs.py::test_plan[nested loop left join with a one-sided ON conjunct]
-- [ ] **EXPLAIN of a join on a unique key still prints zeros for three
-      shapes.** Since RP-377 an inner join of two analysed tables on one key
-      unique on a side is priced: the Hash Join PostgreSQL 15.19 keeps,
-      weighed against the merge join reading the key's index presorted and
-      the nested loop probing it (`unique_key_other_paths` in
-      `scan_estimate.rs`, over `JoinRel::add_paths_general` with no hash
-      path). Not yet, each a Hash Join on PostgreSQL: the indexed side
-      filtered by its own WHERE (`where k.b = 'v3'`, 18.75..36.39 -- `hash_side`
-      declines a filtered side over an indexed table whenever
-      `index_scan_estimate` finds no cheaper index path, though the sequential
-      scan is then the side's path), a LEFT join (`Hash Left Join`
-      27.50..45.14), and a join filter beside the key (`and e.b < k.b`,
-      27.50..45.12 rows=333). Measured on a private 15.19 cluster
-      (2026-11-05).
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key whose indexed side is filtered], tests/backlog/test_rp_explain_costs.py::test_plan[a left join on a unique key], tests/backlog/test_rp_explain_costs.py::test_plan[a join on a unique key with a join filter]
-      Backlog-ID: RP-381
 
 - [ ] **EXPLAIN ANALYZE of a user table's index-only or bitmap scan leaves
       out its counters.** PostgreSQL 15.19 prints an Index Only Scan's

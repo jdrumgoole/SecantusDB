@@ -1436,7 +1436,28 @@ impl PgHandler {
         // not modelled -- or a sequential scan may win, which
         // `index_scan_estimate` does not tell apart -- the side is not
         // priced.
-        let (scan, index) = if !filter.is_empty() && indexed {
+        // A WHERE no index of the table reads leaves the sequential scan
+        // its side's cheapest unparameterized path: an index's whole scan
+        // costs more, and is kept only for its order, which the merge
+        // paths weigh from `key_index` (RP-381).
+        let index_reads_filter = || {
+            let Some(quals) = costsize::conjuncts(filter) else {
+                return true;
+            };
+            indexes.iter().any(|ix| {
+                ix.table.name == table
+                    && ix.keys.iter().any(|k| {
+                        // An expression key may read any column.
+                        *k == 0
+                            || usize::try_from(*k)
+                                .ok()
+                                .and_then(|k| k.checked_sub(1))
+                                .and_then(|i| ix.table.columns.get(i))
+                                .is_some_and(|c| quals.iter().any(|(f, _)| *f == c.field()))
+                    })
+            })
+        };
+        let (scan, index) = if !filter.is_empty() && indexed && index_reads_filter() {
             let mut found = None;
             for ix in indexes.iter().filter(|ix| ix.table.name == table) {
                 let key: Option<Vec<String>> = ix
@@ -3969,7 +3990,7 @@ fn hash_join_of(
     // nested loop probing it (RP-377): priced below over each side's
     // pathlist. An outer join or a join filter there is not modelled.
     let unique_key = !multi && (a.unique || b.unique);
-    if unique_key && (left_join || redundant || filter.count != 0) {
+    if unique_key && redundant {
         return None;
     }
     // A side its own WHERE cuts to one row is `inner_unique` as the inner
@@ -3984,7 +4005,19 @@ fn hash_join_of(
             ..join_side(&b)
         },
     );
-    let (startup, total) = joincost::hash_join_stats(&outer, &inner, selectivity, &keys_b);
+    // The join filter (RP-375): `final_cost_hashjoin` charges its
+    // `qp_qual_cost` on each tuple the hash clauses pass -- for a unique
+    // inner side the outer rows that match, the filter's selectivity
+    // among the semi-join factors (RP-381).
+    let qp = filter.ops as f64 * costsize::CPU_OPERATOR_COST;
+    let (startup, total) = joincost::hash_join_stats_filtered(
+        &outer,
+        &inner,
+        selectivity,
+        filter.selectivity,
+        qp,
+        &keys_b,
+    );
     // PostgreSQL builds the path hashing the right relation first
     // (`add_paths_to_joinrel` with the left one outer) and then the
     // other way round; `add_path` keeps the second only when it is
@@ -3992,15 +4025,21 @@ fn hash_join_of(
     // 1.01), and `set_cheapest` then takes the cheaper total. The
     // plan printed follows it: with `swap`, the left table hashed
     // (RP-359).
-    let (l_startup, l_total) = joincost::hash_join_stats(&inner, &outer, selectivity, &keys_a);
+    let (l_startup, l_total) = joincost::hash_join_stats_filtered(
+        &inner,
+        &outer,
+        selectivity,
+        filter.selectivity,
+        qp,
+        &keys_a,
+    );
     // The join filter (RP-375): `final_cost_hashjoin` and
     // `final_cost_mergejoin` charge its `qp_qual_cost` on each pair the
     // join clauses match (`approx_tuple_count`), and each inequality
     // scales the join's rows by its selectivity (RP-379: a `<>` by
     // `neqjoinsel`'s).
     let matched = costsize::clamp_row_est(outer.rows * inner.rows * selectivity);
-    let filter_qual = filter.ops as f64 * costsize::CPU_OPERATOR_COST * matched;
-    let (total, l_total) = (total + filter_qual, l_total + filter_qual);
+    let filter_qual = qp * matched;
     let mut rows = outer.rows * inner.rows * selectivity * filter.selectivity;
     if left_join {
         rows = rows.max(outer.rows);
@@ -4147,7 +4186,7 @@ fn hash_join_of(
         return None;
     }
     if unique_key {
-        let other = unique_key_other_paths(&a, &b, &outer, &inner, rows)?;
+        let other = unique_key_other_paths(&a, &b, &outer, &inner, rows, left_join, filter)?;
         if other <= t0 * 1.01 {
             return None;
         }
@@ -4179,6 +4218,8 @@ fn unique_key_other_paths(
     side_a: &secantus_pgplan::joincost::JoinSide,
     side_b: &secantus_pgplan::joincost::JoinSide,
     rows: f64,
+    left_join: bool,
+    filter: JoinFilterCost,
 ) -> Option<f64> {
     use secantus_pgplan::joincost::{base_pathlist, InPath, JoinRel, MemoKey, RelPaths};
     // The join clause's own class (an edge's, `Search`'s numbering).
@@ -4262,6 +4303,9 @@ fn unique_key_other_paths(
     let ra = rel_paths(side_a, &pa, (ta, sa), a, 1);
     let rb = rel_paths(side_b, &pb, (tb, sb), b, 2);
     let mut rel = JoinRel::without_hash(false);
+    // The join filter, evaluated on each pair a path's clause passes (a
+    // nested loop's every pair), RP-381.
+    rel.set_filter_cost(filter.ops as f64 * costsize::CPU_OPERATOR_COST);
     rel.add_paths_general(
         0,
         Some(CLASS),
@@ -4270,7 +4314,7 @@ fn unique_key_other_paths(
         &|_| false,
         &ra,
         &rb,
-        false,
+        left_join,
         rows,
         0,
     );

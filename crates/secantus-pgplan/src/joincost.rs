@@ -343,7 +343,7 @@ pub fn hash_join(outer: &JoinSide, inner: &JoinSide) -> (f64, f64) {
 /// the hash clause passes (`final_cost_hashjoin`'s `qp_qual_cost` over
 /// `hashjointuples`).
 fn hash_join_qp(outer: &JoinSide, inner: &JoinSide, qp: f64) -> (f64, f64) {
-    hash_join_core(outer, inner, qp, join_selectivity(outer, inner), &[])
+    hash_join_core(outer, inner, qp, join_selectivity(outer, inner), 1.0, &[])
 }
 
 /// One join key's statistics as `eqjoinsel` and
@@ -443,7 +443,24 @@ pub fn hash_join_stats(
     sel: f64,
     inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
-    hash_join_core(outer, inner, 0.0, sel, inner_keys)
+    hash_join_core(outer, inner, 0.0, sel, 1.0, inner_keys)
+}
+
+/// [`hash_join_stats`] with join filters beside the hash clauses: `qp`
+/// their cost a tuple, `filter_sel` their selectivity. `final_cost_hashjoin`
+/// charges them on each tuple the hash clauses pass, which for a unique
+/// inner side are the outer rows that find their match
+/// (`compute_semi_anti_join_factors` over every join clause, the filters
+/// included, RP-381).
+pub fn hash_join_stats_filtered(
+    outer: &JoinSide,
+    inner: &JoinSide,
+    sel: f64,
+    filter_sel: f64,
+    qp: f64,
+    inner_keys: &[KeyStats<'_>],
+) -> (f64, f64) {
+    hash_join_core(outer, inner, qp, sel, filter_sel, inner_keys)
 }
 
 fn hash_join_core(
@@ -451,6 +468,7 @@ fn hash_join_core(
     inner: &JoinSide,
     qp: f64,
     sel: f64,
+    filter_sel: f64,
     inner_keys: &[KeyStats<'_>],
 ) -> (f64, f64) {
     let mut startup = outer.scan.0 + inner.scan.1;
@@ -542,8 +560,8 @@ fn hash_join_core(
         bucket
     };
     let tuples = if inner.unique {
-        let match_frac = sel;
-        let match_count = (sel * inner.rows / sel).max(1.0);
+        let match_frac = sel * filter_sel;
+        let match_count = (match_frac * inner.rows / match_frac).max(1.0);
         let matched = (outer.rows * match_frac).round();
         let scan_frac = 2.0 / (match_count + 1.0);
         run += clause_cost(outer, inner)
