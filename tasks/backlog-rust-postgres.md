@@ -1487,17 +1487,22 @@ a regression test.
       private 15.19 cluster (found while working RP-383).
       Backlog-ID: RP-384
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an index-only scan over a dead version], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a BitmapOr]
-- [ ] **EXPLAIN ANALYZE prints no actual rows below a join.** A Nested
-      Loop's or Hash Join's own `(actual rows=N loops=1)` is printed, but
-      its children carry none, so a parameterized inner scan shows neither
-      its `loops` (one per outer row) nor, as an Index Only Scan, its `Heap
-      Fetches`: `select k.a from e, k where e.a < k.a` is `Index Only Scan
-      using k_pkey on k (actual rows=500 loops=1000)` with `Heap Fetches:
-      499500` on PostgreSQL 15.19, and a Hash Join's `Hash` prints its
-      `Buckets: 1024  Batches: 1  Memory Usage: 47kB` line. Measured on a
-      private 15.19 cluster (found while working RP-354).
-      Backlog-ID: RP-386
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a nested loop's children], tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a hash join's children]
+- [ ] **EXPLAIN ANALYZE of a LEFT Nested Loop with a Join Filter prints
+      no counts below it.** Since RP-386 a join's children print their
+      actual rows and loops, a parameterized inner index-only scan its
+      `Heap Fetches`, a Hash its `Buckets / Batches / Memory Usage` line
+      and an inner Nested Loop its `Rows Removed by Join Filter`, as
+      PostgreSQL 15.19 counts them. A LEFT join's filter is left out: its
+      null-extended rows hide how many pairs the filter rejected, which
+      needs the filter evaluated per pair (`select * from s left join e
+      on s.a < e.a`: `Rows Removed by Join Filter: 465`, the Materialize
+      `(actual rows=1000 loops=30)`). Also unannotated: a join whose scans
+      have their own quals, a Merge Join (its Sorts' `Sort Method`), a
+      hash table past `hash_mem` (several batches) and a join with an
+      inner-unique inner side. Measured on a private 15.19 cluster (found
+      while working RP-386).
+      Backlog-ID: RP-387
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop's join filter]
 
 ## Found by batch 54 (2026-10-24)
 

@@ -814,6 +814,70 @@ impl PgHandler {
     /// the join's estimates, and whether the left table is the hashed one;
     /// the Hash node is its input's total. `None` -- zeros -- for any
     /// other shape.
+    /// For EXPLAIN ANALYZE of a hash join on one key (RP-386): the outer
+    /// side's key field, the hashed side's, and the fields the hashed
+    /// side's scan projects (its target list, in the order the planner
+    /// builds it: what the join's output reads, then the key), by the two
+    /// sides' aliases. `None` for a join on several keys.
+    pub(crate) fn hash_join_reads(
+        &self,
+        sel: &secantus_pgplan::Select,
+        outer_alias: &str,
+        inner_alias: &str,
+    ) -> Option<(String, String, Vec<String>)> {
+        if let Some(j) = &sel.join {
+            if j.left_sub.is_some() || j.right_sub.is_some() {
+                return None;
+            }
+            let (a, b) = j.on.as_ref()?;
+            let col = |alias: &str| {
+                if a.0 == alias {
+                    Some(&a.1)
+                } else if b.0 == alias {
+                    Some(&b.1)
+                } else {
+                    None
+                }
+            };
+            let table = |alias: &str| {
+                [&j.left, &j.right]
+                    .into_iter()
+                    .find(|(_, al)| al == alias)
+                    .map(|(t, _)| t.clone())
+            };
+            let defs = self.all_table_defs().ok()?;
+            let def_of = |alias: &str| {
+                let t = table(alias)?;
+                defs.iter().find(|d| d.name == t).cloned()
+            };
+            let (outer_def, inner_def) = (def_of(outer_alias)?, def_of(inner_alias)?);
+            let outer_key = outer_def.field_of(col(outer_alias)?)?;
+            let inner_key = inner_def.field_of(col(inner_alias)?)?;
+            let mut read: Vec<String> = j
+                .columns
+                .iter()
+                .filter(|(_, side, _)| side == inner_alias)
+                .map(|(_, _, c)| inner_def.field_of(c))
+                .collect::<Option<_>>()?;
+            if !read.contains(&inner_key) {
+                read.push(inner_key.clone());
+            }
+            return Some((outer_key, inner_key, read));
+        }
+        let (a, b, more, _, _) = self.joined_sides(sel)?;
+        if !more.is_empty() {
+            return None;
+        }
+        let (outer, inner) = if a.alias == outer_alias && b.alias == inner_alias {
+            (a, b)
+        } else if b.alias == outer_alias && a.alias == inner_alias {
+            (b, a)
+        } else {
+            return None;
+        };
+        Some((outer.field, inner.field.clone(), inner.read))
+    }
+
     pub(crate) fn hash_join_estimate(&self, sel: &secantus_pgplan::Select) -> Option<JoinEstimate> {
         let (a, b, more, filter, left_join) = self.joined_sides(sel)?;
         // A WHERE conjunct pushed into a side's scan (RP-365) is priced as

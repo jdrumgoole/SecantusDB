@@ -41,6 +41,13 @@ _ANALYSED = [
     "analyze k",
 ]
 
+# Those, and thirty rows of a text column whose lengths vary (RP-386).
+_ANALYSED_THIRTY = _ANALYSED + [
+    "create table s (a int, c text)",
+    "insert into s select g, repeat('x', g % 50) from generate_series(1, 30) g",
+    "analyze s",
+]
+
 # Those, a ten-row table analysed and one never analysed (RP-329).
 _ANALYSED_SMALL = _ANALYSED + [
     "create table zs (a int, b text)",
@@ -2040,8 +2047,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         ],
     ),
     # ------------- RP-386 EXPLAIN ANALYZE of a join's children
-    # A join's children print their own actual rows and loops, and a
-    # parameterized inner index-only scan its Heap Fetches.
+    # Fixed: a join's children print their own actual rows and loops, a
+    # parameterized inner index-only scan its Heap Fetches, a Hash its
+    # table and a nested loop its Rows Removed by Join Filter.
     "analyze of a nested loop's children": (
         "RP-386",
         _ANALYSED,
@@ -2067,6 +2075,48 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  ->  Hash (actual rows=1000 loops=1)",
             "        Buckets: 1024  Batches: 1  Memory Usage: 47kB",
             "        ->  Seq Scan on e e2 (actual rows=1000 loops=1)",
+        ],
+    ),
+    "analyze of a materialized nested loop's join filter": (
+        "RP-386",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off) select * from s, e where s.a < e.a",
+        [
+            "Nested Loop (actual rows=29535 loops=1)",
+            "  Join Filter: (s.a < e.a)",
+            "  Rows Removed by Join Filter: 465",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Materialize (actual rows=30 loops=1000)",
+            "        ->  Seq Scan on s (actual rows=30 loops=1)",
+        ],
+    ),
+    "analyze of a hash join of a narrower inner side": (
+        "RP-386",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join e on e.a = s.a",
+        [
+            "Hash Right Join (actual rows=30 loops=1)",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Hash (actual rows=30 loops=1)",
+            "        Buckets: 1024  Batches: 1  Memory Usage: 10kB",
+            "        ->  Seq Scan on s (actual rows=30 loops=1)",
+        ],
+    ),
+    # ------------- RP-387 a LEFT nested loop's Join Filter count
+    "analyze of a left nested loop's join filter": (
+        "RP-387",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join e on s.a < e.a",
+        [
+            "Nested Loop Left Join (actual rows=29535 loops=1)",
+            "  Join Filter: (s.a < e.a)",
+            "  Rows Removed by Join Filter: 465",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=1000 loops=30)",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
         ],
     ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
@@ -2408,6 +2458,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-381",
         "RP-382",
         "RP-383",
+        "RP-386",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
