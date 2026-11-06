@@ -2282,9 +2282,9 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "                    Index Cond: (a = e.a)",
         ],
     ),
-    # A constant true conjunct of an ON is folded away
-    # (`eval_const_expressions`), not printed as a Join Filter (found while
-    # working RP-392).
+    # A constant true conjunct of an ON was printed as a Join Filter; it is
+    # folded away, as `eval_const_expressions` does (found while working
+    # RP-392, fixed).
     "analyze of an inner join whose ON has a constant true conjunct": (
         "RP-394",
         _ANALYSED_THIRTY,
@@ -2296,6 +2296,46 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        Filter: (a > 29)",
             "        Rows Removed by Filter: 29",
             "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    # A LEFT Nested Loop with no Join Filter printed no counts below it
+    # (found while working RP-394, fixed).
+    "analyze of a left join on true": (
+        "RP-396",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select s.a, e.a from s left join e on true",
+        [
+            "Nested Loop Left Join (actual rows=30000 loops=1)",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=1000 loops=30)",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    "analyze of a left join whose ON has a constant true conjunct": (
+        "RP-394",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select s.a, e.a from s left join e on true and s.a < e.a",
+        [
+            "Nested Loop Left Join (actual rows=29535 loops=1)",
+            "  Join Filter: (s.a < e.a)",
+            "  Rows Removed by Join Filter: 465",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=1000 loops=30)",
+            "        ->  Seq Scan on e (actual rows=1000 loops=1)",
+        ],
+    ),
+    "analyze of an inner join on true": (
+        "RP-394",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select s.a, e.a from s join e on true",
+        [
+            "Nested Loop (actual rows=30000 loops=1)",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
+            "  ->  Materialize (actual rows=30 loops=1000)",
+            "        ->  Seq Scan on s (actual rows=30 loops=1)",
         ],
     ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
@@ -2644,6 +2684,8 @@ def _marked(name: str, item: str) -> Any:
         "RP-389",
         "RP-391",
         "RP-392",
+        "RP-394",
+        "RP-396",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

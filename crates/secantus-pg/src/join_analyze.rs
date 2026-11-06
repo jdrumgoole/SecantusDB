@@ -564,7 +564,10 @@ impl PgHandler {
         // a null-extended row for each outer row that kept none, so its
         // filter is evaluated per pair here to tell the two apart.
         let kept = if !filtered {
-            if left || actual != pairs {
+            // With no filter every outer row pairs with every inner row
+            // (the inner side is not empty), so a LEFT join null-extends
+            // none and returns the pairs, as an inner one does (RP-396).
+            if actual != pairs {
                 return;
             }
             pairs

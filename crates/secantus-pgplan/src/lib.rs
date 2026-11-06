@@ -10086,9 +10086,10 @@ fn plan_explain(
     let mut join_cond_splits = Vec::new();
     let join_conds = match &query {
         N::SelectStmt(s) => {
-            // An inner join's one-table ON conjunct is printed on its
-            // table's scan, as the planner runs it (RP-391).
-            let hoisted = joins::hoist_inner_on_conjuncts(s);
+            // A constant TRUE ON conjunct is folded away (RP-394), and an
+            // inner join's one-table ON conjunct is printed on its table's
+            // scan, as the planner runs it (RP-391).
+            let hoisted = joins::prepare_on_quals(s);
             let s = hoisted.as_ref().unwrap_or(s);
             let none = |_: &str| None;
             let cat = ruleutils::Catalog {

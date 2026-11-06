@@ -1488,14 +1488,6 @@ a regression test.
       working RP-392).
       Backlog-ID: RP-393
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct]
-- [ ] **A constant `true` ON conjunct is printed as a Join Filter.**
-      PostgreSQL 15.19's `eval_const_expressions` drops a TRUE argument of
-      an AND, so `select s.a, e.a from s join e on true and s.a > 29` is a
-      plain Nested Loop; here it prints `Join Filter: true` (and so does a
-      LEFT JOIN `on true`). Its rows are right. Measured on a private 15.19
-      cluster (found while working RP-392).
-      Backlog-ID: RP-394
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join whose ON has a constant true conjunct]
 - [ ] **A LEFT join's ON conjunct over its nullable side alone stays in
       its Join Filter.** PostgreSQL 15.19 pushes it down to the nullable
       side's scan (`distribute_qual_to_rels`: a qual of the inner side of
