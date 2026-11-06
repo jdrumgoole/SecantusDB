@@ -899,6 +899,75 @@ one beside it.
       Backlog-ID: RP-268
       Verify: none -- not reproduced outside one Windows CI run; no test fails on demand
 
+## Found by the security reviews (2026-11-06)
+
+- [ ] **The server accepts a table of more than 1600 columns and a target
+      list of more than 1664 entries; PostgreSQL refuses both with 54011,
+      and EXPLAIN's cost blocks go quadratic on the list.** GitHub issue
+      #2289 (security review 2026-11-03). PostgreSQL 15.19:
+      `CREATE TABLE` of 1601 columns fails `54011 tables can have at most
+      1600 columns`, and a SELECT or EXPLAIN whose target list has 1665
+      entries fails `54011 target lists can have at most 1664 entries`
+      (1600 and 1664 are accepted; a repeated column counts once per
+      entry). Measured 2026-11-06 on the Rust server (debug build): the
+      1601-column table is created, and `EXPLAIN SELECT count(c0), ...,
+      count(cN)` over 1665 entries plans (7.3 s) as does `EXPLAIN SELECT
+      DISTINCT ... ORDER BY ...` over 1665. Nothing bounds the list, so
+      the RP-320 block (`distinct_fields` in `crates/secantus-pg/src/lib.rs`)
+      and the RP-321 block (the `fields.contains(&f)` loop over
+      `agg.items`, now also at the grouped-aggregate block the issue's
+      2026-11-06 update names) dedup it with `Vec::contains`, O(n^2) in a
+      count the client sets, with no cancellation point inside.
+      The fix, most faithful first: refuse both limits where PostgreSQL does
+      -- `DefineRelation` for the 1600-column table (CREATE TABLE and ALTER
+      TABLE ADD COLUMN) and `checkTargetlistSize` in parse analysis for the
+      target list -- which also bounds n at 1664. Then, as defence in
+      depth, replace the `Vec::contains` dedups with a `HashSet` (the issue
+      proposes it).
+      The gap tests assert PostgreSQL's refusals; the dedup loops are not
+      timed (at the 1664 entries PostgreSQL permits, n^2 is 2.8 million
+      string comparisons).
+      Backlog-ID: RP-387
+      Verify: tests/backlog/test_rp_explain_bounds.py::test_create_table_over_1600_columns_is_refused,
+      tests/backlog/test_rp_explain_bounds.py::test_explain_count_target_list_over_1664_entries_is_refused,
+      tests/backlog/test_rp_explain_bounds.py::test_explain_distinct_order_by_over_1664_entries_is_refused
+
+- [ ] **EXPLAIN of a comma join takes time quadratic or worse in the number
+      of WHERE conjuncts.** GitHub issue #2346 (security review
+      2026-11-05, updated 2026-11-06). `EXPLAIN SELECT * FROM a, b WHERE
+      a.x = b.x AND b.y = 1 AND a.x = b.x AND b.y = 3 AND ...` (n
+      conjuncts, a cross-table equality alternating with a single-table
+      one) takes 0.17 s for 250, 0.87 s for 500 and 5.7 s for 1000 on the
+      Rust server (debug build, 2026-11-06): 35x the time for 4x the
+      conjuncts, where linear is 4x. PostgreSQL 15.19 plans 16,000 of them
+      in 0.24 s (3.7x for 8x). The statement itself is cheap: the same
+      `SELECT` runs in 0.29 s at n = 1000. PostgreSQL has no limit on the
+      number of conjuncts, so the fix is to make the planning linear, not
+      to refuse. The issue names three loops in `comma_join_conds`
+      (`crates/secantus-pgplan/src/ruleutils.rs`): `quals.remove(i)` per
+      cross-table equality (loop A), `spanning.contains(i)` per conjunct
+      (loop B) and `slots.iter().position(..)` per reordered conjunct
+      (loop C), and proposes one classification pass over `quals` and a
+      direct `sort_by_key` in place of the `slots` / `originals` round
+      trip, plus a `cancel::check()` at the head of the pass and
+      `qual_operators` propagating `walk_expr`'s `Result`.
+      **That fix will not close the item by itself.** A sample of the server
+      during the n = 1500 EXPLAIN puts the time in
+      `scan_estimate::conjunct_in` (`crates/secantus-pg/src/scan_estimate.rs`),
+      which scans the pushed `$and` of the scan's filter once per
+      single-table conjunct, and every shape with many single-table
+      conjuncts on one side of the join is as slow (`b.y = 1` repeated,
+      `b.y IS NOT NULL`, `b.y <> i`: 21 s at n = 1000). Loops B and C do not
+      show at a testable size: n cross-table equalities (loop B) cost 2.3 s
+      at 10,000 and 16.3 s at 40,000 (7.1x for 4x), and a cross-table
+      inequality per conjunct (loop C) 2.7 s and 13.2 s (4.9x), because
+      their steps are `usize` compares under a linear parse.
+      The gap test times the interleaved shape at n = 250 and n = 1000 and
+      asserts a ratio under 8x; it is the issue's own reproduction, and it
+      passes only when `conjunct_in`'s quadratic is fixed as well as loop A.
+      Backlog-ID: RP-388
+      Verify: tests/backlog/test_rp_explain_bounds.py::test_explain_comma_join_time_is_linear_in_conjuncts
+
 ## Found by a CI run (2026-11-01)
 
 - [ ] **OPEN — CI: three jobs ran out of disk; the one that left a log had
