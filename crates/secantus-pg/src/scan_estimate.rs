@@ -45,6 +45,11 @@ pub(crate) struct ScanIndex {
     pub or_arms: Vec<(String, Estimate)>,
 }
 
+/// [`PgHandler::upper_scan`]'s answer: the scan's estimate, its index
+/// path (none for the Seq Scan) and the presorted index scans'
+/// `(startup, total)`.
+pub(crate) type UpperScan = (Estimate, Option<ScanIndex>, Vec<(f64, f64)>);
+
 /// What a node over a user table's scan asks of it (RP-382).
 #[derive(Debug, Default)]
 pub(crate) struct PathWant {
@@ -1555,7 +1560,7 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
         want: &PathWant,
-    ) -> Option<(Estimate, Option<ScanIndex>, Vec<(f64, f64)>)> {
+    ) -> Option<UpperScan> {
         let indexed = self
             .index_relations()
             .iter()
