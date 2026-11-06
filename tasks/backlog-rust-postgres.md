@@ -1394,16 +1394,16 @@ a regression test.
       since 2026-11-05 so do `aclitem[]` (`=` but no `<`:
       `compute_distinct_stats`) and the `reg*` types (under `oid`'s
       opclass), and since 2026-11-06 `int2vector` (an array to
-      `type_is_array`: `array_ops`). The other columns keep `initdb`'s
-      rows, where PostgreSQL 15.19 measures them too: `oidvector` (its own
-      `oidvector_ops`; after a CREATE FUNCTION, `pg_proc.proargtypes`'
-      distinct count and frequencies move) and `pg_node_tree`. Not modelled
+      `type_is_array`: `array_ops`) and `oidvector` (its own
+      `oidvector_ops`). The other columns keep `initdb`'s rows, where
+      PostgreSQL 15.19 measures them too: `pg_node_tree`. Not modelled
       either: the measured
       catalogs' `relpages` / `reltuples` in `pg_class`, and the row order
       of the replaced `pg_statistic` rows (an update moves PostgreSQL's)
       (found while working RP-311).
       Backlog-ID: RP-313
-      Verify: tests/backlog/test_rp_catalog_reads.py::test_a_database_wide_analyze_measures_an_oidvector_column
+      Verify: none -- the `pg_node_tree` columns need `nodeToString`'s
+      text of each stored tree; no gap test until a probe pins one
 - [ ] **A database-wide ANALYZE's correlation of a catalog column is not
       PostgreSQL's.** `compute_scalar_stats` correlates a column's sort order
       with the rows' heap order; here the catalog's rows are walked in this

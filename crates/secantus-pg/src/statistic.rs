@@ -7,7 +7,7 @@
 //!
 //! Only the columns whose type's equality ANALYZE models here have a row
 //! (`analyze_sample`): integers, booleans, floats, `text` / `varchar`,
-//! `char(n)`, `name`, `"char"`, `int2vector` and the `reg*` types; a table larger than ANALYZE's sample has relation statistics
+//! `char(n)`, `name`, `"char"`, `int2vector`, `oidvector` and the `reg*` types; a table larger than ANALYZE's sample has relation statistics
 //! only.
 //!
 //! The built-in catalogs' rows are the ones PostgreSQL 15.19's `initdb`
@@ -55,6 +55,10 @@ pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
         // and `array_lt`, not `int2vectoreq` (its rows in PostgreSQL 15.19
         // carry 1070 / 1072 and a histogram).
         "int2vector" => (1070, 1072, 0),
+        // `oidvector` has its own opclass, `oidvector_ops`, which
+        // `GetDefaultOpClass` finds by exact type before `array_ops`:
+        // `oidvectoreq` and `oidvectorlt`.
+        "oidvector" => (649, 645, 0),
         // A `reg*` type has no opclass of its own: `GetDefaultOpClass` takes
         // `oid_ops`, as the type is binary-coercible to `oid` (so `initdb`'s
         // rows for `pg_type.typinput` carry `oideq` and `oidlt`).
@@ -330,6 +334,21 @@ pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bso
                 .collect::<Option<Vec<_>>>()?
                 .join(" "),
         ),
+        // `oidvector`: `analyze_sample`'s length-prefixed oids, in
+        // `oidvectorout`'s space-separated text.
+        "oidvector" => {
+            let (len, oids) = key.split_first_chunk::<4>()?;
+            let (oids, rest) = oids.as_chunks::<4>();
+            if !rest.is_empty() || oids.len() != u32::from_be_bytes(*len) as usize {
+                return None;
+            }
+            Bson::String(
+                oids.iter()
+                    .map(|o| u32::from_be_bytes(*o).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            )
+        }
         "text" | "varchar" | "character varying" | "name" | secantus_pgplan::QUOTED_CHAR => {
             Bson::String(String::from_utf8(key.to_vec()).ok()?)
         }
@@ -807,6 +826,28 @@ mod array_tests {
             Some(Bson::String("2 3 4".into()))
         );
         assert_eq!(operators("int2vector"), Some((1070, 1072, 0)));
+    }
+
+    /// An `oidvector`'s key orders as `btoidvectorcmp` (length first, then
+    /// each oid unsigned) and prints as `oidvectorout`'s text (RP-313).
+    #[test]
+    fn oidvector_keys() {
+        let key = |ns: &[u32]| {
+            let mut k = (ns.len() as u32).to_be_bytes().to_vec();
+            ns.iter().for_each(|n| k.extend(n.to_be_bytes()));
+            k
+        };
+        assert!(key(&[]) < key(&[5000]));
+        assert!(key(&[5000]) < key(&[17, 23]));
+        assert!(key(&[25, 16]) < key(&[25, 26]));
+        assert!(key(&[3_000_000_000]) > key(&[26]));
+        let c = secantus_pgcatalog::Column::new("proargtypes", "oidvector", false);
+        assert_eq!(
+            value_of(&key(&[23, 25, 26]), &c),
+            Some(Bson::String("23 25 26".into()))
+        );
+        assert_eq!(value_of(&key(&[]), &c), Some(Bson::String(String::new())));
+        assert_eq!(operators("oidvector"), Some((649, 645, 0)));
     }
 
     /// `construct_md_array` pads after each element; a NULL adds a bitmap.
