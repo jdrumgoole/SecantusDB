@@ -16921,6 +16921,25 @@ impl PgHandler {
             // `aclitemeq` compares grantee, grantor and privileges, which
             // the item's text spells out one way; `aclitem` is fixed-width.
             ("aclitem", Bson::String(s)) => Some(Some((s.as_bytes().to_vec(), 0))),
+            // `array_eq` / `array_cmp` over the numbers, keyed as an
+            // `int2[]` (`statistic::operators`). An `int2vector` is a
+            // one-dimensional `int2[]` with no NULLs, stored plain
+            // (`typstorage` 'p'), so always with its 4-byte header.
+            ("int2vector", Bson::Array(items)) => {
+                let keys = items
+                    .iter()
+                    .map(|v| match v {
+                        Bson::Int32(n) => {
+                            Some(Some(secantus_pgplan::colstats::int_key(i64::from(*n))))
+                        }
+                        Bson::Int64(n) => Some(Some(secantus_pgplan::colstats::int_key(*n))),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                // `Int2VectorSize`: one dimension even when empty.
+                let size = 24 + 2 * keys.len();
+                (size <= 1024).then(|| Some((statistic::array_key(&keys), size)))
+            }
             // `float8eq`: -0 equals 0, and NaN equals NaN.
             ("float4" | "float8", Bson::Double(x)) => {
                 let x = if *x == 0.0 {
