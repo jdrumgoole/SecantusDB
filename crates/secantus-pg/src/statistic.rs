@@ -7,7 +7,7 @@
 //!
 //! Only the columns whose type's equality ANALYZE models here have a row
 //! (`analyze_sample`): integers, booleans, floats, `text` / `varchar`,
-//! `char(n)`, `name`, `"char"` and the `reg*` types; a table larger than ANALYZE's sample has relation statistics
+//! `char(n)`, `name`, `"char"`, `int2vector` and the `reg*` types; a table larger than ANALYZE's sample has relation statistics
 //! only.
 //!
 //! The built-in catalogs' rows are the ones PostgreSQL 15.19's `initdb`
@@ -50,6 +50,11 @@ pub(crate) fn operators(pg_type: &str) -> Option<(i64, i64, i64)> {
         "float8" => (670, 672, 0),
         "bool" => (91, 58, 0),
         "oid" => (607, 609, 0),
+        // `int2vector` is an array to `type_is_array` (a varlena with a
+        // `typelem`), so `GetDefaultOpClass` takes `array_ops`: `array_eq`
+        // and `array_lt`, not `int2vectoreq` (its rows in PostgreSQL 15.19
+        // carry 1070 / 1072 and a histogram).
+        "int2vector" => (1070, 1072, 0),
         // A `reg*` type has no opclass of its own: `GetDefaultOpClass` takes
         // `oid_ops`, as the type is binary-coercible to `oid` (so `initdb`'s
         // rows for `pg_type.typinput` carry `oideq` and `oidlt`).
@@ -313,6 +318,18 @@ pub(crate) fn value_of(key: &[u8], c: &secantus_pgcatalog::Column) -> Option<Bso
         }
         "bool" => Bson::Boolean(*key.first()? != 0),
         "aclitem" => Bson::String(String::from_utf8(key.to_vec()).ok()?),
+        // `int2vector`: its numbers, from `analyze_sample`'s `array_key`,
+        // in `int2vectorout`'s text (space-separated, which the slot's
+        // array quotes: `{"1 2",1}`).
+        "int2vector" => Bson::String(
+            array_key_elements(key)?
+                .iter()
+                .map(|k| {
+                    secantus_pgplan::colstats::int_of_key(k.as_deref()?).map(|n| n.to_string())
+                })
+                .collect::<Option<Vec<_>>>()?
+                .join(" "),
+        ),
         "text" | "varchar" | "character varying" | "name" | secantus_pgplan::QUOTED_CHAR => {
             Bson::String(String::from_utf8(key.to_vec()).ok()?)
         }
@@ -768,6 +785,28 @@ mod array_tests {
         for k in &ordered {
             assert_eq!(array_key(&array_key_elements(k).unwrap()), *k);
         }
+    }
+
+    /// An `int2vector`'s key orders as `array_cmp` (a prefix first) and
+    /// prints as `int2vectorout`'s text (RP-313).
+    #[test]
+    fn int2vector_keys() {
+        let key = |ns: &[i64]| {
+            array_key(
+                &ns.iter()
+                    .map(|n| Some(secantus_pgplan::colstats::int_key(*n)))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert!(key(&[3]) < key(&[3, 4]));
+        assert!(key(&[1, 3]) < key(&[2]));
+        assert!(key(&[0]) < key(&[1, 2]));
+        let c = secantus_pgcatalog::Column::new("indkey", "int2vector", false);
+        assert_eq!(
+            value_of(&key(&[2, 3, 4]), &c),
+            Some(Bson::String("2 3 4".into()))
+        );
+        assert_eq!(operators("int2vector"), Some((1070, 1072, 0)));
     }
 
     /// `construct_md_array` pads after each element; a NULL adds a bitmap.

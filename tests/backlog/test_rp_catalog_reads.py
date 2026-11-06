@@ -2244,14 +2244,14 @@ def test_a_database_wide_analyze_measures_a_regproc_column(rust_pg: Any) -> None
     )
 
 
-@pytest.mark.backlog("RP-313")
+@pytest.mark.backlog_fixed("RP-313")
 def test_a_database_wide_analyze_measures_an_int2vector_column(rust_pg: Any) -> None:
     """PostgreSQL 15.19 (a fresh database on a private cluster, measured on
     two new clusters): after a CREATE TABLE with a primary key, a plain
-    ANALYZE re-measures `pg_index.indkey` (`int2vector`, which has
-    `int2vectoreq` but no `<`: `compute_distinct_stats`), so its
-    frequencies follow the new index's row; here the column keeps
-    `initdb`'s row."""
+    ANALYZE re-measures `pg_index.indkey` (`int2vector`, an array to
+    `type_is_array`, so `array_ops`' `array_eq` / `array_lt` and
+    `compute_scalar_stats`), so its frequencies follow the new index's
+    row; the column kept `initdb`'s row."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute("drop database if exists rp313_d")
         c.execute("create database rp313_d")
@@ -2259,15 +2259,41 @@ def test_a_database_wide_analyze_measures_an_int2vector_column(rust_pg: Any) -> 
         c.execute("create table zz_vec (a int primary key)")
         c.execute("analyze")
         row = c.execute(
-            "select null_frac, n_distinct, most_common_freqs::text from pg_stats"
+            "select null_frac, n_distinct, avg_width, most_common_vals::text,"
+            " most_common_freqs::text from pg_stats"
             " where tablename = 'pg_index' and attname = 'indkey'"
         ).fetchone()
     assert row == (
         0.0,
         -0.1595092,
+        27,
+        '{1,"1 2",2,"2 3","1 2 3","3 2","2 3 4","2 4","1 2 3 4","2 1","2 3 4 5",11}',
         "{0.3006135,0.2822086,0.10429448,0.0797546,0.036809817,0.024539877,"
         "0.018404908,0.018404908,0.012269938,0.012269938,0.012269938,0.012269938}",
     )
+
+
+@pytest.mark.backlog("RP-313")
+def test_a_database_wide_analyze_measures_an_oidvector_column(rust_pg: Any) -> None:
+    """PostgreSQL 15.19 (a fresh database on a private cluster, measured on
+    two new clusters): after a CREATE FUNCTION, a plain ANALYZE re-measures
+    `pg_proc.proargtypes` (`oidvector`, under its own B-tree opclass
+    `oidvector_ops`), so its distinct count and frequencies follow the new
+    row (`initdb`'s are -0.18156597 and 0.051787917, 0.045930948,
+    0.04377312); here the column keeps `initdb`'s row."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp313_o")
+        c.execute("create database rp313_o")
+    with psycopg.connect(_dsn(rust_pg) + " dbname=rp313_o", autocommit=True) as c:
+        c.execute(
+            "create function zz_f(a int, b text, c oid) returns int language sql as 'select 1'"
+        )
+        c.execute("analyze")
+        row = c.execute(
+            "select n_distinct, avg_width, (most_common_freqs::text::float4[])[1:3]::text"
+            " from pg_stats where tablename = 'pg_proc' and attname = 'proargtypes'"
+        ).fetchone()
+    assert row == (-0.18181819, 31, "{0.051771957,0.045916796,0.04375963}")
 
 
 @pytest.mark.backlog_fixed("RP-314")
