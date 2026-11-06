@@ -563,6 +563,33 @@ pub fn param_index_scan(
     )
 }
 
+/// A scan of `index` inside a nested loop whose index qual bounds its
+/// leading column by the outer row's value (`a > e.a`, RP-354): with no
+/// constant to compare against, `scalarineqsel` is `DEFAULT_INEQ_SEL`, a
+/// third of the rows, and `lower` says which bound it is. Repeated
+/// `loop_count` times as [`param_index_scan`] is. `(startup, total)`.
+pub fn param_range_index_scan(
+    rel: &Rel,
+    index: &Index,
+    quals: &[(String, Qual)],
+    lower: bool,
+    loop_count: f64,
+) -> Option<(f64, f64)> {
+    if index.hash || quals.iter().any(|(f, _)| f == &index.field) {
+        return None;
+    }
+    let mut quals = quals.to_vec();
+    quals.push((index.field.clone(), Qual::Range(lower)));
+    index_scan_loops(
+        rel,
+        index,
+        &quals,
+        ColSel::Given(1.0 / 3.0),
+        false,
+        loop_count,
+    )
+}
+
 /// A bitmap heap scan over `index` parameterized as [`param_index_scan`]
 /// is (`create_index_paths`' join bitmap paths): the bitmap's index cost
 /// over `loop_count` scans and a tenth of an operator a row it returns

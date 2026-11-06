@@ -41117,11 +41117,18 @@ impl PgHandler {
                         .all(|c| c.children.is_empty() && c.name.starts_with("Seq Scan on "))
                 {
                     if let Statement::Select(sel) = inner.as_ref() {
-                        if let Some((plan, a, b, join)) = self
-                            .nest_loop_estimate(sel)
-                            .or_else(|| self.join_select_nest_loop_estimate(sel))
+                        if let Some((plan, a, b, join, param)) =
+                            self.nest_loop_estimate(sel).or_else(|| {
+                                self.join_select_nest_loop_estimate(sel)
+                                    .map(|(plan, a, b, join)| (plan, a, b, join, None))
+                            })
                         {
                             explain::price_nest_loop(&mut tree, &plan, a, b, join);
+                            // The inner read through its index, the join
+                            // clause its Index Cond (RP-354).
+                            if let Some(p) = param {
+                                explain::param_index_inner(&mut tree, &p);
+                            }
                         }
                     }
                 }
@@ -41791,6 +41798,7 @@ impl PgHandler {
                     &options.join_cond_splits,
                 );
                 explain::attach_join_where(&mut tree, &options.join_where, &index_columns);
+                explain::move_param_conds(&mut tree);
                 explain::apply_implied_filters(&mut tree);
                 // ANALYZE runs the statement, as PostgreSQL's does -- a write
                 // is written -- and reports the rows it produced.

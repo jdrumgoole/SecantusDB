@@ -720,6 +720,7 @@ fn finish_join_source(
                         expr,
                         kind,
                         ops,
+                        compare: comparison(c),
                     })
                 })
                 .collect()
@@ -1851,6 +1852,7 @@ fn build_join(
                         expr: on_expr(c, &side_scope, params)?,
                         kind: filter_kind(c),
                         ops: operator_count(c),
+                        compare: comparison(c),
                     });
                 }
             }
@@ -1940,6 +1942,11 @@ pub struct JoinFilter {
     pub kind: FilterKind,
     /// The operators it evaluates a row (`cost_qual_eval`).
     pub ops: usize,
+    /// A `<`, `<=`, `>` or `>=` between two joined keys: `(left key,
+    /// operator, right key)`, which a B-tree on either side's column can
+    /// take as a parameterized index qual (`match_clause_to_indexcol`,
+    /// RP-354). `None` for anything else.
+    pub compare: Option<(String, String, String)>,
 }
 
 /// What a join filter's selectivity is estimated as with no statistics.
@@ -1977,6 +1984,31 @@ fn operator_count(n: &pg_query::protobuf::Node) -> usize {
         Ok(())
     });
     count
+}
+
+/// `n` as a `<`, `<=`, `>` or `>=` of two joined keys: `(left key,
+/// operator, right key)`.
+fn comparison(n: &pg_query::protobuf::Node) -> Option<(String, String, String)> {
+    use pg_query::protobuf::AExprKind;
+    let key = |x: Option<&pg_query::protobuf::Node>| match x?.node.as_ref()? {
+        N::ColumnRef(c) if c.fields.len() == 1 => column_ref_name(c),
+        _ => None,
+    };
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return None;
+    };
+    if e.kind != AExprKind::AexprOp as i32 {
+        return None;
+    }
+    let op = operator_name(e).ok()?;
+    if !matches!(op, "<" | "<=" | ">" | ">=") {
+        return None;
+    }
+    Some((
+        key(e.lexpr.as_deref())?,
+        op.to_string(),
+        key(e.rexpr.as_deref())?,
+    ))
 }
 
 /// How `n`, a WHERE conjunct over joined keys, is estimated.

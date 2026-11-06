@@ -413,9 +413,12 @@ impl PgHandler {
     /// `cost_seqscan` of the columns the join reads from it
     /// (`build_base_rel_tlists`), the join's width the columns read above
     /// it (`build_joinrel_tlist`), and the plan
-    /// [`joincost::cheapest_nest_loop`]'s. `None` -- zeros -- where a table
-    /// has an index (a parameterized inner index scan may win, which is
-    /// not modelled here) or anything else sits in the plan.
+    /// [`joincost::cheapest_nest_loop_param`]'s: over an analysed table
+    /// whose B-tree leads with a column an inequality compares to the other
+    /// side's, that side's index scan parameterized by the outer row is
+    /// weighed as the inner (RP-354), and the last element names it when
+    /// it wins. `None` -- zeros -- where an index the model does not price
+    /// could serve, or anything else sits in the plan.
     pub(crate) fn nest_loop_estimate(
         &self,
         sel: &secantus_pgplan::Select,
@@ -424,6 +427,7 @@ impl PgHandler {
         Estimate,
         Estimate,
         Estimate,
+        Option<ParamScan>,
     )> {
         use secantus_pgplan::joins::{FilterKind, JoinKind, JoinNode, JoinRows};
         use secantus_pgplan::Statement;
@@ -492,16 +496,20 @@ impl PgHandler {
         }) {
             return None;
         }
-        // A `<`, `<=`, `>` or `>=` between the sides could be an indexed
-        // side's parameterized Index Cond (RP-354's "into an index"), which
-        // is not priced here; a `<>` never is one (no B-tree strategy).
-        let any_inequality = filters
+        // A `<`, `<=`, `>` or `>=` between the sides can be an indexed
+        // side's parameterized Index Cond (RP-354), priced below where it
+        // compares two plain keys; a `<>` never is one (no B-tree
+        // strategy).
+        let opaque_inequality = filters
             .iter()
-            .any(|f| matches!(f.kind, FilterKind::Inequality));
+            .any(|f| matches!(f.kind, FilterKind::Inequality) && f.compare.is_none());
         let indexes = self.index_relations();
         let project = j.project.as_deref();
         // Each joined key's table and field, for `neqjoinsel`.
         let mut key_columns: Vec<(String, String, String)> = Vec::new();
+        // Each side's table, its keys' stored fields and SQL names, and
+        // the fields it reads.
+        let mut leaves: Vec<SideLeaf> = Vec::new();
         let mut side = |node: &JoinNode| -> Option<(Estimate, i64)> {
             let JoinNode::Leaf { plan, def, columns } = node else {
                 return None;
@@ -519,10 +527,9 @@ impl PgHandler {
                 || leaf.offset != 0
                 || !matches!(leaf.distinct, secantus_pgplan::Distinct::None)
                 || leaf.casts.iter().any(Option::is_some)
-                // An indexed table's own filter may be an index scan's, and
-                // an inequality join clause its parameterized one.
+                // An indexed table's own filter may be an index scan's.
                 || (indexes.iter().any(|ix| ix.table.name == leaf.table)
-                    && (any_inequality || !leaf.filter.is_empty()))
+                    && (opaque_inequality || !leaf.filter.is_empty()))
             {
                 return None;
             }
@@ -549,9 +556,17 @@ impl PgHandler {
             let (width, None) = self.scan_estimate(&leaf.table, &Document::new(), &above)? else {
                 return None;
             };
+            let mut keys = Vec::new();
             for (key, f) in columns {
                 key_columns.push((key.clone(), leaf.table.clone(), stored(f)?));
+                let name = def.columns.iter().find(|c| c.field() == *f)?.name.clone();
+                keys.push((key.clone(), stored(f)?, name));
             }
+            leaves.push(SideLeaf {
+                table: leaf.table.clone(),
+                keys,
+                read,
+            });
             Some((scan, width.3))
         };
         let (a, a_above) = side(left)?;
@@ -591,18 +606,195 @@ impl PgHandler {
                 _ => return None,
             };
         }
-        let (plan, rows) = if left_join {
+        // Each side as the inner of a nested loop through its index,
+        // parameterized by the other side's row: `param[0]` is `b` inner
+        // (a LEFT join's nullable side), `param[1]` is `a`.
+        let mut param: [Option<secantus_pgplan::joincost::ParamInner>; 2] = [None, None];
+        let mut param_scans: [Option<ParamScan>; 2] = [None, None];
+        let [la, lb] = leaves.as_slice() else {
+            return None;
+        };
+        for (slot, (inner_leaf, outer_rows, inner_rows)) in
+            [(lb, a.2, b.2), (la, b.2, a.2)].into_iter().enumerate()
+        {
+            if left_join && slot == 1 {
+                break;
+            }
+            let found = self.param_index_inner(
+                inner_leaf,
+                &filters,
+                outer_rows,
+                inner_rows * sel_factor,
+                inner_rows,
+            );
+            match found {
+                ParamFound::None => {}
+                ParamFound::Unmodelled => return None,
+                ParamFound::Scan(p, scan) => {
+                    param[slot] = Some(p);
+                    param_scans[slot] = Some(scan);
+                }
+            }
+        }
+        let plan =
+            secantus_pgplan::joincost::cheapest_nest_loop_param(a, b, qual, param, left_join);
+        let rows = if left_join {
             // `calc_joinrel_size_estimate`'s JOIN_LEFT: never fewer rows
             // than the outer side.
-            let plan = secantus_pgplan::joincost::cheapest_nest_loop_left(a, b, qual);
-            (plan, (a.2 * b.2 * sel_factor).max(a.2))
+            (a.2 * b.2 * sel_factor).max(a.2)
         } else {
-            let plan = secantus_pgplan::joincost::cheapest_nest_loop(a, b, qual);
-            (plan, a.2 * b.2 * sel_factor)
+            a.2 * b.2 * sel_factor
         };
         let rows = costsize::clamp_row_est(rows);
         let join = (plan.startup, plan.total, rows, a_above + b_above);
-        Some((plan, a, b, join))
+        let (a, b, scan) = if plan.param {
+            let slot = usize::from(plan.b_outer);
+            let p = param[slot]?;
+            let est = |e: Estimate| (p.startup, p.total, p.rows, e.3);
+            let scan = param_scans[slot].take();
+            if plan.b_outer {
+                (est(a), b, scan)
+            } else {
+                (a, est(b), scan)
+            }
+        } else {
+            (a, b, None)
+        };
+        Some((plan, a, b, join, scan))
+    }
+
+    /// `leaf` as the inner side of a nested loop through one of its
+    /// table's B-trees, its index qual one of `filters`' inequalities
+    /// between its leading column and the outer side's key (RP-354):
+    /// `create_index_paths`' join clauses, `get_loop_count` the outer
+    /// side's `outer_rows`. Every other join clause moves into the scan
+    /// too (`join_clause_is_movable_into`), checked on each row it fetches,
+    /// so the join checks none and the scan returns `param_rows` -- the
+    /// inner rows times every join clause's selectivity, as
+    /// `get_parameterized_baserel_size` multiplies them; `inner_rows` is
+    /// the plain scan's. [`ParamFound::Unmodelled`] where an index could serve
+    /// in a way not priced here: a later key column, two bounds, an
+    /// index-only read or a table never analysed.
+    fn param_index_inner(
+        &self,
+        leaf: &SideLeaf,
+        filters: &[&secantus_pgplan::joins::JoinFilter],
+        outer_rows: f64,
+        param_rows: f64,
+        inner_rows: f64,
+    ) -> ParamFound {
+        let relations = self.index_relations();
+        let table_indexes: Vec<_> = relations
+            .iter()
+            .filter(|ix| ix.table.name == leaf.table)
+            .collect();
+        if table_indexes.is_empty() {
+            return ParamFound::None;
+        }
+        let key_fields = |ix: &crate::IndexRelation| -> Option<Vec<String>> {
+            ix.keys
+                .iter()
+                .map(|k| {
+                    let i = usize::try_from(*k).ok()?.checked_sub(1)?;
+                    Some(ix.table.columns.get(i)?.field())
+                })
+                .collect()
+        };
+        // The comparisons naming one of this side's keys, as `(this side's
+        // stored field, SQL column, its operator written this side first,
+        // the filter's cost)`.
+        let mut clauses = Vec::new();
+        for f in filters {
+            let Some((l, op, r)) = &f.compare else {
+                continue;
+            };
+            let mine = |k: &str| leaf.keys.iter().find(|(key, _, _)| key == k);
+            let (own, op) = match (mine(l), mine(r)) {
+                (Some(_), Some(_)) => return ParamFound::Unmodelled,
+                (Some(k), None) => (k, op.clone()),
+                (None, Some(k)) => (k, commuted(op).to_string()),
+                (None, None) => continue,
+            };
+            clauses.push((own.1.clone(), own.2.clone(), op, f.ops));
+        }
+        let mut serving = Vec::new();
+        for ix in &table_indexes {
+            let Some(fields) = key_fields(ix) else {
+                return ParamFound::Unmodelled;
+            };
+            for (field, _, _, _) in &clauses {
+                match fields.iter().position(|f| f == field) {
+                    Some(0) => serving.push((*ix, field.clone())),
+                    Some(_) => return ParamFound::Unmodelled,
+                    None => {}
+                }
+            }
+        }
+        if serving.is_empty() {
+            return ParamFound::None;
+        }
+        // One clause over one index (the primary key is listed as both
+        // the SQL key and the storage's `_id` index: one relation).
+        let field = serving[0].1.clone();
+        if serving.iter().any(|(_, f)| *f != field)
+            || clauses.iter().filter(|(f, _, _, _)| *f == field).count() != 1
+        {
+            return ParamFound::Unmodelled;
+        }
+        let Some(key) = self.analysed_key(&leaf.table, &field) else {
+            return ParamFound::Unmodelled;
+        };
+        let Some(ki) = self.key_index(&leaf.table, &Document::new(), &field, &key, inner_rows)
+        else {
+            return ParamFound::Unmodelled;
+        };
+        if leaf.read.iter().all(|f| ki.index.columns.contains(f)) {
+            return ParamFound::Unmodelled;
+        }
+        let (_, column, op, ops) = clauses
+            .iter()
+            .find(|(f, _, _, _)| *f == field)
+            .expect("counted above");
+        let lower = op.starts_with('>');
+        // The other join clauses, a filter on each row the scan fetches.
+        let rest_ops = (filters.iter().map(|f| f.ops).sum::<usize>() - *ops) as f64;
+        let rest: Vec<(String, costsize::Qual)> = if rest_ops > 0.0 {
+            vec![(String::new(), costsize::Qual::Filter(rest_ops))]
+        } else {
+            Vec::new()
+        };
+        let Some((startup, total)) =
+            costsize::param_range_index_scan(&ki.rel, &ki.index, &rest, lower, outer_rows)
+        else {
+            return ParamFound::Unmodelled;
+        };
+        let Some(name) = serving
+            .iter()
+            .map(|(ix, _)| ix.name.clone())
+            .find(|n| !n.starts_with('_'))
+            .or_else(|| serving.first().map(|(ix, _)| ix.name.clone()))
+        else {
+            return ParamFound::Unmodelled;
+        };
+        let alias = leaf
+            .keys
+            .first()
+            .and_then(|(k, _, _)| k.split(secantus_pgplan::joins::SEP).next())
+            .unwrap_or(&leaf.table)
+            .to_string();
+        ParamFound::Scan(
+            secantus_pgplan::joincost::ParamInner {
+                startup,
+                total,
+                rows: costsize::clamp_row_est(param_rows),
+                qual: 0.0,
+            },
+            ParamScan {
+                index: name,
+                alias,
+                column: column.clone(),
+            },
+        )
     }
 
     /// A Hash Join of two tables' sequential scans on one column equality
@@ -3890,6 +4082,42 @@ impl HashSide {
         self.column
             .as_ref()
             .map(|(stats, _)| i64::from(stats.width))
+    }
+}
+
+/// A nested loop's side as [`PgHandler::nest_loop_estimate`] reads it: its
+/// table, each key with its stored field and SQL column, and the stored
+/// fields its scan reads.
+struct SideLeaf {
+    table: String,
+    keys: Vec<(String, String, String)>,
+    read: Vec<String>,
+}
+
+/// A nested loop's inner index scan parameterized by the outer row
+/// (RP-354): the index, the scan's alias, and the column whose join
+/// clause is its `Index Cond`.
+#[derive(Debug, Clone)]
+pub(crate) struct ParamScan {
+    pub index: String,
+    pub alias: String,
+    pub column: String,
+}
+
+enum ParamFound {
+    None,
+    Unmodelled,
+    Scan(secantus_pgplan::joincost::ParamInner, ParamScan),
+}
+
+/// A comparison operator with its operands swapped.
+fn commuted(op: &str) -> &str {
+    match op {
+        "<" => ">",
+        "<=" => ">=",
+        ">" => "<",
+        ">=" => "<=",
+        other => other,
     }
 }
 
