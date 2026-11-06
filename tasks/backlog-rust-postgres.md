@@ -1386,16 +1386,17 @@ a regression test.
       `s left join e on s.a + 1 < e.a` is `Rows Removed by Join Filter:
       495`), and since 2026-11-06 a plain Nested Loop's Seq Scans their
       `Rows Removed by Filter` (`select * from s join e on s.a < e.a where
-      e.b = 'v1'`), as PostgreSQL 15.19 counts them. Still unannotated: a
-      Hash Join or parameterized Nested Loop whose scans have their own
-      Filter (`s join e on s.a = e.a where e.b = 'v1' and s.a > 5`: `Seq
-      Scan on e (actual rows=100 loops=1)`, `Rows Removed by Filter:
-      900`), a LEFT join filter over a char(n) column, a Merge Join (its
-      Sorts' `Sort Method`), a hash table past `hash_mem` (several
-      batches) and a join with an inner-unique inner side. Measured on a
-      private 15.19 cluster (found while working RP-386).
+      e.b = 'v1'`), as PostgreSQL 15.19 counts them, and since RP-403 a
+      Hash Join's and a parameterized Nested Loop's outer Seq Scans theirs
+      too. Still unannotated: a LEFT join filter over a char(n) column
+      (`cc left join s on cc.b < s.c`, `b char(4)`: `Seq Scan on cc
+      (actual rows=30 loops=1)`), a LEFT join with a WHERE (unpriced too,
+      RP-379), a parameterized inner index scan with its own Filter, a
+      Merge Join (its Sorts' `Sort Method`), a hash table past `hash_mem`
+      (several batches) and a join with an inner-unique inner side.
+      Measured on a private 15.19 cluster (found while working RP-386).
       Backlog-ID: RP-390
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a hash join over two filtered scans]
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over a char(n) join filter]
 - [ ] **An inner join nested in an outer join keeps its one-table ON
       conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
       join's ON conjunct over one table is that table's scan Filter, but
@@ -1478,6 +1479,35 @@ a regression test.
       private 15.19 cluster (found while working RP-388).
       Backlog-ID: RP-402
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
+- [ ] **EXPLAIN prints no estimate for a scan filtered by an expression
+      or a LIKE.** PostgreSQL 15.19 prices `select * from e where a + 1 >
+      996` at `rows=333` (`scalarineqsel`'s default 1/3 for an expression
+      it has no statistics for) and `select * from s where c like 'x%'`
+      at `rows=30` (`patternsel`: the prefix `x`'s range selectivity over
+      the column's histogram); here both print `cost=0.00..0.00 rows=0
+      width=0`, and so does every join over such a scan. Measured on a
+      private 15.19 cluster (found while working RP-403).
+      Backlog-ID: RP-404
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by a LIKE prefix]
+- [ ] **A join's scan filtered by an expression prints a `Filter: (...)`
+      line.** `explain (costs off) select * from e left join s on s.a =
+      e.a where e.a + 1 > 996`: PostgreSQL 15.19 prints `Filter: ((a + 1)
+      > 996)` under `Seq Scan on e`; here a `Filter: (...)` line comes
+      first, and below an inner join the conjunct is printed twice, once
+      unparsed. The rows are right. Measured on a private 15.19 cluster
+      (found while working RP-403).
+      Backlog-ID: RP-405
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's scan filtered by an expression]
+- [ ] **A lone scan's Filter does not put an expression's conjunct
+      after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
+      first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
+      where a + 1 > 996 and b = 'v1'` is `Filter: ((b = 'v1'::text) AND
+      ((a + 1) > 996))`, the expression's two operators after the
+      column's one. Here the conjuncts are printed as written (a join's
+      scan keeps the written order in other cases too, RP-398). Measured
+      on a private 15.19 cluster (found while working RP-403).
+      Backlog-ID: RP-406
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's conjuncts in cost order]
 
 ## Found by batch 54 (2026-10-24)
 

@@ -827,7 +827,16 @@ impl PgHandler {
     ) -> Option<Document> {
         use secantus_pgplan::joins::{JoinKind, JoinNode, SEP};
         use secantus_pgplan::Statement;
-        if sel.residual.is_some() || sel.join.is_some() {
+        // A residual is a filter of no scan only where it is one operator
+        // over two or more tables: a comma join's `e.a < k.a`, its join
+        // clause. Any other may hold a conjunct over one table, which is
+        // that table's scan's filter.
+        if let Some(residual) = &sel.residual {
+            if !joins_tables(residual) {
+                return None;
+            }
+        }
+        if sel.join.is_some() {
             return None;
         }
         let Statement::JoinRows(j) = sel.sub.as_ref()?.plan.as_ref() else {
@@ -972,7 +981,10 @@ impl PgHandler {
         // constant there joins the key's equivalence class, which leaves no
         // join clause (RP-363; joined rows, [`Self::joined_implied_estimate`]).
         let priced = |p: &JoinedSide| {
-            if !p.filter.is_empty() && filter_names(&p.filter, &p.field) {
+            if !p.filter.is_empty()
+                && filter_names(&p.filter, &p.field)
+                && !bounds_only(&p.filter, &p.field)
+            {
                 return None;
             }
             self.hash_side(&p.table, &p.filter, &p.field, &p.read, &p.above)
@@ -4877,6 +4889,31 @@ pub(crate) type LeftImplied = (Vec<(String, String)>, (String, String));
 
 /// Whether a stored filter reads `field` anywhere (under `$and`, `$or`
 /// and operators alike).
+/// Does `filter` name `field` only to bound it -- `>`, `>=`, `<`, `<=`
+/// against a constant, at its top or under `$and`? Such a qual is a
+/// restriction of its scan (`distribute_restrictinfo_to_rels`) and leaves
+/// the column's join clause in place, as an equality would not: that one
+/// joins the key's equivalence class (RP-363).
+fn bounds_only(filter: &Document, field: &str) -> bool {
+    filter.iter().all(|(k, v)| match (k.as_str(), v) {
+        ("$and", bson::Bson::Array(items)) => items.iter().all(|x| match x {
+            bson::Bson::Document(d) => bounds_only(d, field),
+            _ => false,
+        }),
+        (k, bson::Bson::Document(d)) if k == field => {
+            !d.is_empty()
+                && d.iter().all(|(op, c)| {
+                    matches!(op.as_str(), "$gt" | "$gte" | "$lt" | "$lte")
+                        && !matches!(c, bson::Bson::Document(_) | bson::Bson::Array(_))
+                })
+        }
+        (k, _) if k == field => false,
+        (k, v) if k.starts_with('$') => !filter_names(&bson::doc! { "x": v.clone() }, field),
+        (_, bson::Bson::Document(d)) => !filter_names(d, field),
+        _ => true,
+    })
+}
+
 fn filter_names(filter: &Document, field: &str) -> bool {
     filter.iter().any(|(k, v)| {
         k == field
@@ -4967,6 +5004,28 @@ fn is_key_equality(
 /// v}}`), flattening `$and`. Every key names one table, so each conjunct
 /// can be pushed to that table's scan (RP-365). `None` for anything else
 /// (an `$or`, an expression).
+/// Is `e` one operator expression (no AND or OR) reading the columns of
+/// two or more tables: a join clause, filtering no single scan?
+fn joins_tables(e: &secantus_pgplan::ColumnExpr) -> bool {
+    use secantus_pgplan::joins::SEP;
+    let secantus_pgplan::ColumnExpr::Row { expr, fields, .. } = e else {
+        return false;
+    };
+    if !matches!(expr.node, Some(pg_query::NodeEnum::AExpr(_))) {
+        return false;
+    }
+    let mut aliases: Vec<&str> = Vec::new();
+    for (key, _, _) in fields {
+        let Some((alias, _)) = key.split_once(SEP) else {
+            return false;
+        };
+        if !aliases.contains(&alias) {
+            aliases.push(alias);
+        }
+    }
+    aliases.len() >= 2
+}
+
 fn joined_conjuncts(filter: &Document) -> Option<Vec<(String, bson::Bson)>> {
     let mut out = Vec::new();
     for (k, v) in filter {
@@ -5019,5 +5078,31 @@ mod pushed_conjuncts_tests {
         let one = bson::doc! { "y": 5 };
         assert!(PushedConjuncts::new(&one).holds("y", &bson::Bson::Int32(5)));
         assert!(!PushedConjuncts::new(&one).holds("y", &bson::Bson::Int32(6)));
+    }
+}
+
+#[cfg(test)]
+mod key_bound_tests {
+    use super::bounds_only;
+    use bson::doc;
+
+    #[test]
+    fn a_range_bounds_its_key_and_an_equality_does_not() {
+        // A range on the key, alone or beside another column's filter,
+        // restricts its scan and keeps the join clause (RP-403).
+        assert!(bounds_only(&doc! { "a": { "$gt": 5 } }, "a"));
+        assert!(bounds_only(
+            &doc! { "$and": [{ "a": { "$gte": 3, "$lt": 20 } }, { "b": "v1" }] },
+            "a"
+        ));
+        // An equality joins the key's equivalence class (RP-363).
+        assert!(!bounds_only(&doc! { "a": 5 }, "a"));
+        assert!(!bounds_only(&doc! { "a": { "$eq": 5 } }, "a"));
+        assert!(!bounds_only(&doc! { "a": { "$in": [1, 2] } }, "a"));
+        // The key under an OR is not a bound of the scan.
+        assert!(!bounds_only(
+            &doc! { "$or": [{ "a": { "$gt": 5 } }, { "b": "v1" }] },
+            "a"
+        ));
     }
 }

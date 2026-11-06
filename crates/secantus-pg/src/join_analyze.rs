@@ -167,7 +167,7 @@ impl PgHandler {
             self.analyze_hash_join(tree, sel, actual);
         } else if tree.name.starts_with("Nested Loop") {
             if tree.children[1].param_cond.is_some() {
-                self.analyze_param_nest_loop(tree, actual);
+                self.analyze_param_nest_loop(tree, sel, actual);
             } else {
                 self.analyze_plain_nest_loop(tree, sel, actual);
             }
@@ -181,7 +181,8 @@ impl PgHandler {
             .find(|d| d.name == table)
     }
 
-    /// A Hash Join of two unfiltered Seq Scans on one key, its only qual.
+    /// A Hash Join of two Seq Scans on one key, its only qual; each scan
+    /// bare or with its own Filter (RP-390).
     fn analyze_hash_join(&self, tree: &mut PlanNode, sel: &secantus_pgplan::Select, actual: usize) {
         if tree.details.len() != 1 || tree.details[0].0 != "Hash Cond" {
             return;
@@ -190,10 +191,10 @@ impl PgHandler {
         if hash.name != "Hash" || hash.children.len() != 1 {
             return;
         }
-        let Some((outer_table, outer_alias)) = bare_seq_scan(&tree.children[0]) else {
+        let Some((outer_table, outer_alias)) = filtered_seq_scan(&tree.children[0]) else {
             return;
         };
-        let Some((inner_table, inner_alias)) = bare_seq_scan(&hash.children[0]) else {
+        let Some((inner_table, inner_alias)) = filtered_seq_scan(&hash.children[0]) else {
             return;
         };
         let Some((_, _, plan_rows, plan_width)) = hash.children[0].estimate else {
@@ -204,8 +205,15 @@ impl PgHandler {
         else {
             return;
         };
-        let (Ok(outer_docs), Ok(inner_docs)) =
-            (self.table_docs(&outer_table), self.table_docs(&inner_table))
+        // Each scan's rows: those of its table its Filter keeps
+        // (`ExecScan`'s `nfiltered1` counts the rest).
+        let Some((outer_docs, outer_read)) =
+            self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias)
+        else {
+            return;
+        };
+        let Some((inner_docs, inner_read)) =
+            self.scan_rows(sel, &hash.children[0], &inner_table, &inner_alias)
         else {
             return;
         };
@@ -282,17 +290,28 @@ impl PgHandler {
         let Some(info) = build_hash(&lens, nbuckets, space_allowed) else {
             return;
         };
-        tree.children[0].actual_rows = Some(outer_docs.len());
+        let removed =
+            |read: usize, kept: usize, n: &PlanNode| (!n.details.is_empty()).then(|| read - kept);
+        let outer = &mut tree.children[0];
+        outer.removed_by_filter = removed(outer_read, outer_docs.len(), outer);
+        outer.actual_rows = Some(outer_docs.len());
         let hash = &mut tree.children[1];
         hash.actual_rows = Some(lens.len());
         hash.hash_info = Some(info);
-        hash.children[0].actual_rows = Some(inner_docs.len());
+        let scan = &mut hash.children[0];
+        scan.removed_by_filter = removed(inner_read, inner_docs.len(), scan);
+        scan.actual_rows = Some(inner_docs.len());
     }
 
-    /// A Nested Loop over an unfiltered Seq Scan whose inner side is an
-    /// index scan parameterized by the outer row, its Index Cond the only
-    /// qual of the two (RP-354's plan).
-    fn analyze_param_nest_loop(&self, tree: &mut PlanNode, actual: usize) {
+    /// A Nested Loop over a Seq Scan (bare or with its own Filter, RP-390)
+    /// whose inner side is an index scan parameterized by the outer row,
+    /// its Index Cond the inner side's only qual (RP-354's plan).
+    fn analyze_param_nest_loop(
+        &self,
+        tree: &mut PlanNode,
+        sel: &secantus_pgplan::Select,
+        actual: usize,
+    ) {
         if !tree.details.is_empty() || tree.inner_unique {
             return;
         }
@@ -301,7 +320,7 @@ impl PgHandler {
             "Nested Loop Left Join" => true,
             _ => return,
         };
-        let Some((outer_table, outer_alias)) = bare_seq_scan(&tree.children[0]) else {
+        let Some((outer_table, outer_alias)) = filtered_seq_scan(&tree.children[0]) else {
             return;
         };
         let inner = &tree.children[1];
@@ -363,9 +382,13 @@ impl PgHandler {
         {
             return;
         }
-        let (Ok(outer_docs), Ok(inner_docs)) =
-            (self.table_docs(&outer_table), self.table_docs(&inner_table))
+        // The outer scan's rows: those its Filter keeps.
+        let Some((outer_docs, outer_read)) =
+            self.scan_rows(sel, &tree.children[0], &outer_table, &outer_alias)
         else {
+            return;
+        };
+        let Ok(inner_docs) = self.table_docs(&inner_table) else {
             return;
         };
         if outer_docs.is_empty() {
@@ -419,7 +442,11 @@ impl PgHandler {
             return;
         }
         let loops = outer_docs.len();
-        tree.children[0].actual_rows = Some(loops);
+        let outer = &mut tree.children[0];
+        if !outer.details.is_empty() {
+            outer.removed_by_filter = Some(outer_read - loops);
+        }
+        outer.actual_rows = Some(loops);
         let inner = &mut tree.children[1];
         inner.actual_rows = Some(per_loop(total, loops));
         inner.actual_loops = Some(loops);
