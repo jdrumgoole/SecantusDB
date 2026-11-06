@@ -171,7 +171,8 @@ pub(crate) fn plan_tree(stmt: &Statement, scan: &ScanChooser<'_>) -> PlanNode {
                 table_scan(&sel.table, &sel.filter, scan)
             };
             if sel.residual.is_some() && node.details.is_empty() && !sel.table.is_empty() {
-                node.details.push(("Filter".into(), "(...)".into()));
+                node.details
+                    .push(("Filter".into(), FILTER_PLACEHOLDER.into()));
             }
             if !sel.windows.is_empty() {
                 // Each distinct window is a WindowAgg, stacked in the order
@@ -825,6 +826,9 @@ pub(crate) fn move_param_conds(root: &mut PlanNode) {
         .map(|c| unqualify(c, &alias))
         .filter(|c| !implied(c))
         .collect();
+    if !rest.is_empty() {
+        drop_filter_placeholder(inner);
+    }
     match rest.as_slice() {
         [] => {}
         [one] => inner.details.insert(1, ("Filter".into(), one.clone())),
@@ -1603,6 +1607,18 @@ mod serde_json_lite {
     }
 }
 
+/// The `Filter` text `plan_tree` gives a scan whose statement keeps a
+/// residual it cannot print from the lowered filter.
+const FILTER_PLACEHOLDER: &str = "(...)";
+
+/// Drop the placeholder `Filter` from a scan about to print its real one:
+/// the printed WHERE replaces what a residual left, alone (RP-367) or as a
+/// join's scan (RP-405), where it was printed above the real line.
+fn drop_filter_placeholder(scan: &mut PlanNode) {
+    scan.details
+        .retain(|(k, v)| !(k == "Filter" && v == FILTER_PLACEHOLDER));
+}
+
 /// Put a single-relation statement's WHERE on its scan, as PostgreSQL shows
 /// it: the conjuncts an index scan's key constrains as `Index Cond`, the
 /// rest as `Filter`. A plan with more than one scan is left alone.
@@ -1702,8 +1718,7 @@ fn or_quals_on_scan(
     } else {
         format!("({})", conds.join(" OR "))
     };
-    scan.details
-        .retain(|(k, v)| !(k == "Filter" && v == "(...)"));
+    drop_filter_placeholder(scan);
     scan.details.push(("Recheck Cond".into(), recheck));
     let filter: Vec<&String> = quals
         .iter()
@@ -1790,9 +1805,7 @@ fn quals_on_scan(
     quals: &[(String, Option<String>)],
     index_columns: &dyn Fn(&str) -> Vec<String>,
 ) {
-    // The printed WHERE replaces the placeholder a residual left (RP-367).
-    scan.details
-        .retain(|(k, v)| !(k == "Filter" && v == "(...)"));
+    drop_filter_placeholder(scan);
     let bitmap = scan.name.starts_with("Bitmap Heap Scan on ");
     let index_node = if bitmap {
         scan.children.first()
@@ -2021,7 +2034,7 @@ pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
             let filter = n
                 .details
                 .iter()
-                .find(|(k, _)| k == "Filter")
+                .find(|(k, v)| k == "Filter" && v != FILTER_PLACEHOLDER)
                 .map(|(_, v)| v.clone());
             out.push((alias_of(n), n.implied_filter.clone(), filter));
         }
@@ -2067,6 +2080,7 @@ pub(crate) fn apply_implied_filters(root: &mut PlanNode) {
         if n.children.is_empty() {
             if let Some(alias) = alias_of(n) {
                 if let Some((_, text)) = texts.iter().find(|(a, _)| *a == alias) {
+                    drop_filter_placeholder(n);
                     match n.details.iter_mut().find(|(k, _)| k == "Filter") {
                         Some((_, f)) => *f = text.clone(),
                         None => n.details.push(("Filter".into(), text.clone())),
@@ -2208,6 +2222,9 @@ pub(crate) fn attach_join_where(
             let inner = home.is_none()
                 && (n.name == "Hash Join" || n.name == "Nested Loop" || n.name == "Merge Join");
             let label = if inner { "Join Filter" } else { "Filter" };
+            if home.is_some() {
+                drop_filter_placeholder(n);
+            }
             n.details.push((label.into(), combine(&parts)));
         }
     }
@@ -2620,5 +2637,53 @@ mod heap_fetches_tests {
         assert!(at("\"Index Cond\"") < at("\"Rows Removed by Index Recheck\": 0"));
         assert!(at("\"Rows Removed by Index Recheck\"") < at("\"Filter\""));
         assert!(at("\"Filter\"") < at("\"Rows Removed by Filter\": 0"));
+    }
+}
+
+#[cfg(test)]
+mod join_where_tests {
+    use super::*;
+
+    /// `Hash Join` over e's scan, which keeps a residual's placeholder, and
+    /// a hashed scan of s.
+    fn joined() -> PlanNode {
+        let mut e = PlanNode::new("Seq Scan on e");
+        e.props.push(("Relation Name".into(), "e".into()));
+        e.details.push(("Filter".into(), FILTER_PLACEHOLDER.into()));
+        let mut s = PlanNode::new("Seq Scan on s");
+        s.props.push(("Relation Name".into(), "s".into()));
+        let mut root = PlanNode::new("Hash Join");
+        root.details
+            .push(("Hash Cond".into(), "(e.a = s.a)".into()));
+        root.children.push(e);
+        root.children.push(PlanNode::over("Hash", s));
+        root
+    }
+
+    #[test]
+    fn a_join_scans_where_replaces_the_placeholder() {
+        // PostgreSQL 15.19 (RP-405): `... where e.a + 1 > 996` is the one
+        // `Filter: ((a + 1) > 996)` on e's scan.
+        let mut root = joined();
+        let quals = vec![("((a + 1) > 996)".to_string(), Some("e".to_string()), None)];
+        attach_join_where(&mut root, &quals, &|_| Vec::new());
+        assert_eq!(
+            root.children[0].details,
+            vec![("Filter".to_string(), "((a + 1) > 996)".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_conjunct_left_on_the_join_keeps_the_placeholder() {
+        // A conjunct over both sides is the join's; the scan's placeholder
+        // stands until something prints the scan's own.
+        let mut root = joined();
+        let quals = vec![("((e.a + s.a) > 3)".to_string(), None, None)];
+        attach_join_where(&mut root, &quals, &|_| Vec::new());
+        assert_eq!(
+            root.details.last(),
+            Some(&("Join Filter".to_string(), "((e.a + s.a) > 3)".to_string()))
+        );
+        assert_eq!(root.children[0].details.len(), 1);
     }
 }

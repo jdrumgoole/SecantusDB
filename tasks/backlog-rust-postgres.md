@@ -1489,15 +1489,6 @@ a regression test.
       private 15.19 cluster (found while working RP-403).
       Backlog-ID: RP-404
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by a LIKE prefix]
-- [ ] **A join's scan filtered by an expression prints a `Filter: (...)`
-      line.** `explain (costs off) select * from e left join s on s.a =
-      e.a where e.a + 1 > 996`: PostgreSQL 15.19 prints `Filter: ((a + 1)
-      > 996)` under `Seq Scan on e`; here a `Filter: (...)` line comes
-      first, and below an inner join the conjunct is printed twice, once
-      unparsed. The rows are right. Measured on a private 15.19 cluster
-      (found while working RP-403).
-      Backlog-ID: RP-405
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a join's scan filtered by an expression]
 - [ ] **A lone scan's Filter does not put an expression's conjunct
       after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
       first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
@@ -1508,6 +1499,26 @@ a regression test.
       on a private 15.19 cluster (found while working RP-403).
       Backlog-ID: RP-406
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's conjuncts in cost order]
+- [ ] **A constant coerced to its operator's type prints unfolded.**
+      PostgreSQL 15.19 folds the coercion of an integer literal compared
+      with a numeric before it prints the qual
+      (`eval_const_expressions`): `select * from e where a::numeric > 4`
+      is `Filter: ((a)::numeric > '4'::numeric)`; here `((a)::numeric >
+      (4)::numeric)`, alone or as a join's scan. A cast written on the
+      constant is folded already (RP-370). Measured on a private 15.19
+      cluster (found while working RP-405).
+      Backlog-ID: RP-407
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's coerced constant is folded]
+- [ ] **A column that does not exist gets no HINT.** PostgreSQL 15.19's
+      `errorMissingColumn` names the closest column in the FROM
+      (`searchRangeTableForCol`, a Levenshtein distance over every range
+      table entry): `select s.b from e, s` is 42703 `column s.b does not
+      exist` with `HINT: Perhaps you meant to reference the column
+      "e.b".`, and so is a misspelt `select bb from e`. Here the 42703's
+      message is the same and there is no HINT. Measured on a private
+      15.19 cluster (found while working RP-405).
+      Backlog-ID: RP-408
+      Verify: tests/backlog/test_rp_column_hint.py::test_missing_column_hint
 
 ## Found by batch 54 (2026-10-24)
 

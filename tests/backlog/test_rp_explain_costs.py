@@ -2427,6 +2427,52 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s",
         ],
     ),
+    # The same below an inner join, and for an ON conjunct over the
+    # nullable side, which printed the placeholder too.
+    "an inner join's scan filtered by an expression": (
+        "RP-405",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e join s on s.a = e.a and e.a + 1 > 996",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "        Filter: ((a + 1) > 996)",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+        ],
+    ),
+    # A WHERE over an expression of the nullable side reduces the LEFT join
+    # (`find_nonnullable_rels` descends into a strict operator), and its
+    # conjunct filters that side's scan. The plan reduced it while EXPLAIN
+    # kept the conjunct in the join's `Join Filter`, the scan printing only
+    # `Filter: (...)`.
+    "a left join reduced by a where over an expression": (
+        "RP-405",
+        _ANALYSED_THIRTY,
+        "explain (costs off) select * from e left join s on s.a = e.a where s.a * 2 > 4",
+        [
+            "Hash Join",
+            "  Hash Cond: (e.a = s.a)",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on s",
+            "              Filter: ((a * 2) > 4)",
+        ],
+    ),
+    # An integer literal coerced to numeric for its operator is folded to
+    # a typed literal (`eval_const_expressions`) before the Filter is
+    # printed; here the coercion prints unfolded (found while working
+    # RP-405).
+    "a scan filter's coerced constant is folded": (
+        "RP-407",
+        _ANALYSED,
+        "explain (costs off) select * from e where a::numeric > 4",
+        [
+            "Seq Scan on e",
+            "  Filter: ((a)::numeric > '4'::numeric)",
+        ],
+    ),
     # A scan's Filter lists its conjuncts cheapest first
     # (`order_qual_clauses`): the operator over a column before the one
     # over an expression. Here they keep the WHERE's order (found while
@@ -2930,6 +2976,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-395",
         "RP-396",
         "RP-403",
+        "RP-405",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

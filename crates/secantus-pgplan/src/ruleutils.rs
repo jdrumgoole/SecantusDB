@@ -4246,38 +4246,18 @@ pub fn join_where(s: &pg_query::protobuf::SelectStmt, cat: &Catalog<'_>) -> Opti
         }
     }
     flatten(w, &mut parts);
-    // The relations a conjunct proves non-NULL: a comparison operator
-    // (every one strict) over a plain column, or `IS NOT NULL` of one.
+    // The relations a conjunct proves non-NULL, as the planner's own
+    // `reduce_outer_joins` finds them (`joins::strict_aliases`), so the
+    // printed plan reduces the joins the executed one does: a comparison
+    // over columns under a cast or arithmetic (`(s.a * 2) > 4`), or `IS
+    // NOT NULL` of one (RP-405).
     let mut nonnull: Vec<String> = Vec::new();
-    for part in &parts {
-        let mut cols: Vec<&Node> = Vec::new();
-        match part.node.as_ref() {
-            Some(N::AExpr(a)) if a.kind == pg_query::protobuf::AExprKind::AexprOp as i32 => {
-                let strict = matches!(
-                    a.name.as_slice(),
-                    [one] if matches!(
-                        one.node.as_ref(),
-                        Some(N::String(op)) if matches!(op.sval.as_str(), "=" | "<>" | "<" | "<=" | ">" | ">=")
-                    )
-                );
-                if strict {
-                    cols.extend(a.lexpr.as_deref());
-                    cols.extend(a.rexpr.as_deref());
-                }
-            }
-            Some(N::NullTest(t))
-                if t.nulltesttype == pg_query::protobuf::NullTestType::IsNotNull as i32 =>
-            {
-                cols.extend(t.arg.as_deref());
-            }
-            _ => {}
-        }
-        for c in cols {
-            if let Some(N::ColumnRef(c)) = c.node.as_ref() {
-                if let Some((rel, _, _)) = p.resolve(&names(&c.fields)) {
-                    if !nonnull.contains(&rel) {
-                        nonnull.push(rel);
-                    }
+    {
+        let owner = |name: &str| p.resolve(&[name.to_string()]).map(|(rel, _, _)| rel);
+        for part in &parts {
+            for rel in crate::joins::strict_aliases(part, &owner) {
+                if !nonnull.contains(&rel) {
+                    nonnull.push(rel);
                 }
             }
         }
@@ -4912,5 +4892,71 @@ mod comma_join_conds_tests {
         let mut quals = vec![q("(e.b = k.b)", None)];
         assert!(comma_join_conds(&s, &mut quals).unwrap().is_empty());
         assert_eq!(quals.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod join_where_tests {
+    use super::*;
+    use secantus_pgcatalog::Column;
+
+    fn lookup(name: &str) -> Option<TableDef> {
+        matches!(name, "e" | "s").then(|| {
+            TableDef::new(
+                name,
+                vec![
+                    Column::new("a", "int4", false),
+                    Column::new(if name == "e" { "b" } else { "c" }, "text", false),
+                ],
+            )
+        })
+    }
+
+    fn homes(sql: &str) -> Vec<(String, Option<String>)> {
+        let p = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = p.protobuf.stmts[0].stmt.as_ref().unwrap().node.as_ref()
+        else {
+            panic!("{sql}")
+        };
+        let none = |_: &str| None;
+        let cat = Catalog {
+            lookup: &lookup,
+            view_sql: &none,
+        };
+        join_where(s, &cat)
+            .unwrap()
+            .into_iter()
+            .map(|(text, home, _)| (text, home))
+            .collect()
+    }
+
+    #[test]
+    fn a_where_over_an_expression_reduces_the_left_join() {
+        // PostgreSQL 15.19 (RP-405): `(s.a * 2) > 4` is false or NULL for
+        // a NULL-extended s, so the join is an inner one and the conjunct
+        // filters s's scan, as the planner's `strict_aliases` decides.
+        for (sql, want) in [
+            (
+                "select * from e left join s on s.a = e.a where s.a * 2 > 4",
+                ("((a * 2) > 4)", Some("s")),
+            ),
+            (
+                "select * from e left join s on s.a = e.a where s.a::numeric > 4",
+                ("((a)::numeric > 4)", Some("s")),
+            ),
+        ] {
+            let got = homes(sql);
+            assert_eq!(got.len(), 1, "{sql}");
+            assert_eq!(got[0].1.as_deref(), want.1, "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_where_that_proves_nothing_keeps_the_side_nullable() {
+        // `IS NULL` holds for a NULL-extended row: s stays null-extended,
+        // its conjunct the join's.
+        let got = homes("select * from e left join s on s.a = e.a where s.a is null");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, None);
     }
 }
