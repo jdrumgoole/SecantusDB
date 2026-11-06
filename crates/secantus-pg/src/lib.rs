@@ -12048,6 +12048,46 @@ impl PgHandler {
         index: &str,
         filter: &Document,
     ) -> Option<(usize, usize, usize)> {
+        let (ctids, not_visible) = self.user_index_ctids(table, index, filter)?;
+        let pages: std::collections::BTreeSet<i64> = ctids.iter().map(|c| c / 65536).collect();
+        Some((ctids.len(), not_visible, pages.len()))
+    }
+
+    /// A Bitmap Heap Scan over a BitmapOr of one Bitmap Index Scan per arm
+    /// of `filter`'s `$or` (RP-384): each arm's index tuples, in the
+    /// BitmapOr's order, and the distinct heap pages of their union -- the
+    /// heap scan's `exact_pages`, as `tbm_union` merges the arms' bitmaps.
+    /// `None` where `user_index_tids` would refuse an arm, or the arms are
+    /// not the WHERE's `$or` one for one.
+    fn user_bitmap_or_tids(
+        &self,
+        table: &str,
+        indexes: &[String],
+        filter: &Document,
+    ) -> Option<(Vec<usize>, usize)> {
+        let arms = match filter.get("$or") {
+            Some(Bson::Array(arms)) if filter.len() == 1 && arms.len() == indexes.len() => arms,
+            _ => return None,
+        };
+        let mut tuples = Vec::with_capacity(arms.len());
+        let mut pages = std::collections::BTreeSet::new();
+        for (index, arm) in indexes.iter().zip(arms) {
+            let (ctids, _) = self.user_index_ctids(table, index, arm.as_document()?)?;
+            tuples.push(ctids.len());
+            pages.extend(ctids.iter().map(|c| c / 65536));
+        }
+        Some((tuples, pages.len()))
+    }
+
+    /// The heap ctids a scan of `table`'s B-tree `index` reaches under
+    /// `filter`'s index quals, and how many of them sit on a page the
+    /// visibility map leaves unmarked (see `user_index_tids`).
+    fn user_index_ctids(
+        &self,
+        table: &str,
+        index: &str,
+        filter: &Document,
+    ) -> Option<(Vec<i64>, usize)> {
         if !self.has_heap(table)
             || self
                 .with_heap_read(table, |h| h.has_dead_entries())
@@ -12112,8 +12152,7 @@ impl PgHandler {
             })
             .ok()?;
         let not_visible = visible.iter().filter(|v| !**v).count();
-        let pages: std::collections::BTreeSet<i64> = ctids.iter().map(|c| c / 65536).collect();
-        Some((ctids.len(), not_visible, pages.len()))
+        Some((ctids, not_visible))
     }
 
     fn index_relations(&self) -> Vec<IndexRelation> {
@@ -41977,6 +42016,39 @@ impl PgHandler {
                         {
                             tree.heap_blocks = Some(blocks);
                             tree.children[0].actual_rows = Some(tuples);
+                        }
+                    }
+                    // A BitmapOr's arms (RP-384): each Bitmap Index Scan's
+                    // tuples, the heap scan's pages of their union, and the
+                    // BitmapOr's own `actual rows=0` -- `MultiExecBitmapOr`
+                    // returns a bitmap and counts no tuples.
+                    let or_indexes: Option<Vec<String>> =
+                        (tree.name.starts_with("Bitmap Heap Scan on ")
+                            && tree.children.len() == 1
+                            && tree.children[0].name == "BitmapOr")
+                            .then(|| {
+                                tree.children[0]
+                                    .children
+                                    .iter()
+                                    .map(|c| {
+                                        (c.children.is_empty())
+                                            .then(|| c.name.strip_prefix("Bitmap Index Scan on "))
+                                            .flatten()
+                                            .map(str::to_string)
+                                    })
+                                    .collect()
+                            })
+                            .flatten();
+                    if let Some(indexes) = or_indexes {
+                        if let Some((tuples, blocks)) =
+                            self.user_bitmap_or_tids(&sel.table, &indexes, &sel.filter)
+                        {
+                            tree.heap_blocks = Some(blocks);
+                            let or = &mut tree.children[0];
+                            or.actual_rows = Some(0);
+                            for (arm, n) in or.children.iter_mut().zip(tuples) {
+                                arm.actual_rows = Some(n);
+                            }
                         }
                     }
                     // A join's children: their rows, loops and counters
