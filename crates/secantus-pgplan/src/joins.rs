@@ -486,8 +486,20 @@ pub(crate) fn plan_join_source(
     // WHERE conjunct is (RP-391).
     let hoisted = prepare_on_quals(s);
     let s = hoisted.as_ref().unwrap_or(s);
+    // An outer join's ON conjunct over its nullable side alone runs in
+    // that side's scan (RP-395).
+    let nullable_side = nullable_side_on_conjuncts(s);
+    let (s, nullable_pushed) = match &nullable_side {
+        Some((rewritten, pushed)) => (rewritten, pushed.as_slice()),
+        None => (s, &[][..]),
+    };
     // A nested join (one inside a FROM subquery) plans with its own.
-    let (pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
+    let (mut pushdown, nonnullable, ec, placed, moved) = pushdown_filters(s, lookup);
+    for (alias, _, c) in nullable_pushed {
+        let mut c = c.clone();
+        strip_qualifier(&mut c);
+        pushdown.push((alias.clone(), c));
+    }
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
@@ -2653,6 +2665,97 @@ pub(crate) fn hoist_inner_on_conjuncts(
     Some(out)
 }
 
+/// An ON conjunct an outer join's nullable side runs in its scan: the
+/// side's alias, its relation, and the conjunct as written (RP-395).
+pub(crate) type NullableSideQual = (
+    String,
+    pg_query::protobuf::RangeVar,
+    pg_query::protobuf::Node,
+);
+
+/// `s` with every ON conjunct of a LEFT or RIGHT join that reads only its
+/// nullable side taken out of the ON, and those conjuncts, or `None` when
+/// there is none (RP-395).
+///
+/// PostgreSQL's `distribute_qual_to_rels` evaluates an outer join's qual
+/// that mentions only the nullable side below the join, in that side's
+/// scan: `s left join e on s.a * 40 > e.a and e.b = 'v3'` is `Join Filter:
+/// ((s.a * 40) > e.a)` over `Seq Scan on e` with `Filter: (b =
+/// 'v3'::text)`. A row of that side the conjunct rejects pairs with no
+/// outer row, so filtering it out first leaves the join's rows unchanged.
+/// A conjunct over the preserved side stays in the Join Filter (it does
+/// not remove preserved rows), and so does any conjunct a FULL join has.
+/// Taken only where the nullable side is one stored table whose columns
+/// keep their names (a leaf `build` gives a pushed filter), only for a
+/// FROM of one join tree (the FROM whose quals EXPLAIN places), and only
+/// for a conjunct of `single_alias`'s shape: every column qualified by the
+/// side's alias, immutable parts, no subquery.
+pub(crate) fn nullable_side_on_conjuncts(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Option<(pg_query::protobuf::SelectStmt, Vec<NullableSideQual>)> {
+    use pg_query::protobuf::JoinType;
+    fn walk(item: &mut pg_query::protobuf::Node, out: &mut Vec<NullableSideQual>) {
+        let Some(N::JoinExpr(j)) = item.node.as_mut() else {
+            return;
+        };
+        for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            walk(side, out);
+        }
+        if j.is_natural {
+            return;
+        }
+        let nullable = match JoinType::try_from(j.jointype) {
+            Ok(JoinType::JoinLeft) => j.rarg.as_deref(),
+            Ok(JoinType::JoinRight) => j.larg.as_deref(),
+            _ => None,
+        };
+        let Some(nullable) = nullable else {
+            return;
+        };
+        let Some(N::RangeVar(r)) = nullable.node.as_ref() else {
+            return;
+        };
+        let mut leaves = Vec::new();
+        filtered_leaves(nullable, &mut leaves);
+        let [alias] = leaves.as_slice() else {
+            return;
+        };
+        let (alias, table) = (alias.clone(), r.clone());
+        let Some(quals) = j.quals.as_deref() else {
+            return;
+        };
+        let mut conjuncts = Vec::new();
+        split_and(quals, &mut conjuncts);
+        let (mine, kept): (Vec<_>, Vec<_>) = conjuncts
+            .into_iter()
+            .partition(|c| single_alias(c, &|_| None).as_deref() == Some(alias.as_str()));
+        if mine.is_empty() {
+            return;
+        }
+        out.extend(
+            mine.into_iter()
+                .map(|c| (alias.clone(), table.clone(), c.clone())),
+        );
+        let kept: Vec<pg_query::protobuf::Node> = kept.into_iter().cloned().collect();
+        j.quals = and_of(kept).map(Box::new);
+    }
+    let [only] = s.from_clause.as_slice() else {
+        return None;
+    };
+    if !matches!(only.node.as_ref(), Some(N::JoinExpr(_))) {
+        return None;
+    }
+    let mut out = s.clone();
+    let mut pushed = Vec::new();
+    for item in &mut out.from_clause {
+        walk(item, &mut pushed);
+    }
+    (!pushed.is_empty()).then_some((out, pushed))
+}
+
 /// The AND of `args`: `None` for none, the one itself for one.
 fn and_of(args: Vec<pg_query::protobuf::Node>) -> Option<pg_query::protobuf::Node> {
     match args.len() {
@@ -3297,7 +3400,7 @@ fn alias_of(
 }
 
 /// `a.x` -> `x`, for a conjunct moved into `a`'s own `SELECT * FROM t`.
-fn strip_qualifier(n: &mut pg_query::protobuf::Node) {
+pub(crate) fn strip_qualifier(n: &mut pg_query::protobuf::Node) {
     let _ = walk_expr(n, &mut |x| {
         if let Some(N::ColumnRef(c)) = x.node.as_mut() {
             if c.fields.len() == 2 {
@@ -3419,6 +3522,117 @@ mod tests {
         assert_eq!(prepared("select * from s left join e on false"), None);
         assert_eq!(
             prepared("select * from s join e on 1 = 1 and s.a < e.a"),
+            None
+        );
+    }
+
+    /// The ON conjuncts `nullable_side_on_conjuncts` takes from `sql`, as
+    /// `alias: conjunct`, and the statement it leaves, deparsed.
+    fn nullable_pushed(sql: &str) -> Option<(Vec<String>, String)> {
+        let mut parsed = pg_query::parse(sql).unwrap().protobuf;
+        let Some(N::SelectStmt(s)) = parsed.stmts[0].stmt.as_mut().and_then(|n| n.node.as_mut())
+        else {
+            panic!("a SELECT");
+        };
+        let (rewritten, pushed) = nullable_side_on_conjuncts(s)?;
+        let mut template = pg_query::parse("select 1 where true").unwrap().protobuf;
+        let texts = pushed
+            .into_iter()
+            .map(|(alias, _, c)| {
+                if let Some(N::SelectStmt(t)) = template.stmts[0]
+                    .stmt
+                    .as_mut()
+                    .and_then(|n| n.node.as_mut())
+                {
+                    t.where_clause = Some(Box::new(c));
+                }
+                let text = template.deparse().unwrap();
+                format!("{alias}: {}", text.trim_start_matches("SELECT 1 WHERE "))
+            })
+            .collect();
+        // A LEFT join left with no ON deparses as a CROSS JOIN would not:
+        // give it `ON true` to print.
+        let mut rewritten = rewritten;
+        fn on_true(n: &mut pg_query::protobuf::Node) {
+            if let Some(N::JoinExpr(j)) = n.node.as_mut() {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    on_true(side);
+                }
+                if j.quals.is_none() && j.jointype != pg_query::protobuf::JoinType::JoinInner as i32
+                {
+                    j.quals = Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::AConst(pg_query::protobuf::AConst {
+                            val: Some(pg_query::protobuf::a_const::Val::Boolval(
+                                pg_query::protobuf::Boolean { boolval: true },
+                            )),
+                            ..Default::default()
+                        })),
+                    }));
+                }
+            }
+        }
+        for item in &mut rewritten.from_clause {
+            on_true(item);
+        }
+        **s = rewritten;
+        Some((texts, parsed.deparse().unwrap()))
+    }
+
+    #[test]
+    fn an_outer_joins_nullable_side_on_conjunct_filters_its_scan() {
+        // RP-395: `distribute_qual_to_rels` runs it below the join.
+        let (pushed, rest) =
+            nullable_pushed("select * from s left join e on s.a * 40 > e.a and e.b = 'v3'")
+                .unwrap();
+        assert_eq!(pushed, vec!["e: e.b = 'v3'"]);
+        assert_eq!(rest, "SELECT * FROM s LEFT JOIN e ON (s.a * 40) > e.a");
+        // Every conjunct over the nullable side leaves the join no ON.
+        let (pushed, rest) = nullable_pushed("select * from s left join e on e.b = 'v3'").unwrap();
+        assert_eq!(pushed, vec!["e: e.b = 'v3'"]);
+        assert_eq!(rest, "SELECT * FROM s LEFT JOIN e ON true");
+        // A RIGHT join's nullable side is its left; an alias names it.
+        let (pushed, _) =
+            nullable_pushed("select * from x e right join s on s.a = e.a and e.c > 1").unwrap();
+        assert_eq!(pushed, vec!["e: e.c > 1"]);
+        // A nested LEFT join's nullable leaf is taken too.
+        let (pushed, _) = nullable_pushed(
+            "select * from s left join e on s.a = e.a left join k on k.a = e.a and k.b = 'x'",
+        )
+        .unwrap();
+        assert_eq!(pushed, vec!["k: k.b = 'x'"]);
+        // A conjunct over the preserved side does not remove preserved rows,
+        // and a FULL join null-extends both: those stay in the ON.
+        assert_eq!(
+            nullable_pushed("select * from s left join e on s.a < e.a and s.a > 5"),
+            None
+        );
+        assert_eq!(
+            nullable_pushed("select * from s full join e on s.a = e.a and e.b = 'v3'"),
+            None
+        );
+        // Not modelled: a nullable side that is a join or has renamed
+        // columns, an unqualified column, a subquery, a volatile call.
+        assert_eq!(
+            nullable_pushed("select * from s left join (e join k on e.a = k.a) on k.b = 'x'"),
+            None
+        );
+        assert_eq!(
+            nullable_pushed("select * from s left join e as e(x, y) on e.y = 'v3'"),
+            None
+        );
+        assert_eq!(
+            nullable_pushed("select * from s left join e on s.a = e.a and b = 'v3'"),
+            None
+        );
+        assert_eq!(
+            nullable_pushed("select * from s left join e on e.a in (select 1)"),
+            None
+        );
+        assert_eq!(
+            nullable_pushed("select * from s left join e on e.a > random()"),
             None
         );
     }

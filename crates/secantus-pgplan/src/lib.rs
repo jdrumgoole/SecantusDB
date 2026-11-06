@@ -9978,6 +9978,70 @@ fn predicate_string_literal(text: &str, ty: &str) -> Option<String> {
     })
 }
 
+/// The scan Filters of an outer join's nullable-side ON conjuncts
+/// ([`joins::nullable_side_on_conjuncts`], RP-395), as [`ruleutils::join_where`]
+/// lists a WHERE's: per side, its conjuncts printed bare in the order
+/// PostgreSQL's planner leaves a scan's quals (`ruleutils::explain_conjuncts`:
+/// an equality to a constant after the rest). Where that order is not
+/// modelled for the table, the conjuncts keep the order they were written
+/// in, printed as a WHERE over that table alone would print them.
+fn nullable_side_scan_quals(
+    pushed: &[joins::NullableSideQual],
+    cat: &ruleutils::Catalog<'_>,
+) -> Vec<ruleutils::JoinQual> {
+    type Side<'p> = (
+        &'p str,
+        &'p pg_query::protobuf::RangeVar,
+        Vec<pg_query::protobuf::Node>,
+    );
+    let and = |args: Vec<pg_query::protobuf::Node>| pg_query::protobuf::Node {
+        node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+            boolop: pg_query::protobuf::BoolExprType::AndExpr as i32,
+            args,
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let mut sides: Vec<Side<'_>> = Vec::new();
+    for (alias, rv, c) in pushed {
+        match sides.iter_mut().find(|(a, _, _)| a == alias) {
+            Some((_, _, cs)) => cs.push(c.clone()),
+            None => sides.push((alias, rv, vec![c.clone()])),
+        }
+    }
+    let mut out = Vec::new();
+    for (alias, rv, conjuncts) in sides {
+        let ordered = (cat.lookup)(&relation_name(rv)).and_then(|def| {
+            let bare: Vec<pg_query::protobuf::Node> = conjuncts
+                .iter()
+                .map(|c| {
+                    let mut c = c.clone();
+                    joins::strip_qualifier(&mut c);
+                    c
+                })
+                .collect();
+            ruleutils::explain_conjuncts(&and(bare), &def)
+        });
+        if let Some(ordered) = ordered {
+            out.extend(
+                ordered
+                    .into_iter()
+                    .map(|(text, column)| (text, Some(alias.to_string()), column)),
+            );
+            continue;
+        }
+        let alone = pg_query::protobuf::SelectStmt {
+            from_clause: vec![pg_query::protobuf::Node {
+                node: Some(N::RangeVar(rv.clone())),
+            }],
+            where_clause: Some(Box::new(and(conjuncts))),
+            ..Default::default()
+        };
+        out.extend(ruleutils::join_where(&alone, cat).unwrap_or_default());
+    }
+    out
+}
+
 /// `EXPLAIN`. The statement is planned as it would run; the server renders
 /// the plan's SHAPE -- this server has no cost model, so it never pretends to
 /// PostgreSQL's numbers.
@@ -10091,6 +10155,13 @@ fn plan_explain(
             // scan, as the planner runs it (RP-391).
             let hoisted = joins::prepare_on_quals(s);
             let s = hoisted.as_ref().unwrap_or(s);
+            // An outer join's ON conjunct over its nullable side alone is
+            // printed on that side's scan, as it runs there (RP-395).
+            let nullable_side = joins::nullable_side_on_conjuncts(s);
+            let (s, nullable_pushed) = match &nullable_side {
+                Some((rewritten, pushed)) => (rewritten, pushed.as_slice()),
+                None => (s, &[][..]),
+            };
             let none = |_: &str| None;
             let cat = ruleutils::Catalog {
                 lookup,
@@ -10112,6 +10183,13 @@ fn plan_explain(
             } else {
                 Vec::new()
             };
+            // Those go first: `deconstruct_jointree` distributes a join's
+            // own quals before the WHERE's.
+            if joined && !nullable_pushed.is_empty() {
+                let mut first = nullable_side_scan_quals(nullable_pushed, &cat);
+                first.append(&mut options.join_where);
+                options.join_where = first;
+            }
             let split = ruleutils::join_conditions_split(s, &cat).unwrap_or_default();
             let conds: Vec<String> = split.iter().map(|(c, _)| c.clone()).collect();
             join_cond_splits = split.into_iter().map(|(_, s)| s).collect();
