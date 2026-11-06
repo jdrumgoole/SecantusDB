@@ -73,9 +73,9 @@ fn hint_for(table: &str) -> Option<ScanHint> {
     HINTS.with(|h| h.borrow().iter().rev().find(|x| x.table == table).cloned())
 }
 
-/// A GIN index this models: one array column under `array_ops`, one
-/// `jsonb` column under `jsonb_ops`, or one `tsvector` column under
-/// `tsvector_ops`.
+/// A GIN index this models: array columns under `array_ops`, `jsonb`
+/// columns under `jsonb_ops` or `jsonb_path_ops`, `tsvector` columns
+/// under `tsvector_ops` -- one, or several (a multi-column index).
 #[derive(Debug, Clone)]
 pub(crate) struct GinShape {
     pub(crate) oid: i64,
@@ -84,6 +84,9 @@ pub(crate) struct GinShape {
     /// The array's element type, `jsonb` for `jsonb_ops`, or `tsvector`
     /// for `tsvector_ops`.
     pub(crate) elem: String,
+    /// Every key column, `field` and `elem` the first: a multi-column
+    /// index's pages are modelled, its scans are not.
+    pub(crate) cols: Vec<(String, String)>,
     /// `fastupdate` (on unless `WITH` turned it off).
     pub(crate) fastupdate: bool,
     /// `gin_pending_list_limit`, kB, when `WITH` set it.
@@ -192,8 +195,96 @@ impl ElemOps {
     }
 }
 
+impl ElemOps {
+    /// `index_form_tuple`'s size for a key of this column in a
+    /// multi-column index: the 8-byte header, the `int2` attnum, then the
+    /// key aligned as its type is (a short varlena unaligned), MAXALIGNed.
+    fn multi_key_size(&self, v: &Bson) -> usize {
+        const AFTER_ATTNUM: usize = 8 + 2;
+        let align = |n: usize, a: usize| (n + a - 1) & !(a - 1);
+        if self.textual() {
+            let len = match v {
+                Bson::String(s) => secantus_pgplan::server_encoding::bytes(s).len(),
+                other => other.to_string().len(),
+            };
+            let end = if len < 127 {
+                AFTER_ATTNUM + 1 + len
+            } else {
+                align(AFTER_ATTNUM, 4) + 4 + len
+            };
+            return align(end, 8);
+        }
+        let (size, typalign) = match self.elem.as_str() {
+            "bool" | "boolean" => (1, 1),
+            "int2" | "smallint" => (2, 2),
+            "int8" | "bigint" | "float8" | "double precision" => (8, 8),
+            _ => (4, 4),
+        };
+        align(align(AFTER_ATTNUM, typalign) + size, 8)
+    }
+}
+
+/// A GIN index's key columns, each with its opclass (`GinState`): a key's
+/// `att` picks its column, 0 in a one-column index.
+pub(crate) struct GinOps {
+    cols: Vec<ElemOps>,
+}
+
+impl GinOps {
+    fn of(s: &GinShape) -> GinOps {
+        GinOps {
+            cols: s
+                .cols
+                .iter()
+                .map(|(_, elem)| ElemOps { elem: elem.clone() })
+                .collect(),
+        }
+    }
+
+    fn col(&self, att: u16) -> &ElemOps {
+        &self.cols[usize::from(att.max(1)) - 1]
+    }
+
+    /// `ginExtractEntries` for each column of `row` in turn, each key
+    /// marked with its column when there are several.
+    fn row_keys(&self, s: &GinShape, row: &Document) -> Vec<GinKey> {
+        if self.cols.len() == 1 {
+            return gin_keys(&self.cols[0], row.get(&s.field));
+        }
+        let mut out = Vec::new();
+        for (i, (ops, (field, _))) in self.cols.iter().zip(&s.cols).enumerate() {
+            let att = u16::try_from(i + 1).unwrap_or(u16::MAX);
+            out.extend(
+                gin_keys(ops, row.get(field))
+                    .into_iter()
+                    .map(|k| k.of_att(att)),
+            );
+        }
+        out
+    }
+}
+
+impl KeyOps for GinOps {
+    fn cmp(&self, att: u16, a: &Bson, b: &Bson) -> std::cmp::Ordering {
+        self.col(att).cmp(0, a, b)
+    }
+
+    fn key_size(&self, att: u16, v: &Bson) -> usize {
+        if att == 0 {
+            self.col(att).key_size(0, v)
+        } else {
+            self.col(att).multi_key_size(v)
+        }
+    }
+
+    fn datum_size(&self, att: u16, v: &Bson) -> Option<usize> {
+        self.col(att).datum_size(0, v)
+    }
+}
+
+/// One column's opclass alone, as a one-column index has it (`att` 0).
 impl KeyOps for ElemOps {
-    fn cmp(&self, a: &Bson, b: &Bson) -> std::cmp::Ordering {
+    fn cmp(&self, _: u16, a: &Bson, b: &Bson) -> std::cmp::Ordering {
         match (a, b) {
             (Bson::Int32(x), Bson::Int32(y)) => x.cmp(y),
             (Bson::Int64(x), Bson::Int64(y)) => x.cmp(y),
@@ -212,7 +303,7 @@ impl KeyOps for ElemOps {
         }
     }
 
-    fn key_size(&self, v: &Bson) -> usize {
+    fn key_size(&self, _: u16, v: &Bson) -> usize {
         if self.textual() {
             let len = match v {
                 Bson::String(s) => secantus_pgplan::server_encoding::bytes(s).len(),
@@ -225,7 +316,7 @@ impl KeyOps for ElemOps {
         16
     }
 
-    fn datum_size(&self, v: &Bson) -> Option<usize> {
+    fn datum_size(&self, _: u16, v: &Bson) -> Option<usize> {
         self.textual().then(|| match v {
             Bson::String(s) => 4 + secantus_pgplan::server_encoding::bytes(s).len(),
             other => 4 + other.to_string().len(),
@@ -708,7 +799,8 @@ impl crate::PgHandler {
         let mut by_table: HashMap<String, Vec<AmShape>> = HashMap::new();
         let mut stored_of: HashMap<String, Vec<Document>> = HashMap::new();
         for ix in self.index_relations() {
-            if ix.primary || ix.exclusion || ix.keys.len() != 1 || ix.keys[0] <= 0 {
+            if ix.primary || ix.exclusion || ix.keys.is_empty() || ix.keys.iter().any(|k| *k <= 0)
+            {
                 continue;
             }
             let def = &ix.table;
@@ -747,42 +839,54 @@ impl crate::PgHandler {
                 }
                 Some(_) => continue,
             };
-            // The column's default opclass, or `jsonb_path_ops`.
+            // A multi-column GiST index is not modelled.
+            if method == "gist" && ix.keys.len() != 1 {
+                continue;
+            }
+            // Each key's opclass, as `pg_index.indclass` holds it: the
+            // column's default (0), or `jsonb_path_ops`.
             let explicit: Vec<i64> = match opt("sqlOpclasses") {
-                Some(Bson::Array(a)) => a
-                    .iter()
-                    .map(|v| crate::bson_i64(v).unwrap_or(0))
-                    .filter(|c| *c != 0)
-                    .collect(),
+                Some(Bson::Array(a)) => a.iter().map(|v| crate::bson_i64(v).unwrap_or(0)).collect(),
                 _ => Vec::new(),
             };
-            let path_ops = match explicit.as_slice() {
-                [] => false,
-                [oid] if method == "gin" => {
-                    let named = secantus_pgplan::misc_alter::all_opclasses()
-                        .into_iter()
-                        .find(|o| o.oid == *oid)
-                        .map(|o| o.schema == "pg_catalog" && o.name == "jsonb_path_ops");
-                    if named != Some(true) {
-                        continue;
+            let mut path_ops = Vec::with_capacity(ix.keys.len());
+            for i in 0..ix.keys.len() {
+                match explicit.get(i).copied().unwrap_or(0) {
+                    0 => path_ops.push(false),
+                    oid if method == "gin" => {
+                        let named = secantus_pgplan::misc_alter::all_opclasses()
+                            .into_iter()
+                            .find(|o| o.oid == oid)
+                            .map(|o| o.schema == "pg_catalog" && o.name == "jsonb_path_ops");
+                        if named != Some(true) {
+                            break;
+                        }
+                        path_ops.push(true);
                     }
-                    true
+                    _ => break,
                 }
-                _ => continue,
-            };
+            }
+            if path_ops.len() != ix.keys.len() {
+                continue;
+            }
             if opt("sqlExpressions").is_some() {
                 continue;
             }
-            let Some(field) = d
+            let fields: Vec<String> = d
                 .get_document("key")
-                .ok()
-                .and_then(|k| k.keys().next().cloned())
+                .map(|k| k.keys().cloned().collect())
+                .unwrap_or_default();
+            if fields.len() != ix.keys.len() {
+                continue;
+            }
+            let Some(cols) = fields
+                .iter()
+                .map(|f| def.columns.iter().find(|c| c.field() == *f))
+                .collect::<Option<Vec<_>>>()
             else {
                 continue;
             };
-            let Some(col) = def.columns.iter().find(|c| c.field() == field) else {
-                continue;
-            };
+            let col = cols[0];
             let reloptions: Vec<String> = match opt("sqlReloptions") {
                 Some(Bson::Array(a)) => a
                     .iter()
@@ -798,27 +902,35 @@ impl crate::PgHandler {
                 })
             };
             let shape = if method == "gin" {
-                let elem = if path_ops {
-                    if col.pg_type != "jsonb" {
-                        continue;
-                    }
-                    "jsonb_path"
-                } else if matches!(col.pg_type.as_str(), "jsonb" | "tsvector") {
-                    col.pg_type.as_str()
-                } else {
-                    let Some(elem) = col.pg_type.strip_suffix("[]") else {
-                        continue;
+                let mut gin_cols = Vec::with_capacity(cols.len());
+                for (col, path_ops) in cols.iter().zip(&path_ops) {
+                    let elem = if *path_ops {
+                        if col.pg_type != "jsonb" {
+                            break;
+                        }
+                        "jsonb_path"
+                    } else if matches!(col.pg_type.as_str(), "jsonb" | "tsvector") {
+                        col.pg_type.as_str()
+                    } else {
+                        let Some(elem) = col.pg_type.strip_suffix("[]") else {
+                            break;
+                        };
+                        elem
                     };
-                    elem
-                };
-                if !ElemOps::supported(elem) || col.extra.contains_key("collation") {
+                    if !ElemOps::supported(elem) || col.extra.contains_key("collation") {
+                        break;
+                    }
+                    gin_cols.push((col.field(), elem.to_string()));
+                }
+                if gin_cols.len() != cols.len() {
                     continue;
                 }
                 AmShape::Gin(GinShape {
                     oid: ix.oid,
                     name: ix.name.clone(),
-                    field: col.field(),
-                    elem: elem.to_string(),
+                    field: gin_cols[0].0.clone(),
+                    elem: gin_cols[0].1.clone(),
+                    cols: gin_cols,
                     fastupdate: !matches!(
                         reloption("fastupdate").as_deref(),
                         Some("off" | "false" | "no" | "0")
@@ -895,13 +1007,11 @@ impl crate::PgHandler {
         let rows = self.am_rows(table);
         match shape {
             AmShape::Gin(s) => {
-                let ops = ElemOps {
-                    elem: s.elem.clone(),
-                };
+                let ops = GinOps::of(s);
                 let keyed: Vec<(u64, Vec<GinKey>)> = rows
                     .iter()
                     .filter(|(_, d)| gin_admits(s, d))
-                    .map(|(c, d)| (*c, gin_keys(&ops, d.get(&s.field))))
+                    .map(|(c, d)| (*c, ops.row_keys(s, d)))
                     .collect();
                 Model::Gin(Gin::build(
                     &ops,
@@ -982,9 +1092,7 @@ impl crate::PgHandler {
         let work_mem = self.kb_setting("maintenance_work_mem", 65536);
         for shape in self.am_shapes(table) {
             let ops = match &shape {
-                AmShape::Gin(s) => Some(ElemOps {
-                    elem: s.elem.clone(),
-                }),
+                AmShape::Gin(s) => Some(GinOps::of(s)),
                 AmShape::Gist(_) => None,
             };
             self.with_am_model(table, &shape, |m| match (m, &ops) {
@@ -1026,10 +1134,8 @@ impl crate::PgHandler {
                 let tid = *ctid as u64;
                 let events: Vec<(bool, u32, u32)> = match &shape {
                     AmShape::Gin(s) => {
-                        let ops = ElemOps {
-                            elem: s.elem.clone(),
-                        };
-                        let keys = gin_keys(&ops, doc.get(&s.field));
+                        let ops = GinOps::of(s);
+                        let keys = ops.row_keys(s, doc);
                         self.with_am_model(table, &shape, |m| match m {
                             Model::Gin(g) => g
                                 .insert(
@@ -1119,8 +1225,11 @@ impl crate::PgHandler {
             let (field, served): (&str, Vec<usize>) = match &shape {
                 // A partial index serves a scan only when the WHERE implies
                 // its predicate (`predicate_implied_by`), which is not
-                // modelled: such a scan keeps the relation lock.
-                AmShape::Gin(s) if s.predicate.is_some() => (&s.field, Vec::new()),
+                // modelled; nor is a multi-column index's scan: such a
+                // scan keeps the relation lock.
+                AmShape::Gin(s) if s.predicate.is_some() || s.cols.len() > 1 => {
+                    (&s.field, Vec::new())
+                }
                 AmShape::Gin(s) => (
                     &s.field,
                     // `jsonb_ops`' and `tsvector_ops`' scans are not
@@ -1417,7 +1526,7 @@ fn gin_scan(g: &Gin, ops: &ElemOps, quals: &[OpQual], served: &[usize]) -> (Vec<
     let add = |k: GinKey, entries: &mut Vec<gin_index::ScanEntry>| {
         if !entries.iter().any(|e| {
             e.key.cat == k.cat
-                && (k.cat != gin_index::Cat::Norm || ops.cmp(&e.key.val, &k.val).is_eq())
+                && (k.cat != gin_index::Cat::Norm || ops.cmp(0, &e.key.val, &k.val).is_eq())
         }) {
             entries.push(gin_index::ScanEntry { key: k });
         }
