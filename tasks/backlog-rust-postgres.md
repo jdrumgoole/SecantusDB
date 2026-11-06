@@ -1474,18 +1474,26 @@ a regression test.
       (found while working RP-386).
       Backlog-ID: RP-390
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of a left nested loop over an expression filter]
-- [ ] **An inner join whose every ON conjunct reads one table keeps
-      them in its Join Filter.** Since RP-391 an inner join's one-table ON
-      conjunct is its table's scan Filter, but only while the ON keeps a
-      conjunct of its own; PostgreSQL 15.19 pushes every one
-      (`distribute_qual_to_rels`) and prints a plain Nested Loop with no
-      Join Filter: `select * from s join e on s.a > 25 and e.a > 990` is a
-      `Seq Scan on e` with `Filter: (a > 990)` under a Materialized `Seq
-      Scan on s` with `Filter: (a > 25)`. Here the ON stays whole, as the
-      join with no clause left (a cross join) is not modelled. Its rows
-      are right. Measured on PostgreSQL 15.19 (found while working RP-391).
-      Backlog-ID: RP-392
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join whose ON conjuncts each read one table]
+- [ ] **An inner join nested in an outer join keeps its one-table ON
+      conjuncts in its Join Filter.** Since RP-391 / RP-392 an inner
+      join's ON conjunct over one table is that table's scan Filter, but
+      only for joins reached from the FROM through inner joins. PostgreSQL
+      15.19's `distribute_qual_to_rels` places an inner join's qual the
+      same below an outer join: `select * from s left join (e join k on
+      e.a > 998 and k.a = e.a) on true` runs `Filter: (a > 998)` on `Seq
+      Scan on e`; here the Hash Join keeps `Join Filter: (e.a > 998)`. Its
+      rows are right. Measured on a private 15.19 cluster (found while
+      working RP-392).
+      Backlog-ID: RP-393
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join under an outer join with a one-table ON conjunct]
+- [ ] **A constant `true` ON conjunct is printed as a Join Filter.**
+      PostgreSQL 15.19's `eval_const_expressions` drops a TRUE argument of
+      an AND, so `select s.a, e.a from s join e on true and s.a > 29` is a
+      plain Nested Loop; here it prints `Join Filter: true` (and so does a
+      LEFT JOIN `on true`). Its rows are right. Measured on a private 15.19
+      cluster (found while working RP-392).
+      Backlog-ID: RP-394
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[analyze of an inner join whose ON has a constant true conjunct]
 
 ## Found by batch 54 (2026-10-24)
 

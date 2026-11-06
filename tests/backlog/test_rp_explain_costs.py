@@ -2207,8 +2207,8 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "              Rows Removed by Filter: 25",
         ],
     ),
-    # Every ON conjunct over one table: each is its table's scan Filter, and
-    # the join is a plain cross product with no Join Filter.
+    # Fixed: every ON conjunct over one table is its table's scan Filter,
+    # and the join was a plain cross product with no Join Filter.
     "analyze of an inner join whose ON conjuncts each read one table": (
         "RP-392",
         _ANALYSED_THIRTY,
@@ -2223,6 +2223,41 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "        ->  Seq Scan on s (actual rows=5 loops=1)",
             "              Filter: (a > 25)",
             "              Rows Removed by Filter: 25",
+        ],
+    ),
+    # An inner join nested inside an outer join: its one-table ON conjunct
+    # is still its table's scan Filter (found while working RP-392).
+    "analyze of an inner join under an outer join with a one-table ON conjunct": (
+        "RP-393",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select * from s left join (e join k on e.a > 998 and k.a = e.a) on true",
+        [
+            "Nested Loop Left Join (actual rows=60 loops=1)",
+            "  ->  Seq Scan on s (actual rows=30 loops=1)",
+            "  ->  Materialize (actual rows=2 loops=30)",
+            "        ->  Nested Loop (actual rows=2 loops=1)",
+            "              ->  Seq Scan on e (actual rows=2 loops=1)",
+            "                    Filter: (a > 998)",
+            "                    Rows Removed by Filter: 998",
+            "              ->  Index Scan using k_pkey on k (actual rows=1 loops=2)",
+            "                    Index Cond: (a = e.a)",
+        ],
+    ),
+    # A constant true conjunct of an ON is folded away
+    # (`eval_const_expressions`), not printed as a Join Filter (found while
+    # working RP-392).
+    "analyze of an inner join whose ON has a constant true conjunct": (
+        "RP-394",
+        _ANALYSED_THIRTY,
+        "explain (analyze, costs off, timing off, summary off)"
+        " select s.a, e.a from s join e on true and s.a > 29",
+        [
+            "Nested Loop (actual rows=1000 loops=1)",
+            "  ->  Seq Scan on s (actual rows=1 loops=1)",
+            "        Filter: (a > 29)",
+            "        Rows Removed by Filter: 29",
+            "  ->  Seq Scan on e (actual rows=1000 loops=1)",
         ],
     ),
     # ------------- RP-383 EXPLAIN ANALYZE counters of a user table's scans
@@ -2570,6 +2605,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-386",
         "RP-389",
         "RP-391",
+        "RP-392",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)

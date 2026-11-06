@@ -2519,7 +2519,8 @@ fn pushdown_filters(
 /// the joined rows. A conjunct qualifies on `single_alias`'s terms (every
 /// column qualified by one alias, built of immutable parts, no subquery),
 /// which is also the shape `pushdown_filters` copies into a scan. A join
-/// whose every ON conjunct reads one table keeps its ON.
+/// whose every ON conjunct reads one table is left with no ON, the shape
+/// of a CROSS JOIN: a plain Nested Loop with no Join Filter (RP-392).
 pub(crate) fn hoist_inner_on_conjuncts(
     s: &pg_query::protobuf::SelectStmt,
 ) -> Option<pg_query::protobuf::SelectStmt> {
@@ -2544,9 +2545,7 @@ pub(crate) fn hoist_inner_on_conjuncts(
         let (one, kept): (Vec<_>, Vec<_>) = conjuncts
             .into_iter()
             .partition(|c| single_alias(c, &|_| None).is_some());
-        // A join left with no clause of its own is not modelled: its ON
-        // stays as written.
-        if one.is_empty() || kept.is_empty() {
+        if one.is_empty() {
             return;
         }
         out.extend(one.into_iter().cloned());
@@ -3297,14 +3296,14 @@ mod tests {
                 .as_deref(),
             Some("s.c = 1 AND e.b = 'x'")
         );
-        // Below an outer join, or with nothing left for the join, the ON
-        // stays as written.
+        // RP-392: every conjunct over one table leaves the join no ON.
+        assert_eq!(
+            hoisted_where("select * from s join e on s.a > 25 and e.a > 1").as_deref(),
+            Some("s.a > 25 AND e.a > 1")
+        );
+        // Below an outer join the ON stays as written.
         assert_eq!(
             hoisted_where("select * from s left join e on s.a < e.a and s.a > 25"),
-            None
-        );
-        assert_eq!(
-            hoisted_where("select * from s join e on s.a > 25 and e.a > 1"),
             None
         );
         // A subquery is not a one-table shape.
