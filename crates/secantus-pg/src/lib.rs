@@ -12055,7 +12055,22 @@ impl PgHandler {
             || self
                 .with_heap_read(table, |h| h.has_dead_entries())
                 .unwrap_or(true)
-            || filter.keys().any(|k| k.starts_with('$'))
+        {
+            return None;
+        }
+        // A WHERE of several conjuncts arrives as one `$and`; its
+        // conjuncts on other columns are the scan's Filter, not its Index
+        // Cond (RP-384). Any other operator key is refused.
+        let conjuncts: Vec<Document> = match filter.get("$and") {
+            Some(Bson::Array(arms)) if filter.len() == 1 => arms
+                .iter()
+                .map(|a| a.as_document().cloned())
+                .collect::<Option<_>>()?,
+            _ => vec![filter.clone()],
+        };
+        if conjuncts
+            .iter()
+            .any(|c| c.keys().any(|k| k.starts_with('$')))
         {
             return None;
         }
@@ -12069,14 +12084,21 @@ impl PgHandler {
                 ix.table.field_of(&ix.table.columns.get(i)?.name)
             })
             .collect::<Option<_>>()?;
-        let quals: Document = filter
+        let arms: Vec<Bson> = conjuncts
             .iter()
+            .flat_map(|c| c.iter())
             .filter(|(k, _)| columns.contains(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
+            .map(|(k, v)| {
+                let mut d = Document::new();
+                d.insert(k.clone(), v.clone());
+                Bson::Document(d)
+            })
             .collect();
-        if quals.is_empty() {
+        if arms.is_empty() {
             return None;
         }
+        let mut quals = Document::new();
+        quals.insert("$and", arms);
         let empty = Document::new();
         let mut ctids = Vec::new();
         for d in self.table_docs(table).ok()? {
@@ -41906,6 +41928,24 @@ impl PgHandler {
                                     self.catalog_heap_fetches(&sel.table, &index, &sel.filter, rows)
                                 }
                             };
+                    }
+                    // An index scan's rows its Filter removed (RP-384): the
+                    // tuples its Index Cond fetched, less the rows it returned.
+                    let scan_index = tree
+                        .name
+                        .strip_prefix("Index Scan using ")
+                        .and_then(|r| r.split_once(" on "))
+                        .map(|(i, _)| i.to_string())
+                        .filter(|_| {
+                            tree.children.is_empty()
+                                && tree.details.iter().any(|(k, _)| k == "Filter")
+                        });
+                    if let Some(index) = scan_index {
+                        if let Some((tuples, _, _)) =
+                            self.user_index_tids(&sel.table, &index, &sel.filter)
+                        {
+                            tree.removed_by_filter = tuples.checked_sub(rows);
+                        }
                     }
                     // A bitmap scan's pages and its index scan's tuples (RP-383).
                     let bitmap_index = (tree.name.starts_with("Bitmap Heap Scan on ")
