@@ -1894,19 +1894,20 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
 
-## Found while working RP-461 (2026-11-07)
+## Found while working RP-477 (2026-11-07)
 
-- [ ] **A function with one OUT parameter names its FROM column after the
-      function.** `gto(out t int)` and `gtt() returns table (t int)` give
-      `select * from gto()` one column `t` on PostgreSQL 15.19, so `select
-      t from gto()`, `select g.t from gto() as g` and `select t from gtt()`
-      answer their row; here the column is `gto` (or the alias `g`), and
-      each is 42703. Two or more OUT columns are already named by their
-      parameters. A SQL function body naming such a column now meets the
-      same 42703, where it read a parameter of that name before RP-461.
-      Measured on PostgreSQL 15.19.
-      Backlog-ID: RP-477
-      Verify: tests/backlog/test_rp_function_bodies.py::test_one_out_parameter_names_the_column
+- [ ] **A call of a function with one OUT parameter, in a select list, is
+      named after the parameter, and a field of it is refused as a gap.**
+      `gtt() returns table (t int)` and `gto(out t int)` over PostgreSQL
+      15.19: `select gtt()` is the column `gtt` (FigureColname names a call
+      by its function), and `select (gto()).t` is 42809 `column notation .t
+      applied to type integer, which is not a composite type` at 9, the
+      result being a scalar. Here the first is named `t`, and the second is
+      0A000 `field selection on a non-record value is not supported yet`.
+      In FROM both functions name their column `t` since RP-477, as
+      PostgreSQL does. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_one_out_parameter_call_in_the_select_list
+      Backlog-ID: RP-483
 
 ## Found while working RP-472 (2026-11-07)
 

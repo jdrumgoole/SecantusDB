@@ -14100,20 +14100,11 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
     for (n, given) in names.iter_mut().zip(&colnames) {
         *n = given.clone();
     }
-    if colnames.is_empty() && names.len() == 1 && !alias.is_empty() {
-        names[0] = alias.clone();
-    }
-    // A function whose one column is a named OUT parameter keeps that name
-    // in FROM, whatever the alias: `pg_partition_ancestors(...)` is `relid`,
-    // and `json_array_elements(...)` is `value`.
-    if colnames.is_empty() && names.len() == 1 {
-        match name.as_str() {
-            "pg_partition_ancestors" => names[0] = "relid".into(),
-            "json_array_elements"
-            | "json_array_elements_text"
-            | "jsonb_array_elements"
-            | "jsonb_array_elements_text" => names[0] = "value".into(),
-            _ => {}
+    if colnames.is_empty() && names.len() == 1 && calls.len() == 1 {
+        if let Some(own) = function_column_name(&call) {
+            names[0] = own;
+        } else if !alias.is_empty() {
+            names[0] = alias.clone();
         }
     }
     let plan = Statement::ValuesConstant(ValuesConstant {
@@ -14138,6 +14129,38 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         def,
         unread: Vec::new(),
     }))
+}
+
+/// The name a FROM function's ONE column keeps whatever the item's alias,
+/// or `None` for a scalar result, whose column the alias names (or, with
+/// none, the function). PostgreSQL's `addRangeTableEntryForFunction`: a
+/// composite result's column is its type's field (`returns c1` is `k`), and
+/// `chooseScalarFunctionAlias` names a scalar one by its single named OUT
+/// parameter ahead of the alias (`get_func_result_name`) -- an OUT, INOUT
+/// or `RETURNS TABLE` one alike: `gto(out t int)` is `t` in `from gto() g`.
+/// Among the built-ins this server materialises, `pg_partition_ancestors`
+/// is `relid` and the `json[b]_array_elements[_text]` are `value`.
+pub(crate) fn function_column_name(call: &pg_query::protobuf::FuncCall) -> Option<String> {
+    let name = func_name(call)?;
+    if let Some(u) = correlated::user_function_for(&name, &call.args) {
+        return match u.columns.as_slice() {
+            [] => user_composite(&u.return_type).and_then(|(_, fields)| match fields.as_slice() {
+                [(field, _)] => Some(field.clone()),
+                _ => None,
+            }),
+            // An unnamed OUT parameter leaves the column to the alias.
+            [(out, _)] if !out.is_empty() => Some(out.clone()),
+            _ => None,
+        };
+    }
+    match name.as_str() {
+        "pg_partition_ancestors" => Some("relid".into()),
+        "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text" => Some("value".into()),
+        _ => None,
+    }
 }
 
 /// A JSON value as a SQL value of type `ty`: json / jsonb keep it as JSON,
@@ -37220,7 +37243,50 @@ fn whole_row_rewrite(
     // A table's whole row is its composite ROWTYPE (typed by the table's
     // name); a subquery's is an anonymous record.
     let mut rowtype: Option<String> = None;
+    // A scalar function's whole row is its one value, not a row of it.
+    let mut scalar = false;
     let (alias, columns): (String, Vec<String>) = match item.node.as_ref() {
+        // A function's whole row (PostgreSQL's whole-row Var over its RTE):
+        // its composite result, or the value of a scalar one. Only a
+        // function that names its own one column needs rewriting: a scalar
+        // one the alias names is already read by that name, the column
+        // winning as it does in PostgreSQL.
+        Some(N::RangeFunction(rf))
+            if rf.functions.len() == 1 && !rf.ordinality && rf.coldeflist.is_empty() =>
+        {
+            let Some(call) = joins::range_function_call(rf) else {
+                return Ok(None);
+            };
+            let Some(own) = function_column_name(call) else {
+                return Ok(None);
+            };
+            let Some(alias) = rf
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .or_else(|| func_name(call))
+            else {
+                return Ok(None);
+            };
+            if !names_alias(s, &alias)? {
+                return Ok(None);
+            }
+            let column = rf
+                .alias
+                .as_ref()
+                .and_then(|a| a.colnames.first())
+                .and_then(alias_colname)
+                .unwrap_or(own);
+            match func_name(call)
+                .and_then(|n| correlated::user_function_for(&n, &call.args))
+                .filter(|u| u.columns.is_empty() && user_composite(&u.return_type).is_some())
+            {
+                Some(u) => rowtype = Some(u.return_type),
+                None => scalar = true,
+            }
+            (alias, vec![column])
+        }
         Some(N::RangeVar(r)) => {
             let alias = r
                 .alias
@@ -37344,6 +37410,9 @@ fn whole_row_rewrite(
                 location: 0,
             })),
         };
+        if scalar {
+            return col_node(&arg_names[0]);
+        }
         let row = pg_query::protobuf::Node {
             node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
                 xpr: None,

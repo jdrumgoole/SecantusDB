@@ -1211,8 +1211,7 @@ fn build(
             let mut rf = rf.clone();
             rf.lateral = false;
             let colnames = function_colnames(&rf);
-            let bare =
-                colnames.is_empty() && rf.alias.as_ref().is_some_and(|a| !a.aliasname.is_empty());
+            let bare = alias_names_the_column(&rf);
             rf.alias = keep_column_names(&rf, &alias);
             let prev = BARE_FUNCTION_ALIAS.with(|b| b.replace(bare));
             let built = leaf(
@@ -1445,7 +1444,7 @@ fn lateral_leaf(
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
     let bare_alias = matches!(
         item.node.as_ref(),
-        Some(N::RangeFunction(rf)) if rf.alias.as_ref().is_some_and(|a| !a.aliasname.is_empty())
+        Some(N::RangeFunction(rf)) if alias_names_the_column(rf)
     );
     let names = scalar_alias(names, function && bare_alias, &alias, def.columns.len());
     if names.len() > def.columns.len() {
@@ -2053,6 +2052,13 @@ fn star_target() -> pg_query::protobuf::Node {
 }
 
 pub(crate) fn range_function_name(rf: &pg_query::protobuf::RangeFunction) -> Option<String> {
+    func_name(range_function_call(rf)?)
+}
+
+/// A FROM function item's (first) call.
+pub(crate) fn range_function_call(
+    rf: &pg_query::protobuf::RangeFunction,
+) -> Option<&pg_query::protobuf::FuncCall> {
     let first = rf.functions.first()?;
     let N::List(l) = first.node.as_ref()? else {
         return None;
@@ -2060,7 +2066,19 @@ pub(crate) fn range_function_name(rf: &pg_query::protobuf::RangeFunction) -> Opt
     let N::FuncCall(f) = l.items.first()?.node.as_ref()? else {
         return None;
     };
-    func_name(f)
+    Some(f)
+}
+
+/// A bare alias (`f(...) AS x`) names the function's one column only when
+/// the result is a scalar the function does not name itself
+/// (`crate::function_column_name`), and only for one function: a ROWS FROM
+/// of several keeps each function's names.
+fn alias_names_the_column(rf: &pg_query::protobuf::RangeFunction) -> bool {
+    rf.alias
+        .as_ref()
+        .is_some_and(|a| !a.aliasname.is_empty() && a.colnames.is_empty())
+        && rf.functions.len() == 1
+        && range_function_call(rf).is_none_or(|c| crate::function_column_name(c).is_none())
 }
 
 /// A leaf planned as `SELECT * FROM <item>`, so its rows are decoded by the
@@ -2097,6 +2115,25 @@ fn leaf_filtered(
                     .is_some_and(|d| d.columns.iter().any(|c| c.name == alias)) =>
         {
             Some(r.relname.clone())
+        }
+        // A function that names its own one column: its whole row is
+        // built at its scan as a table's is, under the name the leaf's
+        // `SELECT *` gives it (`whole_row_rewrite`). A scalar one the alias
+        // names is read as that column.
+        Some(N::RangeFunction(rf))
+            if whole_row_named(alias)
+                && !bare_alias
+                && rf.functions.len() == 1
+                && !rf.ordinality
+                && range_function_call(rf).is_some_and(|c| {
+                    crate::function_column_name(c).is_some_and(|own| own != alias)
+                }) =>
+        {
+            rf.alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .or_else(|| range_function_name(rf))
         }
         _ => None,
     };

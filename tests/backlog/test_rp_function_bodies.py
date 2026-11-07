@@ -4,8 +4,9 @@ a word; fixed), RP-462 (a composite parameter's field was not read; fixed), RP-4
 PL/pgSQL block label does not qualify its variables), RP-464 (a SQL
 function ending in a write's RETURNING returned NULL; fixed) and RP-465 (CREATE
 FUNCTION does not check a SQL body); and found while working RP-461,
-RP-477 (a function with one OUT parameter, called in FROM, names its
-column after the function).
+RP-477 (a function with one OUT parameter, called in FROM, named its
+column after the function; fixed), and found while working RP-477, RP-483
+(the same function's call in a select list is named after its parameter).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -26,7 +27,7 @@ from tests.backlog.test_rp_batch26 import _dsn
 _FUNCTIONS = ("gb(int)", "gal(int)", "gr1(fe)", "gr2(fe)", "gl(int)", "gi(int)")
 _FUNCTIONS += ("gi2(int)", "gu(int)", "gd(int)", "gx(int)")
 _FUNCTIONS += tuple(f"gn{i}(int)" for i in range(1, 16))
-_FUNCTIONS += ("gto()", "gtt()")
+_FUNCTIONS += ("gto()", "gtt()", "gtun()", "gtio(int)", "gtc()", "gts()")
 
 # RP-461's further shapes: which bare names are a column and which the
 # parameter, by query level, FROM item and clause.
@@ -54,6 +55,7 @@ _BARE_NAME_BODIES = [
 _SETUP = [
     *(f"drop function if exists {f}" for f in _FUNCTIONS),
     "drop table if exists fe, fs cascade",
+    "drop type if exists gtk",
     "create table fe (a int, b text)",
     "create table fs (a int, c text)",
     "insert into fe values (1, 'x')",
@@ -61,6 +63,11 @@ _SETUP = [
     "create view gnv as select a from fe",
     "create function gto(out t int) language sql as $$ select 6 $$",
     "create function gtt() returns table (t int) language sql as $$ select 5 $$",
+    "create function gtun(out int) language sql as $$ select 3 $$",
+    "create function gtio(inout x int) language sql as $$ select x + 1 $$",
+    "create type gtk as (k int)",
+    "create function gtc() returns gtk language sql as $$ select row(8)::gtk $$",
+    "create function gts() returns int language sql as $$ select 4 $$",
     "create function gb(a int) returns int language sql as $$ select a from fe $$",
     "create function gal(p int) returns int language sql as $$ select 1 as p $$",
     "create function gr1(r fe) returns int language sql as $$ select r.a $$",
@@ -86,6 +93,7 @@ def dsn(rust_pg: object) -> Iterator[str]:
         for f in _FUNCTIONS:
             c.execute(f"drop function if exists {f}")
         c.execute("drop table if exists fe, fs cascade")
+        c.execute("drop type if exists gtk")
 
 
 def answer(dsn: str, query: str) -> Any:
@@ -259,16 +267,70 @@ def test_create_checks_the_body(query: str, dsn: str) -> None:
 
 # Found while working RP-461: a function with one OUT parameter, or a
 # RETURNS TABLE of one column, called in FROM has one column named by that
-# parameter; here it is named by the function (or the item's alias), so
-# the parameter's name is 42703.
+# parameter, ahead of the item's alias (`chooseScalarFunctionAlias`), and a
+# composite result its type's field; it was named by the function (or the
+# item's alias), so the parameter's name was 42703. A scalar result's column
+# is still the alias's, WITH ORDINALITY too, and an item's whole row is its
+# scalar value or its composite.
 ONE_OUT_PARAMETER_COLUMN = {
     "select t from gto()": [(6,)],
     "select g.t from gto() as g": [(6,)],
     "select t from gtt()": [(5,)],
+    "select * from gto() g": [(6,)],
+    "select x from gtio(1) g": [(2,)],
+    "select k from gtc() g": [(8,)],
+    "select g from gtc() g": [("(8)",)],
+    # An unnamed OUT parameter, or a scalar result: the alias.
+    "select g from gtun() g": [(3,)],
+    "select gtun from gtun()": [(3,)],
+    "select g from gts() g": [(4,)],
+    "select g, ordinality from gts() with ordinality g": [(4, 1)],
+    "select t, ordinality from gto() with ordinality g": [(6, 1)],
+    "select t from rows from (gto()) g": [(6,)],
+    # In a join, and LATERAL.
+    "select a, t from fe, gto() g": [(1, 6)],
+    "select t from fe join gtt() g on true": [(5,)],
+    "select a, x from fe, lateral gtio(fe.a) g": [(1, 2)],
+    "select a, value::text from fe, json_array_elements('[1]') x": [(1, "1")],
+    # The item's whole row: its scalar value, NULL where an outer join
+    # NULL-extends it.
+    "select g from gto() g": [(6,)],
+    "select gto from gto()": [(6,)],
+    "select g from gtt() g where g = 5": [(5,)],
+    "select g from fe, gto() g": [(6,)],
+    "select g from fe left join gto() g on false": [(None,)],
 }
 
 
-@pytest.mark.backlog("RP-477")
+@pytest.mark.backlog_fixed("RP-477")
 @pytest.mark.parametrize("query", list(ONE_OUT_PARAMETER_COLUMN))
 def test_one_out_parameter_names_the_column(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ONE_OUT_PARAMETER_COLUMN[query]
+
+
+# Found while working RP-477: in a select list a call is named by its
+# function (FigureColname), and the result of one with a single OUT
+# parameter is a scalar, so a field of it is 42809.
+ONE_OUT_PARAMETER_CALL = {
+    "select gtt()": [(5,)],
+    "select (gto()).t": (
+        "42809",
+        "column notation .t applied to type integer, which is not a composite type",
+        None,
+        "9",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-483")
+@pytest.mark.parametrize("query", list(ONE_OUT_PARAMETER_CALL))
+def test_one_out_parameter_call_in_the_select_list(query: str, dsn: str) -> None:
+    answer_ = answer(dsn, query)
+    if query == "select gtt()":
+        # The column's name is the divergence: the value already agrees.
+        with psycopg.connect(dsn, autocommit=True) as c:
+            for q in _SETUP:
+                c.execute(q)
+            cur = c.execute(query)
+            assert [d.name for d in cur.description] == ["gtt"]
+    assert answer_ == ONE_OUT_PARAMETER_CALL[query]
