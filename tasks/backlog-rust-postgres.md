@@ -1826,20 +1826,6 @@ and `fs(a int, c text)`, one row each.
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_subquery_is_analysed
       Backlog-ID: RP-459
 
-## Found while working RP-453 (2026-11-07)
-
-- [ ] **An UPDATE ... FROM's or a DELETE ... USING's RETURNING subquery
-      cannot read the FROM.** `update fe set b = 'w' from fs returning
-      (select fs.a from fe limit 1)` answers 1 on PostgreSQL 15.19, `delete
-      from fe using fs returning (select fs.c from fe limit 1)` `y`, and the
-      same through an alias (`from fs x ... x.c`); the FROM and USING items
-      are relations of the statement's own level. Here each is 42P01
-      `missing FROM-clause entry for table "fs"` (or `"x"`). A subquery over
-      the write's target alone already reads it. Measured on PostgreSQL
-      15.19.
-      Backlog-ID: RP-457
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_returning_subquery_reads_the_from
-
 ## Found while working RP-455 (2026-11-07)
 
 - [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as

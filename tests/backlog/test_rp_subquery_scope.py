@@ -4,7 +4,7 @@ RP-451 (a parameter qualified by its function's name was not bound; fixed), RP-4
 out text; fixed), RP-454 (a join's alias was refused or not found;
 fixed), RP-456 (a CTE hidden by its alias still answered to its name in a
 subquery; fixed) and RP-457 (an UPDATE ... FROM's or DELETE ... USING's
-RETURNING subquery cannot read the FROM); the regression test of RP-455 (a
+RETURNING subquery could not read the FROM; fixed); the regression test of RP-455 (a
 write's target was not an enclosing relation to its subqueries, and an
 enclosing level's hidden table name was not `errorMissingRTE`'s "invalid
 reference"); found while working RP-455, RP-460 (a subquery inside a
@@ -348,7 +348,9 @@ def test_cte_alias_hides_its_name(query: str, dsn: str) -> None:
 
 
 # An UPDATE's FROM and a DELETE's USING are relations of the statement's
-# own level, which its RETURNING's subqueries read.
+# own level, which its RETURNING's subqueries read. Each was 42P01: only a
+# RETURNING item naming a FROM item outside any subquery was read through
+# the FROM.
 RETURNING_READS_FROM = {
     "update fe set b = 'w' from fs returning (select fs.a from fe limit 1)": [(1,)],
     "delete from fe using fs returning (select fs.c from fe limit 1)": [("y",)],
@@ -356,7 +358,7 @@ RETURNING_READS_FROM = {
 }
 
 
-@pytest.mark.backlog("RP-457")
+@pytest.mark.backlog_fixed("RP-457")
 @pytest.mark.parametrize("query", list(RETURNING_READS_FROM))
 def test_returning_subquery_reads_the_from(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RETURNING_READS_FROM[query]

@@ -15704,6 +15704,60 @@ def test_update_from_and_delete_using(home: Path) -> None:
         assert _fetch(conn, "SELECT id FROM uf_t") == [(3,)]
 
 
+def test_returning_subquery_reads_the_from(home: Path) -> None:
+    """A subquery in the RETURNING of an `UPDATE ... FROM` or a `DELETE ...
+    USING` reads the FROM items, which are relations of the write's own
+    level (RP-457): each was 42P01 `missing FROM-clause entry`. Answers
+    measured on PostgreSQL 15.19 with fe(1, 'x') and fs(1, 'y')."""
+    cases = [
+        ("update fe set b = 'w' from fs returning (select fs.a)", [(1,)]),
+        ("update fe set b = 'w' from fs returning (select fs.a from fe limit 1)", [(1,)]),
+        ("update fe set b = 'w' from fs returning (select c from fe limit 1)", [("y",)]),
+        ("update fe set b = 'w' from fs returning (select a from fs limit 1)", [(1,)]),
+        (
+            "update fe set b = 'w' from fs returning (select count(*) from fe where fe.a = fs.a)",
+            [(1,)],
+        ),
+        (
+            "update fe set b = 'w' from fs returning exists (select 1 from fe where fs.c = 'y')",
+            [(True,)],
+        ),
+        (
+            "update fe set b = 'w' from fs where fe.a = fs.a returning (select fs.c || fe.b)",
+            [("yw",)],
+        ),
+        ("update fe set b = 'w' from fs returning fe.a in (select fs.a)", [(True,)]),
+        (
+            "update fe set b = 'w' from fs, (select 5 z) q returning (select q.z + fs.a)",
+            [(6,)],
+        ),
+        (
+            "update fe set b = 'w' from fs join fe f2 on f2.a = fs.a returning (select f2.b)",
+            [("x",)],
+        ),
+        ("update fe set b = 'w' from fs x returning (select x.c from fe limit 1)", [("y",)]),
+        ("delete from fe using fs returning (select fs.c)", [("y",)]),
+        ("delete from fe using fs returning (select fs.c from fe limit 1)", [("y",)]),
+    ]
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("CREATE TABLE fe (a int, b text)")
+        conn.execute("CREATE TABLE fs (a int, c text)")
+        conn.execute("INSERT INTO fs VALUES (1, 'y')")
+        for sql, rows in cases:
+            conn.execute("DELETE FROM fe")
+            conn.execute("INSERT INTO fe VALUES (1, 'x')")
+            assert (sql, _fetch(conn, sql)) == (sql, rows)
+        # An aliased FROM table goes by its alias alone, at the write's
+        # level as anywhere: `fs` is PostgreSQL's invalid reference.
+        assert (
+            _sqlstate(
+                conn, "update fe set b = 'w' from fs x returning (select fs.c from fe limit 1)"
+            )
+            == "42P01"
+        )
+
+
 def test_integer_overflow_numeric_math_and_bits(home: Path) -> None:
     """int4 arithmetic overflows as 22003 instead of widening; the numeric
     transcendentals answer numeric at PostgreSQL's result scale; bit strings

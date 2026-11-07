@@ -20081,16 +20081,79 @@ fn rewrite_dml_from(
             ..Default::default()
         }
     }
+    /// Whether a subquery reads a FROM item of the statement around it
+    /// (RP-457): the FROM and USING items are relations of the write's own
+    /// level, so PostgreSQL resolves a subquery's reference to them as it
+    /// resolves one to the target. A qualifier the subquery's own FROM does
+    /// not name (`correlated::inner_names`, the aliased-relation rule
+    /// included) is an outer reference, and so is a bare name none of the
+    /// subquery's own tables has.
+    fn sublink_reads_from_items(
+        sl: &pg_query::protobuf::SubLink,
+        names: &[String],
+        from_only: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> bool {
+        let Some(body @ N::SelectStmt(s)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref())
+        else {
+            return false;
+        };
+        let inner = correlated::inner_names(s);
+        let mut inner_columns: Vec<String> = Vec::new();
+        for (n, _, _, _) in body.nodes() {
+            match n {
+                pg_query::NodeRef::RangeVar(r) => {
+                    if let Some(def) = lookup(&r.relname) {
+                        inner_columns.extend(def.columns.iter().map(|c| c.name.clone()));
+                    }
+                }
+                // A derived table's columns, where they can be told without
+                // planning it (a function's cannot: it hides nothing here).
+                pg_query::NodeRef::RangeSubselect(rs) => {
+                    let item = pg_query::protobuf::Node {
+                        node: Some(N::RangeSubselect(Box::new(rs.clone()))),
+                    };
+                    inner_columns.extend(from_item_columns(&item, lookup).unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+        body.nodes().into_iter().any(|(n, _, _, _)| {
+            let pg_query::NodeRef::ColumnRef(c) = n else {
+                return false;
+            };
+            let parts: Vec<&str> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match parts.as_slice() {
+                [one] => {
+                    from_only.iter().any(|c| c == one) && !inner_columns.iter().any(|c| c == one)
+                }
+                [.., q, _] => names.iter().any(|x| x == q) && !inner.iter().any(|x| x == q),
+                _ => false,
+            }
+        })
+    }
     /// Whether `n` reads a FROM item: a reference qualified by one of its
-    /// names, or an unqualified one only a FROM item has.
+    /// names, or an unqualified one only a FROM item has -- in `n` itself or
+    /// in a subquery inside it.
     fn reads_from_items(
         n: &pg_query::protobuf::Node,
         names: &[String],
         from_only: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) -> Result<bool> {
         let mut found = false;
         let mut n = n.clone();
         walk_expr(&mut n, &mut |node| {
+            if let Some(N::SubLink(sl)) = node.node.as_ref() {
+                found |= sublink_reads_from_items(sl, names, from_only, lookup);
+            }
             if let Some(N::ColumnRef(c)) = node.node.as_ref() {
                 let parts: Vec<&str> = c
                     .fields
@@ -20124,6 +20187,7 @@ fn rewrite_dml_from(
         from_only: &[String],
         target_names: &[String],
         changed: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) -> Result<()> {
         let mut cond_reads_changed = false;
         if let Some(c) = cond {
@@ -20154,7 +20218,7 @@ fn rewrite_dml_from(
                 continue;
             };
             let Some(v) = rt.val.as_deref() else { continue };
-            if !reads_from_items(v, names, from_only)? {
+            if !reads_from_items(v, names, from_only, lookup)? {
                 continue;
             }
             if cond_reads_changed {
@@ -20313,6 +20377,7 @@ fn rewrite_dml_from(
                 &from_only,
                 &target_names,
                 &changed,
+                lookup,
             )?;
             for t in &mut u.target_list {
                 let Some(N::ResTarget(rt)) = t.node.as_mut() else {
@@ -20367,6 +20432,7 @@ fn rewrite_dml_from(
                 &from_only,
                 &target_names,
                 &[],
+                lookup,
             )?;
             d.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
