@@ -116,6 +116,23 @@ lane() {
         # (scripts/wait_for_load.sh has the 2026-11-02 numbers).
         scripts/wait_for_load.sh "fix_many item $n" 2>>"$out/summary.txt"
         [[ -e $out/STOP ]] && return 0
+        # A reused lane's cargo targets grow with every item: cargo keeps
+        # each build's incremental state and never removes a stale one. On
+        # 2026-11-07 two lanes reached 41 and 50 GB after about six items
+        # each (36 GB of it incremental) and filled the disk mid-gate. The
+        # incremental state is a cache: clear it before each item (the
+        # compiled dependencies stay, so the next build is not cold), and
+        # stop the batch rather than start an item on a disk below the floor.
+        if [[ -n $wt ]]; then
+            rm -rf "$wt"/crates/target/*/incremental "$wt"/crates/*/target/*/incremental
+        fi
+        local free_gb
+        free_gb=$(df -g "${wt:-.}" | awk 'NR == 2 { print $4 }')
+        if [[ $free_gb -lt ${SECANTUS_MIN_FREE_GB:-40} ]]; then
+            echo "$(date '+%F %T') STOPPING: item $n: ${free_gb} GB free, under SECANTUS_MIN_FREE_GB (${SECANTUS_MIN_FREE_GB:-40})" >>"$out/summary.txt"
+            echo "disk" >"$out/STOP"
+            return 0
+        fi
         local id=
         [[ -n $list ]] && id=$(grep -vE '^[[:space:]]*(#|$)' "$list" | sed -n "${n}p" | awk '{print $1}')
         scripts/fix_one.sh -p "$backlog" $id ${into:+into "$into"} ${wt:+lane "$wt"} >"$out/$n.log" 2>&1
