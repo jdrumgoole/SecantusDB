@@ -293,8 +293,18 @@ def test_update_parse_errors_without_a_match(rust_mongo: Any, mongod: Any, seed:
 
 @pytest.mark.backlog_fixed("RM-066")
 def test_list_databases_always_has_admin_and_config(tmp_path: Any, mongod: Any) -> None:
-    """A fresh mongod 8.2.11 lists `admin`, `config` and `local`."""
-    assert {"admin", "config", "local"} <= set(mongod.list_database_names())
+    """A fresh mongod 8.2.11 lists `admin`, `config` and `local`.
+
+    mongod creates `config.system.sessions` from its session refresh just
+    after it starts, so a check made as it comes up can find `config` not
+    there yet: under a loaded gate it failed 6 of 24 runs (2026-11-07). The
+    reference is given until its database appears; this server creates it
+    before it listens, and is asked at once."""
+    wanted = {"admin", "config", "local"}
+    deadline = time.monotonic() + 30
+    while not wanted <= set(mongod.list_database_names()) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert wanted <= set(mongod.list_database_names())
     with fresh_rust(tmp_path) as client:
         assert {"admin", "config", "local"} <= set(client.list_database_names())
 
