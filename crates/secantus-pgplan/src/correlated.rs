@@ -773,6 +773,13 @@ fn outer_ref_type(
                 if qualifier.is_some_and(|q| rs.alias.as_ref().is_none_or(|a| &a.aliasname != q)) {
                     continue;
                 }
+            } else if let Some(N::JoinExpr(_)) = item.node.as_ref() {
+                // A join's column: a leaf's, a merged USING one, or one
+                // of the join's alias (RP-468).
+                match crate::optype::join_column_type(item, parts, lookup) {
+                    Some(ty) => return ty,
+                    None => continue,
+                }
             } else {
                 continue;
             }

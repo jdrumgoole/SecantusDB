@@ -2006,14 +2006,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
       Backlog-ID: RP-467
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
-- [ ] **A correlated subquery reading a join's column gets text.** `select
-      (select fs.a from fe where fe.a = fs.a) from fs join fe using (a)`
-      answers the integer 1 on PostgreSQL 15.19, as do the same read through
-      a join's alias (`j.a`) and a USING alias (`u.a`). Here each is the text
-      `'1'`: RP-453's lookup of an outer reference's type covers tables,
-      FROM-subqueries, CTEs and a write's target, not a column of a join.
-      Backlog-ID: RP-468
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_join_column_in_a_subquery_keeps_its_type
 
 ## Found while working RP-316 (2026-11-02)
 

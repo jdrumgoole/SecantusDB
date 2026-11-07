@@ -731,6 +731,79 @@ pub(crate) fn type_in_select(
     operand_type(expr, &scope).filter(|t| !t.is_empty() && t != "unknown")
 }
 
+/// The type of an outer reference (`col`, or `q.col` with any schema in
+/// front) read from one JOIN in an enclosing query's FROM, as PostgreSQL's
+/// join RTE types it (`transformFromClauseItem`): a leaf's own column, a
+/// USING / NATURAL join's merged column (the sides' `select_common_type`),
+/// a column of the join's alias or of a USING alias. The CTEs in view
+/// (`VISIBLE_CTES`) name the leaves that are CTEs.
+///
+/// `None` when the join does not answer to the reference -- a qualifier
+/// naming none of its entries, a name none of its columns has -- so the
+/// caller looks on; `Some(None)` when it does but this cannot type it
+/// (untyped, as before).
+pub(crate) fn join_column_type(
+    item: &pg_query::protobuf::Node,
+    parts: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Option<String>> {
+    let visible = crate::VISIBLE_CTES.with(|v| v.borrow().clone());
+    let ctes: Vec<Cte> = visible
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(c)) => Some(c),
+            _ => None,
+        })
+        .map(|c| {
+            let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
+                Some(N::SelectStmt(q)) => Some(((**q).clone(), c.aliascolnames.clone())),
+                _ => None,
+            };
+            (c.ctename.clone(), query)
+        })
+        .collect();
+    let scope = Scope::new(std::slice::from_ref(item), &ctes, lookup, None);
+    let field = |s: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: s.to_string(),
+        })),
+    };
+    let (qualifier, col) = match parts {
+        [.., q, c] => (Some(q), c),
+        [c] => (None, c),
+        _ => return None,
+    };
+    let reference = pg_query::protobuf::ColumnRef {
+        fields: qualifier
+            .iter()
+            .map(|q| field(q))
+            .chain([field(col)])
+            .collect(),
+        location: -1,
+    };
+    match qualifier {
+        Some(q) => {
+            let answers = scope.tables.iter().any(|(a, _)| a == q)
+                || scope.using_aliases.iter().any(|(a, _)| a == q);
+            if answers {
+                Some(scope.column_type(&reference))
+            } else if !scope.complete {
+                // A leaf this cannot see into may be the one named.
+                Some(None)
+            } else {
+                None
+            }
+        }
+        None => match scope.column_type(&reference) {
+            Some(t) => Some(Some(t)),
+            None if scope.complete && scope.knows(col) == Some(false) => None,
+            // Named more than once, or possibly by a leaf this cannot see
+            // into: not typed here.
+            None => Some(None),
+        },
+    }
+}
+
 /// The type an operand has statically, or `None`.
 /// An operand's type, a domain read as its base type (operator resolution
 /// looks through a domain, `getBaseType`): a view column of
