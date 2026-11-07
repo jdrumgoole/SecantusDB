@@ -23608,7 +23608,11 @@ fn alias_field_rewrite(
                     op: pg_query::protobuf::SetOperation::SetopNone as i32,
                     ..Default::default()
                 };
-                let def = plan_select(&probe, lookup, &[]).and_then(|p| sub_plan_def(&p, lookup));
+                // Typed, not run: the function is called once, by the
+                // statement's own plan (RP-472).
+                let def = correlated::without_calls(|| {
+                    plan_select(&probe, lookup, &[]).and_then(|p| sub_plan_def(&p, lookup))
+                });
                 match def.as_ref().map(|d| d.columns.as_slice()) {
                     Ok([one]) => {
                         out.push((a.aliasname.clone(), Some(format!("\u{1}{}", one.pg_type))))
@@ -37133,8 +37137,12 @@ fn whole_row_rewrite(
                     return Ok(None);
                 }
             }
-            let stmt = plan_select(sub, lookup, params)?;
-            let def = sub_plan_def(&stmt, lookup)?;
+            // Planned only for its output NAMES: nothing in it may be
+            // called, or a function in its FROM runs once more than the
+            // statement runs it (RP-472).
+            let def = correlated::without_calls(|| {
+                plan_select(sub, lookup, params).and_then(|stmt| sub_plan_def(&stmt, lookup))
+            })?;
             let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
             // `s(a, b)` column aliases rename the subquery's outputs.
             if let Some(a) = rs.alias.as_ref() {
