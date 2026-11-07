@@ -4132,3 +4132,61 @@ fn a_subquery_two_levels_down_reads_the_outer_row() {
     let err = analysed("select (select (select nosuch)) from t").expect_err("no level has it");
     assert_eq!(err.sqlstate(), "42703", "{err}");
 }
+
+/// `errorMissingRTE`'s hint across query levels (RP-455): the entry found
+/// innermost first, the alias hinted only when it is what the name would
+/// resolve to from the referring level. Answers measured on PostgreSQL
+/// 15.19.
+#[test]
+fn missing_rte_hint_follows_search_range_table_for_rel() {
+    fn parse_level(from: &str, target: Option<&str>) -> RangeLevel {
+        let sql = if from.is_empty() {
+            "select 1".to_string()
+        } else {
+            format!("select 1 from {from}")
+        };
+        let tree = pg_query::parse(&sql).expect("parses");
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("a SELECT");
+        };
+        let target = target.map(|t| {
+            let (relname, alias) = t.split_once(' ').map_or((t, None), |(r, a)| (r, Some(a)));
+            pg_query::protobuf::RangeVar {
+                relname: relname.into(),
+                alias: alias.map(|a| pg_query::protobuf::Alias {
+                    aliasname: a.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        });
+        range_level(&s.from_clause, &target.iter().collect::<Vec<_>>(), true)
+    }
+    let alias = |a: &str| Some(format!("alias {a}"));
+    let entry = |e: &str| Some(format!("entry {e}"));
+    let hint = |levels: &[RangeLevel], q: &str| {
+        missing_rte_hint(levels, q).map(|h| match h {
+            MissingRteHint::Alias(a) => format!("alias {a}"),
+            MissingRteHint::Entry(e) => format!("entry {e}"),
+        })
+    };
+    // `update fe x set a = (select fe.a from fs limit 1)`
+    let levels = [parse_level("fs", None), parse_level("", Some("fe x"))];
+    assert_eq!(hint(&levels, "fe"), alias("x"));
+    // `update fe x set a = (select fe.a from fs x limit 1)`: the inner `x`
+    // shadows the target's alias.
+    let mut shadowed = levels.clone();
+    shadowed[0] = parse_level("fs x", None);
+    assert_eq!(hint(&shadowed, "fe"), entry("x"));
+    // `select (select fs.a) from (fs join fe using (a)) as j`: a table an
+    // aliased join hides has no alias of its own.
+    let mut hidden = parse_level("(fs join fe using (a)) as j", None);
+    hidden.visible = vec!["j".into()];
+    assert_eq!(hint(&[RangeLevel::default(), hidden], "fs"), entry("fs"));
+    // A name no level's range table has.
+    assert_eq!(hint(&levels, "q"), None);
+}

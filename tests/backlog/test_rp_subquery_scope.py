@@ -1,11 +1,14 @@
 """Gap tests of the name-scope divergences found while working RP-443:
-RP-451 (a parameter qualified by its function's name is not bound), RP-455
-(a write's target is not an enclosing relation to its subqueries), RP-453
+RP-451 (a parameter qualified by its function's name is not bound), RP-453
 (a correlated subquery's value read from a CTE or a write's target came
 out text; fixed), RP-454 (a join's alias is refused or not found), RP-456
-(a CTE hidden by its alias still answers to its name in a subquery) and
-RP-457 (an UPDATE ... FROM's or DELETE ... USING's RETURNING subquery
-cannot read the FROM).
+(a CTE hidden by its alias still answered to its name in a subquery;
+fixed) and RP-457 (an UPDATE ... FROM's or DELETE ... USING's RETURNING subquery
+cannot read the FROM); the regression test of RP-455 (a write's target was
+not an enclosing relation to its subqueries, and an enclosing level's
+hidden table name was not `errorMissingRTE`'s "invalid reference"); and,
+found while working RP-455, RP-460 (a subquery inside a FROM-subquery is
+offered a sibling's alias as its hint).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -88,20 +91,88 @@ _FE_ALIAS_X = (
     'Perhaps you meant to reference the table alias "x".',
 )
 
+
+def _fe_alias_x(position: str) -> tuple[str, ...]:
+    return (*_FE_ALIAS_X, position)
+
+
+def _entry(table: str, eref: str, position: str) -> tuple[str, ...]:
+    """`errorMissingRTE`'s error for an entry that is not an alias's."""
+    return (
+        "42P01",
+        f'invalid reference to FROM-clause entry for table "{table}"',
+        f'There is an entry for table "{eref}", but it cannot be referenced'
+        " from this part of the query.",
+        position,
+    )
+
+
+_FS_ALIAS_Y = (
+    "42P01",
+    'invalid reference to FROM-clause entry for table "fs"',
+    'Perhaps you meant to reference the table alias "y".',
+)
+
 # An UPDATE's or DELETE's target is a relation of the statement's own
 # level: a subquery's `fe.a` reads it, and with the target aliased `x` its
-# table name is hidden.
+# table name is hidden -- in a SET, a WHERE or a RETURNING, and so is an
+# aliased table of an UPDATE's FROM or a DELETE's USING. An INSERT's target
+# is in its level's range table but not its namespace, except for RETURNING.
 WRITE_TARGET_SCOPE = {
     "update fe set a = (select fe.a from fe x limit 1)": ("rowcount", 1),
-    "update fe x set a = (select fe.a from fs limit 1)": (*_FE_ALIAS_X, "29"),
-    "delete from fe x where exists (select fe.a from fs)": (*_FE_ALIAS_X, "39"),
+    "update fe x set a = (select fe.a from fs limit 1)": _fe_alias_x("29"),
+    "delete from fe x where exists (select fe.a from fs)": _fe_alias_x("39"),
+    "update fe x set a = 3 where (select count(*) from fs where fs.a = fe.a) = 1": (
+        _fe_alias_x("67")
+    ),
+    "update fe x set a = 1 returning (select fe.a from fs limit 1)": _fe_alias_x("41"),
+    "delete from fe x returning (select fe.a from fs limit 1)": _fe_alias_x("36"),
+    "delete from fe x where x.a = (select max(fe.a) from fs)": _fe_alias_x("42"),
+    "delete from fe using fs y where exists (select fs.a from fe x)": (*_FS_ALIAS_Y, "48"),
+    "update fe set a = 3 from fs y where exists (select fs.a)": (*_FS_ALIAS_Y, "52"),
+    "delete from fe where exists (select fe.a from fe x)": ("rowcount", 1),
+    "update fe x set a = (select x.a + 1 from fs limit 1)": ("rowcount", 1),
+    "update fe x set a = 7 where exists (select x.a from fs where fs.a = x.a)": ("rowcount", 1),
+    # The subquery's own `x` shadows the target's alias, so the entry found
+    # for `fe` (the target) is named by its eref, not offered as an alias.
+    "update fe x set a = (select fe.a from fs x limit 1)": _entry("fe", "x", "29"),
+    "insert into fe as x values (2, 'z') returning (select fe.a from fs limit 1)": (
+        _fe_alias_x("55")
+    ),
+    "insert into fe select (select fe.a from fs limit 1), 'z'": _entry("fe", "fe", "31"),
 }
 
 
-@pytest.mark.backlog("RP-455")
+@pytest.mark.backlog_fixed("RP-455")
 @pytest.mark.parametrize("query", list(WRITE_TARGET_SCOPE))
 def test_write_target_scope_in_a_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WRITE_TARGET_SCOPE[query]
+
+
+# The same `errorMissingRTE` for a SELECT's enclosing level, which an EXISTS
+# (whose select list is dropped) and a join's ON used to step past.
+ENCLOSING_HIDDEN_NAME = {
+    "select 1 from fe x where exists (select fe.a from fs)": _fe_alias_x("41"),
+    "select 1 from fe x where exists (select 1 from fs where exists (select fe.a))": (
+        _fe_alias_x("72")
+    ),
+    "select 1 from fe x where 1 = any (select fe.a from fs)": _fe_alias_x("42"),
+    "select 1 from fe x, fs y where exists (select fs.a)": (*_FS_ALIAS_Y, "47"),
+    "select * from fe x join fs on exists (select fe.a)": _fe_alias_x("46"),
+    "select * from fe x, lateral (select (select fe.a)) s": _fe_alias_x("45"),
+    "with c as (select 1 a) select 1 from c x where exists (select c.a from fs)": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "c"',
+        'Perhaps you meant to reference the table alias "x".',
+        "63",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-455")
+@pytest.mark.parametrize("query", list(ENCLOSING_HIDDEN_NAME))
+def test_enclosing_hidden_name_in_a_subquery(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == ENCLOSING_HIDDEN_NAME[query]
 
 
 # The subquery's value has the outer column's type, `integer`; it came out
@@ -154,7 +225,10 @@ _C_ALIAS_X = (
 )
 
 # A CTE referenced under an alias is hidden by it, as a table is: a
-# subquery's `c.a` names nothing.
+# subquery's `c.a` is `errorMissingRTE`'s "invalid reference" with the
+# alias hint. It was `missing FROM-clause entry` at the WITH's own name,
+# and the EXISTS form answered its row (fixed with RP-455's range-table
+# search).
 CTE_ALIAS_HIDES_NAME = {
     "with c as (select 1 as a) select (select c.a from fs limit 1) from c x": (
         *_C_ALIAS_X,
@@ -167,7 +241,7 @@ CTE_ALIAS_HIDES_NAME = {
 }
 
 
-@pytest.mark.backlog("RP-456")
+@pytest.mark.backlog_fixed("RP-456")
 @pytest.mark.parametrize("query", list(CTE_ALIAS_HIDES_NAME))
 def test_cte_alias_hides_its_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CTE_ALIAS_HIDES_NAME[query]
@@ -186,3 +260,20 @@ RETURNING_READS_FROM = {
 @pytest.mark.parametrize("query", list(RETURNING_READS_FROM))
 def test_returning_subquery_reads_the_from(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RETURNING_READS_FROM[query]
+
+
+# A FROM-subquery that is not LATERAL is analysed with the FROM items before
+# it in its level's range table but out of its namespace (`p_lateral_only`),
+# so a subquery inside it that names an aliased one by its table's name is
+# `errorMissingRTE`'s "cannot be referenced from this part of the query":
+# the alias is not visible there, so it is not offered as the hint.
+FROM_SUBQUERY_SIBLING = {
+    "select * from fe x, (select (select fe.a)) s": _entry("fe", "x", "37"),
+    "select * from fe x, (select 1 where exists (select fe.a)) s": _entry("fe", "x", "52"),
+}
+
+
+@pytest.mark.backlog("RP-460")
+@pytest.mark.parametrize("query", list(FROM_SUBQUERY_SIBLING))
+def test_from_subquery_sibling_is_not_visible(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == FROM_SUBQUERY_SIBLING[query]
