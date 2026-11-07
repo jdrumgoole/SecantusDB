@@ -314,6 +314,93 @@ def test_one_out_parameter_names_the_column(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ONE_OUT_PARAMETER_COLUMN[query]
 
 
+# The item's whole row in a join: a bare alias on a FROM function that names
+# its own one column (`jsonb_array_elements` is `value`) is the function's
+# whole-row Var, not a column. The answers were measured on PostgreSQL 15.19
+# over VALUES lists, so nothing was created there: a scalar function's row is
+# its value (`pg_typeof(e)` is jsonb), WITH ORDINALITY's and a subquery's a
+# record, and a LEFT JOIN NULL-extends either to NULL. LATERAL, the implicit
+# lateral of a comma join, and a function either side of a plain JOIN all
+# read it; `e.value` and a bare `value` still read the column. The two user
+# functions follow from the same rule (one named OUT parameter: a scalar).
+_T = "(VALUES (1, '[1,2]'::jsonb)) t(id, j)"
+_T2 = "(VALUES (1, '[1,2]'::jsonb), (2, '[]'::jsonb)) t(id, j)"
+JOINED_FUNCTION_WHOLE_ROW = {
+    f"SELECT t.id, e FROM {_T}, LATERAL jsonb_array_elements(t.j) AS e": [(1, 1), (1, 2)],
+    f"SELECT t.id, e FROM {_T}, jsonb_array_elements(t.j) AS e": [(1, 1), (1, 2)],
+    f"SELECT t.id, e FROM {_T}, LATERAL json_array_elements(t.j::json) AS e": [(1, 1), (1, 2)],
+    'SELECT t.id, e FROM (VALUES (1, \'["a","b"]\'::jsonb)) t(id, j)'
+    " CROSS JOIN LATERAL jsonb_array_elements_text(t.j) AS e": [(1, "a"), (1, "b")],
+    f"SELECT t.id, e FROM {_T2} LEFT JOIN LATERAL jsonb_array_elements(t.j) AS e ON true"
+    " ORDER BY 1, 2": [(1, 1), (1, 2), (2, None)],
+    f"SELECT t.id, e FROM {_T} LEFT JOIN LATERAL jsonb_array_elements(t.j) AS e ON false": [
+        (1, None)
+    ],
+    f"SELECT t.id, e, e IS NULL FROM {_T2} LEFT JOIN LATERAL jsonb_array_elements(t.j) AS e"
+    " ON true ORDER BY 1, 2": [(1, 1, False), (1, 2, False), (2, None, True)],
+    f"SELECT t.id, e FROM {_T} JOIN LATERAL jsonb_array_elements(t.j) AS e ON e = '2'::jsonb": [
+        (1, 2)
+    ],
+    f"SELECT t.id FROM {_T}, LATERAL jsonb_array_elements(t.j) AS e WHERE e = '2'": [(1,)],
+    # The column keeps the function's name.
+    f"SELECT t.id, e.value, pg_typeof(e) FROM {_T}, LATERAL jsonb_array_elements(t.j) AS e": [
+        (1, 1, "jsonb"),
+        (1, 2, "jsonb"),
+    ],
+    f"SELECT t.id, value FROM {_T}, LATERAL jsonb_array_elements(t.j) AS e": [(1, 1), (1, 2)],
+    f"SELECT t.id, e.* FROM {_T}, LATERAL jsonb_array_elements(t.j) AS e": [(1, 1), (1, 2)],
+    f"SELECT t.id, e, v FROM {_T}, LATERAL jsonb_array_elements(t.j) AS e(v)": [
+        (1, 1, 1),
+        (1, 2, 2),
+    ],
+    # A column of the alias's name wins over the row.
+    f"SELECT t.id, value FROM {_T}, LATERAL jsonb_array_elements(t.j) AS value": [
+        (1, 1),
+        (1, 2),
+    ],
+    # The function on either side of a plain JOIN, not lateral.
+    "SELECT e FROM (VALUES (1)) t(id) JOIN jsonb_array_elements('[1,2]') AS e ON true": [
+        (1,),
+        (2,),
+    ],
+    "SELECT e FROM jsonb_array_elements('[1,2]') AS e, (VALUES (1)) t(id)": [(1,), (2,)],
+    "SELECT e, t.id FROM jsonb_array_elements('[1,2]') AS e"
+    " RIGHT JOIN (VALUES (1), (2), (3)) t(id) ON e::text = t.id::text ORDER BY 2": [
+        (1, 1),
+        (2, 2),
+        (None, 3),
+    ],
+    # WITH ORDINALITY: the row is a record of value and ordinality.
+    f"SELECT t.id, e FROM {_T}, LATERAL jsonb_array_elements(t.j) WITH ORDINALITY AS e": [
+        (1, ("1", "1")),
+        (1, ("2", "2")),
+    ],
+    f"SELECT t.id, e FROM {_T2} LEFT JOIN LATERAL jsonb_array_elements(t.j) WITH ORDINALITY AS e"
+    " ON true ORDER BY 1": [(1, ("1", "1")), (1, ("2", "2")), (2, None)],
+    # A later FROM function reads the row as its argument.
+    "SELECT t.id, e, f FROM (VALUES (1, '[[1],[2]]'::jsonb)) t(id, j),"
+    " LATERAL jsonb_array_elements(t.j) AS e, LATERAL jsonb_array_elements(e) AS f": [
+        (1, [1], 1),
+        (1, [2], 2),
+    ],
+    # A LATERAL subquery's row is a record, NULL where an outer join
+    # NULL-extends it.
+    f"SELECT t.id, e FROM {_T}, LATERAL (SELECT x.value, t.id AS i2"
+    " FROM jsonb_array_elements(t.j) x) e": [(1, ("1", "1")), (1, ("2", "1"))],
+    f"SELECT t.id, e FROM {_T} LEFT JOIN LATERAL (SELECT x.value"
+    " FROM jsonb_array_elements(t.j) x WHERE x.value = '3') e ON true": [(1, None)],
+    # A user function with one named OUT parameter.
+    "select a, g from fe, lateral gtio(fe.a) g": [(1, 2)],
+    "select a, g from fe left join lateral gtio(fe.a) g on false": [(1, None)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-477")
+@pytest.mark.parametrize("query", list(JOINED_FUNCTION_WHOLE_ROW))
+def test_joined_function_names_its_whole_row(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == JOINED_FUNCTION_WHOLE_ROW[query]
+
+
 # Found while working RP-477, fixed by RP-483: in a select list a call is
 # named by its function (FigureColname), and the result of one with a
 # single OUT parameter is a scalar, so a field of it is 42809.

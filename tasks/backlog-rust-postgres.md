@@ -1992,18 +1992,16 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 
 ## Found while working RP-470 (2026-11-07)
 
-- [ ] **A whole-row reference is still refused in three shapes.** On
-      PostgreSQL 15.19, `select l from fs join lateral (select fs.a) l on
-      true` answers `(1)` (and NULL for a LATERAL side an outer join
-      NULL-extends), `select (select fs) from fs` and the same over `fs,
+- [ ] **A whole-row reference is still refused in two shapes.** On
+      PostgreSQL 15.19, `select (select fs) from fs` and the same over `fs,
       fe` answer `(1,y)`, and `select (fs).* from fs, fe order by 1`
-      answers `1, y`. Here the first two are 42703 `column "l" (or "fs")
-      does not exist` -- a LATERAL leaf (`lateral_leaf`) carries no row
-      column, and a subquery's correlation does not bind an outer FROM
-      item's whole row -- and the last is 0A000 `this field selection is
-      not supported yet`: `ORDER BY 1` copies the `(fs).*` target before
-      the join expands it. Since RP-470 a table's or a plain subquery's
-      whole row over a join works, built at its scan.
+      answers `1, y`. Here the first is 42703 `column "fs" does not exist`
+      -- a subquery's correlation does not bind an outer FROM item's whole
+      row -- and the last is 0A000 `this field selection is not supported
+      yet`: `ORDER BY 1` copies the `(fs).*` target before the join expands
+      it. Since RP-470 a table's or a plain subquery's whole row over a
+      join works, built at its scan, and since RP-477 a LATERAL leaf's
+      (`select l from fs join lateral (select fs.a) l on true`) does too.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
       Backlog-ID: RP-479
 - [ ] **A missing USING column's 42703 carries a position.** PostgreSQL

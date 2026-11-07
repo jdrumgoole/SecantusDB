@@ -737,7 +737,50 @@ fn whole_row_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     for item in &s.from_clause {
         on_quals(item, &note);
     }
-    out.into_inner()
+    // The arguments of a FROM function, which reads the items to its left
+    // (`from jsonb_array_elements(t.a) e, jsonb_array_elements(e) f`), and
+    // the body of a LATERAL subquery.
+    fn from_args(
+        item: &pg_query::protobuf::Node,
+        note: &dyn Fn(&pg_query::protobuf::Node) -> bool,
+        out: &mut Vec<String>,
+    ) {
+        match item.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    from_args(side, note, out);
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                for f in &rf.functions {
+                    if let Some(N::List(l)) = f.node.as_ref() {
+                        if let Some(call) = l.items.first() {
+                            expr_any(call, note);
+                        }
+                    }
+                }
+            }
+            Some(N::RangeSubselect(rs)) if rs.lateral => {
+                if let Some(N::SelectStmt(inner)) =
+                    rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+                {
+                    out.extend(whole_row_names(inner));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut nested = Vec::new();
+    for item in &s.from_clause {
+        from_args(item, &note, &mut nested);
+    }
+    let mut out = out.into_inner();
+    for n in nested {
+        if !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
 }
 
 /// Is `alias` named as a whole row by the join being built?
@@ -1361,6 +1404,15 @@ fn lateral_leaf(
             Ok(Some(k)) => k,
             Ok(None) => {
                 if let [name] = parts.as_slice() {
+                    // A left item's whole row, built at its scan
+                    // (`jsonb_array_elements(e)` over `... e`): a column
+                    // of the name would have been found above.
+                    if let Some((_, WholeRow::Column(row))) = left.whole_row(name) {
+                        let row = row.clone();
+                        let i = left_slot(left, &mut keys, &mut types, row);
+                        n.node = bound_left_ref(base + i, c.location, &types[i]).node;
+                        return Ok(());
+                    }
                     unresolved.get_or_insert_with(|| name.clone());
                 }
                 return Ok(());
@@ -1423,6 +1475,46 @@ fn lateral_leaf(
         // It reads nothing on its left after all.
         return Ok(None);
     }
+    // The item named as a whole row (`select t.id, e from t, lateral
+    // f(t.j) as e`): built at its scan as a leaf's is (`leaf_filtered`),
+    // and beside its columns as a column of its own, so a LEFT JOIN
+    // NULL-extends it to NULL.
+    let row_name = lateral_row_name(item, &alias, function);
+    if let Some(name) = &row_name {
+        inner = match item.node.as_ref() {
+            // A function's own name for its one column: `SELECT *, <the
+            // function> FROM f(...)`, read by `whole_row_rewrite`.
+            Some(N::RangeFunction(_)) => {
+                with_whole_row_target(&mut inner, name);
+                inner
+            }
+            // A subquery: `SELECT *, s FROM (...) s`, its row a record.
+            _ => {
+                let mut select = pg_query::protobuf::SelectStmt {
+                    target_list: vec![star_target()],
+                    from_clause: vec![pg_query::protobuf::Node {
+                        node: Some(N::RangeSubselect(Box::new(
+                            pg_query::protobuf::RangeSubselect {
+                                lateral: false,
+                                subquery: Some(Box::new(pg_query::protobuf::Node {
+                                    node: Some(N::SelectStmt(Box::new(inner))),
+                                })),
+                                alias: Some(pg_query::protobuf::Alias {
+                                    aliasname: name.clone(),
+                                    colnames: colnames.clone(),
+                                }),
+                            },
+                        ))),
+                    }],
+                    limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                    op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                    ..Default::default()
+                };
+                with_whole_row_target(&mut select, name);
+                select
+            }
+        };
+    }
     // Planned once over typed sample values, for the output's shape; each left
     // row re-plans it with its own. Only the shape is wanted, so no user
     // function is called and no sequence drawn: planning a FROM-less body
@@ -1439,8 +1531,18 @@ fn lateral_leaf(
         }
         p => p?,
     };
-    let def = sub_plan_def(&plan, lookup)?;
-    let scan = function_scan(&inner, function, &def).map(Box::new);
+    let mut def = sub_plan_def(&plan, lookup)?;
+    // The whole row is the select list's last column.
+    let row_column = if row_name.is_some() {
+        def.columns.pop()
+    } else {
+        None
+    };
+    let scan = if row_column.is_some() {
+        None
+    } else {
+        function_scan(&inner, function, &def).map(Box::new)
+    };
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
     let bare_alias = matches!(
         item.node.as_ref(),
@@ -1487,6 +1589,21 @@ fn lateral_leaf(
             source: c.source,
             qual: alias.clone(),
         });
+    }
+    if let Some(row_column) = row_column {
+        let key = join_key(&alias, WHOLE_ROW_COLUMN);
+        columns.push((key.clone(), def.columns.len()));
+        scope.cols.push(ScopeCol {
+            alias: alias.clone(),
+            name: WHOLE_ROW_COLUMN.to_string(),
+            key: key.clone(),
+            pg_type: row_column.pg_type.clone(),
+            bare: false,
+            star: false,
+            source: None,
+            qual: String::new(),
+        });
+        scope.rows.push((alias.clone(), WholeRow::Column(key)));
     }
     Ok(Some((
         JoinNode::Lateral {
@@ -2081,6 +2198,52 @@ fn alias_names_the_column(rf: &pg_query::protobuf::RangeFunction) -> bool {
         && range_function_call(rf).is_none_or(|c| crate::function_column_name(c).is_none())
 }
 
+/// The name a FROM function's whole row is read under, when the function
+/// names its own one column and the query names the item as a whole row:
+/// `leaf_filtered` and `lateral_leaf` both build it at the scan
+/// (`whole_row_rewrite`). A scalar function the alias names is read as that
+/// column, which wins over the row, as in PostgreSQL.
+fn function_row_name(
+    rf: &pg_query::protobuf::RangeFunction,
+    alias: &str,
+    bare_alias: bool,
+) -> Option<String> {
+    if !whole_row_named(alias)
+        || bare_alias
+        || rf.functions.len() != 1
+        || rf.ordinality
+        || !range_function_call(rf)
+            .is_some_and(|c| crate::function_column_name(c).is_some_and(|own| own != alias))
+    {
+        return None;
+    }
+    rf.alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .filter(|a| !a.is_empty())
+        .or_else(|| range_function_name(rf))
+}
+
+/// The name a LATERAL item's whole row is built under, if the query names
+/// it as one: a function that names its own one column, or a subquery.
+fn lateral_row_name(
+    item: &pg_query::protobuf::Node,
+    alias: &str,
+    function: bool,
+) -> Option<String> {
+    match item.node.as_ref() {
+        // The alias is dropped from the planned `SELECT * FROM f(...)`
+        // unless it lists column names (`keep_column_names`).
+        Some(N::RangeFunction(rf)) if function => {
+            let mut planned = rf.clone();
+            planned.alias = keep_column_names(rf, alias);
+            function_row_name(&planned, alias, alias_names_the_column(rf))
+        }
+        Some(N::RangeSubselect(_)) if whole_row_named(alias) => Some(alias.to_string()),
+        _ => None,
+    }
+}
+
 /// A leaf planned as `SELECT * FROM <item>`, so its rows are decoded by the
 /// same path every other query's are.
 fn leaf(
@@ -2120,21 +2283,7 @@ fn leaf_filtered(
         // built at its scan as a table's is, under the name the leaf's
         // `SELECT *` gives it (`whole_row_rewrite`). A scalar one the alias
         // names is read as that column.
-        Some(N::RangeFunction(rf))
-            if whole_row_named(alias)
-                && !bare_alias
-                && rf.functions.len() == 1
-                && !rf.ordinality
-                && range_function_call(rf).is_some_and(|c| {
-                    crate::function_column_name(c).is_some_and(|own| own != alias)
-                }) =>
-        {
-            rf.alias
-                .as_ref()
-                .map(|a| a.aliasname.clone())
-                .filter(|a| !a.is_empty())
-                .or_else(|| range_function_name(rf))
-        }
+        Some(N::RangeFunction(rf)) => function_row_name(rf, alias, bare_alias),
         _ => None,
     };
     let mut select = pg_query::protobuf::SelectStmt {
