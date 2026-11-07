@@ -1,9 +1,10 @@
-"""Gap test of a subquery in a JOIN's ON (found while working RP-437).
+"""Regression test of a subquery in a JOIN's ON (RP-438, found while working
+RP-437).
 
 PostgreSQL evaluates a scalar or IN subquery in a join condition as it does
-one in a WHERE. Here the ON with a SubLink in it is refused with 0A000. The
-rows were measured on PostgreSQL 15.19 over the same rows as `VALUES`
-lists.
+one in a WHERE. The ON with a SubLink in it was refused with 0A000 until
+RP-438 resolved the subqueries in a join's ON as it does a WHERE's. The rows
+were measured on PostgreSQL 15.19 over the same rows as `VALUES` lists.
 """
 
 from __future__ import annotations
@@ -51,11 +52,11 @@ def dsn(rust_pg: object) -> Iterator[str]:
         c.execute(_SETUP[0])
 
 
-@pytest.mark.backlog("RP-438")
+@pytest.mark.backlog_fixed("RP-438")
 @pytest.mark.parametrize("query", list(ON_SUBLINK))
 def test_subquery_in_join_on(query: str, dsn: str) -> None:
     """A scalar or IN subquery in a join's ON is evaluated, under an inner
-    and a LEFT join, as PostgreSQL 15.19 does; here it is 0A000."""
+    and a LEFT join, as PostgreSQL 15.19 does; it was 0A000."""
     with psycopg.connect(dsn, autocommit=True) as c:
         try:
             rows: object = c.execute(query).fetchall()

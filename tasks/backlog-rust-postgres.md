@@ -1714,16 +1714,19 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
       Backlog-ID: RP-422
-- [ ] **A subquery in a JOIN's ON is refused.** `select ns.a, nk.bc from
-      ns join nk on ns.a = nk.a and nk.b = (select 'p'::text)`, the same
-      under a LEFT join, and `... on ns.a = nk.a and nk.a in (select 2)`
-      each answer `0A000 SubLink is not supported yet`; PostgreSQL 15.19
-      runs them (`(1, 10), (2, 20)`; the LEFT join adds `(3, NULL), (5,
-      NULL)`; `(2), (2)`). The same subquery in the WHERE runs here.
-      Measured on PostgreSQL 15.19 over the same rows as `VALUES` lists
-      (found while working RP-437).
-      Verify: tests/backlog/test_rp_join_on_sublink.py::test_subquery_in_join_on
-      Backlog-ID: RP-438
+- [ ] **EXPLAIN prints an uncorrelated subquery inline, with no InitPlan
+      and no estimate.** PostgreSQL 15.19 plans `(select 'v3'::text)` as
+      an `InitPlan 1 (returns $0)` over a `Result`, run once, and the qual
+      reads `$0`: `explain select * from e where b = (select 'v3'::text)` is
+      `Seq Scan on e  (cost=0.01..17.51 rows=100 width=7)`, `Filter: (b =
+      $0)`, then the InitPlan. Here `Filter: (b = ( SELECT 'v3'::text AS
+      text))`, every cost zero, no InitPlan, in a WHERE as in a join. In a
+      join's ON (runnable since RP-438) the conjunct also stays in the
+      join's `Join Filter`, where PostgreSQL pushes it to `Seq Scan on k`'s
+      `Filter: (b = $0)`, inner and LEFT join alike. Its rows are right.
+      Measured on a private 15.19 cluster (found while working RP-438).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
+      Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
 

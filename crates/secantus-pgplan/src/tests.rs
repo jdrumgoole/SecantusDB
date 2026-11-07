@@ -3913,3 +3913,47 @@ fn a_star_derived_table_is_type_checked() {
         }
     }
 }
+
+#[test]
+fn a_join_on_may_hold_a_subquery() {
+    // RP-438: a subquery in a join's ON is resolved as one in a WHERE is --
+    // an uncorrelated one run once while planning, a correlated one per row.
+    // The ON was not searched, so its SubLink reached the lowering, 0A000.
+    let two = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    let ran = std::cell::Cell::new(0);
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> {
+        ran.set(ran.get() + 1);
+        Ok(vec![vec![Bson::String("p".into())]])
+    };
+    for q in [
+        "select * from s join k on s.a = k.a and k.b = (select 'p'::text)",
+        "select * from s left join k on s.a = k.a and k.b = (select 'p'::text)",
+        "select * from s full join k on s.a = k.a and k.a in (select 2)",
+        "select * from s left join (k join k k2 on k2.a = k.a and k2.b = (select 'q')) on s.a = k.a",
+    ] {
+        ran.set(0);
+        let planned = plan_with_subqueries(q, &two, &[], &run);
+        assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+        assert_eq!(ran.get(), 1, "{q}: the subquery runs once, while planning");
+    }
+    // A correlated one is evaluated per row, not run while planning.
+    ran.set(0);
+    let q = "select * from s join k on s.a = k.a and k.bc = (select max(bc) from k k2 where k2.a = s.a)";
+    let planned = plan_with_subqueries(q, &two, &[], &run);
+    assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+    assert_eq!(ran.get(), 0, "{q}");
+}

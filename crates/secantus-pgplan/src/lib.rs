@@ -20287,7 +20287,7 @@ fn resolve_sublinks_in_select_scoped(
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
     for (i, item) in s.from_clause.iter_mut().enumerate() {
-        resolve_sublinks_in_from(item, i > 0, lookup, params, run)?;
+        resolve_sublinks_in_from(item, i > 0, lookup, params, run, &outer)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -20330,13 +20330,15 @@ fn resolve_sublinks_in_select_scoped(
 }
 
 /// `has_left`: a FROM item stands to this one's left (see
-/// `rowsfrom::rewrite`).
+/// `rowsfrom::rewrite`). `outer`: the columns the query's FROM exposes, which
+/// a subquery in a join's ON may read.
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
     has_left: bool,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
+    outer: &[String],
 ) -> Result<()> {
     // `WITH ORDINALITY` / a several-function `ROWS FROM` become the
     // subqueries they mean first, so the subqueries THAT introduces
@@ -20373,10 +20375,16 @@ fn resolve_sublinks_in_from(
         }
         Some(N::JoinExpr(j)) => {
             if let Some(l) = j.larg.as_deref_mut() {
-                resolve_sublinks_in_from(l, has_left, lookup, params, run)?;
+                resolve_sublinks_in_from(l, has_left, lookup, params, run, outer)?;
             }
             if let Some(r) = j.rarg.as_deref_mut() {
-                resolve_sublinks_in_from(r, true, lookup, params, run)?;
+                resolve_sublinks_in_from(r, true, lookup, params, run, outer)?;
+            }
+            // A subquery in the ON is evaluated as one in a WHERE is
+            // (PostgreSQL's `transformJoinOnClause` analyses it with the
+            // join's sides visible): `on js.a = jk.a and jk.b = (select 'p')`.
+            if let Some(q) = j.quals.as_deref_mut() {
+                resolve_sublinks_in_expr(q, lookup, params, run, outer)?;
             }
             Ok(())
         }
