@@ -243,8 +243,13 @@ impl<'p> Scope<'p> {
                     op: pg_query::protobuf::SetOperation::SetopNone as i32,
                     ..Default::default()
                 };
-                let def = crate::plan_select(&probe, lookup, &[])
-                    .and_then(|p| crate::sub_plan_def(&p, lookup));
+                // Only the columns' TYPES are wanted, which the function's
+                // declaration gives: the probe must not CALL it, or a body
+                // that writes writes once more than the statement runs it.
+                let def = crate::correlated::without_calls(|| {
+                    crate::plan_select(&probe, lookup, &[])
+                        .and_then(|p| crate::sub_plan_def(&p, lookup))
+                });
                 match (alias, def) {
                     (Some(alias), Ok(mut def)) => {
                         let names: Vec<String> = rf

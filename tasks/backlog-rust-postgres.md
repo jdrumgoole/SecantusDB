@@ -1929,19 +1929,40 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
 
-## Found while working RP-464 (2026-11-07)
+## Found while working RP-472 (2026-11-07)
 
-- [ ] **A function called in FROM runs its body twice.** `select * from
-      fz()`, where `fz()` returns `setof int` with the body `insert into t
-      values (100); select 1`, inserts one row on PostgreSQL 15.19 and two
-      here; a scalar `fq()` called as `select * from fq()` does the same,
-      and `select * from fs(10)` over `update t set a = a + p returning a`
-      adds 20 to every row and answers 21, 22, 23 where PostgreSQL adds 10
-      and answers 11, 12, 13. The same call in a select list (`select
-      fq()`) runs once. A silent double write; the extended protocol does
-      it too. Measured on PostgreSQL 15.19.
-      Backlog-ID: RP-472
-      Verify: tests/backlog/test_rp_from_function_runs_once.py::test_from_function_runs_once
+- [ ] **A scan sees the rows a function the same statement ran wrote.**
+      With `fq()` a SQL function whose body is `insert into t values (7);
+      select 1`, over `t` holding 1, 2, 3: `select * from t, fq()`, `select
+      * from fq(), t`, `select * from t x, lateral fq()` and `select * from
+      t where a < (select * from fq()) + 10` each answer t's three rows on
+      PostgreSQL 15.19, as the statement's snapshot predates the call; here
+      each answers four, 7 included. The function runs once (RP-472), but
+      a FROM function and an uncorrelated subquery are run while the
+      statement is PLANNED, before its scan, and the scan reads everything
+      committed by then. The faithful fix is PostgreSQL's: the statement
+      reads at its own snapshot and command id, which a volatile
+      function's writes come after.
+      Backlog-ID: RP-473
+      Verify: tests/backlog/test_rp_from_function_scan.py::test_scan_does_not_see_the_functions_write
+- [ ] **A scalar user function in FROM is refused in three shapes.** With
+      `fq()` returning `int` (not SETOF): `select count(*) from fq()` is
+      0A000 `RangeFunction is not supported yet`, `select * from fq() as
+      f(x) where x = 1` 0A000 `ColumnRef is not supported yet`, and `select
+      * from rows from (fq(), fz())` 0A000 `fq() in ROWS FROM is not
+      supported yet`. PostgreSQL 15.19 answers 1, 1 and `(1, 1)`. The same
+      shapes over a SETOF function or `generate_series` already work.
+      Backlog-ID: RP-474
+      Verify: tests/backlog/test_rp_from_function_scan.py::test_scalar_function_in_from
+- [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
+      PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
+      off) select * from fq()`, a scalar or a SETOF SQL function alike.
+      Here a scalar one prints `Result`, and a SETOF one `Subquery Scan on
+      fz` over `Values Scan on "*VALUES*"`: the call is answered at plan
+      time and its rows planned as a VALUES list. A built-in
+      (`generate_series`) already prints its Function Scan.
+      Backlog-ID: RP-475
+      Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
 
 ## Found while working RP-454 (2026-11-07)
 
