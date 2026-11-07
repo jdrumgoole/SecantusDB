@@ -3647,3 +3647,33 @@ fn a_pair_expression_reads_each_sides_row() {
     assert!(plan_pair_expression("(a < e.a)", ("s", &s), ("e", &e)).is_err());
     assert!(plan_pair_expression("(x.a < e.a)", ("s", &s), ("e", &e)).is_err());
 }
+
+/// EXPLAIN analyses its statement before it reads an option, as
+/// `transformExplainStmt` runs before `ExplainQuery` (RP-419). Each answer
+/// was measured on PostgreSQL 15.19.
+#[test]
+fn explain_refuses_what_parse_analysis_refuses() {
+    for (sql, want) in [
+        ("EXPLAIN SELECT * FROM t WHERE n = true", "42883"),
+        (
+            "EXPLAIN (COSTS OFF) SELECT * FROM t WHERE name = 1",
+            "42883",
+        ),
+        ("EXPLAIN ANALYZE DELETE FROM t WHERE name = 1", "42883"),
+        ("EXPLAIN UPDATE t SET n = 1 WHERE n = true", "42883"),
+        ("EXPLAIN (BOGUS) SELECT * FROM t WHERE n = true", "42883"),
+        (
+            "EXPLAIN (FORMAT nope) SELECT * FROM t WHERE n = true",
+            "42883",
+        ),
+        (
+            "EXPLAIN SELECT n AS x, name AS x FROM t ORDER BY x",
+            "42702",
+        ),
+        // An option's own error still precedes a planner-time one.
+        ("EXPLAIN (BOGUS) SELECT 1/0", "42601"),
+    ] {
+        let err = plan(sql, &lookup).expect_err(sql);
+        assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
+    }
+}
