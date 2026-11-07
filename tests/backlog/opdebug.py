@@ -14,7 +14,7 @@ from __future__ import annotations
 import contextlib
 import json
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 from bson import json_util
@@ -94,6 +94,24 @@ def logged(
     ]
     client.drop_database(db.name)
     return lines, entries
+
+
+@contextlib.contextmanager
+def no_timed_yields(mongod: Any) -> Iterator[None]:
+    """mongod with its executor's time-based yields off, as RM-185's
+    regression tests run it. mongod also yields -- saves every stage, and
+    releases and re-takes its locks and flow control ticket -- once an
+    operation has run `internalQueryExecYieldPeriodMS` (10 ms), which load
+    decides: a `delete_many` of six documents yielded once in 60 runs under
+    six concurrent writers (`numYields: 1`, a third write lock round,
+    `flowControl: {acquireCount: 2}`) and in none of 120 with the period off
+    (2026-11-07). This server keeps no such clock, so the reference runs
+    without it and its counts are the operation's own."""
+    was = mongod.admin.command("setParameter", 1, internalQueryExecYieldPeriodMS=86_400_000)
+    try:
+        yield
+    finally:
+        mongod.admin.command("setParameter", 1, internalQueryExecYieldPeriodMS=was["was"])
 
 
 def keys(doc: dict, leave_out: frozenset[str] = frozenset()) -> list[str]:

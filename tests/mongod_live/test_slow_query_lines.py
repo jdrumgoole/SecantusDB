@@ -28,7 +28,7 @@ import pytest
 from pymongo.read_concern import ReadConcern
 from pymongo.write_concern import WriteConcern
 
-from tests.backlog.opdebug import keys, logged, seed
+from tests.backlog.opdebug import keys, logged, no_timed_yields, seed
 
 #: Fields this server does not write yet, each an open item (above).
 UNMODELLED = frozenset(
@@ -188,7 +188,8 @@ def _scenario(
     rust_mongo: Any, mongod_rs: Any, op: Callable[[Any], Any], gaps: frozenset[str]
 ) -> None:
     our_lines, our_entries = logged(rust_mongo, False, seed, op)
-    their_lines, their_entries = logged(mongod_rs, True, seed, op)
+    with no_timed_yields(mongod_rs):
+        their_lines, their_entries = logged(mongod_rs, True, seed, op)
     problems = []
     if _shape(our_lines) != _shape(their_lines):
         problems.append(f"lines: ours {_shape(our_lines)}, mongod {_shape(their_lines)}")
