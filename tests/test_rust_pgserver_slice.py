@@ -1638,8 +1638,22 @@ def test_regclass_names_a_relation(home: Path) -> None:
         assert isinstance(oid, int) and oid > 0
         cur.execute("select typrelid, oid <> typrelid from pg_type where typname = 't1'")
         assert cur.fetchone() == (oid, True)
-        cur.execute("select attname from pg_attribute where attrelid = 't1'::regclass")
-        assert cur.fetchall() == [("f1",)]
+        # A table's system columns are pg_attribute rows too, numbered -6..-1
+        # (PostgreSQL 15.19: `pg_namespace` lists tableoid -6 ... ctid -1
+        # before its own columns; RP-490).
+        cur.execute(
+            "select attname, attnum from pg_attribute where attrelid = 't1'::regclass"
+            " order by attnum"
+        )
+        assert cur.fetchall() == [
+            ("tableoid", -6),
+            ("cmax", -5),
+            ("xmax", -4),
+            ("cmin", -3),
+            ("xmin", -2),
+            ("ctid", -1),
+            ("f1", 1),
+        ]
         cur.execute("select 't1'::regclass = 't1'::regclass::oid, %s::regclass::oid", (str(oid),))
         assert cur.fetchone() == (True, oid)
         cur.execute("select 'pg_class'::regclass::oid, '\"Order\"'::regclass::text")
