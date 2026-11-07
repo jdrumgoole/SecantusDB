@@ -1,9 +1,11 @@
 """Gap tests of the missing-column and ON-clause errors found while working
 RP-408: RP-413 (a function in FROM leaves a 42703 with no HINT), RP-414 (a
 42703 names the wrong reference or drops its qualifier), RP-415 (a column
-in an INSERT's VALUES is refused as a gap) and RP-416 (a join's ON after a
-comma item was not type-checked; fixed), and RP-430, found while fixing
-RP-416 (a subquery's join ON could not name the outer query; fixed).
+in an INSERT's VALUES was refused as a gap; fixed) and RP-416 (a join's ON
+after a comma item was not type-checked; fixed); RP-430, found while fixing
+RP-416 (a subquery's join ON could not name the outer query; fixed); and
+RP-443, found while fixing RP-415 (a subquery's qualifier naming no FROM
+entry is not 42P01).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. The expected answers were measured on a private,
@@ -20,10 +22,11 @@ import pytest
 from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
-    "drop table if exists e, s, k",
+    "drop table if exists e, s, k, g",
     "create table e (a int, b text)",
     "create table s (a int, c text)",
     "create table k (a int, b text, bc int)",
+    "create table g (a int, b int generated always as (a * 2) stored)",
 ]
 
 Answer = tuple[str | None, str | None, str | None, str | None] | None
@@ -149,10 +152,173 @@ INSERT_VALUES = {
 }
 
 
-@pytest.mark.backlog("RP-415")
+@pytest.mark.backlog_fixed("RP-415")
 @pytest.mark.parametrize("query", list(INSERT_VALUES))
 def test_insert_values_column_reference(query: str, dsn: str) -> None:
+    """A column reference in an INSERT's VALUES was refused as a gap,
+    `0A000 ColumnRef is not supported yet`; PostgreSQL analyses VALUES in
+    the INSERT's own level, where the target is in the range table but not
+    visible, and answers 42703 with errorMissingColumn's hint."""
     assert answer(dsn, query) == INSERT_VALUES[query]
+
+
+_NOT_HERE = (
+    'There is an entry for table "{}", but it cannot be referenced from this part of the query.'
+)
+
+
+def _invalid(table: str, entry: str, position: str) -> Answer:
+    return (
+        "42P01",
+        f'invalid reference to FROM-clause entry for table "{table}"',
+        _NOT_HERE.format(entry),
+        position,
+    )
+
+
+def _not_visible(column: str, position: str) -> Answer:
+    return (
+        "42703",
+        f'column "{column}" does not exist',
+        f'There is a column named "{column}" in table "e", but it cannot be'
+        " referenced from this part of the query.",
+        position,
+    )
+
+
+_BB_HINT = 'Perhaps you meant to reference the column "e.b".'
+
+INSERT_VALUES_FORMS = {
+    # A name the target has: in the range table, out of reach.
+    "insert into e values (a)": _not_visible("a", "23"),
+    "insert into e (b) values (a)": _not_visible("a", "27"),
+    "insert into e values (a + 1, 'x')": _not_visible("a", "23"),
+    "insert into e values (1, upper(b))": _not_visible("b", "32"),
+    "insert into e values (1, coalesce(b, 'x'))": _not_visible("b", "35"),
+    "insert into e values (1, 'x' || b)": _not_visible("b", "33"),
+    "insert into e values (case when a > 1 then 1 end, 'x')": _not_visible("a", "33"),
+    "insert into e values (default, b)": _not_visible("b", "32"),
+    "insert into e values (nosuch, 'x', 3)": (
+        "42703",
+        'column "nosuch" does not exist',
+        None,
+        "23",
+    ),
+    "insert into e values (e)": ("42703", 'column "e" does not exist', None, "23"),
+    "insert into e values ((zz).f)": ("42703", 'column "zz" does not exist', None, "24"),
+    "insert into e values (zz[1])": ("42703", 'column "zz" does not exist', None, "23"),
+    "insert into e values (1::text::int + zz, 'x')": (
+        "42703",
+        'column "zz" does not exist',
+        None,
+        "38",
+    ),
+    "insert into e as x values (bb)": (
+        "42703",
+        'column "bb" does not exist',
+        'Perhaps you meant to reference the column "x.b".',
+        "28",
+    ),
+    # A qualifier naming the target, by its name, its alias or its schema.
+    "insert into e values (e.a)": _invalid("e", "e", "23"),
+    "insert into e values (e.bb)": _invalid("e", "e", "23"),
+    "insert into e values (public.e.a)": _invalid("e", "e", "23"),
+    "insert into e values (nosuch.e.a)": _invalid("e", "e", "23"),
+    "insert into public.e values (e.a)": _invalid("e", "e", "30"),
+    "insert into e values (1, e.*)": _invalid("e", "e", "26"),
+    "insert into e as x values (x.a)": _invalid("x", "x", "28"),
+    "insert into e as x values (e.a)": _invalid("e", "x", "28"),
+    # A qualifier naming nothing in the range table, a CTE included.
+    "insert into e values (x.a)": (
+        "42P01",
+        'missing FROM-clause entry for table "x"',
+        None,
+        "23",
+    ),
+    "insert into e values (s.a)": (
+        "42P01",
+        'missing FROM-clause entry for table "s"',
+        None,
+        "23",
+    ),
+    "with w as (select 1 as q) insert into e values (w.q, 'x')": (
+        "42P01",
+        'missing FROM-clause entry for table "w"',
+        None,
+        "49",
+    ),
+    "with w as (select 1 as q) insert into e values (q, 'x')": (
+        "42703",
+        'column "q" does not exist',
+        None,
+        "49",
+    ),
+    "insert into e values (a.b.c.d)": (
+        "0A000",
+        "cross-database references are not implemented: a.b.c.d",
+        None,
+        "23",
+    ),
+    # Analysis comes before evaluation, and goes row by row: a row's
+    # references, then its length, then its assignment types.
+    "insert into e values (1/0, bb)": ("42703", 'column "bb" does not exist', _BB_HINT, "28"),
+    "insert into e values (true, bb)": ("42703", 'column "bb" does not exist', _BB_HINT, "29"),
+    "insert into e values (bb, 'y'), (true, 'x')": (
+        "42703",
+        'column "bb" does not exist',
+        _BB_HINT,
+        "23",
+    ),
+    "insert into e values (true, 'x'), (bb, 'y')": (
+        "42804",
+        'column "a" is of type integer but expression is of type boolean',
+        "You will need to rewrite or cast the expression.",
+        "23",
+    ),
+    "insert into e values (1, 'x'), (bb, 'y', 3)": (
+        "42703",
+        'column "bb" does not exist',
+        _BB_HINT,
+        "33",
+    ),
+    "insert into e values (1, 'x'), (2, 'y', 3), (zz, 'q')": (
+        "42601",
+        "VALUES lists must all be the same length",
+        None,
+        "33",
+    ),
+    "insert into e values (1, 'x', 3), (zz, 'q')": (
+        "42601",
+        "INSERT has more expressions than target columns",
+        None,
+        "31",
+    ),
+    # A generated column's value is refused by the rewriter, after every
+    # row is analysed.
+    "insert into g values (1, 2), (true, default)": (
+        "42804",
+        'column "a" is of type integer but expression is of type boolean',
+        "You will need to rewrite or cast the expression.",
+        "31",
+    ),
+    "insert into g values (1, 2), (zz, default)": (
+        "42703",
+        'column "zz" does not exist',
+        None,
+        "31",
+    ),
+    # A subquery's own FROM still binds its columns.
+    "insert into e values ((select a from s limit 1), 'x')": None,
+}
+
+
+@pytest.mark.backlog_fixed("RP-415")
+@pytest.mark.parametrize("query", list(INSERT_VALUES_FORMS))
+def test_insert_values_reference_forms(query: str, dsn: str) -> None:
+    """The other forms of a column reference in an INSERT's VALUES, each
+    refused as a gap here before (or, behind an earlier item, answered with
+    that item's run-time error), as PostgreSQL 15.19 answers them."""
+    assert answer(dsn, query) == INSERT_VALUES_FORMS[query]
 
 
 _NO_OPERATOR = (
@@ -270,3 +436,38 @@ def test_subquery_join_on_outer_reference_rows(query: str, rows_dsn: str) -> Non
     outer value matches nothing."""
     with psycopg.connect(rows_dsn, autocommit=True) as c:
         assert c.execute(query).fetchall() == SUBQUERY_ON_ROWS[query]
+
+
+SUBQUERY_QUALIFIER = {
+    "select (select x.a from s limit 1)": (
+        "42P01",
+        'missing FROM-clause entry for table "x"',
+        None,
+        "16",
+    ),
+    # Here this one answers rows.
+    "select 1 from k where exists (select x.a from s)": (
+        "42P01",
+        'missing FROM-clause entry for table "x"',
+        None,
+        "38",
+    ),
+    "insert into e values ((select x.a from s limit 1), 'x')": (
+        "42P01",
+        'missing FROM-clause entry for table "x"',
+        None,
+        "31",
+    ),
+    "insert into e values ((select e.a from s limit 1), 'x')": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "e"',
+        'There is an entry for table "e", but it cannot be referenced from this part of the query.',
+        "31",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-443")
+@pytest.mark.parametrize("query", list(SUBQUERY_QUALIFIER))
+def test_subquery_qualifier_naming_nothing(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == SUBQUERY_QUALIFIER[query]

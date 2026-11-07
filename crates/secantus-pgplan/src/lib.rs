@@ -20,6 +20,7 @@ mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
 mod colhint;
+mod values_refs;
 pub use colhint::missing_column_hint;
 pub mod colstats;
 pub mod costsize;
@@ -12154,8 +12155,11 @@ fn plan_insert(
             arity(&exprs)?;
         }
     }
-    // Every VALUES list as long as the first, before the target list is
-    // counted against any of them.
+    // `transformInsertStmt` analyses the VALUES rows one at a time: a row's
+    // expressions (where a column reference fails, RP-415), then its length
+    // against the first row's, then the row against the target list -- the
+    // first row's arity, and each item's assignment type -- before the next
+    // row is looked at. Nothing is evaluated until every row has passed.
     let lists: Vec<&Vec<pg_query::protobuf::Node>> = sel
         .values_lists
         .iter()
@@ -12164,17 +12168,32 @@ fn plan_insert(
             _ => None,
         })
         .collect();
-    if let Some(first) = lists.first() {
-        // `transformInsertStmt` counts the first row against the targets,
-        // then each later one against the first.
-        arity(&first.iter().collect::<Vec<_>>())?;
-        if let Some(odd) = lists.iter().find(|l| l.len() != first.len()) {
-            if let Some(loc) = odd.first().and_then(expr_location) {
-                set_error_location(loc);
+    let target_rel = i
+        .relation
+        .as_ref()
+        .ok_or_else(|| Error::Parse("INSERT without a relation".into()))?;
+    let mut first_len = None;
+    for items in &lists {
+        values_refs::check_row(items, target_rel, &def, lookup)?;
+        match first_len {
+            None => {
+                arity(&items.iter().collect::<Vec<_>>())?;
+                first_len = Some(items.len());
             }
-            return Err(Error::Parse(
-                "VALUES lists must all be the same length".into(),
-            ));
+            Some(len) if items.len() != len => {
+                if let Some(loc) = items.first().and_then(expr_location) {
+                    set_error_location(loc);
+                }
+                return Err(Error::Parse(
+                    "VALUES lists must all be the same length".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+        for (item, target) in items.iter().zip(&targets) {
+            if let Some(column) = def.column(target) {
+                check_assignment_type(column, item)?;
+            }
         }
     }
     let source = if sel.values_lists.is_empty() {
@@ -12194,6 +12213,8 @@ fn plan_insert(
             Some(N::List(l)) => &l.items,
             _ => return Err(Error::Unsupported("this VALUES form".into())),
         };
+        // A value for a generated column is refused by the rewriter
+        // (`rewriteTargetListIU`), after every row has been analysed.
         for (item, target) in items.iter().zip(&targets) {
             if let Some(column) = def.column(target) {
                 if column.extra.get_str("generated").is_ok()
@@ -12201,7 +12222,6 @@ fn plan_insert(
                 {
                     return Err(generated_assignment(target, true));
                 }
-                check_assignment_type(column, item)?;
             }
         }
         // A `DEFAULT` item leaves its column out of the row, so the column's

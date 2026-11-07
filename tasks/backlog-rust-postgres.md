@@ -1589,17 +1589,23 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **A column reference in an INSERT's VALUES is refused as a gap.**
-      `insert into e values (bb)` and `insert into e values (1, 'x'), (bb,
-      'y')` answer `0A000 ColumnRef is not supported yet`; PostgreSQL
-      15.19 analyses VALUES in the INSERT's own level, where the target
-      is in the range table but not visible, and answers `42703 column
-      "bb" does not exist` (HINT `Perhaps you meant to reference the
-      column "e.b".`). A client matching on the class reads a missing
-      feature where it made a mistake. Measured on a private 15.19
-      cluster (found while working RP-408).
-      Backlog-ID: RP-415
-      Verify: tests/backlog/test_rp_column_errors.py::test_insert_values_column_reference
+- [ ] **A subquery's qualifier naming no FROM entry is not 42P01.**
+      PostgreSQL 15.19 refuses `select (select x.a from s limit 1)` and
+      `select 1 from k where exists (select x.a from s)` with 42P01
+      `missing FROM-clause entry for table "x"` at the reference (16, 38).
+      Here the first is 42883 `function \x1fcorrelated(integer, unknown,
+      ...) does not exist`, naming the correlated rewrite's internal
+      function, and the EXISTS answers rows. The qualifier looks to be
+      taken for an outer reference (`foreign_qualifier`) though no
+      enclosing level holds it; not yet confirmed in the code. In an INSERT's
+      VALUES (since RP-415) the message is right, but at the subquery's
+      position, 23, where PostgreSQL's is the reference's, 31 (`insert into
+      e values ((select x.a from s limit 1), 'x')`, and `invalid reference
+      to FROM-clause entry for table "e"` for `e.a`). Measured on a private
+      15.19 cluster with `e(a int, b text)`, `s(a int, c text)`, `k(a int,
+      b text, bc int)` (found while working RP-415).
+      Backlog-ID: RP-443
+      Verify: tests/backlog/test_rp_column_errors.py::test_subquery_qualifier_naming_nothing
 - [ ] **A missing output column is reported after the WHERE's errors.**
       PostgreSQL 15.19's `transformSelectStmt` transforms the target list
       before the WHERE, so `select nosuch from e where 1`, `... where a =
