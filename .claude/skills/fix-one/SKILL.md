@@ -202,7 +202,10 @@ git push origin HEAD:<branch>   # fast-forward only, never --force
   rebase, the same overlap test, push again. (A session gated three times
   for other lanes' unrelated commits, 150 min, on 2026-11-06.)
 - Check the landing: `git log origin/<branch> --oneline -1` is your commit.
-  Report `landed on <branch> at <sha>` (no PR number). Then step 8.
+  Put this line in your final report exactly, plain text, sha unformatted
+  (`scripts/fix_many.sh` reads it to decide whether the item landed, and
+  stops the batch when it cannot find it):
+  `landed on <branch> at <sha>` (no PR number). Then step 8.
 
 ```bash
 git status --short          # read it: no build output, no .scratch/
