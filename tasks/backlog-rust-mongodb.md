@@ -756,16 +756,25 @@ These are explicit non-goals. Don't add them without a reason.
       Measured 2026-10-27 and 2026-11-07.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
-- [ ] **WiredTiger 11's statistics are not on the line.** mongod 8.2.11's
-      WiredTiger keeps two that the one vendored here (mongodb-7.0.33) does
-      not: the share of a cache wait spent in interruptible eviction
-      (`timeWaitingMicros.cacheInterruptibleMicros`, which this engine
-      counts in `cacheMicros` with the rest), and a transaction's update
-      count (`data.txnNumUpdates`, beside `txnBytesDirty`). Measured
-      2026-10-27 (an insert in a transaction; eviction under a 256 MB
-      cache).
+- [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
+      mongod 8.2.11's WiredTiger splits a cache wait into the share spent
+      in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
+      and the mandatory rest; the one vendored here (mongodb-7.0.33) has no
+      interruptible eviction, and this engine counts the whole wait in
+      `cacheMicros`. Porting it means WiredTiger 11's `interruptible` path
+      through application eviction (`__wt_evict_app_assist_worker`,
+      `__evict_check_user_ok_with_eviction`) and mongod's interrupt
+      callback, not a counter. Measured 2026-10-27 (eviction under a 256 MB
+      cache). (Its other half, `txnNumUpdates`, closed 2026-11-07.)
       Backlog-ID: RM-364
-      Verify: tests/backlog/test_rm_355_364.py::test_a_transaction_statement_counts_its_updates
+      Verify: none -- no test drives mongod's eviction into an interruptible wait on demand
+- [ ] **A transaction's `update` and `delete` lines count dirty bytes.**
+      mongod 8.2.11's line for an `update` or a `delete` inside a
+      transaction carries no `txnBytesDirty` or `txnNumUpdates`, where an
+      insert's carries both; this server's counts the statement's share on
+      all three (measured 2026-11-07). Found while working RM-364.
+      Backlog-ID: RM-385
+      Verify: tests/backlog/test_rm_355_364.py::test_an_update_in_a_transaction_counts_no_dirty_bytes
 
 - [ ] **mongod's connection lines this server does not write.** Since
   RM-302 the log is mongod's structured log, and the lines this server

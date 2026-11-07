@@ -267,6 +267,8 @@ pub struct OperationCounts {
     pub handle_lock_wait_micros: i64,
     /// What a transaction still running has added to the cache.
     pub txn_bytes_dirty: i64,
+    /// The new updates a transaction still running has made.
+    pub txn_updates: i64,
     /// `None` when the operation inserted no index key: mongod prints the
     /// count only for an operation that inserted documents or keys.
     pub keys_inserted: Option<i64>,

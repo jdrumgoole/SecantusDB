@@ -572,6 +572,10 @@ pub struct OperationStats {
     /// engine keeps the count until the next one begins, so a session read
     /// after its transaction ended gives none.
     pub txn_bytes_dirty: i64,
+    /// `number of updates in this txn` (`cmake/patch_wt_txn_updates.py`,
+    /// WiredTiger 11's): the new updates a transaction still running has
+    /// linked into pages, kept and cleared as `txn_bytes_dirty` is.
+    pub txn_updates: i64,
 }
 
 impl OperationStats {
@@ -584,6 +588,7 @@ impl OperationStats {
         self.schema_lock_wait_micros += o.schema_lock_wait_micros;
         self.handle_lock_wait_micros += o.handle_lock_wait_micros;
         self.txn_bytes_dirty += o.txn_bytes_dirty;
+        self.txn_updates += o.txn_updates;
     }
 }
 
@@ -711,6 +716,7 @@ impl Session {
                 sys::WT_STAT_SESSION_LOCK_SCHEMA_WAIT => out.schema_lock_wait_micros = value,
                 sys::WT_STAT_SESSION_LOCK_DHANDLE_WAIT => out.handle_lock_wait_micros = value,
                 sys::WT_STAT_SESSION_TXN_BYTES_DIRTY => out.txn_bytes_dirty = value,
+                sys::WT_STAT_SESSION_TXN_UPDATES => out.txn_updates = value,
                 _ => {}
             }
         }
@@ -737,6 +743,7 @@ impl Session {
         let mut stats = self.statistics(true)?;
         if !self.in_txn.get() {
             stats.txn_bytes_dirty = 0;
+            stats.txn_updates = 0;
         }
         note_operation_stats(&stats);
         Ok(())
@@ -768,6 +775,7 @@ impl Drop for Session {
                     // with the close: it holds no dirty bytes.
                     Ok(mut stats) => {
                         stats.txn_bytes_dirty = 0;
+                        stats.txn_updates = 0;
                         note_operation_stats(&stats);
                     }
                     // Only the `Slow query` line's numbers are lost, but

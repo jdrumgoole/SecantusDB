@@ -424,6 +424,7 @@ pub(crate) fn storage_section(c: &OperationCounts) -> Option<Document> {
     put(&mut data, "timeReadingMicros", c.read_micros);
     put(&mut data, "timeWritingMicros", c.write_micros);
     put(&mut data, "txnBytesDirty", c.txn_bytes_dirty);
+    put(&mut data, "txnNumUpdates", c.txn_updates);
     let mut waiting = Document::new();
     put(&mut waiting, "cacheMicros", c.cache_wait_micros);
     put(&mut waiting, "schemaLock", c.schema_lock_wait_micros);

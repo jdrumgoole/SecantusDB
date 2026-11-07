@@ -1020,6 +1020,7 @@ pub const WT_STAT_SESSION_READ_TIME: u32 = 4004;
 pub const WT_STAT_SESSION_WRITE_TIME: u32 = 4005;
 pub const WT_STAT_SESSION_LOCK_SCHEMA_WAIT: u32 = 4006;
 pub const WT_STAT_SESSION_CACHE_TIME: u32 = 4007;
+pub const WT_STAT_SESSION_TXN_UPDATES: u32 = 4008;
 pub type WT_COLLATOR = __wt_collator;
 pub type WT_COMPRESSOR = __wt_compressor;
 pub type WT_CONFIG_ITEM = __wt_config_item;

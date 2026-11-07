@@ -59,6 +59,14 @@ set(_patches
     # The second behavioural patch: under method=fsync one sync is credited
     # with every commit already written, not only the syncing thread's own.
     "patch_wt_fsync_group.py|${WT_SOURCE_DIR}/src/log/log.c"
+    # Not a change of behaviour but of what is counted: WiredTiger 11's session
+    # statistic txn_updates (mongod's txnNumUpdates). One script, six files.
+    "patch_wt_txn_updates.py|${WT_SOURCE_DIR}/src/include/stat.h"
+    "patch_wt_txn_updates.py|${WT_SOURCE_DIR}/src/support/stat.c"
+    "patch_wt_txn_updates.py|${WT_SOURCE_DIR}/src/include/wiredtiger.in"
+    "patch_wt_txn_updates.py|${WT_SOURCE_DIR}/src/include/btree_inline.h"
+    "patch_wt_txn_updates.py|${WT_SOURCE_DIR}/src/include/serial_inline.h"
+    "patch_wt_txn_updates.py|${WT_SOURCE_DIR}/src/session/session_api.c"
 )
 
 foreach(_entry IN LISTS _patches)
