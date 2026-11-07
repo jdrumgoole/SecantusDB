@@ -172,11 +172,11 @@ def _running_bulk_write(client: Any) -> list:
     return [(o.get("op"), o.get("ns"), next(iter(o.get("command", {})), None)) for o in ops]
 
 
-@pytest.mark.backlog("RM-324")
+@pytest.mark.backlog_fixed("RM-324")
 def test_current_op_lists_a_bulk_write_under_its_op(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 lists a running `bulkWrite` as op `bulkWrite`, under
     the namespace and command of the op it is running (measured
-    2026-10-27). This server lists the whole command, as `command` on
+    2026-10-27). This server listed the whole command, as `command` on
     `admin.$cmd`."""
     theirs = _running_bulk_write(mongod_rs)
     assert theirs == [("bulkWrite", "live_interrupts.c", "update")], theirs

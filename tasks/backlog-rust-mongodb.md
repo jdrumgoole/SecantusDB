@@ -949,15 +949,21 @@ about forty such points; these are the ones measured.
       tests into the delete rather than repeat them.
       Backlog-ID: RM-323
       Verify: tests/backlog/test_rm_found_2026_10_27.py::test_a_killed_delete_many_keeps_the_batches_it_deleted, tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_out_of_time_keeps_the_documents_it_updated
-- [ ] **`$currentOp` lists a running `bulkWrite` as the whole command.**
-      mongod 8.2.11 lists it as op `bulkWrite`, under the namespace of the
-      op it is running and that op as its `command` (`{update: 0, filter:
-      ...}` on `db.c`); this server lists op `command` on `admin.$cmd` with
-      the whole `bulkWrite` command. Found 2026-10-27 while comparing kills
-      (RM-313): a `$match` on the op's namespace finds mongod's and not this
-      server's.
-      Backlog-ID: RM-324
-      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_current_op_lists_a_bulk_write_under_its_op
+- [ ] **A write tests its filter against each document twice.** mongod
+      tests an update's or a delete's filter once per document, so writing
+      one document whose filter is slow takes as long as a `find` of it
+      (mongod 8.2.1, 2026-11-07: 1.0 s for each). This server takes twice
+      as long (find 0.98 s, update 2.07 s, delete 2.19 s), so a write fits
+      in half the `maxTimeMS` it does on mongod. The handler's selection
+      read (`write_selection`, `explain/order.rs`) tests each candidate,
+      then the storage write (`candidate_docs` and the single / chunked
+      paths in `secantus-storage/src/lib.rs`) re-reads the pinned rows and
+      tests them again; the chunk step already skips a re-test when the
+      bytes are unchanged since its own scan. The work is to carry the
+      selection's verdicts (or its bytes) into the write. Overlaps RM-323,
+      which names the deleteMany case as an interrupt bug.
+      Verify: tests/backlog/test_rm_found_2026_11_07d.py::test_a_write_tests_each_document_once
+      Backlog-ID: RM-391
 - [ ] **`$near` returns documents tied at one distance in the macOS build's
       order, not the Linux build's.** mongod's builds disagree: for four
       points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,
