@@ -93,9 +93,14 @@ fn not_allowed_in(srfs: &[&pg_query::protobuf::FuncCall], what: &str) -> Result<
 
 /// The location PostgreSQL's `exprLocation` gives an expression: its
 /// leftmost token for an operator expression.
-fn leftmost(n: &pg_query::protobuf::Node) -> i32 {
+pub(crate) fn leftmost(n: &pg_query::protobuf::Node) -> i32 {
     match n.node.as_ref() {
-        Some(N::AExpr(e)) => e.lexpr.as_deref().map_or(e.location, leftmost),
+        // `leftmostLoc` of the operator and its left operand: a NULLIF's
+        // keyword stands before its first argument.
+        Some(N::AExpr(e)) => match e.lexpr.as_deref().map(leftmost) {
+            Some(l) if l >= 0 && (e.location < 0 || l < e.location) => l,
+            _ => e.location,
+        },
         Some(N::BoolExpr(b)) => b.args.first().map_or(b.location, leftmost),
         Some(N::TypeCast(tc)) => tc.arg.as_deref().map_or(tc.location, leftmost),
         Some(N::FuncCall(f)) => f.location,

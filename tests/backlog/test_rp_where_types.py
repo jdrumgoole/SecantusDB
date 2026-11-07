@@ -32,9 +32,10 @@ def _answers(server: Any, queries: list[str]) -> list[tuple]:
         return [pg_answer(c, q) for q in queries]
 
 
-@pytest.mark.backlog("RP-418")
+@pytest.mark.backlog_fixed("RP-418")
 def test_where_must_be_boolean(rust_pg: Any) -> None:
-    """`coerce_to_boolean`: a WHERE of another type is 42804, never rows."""
+    """`coerce_to_boolean`: a WHERE of another type is 42804, never rows.
+    Both counted 0 before RP-418."""
     assert _answers(
         rust_pg,
         [
@@ -52,6 +53,84 @@ def test_where_must_be_boolean(rust_pg: Any) -> None:
             "42804",
             "argument of WHERE must be type boolean, not type integer",
         ),
+    ]
+
+
+def _positioned(server: Any, queries: list[str]) -> list[tuple]:
+    """Each query's answer, an error with its 1-based `position`."""
+    with psycopg.connect(_dsn(server) + " dbname=postgres", autocommit=True) as c:
+        c.execute("drop database if exists rp418_where")
+        c.execute("create database rp418_where")
+    out: list[tuple] = []
+    with psycopg.connect(_dsn(server) + " dbname=rp418_where", autocommit=True) as c:
+        for s in [*_SETUP, "create table k (a int, b text)", "insert into k values (1, 'x')"]:
+            c.execute(s)
+        for q in queries:
+            try:
+                cur = c.execute(q)
+                out.append(("ok", cur.fetchall() if cur.description else cur.statusmessage))
+            except psycopg.Error as e:
+                out.append(("err", e.sqlstate, str(e).splitlines()[0], e.diag.statement_position))
+    return out
+
+
+@pytest.mark.backlog_fixed("RP-418")
+def test_clause_must_be_boolean_everywhere(rust_pg: Any) -> None:
+    """The same check in every clause shape that reaches it -- a column, an
+    expression, a function, a subquery's WHERE, an UPDATE's and a DELETE's,
+    HAVING -- at the clause's leftmost token, while a boolean clause still
+    answers. Each answer measured on a private PostgreSQL 15.19 cluster."""
+    assert _positioned(
+        rust_pg,
+        [
+            "select count(*) from e where a",
+            "select count(*) from e where (a)::text",
+            "select count(*) from e where a + 1",
+            "select count(*) from e where length(b)",
+            "select count(*) from e where nullif(a, 1)",
+            "select count(*) from e where (select 1)",
+            "select count(*) from e where exists (select 1 from k where k.a)",
+            "select count(*) from e join k on e.a = k.a where k.b",
+            "update e set a = a where b",
+            "delete from e where a",
+            "select a from e group by a having a",
+            "select count(*) from e having count(*)",
+            "select count(*) from e where a::text = 'v1'",
+            "select count(*) from e where case when a > 1 then true end",
+            "select count(*) from e where null",
+            "explain (costs off) select * from e where a::text",
+        ],
+    ) == [
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "30"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type text", "31"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "30"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "30"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "30"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "30"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "60"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type text", "50"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type text", "26"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type integer", "21"),
+        ("err", "42804", "argument of HAVING must be type boolean, not type integer", "35"),
+        ("err", "42804", "argument of HAVING must be type boolean, not type bigint", "31"),
+        ("ok", [(0,)]),
+        ("ok", [(9,)]),
+        ("ok", [(0,)]),
+        ("err", "42804", "argument of WHERE must be type boolean, not type text", "43"),
+    ]
+
+
+@pytest.mark.backlog("RP-424")
+def test_where_untyped_literal_reads_as_boolean(rust_pg: Any) -> None:
+    """A bare string literal is of type UNKNOWN, and `coerce_to_boolean`
+    reads it as a boolean: `where 't'` keeps every row and `where 'x'` is
+    22P02, not 42804 `not type text`."""
+    assert _answers(
+        rust_pg,
+        ["select count(*) from e where 't'", "select count(*) from e where 'x'"],
+    ) == [
+        ("ok", [(10,)]),
+        ("err", "22P02", 'invalid input syntax for type boolean: "x"'),
     ]
 
 
