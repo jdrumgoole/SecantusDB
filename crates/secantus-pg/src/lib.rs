@@ -119,6 +119,7 @@ mod schema_rows;
 mod scram_binding;
 mod serializable;
 mod server;
+mod sql_fn_params;
 mod ssi;
 mod statistic;
 mod stream_join;
@@ -1530,379 +1531,6 @@ pub(crate) fn normalize_function_doc(d: &Document) -> Document {
             .collect::<Vec<_>>(),
     );
     out
-}
-
-/// A SQL function body's references to its parameters BY NAME, rewritten to
-/// `$n` -- token by token, so a column that happens to share a name inside
-/// a string literal is untouched.
-///
-/// A name qualified by the function's own name, `fname.p`, is the
-/// parameter `p` too, as `sql_fn_post_column_ref` resolves it, at any depth
-/// of subquery -- unless a relation of the statement known as `fname` may
-/// have a column `p`: PostgreSQL gives a column the reference resolves to
-/// precedence over the parameter, so such a reference is left to the
-/// planner. `table_has_column(table, column)` answers for a stored table,
-/// `None` for a name that is not one.
-fn bind_parameter_names(
-    sql: &str,
-    fname: &str,
-    names: &[String],
-    types: &[String],
-    table_has_column: &dyn Fn(&str, &str) -> Option<bool>,
-) -> String {
-    let Ok(scan) = pg_query::scan(sql) else {
-        return sql.to_string();
-    };
-    let mut out = String::new();
-    let mut cursor = 0usize;
-    let tokens = scan.tokens;
-    let text = |i: usize| {
-        tokens
-            .get(i)
-            .and_then(|t| sql.get(t.start as usize..t.end as usize))
-    };
-    let is_word = |i: usize| {
-        tokens.get(i).is_some_and(|t| {
-            t.token == pg_query::protobuf::Token::Ident as i32
-                || t.keyword_kind == pg_query::protobuf::KeywordKind::UnreservedKeyword as i32
-        })
-    };
-    let param_at = |i: usize| -> Option<usize> {
-        let lower = text(i)?.trim_matches('"').to_ascii_lowercase();
-        names.iter().position(|n| !n.is_empty() && *n == lower)
-    };
-    let bound = |pos: usize| {
-        format!(
-            "${}::{}",
-            pos + 1,
-            types.get(pos).map_or("text", String::as_str)
-        )
-    };
-    let mut i = 0usize;
-    while i < tokens.len() {
-        let (start, end) = (tokens[i].start as usize, tokens[i].end as usize);
-        let prev_dot = i > 0 && text(i - 1) == Some(".");
-        let next = text(i + 1);
-        if !is_word(i) || prev_dot || next == Some("(") {
-            i += 1;
-            continue;
-        }
-        if next == Some(".") {
-            // `fname.p`, but not `fname.p.f` (a field of a composite
-            // parameter) nor `fname.p(` (a schema-qualified call).
-            let qualified = !fname.is_empty()
-                && text(i).map(normalize_identifier).as_deref() == Some(fname)
-                && is_word(i + 2)
-                && !matches!(text(i + 3), Some(".") | Some("("));
-            if let Some(pos) = qualified.then(|| param_at(i + 2)).flatten() {
-                let column = names[pos].as_str();
-                if !relation_may_have_column(sql, fname, column, table_has_column) {
-                    out.push_str(&sql[cursor..start]);
-                    out.push_str(&bound(pos));
-                    cursor = tokens[i + 2].end as usize;
-                    i += 3;
-                    continue;
-                }
-            }
-            i += 1;
-            continue;
-        }
-        if let Some(pos) = param_at(i) {
-            out.push_str(&sql[cursor..start]);
-            out.push_str(&bound(pos));
-            cursor = end;
-        }
-        i += 1;
-    }
-    out.push_str(&sql[cursor..]);
-    out
-}
-
-/// A SQL function body's parameters bound: by name
-/// ([`bind_parameter_names`]), then a field of a composite parameter
-/// ([`bind_parameter_fields`]).
-fn bind_parameters(
-    sql: &str,
-    fname: &str,
-    names: &[String],
-    types: &[String],
-    table_has_column: &dyn Fn(&str, &str) -> Option<bool>,
-    type_has_field: &dyn Fn(&str, &str) -> bool,
-) -> String {
-    let named = bind_parameter_names(sql, fname, names, types, table_has_column);
-    bind_parameter_fields(
-        &named,
-        fname,
-        names,
-        types,
-        table_has_column,
-        type_has_field,
-    )
-}
-
-/// A field of a composite parameter, `p.f` or `fname.p.f`, rewritten to
-/// `($n::type).f`, as `sql_fn_post_column_ref` resolves a column reference
-/// the parser found no column for: a two-part name is `fname.p` when that
-/// names a parameter (bound by [`bind_parameter_names`]), else the field
-/// `f` of the parameter `p`; a three-part one is the field `f` of `p`
-/// qualified by the function's name. Only a reference PostgreSQL would
-/// resolve so is rewritten:
-///
-/// - a relation of the statement known as `p` that may have a column `f`
-///   (for `fname.p.f`, a table `fname.p`) is the column, which comes first;
-/// - `f` must be a field of the parameter's type (`type_has_field`): over
-///   any other the hook's `ParseFuncOrColumn` finds nothing and the
-///   reference stays the parser's 42P01.
-///
-/// Runs over [`bind_parameter_names`]' output, so a type name it wrote is
-/// never taken for a parameter's name.
-fn bind_parameter_fields(
-    sql: &str,
-    fname: &str,
-    names: &[String],
-    types: &[String],
-    table_has_column: &dyn Fn(&str, &str) -> Option<bool>,
-    type_has_field: &dyn Fn(&str, &str) -> bool,
-) -> String {
-    use pg_query::protobuf::node::Node as N;
-    use pg_query::NodeRef as R;
-    if names.iter().all(String::is_empty) {
-        return sql.to_string();
-    }
-    let (Ok(tree), Ok(scan)) = (pg_query::parse(sql), pg_query::scan(sql)) else {
-        return sql.to_string();
-    };
-    let nodes = tree.protobuf.nodes();
-    let param = |n: &str| names.iter().position(|p| !p.is_empty() && p == n);
-    let field_of = |pos: usize, f: &str| types.get(pos).is_some_and(|t| type_has_field(t, f));
-    // A stored table `schema.relation` the statement reads that may have
-    // `column`: the column a three-part name names first.
-    let schema_table_may_have = |schema: &str, relation: &str, column: &str| {
-        nodes.iter().any(|(n, _, _, _)| match n {
-            R::RangeVar(v) => {
-                v.schemaname == schema
-                    && v.relname == relation
-                    && table_has_column(&format!("{schema}.{relation}"), column).unwrap_or(true)
-            }
-            _ => false,
-        })
-    };
-    // (byte offset of the reference, its number of names, the parameter).
-    let mut found: Vec<(usize, usize, usize)> = Vec::new();
-    for (n, _, _, _) in &nodes {
-        let R::ColumnRef(c) = n else {
-            continue;
-        };
-        let parts: Option<Vec<&str>> = c
-            .fields
-            .iter()
-            .map(|f| match f.node.as_ref() {
-                Some(N::String(s)) => Some(s.sval.as_str()),
-                _ => None,
-            })
-            .collect();
-        let hit = match parts.as_deref() {
-            Some([p, f]) if !(*p == fname && param(f).is_some()) => param(p).filter(|&pos| {
-                field_of(pos, f) && !relation_may_have_column(sql, p, f, table_has_column)
-            }),
-            Some([q, p, f]) if !fname.is_empty() && *q == fname => {
-                param(p).filter(|&pos| field_of(pos, f) && !schema_table_may_have(q, p, f))
-            }
-            _ => None,
-        };
-        if let (Some(pos), Ok(at)) = (hit, usize::try_from(c.location)) {
-            found.push((at, parts.map_or(0, |p| p.len()), pos));
-        }
-    }
-    if found.is_empty() {
-        return sql.to_string();
-    }
-    found.sort_unstable();
-    let tokens = scan.tokens;
-    let text = |i: usize| {
-        tokens
-            .get(i)
-            .and_then(|t| sql.get(t.start as usize..t.end as usize))
-    };
-    let mut out = String::new();
-    let mut cursor = 0usize;
-    for (at, len, pos) in found {
-        let Some(first) = tokens.iter().position(|t| t.start as usize == at) else {
-            continue;
-        };
-        // The names and their dots: `p . f`, or `fname . p . f`.
-        let last_dot = first + 2 * len - 3;
-        if at < cursor
-            || (first + 1..=last_dot)
-                .step_by(2)
-                .any(|i| text(i) != Some("."))
-        {
-            continue;
-        }
-        out.push_str(&sql[cursor..at]);
-        out.push_str(&format!(
-            "(${}::{}).",
-            pos + 1,
-            types.get(pos).map_or("text", String::as_str)
-        ));
-        cursor = tokens[last_dot].end as usize;
-    }
-    out.push_str(&sql[cursor..]);
-    out
-}
-
-/// An identifier token as PostgreSQL folds it: a quoted one as written
-/// (`""` an escaped quote), any other in lower case.
-fn normalize_identifier(raw: &str) -> String {
-    match raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        Some(inner) => inner.replace("\"\"", "\""),
-        None => raw.to_ascii_lowercase(),
-    }
-}
-
-/// Whether a relation of `sql` known by `name` -- a table, view or CTE it
-/// reads or writes, a FROM subquery, function or join -- may have the
-/// column `column`. A stored table's columns are read from the catalog, a
-/// CTE's or a FROM subquery's figured from its column aliases or target
-/// list ([`select_output_names`]); any other relation of that name may
-/// have it, and so may every relation of a statement that does not parse,
-/// so nothing is rewritten.
-fn relation_may_have_column(
-    sql: &str,
-    name: &str,
-    column: &str,
-    table_has_column: &dyn Fn(&str, &str) -> Option<bool>,
-) -> bool {
-    use pg_query::protobuf::node::Node as N;
-    use pg_query::NodeRef as R;
-    let Ok(tree) = pg_query::parse(sql) else {
-        return true;
-    };
-    let nodes = tree.protobuf.nodes();
-    let ctes: Vec<&pg_query::protobuf::CommonTableExpr> = nodes
-        .iter()
-        .filter_map(|(n, _, _, _)| match n {
-            R::CommonTableExpr(c) => Some(*c),
-            _ => None,
-        })
-        .collect();
-    let has = |names: Option<Vec<String>>| names.is_none_or(|n| n.iter().any(|c| c == column));
-    let aliased = |a: &pg_query::protobuf::Alias| -> Option<Vec<String>> {
-        (!a.colnames.is_empty()).then(|| {
-            a.colnames
-                .iter()
-                .filter_map(|c| match c.node.as_ref() {
-                    Some(N::String(s)) => Some(s.sval.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-    };
-    let table_may_have = |v: &pg_query::protobuf::RangeVar| {
-        if v.schemaname.is_empty() {
-            // A CTE of that name: its column aliases, else its query's
-            // output names. (Which of two same-named CTEs is in scope is
-            // not told apart: either may have it.)
-            let same: Vec<_> = ctes.iter().filter(|c| c.ctename == v.relname).collect();
-            if !same.is_empty() {
-                let renamed = v.alias.as_ref().and_then(aliased);
-                return same.iter().any(|c| {
-                    has(renamed.clone().or_else(|| {
-                        let own = aliased(&pg_query::protobuf::Alias {
-                            aliasname: String::new(),
-                            colnames: c.aliascolnames.clone(),
-                        });
-                        own.or_else(|| select_output_names(c.ctequery.as_deref()?))
-                    }))
-                });
-            }
-        }
-        let key = if v.schemaname.is_empty() || v.schemaname == "public" {
-            v.relname.clone()
-        } else {
-            format!("{}.{}", v.schemaname, v.relname)
-        };
-        table_has_column(&key, column).unwrap_or(true)
-    };
-    let alias_is =
-        |a: &Option<pg_query::protobuf::Alias>| a.as_ref().is_some_and(|a| a.aliasname == name);
-    // An unaliased function in FROM is known by the function's name.
-    let call_named = |item: &pg_query::protobuf::Node| -> bool {
-        let Some(N::List(l)) = item.node.as_ref() else {
-            return false;
-        };
-        let Some(N::FuncCall(call)) = l.items.first().and_then(|c| c.node.as_ref()) else {
-            return false;
-        };
-        matches!(
-            call.funcname.last().and_then(|s| s.node.as_ref()),
-            Some(N::String(s)) if s.sval == name
-        )
-    };
-    nodes.iter().any(|(n, _, _, _)| match n {
-        R::RangeVar(v) => {
-            let known_as = match v.alias.as_ref().filter(|a| !a.aliasname.is_empty()) {
-                Some(a) => a.aliasname.as_str(),
-                None => v.relname.as_str(),
-            };
-            known_as == name && table_may_have(v)
-        }
-        R::RangeSubselect(s) => {
-            alias_is(&s.alias)
-                && has(s
-                    .alias
-                    .as_ref()
-                    .and_then(aliased)
-                    .or_else(|| select_output_names(s.subquery.as_deref()?)))
-        }
-        R::RangeFunction(f) => match &f.alias {
-            Some(_) => alias_is(&f.alias),
-            None => f.functions.iter().any(call_named),
-        },
-        R::JoinExpr(j) => alias_is(&j.alias) || alias_is(&j.join_using_alias),
-        R::RangeTableFunc(f) => alias_is(&f.alias),
-        _ => false,
-    })
-}
-
-/// A query's output column names as PostgreSQL's analyser names them: a
-/// target's alias, else `FigureColname`; a VALUES list's `column1`, ...; a
-/// set operation's from its first branch. `None` when one cannot be told
-/// (a star, a shape not figured).
-fn select_output_names(query: &pg_query::protobuf::Node) -> Option<Vec<String>> {
-    match query.node.as_ref()? {
-        pg_query::protobuf::node::Node::SelectStmt(s) => select_stmt_output_names(s),
-        _ => None,
-    }
-}
-
-fn select_stmt_output_names(s: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
-    use pg_query::protobuf::node::Node as N;
-    if let Some(first) = s.larg.as_deref() {
-        return select_stmt_output_names(first);
-    }
-    if let Some(row) = s.values_lists.first() {
-        let Some(N::List(l)) = row.node.as_ref() else {
-            return None;
-        };
-        return Some((1..=l.items.len()).map(|i| format!("column{i}")).collect());
-    }
-    s.target_list
-        .iter()
-        .map(|t| match t.node.as_ref()? {
-            N::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
-            N::ResTarget(rt) => {
-                let val = rt.val.as_deref()?;
-                if let Some(N::ColumnRef(c)) = val.node.as_ref() {
-                    if matches!(c.fields.last()?.node.as_ref()?, N::AStar(_)) {
-                        return None;
-                    }
-                }
-                secantus_pgplan::figure_colname(val)
-            }
-            _ => None,
-        })
-        .collect()
 }
 
 /// A stored function document as the planner's `UserFn`.
@@ -14396,6 +14024,72 @@ impl PgHandler {
     /// A `LANGUAGE sql` function: its statements run in order with the
     /// arguments bound (by `$n` or by parameter name); the LAST one's result
     /// is the function's.
+    /// The columns of what the function `name` returns when it is called
+    /// in FROM, over all its overloads (built-in and the user's):
+    /// `addRangeTableEntryForFunction`'s result description, from its OUT
+    /// parameters, its composite result type, or its one scalar column.
+    fn function_result_columns(&self, name: &str) -> sql_fn_params::FnColumns {
+        use sql_fn_params::FnColumns;
+        let mut shapes: Vec<FnColumns> = Vec::new();
+        for (ret, out) in catalog_facts::builtin_result_columns(name) {
+            let composite = catalog_facts::builtin()
+                .types
+                .get(ret)
+                .is_some_and(|t| t.typtype == 'c');
+            shapes.push(if !out.is_empty() {
+                FnColumns::Named(out.clone())
+            } else if *ret == 2249 || composite {
+                FnColumns::Unknown
+            } else {
+                FnColumns::Scalar
+            });
+        }
+        if let Ok(docs) = self.type_catalog_docs(Self::FUNCTION_COLLECTION) {
+            for d in docs.iter().filter(|d| d.get_str("name") == Ok(name)) {
+                let named: Vec<String> = d
+                    .get_array("table_columns")
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(|c| c.as_document()?.get_str("name").ok())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ret = d.get_str("return_tag").unwrap_or_default();
+                shapes.push(if !named.is_empty() {
+                    FnColumns::Named(named)
+                } else if ret == "record" {
+                    FnColumns::Unknown
+                } else if let Some(t) = self.lookup(ret) {
+                    FnColumns::Named(t.columns.iter().map(|c| c.name.clone()).collect())
+                } else if let Some((_, _, fields)) = self
+                    .composites()
+                    .ok()
+                    .and_then(|c| c.into_iter().find(|(n, _, _)| n == ret))
+                {
+                    FnColumns::Named(fields.into_iter().map(|(n, _)| n).collect())
+                } else {
+                    FnColumns::Scalar
+                });
+            }
+        }
+        // Overloads that disagree leave the columns to the call's own.
+        let mut names: Vec<String> = Vec::new();
+        let (mut scalar, mut unknown) = (false, shapes.is_empty());
+        for s in shapes {
+            match s {
+                FnColumns::Scalar => scalar = true,
+                FnColumns::Named(n) => names.extend(n),
+                FnColumns::Unknown => unknown = true,
+            }
+        }
+        match (scalar, names.is_empty(), unknown) {
+            (_, _, true) | (true, false, _) => FnColumns::Unknown,
+            (true, true, false) => FnColumns::Scalar,
+            (false, _, false) => FnColumns::Named(names),
+        }
+    }
+
     fn call_sql_function(
         &self,
         doc: &Document,
@@ -14413,8 +14107,19 @@ impl PgHandler {
         // The name a parameter may be qualified by (`fname.p`), and what
         // decides whether a relation of that name has the column instead.
         let fname = doc.get_str("name").unwrap_or_default();
-        let table_has_column =
-            |table: &str, column: &str| self.lookup(table).map(|d| d.column(column).is_some());
+        let table_has_column = |table: &str, column: &str| match self.lookup(table) {
+            Some(d) => Some(d.column(column).is_some()),
+            // A view's columns are its query's output.
+            None => {
+                let definition = self
+                    .view_doc(table)?
+                    .get_str("definition")
+                    .ok()?
+                    .to_string();
+                let fields = self.describe_fields(&definition, 0, &[]).ok()??;
+                Some(fields.iter().any(|f| f.name() == column))
+            }
+        };
         // Whether a parameter's type is a row type with that field: a
         // table's (or view's) row type, or a composite of CREATE TYPE.
         let type_has_field = |ty: &str, field: &str| {
@@ -14426,6 +14131,12 @@ impl PgHandler {
                         .any(|(n, _, fields)| n == bare && fields.iter().any(|(f, _)| f == field))
                 }),
             }
+        };
+        let function_columns = |name: &str| self.function_result_columns(name);
+        let look = sql_fn_params::Lookups {
+            table_has_column: &table_has_column,
+            function_columns: &function_columns,
+            type_has_field: &type_has_field,
         };
         let body = doc.get_str("body").unwrap_or_default();
         let statements = pg_query::split_with_parser(body).map_err(|e| {
@@ -14451,14 +14162,8 @@ impl PgHandler {
         // runs, as `functions.c` checks it at the function's startup.
         if NON_VOLATILE.with(|v| v.get()) && doc.get_str("call_sql").is_err() {
             for stmt in &statements {
-                let sql = bind_parameters(
-                    stmt,
-                    fname,
-                    &names,
-                    &u.arg_types,
-                    &table_has_column,
-                    &type_has_field,
-                );
+                let sql =
+                    sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
                 let plan = || {
                     host.plan(&sql, args, &u.arg_types)
                         .ok()
@@ -14499,14 +14204,7 @@ impl PgHandler {
                 && doc.get_str("volatility").unwrap_or("volatile") == "immutable");
         let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
-            let sql = bind_parameters(
-                stmt,
-                fname,
-                &names,
-                &u.arg_types,
-                &table_has_column,
-                &type_has_field,
-            );
+            let sql = sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
             let head = sql.trim_start().to_ascii_lowercase();
             let is_query = head.starts_with("select")
                 || head.starts_with("with")
@@ -55893,143 +55591,4 @@ fn first_occurrences(start: Vec<String>, more: impl IntoIterator<Item = String>)
         }
     }
     fields
-}
-
-#[cfg(test)]
-mod function_parameter_tests {
-    //! A SQL function body's `fname.p` bound as its parameter `p`
-    //! (`sql_fn_post_column_ref`), unless a relation known as `fname` has a
-    //! column `p`, which PostgreSQL resolves first. Each case's answer was
-    //! measured on PostgreSQL 15.19 (RP-451).
-    use super::*;
-
-    /// A catalog of two tables, `fq5(p int)` and `fe(a int, b text)`.
-    fn has_column(table: &str, column: &str) -> Option<bool> {
-        match table {
-            "fq5" => Some(column == "p"),
-            "fe" => Some(matches!(column, "a" | "b")),
-            _ => None,
-        }
-    }
-
-    fn bind(sql: &str) -> String {
-        bind_parameter_names(sql, "f", &["p".into()], &["int4".into()], &has_column)
-    }
-
-    #[test]
-    fn a_qualified_parameter_is_bound_at_any_depth() {
-        assert_eq!(bind("select f.p"), "select $1::int4");
-        assert_eq!(bind("select F . P + \"f\".p"), "select $1::int4 + $1::int4");
-        assert_eq!(
-            bind("select exists (select f.p from fs)"),
-            "select exists (select $1::int4 from fs)"
-        );
-        // An alias of that name without the column: the parameter (fal(5)
-        // answered 5), as for a subquery, VALUES or set operation without it.
-        assert_eq!(bind("select f.p from fe f"), "select $1::int4 from fe f");
-        assert_eq!(
-            bind("select f.p from (values (4)) f"),
-            "select $1::int4 from (values (4)) f"
-        );
-        assert_eq!(
-            bind("select f.p from (select 1 as z union select 2) f"),
-            "select $1::int4 from (select 1 as z union select 2) f"
-        );
-    }
-
-    #[test]
-    fn a_column_of_that_name_comes_first() {
-        // `select fq5.p from fq5` in `fq5(p int)` answered the column, 99.
-        let fq5 = bind_parameter_names(
-            "select fq5.p from fq5",
-            "fq5",
-            &["p".into()],
-            &["int4".into()],
-            &has_column,
-        );
-        assert_eq!(fq5, "select fq5.p from fq5");
-        for sql in [
-            "select f.p from fq5 f",
-            "select f.p from (select * from fq5) f",
-            // A relation whose columns are not known here may have it.
-            "select f.p from some_view f",
-            "select f.p from g() f",
-        ] {
-            assert_eq!(bind(sql), sql);
-        }
-    }
-
-    #[test]
-    fn other_dotted_names_are_left() {
-        for sql in [
-            "select 'f.p'",
-            "select f.q",
-            "select g.p from g",
-            // A field of a composite parameter, and a qualified call.
-            "select f.p.a",
-            "select f.p(1)",
-        ] {
-            assert_eq!(bind(sql), sql);
-        }
-    }
-
-    /// `f(r fe, p int)`'s fields, over the catalog above plus a table `r(a
-    /// int)`: a row type's fields are `fe`'s (RP-462).
-    fn fields(sql: &str) -> String {
-        let has = |t: &str, c: &str| match t {
-            "r" => Some(c == "a"),
-            "s.r" => Some(c == "a"),
-            _ => has_column(t, c),
-        };
-        let type_has_field = |t: &str, f: &str| has_column(t, f).unwrap_or(false);
-        bind_parameter_fields(
-            sql,
-            "f",
-            &["r".into(), "p".into()],
-            &["fe".into(), "int4".into()],
-            &has,
-            &type_has_field,
-        )
-    }
-
-    #[test]
-    fn a_composite_parameters_field_is_read() {
-        // gr1 / gr2 answered 2 for row(2, 'z')::fe on PostgreSQL 15.19.
-        assert_eq!(fields("select r.a"), "select ($1::fe).a");
-        assert_eq!(fields("select f.r.a"), "select ($1::fe).a");
-        assert_eq!(fields("select R . \"b\""), "select ($1::fe). \"b\"");
-        assert_eq!(
-            fields("select count(*) from fe where fe.a = r.a"),
-            "select count(*) from fe where fe.a = ($1::fe).a"
-        );
-        // A relation `r` without the field: the parameter's (gr6 answered
-        // 'z'); a schema's `s.r` is not `f.r`.
-        assert_eq!(fields("select r.b from r"), "select ($1::fe).b from r");
-        assert_eq!(
-            fields("select f.r.a from s.r"),
-            "select ($1::fe).a from s.r"
-        );
-    }
-
-    #[test]
-    fn a_column_or_a_missing_field_is_left() {
-        for sql in [
-            // A relation known as `r` with the column comes first (gr5
-            // answered the table's 99), as does a table `f.r`.
-            "select r.a from r",
-            "select r.a from fe r",
-            "select r.a from (select 1 as a) r",
-            "select f.r.a from f.r",
-            // No such field, or not a composite: the parser's 42P01.
-            "select r.zz",
-            "select p.a",
-            // Not a reference to a field.
-            "select 'r.a'",
-            "select r.a.b",
-            "select g.r.a",
-            "select r.*",
-        ] {
-            assert_eq!(fields(sql), sql);
-        }
-    }
 }

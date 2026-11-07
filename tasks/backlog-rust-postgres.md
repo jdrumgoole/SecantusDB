@@ -1876,21 +1876,6 @@ and `fs(a int, c text)`, one row each.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 `fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
 
-- [ ] **A SQL function's bare parameter name is replaced wherever it is a
-      word.** PostgreSQL resolves an unqualified name as a column first and
-      as a parameter only when no column of that name is in scope
-      (`sql_fn_post_column_ref`), and a name that is not a reference at all
-      -- an output alias -- is never a parameter: `gb(a int)` with the body
-      `select a from fe` answers fe's 1 for `gb(7)`, and `gal(p int)` with
-      `select 1 as p` answers 1. Here every identifier token naming a
-      parameter becomes `$n` (`bind_parameter_names`), so the first answers
-      7 and the second is 42601 `syntax error at or near "$1"`. The
-      faithful fix resolves a parameter where the planner fails to resolve
-      a column (the post-columnref hook), not by token; RP-451 resolved the
-      qualified form `fname.p` by token with a catalog check, which that
-      hook would replace.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_bare_parameter_name
-      Backlog-ID: RP-461
 - [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
       declare x int := 3; begin return blk.x + p; end` answers 10 for
       `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table
@@ -1908,6 +1893,32 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       succeeds and the error waits for the first call.
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
+
+## Found while working RP-461 (2026-11-07)
+
+- [ ] **A LATERAL subquery's bare name for an earlier FROM item's column is
+      not found.** `select x from fe, lateral (select b as x) s` answers
+      `x` on PostgreSQL 15.19 and `select x from fe join lateral (select b
+      || c as x from fs) s on true` `xy`; here each is 42703 `column "b"
+      does not exist`. The qualified form (`lateral (select fe.b as x)`)
+      and a LATERAL function (`lateral generate_series(a, a + 1)`) already
+      read it. A SQL function's body now resolves its bare names the same
+      way (RP-461), so a parameter named like such a column is no longer
+      read in its place, and the body's statement meets this 42703 instead.
+      Measured on PostgreSQL 15.19.
+      Backlog-ID: RP-478
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_lateral_subquery_reads_an_earlier_item_by_bare_name
+- [ ] **A function with one OUT parameter names its FROM column after the
+      function.** `gto(out t int)` and `gtt() returns table (t int)` give
+      `select * from gto()` one column `t` on PostgreSQL 15.19, so `select
+      t from gto()`, `select g.t from gto() as g` and `select t from gtt()`
+      answer their row; here the column is `gto` (or the alias `g`), and
+      each is 42703. Two or more OUT columns are already named by their
+      parameters. A SQL function body naming such a column now meets the
+      same 42703, where it read a parameter of that name before RP-461.
+      Measured on PostgreSQL 15.19.
+      Backlog-ID: RP-477
+      Verify: tests/backlog/test_rp_function_bodies.py::test_one_out_parameter_names_the_column
 
 ## Found while working RP-472 (2026-11-07)
 

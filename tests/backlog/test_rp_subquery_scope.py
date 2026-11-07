@@ -13,7 +13,8 @@ working RP-454, RP-469 (a FROM item named as a table an aliased JOIN hides
 is refused), RP-470 (a whole-row reference to a joined table), RP-471
 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an aliased JOIN)
 and RP-468 (a correlated subquery reading a join's column got text;
-fixed).
+fixed); and found while working RP-461, RP-478 (a LATERAL subquery's bare
+name for an earlier FROM item's column is not found).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -488,3 +489,19 @@ JOIN_COLUMN_IN_A_SUBQUERY = {
 @pytest.mark.parametrize("query", list(JOIN_COLUMN_IN_A_SUBQUERY))
 def test_join_column_in_a_subquery_keeps_its_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == JOIN_COLUMN_IN_A_SUBQUERY[query]
+
+
+# Found while working RP-461: a LATERAL subquery reads the FROM items
+# before it by their bare column names too; here only a qualified name
+# (`fe.b`) is found, and a bare one is 42703. A LATERAL function already
+# reads them.
+LATERAL_BARE_NAME = {
+    "select x from fe, lateral (select b as x) s": [("x",)],
+    "select x from fe join lateral (select b || c as x from fs) s on true": [("xy",)],
+}
+
+
+@pytest.mark.backlog("RP-478")
+@pytest.mark.parametrize("query", list(LATERAL_BARE_NAME))
+def test_lateral_subquery_reads_an_earlier_item_by_bare_name(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == LATERAL_BARE_NAME[query]
