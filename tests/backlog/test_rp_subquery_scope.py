@@ -1,5 +1,5 @@
 """Gap tests of the name-scope divergences found while working RP-443:
-RP-451 (a parameter qualified by its function's name is not bound), RP-453
+RP-451 (a parameter qualified by its function's name was not bound; fixed), RP-453
 (a correlated subquery's value read from a CTE or a write's target came
 out text; fixed), RP-454 (a join's alias is refused or not found), RP-456
 (a CTE hidden by its alias still answered to its name in a subquery;
@@ -70,7 +70,8 @@ def answer(dsn: str, query: str) -> Any:
 
 # PostgreSQL resolves `fq1.p` as the parameter `p` of the function `fq1`
 # (`sql_fn_post_column_ref` for SQL, `plpgsql_post_column_ref` for
-# PL/pgSQL), at any depth of subquery.
+# PL/pgSQL), at any depth of subquery. Each was refused: a dotted name was
+# skipped by the binder, and taken for a table.
 FUNCTION_QUALIFIED_PARAMETER = {
     "select fq1(7)": [(7,)],
     "select fq2(7)": [(7,)],
@@ -79,7 +80,7 @@ FUNCTION_QUALIFIED_PARAMETER = {
 }
 
 
-@pytest.mark.backlog("RP-451")
+@pytest.mark.backlog_fixed("RP-451")
 @pytest.mark.parametrize("query", list(FUNCTION_QUALIFIED_PARAMETER))
 def test_function_qualified_parameter(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FUNCTION_QUALIFIED_PARAMETER[query]

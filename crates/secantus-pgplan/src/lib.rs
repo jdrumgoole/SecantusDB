@@ -164,6 +164,7 @@ pub mod pgp;
 pub mod pgp_pub;
 pub mod privileges;
 mod prune_outputs;
+pub use prune_outputs::figure_colname;
 mod pullup;
 pub mod read_apart;
 pub mod regobj;
