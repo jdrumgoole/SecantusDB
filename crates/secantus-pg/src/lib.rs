@@ -26447,6 +26447,12 @@ fn internal_type_name(ty: &Type) -> Option<String> {
             1003 => "name[]",
             790 => "money",
             791 => "money[]",
+            // Without these CREATE TABLE AS refused a `bit(3)` / `varbit(5)`
+            // column, which PostgreSQL makes as written (RP-494).
+            1560 => "bit",
+            1562 => "varbit",
+            1561 => "bit[]",
+            1563 => "varbit[]",
             // JDBC's OUT-parameter placeholder: the planner drops a `void`
             // argument from a function call, as PostgreSQL does.
             2278 => "void",

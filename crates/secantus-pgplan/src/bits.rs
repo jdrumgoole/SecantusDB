@@ -70,19 +70,17 @@ pub fn fit_explicit(bits: &str, ty: &str, n: Option<usize>) -> String {
 
 /// An ASSIGNMENT to a `bit(n)` / `varbit(n)` column: no padding, no
 /// truncation -- a mismatch is an error.
+///
+/// `n` of `None` (typmod -1) checks no length, as `bit()` does for an
+/// `atttypmod <= 0`: a bare `bit` in DDL is already `bit(1)` from the
+/// grammar, so only a column with no modifier -- CREATE TABLE AS over
+/// `B'1101'`, whose column PostgreSQL types `"bit"` -- reaches it (RP-494).
 pub fn fit_assignment(bits: &str, ty: &str, n: Option<usize>) -> Result<String> {
     match (ty, n) {
         ("bit", Some(n)) if bits.len() != n => Err(Error::Sqlstate(
             "22026",
             format!(
                 "bit string length {} does not match type bit({n})",
-                bits.len()
-            ),
-        )),
-        ("bit", None) if bits.len() != 1 => Err(Error::Sqlstate(
-            "22026",
-            format!(
-                "bit string length {} does not match type bit(1)",
                 bits.len()
             ),
         )),
@@ -343,4 +341,19 @@ pub fn from_wire(bytes: &[u8]) -> Option<String> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assignment_to_a_bit_with_no_modifier_checks_no_length() {
+        // `bit()` skips the length check for an `atttypmod <= 0` (RP-494).
+        assert_eq!(fit_assignment("1101", "bit", None).unwrap(), "1101");
+        assert_eq!(fit_assignment("1", "bit", Some(1)).unwrap(), "1");
+        assert!(fit_assignment("11", "bit", Some(1)).is_err());
+        assert!(fit_assignment("111111", "varbit", Some(5)).is_err());
+        assert_eq!(fit_assignment("111111", "varbit", None).unwrap(), "111111");
+    }
 }

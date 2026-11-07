@@ -2251,6 +2251,19 @@ pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
     if let Some(element) = name.strip_suffix("[]") {
         return format!("{}[]", format_type_text(element, typmod));
     }
+    // `format_type_extended` with FORMAT_TYPE_TYPEMOD_GIVEN and no modifier:
+    // a bare `bit` / `character` is `bit(1)` / `character(1)` per the SQL
+    // spec, so it prints the type's own name instead, which the parser
+    // will not give a bogus modifier -- `"bit"` (quoted, a keyword) and
+    // `bpchar`. `format_type(1560, -1)` on PostgreSQL 15.19; `NULL` keeps
+    // `bit` (RP-494).
+    if typmod.is_some_and(|m| m < 0) {
+        match name {
+            "bit" => return "\"bit\"".to_string(),
+            "bpchar" => return "bpchar".to_string(),
+            _ => {}
+        }
+    }
     let display = crate::display_type(name);
     let Some(typmod) = typmod.filter(|m| *m >= 0) else {
         return display;

@@ -407,30 +407,59 @@ def test_typmod_from_scalar_subquery_and_computed_constants(rust_pg: Any) -> Non
     assert got == [want for _, want in cases]
 
 
-@pytest.mark.backlog("RP-494")
+@pytest.mark.backlog_fixed("RP-494")
 def test_ctas_over_a_bit_column(rust_pg: Any) -> None:
     """`create table t as select B'101'::bit(3) b` makes a `bit(3)` column,
     `atttypmod` 3, on a private PostgreSQL 15.19 cluster; a `varbit` one
-    likewise. Here each is refused 0A000 `CREATE TABLE AS over a column of
-    type bit is not supported yet`."""
+    likewise, and their arrays keep the element's modifier. An untyped
+    `B'1101'`, or an operator over bits, makes a `"bit"` column with no
+    modifier, which takes a bit string of any length. Each was refused
+    0A000 `CREATE TABLE AS over a column of type bit is not supported yet`;
+    with the type named, the modifier-less column read as `bit(1)` and its
+    row was 22026."""
     with rust_pg.connect() as c:
         c.autocommit = True
         got = []
         for name, q in [
             ("rp494_b", "select B'101'::bit(3) b"),
             ("rp494_vb", "select B'10'::varbit(5) b"),
+            ("rp494_u", "select B'1101' b"),
+            ("rp494_and", "select B'101'::bit(3) & B'111' b"),
+            ("rp494_ab", "select array[B'101'::bit(3)] b"),
+            ("rp494_av", "select array[B'10'::varbit(4)] b"),
         ]:
             try:
                 c.execute(f"create table {name} as {q}")
                 got.append(
                     c.execute(
-                        "select format_type(atttypid, atttypmod) from pg_attribute"
+                        "select format_type(atttypid, atttypmod), b::text"
+                        f" from pg_attribute, {name}"
                         f" where attrelid = '{name}'::regclass and attnum = 1"
                     ).fetchone()
                 )
             except psycopg.Error as e:
                 got.append((e.sqlstate,))
-    assert got == [("bit(3)",), ("bit varying(5)",)]
+        c.execute("insert into rp494_u values (B'1')")
+        # `format_type_extended` given a -1 modifier names `bit` and
+        # `bpchar` so the parser gives them no bogus `(1)`.
+        got.append(
+            c.execute(
+                "select format_type(1560, NULL), format_type(1560, -1),"
+                " format_type(1561, -1), format_type(1042, -1),"
+                " format_type(1042, NULL), format_type(1562, -1)"
+            ).fetchone()
+        )
+        got.append(tuple(r[0] for r in c.execute("select b::text from rp494_u order by 1")))
+    assert got == [
+        ("bit(3)", "101"),
+        ("bit varying(5)", "10"),
+        ('"bit"', "1101"),
+        ('"bit"', "101"),
+        ("bit(3)[]", "{101}"),
+        ("bit varying(4)[]", "{10}"),
+        ("bit", '"bit"', '"bit"[]', "bpchar", "character", "bit varying"),
+        ("1", "1101"),
+    ]
 
 
 @pytest.mark.backlog_fixed("RP-490")

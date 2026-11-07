@@ -939,9 +939,14 @@ pub(crate) fn bind_parameter_names_mapped(
             continue;
         };
         let ty = types.get(pos).map_or("text", String::as_str);
+        // A subscript after the reference (`v[1]`) would read as part of the
+        // cast's type name (`$1::int4[][1]`, an array type with a bound), so
+        // the cast is parenthesised there: `($1::int4[])[1]` subscripts it.
+        let subscripted = text(last + 1) == Some("[");
         out.push_str(&sql[cursor..location]);
         let start = out.len();
         out.push_str(&match what {
+            Bound::Value if subscripted => format!("(${}::{ty})", pos + 1),
             Bound::Value => format!("${}::{ty}", pos + 1),
             Bound::Field => format!("(${}::{ty}).", pos + 1),
         });
@@ -1100,6 +1105,20 @@ mod tests {
             &["r".into(), "p".into()],
             &["fe".into(), "int4".into()],
         )
+    }
+
+    #[test]
+    fn an_array_parameters_subscript_subscripts_the_cast() {
+        // h1(v int[]) answered 4, 5 and 7 on PostgreSQL 15.19 (RP-502).
+        let arr = |sql: &str| bind_typed(sql, &["v".into()], &["int4[]".into()]);
+        assert_eq!(arr("select v[1]"), "select ($1::int4[])[1]");
+        assert_eq!(arr("select v[1] + 1"), "select ($1::int4[])[1] + 1");
+        assert_eq!(
+            arr("select v[2] + array_length(v, 1)"),
+            "select ($1::int4[])[2] + array_length($1::int4[], 1)"
+        );
+        assert_eq!(arr("select f.v [1:2]"), "select ($1::int4[]) [1:2]");
+        assert_eq!(arr("select v || 3"), "select $1::int4[] || 3");
     }
 
     #[test]

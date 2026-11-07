@@ -490,7 +490,9 @@ def test_create_checks_literals_and_result(case: tuple[str | None, str], dsn: st
 
 
 # Found while working RP-465: an array parameter's subscript, measured on
-# the same cluster.
+# the same cluster. The parameter was bound as `$1::int4[]`, so `v[1]` read
+# as a cast to an array type with a bound (22P02, or 0A000 under `+`); the
+# cast is now parenthesised before a subscript (RP-502).
 ARRAY_PARAMETER_SUBSCRIPT = {
     "create function h1(v int[]) returns int language sql as $$ select v[1] $$": [(4,)],
     "create function h1(v int[]) returns int language sql as $$ select v[1] + 1 $$": [(5,)],
@@ -499,7 +501,7 @@ ARRAY_PARAMETER_SUBSCRIPT = {
 }
 
 
-@pytest.mark.backlog("RP-502")
+@pytest.mark.backlog_fixed("RP-502")
 @pytest.mark.parametrize("create", list(ARRAY_PARAMETER_SUBSCRIPT))
 def test_array_parameter_subscript(create: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
