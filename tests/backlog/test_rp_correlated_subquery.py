@@ -1,7 +1,7 @@
 """Gap tests of a correlated subquery's output, found while working RP-445.
 
 The column name of an expression target (RP-449) was measured on PostgreSQL
-15.19 and needs no table. The sequence draws (RP-450) were measured on a
+15.19 and needs no table. The sequence draws (RP-450, fixed) were measured on a
 private, freshly initdb'd PostgreSQL 15.19 cluster, as a sequence is an
 object the shared reference must not be given.
 """
@@ -39,10 +39,12 @@ DRAWS = [
 ]
 
 
-@pytest.mark.backlog("RP-450")
+@pytest.mark.backlog_fixed("RP-450")
 @pytest.mark.parametrize("query", DRAWS)
 def test_fromless_correlated_nextval_draws_once_per_row(query: str, rust_pg: Any) -> None:
-    """3 and 5, and a next draw of 4, here."""
+    """Was 3 and 5, and a next draw of 4: the plan that only checks and
+    types a FROM-less body evaluated its targets, drawing once more than
+    the rows it ran for."""
     q = f"rp450_{DRAWS.index(query)}"
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         c.execute(f"drop sequence if exists {q}")

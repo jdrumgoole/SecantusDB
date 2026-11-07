@@ -1664,17 +1664,19 @@ a regression test.
       15.19 (found while working RP-445).
       Verify: tests/backlog/test_rp_correlated_subquery.py::test_expression_target_is_named_column
       Backlog-ID: RP-449
-- [ ] **A FROM-less correlated subquery draws its sequence one extra
-      time.** Over `values (1), (2)`, `select (select nextval('q') + a)`
-      answers 3 and 5 and leaves the next draw at 4; PostgreSQL 15.19
-      answers 2 and 4 and next draws 3. With a FROM in the subquery
-      (`(select nextval('q') + a from (select 1) z)`) the draws match, and a
-      FROM-less one two levels down (`(select (select nextval('q') + a))`)
-      draws one extra as at one level. A sequence value is never given back,
-      so the extra draw is a number PostgreSQL never skips. Measured on a
-      private 15.19 cluster (found while working RP-445).
-      Verify: tests/backlog/test_rp_correlated_subquery.py::test_fromless_correlated_nextval_draws_once_per_row
-      Backlog-ID: RP-450
+- [ ] **A subquery with more than one column runs on its first where
+      PostgreSQL refuses it.** `select (select 1, 2)` answers 1, `select
+      array(select 1, 2)` `{1}`, `select 1 in (select 1, 2)` and `select 1 =
+      any (select 1, 2)` true, a correlated `(select a, 1)` its `a`, and the
+      same in a WHERE; PostgreSQL 15.19's `transformSubLink` refuses an EXPR
+      or ARRAY sublink with more than one target as 42601 `subquery must
+      return only one column` at the sublink, and an ANY / IN one as 42601
+      `subquery has too many columns` at the operator. A statement
+      PostgreSQL refuses answers a value built from part of its subquery.
+      An EXISTS ignores its targets on both. Measured on PostgreSQL 15.19
+      (found while working RP-450).
+      Verify: tests/backlog/test_rp_subquery_columns.py::test_subquery_with_more_than_one_column
+      Backlog-ID: RP-452
 - [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
       `0A000 this target is not supported yet`; PostgreSQL 15.19's
       `transformTargetList` answers 42601 `SELECT * with no tables

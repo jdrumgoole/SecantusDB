@@ -527,7 +527,10 @@ pub(crate) fn correlate(
         let body = substitute(inner, &outer_refs, first);
         let mut probe_params = params.to_vec();
         probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
-        match probing(|| plan_select(&body, lookup, &probe_params)) {
+        // Planned only to check and type the body, never to run it: a
+        // FROM-less body's targets are evaluated as it is planned, so a
+        // `nextval` there drew once more than the rows it ran for (RP-450).
+        match probing(|| without_calls(|| plan_select(&body, lookup, &probe_params))) {
             Ok(p) => break (p, body),
             Err(Error::UndefinedColumn(name))
                 if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
