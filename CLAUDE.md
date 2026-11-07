@@ -289,7 +289,8 @@ the `pg-batch` integration branch after the local `gate_pg.sh --fast`, then
 `scripts/land_batch.sh pg-batch <batch pid>` lands that branch on `main` in
 snapshot PRs, each after green CI
 (start it through `scripts/detached_run.py`; the `fix-one` skill has the
-detail).
+detail). MongoDB: `fix_many.sh -i rm-batch -l <ids> mongodb <n>`, gated by
+`scripts/gate_rm.py`.
 
 **Every Rust item is a failing test with prose attached.** Each carries a permanent `Backlog-ID:` (`RM-nnn` / `RP-nnn`) and a `Verify:` line naming a gap test under `tests/backlog/` -- asserting the real product's answer, so it fails while the item is open -- and `python tools/backlog.py verify` runs them all (OPEN / FIXED? / BROKEN / UNCHECKED). A fix turns its gap test into the regression test and the `changelog.d/` fragment names both (`Fixes RM-142 (tests/...::test_x)`), so every fix stays traceable to the test that proves it. **The `backlog` skill is the protocol: read it before filing, working or closing an item.**
 

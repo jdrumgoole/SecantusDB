@@ -161,21 +161,22 @@ longer runs. Read every `.rc` that is not 0, and the log beside it.
   comma-separated), and read its table of every step on record. A fix to
   code or tests: the whole gate again (with `--fast` in integration mode).
 
-**RM backlog, or a change to the shared storage crates that the MongoDB
-server links:** the full list below.
+**RM backlog: run `scripts/gate_rm.py`** through `scripts/detached_run.py`,
+and wait for it. It runs what CI runs for the Rust MongoDB server -- the
+clean workspace and every WiredTiger-linked crate, both server builds from
+HEAD, the `test` job's selection less the files CI deliberately does not
+run, the `storage-engine` job's named files (read from `test.yml`), the
+concurrency invariants, the backlog verify with `--regressions` and
+`tests/mongod_live/` against mongod 8.2, lint and ruff -- with the same
+`.scratch/gate/<step>.rc` files and `gate=0|1` as `gate_pg.sh`. It replaces
+`rust-gate` and the full pytest suite, whose extra cost is the deprecated
+Python servers' tests and the parity suites CI no longer runs. A change to
+the shared storage crates also runs `scripts/gate_pg.sh --storage`, since
+the PG server links them.
 
-Run every one of these and read each exit code itself. Do not trust one
-taken through a pipe or a trailing `echo`.
-
-- the crates you touched: `./inv rust-storage-test` (WT-linked crates are
-  not covered by workspace commands), `./inv rust-gate` for server changes;
-- rebuild the binaries from HEAD, then `python tools/backlog.py verify
-  --file backlog-rust-postgres.md --regressions` (the bare file name, as
-  `--file` refuses a `tasks/` path; `backlog-rust-mongodb.md` for RM),
-  plus the other Rust backlog when shared code moved. Expected: this item gone, no `REGRESSED`, no new `FIXED?`
-  or `BROKEN`;
-- the full pytest suite once (`build-and-test` for long runs);
-- `./inv lint` and repo-wide `ruff check .` / `ruff format --check .`.
+Read every `.rc` that is not 0, and the log beside it; do not trust an exit
+code taken through a pipe or a trailing `echo`. Expected from the backlog
+step: this item gone, no `REGRESSED`, no new `FIXED?` or `BROKEN`.
 
 A failure is a bug to fix, never a test to skip (CLAUDE.md "Never ignore or
 discount an error").

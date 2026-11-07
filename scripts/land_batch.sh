@@ -23,6 +23,12 @@ branch=${1:?usage: $0 <integration-branch> [batch-pid]}
 batch_pid=${2:-}
 [[ $branch == main ]] && { echo "not main" >&2; exit 2; }
 ci=$branch-ci
+# Which server's batch this is: the MongoDB backlog's integration branches
+# start `rm` (rm-batch), the PostgreSQL one's anything else (pg-batch).
+case "$branch" in
+    rm*) server="Rust MongoDB server"; gate="scripts/gate_rm.py" ;;
+    *) server="Rust PG server"; gate="scripts/gate_pg.sh --fast" ;;
+esac
 cd "$(dirname "$0")/.."
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
 while :; do
@@ -40,10 +46,10 @@ while :; do
     pr=$(gh pr list --head $ci --base main --state open --json number -q '.[0].number')
     if [[ -z $pr ]]; then
         url=$(gh pr create --base main --head $ci \
-            --title "Rust PG server: fix-one batch snapshot of $branch (${snap:0:8}, $ahead commits)" \
+            --title "$server: fix-one batch snapshot of $branch (${snap:0:8}, $ahead commits)" \
             --body "$(git log --reverse --format='- %s' origin/main..$snap)
 
-A snapshot of \`$branch\`, frozen on \`$ci\` so the lanes' later pushes don't cancel its CI. Each commit passed \`scripts/gate_pg.sh --fast\` locally. This run is their \`pg-suites\` and Linux check. It will be merged with a merge commit, pinned to the commit CI passed.
+A snapshot of \`$branch\`, frozen on \`$ci\` so the lanes' later pushes don't cancel its CI. Each commit passed \`$gate\` locally. This run is their cross-platform check. It will be merged with a merge commit, pinned to the commit CI passed.
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)") || exit 2
         pr=${url##*/}

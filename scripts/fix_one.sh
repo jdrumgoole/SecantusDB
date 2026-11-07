@@ -9,10 +9,18 @@
 #   scripts/fix_one.sh pg hardest          # with a choice rule
 #   scripts/fix_one.sh -p postgres         # headless (claude -p): no questions
 #   scripts/fix_one.sh -p postgres into pg-batch   # land on pg-batch (fix-one, "Integration mode")
-#   ... into pg-batch lane ../SecantusDB-lane1     # reuse a lane worktree (fix_many -i)
+#   ... into pg-batch lane ../SecantusDB-lane-pg-batch-1   # reuse a lane worktree (fix_many -i)
 #
 # Interactive is the default because the skill may stop to ask Joe for a
 # decision; `-p` runs it unattended and prints the final report.
+#
+# A headless session runs in `--permission-mode auto` and is granted its
+# worktree with `--add-dir`: started in the main checkout, it may not enter a
+# sibling directory, and has no one to approve the write (2026-11-06: three
+# mongodb sessions claimed an item, were refused their own worktree, and
+# exited 0 with nothing done). So `-p` always works in a lane: the one the
+# arguments name, else a one-off this script creates and removes again
+# unless it holds work.
 set -euo pipefail
 
 headless=0
@@ -31,13 +39,30 @@ case "$1" in
         ;;
 esac
 
-# Run from the main checkout, whatever directory this was called from: the
-# skill makes its own worktree.
+# Run from the main checkout, whatever directory this was called from.
 cd "$(dirname "$0")/.."
+main=$PWD
 command -v claude >/dev/null || {
     echo "$0: the claude CLI is not on PATH" >&2
     exit 127
 }
+
+# The lane and the integration branch, if the arguments name them.
+lane=
+base=main
+args=("$@")
+for ((i = 0; i < ${#args[@]} - 1; i++)); do
+    [[ ${args[i]} == lane ]] && lane=${args[i + 1]}
+    [[ ${args[i]} == into ]] && base=${args[i + 1]}
+done
+oneoff=0
+if [[ $headless -eq 1 && -z $lane ]]; then
+    lane=$(cd .. && pwd)/SecantusDB-fixone-$$
+    git fetch -q origin
+    git worktree add -q --detach "$lane" "origin/$base"
+    oneoff=1
+    set -- "$@" lane "$lane"
+fi
 
 prompt="/fix-one $*"
 stamp() { date '+%Y-%m-%d %H:%M:%S %Z'; }
@@ -51,9 +76,23 @@ if [[ $headless -eq 1 ]]; then
     # last turn and exits, which cut off two sessions mid-gate on
     # 2026-11-02 (RP-320, RP-344) with their fixes committed but unlanded.
     # 0 means wait for them, however long the gate and CI take.
-    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p "$prompt" || status=$?
+    CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0 claude -p "$prompt" \
+        --permission-mode auto --add-dir "$lane" || status=$?
+elif [[ -n $lane ]]; then
+    claude "$prompt" --add-dir "$lane" || status=$?
 else
     claude "$prompt" || status=$?
 fi
 echo "[$(stamp)] end: $prompt (exit $status)"
+
+# A one-off lane goes when the session does, unless it holds work.
+if [[ $oneoff -eq 1 ]]; then
+    cd "$main"
+    if [[ -z $(git -C "$lane" status --short) ]] &&
+        [[ -z $(git -C "$lane" log --oneline "origin/$base..HEAD" 2>/dev/null) ]]; then
+        git worktree remove --force "$lane"
+    else
+        echo "[$(stamp)] kept $lane: it holds uncommitted or unlanded work" >&2
+    fi
+fi
 exit "$status"
