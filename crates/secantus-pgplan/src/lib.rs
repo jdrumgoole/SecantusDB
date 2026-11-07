@@ -40217,6 +40217,42 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
     const_value_node(node, params)
 }
 
+/// A simple CASE's WHEN label as its comparison with the argument sees it.
+///
+/// `transformCaseExpr` compares the argument to each WHEN with `=` (`make_op`
+/// over `CaseTestExpr = warg`), so an untyped string WHEN is `unknown` and
+/// takes the argument's type, read by that type's input function -- as
+/// `NULLIF`'s untyped side is. `case a when '1'` over an integer compares
+/// two integers, where the label stayed a string and the comparison was
+/// refused (RP-433). A label the type's input refuses is its error at the
+/// literal; a string-typed or untyped argument leaves the label text.
+fn case_label(
+    arg: Option<&pg_query::protobuf::Node>,
+    subject: &Bson,
+    test: &pg_query::protobuf::Node,
+    label: Bson,
+) -> Result<Bson> {
+    let (Some(arg), Bson::String(_)) = (arg, &label) else {
+        return Ok(label);
+    };
+    let Some(N::AConst(c)) = test.node.as_ref() else {
+        return Ok(label);
+    };
+    if !matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) {
+        return Ok(label);
+    }
+    let ty = static_type(arg, subject);
+    if ty.is_empty() || ty == "unknown" || is_string_type(&ty) {
+        return Ok(label);
+    }
+    let location = c.location;
+    cast_value(label, &ty).inspect_err(|_| {
+        if location >= 0 {
+            set_error_location(location);
+        }
+    })
+}
+
 fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // A hashed SubPlan (`hashed_subplan`), whose arguments are not all
     // values to evaluate.
@@ -41544,7 +41580,8 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             let taken = match &subject {
                 // Simple form: the parser leaves the comparison implicit.
                 Some(subject) => {
-                    let label = const_value(test, params)?;
+                    let label =
+                        case_label(c.arg.as_deref(), subject, test, const_value(test, params)?)?;
                     *subject != Bson::Null
                         && label != Bson::Null
                         && eval_binary("=", subject.clone(), label)? == Bson::Boolean(true)

@@ -2447,6 +2447,44 @@ fn scalar_builtins_match_postgres() {
     }
 }
 
+/// A simple CASE compares its argument to each WHEN with `=`, so an untyped
+/// WHEN literal takes the argument's type (RP-433). Each answer measured on
+/// PostgreSQL 15.19; every non-text one was 0A000 `comparing int32 with
+/// string` before.
+#[test]
+fn simple_case_reads_an_untyped_when_as_its_argument_type() {
+    let calc = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::String(s)) => s.clone(),
+            other => panic!("{sql} -> {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for sql in [
+        "select case 1 when '1' then 'y' else 'n' end",
+        "select case 1::int8 when '1' then 'y' else 'n' end",
+        "select case 1.5 when '1.5' then 'y' else 'n' end",
+        "select case true when 't' then 'y' else 'n' end",
+        "select case interval '1 day' when '24 hours' then 'y' else 'n' end",
+        "select case '1' when '1' then 'y' else 'n' end",
+        "select case 1 when 2 then 'n' when '1' then 'y' end",
+    ] {
+        assert_eq!(calc(sql), "y", "for {sql}");
+    }
+    // A NULL argument matches no WHEN, its label typed all the same.
+    assert_eq!(
+        calc("select case null::int when '1' then 'y' else 'n' end"),
+        "n"
+    );
+    // A label the argument type's input refuses is that input's 22P02.
+    let err = plan_ok_err("select case 1 when 'x' then 'y' else 'n' end");
+    assert!(
+        err.to_string()
+            .contains("invalid input syntax for type integer: \"x\""),
+        "{err}"
+    );
+}
+
 /// A built-in's RESULT TYPE is as much of the answer as its value.
 ///
 /// `sign` answers `float8` even for an integer argument; `nullif` answers its

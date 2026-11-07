@@ -1420,6 +1420,21 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                     }
                 }
             }
+            // A simple CASE compares its argument to each WHEN with `=`
+            // (`transformCaseExpr` builds `CaseTestExpr = warg` by
+            // `make_op`), so an untyped WHEN literal takes the argument's
+            // type, read by its input function as the WHEN is transformed:
+            // `case a when 't'` over an integer is 22P02 at the literal,
+            // whether or not a row reaches it (RP-433).
+            if let Some(ty) = c.arg.as_deref().and_then(|a| operand_type(a, scope)) {
+                for w in &c.args {
+                    if let Some(N::CaseWhen(w)) = w.node.as_ref() {
+                        if let Some(e) = w.expr.as_deref() {
+                            literal_fits(e, &ty)?;
+                        }
+                    }
+                }
+            }
             // PostgreSQL resolves the ELSE first, then each THEN in order.
             let mut parts: Vec<&pg_query::protobuf::Node> =
                 c.defresult.as_deref().into_iter().collect();

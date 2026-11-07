@@ -1610,16 +1610,19 @@ a regression test.
       while working RP-424).
       Verify: tests/backlog/test_rp_where_types.py::test_target_list_is_analysed_before_where
       Backlog-ID: RP-429
-- [ ] **A simple CASE refuses an untyped WHEN literal over a non-text
-      argument.** `select case 1 when '1' then 'y' else 'n' end` and
-      `sum(case a when '1' then 1 else 0 end)` over an integer `a` answer
-      `0A000 comparing int32 with string using = is not supported yet`;
-      PostgreSQL 15.19 compares the argument to each WHEN with `=`, so the
-      literal takes the integer type (`'y'`, and 1), and `case a when 't'`
-      is 22P02 `invalid input syntax for type integer: "t"` at 24. Measured
-      on a private 15.19 cluster (found while working RP-424).
-      Verify: tests/backlog/test_rp_where_types.py::test_simple_case_types_untyped_when_from_its_argument
-      Backlog-ID: RP-433
+- [ ] **A simple CASE whose WHEN is typed in another category than its
+      argument is refused as a gap.** `select case 1 when true then 1
+      end`, `case b when 1` over a text `b` and `case a when b` over an
+      integer `a` and a text `b` answer `0A000 comparing int32 with boolean
+      using = is not supported yet` (and the string / int32 forms);
+      PostgreSQL 15.19's `transformCaseExpr` builds `CaseTestExpr = warg`
+      with `make_op`, which finds no operator and is 42883 `operator does
+      not exist: integer = boolean` (`text = integer`, `integer = text`) at
+      the WHEN, position 15. `optype`'s CASE arm checks only the untyped
+      WHEN literals against the argument (RP-433), not the typed ones'
+      category. Measured on PostgreSQL 15.19 (found while working RP-433).
+      Verify: tests/backlog/test_rp_where_types.py::test_simple_case_when_of_another_category_is_42883
+      Backlog-ID: RP-439
 - [ ] **A LATERAL subquery's columns, a view's, a VALUES column of
       literals and a USING join's merged column of two types are not
       type-checked.** Each comparison below returns no rows here;
