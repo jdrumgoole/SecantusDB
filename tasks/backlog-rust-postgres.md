@@ -1914,17 +1914,6 @@ Measured on a private PostgreSQL 15.19 cluster.
 
 Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
-- [ ] **A failed statement keeps the writes of its data-modifying WITH
-      items.** `with x as (delete from t returning a) select nosuch from x`
-      is 42703 on both, but here the rows are deleted all the same, in
-      autocommit; an INSERT or UPDATE item, or a later division by zero,
-      the same. PostgreSQL undoes every write of a statement that fails.
-      Here a data-modifying item is run (`materialize_dml_ctes`) before the
-      rest of the statement is planned, and nothing takes its write back
-      when the rest then fails. A statement reported as failed has changed
-      the table.
-      Verify: tests/backlog/test_rp_dml_cte_atomicity.py::test_failed_statement_keeps_no_write
-      Backlog-ID: RP-503
 - [ ] **What `transformWithClause` checks of a WITH is not all checked.**
       Since RP-501 an unread item is planned without being run, so its
       names and types are checked, but not: an unread item's literal input

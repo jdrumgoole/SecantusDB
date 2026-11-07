@@ -31921,8 +31921,10 @@ impl PgHandler {
     }
 
     /// Can `query` run user-written code -- a DO block, or DML / a query
-    /// while a trigger or a user function exists? Outside a block such a
-    /// statement needs its own implicit transaction.
+    /// while a trigger or a user function exists -- or write while it is
+    /// planned (a data-modifying WITH item, RP-503)? Outside a block such a
+    /// statement needs its own implicit transaction, or a failure after its
+    /// first write leaves that write committed.
     fn runs_user_code(&self, query: &str) -> bool {
         if self.txn.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
             return false;
@@ -31936,7 +31938,8 @@ impl PgHandler {
         match word.as_str() {
             "do" | "call" => true,
             "insert" | "update" | "delete" | "select" | "with" | "values" | "truncate" => {
-                self.trigger_docs().is_ok_and(|t| !t.is_empty())
+                secantus_pgplan::has_data_modifying_with(query)
+                    || self.trigger_docs().is_ok_and(|t| !t.is_empty())
                     || self.user_function_docs().is_ok_and(|f| !f.is_empty())
                     || self.any_rules()
             }

@@ -4310,6 +4310,54 @@ pub fn lone_command(sql: &str) -> Option<&str> {
         .then_some(text)
 }
 
+/// Does `sql`, one statement, carry a data-modifying WITH item (`with x as
+/// (delete from t returning a) select ...`)? Such an item WRITES while the
+/// statement is planned (`materialize_dml_ctes`), before the rest of it runs,
+/// so the statement needs a transaction of its own to take the write back
+/// when the rest then fails -- as PostgreSQL runs every statement in one
+/// (RP-503). Only a top-level WITH can hold one: PostgreSQL refuses it
+/// anywhere else (0A000). A text without `with` in it is not parsed.
+pub fn has_data_modifying_with(sql: &str) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    if !sql
+        .as_bytes()
+        .windows(4)
+        .any(|w| w.eq_ignore_ascii_case(b"with"))
+    {
+        return false;
+    }
+    let Some(tree) = memoised_parse(sql) else {
+        return false;
+    };
+    let modifying = |with: Option<&pg_query::protobuf::WithClause>| {
+        with.is_some_and(|w| {
+            w.ctes.iter().any(|c| match c.node.as_ref() {
+                Some(N::CommonTableExpr(cte)) => matches!(
+                    cte.ctequery.as_deref().and_then(|q| q.node.as_ref()),
+                    Some(N::InsertStmt(_) | N::UpdateStmt(_) | N::DeleteStmt(_) | N::MergeStmt(_))
+                ),
+                _ => false,
+            })
+        })
+    };
+    tree.stmts
+        .iter()
+        .any(|s| match s.stmt.as_ref().and_then(|n| n.node.as_ref()) {
+            Some(N::SelectStmt(sel)) => modifying(sel.with_clause.as_ref()),
+            Some(N::InsertStmt(i)) => {
+                modifying(i.with_clause.as_ref())
+                    || matches!(
+                        i.select_stmt.as_deref().and_then(|n| n.node.as_ref()),
+                        Some(N::SelectStmt(sel)) if modifying(sel.with_clause.as_ref())
+                    )
+            }
+            Some(N::UpdateStmt(u)) => modifying(u.with_clause.as_ref()),
+            Some(N::DeleteStmt(d)) => modifying(d.with_clause.as_ref()),
+            Some(N::MergeStmt(m)) => modifying(m.with_clause.as_ref()),
+            _ => false,
+        })
+}
+
 pub fn split_statements(sql: &str) -> Result<Vec<String>> {
     let parts = pg_query::split_with_parser(sql).map_err(parse_error)?;
     Ok(parts
