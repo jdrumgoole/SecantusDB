@@ -4870,6 +4870,43 @@ fn plan_with_subqueries_parsed(
             return Ok(declare_cursor(d, inner));
         }
     }
+    // So is a CREATE TABLE AS's or a CREATE MATERIALIZED VIEW's (RP-466):
+    // PostgreSQL analyses it as the SELECT it is (`transformCreateTableAsStmt`
+    // hands it to `transformStmt`), so its subqueries, views and CTEs are
+    // resolved as a bare SELECT's are. (`SELECT ... INTO` is a SelectStmt,
+    // which takes that path already.)
+    //
+    // The query is analysed and planned but never run when it fills nothing:
+    // `WITH NO DATA`, or a relation of that name already there, which an
+    // `IF NOT EXISTS` skips (`CreateTableAsRelExists`) and anything else
+    // refuses with 42P07 before the executor starts. So its subqueries
+    // draw no sequence and call no function, as PostgreSQL's initplans,
+    // run at first use, are never reached.
+    if let Some(N::CreateTableAsStmt(c)) = node.node.as_ref() {
+        if let Some(N::SelectStmt(_)) = c.query.as_ref().and_then(|q| q.node.as_ref()) {
+            let fills = c.into.as_ref().is_some_and(|i| {
+                !i.skip_data && i.rel.as_ref().is_none_or(|r| lookup(&r.relname).is_none())
+            });
+            let plan =
+                |q: &pg_query::protobuf::Node| plan_query_node(sql, q.clone(), lookup, params, run);
+            return if fills {
+                plan_create_table_as_with(c, plan)
+            } else {
+                planning_without_running(|| plan_create_table_as_with(c, plan))
+            };
+        }
+    }
+    // `SELECT ... INTO` a relation already there is the same 42P07.
+    if let Some(N::SelectStmt(s)) = node.node.as_ref() {
+        let exists = s
+            .into_clause
+            .as_ref()
+            .and_then(|i| i.rel.as_ref())
+            .is_some_and(|r| lookup(&r.relname).is_some());
+        if exists {
+            return planning_without_running(|| plan_query_node(sql, node, lookup, params, run));
+        }
+    }
     plan_query_node(sql, node, lookup, params, run)
 }
 
@@ -7104,13 +7141,29 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
     }
 }
 
-/// `CREATE TABLE ... AS <query>`. Only a table target: a materialized view
-/// (`objtype` OBJECT_MATVIEW) is a refreshable relation this server has no
-/// catalog for, and `SELECT ... INTO` is the same statement in older clothes.
+/// `CREATE TABLE ... AS <query>` or `CREATE MATERIALIZED VIEW ... AS
+/// <query>`, its query planned as a bare SELECT; `SELECT ... INTO` is the
+/// same statement in older clothes. With a subquery runner the planner
+/// takes [`plan_create_table_as_with`] instead, from
+/// `plan_with_subqueries_parsed`.
 fn plan_create_table_as(
     c: &pg_query::protobuf::CreateTableAsStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
+) -> Result<Statement> {
+    plan_create_table_as_with(c, |q| match q.node.as_ref() {
+        Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params),
+        Some(other) => Err(Error::Unsupported(disc(other))),
+        None => Err(Error::Parse("CREATE TABLE AS without a query".into())),
+    })
+}
+
+/// [`plan_create_table_as`] with the query planned by `plan_query`: the
+/// subquery-resolving pipeline when the caller has a runner, the bare
+/// SELECT planner when it has not.
+fn plan_create_table_as_with(
+    c: &pg_query::protobuf::CreateTableAsStmt,
+    plan_query: impl FnOnce(&pg_query::protobuf::Node) -> Result<Statement>,
 ) -> Result<Statement> {
     use pg_query::protobuf::ObjectType;
     let matview = c.objtype == ObjectType::ObjectMatview as i32;
@@ -7125,9 +7178,8 @@ fn plan_create_table_as(
         .rel
         .as_ref()
         .ok_or_else(|| Error::Parse("CREATE TABLE AS without a relation".into()))?;
-    let query = match c.query.as_ref().and_then(|q| q.node.as_ref()) {
-        Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
-        Some(other) => return Err(Error::Unsupported(disc(other))),
+    let query = match c.query.as_deref() {
+        Some(q) => plan_query(q)?,
         None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
     };
     let matview_sql = if matview {

@@ -1627,16 +1627,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A subquery in a CREATE TABLE AS or CREATE MATERIALIZED VIEW is
-      refused.** `create table ct as select (select 1) x from e` is 0A000
-      `SubLink is not supported yet`, uncorrelated or correlated (`(select
-      e.a + 1)`, `exists(select ... where f.a = e.a)`), and so is `create
-      materialized view mv as select (select a + 1) from e`; PostgreSQL
-      15.19 makes each table with its rows. `select ... into` of the same
-      list is made. Measured on a private 15.19 cluster with `e(a int, b
-      text)` (found while working RP-449).
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_subquery_in_create_table_as
-      Backlog-ID: RP-466
 - [ ] **A missing relation named by a string literal for a `regclass`
       parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
       untyped literal argument to its parameter's type during analysis
@@ -1992,6 +1982,18 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       33 in the gap test's two statements).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
+
+## Found while working RP-466 (2026-11-07)
+
+- [ ] **A materialized view's columns are each listed twice in
+      `pg_attribute`.** `create materialized view mvx as select 1 n`, with
+      or without `WITH NO DATA`, gives `select attname from pg_attribute
+      where attrelid = 'mvx'::regclass and attnum > 0` one row `n` on a
+      private PostgreSQL 15.19 cluster; here two. `pg_class` holds the one
+      relation. A client that introspects the view's columns sees each
+      twice.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_matview_columns_listed_once
+      Backlog-ID: RP-484
 
 ## Found while working RP-316 (2026-11-02)
 
