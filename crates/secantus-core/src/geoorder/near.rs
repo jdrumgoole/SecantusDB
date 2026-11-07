@@ -207,8 +207,8 @@ pub fn near_order(
     Some(out)
 }
 
-/// `distance()` in the plane.
-fn flat_distance(p: (f64, f64), q: (f64, f64)) -> f64 {
+/// `distance()` in the plane (`shapes.cpp`).
+pub(crate) fn flat_distance(p: (f64, f64), q: (f64, f64)) -> f64 {
     let a = p.0 - q.0;
     let b = p.1 - q.1;
     if a == 0.0 {
@@ -217,7 +217,9 @@ fn flat_distance(p: (f64, f64), q: (f64, f64)) -> f64 {
     if b == 0.0 {
         return a.abs();
     }
-    a.mul_add(a, b * b).sqrt()
+    // Rounded after each step, as the Linux build computes it (the macOS
+    // build fuses the add, RM-231).
+    (a * a + b * b).sqrt()
 }
 
 /// `computeGeoNearDistance`: the least distance from the centre to what

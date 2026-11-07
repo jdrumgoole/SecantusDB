@@ -1365,11 +1365,10 @@ pub(crate) fn std_dev_sbe(values: &[f64], pop: bool) -> Option<f64> {
 }
 
 /// Population / sample standard deviation as mongod computes it: Welford's
-/// online algorithm in document order, with the `m2` update a fused
-/// multiply-add, which is what mongod's arm64 build compiles it to (RM-128:
-/// matches mongod 8.2.11 bit for bit on 300 random value sets, where a
-/// two-pass mean-then-squares answered 160 and Welford without the fused
-/// step 179). `None` for an empty set, and for a sample (`pop == false`)
+/// online algorithm in document order, the `m2` update a multiply and then
+/// an add, as mongod's Linux build -- the exemplar -- compiles it (RM-231:
+/// matches 8.2.12 on Linux x86-64 bit for bit on 300 random value sets; the
+/// macOS arm64 build fuses the step into one rounding and differs on 60). `None` for an empty set, and for a sample (`pop == false`)
 /// with fewer than 2 values. Shared with the EXPRESSION forms in
 /// `expressions.rs`, so the two cannot answer different numbers.
 pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
@@ -1383,7 +1382,7 @@ pub(crate) fn std_dev(values: &[f64], pop: bool) -> Option<f64> {
         // mongod skips a zero step (`accumulator_std_dev.cpp`).
         if delta != 0.0 {
             mean += delta / (i + 1) as f64;
-            m2 = delta.mul_add(x - mean, m2);
+            m2 += delta * (x - mean);
         }
     }
     let denom = if pop { n } else { n - 1 } as f64;

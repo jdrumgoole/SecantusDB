@@ -9,30 +9,28 @@
 //! which is mongod's exemplar (RM-280).
 //!
 //! `less(a, b)` is the comparator the C++ code passes: a strict weak order.
+//!
+//! The heap steps move elements with swaps where libstdc++ moves them into
+//! a hole: the hole always holds the value being placed, and every
+//! comparison reads it from there, so the two orders are the same.
 
-fn push_up<T, F: Fn(&T, &T) -> bool>(v: &mut [T], mut hole: usize, top: usize, value: T, less: &F)
-where
-    T: Clone,
-{
+/// `std::__push_heap`: the value at `hole` rises past each parent less
+/// than it, no higher than `top`.
+fn push_up<T, F: Fn(&T, &T) -> bool>(v: &mut [T], mut hole: usize, top: usize, less: &F) {
     while hole > top {
         let parent = (hole - 1) / 2;
-        if !less(&v[parent], &value) {
+        if !less(&v[parent], &v[hole]) {
             break;
         }
-        v[hole] = v[parent].clone();
+        v.swap(hole, parent);
         hole = parent;
     }
-    v[hole] = value;
 }
 
-/// `std::__adjust_heap`.
-fn adjust<T: Clone, F: Fn(&T, &T) -> bool>(
-    v: &mut [T],
-    mut hole: usize,
-    len: usize,
-    value: T,
-    less: &F,
-) {
+/// `std::__adjust_heap`: the value at `hole` goes down to a leaf, each
+/// step to the greater child (the left one when they are equal), then
+/// rises as `push_heap` would.
+fn adjust<T, F: Fn(&T, &T) -> bool>(v: &mut [T], mut hole: usize, len: usize, less: &F) {
     let top = hole;
     let mut second = hole;
     while len >= 2 && second < (len - 1) / 2 {
@@ -40,52 +38,49 @@ fn adjust<T: Clone, F: Fn(&T, &T) -> bool>(
         if less(&v[second], &v[second - 1]) {
             second -= 1;
         }
-        v[hole] = v[second].clone();
+        v.swap(hole, second);
         hole = second;
     }
     if len >= 2 && len.is_multiple_of(2) && second == (len - 2) / 2 {
         second = 2 * (second + 1);
-        v[hole] = v[second - 1].clone();
+        v.swap(hole, second - 1);
         hole = second - 1;
     }
-    push_up(v, hole, top, value, less);
+    push_up(v, hole, top, less);
 }
 
 /// `std::push_heap(v.begin(), v.end(), less)`: the last element joins the
 /// heap in front of it.
-pub fn push_heap<T: Clone, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
+pub fn push_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
     let Some(last) = v.len().checked_sub(1) else {
         return;
     };
-    let value = v[last].clone();
-    push_up(v, last, 0, value, less);
+    push_up(v, last, 0, less);
 }
 
 /// `std::__pop_heap(first, last, result)`: the root goes to `result`, and
 /// the element that was there is sifted into `v[..last]`.
-fn pop_into<T: Clone, F: Fn(&T, &T) -> bool>(v: &mut [T], last: usize, result: usize, less: &F) {
-    let value = v[result].clone();
-    v[result] = v[0].clone();
-    adjust(v, 0, last, value, less);
+fn pop_into<T, F: Fn(&T, &T) -> bool>(v: &mut [T], last: usize, result: usize, less: &F) {
+    v.swap(0, result);
+    adjust(v, 0, last, less);
 }
 
 /// `std::pop_heap(v.begin(), v.end(), less)`: the root moves to the end.
-pub fn pop_heap<T: Clone, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
+pub fn pop_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
     if v.len() > 1 {
         let last = v.len() - 1;
         pop_into(v, last, last, less);
     }
 }
 
-fn make_heap<T: Clone, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
+fn make_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
     let len = v.len();
     if len < 2 {
         return;
     }
     let mut parent = (len - 2) / 2;
     loop {
-        let value = v[parent].clone();
-        adjust(v, parent, len, value, less);
+        adjust(v, parent, len, less);
         if parent == 0 {
             return;
         }

@@ -965,22 +965,21 @@ about forty such points; these are the ones measured.
       write, and to stream the order.
       Backlog-ID: RM-390
       Verify: tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_of_a_clustered_collection_out_of_time_keeps_its_updates
-- [ ] **`$near` returns documents tied at one distance in the macOS build's
-      order, not the Linux build's.** mongod's builds disagree: for four
-      points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,
-      macOS arm64 8.2.11 / 8.2.12 answer `[2, 3, 0, 1]`, and this server
-      returns the macOS order. **Decided (Joe, 2026-10-21): the Linux build
-      is the exemplar** where builds differ. The tie order is not a rounding
-      matter (the distances are exact), so probe what orders Linux's ties
-      before building. The other build split measured, a window `$stdDev`'s
-      last digit (the macOS build fuses `count * x - sum` into one rounding),
-      was fixed in the same batch (`windowfields.rs` rounds twice, as Linux
-      does; `test_std_dev_window_rounds_as_the_linux_build`). Not yet
-      measured on Linux, and written to the macOS build's fused arithmetic:
-      the `$group` deviation (`group.rs`, `delta.mul_add`) and the 2d
-      distances (`geohash2d.rs`, two `mul_add`s).
-      Backlog-ID: RM-231
-      Verify: tests/backlog/test_rm_029_056.py::test_near_ties_in_scan_order
+- [ ] **The S2 geometry computes with the macOS build's fused arithmetic,
+      not the Linux build's.** `crates/secantus-core/src/s2legacy/` was
+      written to the macOS arm64 mongod, which fuses multiply-adds: the
+      dot and cross products (`point.rs`), the face-UV transforms, the
+      interval arithmetic all use `mul_add`. mongod 8.2.12 on Linux, the
+      exemplar (Joe, 2026-10-21), rounds each step, x86-64 and arm64 alike
+      (measured in `mongo:8.2` containers, 2026-11-07). Seen: a 2dsphere
+      `$geoNear` from a LineString's own vertex is 0.0 on Linux, 6.4e-12 m
+      here (and on macOS, to within the last digits), so a `$near` returns
+      the line after the point and polygon tied with it at 0, not before.
+      The face-UV transforms decide which cell a point is in, so the
+      change can move index keys and explain bounds: measure the covering
+      and explain sweeps against a Linux mongod, not the macOS one on PATH.
+      Verify: tests/backlog/test_rm_found_2026_11_07e.py::test_a_line_through_the_centre_is_at_distance_zero
+      Backlog-ID: RM-393
 
 ### 7.086 The Rust MongoDB server, audited -- 2026-10-20
 

@@ -265,8 +265,9 @@ pub fn distance_compare(p1: (f64, f64), p2: (f64, f64), radius: f64) -> f64 {
             p1.0 - (p2.0 + radius)
         };
     }
-    // `sqrt((a * a) + (b * b))`, fused as clang fuses it.
-    a.mul_add(a, b * b).sqrt() - radius
+    // `sqrt((a * a) + (b * b))`, rounded after each step as the Linux
+    // build computes it (the macOS build fuses the add, RM-231).
+    (a * a + b * b).sqrt() - radius
 }
 
 fn circle_contains_box(center: (f64, f64), r: f64, b: &Box2, boundary: bool) -> bool {
@@ -453,7 +454,7 @@ impl Converter {
         let (ax, ay) = c.unhash(a);
         let (bx, by) = c.unhash(b);
         let (dx, dy) = (bx - ax, by - ay);
-        c.error = dx.mul_add(dx, dy * dy).sqrt() + 0.001 / scaling;
+        c.error = (dx * dx + dy * dy).sqrt() + 0.001 / scaling;
         c
     }
 

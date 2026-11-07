@@ -1,14 +1,15 @@
-//! `std::priority_queue` as libc++ builds it.
+//! `std::priority_queue` as libstdc++ builds it.
 //!
-//! mongod keeps two queues whose order among equal entries reaches the
-//! client: the S2 region coverer's candidates (equal priority), and the
-//! `$near` result buffer (equal distance). A `std::priority_queue` compares
-//! entries and nothing else, so of two equal entries the one that comes out
-//! first is whichever the heap's sift steps leave on top. This is libc++'s
-//! `push_heap` (`__sift_up`) and `pop_heap` (Floyd's sift-down to a leaf,
-//! then `__sift_up`), which the reference mongod 8.2.11 on macOS is built
-//! with. libstdc++ (a Linux build) sifts differently, and can leave equal
-//! entries in another order.
+//! mongod keeps queues whose order among equal entries reaches the client:
+//! the S2 and 2d region coverers' candidates (equal priority), the `$near`
+//! result buffer (equal distance) and a SORT_MERGE's heads (equal sort
+//! keys). A `std::priority_queue` compares entries and nothing else, so of
+//! two equal entries the one that comes out first is whichever the heap's
+//! sift steps leave on top, and the C++ libraries sift differently: libc++
+//! (the macOS build) and libstdc++ (the Linux build) can hand the same
+//! equal entries back in different orders. The Linux build is the exemplar
+//! where builds differ (Joe, 2026-10-21), so this is libstdc++'s
+//! `push_heap` and `pop_heap` ([`crate::stl`]).
 
 pub trait HeapOrder {
     /// The queue's comparator: `true` when `self` belongs BELOW `other`
@@ -57,67 +58,12 @@ impl<T: HeapOrder> Heap<T> {
 
     pub fn push(&mut self, value: T) {
         self.c.push(value);
-        let len = self.c.len();
-        sift_up(&mut self.c, len);
+        crate::stl::push_heap(&mut self.c, &T::heap_less);
     }
 
     pub fn pop(&mut self) -> Option<T> {
-        let len = self.c.len();
-        if len == 0 {
-            return None;
-        }
-        if len > 1 {
-            // Floyd: move the hole at the top down to a leaf, always to the
-            // greater child (the right one only when it is strictly greater).
-            let mut hole = 0usize;
-            let mut child = 0usize;
-            loop {
-                let mut child_i = 2 * child + 1;
-                child = child_i;
-                if child + 1 < len && self.c[child_i].heap_less(&self.c[child_i + 1]) {
-                    child_i += 1;
-                    child += 1;
-                }
-                self.c.swap(hole, child_i);
-                hole = child_i;
-                if child > (len - 2) / 2 {
-                    break;
-                }
-            }
-            // The old top now sits at `hole`.
-            let last = len - 1;
-            if hole != last {
-                // The last element fills the hole and sifts up; the old top
-                // goes to the end.
-                self.c.swap(hole, last);
-                sift_up(&mut self.c[..last], hole + 1);
-            }
-        }
+        crate::stl::pop_heap(&mut self.c, &T::heap_less);
         self.c.pop()
-    }
-}
-
-/// libc++'s `__sift_up(first, first + len)`: the element at `len - 1`
-/// rises while its parent is less than it.
-fn sift_up<T: HeapOrder>(c: &mut [T], len: usize) {
-    if len <= 1 {
-        return;
-    }
-    let mut last = len - 1;
-    let mut parent = (len - 2) / 2;
-    if !c[parent].heap_less(&c[last]) {
-        return;
-    }
-    loop {
-        c.swap(parent, last);
-        last = parent;
-        if parent == 0 {
-            break;
-        }
-        parent = (parent - 1) / 2;
-        if !c[parent].heap_less(&c[last]) {
-            break;
-        }
     }
 }
 
@@ -145,13 +91,13 @@ mod tests {
 
     #[test]
     fn equal_entries_leave_in_heap_order() {
-        // Four equal distances pushed in order 0..4: libc++'s sift steps
-        // hand them back 0, 1, 3, 2.
+        // Four equal distances pushed in order 0..4: libstdc++'s sift
+        // steps hand them back 0, 2, 1, 3 (libc++'s: 0, 1, 3, 2).
         let mut h = Heap::new();
         for i in 0..4 {
             h.push(D(1.0, i));
         }
         let out: Vec<u32> = std::iter::from_fn(|| h.pop().map(|d| d.1)).collect();
-        assert_eq!(out, vec![0, 1, 3, 2]);
+        assert_eq!(out, vec![0, 2, 1, 3]);
     }
 }

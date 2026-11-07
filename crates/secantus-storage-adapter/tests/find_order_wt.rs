@@ -469,7 +469,9 @@ fn a_pipeline_sort_reads_in_the_order_of_the_plan() {
 fn a_merge_of_scans_hands_over_equal_documents_in_its_heap_order() {
     with_wt(|c| {
         // One scan per value of `a`, merged on `b` through a priority queue:
-        // equal `b`s come out as libc++'s heap leaves them, not scan by scan.
+        // equal `b`s come out as libstdc++'s heap leaves them, not scan by
+        // scan (mongod 8.2.12's Linux build; the macOS build's libc++ heap
+        // answers 14 before 13 and 17 before 7 in the last two, RM-231).
         seed(c, mixed(), vec![doc! { "a": 1, "b": 1 }]);
         assert_eq!(
             find(
@@ -495,7 +497,7 @@ fn a_merge_of_scans_hands_over_equal_documents_in_its_heap_order() {
                 doc! { "a": { "$in": [7, "b", 5, Bson::Null] } },
                 doc! { "sort": { "b": 1 } }
             ),
-            [11, 9, 3, 14, 13, 17, 7, 2]
+            [11, 9, 3, 13, 14, 7, 17, 2]
         );
         seed(c, mixed(), vec![doc! { "a": 1, "b": -1 }]);
         assert_eq!(
@@ -504,7 +506,7 @@ fn a_merge_of_scans_hands_over_equal_documents_in_its_heap_order() {
                 doc! { "a": { "$in": [7, "b", 5, Bson::Null] } },
                 doc! { "sort": { "b": 1 } }
             ),
-            [3, 9, 11, 14, 13, 17, 7, 2]
+            [3, 9, 11, 13, 14, 7, 17, 2]
         );
     });
 }
@@ -626,7 +628,8 @@ fn a_merge_holds_the_documents_its_filter_rejects_too() {
     with_wt(|c| {
         // The FETCH that rejects `c` sits above the merge, so the rejected
         // documents take their places in its heap and move where equal
-        // documents come out.
+        // documents come out (libstdc++'s heap, mongod 8.2.12 on Linux;
+        // the macOS build puts 13 before 4 in the second, RM-231).
         seed(c, mixed(), vec![doc! { "a": 1, "b": 1 }]);
         assert_eq!(
             find(
@@ -642,7 +645,7 @@ fn a_merge_holds_the_documents_its_filter_rejects_too() {
                 doc! { "a": { "$in": [5, 3, 1, 7, "a"] }, "c": { "$ne": 0 } },
                 doc! { "sort": { "b": 1 } }
             ),
-            [1, 3, 13, 4, 19, 7, 6, 20, 2]
+            [1, 3, 4, 13, 19, 7, 6, 20, 2]
         );
         assert_eq!(
             find(
