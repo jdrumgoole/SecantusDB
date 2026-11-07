@@ -6078,8 +6078,45 @@ impl PgHandler {
                 schema,
             ));
         }
-        let (schema, bare, oid, fields) = self.composite_with_schema_named(pg_type).ok()??;
+        if let Some((schema, bare, oid, fields)) = self.composite_with_schema_named(pg_type).ok()? {
+            return self.composite_type(&schema, &bare, oid, &fields);
+        }
+        // A view's row type (`select v from v`) reports the oid `pg_type`
+        // lists it with, as a table's does, not varchar (RP-480).
+        let (schema, bare, oid, fields) = self.view_row_type_named(pg_type)?;
         self.composite_type(&schema, &bare, oid, &fields)
+    }
+
+    /// A view's row type by its resolution name (`name` in public, else
+    /// `schema.name`): its schema, bare name, `pg_type` oid and fields, as
+    /// `set_user_composites` hands them to the planner.
+    fn view_row_type_named(
+        &self,
+        resolution: &str,
+    ) -> Option<(String, String, i64, CompositeFields)> {
+        self.type_catalog_docs(Self::VIEW_COLLECTION)
+            .ok()?
+            .iter()
+            .find_map(|d| {
+                let (Ok(view), Ok(row)) = (d.get_str("_id"), d.get_array("row_fields")) else {
+                    return None;
+                };
+                let (schema, bare) = secantus_pgplan::schemas::split_key(view);
+                if Self::type_resolution(&schema, &bare) != resolution {
+                    return None;
+                }
+                let fields: CompositeFields = row
+                    .iter()
+                    .filter_map(|f| {
+                        let f = f.as_array()?;
+                        Some((
+                            f.first()?.as_str()?.to_string(),
+                            f.get(1)?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect();
+                Some((schema, bare, self.view_type_relid(view), fields))
+            })
     }
 
     /// The wire `Type` for a DEFINED base type or its array, by resolution

@@ -4282,3 +4282,63 @@ fn missing_rte_hint_follows_search_range_table_for_rel() {
     // A name no level's range table has.
     assert_eq!(hint(&levels, "q"), None);
 }
+
+/// `select x from t as x(a, b)`'s whole row after the column-alias and
+/// whole-row rewrites: its cast's type, the ROW's arguments and its field
+/// names.
+fn aliased_whole_row(sql: &str) -> (String, Vec<String>, Vec<String>) {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not a SELECT: {sql}");
+    };
+    let aliased = column_alias_rewrite(s, &lookup).unwrap().expect("aliased");
+    let out = whole_row_rewrite(&aliased, &lookup, &[])
+        .unwrap()
+        .expect("a whole row");
+    let Some(N::ResTarget(rt)) = out.target_list[0].node.as_ref() else {
+        panic!("no target");
+    };
+    let Some(N::TypeCast(cast)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+        panic!("the row is not cast to a row type: {:?}", rt.val);
+    };
+    let Some(N::RowExpr(row)) = cast.arg.as_deref().and_then(|v| v.node.as_ref()) else {
+        panic!("no ROW under the cast");
+    };
+    let names = |ns: &[pg_query::protobuf::Node]| -> Vec<String> {
+        ns.iter()
+            .map(|n| match n.node.as_ref() {
+                Some(N::String(sv)) => sv.sval.clone(),
+                Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                    Some(N::String(sv)) => sv.sval.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .collect()
+    };
+    let ty = cast
+        .type_name
+        .as_ref()
+        .map(|t| names(&t.names).join("."))
+        .unwrap_or_default();
+    (ty, names(&row.args), names(&row.colnames))
+}
+
+#[test]
+fn a_tables_whole_row_under_a_column_alias_list_is_its_row_type() {
+    // PostgreSQL 15.19: the whole row of `t x(a, b)` is of t's row type,
+    // its fields named as t names them (`row_to_json` prints `id`, not
+    // `a`), read from the renamed columns (RP-480).
+    assert_eq!(
+        aliased_whole_row("select x from t as x(a, b)"),
+        (
+            "t".to_string(),
+            vec!["a".into(), "b".into(), "n".into()],
+            vec!["id".into(), "name".into(), "n".into()],
+        )
+    );
+}

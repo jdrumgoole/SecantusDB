@@ -1986,15 +1986,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       whole row over a join works, built at its scan.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
       Backlog-ID: RP-479
-- [ ] **A whole row is typed as a record, or as varchar.** `select x from
-      fs as x(p, q)`, alone or over a join, is of `fs`'s row type on
-      PostgreSQL 15.19 (psycopg reads `(1,y)`); here it is a `record`, as
-      `column_alias_rewrite` turns the table into a subquery first. A
-      view's whole row (`select v from v`, alone or over a join) has the
-      right value, but its RowDescription's type OID is 1043, varchar,
-      where PostgreSQL sends the view's row type (`'v'::regtype`).
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_under_column_aliases, tests/backlog/test_rp_subquery_scope.py::test_whole_row_of_a_view_is_its_row_type
-      Backlog-ID: RP-480
 - [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
       15.19 reports `column "a" specified in USING clause does not exist in
       left table` with no position; here it points into the statement (41,

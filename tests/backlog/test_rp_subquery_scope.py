@@ -16,8 +16,8 @@ aliased JOIN) and RP-468 (a correlated subquery reading a join's column got
 text; fixed); found while working RP-461, RP-478 (a LATERAL subquery's bare
 name for an earlier FROM item's column was not found; fixed); and found while
 working RP-470, RP-479 (a whole-row reference still refused in three
-shapes), RP-480 (a whole row typed as a record or as varchar) and RP-481 (a
-USING column's 42703 carries a position).
+shapes), RP-480 (a whole row was typed as a record or as varchar; fixed)
+and RP-481 (a USING column's 42703 carries a position).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -458,24 +458,40 @@ def test_whole_row_remainder(query: str, dsn: str) -> None:
 
 # Found while working RP-470. A table's whole row is of its row type even
 # under a column-alias list; psycopg reads an unknown composite as text and
-# a record as a tuple.
+# a record as a tuple, which is what it read here before RP-480 was fixed.
 WHOLE_ROW_COLUMN_ALIASES = {
     "select x from fs as x(p, q)": [("(1,y)",)],
     "select x from fs as x(p, q), fe": [("(1,y)",)],
+    "select x from fe left join fs as x(p, q) on false": [(None,)],
 }
 
 
-@pytest.mark.backlog("RP-480")
+@pytest.mark.backlog_fixed("RP-480")
 @pytest.mark.parametrize("query", list(WHOLE_ROW_COLUMN_ALIASES))
 def test_whole_row_under_column_aliases(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WHOLE_ROW_COLUMN_ALIASES[query]
 
 
-@pytest.mark.backlog("RP-480")
+# Found while working RP-480. Under a column-alias list the row keeps the
+# relation's own field names; here `row_to_json` printed the aliases.
+WHOLE_ROW_FIELD_NAMES = {
+    "select row_to_json(x) from fs as x(p, q)": [({"a": 1, "c": "y"},)],
+    "select row_to_json(x) from fs as x(p, q), fe": [({"a": 1, "c": "y"},)],
+    "select (x).c, (x).p from fs as x(p)": [("y", 1)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-480")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_FIELD_NAMES))
+def test_whole_row_under_column_aliases_keeps_field_names(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_FIELD_NAMES[query]
+
+
+@pytest.mark.backlog_fixed("RP-480")
 def test_whole_row_of_a_view_is_its_row_type(dsn: str) -> None:
     """A view's whole row is of the view's row type (the RowDescription's
-    type OID is `'v'::regtype`), alone or over a join; here it was 1043,
-    varchar."""
+    type OID is `'v'::regtype`), alone, over a join or under a column-alias
+    list; here it was 1043, varchar."""
     with psycopg.connect(dsn, autocommit=True) as c:
         for q in _SETUP:
             c.execute(q)
@@ -483,10 +499,11 @@ def test_whole_row_of_a_view_is_its_row_type(dsn: str) -> None:
         try:
             lone = c.execute("select rp_wv from rp_wv").description[0].type_code
             joined = c.execute("select rp_wv from rp_wv, fe").description[0].type_code
+            aliased = c.execute("select v from rp_wv as v(p, q)").description[0].type_code
             row = c.execute("select 'rp_wv'::regtype::oid").fetchone()
         finally:
             c.execute("drop view rp_wv")
-    assert row is not None and (lone, joined) == (row[0], row[0])
+    assert row is not None and (lone, joined, aliased) == (row[0], row[0], row[0])
 
 
 # Found while working RP-470. PostgreSQL 15.19 reports a missing USING

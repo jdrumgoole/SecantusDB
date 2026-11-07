@@ -4953,6 +4953,7 @@ fn plan_query_node(
     if DEPTH.with(|d| d.replace(d.get() + 1)) == 0 {
         EXPANDED_VIEWS.with(|e| e.borrow_mut().clear());
         EXPANDED_SYSTEM_VIEWS.with(|e| e.borrow_mut().clear());
+        ALIASED_TABLES.with(|e| e.borrow_mut().clear());
     }
     let _nested = Nested;
     // Views expand BEFORE subqueries resolve: a view's body may hold a
@@ -23830,6 +23831,36 @@ fn alias_field_rewrite(
     Ok(changed.then_some(out))
 }
 
+thread_local! {
+    /// The FROM subqueries `column_alias_rewrite` made of a table with a
+    /// column-alias list: `(alias, subquery, table)`.
+    static ALIASED_TABLES: std::cell::RefCell<Vec<(String, pg_query::protobuf::SelectStmt, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The table a FROM subquery under `alias` was written as, when
+/// `column_alias_rewrite` made it of `t alias(a, b)`: its whole row is the
+/// table's row type, with the table's own field names (RP-480).
+fn aliased_table(alias: &str, sub: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    ALIASED_TABLES.with(|t| {
+        t.borrow()
+            .iter()
+            .rev()
+            .find(|(a, s, _)| a == alias && s == sub)
+            .map(|(_, _, table)| table.clone())
+    })
+}
+
+/// A table's row type by name: one named after a built-in type (`tid`) is
+/// `public.tid`, as the bare name is pg_catalog's.
+fn table_rowtype(name: String) -> String {
+    if pgtypes::shadowed_by_catalog(&name) {
+        format!("public.{name}")
+    } else {
+        name
+    }
+}
+
 /// A table in FROM with a column-alias list (`t r(a, b)`) as the subquery
 /// it is shorthand for, `(SELECT id AS a, g AS b, v FROM t) r`, so every
 /// planner path sees ordinary column names. `None` when there is none.
@@ -23901,6 +23932,15 @@ fn column_alias_rewrite(
                     ..Default::default()
                 };
                 let aliasname = alias.aliasname.clone();
+                // The subquery is still the table to its whole row, which
+                // is of the table's row type (RP-480).
+                ALIASED_TABLES.with(|t| {
+                    let mut t = t.borrow_mut();
+                    if t.len() >= 64 {
+                        t.clear();
+                    }
+                    t.push((aliasname.clone(), sub.clone(), relation_name(rv)));
+                });
                 *n = pg_query::protobuf::Node {
                     node: Some(N::RangeSubselect(Box::new(
                         pg_query::protobuf::RangeSubselect {
@@ -37245,6 +37285,9 @@ fn whole_row_rewrite(
     let mut rowtype: Option<String> = None;
     // A scalar function's whole row is its one value, not a row of it.
     let mut scalar = false;
+    // The row's field names, where they are not the names the query reads
+    // its columns by: a row type's own, under a column-alias list.
+    let mut field_names: Option<Vec<String>> = None;
     let (alias, columns): (String, Vec<String>) = match item.node.as_ref() {
         // A function's whole row (PostgreSQL's whole-row Var over its RTE):
         // its composite result, or the value of a scalar one. Only a
@@ -37300,14 +37343,7 @@ fn whole_row_rewrite(
             }
             match lookup(&relation_name(r)) {
                 Some(def) => {
-                    // A table named after a built-in type (`tid`) has the
-                    // row type `public.tid`: the bare name is pg_catalog's.
-                    let name = relation_name(r);
-                    rowtype = Some(if pgtypes::shadowed_by_catalog(&name) {
-                        format!("public.{name}")
-                    } else {
-                        name
-                    });
+                    rowtype = Some(table_rowtype(relation_name(r)));
                     (alias, def.columns.iter().map(|c| c.name.clone()).collect())
                 }
                 None => return Ok(None),
@@ -37341,6 +37377,8 @@ fn whole_row_rewrite(
                 plan_select(sub, lookup, params).and_then(|stmt| sub_plan_def(&stmt, lookup))
             })?;
             let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+            // A view's row keeps the view's own field names under `v(a, b)`.
+            let own = cols.clone();
             // `s(a, b)` column aliases rename the subquery's outputs.
             if let Some(a) = rs.alias.as_ref() {
                 for (i, c) in a.colnames.iter().enumerate() {
@@ -37359,6 +37397,15 @@ fn whole_row_rewrite(
             });
             if let Some(view) = view.filter(|v| user_composite(v).is_some()) {
                 rowtype = Some(view);
+                field_names = Some(own);
+            }
+            // A table under a column-alias list: its row type, and its own
+            // column names as the row's field names (RP-480).
+            if let Some(table) = aliased_table(&alias, sub) {
+                if let Some(t) = lookup(&table) {
+                    field_names = Some(t.columns.iter().map(|c| c.name.clone()).collect());
+                    rowtype = Some(table_rowtype(table));
+                }
             }
             (alias, cols)
         }
@@ -37419,7 +37466,9 @@ fn whole_row_rewrite(
                 args: arg_names.iter().map(|c| col_node(c)).collect(),
                 row_typeid: 0,
                 row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
-                colnames: columns
+                colnames: field_names
+                    .as_ref()
+                    .unwrap_or(&columns)
                     .iter()
                     .map(|c| pg_query::protobuf::Node {
                         node: Some(N::String(pg_query::protobuf::String { sval: c.clone() })),
