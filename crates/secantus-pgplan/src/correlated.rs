@@ -689,7 +689,17 @@ pub(crate) fn from_item_def(
 ) -> Option<(Vec<String>, TableDef)> {
     match item.node.as_ref()? {
         N::RangeVar(r) => {
-            let def = lookup(&relation_name(r))?;
+            // An unqualified name an enclosing WITH declares is that CTE,
+            // ahead of any table of the name (RP-453).
+            let cte = if r.schemaname.is_empty() {
+                visible_cte_def(&r.relname, lookup, params)
+            } else {
+                None
+            };
+            let def = match cte {
+                Some(def) => def,
+                None => lookup(&relation_name(r))?,
+            };
             let name = r
                 .alias
                 .as_ref()

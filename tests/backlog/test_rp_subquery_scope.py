@@ -1,8 +1,11 @@
 """Gap tests of the name-scope divergences found while working RP-443:
 RP-451 (a parameter qualified by its function's name is not bound), RP-455
 (a write's target is not an enclosing relation to its subqueries), RP-453
-(a correlated subquery's value read from a CTE or a write's target comes
-out text) and RP-454 (a join's alias is refused or not found).
+(a correlated subquery's value read from a CTE or a write's target came
+out text; fixed), RP-454 (a join's alias is refused or not found), RP-456
+(a CTE hidden by its alias still answers to its name in a subquery) and
+RP-457 (an UPDATE ... FROM's or DELETE ... USING's RETURNING subquery
+cannot read the FROM).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -13,6 +16,7 @@ were measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -100,14 +104,30 @@ def test_write_target_scope_in_a_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WRITE_TARGET_SCOPE[query]
 
 
-# The subquery's value has the outer column's type, `integer`.
+# The subquery's value has the outer column's type, `integer`; it came out
+# the text of an untyped parameter, as the outer reference's type was looked
+# up only among tables and FROM-subqueries.
 CORRELATED_VALUE_TYPE = {
     "with c as (select 1 as a) select (select c.a from fs limit 1) from c": [(1,)],
     "insert into fe values (2, 'x') returning (select fe.a from fs limit 1)": [(2,)],
+    "update fe set b = 'z' returning (select fe.a from fs limit 1)": [(1,)],
+    "delete from fe returning (select fe.a from fs limit 1)": [(1,)],
+    "insert into fe as x values (3, 'y') returning (select x.a from fs limit 1)": [(3,)],
+    "with c(x) as (select 1) select (select c.x from fs limit 1) from c": [(1,)],
+    "with c as (select 2.5::numeric b, 1 a) select (select c.b from fs limit 1) from c": [
+        (Decimal("2.5"),)
+    ],
+    "with c as (select 1::int8 a), d as (select a from c)"
+    " select (select d.a from fs limit 1) from d": [(1,)],
+    # An ARRAY sublink over it was `{NULL}`.
+    "with c as (select 1 as a) select array(select c.a from fs) from c": [([1],)],
+    # A CTE hides a table of its name: typed by the table, the text `q` was
+    # sent as an integer.
+    "with fs as (select 'q'::text as a) select (select fs.a from fe limit 1) from fs": [("q",)],
 }
 
 
-@pytest.mark.backlog("RP-453")
+@pytest.mark.backlog_fixed("RP-453")
 @pytest.mark.parametrize("query", list(CORRELATED_VALUE_TYPE))
 def test_correlated_value_keeps_its_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CORRELATED_VALUE_TYPE[query]
@@ -125,3 +145,44 @@ JOIN_ALIAS = {
 @pytest.mark.parametrize("query", list(JOIN_ALIAS))
 def test_join_alias(query: str, dsn: str) -> None:
     assert answer(dsn, query) == JOIN_ALIAS[query]
+
+
+_C_ALIAS_X = (
+    "42P01",
+    'invalid reference to FROM-clause entry for table "c"',
+    'Perhaps you meant to reference the table alias "x".',
+)
+
+# A CTE referenced under an alias is hidden by it, as a table is: a
+# subquery's `c.a` names nothing.
+CTE_ALIAS_HIDES_NAME = {
+    "with c as (select 1 as a) select (select c.a from fs limit 1) from c x": (
+        *_C_ALIAS_X,
+        "42",
+    ),
+    "with c as (select 1 as a) select 1 from c x where exists (select c.a from fs)": (
+        *_C_ALIAS_X,
+        "66",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-456")
+@pytest.mark.parametrize("query", list(CTE_ALIAS_HIDES_NAME))
+def test_cte_alias_hides_its_name(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == CTE_ALIAS_HIDES_NAME[query]
+
+
+# An UPDATE's FROM and a DELETE's USING are relations of the statement's
+# own level, which its RETURNING's subqueries read.
+RETURNING_READS_FROM = {
+    "update fe set b = 'w' from fs returning (select fs.a from fe limit 1)": [(1,)],
+    "delete from fe using fs returning (select fs.c from fe limit 1)": [("y",)],
+    "update fe set b = 'w' from fs x returning (select x.c from fe limit 1)": [("y",)],
+}
+
+
+@pytest.mark.backlog("RP-457")
+@pytest.mark.parametrize("query", list(RETURNING_READS_FROM))
+def test_returning_subquery_reads_the_from(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RETURNING_READS_FROM[query]

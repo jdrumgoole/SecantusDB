@@ -19622,7 +19622,33 @@ fn resolve_sublinks(
         ),
         _ => push_outer_range_names([], &[]),
     };
+    // ...and the same range table is where a correlated subquery's outer
+    // reference finds its TYPE (RP-453): `returning (select fe.a from fs)`
+    // reads the target's integer, not an untyped text parameter.
+    let from_depth = {
+        let as_node = |r: &pg_query::protobuf::RangeVar| pg_query::protobuf::Node {
+            node: Some(N::RangeVar(r.clone())),
+        };
+        let items: Vec<pg_query::protobuf::Node> = match node.node.as_ref() {
+            Some(N::UpdateStmt(u)) => u
+                .relation
+                .iter()
+                .map(as_node)
+                .chain(u.from_clause.iter().cloned())
+                .collect(),
+            Some(N::DeleteStmt(d)) => d
+                .relation
+                .iter()
+                .map(as_node)
+                .chain(d.using_clause.iter().cloned())
+                .collect(),
+            Some(N::InsertStmt(i)) => i.relation.iter().map(as_node).collect(),
+            _ => Vec::new(),
+        };
+        correlated::push_outer_from(&items)
+    };
     let out = resolve_sublinks_scoped(node, lookup, params, run);
+    correlated::pop_outer_from(from_depth);
     pop_outer_range_names(range_depth);
     VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
     out
@@ -22192,6 +22218,65 @@ fn attach_outer_ctes(
     // for the statement around them.
     w.recursive |= recursive;
     w.ctes.extend(ctes.iter().cloned());
+}
+
+/// The columns of the enclosing statements' CTE `name`, when one is in
+/// scope: what a correlated subquery's reference to an outer row read from
+/// a CTE is typed by (RP-453). PostgreSQL's range table entry for a CTE
+/// reference carries the CTE's own output columns (`addRangeTableEntryForCTE`),
+/// and a CTE of that name hides a table of it, as here.
+pub(crate) fn visible_cte_def(
+    name: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<TableDef> {
+    let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    let declared = ctes
+        .iter()
+        .any(|c| matches!(c.node.as_ref(), Some(N::CommonTableExpr(c)) if c.ctename == name));
+    if !declared {
+        return None;
+    }
+    // `SELECT * FROM name` under the visible WITH, as a subquery sees it
+    // (`resolve_one_sublink`): inlining substitutes the earlier CTEs a body
+    // reads and applies the CTE's column aliases.
+    let star = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let from = pg_query::protobuf::Node {
+        node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
+            relname: name.to_string(),
+            inh: true,
+            relpersistence: "p".into(),
+            location: -1,
+            ..Default::default()
+        })),
+    };
+    let s = pg_query::protobuf::SelectStmt {
+        target_list: vec![star],
+        from_clause: vec![from],
+        with_clause: Some(pg_query::protobuf::WithClause {
+            ctes,
+            ..Default::default()
+        }),
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    let flat = inline_ctes(&s).ok()?;
+    let planned = correlated::without_side_effects(|| plan_select(&flat, lookup, params)).ok()?;
+    sub_plan_def(&planned, lookup).ok()
 }
 
 /// Push a WITH's items onto `VISIBLE_CTES` for the subqueries resolved

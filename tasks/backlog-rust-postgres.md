@@ -1855,17 +1855,6 @@ and `fs(a int, c text)`, one row each.
       (`OUTER_RELATIONS`) the way a SELECT's FROM is.
       Backlog-ID: RP-455
       Verify: tests/backlog/test_rp_subquery_scope.py::test_write_target_scope_in_a_subquery
-- [ ] **A correlated subquery's value read from a CTE or a write's target
-      comes out text.** `with c as (select 1 as a) select (select c.a from
-      fs limit 1) from c` and `insert into fe values (2, 'x') returning
-      (select fe.a from fs limit 1)` answer the integer 1 and 2 on
-      PostgreSQL; here the strings `'1'` and `'2'`. The correlated
-      rewrite types its parameters by the outer FROM's columns
-      (`typed_probe`), which finds no columns for a CTE or for an INSERT's
-      RETURNING, so the untyped `$n` stays text. The same over a table in
-      the outer FROM is right.
-      Backlog-ID: RP-453
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_correlated_value_keeps_its_type
 - [ ] **A join's alias is refused or not found.** `select u.a from fs join
       fe using (a) as u` (the `USING ... AS` alias PostgreSQL 14 added) and
       `select j.a from (fs join fe using (a)) as j` answer 1 on PostgreSQL
@@ -1877,6 +1866,33 @@ and `fs(a int, c text)`, one row each.
       naming the rewrite's internal function.
       Backlog-ID: RP-454
       Verify: tests/backlog/test_rp_subquery_scope.py::test_join_alias
+
+## Found while working RP-453 (2026-11-07)
+
+- [ ] **A CTE hidden by its alias still answers to its name in a
+      subquery.** In PostgreSQL an alias hides the CTE's name as it hides a
+      table's: `with c as (select 1 as a) select (select c.a from fs limit
+      1) from c x` and `... from c x where exists (select c.a from fs)` are
+      42P01 `invalid reference to FROM-clause entry for table "c"`, hint
+      `Perhaps you meant to reference the table alias "x".`, at 42 and 66.
+      Here the first is 42P01 `missing FROM-clause entry for table "c"` with
+      no hint, at 6 (the WITH's own name), and the EXISTS form answers its
+      row: a statement PostgreSQL refuses runs. The table form is RP-455's
+      write-target case; this is a SELECT's CTE. Measured on PostgreSQL
+      15.19.
+      Backlog-ID: RP-456
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_cte_alias_hides_its_name
+- [ ] **An UPDATE ... FROM's or a DELETE ... USING's RETURNING subquery
+      cannot read the FROM.** `update fe set b = 'w' from fs returning
+      (select fs.a from fe limit 1)` answers 1 on PostgreSQL 15.19, `delete
+      from fe using fs returning (select fs.c from fe limit 1)` `y`, and the
+      same through an alias (`from fs x ... x.c`); the FROM and USING items
+      are relations of the statement's own level. Here each is 42P01
+      `missing FROM-clause entry for table "fs"` (or `"x"`). A subquery over
+      the write's target alone already reads it. Measured on PostgreSQL
+      15.19.
+      Backlog-ID: RP-457
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_returning_subquery_reads_the_from
 
 ## Found while working RP-316 (2026-11-02)
 
