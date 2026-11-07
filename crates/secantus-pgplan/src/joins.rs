@@ -389,9 +389,89 @@ struct Scope {
     /// u`), which is no range table entry: an aliased JOIN above it drops
     /// it rather than hiding it.
     using_aliases: Vec<String>,
+    /// The FROM items a whole-row reference (`t`, `t.*` inside an
+    /// expression) may name, with the composite type of that row: a table's
+    /// own ROWTYPE, or `None` for an anonymous record (a subquery, an
+    /// aliased JOIN). PostgreSQL builds the row as a whole-row Var of the
+    /// entry (`transformWholeRowRef`); a function's entry is not listed.
+    rows: Vec<(String, WholeRow)>,
+}
+
+/// How a FROM item's whole row is read.
+#[derive(Debug, Clone)]
+enum WholeRow {
+    /// From the leaf's row column, under this key (a table, a subquery).
+    Column(String),
+    /// As `ROW(...)` of the entry's columns, of this composite type or an
+    /// anonymous record (an aliased JOIN, whose whole row PostgreSQL
+    /// expands to its columns: `flatten_join_alias_vars`).
+    Expand(Option<String>),
 }
 
 impl Scope {
+    /// The columns and row type of `alias`'s whole row, when it is a visible
+    /// entry with one: a FROM item's own columns in its order, or an aliased
+    /// JOIN's listed ones (`expandNSItemVars`).
+    fn whole_row(&self, alias: &str) -> Option<(Vec<&ScopeCol>, &WholeRow)> {
+        if !self.aliases.iter().any(|a| a == alias) {
+            return None;
+        }
+        let (_, rowtype) = self.rows.iter().rev().find(|(a, _)| a == alias)?;
+        let cols: Vec<&ScopeCol> = self
+            .cols
+            .iter()
+            .filter(|c| c.qual == alias && (c.alias == alias || c.star))
+            .collect();
+        (!cols.is_empty()).then_some((cols, rowtype))
+    }
+
+    /// `alias`'s whole row as `ROW(keys...)`, cast to its row type, the
+    /// field names kept in `colnames` (as `whole_row_rewrite` builds it for
+    /// a lone FROM item).
+    fn whole_row_node(&self, alias: &str, location: i32) -> Option<pg_query::protobuf::Node> {
+        let (cols, how) = self.whole_row(alias)?;
+        let rowtype = match how {
+            WholeRow::Column(key) => {
+                return Some(pg_query::protobuf::Node {
+                    node: Some(key_ref(key.clone(), location)),
+                });
+            }
+            WholeRow::Expand(rowtype) => rowtype,
+        };
+        let row = pg_query::protobuf::Node {
+            node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                xpr: None,
+                args: cols
+                    .iter()
+                    .map(|c| pg_query::protobuf::Node {
+                        node: Some(key_ref(c.key.clone(), -1)),
+                    })
+                    .collect(),
+                row_typeid: 0,
+                row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                colnames: cols
+                    .iter()
+                    .map(|c| pg_query::protobuf::Node {
+                        node: Some(N::String(pg_query::protobuf::String {
+                            sval: c.name.clone(),
+                        })),
+                    })
+                    .collect(),
+                location,
+            }))),
+        };
+        Some(match rowtype {
+            None => row,
+            Some(t) => pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(row)),
+                    type_name: Some(type_name_node(t)),
+                    location: -1,
+                }))),
+            },
+        })
+    }
+
     fn fields(&self) -> Vec<RowField> {
         self.cols
             .iter()
@@ -488,6 +568,11 @@ thread_local! {
     /// The equivalence classes of the two-table join being built (see
     /// `equivalence_classes`).
     static EC_PLAN: std::cell::RefCell<Option<EcPlan>> = const { std::cell::RefCell::new(None) };
+    /// The names the join being built refers to as a whole row (`t`, or
+    /// `t.*` inside an expression; see `whole_row_names`): a table or
+    /// subquery leaf of one of these names carries its row as a column.
+    static WHOLE_ROW_REFS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Join sources planned for the statement in flight, by placeholder name.
     static PLANNED_JOINS: std::cell::RefCell<Vec<(String, SubSource)>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -544,10 +629,12 @@ pub(crate) fn plan_join_source(
     let outer_pushdown = PUSHDOWN.with(|p| p.replace(pushdown));
     let outer_nonnullable = NONNULLABLE.with(|p| p.replace(nonnullable));
     let outer_ec = EC_PLAN.with(|p| p.replace(ec));
+    let outer_whole = WHOLE_ROW_REFS.with(|p| p.replace(whole_row_names(s)));
     let built = build_tree(s, lookup, params);
     PUSHDOWN.with(|p| *p.borrow_mut() = outer_pushdown);
     NONNULLABLE.with(|p| *p.borrow_mut() = outer_nonnullable);
     EC_PLAN.with(|p| *p.borrow_mut() = outer_ec);
+    WHOLE_ROW_REFS.with(|p| *p.borrow_mut() = outer_whole);
     let (tree, scope) = built?;
     if moved.is_empty() {
         return finish_join_source(s, tree, scope, params, &placed);
@@ -587,6 +674,98 @@ pub(crate) fn plan_join_source(
     finish_join_source(&rest, tree, scope, params, &placed)
 }
 
+/// The names `s` may refer to as a whole row: a one-part column reference,
+/// or `name.*` anywhere but as a select-list item of its own (which is the
+/// columns, not the row). A name that turns out to be a column costs only
+/// the unread row column of a leaf of that name.
+fn whole_row_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    let out: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+    // The same nodes `rewrite_expr` walks (`walk_expr`), so that every
+    // reference it rewrites was seen here.
+    let note = |n: &pg_query::protobuf::Node| {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            let name = match c.fields.as_slice() {
+                [f] => f.node.as_ref(),
+                [f, star] if matches!(star.node.as_ref(), Some(N::AStar(_))) => f.node.as_ref(),
+                _ => None,
+            };
+            if let Some(N::String(sv)) = name {
+                let mut out = out.borrow_mut();
+                if !out.contains(&sv.sval) {
+                    out.push(sv.sval.clone());
+                }
+            }
+        }
+        false
+    };
+    for t in &s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            continue;
+        };
+        let Some(v) = rt.val.as_deref() else {
+            continue;
+        };
+        let lone_star = matches!(v.node.as_ref(), Some(N::ColumnRef(c))
+            if matches!(c.fields.last().and_then(|f| f.node.as_ref()), Some(N::AStar(_))));
+        if !lone_star {
+            expr_any(v, &note);
+        }
+    }
+    for n in s
+        .where_clause
+        .as_deref()
+        .into_iter()
+        .chain(s.having_clause.as_deref())
+        .chain(&s.group_clause)
+        .chain(&s.sort_clause)
+        .chain(&s.distinct_clause)
+        .chain(&s.window_clause)
+    {
+        expr_any(n, &note);
+    }
+    // The ON clauses of the FROM's joins.
+    fn on_quals(item: &pg_query::protobuf::Node, note: &dyn Fn(&pg_query::protobuf::Node) -> bool) {
+        if let Some(N::JoinExpr(j)) = item.node.as_ref() {
+            if let Some(q) = j.quals.as_deref() {
+                expr_any(q, note);
+            }
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                on_quals(side, note);
+            }
+        }
+    }
+    for item in &s.from_clause {
+        on_quals(item, &note);
+    }
+    out.into_inner()
+}
+
+/// Is `alias` named as a whole row by the join being built?
+fn whole_row_named(alias: &str) -> bool {
+    WHOLE_ROW_REFS.with(|w| w.borrow().iter().any(|n| n == alias))
+}
+
+/// The name of a leaf's whole-row column: no reference can name it, and
+/// `*`, NATURAL and USING skip it (`bare` and `star` are false).
+const WHOLE_ROW_COLUMN: &str = "\u{1f}row";
+
+/// `SELECT *, <name> AS <row column>` over `item`: the leaf's rows with its
+/// whole row beside them, built at the scan as PostgreSQL builds a
+/// whole-row Var there, so that an outer join NULL-extends it to NULL
+/// rather than to a row of NULLs.
+fn with_whole_row_target(select: &mut pg_query::protobuf::SelectStmt, name: &str) {
+    select.target_list.push(pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            name: WHOLE_ROW_COLUMN.to_string(),
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(key_ref(name.to_string(), -1)),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    });
+}
+
 fn build_tree(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -602,6 +781,7 @@ fn build_tree(
         scope
             .using_aliases
             .extend(item_scope.using_aliases.iter().cloned());
+        scope.rows.extend(item_scope.rows.iter().cloned());
         items.push((node, item_scope.cols));
     }
     if items.is_empty() {
@@ -986,8 +1166,37 @@ fn build(
             // LATERAL with nothing to its left is an ordinary subquery.
             let mut rs = rs.clone();
             rs.lateral = false;
+            // Named as a whole row: planned as `SELECT *, s FROM (...) s`,
+            // its row (a record, a view's row type) a column of its own.
+            let alias = rs.alias.as_ref().map(|a| a.aliasname.clone());
+            let whole_row = alias.as_deref().is_some_and(whole_row_named);
+            let rs = match alias {
+                Some(alias) if whole_row => {
+                    let mut select = pg_query::protobuf::SelectStmt {
+                        target_list: vec![star_target()],
+                        from_clause: vec![pg_query::protobuf::Node {
+                            node: Some(N::RangeSubselect(rs)),
+                        }],
+                        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+                        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+                        ..Default::default()
+                    };
+                    with_whole_row_target(&mut select, &alias);
+                    Box::new(pg_query::protobuf::RangeSubselect {
+                        lateral: false,
+                        subquery: Some(Box::new(pg_query::protobuf::Node {
+                            node: Some(N::SelectStmt(Box::new(select))),
+                        })),
+                        alias: Some(pg_query::protobuf::Alias {
+                            aliasname: alias,
+                            colnames: Vec::new(),
+                        }),
+                    })
+                }
+                _ => rs,
+            };
             let src = plan_from_subquery(&rs, lookup, params)?;
-            leaf_from_source(src.plan, src.def, &src.alias, lookup, aliases)
+            leaf_from_source(src.plan, src.def, &src.alias, aliases, whole_row)
         }
         Some(N::RangeFunction(rf)) => {
             // A function call's own alias names the source; without one,
@@ -1521,7 +1730,19 @@ fn leaf_filtered(
 ) -> Result<(JoinNode, Scope)> {
     // Taken before anything nested plans, which may build leaves of its own.
     let bare_alias = BARE_FUNCTION_ALIAS.with(|b| b.replace(false));
-    let select = pg_query::protobuf::SelectStmt {
+    // A table's whole row, when the query names it as one and no column of
+    // the table has that name (a column wins).
+    let row_name = match item.node.as_ref() {
+        Some(N::RangeVar(r))
+            if whole_row_named(alias)
+                && !lookup(&relation_name(r))
+                    .is_some_and(|d| d.columns.iter().any(|c| c.name == alias)) =>
+        {
+            Some(r.relname.clone())
+        }
+        _ => None,
+    };
+    let mut select = pg_query::protobuf::SelectStmt {
         where_clause: filter.map(Box::new),
         target_list: vec![pg_query::protobuf::Node {
             node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
@@ -1541,8 +1762,16 @@ fn leaf_filtered(
         op: pg_query::protobuf::SetOperation::SetopNone as i32,
         ..Default::default()
     };
+    if let Some(name) = &row_name {
+        with_whole_row_target(&mut select, name);
+    }
     let plan = plan_select(&select, lookup, params)?;
     let mut def = sub_plan_def(&plan, lookup)?;
+    let row_column = if row_name.is_some() {
+        def.columns.pop()
+    } else {
+        None
+    };
     let names: Vec<String> = colnames.iter().filter_map(alias_colname).collect();
     let names = scalar_alias(names, bare_alias, alias, def.columns.len());
     if names.len() > def.columns.len() {
@@ -1565,22 +1794,62 @@ fn leaf_filtered(
     for (c, n) in node_def.columns.iter_mut().zip(&renamed) {
         c.name = n.clone();
     }
-    leaf_with_names(plan, def, alias, &renamed, &fields, &node_def, aliases)
+    let Some(row_column) = row_column else {
+        return leaf_with_names(plan, def, alias, &renamed, &fields, &node_def, aliases);
+    };
+    def.columns.push(row_column.clone());
+    let (mut node, mut scope) =
+        leaf_with_names(plan, def, alias, &renamed, &fields, &node_def, aliases)?;
+    add_whole_row(&mut node, &mut scope, alias, &row_column);
+    Ok((node, scope))
+}
+
+/// Give a leaf the whole-row column its plan's last output holds (see
+/// `with_whole_row_target`): a key no reference names, and the way its
+/// alias's whole row is read.
+fn add_whole_row(node: &mut JoinNode, scope: &mut Scope, alias: &str, column: &Column) {
+    let JoinNode::Leaf { columns, .. } = node else {
+        return;
+    };
+    let key = join_key(alias, WHOLE_ROW_COLUMN);
+    columns.push((key.clone(), column.field()));
+    scope.cols.push(ScopeCol {
+        alias: alias.to_string(),
+        name: WHOLE_ROW_COLUMN.to_string(),
+        key: key.clone(),
+        pg_type: column.pg_type.clone(),
+        bare: false,
+        star: false,
+        source: None,
+        qual: String::new(),
+    });
+    scope.rows.push((alias.to_string(), WholeRow::Column(key)));
 }
 
 fn leaf_from_source(
     plan: Box<Statement>,
     def: TableDef,
     alias: &str,
-    _lookup: &dyn Fn(&str) -> Option<TableDef>,
     aliases: &mut Vec<String>,
+    whole_row: bool,
 ) -> Result<(JoinNode, Scope)> {
     // A FROM-subquery's def already carries its `s(a, b)` renames, and its
-    // rows are materialised POSITIONALLY into those same fields.
-    let names: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
-    let fields: Vec<String> = def.columns.iter().map(|c| c.field()).collect();
+    // rows are materialised POSITIONALLY into those same fields. Its last
+    // column is its whole row when `whole_row` asked for one.
+    let width = def.columns.len() - usize::from(whole_row && !def.columns.is_empty());
+    let names: Vec<String> = def.columns[..width]
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let fields: Vec<String> = def.columns[..width].iter().map(|c| c.field()).collect();
+    let row_column = def.columns.get(width).cloned();
     let node_def = def.clone();
-    leaf_with_names(*plan, def, alias, &names, &fields, &node_def, aliases)
+    let (mut node, mut scope) =
+        leaf_with_names(*plan, def, alias, &names, &fields, &node_def, aliases)?;
+    if let Some(row_column) = row_column {
+        add_whole_row(&mut node, &mut scope, alias, &row_column);
+    }
+    Ok((node, scope))
 }
 
 fn leaf_with_names(
@@ -1716,6 +1985,7 @@ fn build_join(
     let mut visible = outer_left.cloned().unwrap_or_default();
     visible.cols.extend(lscope.cols.iter().cloned());
     visible.aliases.extend(lscope.aliases.iter().cloned());
+    visible.rows.extend(lscope.rows.iter().cloned());
     with_local(matches!(reduced, JoinKind::Inner | JoinKind::Left));
     let right = build(rarg, lookup, params, aliases, Some(&visible));
     NONNULLABLE.with(|n| *n.borrow_mut() = saved);
@@ -1850,6 +2120,7 @@ fn build_join(
             .chain(&rscope.using_aliases)
             .cloned()
             .collect(),
+        rows: lscope.rows.iter().chain(&rscope.rows).cloned().collect(),
     };
     if let Some(u) = j.join_using_alias.as_ref() {
         // The USING alias is an entry of the join's namespace beside its
@@ -1863,6 +2134,10 @@ fn build_join(
         aliases.push(u.aliasname.clone());
         scope.aliases.push(u.aliasname.clone());
         scope.using_aliases.push(u.aliasname.clone());
+        // Its whole row is a record of the merged columns.
+        scope
+            .rows
+            .push((u.aliasname.clone(), WholeRow::Expand(None)));
     }
     for c in lscope.cols.iter().chain(&rscope.cols) {
         let mut c = c.clone();
@@ -1916,6 +2191,7 @@ fn build_join(
                 aliases: scope.aliases.clone(),
                 hidden: scope.hidden.clone(),
                 using_aliases: scope.using_aliases.clone(),
+                rows: scope.rows.clone(),
             };
             rewrite_expr(&mut q, &side_scope, &[])?;
             on_aliases = key_aliases(&q);
@@ -2097,6 +2373,8 @@ fn apply_join_alias(
     hidden.append(&mut scope.hidden);
     scope.hidden = hidden;
     scope.aliases = vec![name.clone()];
+    // An aliased JOIN's whole row is a record of its listed columns.
+    scope.rows.push((name.clone(), WholeRow::Expand(None)));
     Ok(())
 }
 
@@ -2418,6 +2696,7 @@ fn key_ref(key: String, location: i32) -> N {
 /// Rewrite every column reference under `node` to its key. `keep` holds bare
 /// names left alone (output aliases an ORDER BY may name).
 fn rewrite_expr(node: &mut pg_query::protobuf::Node, scope: &Scope, keep: &[String]) -> Result<()> {
+    rewrite_star_rows(node, scope)?;
     walk_expr(node, &mut |n| {
         let Some(N::ColumnRef(c)) = n.node.as_ref() else {
             return Ok(());
@@ -2435,6 +2714,59 @@ fn rewrite_expr(node: &mut pg_query::protobuf::Node, scope: &Scope, keep: &[Stri
         })?;
         if let Some(key) = resolved {
             n.node = Some(key_ref(key, c.location));
+        } else if let [name] = parts.as_slice() {
+            // A name no column has, naming a FROM item: its whole row (a
+            // column of that name wins, as in PostgreSQL).
+            if let Some(row) = scope.whole_row_node(name, c.location) {
+                *n = row;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `alias.*` inside an expression: the FROM item's whole row
+/// (`transformWholeRowRef`); inside a row constructor its COLUMNS, as
+/// PostgreSQL expands a star there. A select-list `alias.*` is expanded to
+/// the columns before this (`rewrite_query`).
+fn rewrite_star_rows(node: &mut pg_query::protobuf::Node, scope: &Scope) -> Result<()> {
+    let star_alias = |n: &pg_query::protobuf::Node| -> Option<String> {
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return None;
+        };
+        match c.fields.as_slice() {
+            [q, star] if matches!(star.node.as_ref(), Some(N::AStar(_))) => match q.node.as_ref() {
+                Some(N::String(sv)) => Some(sv.sval.clone()),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    walk_expr(node, &mut |n| {
+        if let Some(N::RowExpr(r)) = n.node.as_mut() {
+            let expandable = |a: &pg_query::protobuf::Node| {
+                star_alias(a).is_some_and(|q| scope.whole_row(&q).is_some())
+            };
+            if r.args.iter().any(expandable) {
+                for a in std::mem::take(&mut r.args) {
+                    match star_alias(&a).and_then(|q| scope.whole_row(&q).map(|w| w.0)) {
+                        Some(cols) => {
+                            r.args.extend(cols.iter().map(|c| pg_query::protobuf::Node {
+                                node: Some(key_ref(c.key.clone(), -1)),
+                            }))
+                        }
+                        None => r.args.push(a),
+                    }
+                }
+            }
+            return Ok(());
+        }
+        let location = match n.node.as_ref() {
+            Some(N::ColumnRef(c)) => c.location,
+            _ => return Ok(()),
+        };
+        if let Some(row) = star_alias(n).and_then(|q| scope.whole_row_node(&q, location)) {
+            *n = row;
         }
         Ok(())
     })
@@ -2556,6 +2888,7 @@ fn rewrite_query(s: &mut pg_query::protobuf::SelectStmt, scope: &Scope) -> Resul
                     if let Some([name]) = names_of(c).as_deref() {
                         if outputs.contains(name)
                             && scope.resolve(std::slice::from_ref(name))?.is_none()
+                            && scope.whole_row(name).is_none()
                         {
                             if c.location >= 0 {
                                 set_error_location(c.location);
@@ -3853,6 +4186,35 @@ mod tests {
         assert_eq!(
             nullable_pushed("select * from s left join e on e.a > random()"),
             None
+        );
+    }
+
+    /// The names `sql` may read as a whole row (RP-470).
+    fn whole_rows(sql: &str) -> Vec<String> {
+        let parsed = pg_query::parse(sql).unwrap();
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().unwrap();
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("not a SELECT: {sql}");
+        };
+        whole_row_names(s)
+    }
+
+    #[test]
+    fn a_whole_row_reference_is_found_wherever_the_join_rewrites_one() {
+        // A select-list `t.*` is t's columns, not its row; one inside an
+        // expression, or a bare name, may be the row.
+        assert_eq!(
+            whole_rows("select a.*, b.v, b from a join b on a.id = b.id"),
+            ["b"]
+        );
+        assert_eq!(
+            whole_rows("select (a).v, b.*::text from a, b where c is null order by d"),
+            ["a", "b", "c", "d"]
+        );
+        // Under a field selection, and in an ON clause.
+        assert_eq!(
+            whole_rows("select 1 from a join b on (a.*).v = 1 and b = row(1)"),
+            ["a", "b"]
         );
     }
 

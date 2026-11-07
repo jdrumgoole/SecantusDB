@@ -251,6 +251,38 @@ fn text(r: &HashMap<String, String>, k: &str) -> String {
     r.get(k).cloned().unwrap_or_default()
 }
 
+/// A function overload's `(prorettype, OUT parameter names)`.
+pub(crate) type ResultColumns = (i64, Vec<String>);
+
+/// Each built-in function's overloads by name, as a function in FROM
+/// returns them: `(prorettype, the names of its OUT, INOUT and TABLE
+/// parameters)`, read once from the dumped `pg_proc`.
+pub(crate) fn builtin_result_columns(name: &str) -> &'static [ResultColumns] {
+    static R: OnceLock<HashMap<String, Vec<ResultColumns>>> = OnceLock::new();
+    R.get_or_init(|| {
+        let mut m: HashMap<String, Vec<ResultColumns>> = HashMap::new();
+        for r in rows("pg_proc") {
+            let names = crate::rule_trees::array_items(&r.get("proargnames").cloned());
+            let modes = crate::rule_trees::array_items(&r.get("proargmodes").cloned());
+            let out = match (names, modes) {
+                (Some(n), Some(m)) if n.len() == m.len() => n
+                    .into_iter()
+                    .zip(m)
+                    .filter(|(_, m)| matches!(m.as_str(), "o" | "b" | "t"))
+                    .map(|(n, _)| n)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            m.entry(text(&r, "proname"))
+                .or_default()
+                .push((int(&r, "prorettype"), out));
+        }
+        m
+    })
+    .get(name)
+    .map_or(&[], Vec::as_slice)
+}
+
 /// The built-in facts, read once.
 pub(crate) fn builtin() -> &'static Builtin {
     static B: OnceLock<Builtin> = OnceLock::new();

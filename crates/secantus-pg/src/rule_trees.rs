@@ -56,7 +56,7 @@ fn string(v: &Option<String>) -> String {
 }
 
 /// A one-dimensional array's text form, element by element.
-fn array_items(v: &Option<String>) -> Option<Vec<String>> {
+pub(crate) fn array_items(v: &Option<String>) -> Option<Vec<String>> {
     let s = v.as_deref()?;
     let inner = s.trim().strip_prefix('{')?.strip_suffix('}')?;
     let mut out = Vec::new();

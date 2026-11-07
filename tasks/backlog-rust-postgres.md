@@ -1890,21 +1890,6 @@ and `fs(a int, c text)`, one row each.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 `fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
 
-- [ ] **A SQL function's bare parameter name is replaced wherever it is a
-      word.** PostgreSQL resolves an unqualified name as a column first and
-      as a parameter only when no column of that name is in scope
-      (`sql_fn_post_column_ref`), and a name that is not a reference at all
-      -- an output alias -- is never a parameter: `gb(a int)` with the body
-      `select a from fe` answers fe's 1 for `gb(7)`, and `gal(p int)` with
-      `select 1 as p` answers 1. Here every identifier token naming a
-      parameter becomes `$n` (`bind_parameter_names`), so the first answers
-      7 and the second is 42601 `syntax error at or near "$1"`. The
-      faithful fix resolves a parameter where the planner fails to resolve
-      a column (the post-columnref hook), not by token; RP-451 resolved the
-      qualified form `fname.p` by token with a catalog check, which that
-      hook would replace.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_bare_parameter_name
-      Backlog-ID: RP-461
 - [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
       declare x int := 3; begin return blk.x + p; end` answers 10 for
       `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table
@@ -1922,6 +1907,32 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       succeeds and the error waits for the first call.
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
+
+## Found while working RP-461 (2026-11-07)
+
+- [ ] **A LATERAL subquery's bare name for an earlier FROM item's column is
+      not found.** `select x from fe, lateral (select b as x) s` answers
+      `x` on PostgreSQL 15.19 and `select x from fe join lateral (select b
+      || c as x from fs) s on true` `xy`; here each is 42703 `column "b"
+      does not exist`. The qualified form (`lateral (select fe.b as x)`)
+      and a LATERAL function (`lateral generate_series(a, a + 1)`) already
+      read it. A SQL function's body now resolves its bare names the same
+      way (RP-461), so a parameter named like such a column is no longer
+      read in its place, and the body's statement meets this 42703 instead.
+      Measured on PostgreSQL 15.19.
+      Backlog-ID: RP-478
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_lateral_subquery_reads_an_earlier_item_by_bare_name
+- [ ] **A function with one OUT parameter names its FROM column after the
+      function.** `gto(out t int)` and `gtt() returns table (t int)` give
+      `select * from gto()` one column `t` on PostgreSQL 15.19, so `select
+      t from gto()`, `select g.t from gto() as g` and `select t from gtt()`
+      answer their row; here the column is `gto` (or the alias `g`), and
+      each is 42703. Two or more OUT columns are already named by their
+      parameters. A SQL function body naming such a column now meets the
+      same 42703, where it read a parameter of that name before RP-461.
+      Measured on PostgreSQL 15.19.
+      Backlog-ID: RP-477
+      Verify: tests/backlog/test_rp_function_bodies.py::test_one_out_parameter_names_the_column
 
 ## Found while working RP-472 (2026-11-07)
 
@@ -1978,15 +1989,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       the alias the query wrote.
       Backlog-ID: RP-469
       Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused
-- [ ] **A whole-row reference to a joined table is not found.** `select fs
-      from fs, fe` and `select fs from fs join fe using (a)` answer `(1,y)`
-      on PostgreSQL 15.19, `select fe.*::text from fs join fe using (a)`
-      `(1,x)`, and `select j from (fs join fe using (a)) as j` the join's
-      row. Here the first two and the last are 42703 `column "fs" does not
-      exist`, and the cast star 42P01 `invalid reference to FROM-clause
-      entry for table "fe"`. A lone table's whole row already works.
-      Backlog-ID: RP-470
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_over_a_join
 - [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
       above the join.** PostgreSQL flattens a join alias's columns to the
       sides' own (`flatten_join_alias_vars`), so `explain (costs off)
@@ -2007,6 +2009,38 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
       Backlog-ID: RP-467
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
+
+## Found while working RP-470 (2026-11-07)
+
+- [ ] **A whole-row reference is still refused in three shapes.** On
+      PostgreSQL 15.19, `select l from fs join lateral (select fs.a) l on
+      true` answers `(1)` (and NULL for a LATERAL side an outer join
+      NULL-extends), `select (select fs) from fs` and the same over `fs,
+      fe` answer `(1,y)`, and `select (fs).* from fs, fe order by 1`
+      answers `1, y`. Here the first two are 42703 `column "l" (or "fs")
+      does not exist` -- a LATERAL leaf (`lateral_leaf`) carries no row
+      column, and a subquery's correlation does not bind an outer FROM
+      item's whole row -- and the last is 0A000 `this field selection is
+      not supported yet`: `ORDER BY 1` copies the `(fs).*` target before
+      the join expands it. Since RP-470 a table's or a plain subquery's
+      whole row over a join works, built at its scan.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
+      Backlog-ID: RP-479
+- [ ] **A whole row is typed as a record, or as varchar.** `select x from
+      fs as x(p, q)`, alone or over a join, is of `fs`'s row type on
+      PostgreSQL 15.19 (psycopg reads `(1,y)`); here it is a `record`, as
+      `column_alias_rewrite` turns the table into a subquery first. A
+      view's whole row (`select v from v`, alone or over a join) has the
+      right value, but its RowDescription's type OID is 1043, varchar,
+      where PostgreSQL sends the view's row type (`'v'::regtype`).
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_under_column_aliases, tests/backlog/test_rp_subquery_scope.py::test_whole_row_of_a_view_is_its_row_type
+      Backlog-ID: RP-480
+- [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
+      15.19 reports `column "a" specified in USING clause does not exist in
+      left table` with no position; here it points into the statement (41,
+      33 in the gap test's two statements).
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
+      Backlog-ID: RP-481
 
 ## Found while working RP-316 (2026-11-02)
 

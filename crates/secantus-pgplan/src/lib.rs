@@ -15967,7 +15967,17 @@ fn order_by_ambiguity(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
 /// function's, anything else is `?column?`.
 fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
     match node.node.as_ref() {
-        Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".to_string()),
+        // The last field NAME, a trailing `*` ignored (`t.*` is `t`), as
+        // FigureColnameInternal reads a ColumnRef.
+        Some(N::ColumnRef(c)) => c
+            .fields
+            .iter()
+            .rev()
+            .find_map(|f| match f.node.as_ref() {
+                Some(N::String(st)) => Some(st.sval.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "?column?".to_string()),
         // A cast keeps a column's or a call's name (`id::int8` is `id`,
         // `abs(n)::int8` is `abs`) and otherwise takes the TARGET type's bare
         // name: `(1 + 2)::int8` is `int8`, `x::varchar(3)` is `varchar`.
@@ -25583,6 +25593,42 @@ fn plan_join_select(
     }
     if right_sub.is_none() {
         lookup(&right.0).ok_or_else(|| Error::UndefinedTable(right.0.clone()))?;
+    }
+    // A side's name alone is its whole row (unless a table side has a column
+    // of that name, which wins). This path resolves a bare name only as a
+    // column; the general join planner builds the row (RP-470).
+    let has_column = |side: &(String, String), sub: &Option<Box<Statement>>, name: &str| {
+        sub.is_none() && lookup(&side.0).is_some_and(|d| d.columns.iter().any(|c| c.name == name))
+    };
+    // An aliased JOIN's name is its whole row too.
+    let join_alias = match s.from_clause.as_slice() {
+        [one] => match one.node.as_ref() {
+            Some(N::JoinExpr(j)) => j.alias.as_ref().map(|a| a.aliasname.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let whole_row = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => match c.fields.as_slice() {
+            [f] => matches!(f.node.as_ref(), Some(N::String(sv))
+                if (sv.sval == left.1 || sv.sval == right.1
+                    || join_alias.as_deref() == Some(sv.sval.as_str()))
+                    && !has_column(&left, &left_sub, &sv.sval)
+                    && !has_column(&right, &right_sub, &sv.sval)),
+            _ => false,
+        },
+        _ => false,
+    };
+    if s.target_list
+        .iter()
+        .chain(s.where_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .chain(s.distinct_clause.iter())
+        .any(|n| expr_any(n, &whole_row))
+    {
+        return Err(Error::Unsupported(
+            "a whole-row reference on this path".into(),
+        ));
     }
 
     // ON a.x = b.y, either order.
@@ -37363,7 +37409,16 @@ fn whole_row_rewrite(
                 continue;
             }
             if let Some(v) = rt.val.as_deref_mut() {
+                // An unnamed target keeps the name it was written with
+                // (`t::text` is `t`), not the row constructor's (`row`).
+                let written = expression_column_name(v);
                 rewrite(v, true)?;
+                if rt.name.is_empty()
+                    && written != "?column?"
+                    && expression_column_name(v) != written
+                {
+                    rt.name = written;
+                }
             }
         }
         targets.push(t);
