@@ -915,6 +915,10 @@ enum WhereClause {
     Null(String, bool),
     /// `col NOT IN (...)` of these constants.
     NotIn(String, Vec<Bson>),
+    /// `col LIKE pattern` (`ILIKE` when the first flag is set; `NOT` when
+    /// the second is), its pattern read from the EXPLAIN's own
+    /// (`scan_estimate::explain_pattern`).
+    Pattern(String, String, bool, bool),
     /// An `OR` of conjunctions.
     Or(Vec<Vec<WhereClause>>),
 }
@@ -1015,6 +1019,19 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
                 }
                 (k, _) if k.starts_with('$') => return None,
                 (field, Bson::Null) => out.push(WhereClause::Null(field.to_string(), true)),
+                (field, Bson::Document(ops)) if ops.contains_key("$regex") => {
+                    out.push(pattern_clause(field, ops, false)?);
+                }
+                (field, Bson::Document(ops))
+                    if ops.len() == 2
+                        && ops.get("$ne") == Some(&Bson::Null)
+                        && ops
+                            .get_document("$not")
+                            .is_ok_and(|d| d.contains_key("$regex")) =>
+                {
+                    guards.push(field.to_string());
+                    out.push(pattern_clause(field, ops.get_document("$not").ok()?, true)?);
+                }
                 (field, Bson::Document(ops)) if ops.keys().any(|k| k.starts_with('$')) => {
                     for (op, operand) in ops {
                         if op == "$ne" && operand == &Bson::Null {
@@ -1069,7 +1086,13 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
         let ne = out
             .iter()
             .filter(|c| {
-                matches!(c, WhereClause::Cmp(g, Op::Ne, _) | WhereClause::NotIn(g, _) if g == f)
+                matches!(
+                    c,
+                    WhereClause::Cmp(g, Op::Ne, _)
+                    | WhereClause::NotIn(g, _)
+                    | WhereClause::Pattern(g, _, _, true)
+                    if g == f
+                )
             })
             .count();
         extra.extend(std::iter::repeat_n(
@@ -1079,6 +1102,28 @@ fn lowered_clauses(filter: &Document) -> Option<Vec<WhereClause>> {
     }
     out.extend(extra);
     Some(out)
+}
+
+/// A lowered pattern match (`{$regex, $options}`) on `field` as the LIKE or
+/// ILIKE its EXPLAIN holds; `None` for any other regex.
+fn pattern_clause(field: &str, spec: &Document, negated: bool) -> Option<WhereClause> {
+    let regex = spec.get_str("$regex").ok()?;
+    let insensitive = match spec.get("$options") {
+        None => false,
+        Some(Bson::String(o)) if o == "i" => true,
+        Some(_) => return None,
+    };
+    if spec.keys().any(|k| k != "$regex" && k != "$options") {
+        return None;
+    }
+    let (pattern, insensitive) =
+        scan_estimate::explain_pattern(field, regex, insensitive, negated)?;
+    Some(WhereClause::Pattern(
+        field.to_string(),
+        pattern,
+        insensitive,
+        negated,
+    ))
 }
 
 /// What a grouping asks of the planner beyond its keys, for the choice
@@ -6498,7 +6543,7 @@ impl PgHandler {
                 let e = PgWireError::UserError(info);
                 let map = self.string_map(sql);
                 Err(Self::restore_position(
-                    Self::syntax_positioned(e, sql),
+                    self.column_hinted(Self::syntax_positioned(e, sql), sql),
                     map.as_ref(),
                 ))
             }
@@ -8092,6 +8137,21 @@ impl PgHandler {
         })
     }
 
+    /// Whether a column's collation, its own or the database's, is `C` or
+    /// `POSIX` (`lc_collate_is_c`; `C.UTF-8` is not).
+    pub(crate) fn column_is_c_collation(&self, c: &secantus_pgcatalog::Column) -> bool {
+        let is_c = |collation: &str| matches!(collation, "C" | "POSIX");
+        match c.extra.get_str("collation") {
+            Ok(coll) if coll.trim_matches('"') != "default" => is_c(coll.trim_matches('"')),
+            _ => self
+                .databases
+                .lookup(&self.storage, self.db())
+                .ok()
+                .flatten()
+                .is_some_and(|info| is_c(&info.collate)),
+        }
+    }
+
     /// How a column's statistics keys order (`colstats::Column`): whether
     /// they are integers (`convert_to_scalar`), and whether they order
     /// bytewise as the column compares -- `name` and `"char"` always, a
@@ -8550,7 +8610,8 @@ impl PgHandler {
                     WhereClause::Cmp(f, ..)
                     | WhereClause::In(f, _)
                     | WhereClause::NotIn(f, _)
-                    | WhereClause::Null(f, _) => {
+                    | WhereClause::Null(f, _)
+                    | WhereClause::Pattern(f, ..) => {
                         if !out.contains(&f.as_str()) {
                             out.push(f);
                         }
@@ -8575,6 +8636,22 @@ impl PgHandler {
             let c = def.columns.iter().find(|c| c.field() == *f)?;
             let base = c.pg_type.trim_start_matches("pg_catalog.");
             let (numeric, ordered) = self.column_key_order(c);
+            let string = matches!(
+                base,
+                "text" | "varchar" | "character varying" | "name" | "char" | "\"char\""
+            );
+            let c_collation = self.column_is_c_collation(c);
+            // A pattern over a column an index holds is also an index path
+            // in the `C` collation (`match_pattern_prefix`'s range over the
+            // fixed prefix), which is not modelled.
+            if c_collation
+                && indexed(f)
+                && clauses
+                    .iter()
+                    .any(|w| matches!(w, WhereClause::Pattern(g, ..) if g == f))
+            {
+                return None;
+            }
             let measured = match stats.get(*f) {
                 Some(Some(a)) => Some((a.stats, a.slots.as_ref()?)),
                 Some(None) => return None,
@@ -8582,22 +8659,25 @@ impl PgHandler {
             };
             // `get_actual_variable_range`: the current extremes, read from a
             // B-tree index that leads with the column.
-            let actual = (numeric && indexes.iter().any(|ix| ix.field == *f))
-                .then(|| {
-                    let mut keys: Vec<Vec<u8>> = docs
-                        .iter()
-                        .filter_map(|d| Self::stats_key(base, d.get(*f)?))
-                        .collect();
-                    keys.sort();
-                    Some((keys.first()?.clone(), keys.last()?.clone()))
-                })
-                .flatten();
+            let actual = ((numeric || (string && ordered))
+                && indexes.iter().any(|ix| ix.field == *f))
+            .then(|| {
+                let mut keys: Vec<Vec<u8>> = docs
+                    .iter()
+                    .filter_map(|d| Self::stats_key(base, d.get(*f)?))
+                    .collect();
+                keys.sort();
+                Some((keys.first()?.clone(), keys.last()?.clone()))
+            })
+            .flatten();
             columns.push(colstats::Column {
                 stats: measured,
                 unique: unique.iter().any(|u| u == f),
                 boolean: base == "bool",
                 numeric,
                 ordered,
+                string,
+                c_collation,
                 actual,
                 tuples,
             });
@@ -8666,6 +8746,13 @@ impl PgHandler {
                     }
                     WhereClause::Null(f, is_null) => {
                         others.push(columns[at(f)?].null_sel(*is_null));
+                    }
+                    WhereClause::Pattern(f, pattern, insensitive, negated) => {
+                        others.push(columns[at(f)?].pattern_sel(
+                            pattern,
+                            *insensitive,
+                            *negated,
+                        )?);
                     }
                     WhereClause::Or(arms) => {
                         let sels: Vec<f64> = arms
@@ -8773,6 +8860,8 @@ impl PgHandler {
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) if v.len() >= 9 => None,
                     WhereClause::In(_, v) | WhereClause::NotIn(_, v) => Some(v.len() as f64 * 0.5),
                     WhereClause::Null(..) => Some(0.0),
+                    // `textlike` and its kin, `procost` 1.
+                    WhereClause::Pattern(..) => Some(1.0),
                     WhereClause::Or(arms) => arms.iter().map(|a| ops(a)).sum(),
                 })
                 .sum()
@@ -8783,6 +8872,7 @@ impl PgHandler {
                 Some(match c {
                     WhereClause::Cmp(f, Op::Ne, _) => (f.clone(), Qual::Ne),
                     WhereClause::NotIn(f, v) => (f.clone(), Qual::NotIn(v.len())),
+                    WhereClause::Pattern(f, ..) => (f.clone(), Qual::Filter(1.0)),
                     WhereClause::Or(arms) => (
                         String::new(),
                         Qual::Filter(arms.iter().map(|a| ops(a)).sum::<Option<f64>>()?),
@@ -24250,6 +24340,41 @@ impl PgHandler {
         out
     }
 
+    /// A missing column's 42703, with the HINT PostgreSQL's
+    /// `errorMissingColumn` gives it from the statement's range tables
+    /// (RP-408). `sql` is the text the error's position counts in.
+    fn column_hinted(&self, mut e: PgWireError, sql: &str) -> PgWireError {
+        if let PgWireError::UserError(info) = &mut e {
+            if info.code == "42703" && info.hint.is_none() {
+                if let Some(position) = info.position.as_deref().and_then(|p| p.parse().ok()) {
+                    // A table's columns, or a view's as its catalog row
+                    // records them.
+                    let columns = |n: &str| {
+                        self.lookup(n)
+                            .map(|def| def.columns.into_iter().map(|c| c.name).collect())
+                            .or_else(|| {
+                                let doc = self.view_doc(n)?;
+                                let row = doc.get_array("row_fields").ok()?;
+                                row.iter()
+                                    .map(|f| match f {
+                                        Bson::Array(f) => f.first()?.as_str().map(str::to_string),
+                                        _ => None,
+                                    })
+                                    .collect()
+                            })
+                    };
+                    info.hint = secantus_pgplan::missing_column_hint(
+                        sql,
+                        position,
+                        &info.message,
+                        &columns,
+                    );
+                }
+            }
+        }
+        e
+    }
+
     /// `positioned`, for an error found while describing a prepared
     /// statement: PostgreSQL positions it as it does from a simple query
     /// (a syntax error, an unknown column or relation, a grouping error), but
@@ -31663,7 +31788,12 @@ impl PgHandler {
                     })
                     .collect()
             })
-            .map_err(|e| Self::restore_position(Self::positioned(e, query), map.as_ref()))
+            .map_err(|e| {
+                Self::restore_position(
+                    self.column_hinted(Self::positioned(e, query), query),
+                    map.as_ref(),
+                )
+            })
     }
 
     /// Record what `pg_stat_activity` shows for this backend: the state, and
@@ -32060,7 +32190,7 @@ impl PgHandler {
             }
         }
         let stmt = planned
-            .map_err(|e| Self::err_in(&e, sql))
+            .map_err(|e| self.column_hinted(Self::err_in(&e, sql), sql))
             .inspect_err(|_| self.note_failure())?;
         // A portal or cursor of the block still streaming reads the snapshot
         // of the statement that opened it: its rest is read NOW, before this
@@ -41035,6 +41165,7 @@ impl PgHandler {
             ))),
             Statement::Explain { inner, options } => {
                 let _in_lengths = scan_estimate::explain_in_lengths(&options.scan_in_lengths);
+                let _patterns = scan_estimate::explain_patterns(&options.scan_patterns);
                 let db = self.db().to_string();
                 let chooser = |table: &str, filter: &Document| -> Option<String> {
                     match self.storage.explain_plan(&db, table, filter).ok()? {
@@ -41158,7 +41289,13 @@ impl PgHandler {
                             .scan_array_quals
                             .as_deref()
                             .filter(|_| sel.residual.is_some() && sel.filter.is_empty());
-                        if (sel.residual.is_none() || array_quals.is_some())
+                        // A comparison of an expression with a constant runs
+                        // per row too, estimated with no statistics (RP-404).
+                        let expr_quals = options
+                            .scan_expr_quals
+                            .as_deref()
+                            .filter(|_| sel.residual.is_some() && array_quals.is_none());
+                        if (sel.residual.is_none() || array_quals.is_some() || expr_quals.is_some())
                             && sel.sub.is_none()
                             && sel.series.is_none()
                             && sel.join.is_none()
@@ -41169,16 +41306,26 @@ impl PgHandler {
                             // is its type's width (RP-333).
                             let priced = scan_estimate::target_cost(sel).and_then(
                                 |(cost, width, fields)| {
-                                    let (est, index) = match array_quals {
-                                        Some(quals) => (
+                                    let (est, index) = match (array_quals, expr_quals) {
+                                        (Some(quals), _) => (
                                             self.array_qual_scan_estimate(
                                                 &sel.table, quals, &fields,
                                             )?,
                                             None,
                                         ),
+                                        (None, Some(exprs)) => (
+                                            self.residual_scan_estimate(
+                                                &sel.table,
+                                                &sel.filter,
+                                                exprs,
+                                                &fields,
+                                                &scan_estimate::computed_reads(sel),
+                                            )?,
+                                            None,
+                                        ),
                                         // A computed select list's reads count
                                         // towards an index-only scan (RP-378).
-                                        None => self.scan_estimate_reading(
+                                        (None, None) => self.scan_estimate_reading(
                                             &sel.table,
                                             &sel.filter,
                                             &fields,
@@ -52228,7 +52375,10 @@ impl ExtendedQueryHandler for PgHandler {
             .map_err(|e| {
                 let map = self.string_map(&target.statement.sql);
                 Self::restore_position(
-                    Self::syntax_positioned(e, &target.statement.sql),
+                    self.column_hinted(
+                        Self::syntax_positioned(e, &target.statement.sql),
+                        &target.statement.sql,
+                    ),
                     map.as_ref(),
                 )
             })?;
@@ -52541,7 +52691,10 @@ impl ExtendedQueryHandler for PgHandler {
             .map_err(|e| {
                 let map = self.string_map(&target.statement.statement.sql);
                 Self::restore_position(
-                    Self::syntax_positioned(e, &target.statement.statement.sql),
+                    self.column_hinted(
+                        Self::syntax_positioned(e, &target.statement.statement.sql),
+                        &target.statement.statement.sql,
+                    ),
                     map.as_ref(),
                 )
             })?;

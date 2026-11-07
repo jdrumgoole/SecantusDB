@@ -6,8 +6,9 @@
 //!
 //! Values are compared as byte keys whose order is the type's (`int_key`
 //! for the integers); a text key is its bytes, which is the C locale's
-//! order and not every locale's, so only equality is read from a text
-//! column's statistics.
+//! order and not every locale's, so a range or a pattern is read from a
+//! text column's statistics only in a collation that compares by bytes
+//! (`Column::ordered`), and only equality in any other.
 
 use crate::hashagg::{ColumnStats, Sampled};
 
@@ -356,9 +357,16 @@ pub struct Column<'a> {
     /// Its keys are not numbers but order bytewise as the column's
     /// comparison does: a string in a collation that compares by bytes
     /// (`C`, `POSIX`, `C.UTF-8`), whose most common values a range is
-    /// compared with but whose histogram bins are not interpolated here
-    /// (`convert_string_to_scalar`).
+    /// compared with.
     pub ordered: bool,
+    /// Its keys are a string's bytes (`text`, `varchar`, `name`,
+    /// `"char"`), which `convert_string_to_scalar` places inside a
+    /// histogram bin when the column is `ordered`.
+    pub string: bool,
+    /// Its collation is `C` or `POSIX` (`lc_collate_is_c`; `C.UTF-8` is
+    /// not): `make_greater_string` then needs no suffix, and ILIKE's fixed
+    /// prefix stops only at an ASCII letter.
+    pub c_collation: bool,
     /// The column's current least and greatest value, when a B-tree index
     /// leads with it (`get_actual_variable_range`).
     pub actual: Option<(Vec<u8>, Vec<u8>)>,
@@ -424,18 +432,14 @@ impl Column<'_> {
         let Some((stats, slots)) = self.stats else {
             return Some(DEFAULT_INEQ_SEL);
         };
-        // A string's position inside a histogram bin is
-        // `convert_string_to_scalar`'s, not modelled: only its most common
-        // values are compared, which needs no histogram.
-        if !self.numeric && !(self.ordered && slots.histogram.len() < 2) {
+        // A position inside a histogram bin is read from a number or, in a
+        // bytewise collation, a string (`convert_to_scalar`); any other
+        // ordered column only compares its most common values, which needs
+        // no histogram.
+        if !self.numeric && !(self.ordered && (self.string || slots.histogram.len() < 2)) {
             return None;
         }
-        let holds = |v: &[u8]| match (isgt, iseq) {
-            (true, true) => v >= key,
-            (true, false) => v > key,
-            (false, true) => v <= key,
-            (false, false) => v < key,
-        };
+        let holds = |v: &[u8]| holds(v, key, isgt, iseq);
         let mut mcv_selec = 0.0;
         let mut sumcommon = 0.0;
         for (v, f) in &slots.mcv {
@@ -504,9 +508,19 @@ impl Column<'_> {
                     eq_selec = 1.0 / otherdistinct;
                 }
             }
-            let val = int_of_key(key)? as f64;
-            let low = int_of_key(&hv[i - 1])? as f64;
-            let high = int_of_key(&hv[i])? as f64;
+            let (val, low, high) = if self.numeric {
+                (
+                    int_of_key(key)? as f64,
+                    int_of_key(&hv[i - 1])? as f64,
+                    int_of_key(&hv[i])? as f64,
+                )
+            } else if self.ordered && self.string {
+                // `convert_string_datum`: a bytewise collation's
+                // `strxfrm` is the string itself.
+                convert_string_to_scalar(key, &hv[i - 1], &hv[i])
+            } else {
+                return None;
+            };
             let binfrac = if high <= low {
                 0.5
             } else if val <= low {
@@ -514,7 +528,12 @@ impl Column<'_> {
             } else if val >= high {
                 1.0
             } else {
-                (val - low) / (high - low)
+                let binfrac = (val - low) / (high - low);
+                if binfrac.is_nan() || !(0.0..=1.0).contains(&binfrac) {
+                    0.5
+                } else {
+                    binfrac
+                }
             };
             let mut histfrac = ((i - 1) as f64 + binfrac) / (nvalues - 1) as f64;
             if i == 1 {
@@ -594,6 +613,334 @@ impl Column<'_> {
             Op::Ge => self.ineq_sel(key, true, true),
         }
     }
+
+    /// `patternsel_common` (PostgreSQL 15.19's `like_support.c`) for a
+    /// LIKE or ILIKE, or their negations, of this column against a
+    /// constant pattern with the default escape (RP-404). A pattern that
+    /// is its own fixed prefix is `var_eq_const` of it. Otherwise the
+    /// histogram's inner entries the pattern matches
+    /// (`histogram_selectivity`, at least 10 of them), blended under 100
+    /// with the fixed prefix's range (`prefix_selectivity`) times the rest
+    /// of the pattern's guess (`like_selectivity`), clamped to
+    /// `[0.0001, 0.9999]`, scaled to the rows the MCVs and NULLs leave,
+    /// plus the MCVs the pattern matches. A negation is the complement
+    /// less the NULLs. The caller passes only a string column, whose
+    /// LIKE operator `patternsel` knows (`text`, `varchar`, `name`).
+    /// `None` where the statistics are not modelled: a string not in a
+    /// bytewise collation, an MCV list whose contents depend on an order
+    /// not reproduced, a value not UTF-8.
+    pub fn pattern_sel(&self, pattern: &str, insensitive: bool, negated: bool) -> Option<f64> {
+        if self.stats.is_some() && !self.ordered {
+            return None;
+        }
+        let nullfrac = self.null_frac();
+        let (prefix, rest_selec, status) =
+            like_fixed_prefix(pattern.as_bytes(), insensitive, self.c_collation);
+        let matches = |v: &[u8]| -> Option<bool> {
+            crate::like_match::like_match(
+                std::str::from_utf8(v).ok()?,
+                pattern,
+                Some('\\'),
+                insensitive,
+            )
+            .ok()
+        };
+        let result = if status == PrefixStatus::Exact {
+            self.eq_sel(&prefix, false)?
+        } else {
+            let slots = self.stats.map(|(_, slots)| slots);
+            // `histogram_selectivity(..., 10, 1, ...)`.
+            let hist_size = slots.map_or(0, |s| s.histogram.len());
+            let mut selec = match slots {
+                Some(s) if hist_size >= 10 => {
+                    let mut nmatch = 0usize;
+                    for v in &s.histogram[1..hist_size - 1] {
+                        if matches(v)? {
+                            nmatch += 1;
+                        }
+                    }
+                    nmatch as f64 / (hist_size - 2) as f64
+                }
+                _ => -1.0,
+            };
+            if hist_size < 100 {
+                let prefixsel = if status == PrefixStatus::Partial {
+                    self.prefix_sel(&prefix)?
+                } else {
+                    1.0
+                };
+                let heursel = prefixsel * rest_selec;
+                selec = if selec < 0.0 {
+                    heursel
+                } else {
+                    let hist_weight = hist_size as f64 / 100.0;
+                    selec * hist_weight + heursel * (1.0 - hist_weight)
+                };
+            }
+            // Neither tiny nor near-certain is believed.
+            selec = selec.clamp(0.0001, 0.9999);
+            // `mcv_selectivity`.
+            let (mut mcv_selec, mut sumcommon) = (0.0, 0.0);
+            if let Some(s) = slots {
+                if !self.numeric && !s.mcv_complete {
+                    return None;
+                }
+                for (v, f) in &s.mcv {
+                    if matches(v)? {
+                        mcv_selec += f64::from(*f);
+                    }
+                    sumcommon += f64::from(*f);
+                }
+            }
+            selec *= 1.0 - nullfrac - sumcommon;
+            selec + mcv_selec
+        };
+        let result = if negated {
+            1.0 - result - nullfrac
+        } else {
+            result
+        };
+        Some(result.clamp(0.0, 1.0))
+    }
+
+    /// `prefix_selectivity`: the histogram's share of `col >= prefix AND
+    /// col < greater`, `greater` the least string `make_greater_string`
+    /// finds above every string starting with the prefix, paired as a range
+    /// is (`hi + lo - 1`), and never less than `col = prefix`.
+    /// `DEFAULT_MATCH_SEL` with no histogram.
+    fn prefix_sel(&self, prefix: &[u8]) -> Option<f64> {
+        let Some((_, slots)) = self.stats else {
+            return Some(DEFAULT_MATCH_SEL);
+        };
+        let ge = |v: &[u8]| holds(v, prefix, true, true);
+        let mut prefixsel = self.histogram_selectivity(slots, prefix, true, true, &ge)?;
+        if prefixsel < 0.0 {
+            return Some(DEFAULT_MATCH_SEL);
+        }
+        if let Some(greater) = make_greater_string(prefix, self.c_collation) {
+            let lt = |v: &[u8]| holds(v, &greater, false, false);
+            let topsel = self.histogram_selectivity(slots, &greater, false, false, &lt)?;
+            prefixsel = topsel + prefixsel - 1.0;
+        }
+        Some(prefixsel.max(self.eq_sel(prefix, false)?))
+    }
+}
+
+/// Whether the comparison `v OP key` holds, `OP` being `>` / `>=` (`isgt`)
+/// or `<` / `<=`, with equality when `iseq`, over keys that order as their
+/// type does.
+fn holds(v: &[u8], key: &[u8], isgt: bool, iseq: bool) -> bool {
+    match (isgt, iseq) {
+        (true, true) => v >= key,
+        (true, false) => v > key,
+        (false, true) => v <= key,
+        (false, false) => v < key,
+    }
+}
+
+/// `DEFAULT_MATCH_SEL`, a pattern match with no statistics to read.
+const DEFAULT_MATCH_SEL: f64 = 0.005;
+/// `like_selectivity`'s guesses: a fixed character, `_`, `%`.
+const FIXED_CHAR_SEL: f64 = 0.20;
+const ANY_CHAR_SEL: f64 = 0.9;
+const FULL_WILDCARD_SEL: f64 = 5.0;
+
+/// `Pattern_Prefix_Status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrefixStatus {
+    None,
+    Partial,
+    Exact,
+}
+
+/// `like_fixed_prefix` over a pattern's bytes, with the default escape
+/// (`\`): the literal prefix before the first wildcard -- for ILIKE before
+/// the first character whose case can vary too (`pattern_char_isalpha`:
+/// an ASCII letter, and in a collation that is not `C` any byte of a
+/// multibyte character) -- the selectivity of the rest
+/// (`like_selectivity`), and whether the prefix is the whole pattern.
+fn like_fixed_prefix(
+    patt: &[u8],
+    insensitive: bool,
+    c_ctype: bool,
+) -> (Vec<u8>, f64, PrefixStatus) {
+    let isalpha = |c: u8| c.is_ascii_alphabetic() || (!c_ctype && c >= 0x80);
+    let mut prefix = Vec::with_capacity(patt.len());
+    let mut pos = 0;
+    while pos < patt.len() {
+        if patt[pos] == b'%' || patt[pos] == b'_' {
+            break;
+        }
+        if patt[pos] == b'\\' {
+            pos += 1;
+            if pos >= patt.len() {
+                break;
+            }
+        }
+        if insensitive && isalpha(patt[pos]) {
+            break;
+        }
+        prefix.push(patt[pos]);
+        pos += 1;
+    }
+    let rest = like_selectivity(&patt[pos.min(patt.len())..]);
+    let status = if pos >= patt.len() {
+        PrefixStatus::Exact
+    } else if !prefix.is_empty() {
+        PrefixStatus::Partial
+    } else {
+        PrefixStatus::None
+    };
+    (prefix, rest, status)
+}
+
+/// `like_selectivity`: a leading run of wildcards counts nothing, then each
+/// fixed character `FIXED_CHAR_SEL`, each `_` `ANY_CHAR_SEL` and each `%`
+/// `FULL_WILDCARD_SEL`, the product capped at 1.
+fn like_selectivity(patt: &[u8]) -> f64 {
+    let mut sel = 1.0f64;
+    let mut pos = patt
+        .iter()
+        .position(|&c| c != b'%' && c != b'_')
+        .unwrap_or(patt.len());
+    while pos < patt.len() {
+        match patt[pos] {
+            b'%' => sel *= FULL_WILDCARD_SEL,
+            b'_' => sel *= ANY_CHAR_SEL,
+            b'\\' => {
+                pos += 1;
+                if pos >= patt.len() {
+                    break;
+                }
+                sel *= FIXED_CHAR_SEL;
+            }
+            _ => sel *= FIXED_CHAR_SEL,
+        }
+        pos += 1;
+    }
+    sel.min(1.0)
+}
+
+/// `make_greater_string` for a string in a bytewise collation: the
+/// prefix with its last character incremented (`pg_utf8_increment`), or,
+/// when that character has no successor, the last character dropped and
+/// the one before incremented, until the result sorts after the prefix --
+/// after the prefix with the collation's greatest of `Z`, `z`, `y` and `9`
+/// appended (`z` by bytes), outside the `C` collation. `None` when no
+/// character can be incremented.
+fn make_greater_string(prefix: &[u8], c_collation: bool) -> Option<Vec<u8>> {
+    let mut work = prefix.to_vec();
+    let mut len = work.len();
+    let cmp: Vec<u8> = if c_collation || len == 0 {
+        prefix.to_vec()
+    } else {
+        let mut c = prefix.to_vec();
+        c.push(b'z');
+        c
+    };
+    while len > 0 {
+        // `pg_mbcliplen`: the last character's bytes.
+        let start = (0..len)
+            .rev()
+            .find(|&i| work[i] & 0xC0 != 0x80)
+            .unwrap_or(0);
+        let charlen = len - start;
+        while utf8_increment(&mut work[start..len]) {
+            if cmp.as_slice() < &work[..len] {
+                work.truncate(len);
+                return Some(work);
+            }
+        }
+        len -= charlen;
+    }
+    None
+}
+
+/// `pg_utf8_increment`: the next character's bytes, in place, the last
+/// byte first (left at its limit when it overflows into the one before);
+/// `false` when none follows.
+fn utf8_increment(ch: &mut [u8]) -> bool {
+    let n = ch.len();
+    if !(1..=4).contains(&n) {
+        return false;
+    }
+    if n == 4 && ch[3] < 0xBF {
+        ch[3] += 1;
+        return true;
+    }
+    if n >= 3 && ch[2] < 0xBF {
+        ch[2] += 1;
+        return true;
+    }
+    if n >= 2 {
+        let limit = match ch[0] {
+            0xED => 0x9F,
+            0xF4 => 0x8F,
+            _ => 0xBF,
+        };
+        if ch[1] < limit {
+            ch[1] += 1;
+            return true;
+        }
+    }
+    if matches!(ch[0], 0x7F | 0xDF | 0xEF | 0xF4) {
+        return false;
+    }
+    ch[0] += 1;
+    true
+}
+
+/// `convert_string_to_scalar`: a value and its histogram bin's bounds as
+/// fractions in one base. The base spans the bytes the bounds use, widened
+/// to all of `A`-`Z`, `a`-`z` or `0`-`9` where it reaches into one, and to
+/// printable ASCII when under ten; the prefix all three share is dropped
+/// first.
+fn convert_string_to_scalar(value: &[u8], lobound: &[u8], hibound: &[u8]) -> (f64, f64, f64) {
+    let at = |s: &[u8], i: usize| s.get(i).copied().unwrap_or(0);
+    let mut rangelo = i32::from(at(hibound, 0));
+    let mut rangehi = rangelo;
+    for &c in lobound.iter().chain(hibound) {
+        rangelo = rangelo.min(i32::from(c));
+        rangehi = rangehi.max(i32::from(c));
+    }
+    for (lo, hi) in [(b'A', b'Z'), (b'a', b'z'), (b'0', b'9')] {
+        let (lo, hi) = (i32::from(lo), i32::from(hi));
+        if rangelo <= hi && rangehi >= lo {
+            rangelo = rangelo.min(lo);
+            rangehi = rangehi.max(hi);
+        }
+    }
+    if rangehi - rangelo < 9 {
+        rangelo = i32::from(b' ');
+        rangehi = 127;
+    }
+    let mut skip = 0;
+    while at(lobound, skip) != 0
+        && at(lobound, skip) == at(hibound, skip)
+        && at(lobound, skip) == at(value, skip)
+    {
+        skip += 1;
+    }
+    let tail = |s: &[u8]| s.get(skip..).unwrap_or(&[]).to_vec();
+    (
+        convert_one_string_to_scalar(&tail(value), rangelo, rangehi),
+        convert_one_string_to_scalar(&tail(lobound), rangelo, rangehi),
+        convert_one_string_to_scalar(&tail(hibound), rangelo, rangehi),
+    )
+}
+
+/// `convert_one_string_to_scalar`: the first twelve bytes as digits of a
+/// fraction in base `rangehi - rangelo + 1`, a byte outside the range
+/// counting as one step beyond it.
+fn convert_one_string_to_scalar(value: &[u8], rangelo: i32, rangehi: i32) -> f64 {
+    let base = f64::from(rangehi - rangelo + 1);
+    let (mut num, mut denom) = (0.0f64, base);
+    for &c in value.iter().take(12) {
+        let ch = i32::from(c).clamp(rangelo - 1, rangehi + 1);
+        num += f64::from(ch - rangelo) / denom;
+        denom *= base;
+    }
+    num
 }
 
 /// `clauselist_selectivity_or`: the arms' selectivities combined as
@@ -691,6 +1038,97 @@ mod tests {
         assert!(slots.histogram.is_empty() && slots.correlation.is_none());
     }
 
+    /// PostgreSQL 15.19's row estimates (`EXPLAIN`, C locale) over 30
+    /// analysed rows of `repeat('x', g)`, g from 1 to 30: thirty distinct
+    /// strings, so no MCVs and a histogram of all thirty, under the 100
+    /// entries past which `patternsel` reads the histogram alone (RP-404).
+    #[test]
+    fn patterns_and_text_ranges_match_postgres() {
+        let values: Vec<Sampled> = (1..=30)
+            .map(|g| Some(("x".repeat(g).into_bytes(), g + 1)))
+            .collect();
+        let stats = crate::hashagg::analyze_column(&values, -1);
+        let slots = scalar_slots(&values, 100);
+        let col = Column {
+            stats: Some((stats, &slots)),
+            unique: false,
+            boolean: false,
+            numeric: false,
+            ordered: true,
+            string: true,
+            c_collation: true,
+            actual: None,
+            tuples: 30.0,
+        };
+        let rows = |sel: f64| crate::costsize::clamp_row_est(sel * 30.0);
+        for (pattern, insensitive, negated, expected) in [
+            ("x%", false, false, 30.0),
+            ("xxx%", false, false, 29.0),
+            ("%x", false, false, 13.0),
+            ("xx_x%", false, false, 29.0),
+            ("x%", false, true, 1.0),
+            ("xxxxx", false, false, 1.0),
+            ("X%", true, false, 30.0),
+            ("y%", false, false, 1.0),
+        ] {
+            let sel = col.pattern_sel(pattern, insensitive, negated).unwrap();
+            assert_eq!(rows(sel), expected, "{pattern} {insensitive} {negated}");
+        }
+        let gt = col.clause_sel(Op::Gt, b"xxxx").unwrap();
+        assert_eq!(rows(gt), 27.0);
+        let lt = col.clause_sel(Op::Lt, b"xxx").unwrap();
+        assert_eq!(rows(lt), 1.0);
+    }
+
+    /// `like_fixed_prefix` and `like_selectivity`: the prefix stops at the
+    /// first wildcard (for ILIKE at a letter too), a leading wildcard
+    /// counts nothing, and a pattern with no wildcard is exact.
+    #[test]
+    fn like_prefixes_are_postgres() {
+        let (p, rest, status) = like_fixed_prefix(b"ab%c", false, true);
+        assert_eq!((p.as_slice(), status), (&b"ab"[..], PrefixStatus::Partial));
+        assert!((rest - FIXED_CHAR_SEL).abs() < 1e-12);
+        let (p, rest, status) = like_fixed_prefix(b"%x_", false, true);
+        assert_eq!((p.as_slice(), status), (&b""[..], PrefixStatus::None));
+        assert!((rest - FIXED_CHAR_SEL * ANY_CHAR_SEL).abs() < 1e-12);
+        let (p, _, status) = like_fixed_prefix(br"a\%b", false, true);
+        assert_eq!((p.as_slice(), status), (&b"a%b"[..], PrefixStatus::Exact));
+        let (p, rest, status) = like_fixed_prefix(b"1a%", true, true);
+        assert_eq!((p.as_slice(), status), (&b"1"[..], PrefixStatus::Partial));
+        assert_eq!(rest, 1.0);
+        // Outside the C collation a multibyte character's case may vary.
+        let (p, _, _) = like_fixed_prefix("1é%".as_bytes(), true, false);
+        assert_eq!(p, b"1");
+        let (p, _, _) = like_fixed_prefix("1é%".as_bytes(), true, true);
+        assert_eq!(p, "1é".as_bytes());
+    }
+
+    /// `make_greater_string` increments the last character
+    /// (`pg_utf8_increment`), dropping one that has no successor.
+    #[test]
+    fn greater_strings_are_postgres() {
+        assert_eq!(make_greater_string(b"x", true).unwrap(), b"y");
+        assert_eq!(make_greater_string(b"x", false).unwrap(), b"y");
+        assert_eq!(make_greater_string(b"az", false).unwrap(), b"a{");
+        assert_eq!(make_greater_string(b"a\x7f", true).unwrap(), b"b");
+        assert_eq!(make_greater_string(b"\x7f", true), None);
+        assert_eq!(
+            make_greater_string("é".as_bytes(), true).unwrap(),
+            "ê".as_bytes()
+        );
+    }
+
+    /// `convert_string_to_scalar`: `b` between `a` and `c` in base 26, the
+    /// range widened to the lower-case letters.
+    #[test]
+    fn strings_convert_in_the_letters_base() {
+        let (v, lo, hi) = convert_string_to_scalar(b"b", b"a", b"c");
+        assert_eq!((v, lo, hi), (1.0 / 26.0, 0.0, 2.0 / 26.0));
+        // The prefix all three share is dropped first.
+        let (v, lo, hi) = convert_string_to_scalar(b"w0500", b"w0491", b"w0501");
+        assert!(lo < v && v < hi);
+    }
+
     fn ints(vals: impl Iterator<Item = i64>) -> Vec<Sampled> {
         vals.map(|n| Some((int_key(n), 0))).collect()
     }
@@ -760,6 +1198,8 @@ mod tests {
             boolean: false,
             numeric: true,
             ordered: false,
+            string: false,
+            c_collation: false,
             actual: Some((int_key(1), int_key(tuples as i64))),
             tuples,
         };
@@ -784,6 +1224,8 @@ mod tests {
             boolean: false,
             numeric: true,
             ordered: false,
+            string: false,
+            c_collation: false,
             actual: None,
             tuples: 300.0,
         };
@@ -810,6 +1252,8 @@ mod tests {
                 boolean: false,
                 numeric: true,
                 ordered: false,
+                string: false,
+                c_collation: false,
                 actual: None,
                 tuples: 300.0,
             }

@@ -2913,7 +2913,54 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
     ) -> Option<Estimate> {
-        self.user_seq_scan_with(table, filter, fields, &[])
+        self.user_seq_scan_with(table, filter, fields, &[], &[])
+    }
+
+    /// A user table's sequential scan whose WHERE runs per row, in part or
+    /// whole, as comparisons of expressions with constants (RP-404): each
+    /// such conjunct a `Filter` of its operators, selecting what
+    /// `clauselist_selectivity` estimates for an expression with no
+    /// statistics -- `DEFAULT_INEQ_SEL` a bound, a pair of bounds on one
+    /// expression `DEFAULT_RANGE_INEQ_SEL`, an equality the reciprocal of
+    /// `get_variable_numdistinct`'s guess (the table's rows under 200, else
+    /// 200) -- times the lowered filter's selectivity. `None` where an
+    /// index path competes, which is not modelled with such a filter: an
+    /// index on an expression (whose statistics ANALYZE keeps), a lowered
+    /// filter over a table with any index, or an index holding every column
+    /// the scan reads (an index-only scan).
+    pub(crate) fn residual_scan_estimate(
+        &self,
+        table: &str,
+        filter: &Document,
+        exprs: &[secantus_pgplan::ExprQual],
+        fields: &[String],
+        reads: &[String],
+    ) -> Option<Estimate> {
+        if exprs.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
+            return None;
+        }
+        let relations = self.index_relations();
+        let mut read: Vec<String> = fields.iter().chain(reads).cloned().collect();
+        for q in exprs {
+            read.extend(q.fields.iter().cloned());
+        }
+        for r in relations.iter().filter(|r| r.table.name == table) {
+            if !filter.is_empty() || r.keys.contains(&0) {
+                return None;
+            }
+            let held: Vec<String> = r
+                .keys
+                .iter()
+                .chain(&r.include)
+                .filter_map(|k| usize::try_from(*k).ok()?.checked_sub(1))
+                .filter_map(|i| r.table.columns.get(i))
+                .map(|c| c.field())
+                .collect();
+            if read.iter().all(|f| held.contains(f)) {
+                return None;
+            }
+        }
+        self.user_seq_scan_with(table, filter, fields, &[], exprs)
     }
 
     /// A user table's sequential scan whose WHERE is only array operators
@@ -2930,7 +2977,7 @@ impl PgHandler {
         if quals.is_empty() || !self.all_table_defs().ok()?.iter().any(|d| d.name == table) {
             return None;
         }
-        self.user_seq_scan_with(table, &Document::new(), fields, quals)
+        self.user_seq_scan_with(table, &Document::new(), fields, quals, &[])
     }
 
     /// One array conjunct's selectivity (`arraycontsel`, or
@@ -3004,6 +3051,7 @@ impl PgHandler {
         filter: &Document,
         fields: &[String],
         array_quals: &[secantus_pgplan::ArrayQual],
+        expr_quals: &[secantus_pgplan::ExprQual],
     ) -> Option<Estimate> {
         let counted: std::cell::OnceCell<Option<usize>> = std::cell::OnceCell::new();
         let count = || {
@@ -3050,6 +3098,15 @@ impl PgHandler {
                 q.field.clone(),
                 costsize::Qual::Filter(q.operators_per_row()),
             ));
+        }
+        if !expr_quals.is_empty() {
+            sel *= expr_selectivity(expr_quals, pt.tuples)?;
+            for q in expr_quals {
+                quals.push((
+                    String::new(),
+                    costsize::Qual::Filter(f64::from(q.operators)),
+                ));
+            }
         }
         let width = output_width(&pt.def, pt.analyzed.as_ref(), fields)?;
         let rel = costsize::Rel {
@@ -4157,6 +4214,87 @@ pub(crate) fn explain_in_lengths(lengths: &[(String, usize)]) -> InLengthsGuard 
     InLengthsGuard(())
 }
 
+thread_local! {
+    /// The EXPLAIN being estimated: its single relation's LIKE / ILIKE
+    /// conjuncts, which the lowered filter keeps only as regexes (RP-404).
+    static EXPLAIN_PATTERNS: std::cell::RefCell<Vec<secantus_pgplan::ScanPattern>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Holds an EXPLAIN's LIKE patterns until it is dropped.
+pub(crate) struct PatternsGuard(());
+
+impl Drop for PatternsGuard {
+    fn drop(&mut self) {
+        EXPLAIN_PATTERNS.with(|c| c.borrow_mut().clear());
+    }
+}
+
+/// Make `patterns` (`ExplainOptions::scan_patterns`) what this EXPLAIN's
+/// scans read a `$regex` clause as, until the guard is dropped.
+pub(crate) fn explain_patterns(patterns: &[secantus_pgplan::ScanPattern]) -> PatternsGuard {
+    EXPLAIN_PATTERNS.with(|c| *c.borrow_mut() = patterns.to_vec());
+    PatternsGuard(())
+}
+
+/// The LIKE / ILIKE pattern behind a lowered `$regex` clause on `field`:
+/// `(pattern, insensitive)`, or `None` where this EXPLAIN holds none that
+/// lowers to it (a regex operator's, say).
+pub(crate) fn explain_pattern(
+    field: &str,
+    regex: &str,
+    insensitive: bool,
+    negated: bool,
+) -> Option<(String, bool)> {
+    EXPLAIN_PATTERNS.with(|c| {
+        c.borrow()
+            .iter()
+            .find(|p| {
+                p.field == field
+                    && p.regex == regex
+                    && p.insensitive == insensitive
+                    && p.negated == negated
+            })
+            .map(|p| (p.pattern.clone(), p.insensitive))
+    })
+}
+
+/// `clauselist_selectivity` over comparisons of expressions with
+/// constants, none with statistics (`examine_variable`): each expression a
+/// column of `tuples` rows with no `pg_statistic` row, so two bounds on one
+/// expression pair as a range does.
+fn expr_selectivity(quals: &[secantus_pgplan::ExprQual], tuples: f64) -> Option<f64> {
+    use secantus_pgplan::colstats::Column;
+    let mut exprs: Vec<&str> = Vec::new();
+    for q in quals {
+        if !exprs.contains(&q.expr.as_str()) {
+            exprs.push(&q.expr);
+        }
+    }
+    let columns: Vec<Column> = exprs
+        .iter()
+        .map(|_| Column {
+            stats: None,
+            unique: false,
+            boolean: false,
+            numeric: false,
+            ordered: false,
+            string: false,
+            c_collation: false,
+            actual: None,
+            tuples,
+        })
+        .collect();
+    let clauses: Vec<(&Column, secantus_pgplan::colstats::Op, Vec<u8>)> = quals
+        .iter()
+        .map(|q| {
+            let i = exprs.iter().position(|e| *e == q.expr)?;
+            Some((&columns[i], q.op, Vec::new()))
+        })
+        .collect::<Option<_>>()?;
+    secantus_pgplan::colstats::clauselist(&clauses)
+}
+
 /// An `IN` list's cost counts every element, NULLs included
 /// (`estimate_array_length`), though the lowered filter -- where a NULL
 /// would match a NULL column -- drops them; its selectivity keeps counting
@@ -4580,6 +4718,11 @@ fn hash_join_of(
                 boolean: false,
                 numeric: s.numeric,
                 ordered: s.ordered,
+                // A string key's place in a bin (`convert_string_to_scalar`)
+                // is not read for a merge's scan fractions yet: such a merge
+                // stays unpriced, as it was.
+                string: false,
+                c_collation: false,
                 actual: None,
                 tuples: s.tuples,
             })

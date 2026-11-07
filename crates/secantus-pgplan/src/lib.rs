@@ -19,6 +19,8 @@ mod agg_support;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
+mod colhint;
+pub use colhint::missing_column_hint;
 pub mod colstats;
 pub mod costsize;
 mod expr_memo;
@@ -3565,6 +3567,16 @@ pub struct ExplainOptions {
     /// against constants (`a @> '{1}'`, `a && '{1,2}'`): each conjunct, as
     /// `arraycontsel` reads it (RP-367). `None` for any other WHERE.
     pub scan_array_quals: Option<Vec<ArrayQual>>,
+    /// A single-relation statement's LIKE / ILIKE conjuncts over a string
+    /// column against a constant pattern, at any depth of its WHERE, as
+    /// `patternsel` reads them (RP-404): the lowered filter keeps only
+    /// their regexes.
+    pub scan_patterns: Vec<ScanPattern>,
+    /// A single-relation statement whose WHERE runs per row as a residual
+    /// only for comparisons of an expression with a constant: each of
+    /// those conjuncts, as `clauselist_selectivity` reads it (RP-404).
+    /// `None` for any other WHERE.
+    pub scan_expr_quals: Option<Vec<ExprQual>>,
     /// Each JOIN's ON condition, post-order, as its join node prints it.
     pub join_conds: Vec<String>,
     /// Each of `join_conds` as a hash or merge join prints it when the ON
@@ -10061,6 +10073,8 @@ fn plan_explain(
         scan_or_arms: Vec::new(),
         scan_in_lengths: Vec::new(),
         scan_array_quals: None,
+        scan_patterns: Vec::new(),
+        scan_expr_quals: None,
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
         join_cond_splits: Vec::new(),
@@ -10145,6 +10159,8 @@ fn plan_explain(
     let scan_or_arms = explain_scan_or_arms(&query, lookup).unwrap_or_default();
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     options.scan_array_quals = explain_scan_array_quals(&query, lookup);
+    options.scan_patterns = explain_scan_patterns(&query, lookup).unwrap_or_default();
+    options.scan_expr_quals = explain_scan_expr_quals(&query, lookup);
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let mut join_cond_splits = Vec::new();
@@ -44187,6 +44203,287 @@ fn explain_scan_array_quals(
             Some(ArrayQual::new(field, op, elems))
         })
         .collect()
+}
+
+/// A LIKE or ILIKE (or its negation) of a single relation's string column
+/// against a constant pattern (`ExplainOptions::scan_patterns`), with the
+/// regex its lowering matches with, which identifies it in the filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanPattern {
+    pub field: String,
+    pub regex: String,
+    pub pattern: String,
+    pub insensitive: bool,
+    pub negated: bool,
+}
+
+/// A single-relation statement's LIKE / ILIKE conjuncts, at any depth of
+/// its WHERE's ANDs and ORs: a `text`, `varchar` or `name` column on the
+/// left, a string constant (bare or cast to `text`) with the default escape
+/// on the right, lowered as `lower_pattern_match` lowers it.
+fn explain_scan_patterns(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<ScanPattern>> {
+    let (table, where_clause) = explain_scan_where(query)?;
+    let def = lookup(&table)?;
+    fn walk(n: &pg_query::protobuf::Node, def: &TableDef, out: &mut Vec<ScanPattern>) {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b)) => b.args.iter().for_each(|a| walk(a, def, out)),
+            Some(N::AExpr(e)) => {
+                if let Some(p) = scan_pattern(e, def) {
+                    out.push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(where_clause, &def, &mut out);
+    Some(out)
+}
+
+fn scan_pattern(e: &AExpr, def: &TableDef) -> Option<ScanPattern> {
+    if !matches!(
+        AExprKind::try_from(e.kind),
+        Ok(AExprKind::AexprLike | AExprKind::AexprIlike | AExprKind::AexprOp)
+    ) {
+        return None;
+    }
+    let (negated, insensitive, is_like) = pattern_operator(operator_name(e).ok()?)?;
+    if !is_like {
+        return None;
+    }
+    let field = column_field(e.lexpr.as_deref(), def).ok()?;
+    let column = def.columns.iter().find(|c| c.field() == field)?;
+    if !matches!(
+        column.pg_type.trim_start_matches("pg_catalog."),
+        "text" | "varchar" | "character varying" | "name"
+    ) {
+        return None;
+    }
+    let lit = match e.rexpr.as_deref()?.node.as_ref()? {
+        N::AConst(c) => c,
+        N::TypeCast(tc) => {
+            let target = type_name_of(tc.type_name.as_ref()?);
+            if ruleutils::base_type(&target) != "text" {
+                return None;
+            }
+            match tc.arg.as_deref()?.node.as_ref()? {
+                N::AConst(c) => c,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    let Some(pg_query::protobuf::a_const::Val::Sval(s)) = lit.val.as_ref() else {
+        return None;
+    };
+    let pattern = s.sval.clone();
+    if like_match::ends_in_escape(&pattern, Some('\\')) {
+        return None;
+    }
+    Some(ScanPattern {
+        regex: like_to_regex(&pattern, Some('\\')).ok()?,
+        field,
+        pattern,
+        insensitive,
+        negated,
+    })
+}
+
+/// A conjunct of a single-relation WHERE that runs per row as the residual
+/// and compares an expression over the relation's columns with a constant
+/// (`ExplainOptions::scan_expr_quals`): `examine_variable` finds no
+/// statistics for the expression, so `scalarineqsel` is
+/// `DEFAULT_INEQ_SEL` and `var_eq_const` the reciprocal of
+/// `get_variable_numdistinct`'s guess.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExprQual {
+    /// The expression's text: two conjuncts over the same expression pair
+    /// into one range (`clauselist_selectivity`'s `addRangeClause`).
+    pub expr: String,
+    /// The comparison, the expression on its left.
+    pub op: colstats::Op,
+    /// The operators `cost_qual_eval` charges a row: the comparison and
+    /// each the expression evaluates.
+    pub operators: u32,
+    /// The stored fields the expression reads.
+    pub fields: Vec<String>,
+}
+
+/// A single-relation statement's WHERE as [`ExprQual`]s: `Some` only when
+/// its top-level AND conjuncts that do not lower to the filter are all
+/// comparisons (`=`, `<>`, `<`, `<=`, `>`, `>=`) of an expression with a
+/// constant, and there is at least one. An expression here is integer
+/// arithmetic (`+`, `-`, `*`, `/`, `%`) over integer columns and integer
+/// literals, or `||` over `text` / `varchar` columns and string literals:
+/// operators that are each one function of `procost` 1, with no implicit
+/// cast between them (a cast is a function call of its own, not priced
+/// here). A function call, a cast or any other node is declined.
+fn explain_scan_expr_quals(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<ExprQual>> {
+    let (table, where_clause) = explain_scan_where(query)?;
+    let def = lookup(&table)?;
+    let mut parts = Vec::new();
+    let mut stack = vec![where_clause];
+    while let Some(n) = stack.pop() {
+        match n.node.as_ref() {
+            Some(N::BoolExpr(b))
+                if BoolExprType::try_from(b.boolop) == Ok(BoolExprType::AndExpr) =>
+            {
+                stack.extend(b.args.iter().rev());
+            }
+            _ => parts.push(n),
+        }
+    }
+    let mut out = Vec::new();
+    for p in parts {
+        match lower_where_nonvolatile(p, &def, &[]) {
+            Ok(_) => continue,
+            Err(Error::Unsupported(_)) => out.push(expr_qual(p, &def)?),
+            Err(_) => return None,
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// An expression side of an [`ExprQual`]: its text, its operators, its
+/// type family (`true` for an integer, `false` for a string) and the
+/// stored fields it reads.
+struct ExprSide {
+    text: String,
+    operators: u32,
+    integer: bool,
+    fields: Vec<String>,
+}
+
+fn expr_side(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprSide> {
+    use pg_query::protobuf::a_const::Val;
+    Some(match n.node.as_ref()? {
+        N::ColumnRef(c) => {
+            if c.fields.len() > 2 {
+                return None;
+            }
+            let Some(N::String(name)) = c.fields.last()?.node.as_ref() else {
+                return None;
+            };
+            let col = def.column(&name.sval)?;
+            let integer = match col.pg_type.trim_start_matches("pg_catalog.") {
+                "int2" | "int4" | "int8" => true,
+                "text" | "varchar" | "character varying" => false,
+                _ => return None,
+            };
+            ExprSide {
+                text: name.sval.clone(),
+                operators: 0,
+                integer,
+                fields: vec![col.field()],
+            }
+        }
+        N::AConst(c) => match c.val.as_ref()? {
+            Val::Ival(i) => ExprSide {
+                text: i.ival.to_string(),
+                operators: 0,
+                integer: true,
+                fields: Vec::new(),
+            },
+            Val::Sval(s) => ExprSide {
+                text: format!("'{}'", s.sval.replace('\'', "''")),
+                operators: 0,
+                integer: false,
+                fields: Vec::new(),
+            },
+            _ => return None,
+        },
+        N::AExpr(e) if AExprKind::try_from(e.kind) == Ok(AExprKind::AexprOp) => {
+            let op = operator_name(e).ok()?;
+            let integer = match op {
+                "+" | "-" | "*" | "/" | "%" => true,
+                "||" => false,
+                _ => return None,
+            };
+            let r = expr_side(e.rexpr.as_deref()?, def)?;
+            let l = match e.lexpr.as_deref() {
+                Some(l) => Some(expr_side(l, def)?),
+                // Only a unary minus.
+                None if op == "-" => None,
+                None => return None,
+            };
+            if r.integer != integer || l.as_ref().is_some_and(|l| l.integer != integer) {
+                return None;
+            }
+            let mut fields = l.as_ref().map(|l| l.fields.clone()).unwrap_or_default();
+            for f in &r.fields {
+                if !fields.contains(f) {
+                    fields.push(f.clone());
+                }
+            }
+            let below = r.operators + l.as_ref().map_or(0, |l| l.operators);
+            ExprSide {
+                text: match &l {
+                    Some(l) => format!("({} {op} {})", l.text, r.text),
+                    None => format!("(- {})", r.text),
+                },
+                // A subtree reading no column is folded to a constant.
+                operators: if fields.is_empty() { 0 } else { below + 1 },
+                integer,
+                fields,
+            }
+        }
+        _ => return None,
+    })
+}
+
+fn expr_qual(n: &pg_query::protobuf::Node, def: &TableDef) -> Option<ExprQual> {
+    use colstats::Op;
+    let Some(N::AExpr(e)) = n.node.as_ref() else {
+        return None;
+    };
+    if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
+        return None;
+    }
+    let op = match operator_name(e).ok()? {
+        "=" => Op::Eq,
+        "<>" => Op::Ne,
+        "<" => Op::Lt,
+        "<=" => Op::Le,
+        ">" => Op::Gt,
+        ">=" => Op::Ge,
+        _ => return None,
+    };
+    let l = expr_side(e.lexpr.as_deref()?, def)?;
+    let r = expr_side(e.rexpr.as_deref()?, def)?;
+    if l.integer != r.integer {
+        return None;
+    }
+    // The expression on the left; the other side a constant.
+    let (expr, op) = match (l.fields.is_empty(), r.fields.is_empty()) {
+        (false, true) => (l, op),
+        (true, false) => (
+            r,
+            match op {
+                Op::Lt => Op::Gt,
+                Op::Le => Op::Ge,
+                Op::Gt => Op::Lt,
+                Op::Ge => Op::Le,
+                o => o,
+            },
+        ),
+        _ => return None,
+    };
+    // A bare column is a statistics-backed clause, not this one.
+    if expr.operators == 0 {
+        return None;
+    }
+    Some(ExprQual {
+        expr: expr.text,
+        op,
+        operators: expr.operators + 1,
+        fields: expr.fields,
+    })
 }
 
 /// A single-relation statement's table and WHERE.

@@ -1470,16 +1470,27 @@ a regression test.
       private 15.19 cluster (found while working RP-388).
       Backlog-ID: RP-402
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated join equality], tests/backlog/test_rp_explain_costs.py::test_plan[comma join with a repeated constant equality]
-- [ ] **EXPLAIN prints no estimate for a scan filtered by an expression
-      or a LIKE.** PostgreSQL 15.19 prices `select * from e where a + 1 >
-      996` at `rows=333` (`scalarineqsel`'s default 1/3 for an expression
-      it has no statistics for) and `select * from s where c like 'x%'`
-      at `rows=30` (`patternsel`: the prefix `x`'s range selectivity over
-      the column's histogram); here both print `cost=0.00..0.00 rows=0
-      width=0`, and so does every join over such a scan. Measured on a
-      private 15.19 cluster (found while working RP-403).
-      Backlog-ID: RP-404
-      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a scan filtered by a LIKE prefix]
+- [ ] **EXPLAIN prints no estimate for a scan filtered by a function
+      call, a pattern over an expression, a LIKE over a table never
+      analysed, or a regex.** Since RP-404 a comparison of integer or text
+      arithmetic with a constant, and a LIKE / ILIKE of an analysed string
+      column, are estimated as PostgreSQL 15.19 estimates them. Still
+      zeros: `select * from e where abs(a) > 5` (PostgreSQL `rows=333`,
+      `cost=0.00..20.00`: `abs` is one function of `procost` 1, which is
+      not modelled for any function), `lower(b) like 'v%'` (`rows=5`,
+      `patternsel` with no statistics), `select * from zu where c like
+      'x%'` over a table never analysed (`rows=6`, `cost=0.00..25.88`), and
+      the regex operators: `c ~ '^xx'` over thirty analysed strings is
+      `rows=30`, whose fixed prefix `regex_fixed_prefix` reads from the
+      compiled regex, and `c ~ 'w01'` over a thousand is `rows=101`. Only
+      a single relation's scan is estimated so: a join over such a scan
+      prints zeros throughout (`e join s on s.a = e.a where s.c like
+      'xxx%'` is PostgreSQL's `Hash Join (cost=1.74..20.78 rows=29
+      width=27)`; `where e.a + 1 > 996` instead, `cost=1.68..23.02
+      rows=10`). Measured on a private 15.19 cluster (found while working
+      RP-404).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a function call compared with a constant], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a join over a scan filtered by a LIKE], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over an expression], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of a LIKE over a table never analysed], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an anchored regex match], tests/backlog/test_rp_explain_costs.py::test_plan[estimate of an unanchored regex match]
+      Backlog-ID: RP-423
 - [ ] **A lone scan's Filter does not put an expression's conjunct
       after a cheaper one.** PostgreSQL 15.19 orders a qual list cheapest
       first (`order_qual_clauses`, by `cost_qual_eval`): `select * from e
@@ -1506,16 +1517,6 @@ a regression test.
       cluster (found while working RP-405).
       Backlog-ID: RP-407
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a scan filter's coerced constant is folded]
-- [ ] **A column that does not exist gets no HINT.** PostgreSQL 15.19's
-      `errorMissingColumn` names the closest column in the FROM
-      (`searchRangeTableForCol`, a Levenshtein distance over every range
-      table entry): `select s.b from e, s` is 42703 `column s.b does not
-      exist` with `HINT: Perhaps you meant to reference the column
-      "e.b".`, and so is a misspelt `select bb from e`. Here the 42703's
-      message is the same and there is no HINT. Measured on a private
-      15.19 cluster (found while working RP-405).
-      Backlog-ID: RP-408
-      Verify: tests/backlog/test_rp_column_hint.py::test_missing_column_hint
 - [ ] **A comparison with a NULL constant still scans, and alone prints an
       index the table does not have.** PostgreSQL 15.19 folds a strict
       operator over a NULL constant to NULL (`eval_const_expressions`)
@@ -1567,6 +1568,57 @@ a regression test.
       working RP-399).
       Backlog-ID: RP-412
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a not over an or is the and of its negated arms], tests/backlog/test_rp_explain_costs.py::test_plan[a not over a between is the or of its negators]
+- [ ] **A function in FROM leaves a missing column with no HINT.** Since
+      RP-408 a 42703 carries PostgreSQL's `errorMissingColumn` hint, but
+      only when every range table entry in reach has columns this server
+      can tell: a function in FROM has the columns of its result type,
+      which the hint's search does not know, so it gives none.
+      PostgreSQL 15.19: `select * from generate_series(1,2) g where gg =
+      1` hints `Perhaps you meant to reference the column "g.g".`, and
+      `select * from e, generate_series(1, 2) g where bb = 1` hints
+      `"e.b"`; here neither has a HINT. Measured on a private 15.19
+      cluster (found while working RP-408).
+      Backlog-ID: RP-413
+      Verify: tests/backlog/test_rp_column_errors.py::test_function_in_from_hint
+- [ ] **A missing column's 42703 names the wrong reference, or drops its
+      qualifier.** PostgreSQL 15.19 reports the first missing column in
+      the order it analyses the statement, by the name as written and at
+      its first token. Here: `select * from e, k where k.bcc = 1 and e.bb =
+      2` reports `column e.bb does not exist` at 40 (PostgreSQL `column
+      k.bcc does not exist` at 26); a third table's `join k on k.bcc = 1`
+      reports `column "bcc"` at the name's own token; an UPDATE's or
+      DELETE's alias is dropped (`update e x set a = 1 where x.bb = 1` is
+      `column "bb"` at 30, PostgreSQL `column x.bb` at 28);
+      `public.e.bb` is positioned at 15, not 8; and `on conflict (a) do
+      update set b = excluded.bb` reports this server's internal name,
+      `column "__excluded__.bb" does not exist`, with no position
+      (PostgreSQL `column excluded.bb does not exist` at 65). Each loses
+      its HINT too, as the hint is found from the reference at the
+      error's position. Measured on a private 15.19 cluster with `e(a
+      int, b text)`, `s(a int, c text)`, `k(a int, b text, bc int)`
+      (found while working RP-408).
+      Backlog-ID: RP-414
+      Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
+- [ ] **A column reference in an INSERT's VALUES is refused as a gap.**
+      `insert into e values (bb)` and `insert into e values (1, 'x'), (bb,
+      'y')` answer `0A000 ColumnRef is not supported yet`; PostgreSQL
+      15.19 analyses VALUES in the INSERT's own level, where the target
+      is in the range table but not visible, and answers `42703 column
+      "bb" does not exist` (HINT `Perhaps you meant to reference the
+      column "e.b".`). A client matching on the class reads a missing
+      feature where it made a mistake. Measured on a private 15.19
+      cluster (found while working RP-408).
+      Backlog-ID: RP-415
+      Verify: tests/backlog/test_rp_column_errors.py::test_insert_values_column_reference
+- [ ] **A join's ON after a comma item is not type-checked.** `select *
+      from e, s join k on b = k.a` (`k.b text`, `k.a int`) returns rows
+      here; PostgreSQL 15.19 refuses it, `42883 operator does not exist:
+      text = integer`, as this server does for the same ON without the
+      comma item before it (`select * from s join k on b = k.a`). A
+      confident answer to a statement PostgreSQL rejects. Measured on a
+      private 15.19 cluster (found while working RP-408).
+      Backlog-ID: RP-416
+      Verify: tests/backlog/test_rp_column_errors.py::test_join_on_after_comma_item_is_type_checked
 
 ## Found by batch 54 (2026-10-24)
 
@@ -1668,7 +1720,12 @@ and most of RP-193 in batch 48; their tests there are regression tests.
       idle) the whole test takes 27 s. Not diagnosed: which phase of
       `pgbench -i` (the 100,000-row COPY, VACUUM, the primary keys) used
       the time is not in the log, so the next step is the server's log of
-      a slow run with each statement's duration.
+      a slow run with each statement's duration. Seen a second time on
+      PR #2397's `pg-oracle (backlog)` job (run on commit 05d7a19c, RP-404
+      and RP-408; 2026-11-06): pgbench had printed `creating tables...` when
+      the 120 s ran out, and that job's backlog step took 1102 s against
+      476 s on PR #2395's. Locally, a debug build of the same commit runs
+      `pgbench -i -s 1` in 22 s, as does the commit before it.
       Backlog-ID: RP-380
       Verify: none -- seen once in CI; a timing that does not fail on demand
 
