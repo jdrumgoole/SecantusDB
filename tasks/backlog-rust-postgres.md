@@ -1905,12 +1905,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       hook would replace.
       Verify: tests/backlog/test_rp_function_bodies.py::test_bare_parameter_name
       Backlog-ID: RP-461
-- [ ] **A composite parameter's field is not read.** `gr1(r fe)` with
-      `select r.a` and `gr2(r fe)` with `select gr2.r.a` answer 2 for
-      `row(2, 'z')::fe` on PostgreSQL; here both are 42P01 `missing
-      FROM-clause entry for table "r"`.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_composite_parameter_field
-      Backlog-ID: RP-462
 - [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
       declare x int := 3; begin return blk.x + p; end` answers 10 for
       `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table

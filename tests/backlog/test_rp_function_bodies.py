@@ -1,6 +1,6 @@
 """Gap tests of the function-body divergences found while working RP-451:
 RP-461 (a SQL function's bare parameter name is replaced wherever it is a
-word), RP-462 (a composite parameter's field is not read), RP-463 (a
+word), RP-462 (a composite parameter's field was not read; fixed), RP-463 (a
 PL/pgSQL block label does not qualify its variables), RP-464 (a SQL
 function ending in a write's RETURNING returned NULL; fixed) and RP-465 (CREATE
 FUNCTION does not check a SQL body).
@@ -92,9 +92,12 @@ COMPOSITE_PARAMETER_FIELD = {
 }
 
 
-@pytest.mark.backlog("RP-462")
+@pytest.mark.backlog_fixed("RP-462")
 @pytest.mark.parametrize("query", list(COMPOSITE_PARAMETER_FIELD))
 def test_composite_parameter_field(query: str, dsn: str) -> None:
+    """`r.a` and `gr2.r.a` over a composite parameter `r` were 42P01
+    `missing FROM-clause entry for table "r"`: the body bound only a
+    parameter's bare name and `fname.p`, never a field of one."""
     assert answer(dsn, query) == COMPOSITE_PARAMETER_FIELD[query]
 
 
