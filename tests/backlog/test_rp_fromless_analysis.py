@@ -189,23 +189,40 @@ def test_exists_target_list_is_analysed(query: str, rust_pg: Any) -> None:
     assert answer(rust_pg, query) == EXISTS_TARGETS[query]
 
 
-@pytest.mark.backlog("RP-445")
-@pytest.mark.parametrize(
-    "query",
-    [
-        "select (select (select a)) from (select 1 a) t",
-        "select (select (select t.a)) from (select 1 a) t",
+TWO_LEVELS_DOWN = {
+    "select (select (select a)) from (select 1 a) t": [(1,)],
+    "select (select (select t.a)) from (select 1 a) t": [(1,)],
+    "select (select (select (select a))) from (select 1 a) t": [(1,)],
+    "select (select (select a) + 1) from (select 1 a) t": [(2,)],
+    "select (select (select a + b) from (select 2 b) u) from (select 1 a) t": [(3,)],
+    "select (select (select a)) from (values (1), (2), (3)) t(a) order by 1": [
+        (1,),
+        (2,),
+        (3,),
     ],
-)
+    "select (select (select a) from (select 5 a) u) from (select 1 a) t": [(5,)],
+    "select (select (select b) from (select 1 a) u) from (select 2 b) t": [(2,)],
+    "select (select exists (select a)) from (select 1 a) t": [(True,)],
+    "select 1 from (select 1 a) t where (select (select a)) = 1": [(1,)],
+    "select pg_typeof((select (select a))) from (select 1::int8 a) t": [("bigint",)],
+    "select (select (select x)) from (select 1 a) t": ("42703", 'column "x" does not exist'),
+}
+
+
+@pytest.mark.backlog_fixed("RP-445")
+@pytest.mark.parametrize("query", list(TWO_LEVELS_DOWN))
 def test_fromless_subquery_two_levels_down_reads_the_outer_row(query: str, rust_pg: Any) -> None:
-    """42703 with a cannot-be-referenced HINT, and a leaked internal
-    `\\x1fcorrelated` call, where PostgreSQL answers the outer row's 1."""
+    """Was 42703 with a cannot-be-referenced HINT, or a leaked internal
+    `\\x1fcorrelated` call: a bare name in a subquery was looked up only in
+    the FROM of the query right around it, so a FROM-less one in between
+    hid the outer row. The nearer level still wins (`(select 5 a) u`), and a
+    name no level has stays 42703."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         try:
             got: object = c.execute(query).fetchall()
         except psycopg.Error as e:
             got = (e.sqlstate, e.diag.message_primary)
-    assert got == [(1,)]
+    assert got == TWO_LEVELS_DOWN[query]
 
 
 @pytest.mark.backlog("RP-446")

@@ -20259,6 +20259,12 @@ thread_local! {
     /// outermost first, while their subqueries are resolved.
     static OUTER_RELATIONS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The columns the queries enclosing a subquery expose, by name, while
+    /// that subquery's own subqueries are resolved: what a bare name two or
+    /// more levels down may read (RP-445). Pushed per subquery, not per FROM
+    /// item, so a FROM-subquery never sees its siblings' columns.
+    static ENCLOSING_COLUMNS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn resolve_sublinks_in_select_scoped(
@@ -20275,6 +20281,19 @@ fn resolve_sublinks_in_select_scoped(
     for item in &s.from_clause {
         collect_from_columns(item, lookup, &mut outer);
     }
+    // ...and every column the queries AROUND it expose: PostgreSQL's
+    // `colNameToVar` searches the namespace of each enclosing level in turn,
+    // nearest first, so `(select (select a)) from t` reads `t.a` two levels
+    // up (RP-445). The nearer level still wins: the per-row call a
+    // subquery becomes names the column at the level around it, which
+    // resolves it against its own FROM before looking further out.
+    ENCLOSING_COLUMNS.with(|e| {
+        for c in e.borrow().iter() {
+            if !outer.contains(c) {
+                outer.push(c.clone());
+            }
+        }
+    });
 
     // A CTE body is a select in its own right, and is resolved BEFORE the
     // query that references it -- the inlining that expands `WITH` runs later,
@@ -21121,7 +21140,15 @@ fn resolve_one_sublink(
         SYSTEM_VIEWS_ONLY.with(|f| f.set(previous));
         expanded?;
     }
-    resolve_sublinks_in_select(&mut inner, lookup, params, run)?;
+    let enclosing = ENCLOSING_COLUMNS.with(|e| {
+        let mut e = e.borrow_mut();
+        let d = e.len();
+        e.extend(outer.iter().cloned());
+        d
+    });
+    let resolved = resolve_sublinks_in_select(&mut inner, lookup, params, run);
+    ENCLOSING_COLUMNS.with(|e| e.borrow_mut().truncate(enclosing));
+    resolved?;
     // The enclosing statements' CTEs are in scope, behind the subquery's own
     // (inlining takes the first definition of a name, so its own win). Added
     // AFTER the subquery's own resolution: they are already resolved.
@@ -28211,6 +28238,23 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     },
                     ConstCol::Value(const_value(node, params)?),
                     "bool".to_string(),
+                    -1,
+                ));
+                continue;
+            }
+            // The per-row call a correlated subquery became, in the body of
+            // a FROM-less subquery around it (`(select (select a))`, RP-445):
+            // run with the outer row's values, typed as the subquery was.
+            Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                columns.push((
+                    if rt.name.is_empty() {
+                        "?column?".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(const_value(node, params)?),
+                    correlated::correlated_type(f).expect("checked"),
                     -1,
                 ));
                 continue;

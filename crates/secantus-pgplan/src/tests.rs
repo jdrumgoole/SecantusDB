@@ -4061,3 +4061,22 @@ fn a_column_reference_with_no_from_names_nothing() {
     let err = analysed("select count(1), nosuch").expect_err("should refuse");
     assert_eq!(err.sqlstate(), "42703", "{err}");
 }
+
+#[test]
+fn a_subquery_two_levels_down_reads_the_outer_row() {
+    // `colNameToVar` searches every enclosing level, nearest first (RP-445):
+    // a FROM-less subquery in between hid the outer row, as 42703 or a
+    // leaked `\x1fcorrelated` call.
+    for q in [
+        "select (select (select id)) from t",
+        "select (select (select t.id)) from t",
+        "select (select (select (select id))) from t",
+        "select (select (select id) + 1) from t",
+        "select (select (select id + b) from (select 2 b) u) from t",
+    ] {
+        let planned = analysed(q);
+        assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+    }
+    let err = analysed("select (select (select nosuch)) from t").expect_err("no level has it");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+}

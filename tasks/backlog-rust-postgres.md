@@ -1653,17 +1653,28 @@ a regression test.
       PostgreSQL 15.19 (found while working RP-441).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_list_is_analysed
       Backlog-ID: RP-444
-- [ ] **A FROM-less subquery inside a FROM-less subquery cannot read the
-      outer query's columns.** `select (select (select a)) from (select 1
-      a) t` is 42703 `column "a" does not exist` with the HINT that it
-      cannot be referenced from there, and `select (select (select t.a))
-      from (select 1 a) t` leaks this server's internal call, 42883
-      `function \x1fcorrelated(integer, ...) does not exist`; PostgreSQL
-      15.19 resolves both to the outer row and answers 1. One level (`select
-      (select a) from ...`) already works. Measured on PostgreSQL 15.19
-      (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_fromless_subquery_two_levels_down_reads_the_outer_row
-      Backlog-ID: RP-445
+- [ ] **A correlated subquery whose target is an expression names its
+      column `\x1fcorrelated`.** `select (select a + 1) from (select 1 a)
+      t` answers its row (2) under the column name `\x1fcorrelated`, the
+      internal per-row call the subquery was rewritten into; PostgreSQL
+      15.19's `FigureColname` names it `?column?`, as it does `(select (select
+      a) + 1)` and `(select a + 1 from (select 2 b) u)`. A target that is a
+      bare column (`(select a)`) is already named after it. A client that
+      reads columns by name sees the internal one. Measured on PostgreSQL
+      15.19 (found while working RP-445).
+      Verify: tests/backlog/test_rp_correlated_subquery.py::test_expression_target_is_named_column
+      Backlog-ID: RP-449
+- [ ] **A FROM-less correlated subquery draws its sequence one extra
+      time.** Over `values (1), (2)`, `select (select nextval('q') + a)`
+      answers 3 and 5 and leaves the next draw at 4; PostgreSQL 15.19
+      answers 2 and 4 and next draws 3. With a FROM in the subquery
+      (`(select nextval('q') + a from (select 1) z)`) the draws match, and a
+      FROM-less one two levels down (`(select (select nextval('q') + a))`)
+      draws one extra as at one level. A sequence value is never given back,
+      so the extra draw is a number PostgreSQL never skips. Measured on a
+      private 15.19 cluster (found while working RP-445).
+      Verify: tests/backlog/test_rp_correlated_subquery.py::test_fromless_correlated_nextval_draws_once_per_row
+      Backlog-ID: RP-450
 - [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
       `0A000 this target is not supported yet`; PostgreSQL 15.19's
       `transformTargetList` answers 42601 `SELECT * with no tables

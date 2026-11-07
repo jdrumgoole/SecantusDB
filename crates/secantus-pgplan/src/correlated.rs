@@ -31,6 +31,21 @@ type Runner = CorrelatedRunner<'static>;
 
 thread_local! {
     static RUNNER: std::cell::Cell<Option<*const Runner>> = const { std::cell::Cell::new(None) };
+    /// Set while `correlate` plans a subquery's body only to check and type
+    /// it, with its outer references bound to NULLs.
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as a probe plan of a correlated subquery's body: a correlated
+/// call nested in it (a subquery two levels down reading the outer row,
+/// RP-445) is a NULL of its type, never run, as the probe's NULL bindings
+/// are not the row it will see and the probe may be a Describe's, with no
+/// executor to run it.
+fn probing<R>(f: impl FnOnce() -> R) -> R {
+    let previous = PROBING.with(|p| p.replace(true));
+    let out = f();
+    PROBING.with(|p| p.set(previous));
+    out
 }
 
 /// Run `f` with `runner` as the way to run a correlated subquery's SQL. The
@@ -512,7 +527,7 @@ pub(crate) fn correlate(
         let body = substitute(inner, &outer_refs, first);
         let mut probe_params = params.to_vec();
         probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
-        match plan_select(&body, lookup, &probe_params) {
+        match probing(|| plan_select(&body, lookup, &probe_params)) {
             Ok(p) => break (p, body),
             Err(Error::UndefinedColumn(name))
                 if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
@@ -783,7 +798,7 @@ fn typed_probe(
     });
     let mut probe_params = params.to_vec();
     probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
-    without_side_effects(|| plan_select(&body, lookup, &probe_params)).ok()
+    probing(|| without_side_effects(|| plan_select(&body, lookup, &probe_params))).ok()
 }
 
 /// Is `name` the function a correlated subquery's per-row call is named?
@@ -882,6 +897,9 @@ pub(crate) fn eval_correlated(
 ) -> Option<Result<Bson>> {
     if !is_correlated(f) {
         return None;
+    }
+    if PROBING.with(std::cell::Cell::get) {
+        return Some(Ok(Bson::Null));
     }
     Some(eval(f, params))
 }
