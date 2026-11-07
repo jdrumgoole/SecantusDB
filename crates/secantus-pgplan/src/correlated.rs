@@ -483,6 +483,7 @@ pub(crate) fn fromless_outer_ref(inner: &pg_query::protobuf::SelectStmt, outer: 
 
 pub(crate) fn correlate(
     sl: &pg_query::protobuf::SubLink,
+    shape: &pg_query::protobuf::SubLink,
     inner: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
@@ -573,6 +574,13 @@ pub(crate) fn correlate(
             },
         }
     };
+    // As wide as its sublink takes (RP-452): `(select a, 1)` is refused,
+    // not answered from its first column.
+    crate::check_sublink_width(
+        shape,
+        sub_plan_def(&planned, lookup).ok().map(|d| d.columns.len()),
+        outer,
+    )?;
     let result_type = match kind {
         SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink => {
             "bool".to_string()
