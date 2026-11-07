@@ -1272,7 +1272,9 @@ jobs:
         shell: bash
         run: |
           mongod --version | head -1
-          deps="--with pymongo==4.17.0 --with pytest --with pytest-xdist --with psycopg[binary]==3.3.4"
+          # invoke: a gap test about the build tooling imports rust_tasks
+          # (RM-388), which imports invoke; uv.lock's version.
+          deps="--with pymongo==4.17.0 --with pytest --with pytest-xdist --with psycopg[binary]==3.3.4 --with invoke==3.0.3"
           status=0
           uv run --no-project $deps \
             python tools/backlog.py verify --file backlog-rust-mongodb.md --regressions \
