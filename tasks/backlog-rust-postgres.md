@@ -1661,19 +1661,21 @@ a regression test.
       15.19 (found while working RP-445).
       Verify: tests/backlog/test_rp_correlated_subquery.py::test_expression_target_is_named_column
       Backlog-ID: RP-449
-- [ ] **A subquery with more than one column runs on its first where
-      PostgreSQL refuses it.** `select (select 1, 2)` answers 1, `select
-      array(select 1, 2)` `{1}`, `select 1 in (select 1, 2)` and `select 1 =
-      any (select 1, 2)` true, a correlated `(select a, 1)` its `a`, and the
-      same in a WHERE; PostgreSQL 15.19's `transformSubLink` refuses an EXPR
-      or ARRAY sublink with more than one target as 42601 `subquery must
-      return only one column` at the sublink, and an ANY / IN one as 42601
-      `subquery has too many columns` at the operator. A statement
-      PostgreSQL refuses answers a value built from part of its subquery.
-      An EXISTS ignores its targets on both. Measured on PostgreSQL 15.19
-      (found while working RP-450).
-      Verify: tests/backlog/test_rp_subquery_columns.py::test_subquery_with_more_than_one_column
-      Backlog-ID: RP-452
+- [ ] **A missing relation named by a string literal for a `regclass`
+      parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
+      untyped literal argument to its parameter's type during analysis
+      (`coerce_type` runs `regclassin`), so a relation it names that does
+      not exist is 42P01 `relation "nosuchseq" does not exist` at the
+      literal wherever the call sits: `select 1 where false and
+      nextval('nosuchseq') > 0` (zero rows here), `select (select
+      nextval('nosuchseq') where false)` (a NULL here), `select (select
+      nextval('nosuchseq'), 2)` (here the subquery's 42601 width error,
+      since RP-452) and `select nextval('nosuchseq') + (1 + true)` (here
+      the operator's 42883). An explicit `'nosuchseq'::regclass` is already
+      42P01 as it is planned. A statement PostgreSQL refuses runs.
+      Measured on PostgreSQL 15.19 (found while working RP-452).
+      Verify: tests/backlog/test_rp_regclass_literal.py::test_regclass_literal_is_resolved_at_analysis
+      Backlog-ID: RP-458
 - [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
       `0A000 this target is not supported yet`; PostgreSQL 15.19's
       `transformTargetList` answers 42601 `SELECT * with no tables

@@ -20574,9 +20574,36 @@ fn resolve_sublinks_in_expr(
         let N::SubLink(sl) = node.node.clone().expect("matched above") else {
             unreachable!("matched SubLink")
         };
-        let replacement = resolve_one_sublink(&sl, lookup, params, run, outer)?;
+        let replacement = resolve_one_sublink(&sl, &sl, lookup, params, run, outer)?;
         *node = replacement;
         return Ok(());
+    }
+    // `row op (subquery)` is a ROWCOMPARE sublink to PostgreSQL, which
+    // `transformAExprOp` makes of the EXPR one the grammar built: its width
+    // is held to the row's, at the operator, not to one column (RP-452).
+    if let Some(N::AExpr(e)) = node.node.as_mut() {
+        if e.kind == AExprKind::AexprOp as i32
+            && matches!(
+                e.lexpr.as_deref().and_then(|l| l.node.as_ref()),
+                Some(N::RowExpr(_))
+            )
+        {
+            if let Some(N::SubLink(sl)) = e.rexpr.as_deref().and_then(|r| r.node.as_ref()) {
+                if sl.sub_link_type == SubLinkType::ExprSublink as i32 {
+                    let sl = (**sl).clone();
+                    let mut shape = sl.clone();
+                    shape.sub_link_type = SubLinkType::RowcompareSublink as i32;
+                    shape.testexpr = e.lexpr.clone();
+                    shape.location = e.location;
+                    if let Some(l) = e.lexpr.as_deref_mut() {
+                        resolve_sublinks_in_expr(l, lookup, params, run, outer)?;
+                    }
+                    let replacement = resolve_one_sublink(&sl, &shape, lookup, params, run, outer)?;
+                    e.rexpr = Some(Box::new(replacement));
+                    return Ok(());
+                }
+            }
+        }
     }
     // Not a SubLink itself: descend. `walk_expr` visits outermost-first and
     // does not enter a SubLink body, so recursing by hand here keeps the
@@ -21167,9 +21194,70 @@ fn calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
     found
 }
 
-/// One subquery, resolved to the node that stands in for it.
+/// PostgreSQL's `transformSubLink` check of a subquery's width (RP-452),
+/// once the subquery is analysed and before it runs.
+///
+/// `width` is the number of the subquery's output columns, a `*` expanded
+/// (`count_nonjunk_tlist_entries`: an ORDER BY column the select list does
+/// not hold is not one); `None` when the planned shape does not say, which
+/// leaves the subquery as it was. An EXPR or ARRAY sublink must deliver one
+/// column, or it is 42601 `subquery must return only one column` at the
+/// sublink. An ANY / ALL / row comparison one is held to its left side's
+/// width -- a row constructor's arity, else one -- as 42601 `subquery has
+/// too many columns` / `too few columns` at the sublink, which the grammar
+/// places at the operator (`1 in (...)` at `in`). An EXISTS ignores its
+/// targets, and a MULTIEXPR one (`set (a, b) = (select ...)`) is matched
+/// to its targets where it is rewritten (`multi_assign`).
+///
+/// The left side is transformed before its width is compared, so a column
+/// it names that no level in reach (`outer`) has keeps its 42703 (`select
+/// nosuch in (select 1, 2)`): that is left to planning, which reports it.
+pub(crate) fn check_sublink_width(
+    sl: &pg_query::protobuf::SubLink,
+    width: Option<usize>,
+    outer: &[String],
+) -> Result<()> {
+    let Some(width) = width else {
+        return Ok(());
+    };
+    let message = match SubLinkType::try_from(sl.sub_link_type) {
+        Ok(SubLinkType::ExprSublink | SubLinkType::ArraySublink) if width != 1 => {
+            "subquery must return only one column"
+        }
+        Ok(SubLinkType::AnySublink | SubLinkType::AllSublink | SubLinkType::RowcompareSublink) => {
+            let left = match sl.testexpr.as_deref().and_then(|t| t.node.as_ref()) {
+                Some(N::RowExpr(r)) => r.args.len(),
+                _ => 1,
+            };
+            let unknown = sl.testexpr.as_deref().is_some_and(|t| {
+                expr_any(t, &|n| match n.node.as_ref() {
+                    Some(N::ColumnRef(c)) => {
+                        column_ref_name(c).is_some_and(|n| !outer.contains(&n))
+                    }
+                    _ => false,
+                })
+            });
+            if unknown {
+                return Ok(());
+            }
+            match left.cmp(&width) {
+                std::cmp::Ordering::Less => "subquery has too many columns",
+                std::cmp::Ordering::Greater => "subquery has too few columns",
+                std::cmp::Ordering::Equal => return Ok(()),
+            }
+        }
+        _ => return Ok(()),
+    };
+    set_error_location(sl.location);
+    Err(Error::Parse(message.into()))
+}
+
+/// One subquery, resolved to the node that stands in for it. `shape` is the
+/// sublink as PostgreSQL analyses it, whose width rules apply: `sl` itself,
+/// or the ROWCOMPARE one `row op (subquery)` is to `transformAExprOp`.
 fn resolve_one_sublink(
     sl: &pg_query::protobuf::SubLink,
+    shape: &pg_query::protobuf::SubLink,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -21241,7 +21329,7 @@ fn resolve_one_sublink(
             resolve_sublinks_in_expr(&mut t, lookup, params, run, outer)?;
             sl.testexpr = Some(Box::new(t));
         }
-        return correlated::correlate(&sl, &inner, lookup, params, outer);
+        return correlated::correlate(&sl, shape, &inner, lookup, params, outer);
     }
     let plan = match plan_select(&inner, lookup, params) {
         Ok(p) => p,
@@ -21255,7 +21343,7 @@ fn resolve_one_sublink(
                 resolve_sublinks_in_expr(&mut t, lookup, params, run, outer)?;
                 sl.testexpr = Some(Box::new(t));
             }
-            return correlated::correlate(&sl, &inner, lookup, params, outer);
+            return correlated::correlate(&sl, shape, &inner, lookup, params, outer);
         }
         // A bare name in a FROM function's arguments that neither the
         // subquery nor the query around it has is PostgreSQL's 42703.
@@ -21268,6 +21356,12 @@ fn resolve_one_sublink(
         }
         Err(e) => return Err(e),
     };
+    // Its width is checked as it is analysed, before anything runs it.
+    check_sublink_width(
+        shape,
+        sub_plan_def(&plan, lookup).ok().map(|d| d.columns.len()),
+        outer,
+    )?;
     // A subquery with a side effect runs only in the plan that executes; any
     // other plan needs just its TYPE, and sees it return no rows.
     let rows = if calls_volatile(&inner) && !PLANNING_TO_EXECUTE.with(|p| p.get()) {
