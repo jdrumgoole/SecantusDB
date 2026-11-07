@@ -3677,3 +3677,57 @@ fn explain_refuses_what_parse_analysis_refuses() {
         assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
     }
 }
+
+#[test]
+fn a_join_on_after_a_comma_item_is_type_checked_in_its_own_scope() {
+    // RP-416: an ON sees only its join's two sides, so in `FROM e, s JOIN
+    // k ON b = k.a` the bare `b` is `k.b` (text) -- `e.b` is not in view
+    // -- and PostgreSQL 15.19 answers 42883 `text = integer`. Judged in
+    // the whole FROM's scope, `b` read as ambiguous and the ON ran.
+    let three = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "e" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    // The server's entry point: `plan` alone runs no operator check.
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> { Ok(Vec::new()) };
+    let plan = |q: &str, lookup: &dyn Fn(&str) -> Option<TableDef>| {
+        plan_with_subqueries(q, lookup, &[], &run)
+    };
+    for q in [
+        "select * from e, s join k on b = k.a",
+        "select * from s join k on b = k.a",
+        "select * from e, (s join k on b = k.a) j",
+        "select * from s join (e cross join k) on k.bc = s.c",
+    ] {
+        match plan(q, &three) {
+            Err(Error::UndefinedFunction(m)) => {
+                assert!(m.starts_with("operator does not exist: "), "{q}: {m}")
+            }
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    // What must still plan: a well-typed ON after a comma item, and a
+    // later join's ON over the sides an earlier join built.
+    for q in [
+        "select * from e, s join k on c = k.b",
+        "select * from e, s join k on s.a = k.a",
+        "select * from e join s on e.a = s.a join k on k.b = e.b",
+    ] {
+        assert!(plan(q, &three).is_ok(), "{q}: {:?}", plan(q, &three).err());
+    }
+}

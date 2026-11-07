@@ -1290,8 +1290,26 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             }
         }
         N::JoinExpr(j) => {
-            for s in j.larg.iter().chain(j.rarg.iter()).chain(j.quals.iter()) {
+            for s in j.larg.iter().chain(j.rarg.iter()) {
                 walk(s, scope, cx)?;
+            }
+            // An ON sees only its own join's two sides, and the queries
+            // around this one -- never a FROM item beside the join
+            // (`transformJoinOnClause` sets the namespace to the join's
+            // own). In `FROM e, s JOIN k ON b = k.a`, `b` is `k.b`
+            // alone, so the `text = integer` is judged (RP-416).
+            if let Some(q) = j.quals.as_deref() {
+                let mut on = Scope {
+                    tables: Vec::new(),
+                    complete: true,
+                    parent: scope.parent,
+                    lookup: Some(cx.lookup),
+                    ctes: cx.ctes.clone(),
+                };
+                for side in j.larg.iter().chain(j.rarg.iter()) {
+                    on.add(side, &cx.ctes, cx.lookup);
+                }
+                walk(q, &on, cx)?;
             }
         }
         N::SubLink(sl) => {

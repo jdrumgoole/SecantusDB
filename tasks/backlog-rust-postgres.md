@@ -1600,15 +1600,16 @@ a regression test.
       cluster (found while working RP-408).
       Backlog-ID: RP-415
       Verify: tests/backlog/test_rp_column_errors.py::test_insert_values_column_reference
-- [ ] **A join's ON after a comma item is not type-checked.** `select *
-      from e, s join k on b = k.a` (`k.b text`, `k.a int`) returns rows
-      here; PostgreSQL 15.19 refuses it, `42883 operator does not exist:
-      text = integer`, as this server does for the same ON without the
-      comma item before it (`select * from s join k on b = k.a`). A
-      confident answer to a statement PostgreSQL rejects. Measured on a
-      private 15.19 cluster (found while working RP-408).
-      Backlog-ID: RP-416
-      Verify: tests/backlog/test_rp_column_errors.py::test_join_on_after_comma_item_is_type_checked
+- [ ] **A subquery's join ON cannot name the outer query.** `select *
+      from e where exists (select 1 from s join k on s.a = k.a and k.b =
+      e.b)` is 42P01 `missing FROM-clause entry for table "e"` here, and
+      `... (select 1 from s join k on k.b = e.b)` and `e.a in (select s.a
+      from s left join k on k.b = e.b)` are 42703 `column "b" does not
+      exist`; PostgreSQL 15.19 runs all three, as this server does when
+      the same outer reference is in the subquery's WHERE. Measured on a
+      private 15.19 cluster (found while working RP-416).
+      Backlog-ID: RP-430
+      Verify: tests/backlog/test_rp_column_errors.py::test_subquery_join_on_sees_the_outer_query
 - [ ] **A WHERE of a bare string literal is refused as text.** A string
       literal is of type UNKNOWN, and PostgreSQL 15.19's
       `coerce_to_boolean` reads it as a boolean: `select count(*) from e
