@@ -1848,20 +1848,6 @@ and `fs(a int, c text)`, one row each.
       select list it drops was never read.
       Backlog-ID: RP-451
       Verify: tests/backlog/test_rp_subquery_scope.py::test_function_qualified_parameter
-- [ ] **An UPDATE's or DELETE's target is not an enclosing relation to its
-      subqueries.** In PostgreSQL the target is a relation of the
-      statement's own level, so `update fe set a = (select fe.a from fe x
-      limit 1)` reads the target's `fe.a` (UPDATE 1), and with the target
-      aliased its table name is hidden: `update fe x set a = (select fe.a
-      from fs limit 1)` and `delete from fe x where exists (select fe.a
-      from fs)` are 42P01 `invalid reference to FROM-clause entry for table
-      "fe"`, hint `Perhaps you meant to reference the table alias "x".`, at
-      29 and 39. Here the first is that 42P01 (the subquery's own `fe x`
-      taken for the name), and the other two update and delete a row: the
-      write's target is not pushed as an outer relation
-      (`OUTER_RELATIONS`) the way a SELECT's FROM is.
-      Backlog-ID: RP-455
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_target_scope_in_a_subquery
 - [ ] **A join's alias is refused or not found.** `select u.a from fs join
       fe using (a) as u` (the `USING ... AS` alias PostgreSQL 14 added) and
       `select j.a from (fs join fe using (a)) as j` answer 1 on PostgreSQL
@@ -1892,19 +1878,6 @@ and `fs(a int, c text)`, one row each.
 
 ## Found while working RP-453 (2026-11-07)
 
-- [ ] **A CTE hidden by its alias still answers to its name in a
-      subquery.** In PostgreSQL an alias hides the CTE's name as it hides a
-      table's: `with c as (select 1 as a) select (select c.a from fs limit
-      1) from c x` and `... from c x where exists (select c.a from fs)` are
-      42P01 `invalid reference to FROM-clause entry for table "c"`, hint
-      `Perhaps you meant to reference the table alias "x".`, at 42 and 66.
-      Here the first is 42P01 `missing FROM-clause entry for table "c"` with
-      no hint, at 6 (the WITH's own name), and the EXISTS form answers its
-      row: a statement PostgreSQL refuses runs. The table form is RP-455's
-      write-target case; this is a SELECT's CTE. Measured on PostgreSQL
-      15.19.
-      Backlog-ID: RP-456
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_cte_alias_hides_its_name
 - [ ] **An UPDATE ... FROM's or a DELETE ... USING's RETURNING subquery
       cannot read the FROM.** `update fe set b = 'w' from fs returning
       (select fs.a from fe limit 1)` answers 1 on PostgreSQL 15.19, `delete
@@ -1916,6 +1889,27 @@ and `fs(a int, c text)`, one row each.
       15.19.
       Backlog-ID: RP-457
       Verify: tests/backlog/test_rp_subquery_scope.py::test_returning_subquery_reads_the_from
+
+## Found while working RP-455 (2026-11-07)
+
+- [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as
+      its hint.** PostgreSQL 15.19 analyses a FROM-subquery that is not
+      LATERAL with the FROM items before it in its level's range table but
+      out of its namespace (`p_lateral_only`), so `select * from fe x,
+      (select (select fe.a)) s` and `select * from fe x, (select 1 where
+      exists (select fe.a)) s` are 42P01 `invalid reference to FROM-clause
+      entry for table "fe"` with the hint `There is an entry for table "x",
+      but it cannot be referenced from this part of the query.`; here the
+      hint is `Perhaps you meant to reference the table alias "x".`, an
+      alias the client cannot use there. `resolve_sublinks_in_select`
+      pushes the whole FROM, every item visible, onto `OUTER_RELATIONS` and
+      `OUTER_RANGE_LEVELS` before it resolves the FROM-subqueries, so
+      `missing_rte_hint` finds the alias visible; a LATERAL one may see only
+      the items to its left. (The EXISTS forms naming the sibling itself,
+      `exists (select x.a)`, answered rows when this was filed; RP-444 made
+      them 42P01.) Measured on PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_from_subquery_sibling_is_not_visible
+      Backlog-ID: RP-460
 
 ## Found while working RP-316 (2026-11-02)
 
