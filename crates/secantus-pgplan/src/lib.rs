@@ -28943,6 +28943,19 @@ fn plan_select_unnest(
         return Ok(None);
     };
     let name = func_name(f).unwrap_or_default();
+    // The column is named after the function as written, its last name
+    // part (FigureColname), whatever the FROM form calls its column:
+    // `select json_array_elements(j)` is `json_array_elements`, not
+    // `value`, and a call of `f() returns table (t int)` is `f` (RP-483).
+    let figured = f
+        .funcname
+        .iter()
+        .rev()
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| name.clone());
     // A populate_recordset function names its row type by its first
     // argument; each row is a record of that type. The single-record
     // populate functions are scalar (`populate_composite`).
@@ -28989,7 +29002,7 @@ fn plan_select_unnest(
             .collect();
         return Ok(Some(Statement::ValuesConstant(ValuesConstant {
             names: vec![if rt.name.is_empty() {
-                name
+                figured
             } else {
                 rt.name.clone()
             }],
@@ -28999,7 +29012,7 @@ fn plan_select_unnest(
         })));
     }
     let names = vec![if rt.name.is_empty() {
-        names.into_iter().next().unwrap_or(name)
+        figured
     } else {
         rt.name.clone()
     }];

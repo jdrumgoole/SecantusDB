@@ -5,8 +5,11 @@ PL/pgSQL block label does not qualify its variables), RP-464 (a SQL
 function ending in a write's RETURNING returned NULL; fixed) and RP-465 (CREATE
 FUNCTION does not check a SQL body); and found while working RP-461,
 RP-477 (a function with one OUT parameter, called in FROM, named its
-column after the function; fixed), and found while working RP-477, RP-483
-(the same function's call in a select list is named after its parameter).
+column after the function; fixed), found while working RP-477, RP-483
+(the same function's call in a select list was named after its parameter,
+and a field of its scalar result was not refused; fixed), and found while
+working RP-483, RP-485 (a call in a schema that does not exist is a missing
+function, not a missing schema).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -308,9 +311,9 @@ def test_one_out_parameter_names_the_column(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ONE_OUT_PARAMETER_COLUMN[query]
 
 
-# Found while working RP-477: in a select list a call is named by its
-# function (FigureColname), and the result of one with a single OUT
-# parameter is a scalar, so a field of it is 42809.
+# Found while working RP-477, fixed by RP-483: in a select list a call is
+# named by its function (FigureColname), and the result of one with a
+# single OUT parameter is a scalar, so a field of it is 42809.
 ONE_OUT_PARAMETER_CALL = {
     "select gtt()": [(5,)],
     "select (gto()).t": (
@@ -322,15 +325,105 @@ ONE_OUT_PARAMETER_CALL = {
 }
 
 
-@pytest.mark.backlog("RP-483")
+@pytest.mark.backlog_fixed("RP-483")
 @pytest.mark.parametrize("query", list(ONE_OUT_PARAMETER_CALL))
 def test_one_out_parameter_call_in_the_select_list(query: str, dsn: str) -> None:
     answer_ = answer(dsn, query)
     if query == "select gtt()":
-        # The column's name is the divergence: the value already agrees.
-        with psycopg.connect(dsn, autocommit=True) as c:
-            for q in _SETUP:
-                c.execute(q)
-            cur = c.execute(query)
-            assert [d.name for d in cur.description] == ["gtt"]
+        # The column's name was the divergence: the value already agreed.
+        assert column_names(dsn, query) == ["gtt"]
     assert answer_ == ONE_OUT_PARAMETER_CALL[query]
+
+
+def column_names(dsn: str, query: str) -> list[str]:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        cur = c.execute(query)
+        return [d.name for d in cur.description]
+
+
+def _notation(field: str, ty: str, at: str) -> tuple[str, str, None, str]:
+    return (
+        "42809",
+        f"column notation .{field} applied to type {ty}, which is not a composite type",
+        None,
+        at,
+    )
+
+
+# RP-483's further shapes, measured on the same private 15.19 cluster: the
+# one-column set-returning call is a scalar inside an expression too, and
+# column notation over ANY base type is refused at analysis, wherever it is
+# written and whatever the rows (a NULL included). Each answered 0A000, a
+# record or the field's value before.
+COLUMN_NOTATION = {
+    "select gtt() + 1": [(6,)],
+    "select gtt()::text": [("5",)],
+    "select gtt from (select gtt()) s": [(5,)],
+    "select (gtt()).t": _notation("t", "integer", "9"),
+    "select (gtio(1)).x": _notation("x", "integer", "9"),
+    "select (gto()).*": ("42809", "type integer is not composite", None, None),
+    "select (gtt()).*": ("42809", "type integer is not composite", None, None),
+    "select (1).x": _notation("x", "integer", "9"),
+    "select (null::int).x": _notation("x", "integer", "9"),
+    "select ('a'::text).x": _notation("x", "text", "9"),
+    "select (array[array[1]]).x": _notation("x", "integer[]", "9"),
+    "select (now()).x": _notation("x", "timestamp with time zone", "9"),
+    "select (a).x from fe": _notation("x", "integer", "9"),
+    "select (fe.a).x from fe": _notation("x", "integer", "9"),
+    "select 1 from fe where (a).x = 1": _notation("x", "integer", "25"),
+    "select (generate_series(1, 2)).x": _notation("x", "integer", "9"),
+    "select (unnest(array[1])).x": _notation("x", "integer", "9"),
+    "select (json_array_elements('[1]')).value": _notation("value", "json", "9"),
+    # A composite's field still reads.
+    "select (gtc()).k": [(8,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-483")
+@pytest.mark.parametrize("query", list(COLUMN_NOTATION))
+def test_column_notation_on_a_base_type(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == COLUMN_NOTATION[query]
+
+
+# A set-returning built-in in a select list is named by the function, not
+# by its FROM column (`value`); measured on the same cluster (RP-483).
+SRF_TARGET_NAME = {
+    "select json_array_elements('[1,2]')": ["json_array_elements"],
+    "select json_array_elements_text('[1,2]')": ["json_array_elements_text"],
+    "select jsonb_array_elements('[1]')": ["jsonb_array_elements"],
+    "select gtt() as z": ["z"],
+}
+
+
+@pytest.mark.backlog_fixed("RP-483")
+@pytest.mark.parametrize("query", list(SRF_TARGET_NAME))
+def test_set_returning_target_is_named_by_its_function(query: str, dsn: str) -> None:
+    assert column_names(dsn, query) == SRF_TARGET_NAME[query]
+
+
+# Found while working RP-483: a call qualified by a schema that does not
+# exist is 3F000 on PostgreSQL 15.19 (`LookupExplicitNamespace`), at the
+# call; `pg_temp` is such a schema until the session makes a temp object.
+MISSING_SCHEMA_CALL = {
+    "select nosuch_schema.nosuch()": (
+        "3F000",
+        'schema "nosuch_schema" does not exist',
+        None,
+        "8",
+    ),
+    "select 1 + nosuch_schema.f(1)": (
+        "3F000",
+        'schema "nosuch_schema" does not exist',
+        None,
+        "12",
+    ),
+    "select pg_temp.nosuch()": ("3F000", 'schema "pg_temp" does not exist', None, "8"),
+}
+
+
+@pytest.mark.backlog("RP-485")
+@pytest.mark.parametrize("query", list(MISSING_SCHEMA_CALL))
+def test_call_in_a_missing_schema(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == MISSING_SCHEMA_CALL[query]

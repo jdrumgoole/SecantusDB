@@ -4207,6 +4207,50 @@ fn a_subquery_target_is_named_as_written() {
 }
 
 #[test]
+fn column_notation_over_a_base_type_is_refused_at_analysis() {
+    // `ParseFuncOrColumn` refuses `.field` over a type that is not
+    // composite, at the operand, whatever the rows; `ExpandRowReference`
+    // refuses `.*` with no position (RP-483). Each was 0A000 `field
+    // selection on a non-record value`, or a NULL. Answers measured on
+    // PostgreSQL 15.19.
+    let notation = |ty: &str| {
+        format!("column notation .x applied to type {ty}, which is not a composite type")
+    };
+    for (q, want, at) in [
+        ("select (1).x", notation("integer"), Some(8)),
+        ("select (null::int).x", notation("integer"), Some(8)),
+        ("select (id).x from t", notation("integer"), Some(8)),
+        (
+            "select 1 from t where (name).x = 'a'",
+            notation("text"),
+            Some(23),
+        ),
+        ("select (array[array[1]]).x", notation("integer[]"), Some(8)),
+        ("select (unnest(array[1])).x", notation("integer"), Some(8)),
+        (
+            "select (generate_series(1, 2)).x",
+            notation("integer"),
+            Some(8),
+        ),
+        (
+            "select (1).*",
+            "type integer is not composite".to_string(),
+            None,
+        ),
+    ] {
+        let _ = take_error_location();
+        let err = analysed(q).expect_err(q);
+        assert!(
+            matches!(&err, Error::Sqlstate("42809", m) if *m == want),
+            "{q}: {err:?}"
+        );
+        assert_eq!(take_error_location(), at, "{q}");
+    }
+    // A record's field still reads.
+    analysed("select (row(1, 2)).f1").expect("a record's field");
+}
+
+#[test]
 fn a_subquery_two_levels_down_reads_the_outer_row() {
     // `colNameToVar` searches every enclosing level, nearest first (RP-445):
     // a FROM-less subquery in between hid the outer row, as 42703 or a
