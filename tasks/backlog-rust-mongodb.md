@@ -518,6 +518,35 @@ These are explicit non-goals. Don't add them without a reason.
       is WiredTiger's per-session statistics alone (RM-023), absent when
       they counted nothing. A stand-in number is not to be printed; the
       field follows the mechanism, if one is built.
+      **Decision needed (2026-11-07):** building the mechanism changes the
+      server's default concurrency. Measured on mongod 8.2.11 (single-node
+      set, this Mac): `storageEngineConcurrencyAdjustmentAlgorithm:
+      throughputProbing` (initial concurrency 0 = from the cores, min 4,
+      max 128, read/write ratio 0.5, adjusted every 100 ms) gave 8 read and
+      8 write tickets; `serverStatus.queues` has `execution.{read, write}`
+      (out, available, totalTickets, `exempt` and `normalPriority` queue
+      stats with the three delinquency counters) and `execution.monitor`,
+      plus `ingress` (a 1,000,000-ticket pool, `ingressAdmissionControlEnabled:
+      true`) and `ingressSessionEstablishment`. Every user command, `ping`
+      included, has `ingress: {admissions: 1}`; `execution.admissions` is 2
+      for `find`, `getMore`, `aggregate`, `count`, `listCollections` and
+      `dbStats`, 3 for an `insert`, 2 for an update statement and 4 for its
+      `update` command, and `ping`'s `execution` is `{}` with no `storage`;
+      `storageExecutionMicros` was 1-6 us whenever admissions > 0. The
+      count is mongod's acquisition structure, not its `locks`: a `find`
+      with `Global: {r: 1}` has 2 admissions, with or without the profiler,
+      so each command's acquisition points need their own probe. The
+      options: (a, recommended, the faithful one) build mongod's execution
+      control -- the ingress controller, read and write ticket holders with
+      throughput probing replacing `admission.rs`'s opt-in write tickets,
+      the queue sections, and per-command admission points -- sequenced as
+      ingress first (its 1,000,000 pool limits nothing), then the ticket
+      holders, then the per-command counts; it bounds concurrent engine
+      reads and writes by default, where today the server admits all
+      (`admission.rs` measured 16 to 4 writers costing 23% throughput on a
+      fixed limit; probing moves the limit to where throughput is best);
+      (b) ingress only, leaving this item open; (c) leave it open, as
+      RM-170's decision did for the delinquency counters.
       Backlog-ID: RM-355
       Verify: tests/backlog/test_rm_355_364.py::test_a_line_says_what_execution_control_admitted, tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 - [ ] **A write's `locks` and `flowControl` are not mongod's.** Since RM-023
