@@ -5,7 +5,8 @@ while working RP-472 (2026-11-07).
 - RP-474 (fixed): a scalar user function in FROM was refused under an
   aggregate, an alias column list with a WHERE, and ROWS FROM.
 - RP-475: EXPLAIN of a user function in FROM prints no Function Scan.
-- RP-476: a function in FROM under an aggregate and a WHERE runs twice.
+- RP-476 (fixed): a function in FROM under an aggregate and a WHERE ran
+  twice.
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each scenario runs after.
@@ -117,12 +118,25 @@ AGGREGATE_OVER_WHERE = {
         [(1, 1)],
         [([1, 2, 3, 100],)],
     ),
+    # The WHERE's rewrite puts the function in a FROM subquery, and the
+    # grouped expression's rewrite plans that subquery again.
+    "select x + 1, count(*) from fz473() as f(x) where 1 = 1 group by x": (
+        [(2, 1)],
+        [([1, 2, 3, 100],)],
+    ),
+    "with c as (select * from fz473() f(x)) select x + 1, count(*) from c where 1 = 1 group by x": (
+        [(2, 1)],
+        [([1, 2, 3, 100],)],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-476")
+@pytest.mark.backlog_fixed("RP-476")
 @pytest.mark.parametrize("call", list(AGGREGATE_OVER_WHERE))
 def test_aggregate_over_where_runs_the_function_once(call: str, dsn: str) -> None:
+    """An aggregate's first plan, refused, ran the FROM function before a
+    rewrite planned the statement again and ran it a second time; that
+    first attempt is now made with calls switched off."""
     assert answer(dsn, call) == AGGREGATE_OVER_WHERE[call]
 
 

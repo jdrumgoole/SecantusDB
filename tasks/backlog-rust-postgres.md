@@ -1935,21 +1935,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Backlog-ID: RP-475
       Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
 
-## Found while working RP-474 (2026-11-07)
-
-- [ ] **A function in FROM runs twice under an aggregate whose WHERE has a
-      conjunct that reads no column.** With `fz()` a SETOF SQL function
-      whose body inserts a row, `select count(*) from fz() where 1 = 1`,
-      `select max(x) from fz() as f(x) where x > 0 and 1 = 1` and `select
-      x, count(*) from fz() as f(x) where 1 = 1 group by x` each insert
-      twice here; PostgreSQL 15.19 runs the function once. A scalar
-      function (`fq()`) the same, and a `$1 = 1` WHERE under the extended
-      protocol too. `where true`, `where x = 1` and no WHERE run it once.
-      Its rows are right; its side effects are doubled. Measured on a
-      private 15.19 cluster.
-      Backlog-ID: RP-476
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_aggregate_over_where_runs_the_function_once
-
 ## Found while working RP-454 (2026-11-07)
 
 - [ ] **A FROM item named as a table an aliased JOIN hides is refused.**
