@@ -279,6 +279,22 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-011
       Verify: none -- .NET gauge teardown stall (tooling)
 
+- [ ] **`rust-binary-build` links a WiredTiger it did not refresh
+      (2026-11-07).** The task rebuilds `build/rust-wt/wt-build` when a
+      `cmake/patch_wt_*.py` patcher changes (`_build_wiredtiger` stamps the
+      patch digest), then hands cargo whatever `_find_wt_build` finds
+      first. `build/cp312-*/wt-build`, the wheel's WiredTiger, sorts ahead
+      of `build/rust-wt/`, and only `rust-server-build` re-patches it. A
+      checkout that has built the wheel once therefore links an unpatched
+      WiredTiger into `secantusd-rs` after a patcher lands, and `gate_rm.py`
+      builds the binary before the wheel. Measured when RM-364's patcher
+      reached a lane: the binary lacked `txnNumUpdates` and RM-364's
+      regression test failed until `rust-server-build` had run and
+      `secantus-wt` was rebuilt. The task should link the directory
+      `_build_wiredtiger` returns.
+      Backlog-ID: RM-388
+      Verify: tests/backlog/test_rm_found_2026_11_07b.py::test_the_binary_links_the_wiredtiger_its_build_refreshed
+
 
 - [ ] **OPEN — `test_stop_ends_a_running_command` on Windows: the fix is not
       yet observed under the original race, and `test_opsboard.py`'s half was
@@ -776,18 +792,30 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-385
       Verify: tests/backlog/test_rm_355_364.py::test_an_update_in_a_transaction_counts_no_dirty_bytes
 
-- [ ] **mongod's connection lines this server does not write.** Since
-  RM-302 the log is mongod's structured log, and the lines this server
-  writes -- `MongoDB starting`, `Waiting for connections`, `Connection
-  accepted` / `ended`, every `Slow query` -- carry mongod's ids, threads
-  and connection attributes. mongod 8.2.11 also writes, per connection,
-  `client metadata` (NETWORK, 51800, the driver's `hello` document, on the
-  first `hello`) and `Received first command on ingress connection ...`
-  (6788700), and at startup about eighty more lines (build and OS
-  information, options, storage engine settings); this server writes none
-  of them (measured 2026-10-24). Found with RM-302.
+- [ ] **mongod's startup lines this server does not write.** Since RM-302
+  the log is mongod's structured log, and the lines this server writes --
+  `MongoDB starting`, `Waiting for connections`, `Connection accepted` /
+  `ended`, `client metadata`, `Received first command on ingress
+  connection`, every `Slow query` -- carry mongod's ids, threads and
+  attributes. At startup mongod 8.2.11 also writes about eighty more on
+  `initandlisten` (`Build Info` 23403, `Operating System` 51765, `Options
+  set by command line` 21951, then the network, WiredTiger and recovery
+  lines); this server writes `MongoDB starting` alone (measured
+  2026-10-24 and 2026-11-07). Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_client_metadata_is_logged
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_build_os_and_options_lines
+- [ ] **A command that fails to parse is counted as a connection's first
+  command.** mongod 8.2.11 writes `Received first command on ingress
+  connection` (6788700) for the first command after the handshake that it
+  parses (`IngressHandshakeMetrics::onCommandReceived`, after the
+  command's IDL parse): `{find: 1}` after `hello`, refused for its
+  namespace, is passed over and the next command writes the line, timed
+  from the `hello`. This server counts every command either server knows
+  as it arrives, since its handlers parse and run in one step; the fix is
+  a parse step ahead of the run that the line can follow (measured
+  2026-11-07). Found with RM-305.
+  Backlog-ID: RM-386
+  Verify: tests/backlog/test_rm_001_028.py::test_a_command_that_fails_to_parse_is_not_the_first_command
 - [ ] **Change stream pre-images are not in `config.system.preimages`.**
   mongod 8.2.11 keeps each pre-image a collection with
   `changeStreamPreAndPostImages` records as a document of the clustered

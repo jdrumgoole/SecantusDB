@@ -10,9 +10,12 @@ from __future__ import annotations
 import datetime
 import json
 import re
+import socket
+import struct
 import time
 from typing import Any
 
+import bson
 import pymongo
 import pytest
 
@@ -669,14 +672,60 @@ def _client_metadata(client: Any) -> list:
     return out[-1:]
 
 
-@pytest.mark.backlog("RM-305")
+@pytest.mark.backlog_fixed("RM-305")
 def test_client_metadata_is_logged(rust_mongo: Any) -> None:
     """mongod 8.2.11 logs a connection's first `hello` as `client metadata`
     (NETWORK, 51800) with the driver's document (measured 2026-10-24 on a
     default mongod; the reference runs `--quiet`, which leaves the line
-    out). This server writes no such line."""
+    out). This server wrote no such line until 2026-11-07."""
     want = [("I", "NETWORK", 51800, ["client", "doc", "negotiatedCompressors", "remote"])]
     assert _client_metadata(rust_mongo) == want
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_writes_build_os_and_options_lines(rust_mongo: Any) -> None:
+    """mongod 8.2.11 follows `MongoDB starting` with `Build Info` (23403),
+    `Operating System` (51765) and `Options set by command line` (21951),
+    all on `initandlisten` (measured 2026-11-07 on a default mongod). This
+    server writes `MongoDB starting` alone."""
+    ids = [
+        e["id"]
+        for e in map(json.loads, rust_mongo.admin.command("getLog", "global")["log"])
+        if e["ctx"] == "initandlisten"
+    ]
+    assert ids[:4] == [4615611, 23403, 51765, 21951]
+
+
+def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:
+    body = struct.pack("<I", 0) + b"\x00" + bson.encode(command)
+    sock.sendall(struct.pack("<iiii", 16 + len(body), request_id, 0, 2013) + body)
+    header = sock.recv(16, socket.MSG_WAITALL)
+    length = struct.unpack("<i", header[:4])[0]
+    return bson.decode(sock.recv(length - 16, socket.MSG_WAITALL)[5:])
+
+
+@pytest.mark.backlog("RM-386")
+def test_a_command_that_fails_to_parse_is_not_the_first_command(rust_mongo: Any) -> None:
+    """mongod 8.2.11 times `Received first command on ingress connection`
+    (6788700) from the first command it PARSES: after `hello`, a `{find: 1}`
+    (refused for its namespace) is passed over and the line is written by
+    the `ping` a second later, with `elapsedMillis` about 1000 (measured
+    2026-11-07). This server counts the `find`, at about 0."""
+    host, port = rust_mongo.address
+    with socket.create_connection((host, port)) as sock:
+        local_host, local_port = sock.getsockname()[:2]
+        local = f"{local_host}:{local_port}"
+        client = {"driver": {"name": "rm386", "version": "1"}, "os": {"type": "Darwin"}}
+        _op_msg(sock, {"hello": 1, "client": client, "$db": "admin"}, 1)
+        _op_msg(sock, {"find": 1, "$db": "admin"}, 2)
+        time.sleep(1.0)
+        _op_msg(sock, {"ping": 1, "$db": "admin"}, 3)
+    lines = [json.loads(line) for line in rust_mongo.admin.command("getLog", "global")["log"]]
+    thread = next(e["ctx"] for e in lines if e["id"] == 51800 and e["attr"]["remote"] == local)
+    elapsed = [
+        e["attr"]["elapsedMillis"] for e in lines if e["id"] == 6788700 and e["ctx"] == thread
+    ]
+    assert len(elapsed) == 1 and elapsed[0] >= 900, elapsed
 
 
 @pytest.mark.backlog_fixed("RM-025")

@@ -853,6 +853,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         stats.count_op(doc);
     }
     let name = command_name(doc);
+    handshake::note_command(name, ctx, started);
     let _active = stats
         .as_ref()
         .map(|s| s.status.activate(status::OpKind::of(name)));
