@@ -44,7 +44,10 @@ use secantus_core::order::{with_bindata_order, BinDataOrder};
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
 use secantus_core::{get_path, get_path_values};
-use secantus_wt::{Connection, Cursor, Session, WtError};
+/// The engine error [`StorageError::Wt`] carries, nameable by the crates
+/// that see it (a [`ReadFault`] in a test builds one).
+pub use secantus_wt::WtError;
+use secantus_wt::{Connection, Cursor, Session};
 
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
@@ -6306,6 +6309,36 @@ pub fn set_test_hook(hook: Option<TestHook>) {
     let mut slot = TEST_HOOK.lock().unwrap_or_else(|e| e.into_inner());
     TEST_HOOK_ON.store(hook.is_some(), Ordering::SeqCst);
     *slot = hook;
+}
+
+/// A scan a test may fail ([`set_read_fault`]): given the database and the
+/// collection a [`Storage::find_matching_with`] scan reads, the error to fail
+/// it with, or `None` to let it run.
+pub type ReadFault = Arc<dyn Fn(&str, &str) -> Option<StorageError> + Send + Sync>;
+
+static READ_FAULT_ON: AtomicBool = AtomicBool::new(false);
+static READ_FAULT: Mutex<Option<ReadFault>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the fault every document scan asks
+/// first -- process-wide, for a test that must prove a failed read reaches
+/// the client as an error rather than as an empty answer. Not for
+/// production use.
+#[doc(hidden)]
+pub fn set_read_fault(fault: Option<ReadFault>) {
+    let mut slot = READ_FAULT.lock().unwrap_or_else(|e| e.into_inner());
+    READ_FAULT_ON.store(fault.is_some(), Ordering::SeqCst);
+    *slot = fault;
+}
+
+fn read_fault(db: &str, coll: &str) -> Result<()> {
+    if !READ_FAULT_ON.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let fault = READ_FAULT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match fault.and_then(|f| f(db, coll)) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 fn test_point(point: TestPoint, row: &WrittenRow) {
@@ -19305,6 +19338,7 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        read_fault(db, coll)?;
         if self.is_oplog_rs(db, coll) {
             // A `$natural` hint is the oplog's order, as a `$natural` sort
             // is: the command layer sends `sort({$natural: -1})` as the hint.

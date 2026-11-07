@@ -955,6 +955,40 @@ one beside it.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
+## Found by a CI run (2026-11-07)
+
+- [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
+      once; not reproduced.** Commit `f96fc90d`, job 128491514608
+      (`pg-oracle (differential)`),
+      `tests/test_rust_pg_corpora.py::test_corpus_answers_as_postgresql_does[sqlalchemy_catalog]`.
+      The setup ran `COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'`, and
+      `SELECT obj_description('sa35_s.sa35_d_ix'::regclass, 'pg_class')`
+      then answered NULL where PostgreSQL answers `ix comment`. About 2,000
+      local runs, including runs under load and runs with forced
+      interleavings, never reproduced it. Two things that could each
+      produce exactly this symptom were found and fixed.
+      First, every storage read on the comment path answered a failure
+      with "no comment", and the publication was then recorded as current
+      for that catalog version. Those reads were the index comments, the
+      catalog, each table's index list, and `COMMENT ON INDEX`'s own lookup.
+      Second, the corpus test ignored a failed setup statement.
+      Since 2026-11-07 those reads raise `XX000` naming the storage error.
+      The publication is not recorded, and a failed corpus setup statement
+      fails its test with its error (regression test:
+      `crates/secantus-pg/tests/embedded.rs::a_failed_comment_read_is_an_error_not_a_null`).
+      **If it recurs, the job log names the cause.** Read the failing
+      statement's error, or the setup statement the test now reports. A
+      NULL with no error would mean the comment was never written, or was
+      published to a planner thread that missed it, and the transient
+      storage read is ruled out.
+      Some reads under `object_comments` still answer a failure as "none":
+      the constraint, text-search, conversion, opclass, subscription and
+      transform comment helpers, and `shobj_description`'s
+      `shared_comments`. They were not on this corpus's path, and their
+      first failure should be made to surface the same way.
+      Backlog-ID: RP-499
+      Verify: none -- seen once in CI, not reproduced; a recurrence now names its cause in the job log
+
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`

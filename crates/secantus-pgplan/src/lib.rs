@@ -9623,8 +9623,10 @@ thread_local! {
 thread_local! {
     /// `COMMENT ON` text: `(object oid, sub-id, comment)`, the sub-id a
     /// column's number or 0 for the object itself -- pg_description's key.
-    static OBJECT_COMMENTS: std::cell::RefCell<Vec<(i64, i32, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// The error instead when the server could not read them: a lookup then
+    /// raises it, never answers NULL for a comment it did not read.
+    static OBJECT_COMMENTS: std::cell::RefCell<Result<Vec<(i64, i32, String)>>> =
+        const { std::cell::RefCell::new(Ok(Vec::new())) };
 }
 
 /// Install the comments `obj_description` / `col_description` answer from.
@@ -9656,17 +9658,22 @@ pub(crate) fn shared_comment(oid: i64, catalog: &str) -> Option<String> {
     })
 }
 
-pub fn set_object_comments(comments: Vec<(i64, i32, String)>) {
+/// Install the comments `obj_description` / `col_description` answer from,
+/// or the error the server's read of them failed with -- which every lookup
+/// then raises.
+pub fn set_object_comments(comments: Result<Vec<(i64, i32, String)>>) {
     OBJECT_COMMENTS.with(|c| *c.borrow_mut() = comments);
 }
 
-/// The comment on object `oid` (column `subid`, or 0 for the object).
-pub(crate) fn object_comment(oid: i64, subid: i32) -> Option<String> {
-    OBJECT_COMMENTS.with(|c| {
-        c.borrow()
+/// The comment on object `oid` (column `subid`, or 0 for the object); the
+/// read's error when the comments could not be read.
+pub(crate) fn object_comment(oid: i64, subid: i32) -> Result<Option<String>> {
+    OBJECT_COMMENTS.with(|c| match &*c.borrow() {
+        Ok(comments) => Ok(comments
             .iter()
             .find(|(o, s, _)| *o == oid && *s == subid)
-            .map(|(_, _, t)| t.clone())
+            .map(|(_, _, t)| t.clone())),
+        Err(e) => Err(e.clone()),
     })
 }
 

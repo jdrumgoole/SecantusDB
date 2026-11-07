@@ -838,3 +838,116 @@ fn a_write_slips_under_a_guard(writer_isolation: &str, writer_sql: &str) {
     drop(rt);
     server.stop();
 }
+
+/// A failed read of the stored comments is the statement's error, never a
+/// NULL comment (CI, 2026-11-07: `obj_description` of a commented index
+/// answered NULL once on the `pg-oracle` job, and every read on the comment
+/// path answered a failure as "no comment"). The fault fails every scan of
+/// the index-comment collection in this test's own database, as a
+/// WiredTiger `WT_ROLLBACK` would; the other tests in this binary use other
+/// databases, so the process-wide fault never reaches them.
+#[test]
+fn a_failed_comment_read_is_an_error_not_a_null() {
+    use secantus_storage::{set_read_fault, StorageError, WtError};
+
+    const DB: &str = "comment_fault";
+    struct Unfault;
+    impl Drop for Unfault {
+        fn drop(&mut self) {
+            set_read_fault(None);
+        }
+    }
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fault_armed = Arc::clone(&armed);
+    let fault = Arc::new(move |db: &str, coll: &str| {
+        (fault_armed.load(std::sync::atomic::Ordering::SeqCst)
+            && db == DB
+            && coll == "__sql_index_comments__")
+            .then(|| {
+                StorageError::Wt(WtError {
+                    code: -31800,
+                    message: "WT_ROLLBACK: injected by the test".into(),
+                })
+            })
+    });
+
+    let dir = TempDir::new().expect("tempdir");
+    let storage = Storage::open(dir.path().to_str().expect("utf-8 home")).expect("open storage");
+    let databases = Arc::new(DatabaseRegistry::new("postgres", vec![DB.to_string()]));
+    let mut server = bind("127.0.0.1:0", storage, databases).expect("bind");
+    let a = server.address();
+    let dsn = format!(
+        "host={} port={} dbname={DB} user=postgres",
+        a.ip(),
+        a.port()
+    );
+    let _unfault = Unfault;
+    set_read_fault(Some(fault));
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute(
+                "CREATE TABLE cf (id int PRIMARY KEY, d int);
+                 CREATE INDEX cf_d_ix ON cf (d);
+                 COMMENT ON INDEX cf_d_ix IS 'ix comment'",
+            )
+            .await
+            .expect("setup");
+        let comment = "SELECT obj_description('cf_d_ix'::regclass, 'pg_class')";
+        let described = "SELECT description FROM pg_description \
+                         WHERE objoid = 'cf_d_ix'::regclass";
+        let read = |sql: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .query_one(sql, &[])
+                    .await
+                    .map(|r| r.get::<_, Option<String>>(0))
+            }
+        };
+        assert_eq!(
+            read(comment).await.expect("unfaulted").as_deref(),
+            Some("ix comment")
+        );
+
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A catalog change, so the next statement publishes the comments
+        // afresh (and reads them under the fault).
+        client
+            .batch_execute("CREATE TABLE cf_bump (k int)")
+            .await
+            .expect("a statement that reads no comment is not failed");
+        for sql in [comment, described] {
+            let err = read(sql)
+                .await
+                .expect_err("a failed comment read must be an error, not NULL");
+            let db = err.as_db_error().expect("a server error");
+            assert_eq!(db.code().code(), "XX000", "{sql}: {db:?}");
+            assert!(
+                db.message().contains("could not read the index comments")
+                    && db.message().contains("WT_ROLLBACK: injected by the test"),
+                "{sql}: the error names its cause: {}",
+                db.message()
+            );
+        }
+
+        // The failed publication was not recorded as current: with the
+        // fault gone, the same catalog version reads the comment.
+        armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            read(comment).await.expect("unfaulted").as_deref(),
+            Some("ix comment")
+        );
+        assert_eq!(
+            read(described).await.expect("unfaulted").as_deref(),
+            Some("ix comment")
+        );
+    });
+    server.stop();
+}

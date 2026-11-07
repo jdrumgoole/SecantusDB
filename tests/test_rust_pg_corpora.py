@@ -72,6 +72,52 @@ PINNED_ELSEWHERE = {
 #: tasks/backlog-rust-postgres.md. Fix one and its entry must go.
 KNOWN_DIVERGENCES: dict[str, dict[str, str]] = {}
 
+#: {corpus: {"<setup statement>": (why, "<SQLSTATE>: <message>")}}. A setup
+#: statement that errors fails its corpus's test unless it is listed here with
+#: the error it gives, and a listed one that no longer gives that error fails
+#: it too. Each entry either names the open RP-nnn that owns a failure
+#: PostgreSQL does not have, or says how it was measured that PostgreSQL fails
+#: the statement the same way -- in which case the recorded checks were made
+#: without it, and fixing the setup means re-recording the corpus.
+_MEASURED = (
+    "PostgreSQL 14.13 and 15.19 give the same error (fresh private clusters, "
+    "this setup file run as this test runs it, 2026-11-07)"
+)
+_ONE_LINE = (
+    "a corpus line is one statement (`pg_differential._read`), so this "
+    "multi-line INSERT is four statements, each a syntax error; " + _MEASURED
+)
+SETUP_ERRORS: dict[str, dict[str, tuple[str, str]]] = {
+    "hash_partitions": {
+        "INSERT INTO hp_m SELECT g * 1000000007, 'x' || g, date '2020-01-01' + g, "
+        "('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a' || lpad(g::text, 2, '0'))::uuid "
+        "FROM generate_series(1, 30) g": (
+            "int4 * int4 overflows from g = 3; " + _MEASURED,
+            "22003: integer out of range",
+        ),
+    },
+    "numeric_index": {
+        "INSERT INTO ni15 VALUES (41, 1.5), (42, 1.50), (43, 'NaN'), (44, NULL), (45, -3),": (
+            _ONE_LINE,
+            "42601: syntax error at end of input",
+        ),
+        "  (46, 1.2345678901234567890123456789012345), "
+        "(47, 123456789012345678901234567890123456789),": (
+            _ONE_LINE,
+            '42601: syntax error at or near "46"',
+        ),
+        "  (48, 5.0000000000000000000000000000000000000000), "
+        "(49, -123456789012345678901234567890123456789),": (
+            _ONE_LINE,
+            '42601: syntax error at or near "48"',
+        ),
+        "  (50, 'Infinity'), (51, '-Infinity');": (
+            _ONE_LINE,
+            '42601: syntax error at or near "50"',
+        ),
+    },
+}
+
 #: {corpus: {"<sql> [<binding mode>]": (why, [another payload PostgreSQL gives])}}.
 #: The records were made on macOS; a few answers come from the platform's libm,
 #: which PostgreSQL calls as this server does, so PostgreSQL itself answers
@@ -108,6 +154,13 @@ def _corpora() -> list[str]:
         for p in CORPORA.glob("*.sql")
         if not p.name.endswith(".setup.sql") and p.name[: -len(".sql")] not in PINNED_ELSEWHERE
     )
+
+
+def pd_read(path: Path) -> list[str]:
+    """A corpus file's statements, as `pg_differential` reads them."""
+    from tools.probes import pg_differential as pd
+
+    return pd._read(str(path))
 
 
 def _key(sql: str, label: str) -> str:
@@ -175,6 +228,19 @@ def test_known_divergences_name_an_open_backlog_item() -> None:
             assert item in open_ids, f"{corpus}: {key!r} names {item}, not an open RP item"
 
 
+def test_setup_errors_are_measured_or_owned() -> None:
+    """A listed setup failure says PostgreSQL fails it too, or names its open item."""
+    backlog = (REPO / "tasks" / "backlog-rust-postgres.md").read_text(encoding="utf-8")
+    open_ids = set(re.findall(r"Backlog-ID: (RP-\d+)", backlog))
+    for corpus, entries in SETUP_ERRORS.items():
+        setup = pd_read(CORPORA / f"{corpus}.setup.sql")
+        for statement, (why, _error) in entries.items():
+            assert statement in setup, f"{corpus}: {statement!r} is not in its setup file"
+            items = set(re.findall(r"RP-\d+", why))
+            assert items <= open_ids, f"{corpus}: {statement!r} names {items - open_ids}"
+            assert items or _MEASURED in why, f"{corpus}: {statement!r} says neither"
+
+
 # Twice the suite's 600 s deadline. `psql_describe` takes 268 s on a debug
 # build (2026-10-21), 263 of them in one catalog query that RP-077 owns; a CI
 # runner slower than that laptop would otherwise hit the deadline on a known
@@ -192,10 +258,27 @@ def test_corpus_answers_as_postgresql_does(corpus: str, connection: psycopg.Conn
     checks = record["checks"]
 
     cur = connection.cursor()
+    # A setup statement that fails is not the corpus's subject: its failure
+    # showed up only later, as a wrong answer to some check, and the check
+    # was blamed (sqlalchemy_catalog on 2026-11-07). It fails here, by name,
+    # unless SETUP_ERRORS lists it.
+    allowed = SETUP_ERRORS.get(corpus, {})
+    failed: list[str] = []
+    still: set[str] = set()
     for statement in pd._read(str(CORPORA / f"{corpus}.setup.sql")):
-        # As the probe does: a setup statement that fails is the server's
-        # answer too, and shows up in the checks that depend on it.
-        pd._run(cur, statement, False)
+        got = pd._run(cur, statement, False)
+        if got[0] != "err":
+            continue
+        if statement in allowed and got[1] == allowed[statement][1]:
+            still.add(statement)
+            continue
+        failed.append(f"{statement}\n   secantusd-pg: {got[1]}")
+    assert not failed, f"{len(failed)} setup statement(s) of {corpus} failed:\n" + "\n".join(failed)
+    stale = sorted(set(allowed) - still)
+    assert not stale, (
+        "these SETUP_ERRORS no longer fail as listed; remove them (and close or update "
+        "their backlog items):\n  " + "\n  ".join(stale)
+    )
 
     runs: list[tuple[str, str, tuple]] = []
     for line in pd._read(str(CORPORA / f"{corpus}.sql")):

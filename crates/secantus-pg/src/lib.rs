@@ -5445,11 +5445,13 @@ impl PgHandler {
             serial,
             search_path,
         );
-        self.publish_user_types();
+        let complete = self.publish_user_types();
         // A view assembled from reads taken under a transaction's own
         // snapshot is that block's private one and is not reusable (see
         // `may_fill_catalog_cache`): publish it, but do not record it.
-        let record = self.may_fill_catalog_cache(version);
+        // Nor one a read failed in: the failure is published in its place,
+        // for this statement to raise, and the next statement reads again.
+        let record = complete && self.may_fill_catalog_cache(version);
         INSTALLED_USER_TYPES.with(|c| *c.borrow_mut() = record.then_some(held));
     }
 
@@ -5493,7 +5495,20 @@ impl PgHandler {
 
     /// Build the planner's user-type tables from the catalog and publish
     /// them to this thread. `install_user_types` is the gate in front.
-    fn publish_user_types(&self) {
+    /// False when a read the publication needs failed: the planner then holds
+    /// that error where the table would be (the comments, so far), and the
+    /// publication must not be recorded as current.
+    ///
+    /// The error is published rather than returned: several of the callers
+    /// that install the tables can carry no error (preparing a statement's
+    /// record, a `pg_shdepend` read, server start, and after a DDL statement
+    /// has already committed), and every other table must still be
+    /// published -- this thread's are otherwise another session's. A
+    /// statement that reads a comment raises the read's own error. A caller
+    /// outside `install_user_types` records nothing, so it may ignore the
+    /// flag: the failure stays published for a reader to raise.
+    fn publish_user_types(&self) -> bool {
+        let mut complete = true;
         // Views ride the same per-version gate: a view is expanded by the
         // planner, which cannot read the catalog itself.
         // A partition is read and written as a view over its parent (see
@@ -5678,7 +5693,9 @@ impl PgHandler {
                 })
                 .collect(),
         );
-        secantus_pgplan::set_object_comments(self.object_comments());
+        let comments = self.object_comments();
+        complete &= comments.is_ok();
+        secantus_pgplan::set_object_comments(comments.map_err(Self::plan_error_of));
         secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
@@ -5926,6 +5943,7 @@ impl PgHandler {
                 .chain(self.views().unwrap_or_default().into_iter().map(|(n, _)| n))
                 .collect(),
         );
+        complete
     }
 
     /// `information_schema.columns`' `data_type` and `udt_name` for a column
@@ -6869,7 +6887,7 @@ impl PgHandler {
 
     /// One table's rows as documents, virtual or stored, unfiltered.
     fn table_docs(&self, table: &str) -> PgWireResult<Vec<Document>> {
-        if let Some(docs) = self.virtual_rows(table, &Document::new()) {
+        if let Some(docs) = self.virtual_rows_checked(table, &Document::new())? {
             return Ok(docs);
         }
         let raw = self
@@ -7283,9 +7301,9 @@ impl PgHandler {
                     }
                 }
             }
-            None if Self::virtual_table(&agg.table).is_some() => {
-                self.virtual_rows(&agg.table, &agg.filter).expect("checked")
-            }
+            None if Self::virtual_table(&agg.table).is_some() => self
+                .virtual_rows_checked(&agg.table, &agg.filter)?
+                .expect("checked"),
             None if agg.group_by.is_empty() && agg.grouping_sets.is_none() => {
                 match self.ungrouped_in_bounded_memory(agg)? {
                     Some(vals) => {
@@ -12284,11 +12302,20 @@ impl PgHandler {
         Some((ctids, not_visible))
     }
 
+    /// [`Self::try_index_relations`], a failed catalog or index-list read
+    /// answered as no indexes. Kept for the callers that cannot yet carry the
+    /// error; a reader whose wrong answer would be silent (the comments,
+    /// `COMMENT ON INDEX`) uses the fallible form.
     fn index_relations(&self) -> Vec<IndexRelation> {
+        self.try_index_relations().unwrap_or_default()
+    }
+
+    /// Every index relation `pg_class` / `pg_index` list, in oid order. A
+    /// failed read of the catalog or of a table's index list is the error,
+    /// never an empty list.
+    fn try_index_relations(&self) -> PgWireResult<Vec<IndexRelation>> {
         let mut out = Vec::new();
-        let Ok(defs) = self.all_table_defs() else {
-            return out;
-        };
+        let defs = self.all_table_defs()?;
         let defs_all = defs.clone();
         let defs_partitions = |all: &[TableDef], parent: &str| -> Vec<TableDef> {
             all.iter()
@@ -12345,7 +12372,7 @@ impl PgHandler {
             let stored = self
                 .storage
                 .list_indexes(self.db(), &t.name)
-                .unwrap_or_default();
+                .map_err(|e| Self::storage_err("could not read the index list", e))?;
             let mut names = std::collections::HashSet::new();
             for ix in stored {
                 let Ok(name) = ix.get_str("name") else {
@@ -12490,7 +12517,7 @@ impl PgHandler {
         out.extend(derived_ix);
         // pg_index's physical order is creation order, which the oids follow.
         out.sort_by_key(|ix| ix.oid);
-        out
+        Ok(out)
     }
 
     /// Stamp each column of `def` with where it is read from, for the
@@ -17439,8 +17466,9 @@ impl PgHandler {
                     },
                     [] => (None, String::new()),
                 };
-                // An unqualified name is the index the search path finds.
-                let indexes = self.index_relations();
+                // An unqualified name is the index the search path finds. A
+                // failed read is the error, not "relation does not exist".
+                let indexes = self.try_index_relations()?;
                 let found = match &schema {
                     Some(s) => indexes.iter().find(|ix| {
                         ix.name == name
@@ -19842,21 +19870,18 @@ impl PgHandler {
 
     /// Every stored comment as pg_description keys it: `(object oid,
     /// sub-id, text)`, the sub-id a column's number or 0. Objects with no
-    /// oid here (a sequence, a schema) are not listed.
-    pub(crate) fn object_comments(&self) -> Vec<(i64, i32, String)> {
+    /// oid here (a sequence, a schema) are not listed. A failed read of the
+    /// stores the comments live in is the error: answered as "no comment" it
+    /// was a silent NULL from `obj_description` (CI, 2026-11-07).
+    pub(crate) fn object_comments(&self) -> PgWireResult<Vec<(i64, i32, String)>> {
         let mut out = Vec::new();
         // An extension's description is its control file's `comment`.
-        for (i, (name, _, _)) in self
-            .extensions()
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-        {
+        for (i, (name, _, _)) in self.extensions()?.into_iter().enumerate() {
             if let Some(c) = catalog_fill::extension_description(&name) {
                 out.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
-        for def in self.all_table_defs().unwrap_or_default() {
+        for def in self.all_table_defs()? {
             let Some(oid) = self.relation_oid(&def.name) else {
                 continue;
             };
@@ -19877,12 +19902,12 @@ impl PgHandler {
         let index_comments: Vec<Document> = self
             .storage
             .find_matching(self.db(), Self::INDEX_COMMENT_COLLECTION, &Document::new())
-            .unwrap_or_default()
+            .map_err(|e| Self::storage_err("could not read the index comments", e))?
             .iter()
             .filter_map(|b| decode_doc(b).ok())
             .collect();
         if !index_comments.is_empty() {
-            for ix in self.index_relations() {
+            for ix in self.try_index_relations()? {
                 if let Some(c) = index_comments
                     .iter()
                     .find(|d| d.get_str("_id") == Ok(Self::index_comment_key(&ix).as_str()))
@@ -19892,11 +19917,7 @@ impl PgHandler {
                 }
             }
         }
-        for d in self
-            .type_catalog_docs(Self::DOMAIN_COLLECTION)
-            .map(|d| d.as_ref().clone())
-            .unwrap_or_default()
-        {
+        for d in self.type_catalog_docs(Self::DOMAIN_COLLECTION)?.iter() {
             if let (Ok(c), Some(oid)) = (d.get_str("comment"), d.get("oid").and_then(bson_i64)) {
                 out.push((oid, 0, c.to_string()));
             }
@@ -19929,7 +19950,7 @@ impl PgHandler {
         );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
-        for d in self.user_function_docs().unwrap_or_default() {
+        for d in self.user_function_docs()? {
             if let Ok(c) = d.get_str("comment") {
                 let key = d.get_str("_id").unwrap_or_default();
                 out.push((self.function_oid(key), 0, c.to_string()));
@@ -19938,7 +19959,7 @@ impl PgHandler {
         for d in self
             .storage
             .find_matching(self.db(), Self::COMMENT_COLLECTION, &Document::new())
-            .unwrap_or_default()
+            .map_err(|e| Self::storage_err("could not read the comments", e))?
             .iter()
             .filter_map(|b| decode_doc(b).ok())
         {
@@ -19949,7 +19970,7 @@ impl PgHandler {
                 out.push((oid, 0, c.to_string()));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
@@ -20931,6 +20952,23 @@ impl PgHandler {
             .any(|r| r.get(&field).and_then(bson_i64) == Some(oid))
     }
 
+    /// [`Self::virtual_rows`] for a reader that hands the rows to a client:
+    /// a catalog read that failed while they were built
+    /// ([`note_catalog_fill_error`]) is the reader's error, not rows that
+    /// silently lack what the read would have found.
+    fn virtual_rows_checked(
+        &self,
+        name: &str,
+        filter: &Document,
+    ) -> PgWireResult<Option<Vec<Document>>> {
+        let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
+        let rows = self.virtual_rows(name, filter);
+        match CATALOG_FILL_ERROR.with(|e| e.replace(outer)) {
+            Some(e) => Err(e),
+            None => Ok(rows),
+        }
+    }
+
     /// The rows of one virtual table, already filtered.
     ///
     /// A catalog relation's rows are computed once per message cycle: a
@@ -20990,11 +21028,26 @@ impl PgHandler {
         let rows = match hit {
             Some(rows) => rows,
             None => {
-                let rows = Arc::new(self.virtual_rows_uncached(name, &Document::new())?);
-                self.virtual_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(name.to_string(), (key.0, key.1, key.2, Arc::clone(&rows)));
+                // Rows a read failed in are not kept: the next reader builds
+                // them again (and the failure stays noted for this one's).
+                let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
+                let rows = self.virtual_rows_uncached(name, &Document::new());
+                let failed = CATALOG_FILL_ERROR.with(|e| {
+                    let mut e = e.borrow_mut();
+                    if e.is_none() {
+                        *e = outer;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let rows = Arc::new(rows?);
+                if !failed {
+                    self.virtual_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(name.to_string(), (key.0, key.1, key.2, Arc::clone(&rows)));
+                }
                 rows
             }
         };
@@ -36565,7 +36618,9 @@ impl PgHandler {
                 (docs, series_table_def(series))
             }
             (None, _) if Self::virtual_table(&sel.table).is_some() => {
-                let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
+                let docs = self
+                    .virtual_rows_checked(&sel.table, &sel.filter)?
+                    .expect("checked");
                 (docs, Self::virtual_table(&sel.table).expect("checked"))
             }
             // A sequence read as a relation: its one row, built from the
@@ -48690,6 +48745,23 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
         // The extended families returned above.
         _ => Type::TEXT,
     }
+}
+
+thread_local! {
+    /// A catalog read that failed while a virtual catalog's rows were being
+    /// built (`virtual_rows_uncached` has no error channel): raised by the
+    /// reader of those rows (`virtual_rows_checked`), and it keeps the rows
+    /// out of the per-message cache.
+    static CATALOG_FILL_ERROR: std::cell::RefCell<Option<PgWireError>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Note `e`, a read a virtual catalog's rows needed, for the statement
+/// reading them to raise. The first failure is the one reported.
+pub(crate) fn note_catalog_fill_error(e: PgWireError) {
+    CATALOG_FILL_ERROR.with(|slot| {
+        slot.borrow_mut().get_or_insert(e);
+    });
 }
 
 thread_local! {
