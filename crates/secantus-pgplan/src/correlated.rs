@@ -31,6 +31,21 @@ type Runner = CorrelatedRunner<'static>;
 
 thread_local! {
     static RUNNER: std::cell::Cell<Option<*const Runner>> = const { std::cell::Cell::new(None) };
+    /// Set while `correlate` plans a subquery's body only to check and type
+    /// it, with its outer references bound to NULLs.
+    static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as a probe plan of a correlated subquery's body: a correlated
+/// call nested in it (a subquery two levels down reading the outer row,
+/// RP-445) is a NULL of its type, never run, as the probe's NULL bindings
+/// are not the row it will see and the probe may be a Describe's, with no
+/// executor to run it.
+fn probing<R>(f: impl FnOnce() -> R) -> R {
+    let previous = PROBING.with(|p| p.replace(true));
+    let out = f();
+    PROBING.with(|p| p.set(previous));
+    out
 }
 
 /// Run `f` with `runner` as the way to run a correlated subquery's SQL. The
@@ -488,6 +503,11 @@ pub(crate) fn correlate(
     // Qualified references whose qualifier names nothing inside.
     let names = inner_names(inner);
     let mut outer_refs: Vec<Vec<String>> = Vec::new();
+    // Where each reference was first written, for the argument it becomes:
+    // an error resolving it in the outer query (42P01, 42703) is reported
+    // at the reference, as PostgreSQL's `transformColumnRef` reports it,
+    // not at the subquery around it (RP-443).
+    let mut locations: Vec<i32> = Vec::new();
     let mut probe = inner.clone();
     walk_select(&mut probe, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
@@ -500,6 +520,7 @@ pub(crate) fn correlate(
                     && !outer_refs.contains(&parts)
                 {
                     outer_refs.push(parts);
+                    locations.push(c.location);
                 }
             }
         }
@@ -512,7 +533,10 @@ pub(crate) fn correlate(
         let body = substitute(inner, &outer_refs, first);
         let mut probe_params = params.to_vec();
         probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
-        match plan_select(&body, lookup, &probe_params) {
+        // Planned only to check and type the body, never to run it: a
+        // FROM-less body's targets are evaluated as it is planned, so a
+        // `nextval` there drew once more than the rows it ran for (RP-450).
+        match probing(|| without_calls(|| plan_select(&body, lookup, &probe_params))) {
             Ok(p) => break (p, body),
             Err(Error::UndefinedColumn(name))
                 if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
@@ -606,7 +630,13 @@ pub(crate) fn correlate(
             })),
         });
     }
-    for parts in &outer_refs {
+    for (i, parts) in outer_refs.iter().enumerate() {
+        // A reference found by planning has no location of its own here.
+        let location = locations
+            .get(i)
+            .copied()
+            .filter(|l| *l >= 0)
+            .unwrap_or(sl.location);
         args.push(pg_query::protobuf::Node {
             node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                 fields: parts
@@ -615,7 +645,7 @@ pub(crate) fn correlate(
                         node: Some(N::String(pg_query::protobuf::String { sval: p.clone() })),
                     })
                     .collect(),
-                location: sl.location,
+                location,
             })),
         });
     }
@@ -659,7 +689,17 @@ pub(crate) fn from_item_def(
 ) -> Option<(Vec<String>, TableDef)> {
     match item.node.as_ref()? {
         N::RangeVar(r) => {
-            let def = lookup(&relation_name(r))?;
+            // An unqualified name an enclosing WITH declares is that CTE,
+            // ahead of any table of the name (RP-453).
+            let cte = if r.schemaname.is_empty() {
+                visible_cte_def(&r.relname, lookup, params)
+            } else {
+                None
+            };
+            let def = match cte {
+                Some(def) => def,
+                None => lookup(&relation_name(r))?,
+            };
             let name = r
                 .alias
                 .as_ref()
@@ -783,7 +823,7 @@ fn typed_probe(
     });
     let mut probe_params = params.to_vec();
     probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
-    without_side_effects(|| plan_select(&body, lookup, &probe_params)).ok()
+    probing(|| without_side_effects(|| plan_select(&body, lookup, &probe_params))).ok()
 }
 
 /// Is `name` the function a correlated subquery's per-row call is named?
@@ -882,6 +922,9 @@ pub(crate) fn eval_correlated(
 ) -> Option<Result<Bson>> {
     if !is_correlated(f) {
         return None;
+    }
+    if PROBING.with(std::cell::Cell::get) {
+        return Some(Ok(Bson::Null));
     }
     Some(eval(f, params))
 }

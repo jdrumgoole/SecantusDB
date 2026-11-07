@@ -2449,6 +2449,36 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         "explain (costs off) select * from (select * from e where a > 5) s",
         ["Seq Scan on e", "  Filter: (a > 5)"],
     ),
+    # An uncorrelated subquery is an InitPlan run once, which the qual reads
+    # as `$0`; in a join's ON it is pushed to the scan it constrains (found
+    # while working RP-438).
+    "an uncorrelated subquery is an initplan": (
+        "RP-440",
+        _ANALYSED,
+        "explain select * from e where b = (select 'v3'::text)",
+        [
+            "Seq Scan on e  (cost=0.01..17.51 rows=100 width=7)",
+            "  Filter: (b = $0)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result  (cost=0.00..0.01 rows=1 width=32)",
+        ],
+    ),
+    "a join's on subquery is an initplan on its scan": (
+        "RP-440",
+        _ANALYSED,
+        "explain (costs off) select * from e left join k"
+        " on e.a = k.a and k.b = (select 'v3'::text)",
+        [
+            "Hash Left Join",
+            "  Hash Cond: (e.a = k.a)",
+            "  InitPlan 1 (returns $0)",
+            "    ->  Result",
+            "  ->  Seq Scan on e",
+            "  ->  Hash",
+            "        ->  Seq Scan on k",
+            "              Filter: (b = $0)",
+        ],
+    ),
     # A table whose only index is a composite one, its WHERE constraining
     # both columns (found while working RP-399).
     "a table's only index composite": (

@@ -71,10 +71,11 @@ def test_insert_select_and_cte_are_type_checked(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-431")
+@pytest.mark.backlog_fixed("RP-431")
 def test_star_derived_table_is_typed(rust_pg: Any) -> None:
-    """A FROM subquery or CTE written `select *` has its relation's column
-    types, so a comparison over them is 42883 at parse analysis."""
+    """A FROM subquery or CTE written `select *` was untyped, so a
+    comparison over its columns returned no rows; it has its relation's
+    column types, and the comparison is 42883 at parse analysis."""
     integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
     assert _answers(
         rust_pg,
@@ -86,10 +87,163 @@ def test_star_derived_table_is_typed(rust_pg: Any) -> None:
     ) == [integer_boolean, integer_boolean, integer_boolean]
 
 
-@pytest.mark.backlog("RP-432")
+@pytest.mark.backlog_fixed("RP-431")
+def test_star_derived_table_expands_as_postgres_does(rust_pg: Any) -> None:
+    """A `*` or `t.*` lists its FROM items' columns in order
+    (`ExpandColumnRefStar`), a USING or NATURAL join's merged columns once
+    and first, renamed by an alias list -- a CTE's own and then its FROM
+    alias's -- and a name it lists twice is ambiguous, not typed."""
+    integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
+    text_integer = ("err", "42883", "operator does not exist: text = integer")
+    assert _answers(
+        rust_pg,
+        [
+            "insert into k values (5, 'w')",
+            "select * from (select e.* from e) t where a = true",
+            "select * from (select * from e) t(x, y) where y = 1",
+            "select * from (select *, a + 1 as c from e) t where c = true",
+            "select * from (select a as z, * from e) t where b = 1",
+            "select * from (select k.* from e, k) t where b = 1",
+            "select * from (select * from (select * from e) u) t where a = true",
+            "select * from (select * from e join k using (a)) t where a = true",
+            "select * from (select * from e full join k using (a)) t where a = true",
+            "select * from (select * from e natural join k) t where b = 1",
+            "with t(x, y) as (select * from e) select * from t where y = 1",
+            "with t(x) as (select * from e) select * from t u(p) where p = true",
+            "select * from (select * from e, k) t where b = 1",
+            "select * from (select *, * from e) t where b = 'v1'",
+            "select * from (select * from e join k using (a)) t where a = 5",
+            "with t(x, y) as (select * from e) select x from t where y = 'v5'",
+            "select * from (select * from e) t where nosuch = 1",
+            "select ctid from (select * from e) t",
+        ],
+    ) == [
+        ("ok", "INSERT 0 1"),
+        integer_boolean,
+        text_integer,
+        integer_boolean,
+        text_integer,
+        text_integer,
+        integer_boolean,
+        integer_boolean,
+        integer_boolean,
+        text_integer,
+        text_integer,
+        integer_boolean,
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        ("ok", [(5, "v5", "w")]),
+        ("ok", [(5,)]),
+        ("err", "42703", 'column "nosuch" does not exist'),
+        ("err", "42703", 'column "ctid" does not exist'),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-434")
+def test_lateral_view_values_and_using_columns_are_typed(rust_pg: Any) -> None:
+    """A LATERAL subquery's columns, a view's, a VALUES column of untyped
+    literals (`text`, as `select_common_type` resolves `unknown`) and a USING
+    join's merged column of two types (their common type) were untyped, so a
+    comparison over them returned no rows; each is 42883 at parse analysis."""
+    integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
+    text_integer = ("err", "42883", "operator does not exist: text = integer")
+    bigint_boolean = ("err", "42883", "operator does not exist: bigint = boolean")
+    assert _answers(
+        rust_pg,
+        [
+            "create table n (a bigint, c text)",
+            "create view v as select * from e",
+            "select * from e cross join lateral (select e.a + 1 as c) l where c = true",
+            "select * from v where a = true",
+            "select * from (values (1, 'x')) w where column2 = 1",
+            "select * from e join n using (a) where a = true",
+        ],
+    ) == [
+        ("ok", "CREATE TABLE"),
+        ("ok", "CREATE VIEW"),
+        integer_boolean,
+        integer_boolean,
+        text_integer,
+        bigint_boolean,
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-434")
+def test_common_type_is_select_common_types(rust_pg: Any) -> None:
+    """`select_common_type`'s answer types a VALUES column, a CASE, COALESCE
+    or GREATEST and a merged USING / NATURAL column: inputs that are all
+    untyped literals or NULL resolve as text, a number meets another along
+    the implicit casts (`numeric` and `real` are `real`), and among strings
+    a leading `text` stays, `name` takes over from the rest and otherwise
+    the first stays; a merged column hides its sides' own, the outermost
+    join's when they nest, but not a sibling FROM item's. A LATERAL subquery reads the
+    items before it, unqualified too. Each measured on PostgreSQL 15.19."""
+
+    def no_op(left: str, right: str) -> tuple:
+        return ("err", "42883", f"operator does not exist: {left} = {right}")
+
+    assert _answers(
+        rust_pg,
+        [
+            "select coalesce(null, null) = 1",
+            "select case when true then 'a' end = 1",
+            "select greatest('a', 'b') = 1",
+            "select 1 where case when true then 't' end",
+            "select * from (values (null)) w where column1 = 1",
+            "select * from (values (null), (1)) v where column1 = true",
+            "select * from (values (1.5::numeric), (2::float4)) w where column1 = true",
+            "select * from (values (1::int2), (2::float4), (3::numeric)) v where column1 = true",
+            "select * from (values ('a'::varchar), ('b'::char(1))) v where column1 = 1",
+            "select * from (values ('b'::char(1)), ('a'::varchar)) v where column1 = 1",
+            "select * from (values ('a'::varchar), ('b'::name)) v where column1 = 1",
+            "select * from (values ('a'::varchar), ('b'::text)) v where column1 = 1",
+            "select * from (values ('a'::name), ('b'::text)) v where column1 = 1",
+            "select * from (select 1::float4 as a) x join (select 2::numeric as a) y"
+            " using (a) where a = true",
+            "select * from (select 1::int as a) x natural join (select 2::numeric as a) y"
+            " where a = true",
+            "select * from ((select 1::int2 as a) x join (select 1::int4 as a) y using (a))"
+            " join (select 1::int8 as a) z using (a) where a = true",
+            "select * from (select * from (select 1::int4 as a) x join (select 2::int8 as a) y"
+            " using (a)) t where a = true",
+            "select * from (select 1::int as a) x join (select 2::int as a) y using (a),"
+            " (select 3::text as a) z where a = 1",
+            "select * from (select 1::int as a, 'x'::text as b) x join"
+            " (select 2::int as a, 'y'::varchar as b) y using (a) where b = 1",
+            "select * from (select 1::int as q) s cross join lateral (select q as c) l"
+            " where c = true",
+            "select * from (select 1::int as q) s, lateral (select s.q::text as c) l where c = 1",
+        ],
+    ) == [
+        no_op("text", "integer"),
+        no_op("text", "integer"),
+        no_op("text", "integer"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type text"),
+        no_op("text", "integer"),
+        no_op("integer", "boolean"),
+        no_op("real", "boolean"),
+        no_op("real", "boolean"),
+        no_op("character varying", "integer"),
+        no_op("character", "integer"),
+        no_op("name", "integer"),
+        no_op("character varying", "integer"),
+        no_op("name", "integer"),
+        no_op("real", "boolean"),
+        no_op("numeric", "boolean"),
+        no_op("bigint", "boolean"),
+        no_op("bigint", "boolean"),
+        ("err", "42702", 'column reference "a" is ambiguous'),
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        no_op("integer", "boolean"),
+        no_op("text", "integer"),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-432")
 def test_update_and_delete_read_their_ctes(rust_pg: Any) -> None:
-    """An UPDATE or DELETE reads the CTEs of its own WITH, in FROM / USING
-    and in a subquery, and so does a data-modifying CTE the ones before it."""
+    """An UPDATE or DELETE read the CTEs of its own WITH neither in FROM /
+    USING nor in a subquery, and a data-modifying CTE could not read the ones
+    before it: each was 42P01 `relation "t" does not exist`."""
     assert _answers(
         rust_pg,
         [
@@ -108,6 +262,62 @@ def test_update_and_delete_read_their_ctes(rust_pg: Any) -> None:
         ("ok", "DELETE 1"),
         ("ok", [(2,)]),
         ("ok", [(101, "v1")]),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-432")
+def test_writes_read_their_ctes_everywhere(rust_pg: Any) -> None:
+    """A write's WITH is in scope for the whole write, as PostgreSQL 15.19's
+    `transformWithClause` puts it: a recursive one, an INSERT's VALUES, a
+    SET value, RETURNING, a CTE shadowing a table, a CTE body with its own
+    subquery, and a data-modifying item read in FROM. A CTE in FROM takes
+    part in the unqualified-name check (42702). Each was 42P01."""
+    assert _answers(
+        rust_pg,
+        [
+            "insert into k values (1, 'v1'), (2, 'x'), (3, 'v3'), (7, 'z'), (8, 'q'), (50, 'w')",
+            "with e as (select 3 as a) update k set b = 'shadow' where a in (select a from e)",
+            "with t as (select 2 as a) update k set b = (select 'from-t' || a from t)"
+            " where a = 2 returning a, b, (select a from t) as ta",
+            "with t as (select a from e where a in (select 1)) delete from k using t"
+            " where k.a = t.a returning k.a, t.a",
+            "with t as (select 50 as a) update k set b = 'n' from (select * from t) s"
+            " where k.a = s.a",
+            "with d as (delete from k where a = 7 returning a) update k set b = 'd'"
+            " from d where k.a = d.a + 1",
+            "with recursive r(n) as (select 2 union all select n + 1 from r where n < 3)"
+            " delete from k where a in (select n from r)",
+            "with recursive r(n) as (select 10 union all select n + 1 from r where n < 12)"
+            " insert into k select n, 'r' from r",
+            "with t as (select 20 as a) insert into k values ((select a from t), 'z')",
+            "with t as (select 21 as a), u as (insert into k select a, 'q' from t"
+            " returning a) select * from u",
+            "with t as (select 22 as a), u as (insert into k values ((select a from t), 'q')"
+            " returning a) select * from u",
+            "with t as (select 10 as a) update k set b = 'pub' from public.e t where k.a = t.a",
+            "with t as (select 11 as a) delete from k where exists"
+            " (select 1 from t where t.a = k.a)",
+            "with t(x) as (select 12) delete from k using t where k.a = t.x returning t.x",
+            "with t as (select b from e) delete from k using t where b = 'w'",
+            "select a, b from k order by a",
+        ],
+    ) == [
+        ("ok", "INSERT 0 6"),
+        ("ok", "UPDATE 1"),
+        ("ok", [(2, "from-t2", 2)]),
+        ("ok", [(1, 1)]),
+        ("ok", "UPDATE 1"),
+        ("ok", "UPDATE 1"),
+        ("ok", "DELETE 2"),
+        ("ok", "INSERT 0 3"),
+        ("ok", "INSERT 0 1"),
+        ("ok", [(21,)]),
+        ("ok", [(22,)]),
+        ("ok", "UPDATE 2"),
+        ("ok", "DELETE 1"),
+        ("ok", [(12,)]),
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        ("ok", [(8, "pub"), (10, "pub"), (20, "z"), (21, "q"), (22, "q"), (50, "n")]),
     ]
 
 

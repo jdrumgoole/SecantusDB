@@ -1603,27 +1603,6 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **A column reference in an INSERT's VALUES is refused as a gap.**
-      `insert into e values (bb)` and `insert into e values (1, 'x'), (bb,
-      'y')` answer `0A000 ColumnRef is not supported yet`; PostgreSQL
-      15.19 analyses VALUES in the INSERT's own level, where the target
-      is in the range table but not visible, and answers `42703 column
-      "bb" does not exist` (HINT `Perhaps you meant to reference the
-      column "e.b".`). A client matching on the class reads a missing
-      feature where it made a mistake. Measured on a private 15.19
-      cluster (found while working RP-408).
-      Backlog-ID: RP-415
-      Verify: tests/backlog/test_rp_column_errors.py::test_insert_values_column_reference
-- [ ] **A subquery's join ON cannot name the outer query.** `select *
-      from e where exists (select 1 from s join k on s.a = k.a and k.b =
-      e.b)` is 42P01 `missing FROM-clause entry for table "e"` here, and
-      `... (select 1 from s join k on k.b = e.b)` and `e.a in (select s.a
-      from s left join k on k.b = e.b)` are 42703 `column "b" does not
-      exist`; PostgreSQL 15.19 runs all three, as this server does when
-      the same outer reference is in the subquery's WHERE. Measured on a
-      private 15.19 cluster (found while working RP-416).
-      Backlog-ID: RP-430
-      Verify: tests/backlog/test_rp_column_errors.py::test_subquery_join_on_sees_the_outer_query
 - [ ] **A missing output column is reported after the WHERE's errors.**
       PostgreSQL 15.19's `transformSelectStmt` transforms the target list
       before the WHERE, so `select nosuch from e where 1`, `... where a =
@@ -1634,39 +1613,106 @@ a regression test.
       while working RP-424).
       Verify: tests/backlog/test_rp_where_types.py::test_target_list_is_analysed_before_where
       Backlog-ID: RP-429
-- [ ] **A simple CASE refuses an untyped WHEN literal over a non-text
-      argument.** `select case 1 when '1' then 'y' else 'n' end` and
-      `sum(case a when '1' then 1 else 0 end)` over an integer `a` answer
-      `0A000 comparing int32 with string using = is not supported yet`;
-      PostgreSQL 15.19 compares the argument to each WHEN with `=`, so the
-      literal takes the integer type (`'y'`, and 1), and `case a when 't'`
-      is 22P02 `invalid input syntax for type integer: "t"` at 24. Measured
-      on a private 15.19 cluster (found while working RP-424).
-      Verify: tests/backlog/test_rp_where_types.py::test_simple_case_types_untyped_when_from_its_argument
-      Backlog-ID: RP-433
-- [ ] **A FROM subquery or CTE written `select *` is not type-checked.**
-      `select * from (select * from e) t where a = true` (an integer `a`)
-      returns no rows here, as do the same comparison over `with t as
-      (select * from e)` and an INSERT reading that CTE; PostgreSQL 15.19
-      refuses all three at parse analysis, 42883 `operator does not
-      exist: integer = boolean`. `optype`'s `add_derived` types a derived
-      table from its target list and has no column for a `*`, so the
-      comparison goes unchecked and is lowered across BSON types. With the
-      columns written out (`select a, b from e`) it is refused. Measured on
-      a private 15.19 cluster (found while working RP-427).
-      Verify: tests/backlog/test_rp_analysis_order.py::test_star_derived_table_is_typed
-      Backlog-ID: RP-431
-- [ ] **An UPDATE or DELETE cannot read the CTEs of its own WITH.** `with t
-      as (select b from e) update k set a = a + 100 from t where k.b =
-      t.b`, `... update k ... where a in (select a from t)`, `with t as
-      (select 50 as a) delete from k using t where k.a = t.a` and a
-      data-modifying CTE reading an earlier one (`with t as (...), u as
-      (delete from k where a in (select a from t) returning a) select *
-      from u`) each answer 42P01 `relation "t" does not exist`; PostgreSQL
-      15.19 runs them (UPDATE 1, UPDATE 1, DELETE 1, one row). Measured
-      on a private 15.19 cluster (found while working RP-427).
-      Verify: tests/backlog/test_rp_analysis_order.py::test_update_and_delete_read_their_ctes
-      Backlog-ID: RP-432
+- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
+      Scan of the target alone.** The statement is rewritten into
+      correlated subqueries over its FROM items (`rewrite_dml_from`), and
+      EXPLAIN prints that rewrite's scan: `explain (costs off) delete from k
+      using (select 50 as a) t where k.a = t.a` (and the UPDATE ... FROM
+      form) is `Seq Scan on k`, where PostgreSQL 15.19 pulls the subquery
+      up into `Index Scan using k_pkey on k` with `Index Cond: (a = 50)`;
+      `delete from k using e where k.a = e.a` prints no join, where
+      PostgreSQL prints a `Hash Join` with `Hash Cond: (e.a = k.a)` over
+      both tables. Measured on a private 15.19 cluster with `e(a int, b
+      text)` and `k(a int primary key, b text)` (found while working
+      RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join_and_the_index_scan
+      Backlog-ID: RP-435
+- [ ] **An UPDATE ... FROM or DELETE ... USING reports an ambiguous name
+      ahead of a missing column written before it.** `rewrite_dml_from`'s
+      42702 check reads every expression of the statement before anything
+      else is resolved; PostgreSQL 15.19's `transformUpdateStmt` analyses
+      the WHERE before the SET list, each left to right, and stops at the
+      first bad column. So `update k set a = a from (select 1 as a) t where
+      t.nosuch = 1`, `update k set b = b from e where e.nosuch = 1` and
+      `update k set b = 'x' from e where nosuch = 1 and b = 'y'` are 42702
+      `column reference "a"` / `"b" is ambiguous` here and 42703 `column
+      t.nosuch` / `e.nosuch` / `"nosuch" does not exist` there. A name
+      written before the missing one keeps its 42702 on both. Measured on a
+      private 15.19 cluster (found while working RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
+      Backlog-ID: RP-436
+- [ ] **An EXISTS subquery's target list is not analysed.** `select
+      exists (select nosuch)`, `select 1 where exists (select nosuch)` and
+      `select exists (select nosuch from (select 1) s)` answer `true` / a
+      row here; PostgreSQL 15.19 analyses the subquery whole before the
+      planner drops its targets, so each is 42703 `column "nosuch" does not
+      exist` at the name. A statement PostgreSQL refuses runs. Measured on
+      PostgreSQL 15.19 (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_list_is_analysed
+      Backlog-ID: RP-444
+- [ ] **A correlated subquery whose target is an expression names its
+      column `\x1fcorrelated`.** `select (select a + 1) from (select 1 a)
+      t` answers its row (2) under the column name `\x1fcorrelated`, the
+      internal per-row call the subquery was rewritten into; PostgreSQL
+      15.19's `FigureColname` names it `?column?`, as it does `(select (select
+      a) + 1)` and `(select a + 1 from (select 2 b) u)`. A target that is a
+      bare column (`(select a)`) is already named after it. A client that
+      reads columns by name sees the internal one. Measured on PostgreSQL
+      15.19 (found while working RP-445).
+      Verify: tests/backlog/test_rp_correlated_subquery.py::test_expression_target_is_named_column
+      Backlog-ID: RP-449
+- [ ] **A subquery with more than one column runs on its first where
+      PostgreSQL refuses it.** `select (select 1, 2)` answers 1, `select
+      array(select 1, 2)` `{1}`, `select 1 in (select 1, 2)` and `select 1 =
+      any (select 1, 2)` true, a correlated `(select a, 1)` its `a`, and the
+      same in a WHERE; PostgreSQL 15.19's `transformSubLink` refuses an EXPR
+      or ARRAY sublink with more than one target as 42601 `subquery must
+      return only one column` at the sublink, and an ANY / IN one as 42601
+      `subquery has too many columns` at the operator. A statement
+      PostgreSQL refuses answers a value built from part of its subquery.
+      An EXISTS ignores its targets on both. Measured on PostgreSQL 15.19
+      (found while working RP-450).
+      Verify: tests/backlog/test_rp_subquery_columns.py::test_subquery_with_more_than_one_column
+      Backlog-ID: RP-452
+- [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
+      `0A000 this target is not supported yet`; PostgreSQL 15.19's
+      `transformTargetList` answers 42601 `SELECT * with no tables
+      specified is not valid` at the `*`. Measured on PostgreSQL 15.19
+      (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_star_with_no_from
+      Backlog-ID: RP-446
+- [ ] **An operator's type error is reported ahead of a missing column to
+      its left.** `select nosuch + (1 + true)` is 42883 `operator does not
+      exist: integer + boolean` here, from `optype` checking every operator
+      before the planner meets the column; PostgreSQL 15.19 analyses the
+      left operand first and answers 42703 `column "nosuch" does not exist`
+      at 8. The operator to the reference's LEFT already comes first on
+      both (`select (1 + true) + nosuch`). The same pass as RP-442. Measured
+      on PostgreSQL 15.19 (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_before_operator_to_its_right
+      Backlog-ID: RP-447
+- [ ] **An operator over `current_user` or `current_schema` names its
+      operand `text`, not `name`.** `select 1 + current_user` is 42883
+      `operator does not exist: integer + text` here and `integer + name`
+      on PostgreSQL 15.19 (`select current_schema + 1` likewise);
+      `pg_typeof` of each is `name` on both, so only the operator check's
+      typing of the keyword functions differs. Measured on PostgreSQL 15.19
+      (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_keyword_function_operand_is_name
+      Backlog-ID: RP-448
+- [ ] **A cast literal's input error is reported after the operator
+      around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
+      input function as the cast is transformed, before `make_op` looks the
+      operator up, so `select 'x'::int = true` is 22P02 `invalid input
+      syntax for type integer: "x"` at 8, `select 1 = 'x'::uuid` 22P02 at
+      12 and `select '2020-13-01'::date = 1` 22008 at 8; here each is the
+      operator's 42883 (`integer = boolean`, `integer = uuid`, `date =
+      integer`), from `optype` checking operand types before any cast's
+      value is read. The same in a simple CASE (`case 'x'::uuid when 1`).
+      A lone cast is 22P02 on both. Measured on PostgreSQL 15.19 (found
+      while working RP-439).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_cast_literal_input_error_before_operator
+      Backlog-ID: RP-442
 - [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
       missing function or a bad literal.** PostgreSQL 15.19 analyses the
       statement before `ExplainQuery` reads an option, so `explain (bogus)
@@ -1712,6 +1758,19 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
       Backlog-ID: RP-422
+- [ ] **EXPLAIN prints an uncorrelated subquery inline, with no InitPlan
+      and no estimate.** PostgreSQL 15.19 plans `(select 'v3'::text)` as
+      an `InitPlan 1 (returns $0)` over a `Result`, run once, and the qual
+      reads `$0`: `explain select * from e where b = (select 'v3'::text)` is
+      `Seq Scan on e  (cost=0.01..17.51 rows=100 width=7)`, `Filter: (b =
+      $0)`, then the InitPlan. Here `Filter: (b = ( SELECT 'v3'::text AS
+      text))`, every cost zero, no InitPlan, in a WHERE as in a join. In a
+      join's ON (runnable since RP-438) the conjunct also stays in the
+      join's `Join Filter`, where PostgreSQL pushes it to `Seq Scan on k`'s
+      `Filter: (b = $0)`, inner and LEFT join alike. Its rows are right.
+      Measured on a private 15.19 cluster (found while working RP-438).
+      Verify: tests/backlog/test_rp_explain_costs.py::test_plan[an uncorrelated subquery is an initplan], tests/backlog/test_rp_explain_costs.py::test_plan[a join's on subquery is an initplan on its scan]
+      Backlog-ID: RP-440
 
 ## Found by batch 54 (2026-10-24)
 
@@ -1776,6 +1835,78 @@ scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
 cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
 and most of RP-193 in batch 48; their tests there are regression tests.
 
+
+## Found while working RP-443 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
+and `fs(a int, c text)`, one row each.
+
+- [ ] **A parameter qualified by its function's name is not bound.**
+      PostgreSQL resolves `fq1.p` in a function `fq1(p int)` as its
+      parameter (`sql_fn_post_column_ref`, `plpgsql_post_column_ref`), at
+      any depth of subquery: `select fq1.p` in a SQL function's body
+      answers 7 for `fq1(7)`, and so do `select (select fq2.p from fs
+      limit 1)`, `select exists (select fq3.p from fs)` (true) and the
+      PL/pgSQL `return (select fq4.p from fs limit 1)`. Here a SQL body's
+      parameters are bound by name token by token (`bind_parameter_names`)
+      and a dotted name is skipped: the first is 42703 `column "fq1" does
+      not exist`, the others 42P01 `missing FROM-clause entry for table
+      "fq2"`. The EXISTS form answered true before RP-443 only because the
+      select list it drops was never read.
+      Backlog-ID: RP-451
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_function_qualified_parameter
+- [ ] **An UPDATE's or DELETE's target is not an enclosing relation to its
+      subqueries.** In PostgreSQL the target is a relation of the
+      statement's own level, so `update fe set a = (select fe.a from fe x
+      limit 1)` reads the target's `fe.a` (UPDATE 1), and with the target
+      aliased its table name is hidden: `update fe x set a = (select fe.a
+      from fs limit 1)` and `delete from fe x where exists (select fe.a
+      from fs)` are 42P01 `invalid reference to FROM-clause entry for table
+      "fe"`, hint `Perhaps you meant to reference the table alias "x".`, at
+      29 and 39. Here the first is that 42P01 (the subquery's own `fe x`
+      taken for the name), and the other two update and delete a row: the
+      write's target is not pushed as an outer relation
+      (`OUTER_RELATIONS`) the way a SELECT's FROM is.
+      Backlog-ID: RP-455
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_target_scope_in_a_subquery
+- [ ] **A join's alias is refused or not found.** `select u.a from fs join
+      fe using (a) as u` (the `USING ... AS` alias PostgreSQL 14 added) and
+      `select j.a from (fs join fe using (a)) as j` answer 1 on PostgreSQL
+      15.19. Here the first is 42P01 `missing FROM-clause entry for table
+      "u"`, the second 0A000 `an aliased JOIN is not supported yet`
+      (`joins.rs`), and inside a subquery the USING alias reaches the
+      correlated rewrite: `select (select u.a from fs join fe using (a) as
+      u limit 1)` is 42883 `function \x1fcorrelated(...) does not exist`,
+      naming the rewrite's internal function.
+      Backlog-ID: RP-454
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_join_alias
+
+## Found while working RP-453 (2026-11-07)
+
+- [ ] **A CTE hidden by its alias still answers to its name in a
+      subquery.** In PostgreSQL an alias hides the CTE's name as it hides a
+      table's: `with c as (select 1 as a) select (select c.a from fs limit
+      1) from c x` and `... from c x where exists (select c.a from fs)` are
+      42P01 `invalid reference to FROM-clause entry for table "c"`, hint
+      `Perhaps you meant to reference the table alias "x".`, at 42 and 66.
+      Here the first is 42P01 `missing FROM-clause entry for table "c"` with
+      no hint, at 6 (the WITH's own name), and the EXISTS form answers its
+      row: a statement PostgreSQL refuses runs. The table form is RP-455's
+      write-target case; this is a SELECT's CTE. Measured on PostgreSQL
+      15.19.
+      Backlog-ID: RP-456
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_cte_alias_hides_its_name
+- [ ] **An UPDATE ... FROM's or a DELETE ... USING's RETURNING subquery
+      cannot read the FROM.** `update fe set b = 'w' from fs returning
+      (select fs.a from fe limit 1)` answers 1 on PostgreSQL 15.19, `delete
+      from fe using fs returning (select fs.c from fe limit 1)` `y`, and the
+      same through an alias (`from fs x ... x.c`); the FROM and USING items
+      are relations of the statement's own level. Here each is 42P01
+      `missing FROM-clause entry for table "fs"` (or `"x"`). A subquery over
+      the write's target alone already reads it. Measured on PostgreSQL
+      15.19.
+      Backlog-ID: RP-457
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_returning_subquery_reads_the_from
 
 ## Found while working RP-316 (2026-11-02)
 

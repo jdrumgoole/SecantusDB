@@ -20,12 +20,14 @@ mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
 mod colhint;
+mod values_refs;
 pub use colhint::missing_column_hint;
 pub mod colstats;
 pub mod costsize;
 mod expr_memo;
 mod expr_where;
 mod filter_sublink;
+mod fromless;
 mod functional_grouping;
 mod guc_args;
 pub mod hashagg;
@@ -4928,6 +4930,8 @@ fn plan_query_node(
     let mut params = params.to_vec();
     cancel::check()?;
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
+    cancel::check()?;
+    inline_dml_ctes(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
     rewrite_dml_from(&mut node, lookup)?;
     cancel::check()?;
@@ -12152,8 +12156,11 @@ fn plan_insert(
             arity(&exprs)?;
         }
     }
-    // Every VALUES list as long as the first, before the target list is
-    // counted against any of them.
+    // `transformInsertStmt` analyses the VALUES rows one at a time: a row's
+    // expressions (where a column reference fails, RP-415), then its length
+    // against the first row's, then the row against the target list -- the
+    // first row's arity, and each item's assignment type -- before the next
+    // row is looked at. Nothing is evaluated until every row has passed.
     let lists: Vec<&Vec<pg_query::protobuf::Node>> = sel
         .values_lists
         .iter()
@@ -12162,17 +12169,32 @@ fn plan_insert(
             _ => None,
         })
         .collect();
-    if let Some(first) = lists.first() {
-        // `transformInsertStmt` counts the first row against the targets,
-        // then each later one against the first.
-        arity(&first.iter().collect::<Vec<_>>())?;
-        if let Some(odd) = lists.iter().find(|l| l.len() != first.len()) {
-            if let Some(loc) = odd.first().and_then(expr_location) {
-                set_error_location(loc);
+    let target_rel = i
+        .relation
+        .as_ref()
+        .ok_or_else(|| Error::Parse("INSERT without a relation".into()))?;
+    let mut first_len = None;
+    for items in &lists {
+        values_refs::check_row(items, target_rel, &def, lookup)?;
+        match first_len {
+            None => {
+                arity(&items.iter().collect::<Vec<_>>())?;
+                first_len = Some(items.len());
             }
-            return Err(Error::Parse(
-                "VALUES lists must all be the same length".into(),
-            ));
+            Some(len) if items.len() != len => {
+                if let Some(loc) = items.first().and_then(expr_location) {
+                    set_error_location(loc);
+                }
+                return Err(Error::Parse(
+                    "VALUES lists must all be the same length".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+        for (item, target) in items.iter().zip(&targets) {
+            if let Some(column) = def.column(target) {
+                check_assignment_type(column, item)?;
+            }
         }
     }
     let source = if sel.values_lists.is_empty() {
@@ -12192,6 +12214,8 @@ fn plan_insert(
             Some(N::List(l)) => &l.items,
             _ => return Err(Error::Unsupported("this VALUES form".into())),
         };
+        // A value for a generated column is refused by the rewriter
+        // (`rewriteTargetListIU`), after every row has been analysed.
         for (item, target) in items.iter().zip(&targets) {
             if let Some(column) = def.column(target) {
                 if column.extra.get_str("generated").is_ok()
@@ -12199,7 +12223,6 @@ fn plan_insert(
                 {
                     return Err(generated_assignment(target, true));
                 }
-                check_assignment_type(column, item)?;
             }
         }
         // A `DEFAULT` item leaves its column out of the row, so the column's
@@ -19159,8 +19182,13 @@ fn materialize_dml_ctes(
     let Some(with) = with else {
         return Ok(());
     };
-    for cte in &mut with.ctes {
-        let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
+    for idx in 0..with.ctes.len() {
+        // The items written before this one are in its scope (RP-432):
+        // PostgreSQL's `transformWithClause` analyses a non-recursive WITH's
+        // items in order, each seeing the ones before it. An earlier
+        // data-modifying item is already the VALUES of its rows.
+        let earlier = with.ctes[..idx].to_vec();
+        let Some(N::CommonTableExpr(c)) = with.ctes[idx].node.as_mut() else {
             continue;
         };
         let Some(inner) = c.ctequery.as_deref().and_then(|q| q.node.clone()) else {
@@ -19173,7 +19201,9 @@ fn materialize_dml_ctes(
             continue;
         }
         let mut dml = pg_query::protobuf::Node { node: Some(inner) };
+        attach_outer_ctes(&mut dml, &earlier, with.recursive);
         let mut p = params.clone();
+        inline_dml_ctes(&mut dml, lookup, &mut p, run)?;
         rewrite_dml_from(&mut dml, lookup)?;
         resolve_sublinks(&mut dml, lookup, &mut p, run)?;
         let plan = plan_node(
@@ -19408,6 +19438,19 @@ fn materialize_recursive_ctes(
         })
         .unwrap_or_default();
     let with = s.with_clause.as_mut().expect("checked");
+    materialize_recursive_with(with, &budgets, lookup, params, run)
+}
+
+/// Every CTE of a `WITH RECURSIVE`, run in order and replaced by the rows it
+/// produced (see [`materialize_recursive_ctes`]). `budgets` caps a CTE the
+/// query above reads only so many rows of; a write's WITH has none.
+fn materialize_recursive_with(
+    with: &mut pg_query::protobuf::WithClause,
+    budgets: &[(String, usize)],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
     #[allow(clippy::type_complexity)]
     let mut done: Vec<(
         String,
@@ -19550,9 +19593,77 @@ fn resolve_sublinks(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
+    // A write's own WITH is visible to its subqueries (RP-432); whatever
+    // the arms push is popped here, on every exit.
+    let depth = VISIBLE_CTES.with(|v| v.borrow().len());
+    // So do the names in its range table (RP-443): a write's target, and an
+    // UPDATE's FROM or a DELETE's USING, for a subquery's qualifier.
+    let range_depth = match node.node.as_ref() {
+        Some(N::UpdateStmt(u)) => push_outer_range_names(
+            &u.from_clause,
+            &[u.relation.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        Some(N::DeleteStmt(d)) => push_outer_range_names(
+            &d.using_clause,
+            &[d.relation.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        Some(N::InsertStmt(i)) => push_outer_range_names(
+            [],
+            &[i.relation.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        _ => push_outer_range_names([], &[]),
+    };
+    // ...and the same range table is where a correlated subquery's outer
+    // reference finds its TYPE (RP-453): `returning (select fe.a from fs)`
+    // reads the target's integer, not an untyped text parameter.
+    let from_depth = {
+        let as_node = |r: &pg_query::protobuf::RangeVar| pg_query::protobuf::Node {
+            node: Some(N::RangeVar(r.clone())),
+        };
+        let items: Vec<pg_query::protobuf::Node> = match node.node.as_ref() {
+            Some(N::UpdateStmt(u)) => u
+                .relation
+                .iter()
+                .map(as_node)
+                .chain(u.from_clause.iter().cloned())
+                .collect(),
+            Some(N::DeleteStmt(d)) => d
+                .relation
+                .iter()
+                .map(as_node)
+                .chain(d.using_clause.iter().cloned())
+                .collect(),
+            Some(N::InsertStmt(i)) => i.relation.iter().map(as_node).collect(),
+            _ => Vec::new(),
+        };
+        correlated::push_outer_from(&items)
+    };
+    let out = resolve_sublinks_scoped(node, lookup, params, run);
+    correlated::pop_outer_from(from_depth);
+    pop_outer_range_names(range_depth);
+    VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
+    out
+}
+
+fn resolve_sublinks_scoped(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
     match node.node.as_mut() {
         Some(N::SelectStmt(s)) => resolve_sublinks_in_select(s, lookup, params, run),
         Some(N::UpdateStmt(u)) => {
+            push_visible_ctes(u.with_clause.as_mut(), true, lookup, params, run)?;
             let outer = outer_columns(&u.relation, lookup);
             let mut clauses: Vec<&mut pg_query::protobuf::Node> = Vec::new();
             if let Some(w) = u.where_clause.as_deref_mut() {
@@ -19573,6 +19684,7 @@ fn resolve_sublinks(
             Ok(())
         }
         Some(N::DeleteStmt(d)) => {
+            push_visible_ctes(d.with_clause.as_mut(), true, lookup, params, run)?;
             let outer = outer_columns(&d.relation, lookup);
             if let Some(w) = d.where_clause.as_deref_mut() {
                 resolve_sublinks_in_expr(w, lookup, params, run, &outer)?;
@@ -19600,7 +19712,13 @@ fn resolve_sublinks(
             {
                 if sel.values_lists.is_empty() {
                     resolve_sublinks_in_select(sel, lookup, params, run)?;
+                    // In scope for RETURNING too; resolved just now.
+                    push_visible_ctes(sel.with_clause.as_mut(), false, lookup, params, run)?;
                 } else {
+                    // The INSERT's WITH, moved onto its VALUES list
+                    // (`materialize_dml_ctes`), for the subqueries in it
+                    // and in RETURNING (RP-432).
+                    push_visible_ctes(sel.with_clause.as_mut(), true, lookup, params, run)?;
                     // `INSERT ... VALUES (1, (SELECT ...))`: a VALUES item
                     // cannot see the target's columns, and every row's
                     // subquery reads the snapshot from before the statement
@@ -20182,7 +20300,9 @@ fn resolve_sublinks_in_select(
         d
     });
     let from_depth = correlated::push_outer_from(&s.from_clause);
+    let range_depth = push_outer_range_names(&s.from_clause, &[]);
     let out = resolve_sublinks_in_select_scoped(s, lookup, params, run);
+    pop_outer_range_names(range_depth);
     correlated::pop_outer_from(from_depth);
     OUTER_RELATIONS.with(|o| o.borrow_mut().truncate(outer_depth));
     VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
@@ -20193,6 +20313,12 @@ thread_local! {
     /// Relation names the enclosing queries' FROM clauses make visible,
     /// outermost first, while their subqueries are resolved.
     static OUTER_RELATIONS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The columns the queries enclosing a subquery expose, by name, while
+    /// that subquery's own subqueries are resolved: what a bare name two or
+    /// more levels down may read (RP-445). Pushed per subquery, not per FROM
+    /// item, so a FROM-subquery never sees its siblings' columns.
+    static ENCLOSING_COLUMNS: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -20210,6 +20336,19 @@ fn resolve_sublinks_in_select_scoped(
     for item in &s.from_clause {
         collect_from_columns(item, lookup, &mut outer);
     }
+    // ...and every column the queries AROUND it expose: PostgreSQL's
+    // `colNameToVar` searches the namespace of each enclosing level in turn,
+    // nearest first, so `(select (select a)) from t` reads `t.a` two levels
+    // up (RP-445). The nearer level still wins: the per-row call a
+    // subquery becomes names the column at the level around it, which
+    // resolves it against its own FROM before looking further out.
+    ENCLOSING_COLUMNS.with(|e| {
+        for c in e.borrow().iter() {
+            if !outer.contains(c) {
+                outer.push(c.clone());
+            }
+        }
+    });
 
     // A CTE body is a select in its own right, and is resolved BEFORE the
     // query that references it -- the inlining that expands `WITH` runs later,
@@ -20243,7 +20382,7 @@ fn resolve_sublinks_in_select_scoped(
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
     for (i, item) in s.from_clause.iter_mut().enumerate() {
-        resolve_sublinks_in_from(item, i > 0, lookup, params, run)?;
+        resolve_sublinks_in_from(item, i > 0, lookup, params, run, &outer)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -20286,13 +20425,15 @@ fn resolve_sublinks_in_select_scoped(
 }
 
 /// `has_left`: a FROM item stands to this one's left (see
-/// `rowsfrom::rewrite`).
+/// `rowsfrom::rewrite`). `outer`: the columns the query's FROM exposes, which
+/// a subquery in a join's ON may read.
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
     has_left: bool,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
+    outer: &[String],
 ) -> Result<()> {
     // `WITH ORDINALITY` / a several-function `ROWS FROM` become the
     // subqueries they mean first, so the subqueries THAT introduces
@@ -20329,10 +20470,16 @@ fn resolve_sublinks_in_from(
         }
         Some(N::JoinExpr(j)) => {
             if let Some(l) = j.larg.as_deref_mut() {
-                resolve_sublinks_in_from(l, has_left, lookup, params, run)?;
+                resolve_sublinks_in_from(l, has_left, lookup, params, run, outer)?;
             }
             if let Some(r) = j.rarg.as_deref_mut() {
-                resolve_sublinks_in_from(r, true, lookup, params, run)?;
+                resolve_sublinks_in_from(r, true, lookup, params, run, outer)?;
+            }
+            // A subquery in the ON is evaluated as one in a WHERE is
+            // (PostgreSQL's `transformJoinOnClause` analyses it with the
+            // join's sides visible): `on js.a = jk.a and jk.b = (select 'p')`.
+            if let Some(q) = j.quals.as_deref_mut() {
+                resolve_sublinks_in_expr(q, lookup, params, run, outer)?;
             }
             Ok(())
         }
@@ -21034,6 +21181,9 @@ fn resolve_one_sublink(
     // A subquery may itself contain subqueries and CTEs; both are resolved
     // before it is planned, innermost first.
     let mut inner = (**inner).clone();
+    // A qualifier no level has is an error before anything else is done
+    // with the subquery -- before an EXISTS drops the select list holding it.
+    check_subquery_qualifiers(&inner)?;
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
         simplify_exists(&mut inner);
     }
@@ -21048,7 +21198,15 @@ fn resolve_one_sublink(
         SYSTEM_VIEWS_ONLY.with(|f| f.set(previous));
         expanded?;
     }
-    resolve_sublinks_in_select(&mut inner, lookup, params, run)?;
+    let enclosing = ENCLOSING_COLUMNS.with(|e| {
+        let mut e = e.borrow_mut();
+        let d = e.len();
+        e.extend(outer.iter().cloned());
+        d
+    });
+    let resolved = resolve_sublinks_in_select(&mut inner, lookup, params, run);
+    ENCLOSING_COLUMNS.with(|e| e.borrow_mut().truncate(enclosing));
+    resolved?;
     // The enclosing statements' CTEs are in scope, behind the subquery's own
     // (inlining takes the first definition of a name, so its own win). Added
     // AFTER the subquery's own resolution: they are already resolved.
@@ -21500,6 +21658,25 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
     for a in &mut args {
         let _ = walk_expr(a, &mut check);
     }
+    // So can a join's ON, at any depth of the join tree:
+    // `transformJoinOnClause` gives it the join's two sides and every
+    // query around this one. Missed here, `EXISTS (SELECT 1 FROM s JOIN k
+    // ON k.b = e.b)` planned uncorrelated and failed on `e` (RP-430).
+    fn join_quals(item: &pg_query::protobuf::Node, out: &mut Vec<pg_query::protobuf::Node>) {
+        if let Some(N::JoinExpr(j)) = item.node.as_ref() {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                join_quals(side, out);
+            }
+            out.extend(j.quals.as_deref().cloned());
+        }
+    }
+    let mut quals = Vec::new();
+    for item in &s.from_clause {
+        join_quals(item, &mut quals);
+    }
+    for q in &mut quals {
+        let _ = walk_expr(q, &mut check);
+    }
     if found.is_some() {
         return found;
     }
@@ -21514,6 +21691,243 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
         }
     }
     None
+}
+
+thread_local! {
+    /// Every name an ENCLOSING query level's range table answers to while
+    /// its subqueries are resolved: a FROM item's alias, an aliased table's
+    /// own name, a join's alias, an UPDATE's / DELETE's / INSERT's target.
+    /// Wider than `OUTER_RELATIONS` (the names a subquery may correlate
+    /// with): a name here that is not visible is PostgreSQL's "invalid
+    /// reference", which planning already reports, not a missing one.
+    static OUTER_RANGE_NAMES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push the names `from` puts in its level's range table onto
+/// `OUTER_RANGE_NAMES`; the depth to truncate back to is returned.
+fn push_outer_range_names<'a>(
+    from: impl IntoIterator<Item = &'a pg_query::protobuf::Node>,
+    targets: &[&pg_query::protobuf::RangeVar],
+) -> usize {
+    let mut names = Vec::new();
+    for item in from {
+        collect_range_names(item, &mut names);
+    }
+    for t in targets {
+        names.push(t.relname.clone());
+        names.extend(t.alias.as_ref().map(|a| a.aliasname.clone()));
+    }
+    OUTER_RANGE_NAMES.with(|o| {
+        let mut o = o.borrow_mut();
+        let depth = o.len();
+        o.extend(names);
+        depth
+    })
+}
+
+fn pop_outer_range_names(depth: usize) {
+    OUTER_RANGE_NAMES.with(|o| o.borrow_mut().truncate(depth));
+}
+
+/// `collect_from_names`, with a join's own alias (`(a join b) as j`,
+/// `join b using (x) as u`), which is an entry of the range table too.
+fn collect_range_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    collect_from_names(item, out);
+    fn join_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+        if let Some(N::JoinExpr(j)) = item.node.as_ref() {
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+            out.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                join_aliases(side, out);
+            }
+        }
+    }
+    join_aliases(item, out);
+}
+
+/// PostgreSQL's `errorMissingRTE` for a subquery's qualified column
+/// reference whose qualifier no range table in reach has (RP-443).
+///
+/// `transformColumnRef` looks a qualifier up in this query level and then
+/// in each enclosing one (`refnameNamespaceItem`); one found nowhere is
+/// 42P01 `missing FROM-clause entry for table "x"` at the reference, and
+/// the statement goes no further. Here a qualifier the subquery's own FROM
+/// does not have is taken for an OUTER reference (`foreign_qualifier`),
+/// so without this check one naming nothing at all was carried into the
+/// correlated rewrite: `exists (select x.a from s)` answered rows (the
+/// select list an EXISTS drops is dropped before it was ever resolved) and
+/// `select (select x.a from s)` a 42883 naming the rewrite's internal
+/// function. The subquery's own aliased table named by its table name is
+/// `errorMissingRTE`'s "invalid reference", with the alias as its hint,
+/// reported here for the same reason (`exists (select s.c from s x)`
+/// answered rows). Any other qualifier some level has, visible or not, is
+/// left to planning, which reports the other "invalid reference" forms.
+///
+/// The clauses are read in `transformSelectStmt`'s order -- FROM (a join's
+/// ON, a function's arguments), the select list, WHERE, HAVING, ORDER BY,
+/// GROUP BY, DISTINCT, LIMIT / OFFSET, WINDOW -- and a nested subquery's
+/// body is not read here: it is its own level, checked when it is resolved.
+/// A reference of two names is `rel.col`, of three `schema.rel.col` (a
+/// composite column's field needs parentheses); longer ones keep the
+/// errors they have.
+fn check_subquery_qualifiers(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    let mut known: Vec<String> = Vec::new();
+    for item in &s.from_clause {
+        collect_range_names(item, &mut known);
+    }
+    if let Some(with) = s.with_clause.as_ref() {
+        for cte in &with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_ref() {
+                known.push(c.ctename.clone());
+            }
+        }
+    }
+    // The names that resolve a qualifier here: this level's visible ones,
+    // and those of the levels around it.
+    let mut visible: Vec<String> = Vec::new();
+    for item in &s.from_clause {
+        collect_visible_names(item, &mut visible);
+    }
+    // An aliased table of this level's FROM, by its own name: found by
+    // `searchRangeTableForRel`, innermost level first, so it is the entry
+    // the error names, with the alias that is visible in its place.
+    fn aliased(item: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) {
+        match item.node.as_ref() {
+            Some(N::RangeVar(r)) => {
+                if let Some(a) = r.alias.as_ref() {
+                    out.push((r.relname.clone(), a.aliasname.clone()));
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    aliased(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hidden: Vec<(String, String)> = Vec::new();
+    for item in &s.from_clause {
+        aliased(item, &mut hidden);
+    }
+    let in_reach = |q: &str| {
+        known.iter().any(|n| n == q)
+            || OUTER_RANGE_NAMES.with(|o| o.borrow().iter().any(|n| n == q))
+    };
+    let resolves = |q: &str| {
+        visible.iter().any(|n| n == q)
+            || OUTER_RELATIONS.with(|o| o.borrow().iter().any(|n| n == q))
+    };
+    // (qualifier, the alias hiding it if it is this level's aliased table,
+    // location)
+    let mut bad: Option<(String, Option<String>, i32)> = None;
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if bad.is_some() {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let qualifier = match c.fields.len() {
+            2 | 3 => c.fields[c.fields.len() - 2].node.as_ref(),
+            _ => None,
+        };
+        let Some(N::String(q)) = qualifier else {
+            return Ok(());
+        };
+        let q = q.sval.as_str();
+        if resolves(q) {
+            return Ok(());
+        }
+        if let Some((_, alias)) = hidden.iter().find(|(rel, _)| rel == q) {
+            bad = Some((q.to_string(), Some(alias.clone()), c.location));
+        } else if !in_reach(q) {
+            bad = Some((q.to_string(), None, c.location));
+        }
+        Ok(())
+    };
+    let mut probe = s.clone();
+    fn from_exprs(
+        item: &mut pg_query::protobuf::Node,
+        visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+    ) -> Result<()> {
+        match item.node.as_mut() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    from_exprs(side, visit)?;
+                }
+                if let Some(q) = j.quals.as_deref_mut() {
+                    walk_expr(q, visit)?;
+                }
+                Ok(())
+            }
+            Some(N::RangeFunction(rf)) => {
+                for f in &mut rf.functions {
+                    if let Some(N::List(l)) = f.node.as_mut() {
+                        for call in &mut l.items {
+                            walk_expr(call, visit)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    for item in &mut probe.from_clause {
+        from_exprs(item, &mut visit)?;
+    }
+    for n in probe.target_list.iter_mut() {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in [
+        probe.where_clause.as_deref_mut(),
+        probe.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in probe
+        .sort_clause
+        .iter_mut()
+        .chain(probe.group_clause.iter_mut())
+        .chain(probe.distinct_clause.iter_mut())
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in [
+        probe.limit_count.as_deref_mut(),
+        probe.limit_offset.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in probe.window_clause.iter_mut() {
+        walk_expr(n, &mut visit)?;
+    }
+    match bad {
+        Some((q, alias, location)) => {
+            set_error_location(location);
+            Err(Error::Sqlstate(
+                "42P01",
+                match alias {
+                    Some(alias) => format!(
+                        "invalid reference to FROM-clause entry for table \"{q}\"\nHint: Perhaps you meant to reference the table alias \"{alias}\"."
+                    ),
+                    None => format!("missing FROM-clause entry for table \"{q}\""),
+                },
+            ))
+        }
+        None => Ok(()),
+    }
 }
 
 fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> {
@@ -21670,11 +22084,25 @@ fn inline_ctes(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf:
     // (name, body, column aliases). Built in declared order, because a CTE may
     // reference the ones written before it -- and only those: PostgreSQL scopes
     // a non-recursive WITH that way too.
-    let mut defs: Vec<(
+    let defs = cte_defs(with)?;
+    let mut out = substitute_ctes(s, &defs);
+    out.with_clause = None;
+    Ok(out)
+}
+
+/// A non-recursive WITH's CTEs as `(name, flat body, column aliases)`, in
+/// declared order, each body with the CTEs before it already substituted.
+#[allow(clippy::type_complexity)]
+fn cte_defs(
+    with: &pg_query::protobuf::WithClause,
+) -> Result<
+    Vec<(
         String,
         pg_query::protobuf::SelectStmt,
         Vec<pg_query::protobuf::Node>,
-    )> = Vec::new();
+    )>,
+> {
+    let mut defs = Vec::new();
     for cte in &with.ctes {
         let Some(N::CommonTableExpr(c)) = cte.node.as_ref() else {
             return Err(Error::Unsupported("this WITH item".into()));
@@ -21689,9 +22117,198 @@ fn inline_ctes(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf:
         let body = substitute_ctes(&body, &defs);
         defs.push((c.ctename.clone(), body, c.aliascolnames.clone()));
     }
-    let mut out = substitute_ctes(s, &defs);
-    out.with_clause = None;
-    Ok(out)
+    Ok(defs)
+}
+
+/// The WITH of an UPDATE, a DELETE or an INSERT, read where the statement
+/// reads it (RP-432). PostgreSQL's `transformWithClause` puts a write's CTEs
+/// in scope for its whole query, as a SELECT's; here a SELECT's are inlined
+/// by `plan_select`, which a write never reaches, so a reference to one was
+/// `relation "t" does not exist`.
+///
+/// A recursive WITH is run first, as a SELECT's is. A reference in the
+/// UPDATE's FROM or the DELETE's USING then becomes the FROM-subquery it is
+/// shorthand for, BEFORE `rewrite_dml_from` reads those lists, so the
+/// columns a CTE exposes take part in its ambiguity checks. The statement's
+/// own subqueries see the CTEs through `VISIBLE_CTES` (`resolve_sublinks`),
+/// so the WITH stays on the statement. Runs after `materialize_dml_ctes`,
+/// which leaves a data-modifying item as the VALUES of its RETURNING rows.
+fn inline_dml_ctes(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    let (with, from) = match node.node.as_mut() {
+        Some(N::UpdateStmt(u)) => {
+            let u = &mut **u;
+            (u.with_clause.as_mut(), Some(&mut u.from_clause))
+        }
+        Some(N::DeleteStmt(d)) => {
+            let d = &mut **d;
+            (d.with_clause.as_mut(), Some(&mut d.using_clause))
+        }
+        // An INSERT's WITH is on its SELECT by now (`materialize_dml_ctes`),
+        // which `plan_select` inlines, but a recursive one is run only for
+        // a top-level SELECT.
+        Some(N::InsertStmt(i)) => (
+            i.select_stmt
+                .as_deref_mut()
+                .and_then(|n| n.node.as_mut())
+                .and_then(|n| match n {
+                    N::SelectStmt(s) => s.with_clause.as_mut(),
+                    _ => None,
+                }),
+            None,
+        ),
+        _ => return Ok(()),
+    };
+    let Some(with) = with else {
+        return Ok(());
+    };
+    if with.recursive {
+        materialize_recursive_with(with, &[], lookup, params, run)?;
+    }
+    let Some(from) = from else {
+        return Ok(());
+    };
+    if from.is_empty() {
+        return Ok(());
+    }
+    let defs = cte_defs(with)?;
+    for item in from.iter_mut() {
+        substitute_in_from(item, &defs);
+    }
+    Ok(())
+}
+
+/// `ctes`, the WITH items written before a data-modifying one, in scope for
+/// that item's own statement, behind its own WITH (whose names win, as
+/// `resolve_one_sublink` orders them).
+fn attach_outer_ctes(
+    node: &mut pg_query::protobuf::Node,
+    ctes: &[pg_query::protobuf::Node],
+    recursive: bool,
+) {
+    if ctes.is_empty() {
+        return;
+    }
+    let with = match node.node.as_mut() {
+        Some(N::UpdateStmt(u)) => &mut u.with_clause,
+        Some(N::DeleteStmt(d)) => &mut d.with_clause,
+        Some(N::InsertStmt(i)) => {
+            let own = i.with_clause.take();
+            let Some(N::SelectStmt(sel)) =
+                i.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut())
+            else {
+                i.with_clause = own;
+                return;
+            };
+            if let Some(own) = own {
+                let w = sel.with_clause.get_or_insert_with(Default::default);
+                w.recursive |= own.recursive;
+                w.ctes.extend(own.ctes);
+            }
+            &mut sel.with_clause
+        }
+        _ => return,
+    };
+    let w = with.get_or_insert_with(Default::default);
+    // Items of a recursive WITH are run by `inline_dml_ctes`, as they are
+    // for the statement around them.
+    w.recursive |= recursive;
+    w.ctes.extend(ctes.iter().cloned());
+}
+
+/// The columns of the enclosing statements' CTE `name`, when one is in
+/// scope: what a correlated subquery's reference to an outer row read from
+/// a CTE is typed by (RP-453). PostgreSQL's range table entry for a CTE
+/// reference carries the CTE's own output columns (`addRangeTableEntryForCTE`),
+/// and a CTE of that name hides a table of it, as here.
+pub(crate) fn visible_cte_def(
+    name: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<TableDef> {
+    let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    let declared = ctes
+        .iter()
+        .any(|c| matches!(c.node.as_ref(), Some(N::CommonTableExpr(c)) if c.ctename == name));
+    if !declared {
+        return None;
+    }
+    // `SELECT * FROM name` under the visible WITH, as a subquery sees it
+    // (`resolve_one_sublink`): inlining substitutes the earlier CTEs a body
+    // reads and applies the CTE's column aliases.
+    let star = pg_query::protobuf::Node {
+        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+            val: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                    fields: vec![pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    }],
+                    location: -1,
+                })),
+            })),
+            location: -1,
+            ..Default::default()
+        }))),
+    };
+    let from = pg_query::protobuf::Node {
+        node: Some(N::RangeVar(pg_query::protobuf::RangeVar {
+            relname: name.to_string(),
+            inh: true,
+            relpersistence: "p".into(),
+            location: -1,
+            ..Default::default()
+        })),
+    };
+    let s = pg_query::protobuf::SelectStmt {
+        target_list: vec![star],
+        from_clause: vec![from],
+        with_clause: Some(pg_query::protobuf::WithClause {
+            ctes,
+            ..Default::default()
+        }),
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    let flat = inline_ctes(&s).ok()?;
+    let planned = correlated::without_side_effects(|| plan_select(&flat, lookup, params)).ok()?;
+    sub_plan_def(&planned, lookup).ok()
+}
+
+/// Push a WITH's items onto `VISIBLE_CTES` for the subqueries resolved
+/// next; `resolve` resolves their bodies' own subqueries first, which a
+/// caller that has already resolved them skips. The caller truncates.
+fn push_visible_ctes(
+    with: Option<&mut pg_query::protobuf::WithClause>,
+    resolve: bool,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    let Some(with) = with else {
+        return Ok(());
+    };
+    if with.recursive {
+        return Ok(());
+    }
+    if resolve {
+        for cte in &mut with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    c.ctequery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    resolve_sublinks_in_select(body, lookup, params, run)?;
+                }
+            }
+        }
+    }
+    let ctes = with.ctes.clone();
+    VISIBLE_CTES.with(|v| v.borrow_mut().extend(ctes));
+    Ok(())
 }
 
 /// Replace every FROM reference to one of `defs` with the subquery it names.
@@ -22859,6 +23476,10 @@ fn plan_select(
         return plan_select(&inline_ctes(&s)?, lookup, params);
     }
     cancel::check()?;
+    // With no FROM a column reference names nothing (RP-441): checked as
+    // parse analysis would, before any rewrite folds the expression it is
+    // in away.
+    fromless::check_column_refs(s, params)?;
     // A view is shorthand for the subquery it was defined as, so it is
     // rewritten away here, before any shape check looks at the FROM list.
     // The `tableoid` system column, before the views it may name expand.
@@ -27971,6 +28592,23 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                     },
                     ConstCol::Value(const_value(node, params)?),
                     "bool".to_string(),
+                    -1,
+                ));
+                continue;
+            }
+            // The per-row call a correlated subquery became, in the body of
+            // a FROM-less subquery around it (`(select (select a))`, RP-445):
+            // run with the outer row's values, typed as the subquery was.
+            Some(N::FuncCall(f)) if correlated::correlated_type(f).is_some() => {
+                let node = rt.val.as_deref().expect("a FuncCall target");
+                columns.push((
+                    if rt.name.is_empty() {
+                        "?column?".to_string()
+                    } else {
+                        rt.name.clone()
+                    },
+                    ConstCol::Value(const_value(node, params)?),
+                    correlated::correlated_type(f).expect("checked"),
                     -1,
                 ));
                 continue;
@@ -40010,6 +40648,42 @@ fn const_value_inner(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result
     const_value_node(node, params)
 }
 
+/// A simple CASE's WHEN label as its comparison with the argument sees it.
+///
+/// `transformCaseExpr` compares the argument to each WHEN with `=` (`make_op`
+/// over `CaseTestExpr = warg`), so an untyped string WHEN is `unknown` and
+/// takes the argument's type, read by that type's input function -- as
+/// `NULLIF`'s untyped side is. `case a when '1'` over an integer compares
+/// two integers, where the label stayed a string and the comparison was
+/// refused (RP-433). A label the type's input refuses is its error at the
+/// literal; a string-typed or untyped argument leaves the label text.
+fn case_label(
+    arg: Option<&pg_query::protobuf::Node>,
+    subject: &Bson,
+    test: &pg_query::protobuf::Node,
+    label: Bson,
+) -> Result<Bson> {
+    let (Some(arg), Bson::String(_)) = (arg, &label) else {
+        return Ok(label);
+    };
+    let Some(N::AConst(c)) = test.node.as_ref() else {
+        return Ok(label);
+    };
+    if !matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) {
+        return Ok(label);
+    }
+    let ty = static_type(arg, subject);
+    if ty.is_empty() || ty == "unknown" || is_string_type(&ty) {
+        return Ok(label);
+    }
+    let location = c.location;
+    cast_value(label, &ty).inspect_err(|_| {
+        if location >= 0 {
+            set_error_location(location);
+        }
+    })
+}
+
 fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // A hashed SubPlan (`hashed_subplan`), whose arguments are not all
     // values to evaluate.
@@ -41337,7 +42011,8 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             let taken = match &subject {
                 // Simple form: the parser leaves the comparison implicit.
                 Some(subject) => {
-                    let label = const_value(test, params)?;
+                    let label =
+                        case_label(c.arg.as_deref(), subject, test, const_value(test, params)?)?;
                     *subject != Bson::Null
                         && label != Bson::Null
                         && eval_binary("=", subject.clone(), label)? == Bson::Boolean(true)
