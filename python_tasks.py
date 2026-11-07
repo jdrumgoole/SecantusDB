@@ -248,6 +248,13 @@ def clean(c: Context) -> None:
             f"({freed / 1024**3:.1f} GiB) under {base}"
         )
 
+    reaped, freed = _sweep_stale_rust_test_tmp(base)
+    if reaped:
+        print(
+            f"clean: reaped {reaped} abandoned Rust test store(s) "
+            f"({freed / 1024**3:.1f} GiB) under {base}"
+        )
+
 
 #: How many numbered pytest dirs to keep.
 #:
@@ -381,6 +388,52 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
         # died on a fatal WiredTiger assertion -- "log pre-alloc server error
         # ... the process must exit and restart". Ask the STORE whether it is
         # in use before believing the name.
+        if _wt_home_in_use(path):
+            continue
+        try:
+            freed += _dir_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
+        except OSError:
+            continue
+    return (reaped, freed)
+
+
+#: A directory the Rust code names ``secantus-<kind>-<pid>[-<more>]`` under the
+#: system temp dir: ``<kind>`` is lowercase words, and the FIRST all-digit part
+#: is ``std::process::id()`` of the process that made it (a ``<kind>`` part
+#: always has a letter, as in ``secantus-2pc-{pid}-{n}``). Every such name in
+#: ``crates/`` puts the pid there (``secantus-snap-{pid}-{n}``,
+#: ``secantus-mdb-{pid}-{nanos}-{n}``, ``secantus-index-build-{pid}``). A pid
+#: has no leading zero and at most seven digits (Linux's ceiling is 4194304),
+#: which keeps out ``secantus-cfg-{nanos}-{n}`` -- a 19-digit clock, not a pid
+#: -- and a gauge's random ``mkdtemp`` suffix.
+_RUST_TMP_RE = re.compile(r"secantus-(?:[a-z0-9]*[a-z][a-z0-9]*-)+?([1-9][0-9]{0,6})(?:-[0-9]+)*")
+_LINUX_PID_MAX = 4_194_304
+
+
+def _sweep_stale_rust_test_tmp(base: str) -> tuple[int, int]:
+    """Delete the temp stores dead Rust processes left; return ``(count, bytes)``.
+
+    About sixty Rust test files each make a fresh WiredTiger home per test
+    under ``std::env::temp_dir()`` and never delete it, so every ``cargo
+    test`` run of the storage crates leaves hundreds behind: 1,166 of them,
+    2.5 GiB, on this Mac on 2026-11-07, invisible to every other janitor here.
+    The name carries the creating pid, so a store is garbage once that process
+    is gone -- and, as with probe stores, only once it has also sat untouched
+    for the grace period (`_wt_home_in_use`), because a name is not proof.
+    """
+    reaped = freed = 0
+    for name in os.listdir(base):
+        m = _RUST_TMP_RE.fullmatch(name)
+        if m is None or name.startswith(_PROBE_TMP_PREFIX) or "-gauge-" in name:
+            continue
+        pid = int(m.group(1))
+        if pid > _LINUX_PID_MAX or _pid_alive(pid):
+            continue
+        path = os.path.join(base, name)
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
         if _wt_home_in_use(path):
             continue
         try:

@@ -319,6 +319,15 @@ addopts = "-n auto --dist=loadgroup -m 'not perf and not online and not slow and
 # gauges' `-o addopts=`.
 timeout = 600
 timeout_method = "thread"
+# Keep ONE numbered `pytest-NNN` run directory, not pytest's default three:
+# each run's exit-time janitor deletes the runs before it. Every test that
+# starts a server leaves a WiredTiger home in its `tmp_path` (a 128 MB log
+# file each), so one CI step's run holds tens of GB. On 2026-11-07 the
+# `storage-engine` job on a 72 GB runner kept three earlier steps' runs,
+# 38 GB, and the RP-312 disk watchdog failed PR #2408. The count is how
+# many whole RUNS survive, never a test's directory mid-run: the retention
+# POLICY stays "all" (tests/conftest.py, `pytest_configure`, says why).
+tmp_path_retention_count = 1
 markers = [
     "perf: performance regression tests (run via `invoke perf`, not in default suite)",
     "online: tests that hit the public internet (run via `invoke validate-readme` or `pytest -m online`, not in default suite)",
