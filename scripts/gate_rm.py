@@ -198,6 +198,11 @@ def main() -> int:
     if not args.no_build:
         # What the suites below launch, from HEAD; tools/provenance.py aborts
         # a run against a stale one rather than let it measure old code.
+        # The `_secantus_core` extension the suites import is the third
+        # artifact tools/provenance.py checks; a commit amended or rebased
+        # after the lane's last `./inv sync` leaves it stale and every pytest
+        # step aborts before a test runs (2026-11-07, RM-326's re-gate).
+        g.step("core-sync", ["./inv", "sync"])
         g.step("binary-build", ["./inv", "rust-binary-build"])
         g.step("server-build", ["./inv", "rust-server-build"])
         # tools/provenance.py refuses a run while ANY artifact it knows is
