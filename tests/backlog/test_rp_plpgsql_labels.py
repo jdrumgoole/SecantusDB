@@ -7,8 +7,8 @@ it: RP-486 (fixed: a DO block with a label was a syntax error), RP-487
 (fixed: a bare name read after an inner block or a FOR loop ends was the
 inner level's variable) and RP-488 (an expression's error in a PL/pgSQL
 statement carries no QUERY and no internal position). Found while working
-RP-487: RP-491 (a block's variables are initialised once, when the function
-starts, not each time the block is entered).
+RP-487: RP-491 (fixed: a block's variables were initialised once, when the
+function started, not each time the block is entered).
 
 An answer is the rows, or `(sqlstate, message)` for an error. The expected
 answers were measured on a private, freshly initdb'd PostgreSQL 15.19
@@ -78,6 +78,22 @@ _BODIES = {
     "lb32()": "declare s text := ''; begin for i in 1..2 loop declare c int;"
     " begin s := s || coalesce(c, -1); c := 9; end; end loop; return s; end",
     "lb33()": "declare s text := ''; begin for i in 1..2 loop declare c int := i * 10;"
+    " begin s := s || c || ';'; end; end loop; return s; end",
+    # A record a block declares is unassigned again on each entry.
+    "lb34()": "declare s text := ''; begin for i in 1..2 loop declare r record;"
+    " begin s := s || coalesce(r::text, 'N'); select i as f into r; end; end loop; return s; end",
+    # A default reads its own level's earlier names and the outer level's.
+    "lb35()": "declare a int := 2; b int := a + 1; begin declare a int := b * 10;"
+    " c int := a + 1; begin return a || ',' || c; end; end",
+    # A block with handlers, entered on each pass.
+    "lb36()": "declare s text := ''; begin for i in 1..2 loop declare c int := i;"
+    " begin s := s || c; exception when others then null; end; end loop; return s; end",
+    # A default after an earlier block assigned what it reads.
+    "lb37()": "declare x int := 1; begin begin x := 2; end; declare y int := x * 100;"
+    " begin return y; end; end",
+    # A default's error: its frame is the block's initialisation.
+    "lb38()": "declare x int := 1/0; begin return x; end",
+    "lb39()": "declare s text := ''; begin for i in 1..3 loop declare c int := 10 / (2 - i);"
     " begin s := s || c || ';'; end; end loop; return s; end",
 }
 
@@ -157,18 +173,58 @@ BLOCK_ENTRY = {
     "select lb31()": [("111",)],
     "select lb32()": [("-1-1",)],
     "select lb33()": [("10;20;",)],
+    "select lb34()": [("NN",)],
+    "select lb35()": [("30,31",)],
+    "select lb36()": [("12",)],
+    "select lb37()": [("200",)],
 }
 
 
-@pytest.mark.backlog("RP-491")
+@pytest.mark.backlog_fixed("RP-491")
 @pytest.mark.parametrize("query", list(BLOCK_ENTRY))
 def test_block_initialises_its_variables_on_entry(query: str, dsn: str) -> None:
     """`exec_stmt_block` sets each variable the block declares to its
-    default (or NULL) every time the block is entered. Here every default
-    is evaluated once, before the body runs: 1, 123, -19, and 42703
-    `column "i" does not exist` for a default reading a FOR loop's
-    variable."""
+    default (or NULL) every time the block is entered. Every default was
+    evaluated once, before the body ran: 1, 123, -19, and 42703 `column
+    "i" does not exist` for a default reading a FOR loop's variable, and a
+    block's record kept the last pass's row (`N(1)`)."""
     assert answer(dsn, query) == BLOCK_ENTRY[query]
+
+
+def _context(dsn: str, query: str) -> Any:
+    """An error's sqlstate, message and CONTEXT."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        try:
+            return c.execute(query).fetchall()
+        except psycopg.Error as e:
+            return (e.sqlstate, e.diag.message_primary, e.diag.context)
+
+
+DEFAULT_ERROR = {
+    "select lb38()": (
+        "22012",
+        "division by zero",
+        'SQL expression "1/0"\nPL/pgSQL function lb38() line 1 during statement'
+        " block local variable initialization",
+    ),
+    "select lb39()": (
+        "22012",
+        "division by zero",
+        "PL/pgSQL function lb39() line 1 during statement block local variable initialization",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-491")
+@pytest.mark.parametrize("query", list(DEFAULT_ERROR))
+def test_default_error_names_the_block_initialisation(query: str, dsn: str) -> None:
+    """A default's error carries `exec_stmt_block`'s `during statement block
+    local variable initialization` frame. It carried no function frame,
+    and a default reading a loop's variable was 42703, as every default
+    ran before the body."""
+    assert _context(dsn, query) == DEFAULT_ERROR[query]
 
 
 def _do(dsn: str, body: str) -> Any:

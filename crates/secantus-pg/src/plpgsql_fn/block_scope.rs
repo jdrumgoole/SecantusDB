@@ -16,8 +16,9 @@
 //! body, an EXCEPTION section's `sqlstate` / `sqlerrm` after the body.
 //!
 //! The result is stored in the parsed function: `__scopes`, one entry per
-//! block (`label`, `vars`: `[name, datum]` pairs, `parent`, and `handler`:
-//! the `sqlstate` / `sqlerrm` its EXCEPTION section declares), and a
+//! block (`label`, `vars`: `[name, datum]` pairs, `parent`, `handler`: the
+//! `sqlstate` / `sqlerrm` its EXCEPTION section declares, and `init`: the
+//! datums it initialises on entry, its `initvarnos`), and a
 //! `__scope` index on each block statement, so a copy of the tree keeps it.
 //!
 //! The levels decide a bare name too: `x` is the variable of the innermost
@@ -36,6 +37,10 @@ pub(super) struct Scope {
     /// `sqlstate` and `sqlerrm`, which `pl_gram.y` declares at the block's
     /// EXCEPTION in a level of their own: the one a handler runs in.
     pub(super) handler: Vec<(String, usize)>,
+    /// The datums the block's DECLARE section makes, in order: the ones
+    /// `exec_stmt_block` initialises each time the block is entered (its
+    /// `initvarnos`). An ALIAS makes none.
+    pub(super) init: Vec<usize>,
 }
 
 /// What one DECLARE section declares, in order: each name, and for an
@@ -234,11 +239,16 @@ impl Builder<'_> {
                     vars: Vec::new(),
                     parent,
                     handler: Vec::new(),
+                    init: Vec::new(),
                 };
                 for (name, alias) in decls.0 {
                     let datum = match alias {
                         Some(target) => self.resolve(&target, &level),
-                        None => self.take(&name),
+                        None => {
+                            let d = self.take(&name);
+                            level.init.extend(d);
+                            d
+                        }
                     };
                     if let Some(d) = datum {
                         level.vars.push((name, d));
@@ -349,6 +359,7 @@ pub(super) fn annotate(f: &mut Value, create_sql: &str) {
                 "vars": s.vars.iter().map(|(n, d)| serde_json::json!([n, d])).collect::<Vec<_>>(),
                 "parent": s.parent,
                 "handler": s.handler.iter().map(|(n, d)| serde_json::json!([n, d])).collect::<Vec<_>>(),
+                "init": s.init,
             })
         })
         .collect();
@@ -384,6 +395,16 @@ pub(super) fn scopes(f: &Value) -> Vec<Scope> {
                         vars: pairs("vars"),
                         parent: s.get("parent").and_then(Value::as_u64).map(|p| p as usize),
                         handler: pairs("handler"),
+                        init: s
+                            .get("init")
+                            .and_then(Value::as_array)
+                            .map(|v| {
+                                v.iter()
+                                    .filter_map(|d| d.as_u64())
+                                    .map(|d| d as usize)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
                     }
                 })
                 .collect()
@@ -447,21 +468,8 @@ impl Interp<'_> {
             vars: s.handler.clone(),
             parent: None,
             handler: Vec::new(),
+            init: Vec::new(),
         })
-    }
-
-    /// The levels enclosing (and including) block `k`, outermost first: the
-    /// namespace a declaration of `k` is read in.
-    pub(super) fn chain(&self, k: usize) -> Vec<Scope> {
-        let mut out = Vec::new();
-        let mut at = Some(k);
-        while let Some(i) = at {
-            let Some(s) = self.scopes.get(i) else { break };
-            out.push(s.clone());
-            at = s.parent;
-        }
-        out.reverse();
-        out
     }
 }
 
@@ -495,6 +503,19 @@ mod tests {
     fn levels(create_sql: &str) -> Vec<Level> {
         let f = super::super::parsed(create_sql).unwrap();
         scopes(&f).into_iter().map(|s| (s.label, s.vars)).collect()
+    }
+
+    #[test]
+    fn a_block_initialises_what_it_declares_but_not_an_alias() {
+        // datums: p, found, x, then the inner block's z; `y` is an ALIAS of
+        // the parameter, so entering the inner block leaves p alone.
+        let f = super::super::parsed(
+            "create function f(p int) returns int language plpgsql as $$ declare x int := 1; \
+             begin declare y alias for $1; z int := 2; begin return y + z; end; end $$",
+        )
+        .unwrap();
+        let init: Vec<Vec<usize>> = scopes(&f).into_iter().map(|s| s.init).collect();
+        assert_eq!(init, vec![vec![2], vec![3]]);
     }
 
     #[test]

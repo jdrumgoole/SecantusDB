@@ -1904,23 +1904,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
       Backlog-ID: RP-488
 
-## Found while working RP-487 (2026-11-07)
-
-- [ ] **A block's variables are set once, when the function starts, not
-      each time the block is entered.** `exec_stmt_block` gives every
-      variable a block declares its default (or NULL) on each entry, so a
-      default reads the state at that moment and a block inside a loop
-      starts afresh each time. Here every default is evaluated before the
-      body runs: `declare x int := 1; begin x := 5; declare y int := x;
-      begin return y; end; end` returns 1 (PostgreSQL 15.19: 5); a loop
-      over a block declaring `c int := 0` that adds one to it returns
-      `123` (`111`); one declaring `c int` without a default sees the last
-      pass's value (`-19`, PostgreSQL `-1-1`); and a default reading the
-      loop's variable, `c int := i * 10`, is 42703 `column "i" does not
-      exist` (`10;20;`). Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_block_initialises_its_variables_on_entry
-      Backlog-ID: RP-491
-
 ## Found while working RP-483 (2026-11-07)
 
 - [ ] **A call in a schema that does not exist is reported as a missing

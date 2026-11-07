@@ -307,6 +307,8 @@ struct Interp<'a> {
     dyn_text: Option<String>,
     /// Each block's namespace level, by the `__scope` number on the block.
     scopes: Vec<block_scope::Scope>,
+    /// Each variable's declared default (`default_val`), by datum number.
+    defaults: HashMap<usize, Value>,
     /// The levels of the blocks and labelled FOR loops being run, outermost
     /// first: what a `label.name` is looked up in.
     active: Vec<block_scope::Scope>,
@@ -763,6 +765,19 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         label: function_label(create_sql),
         dyn_text: None,
         scopes: block_scope::scopes(&f),
+        defaults: f
+            .get("datums")
+            .and_then(Value::as_array)
+            .map(|ds| {
+                ds.iter()
+                    .enumerate()
+                    .filter_map(|(i, d)| {
+                        let e = d.get("PLpgSQL_var")?.get("default_val")?;
+                        Some((i, e.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
         active: Vec::new(),
     };
     if let Some(t) = &inv.trigger {
@@ -780,38 +795,26 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             }
         }
     }
-    // Declared defaults, in declaration order: `x int := a * 2` may read a
-    // parameter or an earlier variable.
-    let defaults: Vec<(usize, Value)> = f
-        .get("datums")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+    // A block initialises the variables it declares each time it is
+    // entered (`Interp::enter_block`). Only a default no rebuilt level owns
+    // (a body that does not scan) is set here, before the body runs, in
+    // declaration order: `x int := a * 2` may read a parameter or an
+    // earlier variable.
+    let owned: std::collections::HashSet<usize> = interp
+        .scopes
         .iter()
-        .enumerate()
-        .filter_map(|(i, d)| {
-            d.get("PLpgSQL_var")
-                .and_then(|v| v.get("default_val"))
-                .map(|e| (i, e.clone()))
-        })
+        .flat_map(|s| s.init.iter().copied())
         .collect();
+    let mut defaults: Vec<(usize, Value)> = interp
+        .defaults
+        .iter()
+        .filter(|(i, _)| !owned.contains(i))
+        .map(|(i, e)| (*i, e.clone()))
+        .collect();
+    defaults.sort_by_key(|(i, _)| *i);
     for (i, e) in defaults {
-        // Read in the namespace of the block declaring it: `y int := blk.x`.
-        let block = interp
-            .scopes
-            .iter()
-            .position(|s| s.vars.iter().any(|(_, d)| *d == i));
-        interp.active = block.map(|k| interp.chain(k)).unwrap_or_default();
-        // Its own level holds only what is declared before it: in
-        // `declare y int := x; x int;` the `x` is an outer one.
-        if let Some(own) = interp.active.last_mut() {
-            if let Some(at) = own.vars.iter().position(|(_, d)| *d == i) {
-                own.vars.truncate(at);
-            }
-        }
-        let v = interp.eval_typed(&e, i);
-        interp.active.clear();
-        interp.set_var(i, v?)?;
+        let v = interp.eval_typed(&e, i)?;
+        interp.set_var(i, v)?;
     }
     let action = f.get("action").cloned().unwrap_or(Value::Null);
     match interp.stmt(&action)? {
@@ -1680,6 +1683,50 @@ impl Interp<'_> {
         Err(e)
     }
 
+    /// Enter a block: push its namespace level and give each variable it
+    /// declares its default, or NULL, as `exec_stmt_block` does on every
+    /// entry -- a block inside a loop starts afresh each pass, and a
+    /// default reads the state at that moment. A default is read in the
+    /// levels being run plus the names its own level declares before it.
+    /// Its error carries the block's `during statement block local variable
+    /// initialization` frame.
+    fn enter_block(&mut self, body: &Value, level: block_scope::Scope) -> Result<(), PlError> {
+        let vars = level.vars.clone();
+        self.active.push(block_scope::Scope {
+            vars: Vec::new(),
+            ..level
+        });
+        for (name, d) in vars {
+            if self.active.last().is_some_and(|l| l.init.contains(&d)) {
+                let value = match self.defaults.get(&d).cloned() {
+                    Some(e) => Some(self.eval_typed(&e, d).map_err(|mut e| {
+                        if !e.framed {
+                            let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);
+                            e.push_context(format!(
+                                "PL/pgSQL function {} line {line} during statement block \
+                                 local variable initialization",
+                                self.label
+                            ));
+                            e.framed = true;
+                        }
+                        e
+                    })?),
+                    None => None,
+                };
+                match (self.datums.get_mut(d), value) {
+                    (Some(Datum::Rec { rec, .. }), _) => *rec = None,
+                    (Some(Datum::Var { value: slot, .. }), None) => *slot = Bson::Null,
+                    (Some(Datum::Var { .. }), Some(v)) => self.set_var(d, v)?,
+                    _ => {}
+                }
+            }
+            if let Some(own) = self.active.last_mut() {
+                own.vars.push((name, d));
+            }
+        }
+        Ok(())
+    }
+
     /// Run a block's statements; with EXCEPTION handlers, as a
     /// subtransaction whose handler runs for an error it catches.
     fn block(&mut self, body: &Value, label: Option<String>) -> Result<Flow, PlError> {
@@ -1761,10 +1808,13 @@ impl Interp<'_> {
                 // The block's level stays active through its handlers; a
                 // level an error left behind inside it goes with it.
                 let depth = self.active.len();
-                if let Some(level) = block_scope::scope_of(body).and_then(|k| self.scopes.get(k)) {
-                    self.active.push(level.clone());
-                }
-                let out = self.block(body, label);
+                let level = block_scope::scope_of(body).and_then(|k| self.scopes.get(k).cloned());
+                let out = match level {
+                    Some(level) => self
+                        .enter_block(body, level)
+                        .and_then(|()| self.block(body, label)),
+                    None => self.block(body, label),
+                };
                 self.active.truncate(depth);
                 out
             }
@@ -1925,6 +1975,7 @@ impl Interp<'_> {
                     vars: vec![(name, slot)],
                     parent: None,
                     handler: Vec::new(),
+                    init: Vec::new(),
                 });
                 let mut i = lower;
                 let result = loop {
