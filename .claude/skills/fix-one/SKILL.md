@@ -81,9 +81,13 @@ cd ../SecantusDB-<slug> && git push -u origin <slug>   # the claim
 cd <lane path>
 git status --short                     # must be clean (ignored files aside)
 git fetch -q origin && git switch -C <slug> origin/<branch>
-git submodule update --init vendor/wiredtiger
+git -c protocol.file.allow=always submodule update --init vendor/wiredtiger
 git push -u origin <slug>              # the claim
 ```
+
+The `-c protocol.file.allow=always` is needed on Joe's Mac: its checkout
+points the submodule at a local path, which git refuses by default
+(`transport 'file' not allowed`), so `./inv sync` then fails.
 
 If the lane is not clean, a previous item left work behind: save it with
 `git diff HEAD > .scratch/lane-leftover-<date>.diff`, say so in your report,
@@ -96,7 +100,7 @@ Claimed elsewhere: pick another item, never share or touch their branch.
 
 Build from the worktree (`./inv rust-pgserver-build` / `./inv
 rust-binary-build`, `CARGO_BUILD_JOBS=3`), provision its venv with `./inv
-sync` (needs `git submodule update --init vendor/wiredtiger` first), then
+sync` (needs the submodule update above first), then
 run the item's `Verify:` tests. In a lane worktree both are incremental
 and take a minute or two; still run both, as the branch moved.
 
