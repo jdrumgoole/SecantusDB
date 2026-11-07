@@ -16122,6 +16122,14 @@ fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
                 || ind.arg.as_deref().is_some_and(cast_source_names_column)
         }
         Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(cast_source_names_column),
+        // A scalar subquery always names its column (its one target's
+        // `resname`, `?column?` included), as EXISTS and ARRAY(...) do: so
+        // `(select 1 + 1)::int` is `?column?` and `(select a)::int` is `a`.
+        // ANY / ALL / a row comparison names nothing.
+        Some(N::SubLink(sl)) => matches!(
+            SubLinkType::try_from(sl.sub_link_type),
+            Ok(SubLinkType::ExprSublink | SubLinkType::ExistsSublink | SubLinkType::ArraySublink)
+        ),
         _ => false,
     }
 }
@@ -19793,8 +19801,8 @@ fn resolve_sublinks_scoped(
                 clauses.push(w);
             }
             // A SET value may be a subquery too: `SET n = (SELECT ...)`, and
-            // so may a RETURNING item.
-            for t in u.target_list.iter_mut().chain(u.returning_list.iter_mut()) {
+            // so may a RETURNING item (named as written, below).
+            for t in u.target_list.iter_mut() {
                 if let Some(N::ResTarget(rt)) = t.node.as_mut() {
                     if let Some(v) = rt.val.as_deref_mut() {
                         clauses.push(v);
@@ -19803,6 +19811,11 @@ fn resolve_sublinks_scoped(
             }
             for c in clauses {
                 resolve_sublinks_in_expr(c, lookup, params, run, &outer)?;
+            }
+            for t in &mut u.returning_list {
+                if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                    resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
+                }
             }
             Ok(())
         }
@@ -19814,9 +19827,7 @@ fn resolve_sublinks_scoped(
             }
             for n in &mut d.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
-                    if let Some(v) = rt.val.as_deref_mut() {
-                        resolve_sublinks_in_expr(v, lookup, params, run, &outer)?;
-                    }
+                    resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
                 }
             }
             Ok(())
@@ -19870,11 +19881,9 @@ fn resolve_sublinks_scoped(
             let mut out = Ok(());
             for n in &mut i.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
-                    if let Some(v) = rt.val.as_deref_mut() {
-                        out = resolve_sublinks_in_expr(v, lookup, params, run, &outer);
-                        if out.is_err() {
-                            break;
-                        }
+                    out = resolve_sublinks_in_target(rt, lookup, params, run, &outer);
+                    if out.is_err() {
+                        break;
                     }
                 }
             }
@@ -20558,18 +20567,7 @@ fn resolve_sublinks_in_select_scoped(
     semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
-            if let Some(v) = rt.val.as_deref_mut() {
-                // A subquery target is named after the subquery (its
-                // column, or `exists` / `array`), which the value it is
-                // replaced by would not carry.
-                if rt.name.is_empty() && matches!(v.node.as_ref(), Some(N::SubLink(_))) {
-                    let name = expression_column_name(v);
-                    if name != "?column?" {
-                        rt.name = name;
-                    }
-                }
-                resolve_sublinks_in_expr(v, lookup, params, run, &outer)?;
-            }
+            resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
         }
     }
     for clause in [
@@ -20724,6 +20722,37 @@ fn collect_from_columns(
         }
         _ => {}
     }
+}
+
+/// Resolve the subqueries inside one OUTPUT target -- a select-list item or
+/// a RETURNING one -- keeping the name its written expression gives it.
+///
+/// A target is named by what was written (FigureColname over the raw
+/// expression): a subquery after its column, or `exists` / `array`, through
+/// any cast around it. The value a subquery is replaced by would not carry
+/// that name -- a correlated one's per-row call would name the column
+/// `\x1fcorrelated` (RP-449) -- so a target whose name the replacement
+/// changes keeps the written one, `?column?` included.
+fn resolve_sublinks_in_target(
+    rt: &mut pg_query::protobuf::ResTarget,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+    outer: &[String],
+) -> Result<()> {
+    let Some(v) = rt.val.as_deref_mut() else {
+        return Ok(());
+    };
+    let star = matches!(v.node.as_ref(), Some(N::ColumnRef(c))
+        if c.fields.iter().any(|f| matches!(f.node.as_ref(), Some(N::AStar(_)))));
+    let written = (rt.name.is_empty() && !star).then(|| expression_column_name(v));
+    resolve_sublinks_in_expr(v, lookup, params, run, outer)?;
+    if let Some(name) = written {
+        if expression_column_name(v) != name {
+            rt.name = name;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the subqueries inside one expression.

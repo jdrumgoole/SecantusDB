@@ -2,7 +2,7 @@
 RP-461 (a SQL function's bare parameter name is replaced wherever it is a
 word), RP-462 (a composite parameter's field is not read), RP-463 (a
 PL/pgSQL block label does not qualify its variables), RP-464 (a SQL
-function ending in a write's RETURNING returns NULL) and RP-465 (CREATE
+function ending in a write's RETURNING returned NULL; fixed) and RP-465 (CREATE
 FUNCTION does not check a SQL body).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
@@ -111,10 +111,59 @@ RETURNING_RESULT = {
 }
 
 
-@pytest.mark.backlog("RP-464")
+@pytest.mark.backlog_fixed("RP-464")
 @pytest.mark.parametrize("query", list(RETURNING_RESULT))
 def test_returning_statement_is_the_result(query: str, dsn: str) -> None:
+    """A body ending in a write's RETURNING answered NULL: the result path
+    ran the write for its effect and dropped its rows."""
     assert answer(dsn, query) == RETURNING_RESULT[query]
+
+
+# More shapes of a write's RETURNING as the body's result, over a table of
+# three rows, measured on the same private PostgreSQL 15.19 cluster: a
+# scalar function's write runs to completion though only its first row is
+# the value; a RETURNING before the last statement is not the result; a
+# write that returns no row is NULL; a RETURNING list may be an expression.
+_RETURNING_SETUP = [
+    "drop function if exists gm(int), gmid(int), gn(int), gw(int)",
+    "drop table if exists t464",
+    "create table t464 (a int, b text)",
+    "insert into t464 values (1, 'p'), (2, 'q'), (3, 'r')",
+    "create function gm(p int) returns int language sql"
+    " as $$ update t464 set a = a + p returning a $$",
+    "create function gmid(p int) returns int language sql"
+    " as $$ insert into t464 values (p, 'm') returning a; select count(*)::int from t464 $$",
+    "create function gn(p int) returns int language sql"
+    " as $$ delete from t464 where a = p returning a $$",
+    "create function gw(p int) returns text language sql"
+    " as $$ insert into t464 values (p, 'w') returning b || a $$",
+]
+
+RETURNING_SHAPES = {
+    "select gm(10), (select array_agg(a order by a) from t464)": [(11, [1, 2, 3])],
+    "select gm(10); select array_agg(a order by a) from t464": [([11, 12, 13],)],
+    "select gmid(9)": [(4,)],
+    "select gn(99)": [(None,)],
+    "select gw(5), (select count(*) from t464)": [("w5", 3)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-464")
+@pytest.mark.parametrize("query", list(RETURNING_SHAPES))
+def test_returning_shapes(query: str, dsn: str) -> None:
+    """Each shape answered NULL, or the count without the middle write."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _RETURNING_SETUP:
+            c.execute(q)
+        try:
+            *statements, last = query.split("; ")
+            for q in statements:
+                c.execute(q)
+            got = c.execute(last).fetchall()
+        finally:
+            c.execute("drop function if exists gm(int), gmid(int), gn(int), gw(int)")
+            c.execute("drop table if exists t464")
+    assert got == RETURNING_SHAPES[query]
 
 
 _CREATE_GX = "create function gx(p int) returns int language sql as $$ {} $$"

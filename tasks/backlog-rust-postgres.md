@@ -1641,17 +1641,16 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A correlated subquery whose target is an expression names its
-      column `\x1fcorrelated`.** `select (select a + 1) from (select 1 a)
-      t` answers its row (2) under the column name `\x1fcorrelated`, the
-      internal per-row call the subquery was rewritten into; PostgreSQL
-      15.19's `FigureColname` names it `?column?`, as it does `(select (select
-      a) + 1)` and `(select a + 1 from (select 2 b) u)`. A target that is a
-      bare column (`(select a)`) is already named after it. A client that
-      reads columns by name sees the internal one. Measured on PostgreSQL
-      15.19 (found while working RP-445).
-      Verify: tests/backlog/test_rp_correlated_subquery.py::test_expression_target_is_named_column
-      Backlog-ID: RP-449
+- [ ] **A subquery in a CREATE TABLE AS or CREATE MATERIALIZED VIEW is
+      refused.** `create table ct as select (select 1) x from e` is 0A000
+      `SubLink is not supported yet`, uncorrelated or correlated (`(select
+      e.a + 1)`, `exists(select ... where f.a = e.a)`), and so is `create
+      materialized view mv as select (select a + 1) from e`; PostgreSQL
+      15.19 makes each table with its rows. `select ... into` of the same
+      list is made. Measured on a private 15.19 cluster with `e(a int, b
+      text)` (found while working RP-449).
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_subquery_in_create_table_as
+      Backlog-ID: RP-466
 - [ ] **A missing relation named by a string literal for a `regclass`
       parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
       untyped literal argument to its parameter's type during analysis
@@ -1931,16 +1930,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       body writes does not.
       Verify: tests/backlog/test_rp_function_bodies.py::test_block_label_qualifies_a_variable
       Backlog-ID: RP-463
-- [ ] **A SQL function whose last statement is an INSERT, UPDATE or DELETE
-      ... RETURNING returns NULL.** `gi(p int)` with `insert into fs values
-      (p, 'i') returning p * 2` answers 8 for `gi(4)` on PostgreSQL, and so
-      do `returning a * 2` and `update fs set a = p returning a * 2`;
-      `delete from fs where a = p returning c` answers `y` for 1. Here each
-      is NULL -- a silent wrong answer -- while a prepared `insert ...
-      returning $1 * 2` answers 8: the function's result path drops the
-      RETURNING rows.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_returning_statement_is_the_result
-      Backlog-ID: RP-464
 - [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
       `check_function_bodies` on, its default, PostgreSQL parses and
       analyses each statement at CREATE: a body `select gx.q` is 42P01
@@ -1950,6 +1939,20 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       succeeds and the error waits for the first call.
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
+
+## Found while working RP-464 (2026-11-07)
+
+- [ ] **A function called in FROM runs its body twice.** `select * from
+      fz()`, where `fz()` returns `setof int` with the body `insert into t
+      values (100); select 1`, inserts one row on PostgreSQL 15.19 and two
+      here; a scalar `fq()` called as `select * from fq()` does the same,
+      and `select * from fs(10)` over `update t set a = a + p returning a`
+      adds 20 to every row and answers 21, 22, 23 where PostgreSQL adds 10
+      and answers 11, 12, 13. The same call in a select list (`select
+      fq()`) runs once. A silent double write; the extended protocol does
+      it too. Measured on PostgreSQL 15.19.
+      Backlog-ID: RP-472
+      Verify: tests/backlog/test_rp_from_function_runs_once.py::test_from_function_runs_once
 
 ## Found while working RP-316 (2026-11-02)
 

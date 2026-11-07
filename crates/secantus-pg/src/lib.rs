@@ -2107,6 +2107,30 @@ fn transaction_statement_tag(sql: &str) -> Option<&'static str> {
     })
 }
 
+/// Whether `sql` is an INSERT, UPDATE or DELETE with a RETURNING list: in a
+/// `LANGUAGE sql` body such a statement yields rows, and as the last one
+/// its rows are the function's result (`functions.c`'s
+/// `check_sql_fn_retval` takes the final statement's targetlist, its
+/// RETURNING list for a write).
+fn write_with_returning(sql: &str) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    match parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    {
+        Some(N::InsertStmt(s)) => !s.returning_list.is_empty(),
+        Some(N::UpdateStmt(s)) => !s.returning_list.is_empty(),
+        Some(N::DeleteStmt(s)) => !s.returning_list.is_empty(),
+        _ => false,
+    }
+}
+
 /// Whether `sql` ends a transaction block (`IsTransactionExitStmt`): COMMIT,
 /// ROLLBACK, ROLLBACK TO and PREPARE TRANSACTION, the statements an aborted
 /// block still takes through Parse and Bind.
@@ -14362,6 +14386,14 @@ impl PgHandler {
             if is_query {
                 last = Some(
                     plpgsql_fn::Host::query(&host, &sql, args, &u.arg_types).map_err(to_wire)?,
+                );
+            } else if write_with_returning(&sql) {
+                // A write's RETURNING rows are its result, as a SELECT's
+                // are; it runs to completion even when only the first row
+                // is the function's value.
+                last = Some(
+                    plpgsql_fn::Host::returning(&host, &sql, args, &u.arg_types)
+                        .map_err(to_wire)?,
                 );
             } else {
                 plpgsql_fn::Host::execute(&host, &sql, args, &u.arg_types).map_err(to_wire)?;
