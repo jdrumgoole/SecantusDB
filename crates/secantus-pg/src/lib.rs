@@ -120,6 +120,7 @@ mod scram_binding;
 mod serializable;
 mod server;
 mod sql_fn_params;
+mod sql_fn_validator;
 mod ssi;
 mod statement_views;
 mod statistic;
@@ -13551,7 +13552,7 @@ impl PgHandler {
         // hand, and puts back the routine an OR REPLACE replaced.
         if def.language == "sql" {
             bump_catalog_version();
-            if let Err(e) = self.check_sql_function_body(&def.name, &read_back) {
+            if let Err(e) = self.check_sql_function_body(&def.name, &read_back, def.sql_standard) {
                 self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
                 if let Some(old) = replaced {
                     self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, old)?;
@@ -13569,22 +13570,35 @@ impl PgHandler {
 
     /// `fmgr_sql_validator` with `check_function_bodies` on: each statement
     /// of a LANGUAGE sql body that PostgreSQL parse-analyses (the ones
-    /// `transformStmt` transforms rather than wraps as a utility) is
-    /// planned against the catalog as it now stands, its parameters bound
-    /// by name and type, without being run. An error analysis raises is the
-    /// CREATE's, placed in the CREATE's text as
-    /// `function_parse_error_transpose` places it. A body with a polymorphic
-    /// argument is not analysed (its types are the call's), and an error
-    /// only execution raises -- a division by zero, a privilege, a
-    /// constraint -- is left to the call, as there.
-    fn check_sql_function_body(&self, fname: &str, doc: &Document) -> PgWireResult<()> {
+    /// `transformStmt` transforms rather than wraps as a utility, and a
+    /// CALL) is planned against the catalog as it now stands, its
+    /// parameters bound by name and type, without being run. An error
+    /// analysis raises is the CREATE's, placed in the CREATE's text as
+    /// `function_parse_error_transpose` places it: an unknown name or a type
+    /// mismatch, a string constant its type's input function refuses
+    /// (`coerce_type`), a CALL's missing procedure. Then the final
+    /// statement's result is held to the declared type
+    /// (`check_sql_fn_retval`). A body with a polymorphic argument is not
+    /// analysed (its types are the call's), and an error only execution
+    /// raises -- a division by zero, a privilege, a constraint -- is left
+    /// to the call, as there.
+    ///
+    /// A SQL-standard body (`BEGIN ATOMIC`, `RETURN`) is analysed as CREATE
+    /// reads it (`interpret_AS_clause`), so `check_function_bodies = off`
+    /// postpones only its result check.
+    fn check_sql_function_body(
+        &self,
+        fname: &str,
+        doc: &Document,
+        sql_standard: bool,
+    ) -> PgWireResult<()> {
         let checks = self
             .settings
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get("check_function_bodies")
             .is_none_or(|v| v != "off");
-        if !checks {
+        if !checks && !sql_standard {
             return Ok(());
         }
         let strings = |key: &str| -> Vec<String> {
@@ -13613,9 +13627,20 @@ impl PgHandler {
         let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
         let params = vec![Bson::Null; types.len()];
         let run = |stmt: &Statement| self.subquery_rows(stmt);
+        // The final statement as written, and its result columns' types
+        // when it could be described.
+        let mut last: Option<(String, Option<Vec<i64>>)> = None;
         let failure = self.with_sql_fn_lookups(|look| {
-            for stmt in &statements {
-                if !sql_fn_params::analysed_at_create(stmt) {
+            for (index, stmt) in statements.iter().enumerate() {
+                let is_last = index + 1 == statements.len();
+                let stmt_start = stmt.as_ptr() as usize - body.as_ptr() as usize;
+                // A byte of the statement as written, in characters from 1
+                // in the body.
+                let in_body =
+                    |byte: usize| body[..stmt_start + byte.min(stmt.len())].chars().count() + 1;
+                let call = sql_fn_validator::call_target(stmt);
+                if call.is_none() && !sql_fn_params::analysed_at_create(stmt) {
+                    last = Some((stmt.to_string(), None));
                     continue;
                 }
                 let (bound, spans) =
@@ -13624,56 +13649,136 @@ impl PgHandler {
                 // in FROM is otherwise answered while planning), no sequence
                 // drawn and no volatile subquery run, so nothing the body
                 // would do happens.
-                let planned = secantus_pgplan::planning_without_running(|| {
-                    secantus_pgplan::plan_with_session_types_and_subqueries(
-                        &bound,
-                        &|n| self.lookup(n),
-                        &params,
-                        &declared,
-                        &tz,
-                        Some(&run),
-                    )
-                });
-                let Err(e) = planned else {
-                    continue;
+                let plan = |sql: &str, params: &[Bson], declared: &[Option<String>]| {
+                    secantus_pgplan::planning_without_running(|| {
+                        secantus_pgplan::plan_with_session_types_and_subqueries(
+                            sql,
+                            &|n| self.lookup(n),
+                            params,
+                            declared,
+                            &tz,
+                            Some(&run),
+                        )
+                    })
                 };
-                let mut err = Self::err_in(&e, &bound);
-                // An error `err` gave another code (a function this server
-                // lacks is 42883) is placed by that code.
-                if let PgWireError::UserError(info) = &mut err {
-                    if info.position.is_none() {
-                        info.position =
-                            secantus_pgplan::error_position(&bound, &info.code, &info.message)
+                let mut columns = None;
+                match plan(&bound, &params, &declared) {
+                    Ok(planned) => {
+                        if let Some(call) = &call {
+                            let arg_types = match &planned {
+                                Statement::Call { arg_types, .. } => arg_types.clone(),
+                                _ => Vec::new(),
+                            };
+                            if let Some((err, at)) = self.check_call_in_body(call, &arg_types) {
+                                return Some((err, Some(in_body(at))));
+                            }
+                        } else if is_last {
+                            columns = secantus_pgplan::planning_without_running(|| {
+                                self.describe_planned(planned)
+                            })
+                            .ok()
+                            .flatten()
+                            .map(|fields| {
+                                fields
+                                    .iter()
+                                    .map(|f| i64::from(f.datatype().oid()))
+                                    .collect::<Vec<_>>()
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let mut err = Self::err_in(&e, &bound);
+                        // An error `err` gave another code (a function this
+                        // server lacks is 42883) is placed by that code.
+                        if let PgWireError::UserError(info) = &mut err {
+                            if info.position.is_none() {
+                                info.position = secantus_pgplan::error_position(
+                                    &bound,
+                                    &info.code,
+                                    &info.message,
+                                )
                                 .map(|p| p.to_string());
+                            }
+                        }
+                        let mut err = self.column_hinted(err, &bound);
+                        // Class 42 (an unknown name, a type mismatch, an
+                        // ambiguity) and a missing schema are what analysis
+                        // raises; a refused privilege is checked when the
+                        // statement runs.
+                        let (analysis, input) = match &err {
+                            PgWireError::UserError(info) => (
+                                info.code.starts_with("42") && info.code != "42501"
+                                    || info.code == "3F000",
+                                info.code.starts_with("22"),
+                            ),
+                            _ => (false, false),
+                        };
+                        if analysis {
+                            // The error's place in the body, counted in
+                            // characters from 1, as the parser's cursor
+                            // position is.
+                            let at_in_body = err_position(&err).map(|p| {
+                                let byte = char_to_byte(&bound, p - 1);
+                                in_body(sql_fn_params::original_offset(&spans, byte))
+                            });
+                            return Some((err, at_in_body));
+                        }
+                        // An operator's string operand takes the type the
+                        // operator's resolution gives it, and its input
+                        // error is the analysis's (`'a' = 1`), at the
+                        // constant. Planning raises it only where it folds
+                        // the comparison; the one constant whose value the
+                        // message quotes is the one it read.
+                        if input {
+                            let message = match &err {
+                                PgWireError::UserError(info) => info.message.clone(),
+                                _ => String::new(),
+                            };
+                            let quoted: Vec<_> = sql_fn_validator::operand_literals(stmt)
+                                .into_iter()
+                                .filter(|l| message.contains(&format!("\"{}\"", l.value)))
+                                .collect();
+                            if let [one] = quoted.as_slice() {
+                                if let PgWireError::UserError(info) = &mut err {
+                                    info.position = None;
+                                }
+                                return Some((err, Some(in_body(one.at))));
+                            }
+                        }
                     }
                 }
-                let err = self.column_hinted(err, &bound);
-                // Class 42 (an unknown name, a type mismatch, an ambiguity)
-                // and a missing schema are what analysis raises; a refused
-                // privilege is checked when the statement runs.
-                let analysis = match &err {
-                    PgWireError::UserError(info) => {
-                        info.code.starts_with("42") && info.code != "42501" || info.code == "3F000"
+                // Each constant a cast reads is read by the cast type's
+                // input function while the statement is analysed, whether
+                // or not the expression is ever evaluated.
+                for (lit, probe) in sql_fn_validator::literal_casts(stmt) {
+                    let read = plan(&probe, &[], &[])
+                        .map_err(|e| Self::err(&e))
+                        .and_then(|p| {
+                            secantus_pgplan::planning_without_running(|| self.subquery_rows(&p))
+                                .map_err(|e| Self::err(&e))
+                        });
+                    if let Err(mut err) = read {
+                        if sql_fn_validator::is_input_error(&err) {
+                            if let PgWireError::UserError(info) = &mut err {
+                                info.position = None;
+                            }
+                            return Some((err, Some(in_body(lit.at))));
+                        }
                     }
-                    _ => false,
-                };
-                if !analysis {
-                    continue;
                 }
-                // The error's place in the body, counted in characters
-                // from 1, as the parser's cursor position is.
-                let at_in_body = err_position(&err).map(|p| {
-                    let byte = char_to_byte(&bound, p - 1);
-                    let in_stmt = sql_fn_params::original_offset(&spans, byte);
-                    let stmt_start = stmt.as_ptr() as usize - body.as_ptr() as usize;
-                    body[..stmt_start + in_stmt.min(stmt.len())].chars().count() + 1
-                });
-                return Some((err, at_in_body));
+                last = Some((stmt.to_string(), columns));
             }
             None
         });
         let Some((mut err, at_in_body)) = failure else {
-            return Ok(());
+            if !checks {
+                return Ok(());
+            }
+            let (final_stmt, columns) = match &last {
+                Some((s, c)) => (Some(s.as_str()), c.as_deref()),
+                None => (None, None),
+            };
+            return self.check_sql_fn_retval(fname, doc, final_stmt, columns);
         };
         if let PgWireError::UserError(info) = &mut err {
             match at_in_body {

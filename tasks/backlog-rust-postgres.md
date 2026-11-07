@@ -1890,26 +1890,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check a literal's input,
-      the body's result type, a CALL, or a SQL-standard body with
-      `check_function_bodies` off.** Since RP-465 a body's statements are
-      analysed at CREATE, but only for the class-42 errors names and types
-      raise. PostgreSQL 15.19 (`fmgr_sql_validator`) also refuses, on
-      `create function gx(p int) returns int language sql as $$ ... $$`: a
-      body `select 'x'::int` or `select 'a' = 1` with 22P02 `invalid input
-      syntax for type integer` at 65 (`transformTypeCast` reads a constant's
-      input); `select 'abc'` or `select 1, 2` with 42P13 `return type
-      mismatch in function declared to return integer`, no position, CONTEXT
-      `SQL function "gx"` (`check_sql_fn_retval`); a body `call nosuchproc()`
-      with 42883 `procedure nosuchproc() does not exist` at 60 (`transformCallStmt`;
-      a CALL is planned here only when it runs). And a SQL-standard body
-      (`begin atomic select nosuch; end`) is analysed as it is parsed,
-      `check_function_bodies` off or on, 42703 at 55; here only with it on.
-      Here each CREATE succeeds. A body's `nextval('nosuchseq')` (42P01 at
-      73 there) is RP-458's shape. Measured on a private 15.19 cluster.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_literals_and_result
-      Backlog-ID: RP-500
-
 ## Found while working RP-501 (2026-11-07)
 
 Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
@@ -2063,6 +2043,75 @@ Measured on PostgreSQL 15.19.
       33 in the gap test's two statements).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
+
+## Found while working RP-500 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
+
+- [ ] **A string constant an operator over a column or a parameter, an
+      INSERT or UPDATE target, or COALESCE gives its type is not read at
+      CREATE.** PostgreSQL 15.19 coerces each while it analyses a SQL
+      function's body (`transformExpr`, `coerce_type`), so `create function
+      gx(p int) returns int language sql as $$ select p + 'a' $$` is 22P02
+      `invalid input syntax for type integer: "a"` at 69, and so are `select
+      a + 'q' from fe` (69), `insert into fe values ('q')` (82), `update fe
+      set a = 'q'` (77) and `select coalesce('q', 1)` (74). Here each CREATE
+      succeeds. Since RP-500 a cast's constant is read at CREATE, and an
+      operator's operand only where planning folds the comparison (`'a' =
+      1`, `a = 'q'` in a WHERE): the rest needs each constant's resolved
+      type from the analysis, which the planner does not keep. PREPARE has
+      the same shape (RP-511).
+      Backlog-ID: RP-507
+      Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
+- [ ] **DROP FUNCTION or DROP PROCEDURE with no argument list, over a
+      routine of the other kind, is 42809.** With a procedure `gq(int)`,
+      PostgreSQL 15.19 answers `drop function if exists gq` with the notice
+      `function gq() does not exist, skipping` and `drop function gq` with
+      42883 `could not find a function named "gq"`, and likewise `procedure
+      gq2() does not exist, skipping` / `could not find a procedure named
+      "gq2"` over a function `gq2(int)`. A name without arguments is looked
+      up among routines of the statement's kind only (`LookupFuncWithArgs`
+      with its `objtype`). Here each is 42809 `gq(integer) is not a
+      function` (or `... is not a procedure`), IF EXISTS or not. With an
+      argument list both servers answer 42809. And `drop routine if exists
+      nosuchr(int)`'s notice is `routine nosuchr(pg_catalog.int4) does not
+      exist, skipping` there, `function ...` here.
+      Backlog-ID: RP-508
+      Verify: tests/backlog/test_rp_found_rp500.py::test_drop_without_arguments_over_the_other_kind
+- [ ] **A CALL that leaves a defaulted parameter out, names its arguments,
+      or passes a column fails.** With `create procedure pd(a int, b int
+      default 2)`, PostgreSQL 15.19 runs `call pd(1)` and `call pd(b => 3, a
+      => 1)`. Here the first is 42883 `procedure pd(integer) does not
+      exist`, because `run_procedure` matches a procedure by its full
+      parameter count, and the second is 0A000 `NamedArgExpr is not
+      supported yet`. And `call gvp(nosuch)` is 42703 `column "nosuch" does
+      not exist` at 10 there, 0A000 `ColumnRef is not supported yet` here.
+      Since RP-500 a CALL in a SQL function's body is resolved at CREATE,
+      counting defaults, and a named argument is left to the call.
+      Backlog-ID: RP-509
+      Verify: tests/backlog/test_rp_found_rp500.py::test_call_arguments
+- [ ] **A malformed range literal's 22P02 has no DETAIL.** PostgreSQL
+      15.19's `range_parse` explains each one: `select '[1,2'::int4range`
+      has DETAIL `Unexpected end of input.`, `'[1,2]x'` `Junk after right
+      parenthesis or bracket.`, `'1,2'` `Missing left parenthesis or
+      bracket.`. Here the message and position match and the DETAIL is
+      empty.
+      Backlog-ID: RP-510
+      Verify: tests/backlog/test_rp_found_rp500.py::test_range_literal_detail
+- [ ] **PREPARE evaluates a constant expression, and does not read a cast
+      constant it does not evaluate.** PostgreSQL 15.19's PREPARE
+      parse-analyses its statement and plans nothing: `prepare s1 as select
+      1/0` is prepared, while `prepare s2 as select 'x'::int from fe`,
+      `prepare s3 as select case when false then 'x'::int end` and `prepare
+      s4(int) as select $1 + 'a'` are 22P02 at the constant (22, 43, 32).
+      Here the first is 22012 `division by zero` and the other three are
+      prepared. The planner folds a FROM-less constant expression while it
+      plans and reads a constant only where it folds. Since RP-500 CREATE
+      FUNCTION reads every cast's constant (`sql_fn_validator::literal_casts`),
+      which PREPARE could share, but it also needs planning that does not
+      evaluate.
+      Backlog-ID: RP-511
+      Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
 
 ## Found while working RP-493 (2026-11-07)
 
