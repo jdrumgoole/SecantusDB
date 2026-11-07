@@ -2100,6 +2100,24 @@ Measured on a private PostgreSQL 15.19 cluster.
       Backlog-ID: RP-380
       Verify: none -- seen once in CI; a timing that does not fail on demand
 
+## Found fixing the READ COMMITTED move race (2026-11-07)
+
+- [ ] **A move made inside a running statement still has the write window.**
+      A READ COMMITTED block's move to a new snapshot now installs its guard
+      and rolls back holding the write lock of every collection it has
+      written, so no writer is between its guard check and its write
+      (`rebase_user_transaction_to`, crates/secantus-storage/src/lib.rs). A
+      move made mid-statement -- `rebase_active_transaction_to`, from a
+      PL/pgSQL EXCEPTION block -- skips those locks, because the statement
+      may already hold one of them (they are not re-entrant). There a writer
+      past its check can still write a guarded row after the rollback, and
+      the mover's replay then fails with 40001 after its hundred attempts,
+      an answer PostgreSQL never gives at READ COMMITTED. Measured only for
+      the statement-start move, where a forced interleaving reproduced the
+      CI failure in all six writer shapes.
+      Verify: none -- a timing window reachable only by forcing the interleaving through the storage test hook (`secantus_storage::set_test_hook`, as embedded.rs::a_write_cannot_slip_in_under_a_moving_transactions_guard does); no client-side gap test can hit it
+      Backlog-ID: RP-495
+
 ## Found by batch 34 (2026-10-23)
 
 Found while building `CREATE TEXT SEARCH CONFIGURATION` (RP-072). The gap

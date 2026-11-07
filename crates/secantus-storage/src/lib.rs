@@ -6112,11 +6112,65 @@ fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
         });
     }
     let blocked = store != 0 && share_locks::write_blocked(store, &row, me);
+    if me != 0 {
+        test_point(
+            if blocked {
+                TestPoint::GuardedConflict
+            } else {
+                TestPoint::AfterRowCheck
+            },
+            &row,
+        );
+    }
     LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
     if blocked {
         return Err(StorageError::WriteConflict);
     }
     Ok(())
+}
+
+/// A point in the move of a transaction ([`Storage::rebase_user_transaction_to`])
+/// and in the writes racing it that a test may stop at ([`set_test_hook`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestPoint {
+    /// A write has noted its row and found no guard on it: its WiredTiger
+    /// write follows at once -- unless the hook holds it here.
+    AfterRowCheck,
+    /// A moving transaction has rolled back its old WiredTiger transaction
+    /// and not yet replayed its writes.
+    AfterRollback,
+    /// A write turned away from its row by another transaction's guard or
+    /// shared lock.
+    GuardedConflict,
+    /// A moving transaction is about to wait for a collection's write lock,
+    /// which a writer holds from its check of a row to its write of it.
+    MoveLockWait,
+}
+
+type TestHook = Arc<dyn Fn(TestPoint, &WrittenRow) + Send + Sync>;
+
+static TEST_HOOK_ON: AtomicBool = AtomicBool::new(false);
+static TEST_HOOK: Mutex<Option<TestHook>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the hook every [`TestPoint`] calls --
+/// process-wide, for a test that must force the interleaving of a writer and
+/// a transaction moving beneath it. Not for production use.
+#[doc(hidden)]
+pub fn set_test_hook(hook: Option<TestHook>) {
+    let mut slot = TEST_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    TEST_HOOK_ON.store(hook.is_some(), Ordering::SeqCst);
+    *slot = hook;
+}
+
+fn test_point(point: TestPoint, row: &WrittenRow) {
+    if !TEST_HOOK_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let hook = TEST_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(hook) = hook {
+        hook(point, row);
+    }
 }
 
 /// The document row this thread last wrote or tried to write. Read right
@@ -11030,11 +11084,64 @@ impl Storage {
         fresh.defer_creates = handle.defer_creates;
         fresh.deferred_creates = handle.deferred_creates.clone();
         fresh.deferred_keys = handle.deferred_keys.clone();
+        // The guard and the rollback are made holding the write lock of every
+        // collection the transaction has written a row of (sorted, as the
+        // other multi-collection takers do). A writer holds its collection's
+        // lock from noting a row -- when it looks for a guard -- to writing
+        // it, so one that looked before the guard stood has finished its
+        // write (which collides with the old transaction, still holding the
+        // row) before the rollback lets go, and one that comes after sees the
+        // guard: no writer is ever past the check but not yet at the row, as
+        // in PostgreSQL's `heap_update`, which stamps the tuple under the
+        // buffer lock. The replay below takes the locks itself, one write at
+        // a time.
+        //
+        // Not taken by a move made inside a running statement (a PL/pgSQL
+        // EXCEPTION block): that statement may itself be inside a storage
+        // call holding one of these non-reentrant locks.
+        let mut lock_colls: Vec<(String, String)> = if ACTIVE_HANDLE.with(|c| c.get()).is_null() {
+            handle
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .collections
+                .clone()
+        } else {
+            Vec::new()
+        };
+        lock_colls.sort_unstable();
+        lock_colls.dedup();
+        let coll_locks: Vec<Arc<Mutex<()>>> = lock_colls
+            .iter()
+            .map(|(db, coll)| self.coll_lock(db, coll))
+            .collect();
+        let coll_guards: Vec<_> = coll_locks
+            .iter()
+            .zip(&lock_colls)
+            .map(|(lock, (db, coll))| match lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    test_point(TestPoint::MoveLockWait, &(db.clone(), coll.clone(), 0));
+                    lock.lock().unwrap_or_else(|e| e.into_inner())
+                }
+            })
+            .collect();
         let _moving = MoveGuard::new(&handle.held);
         // The replay rewrites what the journal already recorded (or what
         // came before its savepoints): it records nothing.
         let _undo_paused = UndoPause::new(&handle.held);
         self.rollback_user_transaction_inner(handle, false)?;
+        drop(coll_guards);
+        if TEST_HOOK_ON.load(Ordering::Relaxed) {
+            let guarded: Vec<WrittenRow> = {
+                let h = handle.held.lock().unwrap_or_else(|e| e.into_inner());
+                h.moving.iter().cloned().collect()
+            };
+            for row in &guarded {
+                test_point(TestPoint::AfterRollback, row);
+            }
+        }
         // The locks taken by rewriting a row unchanged have no oplog entry:
         // they are taken again after the replay.
         let mut relock = std::mem::take(&mut handle.locked);
