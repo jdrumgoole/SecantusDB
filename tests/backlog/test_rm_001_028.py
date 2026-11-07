@@ -582,9 +582,22 @@ def _log_kinds(client: Any) -> dict:
     other = pymongo.MongoClient(host=host, port=port)
     other.admin.command("ping")
     other.close()
-    log = client.admin.command("getLog", "global")["log"]
-    if last in log:
-        log = log[len(log) - log[::-1].index(last) :]
+    # A server writes `Connection ended` when it notices the socket closed,
+    # which can be after `close()` returns: wait for it (a bounded wait) when
+    # the server writes connection lines at all. The reference runs
+    # `--quiet`, which writes neither line, so it does not wait.
+    # (2026-11-07: read straight away, CI's storage-engine lane once saw no
+    # `Connection ended` from the Rust server.)
+    deadline = time.monotonic() + 5
+    while True:
+        log = client.admin.command("getLog", "global")["log"]
+        if last in log:
+            log = log[len(log) - log[::-1].index(last) :]
+        accepted = any('"id":22943' in line for line in log)
+        ended = any('"id":22944' in line for line in log)
+        if not accepted or ended or time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
     kinds: dict = {}
     for line in log:
         e = json.loads(line)
