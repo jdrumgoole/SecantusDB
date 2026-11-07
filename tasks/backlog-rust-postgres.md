@@ -1688,18 +1688,16 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
       Backlog-ID: RP-422
-- [ ] **A correlated EXISTS over a join matches a NULL outer value.**
-      `select * from e where exists (select 1 from s join k on s.a = k.a
-      where k.b = e.b)` returns the outer row whose `b` is NULL when a
-      joined `k` row's `b` is NULL too; PostgreSQL 15.19's `k.b = NULL` is
-      NULL and matches nothing, so the row is left out. A LEFT join and
-      `k.b = e.b || ''` do the same. Written `e.b = k.b`, with no join
-      (`from k where k.b = e.b`), with a comma join, or as a scalar
-      `count(*)`, the answer is right, as it is for a NULL bound parameter
-      in the same join (`where k.b = $1`). A confident wrong row. Measured
-      on a private 15.19 cluster (found while working RP-430).
-      Verify: tests/backlog/test_rp_correlated_null.py::test_correlated_exists_over_join_null_matches_nothing
-      Backlog-ID: RP-437
+- [ ] **A subquery in a JOIN's ON is refused.** `select ns.a, nk.bc from
+      ns join nk on ns.a = nk.a and nk.b = (select 'p'::text)`, the same
+      under a LEFT join, and `... on ns.a = nk.a and nk.a in (select 2)`
+      each answer `0A000 SubLink is not supported yet`; PostgreSQL 15.19
+      runs them (`(1, 10), (2, 20)`; the LEFT join adds `(3, NULL), (5,
+      NULL)`; `(2), (2)`). The same subquery in the WHERE runs here.
+      Measured on PostgreSQL 15.19 over the same rows as `VALUES` lists
+      (found while working RP-437).
+      Verify: tests/backlog/test_rp_join_on_sublink.py::test_subquery_in_join_on
+      Backlog-ID: RP-438
 
 ## Found by batch 54 (2026-10-24)
 

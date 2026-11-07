@@ -10590,9 +10590,15 @@ impl PgHandler {
             let op = pred.op.clone();
             let keep = move |d: &Document| -> bool {
                 let cell = d.get(&field);
+                // The comparison operators are strict: a NULL on either side
+                // makes `col = $1` NULL, which a WHERE does not keep -- a
+                // NULL outer value in a correlated subquery included
+                // (RP-437). `narrow_eq` alone holds two NULLs equal.
+                let null = value == Bson::Null || matches!(cell, None | Some(Bson::Null));
                 match op {
                     JoinOp::NotTrue => !matches!(cell, Some(Bson::Boolean(true))),
-                    JoinOp::Eq => cell.map(|v| eq(v, &value)).unwrap_or(false),
+                    _ if null => false,
+                    JoinOp::Eq => cell.is_some_and(|v| eq(v, &value)),
                     _ => {
                         let ord = cell.and_then(|v| secantus_pgplan::compare_values(v, &value));
                         match ord {
