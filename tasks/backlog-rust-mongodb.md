@@ -618,6 +618,36 @@ These are explicit non-goals. Don't add them without a reason.
       placed where its reads loop, not where mongod's are; their count
       would be a different number. `includeQueryStatsMetrics` needs it too
       (RM-170).
+      **Decision needed (2026-11-07):** the count is mongod's code structure,
+      not the work done. Measured on mongod 8.2.11 (single-node set, this
+      Mac, three runs each, identical): `ping` 1; `listIndexes` and a
+      `count` with no query 3; a `find` of a collection that does not exist
+      3; a `find` through a collection scan, by `_id`, with a blocking sort,
+      a `distinct` or a `$group` 4; a `find` through an index (with or
+      without a match), a `count` with a query, and the `find` and each full
+      `getMore` of a cursor 5 (its last, empty `getMore` 4); an `insert` (one
+      document or five) and a `create` 13; an `update` or `delete` command
+      15 (16 for an update of an empty collection); `findAndModify` and
+      `drop` 17; a `createIndexes` 73. It does not grow with documents: a
+      `find` of 20,000 by an index or a scan stays at 5 / 4 with
+      `numYields: 0`. It grows with yields: an `update` of 2,500 documents
+      yielded twice and counted 25, of 20,000 yielded seven times and
+      counted 50 (yields are mongod's 1,000-iteration / 10 ms interval, so
+      that part is timing-dependent on mongod too). Profile entries carry
+      no `numInterruptChecks`; only the line does. This server polls
+      `secantus_core::deadline::check` once per document in its scans,
+      pipelines and index builds (the clock read every 64th call), so its
+      own count would scale with documents (some 20,000 for that `find`).
+      The options: (a, recommended, the faithful one) move this server's
+      interrupt points to mongod's -- command dispatch, each acquisition,
+      the executor's yield-interval check, the write path's retry and
+      commit points -- each command's transcribed from mongod 8.2's
+      `checkForInterrupt` callers and checked against a probe per command,
+      as RM-358's query-shape serializers were, and count those checks; it
+      changes where `maxTimeMS` and `killOp` take effect to where mongod's
+      do (mongod checks a read only at a yield); (b) count this server's own
+      polls where they are -- the real mechanism of this server, never
+      mongod's number; (c) leave it open, as RM-170's decision did.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_a_line_counts_its_interrupt_checks
 - [ ] **A write has no `totalOplogSlotDurationMicros`.** mongod 8.2.11's
