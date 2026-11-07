@@ -3,7 +3,7 @@ RP-408: RP-413 (a function in FROM leaves a 42703 with no HINT), RP-414 (a
 42703 names the wrong reference or drops its qualifier), RP-415 (a column
 in an INSERT's VALUES is refused as a gap) and RP-416 (a join's ON after a
 comma item was not type-checked; fixed), and RP-430, found while fixing
-RP-416 (a subquery's join ON cannot name the outer query).
+RP-416 (a subquery's join ON could not name the outer query; fixed).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. The expected answers were measured on a private,
@@ -190,11 +190,83 @@ SUBQUERY_ON = [
 ]
 
 
-@pytest.mark.backlog("RP-430")
+@pytest.mark.backlog_fixed("RP-430")
 @pytest.mark.parametrize("query", SUBQUERY_ON)
 def test_subquery_join_on_sees_the_outer_query(query: str, dsn: str) -> None:
     """A subquery's join ON may name the enclosing query's columns, as its
-    WHERE may; PostgreSQL 15.19 runs all three. Here the first is 42P01
-    `missing FROM-clause entry for table "e"` and the other two 42703
-    `column "b" does not exist`."""
+    WHERE may; PostgreSQL 15.19 runs all three. The ON was not searched for
+    an outer qualifier, so the subquery planned uncorrelated: the first
+    was 42P01 `missing FROM-clause entry for table "e"` and the other two
+    42703 `column "b" does not exist`."""
     assert answer(dsn, query) is None
+
+
+_ROWS_SETUP = [
+    "drop table if exists oe, os, ok, ox",
+    "create table oe (a int, b text)",
+    "create table os (a int, c text)",
+    "create table ok (a int, b text, bc int)",
+    "create table ox (a int, d text)",
+    "insert into oe values (1, 'p'), (2, 'q'), (3, null), (4, 'r'), (null, 'p')",
+    "insert into os values (1, 'u'), (2, 'v'), (3, 'w'), (5, 'z')",
+    "insert into ok values (1, 'p', 10), (2, 'p', 20), (2, 'q', 30), (3, null, 40), (5, 'r', 50)",
+    "insert into ox values (1, 'p'), (2, 'q'), (5, 'r')",
+]
+
+_OUTER_PQR = [(1, "p"), (2, "q"), (4, "r"), (None, "p")]
+
+# PostgreSQL 15.19's rows, measured on a private cluster with _ROWS_SETUP.
+SUBQUERY_ON_ROWS = {
+    "select * from oe where exists (select 1 from os join ok on os.a = ok.a"
+    " and ok.b = oe.b) order by 1, 2": _OUTER_PQR,
+    "select * from oe where oe.a in (select os.a from os left join ok"
+    " on ok.b = oe.b) order by 1, 2": [(1, "p"), (2, "q"), (3, None)],
+    "select oe.*, (select count(*) from os join ok on os.a = ok.a"
+    " and ok.b = oe.b) from oe order by 1, 2": [
+        (1, "p", 2),
+        (2, "q", 1),
+        (3, None, 0),
+        (4, "r", 1),
+        (None, "p", 2),
+    ],
+    "select oe.*, (select count(*) from os right join ok on os.a = ok.a"
+    " and ok.b = oe.b) from oe order by 1, 2": [
+        (1, "p", 5),
+        (2, "q", 5),
+        (3, None, 5),
+        (4, "r", 5),
+        (None, "p", 5),
+    ],
+    "select oe.*, (select count(*) from os full join ok on os.a = ok.a"
+    " and ok.b = oe.b) from oe order by 1, 2": [
+        (1, "p", 7),
+        (2, "q", 8),
+        (3, None, 9),
+        (4, "r", 8),
+        (None, "p", 7),
+    ],
+    "select * from oe where exists (select 1 from os join (ok join ox"
+    " on ox.a = ok.a and ox.d = oe.b) on os.a = ok.a) order by 1, 2": _OUTER_PQR,
+    "select * from oe o where exists (select 1 from os join ok on os.a = ok.a"
+    " and ok.b = o.b) order by 1, 2": _OUTER_PQR,
+}
+
+
+@pytest.fixture(scope="module")
+def rows_dsn(dsn: str) -> Iterator[str]:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _ROWS_SETUP:
+            c.execute(q)
+    yield dsn
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(_ROWS_SETUP[0])
+
+
+@pytest.mark.backlog_fixed("RP-430")
+@pytest.mark.parametrize("query", list(SUBQUERY_ON_ROWS))
+def test_subquery_join_on_outer_reference_rows(query: str, rows_dsn: str) -> None:
+    """The outer reference in a subquery's join ON is read per outer row,
+    at any depth of the join tree and under every join type, and a NULL
+    outer value matches nothing."""
+    with psycopg.connect(rows_dsn, autocommit=True) as c:
+        assert c.execute(query).fetchall() == SUBQUERY_ON_ROWS[query]

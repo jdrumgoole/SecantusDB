@@ -21500,6 +21500,25 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
     for a in &mut args {
         let _ = walk_expr(a, &mut check);
     }
+    // So can a join's ON, at any depth of the join tree:
+    // `transformJoinOnClause` gives it the join's two sides and every
+    // query around this one. Missed here, `EXISTS (SELECT 1 FROM s JOIN k
+    // ON k.b = e.b)` planned uncorrelated and failed on `e` (RP-430).
+    fn join_quals(item: &pg_query::protobuf::Node, out: &mut Vec<pg_query::protobuf::Node>) {
+        if let Some(N::JoinExpr(j)) = item.node.as_ref() {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                join_quals(side, out);
+            }
+            out.extend(j.quals.as_deref().cloned());
+        }
+    }
+    let mut quals = Vec::new();
+    for item in &s.from_clause {
+        join_quals(item, &mut quals);
+    }
+    for q in &mut quals {
+        let _ = walk_expr(q, &mut check);
+    }
     if found.is_some() {
         return found;
     }

@@ -1600,16 +1600,6 @@ a regression test.
       cluster (found while working RP-408).
       Backlog-ID: RP-415
       Verify: tests/backlog/test_rp_column_errors.py::test_insert_values_column_reference
-- [ ] **A subquery's join ON cannot name the outer query.** `select *
-      from e where exists (select 1 from s join k on s.a = k.a and k.b =
-      e.b)` is 42P01 `missing FROM-clause entry for table "e"` here, and
-      `... (select 1 from s join k on k.b = e.b)` and `e.a in (select s.a
-      from s left join k on k.b = e.b)` are 42703 `column "b" does not
-      exist`; PostgreSQL 15.19 runs all three, as this server does when
-      the same outer reference is in the subquery's WHERE. Measured on a
-      private 15.19 cluster (found while working RP-416).
-      Backlog-ID: RP-430
-      Verify: tests/backlog/test_rp_column_errors.py::test_subquery_join_on_sees_the_outer_query
 - [ ] **A missing output column is reported after the WHERE's errors.**
       PostgreSQL 15.19's `transformSelectStmt` transforms the target list
       before the WHERE, so `select nosuch from e where 1`, `... where a =
@@ -1698,6 +1688,18 @@ a regression test.
       working RP-409).
       Verify: tests/backlog/test_rp_explain_costs.py::test_plan[a plain from-subquery is pulled up]
       Backlog-ID: RP-422
+- [ ] **A correlated EXISTS over a join matches a NULL outer value.**
+      `select * from e where exists (select 1 from s join k on s.a = k.a
+      where k.b = e.b)` returns the outer row whose `b` is NULL when a
+      joined `k` row's `b` is NULL too; PostgreSQL 15.19's `k.b = NULL` is
+      NULL and matches nothing, so the row is left out. A LEFT join and
+      `k.b = e.b || ''` do the same. Written `e.b = k.b`, with no join
+      (`from k where k.b = e.b`), with a comma join, or as a scalar
+      `count(*)`, the answer is right, as it is for a NULL bound parameter
+      in the same join (`where k.b = $1`). A confident wrong row. Measured
+      on a private 15.19 cluster (found while working RP-430).
+      Verify: tests/backlog/test_rp_correlated_null.py::test_correlated_exists_over_join_null_matches_nothing
+      Backlog-ID: RP-437
 
 ## Found by batch 54 (2026-10-24)
 

@@ -3768,3 +3768,49 @@ fn an_insert_query_and_every_cte_body_are_type_checked() {
         }
     }
 }
+
+#[test]
+fn a_subquerys_join_on_may_name_the_outer_query() {
+    // RP-430: an outer qualifier in a subquery's join ON makes it correlated,
+    // as one in its WHERE does. The ON was not searched, so the subquery
+    // planned uncorrelated and failed on `e` (42P01 or 42703).
+    let three = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "e" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> { Ok(Vec::new()) };
+    for q in [
+        "select * from e where exists (select 1 from s join k on s.a = k.a and k.b = e.b)",
+        "select * from e where exists (select 1 from s join k on k.b = e.b)",
+        "select * from e where e.a in (select s.a from s left join k on k.b = e.b)",
+        "select * from e where exists (select 1 from s join (k join s s2 on s2.a = k.a and k.b = e.b) on s.a = k.a)",
+        "select e.a, (select count(*) from s full join k on s.a = k.a and k.b = e.b) from e",
+    ] {
+        let planned = plan_with_subqueries(q, &three, &[], &run);
+        assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+    }
+    // A qualifier naming nothing, here or outside, is still 42P01.
+    let err = plan_with_subqueries(
+        "select * from e where exists (select 1 from s join k on k.b = nosuch.b)",
+        &three,
+        &[],
+        &run,
+    )
+    .expect_err("an unknown qualifier");
+    assert_eq!(err.sqlstate(), "42P01", "{err}");
+}
