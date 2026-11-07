@@ -275,6 +275,9 @@ pub struct CommandContext {
     /// The locks the operation took, as its line prints them, taken with
     /// [`Self::op_counts`].
     pub op_locks: Option<Document>,
+    /// The flow control tickets the operation took, taken with
+    /// [`Self::op_locks`] (RM-357).
+    pub flow_control_tickets: i64,
     /// The time spent planning the operation's query, for the line's and
     /// profile entry's `planningTimeMicros`.
     pub planning_micros: Option<i64>,
@@ -370,6 +373,7 @@ impl CommandContext {
             exec_stats: None,
             op_counts: None,
             op_locks: None,
+            flow_control_tickets: 0,
             planning_micros: None,
             modified: None,
             write_concern_wait: None,
@@ -876,6 +880,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     opdebug::take_examined();
     ctx.op_counts = None;
     ctx.op_locks = None;
+    ctx.flow_control_tickets = 0;
     ctx.planning_micros = None;
     ctx.modified = None;
     ctx.write_concern_wait = None;
@@ -892,7 +897,10 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     if wants_journal(name, doc, client_wc, default_wc.as_ref()) {
         if let Some(storage) = &ctx.storage {
             let waited = std::time::Instant::now();
-            if let Err(e) = storage.flush_journal() {
+            let wait_locks = lock_manager::journal_wait(ctx.locks.as_ref());
+            let flushed = storage.flush_journal();
+            drop(wait_locks);
+            if let Err(e) = flushed {
                 // The write is not durable: that is the answer, not a
                 // footnote to an `ok: 1`.
                 reply = crate::util::command_error(e).into_reply();
@@ -967,6 +975,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     }
     ctx.op_counts = ctx.storage.as_ref().and_then(|s| s.operation_counts());
     ctx.op_locks = Some(lock_manager::operation_locks(false));
+    ctx.flow_control_tickets = lock_manager::flow_control_tickets();
     ctx.planning_micros = planning.micros();
     ctx.cpu_nanos = cpu_started
         .zip(opdebug::thread_cpu_nanos())
@@ -1219,7 +1228,10 @@ pub(crate) fn takes_default_write_concern(name: &str, doc: &Document) -> bool {
             .and_then(|p| p.last())
             .and_then(Bson::as_document)
             .is_some_and(|stage| stage.contains_key("$out") || stage.contains_key("$merge")),
-        n => umc::is_user_or_role_command(n),
+        // `usersInfo` and `rolesInfo` read: they refuse a write concern
+        // (72, as mongod 8.2.11 does), so they take no default and wait for
+        // no journal.
+        n => umc::is_user_or_role_command(n) && !matches!(n, "usersInfo" | "rolesInfo"),
     }
 }
 

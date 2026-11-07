@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pymongo
 import pytest
 from pymongo.write_concern import WriteConcern
 
@@ -273,19 +274,126 @@ def test_explain_counts_the_end_of_a_count_scan(rust_mongo: Any, mongod_rs: Any)
 # ------------------------------------------------------------- RM-357 --
 
 
+def _plain(d: Any) -> Any:
+    """`d` through a client of the same server that sends no retryable
+    writes: no `txnNumber`, so no session is checked out and no session row
+    is kept."""
+    client = pymongo.MongoClient(*d.client.address, directConnection=True, retryWrites=False)
+    _PLAIN.append(client)
+    return client[d.name]
+
+
+_PLAIN: list = []
+
+
+def _w1(d: Any) -> Any:
+    return d.get_collection("c", write_concern=WriteConcern(w=1))
+
+
+def _write_locks(rust_mongo: Any, mongod_rs: Any, op: Any) -> dict:
+    """Each server's `locks` and `flowControl` on each line `op` wrote."""
+    try:
+        got = _both(rust_mongo, mongod_rs, op)
+    finally:
+        while _PLAIN:
+            _PLAIN.pop().close()
+    return {
+        server: [
+            (next(iter(a.get("command", {})), ""), a.get("locks"), a.get("flowControl"))
+            for _, a in lines
+            # `$out` lists the collections on mongod: lines of their own.
+            if next(iter(a.get("command", {})), "") != "listCollections"
+        ]
+        for server, (lines, _) in got.items()
+    }
+
+
+#: Writes whose lines carry mongod's locks and flow control tickets: a
+#: retryable write's session checkout and session row, the journal wait of
+#: `j: true` and `w: "majority"`, a ticket per write round taken apart
+#: (measured 8.2.11, 2026-11-07).
+_MATCHING_WRITES = {
+    "insert": lambda d: d.c.insert_one({"_id": 100}),
+    "insert with w 1": lambda d: _w1(d).insert_one({"_id": 100}),
+    "insert with j": lambda d: d.get_collection(
+        "c", write_concern=WriteConcern(w=1, j=True)
+    ).insert_one({"_id": 100}),
+    "insert of three": lambda d: d.c.insert_many([{"_id": 100}, {"_id": 101}, {"_id": 102}]),
+    "insert creating its collection": lambda d: d.n.insert_one({"_id": 1}),
+    "insert not retryable": lambda d: _plain(d).c.insert_one({"_id": 100}),
+    "insert not retryable with w 1": lambda d: _w1(_plain(d)).insert_one({"_id": 100}),
+    "findAndModify not retryable": lambda d: _w1(_plain(d)).find_one_and_update(
+        {"_id": 1}, {"$set": {"q": 1}}
+    ),
+    "drop": lambda d: d.command("drop", "c", writeConcern={"w": 1}),
+    "create": lambda d: d.command("create", "n", writeConcern={"w": 1}),
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_MATCHING_WRITES))
+def test_a_write_reports_mongods_locks_and_flow_control(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11's line for a retryable insert under the default
+    `w: "majority"` takes the replication state transition lock four times
+    and the global lock in IX twice (`{ReplicationStateTransition: {w: 4},
+    Global: {r: 1, w: 2}, ...}`) and counts `flowControl: {acquireCount:
+    1}`: the session's checkout, its row in `config.transactions` written
+    under the insert's locks, and the wait for the journal (measured
+    2026-10-27 and 2026-11-07). This server took one round of each and had
+    no flow control."""
+    answers = _write_locks(rust_mongo, mongod_rs, _MATCHING_WRITES[name])
+    assert answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+#: Writes whose locks are not mongod's yet (RM-357's remainder).
+_DIVERGING_WRITES = {
+    # A write that writes nothing reads the latest optime for the client's
+    # last op under the global IS: twice for an insert, update or delete
+    # (the write path and the command), once for another command.
+    "insert of a duplicate key": lambda d: _w1(d).insert_one({"_id": 1}),
+    "delete matching nothing": lambda d: _w1(d).delete_one({"_id": 999}),
+    "create of a collection there": lambda d: d.command("create", "c", writeConcern={"w": 1}),
+    # Each statement keeps its session row under its own locks, and takes
+    # its round as it runs: this server takes every statement's first.
+    "update": lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
+    "update of two statements": lambda d: _plain(d).command(
+        "update",
+        "c",
+        updates=[
+            {"q": {"_id": 1}, "u": {"$set": {"k": 1}}},
+            {"q": {"_id": 2}, "u": {"$set": {"k": 1}}},
+        ],
+        writeConcern={"w": 1},
+    ),
+    # The image of a retryable findAndModify is written under its locks;
+    # one that removes takes one round.
+    "findAndModify": lambda d: _w1(d).find_one_and_update({"_id": 1}, {"$set": {"q": 1}}),
+    "findAndModify that removes": lambda d: _w1(_plain(d)).find_one_and_delete({"_id": 1}),
+    "collMod": lambda d: d.command("collMod", "c", writeConcern={"w": 1}),
+    "$out": lambda d: list(_w1(_plain(d)).aggregate([{"$match": {}}, {"$out": "o"}])),
+    # A statement of a transaction prints `{}`; its entry has the
+    # transaction's locks.
+    "insert in a transaction": lambda d: _in_transaction(d),
+    "aggregate of $documents": lambda d: list(d.aggregate([{"$documents": [{"a": 1}]}])),
+}
+
+
+def _in_transaction(d: Any) -> None:
+    with d.client.start_session() as s, s.start_transaction():
+        d.c.insert_one({"_id": 200}, session=s)
+
+
 @pytest.mark.backlog("RM-357")
-def test_a_write_reports_mongods_locks_and_flow_control(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11's line for an insert takes the replication state
-    transition lock four times and the global lock in IX twice
-    (`{ReplicationStateTransition: {w: 4}, Global: {r: 1, w: 2}, ...}`),
-    and counts `flowControl: {acquireCount: 1}` (measured 2026-10-27).
-    This server's lock rounds for a write are one of each, and it has no
-    flow control."""
-    got = _both(rust_mongo, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
-    answers = {}
-    for server, (lines, _) in got.items():
-        attr = _line(lines, "insert")
-        answers[server] = (attr.get("locks"), attr.get("flowControl"))
+@pytest.mark.parametrize("name", list(_DIVERGING_WRITES))
+def test_more_writes_report_mongods_locks(rust_mongo: Any, mongod_rs: Any, name: str) -> None:
+    """mongod 8.2.11's `locks` and `flowControl` on the lines of the writes
+    above (measured 2026-11-07), which this server's lock rounds do not
+    take yet."""
+    answers = _write_locks(rust_mongo, mongod_rs, _DIVERGING_WRITES[name])
+    assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 

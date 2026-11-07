@@ -611,9 +611,11 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if crate::lock_manager::took_global() {
         bump_global_is(&mut locks);
     }
-    // Flow control holds back writes only: an operation that wrote none
-    // has `{}` (a write's acquisitions are not counted, RM-357).
-    if !crate::opdebug::wrote(&locks) && !crate::takes_default_write_concern(name, doc) {
+    // Flow control holds back writes only: an operation that took no
+    // ticket has `{}`.
+    if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
+        entry.insert("flowControl", fc);
+    } else if !crate::opdebug::wrote(&locks) && !crate::takes_default_write_concern(name, doc) {
         entry.insert("flowControl", Document::new());
     }
     entry.insert("locks", locks);
@@ -881,6 +883,8 @@ struct Ran {
     /// The command's locks so far: a statement's are its command's, which
     /// mongod's statement lines print as they stand.
     locks: Document,
+    /// The command's flow control tickets so far, as its locks.
+    flow_control: i64,
     took_global: bool,
     /// The plan cache key's hashes, where mongod keys the statement's query.
     hashes: Option<(String, String)>,
@@ -937,6 +941,9 @@ impl Statement {
         }
         attr.insert("numYields", 0_i64);
         attr.insert("locks", self.ran.locks.clone());
+        if let Some(fc) = crate::opdebug::flow_control(self.ran.flow_control) {
+            attr.insert("flowControl", fc);
+        }
         if let Some(rc) = &self.ran.read_concern {
             attr.insert("readConcern", rc.clone());
         }
@@ -1014,7 +1021,9 @@ impl Statement {
             bump_global_is(&mut locks);
         }
         entry.insert("locks", locks);
-        // A write statement's flow control is RM-357's.
+        if let Some(fc) = crate::opdebug::flow_control(self.ran.flow_control) {
+            entry.insert("flowControl", fc);
+        }
         if let Some(rc) = &self.ran.read_concern {
             entry.insert("readConcern", rc.clone());
         }
@@ -1196,6 +1205,7 @@ impl<'a> Statements<'a> {
                 then.and_then(|c| c.keys_deleted),
             ),
             locks,
+            flow_control: crate::lock_manager::flow_control_tickets(),
             took_global: crate::lock_manager::took_global(),
             read_concern: crate::slowop::replicated().then(|| self.read_concern.clone()),
             // A statement's CPU time, as its command's: where mongod reads

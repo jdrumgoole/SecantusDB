@@ -34,12 +34,36 @@ def mongod() -> Iterator[Any]:
     proc, uri, dbpath = _start_mongod(
         extra_args=("--setParameter", "internalQueryExecYieldPeriodMS=86400000")
     )
-    client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=10_000)
+    client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=10_000, **_BASE_ROUNDS)
     try:
         yield client
     finally:
         client.close()
         _stop_mongod(proc, dbpath)
+
+
+#: The reference is a standalone, which runs no retryable write and waits
+#: for no journal under its default `w: 1`. This server is a replica set's
+#: primary, where a retryable write also checks out its session and keeps
+#: its row, and the default `w: "majority"` waits for the journal: locks
+#: RM-357 compares with a replica set's (`tests/backlog/test_rm_355_364.py`).
+#: Both clients send neither, and this server's default is set to the
+#: standalone's, so the counts here are the rounds a command itself takes,
+#: on either.
+_BASE_ROUNDS = {"retryWrites": False, "w": 1}
+
+
+@pytest.fixture(scope="module")
+def rust_mongo(rust_mongo: Any) -> Iterator[Any]:
+    """The module's `secantusd-rs`, through a client like the reference's."""
+    host, port = rust_mongo.address
+    client = pymongo.MongoClient(host, port, serverSelectionTimeoutMS=10_000, **_BASE_ROUNDS)
+    # A command sent without a write concern takes the standalone's default.
+    client.admin.command("setDefaultRWConcern", defaultWriteConcern={"w": 1})
+    try:
+        yield client
+    finally:
+        client.close()
 
 
 #: A `slowms` no operation reaches.
