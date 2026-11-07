@@ -112,7 +112,30 @@ fn semi_join(
     if outer.contains(&inner_alias) {
         return None;
     }
+    // The rewrite drops the select list, which PostgreSQL analyses first: a
+    // qualifier there naming neither the subquery's table nor this level's
+    // FROM may be an error (42P01 `missing FROM-clause entry`, RP-443) or a
+    // reference further out. The general path resolves both.
+    let foreign_in_list = sub.target_list.iter().any(|t| {
+        contains_node(t, &|n| match n {
+            N::ColumnRef(c) if c.fields.len() >= 2 => {
+                match c.fields[c.fields.len() - 2].node.as_ref() {
+                    Some(N::String(q)) => q.sval != inner_alias && !outer.contains(&q.sval),
+                    _ => false,
+                }
+            }
+            _ => false,
+        })
+    });
+    if foreign_in_list {
+        return None;
+    }
     let def = lookup(&relation_name(rv))?;
+    // So may a name the table does not have, bare or qualified by it
+    // (RP-444): it is an outer row's column or 42703.
+    if !crate::exists_target_refs_to_analyse(sub, lookup).is_empty() {
+        return None;
+    }
     let mut conjuncts = Vec::new();
     split_and(sub.where_clause.as_deref()?, &mut conjuncts);
     // Exactly one conjunct reads the outer query: `inner = outer`.

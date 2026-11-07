@@ -2447,6 +2447,102 @@ fn scalar_builtins_match_postgres() {
     }
 }
 
+/// A simple CASE compares its argument to each WHEN with `=`, so an untyped
+/// WHEN literal takes the argument's type (RP-433). Each answer measured on
+/// PostgreSQL 15.19; every non-text one was 0A000 `comparing int32 with
+/// string` before.
+#[test]
+fn simple_case_reads_an_untyped_when_as_its_argument_type() {
+    let calc = |sql: &str| match plan_ok(sql) {
+        Statement::SelectConstant(sc) => match &sc.columns[0].1 {
+            ConstCol::Value(Bson::String(s)) => s.clone(),
+            other => panic!("{sql} -> {other:?}"),
+        },
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for sql in [
+        "select case 1 when '1' then 'y' else 'n' end",
+        "select case 1::int8 when '1' then 'y' else 'n' end",
+        "select case 1.5 when '1.5' then 'y' else 'n' end",
+        "select case true when 't' then 'y' else 'n' end",
+        "select case interval '1 day' when '24 hours' then 'y' else 'n' end",
+        "select case '1' when '1' then 'y' else 'n' end",
+        "select case 1 when 2 then 'n' when '1' then 'y' end",
+    ] {
+        assert_eq!(calc(sql), "y", "for {sql}");
+    }
+    // A NULL argument matches no WHEN, its label typed all the same.
+    assert_eq!(
+        calc("select case null::int when '1' then 'y' else 'n' end"),
+        "n"
+    );
+    // A label the argument type's input refuses is that input's 22P02.
+    let err = plan_ok_err("select case 1 when 'x' then 'y' else 'n' end");
+    assert!(
+        err.to_string()
+            .contains("invalid input syntax for type integer: \"x\""),
+        "{err}"
+    );
+}
+
+/// A simple CASE resolves `argument = WHEN` against `pg_operator`, so a
+/// TYPED WHEN of another category has no operator: 42883 at the WHEN keyword
+/// (RP-439), as `transformCaseExpr`'s `make_op` answers. Each measured on
+/// PostgreSQL 15.19 (`position` there is this 0-based location plus one);
+/// every one was 0A000 `comparing ... is not supported yet` before.
+#[test]
+fn simple_case_refuses_a_when_with_no_equality_to_its_argument() {
+    for (sql, want, at) in [
+        (
+            "select case 1 when true then 1 end",
+            "operator does not exist: integer = boolean",
+            14,
+        ),
+        (
+            "select case 'a'::text when 1 then 1 end",
+            "operator does not exist: text = integer",
+            22,
+        ),
+        // An untyped argument is coerced to text first.
+        (
+            "select case 'a' when 1 then 1 end",
+            "operator does not exist: text = integer",
+            16,
+        ),
+        // The first WHEN with no operator, in order.
+        (
+            "select case 1 when 2 then 1 when true then 2 end",
+            "operator does not exist: integer = boolean",
+            28,
+        ),
+        (
+            "select case 1 when null::bool then 1 else 0 end",
+            "operator does not exist: integer = boolean",
+            14,
+        ),
+        (
+            "select case true when 1 then 1 end",
+            "operator does not exist: boolean = integer",
+            17,
+        ),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42883", "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // Types an `=` joins still compare, across a category's members.
+    for sql in [
+        "select case 1::int2 when 1::int8 then 1 else 0 end",
+        "select case 'x'::varchar when 'x'::text then 1 else 0 end",
+        "select case 1::numeric when 1::float8 then 1 else 0 end",
+        "select case 1 when null then 1 else 0 end",
+    ] {
+        assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+}
+
 /// A built-in's RESULT TYPE is as much of the answer as its value.
 ///
 /// `sign` answers `float8` even for an integer argument; `nullif` answers its
@@ -3676,4 +3772,421 @@ fn explain_refuses_what_parse_analysis_refuses() {
         let err = plan(sql, &lookup).expect_err(sql);
         assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
     }
+}
+
+#[test]
+fn a_join_on_after_a_comma_item_is_type_checked_in_its_own_scope() {
+    // RP-416: an ON sees only its join's two sides, so in `FROM e, s JOIN
+    // k ON b = k.a` the bare `b` is `k.b` (text) -- `e.b` is not in view
+    // -- and PostgreSQL 15.19 answers 42883 `text = integer`. Judged in
+    // the whole FROM's scope, `b` read as ambiguous and the ON ran.
+    let three = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "e" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    // The server's entry point: `plan` alone runs no operator check.
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> { Ok(Vec::new()) };
+    let plan = |q: &str, lookup: &dyn Fn(&str) -> Option<TableDef>| {
+        plan_with_subqueries(q, lookup, &[], &run)
+    };
+    for q in [
+        "select * from e, s join k on b = k.a",
+        "select * from s join k on b = k.a",
+        "select * from e, (s join k on b = k.a) j",
+        "select * from s join (e cross join k) on k.bc = s.c",
+    ] {
+        match plan(q, &three) {
+            Err(Error::UndefinedFunction(m)) => {
+                assert!(m.starts_with("operator does not exist: "), "{q}: {m}")
+            }
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    // What must still plan: a well-typed ON after a comma item, and a
+    // later join's ON over the sides an earlier join built.
+    for q in [
+        "select * from e, s join k on c = k.b",
+        "select * from e, s join k on s.a = k.a",
+        "select * from e join s on e.a = s.a join k on k.b = e.b",
+    ] {
+        assert!(plan(q, &three).is_ok(), "{q}: {:?}", plan(q, &three).err());
+    }
+}
+
+/// A statement planned as the server plans it, parse analysis first.
+fn analysed(sql: &str) -> Result<Statement> {
+    plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new()))
+}
+
+#[test]
+fn a_write_reads_the_ctes_of_its_own_with() {
+    // `transformWithClause` puts a write's CTEs in scope for the whole
+    // write, as a SELECT's (RP-432). Each of these was 42P01 `relation "c"
+    // does not exist`.
+    for q in [
+        "with c as (select 1 as id) delete from t using c where t.id = c.id",
+        "with c as (select 'x'::text as z) update t set n = 1 from c where t.name = c.z",
+        "with c as (select 1 as id) update t set n = 1 where id in (select id from c)",
+        "with c as (select 1 as id) delete from t where exists (select 1 from c where c.id = t.id)",
+        "with c as (select 1 as id) insert into t (id) values ((select id from c))",
+        "with recursive r(k) as (select 1 union all select k + 1 from r where k < 3) \
+         delete from t where id in (select k from r)",
+        "with c as (select 1 as id), d as (delete from t where id in (select id from c) \
+         returning id) select * from d",
+        "with c as (select 1 as id), d as (insert into t (id) select id from c returning id) \
+         select * from d",
+    ] {
+        if let Err(e) = analysed(q) {
+            panic!("{q}: {e}");
+        }
+    }
+    // A CTE in USING exposes its columns to the unqualified-name check.
+    let err = analysed("with c as (select name from t) delete from t using c where name = 'x'")
+        .expect_err("ambiguous");
+    assert_eq!(err.sqlstate(), "42702", "{err}");
+}
+
+#[test]
+fn an_insert_query_and_every_cte_body_are_type_checked() {
+    // `transformWithClause` analyses each CTE's query, used or not, and
+    // `transformInsertStmt` its SELECT: an operator with no overload for its
+    // operands is 42883 there as in a bare SELECT (RP-427). These planned,
+    // and answered no rows.
+    for q in [
+        "insert into t select * from t where n = true",
+        "with c as (select * from t where n = true) select * from c",
+        "with c as (select * from t where n = true) select 1",
+        "with c as (select name from t), d as (select * from c where name = 1) select 1",
+        "with c as (select name as z from t) insert into t (name) select z from c where z = 1",
+        "with c as (select * from t where n = true) update t set name = 'x'",
+        "with c as (select * from t where n = true) delete from t",
+        "with c as (update t set name = 'q' where n = true returning *) select * from c",
+        "select * from t where exists (with c as (select 1 as x where t.n = true) select * from c)",
+    ] {
+        let err = analysed(q).expect_err(q).to_string();
+        assert!(err.contains("operator does not exist"), "{q}: {err}");
+    }
+    // A CTE's own name, a shadowing CTE and a recursive one stay in view.
+    for q in [
+        "with recursive r(k) as (select 1 union all select k + 1 from r where k < 5) select * from r",
+        "with t as (select 'x'::text as a) select * from t where a = 'y'",
+        "with c as (select n from t) insert into t (n) select n from c where n > 8",
+    ] {
+        if let Err(e) = analysed(q) {
+            assert!(!e.to_string().contains("operator does not exist"), "{q}: {e}");
+        }
+    }
+}
+
+#[test]
+fn a_subquerys_join_on_may_name_the_outer_query() {
+    // RP-430: an outer qualifier in a subquery's join ON makes it correlated,
+    // as one in its WHERE does. The ON was not searched, so the subquery
+    // planned uncorrelated and failed on `e` (42P01 or 42703).
+    let three = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "e" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> { Ok(Vec::new()) };
+    for q in [
+        "select * from e where exists (select 1 from s join k on s.a = k.a and k.b = e.b)",
+        "select * from e where exists (select 1 from s join k on k.b = e.b)",
+        "select * from e where e.a in (select s.a from s left join k on k.b = e.b)",
+        "select * from e where exists (select 1 from s join (k join s s2 on s2.a = k.a and k.b = e.b) on s.a = k.a)",
+        "select e.a, (select count(*) from s full join k on s.a = k.a and k.b = e.b) from e",
+    ] {
+        let planned = plan_with_subqueries(q, &three, &[], &run);
+        assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+    }
+    // A qualifier naming nothing, here or outside, is still 42P01.
+    let err = plan_with_subqueries(
+        "select * from e where exists (select 1 from s join k on k.b = nosuch.b)",
+        &three,
+        &[],
+        &run,
+    )
+    .expect_err("an unknown qualifier");
+    assert_eq!(err.sqlstate(), "42P01", "{err}");
+}
+
+#[test]
+fn a_star_derived_table_is_type_checked() {
+    // A FROM subquery or CTE written `select *` has its FROM items' column
+    // types (`ExpandColumnRefStar`), renamed by an alias list, a USING join's
+    // merged column listed once (RP-431). These planned, and answered no rows.
+    for q in [
+        "select * from (select * from t) s where n = true",
+        "select * from (select t.* from t) s where name = 1",
+        "select * from (select * from t) s(x, y, z) where z = true",
+        "select * from (select id as k, * from t) s where name = 1",
+        "with c as (select * from t) select * from c where n = true",
+        "with c(x, y) as (select * from t) select * from c where y = 1",
+        "select * from (select * from t join t u using (id)) s where id = true",
+        "select * from (select * from (select * from t) u) s where n = true",
+    ] {
+        let err = analysed(q).expect_err(q).to_string();
+        assert!(err.contains("operator does not exist"), "{q}: {err}");
+    }
+    // A name the expansion lists twice is ambiguous, never typed as either.
+    for q in [
+        "select * from (select * from t, t u) s where name = 1",
+        "select * from (select *, * from t) s where name = 1",
+        "select * from (select * from t) s where n = 5",
+    ] {
+        if let Err(e) = analysed(q) {
+            assert!(
+                !e.to_string().contains("operator does not exist"),
+                "{q}: {e}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_join_on_may_hold_a_subquery() {
+    // RP-438: a subquery in a join's ON is resolved as one in a WHERE is --
+    // an uncorrelated one run once while planning, a correlated one per row.
+    // The ON was not searched, so its SubLink reached the lowering, 0A000.
+    let two = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    let ran = std::cell::Cell::new(0);
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> {
+        ran.set(ran.get() + 1);
+        Ok(vec![vec![Bson::String("p".into())]])
+    };
+    for q in [
+        "select * from s join k on s.a = k.a and k.b = (select 'p'::text)",
+        "select * from s left join k on s.a = k.a and k.b = (select 'p'::text)",
+        "select * from s full join k on s.a = k.a and k.a in (select 2)",
+        "select * from s left join (k join k k2 on k2.a = k.a and k2.b = (select 'q')) on s.a = k.a",
+    ] {
+        ran.set(0);
+        let planned = plan_with_subqueries(q, &two, &[], &run);
+        assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+        assert_eq!(ran.get(), 1, "{q}: the subquery runs once, while planning");
+    }
+    // A correlated one is evaluated per row, not run while planning.
+    ran.set(0);
+    let q = "select * from s join k on s.a = k.a and k.bc = (select max(bc) from k k2 where k2.a = s.a)";
+    let planned = plan_with_subqueries(q, &two, &[], &run);
+    assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+    assert_eq!(ran.get(), 0, "{q}");
+}
+
+#[test]
+fn an_exists_subquery_is_analysed_before_its_list_is_dropped() {
+    // `transformSubLink` resolves every name in an EXISTS subquery's list,
+    // ORDER BY and DISTINCT ON before `simplify_EXISTS_query` drops them
+    // (RP-444): each of these planned, and answered, here. (The position
+    // the client sees is pinned by tests/backlog/test_rp_fromless_analysis.py.)
+    for sql in [
+        "select exists (select nosuch)",
+        "select exists (select nosuch from t)",
+        "select exists (select abs(nosuch) from t)",
+        "select exists (select t.id, nosuch from t)",
+        "select exists (select 1 from t order by nosuch)",
+        "select exists (select distinct on (nosuch) 1 from t)",
+        // The one-table, one-equality shape rewritten to an IN.
+        "select id from t where exists (select nosuch from t x where x.id = t.id)",
+    ] {
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42703", "for {sql} (got {err})");
+    }
+    // Names the subquery's own table answers, an output column the ORDER
+    // BY names, and a value never computed: the list is still dropped.
+    for sql in [
+        "select exists (select name from t)",
+        "select exists (select t.n + id from t order by name)",
+        "select exists (select id as x from t order by x)",
+        "select exists (select 1/0)",
+    ] {
+        analysed(sql).expect("analysed clean");
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(outer)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        let Some(N::ResTarget(rt)) = outer.target_list[0].node.as_ref() else {
+            panic!("a target");
+        };
+        let Some(N::SubLink(sl)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            panic!("an EXISTS");
+        };
+        let Some(N::SelectStmt(sub)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref()) else {
+            panic!("its subquery");
+        };
+        assert!(
+            exists_target_refs_to_analyse(sub, &lookup).is_empty(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn a_column_reference_with_no_from_names_nothing() {
+    // `transformColumnRef` over an empty range table (RP-441): 42703 for a
+    // bare name, 42P01 for a qualified one, at the reference's own token,
+    // in whichever clause it is. Each was 0A000 `ColumnRef is not
+    // supported yet`, or planned with the ORDER BY / GROUP BY name ignored.
+    for (sql, state, at) in [
+        ("select 1 + nosuch", "42703", 11),
+        ("select abs(nosuch)", "42703", 11),
+        ("select case nosuch when 1 then 1 end", "42703", 12),
+        ("select 1 where 1 + nosuch = 2", "42703", 19),
+        ("select 1 as x order by x + 1", "42703", 23),
+        ("select 1 group by nosuch", "42703", 18),
+        ("select 1 offset nosuch limit nosuch2", "42703", 16),
+        ("select nosuch.a + 1", "42P01", 7),
+        ("select 1 + x.y.z", "42P01", 11),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // A bare ORDER BY / GROUP BY name may name an output column.
+    for sql in [
+        "select 1 as x order by x",
+        "select abs(1) order by abs",
+        "select 1 x group by x order by x",
+    ] {
+        analysed(sql).expect("an output column");
+    }
+    // An untyped literal's input function runs as its cast is analysed,
+    // before the reference to its right.
+    let err = analysed("select 'x'::int, 1 + nosuch").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "22P02", "{err}");
+    // A call is looked up as it is analysed: the planner's refusal of a
+    // function PostgreSQL lacks, which the server answers as 42883.
+    let err = analysed("select nosuchfn(1), nosuch").expect_err("should refuse");
+    assert!(
+        matches!(&err, Error::Unsupported(m) if m == "function nosuchfn(integer)"),
+        "{err:?}"
+    );
+    // An aggregate exists, so the reference after it is what fails.
+    let err = analysed("select count(1), nosuch").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+}
+
+#[test]
+fn a_subquery_two_levels_down_reads_the_outer_row() {
+    // `colNameToVar` searches every enclosing level, nearest first (RP-445):
+    // a FROM-less subquery in between hid the outer row, as 42703 or a
+    // leaked `\x1fcorrelated` call.
+    for q in [
+        "select (select (select id)) from t",
+        "select (select (select t.id)) from t",
+        "select (select (select (select id))) from t",
+        "select (select (select id) + 1) from t",
+        "select (select (select id + b) from (select 2 b) u) from t",
+    ] {
+        let planned = analysed(q);
+        assert!(planned.is_ok(), "{q}: {:?}", planned.err());
+    }
+    let err = analysed("select (select (select nosuch)) from t").expect_err("no level has it");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+}
+
+/// `errorMissingRTE`'s hint across query levels (RP-455): the entry found
+/// innermost first, the alias hinted only when it is what the name would
+/// resolve to from the referring level. Answers measured on PostgreSQL
+/// 15.19.
+#[test]
+fn missing_rte_hint_follows_search_range_table_for_rel() {
+    fn parse_level(from: &str, target: Option<&str>) -> RangeLevel {
+        let sql = if from.is_empty() {
+            "select 1".to_string()
+        } else {
+            format!("select 1 from {from}")
+        };
+        let tree = pg_query::parse(&sql).expect("parses");
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("a SELECT");
+        };
+        let target = target.map(|t| {
+            let (relname, alias) = t.split_once(' ').map_or((t, None), |(r, a)| (r, Some(a)));
+            pg_query::protobuf::RangeVar {
+                relname: relname.into(),
+                alias: alias.map(|a| pg_query::protobuf::Alias {
+                    aliasname: a.into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        });
+        range_level(&s.from_clause, &target.iter().collect::<Vec<_>>(), true)
+    }
+    let alias = |a: &str| Some(format!("alias {a}"));
+    let entry = |e: &str| Some(format!("entry {e}"));
+    let hint = |levels: &[RangeLevel], q: &str| {
+        missing_rte_hint(levels, q).map(|h| match h {
+            MissingRteHint::Alias(a) => format!("alias {a}"),
+            MissingRteHint::Entry(e) => format!("entry {e}"),
+        })
+    };
+    // `update fe x set a = (select fe.a from fs limit 1)`
+    let levels = [parse_level("fs", None), parse_level("", Some("fe x"))];
+    assert_eq!(hint(&levels, "fe"), alias("x"));
+    // `update fe x set a = (select fe.a from fs x limit 1)`: the inner `x`
+    // shadows the target's alias.
+    let mut shadowed = levels.clone();
+    shadowed[0] = parse_level("fs x", None);
+    assert_eq!(hint(&shadowed, "fe"), entry("x"));
+    // `select (select fs.a) from (fs join fe using (a)) as j`: a table an
+    // aliased join hides has no alias of its own.
+    let mut hidden = parse_level("(fs join fe using (a)) as j", None);
+    hidden.visible = vec!["j".into()];
+    assert_eq!(hint(&[RangeLevel::default(), hidden], "fs"), entry("fs"));
+    // A name no level's range table has.
+    assert_eq!(hint(&levels, "q"), None);
 }

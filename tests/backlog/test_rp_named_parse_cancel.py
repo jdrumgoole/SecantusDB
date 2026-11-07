@@ -31,6 +31,10 @@ import pytest
 # until the window is wide enough to aim at.
 _SIZES = (200_000, 400_000, 800_000)
 _WINDOW = 0.3
+# How long before a Parse answers its cancel must leave to be sure of
+# reaching it: the cancel opens a connection of its own. PostgreSQL 15.19
+# answers a cancelled Parse about 0.015 s after the cancel is sent.
+_ARRIVAL = 0.1
 
 
 def _sql(n: int, size: int) -> bytes:
@@ -75,13 +79,15 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
         pg.cancel()
 
     # On a slow CI runner the target Parse has answered BEFORE a cancel aimed
-    # at the middle of the calibrated window left (PR #2397: 0.27 s before).
-    # Such a trial tests nothing -- the cancel never met the Parse -- so it
-    # is aimed again, at the middle of the window that Parse showed. A cancel
-    # that leaves in time and is lost still fails below.
+    # at the middle of the calibrated window left (PR #2397: 0.27 s before),
+    # and 0.007 s AFTER it left (PR #2402), sooner than a cancel's own new
+    # connection reaches the server. Neither trial tests anything -- the
+    # cancel never met the Parse -- so each is aimed again, at the middle of
+    # the window that Parse showed. A cancel that left _ARRIVAL or more
+    # before the Parse answered, and is lost, still fails below.
     window_end = named
     missed = []
-    for attempt in range(3):
+    for attempt in range(4):
         target = b"rp303_target_%d" % attempt
         timer = threading.Timer(delay, cancel)
         t0 = time.monotonic()
@@ -89,10 +95,14 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
         result = pgconn.prepare(target, _sql(n := n + 1, size))
         answered = time.monotonic()
         timer.join()
-        if sent["at"] < answered:
+        cancelled = result.status == pq.ExecStatus.FATAL_ERROR
+        if cancelled or answered - sent["at"] >= _ARRIVAL:
             break
         window_end = answered - t0
-        missed.append(f"aimed at {delay:.3f}s, the Parse answered at {window_end:.3f}s")
+        missed.append(
+            f"aimed at {delay:.3f}s, the Parse answered at {window_end:.3f}s, "
+            f"{answered - sent['at']:+.3f}s after the cancel left"
+        )
         delay = (unnamed + window_end) / 2
         # The late cancel reaches an idle session, where PostgreSQL ignores
         # it. A pause and a round trip let it arrive before the next trial,
@@ -100,7 +110,7 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
         time.sleep(0.5)
         pgconn.exec_(b"select 1")
     else:
-        pytest.fail(f"no cancel left before its Parse answered: {missed}")
+        pytest.fail(f"no cancel left in time to meet its Parse: {missed}")
     assert result.status == pq.ExecStatus.FATAL_ERROR, (
         f"the Parse answered {pq.ExecStatus(result.status).name} "
         f"{answered - sent['at']:.3f}s after the cancel was sent"
@@ -109,7 +119,9 @@ def test_a_cancel_while_a_named_parse_records_its_statement_is_the_parses_57014(
     assert answered - sent["at"] < 0.5, (
         f"cancel honoured {answered - sent['at']:.2f}s after it was sent"
     )
-    assert answered - t0 < window_end, "the Parse was not cut short"
+    # The window's end is a measurement, not a deadline: a cancel honoured in
+    # its last moments cannot be told from a Parse that finished.
+    assert answered - t0 < window_end + _ARRIVAL, "the Parse was not cut short"
     # The cancelled Parse stored nothing, as PostgreSQL's does not.
     row = pg.execute(
         "select count(*) from pg_prepared_statements where name = %s",

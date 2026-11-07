@@ -499,6 +499,7 @@ def pytest_configure(config: pytest.Config) -> None:
     # than in a fixture because fixtures run only in xdist WORKERS, and the
     # controller is exactly the process that wedges.
     _arm_stall_watchdog(config)
+    _cap_file_size()
 
     policy = config.getini("tmp_path_retention_policy")
     if policy not in _SAFE_TMP_RETENTION:
@@ -509,6 +510,46 @@ def pytest_configure(config: pytest.Config) -> None:
             "'Device or resource busy' for the rest of the xdist worker). "
             "Only 'all' is allowed — leave it at the pytest default."
         )
+
+
+# The largest single file any process the suite starts may write.
+_MAX_FILE_BYTES = 4_294_967_296  # 4 GiB
+
+
+def _cap_file_size() -> None:
+    """Cap the size of any one file this run, or anything it starts, writes.
+
+    On 2026-11-06 the disk of the Mac that runs this suite filled: 427 GB of
+    its 926 GB was ONE file, the `mongod.log` of a reference mongod
+    (`tests/mongod_reference.py`) that outlived its test on 2026-10-26 and
+    logged for six more hours. Every build and test on the machine then
+    failed with "No space left on device". Nothing a test writes needs to be
+    anywhere near that size, so the soft `RLIMIT_FSIZE` is lowered here, in
+    every pytest process, and every process it starts -- mongod,
+    `secantusd-rs`, `secantusd-pg`, `pg_dump` -- inherits it. A child that
+    writes past it is killed by SIGXFSZ (`subprocess` restores that signal's
+    default in the child), which surfaces as a dead server and a failing
+    test: the runaway is reported, not silently absorbed. Inside pytest
+    itself, where the embedded servers run, CPython ignores SIGXFSZ, so the
+    write fails with EFBIG instead -- a WiredTiger write error, just as loud.
+
+    `SECANTUS_TEST_MAX_FILE_BYTES` changes the cap (for a test that genuinely
+    needs a bigger file); `0` leaves the limit as it was. Never raised above
+    the limit already in force. Not on Windows, which has no `resource`.
+    """
+    try:
+        import resource
+    except ImportError:  # Windows
+        return
+    cap = int(os.environ.get("SECANTUS_TEST_MAX_FILE_BYTES", _MAX_FILE_BYTES))
+    if cap <= 0:
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_FSIZE)
+    if soft != resource.RLIM_INFINITY and soft <= cap:
+        return
+    if hard != resource.RLIM_INFINITY:
+        cap = min(cap, hard)
+    resource.setrlimit(resource.RLIMIT_FSIZE, (cap, hard))
 
 
 # Held for the whole process: faulthandler writes to this fd from a signal
@@ -569,12 +610,17 @@ def _reap_abandoned_pytest_tmp(config: pytest.Config) -> None:
         # naming scheme entirely -- and cost ~130 MB a server. See
         # ``python_tasks._sweep_stale_probe_tmp``.
         probes, _ = python_tasks._sweep_stale_probe_tmp(base)
+        # And the per-test WiredTiger homes `cargo test` leaves under the same
+        # temp dir (``python_tasks._sweep_stale_rust_test_tmp``).
+        rust, _ = python_tasks._sweep_stale_rust_test_tmp(base)
     except Exception:  # noqa: BLE001 - never fail a run over housekeeping
         return
     if reaped:
         print(f"\nreaped {reaped} abandoned pytest temp tree(s) from earlier runs")
     if probes:
         print(f"\nreaped {probes} abandoned probe store(s) from earlier runs")
+    if rust:
+        print(f"\nreaped {rust} abandoned Rust test store(s) from earlier runs")
 
 
 def _arm_crash_faulthandler(config: pytest.Config) -> None:

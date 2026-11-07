@@ -248,6 +248,13 @@ def clean(c: Context) -> None:
             f"({freed / 1024**3:.1f} GiB) under {base}"
         )
 
+    reaped, freed = _sweep_stale_rust_test_tmp(base)
+    if reaped:
+        print(
+            f"clean: reaped {reaped} abandoned Rust test store(s) "
+            f"({freed / 1024**3:.1f} GiB) under {base}"
+        )
+
 
 #: How many numbered pytest dirs to keep.
 #:
@@ -331,6 +338,11 @@ def _sweep_stale_pytest_tmp(base: str, *, measure: bool = True) -> tuple[int, in
 #: constant is a better dependency than a package import here.
 #: ``tests/test_clean_pytest_tmp.py`` pins the two to each other.
 _PROBE_TMP_PREFIX = "secantus-probe-"
+# What `tests/mongod_reference.py` named a reference mongod's dbpath before it
+# took the probe prefix: no owner pid in it, so only `mongod.lock` tells
+# whether its mongod is alive. One of these held a 427 GB `mongod.log`
+# (2026-11-06).
+_LEGACY_MONGOD_TMP_PREFIX = "differential-mongod-"
 
 
 def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
@@ -353,13 +365,21 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
     """
     reaped = freed = 0
     for name in os.listdir(base):
-        if not name.startswith(_PROBE_TMP_PREFIX):
+        legacy = name.startswith(_LEGACY_MONGOD_TMP_PREFIX)
+        if not name.startswith(_PROBE_TMP_PREFIX) and not legacy:
             continue
         path = os.path.join(base, name)
         if not os.path.isdir(path) or os.path.islink(path):
             continue
-        owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
-        if not owner.isdigit() or _pid_alive(int(owner)):
+        if not legacy:
+            owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
+            if not owner.isdigit() or _pid_alive(int(owner)):
+                continue
+        # A reference mongod can outlive the test that started it, and one that
+        # is only appending to its log leaves the directory's mtime alone, so
+        # the age check below cannot see it. mongod keeps its pid in
+        # `mongod.lock` while it runs.
+        if _mongod_lock_pid_alive(path):
             continue
         # The PID in the NAME is a hint, not proof of ownership, and trusting
         # it alone deleted a RUNNING mongod's dbpath (2026-09-22): the name had
@@ -368,6 +388,52 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
         # died on a fatal WiredTiger assertion -- "log pre-alloc server error
         # ... the process must exit and restart". Ask the STORE whether it is
         # in use before believing the name.
+        if _wt_home_in_use(path):
+            continue
+        try:
+            freed += _dir_size(path)
+            shutil.rmtree(path, ignore_errors=True)
+            reaped += 1
+        except OSError:
+            continue
+    return (reaped, freed)
+
+
+#: A directory the Rust code names ``secantus-<kind>-<pid>[-<more>]`` under the
+#: system temp dir: ``<kind>`` is lowercase words, and the FIRST all-digit part
+#: is ``std::process::id()`` of the process that made it (a ``<kind>`` part
+#: always has a letter, as in ``secantus-2pc-{pid}-{n}``). Every such name in
+#: ``crates/`` puts the pid there (``secantus-snap-{pid}-{n}``,
+#: ``secantus-mdb-{pid}-{nanos}-{n}``, ``secantus-index-build-{pid}``). A pid
+#: has no leading zero and at most seven digits (Linux's ceiling is 4194304),
+#: which keeps out ``secantus-cfg-{nanos}-{n}`` -- a 19-digit clock, not a pid
+#: -- and a gauge's random ``mkdtemp`` suffix.
+_RUST_TMP_RE = re.compile(r"secantus-(?:[a-z0-9]*[a-z][a-z0-9]*-)+?([1-9][0-9]{0,6})(?:-[0-9]+)*")
+_LINUX_PID_MAX = 4_194_304
+
+
+def _sweep_stale_rust_test_tmp(base: str) -> tuple[int, int]:
+    """Delete the temp stores dead Rust processes left; return ``(count, bytes)``.
+
+    About sixty Rust test files each make a fresh WiredTiger home per test
+    under ``std::env::temp_dir()`` and never delete it, so every ``cargo
+    test`` run of the storage crates leaves hundreds behind: 1,166 of them,
+    2.5 GiB, on this Mac on 2026-11-07, invisible to every other janitor here.
+    The name carries the creating pid, so a store is garbage once that process
+    is gone -- and, as with probe stores, only once it has also sat untouched
+    for the grace period (`_wt_home_in_use`), because a name is not proof.
+    """
+    reaped = freed = 0
+    for name in os.listdir(base):
+        m = _RUST_TMP_RE.fullmatch(name)
+        if m is None or name.startswith(_PROBE_TMP_PREFIX) or "-gauge-" in name:
+            continue
+        pid = int(m.group(1))
+        if pid > _LINUX_PID_MAX or _pid_alive(pid):
+            continue
+        path = os.path.join(base, name)
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
         if _wt_home_in_use(path):
             continue
         try:
@@ -388,6 +454,27 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
 #: reclaimed on the next run after that, and the disk problem this whole sweep
 #: exists for is measured in days, not minutes.
 _PROBE_TMP_GRACE_SECONDS = 1800.0
+
+
+def _mongod_lock_pid_alive(path: str) -> bool:
+    """Whether ``path/mongod.lock`` names a running process.
+
+    mongod writes its pid there at startup and empties the file on a clean
+    shutdown. No file, or an empty one, means no mongod; anything unreadable
+    answers alive, the safe direction.
+    """
+    try:
+        with open(os.path.join(path, "mongod.lock")) as fh:
+            text = fh.read().strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not text:
+        return False
+    if not text.isdigit():
+        return True
+    return _pid_alive(int(text))
 
 
 def _wt_home_in_use(path: str) -> bool:

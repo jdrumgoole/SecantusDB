@@ -70,6 +70,8 @@ cd "$(dirname "$0")/.."
 out=.scratch/fix_many
 mkdir -p "$out"
 rm -f "$out/STOP"
+# summary.txt is appended across batches: mark where this one starts.
+echo "$(date '+%F %T') START pid $$: $backlog x$count${into:+ into $into}${list:+ from $list}" >>"$out/summary.txt"
 
 if [[ -n $into ]]; then
     [[ $into == main ]] && { echo "-i main: use the default mode" >&2; exit 2; }
@@ -120,7 +122,10 @@ lane() {
         local rc=$?
         if [[ $rc -eq 0 && -n $into ]]; then
             local sha
-            sha=$(grep -oE "landed on $into at [0-9a-f]{7,}" "$out/$n.log" | tail -1 | awk '{print $NF}')
+            # The report is markdown, so the branch and sha may be in
+            # backticks (2026-11-07: "landed on `rm-batch` at `b2ab0554`").
+            sha=$(grep -oE "landed on \`?$into\`? at \`?[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
+                grep -oE '[0-9a-f]{7,}$')
             git fetch -q origin "$into"
             if [[ -z $sha ]] || ! git merge-base --is-ancestor "$sha" "origin/$into" 2>/dev/null; then
                 echo "$(date '+%F %T') item $n exit 0 but nothing landed on $into" >>"$out/summary.txt"
@@ -128,7 +133,7 @@ lane() {
             fi
         fi
         local pr
-        pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at [0-9a-f]+' "$out/$n.log" | tail -1)
+        pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at `?[0-9a-f]+' "$out/$n.log" | tail -1 | tr -d '`')
         echo "$(date '+%F %T') item $n (lane $k) exit $rc ${pr:-no PR}" >>"$out/summary.txt"
         if [[ $rc -ne 0 ]]; then
             echo "$n" >"$out/STOP"

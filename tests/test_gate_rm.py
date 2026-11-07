@@ -43,3 +43,23 @@ def test_skips_what_ci_deliberately_does_not_run() -> None:
     excluded = _gate_rm().not_in_ci(ROOT)
     assert "test_rust_sortkey_parity.py" in excluded
     assert all(why.strip() for why in excluded.values())
+
+
+def test_rebuilds_the_pg_binary_provenance_checks() -> None:
+    """The provenance hook refuses a run while any artifact it knows is stale;
+    the gate rebuilds `secantusd-pg` at the path that hook checks."""
+    spec = importlib.util.spec_from_file_location("provenance", ROOT / "tools/provenance.py")
+    assert spec and spec.loader
+    prov = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(prov)
+    assert f'"{prov.PGSERVER_REL}"' in (ROOT / "scripts/gate_rm.py").read_text()
+
+
+def test_runs_ci_async_oplog_storage_step_with_its_environment() -> None:
+    """The gate's async-oplog storage step uses the environment CI's does."""
+    wf = (ROOT / ".github/workflows/test.yml").read_text()
+    start = wf.index("- name: Cargo test (secantus-storage, async-oplog lane)")
+    block = wf[start : wf.index("- name: ", start + 1)]
+    for key, value in _gate_rm().ASYNC_OPLOG_ENV.items():
+        assert f'{key}: "{value}"' in block
+    assert "working-directory: crates/secantus-storage" in block

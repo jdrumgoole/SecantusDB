@@ -52,6 +52,20 @@ STORAGE_ENGINE_STEPS = (
 )
 
 
+#: The environment of CI's "Cargo test (secantus-storage, async-oplog lane)"
+#: step in `.github/workflows/test.yml`.
+ASYNC_OPLOG_ENV = {"SECANTUS_OPLOG_ASYNC": "1", "SECANTUS_OPLOG_NONLOGGED": "1"}
+
+
+def rust_env(root: Path) -> dict[str, str]:
+    """The WiredTiger / libclang build environment the `./inv rust-*` tasks
+    use, for a cargo step this gate runs itself."""
+    sys.path.insert(0, str(root))
+    from rust_tasks import _rust_env
+
+    return _rust_env()
+
+
 def not_in_ci(root: Path) -> dict[str, str]:
     """The test files CI deliberately does not run, each with its reason.
 
@@ -93,7 +107,13 @@ class Gate:
         self.out = out
         self.failed = False
 
-    def step(self, name: str, cmd: list[str], env: dict[str, str] | None = None) -> None:
+    def step(
+        self,
+        name: str,
+        cmd: list[str],
+        env: dict[str, str] | None = None,
+        cwd: Path | None = None,
+    ) -> None:
         print(f"==> {name}: {' '.join(cmd)}", flush=True)
         # Each step waits its turn on a busy machine (another lane's gate,
         # another session's build): scripts/wait_for_load.sh has the numbers.
@@ -101,7 +121,11 @@ class Gate:
         start = time.monotonic()
         with (self.out / f"{name}.log").open("w") as log:
             rc = subprocess.run(
-                cmd, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, **(env or {})}
+                cmd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, **(env or {})},
+                cwd=cwd,
             ).returncode
         (self.out / f"{name}.rc").write_text(f"{rc}\n")
         print(f"    {name}={rc} ({int(time.monotonic() - start)}s)", flush=True)
@@ -148,12 +172,28 @@ def main() -> int:
     g.step("rust-test", ["./inv", "rust-test"])
     g.step("wt-test", ["./inv", "rust-wt-test"])
     g.step("storage-test", ["./inv", "rust-storage-test"])
+    # CI's rust-storage job runs the storage crate's tests a second time on
+    # the asynchronous oplog (2026-11-07: RM-361's slot timing passed this
+    # gate and failed only there).
+    g.step(
+        "storage-async-oplog",
+        ["cargo", "test"],
+        cwd=root / "crates/secantus-storage",
+        env={**rust_env(root), **ASYNC_OPLOG_ENV},
+    )
     g.step("adapter-test", ["./inv", "rust-adapter-test"])
     if not args.no_build:
         # What the suites below launch, from HEAD; tools/provenance.py aborts
         # a run against a stale one rather than let it measure old code.
         g.step("binary-build", ["./inv", "rust-binary-build"])
         g.step("server-build", ["./inv", "rust-server-build"])
+        # tools/provenance.py refuses a run while ANY artifact it knows is
+        # stale, not only the ones this gate launches. A lane that once ran
+        # `gate_pg.sh --storage` holds a `secantusd-pg`, so rebuild it too
+        # (2026-11-07: RM-361's gate aborted every pytest step on one built
+        # before a rebase).
+        if (root / "crates/secantus-pg/target/debug/secantusd-pg").exists():
+            g.step("pg-build", ["./inv", "rust-pgserver-build"])
 
     pytest = [str(py), "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rs"]
     timeouts = ["--timeout=120", "--timeout-method=thread", "--max-worker-restart=3"]
