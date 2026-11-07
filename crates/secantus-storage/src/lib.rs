@@ -487,17 +487,26 @@ fn harvest_locked(handle: &mut UserTransactionHandle, rows: Vec<WrittenRow>) {
 impl UserTransactionHandle {
     /// Remove this transaction's minted ranges from the in-flight window and
     /// wake tailable waiters (the visible tail may advance). Idempotent.
-    fn deregister_minted(&mut self) {
+    /// Returns how long, in microseconds, the ranges held their slots open,
+    /// for the caller to credit when the transaction committed.
+    fn deregister_minted(&mut self) -> i64 {
         if self.minted_ranges.is_empty() {
-            return;
+            return 0;
         }
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
         self.minted_total = 0;
+        let mut held = 0;
         for (start, end) in self.minted_ranges.drain(..) {
-            let removed = st.in_flight.remove(&start).map(|(e, _)| e);
-            debug_assert_eq!(removed, Some(end), "in-flight window out of sync");
+            let removed = st.in_flight.remove(&start);
+            debug_assert_eq!(
+                removed.map(|r| r.end),
+                Some(end),
+                "in-flight window out of sync"
+            );
+            held += removed.map_or(0, |r| r.held_micros());
         }
         self.oplog_cv.notify_all();
+        held
     }
 }
 
@@ -3909,6 +3918,41 @@ thread_local! {
     /// RM-023), each `None` until a write of its kind; the whole `None`
     /// while no operation counts them.
     static INDEX_KEYS: Cell<Option<KeyCounts>> = const { Cell::new(None) };
+    /// How long, in microseconds, the operation running on this thread
+    /// held oplog slots open before the writes that minted them committed
+    /// (mongod's `totalOplogSlotDurationMicros`, RM-361); `None` while no
+    /// operation counts it.
+    static OPLOG_SLOT_MICROS: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+/// One run of oplog seqs a write minted that has not resolved yet: mongod's
+/// oplog hole.
+#[derive(Clone, Copy, Debug)]
+struct InFlight {
+    end: i64,
+    /// The timestamp of its first entry.
+    first_ts: u64,
+    minted_at: Instant,
+}
+
+impl InFlight {
+    /// How long the run has held its slots open, in whole microseconds.
+    fn held_micros(&self) -> i64 {
+        i64::try_from(self.minted_at.elapsed().as_micros()).unwrap_or(i64::MAX)
+    }
+}
+
+/// The operation running on this thread held oplog slots open `micros`
+/// more, until the write that minted them committed. mongod times each
+/// reservation from when it is made to its unit of work's commit, and
+/// counts nothing for one that rolls back (`LocalOplogInfo::getNextOpTimes`;
+/// a duplicate-key insert has none, measured 8.2.11).
+fn note_oplog_slot_held(micros: i64) {
+    OPLOG_SLOT_MICROS.with(|m| {
+        if let Some(n) = m.get() {
+            m.set(Some(n.saturating_add(micros)));
+        }
+    });
 }
 
 /// Index keys inserted and deleted; `None`: no write of that kind.
@@ -3931,6 +3975,9 @@ pub struct OperationCounts {
     pub engine: secantus_wt::OperationStats,
     pub keys_inserted: Option<i64>,
     pub keys_deleted: Option<i64>,
+    /// How long the operation held oplog slots open before its writes
+    /// committed, in microseconds (RM-361).
+    pub oplog_slot_micros: i64,
 }
 
 /// Counts the operation running on this thread while it lives
@@ -3939,6 +3986,7 @@ pub struct OperationCounts {
 pub struct OperationScope {
     engine: secantus_wt::OperationStatsScope,
     keys: Option<KeyCounts>,
+    slot_micros: Option<i64>,
     merge: bool,
 }
 
@@ -3949,6 +3997,7 @@ pub fn operation_scope() -> OperationScope {
     OperationScope {
         engine: secantus_wt::operation_stats_scope(),
         keys: INDEX_KEYS.with(|k| k.replace(Some((None, None)))),
+        slot_micros: OPLOG_SLOT_MICROS.with(|m| m.replace(Some(0))),
         merge: true,
     }
 }
@@ -3960,6 +4009,7 @@ pub fn operation_scope_apart() -> OperationScope {
     OperationScope {
         engine: secantus_wt::operation_stats_scope_apart(),
         keys: INDEX_KEYS.with(|k| k.replace(Some((None, None)))),
+        slot_micros: OPLOG_SLOT_MICROS.with(|m| m.replace(Some(0))),
         merge: false,
     }
 }
@@ -3972,6 +4022,7 @@ impl OperationScope {
             engine: self.engine.stats(),
             keys_inserted,
             keys_deleted,
+            oplog_slot_micros: OPLOG_SLOT_MICROS.with(Cell::get).unwrap_or_default(),
         }
     }
 }
@@ -3991,6 +4042,14 @@ impl Drop for OperationScope {
                 }
             }));
         });
+        OPLOG_SLOT_MICROS.with(|m| {
+            let held = m.get().unwrap_or_default();
+            m.set(
+                self.slot_micros
+                    .take()
+                    .map(|outer| if merge { outer + held } else { outer }),
+            );
+        });
     }
 }
 
@@ -4002,6 +4061,7 @@ pub fn operation_counts() -> Option<OperationCounts> {
         engine: secantus_wt::operation_stats().unwrap_or_default(),
         keys_inserted,
         keys_deleted,
+        oplog_slot_micros: OPLOG_SLOT_MICROS.with(Cell::get).unwrap_or_default(),
     })
 }
 
@@ -5244,8 +5304,11 @@ struct OplogState {
     /// event is lost). A rolled-back batch simply deregisters: the abandoned
     /// range vanishes and `min` moves on — a permanent seq hole, which the
     /// shard merge already tolerates. Empty in async mode (async mints
-    /// post-commit; `written_seq` governs visibility there).
-    in_flight: BTreeMap<i64, (i64, u64)>,
+    /// post-commit; `written_seq` governs visibility there). Each range
+    /// keeps its end, its first timestamp and when it was minted: the time
+    /// its write holds the slot open is mongod's
+    /// `totalOplogSlotDurationMicros` (RM-361).
+    in_flight: BTreeMap<i64, InFlight>,
     /// Commit timestamps reserved for transactions that mint no oplog entry
     /// of their own (`reserve_stamp`), each with the next seq when it was
     /// taken: every entry from that seq on is later in time. They hold the
@@ -7951,19 +8014,25 @@ impl Storage {
         // never appear: the abandoned range must not pin the tail forever).
         // The guard drops at function exit, which is after the
         // commit_transaction / rollback_transaction calls below in all paths.
-        struct SyncMintScope<'a>(&'a Storage);
+        // `committed`: the statement's transaction committed, so the time
+        // its ranges held their slots is the operation's (RM-361); a
+        // rolled-back one's is not, as on mongod.
+        struct SyncMintScope<'a>(&'a Storage, bool);
         impl Drop for SyncMintScope<'_> {
             fn drop(&mut self) {
                 IN_SYNC_STMT.with(|f| f.set(false));
                 let ranges = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
-                self.0.deregister_in_flight(&ranges);
+                let held = self.0.deregister_in_flight(&ranges);
+                if self.1 {
+                    note_oplog_slot_held(held);
+                }
                 let reserved = STMT_RESERVED.with(|r| r.replace(0));
                 if reserved != 0 {
                     release_stamp(&self.0.oplog, reserved);
                 }
             }
         }
-        let _sync_scope = if async_mode {
+        let mut sync_scope = if async_mode {
             None
         } else {
             IN_SYNC_STMT.with(|f| f.set(true));
@@ -7972,7 +8041,7 @@ impl Storage {
             // deregister rather than drop them, or they'd pin the tail.
             let stale = PENDING_MINTED.with(|p| std::mem::take(&mut *p.borrow_mut()));
             self.deregister_in_flight(&stale);
-            Some(SyncMintScope(self))
+            Some(SyncMintScope(self, false))
         };
         // The collections this statement writes, for `NS_COMMITS`: the
         // enclosing scope's are kept aside and put back after.
@@ -8042,7 +8111,10 @@ impl Storage {
                     IN_ASYNC_STMT.with(|f| f.set(false));
                     self.drain_pending_oplog();
                 }
-                // Sync: `_sync_scope`'s drop (below, after this return value is
+                if let Some(scope) = sync_scope.as_mut() {
+                    scope.1 = true;
+                }
+                // Sync: `sync_scope`'s drop (below, after this return value is
                 // built) deregisters the statement's minted ranges and wakes
                 // tailable waiters — the rows are committed and the visible
                 // tail advances atomically with the deregistration.
@@ -8092,7 +8164,14 @@ impl Storage {
         let ts: Vec<bson::Timestamp> = (0..n).map(|_| Self::mint_ts(&mut st)).collect();
         if track_in_flight {
             let first = ts.first().map_or(0, |t| ts_u64(*t));
-            st.in_flight.insert(start, (start + n as i64, first));
+            st.in_flight.insert(
+                start,
+                InFlight {
+                    end: start + n as i64,
+                    first_ts: first,
+                    minted_at: Instant::now(),
+                },
+            );
         }
         (start, ts)
     }
@@ -8102,7 +8181,7 @@ impl Storage {
     /// flight, else the newest timestamp minted. Caller holds the oplog
     /// mutex.
     fn all_committed_ts_locked(st: &OplogState) -> u64 {
-        let minted = st.in_flight.values().next().map(|(_, first)| *first);
+        let minted = st.in_flight.values().next().map(|r| r.first_ts);
         let reserved = st.ts_reserved.keys().next().copied();
         match minted.into_iter().chain(reserved).min() {
             Some(first) => first.saturating_sub(1),
@@ -8219,7 +8298,7 @@ impl Storage {
             let st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             let first = minted
                 .iter()
-                .filter_map(|(start, _)| st.in_flight.get(start).map(|(_, ts)| *ts))
+                .filter_map(|(start, _)| st.in_flight.get(start).map(|r| r.first_ts))
                 .min();
             if let Some(ts) = first {
                 return Some((ts, false));
@@ -8241,16 +8320,25 @@ impl Storage {
     /// transaction committed — rows are MVCC-visible — or rolled back — rows
     /// can never appear) and wake tailable waiters: either way the visible
     /// tail may have advanced.
-    fn deregister_in_flight(&self, ranges: &[(i64, i64)]) {
+    /// Returns how long, in microseconds, the ranges held their slots
+    /// open, for the caller to credit when their transaction committed.
+    fn deregister_in_flight(&self, ranges: &[(i64, i64)]) -> i64 {
         if ranges.is_empty() {
-            return;
+            return 0;
         }
         let mut st = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
+        let mut held = 0;
         for (start, end) in ranges {
-            let removed = st.in_flight.remove(start).map(|(e, _)| e);
-            debug_assert_eq!(removed, Some(*end), "in-flight window out of sync");
+            let removed = st.in_flight.remove(start);
+            debug_assert_eq!(
+                removed.map(|r| r.end),
+                Some(*end),
+                "in-flight window out of sync"
+            );
+            held += removed.map_or(0, |r| r.held_micros());
         }
         self.oplog_cv.notify_all();
+        held
     }
 
     /// Build a CRUD oplog entry as raw BSON — `{op, ns, (ui,) o, o2}` in mongod
@@ -8584,8 +8672,14 @@ impl Storage {
         let do_prune = {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             if !deferred {
-                let removed = g.in_flight.remove(&start).map(|(e, _)| e);
-                debug_assert_eq!(removed, Some(start + n), "in-flight window out of sync");
+                let removed = g.in_flight.remove(&start);
+                debug_assert_eq!(
+                    removed.map(|r| r.end),
+                    Some(start + n),
+                    "in-flight window out of sync"
+                );
+                // Its rows committed as they were written.
+                note_oplog_slot_held(removed.map_or(0, |r| r.held_micros()));
                 self.oplog_cv.notify_all();
             }
             g.emit_count += n;
@@ -10727,7 +10821,7 @@ impl Storage {
                     handle
                         .minted_ranges
                         .iter()
-                        .filter_map(|(start, _)| st.in_flight.get(start).map(|(_, ts)| *ts))
+                        .filter_map(|(start, _)| st.in_flight.get(start).map(|r| r.first_ts))
                         .min()
                 } else {
                     None
@@ -10791,8 +10885,9 @@ impl Storage {
                 LAST_COMMIT_TS.with(|t| t.set(first_ts.map(u64_ts)));
                 // Deregister the transaction's minted ranges — its oplog rows
                 // became visible at this commit, not at emit — advancing the
-                // visible tail and waking tailable change-stream waiters.
-                handle.deregister_minted();
+                // visible tail and waking tailable change-stream waiters. The
+                // time they held their slots is the committing operation's.
+                note_oplog_slot_held(handle.deregister_minted());
                 // Async mode: the transaction's buffered entries mint + reach
                 // the drainer only NOW, after the data commit — the user-txn
                 // analogue of `with_statement_txn`'s post-commit drain. An

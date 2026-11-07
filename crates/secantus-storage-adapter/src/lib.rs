@@ -963,6 +963,7 @@ impl CmdStorage for StorageAdapter {
             txn_bytes_dirty: c.engine.txn_bytes_dirty,
             keys_inserted: c.keys_inserted,
             keys_deleted: c.keys_deleted,
+            oplog_slot_micros: c.oplog_slot_micros,
         })
     }
 

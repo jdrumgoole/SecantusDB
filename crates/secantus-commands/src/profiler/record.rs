@@ -651,6 +651,9 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
             entry.insert("keysDeleted", n);
         }
     }
+    if let Some(micros) = crate::opdebug::oplog_slot_micros(ctx.op_counts.as_ref()) {
+        entry.insert("totalOplogSlotDurationMicros", micros);
+    }
     if ok
         && matches!(
             name,
@@ -934,6 +937,8 @@ struct Ran {
     examined: Option<(i64, i64)>,
     keys_inserted: Option<i64>,
     keys_deleted: Option<i64>,
+    /// How long the statement held oplog slots open (RM-361).
+    oplog_slot_micros: i64,
     /// The command's locks so far: a statement's are its command's, which
     /// mongod's statement lines print as they stand.
     locks: Document,
@@ -1033,6 +1038,12 @@ impl Statement {
         if let (Some((keys, docs)), false) = (self.ran.examined, failed) {
             out.insert("keysExamined", keys);
             out.insert("docsExamined", docs);
+        }
+        if self.ran.oplog_slot_micros > 0 {
+            out.insert(
+                "totalOplogSlotDurationMicros",
+                crate::opdebug::append_number(self.ran.oplog_slot_micros),
+            );
         }
         if !failed {
             if let Some(n) = self.ran.keys_inserted {
@@ -1288,6 +1299,8 @@ impl<'a> Statements<'a> {
                 now.and_then(|c| c.keys_deleted),
                 then.and_then(|c| c.keys_deleted),
             ),
+            oplog_slot_micros: now.map_or(0, |c| c.oplog_slot_micros)
+                - then.map_or(0, |c| c.oplog_slot_micros),
             locks,
             flow_control: crate::lock_manager::flow_control_tickets(),
             took_global: crate::lock_manager::took_global(),

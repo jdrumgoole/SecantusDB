@@ -271,6 +271,10 @@ pub struct OperationCounts {
     /// count only for an operation that inserted documents or keys.
     pub keys_inserted: Option<i64>,
     pub keys_deleted: Option<i64>,
+    /// How long the operation held oplog slots open before the writes that
+    /// minted them committed, in microseconds: mongod's
+    /// `totalOplogSlotDurationMicros` (RM-361).
+    pub oplog_slot_micros: i64,
 }
 
 /// The storage operations the command handlers depend on. Bytes at the seam:

@@ -364,6 +364,9 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
             }
         }
     }
+    if let Some(micros) = crate::opdebug::oplog_slot_micros(ctx.op_counts.as_ref()) {
+        out.insert("totalOplogSlotDurationMicros", micros);
+    }
     out.insert("numYields", 0_i64);
     out.insert("reslen", response_length(reply, ctx));
     out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
