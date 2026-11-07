@@ -273,6 +273,10 @@ struct Interp<'a> {
     datums: Vec<Datum>,
     /// The datum of each argument, in declared order, for `$n`.
     arg_slots: Vec<usize>,
+    /// The function's name: the label of the block its parameters are
+    /// declared in, so `fname.p` names the parameter `p`. `None` for a DO
+    /// block.
+    fn_name: Option<String>,
     host: &'a dyn Host,
     trigger: Option<TriggerData>,
     returns_set: bool,
@@ -724,6 +728,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
     let mut interp = Interp {
         datums,
         arg_slots,
+        fn_name: function_name(create_sql),
         host,
         trigger: inv.trigger.clone(),
         returns_set: inv.returns_set,
@@ -800,6 +805,19 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             "2F005",
             "control reached end of function without RETURN",
         )),
+    }
+}
+
+/// The function's own name, as its CREATE FUNCTION spells it.
+fn function_name(create_sql: &str) -> Option<String> {
+    use pg_query::protobuf::node::Node as N;
+    let p = pg_query::parse(create_sql).ok()?;
+    let N::CreateFunctionStmt(c) = p.protobuf.stmts.first()?.stmt.as_ref()?.node.as_ref()? else {
+        return None;
+    };
+    match c.funcname.last()?.node.as_ref()? {
+        N::String(s) => Some(s.sval.clone()),
+        _ => None,
     }
 }
 
@@ -1124,6 +1142,13 @@ impl Interp<'_> {
                             );
                             e.from_sql = true;
                             return Err(e);
+                        } else if !matches!(tok(i + 3), Some(".") | Some("(")) {
+                            // `fname.p`: a variable of the function's own
+                            // block, labelled with its name -- not
+                            // `fname.r.f`, a field of a record parameter.
+                            if let Some((v, ty)) = self.function_level(&name, &field) {
+                                bound = Some((v, ty, i + 2));
+                            }
                         }
                     }
                 } else if next != Some("(") {
@@ -1223,6 +1248,38 @@ impl Interp<'_> {
                     return Some((value.clone(), ty.clone()));
                 }
             }
+        }
+        None
+    }
+
+    /// `label.name` where `label` is the function's own name: the variables
+    /// `do_compile` declares in the block it labels with that name -- the
+    /// parameters (IN and OUT), FOUND and a trigger's TG_ variables. A
+    /// variable of the body's own blocks is not one of them, and a
+    /// parameter shadowed by one is still reached.
+    fn function_level(&self, label: &str, name: &str) -> Option<(Bson, String)> {
+        if self.fn_name.as_deref() != Some(label) {
+            return None;
+        }
+        if let Some(v) = self.trigger_scalar(name) {
+            return Some(v);
+        }
+        let var = |slot: usize| match self.datums.get(slot) {
+            Some(Datum::Var { name: n, ty, value }) if n == name => {
+                Some((value.clone(), ty.clone()))
+            }
+            _ => None,
+        };
+        if let Some(v) = self.arg_slots.iter().find_map(|s| var(*s)) {
+            return Some(v);
+        }
+        if name == "found" {
+            return self.found_no.and_then(var);
+        }
+        if self.out_params.iter().any(|o| o == name) {
+            // The OUT parameters' datums follow the IN ones', ahead of
+            // anything the body declares: the first of that name is it.
+            return (0..self.datums.len()).find_map(var);
         }
         None
     }

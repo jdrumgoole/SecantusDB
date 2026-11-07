@@ -1034,7 +1034,7 @@ pub(crate) fn returns_set(name: &str) -> bool {
 }
 
 /// PostgreSQL's `FigureColname`, for the shapes whose name is certain.
-fn figure_colname(n: &pg_query::protobuf::Node) -> Option<String> {
+pub fn figure_colname(n: &pg_query::protobuf::Node) -> Option<String> {
     match n.node.as_ref()? {
         N::ColumnRef(c) => match c.fields.last()?.node.as_ref()? {
             N::String(s) => Some(s.sval.clone()),

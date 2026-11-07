@@ -1820,20 +1820,6 @@ and most of RP-193 in batch 48; their tests there are regression tests.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`, one row each.
 
-- [ ] **A parameter qualified by its function's name is not bound.**
-      PostgreSQL resolves `fq1.p` in a function `fq1(p int)` as its
-      parameter (`sql_fn_post_column_ref`, `plpgsql_post_column_ref`), at
-      any depth of subquery: `select fq1.p` in a SQL function's body
-      answers 7 for `fq1(7)`, and so do `select (select fq2.p from fs
-      limit 1)`, `select exists (select fq3.p from fs)` (true) and the
-      PL/pgSQL `return (select fq4.p from fs limit 1)`. Here a SQL body's
-      parameters are bound by name token by token (`bind_parameter_names`)
-      and a dotted name is skipped: the first is 42703 `column "fq1" does
-      not exist`, the others 42P01 `missing FROM-clause entry for table
-      "fq2"`. The EXISTS form answered true before RP-443 only because the
-      select list it drops was never read.
-      Backlog-ID: RP-451
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_function_qualified_parameter
 - [ ] **A join's alias is refused or not found.** `select u.a from fs join
       fe using (a) as u` (the `USING ... AS` alias PostgreSQL 14 added) and
       `select j.a from (fs join fe using (a)) as j` answer 1 on PostgreSQL
@@ -1896,6 +1882,60 @@ and `fs(a int, c text)`, one row each.
       them 42P01.) Measured on PostgreSQL 15.19.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_from_subquery_sibling_is_not_visible
       Backlog-ID: RP-460
+
+## Found while working RP-451 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
+`fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
+
+- [ ] **A SQL function's bare parameter name is replaced wherever it is a
+      word.** PostgreSQL resolves an unqualified name as a column first and
+      as a parameter only when no column of that name is in scope
+      (`sql_fn_post_column_ref`), and a name that is not a reference at all
+      -- an output alias -- is never a parameter: `gb(a int)` with the body
+      `select a from fe` answers fe's 1 for `gb(7)`, and `gal(p int)` with
+      `select 1 as p` answers 1. Here every identifier token naming a
+      parameter becomes `$n` (`bind_parameter_names`), so the first answers
+      7 and the second is 42601 `syntax error at or near "$1"`. The
+      faithful fix resolves a parameter where the planner fails to resolve
+      a column (the post-columnref hook), not by token; RP-451 resolved the
+      qualified form `fname.p` by token with a catalog check, which that
+      hook would replace.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_bare_parameter_name
+      Backlog-ID: RP-461
+- [ ] **A composite parameter's field is not read.** `gr1(r fe)` with
+      `select r.a` and `gr2(r fe)` with `select gr2.r.a` answer 2 for
+      `row(2, 'z')::fe` on PostgreSQL; here both are 42P01 `missing
+      FROM-clause entry for table "r"`.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_composite_parameter_field
+      Backlog-ID: RP-462
+- [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
+      declare x int := 3; begin return blk.x + p; end` answers 10 for
+      `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table
+      "blk"`. The function's own name, the label of the block its
+      parameters are declared in, qualifies them since RP-451; a label the
+      body writes does not.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_block_label_qualifies_a_variable
+      Backlog-ID: RP-463
+- [ ] **A SQL function whose last statement is an INSERT, UPDATE or DELETE
+      ... RETURNING returns NULL.** `gi(p int)` with `insert into fs values
+      (p, 'i') returning p * 2` answers 8 for `gi(4)` on PostgreSQL, and so
+      do `returning a * 2` and `update fs set a = p returning a * 2`;
+      `delete from fs where a = p returning c` answers `y` for 1. Here each
+      is NULL -- a silent wrong answer -- while a prepared `insert ...
+      returning $1 * 2` answers 8: the function's result path drops the
+      RETURNING rows.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_returning_statement_is_the_result
+      Backlog-ID: RP-464
+- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
+      `check_function_bodies` on, its default, PostgreSQL parses and
+      analyses each statement at CREATE: a body `select gx.q` is 42P01
+      `missing FROM-clause entry for table "gx"` at 65, `select nosuch`
+      42703 `column "nosuch" does not exist` at 65, `select 1 from nosuch`
+      42P01 `relation "nosuch" does not exist` at 72. Here each CREATE
+      succeeds and the error waits for the first call.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
+      Backlog-ID: RP-465
 
 ## Found while working RP-316 (2026-11-02)
 
