@@ -68,6 +68,9 @@ struct Scope<'p> {
     /// unqualified reference: PostgreSQL resolves one through the join's
     /// RTE, whose merged column has the sides' common type.
     merged: Vec<(Column, std::ops::Range<usize>)>,
+    /// A USING join's alias (`join b using (x) as u`) with the merged
+    /// columns it names.
+    using_aliases: Vec<(String, Vec<Column>)>,
 }
 
 impl<'p> Scope<'p> {
@@ -85,6 +88,7 @@ impl<'p> Scope<'p> {
             lookup: Some(lookup),
             ctes: ctes.to_vec(),
             merged: Vec::new(),
+            using_aliases: Vec::new(),
         };
         for item in items {
             scope.add(item, ctes, lookup);
@@ -279,19 +283,47 @@ impl<'p> Scope<'p> {
                 // reads the merged one, typed by `select_common_type` over
                 // the sides', not either side's own. Only when every leaf of
                 // the join was typed, one table each, so the leaves line up.
-                if (j.is_natural || !j.using_clause.is_empty())
-                    && self.tables.len() - start == leaf_count(item)
-                {
-                    let mut leaves = self.tables[start..].iter().map(|(_, d)| d);
-                    let sides = j
-                        .larg
-                        .as_deref()
-                        .and_then(|l| item_columns(l, &mut leaves))
-                        .zip(j.rarg.as_deref().and_then(|r| item_columns(r, &mut leaves)));
-                    if let Some((n, cols)) = sides.and_then(|(l, r)| merge_using(j, l, r)) {
+                let typed = self.tables.len() - start == side_leaves(j);
+                let columns = typed
+                    .then(|| {
+                        let mut leaves = self.tables[start..].iter().map(|(_, d)| d);
+                        let sides = j
+                            .larg
+                            .as_deref()
+                            .and_then(|l| item_columns(l, &mut leaves))
+                            .zip(j.rarg.as_deref().and_then(|r| item_columns(r, &mut leaves)));
+                        sides.and_then(|(l, r)| merge_using(j, l, r))
+                    })
+                    .flatten();
+                if j.is_natural || !j.using_clause.is_empty() {
+                    if let Some((n, cols)) = &columns {
                         let range = start..self.tables.len();
                         self.merged
-                            .extend(cols.into_iter().take(n).map(|c| (c, range.clone())));
+                            .extend(cols.iter().take(*n).map(|c| (c.clone(), range.clone())));
+                        if let Some(u) = &j.join_using_alias {
+                            self.using_aliases
+                                .push((u.aliasname.clone(), cols[..*n].to_vec()));
+                        }
+                    }
+                }
+                // `(a join b) as j(x, ...)`: one entry, named `j`, whose
+                // columns are those `*` lists, renamed in order; the sides'
+                // entries and names are hidden behind it.
+                if let Some(alias) = &j.alias {
+                    match columns {
+                        Some((_, mut cols)) if alias.colnames.len() <= cols.len() => {
+                            for (c, n) in cols.iter_mut().zip(names_of_list(&alias.colnames)) {
+                                c.name = n;
+                            }
+                            self.tables.truncate(start);
+                            self.merged.retain(|(_, r)| r.start < start);
+                            self.using_aliases.clear();
+                            self.tables.push((
+                                alias.aliasname.clone(),
+                                TableDef::new(&alias.aliasname, cols),
+                            ));
+                        }
+                        _ => self.complete = false,
                     }
                 }
             }
@@ -309,6 +341,7 @@ impl<'p> Scope<'p> {
             lookup: self.lookup,
             ctes: self.ctes.clone(),
             merged: self.merged.clone(),
+            using_aliases: self.using_aliases.clone(),
         }
     }
 
@@ -480,8 +513,14 @@ impl<'p> Scope<'p> {
             }
             [q, col] => match self.tables.iter().find(|(a, _)| a == q) {
                 Some((_, d)) => d.column(col).map(|c| c.pg_type.clone()),
-                None if self.complete => self.parent?.column_type(c),
-                None => None,
+                None => match self.using_aliases.iter().find(|(a, _)| a == q) {
+                    Some((_, cols)) => cols
+                        .iter()
+                        .find(|c| c.name == *col)
+                        .map(|c| c.pg_type.clone()),
+                    None if self.complete => self.parent?.column_type(c),
+                    None => None,
+                },
             },
             _ => None,
         }
@@ -531,7 +570,12 @@ fn item_columns(
     item: &pg_query::protobuf::Node,
     leaves: &mut dyn Iterator<Item = &TableDef>,
 ) -> Option<Vec<Column>> {
-    let Some(N::JoinExpr(j)) = item.node.as_ref() else {
+    let Some(N::JoinExpr(j)) = item
+        .node
+        .as_ref()
+        .filter(|n| !matches!(n, N::JoinExpr(j) if j.alias.is_some()))
+    else {
+        // A table, or an aliased JOIN, which `Scope::add` gave one entry.
         return Some(leaves.next()?.columns.clone());
     };
     let left = item_columns(j.larg.as_deref()?, leaves)?;
@@ -549,10 +593,6 @@ fn merge_using(
     left: Vec<Column>,
     right: Vec<Column>,
 ) -> Option<(usize, Vec<Column>)> {
-    // Renamed by an alias list: not followed here.
-    if j.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
-        return None;
-    }
     let using: Vec<String> = if j.is_natural {
         left.iter()
             .filter(|l| right.iter().any(|r| r.name == l.name))
@@ -594,11 +634,24 @@ fn merge_using(
 /// How many FROM leaves a FROM item holds: one, or a join's sides' sum.
 fn leaf_count(item: &pg_query::protobuf::Node) -> usize {
     match item.node.as_ref() {
-        Some(N::JoinExpr(j)) => {
-            j.larg.as_deref().map_or(0, leaf_count) + j.rarg.as_deref().map_or(0, leaf_count)
-        }
+        Some(N::JoinExpr(j)) if j.alias.is_none() => side_leaves(j),
         _ => 1,
     }
+}
+
+/// How many entries a join's two sides hold in `Scope::tables`.
+fn side_leaves(j: &pg_query::protobuf::JoinExpr) -> usize {
+    j.larg.as_deref().map_or(0, leaf_count) + j.rarg.as_deref().map_or(0, leaf_count)
+}
+
+/// The names of an alias's column list.
+fn names_of_list(list: &[pg_query::protobuf::Node]) -> Vec<String> {
+    list.iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 thread_local! {
@@ -1683,6 +1736,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                     lookup: Some(cx.lookup),
                     ctes: cx.ctes.clone(),
                     merged: Vec::new(),
+                    using_aliases: Vec::new(),
                 };
                 for side in j.larg.iter().chain(j.rarg.iter()) {
                     on.add(side, &cx.ctes, cx.lookup);

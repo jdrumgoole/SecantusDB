@@ -338,10 +338,15 @@ fn from_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
         ),
         Some(N::RangeSubselect(s)) => out.extend(s.alias.as_ref().map(|a| a.aliasname.clone())),
         Some(N::RangeFunction(f)) => out.extend(f.alias.as_ref().map(|a| a.aliasname.clone())),
+        // An aliased JOIN goes by its alias alone.
+        Some(N::JoinExpr(j)) if j.alias.is_some() => {
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+        }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 from_aliases(side, out);
             }
+            out.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
         }
         _ => {}
     }

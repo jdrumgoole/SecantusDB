@@ -22378,10 +22378,16 @@ fn collect_visible_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>)
                 .map(|a| a.aliasname.clone())
                 .unwrap_or_else(|| r.relname.clone()),
         ),
+        // An aliased JOIN is named by its alias alone; its sides' names,
+        // a USING alias among them, are hidden.
+        Some(N::JoinExpr(j)) if j.alias.is_some() => {
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+        }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 collect_visible_names(side, out);
             }
+            out.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
         }
         _ => collect_from_names(item, out),
     }

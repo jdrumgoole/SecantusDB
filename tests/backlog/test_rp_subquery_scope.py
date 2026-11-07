@@ -1,14 +1,18 @@
 """Gap tests of the name-scope divergences found while working RP-443:
 RP-451 (a parameter qualified by its function's name was not bound; fixed), RP-453
 (a correlated subquery's value read from a CTE or a write's target came
-out text; fixed), RP-454 (a join's alias is refused or not found), RP-456
-(a CTE hidden by its alias still answered to its name in a subquery;
-fixed) and RP-457 (an UPDATE ... FROM's or DELETE ... USING's RETURNING subquery
-cannot read the FROM); the regression test of RP-455 (a write's target was
-not an enclosing relation to its subqueries, and an enclosing level's
-hidden table name was not `errorMissingRTE`'s "invalid reference"); and,
-found while working RP-455, RP-460 (a subquery inside a FROM-subquery is
-offered a sibling's alias as its hint).
+out text; fixed), RP-454 (a join's alias was refused or not found;
+fixed), RP-456 (a CTE hidden by its alias still answered to its name in a
+subquery; fixed) and RP-457 (an UPDATE ... FROM's or DELETE ... USING's
+RETURNING subquery cannot read the FROM); the regression test of RP-455 (a
+write's target was not an enclosing relation to its subqueries, and an
+enclosing level's hidden table name was not `errorMissingRTE`'s "invalid
+reference"); found while working RP-455, RP-460 (a subquery inside a
+FROM-subquery is offered a sibling's alias as its hint); and found while
+working RP-454, RP-469 (a FROM item named as a table an aliased JOIN hides
+is refused), RP-470 (a whole-row reference to a joined table), RP-471
+(EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an aliased JOIN)
+and RP-468 (a correlated subquery reading a join's column gets text).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -205,15 +209,105 @@ def test_correlated_value_keeps_its_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CORRELATED_VALUE_TYPE[query]
 
 
+_FS_HIDDEN = (
+    "42P01",
+    'invalid reference to FROM-clause entry for table "fs"',
+    'There is an entry for table "fs", but it cannot be referenced from this part of the query.',
+)
+
+# A join's alias (`(fs join fe using (a)) as j`) names the join's columns,
+# the ones `*` lists, renamed by a column list; it hides the sides' names.
+# A USING join's alias (`using (a) as u`, PostgreSQL 14) names its merged
+# columns only, beside the sides' names. The first was 0A000 `an aliased
+# JOIN is not supported yet`, the second 42P01 `missing FROM-clause entry
+# for table "u"`, and inside a subquery a 42883 naming the correlated
+# rewrite's internal function.
 JOIN_ALIAS = {
     "select u.a from fs join fe using (a) as u": [(1,)],
     "select (select u.a from fs join fe using (a) as u limit 1)": [(1,)],
     "select j.a from (fs join fe using (a)) as j": [(1,)],
     "select (select j.a from (fs join fe using (a)) as j limit 1)": [(1,)],
+    "select * from (fs join fe using (a)) as j": [(1, "y", "x")],
+    "select j.* from (fs join fe on fs.a = fe.a) as j": [(1, "y", 1, "x")],
+    "select j.x, j.y, j.b from (fs join fe using (a)) as j(x, y)": [(1, "y", "x")],
+    "select * from (fs join fe using (a)) as j(x, y)": [(1, "y", "x")],
+    "select u.* from fs join fe using (a) as u": [(1,)],
+    "select fs.c, fe.b, u.a from fs join fe using (a) as u": [("y", "x", 1)],
+    "select u.c from fs join fe using (a) as u": (
+        "42703",
+        "column u.c does not exist",
+        'Perhaps you meant to reference the column "fs.c".',
+        "8",
+    ),
+    "select fs.a from (fs join fe using (a)) as j": (*_FS_HIDDEN, "8"),
+    "select j.a from (fs join fe on fs.a = fe.a) as j": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "8",
+    ),
+    "select * from (fs join fe using (a)) as j(x, y, z, w)": (
+        "42P10",
+        'join expression "j" has 3 columns available but 4 columns specified',
+        None,
+        None,
+    ),
+    # The operator check sees the join's column through its alias; the
+    # comparison across types matched nothing and answered no rows.
+    "select * from (fs join fe using (a)) as j where j.b = 1": (
+        "42883",
+        "operator does not exist: text = integer",
+        "No operator matches the given name and argument types."
+        " You might need to add explicit type casts.",
+        "53",
+    ),
+    "select * from fs join fe using (a) as u where u.a = 'q'": (
+        "22P02",
+        'invalid input syntax for type integer: "q"',
+        None,
+        "53",
+    ),
+    "select * from fs join fe using (a) as fs": (
+        "42712",
+        'table name "fs" specified more than once',
+        None,
+        None,
+    ),
+    "select u.a from (fs join fe using (a) as u) as x": (
+        "42P01",
+        'missing FROM-clause entry for table "u"',
+        None,
+        "8",
+    ),
+    # A nested USING join's merged column is visible in an enclosing ON;
+    # it was dropped from it, so a bare `a` read `x.a` alone.
+    "select * from fs join fe using (a) join fe x on a = x.a": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "49",
+    ),
+    "select j.c from (fs join fe using (a)) as j join fe x on j.a = x.a": [("y",)],
+    "select j.c from (fs join fe using (a)) as j join fe x on fs.a = x.a": (*_FS_HIDDEN, "58"),
+    "select exists (select j.c from (fs join fe using (a)) as j)": [(True,)],
+    "select exists (select u.a from fs join fe using (a) as u)": [(True,)],
+    # A name the alias hides is the enclosing query's, when it has one.
+    "select (select fs.a from (fs join fe using (a)) as j) from fs": [(1,)],
+    "select (select fs.a from (fs join fe using (a)) as j)": (*_FS_HIDDEN, "16"),
+    "select * from fe where exists (select from (fs join fe x using (a)) as j where j.b = fe.b)": [
+        (1, "x")
+    ],
+    "select j.c from (fs left join fe on fs.a = fe.a + 1) as j where j.b is null": [("y",)],
+    "select k.c, k.b from ((fs join fe using (a)) as j join fe x using (a)) as k": (
+        "42702",
+        'column reference "b" is ambiguous',
+        None,
+        "13",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-454")
+@pytest.mark.backlog_fixed("RP-454")
 @pytest.mark.parametrize("query", list(JOIN_ALIAS))
 def test_join_alias(query: str, dsn: str) -> None:
     assert answer(dsn, query) == JOIN_ALIAS[query]
@@ -278,3 +372,107 @@ FROM_SUBQUERY_SIBLING = {
 @pytest.mark.parametrize("query", list(FROM_SUBQUERY_SIBLING))
 def test_from_subquery_sibling_is_not_visible(query: str, dsn: str) -> None:
     assert answer(dsn, query) == FROM_SUBQUERY_SIBLING[query]
+
+
+# Found while working RP-454. An aliased JOIN hides its sides' names, so
+# another FROM item may reuse one; here the two leaves' keys would be one
+# (a joined row is keyed by the table's alias), and it is refused by name.
+HIDDEN_NAME_REUSED = {
+    "select * from (fs join fe using (a)) as j, fs": [(1, "y", "x", 1, "y")],
+    "select * from fs, (fs join fe using (a)) as j": [(1, "y", 1, "y", "x")],
+}
+
+
+@pytest.mark.backlog("RP-469")
+@pytest.mark.parametrize("query", list(HIDDEN_NAME_REUSED))
+def test_hidden_join_name_reused(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == HIDDEN_NAME_REUSED[query]
+
+
+# A FROM item's name alone is its whole row; over a join it was 42703
+# (or, for `fe.*` cast, 42P01 invalid reference).
+WHOLE_ROW_OVER_A_JOIN = {
+    "select fs from fs, fe": [("(1,y)",)],
+    "select fs from fs join fe using (a)": [("(1,y)",)],
+    "select fe.*::text from fs join fe using (a)": [("(1,x)",)],
+    "select j from (fs join fe using (a)) as j": [(("1", "y", "x"),)],
+}
+
+
+@pytest.mark.backlog("RP-470")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_OVER_A_JOIN))
+def test_whole_row_over_a_join(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_OVER_A_JOIN[query]
+
+
+_JOIN_PLAN = [
+    ("Hash Join",),
+    ("  Hash Cond: (fs.a = fe.a)",),
+    ("  ->  Seq Scan on fs",),
+    ("  ->  Hash",),
+    ("        ->  Seq Scan on fe",),
+    ("              Filter: (b = 'x'::text)",),
+]
+
+# PostgreSQL flattens a join alias's columns to the sides' own
+# (`flatten_join_alias_vars`), so `j.b = 'x'` is `fe`'s scan filter and the
+# plan is the unaliased one's. Here the aliased form prints no Hash Cond
+# and keeps the conjunct above the join.
+ALIASED_JOIN_PLAN = {
+    "explain (costs off) select fs.c from fs join fe on fs.a = fe.a where fe.b = 'x'": _JOIN_PLAN,
+    "explain (costs off) select j.c from (fs join fe on fs.a = fe.a) as j where j.b = 'x'": (
+        _JOIN_PLAN
+    ),
+}
+
+
+@pytest.mark.backlog("RP-471")
+@pytest.mark.parametrize("query", list(ALIASED_JOIN_PLAN))
+def test_aliased_join_plan(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == ALIASED_JOIN_PLAN[query]
+
+
+# ruleutils prints an aliased JOIN with its alias (and a column list when
+# the join's names repeat), and a USING alias's column by the left side's
+# name; here the view's own text comes back.
+ALIASED_JOIN_VIEWDEF = {
+    "select j.c from (fs join fe using (a)) as j": (
+        " SELECT j.c\n   FROM (fs\n     JOIN fe USING (a)) j;"
+    ),
+    "select u.a from fs join fe using (a) as u": (
+        " SELECT fs.a\n   FROM (fs\n     JOIN fe USING (a) AS u);"
+    ),
+    "select j.c from (fs join fe on fs.a = fe.a) as j": (
+        " SELECT j.c\n   FROM (fs\n     JOIN fe ON ((fs.a = fe.a))) j(a, c, a_1, b);"
+    ),
+}
+
+
+@pytest.mark.backlog("RP-467")
+@pytest.mark.parametrize("query", list(ALIASED_JOIN_VIEWDEF))
+def test_aliased_join_viewdef(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("create view rp_v as " + query)
+        try:
+            row = c.execute("select pg_get_viewdef('rp_v')").fetchone()
+        finally:
+            c.execute("drop view rp_v")
+    assert row is not None and row[0] == ALIASED_JOIN_VIEWDEF[query]
+
+
+# A correlated subquery's value read from a join's column has that
+# column's type, `integer`; it came out text, as RP-453's lookup of the
+# outer reference's type does not reach into a join.
+JOIN_COLUMN_IN_A_SUBQUERY = {
+    "select (select fs.a from fe where fe.a = fs.a) from fs join fe using (a)": [(1,)],
+    "select (select j.a from fe limit 1) from (fs join fe using (a)) as j": [(1,)],
+    "select (select u.a from fe limit 1) from fs join fe using (a) as u": [(1,)],
+}
+
+
+@pytest.mark.backlog("RP-468")
+@pytest.mark.parametrize("query", list(JOIN_COLUMN_IN_A_SUBQUERY))
+def test_join_column_in_a_subquery_keeps_its_type(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == JOIN_COLUMN_IN_A_SUBQUERY[query]

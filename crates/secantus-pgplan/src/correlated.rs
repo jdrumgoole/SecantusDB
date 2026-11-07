@@ -275,7 +275,11 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| r.relname.clone()),
             ),
-            Some(N::JoinExpr(_)) => {}
+            // A join's own names: its alias, and a USING join's alias.
+            Some(N::JoinExpr(j)) => {
+                names.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+                names.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
+            }
             _ => collect_from_names(item, names),
         }
         match item.node.as_ref() {
@@ -286,10 +290,22 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
                     select(body, names);
                 }
             }
-            Some(N::JoinExpr(j)) => {
+            Some(N::JoinExpr(j)) if j.alias.is_none() => {
                 for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                     from_item(side, names);
                 }
+            }
+            // An aliased JOIN hides its sides' names: `fs.a` over `(fs join
+            // fe using (a)) as j` is the enclosing query's `fs` -- unless no
+            // enclosing query has one, when it is this hidden entry, which
+            // planning reports as PostgreSQL's "invalid reference".
+            Some(N::JoinExpr(j)) => {
+                let mut hidden = Vec::new();
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    from_item(side, &mut hidden);
+                }
+                let outer = OUTER_RELATIONS.with(|o| o.borrow().clone());
+                names.extend(hidden.into_iter().filter(|n| !outer.contains(n)));
             }
             _ => {}
         }
