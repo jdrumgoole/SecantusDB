@@ -933,22 +933,6 @@ Python behind the Rust server, a deferral answers 2 "aggregation pipeline
 uses a stage or operator not supported by the Rust server". The file has
 about forty such points; these are the ones measured.
 
-- [ ] **A multi-document write interrupted while it reads its candidates
-      writes nothing, where mongod keeps what it wrote.** mongod tests and
-      writes each document as its scan reaches it (a deleteMany a batch of
-      10 at a time), so one killed or out of `maxTimeMS` part-way has
-      written the documents before. This server reads every candidate before
-      it tests or writes one, and on a replica set first works out mongod's
-      order for a deleteMany by testing every document; an interrupt in
-      either leaves nothing written (mongod 8.2.11, 2026-10-27: a deleteMany
-      killed 1.5 s into 100 slow documents had deleted 20, this server 0; an
-      updateMany of 200,000 documents at `maxTimeMS: 5` had updated 1,536,
-      this server 0). An interrupt or a filter error once the documents are
-      read keeps the ones before, as mongod does (RM-313, RM-322). The work
-      is to stream the candidates into the write, and to carry the order's
-      tests into the delete rather than repeat them.
-      Backlog-ID: RM-323
-      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_a_killed_delete_many_keeps_the_batches_it_deleted, tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_out_of_time_keeps_the_documents_it_updated
 - [ ] **A write tests its filter against each document twice.** mongod
       tests an update's or a delete's filter once per document, so writing
       one document whose filter is slow takes as long as a `find` of it
@@ -964,6 +948,23 @@ about forty such points; these are the ones measured.
       which names the deleteMany case as an interrupt bug.
       Verify: tests/backlog/test_rm_found_2026_11_07d.py::test_a_write_tests_each_document_once
       Backlog-ID: RM-391
+- [ ] **An updateMany whose plan the write cannot stream reads every
+      candidate before it writes one.** mongod updates each document as its
+      scan reaches it, whatever the plan, so one out of `maxTimeMS` part-way
+      has updated some (mongod 8.2.11, 2026-11-07: 100,000 documents in a
+      collection clustered by `_id`, `maxTimeMS: 30`). This server's write
+      takes a streamed plan's documents a pull at a time (RM-323), but a
+      plan the stream does not run -- a clustered or time-series
+      collection, a contested or geo plan -- leaves the update to the
+      store's own candidates, read whole (`candidate_docs`) before any is
+      tested, and a budget spent in that read updates nothing. Its deleteMany
+      deletes each staged batch as it tests, but on a replica set a
+      contested or geo plan is first read and tested whole to work out
+      mongod's order (`delete_order`; read from the code, not yet probed).
+      The work is to read the store's candidates a page at a time into the
+      write, and to stream the order.
+      Backlog-ID: RM-390
+      Verify: tests/backlog/test_rm_found_2026_10_27.py::test_an_update_many_of_a_clustered_collection_out_of_time_keeps_its_updates
 - [ ] **`$near` returns documents tied at one distance in the macOS build's
       order, not the Linux build's.** mongod's builds disagree: for four
       points at distance 1, Linux x86-64 8.2.12 (CI) answers `[2, 1, 3, 0]`,

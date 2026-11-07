@@ -87,11 +87,17 @@ def test_a_delete_many_failing_part_way_keeps_the_batches_before(
         assert _delete_fails_at(rust_mongo, at) == theirs, at
 
 
-def _delete_many_killed(client: Any) -> tuple:
-    """A deleteMany of 100 slow documents, its session killed 1.5 s in:
-    its answer, and whether it had deleted any."""
+def _delete_many_killed(client: Any, clustered: bool = False) -> tuple:
+    """A deleteMany of 100 slow documents (in a collection clustered by
+    `_id` when `clustered`), its session killed 1.5 s in: its answer, and
+    whether it had deleted any."""
     slow = Slow(client)
     slow.seed(100, 0.04)
+    if clustered:
+        docs = slow.run({"find": "c", "batchSize": 1000})["cursor"]["firstBatch"]
+        slow.run({"drop": "c"})
+        slow.run({"create": "c", "clusteredIndex": {"key": {"_id": 1}, "unique": True}})
+        slow.run({"insert": "c", "documents": docs})
     lsid = {"id": Binary(uuid.uuid4().bytes, 4)}
     command = {"delete": "c", "deletes": [{"q": SLOW, "limit": 0}], "lsid": lsid}
     replies: list = []
@@ -105,23 +111,26 @@ def _delete_many_killed(client: Any) -> tuple:
     return replies[0].get("code"), left < 100
 
 
-@pytest.mark.backlog("RM-323")
+@pytest.mark.backlog_fixed("RM-323")
 def test_a_killed_delete_many_keeps_the_batches_it_deleted(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 deletes a deleteMany's documents a batch at a time as
     its scan finds them, so one killed 1.5 s into 100 slow documents has
-    deleted some (20, measured 2026-10-27). On a replica set this server
-    first works out mongod's order, testing every document, and a kill
-    there leaves nothing deleted."""
+    deleted some (20, measured 2026-10-27). This server read and tested
+    every document before it deleted one, and a kill there left nothing
+    deleted."""
     theirs = _delete_many_killed(mongod_rs)
     assert theirs == (11601, True), theirs
     assert _delete_many_killed(rust_mongo) == theirs
 
 
-def _update_many_out_of_time(client: Any) -> tuple:
-    """An updateMany of 100,000 plain documents with `maxTimeMS: 30`: its
-    error code, and whether it had updated any."""
+def _update_many_out_of_time(client: Any, clustered: bool = False) -> tuple:
+    """An updateMany of 100,000 plain documents (in a collection clustered
+    by `_id` when `clustered`) with `maxTimeMS: 30`: its error code, and
+    whether it had updated any."""
     db = client["rm323"]
     db.drop_collection("c")
+    if clustered:
+        db.create_collection("c", clusteredIndex={"key": {"_id": 1}, "unique": True})
     for start in range(0, 100_000, 10_000):
         db.c.insert_many([{"_id": i, "k": i % 7, "n": 0} for i in range(start, start + 10_000)])
     command = {
@@ -134,18 +143,34 @@ def _update_many_out_of_time(client: Any) -> tuple:
     return answer[:2], 0 < updated < 100_000
 
 
-@pytest.mark.backlog("RM-323")
+@pytest.mark.backlog_fixed("RM-323")
 def test_an_update_many_out_of_time_keeps_the_documents_it_updated(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11 updates documents as its scan reads them, so an
     updateMany whose `maxTimeMS` runs out part-way has updated some (1,536
-    of 200,000 at 5 ms, measured 2026-10-27). This server reads every
-    candidate before it tests or writes one, and a budget spent in that
-    read leaves nothing updated."""
+    of 200,000 at 5 ms, measured 2026-10-27). This server read every
+    candidate before it tested or wrote one, and a budget spent in that
+    read left nothing updated."""
     theirs = _update_many_out_of_time(mongod_rs)
     assert theirs == (("err", 50), True), theirs
     assert _update_many_out_of_time(rust_mongo) == theirs
+
+
+@pytest.mark.backlog("RM-390")
+def test_an_update_many_of_a_clustered_collection_out_of_time_keeps_its_updates(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 updates a clustered collection's documents as its scan
+    reads them, as it does any collection's, so an updateMany whose
+    `maxTimeMS` runs out part-way has updated some (measured 2026-11-07).
+    A plan this server's write cannot stream -- a clustered or time-series
+    collection, a contested or geo plan -- leaves the update to read every
+    candidate before it tests or writes one, and a budget spent in that
+    read leaves nothing updated."""
+    theirs = _update_many_out_of_time(mongod_rs, clustered=True)
+    assert theirs == (("err", 50), True), theirs
+    assert _update_many_out_of_time(rust_mongo, clustered=True) == theirs
 
 
 def _running_bulk_write(client: Any) -> list:

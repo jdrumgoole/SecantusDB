@@ -83,6 +83,7 @@ pub fn collection_walks() -> u64 {
 pub(crate) const PITR_MANIFEST_NAME: &str = "pitr-manifest.json";
 
 use std::cell::Cell;
+use std::ptr::NonNull;
 
 thread_local! {
     /// The active multi-document-transaction session for the current thread, or
@@ -4124,6 +4125,86 @@ pub fn with_candidate_order<T>(order: Vec<i64>, f: impl FnOnce() -> T) -> T {
     }
     let _r = Restore(CANDIDATE_ORDER.with(|o| o.replace(Some(order))));
     f()
+}
+
+/// One pull from a write's candidate source ([`with_candidate_source`]).
+pub struct Pulled {
+    /// The rows the source's read matched, in its order, each with the
+    /// bytes it matched it as.
+    pub rows: Vec<(i64, Vec<u8>)>,
+    /// The read is at its end: no rows follow these.
+    pub exhausted: bool,
+    /// The read stopped part-way (an interrupt, a filter that failed on a
+    /// document): `rows` are the ones it matched before. The source holds
+    /// the error, and the write answers it.
+    pub stopped: bool,
+}
+
+/// A write's candidate source: up to `want` matches, and none past the
+/// one that brings them to `max_bytes`, read on from the last pull.
+pub type CandidateSource<'a> = dyn FnMut(usize, usize) -> Pulled + 'a;
+
+thread_local! {
+    /// The candidate source the next write on this thread draws from
+    /// (`with_candidate_source`), its lifetime erased; only ever set while
+    /// that call runs.
+    static CANDIDATE_SOURCE: Cell<Option<NonNull<CandidateSource<'static>>>> =
+        const { Cell::new(None) };
+}
+
+/// Run `f` with the next write drawing its candidates from `source` as it
+/// writes them, the way mongod's write stage pulls each document from its
+/// plan (RM-323): an unbounded update or delete outside a transaction tests
+/// and writes a pull at a time, so one interrupted or failing part-way keeps
+/// what it wrote before. Any other write takes every row first. Restored on
+/// return, panic included.
+pub fn with_candidate_source<T>(source: &mut CandidateSource<'_>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<NonNull<CandidateSource<'static>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CANDIDATE_SOURCE.with(|s| s.set(self.0));
+        }
+    }
+    let ptr: NonNull<CandidateSource<'_>> = NonNull::from(source);
+    // SAFETY: only the lifetime changes. The pointer is reachable through
+    // the thread-local only while `f` runs -- `Restore` puts the previous
+    // value back on return and on unwind -- and `source` is borrowed for
+    // all of this call, so it outlives every use.
+    let ptr: NonNull<CandidateSource<'static>> = unsafe { std::mem::transmute(ptr) };
+    let _r = Restore(CANDIDATE_SOURCE.with(|s| s.replace(Some(ptr))));
+    f()
+}
+
+/// The candidate source set for this write, taken so that nothing the
+/// write runs draws on it again. It stays valid until the
+/// [`with_candidate_source`] call that set it returns.
+struct TakenSource(NonNull<CandidateSource<'static>>);
+
+impl TakenSource {
+    fn take() -> Option<Self> {
+        CANDIDATE_SOURCE.with(|s| s.take()).map(TakenSource)
+    }
+
+    fn pull(&mut self, want: usize, max_bytes: usize) -> Pulled {
+        // SAFETY: see `with_candidate_source`; a `TakenSource` lives only
+        // inside the write that call runs, and is used by one thread.
+        unsafe { (*self.0.as_ptr())(want, max_bytes) }
+    }
+
+    /// Every row the source matches, in its order: `None` when it stopped.
+    fn drain(&mut self) -> Option<Vec<i64>> {
+        let mut rows = Vec::new();
+        loop {
+            let pulled = self.pull(0, usize::MAX);
+            rows.extend(pulled.rows.into_iter().map(|(rid, _)| rid));
+            if pulled.stopped {
+                return None;
+            }
+            if pulled.exhausted {
+                return Some(rows);
+            }
+        }
+    }
 }
 
 fn doc_makes_multikey(doc: &Document, key_spec: &Document) -> bool {
@@ -19699,6 +19780,12 @@ impl Storage {
         if let Some(order) = CANDIDATE_ORDER.with(|o| o.borrow().clone()) {
             return self.rows_by_recordids(session, db, coll, order);
         }
+        // A write that does not draw a pull at a time takes the source's
+        // every row first, the same way.
+        if let Some(mut source) = TakenSource::take() {
+            let order = source.drain().ok_or(StorageError::MaxTimeExpired)?;
+            return self.rows_by_recordids(session, db, coll, order);
+        }
         // `force_scan` (a collation is active) bypasses the collation-naive
         // indexes for a full collection scan + in-memory collation matching.
         if filter.is_empty() || force_scan {
@@ -20928,68 +21015,105 @@ impl Storage {
             // call self-deadlocks (found by the first test run).
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-            // The documents the scan found to match, with the bytes it read
-            // them as, and the error that ended the scan early, if one did.
-            // mongod updates each document as its scan reaches it, so a
-            // filter that fails part-way -- an interrupt, or an error on one
-            // document -- leaves the documents before it updated: measured
-            // 8.2.11 (2026-10-27), `$divide: [1, "$d"]` with `d: 0` in the
-            // third of five documents updates the first two, and a kill
-            // half-way through 100 slow documents leaves 13 updated (RM-313).
-            let (rids, scan_error): (Vec<(i64, Vec<u8>)>, Option<StorageError>) = {
+            let source = TakenSource::take();
+            let mut matched = 0usize;
+            let mut modified = 0usize;
+            // Write `rids` in bounded chunks. The chunk committed what it did
+            // before a failure (see `update_chunk_txn`); the failure is then
+            // the statement's.
+            let mut write = |rids: &[(i64, Vec<u8>)]| -> Result<()> {
+                let mut idx = 0usize;
+                while idx < rids.len() {
+                    let (consumed, m, w, stopped) =
+                        self.retry_write_conflicts("update_matching_chunk", || {
+                            let session = self.op_session()?;
+                            self.with_statement_txn(&session, || {
+                                self.update_chunk_txn(
+                                    &session,
+                                    db,
+                                    coll,
+                                    &rids[idx..],
+                                    filter,
+                                    vars,
+                                    coll_opt,
+                                    is_replacement,
+                                    update_spec,
+                                    validator,
+                                    validator_moderate,
+                                    transform,
+                                )
+                            })
+                        })?;
+                    if let Some(e) = stopped {
+                        return Err(e);
+                    }
+                    debug_assert!(consumed > 0);
+                    idx += consumed;
+                    matched += m;
+                    modified += w;
+                }
+                Ok(())
+            };
+            // mongod updates each document as its scan reaches it, so a scan
+            // that fails part-way -- an interrupt, or a filter that errors on
+            // one document -- leaves the documents before it updated:
+            // measured 8.2.11 (2026-10-27), `$divide: [1, "$d"]` with `d: 0`
+            // in the third of five documents updates the first two, a kill
+            // half-way through 100 slow documents leaves 13 updated (RM-313),
+            // and an updateMany of 200,000 documents out of `maxTimeMS` 5 had
+            // updated 1,536 (RM-323).
+            let mut scan_error = None;
+            {
                 let session = self.op_session()?;
                 self.create_for_write(&session, db, coll)?;
-                let mut rids = Vec::new();
-                let mut scan_error = None;
-                for (recordid, _id_k, blob) in
-                    self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
-                {
-                    let raw = bson::RawDocument::from_bytes(&blob)
-                        .map_err(|_| StorageError::QueryUnsupported)?;
-                    match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
-                        Ok(true) => rids.push((recordid, blob)),
-                        Ok(false) => {}
-                        Err(fault) => {
-                            scan_error = Some(query_fault(fault));
+            }
+            match source {
+                // The plan's read, a pull at a time, each pull written before
+                // the next is read. A document the write moved ahead of an
+                // index scan is met again and written once, as mongod's
+                // update stage keeps the RecordIds it updated.
+                Some(mut source) => {
+                    let mut written: HashSet<i64> = HashSet::new();
+                    loop {
+                        let pulled = source.pull(WRITE_CHUNK_MAX_DOCS, usize::MAX);
+                        let ended = pulled.exhausted || pulled.rows.is_empty();
+                        let rows: Vec<(i64, Vec<u8>)> = pulled
+                            .rows
+                            .into_iter()
+                            .filter(|(rid, _)| written.insert(*rid))
+                            .collect();
+                        write(&rows)?;
+                        if pulled.stopped {
+                            scan_error = Some(StorageError::MaxTimeExpired);
+                            break;
+                        }
+                        if ended {
                             break;
                         }
                     }
                 }
-                (rids, scan_error)
-            };
-            let mut matched = 0usize;
-            let mut modified = 0usize;
-            let mut idx = 0usize;
-            while idx < rids.len() {
-                let (consumed, m, w, stopped) =
-                    self.retry_write_conflicts("update_matching_chunk", || {
-                        let session = self.op_session()?;
-                        self.with_statement_txn(&session, || {
-                            self.update_chunk_txn(
-                                &session,
-                                db,
-                                coll,
-                                &rids[idx..],
-                                filter,
-                                vars,
-                                coll_opt,
-                                is_replacement,
-                                update_spec,
-                                validator,
-                                validator_moderate,
-                                transform,
-                            )
-                        })
-                    })?;
-                // The chunk committed what it did before the failure (see
-                // `update_chunk_txn`); the failure is now the statement's.
-                if let Some(e) = stopped {
-                    return Err(e);
+                // The store's own candidates, tested as they are read, with
+                // the bytes each matched as, then written.
+                None => {
+                    let session = self.op_session()?;
+                    let mut rids = Vec::new();
+                    for (recordid, _id_k, blob) in
+                        self.candidate_docs(&session, db, coll, filter, coll_opt.is_some())?
+                    {
+                        let raw = bson::RawDocument::from_bytes(&blob)
+                            .map_err(|_| StorageError::QueryUnsupported)?;
+                        match secantus_core::query::matches_raw(raw, filter, vars, coll_opt) {
+                            Ok(true) => rids.push((recordid, blob)),
+                            Ok(false) => {}
+                            Err(fault) => {
+                                scan_error = Some(query_fault(fault));
+                                break;
+                            }
+                        }
+                    }
+                    drop(session);
+                    write(&rids)?;
                 }
-                debug_assert!(consumed > 0);
-                idx += consumed;
-                matched += m;
-                modified += w;
             }
             (matched, modified, scan_error)
         };
@@ -21704,7 +21828,9 @@ impl Storage {
         let Some(hint) = hint else {
             return self.candidate_docs(session, db, coll, filter, force_scan);
         };
-        if CANDIDATE_ORDER.with(|o| o.borrow().is_some()) {
+        if CANDIDATE_ORDER.with(|o| o.borrow().is_some())
+            || CANDIDATE_SOURCE.with(|s| s.get().is_some())
+        {
             // The hint has to be one the collection has, order fixed or not.
             self.resolve_hint(session, db, coll, hint)?;
             return self.candidate_docs(session, db, coll, filter, force_scan);
@@ -21755,54 +21881,18 @@ impl Storage {
         let _in_sets = secantus_core::query::InSetsGuard::install(&in_sets);
         let lock = self.coll_lock(db, coll);
         let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
-        // The documents the scan found to match, with the bytes it read them
-        // as, and the error that ended the scan early, if one did. mongod
-        // stages the documents it deletes and removes them a batch at a
-        // time (`batchedDeletesTargetBatchDocs`, 10, or
-        // `batchedDeletesTargetStagedDocBytes`, 2 MiB), so a scan that
-        // fails part-way -- an interrupt, a filter that errors on one
-        // document -- leaves the batches before it deleted and the one it
-        // was staging not: measured 8.2.11 (2026-10-27), killed after 1.0 s
-        // and 1.5 s of slow documents it had deleted 10 and 20, after 1.0 s
-        // of fast ones 360, and an error on the third of five deleted none
-        // (RM-313). (Killed after 0.5 s it had deleted 4, which no
-        // documented target explains.)
-        let (rids, scan_error): (Vec<(i64, Vec<u8>)>, Option<StorageError>) = {
-            const BATCH_DOCS: usize = 10;
-            const BATCH_BYTES: usize = 2 * 1024 * 1024;
-            let session = self.op_session()?;
-            let mut rids: Vec<(i64, Vec<u8>)> = Vec::new();
-            let mut scan_error = None;
-            let mut staged_from = 0usize;
-            let mut staged_bytes = 0usize;
-            for (recordid, _id_k, blob) in
-                self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?
-            {
-                let raw = bson::RawDocument::from_bytes(&blob)
-                    .map_err(|_| StorageError::QueryUnsupported)?;
-                match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
-                    Ok(true) => {
-                        staged_bytes += blob.len();
-                        rids.push((recordid, blob));
-                        if rids.len() - staged_from >= BATCH_DOCS || staged_bytes >= BATCH_BYTES {
-                            staged_from = rids.len();
-                            staged_bytes = 0;
-                        }
-                    }
-                    Ok(false) => {}
-                    Err(fault) => {
-                        rids.truncate(staged_from);
-                        scan_error = Some(query_fault(fault));
-                        break;
-                    }
-                }
-            }
-            match DELETE_BATCH.with(Cell::get) {
-                0 => {}
-                batch => rids.chunks_mut(batch).for_each(<[(i64, Vec<u8>)]>::reverse),
-            }
-            (rids, scan_error)
-        };
+        // mongod stages the documents it deletes and removes them a batch at
+        // a time (`batchedDeletesTargetBatchDocs`, 10, or
+        // `batchedDeletesTargetStagedDocBytes`, 2 MiB), so a scan that fails
+        // part-way -- an interrupt, a filter that errors on one document --
+        // leaves the batches before it deleted and the one it was staging
+        // not: measured 8.2.11 (2026-10-27), killed after 1.0 s and 1.5 s of
+        // slow documents it had deleted 10 and 20, after 1.0 s of fast ones
+        // 360, and an error on the third of five deleted none (RM-313,
+        // RM-323). (Killed after 0.5 s it had deleted 4, which no documented
+        // target explains.)
+        const BATCH_DOCS: usize = 10;
+        const BATCH_BYTES: usize = 2 * 1024 * 1024;
         // Each batch of two or more is one `applyOps` entry on mongod.
         struct ClearGroups;
         impl Drop for ClearGroups {
@@ -21811,43 +21901,101 @@ impl Storage {
             }
         }
         let _clear = ClearGroups;
-        if let batch @ 1.. = DELETE_BATCH.with(Cell::get) {
-            DELETE_GROUPS.with(|g| {
-                let mut g = g.borrow_mut();
-                for chunk in rids.chunks(batch).filter(|c| c.len() > 1) {
+        let reversed = DELETE_BATCH.with(Cell::get) > 0;
+        let mut deleted = 0usize;
+        // Delete one staged batch, in bounded chunks: last-read first when
+        // the caller asked for mongod's order. A chunk commits what it did
+        // before a failure; the failure is then the statement's.
+        let mut delete_batch = |mut batch: Vec<(i64, Vec<u8>)>| -> Result<()> {
+            if reversed {
+                batch.reverse();
+                if batch.len() > 1 {
                     let id = self.insert_groups.fetch_add(1, Ordering::Relaxed);
-                    for (rid, _) in chunk {
-                        g.insert(*rid, id);
+                    DELETE_GROUPS.with(|g| {
+                        let mut g = g.borrow_mut();
+                        for (rid, _) in &batch {
+                            g.insert(*rid, id);
+                        }
+                    });
+                }
+            }
+            let mut idx = 0usize;
+            while idx < batch.len() {
+                let (consumed, d, stopped) =
+                    self.retry_write_conflicts("delete_matching_chunk", || {
+                        let session = self.op_session()?;
+                        self.with_statement_txn(&session, || {
+                            self.delete_chunk_txn(
+                                &session,
+                                db,
+                                coll,
+                                &batch[idx..],
+                                filter,
+                                let_vars,
+                                coll_opt,
+                            )
+                        })
+                    })?;
+                if let Some(e) = stopped {
+                    return Err(e);
+                }
+                debug_assert!(consumed > 0);
+                idx += consumed;
+                deleted += d;
+            }
+            Ok(())
+        };
+        let mut scan_error = None;
+        match TakenSource::take() {
+            // The plan's read, a staged batch at a time, each deleted before
+            // the next is read.
+            Some(mut source) => loop {
+                let pulled = source.pull(BATCH_DOCS, BATCH_BYTES);
+                if pulled.stopped {
+                    scan_error = Some(StorageError::MaxTimeExpired);
+                    break;
+                }
+                let ended = pulled.exhausted || pulled.rows.is_empty();
+                if !pulled.rows.is_empty() {
+                    delete_batch(pulled.rows)?;
+                }
+                if ended {
+                    break;
+                }
+            },
+            // The store's own candidates, tested in order, each batch
+            // deleted as it is staged.
+            None => {
+                let candidates = {
+                    let session = self.op_session()?;
+                    self.delete_candidates(&session, db, coll, filter, coll_opt.is_some(), hint)?
+                };
+                let mut staged: Vec<(i64, Vec<u8>)> = Vec::new();
+                let mut staged_bytes = 0usize;
+                for (recordid, _id_k, blob) in candidates {
+                    let raw = bson::RawDocument::from_bytes(&blob)
+                        .map_err(|_| StorageError::QueryUnsupported)?;
+                    match secantus_core::query::matches_raw(raw, filter, let_vars, coll_opt) {
+                        Ok(true) => {
+                            staged_bytes += blob.len();
+                            staged.push((recordid, blob));
+                            if staged.len() >= BATCH_DOCS || staged_bytes >= BATCH_BYTES {
+                                delete_batch(std::mem::take(&mut staged))?;
+                                staged_bytes = 0;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(fault) => {
+                            staged.clear();
+                            scan_error = Some(query_fault(fault));
+                            break;
+                        }
                     }
                 }
-            });
-        }
-        let mut deleted = 0usize;
-        let mut idx = 0usize;
-        while idx < rids.len() {
-            let (consumed, d, stopped) =
-                self.retry_write_conflicts("delete_matching_chunk", || {
-                    let session = self.op_session()?;
-                    self.with_statement_txn(&session, || {
-                        self.delete_chunk_txn(
-                            &session,
-                            db,
-                            coll,
-                            &rids[idx..],
-                            filter,
-                            let_vars,
-                            coll_opt,
-                        )
-                    })
-                })?;
-            // The chunk committed what it did before the failure; the
-            // failure is now the statement's.
-            if let Some(e) = stopped {
-                return Err(e);
+                if !staged.is_empty() {
+                    delete_batch(staged)?;
+                }
             }
-            debug_assert!(consumed > 0);
-            idx += consumed;
-            deleted += d;
         }
         // The batches before it are deleted; the error is the statement's.
         if let Some(e) = scan_error {

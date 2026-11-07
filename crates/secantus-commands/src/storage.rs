@@ -24,6 +24,20 @@ pub use secantus_core::collation::Collation;
 /// `secantus-commands` stay decoupled from the storage crate's `Hint` type.
 pub type RawHint<'a> = &'a Bson;
 
+/// One pull from a write's candidate source
+/// ([`Storage::with_candidate_source`]).
+pub struct Pulled {
+    /// The rows the read matched, in its order, each with the bytes it
+    /// matched it as.
+    pub rows: Vec<(i64, Vec<u8>)>,
+    /// The read is at its end: no rows follow these.
+    pub exhausted: bool,
+    /// The read stopped part-way (an interrupt, a filter that failed on a
+    /// document): `rows` are the ones it matched before. The source holds
+    /// the error.
+    pub stopped: bool,
+}
+
 /// The documents a query matches, for a caller that orders them itself
 /// (`Storage::matching_rows`).
 #[derive(Debug, Default)]
@@ -794,6 +808,31 @@ pub trait Storage: Send + Sync {
     /// that order, in place of the candidates the store would pick.
     fn with_candidate_order(&self, _order: Vec<i64>, f: &mut dyn FnMut()) {
         f()
+    }
+
+    /// Run `f` with the write it makes drawing its candidates from
+    /// `source` as it writes them ([`Pulled`]). Default: every row the
+    /// source matches first, as [`Self::with_candidate_order`] takes them.
+    fn with_candidate_source(
+        &self,
+        source: &mut dyn FnMut(usize, usize) -> Pulled,
+        f: &mut dyn FnMut(),
+    ) {
+        let mut order = Vec::new();
+        loop {
+            let pulled = source(0, usize::MAX);
+            // A read that stopped writes nothing here: the caller answers
+            // its error.
+            if pulled.stopped {
+                return;
+            }
+            let ended = pulled.exhausted || pulled.rows.is_empty();
+            order.extend(pulled.rows.into_iter().map(|(rid, _)| rid));
+            if ended {
+                break;
+            }
+        }
+        self.with_candidate_order(order, f)
     }
 
     /// Run `f` with an unbounded delete outside a transaction removing its

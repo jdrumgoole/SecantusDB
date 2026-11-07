@@ -1761,6 +1761,9 @@ pub(crate) struct Stream {
     yields: Yields,
     /// The yields the last batch's profile entry reports.
     shown: Yields,
+    /// A write's read ([`Stream::pull_for_write`]): the error that ended it
+    /// part-way, kept apart so the results matched before it are returned.
+    failed: Option<Option<StorageError>>,
 }
 
 /// The yields a run went through: a cursor's between its batches, a
@@ -1919,6 +1922,7 @@ impl Stream {
             first: true,
             yields: Yields::default(),
             shown: Yields::default(),
+            failed: None,
         }))
     }
 
@@ -1962,6 +1966,7 @@ impl Stream {
             first: true,
             yields: Yields::default(),
             shown: Yields::default(),
+            failed: None,
         }))
     }
 
@@ -2078,7 +2083,15 @@ impl Stream {
         })();
         self.keys = cx.keys;
         self.docs = cx.docs;
-        result.map(|()| out)
+        match (result, &mut self.failed) {
+            // A write's read ends at the error with what it matched before.
+            (Err(e), Some(failed)) => {
+                *failed = Some(e);
+                self.done = true;
+                Ok(out)
+            }
+            (result, _) => result.map(|()| out),
+        }
     }
 
     /// The next batch: up to `want` results (0: as many as fit) within
@@ -2109,6 +2122,22 @@ impl Stream {
         }
         self.first = false;
         out
+    }
+
+    /// The next of a write's documents, read as mongod's write stage pulls
+    /// them from its plan (RM-323): up to `want` (0: no count limit), and
+    /// none past the one that brings them to `max_bytes`, with what reading
+    /// them examined. A read that fails part-way returns the documents it
+    /// matched before the failure, with the failure, and ends there.
+    pub(crate) fn pull_for_write(
+        &mut self,
+        storage: &dyn Storage,
+        want: usize,
+        max_bytes: usize,
+    ) -> (Result<Batch, StorageError>, Option<StorageError>) {
+        self.failed = Some(None);
+        let batch = self.batch(storage, want, max_bytes, true);
+        (batch, self.failed.take().flatten())
     }
 
     /// What an aggregate's cursor stage buffers: up to `want` results, and
