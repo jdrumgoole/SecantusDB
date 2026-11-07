@@ -1,7 +1,8 @@
 """Regression tests of a subquery in a CREATE TABLE AS or CREATE MATERIALIZED
 VIEW select list (RP-466, found while working RP-449), and of the columns
-such a relation lists in `pg_attribute` (RP-484; RP-489 and RP-490, found
-while working RP-484, are still open).
+such a relation lists in `pg_attribute` (RP-484) and the type modifier
+each takes from its query (RP-489); RP-490, found while working RP-484, is
+still open, and RP-493 and RP-494, found while working RP-489, are too.
 
 Each answer was measured on a private, freshly initdb'd PostgreSQL 15.19
 cluster with this module's table, as the shared reference must not be given
@@ -10,8 +11,10 @@ objects.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
+import psycopg
 import pytest
 
 # Statement, then the query that reads back what it made, and PostgreSQL
@@ -144,12 +147,12 @@ def test_matview_columns_listed_once(rust_pg: Any) -> None:
     assert rows == [("rp_mva", "n"), ("rp_mva", "t"), ("rp_mvb", "n")]
 
 
-@pytest.mark.backlog("RP-489")
+@pytest.mark.backlog_fixed("RP-489")
 def test_ctas_column_keeps_its_typmod(rust_pg: Any) -> None:
     """A CREATE TABLE AS or CREATE MATERIALIZED VIEW column takes its
     expression's type modifier: `2.5::numeric(5,2)` is `atttypmod` 327686
     on a private PostgreSQL 15.19 cluster, as a declared `numeric(5,2)`
-    column is. Here it is -1, the modifier lost."""
+    column is. It was -1 here, the modifier lost, until RP-489."""
     with rust_pg.connect() as c:
         c.autocommit = True
         c.execute("create table rp489_ct as select 2.5::numeric(5,2) z")
@@ -160,6 +163,142 @@ def test_ctas_column_keeps_its_typmod(rust_pg: Any) -> None:
             " and attnum = 1 order by 1"
         ).fetchall()
     assert rows == [("rp489_ct", 327686), ("rp489_mv", 327686)]
+
+
+# CREATE TABLE AS / MATERIALIZED VIEW sources, then PostgreSQL 15.19's
+# `(attname, atttypmod)` for the relation each makes, measured on a private
+# cluster over `rp489_b (n numeric(5,2), v varchar(10), ch char(3), t
+# timestamp(0))`.
+TYPMODS = [
+    (
+        "create table rp489_c1 as select * from rp489_b",
+        [("n", 327686), ("v", 14), ("ch", 7), ("t", 0)],
+    ),
+    (
+        "create table rp489_c2 as select n, ch from rp489_b where n > 0",
+        [("n", 327686), ("ch", 7)],
+    ),
+    (
+        "create materialized view rp489_m1 as select n, v, ch from rp489_b",
+        [("n", 327686), ("v", 14), ("ch", 7)],
+    ),
+    (
+        "create table rp489_c3 as select 'a'::char(3) ch, 'xy'::varchar(4) v with no data",
+        [("ch", 7), ("v", 8)],
+    ),
+    (
+        "create table rp489_c4 as values (2.5::numeric(5,2)), (1.0::numeric(5,2))",
+        [("column1", 327686)],
+    ),
+    (
+        "create table rp489_c5 as values (2.5::numeric(5,2)), (1.0::numeric(6,2))",
+        [("column1", -1)],
+    ),
+    (
+        "create table rp489_c6 as select now()::timestamp(3) ts, '1 day'::interval(2) iv,"
+        " 2.5::numeric(5,2) + 1 sum",
+        [("ts", 3), ("iv", 2147418114), ("sum", -1)],
+    ),
+]
+
+
+@pytest.mark.backlog_fixed("RP-489")
+def test_ctas_typmod_by_source(rust_pg: Any) -> None:
+    """Each source's modifier carries into the column it makes -- a base
+    table's declared one, a cast's, a VALUES list's common one (-1 when the
+    rows disagree), none for an operator's result -- with or without data,
+    and survives REFRESH. Measured on a private PostgreSQL 15.19 cluster."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        c.execute(
+            "create table rp489_b (n numeric(5,2), v varchar(10), ch char(3), t timestamp(0))"
+        )
+        c.execute("insert into rp489_b values (1.25, 'ab', 'a', '2020-01-01 10:00:00.6')")
+        got = []
+        for make, _ in TYPMODS:
+            c.execute(make)
+            rel = make.split()[2] if make.startswith("create table") else make.split()[3]
+            if rel == "rp489_m1":
+                c.execute("refresh materialized view rp489_m1")
+            got.append(
+                c.execute(
+                    "select attname, atttypmod from pg_attribute"
+                    f" where attrelid = '{rel}'::regclass and attnum > 0 order by attnum"
+                ).fetchall()
+            )
+        # The values a typmod'd column holds read back as PostgreSQL's do.
+        row = c.execute("select n, ch || '|', octet_length(ch), t::text from rp489_c1").fetchone()
+    assert got == [want for _, want in TYPMODS]
+    assert row == (Decimal("1.25"), "a|", 3, "2020-01-01 10:00:01")
+
+
+# Queries whose output column keeps a type modifier on PostgreSQL 15.19 --
+# both in its RowDescription and in the column CREATE TABLE AS makes from
+# it -- and the modifiers, measured on a private cluster.
+_S = "(select 2.5::numeric(5,2) z, 'ab'::varchar(10) v)"
+PROPAGATED = [
+    (f"select z, v from {_S} s", [327686, 14]),
+    (f"with w as {_S} select z, v from w", [327686, 14]),
+    (f"select s.z, u.v from {_S} s join {_S} u on true", [327686, 14]),
+    (f"select z from {_S} s union all select 3.5::numeric(5,2)", [327686]),
+    ("select case when true then 'a'::varchar(3) else 'b'::varchar(3) end a", [7]),
+    ("select coalesce(2.5::numeric(5,2), 1::numeric(5,2)) a", [327686]),
+    ("select array[1.5::numeric(5,2)] a", [327686]),
+    (f"select z from {_S} s group by z", [327686]),
+]
+
+
+@pytest.mark.backlog("RP-493")
+def test_typmod_through_subquery_and_expressions(rust_pg: Any) -> None:
+    """A subquery's, a CTE's, a join's or a UNION's column keeps its
+    modifier, and so do CASE, COALESCE and ARRAY over operands that share
+    one (`exprTypmod`), on a private PostgreSQL 15.19 cluster: the
+    RowDescription carries it and CREATE TABLE AS stores it. Here each is
+    -1 in both."""
+    described, stored = [], []
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        for i, (q, _) in enumerate(PROPAGATED):
+            cur = c.execute(q)
+            described.append([cur.pgresult.fmod(k) for k in range(len(cur.description))])
+            c.execute(f"create table rp493_{i} as {q}")
+            stored.append(
+                [
+                    m
+                    for (m,) in c.execute(
+                        "select atttypmod from pg_attribute"
+                        f" where attrelid = 'rp493_{i}'::regclass and attnum > 0 order by attnum"
+                    ).fetchall()
+                ]
+            )
+    want = [m for _, m in PROPAGATED]
+    assert (described, stored) == (want, want)
+
+
+@pytest.mark.backlog("RP-494")
+def test_ctas_over_a_bit_column(rust_pg: Any) -> None:
+    """`create table t as select B'101'::bit(3) b` makes a `bit(3)` column,
+    `atttypmod` 3, on a private PostgreSQL 15.19 cluster; a `varbit` one
+    likewise. Here each is refused 0A000 `CREATE TABLE AS over a column of
+    type bit is not supported yet`."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        got = []
+        for name, q in [
+            ("rp494_b", "select B'101'::bit(3) b"),
+            ("rp494_vb", "select B'10'::varbit(5) b"),
+        ]:
+            try:
+                c.execute(f"create table {name} as {q}")
+                got.append(
+                    c.execute(
+                        "select format_type(atttypid, atttypmod) from pg_attribute"
+                        f" where attrelid = '{name}'::regclass and attnum = 1"
+                    ).fetchone()
+                )
+            except psycopg.Error as e:
+                got.append((e.sqlstate,))
+    assert got == [("bit(3)",), ("bit varying(5)",)]
 
 
 @pytest.mark.backlog("RP-490")

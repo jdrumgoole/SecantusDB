@@ -28080,6 +28080,12 @@ impl PgHandler {
 
     /// The output columns of a `COPY (query) TO STDOUT`, from the same code
     /// that describes the query anywhere else.
+    ///
+    /// Each field carries its column's type modifier (`exprTypmod` of the
+    /// target), which `CREATE TABLE AS` and `CREATE MATERIALIZED VIEW`
+    /// store as the new column's `atttypmod` (`intorel_startup` takes the
+    /// query's tuple descriptor whole, RP-489). COPY reads only the names
+    /// and types.
     fn copy_query_fields(&self, inner: &Statement) -> PgWireResult<Vec<FieldInfo>> {
         match inner {
             // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all. A
@@ -28087,18 +28093,27 @@ impl PgHandler {
             Statement::SelectConstant(sc) => Ok(sc
                 .columns
                 .iter()
-                .map(|(name, _, ty, _)| {
+                .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
                     FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
+                        .with_type_modifier(*typmod)
                 })
                 .collect()),
             Statement::ValuesConstant(vc) => Ok(vc
                 .names
                 .iter()
                 .zip(&vc.types)
-                .map(|(name, ty)| {
+                .enumerate()
+                .map(|(i, (name, ty))| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    // The rows' common modifier (`select_common_typmod`).
+                    let typmod = vc
+                        .typmods
+                        .as_ref()
+                        .and_then(|m| m.get(i).copied())
+                        .unwrap_or(-1);
                     FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
+                        .with_type_modifier(typmod)
                 })
                 .collect()),
             // The query's own description, in TEXT: COPY output is text (or
@@ -28116,6 +28131,7 @@ impl PgHandler {
                         f.datatype().clone(),
                         FieldFormat::Text,
                     )
+                    .with_type_modifier(f.type_modifier())
                 })
                 .collect()),
             // Any other query -- an aggregate, a join, a set operation -- by
@@ -28129,6 +28145,7 @@ impl PgHandler {
                             .user_wire_type(&c.pg_type)
                             .unwrap_or_else(|| wire_type(&c.pg_type));
                         FieldInfo::new(c.name.clone(), None, None, wire, FieldFormat::Text)
+                            .with_type_modifier(c.typmod)
                     })
                     .collect()),
                 Err(_) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -38979,7 +38996,12 @@ impl PgHandler {
                                 ),
                             )))
                         })?;
-                        Ok(secantus_pgcatalog::Column::new(&name, &pg_type, false))
+                        // The query's own modifier (`exprTypmod`): `2.5::numeric(5,2)`
+                        // makes a `numeric(5,2)` column, as `intorel_startup`
+                        // copies the query's tuple descriptor (RP-489).
+                        let mut column = secantus_pgcatalog::Column::new(&name, &pg_type, false);
+                        column.typmod = f.type_modifier();
+                        Ok(column)
                     })
                     .collect::<PgWireResult<Vec<_>>>()?;
                 let mut def = TableDef::new(&table, columns);

@@ -2023,14 +2023,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A CREATE TABLE AS or CREATE MATERIALIZED VIEW column loses its
-      expression's type modifier.** `create table ct as select
-      2.5::numeric(5,2) z` gives `z` `atttypmod` 327686 on PostgreSQL, as a
-      declared `numeric(5,2)` column does, and a materialized view over
-      the same select does too; here each is -1, so `\d` and
-      `format_type` print a bare `numeric`.
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_ctas_column_keeps_its_typmod
-      Backlog-ID: RP-489
 - [ ] **`pg_attribute` lists no system columns.** PostgreSQL lists a
       table's and a materialized view's `tableoid` (-6), `cmax` (-5),
       `xmax` (-4), `cmin` (-3), `xmin` (-2) and `ctid` (-1), each
@@ -2038,6 +2030,30 @@ Measured on a private PostgreSQL 15.19 cluster.
       t` answers.
       Verify: tests/backlog/test_rp_ctas_subquery.py::test_pg_attribute_lists_system_columns
       Backlog-ID: RP-490
+
+## Found while working RP-489 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A column's type modifier is lost through a subquery, a CTE, a
+      join, a UNION or a CASE.** On PostgreSQL `select z from (select
+      2.5::numeric(5,2) z) s` describes `z` with modifier 327686, and so
+      does the same through a CTE, a join, `UNION ALL` of two
+      `numeric(5,2)` branches, `GROUP BY z`, `coalesce`, `array[...]` or a
+      CASE whose branches share a modifier (`exprTypmod`); here each
+      RowDescription sends -1, and a CREATE TABLE AS over it stores -1, so
+      `\d` prints a bare `numeric`. A bare cast (`select
+      2.5::numeric(5,2)`), a base-table column and a VALUES list's common
+      modifier already carry (RP-489).
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_through_subquery_and_expressions
+      Backlog-ID: RP-493
+- [ ] **CREATE TABLE AS over a `bit` or `varbit` column is refused.**
+      `create table t as select B'101'::bit(3) b` makes a `bit(3)` column
+      on PostgreSQL; here it is 0A000 `CREATE TABLE AS over a column of
+      type bit is not supported yet`, as `internal_type_name` has no name
+      for oids 1560 and 1562.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_ctas_over_a_bit_column
+      Backlog-ID: RP-494
 
 ## Found while working RP-316 (2026-11-02)
 
