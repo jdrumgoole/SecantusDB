@@ -961,6 +961,7 @@ impl CmdStorage for StorageAdapter {
             schema_lock_wait_micros: c.engine.schema_lock_wait_micros,
             handle_lock_wait_micros: c.engine.handle_lock_wait_micros,
             txn_bytes_dirty: c.engine.txn_bytes_dirty,
+            txn_updates: c.engine.txn_updates,
             keys_inserted: c.keys_inserted,
             keys_deleted: c.keys_deleted,
             oplog_slot_micros: c.oplog_slot_micros,

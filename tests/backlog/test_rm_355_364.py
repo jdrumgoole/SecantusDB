@@ -1081,22 +1081,66 @@ def test_a_plan_settled_without_the_planner_is_timed(rust_mongo: Any, mongod_rs:
 # ------------------------------------------------------------- RM-364 --
 
 
-@pytest.mark.backlog("RM-364")
+@pytest.mark.backlog_fixed("RM-364")
 def test_a_transaction_statement_counts_its_updates(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11's line for an insert inside a transaction counts, in
-    `storage.data`, the dirty bytes and the updates the transaction holds
-    so far (`txnBytesDirty`, `txnNumUpdates`, measured 2026-10-27). The
-    WiredTiger this server vendors (mongodb-7.0.33) keeps the first and
-    not the second."""
+    """mongod 8.2.11's line for each insert inside a transaction counts, in
+    `storage.data`, the dirty bytes and the updates the statement added
+    (`txnBytesDirty`, `txnNumUpdates`, measured 2026-10-27): 4 updates for
+    a document over `_id` and one more index, 12 for three, each statement
+    its own. The WiredTiger this server vendors (mongodb-7.0.33) kept the
+    first and not the second, until `cmake/patch_wt_txn_updates.py` ported
+    WiredTiger 11's count. (Only the `txn` keys are compared: whether the
+    statement also read a page from disk is the cache's to say.)"""
+
+    def op(db: Any) -> None:
+        db.c.create_index("y")
+        with db.client.start_session() as s, s.start_transaction():
+            db.c.insert_one({"_id": 700, "y": 1}, session=s)
+            db.c.insert_one({"_id": 701, "y": 2}, session=s)
+            db.c.insert_many([{"_id": 800 + i} for i in range(3)], session=s)
+
+    got = _both(rust_mongo, mongod_rs, op)
+    answers = {}
+    for s, (lines, _) in got.items():
+        data = [
+            attr.get("storage", {}).get("data", {})
+            for _, attr in lines
+            if next(iter(attr.get("command", {})), "") == "insert"
+        ]
+        answers[s] = [
+            (sorted(k for k in d if k.startswith("txn")), d.get("txnNumUpdates")) for d in data
+        ]
+    keys = ["txnBytesDirty", "txnNumUpdates"]
+    assert answers["mongod"] == [(keys, 4), (keys, 4), (keys, 12)]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-385")
+def test_an_update_in_a_transaction_counts_no_dirty_bytes(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11's line for an `update` and a `delete` inside a
+    transaction carries no `txnBytesDirty` or `txnNumUpdates`, where an
+    insert's carries both (measured 2026-11-07); this server's counts the
+    statement's share on all three."""
 
     def op(db: Any) -> None:
         with db.client.start_session() as s, s.start_transaction():
-            db.c.insert_one({"_id": 700}, session=s)
+            db.c.insert_one({"_id": 700, "y": 1}, session=s)
+            db.c.update_one({"_id": 700}, {"$set": {"y": 5}}, session=s)
+            db.c.delete_one({"_id": 700}, session=s)
 
     got = _both(rust_mongo, mongod_rs, op)
     answers = {
-        s: sorted(_line(lines, "insert").get("storage", {}).get("data", {}))
+        s: {
+            c: sorted(
+                k for k in _line(lines, c).get("storage", {}).get("data", {}) if k.startswith("txn")
+            )
+            for c in ("insert", "update", "delete")
+        }
         for s, (lines, _) in got.items()
     }
-    assert answers["mongod"] == ["txnBytesDirty", "txnNumUpdates"]
+    assert answers["mongod"] == {
+        "insert": ["txnBytesDirty", "txnNumUpdates"],
+        "update": [],
+        "delete": [],
+    }
     assert answers["rust"] == answers["mongod"]

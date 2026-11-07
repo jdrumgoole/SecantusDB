@@ -155,3 +155,43 @@ fn each_read_of_a_session_counts_from_the_last() {
     drop(conn);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A transaction counts the new updates it links into pages
+/// (`cmake/patch_wt_txn_updates.py`, WiredTiger 11's `txn_updates`, which
+/// mongod prints as `txnNumUpdates`, RM-364): an insert, an update and a
+/// remove are one each, a read none, and each read of the session's
+/// statistics counts from the last, as `txn_bytes_dirty` does.
+#[test]
+fn a_transaction_counts_its_updates() {
+    let home = temp_home();
+    let conn = Connection::open(home.to_str().unwrap(), CONFIG).unwrap();
+    let s = conn.open_session().unwrap();
+    s.create("table:t", "key_format=q,value_format=u").unwrap();
+    let c = s.open_cursor("table:t", None).unwrap();
+    s.begin_transaction(None).unwrap();
+    for i in 0..3i64 {
+        c.set_key_q(i);
+        c.set_value_u(b"v");
+        c.insert().unwrap();
+    }
+    let inserted = s.statistics(true).unwrap();
+    assert_eq!(inserted.txn_updates, 3, "{inserted:?}");
+    assert!(inserted.txn_bytes_dirty > 0, "{inserted:?}");
+    c.set_key_q(1);
+    c.set_value_u(b"w");
+    c.update().unwrap();
+    c.set_key_q(2);
+    c.remove().unwrap();
+    c.set_key_q(0);
+    c.search().unwrap();
+    assert_eq!(s.statistics(true).unwrap().txn_updates, 2);
+    s.commit_transaction(None).unwrap();
+    // The next transaction starts at zero.
+    s.begin_transaction(None).unwrap();
+    assert_eq!(s.statistics(false).unwrap().txn_updates, 0);
+    s.rollback_transaction(None).unwrap();
+    drop(c);
+    drop(s);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&home);
+}

@@ -63,3 +63,14 @@ def test_runs_ci_async_oplog_storage_step_with_its_environment() -> None:
     for key, value in _gate_rm().ASYNC_OPLOG_ENV.items():
         assert f'{key}: "{value}"' in block
     assert "working-directory: crates/secantus-storage" in block
+
+
+def test_a_panic_is_read_from_test_logs_not_build_logs(tmp_path: Path) -> None:
+    """A build that recompiles WiredTiger quotes its source (`WT_PANIC`) in
+    compiler warnings; only a step that ran something can record a panic."""
+    (tmp_path / "binary-build.log").write_text(
+        '  165 |                 WT_IGNORE_RET(__wt_panic(session, WT_PANIC, "self-deadlock"));\n'
+    )
+    (tmp_path / "storage-test.log").write_text("ok\n")
+    (tmp_path / "ci-selected.log").write_text("[WT_PANIC: WiredTiger library panic]\n")
+    assert _gate_rm().panicked_logs(tmp_path) == ["ci-selected.log"]

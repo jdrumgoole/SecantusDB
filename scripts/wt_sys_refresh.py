@@ -14,6 +14,8 @@ Only the patches a Python-free static build needs are applied:
 - ``patch_wt_fsync_group.py`` -- under ``method=fsync`` one sync is credited
   with every commit already written. These two change behaviour rather than
   the build.
+- ``patch_wt_txn_updates.py`` -- WiredTiger 11's session statistic
+  ``txn_updates`` (a transaction's update count, mongod's ``txnNumUpdates``).
 
 The three Python-binding patches have nothing to act on: ``lang/`` is not
 copied. On top of those, the top-level ``CMakeLists.txt`` stops adding the
@@ -74,6 +76,12 @@ PATCHES = (
     ("patch_wt_dsync_group.py", "src/log/log.c"),
     ("patch_wt_dsync_group.py", "src/log/log_slot.c"),
     ("patch_wt_fsync_group.py", "src/log/log.c"),
+    ("patch_wt_txn_updates.py", "src/include/stat.h"),
+    ("patch_wt_txn_updates.py", "src/support/stat.c"),
+    ("patch_wt_txn_updates.py", "src/include/wiredtiger.in"),
+    ("patch_wt_txn_updates.py", "src/include/btree_inline.h"),
+    ("patch_wt_txn_updates.py", "src/include/serial_inline.h"),
+    ("patch_wt_txn_updates.py", "src/session/session_api.c"),
 )
 
 

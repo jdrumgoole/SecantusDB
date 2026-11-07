@@ -133,6 +133,19 @@ class Gate:
             self.failed = True
 
 
+def panicked_logs(out: Path) -> list[str]:
+    """The step logs that record a WiredTiger panic. A build step's log is
+    not read: a compiler diagnostic quotes WiredTiger's own source, which
+    names `WT_PANIC`, whenever a patcher change recompiles it (as
+    `gate_pg.sh` leaves out its build log)."""
+    return [
+        p.name
+        for p in sorted(out.glob("*.log"))
+        if not p.name.endswith("-build.log")
+        and re.search(r"WT_PANIC|Bad address", p.read_text(errors="replace"))
+    ]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--no-build", action="store_true", help="skip the two server builds")
@@ -225,11 +238,7 @@ def main() -> int:
     g.step("ruff-format", ["uvx", RUFF, "format", "--check", "."])
 
     # A WiredTiger panic in any log is the headline, whatever the exit codes say.
-    panics = [
-        p.name
-        for p in sorted(out.glob("*.log"))
-        if re.search(r"WT_PANIC|Bad address", p.read_text(errors="replace"))
-    ]
+    panics = panicked_logs(out)
     if panics:
         print(f"    WT_PANIC / Bad address in: {', '.join(panics)}")
         g.failed = True
