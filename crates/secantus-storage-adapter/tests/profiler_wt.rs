@@ -260,10 +260,10 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         // mongod 8.2.11 writes the plan and its planning time after
         // `millis` (2026-10-24), the counts of the read after the command,
         // and the plan cache key, the engine, the locks and the read
-        // concern after them (RM-023, 2026-10-27), and the query shape's
-        // hash after the plan cache key (RM-358). Its `execStats` (RM-359)
-        // is not written here, nor a `storage` section when WiredTiger
-        // counted nothing.
+        // concern after them (RM-023, 2026-10-27), the query shape's hash
+        // after the plan cache key (RM-358), and the plan's stages as they
+        // ran last (`execStats`, RM-359, 2026-11-07). A `storage` section
+        // is not written when WiredTiger counted nothing.
         let mut want = with(&[
             "op",
             "ns",
@@ -285,12 +285,33 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         let after_millis = want.iter().position(|k| *k == "millis").unwrap() + 1;
         want.insert(after_millis, "planSummary");
         want.insert(after_millis + 1, "planningTimeMicros");
+        want.insert(after_millis + 2, "execStats");
         // `cpuNanos`, before `millis`, where mongod reads a thread's CPU
         // clock: Linux.
         if cfg!(target_os = "linux") {
             want.insert(after_millis - 1, "cpuNanos");
         }
         assert_eq!(keys(find), want);
+        // Two keys in the bounds and the work that finds the end: three
+        // works of the scan's, each the FETCH's too (mongod 8.2.11).
+        let stages = find.get_document("execStats").unwrap();
+        let scan = stages.get_document("inputStage").unwrap();
+        let counts = |d: &Document| {
+            (
+                d.get_str("stage").unwrap().to_string(),
+                d.get_i32("works"),
+                d.get_i32("advanced"),
+                d.get_i32("needTime"),
+                d.get_i32("isEOF"),
+            )
+        };
+        assert_eq!(stages.get_bool("isCached"), Ok(false));
+        assert_eq!(counts(stages), ("FETCH".into(), Ok(3), Ok(2), Ok(0), Ok(1)));
+        assert_eq!(counts(scan), ("IXSCAN".into(), Ok(3), Ok(2), Ok(0), Ok(1)));
+        assert_eq!(
+            (scan.get_i32("keysExamined"), scan.get_i32("seeks")),
+            (Ok(2), Ok(1))
+        );
         assert_eq!(find.get_str("queryFramework"), Ok("classic"));
         assert_eq!(find.get_str("planSummary"), Ok("IXSCAN { _id: 1 }"));
         assert_eq!(
@@ -417,6 +438,7 @@ fn update_and_delete_are_profiled_by_statement() {
             "millis",
             "planSummary",
             "planningTimeMicros",
+            "execStats",
             "ts",
             "client",
             "allUsers",
@@ -436,6 +458,22 @@ fn update_and_delete_are_profiled_by_statement() {
                 profiled[0].get_str("planSummary"),
             ),
             (Ok(1), Ok(1), Ok("IXSCAN { _id: 1 }"))
+        );
+        // The UPDATE over its read, which yields around the document it
+        // writes (RM-359; mongod 8.2.11).
+        let update = profiled[0].get_document("execStats").unwrap();
+        let fetch = update.get_document("inputStage").unwrap();
+        assert_eq!(
+            (
+                update.get_str("stage"),
+                update.get_i32("works"),
+                update.get_i32("nMatched"),
+                update.get_i32("nWouldModify"),
+                fetch.get_str("stage"),
+                fetch.get_i32("saveState"),
+                fetch.get_i32("restoreState"),
+            ),
+            (Ok("UPDATE"), Ok(1), Ok(1), Ok(1), Ok("FETCH"), Ok(1), Ok(1))
         );
         assert_eq!(
             (

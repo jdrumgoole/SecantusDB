@@ -3,7 +3,7 @@
 use super::bounds::{render_bounds, render_key_pattern, Interval};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// A count as mongod sends it: an int32 while it fits.
 pub(crate) fn num(n: i64) -> Bson {
@@ -79,7 +79,7 @@ impl IndexInfo {
 /// One index scan: the index, the bounds per key field, the direction.
 #[derive(Clone, Debug)]
 pub(crate) struct IxScan {
-    pub index: Rc<IndexInfo>,
+    pub index: Arc<IndexInfo>,
     /// Ascending intervals per key field, whatever the field's direction.
     pub bounds: Vec<Vec<Interval>>,
     pub backward: bool,
@@ -90,7 +90,7 @@ pub(crate) struct IxScan {
 }
 
 impl IxScan {
-    pub fn full(index: Rc<IndexInfo>) -> Self {
+    pub fn full(index: Arc<IndexInfo>) -> Self {
         let n = index.key.len();
         IxScan {
             index,
@@ -180,13 +180,13 @@ pub(crate) enum Node {
     Eof(&'static str),
     /// A point lookup through a unique index: `path == value`.
     Express {
-        index: Rc<IndexInfo>,
+        index: Arc<IndexInfo>,
         value: Bson,
     },
     IdHack(Bson),
     /// An update or delete of one document by `_id`.
     ExpressWrite {
-        index: Rc<IndexInfo>,
+        index: Arc<IndexInfo>,
         value: Bson,
         delete: bool,
     },
@@ -232,6 +232,9 @@ pub(crate) struct WorkCounts {
     /// `saveState` and `restoreState`: the yields the stage went through.
     pub saved: i64,
     pub restored: i64,
+    /// `executionTimeMillisEstimate`: the time spent in the stage's works,
+    /// on a coarse clock as mongod's fast clock source times them.
+    pub millis: i64,
 }
 
 impl Stats {
@@ -268,7 +271,7 @@ impl Node {
                 out.insert("nReturned", num(s.n_returned));
             }
             if let Some(w) = work {
-                out.insert("executionTimeMillisEstimate", 0_i32);
+                out.insert("executionTimeMillisEstimate", num(w.millis));
                 out.insert("works", num(w.works));
                 out.insert("advanced", num(w.advanced));
                 out.insert("needTime", num(w.need_time));

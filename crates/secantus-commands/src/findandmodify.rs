@@ -489,6 +489,7 @@ pub fn find_and_modify(doc: &Document, ctx: &mut CommandContext) -> HandlerResul
         .map_err(|e| crate::util::command_error_during(e, "findAndModify"))?;
         let candidates = if let Some(sel) = selection {
             crate::opdebug::note_examined(sel.keys_examined, sel.docs_examined, Some(sel.summary));
+            crate::opdebug::note_write_run(sel.run);
             sel.first.into_iter().collect()
         } else {
             crate::explain::order::find(

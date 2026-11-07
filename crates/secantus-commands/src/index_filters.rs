@@ -11,7 +11,7 @@
 //! them. Setting one for a shape that has one replaces it.
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use bson::{doc, Bson, Document};
@@ -109,7 +109,7 @@ pub(crate) fn allowed(
 }
 
 /// `catalog` cut to the indexes `allowed` names, by name or key pattern.
-pub(crate) fn restrict(catalog: Vec<Rc<IndexInfo>>, allowed: &[Bson]) -> Vec<Rc<IndexInfo>> {
+pub(crate) fn restrict(catalog: Vec<Arc<IndexInfo>>, allowed: &[Bson]) -> Vec<Arc<IndexInfo>> {
     catalog
         .into_iter()
         .filter(|ix| {
@@ -355,8 +355,8 @@ pub(crate) fn apply(
     sort: Option<&Document>,
     projection: Option<&Document>,
     collation: Option<&secantus_core::collation::Collation>,
-    catalog: Vec<Rc<IndexInfo>>,
-) -> (Vec<Rc<IndexInfo>>, bool) {
+    catalog: Vec<Arc<IndexInfo>>,
+) -> (Vec<Arc<IndexInfo>>, bool) {
     let spec = collation.map(|c| c.spec().clone());
     match allowed(storage, db, coll, query, sort, projection, spec.as_ref()) {
         Some(indexes) => (restrict(catalog, &indexes), true),

@@ -37,7 +37,7 @@ use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// One read of a collection.
 pub(crate) struct Ask<'a> {
@@ -134,7 +134,7 @@ fn untested(node: &Node) -> Node {
             if scan.index.partial.is_some() {
                 let mut index = (*scan.index).clone();
                 index.partial = None;
-                scan.index = Rc::new(index);
+                scan.index = Arc::new(index);
             }
             Node::IxScan(scan)
         }
@@ -361,7 +361,7 @@ impl plan::Whole for Lazy<'_> {
 pub(crate) fn ask_catalog(
     storage: &dyn Storage,
     ask: &Ask,
-) -> Result<Vec<std::rc::Rc<super::IndexInfo>>, StorageError> {
+) -> Result<Vec<std::sync::Arc<super::IndexInfo>>, StorageError> {
     let catalog = catalog(storage, ask.db, ask.coll, None)?;
     Ok(crate::index_filters::apply(
         storage,
@@ -378,7 +378,10 @@ pub(crate) fn ask_catalog(
 
 /// The collection's indexes as the planner sees them, before any index
 /// filter: what mongod's plan cache discriminates by and is cleared with.
-fn catalog_of(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Rc<super::IndexInfo>>, StorageError> {
+fn catalog_of(
+    storage: &dyn Storage,
+    ask: &Ask,
+) -> Result<Vec<Arc<super::IndexInfo>>, StorageError> {
     catalog(storage, ask.db, ask.coll, None)
 }
 
@@ -390,7 +393,7 @@ struct ReadCache<'a> {
     ask: &'a Ask<'a>,
     /// The query as parsed, which a rooted `$or`'s branches are found in.
     canonical: Document,
-    catalog: Vec<Rc<super::IndexInfo>>,
+    catalog: Vec<Arc<super::IndexInfo>>,
     index_filter_set: bool,
     /// The read has consulted and written the cache already: it now only
     /// reads back the plans chosen.
@@ -407,7 +410,7 @@ impl<'a> ReadCache<'a> {
         storage: &'a dyn Storage,
         ask: &'a Ask<'a>,
         canonical: Document,
-        catalog: Vec<Rc<super::IndexInfo>>,
+        catalog: Vec<Arc<super::IndexInfo>>,
     ) -> Result<Option<ReadCache<'a>>, StorageError> {
         if !ask.asked.cached {
             return Ok(None);
@@ -1895,6 +1898,8 @@ pub(crate) struct Selection {
     pub keys_examined: i64,
     pub docs_examined: i64,
     pub summary: String,
+    /// What the read's stages did, for the write's `execStats` (RM-359).
+    pub run: Option<super::stream::WriteRun>,
 }
 
 /// The read of a write's documents, run as mongod's plan for it runs
@@ -1910,6 +1915,7 @@ pub(crate) fn write_selection(
     let Planned::Write { multi, delete, .. } = planned else {
         return Ok(None);
     };
+    let started_ms = super::stream::clock_ms();
     let Some(plan) = counted_plan(storage, ask, planned)? else {
         return Ok(None);
     };
@@ -1950,6 +1956,12 @@ pub(crate) fn write_selection(
             keys_examined: n,
             docs_examined: n,
             summary,
+            run: crate::profiler::profiled().then(|| super::stream::WriteRun {
+                plan: plan.clone(),
+                read: None,
+                examined: n,
+                started_ms,
+            }),
         }));
     }
     let opts = super::stream::Options {
@@ -1963,6 +1975,16 @@ pub(crate) fn write_selection(
         return Ok(None);
     };
     let summary = leaves_of.join(", ");
+    // Only a profile entry reports the stages (`execStats`).
+    let profiled = crate::profiler::profiled();
+    let run = |stream: &super::stream::Stream| {
+        profiled.then(|| super::stream::WriteRun {
+            plan: plan.clone(),
+            read: stream.report_with(read, Default::default()),
+            examined: 0,
+            started_ms,
+        })
+    };
     if multi {
         let all = stream.read_all(storage)?;
         return Ok(Some(Selection {
@@ -1971,11 +1993,13 @@ pub(crate) fn write_selection(
             keys_examined: all.keys_examined,
             docs_examined: all.docs_examined,
             summary,
+            run: run(&stream),
         }));
     }
     // A write of one stops at the first match, and counts to there.
     let batch = stream.next_batch(storage, 1, usize::MAX)?;
     let (keys_examined, docs_examined) = (batch.keys_examined, batch.docs_examined);
+    let counted = run(&stream);
     let first = batch.docs.into_iter().next();
     let mut rids = batch.rids;
     if !rids.is_empty() && store_order_is_the_plans(storage, ask)? {
@@ -1995,6 +2019,7 @@ pub(crate) fn write_selection(
         keys_examined,
         docs_examined,
         summary,
+        run: counted,
     }))
 }
 

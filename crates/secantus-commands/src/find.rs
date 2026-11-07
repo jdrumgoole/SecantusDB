@@ -1273,6 +1273,8 @@ struct FindStream {
     return_key: bool,
     /// Each result carries its RecordId (`showRecordId`).
     show_record_id: bool,
+    /// The plan the stream runs, whose stages a profile entry reports.
+    plan: crate::explain::Node,
 }
 
 /// A streamed batch made what the `find` asked for: each document's key
@@ -1411,6 +1413,10 @@ impl crate::cursors::StreamCursor for FindStream {
     fn has_sort_stage(&self) -> bool {
         self.stream.has_sort_stage()
     }
+
+    fn exec_stages(&self) -> Option<Document> {
+        self.stream.exec_stats(&self.plan)
+    }
 }
 
 /// A `find` read through a streaming cursor: its first batch now, the rest
@@ -1516,6 +1522,7 @@ fn stream_find(
         collation: asked.collation.cloned(),
         return_key: asked.return_key,
         show_record_id: asked.show_record_id,
+        plan,
     };
     // `batchSize: 0` asks for the cursor and no documents.
     let batch = if asked.batch_size == 0 {
@@ -1536,6 +1543,11 @@ fn stream_find(
         validate_empty_result(asked.filter, asked.let_vars, asked.collation)?;
     }
     let has_sort_stage = cursor.stream.has_sort_stage();
+    let exec_stages = ctx
+        .profiling
+        .is_some()
+        .then(|| cursor.exec_stages())
+        .flatten();
     let cursor_id = if batch.exhausted || asked.single_batch {
         0
     } else {
@@ -1552,6 +1564,8 @@ fn stream_find(
         plan_summary: None,
         originating_command: None,
         has_sort_stage,
+        exec_stages,
+        write_run: None,
     });
     ctx.pending_batch = Some(crate::PendingBatch {
         batch_field: "firstBatch",

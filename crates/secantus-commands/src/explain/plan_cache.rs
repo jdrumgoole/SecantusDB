@@ -234,7 +234,7 @@ pub(crate) fn fingerprint(
     storage: &dyn crate::storage::Storage,
     db: &str,
     coll: &str,
-    catalog: &[std::rc::Rc<super::IndexInfo>],
+    catalog: &[std::sync::Arc<super::IndexInfo>],
 ) -> Result<String, crate::storage::StorageError> {
     let specs = storage.list_indexes(db, coll)?;
     Ok(format!("{specs:?}{catalog:?}"))

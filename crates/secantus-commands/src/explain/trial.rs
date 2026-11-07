@@ -377,6 +377,7 @@ impl<'a> Stage<'a> {
                 // which a count cannot say: none here.
                 saved: 0,
                 restored: 0,
+                millis: 0,
             }),
         }
     }

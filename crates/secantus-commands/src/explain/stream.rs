@@ -52,7 +52,7 @@ use secantus_core::heap::{Heap, HeapOrder};
 use secantus_core::sortkey::{self, COMPOUND_SEP};
 
 use super::exec::{contiguous, outside_of, ranges, reversed_key, Ranges};
-use super::node::{IxScan, Node};
+use super::node::{num, IxScan, Node, Stats, WorkCounts};
 use crate::storage::{Storage, StorageError};
 
 /// How many index entries or documents one read of the store takes.
@@ -63,6 +63,59 @@ const CHUNK: usize = 256;
 /// bounds; reading ahead in whole chunks made a short range read and
 /// decode 256 entries to return ten (RM-365).
 const FIRST_CHUNK: usize = 16;
+
+/// What one stage did as it ran, counted as mongod's `PlanStage` counts its
+/// `CommonStats` (RM-359): a profile entry's `execStats`.
+///
+/// A stage that hands a work down to its input (a FETCH, a SKIP, an OR, a
+/// SORT reading its input) does not count it: its input does, and the
+/// stage's works are its inputs' and its own (`own`). Its own are the works
+/// that call no input: a scan's every one, a SORT's or a SORT_MERGE's
+/// results, and the work that finds the input already at its end.
+#[derive(Clone, Copy, Default)]
+struct Tally {
+    own: i64,
+    advanced: i64,
+    /// A work of the stage returned EOF (one ends a stage's run).
+    eof_work: bool,
+    keys: i64,
+    docs: i64,
+    seeks: i64,
+    dups_tested: i64,
+    dups_dropped: i64,
+    /// The time spent in the stage's calls, on a coarse clock.
+    millis: i64,
+}
+
+/// Milliseconds on a coarse clock, as cheap to read as mongod's fast clock
+/// source, which times each stage's works (`executionTimeMillisEstimate`).
+fn coarse_ms() -> i64 {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        #[cfg(target_os = "linux")]
+        let clock = libc::CLOCK_MONOTONIC_COARSE;
+        #[cfg(target_os = "macos")]
+        let clock = libc::CLOCK_MONOTONIC_RAW_APPROX;
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid timespec for the call to fill.
+        unsafe { libc::clock_gettime(clock, &mut ts) };
+        // `time_t` and `c_long` are i64 on a 64-bit target, narrower on others.
+        #[allow(clippy::unnecessary_cast)]
+        let ms = ts.tv_sec as i64 * 1000 + ts.tv_nsec as i64 / 1_000_000;
+        ms
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis() as i64
+    }
+}
 
 /// A filter's failure on a document, as the store reports one
 /// (`secantus_storage::query_fault` through the adapter).
@@ -259,6 +312,7 @@ struct IndexScan {
     ended: bool,
     /// How many entries the next read of the store takes.
     chunk: usize,
+    t: Tally,
 }
 
 /// What one unit of an index scan's work did.
@@ -277,6 +331,8 @@ struct Snap {
     run: Option<Vec<Vec<u8>>>,
     /// The batch's keys examined at that point.
     keys: i64,
+    /// The scan's own tally at that point.
+    t: Tally,
 }
 
 impl IndexScan {
@@ -286,6 +342,7 @@ impl IndexScan {
             done: self.done,
             run: self.run.clone(),
             keys,
+            t: self.t,
         }
     }
 
@@ -295,6 +352,7 @@ impl IndexScan {
         self.last = snap.last;
         self.done = snap.done;
         self.run = snap.run;
+        self.t = snap.t;
         self.buf.clear();
         self.end = false;
         if self.meta.multikey {
@@ -471,12 +529,20 @@ impl IndexScan {
                     self.run = Some(run.to_vec());
                 }
                 cx.keys += 1;
+                self.t.keys += 1;
+                self.t.own += 1;
                 let e = self.pop().expect("an entry is at the front");
                 // A DISTINCT_SCAN returns each value, whichever document
                 // holds it: a document is returned once by any other scan.
-                if self.meta.multikey && self.distinct.is_none() && !self.seen.insert(e.rid) {
-                    continue;
+                if self.meta.multikey && self.distinct.is_none() {
+                    self.t.dups_tested += 1;
+                    if !self.seen.insert(e.rid) {
+                        // mongod's scan spends the work and needs more time.
+                        self.t.dups_dropped += 1;
+                        continue;
+                    }
                 }
+                self.t.advanced += 1;
                 return Ok(Step::Entry(Member {
                     rid: e.rid,
                     doc: None,
@@ -501,11 +567,15 @@ impl IndexScan {
                 return Ok(Step::End);
             }
             cx.keys += 1;
+            self.t.keys += 1;
             if !ahead && field == 0 {
                 self.done = true;
                 return Ok(Step::End);
             }
-            // Seek: past every key that fails the same way.
+            // Seek: past every key that fails the same way. The work that
+            // examined the key seeks, and needs more time.
+            self.t.own += 1;
+            self.t.seeks += 1;
             let prefix = self.buf[0].scan[..field].to_vec();
             self.pop();
             while self.fill(cx)? {
@@ -525,19 +595,35 @@ impl IndexScan {
     }
 
     fn next(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
-        loop {
-            match self.work(cx)? {
-                Step::Entry(m) => return Ok(Some(m)),
-                Step::Seek => continue,
-                Step::End => {
+        // A scan at its end is worked no more (mongod's executor stops).
+        if self.t.eof_work {
+            return Ok(None);
+        }
+        let started = coarse_ms();
+        // The first work seeks to the start of the bounds.
+        if self.t.own == 0 {
+            self.t.seeks += 1;
+        }
+        let out = loop {
+            match self.work(cx) {
+                Ok(Step::Entry(m)) => break Ok(Some(m)),
+                Ok(Step::Seek) => continue,
+                Ok(Step::End) => {
                     if self.count_scan && !self.ended {
                         self.ended = true;
                         cx.keys += 1;
+                        self.t.keys += 1;
                     }
-                    return Ok(None);
+                    // The work that finds the end.
+                    self.t.own += 1;
+                    self.t.eof_work = true;
+                    break Ok(None);
                 }
+                Err(e) => break Err(e),
             }
-        }
+        };
+        self.t.millis += coarse_ms() - started;
+        out
     }
 }
 
@@ -549,10 +635,42 @@ struct CollScan {
     filter: Option<Document>,
     buf: VecDeque<(i64, Vec<u8>)>,
     end: bool,
+    t: Tally,
 }
 
 impl CollScan {
+    fn new(backward: bool, filter: Option<Document>, end: bool) -> CollScan {
+        CollScan {
+            after: None,
+            backward,
+            filter,
+            buf: VecDeque::new(),
+            end,
+            t: Tally::default(),
+        }
+    }
+
+    /// Each document is a work, advanced when it matches; the end is one
+    /// more.
     fn next(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
+        if self.t.eof_work {
+            return Ok(None);
+        }
+        let started = coarse_ms();
+        let out = self.scan(cx);
+        match &out {
+            Ok(Some(_)) => self.t.advanced += 1,
+            Ok(None) => {
+                self.t.own += 1;
+                self.t.eof_work = true;
+            }
+            Err(_) => {}
+        }
+        self.t.millis += coarse_ms() - started;
+        out
+    }
+
+    fn scan(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
         loop {
             if self.buf.is_empty() {
                 if self.end {
@@ -573,6 +691,8 @@ impl CollScan {
             let (rid, blob) = self.buf.pop_front().expect("a row is buffered");
             self.after = Some(rid);
             cx.docs += 1;
+            self.t.docs += 1;
+            self.t.own += 1;
             let keep = match &self.filter {
                 None => true,
                 Some(f) => cx.matches(&blob, f)?,
@@ -619,6 +739,10 @@ struct Merge {
     queue: Option<VecDeque<usize>>,
     heads: Heap<Head>,
     seen: HashSet<i64>,
+    /// mongod tests each result for a duplicate only when a scan below can
+    /// return one: over a multikey index.
+    dedup: bool,
+    t: Tally,
 }
 
 /// A document's key under a sort pattern and a collation: each field's
@@ -675,15 +799,44 @@ impl Merge {
         pattern_key(&self.pattern, m)
     }
 
+    /// mongod's `isEOF`: every child at its end and every head handed out,
+    /// which a SORT_MERGE knows without a work.
+    fn is_eof(&self) -> bool {
+        self.queue.as_ref().is_some_and(VecDeque::is_empty) && self.heads.is_empty()
+    }
+
+    /// Each child's work is the child's; each head handed out is a work of
+    /// the merge's own.
     fn next(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
+        if self.is_eof() {
+            if !self.t.eof_work {
+                self.t.eof_work = true;
+                self.t.own += 1;
+            }
+            return Ok(None);
+        }
         let mut queue = self
             .queue
             .take()
             .unwrap_or_else(|| (0..self.inputs.len()).collect());
         while let Some(&child) = queue.front() {
-            match self.inputs[child].next(cx)? {
+            let next = match self.inputs[child].next(cx) {
+                Ok(next) => next,
+                Err(e) => {
+                    self.queue = Some(queue);
+                    return Err(e);
+                }
+            };
+            match next {
                 Some(m) => {
-                    if self.seen.insert(m.rid) {
+                    if self.dedup {
+                        self.t.dups_tested += 1;
+                    }
+                    if !self.seen.insert(m.rid) {
+                        if self.dedup {
+                            self.t.dups_dropped += 1;
+                        }
+                    } else {
                         queue.pop_front();
                         let key = self.key_of(&m);
                         self.heads.push(Head {
@@ -701,6 +854,8 @@ impl Merge {
         let top = self.heads.pop();
         if let Some(top) = &top {
             queue.push_back(top.child);
+            self.t.own += 1;
+            self.t.advanced += 1;
         }
         self.queue = Some(queue);
         Ok(top.map(|t| t.member))
@@ -715,6 +870,7 @@ enum Stage {
     Point {
         filter: Document,
         done: bool,
+        t: Tally,
     },
     Coll(CollScan),
     Ix(Box<IndexScan>),
@@ -727,15 +883,18 @@ enum Stage {
         input: Box<Stage>,
         counted: bool,
         ahead: Option<VecDeque<Ahead>>,
+        t: Tally,
     },
     Skip {
         left: i64,
         input: Box<Stage>,
+        t: Tally,
     },
     Or {
         inputs: Vec<Stage>,
         pos: usize,
         seen: HashSet<i64>,
+        t: Tally,
     },
     Merge(Box<Merge>),
     /// A blocking sort of index keys below the FETCH: everything is read
@@ -750,6 +909,7 @@ enum Stage {
         /// The command's collation: the keys' values compare under it, as
         /// mongod's sort compares them whatever the index's collation.
         collation: Option<Collation>,
+        t: Tally,
     },
     /// A blocking sort of whole documents above the FETCH: every document
     /// read, and examined, for the first batch, then sorted -- documents
@@ -762,12 +922,16 @@ enum Stage {
         sorted: Option<VecDeque<Member>>,
         collation: Option<Collation>,
         budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+        t: Tally,
+        /// What its sorter counted (`totalDataSizeSorted`, the spills).
+        report: Option<Box<secantus_core::memlimit::SpillReport>>,
     },
 }
 
 /// Sort `all` by `pattern` as mongod's `SORT` does, holding it to its
 /// memory budget (a sort past it without `allowDiskUse` is refused, 292)
-/// and keeping documents that compare equal in the order they came.
+/// and keeping documents that compare equal in the order they came; with
+/// what its sorter counted, when it ran one.
 fn sort_members(
     cx: &Cx,
     all: Vec<Member>,
@@ -775,9 +939,17 @@ fn sort_members(
     limit: Option<i64>,
     collation: Option<&Collation>,
     budget: Option<(secantus_core::memlimit::Budgets, bool)>,
-) -> Result<VecDeque<Member>, StorageError> {
+) -> Result<
+    (
+        VecDeque<Member>,
+        Option<secantus_core::memlimit::SpillReport>,
+    ),
+    StorageError,
+> {
     let top = limit.filter(|n| *n > 0).map(|n| n as usize);
+    let mut report = None;
     if let Some((budgets, disk)) = budget {
+        let before = secantus_core::memlimit::report();
         let _disk = secantus_core::memlimit::allow_disk_use(disk);
         let _budgets = secantus_core::memlimit::with_budgets(budgets);
         let decoded: Vec<Document> = all
@@ -805,6 +977,7 @@ fn sort_members(
             },
             None => fault(f),
         })?;
+        report = Some(secantus_core::memlimit::report().less(&before));
     }
     let blobs: Vec<&[u8]> = all
         .iter()
@@ -819,13 +992,118 @@ fn sort_members(
     if let Some(n) = top {
         out.truncate(n);
     }
-    Ok(out)
+    Ok((out, report))
+}
+
+/// A stage that hands its works down reached its end: in the work that
+/// found its input's end, which is the input's own unless the input knew
+/// it was at its end without a work (a SORT_MERGE).
+fn ended(t: &mut Tally, input: &Stage) {
+    if !t.eof_work {
+        t.eof_work = true;
+        if !input.tally().eof_work {
+            t.own += 1;
+        }
+    }
+}
+
+/// A SORT's next result: each one handed out is a work of its own, and so
+/// is the one that finds none left.
+fn sorted_next(sorted: &mut Option<VecDeque<Member>>, t: &mut Tally) -> Option<Member> {
+    let next = sorted.as_mut().and_then(VecDeque::pop_front);
+    if next.is_some() {
+        t.own += 1;
+    } else if !t.eof_work {
+        t.own += 1;
+        t.eof_work = true;
+    }
+    next
 }
 
 impl Stage {
+    /// The stage's tally; `None` for a scan, which keeps its own.
+    fn tally_mut(&mut self) -> &mut Tally {
+        match self {
+            Stage::Point { t, .. }
+            | Stage::Fetch { t, .. }
+            | Stage::Skip { t, .. }
+            | Stage::Or { t, .. }
+            | Stage::SortKeys { t, .. }
+            | Stage::SortDocs { t, .. } => t,
+            Stage::Merge(m) => &mut m.t,
+            Stage::Coll(s) => &mut s.t,
+            Stage::Ix(s) => &mut s.t,
+        }
+    }
+
+    fn tally(&self) -> &Tally {
+        match self {
+            Stage::Point { t, .. }
+            | Stage::Fetch { t, .. }
+            | Stage::Skip { t, .. }
+            | Stage::Or { t, .. }
+            | Stage::SortKeys { t, .. }
+            | Stage::SortDocs { t, .. } => t,
+            Stage::Merge(m) => &m.t,
+            Stage::Coll(s) => &s.t,
+            Stage::Ix(s) => &s.t,
+        }
+    }
+
+    /// A scan below reads a multikey index.
+    fn multikey(&self) -> bool {
+        match self {
+            Stage::Ix(s) => s.meta.multikey,
+            Stage::Fetch { input, .. } | Stage::Skip { input, .. } => input.multikey(),
+            _ => false,
+        }
+    }
+
+    /// mongod's `isEOF` for the stage: a scan, an OR or a SORT once a work
+    /// found its end; a FETCH or a SKIP when its input is; a SORT_MERGE
+    /// once every child is at its end and every head handed out.
+    fn is_eof(&self) -> bool {
+        match self {
+            Stage::Point { done, .. } => *done,
+            Stage::Coll(_) | Stage::Ix(_) | Stage::SortKeys { .. } | Stage::SortDocs { .. } => {
+                self.tally().eof_work
+            }
+            Stage::Fetch { input, ahead, .. } => {
+                ahead.as_ref().is_none_or(VecDeque::is_empty) && input.is_eof()
+            }
+            Stage::Skip { input, .. } => input.is_eof(),
+            Stage::Or { inputs, pos, .. } => *pos >= inputs.len(),
+            Stage::Merge(m) => m.is_eof(),
+        }
+    }
+
     fn next(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
         match self {
-            Stage::Point { filter, done } => {
+            // The scans time their own calls.
+            Stage::Coll(scan) => return scan.next(cx),
+            Stage::Ix(scan) => return scan.next(cx),
+            Stage::Merge(merge) => {
+                let started = coarse_ms();
+                let out = merge.next(cx);
+                merge.t.millis += coarse_ms() - started;
+                return out;
+            }
+            _ => {}
+        }
+        let started = coarse_ms();
+        let out = self.step(cx);
+        let t = self.tally_mut();
+        if let Ok(Some(_)) = &out {
+            t.advanced += 1;
+        }
+        t.millis += coarse_ms() - started;
+        out
+    }
+
+    /// One result of the stage's, counted by [`Self::next`].
+    fn step(&mut self, cx: &mut Cx) -> Result<Option<Member>, StorageError> {
+        match self {
+            Stage::Point { filter, done, t } => {
                 if *done {
                     return Ok(None);
                 }
@@ -841,6 +1119,8 @@ impl Stage {
                 };
                 cx.keys += 1;
                 cx.docs += 1;
+                t.keys += 1;
+                t.docs += 1;
                 Ok(Some(Member {
                     rid,
                     doc: Some(blob),
@@ -848,114 +1128,162 @@ impl Stage {
                     stale: false,
                 }))
             }
-            Stage::Coll(scan) => scan.next(cx),
-            Stage::Ix(scan) => scan.next(cx),
+            Stage::Coll(_) | Stage::Ix(_) | Stage::Merge(_) => {
+                unreachable!("counted by Stage::next")
+            }
             Stage::Fetch {
                 filter,
                 input,
                 counted,
                 ahead,
-            } => loop {
-                if let (Some(queue), Stage::Ix(scan)) = (ahead.as_mut(), input.as_mut()) {
-                    if queue.is_empty() {
-                        let room = match cx.want {
-                            0 => CHUNK,
-                            n => n.min(CHUNK),
-                        };
-                        let mut members = Vec::with_capacity(room);
-                        while members.len() < room {
-                            let snap = scan.snapshot(cx.keys);
-                            match scan.next(cx)? {
-                                Some(m) => members.push((m, snap)),
-                                None => break,
+                t,
+            } => {
+                // Its input at its end: the work that finds it there. The
+                // FETCH a covered plan has here is no stage of mongod's: the
+                // projection above works its input whatever it is at (its
+                // SORT_MERGE spends a work finding itself at its end,
+                // measured 8.2.11).
+                if *counted && ahead.as_ref().is_none_or(VecDeque::is_empty) && input.is_eof() {
+                    ended(t, input);
+                    return Ok(None);
+                }
+                loop {
+                    if let (Some(queue), Stage::Ix(scan)) = (ahead.as_mut(), input.as_mut()) {
+                        if queue.is_empty() {
+                            let room = match cx.want {
+                                0 => CHUNK,
+                                n => n.min(CHUNK),
+                            };
+                            let mut members = Vec::with_capacity(room);
+                            while members.len() < room {
+                                let snap = scan.snapshot(cx.keys);
+                                match scan.next(cx)? {
+                                    Some(m) => members.push((m, snap)),
+                                    None => break,
+                                }
+                            }
+                            if members.is_empty() {
+                                ended(t, input);
+                                return Ok(None);
+                            }
+                            let rids: Vec<i64> = members.iter().map(|(m, _)| m.rid).collect();
+                            let Some(found) = cx.storage.records_by_id(cx.db, cx.coll, &rids)?
+                            else {
+                                return Err(StorageError::Internal(
+                                    "this store cannot stream".into(),
+                                ));
+                            };
+                            for ((member, snap), blob) in members.into_iter().zip(found) {
+                                queue.push_back(Ahead { member, blob, snap });
                             }
                         }
-                        if members.is_empty() {
+                        let Some(Ahead {
+                            mut member, blob, ..
+                        }) = queue.pop_front()
+                        else {
                             return Ok(None);
-                        }
-                        let rids: Vec<i64> = members.iter().map(|(m, _)| m.rid).collect();
-                        let Some(found) = cx.storage.records_by_id(cx.db, cx.coll, &rids)? else {
-                            return Err(StorageError::Internal("this store cannot stream".into()));
                         };
-                        for ((member, snap), blob) in members.into_iter().zip(found) {
-                            queue.push_back(Ahead { member, blob, snap });
+                        let Some(blob) = blob else { continue };
+                        if *counted {
+                            cx.docs += 1;
+                            t.docs += 1;
                         }
-                    }
-                    let Some(Ahead {
-                        mut member, blob, ..
-                    }) = queue.pop_front()
-                    else {
-                        return Ok(None);
-                    };
-                    let Some(blob) = blob else { continue };
-                    if *counted {
-                        cx.docs += 1;
-                    }
-                    if let Some(f) = filter.as_ref() {
-                        if !cx.matches(&blob, f)? {
-                            continue;
-                        }
-                    }
-                    member.doc = Some(blob);
-                    return Ok(Some(member));
-                }
-                let Some(mut m) = input.next(cx)? else {
-                    return Ok(None);
-                };
-                if m.doc.is_none() {
-                    let Some(blob) = cx.read(m.rid)? else {
-                        continue;
-                    };
-                    // An entry held over a yield is fetched only if the
-                    // document still has its key (mongod drops it).
-                    if m.stale {
-                        if let Some(entry) = &m.entry {
-                            if !holds_entry(entry, &blob)? {
+                        if let Some(f) = filter.as_ref() {
+                            if !cx.matches(&blob, f)? {
                                 continue;
                             }
                         }
+                        member.doc = Some(blob);
+                        return Ok(Some(member));
                     }
-                    if *counted {
-                        cx.docs += 1;
+                    let Some(mut m) = input.next(cx)? else {
+                        // The projection above a covered plan works its
+                        // input again, which finds itself at its end.
+                        if !*counted && !input.tally().eof_work {
+                            input.next(cx)?;
+                        }
+                        ended(t, input);
+                        return Ok(None);
+                    };
+                    if m.doc.is_none() {
+                        let Some(blob) = cx.read(m.rid)? else {
+                            continue;
+                        };
+                        // An entry held over a yield is fetched only if the
+                        // document still has its key (mongod drops it).
+                        if m.stale {
+                            if let Some(entry) = &m.entry {
+                                if !holds_entry(entry, &blob)? {
+                                    continue;
+                                }
+                            }
+                        }
+                        if *counted {
+                            cx.docs += 1;
+                            t.docs += 1;
+                        }
+                        m.doc = Some(blob);
                     }
-                    m.doc = Some(blob);
+                    if let (Some(f), Some(blob)) = (filter.as_ref(), m.doc.as_ref()) {
+                        if !cx.matches(blob, f)? {
+                            continue;
+                        }
+                    }
+                    return Ok(Some(m));
                 }
-                if let (Some(f), Some(blob)) = (filter.as_ref(), m.doc.as_ref()) {
-                    if !cx.matches(blob, f)? {
-                        continue;
-                    }
+            }
+            Stage::Skip { left, input, t } => {
+                if input.is_eof() {
+                    ended(t, input);
+                    return Ok(None);
                 }
-                return Ok(Some(m));
-            },
-            Stage::Skip { left, input } => {
                 while *left > 0 {
                     if input.next(cx)?.is_none() {
+                        ended(t, input);
                         return Ok(None);
                     }
                     *left -= 1;
                 }
-                input.next(cx)
+                let next = input.next(cx)?;
+                if next.is_none() {
+                    ended(t, input);
+                }
+                Ok(next)
             }
-            Stage::Or { inputs, pos, seen } => {
+            Stage::Or {
+                inputs,
+                pos,
+                seen,
+                t,
+            } => {
                 while *pos < inputs.len() {
                     match inputs[*pos].next(cx)? {
                         Some(m) => {
+                            // mongod's OR tests every result for a duplicate.
+                            t.dups_tested += 1;
                             if seen.insert(m.rid) {
                                 return Ok(Some(m));
                             }
+                            t.dups_dropped += 1;
                         }
-                        None => *pos += 1,
+                        None => {
+                            *pos += 1;
+                            if *pos == inputs.len() {
+                                // The last child's end is the OR's.
+                                ended(t, &inputs[*pos - 1]);
+                            }
+                        }
                     }
                 }
                 Ok(None)
             }
-            Stage::Merge(merge) => merge.next(cx),
             Stage::SortKeys {
                 pattern,
                 limit,
                 input,
                 sorted,
                 collation,
+                t,
             } => {
                 if sorted.is_none() {
                     let mut all: Vec<(Vec<Vec<u8>>, Member)> = Vec::new();
@@ -979,7 +1307,7 @@ impl Stage {
                     }
                     *sorted = Some(all.into_iter().map(|(_, m)| m).collect());
                 }
-                Ok(sorted.as_mut().and_then(VecDeque::pop_front))
+                Ok(sorted_next(sorted, t))
             }
             Stage::SortDocs {
                 pattern,
@@ -988,6 +1316,8 @@ impl Stage {
                 sorted,
                 collation,
                 budget,
+                t,
+                report,
             } => {
                 if sorted.is_none() {
                     let mut all: Vec<Member> = Vec::new();
@@ -1001,16 +1331,12 @@ impl Stage {
                         }
                         all.push(m);
                     }
-                    *sorted = Some(sort_members(
-                        cx,
-                        all,
-                        pattern,
-                        *limit,
-                        collation.as_ref(),
-                        *budget,
-                    )?);
+                    let (out, counted) =
+                        sort_members(cx, all, pattern, *limit, collation.as_ref(), *budget)?;
+                    *sorted = Some(out);
+                    *report = counted.map(Box::new);
                 }
-                Ok(sorted.as_mut().and_then(VecDeque::pop_front))
+                Ok(sorted_next(sorted, t))
             }
         }
     }
@@ -1203,6 +1529,7 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         count_scan: false,
         ended: false,
         chunk: FIRST_CHUNK,
+        t: Tally::default(),
     }))
 }
 
@@ -1233,19 +1560,19 @@ fn stage_of(
             Some(Stage::Point {
                 filter: doc! { field.clone(): { "$eq": value.clone() } },
                 done: false,
+                t: Tally::default(),
             })
         }
         Node::IdHack(value) => Some(Stage::Point {
             filter: doc! { "_id": { "$eq": value.clone() } },
             done: false,
+            t: Tally::default(),
         }),
-        Node::CollScan { backward, .. } => Some(Stage::Coll(CollScan {
-            after: None,
-            backward: *backward,
-            filter: command.cloned(),
-            buf: VecDeque::new(),
-            end: false,
-        })),
+        Node::CollScan { backward, .. } => Some(Stage::Coll(CollScan::new(
+            *backward,
+            command.cloned(),
+            false,
+        ))),
         Node::Fetch { filter, input } => {
             let Some(input) = stage_of(input, None, opts, false)? else {
                 return Ok(None);
@@ -1259,6 +1586,7 @@ fn stage_of(
                 input: Box::new(input),
                 counted: true,
                 ahead: None,
+                t: Tally::default(),
             })
         }
         // mongod skips index entries below the FETCH when nothing is
@@ -1271,6 +1599,7 @@ fn stage_of(
             Some(Stage::Skip {
                 left: *n,
                 input: Box::new(input),
+                t: Tally::default(),
             })
         }
         Node::IxScan(ix) => {
@@ -1285,6 +1614,7 @@ fn stage_of(
                     input: Box::new(s),
                     counted: false,
                     ahead: None,
+                    t: Tally::default(),
                 })
             } else {
                 Some(s)
@@ -1305,6 +1635,7 @@ fn stage_of(
                 input: Box::new(Stage::Ix(Box::new(s))),
                 counted: !covered,
                 ahead: None,
+                t: Tally::default(),
             })
         }
         Node::Or(inputs) => {
@@ -1319,6 +1650,7 @@ fn stage_of(
                 inputs: stages,
                 pos: 0,
                 seen: HashSet::new(),
+                t: Tally::default(),
             })
         }
         Node::Sort {
@@ -1351,6 +1683,7 @@ fn stage_of(
                 input: Box::new(input),
                 sorted: None,
                 collation: opts.collation.cloned(),
+                t: Tally::default(),
             })
         }
         Node::SortMerge { pattern, inputs } => {
@@ -1379,12 +1712,15 @@ fn stage_of(
                 };
                 stages.push(s);
             }
+            let dedup = stages.iter().any(Stage::multikey);
             Some(Stage::Merge(Box::new(Merge {
                 pattern,
                 inputs: stages,
                 queue: None,
                 heads: Heap::new(),
                 seen: HashSet::new(),
+                dedup,
+                t: Tally::default(),
             })))
         }
         _ => None,
@@ -1412,6 +1748,27 @@ pub(crate) struct Stream {
     /// A COUNT_SCAN: results are index entries, counted without their
     /// documents.
     keys_only: bool,
+    /// What the run's stages at the top did, which the stream does for them
+    /// (RM-359): `skip` at its start, the LIMIT reached, and the work that
+    /// found it so; the yields between batches.
+    skip_given: i64,
+    limit_reached: bool,
+    limit_eof_work: bool,
+    /// No batch has been read yet: `find`'s, whose executor works its
+    /// LIMIT once more after the last result, where a `getMore`'s asks
+    /// whether the plan is at its end first (measured 8.2.11).
+    first: bool,
+    yields: Yields,
+    /// The yields the last batch's profile entry reports.
+    shown: Yields,
+}
+
+/// The yields a run went through: a cursor's between its batches, a
+/// write's around each document it writes.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Yields {
+    pub saved: i64,
+    pub restored: i64,
 }
 
 impl Stream {
@@ -1492,13 +1849,7 @@ impl Stream {
                 };
                 let inner = std::mem::replace(
                     &mut below.root,
-                    Stage::Coll(CollScan {
-                        after: None,
-                        backward: false,
-                        filter: None,
-                        buf: VecDeque::new(),
-                        end: true,
-                    }),
+                    Stage::Coll(CollScan::new(false, None, true)),
                 );
                 below.root = Stage::SortDocs {
                     pattern: pattern.clone(),
@@ -1507,8 +1858,11 @@ impl Stream {
                     sorted: None,
                     collation: opts.collation.cloned(),
                     budget: opts.sort_budget,
+                    t: Tally::default(),
+                    report: None,
                 };
                 below.skip = skip;
+                below.skip_given = skip;
                 below.limit = limit;
                 return Ok(Some(below));
             }
@@ -1529,6 +1883,7 @@ impl Stream {
                         input: Box::new(other),
                         counted: false,
                         ahead: None,
+                        t: Tally::default(),
                     },
                 })
             })?,
@@ -1558,6 +1913,12 @@ impl Stream {
             docs: 0,
             want_keys: opts.keys,
             keys_only: false,
+            skip_given: skip,
+            limit_reached: false,
+            limit_eof_work: false,
+            first: true,
+            yields: Yields::default(),
+            shown: Yields::default(),
         }))
     }
 
@@ -1595,6 +1956,12 @@ impl Stream {
             docs: 0,
             want_keys: false,
             keys_only: true,
+            skip_given: 0,
+            limit_reached: false,
+            limit_eof_work: false,
+            first: true,
+            yields: Yields::default(),
+            shown: Yields::default(),
         }))
     }
 
@@ -1608,6 +1975,7 @@ impl Stream {
         limit: i64,
     ) -> Result<(i64, i64, i64), StorageError> {
         self.skip = skip.max(0);
+        self.skip_given = self.skip;
         self.limit = (limit > 0).then_some(limit);
         let (mut n, mut keys, mut docs) = (0i64, 0i64, 0i64);
         loop {
@@ -1682,6 +2050,12 @@ impl Stream {
         let mut bytes = 0usize;
         let result = (|| {
             while !((want > 0 && out.len() >= want) || budget.is_some_and(|b| bytes >= b)) {
+                // A `getMore`'s executor asks whether the plan is at its
+                // end before it works it (a SORT_MERGE knows it is).
+                if !self.first && self.root.is_eof() {
+                    self.done = true;
+                    break;
+                }
                 cx.want = if want > 0 { want - out.len() } else { 0 };
                 let Some(m) = self.root.next(&mut cx)? else {
                     self.done = true;
@@ -1715,7 +2089,26 @@ impl Stream {
         want: usize,
         max_bytes: usize,
     ) -> Result<Batch, StorageError> {
-        self.batch(storage, want, max_bytes, false)
+        // A `getMore` restores the plan its last batch saved.
+        if !self.first {
+            self.yields.restored += 1;
+        }
+        let out = self.batch(storage, want, max_bytes, false);
+        // A batch that leaves the cursor open saves the plan for the next
+        // `getMore`: `find`'s profile entry counts its save, a `getMore`'s
+        // is written before it (measured 8.2.11).
+        let open = out.as_ref().is_ok_and(|b| !b.exhausted);
+        if !self.first {
+            self.shown = self.yields;
+        }
+        if open {
+            self.yields.saved += 1;
+        }
+        if self.first {
+            self.shown = self.yields;
+        }
+        self.first = false;
+        out
     }
 
     /// What an aggregate's cursor stage buffers: up to `want` results, and
@@ -1831,6 +2224,10 @@ impl Stream {
                     if *l == 0 {
                         self.done = true;
                         self.stashed.clear();
+                        self.limit_reached = true;
+                        // `find`'s executor works the LIMIT once more, which
+                        // finds it at its end; a `getMore`'s does not.
+                        self.limit_eof_work = self.first;
                         break 'fill;
                     }
                 }
@@ -1842,6 +2239,499 @@ impl Stream {
         }
         Ok(out)
     }
+}
+
+impl Stream {
+    /// The run so far as mongod's profile entry gives it (`execStats`),
+    /// with the yields the last batch's entry reports (RM-359). `plan` is
+    /// the one the stream was made from.
+    pub(crate) fn exec_stats(&self, plan: &Node) -> Option<Document> {
+        let run = self.report_with(plan, self.shown)?;
+        Some(exec_stats_doc(plan, &run.stats))
+    }
+
+    /// What each stage of `plan` did, yielding `y` times.
+    pub(crate) fn report_with(&self, plan: &Node, y: Yields) -> Option<Report> {
+        self.top(plan, y, false, false)
+    }
+
+    /// A `count`'s run: its COUNT stage over the stream's, which counted
+    /// `counted` after the results it skipped. The COUNT works once more when
+    /// it reaches its limit, finding itself at its end (measured 8.2.11).
+    pub(crate) fn count_stats(&self, plan: &Node, counted: i64) -> Option<Document> {
+        let Node::Count(input) = plan else {
+            return None;
+        };
+        let skipped = self.skip_given - self.skip.max(0);
+        let c = self.top(input, Yields::default(), false, false)?;
+        let works = c.works + i64::from(self.limit_reached);
+        let mut extra = Document::new();
+        extra.insert("nCounted", num(counted));
+        extra.insert("nSkipped", num(skipped));
+        let stats = Stats {
+            n_returned: 0,
+            keys: 0,
+            docs: 0,
+            extra,
+            children: vec![c.stats],
+            work: Some(work_counts(
+                works,
+                0,
+                true,
+                true,
+                &Tally::default(),
+                Yields::default(),
+                c.millis,
+            )),
+        };
+        Some(exec_stats_doc(plan, &stats))
+    }
+
+    /// The stages the stream runs for those above the plan's first FETCH or
+    /// scan: a projection passes each result on, SKIP and LIMIT are the
+    /// stream's own `skip` and `limit` (as `of_plan_with` takes them).
+    fn top(&self, node: &Node, y: Yields, limited: bool, skipped: bool) -> Option<Report> {
+        match node {
+            Node::Projection { input, .. } | Node::ReturnKey(input) | Node::Subplan(input) => {
+                let c = self.top(input, y, limited, skipped)?;
+                Some(pass(c, y))
+            }
+            Node::Limit(_, input) if !limited && !skipped => {
+                let c = self.top(input, y, true, skipped)?;
+                let works = c.works + i64::from(self.limit_eof_work);
+                let eof = self.limit_reached || c.eof;
+                let eof_work = self.limit_eof_work || c.eof_work;
+                Some(Report {
+                    stats: Stats {
+                        n_returned: c.advanced,
+                        work: Some(work_counts(
+                            works,
+                            c.advanced,
+                            eof,
+                            eof_work,
+                            &Tally::default(),
+                            y,
+                            c.millis,
+                        )),
+                        children: vec![c.stats],
+                        ..Default::default()
+                    },
+                    works,
+                    advanced: c.advanced,
+                    eof,
+                    eof_work,
+                    millis: c.millis,
+                })
+            }
+            Node::Skip(_, input) if !skipped => {
+                let c = self.top(input, y, limited, true)?;
+                // Each result skipped is a work that needs more time.
+                let advanced = c.advanced - (self.skip_given - self.skip.max(0));
+                Some(Report {
+                    stats: Stats {
+                        n_returned: advanced,
+                        work: Some(work_counts(
+                            c.works,
+                            advanced,
+                            c.eof,
+                            c.eof_work,
+                            &Tally::default(),
+                            y,
+                            c.millis,
+                        )),
+                        children: vec![c.stats],
+                        ..Default::default()
+                    },
+                    works: c.works,
+                    advanced,
+                    eof: c.eof,
+                    eof_work: c.eof_work,
+                    millis: c.millis,
+                })
+            }
+            _ => report(node, &self.root, y),
+        }
+    }
+}
+
+/// What a stage of a run did, as its parent counts from it: its statistics
+/// and its `CommonStats` (RM-359).
+#[derive(Clone, Debug)]
+pub(crate) struct Report {
+    pub stats: Stats,
+    works: i64,
+    advanced: i64,
+    eof: bool,
+    eof_work: bool,
+    millis: i64,
+}
+
+/// mongod's `CommonStats` for a stage: every work advanced, needed more
+/// time, or returned EOF (no work here waits to yield).
+fn work_counts(
+    works: i64,
+    advanced: i64,
+    eof: bool,
+    eof_work: bool,
+    t: &Tally,
+    y: Yields,
+    millis: i64,
+) -> WorkCounts {
+    WorkCounts {
+        works,
+        advanced,
+        need_time: works - advanced - i64::from(eof_work),
+        eof,
+        seeks: t.seeks,
+        dups_tested: t.dups_tested,
+        dups_dropped: t.dups_dropped,
+        saved: y.saved,
+        restored: y.restored,
+        millis,
+    }
+}
+
+/// A stage that passes each result of its input on: a projection's.
+fn pass(c: Report, y: Yields) -> Report {
+    Report {
+        stats: Stats {
+            n_returned: c.advanced,
+            work: Some(work_counts(
+                c.works,
+                c.advanced,
+                c.eof,
+                c.eof_work,
+                &Tally::default(),
+                y,
+                c.millis,
+            )),
+            children: vec![c.stats],
+            ..Default::default()
+        },
+        ..c
+    }
+}
+
+/// A scan: every work its own.
+fn leaf(t: &Tally, y: Yields, extra: Document) -> Report {
+    Report {
+        stats: Stats {
+            n_returned: t.advanced,
+            keys: t.keys,
+            docs: t.docs,
+            extra,
+            children: Vec::new(),
+            work: Some(work_counts(
+                t.own, t.advanced, t.eof_work, t.eof_work, t, y, t.millis,
+            )),
+        },
+        works: t.own,
+        advanced: t.advanced,
+        eof: t.eof_work,
+        eof_work: t.eof_work,
+        millis: t.millis,
+    }
+}
+
+/// A stage that hands its works down: its inputs' works and its own.
+fn above(stage: &Stage, t: &Tally, children: Vec<Report>, extra: Document, y: Yields) -> Report {
+    let works = children.iter().map(|c| c.works).sum::<i64>() + t.own;
+    let eof = stage.is_eof();
+    Report {
+        stats: Stats {
+            n_returned: t.advanced,
+            keys: 0,
+            docs: t.docs,
+            extra,
+            children: children.into_iter().map(|c| c.stats).collect(),
+            work: Some(work_counts(
+                works, t.advanced, eof, t.eof_work, t, y, t.millis,
+            )),
+        },
+        works,
+        advanced: t.advanced,
+        eof,
+        eof_work: t.eof_work,
+        millis: t.millis,
+    }
+}
+
+fn dups(t: &Tally) -> Document {
+    doc! { "dupsTested": num(t.dups_tested), "dupsDropped": num(t.dups_dropped) }
+}
+
+/// What `stage`, running `node` of the plan, did.
+fn report(node: &Node, stage: &Stage, y: Yields) -> Option<Report> {
+    match (node, stage) {
+        (Node::Projection { input, .. } | Node::ReturnKey(input) | Node::Subplan(input), _) => {
+            Some(pass(report(input, stage, y)?, y))
+        }
+        // The FETCH that reads a fetching DISTINCT_SCAN's documents is the
+        // scan's own (`isFetching`).
+        (
+            Node::DistinctScan(_, _, fetching),
+            Stage::Fetch {
+                input, t: fetch, ..
+            },
+        ) => {
+            let Stage::Ix(scan) = input.as_ref() else {
+                return None;
+            };
+            let mut extra = Document::new();
+            super::exec::fixed_extra(node, &mut extra);
+            if *fetching {
+                extra.insert("docsExamined", num(fetch.docs));
+            }
+            let mut r = leaf(&scan.t, y, extra);
+            r.stats.docs = fetch.docs;
+            Some(r)
+        }
+        // This store reads the document a covered plan answers from: no
+        // stage of mongod's.
+        (
+            _,
+            Stage::Fetch {
+                counted: false,
+                input,
+                ..
+            },
+        ) if !matches!(node, Node::Fetch { .. }) => report(node, input, y),
+        (Node::Express { .. } | Node::IdHack(_), Stage::Point { t, .. }) => Some(Report {
+            stats: Stats {
+                n_returned: t.advanced,
+                keys: t.keys,
+                docs: t.docs,
+                ..Default::default()
+            },
+            works: 1,
+            advanced: t.advanced,
+            eof: true,
+            eof_work: true,
+            millis: t.millis,
+        }),
+        (Node::CollScan { .. }, Stage::Coll(scan)) => Some(leaf(&scan.t, y, Document::new())),
+        (Node::IxScan(_) | Node::CountScan(_), Stage::Ix(scan)) => {
+            Some(leaf(&scan.t, y, Document::new()))
+        }
+        (Node::Fetch { input: n, .. }, Stage::Fetch { input, t, .. })
+        | (Node::Skip(_, n), Stage::Skip { input, t, .. }) => {
+            let c = report(n, input, y)?;
+            Some(above(stage, t, vec![c], Document::new(), y))
+        }
+        (Node::Or(nodes), Stage::Or { inputs, t, .. }) => {
+            let children = children_of(nodes, inputs, y)?;
+            Some(above(stage, t, children, dups(t), y))
+        }
+        (Node::SortMerge { inputs: nodes, .. }, Stage::Merge(merge)) => {
+            let children = children_of(nodes, &merge.inputs, y)?;
+            Some(above(stage, &merge.t, children, dups(&merge.t), y))
+        }
+        (Node::Sort { input: n, .. }, Stage::SortKeys { input, t, .. }) => {
+            let c = report(n, input, y)?;
+            let mut extra = Document::new();
+            super::exec::fixed_extra(node, &mut extra);
+            Some(above(stage, t, vec![c], extra, y))
+        }
+        (
+            Node::Sort { input: n, .. },
+            Stage::SortDocs {
+                input,
+                t,
+                report: counted,
+                ..
+            },
+        ) => {
+            let c = report(n, input, y)?;
+            let mut extra = Document::new();
+            if let Some(r) = counted {
+                super::exec::sort_extra(&mut extra, r);
+            }
+            super::exec::fixed_extra(node, &mut extra);
+            Some(above(stage, t, vec![c], extra, y))
+        }
+        _ => None,
+    }
+}
+
+fn children_of(nodes: &[Node], stages: &[Stage], y: Yields) -> Option<Vec<Report>> {
+    if nodes.len() != stages.len() {
+        return None;
+    }
+    nodes
+        .iter()
+        .zip(stages)
+        .map(|(n, s)| report(n, s, y))
+        .collect()
+}
+
+/// A run's stages as a profile entry's `execStats`: a streamed plan is
+/// never one the plan cache chose (only a contested plan is cached), and a
+/// projection's `transformBy` is `{}` there, where `explain` gives the
+/// projection (measured 8.2.11).
+pub(crate) fn exec_stats_doc(plan: &Node, stats: &Stats) -> Document {
+    fn blank_projections(stage: &mut Document) {
+        if stage.contains_key("transformBy") {
+            stage.insert("transformBy", Document::new());
+        }
+        if let Ok(input) = stage.get_document_mut("inputStage") {
+            blank_projections(input);
+        }
+        if let Ok(inputs) = stage.get_array_mut("inputStages") {
+            for input in inputs.iter_mut() {
+                if let Bson::Document(d) = input {
+                    blank_projections(d);
+                }
+            }
+        }
+    }
+    let mut out = doc! { "isCached": false };
+    out.extend(plan.to_doc(Some(stats)));
+    blank_projections(&mut out);
+    out
+}
+
+/// A `count` answered from the collection's record count: mongod's
+/// RECORD_STORE_FAST_COUNT, one work (measured 8.2.11).
+pub(crate) fn fast_count_stats(counted: i64, skipped: i64) -> Document {
+    let mut extra = Document::new();
+    extra.insert("nCounted", num(counted));
+    extra.insert("nSkipped", num(skipped));
+    let stats = Stats {
+        extra,
+        work: Some(work_counts(
+            1,
+            0,
+            true,
+            true,
+            &Tally::default(),
+            Yields::default(),
+            0,
+        )),
+        ..Default::default()
+    };
+    exec_stats_doc(&Node::FastCount, &stats)
+}
+
+/// The read of a write's documents, kept for its profile entry until the
+/// write is done (RM-359): the write's plan, what its read did, and when
+/// the write started, on the stages' clock.
+#[derive(Clone, Debug)]
+pub(crate) struct WriteRun {
+    pub plan: Node,
+    pub read: Option<Report>,
+    /// An `_id` point write's keys and documents examined.
+    pub examined: i64,
+    pub started_ms: i64,
+}
+
+/// What a write did, as its stage reports it.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Wrote {
+    pub matched: i64,
+    pub modified: i64,
+    pub upserted: i64,
+    pub deleted: i64,
+    /// A `findAndModify` handed a document back.
+    pub returned: bool,
+}
+
+/// mongod's `batchedDeletesTargetBatchDocs`: a BATCHED_DELETE commits, and
+/// its input yields, once per this many documents (its 5 ms time target is
+/// not kept here).
+const DELETE_BATCH_DOCS: i64 = 10;
+
+impl WriteRun {
+    /// The write's `execStats`: its UPDATE or DELETE over the read, whose
+    /// stages yield around each document written -- once per batch of a
+    /// BATCHED_DELETE -- and whose works are the read's; the write returns
+    /// EOF in its last work unless it hands a document back (measured
+    /// 8.2.11).
+    pub(crate) fn exec_stats(&self, wrote: &Wrote) -> Option<Document> {
+        let millis = coarse_ms() - self.started_ms;
+        let (writes, extra, input) = match &self.plan {
+            Node::ExpressWrite { delete, .. } => {
+                let mut extra = Document::new();
+                extra.insert(
+                    "nWouldModify",
+                    num(if *delete { 0 } else { wrote.modified }),
+                );
+                extra.insert("nWouldUpsert", num(wrote.upserted));
+                extra.insert("nWouldDelete", num(wrote.deleted));
+                let stats = Stats {
+                    n_returned: i64::from(wrote.returned),
+                    keys: self.examined,
+                    docs: self.examined,
+                    extra,
+                    ..Default::default()
+                };
+                return Some(exec_stats_doc(&self.plan, &stats));
+            }
+            Node::Update(input) => {
+                let mut extra = Document::new();
+                extra.insert("nMatched", num(wrote.matched));
+                extra.insert("nWouldModify", num(wrote.modified));
+                extra.insert("nWouldUpsert", num(wrote.upserted));
+                (wrote.matched, extra, input)
+            }
+            Node::Delete { batched, input } => {
+                let mut extra = Document::new();
+                extra.insert("nWouldDelete", num(wrote.deleted));
+                let yields = if *batched {
+                    (wrote.deleted + DELETE_BATCH_DOCS - 1) / DELETE_BATCH_DOCS
+                } else {
+                    wrote.deleted
+                };
+                (yields, extra, input)
+            }
+            _ => return None,
+        };
+        // An `_id` read below the write (IDHACK) keeps no work counts.
+        if matches!(input.as_ref(), Node::IdHack(_)) {
+            return None;
+        }
+        let read = self.read.as_ref()?;
+        let mut child = read.stats.clone();
+        yielded(
+            &mut child,
+            Yields {
+                saved: writes,
+                restored: writes,
+            },
+        );
+        let advanced = i64::from(wrote.returned);
+        let stats = Stats {
+            n_returned: advanced,
+            extra,
+            children: vec![child],
+            work: Some(work_counts(
+                read.works,
+                advanced,
+                true,
+                advanced == 0,
+                &Tally::default(),
+                Yields::default(),
+                millis.max(read.millis),
+            )),
+            ..Default::default()
+        };
+        Some(exec_stats_doc(&self.plan, &stats))
+    }
+}
+
+/// Every stage of `stats` went through `y`.
+fn yielded(stats: &mut Stats, y: Yields) {
+    if let Some(w) = stats.work.as_mut() {
+        w.saved = y.saved;
+        w.restored = y.restored;
+    }
+    for c in &mut stats.children {
+        yielded(c, y);
+    }
+}
+
+/// The stages' clock now: a write's start, for its stage's time.
+pub(crate) fn clock_ms() -> i64 {
+    coarse_ms()
 }
 
 /// Drop the topmost filter of a plan whose command filter is empty.

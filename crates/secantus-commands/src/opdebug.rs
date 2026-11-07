@@ -165,6 +165,15 @@ pub(crate) fn note_examined(keys: i64, docs: i64, summary: Option<String>) {
     });
 }
 
+/// The running command's write read its documents so (RM-359): its
+/// profile entry's `execStats` is made from it once the write is done.
+pub(crate) fn note_write_run(run: Option<crate::explain::stream::WriteRun>) {
+    EXAMINED.with(|e| {
+        let mut e = e.borrow_mut();
+        e.get_or_insert_with(Default::default).write_run = run.map(Box::new);
+    });
+}
+
 /// What [`note_examined`] noted for the command, taken.
 pub(crate) fn take_examined() -> Option<crate::ExecStats> {
     EXAMINED.with(|e| e.borrow_mut().take())
