@@ -44,7 +44,7 @@ pub(crate) use node::IndexInfo;
 pub(crate) use node::Node;
 use node::{num, Stats};
 pub(crate) use parsed::parsed_query;
-pub(crate) use plan::{planning_scope, planning_spent};
+pub(crate) use plan::{planned_apart, planning_scope, planning_spent};
 use plan::{Hint, Query};
 use secantus_core::collation::Collation;
 use secantus_core::query::bson_type_name;

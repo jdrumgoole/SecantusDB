@@ -656,6 +656,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A collection that is not there is read by mongod's EOF plan, which
     // examines nothing (RM-023).
     if !exists {
+        let _planning = crate::explain::planned_apart();
         crate::opdebug::note_examined(0, 0, None);
     }
     if tailable && !exists {

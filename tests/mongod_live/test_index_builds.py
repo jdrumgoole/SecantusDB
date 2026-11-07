@@ -163,16 +163,28 @@ class _Build:
             finally:
                 own.close()
 
+        start = _last_ts(client)
         self.thread = threading.Thread(target=run)
         self.thread.start()
-        # Started: its operation is listed -- or, held before its commit,
-        # it has recorded itself ready (mongod lists no build operation
-        # then, and a small build gets there between two looks).
+        # Started: its `startIndexBuild` is in the oplog, and its operation
+        # is listed -- or, held before its commit, it has recorded itself
+        # ready (mongod lists no build operation then, and a small build
+        # gets there between two looks). mongod lists an operation while it
+        # still sets the build up, before that entry, and a `killOp` that
+        # lands then interrupts the setup instead of the build: no entry at
+        # all, and "Caught exception during index builder ...
+        # initialization" (seen once in the RM gate, 2026-11-07). Between
+        # the setup and the build it lists none for a moment.
         deadline = time.monotonic() + 30
         while not (
-            self.ops()
-            or client.config["system.indexBuilds"].find_one(
-                {"commitReadyMembers": {"$exists": True}}
+            client.local["oplog.rs"].find_one(
+                {"ts": {"$gt": start}, "ns": f"{db}.$cmd", "o.startIndexBuild": "c"}
+            )
+            and (
+                self.ops()
+                or client.config["system.indexBuilds"].find_one(
+                    {"commitReadyMembers": {"$exists": True}}
+                )
             )
         ):
             assert time.monotonic() < deadline, "the build never started"

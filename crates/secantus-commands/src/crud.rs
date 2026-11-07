@@ -1651,8 +1651,12 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // record count (`RECORD_STORE_FAST_COUNT`), read without reading
             // a document -- and so counting another transaction's
             // uncommitted insert, as mongod 8.2.11 does (RM-191, RM-087).
-            examined = Some((0, 0));
-            fast_count = true;
+            {
+                // The plan: the record count, which this server settles here.
+                let _planning = crate::explain::planned_apart();
+                examined = Some((0, 0));
+                fast_count = true;
+            }
             storage
                 .collection_sizes(&ctx.db_name, &coll)
                 .map_err(|e| {

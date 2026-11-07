@@ -4065,6 +4065,15 @@ pub fn operation_counts() -> Option<OperationCounts> {
     })
 }
 
+/// Whether a collection with `options` is defined by a document of its
+/// database's `system.views`, as mongod keeps a view and a time-series
+/// collection (the view over its buckets): creating it inserts that
+/// document's `_id` key, and dropping it deletes the key (measured 8.2.11,
+/// 2026-11-07: `keysInserted: 1`, `keysDeleted: 1`; RM-363).
+fn defines_view(options: &Document) -> bool {
+    options.contains_key("viewOn") || options.contains_key("timeseries")
+}
+
 fn counting_index_keys() -> bool {
     INDEX_KEYS.with(|k| k.get().is_some())
 }
@@ -9759,6 +9768,11 @@ impl Storage {
                 current.insert(k.clone(), v.clone());
             }
             write_coll_options(session, db, coll, &current)?;
+            // A view's definition is a `system.views` document, which mongod
+            // updates in place: neither key of its `_id` index moves.
+            if state_before.contains_key("viewOn") {
+                note_index_keys(Some(0), Some(0));
+            }
             if self.enable_oplog {
                 let ui = collection_uuid(session, db, coll)?;
                 let mut o = Document::new();
@@ -13023,6 +13037,11 @@ impl Storage {
                 Ok(true)
             })
         })
+        .inspect(|&created| {
+            if created && defines_view(options) {
+                note_index_keys(Some(1), None);
+            }
+        })
     }
 
     /// Drop a collection: delete its documents, indexes, and index entries, then
@@ -13061,10 +13080,13 @@ impl Storage {
             // Inside a user transaction the drop must join it atomically; the
             // transaction's own dirty-budget guard (TransactionTooLargeForCache)
             // bounds the size, so the single-transaction purge is safe here.
-            return self.retry_write_conflicts("drop_collection", || {
+            let defined = Cell::new(false);
+            let existed = self.retry_write_conflicts("drop_collection", || {
                 let session = self.op_session()?;
                 self.with_statement_txn(&session, || {
-                    let existed = coll_options(&session, db, coll)?.is_some();
+                    let options = coll_options(&session, db, coll)?;
+                    defined.set(options.as_ref().is_some_and(defines_view));
+                    let existed = options.is_some();
                     let ui = if existed && self.enable_oplog {
                         Some(collection_uuid(&session, db, coll)?)
                     } else {
@@ -13088,7 +13110,11 @@ impl Storage {
                     }
                     Ok(existed)
                 })
-            });
+            })?;
+            if existed && defined.get() {
+                note_index_keys(None, Some(1));
+            }
+            return Ok(existed);
         }
         // Chunked two-phase drop. A whole-collection purge in ONE statement
         // transaction is unbounded dirty content — the WT livelock class the
@@ -13107,13 +13133,14 @@ impl Storage {
         // mid-purge leaves rows behind an unregistered name plus the
         // tombstone; `recover_pending_drops` finishes the purge at next open,
         // before any traffic can re-create the name.
+        let defined = Cell::new(false);
         let existed = self.retry_write_conflicts("drop_collection", || {
             let session = self.op_session()?;
             self.with_statement_txn(&session, || {
-                let existed = coll_options(&session, db, coll)?.is_some();
-                if !existed {
+                let Some(options) = coll_options(&session, db, coll)? else {
                     return Ok(false);
-                }
+                };
+                defined.set(defines_view(&options));
                 let ui = if self.enable_oplog {
                     Some(collection_uuid(&session, db, coll)?)
                 } else {
@@ -13142,6 +13169,9 @@ impl Storage {
         })?;
         if !existed {
             return Ok(false);
+        }
+        if defined.get() {
+            note_index_keys(None, Some(1));
         }
         self.purge_dropped_collection(db, coll)?;
         Ok(true)

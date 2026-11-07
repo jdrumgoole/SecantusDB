@@ -30,7 +30,16 @@ thread_local! {
 }
 
 /// Times one call into the planner, when the outermost.
-struct Timing(Option<std::time::Instant>);
+#[must_use = "the planning is timed while it lives"]
+pub(crate) struct Timing(Option<std::time::Instant>);
+
+/// Times a plan its caller settles without the planner, as mongod plans
+/// it all the same: an `EOF` for a collection that is not there, a
+/// `RECORD_STORE_FAST_COUNT` for a `count` with no query. Its line and
+/// entry carry the `planningTimeMicros` (measured 8.2.11, RM-363).
+pub(crate) fn planned_apart() -> Timing {
+    timing()
+}
 
 fn timing() -> Timing {
     let depth = DEPTH.with(|d| d.replace(d.get() + 1));
