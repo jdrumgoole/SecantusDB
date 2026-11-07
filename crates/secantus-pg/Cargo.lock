@@ -2300,6 +2300,7 @@ dependencies = [
  "rand 0.9.5",
  "regex",
  "regex-automata",
+ "snap",
 ]
 
 [[package]]
@@ -2611,6 +2612,12 @@ dependencies = [
  "borsh",
  "serde_core",
 ]
+
+[[package]]
+name = "snap"
+version = "1.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "199905e6153d6405f9728fe44daace35f8f837bbf830bb6e85fbd5828709a886"
 
 [[package]]
 name = "snowball_stemmers_rs"
