@@ -1618,6 +1618,139 @@ fn bind_parameter_names(
     out
 }
 
+/// A SQL function body's parameters bound: by name
+/// ([`bind_parameter_names`]), then a field of a composite parameter
+/// ([`bind_parameter_fields`]).
+fn bind_parameters(
+    sql: &str,
+    fname: &str,
+    names: &[String],
+    types: &[String],
+    table_has_column: &dyn Fn(&str, &str) -> Option<bool>,
+    type_has_field: &dyn Fn(&str, &str) -> bool,
+) -> String {
+    let named = bind_parameter_names(sql, fname, names, types, table_has_column);
+    bind_parameter_fields(
+        &named,
+        fname,
+        names,
+        types,
+        table_has_column,
+        type_has_field,
+    )
+}
+
+/// A field of a composite parameter, `p.f` or `fname.p.f`, rewritten to
+/// `($n::type).f`, as `sql_fn_post_column_ref` resolves a column reference
+/// the parser found no column for: a two-part name is `fname.p` when that
+/// names a parameter (bound by [`bind_parameter_names`]), else the field
+/// `f` of the parameter `p`; a three-part one is the field `f` of `p`
+/// qualified by the function's name. Only a reference PostgreSQL would
+/// resolve so is rewritten:
+///
+/// - a relation of the statement known as `p` that may have a column `f`
+///   (for `fname.p.f`, a table `fname.p`) is the column, which comes first;
+/// - `f` must be a field of the parameter's type (`type_has_field`): over
+///   any other the hook's `ParseFuncOrColumn` finds nothing and the
+///   reference stays the parser's 42P01.
+///
+/// Runs over [`bind_parameter_names`]' output, so a type name it wrote is
+/// never taken for a parameter's name.
+fn bind_parameter_fields(
+    sql: &str,
+    fname: &str,
+    names: &[String],
+    types: &[String],
+    table_has_column: &dyn Fn(&str, &str) -> Option<bool>,
+    type_has_field: &dyn Fn(&str, &str) -> bool,
+) -> String {
+    use pg_query::protobuf::node::Node as N;
+    use pg_query::NodeRef as R;
+    if names.iter().all(String::is_empty) {
+        return sql.to_string();
+    }
+    let (Ok(tree), Ok(scan)) = (pg_query::parse(sql), pg_query::scan(sql)) else {
+        return sql.to_string();
+    };
+    let nodes = tree.protobuf.nodes();
+    let param = |n: &str| names.iter().position(|p| !p.is_empty() && p == n);
+    let field_of = |pos: usize, f: &str| types.get(pos).is_some_and(|t| type_has_field(t, f));
+    // A stored table `schema.relation` the statement reads that may have
+    // `column`: the column a three-part name names first.
+    let schema_table_may_have = |schema: &str, relation: &str, column: &str| {
+        nodes.iter().any(|(n, _, _, _)| match n {
+            R::RangeVar(v) => {
+                v.schemaname == schema
+                    && v.relname == relation
+                    && table_has_column(&format!("{schema}.{relation}"), column).unwrap_or(true)
+            }
+            _ => false,
+        })
+    };
+    // (byte offset of the reference, its number of names, the parameter).
+    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    for (n, _, _, _) in &nodes {
+        let R::ColumnRef(c) = n else {
+            continue;
+        };
+        let parts: Option<Vec<&str>> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect();
+        let hit = match parts.as_deref() {
+            Some([p, f]) if !(*p == fname && param(f).is_some()) => param(p).filter(|&pos| {
+                field_of(pos, f) && !relation_may_have_column(sql, p, f, table_has_column)
+            }),
+            Some([q, p, f]) if !fname.is_empty() && *q == fname => {
+                param(p).filter(|&pos| field_of(pos, f) && !schema_table_may_have(q, p, f))
+            }
+            _ => None,
+        };
+        if let (Some(pos), Ok(at)) = (hit, usize::try_from(c.location)) {
+            found.push((at, parts.map_or(0, |p| p.len()), pos));
+        }
+    }
+    if found.is_empty() {
+        return sql.to_string();
+    }
+    found.sort_unstable();
+    let tokens = scan.tokens;
+    let text = |i: usize| {
+        tokens
+            .get(i)
+            .and_then(|t| sql.get(t.start as usize..t.end as usize))
+    };
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for (at, len, pos) in found {
+        let Some(first) = tokens.iter().position(|t| t.start as usize == at) else {
+            continue;
+        };
+        // The names and their dots: `p . f`, or `fname . p . f`.
+        let last_dot = first + 2 * len - 3;
+        if at < cursor
+            || (first + 1..=last_dot)
+                .step_by(2)
+                .any(|i| text(i) != Some("."))
+        {
+            continue;
+        }
+        out.push_str(&sql[cursor..at]);
+        out.push_str(&format!(
+            "(${}::{}).",
+            pos + 1,
+            types.get(pos).map_or("text", String::as_str)
+        ));
+        cursor = tokens[last_dot].end as usize;
+    }
+    out.push_str(&sql[cursor..]);
+    out
+}
+
 /// An identifier token as PostgreSQL folds it: a quoted one as written
 /// (`""` an escaped quote), any other in lower case.
 fn normalize_identifier(raw: &str) -> String {
@@ -14282,6 +14415,18 @@ impl PgHandler {
         let fname = doc.get_str("name").unwrap_or_default();
         let table_has_column =
             |table: &str, column: &str| self.lookup(table).map(|d| d.column(column).is_some());
+        // Whether a parameter's type is a row type with that field: a
+        // table's (or view's) row type, or a composite of CREATE TYPE.
+        let type_has_field = |ty: &str, field: &str| {
+            let bare = ty.strip_prefix("public.").unwrap_or(ty);
+            match self.lookup(bare) {
+                Some(d) => d.column(field).is_some(),
+                None => self.composites().is_ok_and(|all| {
+                    all.iter()
+                        .any(|(n, _, fields)| n == bare && fields.iter().any(|(f, _)| f == field))
+                }),
+            }
+        };
         let body = doc.get_str("body").unwrap_or_default();
         let statements = pg_query::split_with_parser(body).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -14306,8 +14451,14 @@ impl PgHandler {
         // runs, as `functions.c` checks it at the function's startup.
         if NON_VOLATILE.with(|v| v.get()) && doc.get_str("call_sql").is_err() {
             for stmt in &statements {
-                let sql =
-                    bind_parameter_names(stmt, fname, &names, &u.arg_types, &table_has_column);
+                let sql = bind_parameters(
+                    stmt,
+                    fname,
+                    &names,
+                    &u.arg_types,
+                    &table_has_column,
+                    &type_has_field,
+                );
                 let plan = || {
                     host.plan(&sql, args, &u.arg_types)
                         .ok()
@@ -14348,7 +14499,14 @@ impl PgHandler {
                 && doc.get_str("volatility").unwrap_or("volatile") == "immutable");
         let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
-            let sql = bind_parameter_names(stmt, fname, &names, &u.arg_types, &table_has_column);
+            let sql = bind_parameters(
+                stmt,
+                fname,
+                &names,
+                &u.arg_types,
+                &table_has_column,
+                &type_has_field,
+            );
             let head = sql.trim_start().to_ascii_lowercase();
             let is_query = head.starts_with("select")
                 || head.starts_with("with")
@@ -55812,6 +55970,66 @@ mod function_parameter_tests {
             "select f.p(1)",
         ] {
             assert_eq!(bind(sql), sql);
+        }
+    }
+
+    /// `f(r fe, p int)`'s fields, over the catalog above plus a table `r(a
+    /// int)`: a row type's fields are `fe`'s (RP-462).
+    fn fields(sql: &str) -> String {
+        let has = |t: &str, c: &str| match t {
+            "r" => Some(c == "a"),
+            "s.r" => Some(c == "a"),
+            _ => has_column(t, c),
+        };
+        let type_has_field = |t: &str, f: &str| has_column(t, f).unwrap_or(false);
+        bind_parameter_fields(
+            sql,
+            "f",
+            &["r".into(), "p".into()],
+            &["fe".into(), "int4".into()],
+            &has,
+            &type_has_field,
+        )
+    }
+
+    #[test]
+    fn a_composite_parameters_field_is_read() {
+        // gr1 / gr2 answered 2 for row(2, 'z')::fe on PostgreSQL 15.19.
+        assert_eq!(fields("select r.a"), "select ($1::fe).a");
+        assert_eq!(fields("select f.r.a"), "select ($1::fe).a");
+        assert_eq!(fields("select R . \"b\""), "select ($1::fe). \"b\"");
+        assert_eq!(
+            fields("select count(*) from fe where fe.a = r.a"),
+            "select count(*) from fe where fe.a = ($1::fe).a"
+        );
+        // A relation `r` without the field: the parameter's (gr6 answered
+        // 'z'); a schema's `s.r` is not `f.r`.
+        assert_eq!(fields("select r.b from r"), "select ($1::fe).b from r");
+        assert_eq!(
+            fields("select f.r.a from s.r"),
+            "select ($1::fe).a from s.r"
+        );
+    }
+
+    #[test]
+    fn a_column_or_a_missing_field_is_left() {
+        for sql in [
+            // A relation known as `r` with the column comes first (gr5
+            // answered the table's 99), as does a table `f.r`.
+            "select r.a from r",
+            "select r.a from fe r",
+            "select r.a from (select 1 as a) r",
+            "select f.r.a from f.r",
+            // No such field, or not a composite: the parser's 42P01.
+            "select r.zz",
+            "select p.a",
+            // Not a reference to a field.
+            "select 'r.a'",
+            "select r.a.b",
+            "select g.r.a",
+            "select r.*",
+        ] {
+            assert_eq!(fields(sql), sql);
         }
     }
 }
