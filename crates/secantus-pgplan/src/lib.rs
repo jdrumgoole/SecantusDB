@@ -13557,7 +13557,10 @@ fn over_one_row(s: &pg_query::protobuf::SelectStmt) -> Option<pg_query::protobuf
 /// GROUP BY, HAVING, a window, LIMIT / OFFSET, or a set-returning call in
 /// the list; a call this server does not know might be any of those, so it
 /// keeps the list too.
-pub(crate) fn simplify_exists(s: &mut pg_query::protobuf::SelectStmt) {
+pub(crate) fn simplify_exists(
+    s: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) {
     const AGGREGATE_OR_SRF: &[&str] = &[
         "count",
         "sum",
@@ -13689,21 +13692,147 @@ pub(crate) fn simplify_exists(s: &mut pg_query::protobuf::SelectStmt) {
     if !plain {
         return;
     }
-    s.target_list = vec![pg_query::protobuf::Node {
-        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
-            val: Some(Box::new(pg_query::protobuf::Node {
-                node: Some(N::AConst(pg_query::protobuf::AConst {
-                    val: Some(a_const::Val::Ival(pg_query::protobuf::Integer { ival: 1 })),
-                    ..Default::default()
+    // PostgreSQL drops the list only after parse analysis has resolved
+    // every name in it (RP-444): a reference the subquery's own tables do
+    // not answer stays, for the planner to resolve as an outer row's or
+    // refuse as 42703.
+    let unresolved = exists_target_refs_to_analyse(s, lookup);
+    s.target_list = if unresolved.is_empty() {
+        vec![pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                val: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::AConst(pg_query::protobuf::AConst {
+                        val: Some(a_const::Val::Ival(pg_query::protobuf::Integer { ival: 1 })),
+                        ..Default::default()
+                    })),
                 })),
-            })),
-            location: -1,
-            ..Default::default()
-        }))),
-    }];
+                location: -1,
+                ..Default::default()
+            }))),
+        }]
+    } else {
+        unresolved
+    };
     s.distinct_clause.clear();
     s.sort_clause.clear();
     s.limit_count = None;
+}
+
+/// The column references in an EXISTS subquery's select list, ORDER BY and
+/// DISTINCT ON that its own FROM cannot be seen to answer, each as a target
+/// of its own, in the order PostgreSQL analyses them.
+///
+/// PostgreSQL's `transformSubLink` analyses the subquery whole -- every
+/// name in its list resolved by `transformColumnRef` against its own range
+/// table and then the levels around it -- and only the planner's
+/// `simplify_EXISTS_query` drops the list (and the sort). So `exists (select nosuch)` is
+/// 42703 at the name, though no row of the list is ever read. A reference
+/// is answered here when exactly one of the FROM's plain tables has the
+/// column (for a qualified one, the table its qualifier names), and every
+/// FROM item is a plain table, so no other could have it too (42702). Any
+/// other is kept for the planner, which resolves it as PostgreSQL would: an
+/// outer row's column (a correlation), 42702, or 42703. A subquery's own
+/// list is its own query and is not walked here; a `*` is left to the
+/// qualifier check.
+pub(crate) fn exists_target_refs_to_analyse(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<pg_query::protobuf::Node> {
+    // Each FROM item's visible name and table, or None when one is not a
+    // plain table whose columns are its own.
+    let tables: Option<Vec<(String, TableDef)>> = s
+        .from_clause
+        .iter()
+        .map(|item| match item.node.as_ref() {
+            Some(N::RangeVar(rv)) if rv.alias.as_ref().is_none_or(|a| a.colnames.is_empty()) => {
+                let def = lookup(&relation_name(rv))?;
+                let name = rv
+                    .alias
+                    .as_ref()
+                    .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+                Some((name, def))
+            }
+            _ => None,
+        })
+        .collect();
+    let answered = |c: &pg_query::protobuf::ColumnRef| -> bool {
+        let Some(tables) = tables.as_ref() else {
+            return false;
+        };
+        let parts: Vec<&str> = c
+            .fields
+            .iter()
+            .map(|f| match f.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Option<_>>()
+            .unwrap_or_default();
+        match parts.as_slice() {
+            [col] => {
+                tables
+                    .iter()
+                    .filter(|(_, d)| d.column(col).is_some())
+                    .count()
+                    == 1
+            }
+            [q, col] => {
+                let named: Vec<_> = tables.iter().filter(|(n, _)| n == q).collect();
+                named.len() == 1 && named[0].1.column(col).is_some()
+            }
+            _ => false,
+        }
+    };
+    // ORDER BY and DISTINCT ON are dropped too, after `transformSortClause`
+    // has analysed them: an item that is a bare output-column name
+    // (`findTargetlistEntrySQL92`) was analysed in the list.
+    let outputs: Vec<String> = s
+        .target_list
+        .iter()
+        .filter_map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) if !rt.name.is_empty() => Some(rt.name.clone()),
+            Some(N::ResTarget(rt)) => rt.val.as_deref().map(nodetostring::target::figure_colname),
+            _ => None,
+        })
+        .collect();
+    let names_output = |n: &pg_query::protobuf::Node| -> bool {
+        let n = match n.node.as_ref() {
+            Some(N::SortBy(sb)) => sb.node.as_deref(),
+            _ => Some(n),
+        };
+        match n.and_then(|n| n.node.as_ref()) {
+            Some(N::ColumnRef(c)) => match c.fields.as_slice() {
+                [f] => matches!(f.node.as_ref(), Some(N::String(st)) if outputs.contains(&st.sval)),
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    let analysed = s.target_list.iter().chain(
+        s.sort_clause
+            .iter()
+            .chain(&s.distinct_clause)
+            .filter(|item| !names_output(item)),
+    );
+    let mut kept = Vec::new();
+    for t in analysed {
+        let _ = walk_expr(&mut t.clone(), &mut |n| {
+            if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                let star = c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_))));
+                if !star && !answered(c) {
+                    kept.push(pg_query::protobuf::Node {
+                        node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                            val: Some(Box::new(n.clone())),
+                            location: c.location,
+                            ..Default::default()
+                        }))),
+                    });
+                }
+            }
+            Ok(())
+        });
+    }
+    kept
 }
 
 pub(crate) fn has_aggregate(s: &pg_query::protobuf::SelectStmt) -> bool {
@@ -21273,7 +21402,7 @@ fn resolve_one_sublink(
     // with the subquery -- before an EXISTS drops the select list holding it.
     check_subquery_qualifiers(&inner)?;
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
-        simplify_exists(&mut inner);
+        simplify_exists(&mut inner, lookup);
     }
     // Its system views expand first, as the statement's do, so the
     // subqueries their bodies hold are resolved here too.

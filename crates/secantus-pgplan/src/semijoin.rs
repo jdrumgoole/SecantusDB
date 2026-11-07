@@ -131,6 +131,11 @@ fn semi_join(
         return None;
     }
     let def = lookup(&relation_name(rv))?;
+    // So may a name the table does not have, bare or qualified by it
+    // (RP-444): it is an outer row's column or 42703.
+    if !crate::exists_target_refs_to_analyse(sub, lookup).is_empty() {
+        return None;
+    }
     let mut conjuncts = Vec::new();
     split_and(sub.where_clause.as_deref()?, &mut conjuncts);
     // Exactly one conjunct reads the outer query: `inner = outer`.
