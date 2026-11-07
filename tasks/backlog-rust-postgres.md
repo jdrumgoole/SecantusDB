@@ -1919,20 +1919,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Backlog-ID: RP-475
       Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
 
-## Found while working RP-473 (2026-11-07)
-
-- [ ] **A volatile function in a FROM subquery or a CTE joined to a table
-      runs twice.** With `fq()` a SQL function whose body is `insert into t
-      values (7); select 1`: `select * from t, (select fq()) s`, `with w as
-      (select fq()) select * from t, w` (`materialized` or not) and `with w
-      as (select * from fq()) select * from t, w` each insert one 7 on
-      PostgreSQL 15.19 and two here. Alone (`with w as (select fq()) select
-      * from w`) it runs once. Not traced yet; RP-472 found the same shape
-      (a planning probe that calls the function) in the operator-type check
-      and the whole-row rewrite.
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_joined_subquery_runs_its_function_once
-      Backlog-ID: RP-496
-
 ## Found while working RP-454 (2026-11-07)
 
 - [ ] **A FROM item named as a table an aliased JOIN hides is refused.**

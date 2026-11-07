@@ -8,8 +8,8 @@ while working RP-472 (2026-11-07).
 - RP-475: EXPLAIN of a user function in FROM prints no Function Scan.
 - RP-476 (fixed): a function in FROM under an aggregate and a WHERE ran
   twice.
-- RP-496: a volatile function in a FROM subquery or a CTE joined to a
-  table runs twice (found while working RP-473).
+- RP-496 (fixed): a volatile function in a FROM subquery or a CTE joined
+  to a table ran twice (found while working RP-473).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each scenario runs after.
@@ -196,12 +196,34 @@ JOINED_SUBQUERY_RUNS_ONCE = {
         [(1, 1), (2, 1), (3, 1)],
         [([1, 2, 3, 7],)],
     ),
+    "select * from t473 join (select fq473() as x) s on t473.a = s.x order by 1": (
+        [(1, 1)],
+        [([1, 2, 3, 7],)],
+    ),
+    "select * from t473 left join (select fq473() as x) s on t473.a = s.x order by 1": (
+        [(1, 1), (2, None), (3, None)],
+        [([1, 2, 3, 7],)],
+    ),
+    "select * from (select fq473() as x) s join t473 on true order by 2": (
+        [(1, 1), (1, 2), (1, 3)],
+        [([1, 2, 3, 7],)],
+    ),
+    "select count(*) from t473, (select fq473()) s": ([(3,)], [([1, 2, 3, 7],)]),
+    "select * from t473 a, t473 b, (select fq473()) s order by 1, 2": (
+        [(1, 1, 1), (1, 2, 1), (1, 3, 1), (2, 1, 1), (2, 2, 1), (2, 3, 1)]
+        + [(3, 1, 1), (3, 2, 1), (3, 3, 1)],
+        [([1, 2, 3, 7],)],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-496")
+@pytest.mark.backlog_fixed("RP-496")
 @pytest.mark.parametrize("call", list(JOINED_SUBQUERY_RUNS_ONCE))
 def test_joined_subquery_runs_its_function_once(call: str, dsn: str) -> None:
+    """The narrow two-table join path planned the subquery side, running
+    its function, before it refused the shape, and the general join planner
+    then ran it again; the narrow attempt is now made with calls switched
+    off first."""
     assert answer(dsn, call) == JOINED_SUBQUERY_RUNS_ONCE[call]
 
 

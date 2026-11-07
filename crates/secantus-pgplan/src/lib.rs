@@ -24294,10 +24294,21 @@ fn plan_select(
     let planned = if joins::is_join(s) {
         // A locking JOIN takes the general path, whose rows carry what the
         // executor needs to find the base rows to lock (`lock_targets`).
-        let narrow = if s.locking_clause.is_empty() {
-            plan_select_rest(s, lookup, params)
-        } else {
+        let narrow = if !s.locking_clause.is_empty() {
             Err(Error::Unsupported("a locking join".into()))
+        } else if from_calls_volatile(s) {
+            // The narrow path plans a subquery side -- running its calls --
+            // before it refuses a shape, and the general planner then plans
+            // that subquery again, which ran a volatile function twice
+            // (RP-496): PostgreSQL runs it once, in its executor. So the
+            // narrow attempt is made with calls switched off first, and made
+            // for real only when it will stand.
+            match correlated::without_calls(|| plan_select_rest(s, lookup, params)) {
+                Err(Error::Unsupported(m)) => Err(Error::Unsupported(m)),
+                _ => plan_select_rest(s, lookup, params),
+            }
+        } else {
+            plan_select_rest(s, lookup, params)
         };
         match narrow {
             Err(Error::Unsupported(_)) => joins::plan_join_source(s, lookup, params)
@@ -24377,7 +24388,7 @@ fn plan_select(
 /// function called as a FROM item (a user function left at that default, a
 /// built-in such as `nextval`; only a volatile SQL function may write), or
 /// anywhere in a FROM subquery or a joined item, which are planned -- and
-/// their calls run -- with the statement? (RP-476)
+/// their calls run -- with the statement? (RP-476, RP-496)
 fn from_calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
     fn select(s: &pg_query::protobuf::SelectStmt) -> bool {
         s.from_clause.iter().any(item)
