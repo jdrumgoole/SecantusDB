@@ -4181,6 +4181,41 @@ fn a_column_reference_with_no_from_names_nothing() {
 }
 
 #[test]
+fn a_values_reference_and_an_unread_with_item_are_analysed() {
+    // `transformValuesClause` and `transformWithClause` (RP-501): a VALUES
+    // row's reference was 0A000 `ColumnRef is not supported yet`, or the
+    // error of an item evaluated before it, and an item no part of the
+    // statement reads was dropped unanalysed.
+    for (sql, state, at) in [
+        ("values (nosuch)", "42703", Some(8)),
+        ("values (1/0, nosuch)", "42703", Some(13)),
+        ("values (1, 2), (nosuch)", "42703", Some(16)),
+        ("values (x.y)", "42P01", Some(8)),
+        ("with w as (select nosuch) select 1", "42703", Some(18)),
+        // A missing relation is placed by the server, from its name.
+        ("with w as (select 1 from nosuch) select 1", "42P01", None),
+        (
+            "with v as (select nosuch2), w as (select 1 from nosuch) select * from v",
+            "42703",
+            Some(18),
+        ),
+        ("with w as (select nosuch) delete from t", "42703", Some(18)),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), at, "for {sql}");
+    }
+    // A row's length is compared after the row is analysed.
+    let err = analysed("values (1, 2), (3), (nosuch)").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42601", "{err}");
+    // Nothing in an unread item is evaluated.
+    analysed("with w as (select 1/0) select 1").expect("an unread item is not run");
+    analysed("with w as (select 1 a), v as (select a from w) select * from w")
+        .expect("an item reading an earlier one");
+}
+
+#[test]
 fn a_subquery_target_is_named_as_written() {
     // FigureColname names a target from the expression as written (RP-449):
     // a correlated subquery's per-row call named it `\x1fcorrelated`, and a
