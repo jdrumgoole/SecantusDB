@@ -207,6 +207,13 @@ fn from_item_cols(
             }
             return;
         }
+        // A function's columns, where it plans on its own: `string_agg(b,
+        // ',') from generate_series(1, 2)` in a LATERAL subquery reads only
+        // the left side's `b` (RP-478).
+        Some(N::RangeFunction(rf)) => match crate::joins::function_columns(rf, lookup, &[]) {
+            Some(names) => found.extend(names),
+            None => unknown = true,
+        },
         _ => unknown = true,
     }
     if unknown {

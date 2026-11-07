@@ -20571,8 +20571,19 @@ fn resolve_sublinks_in_select_scoped(
     {
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
+    // Each item's columns, for the LATERAL items after it.
+    let item_columns: Vec<Vec<String>> = s
+        .from_clause
+        .iter()
+        .map(|item| {
+            let mut cols = Vec::new();
+            collect_from_columns(item, lookup, &mut cols);
+            cols
+        })
+        .collect();
     for (i, item) in s.from_clause.iter_mut().enumerate() {
-        resolve_sublinks_in_from(item, i > 0, lookup, params, run, &outer)?;
+        let left: Vec<String> = item_columns[..i].concat();
+        resolve_sublinks_in_from(item, i > 0, &left, lookup, params, run, &outer)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -20604,11 +20615,13 @@ fn resolve_sublinks_in_select_scoped(
 }
 
 /// `has_left`: a FROM item stands to this one's left (see
-/// `rowsfrom::rewrite`). `outer`: the columns the query's FROM exposes, which
-/// a subquery in a join's ON may read.
+/// `rowsfrom::rewrite`); `left`: the columns those items expose, which a
+/// LATERAL subquery reads. `outer`: the columns the query's FROM exposes,
+/// which a subquery in a join's ON may read.
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
     has_left: bool,
+    left: &[String],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -20628,7 +20641,24 @@ fn resolve_sublinks_in_from(
     }
     match item.node.as_mut() {
         Some(N::RangeSubselect(rs)) => {
+            let lateral = rs.lateral;
             match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
+                // A LATERAL subquery's left siblings are the next namespace
+                // out for the subqueries inside it, as an enclosing query's
+                // FROM is: `lateral (select (select b) from fs)` reads the
+                // left side's `b` (RP-478). Any other FROM-subquery sees no
+                // sibling.
+                Some(N::SelectStmt(inner)) if lateral && !left.is_empty() => {
+                    let enclosing = ENCLOSING_COLUMNS.with(|e| {
+                        let mut e = e.borrow_mut();
+                        let d = e.len();
+                        e.extend(left.iter().cloned());
+                        d
+                    });
+                    let resolved = resolve_sublinks_in_select(inner, lookup, params, run);
+                    ENCLOSING_COLUMNS.with(|e| e.borrow_mut().truncate(enclosing));
+                    resolved
+                }
                 Some(N::SelectStmt(inner)) => {
                     resolve_sublinks_in_select(inner, lookup, params, run)
                 }
@@ -20648,11 +20678,17 @@ fn resolve_sublinks_in_from(
             Ok(())
         }
         Some(N::JoinExpr(j)) => {
+            // The right side's left is everything left of the join and the
+            // join's left side.
+            let mut right_left = left.to_vec();
+            if let Some(l) = j.larg.as_deref() {
+                collect_from_columns(l, lookup, &mut right_left);
+            }
             if let Some(l) = j.larg.as_deref_mut() {
-                resolve_sublinks_in_from(l, has_left, lookup, params, run, outer)?;
+                resolve_sublinks_in_from(l, has_left, left, lookup, params, run, outer)?;
             }
             if let Some(r) = j.rarg.as_deref_mut() {
-                resolve_sublinks_in_from(r, true, lookup, params, run, outer)?;
+                resolve_sublinks_in_from(r, true, &right_left, lookup, params, run, outer)?;
             }
             // A subquery in the ON is evaluated as one in a WHERE is
             // (PostgreSQL's `transformJoinOnClause` analyses it with the

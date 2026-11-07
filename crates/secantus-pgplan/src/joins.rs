@@ -1371,38 +1371,49 @@ fn lateral_leaf(
                 return Ok(());
             }
         };
-        let i = match keys.iter().position(|k| *k == key) {
-            Some(i) => i,
-            None => {
-                let ty = left
-                    .cols
-                    .iter()
-                    .find(|c| c.key == key)
-                    .map(|c| c.pg_type.clone())
-                    .unwrap_or_else(|| "text".into());
-                keys.push(key);
-                types.push(ty);
-                keys.len() - 1
-            }
-        };
-        // Bound as `$N::<the column's type>`, so an operator that depends on
-        // the type (`j -> 'a'` on a jsonb) resolves the same with a value as
-        // it would over the column.
-        let param = pg_query::protobuf::Node {
-            node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
-                number: i32::try_from(base + i).unwrap_or(i32::MAX),
-                location: c.location,
-            })),
-        };
-        n.node = Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-            arg: Some(Box::new(param)),
-            type_name: Some(type_name_node(&types[i])),
-            location: -1,
-        })));
+        let i = left_slot(left, &mut keys, &mut types, key);
+        n.node = bound_left_ref(base + i, c.location, &types[i]).node;
         Ok(())
     })?;
     if let Some(e) = failure {
         return Err(e);
+    }
+    // A bare name in a LATERAL subquery is the subquery's own column when a
+    // FROM item at its level (or a level inside it) has one, and the left
+    // side's only when none does: PostgreSQL's `colNameToVar` searches the
+    // namespaces innermost first, and a LATERAL item's left siblings are
+    // the next one out. Found as `correlate` finds an unqualified outer
+    // name: by planning the body and catching its 42703.
+    if !function && names_a_left_column(&inner, left) {
+        let mut bound: Vec<String> = Vec::new();
+        loop {
+            let mut probe_params = params.to_vec();
+            probe_params.extend(types.iter().map(|t| sample_value_for_type(t)));
+            // Planned only to find the names, never to run anything: a
+            // FROM-less body's targets are evaluated as it is planned.
+            let planned = crate::correlated::probing(|| {
+                crate::correlated::without_calls(|| plan_select(&inner, lookup, &probe_params))
+            });
+            let Err(Error::UndefinedColumn(name)) = planned else {
+                break;
+            };
+            if bound.contains(&name) {
+                break;
+            }
+            let Some(key) = left.resolve(std::slice::from_ref(&name))? else {
+                break;
+            };
+            bound.push(name.clone());
+            let i = left_slot(left, &mut keys, &mut types, key);
+            bind_bare_name(
+                &mut inner,
+                &name,
+                base + i,
+                &types[i],
+                lookup,
+                &probe_params,
+            );
+        }
     }
     if keys.is_empty() {
         // A bare FROM-function argument that is no column anywhere is
@@ -1484,6 +1495,349 @@ fn lateral_leaf(
         },
         scope,
     )))
+}
+
+/// The parameter slot a LATERAL item binds the left side's column `key` to,
+/// added (typed by the column) the first time it is read.
+fn left_slot(left: &Scope, keys: &mut Vec<String>, types: &mut Vec<String>, key: String) -> usize {
+    if let Some(i) = keys.iter().position(|k| *k == key) {
+        return i;
+    }
+    let ty = left
+        .cols
+        .iter()
+        .find(|c| c.key == key)
+        .map(|c| c.pg_type.clone())
+        .unwrap_or_else(|| "text".into());
+    keys.push(key);
+    types.push(ty);
+    keys.len() - 1
+}
+
+/// A reference to the left side's column, bound as `$N::<the column's
+/// type>`, so an operator that depends on the type (`j -> 'a'` on a jsonb)
+/// resolves the same with a value as it would over the column.
+fn bound_left_ref(number: usize, location: i32, ty: &str) -> pg_query::protobuf::Node {
+    let param = pg_query::protobuf::Node {
+        node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
+            number: i32::try_from(number).unwrap_or(i32::MAX),
+            location,
+        })),
+    };
+    pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(param)),
+            type_name: Some(type_name_node(ty)),
+            location: -1,
+        }))),
+    }
+}
+
+/// Whether a LATERAL subquery writes, anywhere, a bare name a column of
+/// the left side goes by: only then can one be the left side's.
+fn names_a_left_column(inner: &pg_query::protobuf::SelectStmt, left: &Scope) -> bool {
+    let mut found = false;
+    let mut probe = inner.clone();
+    let _ = crate::correlated::walk_select(&mut probe, &mut |n| {
+        if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+            if let Some([name]) = names_of(c).as_deref() {
+                found |= left.cols.iter().any(|col| col.bare && col.name == *name);
+            }
+        }
+        Ok(())
+    });
+    found
+}
+
+/// Bind the bare name `name` to the left side's `$number` at every query
+/// level of a LATERAL subquery that does not resolve it itself: a level
+/// whose FROM has a column `name` keeps the reference, in that level and in
+/// every level nested inside it, as `colNameToVar` finds the nearest one.
+fn bind_bare_name(
+    s: &mut pg_query::protobuf::SelectStmt,
+    name: &str,
+    number: usize,
+    ty: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) {
+    if s.from_clause
+        .iter()
+        .any(|item| from_item_has_column(item, name, s.with_clause.as_ref(), lookup, params))
+    {
+        return;
+    }
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        match n.node.as_mut() {
+            Some(N::ColumnRef(c)) if names_of(c).is_some_and(|p| p == [name]) => {
+                *n = bound_left_ref(number, c.location, ty);
+            }
+            Some(N::SubLink(sl)) => {
+                if let Some(N::SelectStmt(body)) =
+                    sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    bind_bare_name(body, name, number, ty, lookup, params);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    };
+    for n in s
+        .target_list
+        .iter_mut()
+        .chain(s.group_clause.iter_mut())
+        .chain(s.sort_clause.iter_mut())
+        .chain(s.distinct_clause.iter_mut())
+        .chain(s.window_clause.iter_mut())
+        .chain(s.where_clause.as_deref_mut())
+        .chain(s.having_clause.as_deref_mut())
+    {
+        let _ = walk_expr(n, &mut visit);
+    }
+    fn from_item(
+        item: &mut pg_query::protobuf::Node,
+        name: &str,
+        number: usize,
+        ty: &str,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &[Bson],
+        visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+    ) {
+        match item.node.as_mut() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    from_item(side, name, number, ty, lookup, params, visit);
+                }
+                if let Some(q) = j.quals.as_deref_mut() {
+                    let _ = walk_expr(q, visit);
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                if let Some(N::SelectStmt(body)) =
+                    rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    bind_bare_name(body, name, number, ty, lookup, params);
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                for f in &mut rf.functions {
+                    if let Some(N::List(l)) = f.node.as_mut() {
+                        for arg in &mut l.items {
+                            let _ = walk_expr(arg, visit);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    for item in &mut s.from_clause {
+        from_item(item, name, number, ty, lookup, params, &mut visit);
+    }
+    for side in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+        .into_iter()
+        .flatten()
+    {
+        bind_bare_name(side, name, number, ty, lookup, params);
+    }
+    if let Some(with) = s.with_clause.as_mut() {
+        for cte in &mut with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    c.ctequery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    bind_bare_name(body, name, number, ty, lookup, params);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a FROM item exposes a column `name` to a bare reference at its
+/// level. Where the item's columns cannot be read (a `*` target, a function
+/// that does not plan on its own), it is taken to have it, which keeps the
+/// reference the level's own: an unbound name stays the 42703 it was.
+fn from_item_has_column(
+    item: &pg_query::protobuf::Node,
+    name: &str,
+    with: Option<&pg_query::protobuf::WithClause>,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> bool {
+    let renamed = |alias: Option<&pg_query::protobuf::Alias>, base: Vec<String>| -> Vec<String> {
+        let given: Vec<String> = alias
+            .map(|a| a.colnames.iter().filter_map(alias_colname).collect())
+            .unwrap_or_default();
+        let mut out = base;
+        for (i, g) in given.iter().enumerate() {
+            match out.get_mut(i) {
+                Some(slot) => *slot = g.clone(),
+                None => out.push(g.clone()),
+            }
+        }
+        out
+    };
+    match item.node.as_ref() {
+        Some(N::RangeVar(r)) => {
+            let cte = with.and_then(|w| {
+                w.ctes.iter().find_map(|c| match c.node.as_ref() {
+                    Some(N::CommonTableExpr(c))
+                        if r.schemaname.is_empty() && c.ctename == r.relname =>
+                    {
+                        Some(c)
+                    }
+                    _ => None,
+                })
+            });
+            let base = match cte {
+                Some(c) => {
+                    let body = match c.ctequery.as_deref().and_then(|q| q.node.as_ref()) {
+                        Some(N::SelectStmt(body)) => select_output_names(body),
+                        _ => None,
+                    };
+                    let Some(body) = body else {
+                        return true;
+                    };
+                    let given: Vec<String> =
+                        c.aliascolnames.iter().filter_map(alias_colname).collect();
+                    let mut out = body;
+                    for (i, g) in given.iter().enumerate() {
+                        if let Some(slot) = out.get_mut(i) {
+                            *slot = g.clone();
+                        }
+                    }
+                    out
+                }
+                None => match lookup(&relation_name(r)) {
+                    Some(d) => d.columns.iter().map(|c| c.name.clone()).collect(),
+                    None => return true,
+                },
+            };
+            renamed(r.alias.as_ref(), base).iter().any(|c| c == name)
+        }
+        Some(N::RangeSubselect(rs)) => {
+            let body = match rs.subquery.as_deref().and_then(|q| q.node.as_ref()) {
+                Some(N::SelectStmt(body)) => select_output_names(body),
+                _ => None,
+            };
+            match body {
+                Some(body) => renamed(rs.alias.as_ref(), body).iter().any(|c| c == name),
+                None => true,
+            }
+        }
+        Some(N::JoinExpr(j)) => [j.larg.as_deref(), j.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|side| from_item_has_column(side, name, with, lookup, params)),
+        Some(N::RangeFunction(rf)) => {
+            function_columns(rf, lookup, params).is_none_or(|cols| cols.iter().any(|c| c == name))
+        }
+        _ => true,
+    }
+}
+
+/// A FROM function's column names -- its OUT parameters, its result
+/// type's, or the function's own name, as renamed by its alias -- read by
+/// planning `SELECT * FROM` it with nothing run. A column its arguments
+/// read is planned as a NULL, as the names do not depend on the values.
+/// `None` when it does not plan so (a polymorphic argument needs its type).
+pub(crate) fn function_columns(
+    rf: &pg_query::protobuf::RangeFunction,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<Vec<String>> {
+    let alias = rf
+        .alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .filter(|a| !a.is_empty())
+        .or_else(|| range_function_name(rf))?;
+    let mut bare = rf.clone();
+    bare.lateral = false;
+    bare.alias = keep_column_names(rf, &alias);
+    for f in &mut bare.functions {
+        if let Some(N::List(l)) = f.node.as_mut() {
+            for arg in &mut l.items {
+                let _ = walk_expr(arg, &mut |n| {
+                    if matches!(n.node.as_ref(), Some(N::ColumnRef(_))) {
+                        n.node = Some(N::AConst(pg_query::protobuf::AConst {
+                            isnull: true,
+                            location: -1,
+                            val: None,
+                        }));
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    let select = pg_query::protobuf::SelectStmt {
+        target_list: vec![star_target()],
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeFunction(bare)),
+        }],
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    let plan = crate::correlated::probing(|| {
+        crate::correlated::without_calls(|| plan_select(&select, lookup, params))
+    })
+    .ok()?;
+    let def = sub_plan_def(&plan, lookup).ok()?;
+    let names: Vec<String> = function_colnames(rf)
+        .iter()
+        .filter_map(alias_colname)
+        .collect();
+    let named_alias = rf.alias.as_ref().is_some_and(|a| !a.aliasname.is_empty());
+    let names = scalar_alias(names, named_alias, &alias, def.columns.len());
+    Some(
+        def.columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| names.get(i).cloned().unwrap_or_else(|| c.name.clone()))
+            .collect(),
+    )
+}
+
+/// The names of a SELECT's output columns as PostgreSQL derives them
+/// (`FigureColname` for the common shapes), `None` where the tree alone
+/// cannot say (a `*`, an unusual expression).
+fn select_output_names(s: &pg_query::protobuf::SelectStmt) -> Option<Vec<String>> {
+    if let Some(l) = s.larg.as_deref() {
+        return select_output_names(l);
+    }
+    if !s.values_lists.is_empty() {
+        let width = match s.values_lists.first().and_then(|r| r.node.as_ref()) {
+            Some(N::List(l)) => l.items.len(),
+            _ => return None,
+        };
+        return Some((1..=width).map(|i| format!("column{i}")).collect());
+    }
+    s.target_list
+        .iter()
+        .map(|t| {
+            let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+                return None;
+            };
+            if !rt.name.is_empty() {
+                return Some(rt.name.clone());
+            }
+            match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                    Some(N::String(s)) => Some(s.sval.clone()),
+                    _ => None,
+                },
+                Some(N::FuncCall(f)) => f.funcname.last().and_then(alias_colname),
+                Some(N::AConst(_) | N::AExpr(_)) => Some("?column?".into()),
+                _ => None,
+            }
+        })
+        .collect()
 }
 
 /// A LATERAL item that is one built-in set-returning function in FROM,
@@ -4215,6 +4569,63 @@ mod tests {
         assert_eq!(
             whole_rows("select 1 from a join b on (a.*).v = 1 and b = row(1)"),
             ["a", "b"]
+        );
+    }
+
+    /// `sql` with the bare name `b` bound as a LATERAL subquery's left
+    /// column (RP-478), deparsed.
+    fn bound_b(sql: &str) -> String {
+        let parsed = pg_query::parse(sql).unwrap();
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().unwrap();
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("not a SELECT: {sql}");
+        };
+        let lookup = |name: &str| -> Option<TableDef> {
+            let cols = match name {
+                "fs" => vec![
+                    Column::new("a", "int4", false),
+                    Column::new("c", "text", false),
+                ],
+                "fb" => vec![Column::new("b", "text", false)],
+                _ => return None,
+            };
+            Some(TableDef::new(name, cols))
+        };
+        let mut s = (**s).clone();
+        bind_bare_name(&mut s, "b", 1, "text", &lookup, &[]);
+        pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(s))),
+        }
+        .deparse()
+        .unwrap()
+    }
+
+    #[test]
+    fn a_lateral_bare_name_is_bound_where_no_nearer_level_has_it() {
+        // RP-478: `colNameToVar` searches innermost first, so a level whose
+        // FROM has `b` (a table's column, a derived table's output, an
+        // alias's rename) keeps it, in itself and every level inside it.
+        assert_eq!(
+            bound_b("select b || c from fs"),
+            "SELECT $1::text || c FROM fs"
+        );
+        assert_eq!(bound_b("select b from fb"), "SELECT b FROM fb");
+        assert_eq!(
+            bound_b("select (select b from fb), (select b), b from fs"),
+            "SELECT (SELECT b FROM fb), (SELECT $1::text), $1::text FROM fs"
+        );
+        assert_eq!(
+            bound_b("select (select b) from fb"),
+            "SELECT (SELECT b) FROM fb"
+        );
+        assert_eq!(
+            bound_b("select b from (select 1 as b) d"),
+            "SELECT b FROM (SELECT 1 AS b) d"
+        );
+        assert_eq!(bound_b("select b from fs t(b)"), "SELECT b FROM fs t(b)");
+        assert_eq!(
+            bound_b("select c from fs where b = 'x' union all select b from fb"),
+            "SELECT c FROM fs WHERE $1::text = 'x' UNION ALL SELECT b FROM fb"
         );
     }
 
