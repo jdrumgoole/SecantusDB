@@ -3,8 +3,9 @@
 //! This is deliberately NOT a PL/pgSQL interpreter. A `DO` body is `begin
 //! <statements> end`, and a statement is one of `raise`, `execute`,
 //! `perform` or `null`. Every other construct -- a `declare` section,
-//! variables, control flow, `into` -- is refused with `0A000`, never
-//! approximated. Expressions are not evaluated here at all: the wire layer
+//! variables, control flow, a label, `into` -- is `ParseError::Unsupported`,
+//! never approximated, and `do_block` hands such a body to the function
+//! interpreter. Expressions are not evaluated here at all: the wire layer
 //! runs each one as a `select`, so they carry the SQL evaluator's exact
 //! semantics rather than a second one.
 //!
@@ -131,6 +132,11 @@ const RAISE_OPTIONS: &[&str] = &[
 pub fn parse(body: &str) -> Result<Vec<Stmt>, ParseError> {
     let chars: Vec<char> = body.chars().collect();
     let mut pos = skip_space(&chars, 0);
+    if is_label_at(&chars, pos) {
+        return Err(ParseError::Unsupported(
+            "a block label in an inline code block".into(),
+        ));
+    }
     let (word, after) = word_at(&chars, pos);
     if word.eq_ignore_ascii_case("declare") {
         return Err(ParseError::Unsupported(
@@ -144,6 +150,11 @@ pub fn parse(body: &str) -> Result<Vec<Stmt>, ParseError> {
     let mut stmts = Vec::new();
     loop {
         pos = skip_space(&chars, pos);
+        if is_label_at(&chars, pos) {
+            return Err(ParseError::Unsupported(
+                "a labelled statement in an inline code block".into(),
+            ));
+        }
         let (word, after) = word_at(&chars, pos);
         if word.eq_ignore_ascii_case("end") {
             let tail = skip_space(&chars, after);
@@ -414,6 +425,13 @@ fn skip_space(chars: &[char], mut pos: usize) -> usize {
         }
         return pos;
     }
+}
+
+/// Whether a `<<label>>` starts at `pos`: PL/pgSQL's `<<` token, which
+/// opens a label on a block or a loop. This path reads no labels, so the
+/// block goes to the function interpreter, which does (RP-486).
+fn is_label_at(chars: &[char], pos: usize) -> bool {
+    chars.get(pos) == Some(&'<') && chars.get(pos + 1) == Some(&'<')
 }
 
 fn is_word_char(c: char) -> bool {
@@ -1009,5 +1027,21 @@ mod tests {
             parse("begin if true then null; end if; end"),
             Err(ParseError::Unsupported(_))
         ));
+    }
+
+    /// A label goes to the interpreter, never a syntax error here (RP-486).
+    #[test]
+    fn labels_go_to_the_interpreter() {
+        for body in [
+            "<<blk>> begin raise notice 'z'; end",
+            " <<blk>> declare x int := 3; begin raise notice '%', blk.x; end",
+            "begin <<l>> for i in 1..2 loop raise notice '%', l.i; end loop; end",
+            "begin null; <<b>> begin null; end; end",
+        ] {
+            assert!(
+                matches!(parse(body), Err(ParseError::Unsupported(_))),
+                "{body}"
+            );
+        }
     }
 }

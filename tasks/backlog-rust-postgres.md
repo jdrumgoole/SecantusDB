@@ -1876,18 +1876,23 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
 
+## Found while working RP-486 (2026-11-07)
+
+- [ ] **A syntax error in a DO block the interpreter compiles carries no
+      position.** A body with a DECLARE section or a label is compiled by
+      the function interpreter, and its 42601 reaches the client with no
+      statement position: `do $$ declare x int; begin raise notice 'z' end
+      $$` is `syntax error at or near "end"` at 45 on PostgreSQL 15.19,
+      `do $$ <<blk>> begin raise notice 'z' end $$` the same at 38, and
+      `do $$ <<blk>> begin raise notice 'z'; end nope $$` `end label "nope"
+      differs from block's label "blk"` at 43. Here each message matches
+      and no position is sent. (The fast path for a plain `begin ... end`
+      body already points at the token.)
+      Verify: tests/backlog/test_rp_do_compile_errors.py::test_compile_error_has_a_position
+      Backlog-ID: RP-492
+
 ## Found while working RP-463 (2026-11-07)
 
-- [ ] **A DO block with a label is a syntax error.** `do $$ <<blk>> begin
-      raise notice 'z'; end $$` is 42601 `syntax error at or near "<"` at 7
-      here, and a labelled FOR loop inside one (`begin <<l>> for i in 1..2
-      loop ... end loop; end`) is 42601 `syntax error at end of input`;
-      PostgreSQL 15.19 runs each. `plpgsql_do::parse`, the DO block's own
-      fast path, answers a syntax error for a `<<` it does not read,
-      instead of handing the block to the function interpreter, which
-      reads labels (RP-463) -- the same body as a function runs.
-      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_do_block_with_a_label
-      Backlog-ID: RP-486
 - [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
       no internal position.** `do $$ declare x int; begin raise notice '%',
       nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends

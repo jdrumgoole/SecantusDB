@@ -3,12 +3,12 @@
 RP-463 (fixed): a block's label qualifies the variables its DECLARE section
 declares, and a FOR loop's label its loop variable, as `plpgsql_ns_lookup`
 searches the namespace from the innermost level out. Found while working
-it: RP-486 (a DO block with a label is a syntax error), RP-487 (fixed: a
-bare name read after an inner block or a FOR loop ends was the inner
-level's variable) and RP-488 (an expression's error in a PL/pgSQL statement
-carries no QUERY and no internal position). Found while working RP-487:
-RP-491 (a block's variables are initialised once, when the function starts,
-not each time the block is entered).
+it: RP-486 (fixed: a DO block with a label was a syntax error), RP-487
+(fixed: a bare name read after an inner block or a FOR loop ends was the
+inner level's variable) and RP-488 (an expression's error in a PL/pgSQL
+statement carries no QUERY and no internal position). Found while working
+RP-487: RP-491 (a block's variables are initialised once, when the function
+starts, not each time the block is entered).
 
 An answer is the rows, or `(sqlstate, message)` for an error. The expected
 answers were measured on a private, freshly initdb'd PostgreSQL 15.19
@@ -205,9 +205,12 @@ DO_LABEL = {
 }
 
 
-@pytest.mark.backlog("RP-486")
+@pytest.mark.backlog_fixed("RP-486")
 @pytest.mark.parametrize("body", list(DO_LABEL))
 def test_do_block_with_a_label(body: str, dsn: str) -> None:
+    """Was 42601 `syntax error at or near "<"`, or `at end of input` for a
+    labelled loop: the DO block's own path read no `<<`, and answered a
+    syntax error instead of handing the block to the function interpreter."""
     assert _do(dsn, body) == DO_LABEL[body]
 
 
