@@ -3731,3 +3731,40 @@ fn a_join_on_after_a_comma_item_is_type_checked_in_its_own_scope() {
         assert!(plan(q, &three).is_ok(), "{q}: {:?}", plan(q, &three).err());
     }
 }
+
+/// A statement planned as the server plans it, parse analysis first.
+fn analysed(sql: &str) -> Result<Statement> {
+    plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new()))
+}
+
+#[test]
+fn an_insert_query_and_every_cte_body_are_type_checked() {
+    // `transformWithClause` analyses each CTE's query, used or not, and
+    // `transformInsertStmt` its SELECT: an operator with no overload for its
+    // operands is 42883 there as in a bare SELECT (RP-427). These planned,
+    // and answered no rows.
+    for q in [
+        "insert into t select * from t where n = true",
+        "with c as (select * from t where n = true) select * from c",
+        "with c as (select * from t where n = true) select 1",
+        "with c as (select name from t), d as (select * from c where name = 1) select 1",
+        "with c as (select name as z from t) insert into t (name) select z from c where z = 1",
+        "with c as (select * from t where n = true) update t set name = 'x'",
+        "with c as (select * from t where n = true) delete from t",
+        "with c as (update t set name = 'q' where n = true returning *) select * from c",
+        "select * from t where exists (with c as (select 1 as x where t.n = true) select * from c)",
+    ] {
+        let err = analysed(q).expect_err(q).to_string();
+        assert!(err.contains("operator does not exist"), "{q}: {err}");
+    }
+    // A CTE's own name, a shadowing CTE and a recursive one stay in view.
+    for q in [
+        "with recursive r(k) as (select 1 union all select k + 1 from r where k < 5) select * from r",
+        "with t as (select 'x'::text as a) select * from t where a = 'y'",
+        "with c as (select n from t) insert into t (n) select n from c where n > 8",
+    ] {
+        if let Err(e) = analysed(q) {
+            assert!(!e.to_string().contains("operator does not exist"), "{q}: {e}");
+        }
+    }
+}

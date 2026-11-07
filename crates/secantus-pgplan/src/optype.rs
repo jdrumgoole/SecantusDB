@@ -1428,18 +1428,7 @@ fn check_select(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     parent: Option<&Scope>,
 ) -> Result<()> {
-    let mut ctes = outer_ctes.to_vec();
-    if let Some(w) = &s.with_clause {
-        for c in &w.ctes {
-            if let Some(N::CommonTableExpr(c)) = c.node.as_ref() {
-                let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
-                    Some(N::SelectStmt(q)) if !w.recursive => Some(cte_named(q, &c.aliascolnames)),
-                    _ => None,
-                };
-                ctes.push((c.ctename.clone(), query));
-            }
-        }
-    }
+    let ctes = with_ctes(s.with_clause.as_ref(), outer_ctes, lookup, parent)?;
     // A set operation's arms each have their own FROM, under the same parent.
     if let Some(l) = s.larg.as_deref() {
         check_select(l, &ctes, lookup, parent)?;
@@ -1877,23 +1866,37 @@ fn walk_other_clauses(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Re
 
 /// 42883 for a comparison with no operator between its operands' types.
 pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
+    check_in(node, &[], lookup)
+}
+
+/// [`check`] with the CTEs of an enclosing WITH in view: a data-modifying
+/// CTE sees the ones before it, as a SELECT's does.
+fn check_in(node: &N, outer: &[Cte], lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
     let relation = |r: &Option<pg_query::protobuf::RangeVar>| {
         r.as_ref().map(|r| pg_query::protobuf::Node {
             node: Some(N::RangeVar(r.clone())),
         })
     };
     match node {
-        N::SelectStmt(s) => check_select(s, &[], lookup, None),
-        N::UpdateStmt(u) if u.with_clause.is_none() => {
+        N::SelectStmt(s) => check_select(s, outer, lookup, None),
+        // `transformInsertStmt` analyses the WITH, then the SELECT as a
+        // query of its own that sees those CTEs. A VALUES list is checked
+        // elsewhere.
+        N::InsertStmt(i) => {
+            let ctes = with_ctes(i.with_clause.as_ref(), outer, lookup, None)?;
+            match i.select_stmt.as_deref().and_then(|n| n.node.as_ref()) {
+                Some(N::SelectStmt(sel)) => check_select(sel, &ctes, lookup, None),
+                _ => Ok(()),
+            }
+        }
+        N::UpdateStmt(u) => {
+            let ctes = with_ctes(u.with_clause.as_ref(), outer, lookup, None)?;
             let items: Vec<_> = relation(&u.relation)
                 .into_iter()
                 .chain(u.from_clause.iter().cloned())
                 .collect();
-            let scope = Scope::new(&items, &[], lookup, None);
-            let cx = Cx {
-                lookup,
-                ctes: Vec::new(),
-            };
+            let scope = Scope::new(&items, &ctes, lookup, None);
+            let cx = Cx { lookup, ctes };
             match u.where_clause.as_deref() {
                 Some(w) => {
                     no_aggregate_in_where(w)?;
@@ -1903,16 +1906,14 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
                 None => Ok(()),
             }
         }
-        N::DeleteStmt(d) if d.with_clause.is_none() => {
+        N::DeleteStmt(d) => {
+            let ctes = with_ctes(d.with_clause.as_ref(), outer, lookup, None)?;
             let items: Vec<_> = relation(&d.relation)
                 .into_iter()
                 .chain(d.using_clause.iter().cloned())
                 .collect();
-            let scope = Scope::new(&items, &[], lookup, None);
-            let cx = Cx {
-                lookup,
-                ctes: Vec::new(),
-            };
+            let scope = Scope::new(&items, &ctes, lookup, None);
+            let cx = Cx { lookup, ctes };
             match d.where_clause.as_deref() {
                 Some(w) => {
                     no_aggregate_in_where(w)?;
@@ -1924,6 +1925,49 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
         }
         _ => Ok(()),
     }
+}
+
+/// The CTEs in view inside a WITH clause's statement: `outer`'s, then the
+/// clause's own. Each CTE's query is checked as `transformWithClause`
+/// analyses it, before the statement it belongs to: a plain WITH's query
+/// sees the CTEs before it; under WITH RECURSIVE every name of the clause
+/// is in view (untyped, as the recursion's columns are not known here).
+fn with_ctes(
+    w: Option<&pg_query::protobuf::WithClause>,
+    outer: &[Cte],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    parent: Option<&Scope>,
+) -> Result<Vec<Cte>> {
+    let mut ctes = outer.to_vec();
+    let Some(w) = w else {
+        return Ok(ctes);
+    };
+    let defs: Vec<&pg_query::protobuf::CommonTableExpr> = w
+        .ctes
+        .iter()
+        .filter_map(|c| match c.node.as_ref() {
+            Some(N::CommonTableExpr(c)) => Some(&**c),
+            _ => None,
+        })
+        .collect();
+    if w.recursive {
+        ctes.extend(defs.iter().map(|c| (c.ctename.clone(), None)));
+    }
+    for c in defs {
+        match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
+            Some(N::SelectStmt(q)) => check_select(q, &ctes, lookup, parent)?,
+            Some(other) => check_in(other, &ctes, lookup)?,
+            None => {}
+        }
+        if !w.recursive {
+            let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
+                Some(N::SelectStmt(q)) => Some(cte_named(q, &c.aliascolnames)),
+                _ => None,
+            };
+            ctes.push((c.ctename.clone(), query));
+        }
+    }
+    Ok(ctes)
 }
 
 /// Does an untyped string literal read as `ty`? Its cast's error at the

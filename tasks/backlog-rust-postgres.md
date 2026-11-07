@@ -1619,17 +1619,29 @@ a regression test.
       15.19 cluster (found while working RP-418).
       Verify: tests/backlog/test_rp_where_types.py::test_where_untyped_literal_reads_as_boolean
       Backlog-ID: RP-424
-- [ ] **An INSERT's SELECT and a WITH query are not type-checked.**
-      `insert into k select * from e where a = true` (an integer `a`)
-      inserts nothing here, and `with t as (select * from e where a = true)
-      select * from t` returns no rows; PostgreSQL 15.19 refuses both at
-      parse analysis, 42883 `operator does not exist: integer = boolean`,
-      as this server does for the SELECT alone. `optype::check` discards
-      the INSERT's `check_select` result (`let _ =`) and never walks a CTE
-      body. A confident empty answer to a statement PostgreSQL rejects.
-      Measured on a private 15.19 cluster (found while working RP-419).
-      Backlog-ID: RP-427
-      Verify: tests/backlog/test_rp_analysis_order.py::test_insert_select_and_cte_are_type_checked
+- [ ] **A FROM subquery or CTE written `select *` is not type-checked.**
+      `select * from (select * from e) t where a = true` (an integer `a`)
+      returns no rows here, as do the same comparison over `with t as
+      (select * from e)` and an INSERT reading that CTE; PostgreSQL 15.19
+      refuses all three at parse analysis, 42883 `operator does not
+      exist: integer = boolean`. `optype`'s `add_derived` types a derived
+      table from its target list and has no column for a `*`, so the
+      comparison goes unchecked and is lowered across BSON types. With the
+      columns written out (`select a, b from e`) it is refused. Measured on
+      a private 15.19 cluster (found while working RP-427).
+      Verify: tests/backlog/test_rp_analysis_order.py::test_star_derived_table_is_typed
+      Backlog-ID: RP-431
+- [ ] **An UPDATE or DELETE cannot read the CTEs of its own WITH.** `with t
+      as (select b from e) update k set a = a + 100 from t where k.b =
+      t.b`, `... update k ... where a in (select a from t)`, `with t as
+      (select 50 as a) delete from k using t where k.a = t.a` and a
+      data-modifying CTE reading an earlier one (`with t as (...), u as
+      (delete from k where a in (select a from t) returning a) select *
+      from u`) each answer 42P01 `relation "t" does not exist`; PostgreSQL
+      15.19 runs them (UPDATE 1, UPDATE 1, DELETE 1, one row). Measured
+      on a private 15.19 cluster (found while working RP-427).
+      Verify: tests/backlog/test_rp_analysis_order.py::test_update_and_delete_read_their_ctes
+      Backlog-ID: RP-432
 - [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
       missing function or a bad literal.** PostgreSQL 15.19 analyses the
       statement before `ExplainQuery` reads an option, so `explain (bogus)
