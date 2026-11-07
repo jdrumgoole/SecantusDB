@@ -24136,6 +24136,16 @@ fn plan_select(
                 .map_err(joins::unmangle),
             other => other,
         }
+    } else if (has_aggregate(s) || !s.group_clause.is_empty()) && from_calls_volatile(s) {
+        // A function in FROM runs when its source is planned. An aggregate
+        // this first attempt refuses is planned again by a rewrite below,
+        // which would run the function a second time (RP-476): PostgreSQL's
+        // Function Scan runs it once. So the attempt is made with calls
+        // switched off first, and made for real only when it will stand.
+        match correlated::without_calls(|| plan_select_rest(s, lookup, params)) {
+            Err(Error::Unsupported(m)) => Err(Error::Unsupported(m)),
+            _ => plan_select_rest(s, lookup, params),
+        }
     } else {
         plan_select_rest(s, lookup, params)
     };
@@ -24192,6 +24202,41 @@ fn plan_select(
     planned
         .map_err(|e| qualify_undefined_column(e, s))
         .map_err(|e| invalid_from_reference(e, s))
+}
+
+/// Does planning `s`'s FROM run something with a side effect: a VOLATILE
+/// function called as a FROM item (a user function left at that default, a
+/// built-in such as `nextval`; only a volatile SQL function may write), or
+/// anywhere in a FROM subquery or a joined item, which are planned -- and
+/// their calls run -- with the statement? (RP-476)
+fn from_calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
+    fn select(s: &pg_query::protobuf::SelectStmt) -> bool {
+        s.from_clause.iter().any(item)
+            || s.target_list.iter().any(correlated::has_volatile_call)
+            || s.where_clause
+                .as_deref()
+                .is_some_and(correlated::has_volatile_call)
+            || s.larg.as_deref().is_some_and(select)
+            || s.rarg.as_deref().is_some_and(select)
+    }
+    fn item(n: &pg_query::protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(N::RangeFunction(rf)) => rf.functions.iter().any(|f| match f.node.as_ref() {
+                Some(N::List(l)) => l.items.iter().any(correlated::has_volatile_call),
+                _ => correlated::has_volatile_call(f),
+            }),
+            Some(N::RangeSubselect(rs)) => match rs.subquery.as_ref().and_then(|q| q.node.as_ref())
+            {
+                Some(N::SelectStmt(inner)) => select(inner),
+                _ => false,
+            },
+            Some(N::JoinExpr(j)) => {
+                j.larg.as_deref().is_some_and(item) || j.rarg.as_deref().is_some_and(item)
+            }
+            _ => false,
+        }
+    }
+    s.from_clause.iter().any(item)
 }
 
 thread_local! {
