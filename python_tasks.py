@@ -331,6 +331,11 @@ def _sweep_stale_pytest_tmp(base: str, *, measure: bool = True) -> tuple[int, in
 #: constant is a better dependency than a package import here.
 #: ``tests/test_clean_pytest_tmp.py`` pins the two to each other.
 _PROBE_TMP_PREFIX = "secantus-probe-"
+# What `tests/mongod_reference.py` named a reference mongod's dbpath before it
+# took the probe prefix: no owner pid in it, so only `mongod.lock` tells
+# whether its mongod is alive. One of these held a 427 GB `mongod.log`
+# (2026-11-06).
+_LEGACY_MONGOD_TMP_PREFIX = "differential-mongod-"
 
 
 def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
@@ -353,13 +358,21 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
     """
     reaped = freed = 0
     for name in os.listdir(base):
-        if not name.startswith(_PROBE_TMP_PREFIX):
+        legacy = name.startswith(_LEGACY_MONGOD_TMP_PREFIX)
+        if not name.startswith(_PROBE_TMP_PREFIX) and not legacy:
             continue
         path = os.path.join(base, name)
         if not os.path.isdir(path) or os.path.islink(path):
             continue
-        owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
-        if not owner.isdigit() or _pid_alive(int(owner)):
+        if not legacy:
+            owner = name[len(_PROBE_TMP_PREFIX) :].split("-", 1)[0]
+            if not owner.isdigit() or _pid_alive(int(owner)):
+                continue
+        # A reference mongod can outlive the test that started it, and one that
+        # is only appending to its log leaves the directory's mtime alone, so
+        # the age check below cannot see it. mongod keeps its pid in
+        # `mongod.lock` while it runs.
+        if _mongod_lock_pid_alive(path):
             continue
         # The PID in the NAME is a hint, not proof of ownership, and trusting
         # it alone deleted a RUNNING mongod's dbpath (2026-09-22): the name had
@@ -388,6 +401,27 @@ def _sweep_stale_probe_tmp(base: str) -> tuple[int, int]:
 #: reclaimed on the next run after that, and the disk problem this whole sweep
 #: exists for is measured in days, not minutes.
 _PROBE_TMP_GRACE_SECONDS = 1800.0
+
+
+def _mongod_lock_pid_alive(path: str) -> bool:
+    """Whether ``path/mongod.lock`` names a running process.
+
+    mongod writes its pid there at startup and empties the file on a clean
+    shutdown. No file, or an empty one, means no mongod; anything unreadable
+    answers alive, the safe direction.
+    """
+    try:
+        with open(os.path.join(path, "mongod.lock")) as fh:
+            text = fh.read().strip()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    if not text:
+        return False
+    if not text.isdigit():
+        return True
+    return _pid_alive(int(text))
 
 
 def _wt_home_in_use(path: str) -> bool:
