@@ -1241,7 +1241,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             },
         )
         .unwrap_or(None);
-        if let Some(sel) = &selection {
+        if let Some(sel) = selection.as_ref().filter(|s| s.pending.is_none()) {
             crate::profiler::note_statement_exec(crate::profiler::StatementExec {
                 summary: Some(sel.summary.clone()),
                 keys_examined: sel.keys_examined,
@@ -1251,49 +1251,54 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
         // A delete of ONE document removes the first its query matches in
         // the order mongod reads them.
+        use crate::explain::order::Pin;
         let first = if let Some(sel) = selection {
-            (!sel.rids.is_empty()).then_some(sel.rids)
+            Pin::of(sel)
         } else if limit == 1 {
-            crate::explain::order::write_candidates(
-                storage,
-                &crate::explain::order::Ask {
-                    db: &ctx.db_name,
-                    coll: &coll,
-                    filter: &filter,
-                    sort: None,
-                    hint: argtypes::given_hint(spec),
-                    collation: collation.as_ref(),
-                    vars: &let_vars,
-                    limit: 0,
-                    asked: crate::near::Asked {
-                        cached: true,
-                        ..Default::default()
+            Pin::rows(
+                crate::explain::order::write_candidates(
+                    storage,
+                    &crate::explain::order::Ask {
+                        db: &ctx.db_name,
+                        coll: &coll,
+                        filter: &filter,
+                        sort: None,
+                        hint: argtypes::given_hint(spec),
+                        collation: collation.as_ref(),
+                        vars: &let_vars,
+                        limit: 0,
+                        asked: crate::near::Asked {
+                            cached: true,
+                            ..Default::default()
+                        },
                     },
-                },
+                )
+                .unwrap_or(None),
             )
-            .unwrap_or(None)
         } else if ctx.replica_set_name.is_some() {
             // Every match, in the order mongod's plan reads them, for the
             // batches it deletes them in. Only the oplog shows that order, so
             // a standalone does not pay for the extra read.
-            crate::explain::order::delete_order(
-                storage,
-                &crate::explain::order::Ask {
-                    db: &ctx.db_name,
-                    coll: &coll,
-                    filter: &filter,
-                    sort: None,
-                    hint: argtypes::given_hint(spec),
-                    collation: collation.as_ref(),
-                    vars: &let_vars,
-                    limit: 0,
-                    asked: crate::near::Asked {
-                        cached: true,
-                        ..Default::default()
+            Pin::rows(
+                crate::explain::order::delete_order(
+                    storage,
+                    &crate::explain::order::Ask {
+                        db: &ctx.db_name,
+                        coll: &coll,
+                        filter: &filter,
+                        sort: None,
+                        hint: argtypes::given_hint(spec),
+                        collation: collation.as_ref(),
+                        vars: &let_vars,
+                        limit: 0,
+                        asked: crate::near::Asked {
+                            cached: true,
+                            ..Default::default()
+                        },
                     },
-                },
+                )
+                .unwrap_or(None),
             )
-            .unwrap_or(None)
         } else {
             // A standalone reads the matches in no order of its own, and
             // mongod still plans the delete through its plan cache.
@@ -1318,7 +1323,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             if let Err(e) = planned {
                 log::warn!("planning a delete of many documents: {e:?}");
             }
-            None
+            Pin::Store
         };
         // The statement's interrupt point before it writes: a kill between
         // statements, or one the reads above took for an answer (RM-313).
@@ -2395,7 +2400,7 @@ pub(crate) fn update_in(
             // A read that fails here fails the update's own read too.
             .unwrap_or(None)
         };
-        if let Some(sel) = &selection {
+        if let Some(sel) = selection.as_ref().filter(|s| s.pending.is_none()) {
             crate::profiler::note_statement_exec(crate::profiler::StatementExec {
                 summary: Some(sel.summary.clone()),
                 keys_examined: sel.keys_examined,
@@ -2405,8 +2410,9 @@ pub(crate) fn update_in(
         }
         // An update of ONE document changes the first its query matches in
         // the order mongod reads them.
+        use crate::explain::order::Pin;
         let first = if let Some(sel) = selection {
-            (!sel.rids.is_empty()).then_some(sel.rids)
+            Pin::of(sel)
         } else if multi || absent {
             if !absent {
                 // An update of many documents reads them in no order of its
@@ -2434,26 +2440,28 @@ pub(crate) fn update_in(
                     log::warn!("planning an update of many documents: {e:?}");
                 }
             }
-            None
+            Pin::Store
         } else {
-            crate::explain::order::write_candidates(
-                storage,
-                &crate::explain::order::Ask {
-                    db: db_name,
-                    coll: &coll,
-                    filter: &q,
-                    sort: None,
-                    hint: argtypes::given_hint(spec),
-                    collation: collation.as_ref(),
-                    vars: &stmt_vars,
-                    limit: 0,
-                    asked: crate::near::Asked {
-                        cached: true,
-                        ..Default::default()
+            Pin::rows(
+                crate::explain::order::write_candidates(
+                    storage,
+                    &crate::explain::order::Ask {
+                        db: db_name,
+                        coll: &coll,
+                        filter: &q,
+                        sort: None,
+                        hint: argtypes::given_hint(spec),
+                        collation: collation.as_ref(),
+                        vars: &stmt_vars,
+                        limit: 0,
+                        asked: crate::near::Asked {
+                            cached: true,
+                            ..Default::default()
+                        },
                     },
-                },
+                )
+                .unwrap_or(None),
             )
-            .unwrap_or(None)
         };
         // The statement's interrupt point before it writes: a kill between
         // statements, or one the reads above took for an answer (RM-313).

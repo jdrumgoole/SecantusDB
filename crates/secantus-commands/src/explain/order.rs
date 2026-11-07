@@ -32,7 +32,7 @@ use super::geo;
 use super::node::Node;
 use super::plan::{self, Query};
 use super::{catalog, parsed, resolve_hint};
-use crate::storage::{RawHint, Storage, StorageError};
+use crate::storage::{Pulled, RawHint, Storage, StorageError};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use std::cell::OnceCell;
@@ -1625,14 +1625,19 @@ pub(crate) fn find(storage: &dyn Storage, ask: &Ask) -> Result<Vec<Vec<u8>>, Sto
     }
 }
 
-/// Run `f`, a write through `storage`, over the rows `order` names.
+/// Run `f`, a write through `storage`, over the documents `pin` names.
+/// A pending read is run as the write takes its documents; when it fails
+/// part-way the write keeps what it wrote before, and its failure is the
+/// write's.
 pub(crate) fn pinned<T>(
     storage: &dyn Storage,
-    order: Option<Vec<i64>>,
-    f: impl FnOnce() -> T,
-) -> T {
-    let Some(order) = order else {
-        return f();
+    pin: Pin,
+    f: impl FnOnce() -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    let order = match pin {
+        Pin::Store => return f(),
+        Pin::Rows(order) => order,
+        Pin::Read(read) => return streamed(storage, *read, f),
     };
     let mut f = Some(f);
     let mut out = None;
@@ -1645,6 +1650,81 @@ pub(crate) fn pinned<T>(
         Some(v) => v,
         // A store that did not call back: run it unpinned.
         None => (f.take().expect("the write ran or it did not"))(),
+    }
+}
+
+/// [`pinned`] over a pending read: the store pulls from it as it writes,
+/// and the read's counts are the statement's (RM-023).
+fn streamed<T>(
+    storage: &dyn Storage,
+    mut read: PendingRead,
+    f: impl FnOnce() -> Result<T, StorageError>,
+) -> Result<T, StorageError> {
+    let mut failed: Option<StorageError> = None;
+    let (mut keys_examined, mut docs_examined) = (0i64, 0i64);
+    let mut out = None;
+    {
+        let stream = &mut read.stream;
+        let mut source = |want: usize, max_bytes: usize| {
+            if failed.is_some() {
+                return Pulled {
+                    rows: Vec::new(),
+                    exhausted: true,
+                    stopped: true,
+                };
+            }
+            let (batch, error) = stream.pull_for_write(storage, want, max_bytes);
+            let (rows, exhausted) = match batch {
+                Ok(batch) => {
+                    keys_examined += batch.keys_examined;
+                    docs_examined += batch.docs_examined;
+                    (
+                        batch.rids.into_iter().zip(batch.docs).collect(),
+                        batch.exhausted,
+                    )
+                }
+                Err(e) => {
+                    failed = Some(e);
+                    (Vec::new(), true)
+                }
+            };
+            if error.is_some() {
+                failed = error;
+            }
+            Pulled {
+                rows,
+                exhausted,
+                stopped: failed.is_some(),
+            }
+        };
+        let mut f = Some(f);
+        storage.with_candidate_source(&mut source, &mut || {
+            if let Some(run) = f.take() {
+                out = Some(run());
+            }
+        });
+        if out.is_none() && failed.is_none() {
+            // A store that did not call back: run it unpinned.
+            out = f.take().map(|run| run());
+        }
+    }
+    crate::profiler::note_statement_exec(crate::profiler::StatementExec {
+        summary: Some(read.summary.clone()),
+        keys_examined,
+        docs_examined,
+        run: read.profiled.then(|| super::stream::WriteRun {
+            read: read
+                .stream
+                .report_with(write_read(&read.plan), Default::default()),
+            plan: read.plan.clone(),
+            examined: 0,
+            started_ms: read.started_ms,
+        }),
+    });
+    match (failed, out) {
+        (Some(e), _) => Err(e),
+        (None, Some(out)) => out,
+        (None, None) => unreachable!("the write ran"),
     }
 }
 
@@ -1900,6 +1980,58 @@ pub(crate) struct Selection {
     pub summary: String,
     /// What the read's stages did, for the write's `execStats` (RM-359).
     pub run: Option<super::stream::WriteRun>,
+    /// A write of many's read, not yet run: the write runs it, a pull at a
+    /// time, as it takes its documents ([`pinned`]). Its counts and `run`
+    /// are noted then.
+    pub pending: Option<Box<PendingRead>>,
+}
+
+/// A write of many's read, run as the write takes its documents (RM-323):
+/// mongod's update and delete stages pull each document from the plan and
+/// write it before reading the next, so a read interrupted or failing
+/// part-way leaves what was written before.
+pub(crate) struct PendingRead {
+    stream: super::stream::Stream,
+    plan: Node,
+    summary: String,
+    started_ms: i64,
+    profiled: bool,
+}
+
+/// The read below a write's UPDATE or DELETE stage.
+fn write_read(plan: &Node) -> &Node {
+    match plan {
+        Node::Update(input) | Node::Delete { input, .. } => input.as_ref(),
+        other => other,
+    }
+}
+
+/// The documents a write takes ([`pinned`]).
+pub(crate) enum Pin {
+    /// The store's own candidates.
+    Store,
+    /// These rows, in this order.
+    Rows(Vec<i64>),
+    /// What this read returns, as the write reaches it.
+    Read(Box<PendingRead>),
+}
+
+impl Pin {
+    /// The rows `rows` names, or the store's candidates when there are none.
+    pub(crate) fn rows(rows: Option<Vec<i64>>) -> Self {
+        match rows {
+            Some(rows) if !rows.is_empty() => Pin::Rows(rows),
+            _ => Pin::Store,
+        }
+    }
+
+    /// A selection's documents: its pending read, else its rows.
+    pub(crate) fn of(selection: Selection) -> Self {
+        match selection.pending {
+            Some(read) => Pin::Read(read),
+            None => Pin::rows(Some(selection.rids)),
+        }
+    }
 }
 
 /// The read of a write's documents, run as mongod's plan for it runs
@@ -1962,6 +2094,7 @@ pub(crate) fn write_selection(
                 examined: n,
                 started_ms,
             }),
+            pending: None,
         }));
     }
     let opts = super::stream::Options {
@@ -1986,14 +2119,20 @@ pub(crate) fn write_selection(
         })
     };
     if multi {
-        let all = stream.read_all(storage)?;
         return Ok(Some(Selection {
-            rids: all.rids,
-            first: all.docs.into_iter().next(),
-            keys_examined: all.keys_examined,
-            docs_examined: all.docs_examined,
-            summary,
-            run: run(&stream),
+            rids: Vec::new(),
+            first: None,
+            keys_examined: 0,
+            docs_examined: 0,
+            summary: summary.clone(),
+            run: None,
+            pending: Some(Box::new(PendingRead {
+                stream,
+                plan,
+                summary,
+                started_ms,
+                profiled,
+            })),
         }));
     }
     // A write of one stops at the first match, and counts to there.
@@ -2020,6 +2159,7 @@ pub(crate) fn write_selection(
         docs_examined,
         summary,
         run: counted,
+        pending: None,
     }))
 }
 

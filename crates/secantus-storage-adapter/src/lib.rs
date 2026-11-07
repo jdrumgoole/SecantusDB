@@ -942,6 +942,22 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::with_candidate_order(order, f)
     }
 
+    fn with_candidate_source(
+        &self,
+        source: &mut dyn FnMut(usize, usize) -> secantus_commands::storage::Pulled,
+        f: &mut dyn FnMut(),
+    ) {
+        let mut source = |want: usize, max_bytes: usize| {
+            let pulled = source(want, max_bytes);
+            secantus_storage::Pulled {
+                rows: pulled.rows,
+                exhausted: pulled.exhausted,
+                stopped: pulled.stopped,
+            }
+        };
+        secantus_storage::with_candidate_source(&mut source, f)
+    }
+
     fn begin_operation_counts(&self) -> Option<Box<dyn std::any::Any>> {
         Some(Box::new(secantus_storage::operation_scope()))
     }
