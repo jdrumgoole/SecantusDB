@@ -610,12 +610,17 @@ def _reap_abandoned_pytest_tmp(config: pytest.Config) -> None:
         # naming scheme entirely -- and cost ~130 MB a server. See
         # ``python_tasks._sweep_stale_probe_tmp``.
         probes, _ = python_tasks._sweep_stale_probe_tmp(base)
+        # And the per-test WiredTiger homes `cargo test` leaves under the same
+        # temp dir (``python_tasks._sweep_stale_rust_test_tmp``).
+        rust, _ = python_tasks._sweep_stale_rust_test_tmp(base)
     except Exception:  # noqa: BLE001 - never fail a run over housekeeping
         return
     if reaped:
         print(f"\nreaped {reaped} abandoned pytest temp tree(s) from earlier runs")
     if probes:
         print(f"\nreaped {probes} abandoned probe store(s) from earlier runs")
+    if rust:
+        print(f"\nreaped {rust} abandoned Rust test store(s) from earlier runs")
 
 
 def _arm_crash_faulthandler(config: pytest.Config) -> None:

@@ -952,6 +952,20 @@ one beside it.
       (removes unused toolchains, prints the disk device and size, warns
       under 40 GB free). Close this when a job on a `cow-root` runner is
       seen passing, or the watchdog names a real writer.
+      **Measured 2026-11-07: no writer, the retained runs.** The watchdog
+      fired in `storage-engine (ubuntu-latest)` on PR #2408 (run
+      42333063884, job 128283737530), on a `cow-root 72G` runner, during
+      that job's FOURTH pytest invocation (`backlog.py verify --file
+      backlog-rust-mongodb.md --regressions`): 9.9 GB free, no file over
+      1 GB, and 38 GB under `/tmp/pytest-of-runner` -- `pytest-1`, the
+      first step's 1,262-test run, alone 27 GB (~260 MB a server-starting
+      test: its 128 MB WiredTiger log file). pytest keeps three earlier
+      runs' directories, and the session-start reap in `tests/conftest.py`
+      cannot run in that job's slim env (`python_tasks` imports `invoke`),
+      so every step's stores stayed. Since then pyproject sets
+      `tmp_path_retention_count = 1`: each run's exit deletes the runs
+      before it. Close this when a `cow-root` `storage-engine` job passes
+      with that in place.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 

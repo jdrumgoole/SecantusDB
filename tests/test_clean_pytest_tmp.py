@@ -271,6 +271,11 @@ def test_session_finish_reaps_too(monkeypatch, tmp_path: Path) -> None:
         "_sweep_stale_probe_tmp",
         lambda *a, **k: (calls.append("probe"), (0, 0))[1],
     )
+    monkeypatch.setattr(
+        python_tasks,
+        "_sweep_stale_rust_test_tmp",
+        lambda *a, **k: (calls.append("rust"), (0, 0))[1],
+    )
     monkeypatch.setattr(ct, "_lost_test_report", lambda *a, **k: None)
 
     class _Config:
@@ -282,7 +287,7 @@ def test_session_finish_reaps_too(monkeypatch, tmp_path: Path) -> None:
 
     ct.pytest_sessionfinish(_Session(), 0)
 
-    assert calls == ["pytest", "probe"], calls
+    assert calls == ["pytest", "probe", "rust"], calls
 
 
 def test_only_one_session_finish_hook_is_defined() -> None:
@@ -462,3 +467,127 @@ def test_the_reference_mongod_prefix_matches_the_sweep() -> None:
         and isinstance(node.value, ast.Constant)
     ]
     assert values == [python_tasks._PROBE_TMP_PREFIX]
+
+
+# ------------------------------------------------ Rust tests' temp stores
+
+
+def _dead_pid() -> int:
+    """A pid that names no process: one that has just exited."""
+    import subprocess
+    import sys
+
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    assert not python_tasks._pid_alive(proc.pid)
+    return proc.pid
+
+
+def _rust_store(base: Path, name: str, *, age_seconds: float) -> Path:
+    d = base / name
+    d.mkdir()
+    (d / "WiredTiger.wt").write_bytes(b"x" * 1024)
+    when = time.time() - age_seconds
+    os.utime(d, (when, when))
+    return d
+
+
+def test_a_dead_rust_tests_stores_are_reaped(tmp_path: Path) -> None:
+    """Each Rust test makes ``secantus-<kind>-<pid>-<n>`` under the temp dir and
+    never deletes it: 1,166 of them, 2.5 GiB, on one Mac (2026-11-07)."""
+    pid = _dead_pid()
+    names = [
+        f"secantus-snap-{pid}-0",
+        f"secantus-wt-ts-{pid}-3",
+        f"secantus-2pc-{pid}-1",
+        f"secantus-cmdwt-mem-{pid}",
+        f"secantus-mdb-{pid}-1762500000000000000-4",
+    ]
+    stores = [_rust_store(tmp_path, n, age_seconds=_OLD) for n in names]
+
+    reaped, freed = python_tasks._sweep_stale_rust_test_tmp(str(tmp_path))
+
+    assert reaped == len(names)
+    assert freed > 0
+    assert not any(d.exists() for d in stores)
+
+
+def test_a_running_processs_rust_store_is_kept_whatever_its_age(tmp_path: Path) -> None:
+    mine = _rust_store(tmp_path, f"secantus-snap-{os.getpid()}-0", age_seconds=_OLD)
+
+    reaped, _ = python_tasks._sweep_stale_rust_test_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert mine.exists()
+
+
+def test_a_fresh_rust_store_is_kept_though_its_pid_is_gone(tmp_path: Path) -> None:
+    """The name is a hint, not proof (`_wt_home_in_use`): recent writes win."""
+    fresh = _rust_store(tmp_path, f"secantus-snap-{_dead_pid()}-0", age_seconds=0)
+
+    reaped, _ = python_tasks._sweep_stale_rust_test_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert fresh.exists()
+
+
+def test_the_rust_sweep_leaves_other_names_alone(tmp_path: Path) -> None:
+    """A clock in the pid's place, a gauge's or a probe's directory, and
+    anything not ours are someone else's to reap, or nobody's."""
+    pid = _dead_pid()
+    names = [
+        "secantus-cfg-1762500000000000000-3",  # a clock, not a pid
+        "secantus-pgjdbc-gauge-1234567",  # mkdtemp suffix, all digits
+        f"secantus-probe-{pid}-mongod-x",  # the probe sweep's
+        f"secantus-tls-0{pid}",  # a leading zero is no pid
+        f"other-snap-{pid}-0",
+    ]
+    kept = [_rust_store(tmp_path, n, age_seconds=_OLD) for n in names]
+    (tmp_path / f"secantus-snap-{pid}-9").write_bytes(b"a file, not a store")
+
+    reaped, _ = python_tasks._sweep_stale_rust_test_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert all(d.exists() for d in kept)
+
+
+def _render(template: str) -> str:
+    """A Rust ``format!`` name with its first ``{}`` (the pid) as 12345."""
+    import re
+
+    first = iter(["12345"] + ["3"] * 8)
+    named = {"nanos": "1762500000000000000", "tag": "multi"}
+
+    def one(g: re.Match[str]) -> str:
+        return named.get(g.group(1), "3") if g.group(1) else next(first)
+
+    return re.sub(r"\{([a-z_]*)\}", one, template)
+
+
+def test_every_rust_temp_store_name_is_one_the_sweep_knows() -> None:
+    """Render each ``secantus-...`` name ``crates/`` builds under
+    ``temp_dir()`` with pid 12345 and check the sweep reads that pid back.
+    A new name shape fails here rather than quietly leaking again."""
+    import re
+
+    root = Path(__file__).resolve().parents[1] / "crates"
+    literal = re.compile(r'"(secantus-[a-z0-9-]*\{[^"]*)"')
+    rendered: dict[str, str] = {}
+    for rs in root.rglob("*.rs"):
+        if "target" in rs.parts:
+            continue
+        lines = rs.read_text(encoding="utf-8", errors="replace").splitlines()
+        for i, line in enumerate(lines):
+            if "temp_dir()" not in "\n".join(lines[max(0, i - 2) : i + 1]):
+                continue
+            for m in literal.finditer(line):
+                name = _render(m.group(1))
+                rendered[name] = f"{rs.relative_to(root)}:{i + 1}"
+    assert len(rendered) > 40, rendered  # the scan found the stores at all
+    wrong = {
+        name: where
+        for name, where in rendered.items()
+        if not name.startswith("secantus-cfg-")
+        and ((m := python_tasks._RUST_TMP_RE.fullmatch(name)) is None or m.group(1) != "12345")
+    }
+    assert not wrong, wrong
