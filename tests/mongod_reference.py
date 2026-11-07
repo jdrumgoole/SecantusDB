@@ -25,6 +25,8 @@ import pytest
 from pymongo import MongoClient
 
 MONGOD = shutil.which("mongod")
+# `python_tasks._PROBE_TMP_PREFIX`; tests/test_clean_pytest_tmp.py pins the match.
+MONGOD_TMP_PREFIX = "secantus-probe-"
 
 
 def _free_port() -> int:
@@ -128,7 +130,12 @@ def _start_mongod_once(
     ARGV) -- ``extra_args`` is appended to the command line for that last one.
     The caller owns the teardown.
     """
-    tmp = tempfile.mkdtemp(prefix="differential-mongod-")
+    # Named like a probe store, with this process's pid, so the sweep at the
+    # next session's start (`python_tasks._sweep_stale_probe_tmp`) reaps it
+    # if this process dies without its teardown. The old
+    # `differential-mongod-` name carried no owner and was never reaped: one
+    # such dbpath held a 427 GB mongod.log (2026-11-06).
+    tmp = tempfile.mkdtemp(prefix=f"{MONGOD_TMP_PREFIX}{os.getpid()}-mongod-")
     port = _free_port()
     # Keep the oracle's own diagnostics. These used to go to DEVNULL, which
     # made a mongod crash unreadable after the fact: one really did abort on

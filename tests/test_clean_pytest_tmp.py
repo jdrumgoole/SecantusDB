@@ -385,3 +385,80 @@ def test_a_live_pid_still_wins_regardless_of_age(tmp_path: Path) -> None:
 def test_wt_home_in_use_on_a_missing_path_fails_safe(tmp_path: Path) -> None:
     """Ambiguous evidence answers IN USE -- refusing to delete is the safe way."""
     assert python_tasks._wt_home_in_use(str(tmp_path / "gone")) is True
+
+
+# ------------------------------------------------ reference mongod dbpaths
+
+
+def _mongod_home(base: Path, name: str, *, lock: str | None, age_seconds: float) -> Path:
+    """A reference mongod's dbpath, its ``mongod.lock`` holding ``lock``."""
+    d = base / name
+    d.mkdir()
+    (d / "mongod.log").write_bytes(b"x" * 1024)
+    if lock is not None:
+        (d / "mongod.lock").write_text(lock)
+    when = time.time() - age_seconds
+    os.utime(d, (when, when))
+    return d
+
+
+_OLD = python_tasks._PROBE_TMP_GRACE_SECONDS + 60
+
+
+def test_a_legacy_mongod_dbpath_whose_mongod_is_gone_is_reaped(tmp_path: Path) -> None:
+    """The `differential-mongod-` name carries no owner pid; an empty
+    `mongod.lock` (a clean shutdown) or a dead pid in it is a mongod that is
+    gone. One such dbpath held a 427 GB `mongod.log` (2026-11-06)."""
+    empty = _mongod_home(tmp_path, "differential-mongod-aaaa", lock="", age_seconds=_OLD)
+    dead = _mongod_home(tmp_path, "differential-mongod-bbbb", lock="999999999\n", age_seconds=_OLD)
+
+    reaped, freed = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 2
+    assert freed > 0
+    assert not empty.exists() and not dead.exists()
+
+
+def test_a_running_mongod_keeps_its_dbpath_whatever_its_age(tmp_path: Path) -> None:
+    """A mongod that outlived its test and only appends to its log leaves the
+    directory's mtime old; its pid in `mongod.lock` still protects it."""
+    legacy = _mongod_home(
+        tmp_path, "differential-mongod-cccc", lock=f"{os.getpid()}\n", age_seconds=_OLD
+    )
+    named = _mongod_home(
+        tmp_path,
+        f"{python_tasks._PROBE_TMP_PREFIX}999999999-mongod-dddd",
+        lock=f"{os.getpid()}\n",
+        age_seconds=_OLD,
+    )
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert legacy.exists() and named.exists()
+
+
+def test_a_fresh_legacy_mongod_dbpath_is_kept(tmp_path: Path) -> None:
+    """No pid at all is not grounds by itself: the age check still applies."""
+    fresh = _mongod_home(tmp_path, "differential-mongod-eeee", lock=None, age_seconds=0)
+
+    reaped, _ = python_tasks._sweep_stale_probe_tmp(str(tmp_path))
+
+    assert reaped == 0
+    assert fresh.exists()
+
+
+def test_the_reference_mongod_prefix_matches_the_sweep() -> None:
+    """`tests/mongod_reference.py` names its dbpath with the sweep's prefix;
+    if the two drift, an abandoned dbpath is never reaped."""
+    import ast
+
+    source = (Path(__file__).parent / "mongod_reference.py").read_text()
+    values = [
+        node.value.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "MONGOD_TMP_PREFIX" for t in node.targets)
+        and isinstance(node.value, ast.Constant)
+    ]
+    assert values == [python_tasks._PROBE_TMP_PREFIX]
