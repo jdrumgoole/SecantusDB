@@ -23384,6 +23384,33 @@ impl PgHandler {
                     // skips only a view and a composite type).
                     rows.extend(Self::system_attribute_rows(&def, relid));
                 }
+                // A sequence is a relation with storage too, its one row's
+                // three columns fixed by `sequence.c`'s `DefineSequence`
+                // (each NOT NULL), plus the system columns. Read from the
+                // same documents `pg_class` lists its relkind 'S' rows from.
+                for s in self.all_sequence_docs().ok()? {
+                    let relid = self.sequence_relid(s.get_str("_id").unwrap_or_default());
+                    const SEQUENCE_COLUMNS: [(&str, i64, i32); 3] = [
+                        ("last_value", 20, 1),
+                        ("log_cnt", 20, 2),
+                        ("is_called", 16, 3),
+                    ];
+                    for (name, atttypid, attnum) in SEQUENCE_COLUMNS {
+                        let mut d = Document::new();
+                        let f = |c: &str| def.field_of(c).expect("column");
+                        d.insert(f("attrelid"), Bson::Int64(relid));
+                        d.insert(f("attname"), name);
+                        d.insert(f("atttypid"), Bson::Int64(atttypid));
+                        d.insert(f("attnum"), Bson::Int32(attnum));
+                        d.insert(f("attisdropped"), Bson::Boolean(false));
+                        d.insert(f("attnotnull"), Bson::Boolean(true));
+                        d.insert(f("atttypmod"), Bson::Int32(-1));
+                        d.insert(f("atthasdef"), Bson::Boolean(false));
+                        d.insert(f("attgenerated"), "");
+                        rows.push(d);
+                    }
+                    rows.extend(Self::system_attribute_rows(&def, relid));
+                }
                 // A view's columns are its output columns; an index's are its
                 // key columns, in key order (psql's `\d view` / `\d index`
                 // read them here). A materialized view's are its table's, as

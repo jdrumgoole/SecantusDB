@@ -519,11 +519,13 @@ def test_system_columns_by_relation_kind(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-498")
+@pytest.mark.backlog_fixed("RP-498")
 def test_pg_attribute_lists_sequence_columns(rust_pg: Any) -> None:
     """A sequence is a relation with storage: on a private PostgreSQL 15.19
     cluster `pg_attribute` lists its three columns and the six system
-    columns. Here it lists no row for a sequence at all."""
+    columns. Here it listed no row for a sequence at all; it lists all
+    nine, read from the same documents `pg_class` lists the sequence from,
+    and every pg_attribute column matched 15.19's on a probe."""
     with rust_pg.connect() as c:
         c.autocommit = True
         c.execute("create sequence rp498_s")

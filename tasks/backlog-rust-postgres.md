@@ -2008,22 +2008,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
 
-## Found while working RP-490 (2026-11-07)
-
-Measured on a private PostgreSQL 15.19 cluster.
-
-- [ ] **A sequence lists no columns in `pg_attribute`.** `create sequence
-      s` makes `s` a `pg_class` row (relkind `S`), and `select * from s`
-      answers `last_value`, `log_cnt`, `is_called`; but `pg_attribute`
-      has no row for it at all. PostgreSQL 15.19 lists those three (attnum
-      1-3, `int8` / `int8` / `bool`, each `attnotnull`) and the six system
-      columns (attnum -6 to -1), as a sequence is a relation with storage.
-      Since RP-490 a table's, a partitioned table's and a materialized
-      view's system columns are listed; the loop that does it reads
-      `all_table_defs`, which holds no sequence.
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_pg_attribute_lists_sequence_columns
-      Backlog-ID: RP-498
-
 ## Found while working RP-489 (2026-11-07)
 
 Measured on a private PostgreSQL 15.19 cluster.
