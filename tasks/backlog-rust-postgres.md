@@ -1916,16 +1916,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       body writes does not.
       Verify: tests/backlog/test_rp_function_bodies.py::test_block_label_qualifies_a_variable
       Backlog-ID: RP-463
-- [ ] **A SQL function whose last statement is an INSERT, UPDATE or DELETE
-      ... RETURNING returns NULL.** `gi(p int)` with `insert into fs values
-      (p, 'i') returning p * 2` answers 8 for `gi(4)` on PostgreSQL, and so
-      do `returning a * 2` and `update fs set a = p returning a * 2`;
-      `delete from fs where a = p returning c` answers `y` for 1. Here each
-      is NULL -- a silent wrong answer -- while a prepared `insert ...
-      returning $1 * 2` answers 8: the function's result path drops the
-      RETURNING rows.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_returning_statement_is_the_result
-      Backlog-ID: RP-464
 - [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
       `check_function_bodies` on, its default, PostgreSQL parses and
       analyses each statement at CREATE: a body `select gx.q` is 42P01
@@ -1935,6 +1925,20 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       succeeds and the error waits for the first call.
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
+
+## Found while working RP-464 (2026-11-07)
+
+- [ ] **A function called in FROM runs its body twice.** `select * from
+      fz()`, where `fz()` returns `setof int` with the body `insert into t
+      values (100); select 1`, inserts one row on PostgreSQL 15.19 and two
+      here; a scalar `fq()` called as `select * from fq()` does the same,
+      and `select * from fs(10)` over `update t set a = a + p returning a`
+      adds 20 to every row and answers 21, 22, 23 where PostgreSQL adds 10
+      and answers 11, 12, 13. The same call in a select list (`select
+      fq()`) runs once. A silent double write; the extended protocol does
+      it too. Measured on PostgreSQL 15.19.
+      Backlog-ID: RP-472
+      Verify: tests/backlog/test_rp_from_function_runs_once.py::test_from_function_runs_once
 
 ## Found while working RP-316 (2026-11-02)
 
