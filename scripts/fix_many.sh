@@ -5,6 +5,18 @@
 #   scripts/fix_many.sh postgres 10        # ten items, two lanes
 #   scripts/fix_many.sh -j 1 postgres 4    # one at a time
 #   scripts/fix_many.sh -i pg-batch postgres 8   # land on pg-batch, not main
+#   scripts/fix_many.sh -l ids.txt -i rm-batch mongodb 8  # item n works line n's ID
+#
+# -l FILE: one backlog ID per line (blank lines and `#` comments skipped),
+# picked beforehand -- e.g. from a `tools/backlog.py verify` run, with the
+# Decision-needed and `Verify: none` items left out -- instead of each
+# session re-reading the whole backlog to choose. Past the end of the list,
+# sessions pick for themselves.
+#
+# In integration mode a session that exits 0 without `landed on <branch> at
+# <sha>` in its report, with that sha on origin/<branch>, stops the batch as
+# a failure does: on 2026-11-06 three sessions were refused their worktrees
+# and exited 0 having done nothing.
 #
 # -i BRANCH (integration mode): each session gates locally and pushes its
 # fix to BRANCH, with no PR and no CI wait (fix-one skill, "Integration
@@ -13,7 +25,8 @@
 # beside the batch. It lands BRANCH on main in snapshot PRs, each merged
 # after green CI.
 #
-# In integration mode each lane keeps ONE worktree, ../SecantusDB-lane<k>,
+# In integration mode each lane keeps ONE worktree, ../SecantusDB-lane-<BRANCH>-<k>
+# (named for the branch, so a PG batch and a MongoDB batch never share one),
 # for every item it works: the session switches it to a new branch off
 # BRANCH, so its cargo target and venv stay warm (builds go incremental, and
 # a fresh 4.3 GB worktree's 2-11 min build and slow teardown go away). The
@@ -40,16 +53,18 @@ set -uo pipefail
 
 jobs=2
 into=
+list=
 while [[ "${1:-}" == -* ]]; do
     case "$1" in
         -j) jobs=$2 ;;
         -i) into=$2 ;;
+        -l) list=$(cd "$(dirname "$2")" && pwd)/$(basename "$2") ;;
         *) echo "unknown option $1" >&2; exit 2 ;;
     esac
     shift 2
 done
-backlog=${1:?usage: $0 [-j N] [-i BRANCH] <postgres|mongodb> <count>}
-count=${2:?usage: $0 [-j N] [-i BRANCH] <postgres|mongodb> <count>}
+backlog=${1:?usage: $0 [-j N] [-i BRANCH] [-l IDS] <postgres|mongodb> <count>}
+count=${2:?usage: $0 [-j N] [-i BRANCH] [-l IDS] <postgres|mongodb> <count>}
 
 cd "$(dirname "$0")/.."
 out=.scratch/fix_many
@@ -80,7 +95,7 @@ lane() {
     # claiming the same item.
     sleep $(((k - 1) * 120))
     if [[ -n $into ]]; then
-        wt=$(cd .. && pwd)/SecantusDB-lane$k
+        wt=$(cd .. && pwd)/SecantusDB-lane-$into-$k
         if [[ ! -d $wt ]]; then
             git worktree add -q --detach "$wt" "origin/$into" || {
                 echo "$(date '+%F %T') lane $k: could not create $wt" >>"$out/summary.txt"
@@ -99,8 +114,19 @@ lane() {
         # (scripts/wait_for_load.sh has the 2026-11-02 numbers).
         scripts/wait_for_load.sh "fix_many item $n" 2>>"$out/summary.txt"
         [[ -e $out/STOP ]] && return 0
-        scripts/fix_one.sh -p "$backlog" ${into:+into "$into"} ${wt:+lane "$wt"} >"$out/$n.log" 2>&1
+        local id=
+        [[ -n $list ]] && id=$(grep -vE '^[[:space:]]*(#|$)' "$list" | sed -n "${n}p" | awk '{print $1}')
+        scripts/fix_one.sh -p "$backlog" $id ${into:+into "$into"} ${wt:+lane "$wt"} >"$out/$n.log" 2>&1
         local rc=$?
+        if [[ $rc -eq 0 && -n $into ]]; then
+            local sha
+            sha=$(grep -oE "landed on $into at [0-9a-f]{7,}" "$out/$n.log" | tail -1 | awk '{print $NF}')
+            git fetch -q origin "$into"
+            if [[ -z $sha ]] || ! git merge-base --is-ancestor "$sha" "origin/$into" 2>/dev/null; then
+                echo "$(date '+%F %T') item $n exit 0 but nothing landed on $into" >>"$out/summary.txt"
+                rc=3
+            fi
+        fi
         local pr
         pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at [0-9a-f]+' "$out/$n.log" | tail -1)
         echo "$(date '+%F %T') item $n (lane $k) exit $rc ${pr:-no PR}" >>"$out/summary.txt"
