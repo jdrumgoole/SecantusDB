@@ -23313,9 +23313,11 @@ impl PgHandler {
                         rows.push(Self::dropped_attribute_row(&def, relid, i32::from(n)));
                     }
                 }
-                // A view's and a materialized view's columns are its output
-                // columns; an index's are its key columns, in key order
-                // (psql's `\d view` / `\d index` read them here).
+                // A view's columns are its output columns; an index's are its
+                // key columns, in key order (psql's `\d view` / `\d index`
+                // read them here). A materialized view's are its table's, as
+                // PostgreSQL stores its rows in one: the loop above listed
+                // them, so it is not listed again here (RP-484).
                 let plain = |relid: i64, name: &str, atttypid: i64, attnum: usize| {
                     let mut d = Document::new();
                     d.insert(
@@ -23351,13 +23353,7 @@ impl PgHandler {
                     .views()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(n, _)| (self.view_relid(&n), n))
-                    .chain(
-                        self.matviews()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|(n, _, _)| Some((self.relation_oid(&n)?, n))),
-                    );
+                    .map(|(n, _)| (self.view_relid(&n), n));
                 for (relid, name) in views {
                     // The output columns' types AND modifiers: a view over
                     // `x::numeric(5,2)` reports `numeric(5,2)`.

@@ -1,5 +1,7 @@
 """Regression tests of a subquery in a CREATE TABLE AS or CREATE MATERIALIZED
-VIEW select list (RP-466, found while working RP-449).
+VIEW select list (RP-466, found while working RP-449), and of the columns
+such a relation lists in `pg_attribute` (RP-484; RP-489 and RP-490, found
+while working RP-484, are still open).
 
 Each answer was measured on a private, freshly initdb'd PostgreSQL 15.19
 cluster with this module's table, as the shared reference must not be given
@@ -124,11 +126,12 @@ def test_refresh_runs_the_subquery_again(rust_pg: Any) -> None:
     assert (m1, m2) == ([(7,)], [(1, 1), (2, 2), (5, 3), (7, 4)])
 
 
-@pytest.mark.backlog("RP-484")
+@pytest.mark.backlog_fixed("RP-484")
 def test_matview_columns_listed_once(rust_pg: Any) -> None:
     """Each column of a materialized view is one `pg_attribute` row on a
-    private PostgreSQL 15.19 cluster, with data or without; here each is
-    two."""
+    private PostgreSQL 15.19 cluster, with data or without; each was two
+    here, listed once as the table that holds its rows and again as a
+    view."""
     with rust_pg.connect() as c:
         c.autocommit = True
         c.execute("create materialized view rp_mva as select 1 n, 'x'::text t")
@@ -139,3 +142,51 @@ def test_matview_columns_listed_once(rust_pg: Any) -> None:
             " and attnum > 0 order by 1, attnum"
         ).fetchall()
     assert rows == [("rp_mva", "n"), ("rp_mva", "t"), ("rp_mvb", "n")]
+
+
+@pytest.mark.backlog("RP-489")
+def test_ctas_column_keeps_its_typmod(rust_pg: Any) -> None:
+    """A CREATE TABLE AS or CREATE MATERIALIZED VIEW column takes its
+    expression's type modifier: `2.5::numeric(5,2)` is `atttypmod` 327686
+    on a private PostgreSQL 15.19 cluster, as a declared `numeric(5,2)`
+    column is. Here it is -1, the modifier lost."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        c.execute("create table rp489_ct as select 2.5::numeric(5,2) z")
+        c.execute("create materialized view rp489_mv as select 2.5::numeric(5,2) z")
+        rows = c.execute(
+            "select attrelid::regclass::text, atttypmod from pg_attribute"
+            " where attrelid in ('rp489_ct'::regclass, 'rp489_mv'::regclass)"
+            " and attnum = 1 order by 1"
+        ).fetchall()
+    assert rows == [("rp489_ct", 327686), ("rp489_mv", 327686)]
+
+
+@pytest.mark.backlog("RP-490")
+def test_pg_attribute_lists_system_columns(rust_pg: Any) -> None:
+    """A table's system columns are `pg_attribute` rows with negative
+    attnums on a private PostgreSQL 15.19 cluster: `tableoid` -6, `cmax`
+    -5, `xmax` -4, `cmin` -3, `xmin` -2, `ctid` -1, each `attnotnull`. A
+    materialized view has them too. Here none is listed, though `select
+    ctid from t` answers."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        c.execute("create table rp490_t (a int)")
+        c.execute("create materialized view rp490_mv as select 1 n")
+        rows = c.execute(
+            "select attrelid::regclass::text, attname, atttypid::regtype::text,"
+            " attnum, attnotnull from pg_attribute"
+            " where attrelid in ('rp490_t'::regclass, 'rp490_mv'::regclass)"
+            " and attnum < 0 order by 1, attnum"
+        ).fetchall()
+    system = [
+        ("tableoid", "oid", -6),
+        ("cmax", "cid", -5),
+        ("xmax", "xid", -4),
+        ("cmin", "cid", -3),
+        ("xmin", "xid", -2),
+        ("ctid", "tid", -1),
+    ]
+    assert rows == [
+        (rel, name, typ, num, True) for rel in ("rp490_mv", "rp490_t") for name, typ, num in system
+    ]

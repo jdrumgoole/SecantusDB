@@ -2011,17 +2011,25 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
 
-## Found while working RP-466 (2026-11-07)
+## Found while working RP-484 (2026-11-07)
 
-- [ ] **A materialized view's columns are each listed twice in
-      `pg_attribute`.** `create materialized view mvx as select 1 n`, with
-      or without `WITH NO DATA`, gives `select attname from pg_attribute
-      where attrelid = 'mvx'::regclass and attnum > 0` one row `n` on a
-      private PostgreSQL 15.19 cluster; here two. `pg_class` holds the one
-      relation. A client that introspects the view's columns sees each
-      twice.
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_matview_columns_listed_once
-      Backlog-ID: RP-484
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A CREATE TABLE AS or CREATE MATERIALIZED VIEW column loses its
+      expression's type modifier.** `create table ct as select
+      2.5::numeric(5,2) z` gives `z` `atttypmod` 327686 on PostgreSQL, as a
+      declared `numeric(5,2)` column does, and a materialized view over
+      the same select does too; here each is -1, so `\d` and
+      `format_type` print a bare `numeric`.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_ctas_column_keeps_its_typmod
+      Backlog-ID: RP-489
+- [ ] **`pg_attribute` lists no system columns.** PostgreSQL lists a
+      table's and a materialized view's `tableoid` (-6), `cmax` (-5),
+      `xmax` (-4), `cmin` (-3), `xmin` (-2) and `ctid` (-1), each
+      `attnotnull`; here `attnum < 0` finds none, though `select ctid from
+      t` answers.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_pg_attribute_lists_system_columns
+      Backlog-ID: RP-490
 
 ## Found while working RP-316 (2026-11-02)
 
