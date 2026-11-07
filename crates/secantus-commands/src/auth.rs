@@ -111,6 +111,12 @@ pub struct ConnectionAuth {
     /// The mechanism and start of an authentication still in conversation,
     /// for `serverStatus.security` (`crate::status`).
     pub(crate) auth_started: Option<(String, std::time::Instant)>,
+    /// When the connection began, or when its last handshake command
+    /// (`hello`, `isMaster`, an authentication step) arrived: the start of
+    /// the wait mongod logs as `Received first command on ingress
+    /// connection` (6788700). `None` once that line is written; mongod
+    /// writes it once a connection (`IngressHandshakeMetrics`).
+    pub(crate) awaiting_first_command: Option<std::time::Instant>,
 }
 
 impl ConnectionAuth {
@@ -128,6 +134,7 @@ impl ConnectionAuth {
             peer_loopback: false,
             privileges: None,
             auth_started: None,
+            awaiting_first_command: Some(std::time::Instant::now()),
         }
     }
 
