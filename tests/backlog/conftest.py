@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import platform
 import re
 import subprocess
 import threading
@@ -104,6 +105,25 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Itera
         }
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec) + "\n")
+
+
+# -------------------------------------------------------------- platform --
+
+#: This machine's platform, as mongod's builds differ: `arm64` (Apple silicon,
+#: Linux aarch64) or `x86_64`.
+PLATFORM = {"aarch64": "arm64"}.get(platform.machine(), platform.machine())
+
+
+def only_on(*platforms: str, why: str) -> None:
+    """Skip the calling test unless this machine is one of `platforms`.
+
+    For a gap (or a case of a regression test) where mongod's own answer
+    differs by platform and this server gives it on the others: each
+    platform's mongod is the reference (Joe, 2026-11-07). `tools/backlog.py
+    verify` reports the skip as ELSEWHERE, never as passing or REGRESSED.
+    Call it in the test body, not a fixture, so verify reads the reason."""
+    if PLATFORM not in platforms:
+        pytest.skip(f"platform: {why} (here: {PLATFORM}; checked on {', '.join(platforms)})")
 
 
 # --------------------------------------------------------------- answers --

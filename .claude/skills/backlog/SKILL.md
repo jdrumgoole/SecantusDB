@@ -64,6 +64,15 @@ the helpers (`mongo_answer`, `pg_answer`) that turn an error into a value.
   the version in the docstring where it is stable, the live reference
   fixture where it is not. Never the other SecantusDB server's answer.
 - **Narrow and fast**: the gap the item names, not its neighbours; seconds.
+- **A gap that exists on one platform only** -- mongod's own answer differs
+  between its arm64 and x86_64 builds, and this server already gives one of
+  them -- is checked where it exists: each platform's mongod is the
+  reference (Joe, 2026-11-07). Call `only_on("x86_64", why=...)` (from
+  `tests/backlog/conftest.py`) first in the test body; elsewhere it skips
+  as `platform: ...`, which verify reports `ELSEWHERE`, never a pass. Local
+  gates run on this arm64 Mac and CI's comparison on x86_64 Linux, so an
+  x86-only gap is checked by CI alone: say so in the item. A regression
+  test's per-platform case does the same.
 - Gap tests and regression tests are excluded from the default suite by
   their markers (gap tests fail by design, and both need the reference
   servers) and run through the verifier. **CI runs the RM side on every
@@ -204,6 +213,7 @@ stale build is refused rather than measured. Each item comes back:
 | `FIXED?` | a gap test passes | confirm with a probe, then delete the item and keep the test as a regression test (above) |
 | `BROKEN` | a gap test errored, was skipped, failed off an assertion, or is not marked with the item's ID | repair the test; until then the item is unverified |
 | `UNCHECKED` | `Verify: none -- …`, or no Verify line | the first is by design; the second is a defect: write a test |
+| `ELSEWHERE` | a gap test skipped itself with `only_on`: the gap is on another platform | nothing here; CI (x86_64) or this Mac (arm64) checks it |
 | `REGRESSED` | a `backlog_fixed` regression test failed | a fixed behaviour broke: re-open the item (same ID) or fix the regression |
 
 Run it before a release, after a large batch, and whenever you are about to
