@@ -25,6 +25,8 @@ pub use colhint::missing_column_hint;
 pub mod colstats;
 pub mod costsize;
 mod expr_memo;
+mod expr_typmod;
+pub use expr_typmod::{analysed_typmods, with_analysed_typmods};
 mod expr_where;
 mod filter_sublink;
 mod fromless;
@@ -7013,23 +7015,6 @@ fn typmod_ival(node: &pg_query::protobuf::Node) -> Option<i32> {
     }
 }
 
-/// PostgreSQL's wire type-modifier (`atttypmod`) for a declared cast type such
-/// as `varchar(10)` (-> 14) or `numeric(10,2)` (-> 655366), or `-1` for a bare
-/// type or one whose modifier this server does not encode.
-///
-/// DESCRIPTION metadata only: it feeds the `RowDescription`, from which clients
-/// derive `precision` / `scale` / `display_size`. It never changes how a value
-/// is decoded.
-fn cast_typmod(node: &pg_query::protobuf::Node) -> i32 {
-    let Some(N::TypeCast(tc)) = node.node.as_ref() else {
-        return -1;
-    };
-    let Some(tn) = tc.type_name.as_ref() else {
-        return -1;
-    };
-    declared_typmod(tn)
-}
-
 /// The `atttypmod` a declared type carries, or -1 for an unmodified type.
 pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)
@@ -7178,7 +7163,10 @@ fn plan_create_table_as_with(
         .rel
         .as_ref()
         .ok_or_else(|| Error::Parse("CREATE TABLE AS without a relation".into()))?;
+    // `WITH NO DATA` takes its columns from the analysed query, not a
+    // planned one (`create_ctas_nodata`), so no constant is folded first.
     let query = match c.query.as_deref() {
+        Some(q) if into.skip_data => with_analysed_typmods(|| plan_query(q))?,
         Some(q) => plan_query(q)?,
         None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
     };
@@ -26230,33 +26218,18 @@ pub fn sub_plan_def(
         Statement::JoinRows(j) => Ok(j.def.clone()),
         Statement::Aggregate(agg) => aggregate_output_def(agg),
         Statement::Select(sel) => select_output_def(sel, lookup),
-        Statement::SetOp(set) => {
-            // The column NAMES are the left side's; each TYPE is the two
-            // sides' common type, as the executor reports it on the wire.
-            let mut left = sub_plan_def(&set.left, lookup)?;
-            let Ok(right) = sub_plan_def(&set.right, lookup) else {
-                return Ok(left);
-            };
-            let untyped = |stmt: &Statement, i: usize| match stmt {
-                Statement::SelectConstant(sc) => sc.untyped.get(i).copied().unwrap_or(false),
-                _ => false,
-            };
-            for (i, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
-                l.pg_type = if untyped(&set.left, i) {
-                    r.pg_type.clone()
-                } else if untyped(&set.right, i) {
-                    l.pg_type.clone()
-                } else {
-                    set_op_common_type(&l.pg_type, &r.pg_type)
-                };
-            }
-            Ok(left)
-        }
+        Statement::SetOp(set) => set_op_output_def(set, lookup),
+        // Each column keeps its modifier: `(select 2.5::numeric(5,2) z) s`
+        // reads back as a `numeric(5,2)` column (RP-493).
         Statement::SelectConstant(sc) => Ok(TableDef::new(
             "",
             sc.columns
                 .iter()
-                .map(|(name, _, ty, _)| Column::new(name, ty, false))
+                .map(|(name, _, ty, typmod)| {
+                    let mut c = Column::new(name, ty, false);
+                    c.typmod = *typmod;
+                    c
+                })
                 .collect(),
         )),
         Statement::ValuesConstant(vc) => Ok(TableDef::new(
@@ -26264,11 +26237,64 @@ pub fn sub_plan_def(
             vc.names
                 .iter()
                 .zip(&vc.types)
-                .map(|(name, ty)| Column::new(name, ty, false))
+                .enumerate()
+                .map(|(i, (name, ty))| {
+                    let mut c = Column::new(name, ty, false);
+                    c.typmod = vc
+                        .typmods
+                        .as_ref()
+                        .and_then(|m| m.get(i).copied())
+                        .unwrap_or(-1);
+                    c
+                })
                 .collect(),
         )),
         _ => Err(Error::Unsupported("this subquery shape".into())),
     }
+}
+
+/// The output def of a set operation: the column NAMES are the left side's;
+/// each TYPE is the two sides' common type, as the executor reports it on
+/// the wire, and each modifier their common one (`select_common_typmod`).
+pub fn set_op_output_def(
+    set: &SetOpSelect,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<TableDef> {
+    let mut left = sub_plan_def(&set.left, lookup)?;
+    let Ok(right) = sub_plan_def(&set.right, lookup) else {
+        return Ok(left);
+    };
+    let untyped = |stmt: &Statement, i: usize| match stmt {
+        Statement::SelectConstant(sc) => sc.untyped.get(i).copied().unwrap_or(false),
+        _ => false,
+    };
+    for (i, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
+        let common = if untyped(&set.left, i) {
+            r.pg_type.clone()
+        } else if untyped(&set.right, i) {
+            l.pg_type.clone()
+        } else {
+            set_op_common_type(&l.pg_type, &r.pg_type)
+        };
+        // `select_common_typmod`: an untyped literal side is
+        // `unknown`, coerced to the common type with no modifier.
+        fn side(untyped: bool, c: &Column) -> (&str, i32) {
+            if untyped {
+                ("unknown", -1)
+            } else {
+                (c.pg_type.as_str(), c.typmod)
+            }
+        }
+        l.typmod = expr_typmod::common_typmod(
+            &common,
+            &[
+                side(untyped(&set.left, i), l),
+                side(untyped(&set.right, i), r),
+            ],
+        );
+        l.pg_type = common;
+    }
+    Ok(left)
 }
 
 /// Two set-operation sides' common column type, PostgreSQL's
@@ -26370,7 +26396,7 @@ pub fn select_output_def(
                     col.source = c.source;
                 }
             }
-            Some(e) => col.typmod = column_expr_typmod(e),
+            Some(e) => col.typmod = column_expr_typmod(e, &source),
         }
         columns.push(col);
     }
@@ -26399,11 +26425,11 @@ pub fn join_output_def(
         // coalesce and a constant are computed, which PostgreSQL reports as
         // table 0 / column 0 (measured 16).
         let expr = join.exprs.get(i).and_then(|e| e.as_ref());
-        let (ty, source) = match expr {
+        let (ty, source, typmod) = match expr {
             Some(ColumnExpr::Casts { .. })
             | Some(ColumnExpr::Call { .. })
             | Some(ColumnExpr::Const { .. }) => {
-                (column_expr_type(expr.expect("some")).to_string(), None)
+                (column_expr_type(expr.expect("some")).to_string(), None, -1)
             }
             _ => {
                 let side_def = if *alias == join.left.1 {
@@ -26418,14 +26444,29 @@ pub fn join_output_def(
                 let c = side_def
                     .column(col)
                     .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+                // A column read through keeps its modifier, and so does a
+                // COALESCE whose fallbacks are all NULL constants, which
+                // `simplify_coalesce` drops; a non-NULL fallback is a constant
+                // with no modifier (RP-493).
+                let typmod = match expr {
+                    None => c.typmod,
+                    Some(ColumnExpr::Coalesce { args })
+                        if args.iter().flatten().all(|a| *a == Bson::Null) =>
+                    {
+                        c.typmod
+                    }
+                    Some(_) => -1,
+                };
                 (
                     c.pg_type.clone(),
                     expr.is_none().then_some(c.source).flatten(),
+                    typmod,
                 )
             }
         };
         let mut column = Column::new(&keys[i], &ty, false);
         column.source = source;
+        column.typmod = typmod;
         columns.push(column);
     }
     Ok(TableDef::new("", columns))
@@ -29164,19 +29205,22 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         }
     }
     // The common typmod of each column (`select_common_typmod`): the one
-    // every row's expression carries, else -1.
+    // every row's expression carries with the column's common type, else -1
+    // (a row of another type is coerced, which drops its modifier).
     let typmods = (0..width)
         .map(|i| {
-            let mut mods = s.values_lists.iter().map(|vl| match vl.node.as_ref() {
-                Some(N::List(l)) => l.items.get(i).map_or(-1, cast_typmod),
-                _ => -1,
-            });
-            let first = mods.next().unwrap_or(-1);
-            if mods.all(|m| m == first) {
-                first
-            } else {
-                -1
+            let mut sides = Vec::new();
+            for vl in &s.values_lists {
+                let Some(N::List(l)) = vl.node.as_ref() else {
+                    return -1;
+                };
+                match l.items.get(i).and_then(expr_typmod::analysed_expr_typed) {
+                    Some(typed) => sides.push(typed),
+                    None => return -1,
+                }
             }
+            let sides: Vec<(&str, i32)> = sides.iter().map(|(t, m)| (t.as_str(), *m)).collect();
+            expr_typmod::common_typmod(&types[i], &sides)
         })
         .collect();
     let names = (1..=width).map(|i| format!("column{i}")).collect();
@@ -29986,11 +30030,13 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             .trim_start_matches("SVFOP_")
                             .trim_end_matches("_N")
                             .to_ascii_lowercase();
+                        // `current_time(3)` carries its precision as its
+                        // modifier (RP-493).
                         columns.push((
                             if rt.name.is_empty() { name } else { rt.name.clone() },
                             ConstCol::Value(sql_value_function(svf)?),
                             sql_value_function_type(svf).to_string(),
-                            -1,
+                            svf.typmod.max(-1),
                         ));
                         continue;
                     }
@@ -30043,7 +30089,9 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let v = const_value(val, params)?;
                 let t = static_type(val, &v);
                 let _ = node;
-                let typmod = cast_typmod(val);
+                // `exprTypmod`: a cast's modifier, or one every operand of a
+                // CASE / COALESCE / ARRAY shares (RP-493).
+                let typmod = expr_typmod::raw_expr_typmod(val, &|_| None);
                 (expression_column_name(val), ConstCol::Value(v), t, typmod)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -33764,11 +33812,18 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
     }
 }
 
-/// The type modifier a ColumnExpr's column carries: a top-level cast's
-/// (`x::numeric(5,2)`), else -1.
-pub fn column_expr_typmod(expr: &ColumnExpr) -> i32 {
+/// The type modifier a ColumnExpr's column carries (`exprTypmod`, see
+/// `expr_typmod`), its columns' read from `def`, the source it is computed
+/// over: a cast's (`x::numeric(5,2)`), or one a CASE's, a COALESCE's or an
+/// ARRAY's operands share; else -1.
+pub fn column_expr_typmod(expr: &ColumnExpr, def: &TableDef) -> i32 {
     match expr {
-        ColumnExpr::Row { expr, .. } => cast_typmod(expr),
+        ColumnExpr::Row {
+            expr,
+            fields,
+            params,
+            ..
+        } => expr_typmod::row_expr_typmod(expr, fields, params.len(), def),
         _ => -1,
     }
 }

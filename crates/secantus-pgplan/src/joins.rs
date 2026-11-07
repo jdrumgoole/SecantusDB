@@ -369,6 +369,9 @@ struct ScopeCol {
     star: bool,
     /// The base column it reads, for the RowDescription (RP-087).
     source: Option<(i64, i16)>,
+    /// Its type modifier (`atttypmod`, -1 for none): a `Var`'s
+    /// `vartypmod`, which a join passes through (RP-493).
+    typmod: i32,
     /// The qualifier a reference names it by: its FROM item's alias, the
     /// alias of an aliased JOIN above it, a USING join's alias for a merged
     /// column, or empty when no qualifier reaches it (a merged column of a
@@ -949,6 +952,7 @@ fn finish_join_source(
             .map(|c| {
                 let mut col = Column::new(&c.key, &c.pg_type, false);
                 col.source = c.source;
+                col.typmod = c.typmod;
                 col
             })
             .collect(),
@@ -1587,6 +1591,7 @@ fn lateral_leaf(
             bare: true,
             star: true,
             source: c.source,
+            typmod: c.typmod,
             qual: alias.clone(),
         });
     }
@@ -1601,6 +1606,7 @@ fn lateral_leaf(
             bare: false,
             star: false,
             source: None,
+            typmod: -1,
             qual: String::new(),
         });
         scope.rows.push((alias.clone(), WholeRow::Column(key)));
@@ -2365,6 +2371,7 @@ fn add_whole_row(node: &mut JoinNode, scope: &mut Scope, alias: &str, column: &C
         bare: false,
         star: false,
         source: None,
+        typmod: -1,
         qual: String::new(),
     });
     scope.rows.push((alias.to_string(), WholeRow::Column(key)));
@@ -2430,6 +2437,7 @@ fn leaf_with_names(
             bare: true,
             star: true,
             source: typed.columns[i].source,
+            typmod: typed.columns[i].typmod,
             qual: alias.to_string(),
         });
     }
@@ -2627,6 +2635,16 @@ fn build_join(
             Ok(pg_query::protobuf::JoinType::JoinRight) => r.source,
             _ => l.source,
         };
+        // `buildMergedJoinVar`: whichever side the merged column reads, it
+        // is relabelled to the two sides' common modifier
+        // (`select_common_typmod`), so it keeps one only when both share
+        // it, under every join type. A side of another type is coerced,
+        // which drops it.
+        let typmod = if l.pg_type == r.pg_type && l.typmod == r.typmod {
+            l.typmod
+        } else {
+            -1
+        };
         merged_cols.push(ScopeCol {
             alias: String::new(),
             name: name.clone(),
@@ -2635,6 +2653,7 @@ fn build_join(
             bare: true,
             star: true,
             source,
+            typmod,
             // `join ... using (a) as u` names its merged columns `u.a`
             // (PostgreSQL 14's `join_using_alias`); nothing else does.
             qual: j

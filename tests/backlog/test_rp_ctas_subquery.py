@@ -1,8 +1,10 @@
 """Regression tests of a subquery in a CREATE TABLE AS or CREATE MATERIALIZED
 VIEW select list (RP-466, found while working RP-449), and of the columns
 such a relation lists in `pg_attribute` (RP-484) and the type modifier
-each takes from its query (RP-489); RP-490, found while working RP-484, is
-still open, and RP-493 and RP-494, found while working RP-489, are too.
+each takes from its query (RP-489) -- through a subquery, a CTE, a join, a
+set operation and the expressions whose operands share one (RP-493).
+RP-490, found while working RP-484, is still open, and so are RP-494, found
+while working RP-489, and RP-497, found while working RP-493.
 
 Each answer was measured on a private, freshly initdb'd PostgreSQL 15.19
 cluster with this module's table, as the shared reference must not be given
@@ -248,13 +250,13 @@ PROPAGATED = [
 ]
 
 
-@pytest.mark.backlog("RP-493")
+@pytest.mark.backlog_fixed("RP-493")
 def test_typmod_through_subquery_and_expressions(rust_pg: Any) -> None:
     """A subquery's, a CTE's, a join's or a UNION's column keeps its
     modifier, and so do CASE, COALESCE and ARRAY over operands that share
     one (`exprTypmod`), on a private PostgreSQL 15.19 cluster: the
-    RowDescription carries it and CREATE TABLE AS stores it. Here each is
-    -1 in both."""
+    RowDescription carries it and CREATE TABLE AS stores it. Each was -1 in
+    both until RP-493."""
     described, stored = [], []
     with rust_pg.connect() as c:
         c.autocommit = True
@@ -273,6 +275,134 @@ def test_typmod_through_subquery_and_expressions(rust_pg: Any) -> None:
             )
     want = [m for _, m in PROPAGATED]
     assert (described, stored) == (want, want)
+
+
+def _typmod_contexts(c: psycopg.Connection[Any], name: str, q: str) -> dict[str, list[int]]:
+    """`q`'s column modifiers as each of PostgreSQL's six readers sees them:
+    a portal's Describe and a SELECT from a view over it (the planned
+    query), a prepared statement's Describe, the view's own columns and
+    CREATE TABLE AS ... WITH NO DATA (the analysed one), and a populating
+    CREATE TABLE AS (planned)."""
+
+    def att(rel: str) -> list[int]:
+        return [
+            m
+            for (m,) in c.execute(
+                "select atttypmod from pg_attribute"
+                f" where attrelid = '{rel}'::regclass and attnum > 0 order by attnum"
+            ).fetchall()
+        ]
+
+    def mods(r: Any) -> list[int]:
+        return [r.fmod(k) for k in range(r.nfields)]
+
+    out = {"portal": mods(c.execute(q).pgresult)}
+    c.pgconn.prepare(b"", q.encode())
+    out["statement"] = mods(c.pgconn.describe_prepared(b""))
+    c.execute(f"create table {name}_t as {q}")
+    out["ctas"] = att(f"{name}_t")
+    c.execute(f"create table {name}_n as {q} with no data")
+    out["ctas_no_data"] = att(f"{name}_n")
+    c.execute(f"create view {name}_v as {q}")
+    out["view"] = att(f"{name}_v")
+    out["from_view"] = mods(c.execute(f"select * from {name}_v").pgresult)
+    return out
+
+
+def _planned(mods: list[int], analysed: list[int]) -> dict[str, list[int]]:
+    """The six readers' modifiers: `mods` where PostgreSQL reads the planned
+    query, whose constants are folded first, and `analysed` where it reads
+    the query as parse analysis leaves it."""
+    return {
+        "portal": mods,
+        "statement": analysed,
+        "ctas": mods,
+        "ctas_no_data": analysed,
+        "view": analysed,
+        "from_view": mods,
+    }
+
+
+_W = "'x'::varchar(9) w"
+# Queries and their modifiers in each reader, measured on a private
+# PostgreSQL 15.19 cluster. `eval_const_expressions` simplifies a CASE with
+# a constant WHEN and a COALESCE with a constant argument before the
+# planned readers see them, so those differ from the analysed ones.
+CONTEXTS = [
+    ("select case when true then 'a'::varchar(3) end a", _planned([7], [-1])),
+    ("select coalesce(2.5::numeric(5,2), 1::numeric(6,2)) a", _planned([327686], [-1])),
+    (
+        "select case when false then 'a'::varchar(4) else 'b'::varchar(3) end a",
+        _planned([7], [-1]),
+    ),
+    ("select coalesce(null, 2.5::numeric(5,2)) a", _planned([327686], [-1])),
+    (
+        f"select case when true then z else 1::numeric(6,2) end a from {_S} s",
+        _planned([327686], [-1]),
+    ),
+    (
+        f"select case when z > 1 then z else 1::numeric(5,2) end a from {_S} s",
+        _planned([327686], [327686]),
+    ),
+    (
+        f"select coalesce(z, z) a, array[z] b, greatest(z, z) c, z + 1 d from {_S} s",
+        _planned([327686, 327686, 327686, -1], [327686, 327686, 327686, -1]),
+    ),
+    ("values (1::numeric(5,2)), (2::numeric(5,2))", _planned([327686], [327686])),
+    ("values (1::numeric(5,2)), (2)", _planned([-1], [-1])),
+    ("select 1::numeric(5,2) a union select 2::numeric(5,2)", _planned([327686], [327686])),
+    ("select 1::numeric(5,2) a union select 2::numeric(6,2)", _planned([-1], [-1])),
+    ("select 1::numeric(5,2) a union select 2", _planned([-1], [-1])),
+    (
+        f"select * from {_S} s full join (select 2.5::numeric(5,2) z, {_W}) u using (z)",
+        _planned([327686, 14, 13], [327686, 14, 13]),
+    ),
+    (
+        f"select * from {_S} s right join (select 2.5::numeric(6,2) z, {_W}) u using (z)",
+        _planned([-1, 14, 13], [-1, 14, 13]),
+    ),
+    ("select current_time(3) a, localtimestamp(2) b", _planned([3, 2], [3, 2])),
+    (
+        "select greatest(1::numeric(5,2), 2::numeric(5,2)) a, nullif(1::numeric(5,2), 2) b",
+        _planned([327686, 327686], [327686, 327686]),
+    ),
+]
+
+
+@pytest.mark.backlog_fixed("RP-493")
+def test_typmod_planned_and_analysed(rust_pg: Any) -> None:
+    """Each reader of a column's modifier sees PostgreSQL 15.19's (a private
+    cluster): the planned query's, with a CASE's or a COALESCE's literal
+    constants folded first, in a portal's Describe, a populating CREATE
+    TABLE AS and a SELECT from a view; the analysed query's in a prepared
+    statement's Describe, a view's columns and WITH NO DATA. A USING
+    column takes the two sides' common modifier under every join type,
+    and a set operation's and a VALUES list's column likewise. Fixed by
+    RP-493."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        got = [_typmod_contexts(c, f"rp493c{i}", q) for i, (q, _) in enumerate(CONTEXTS)]
+    assert got == [want for _, want in CONTEXTS]
+
+
+@pytest.mark.backlog("RP-497")
+def test_typmod_from_scalar_subquery_and_computed_constants(rust_pg: Any) -> None:
+    """On a private PostgreSQL 15.19 cluster a scalar subquery's column
+    carries its select list's modifier in every reader, and a CASE whose
+    WHEN folds to a constant -- a simple CASE over constants, or a
+    computed condition -- is simplified before the planned readers see it.
+    Here the subquery is -1 everywhere, and only a literal `true` /
+    `false` / `null` condition is folded, so the others are -1 in the
+    planned readers too."""
+    cases = [
+        ("select (select 2.5::numeric(5,2)) a", _planned([327686], [327686])),
+        ("select case 1 when 1 then 'a'::varchar(3) end a", _planned([7], [-1])),
+        ("select case when 1 = 1 then 'a'::varchar(3) end a", _planned([7], [-1])),
+    ]
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        got = [_typmod_contexts(c, f"rp497c{i}", q) for i, (q, _) in enumerate(cases)]
+    assert got == [want for _, want in cases]
 
 
 @pytest.mark.backlog("RP-494")

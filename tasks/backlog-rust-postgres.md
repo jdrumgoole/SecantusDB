@@ -2004,18 +2004,6 @@ Measured on a private PostgreSQL 15.19 cluster.
 
 Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A column's type modifier is lost through a subquery, a CTE, a
-      join, a UNION or a CASE.** On PostgreSQL `select z from (select
-      2.5::numeric(5,2) z) s` describes `z` with modifier 327686, and so
-      does the same through a CTE, a join, `UNION ALL` of two
-      `numeric(5,2)` branches, `GROUP BY z`, `coalesce`, `array[...]` or a
-      CASE whose branches share a modifier (`exprTypmod`); here each
-      RowDescription sends -1, and a CREATE TABLE AS over it stores -1, so
-      `\d` prints a bare `numeric`. A bare cast (`select
-      2.5::numeric(5,2)`), a base-table column and a VALUES list's common
-      modifier already carry (RP-489).
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_through_subquery_and_expressions
-      Backlog-ID: RP-493
 - [ ] **CREATE TABLE AS over a `bit` or `varbit` column is refused.**
       `create table t as select B'101'::bit(3) b` makes a `bit(3)` column
       on PostgreSQL; here it is 0A000 `CREATE TABLE AS over a column of
@@ -2023,6 +2011,26 @@ Measured on a private PostgreSQL 15.19 cluster.
       for oids 1560 and 1562.
       Verify: tests/backlog/test_rp_ctas_subquery.py::test_ctas_over_a_bit_column
       Backlog-ID: RP-494
+
+## Found while working RP-493 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A scalar subquery's column, and a CASE folded by a computed
+      constant, lose their type modifier.** `select (select
+      2.5::numeric(5,2))` carries 327686 in every reader on PostgreSQL (the
+      subquery's first column, `exprTypmod` of its SubLink); here it is -1
+      everywhere. And `eval_const_expressions` simplifies a CASE whose WHEN
+      folds to a constant before the planned readers (a portal's Describe,
+      a populating CREATE TABLE AS, a SELECT from a view) see it, so `case
+      1 when 1 then 'a'::varchar(3) end` and `case when 1 = 1 then
+      'a'::varchar(3) end` describe 7 there (-1 in a prepared statement's
+      Describe, a view's columns and WITH NO DATA, as here). Since RP-493
+      only a literal `true` / `false` / `null` condition, or a literal
+      COALESCE argument, is folded (`expr_typmod.rs`); a computed one needs
+      the constant evaluator's own verdict on what folds.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_from_scalar_subquery_and_computed_constants
+      Backlog-ID: RP-497
 
 ## Found while working RP-316 (2026-11-02)
 

@@ -23369,15 +23369,18 @@ impl PgHandler {
                     .map(|(n, _)| (self.view_relid(&n), n));
                 for (relid, name) in views {
                     // The output columns' types AND modifiers: a view over
-                    // `x::numeric(5,2)` reports `numeric(5,2)`.
-                    let Ok(fields) = self
-                        .plan_internal(&format!(
+                    // `x::numeric(5,2)` reports `numeric(5,2)`. They are the
+                    // analysed query's (`DefineView`), with no constant
+                    // folded: `case when true then 'a'::varchar(3) end` is
+                    // -1 here though a SELECT from the view describes 7.
+                    let Ok(fields) = secantus_pgplan::with_analysed_typmods(|| {
+                        self.plan_internal(&format!(
                             "SELECT * FROM {} LIMIT 0",
                             secantus_pgplan::scalar::quote_identifier(&name)
                         ))
                         .and_then(|stmt| self.rows_with_schema(&stmt))
                         .map(|(fields, _)| fields)
-                    else {
+                    }) else {
                         continue;
                     };
                     for (i, f) in fields.iter().enumerate() {
@@ -25365,9 +25368,11 @@ impl PgHandler {
     }
 }
 
-/// `(statement text, parameter count, parameter types, binary results)`:
-/// a column's described FORMAT follows the Bind's result format.
-type DescribeKey = (String, usize, Vec<Option<String>>, bool);
+/// `(statement text, parameter count, parameter types, binary results,
+/// analysed modifiers)`: a column's described FORMAT follows the Bind's
+/// result format, and its modifier whether a statement or a portal is
+/// described (`secantus_pgplan::analysed_typmods`).
+type DescribeKey = (String, usize, Vec<Option<String>>, bool, bool);
 /// `(statement text, parameter types, the values' BSON element types)`.
 type PlanKey = (String, Vec<Option<String>>, Vec<u8>);
 /// `(catalog version, settings generation, role, the template -- its
@@ -36314,7 +36319,7 @@ impl PgHandler {
                 // described as 4, which is also what the output padding below
                 // reads. A computed column (a cast or a call) keeps -1.
                 let typmod = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(expr) => secantus_pgplan::column_expr_typmod(expr),
+                    Some(expr) => secantus_pgplan::column_expr_typmod(expr, def),
                     None => def
                         .columns
                         .iter()
@@ -37176,6 +37181,25 @@ impl PgHandler {
         ))))
     }
 
+    /// A VALUES list's fields, each with its rows' common modifier
+    /// (`select_common_typmod`).
+    fn values_fields(&self, vc: &secantus_pgplan::ValuesConstant) -> Vec<FieldInfo> {
+        vc.names
+            .iter()
+            .zip(&vc.types)
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                let typmod = vc
+                    .typmods
+                    .as_ref()
+                    .and_then(|m| m.get(i).copied())
+                    .unwrap_or(-1);
+                self.field_mod(name.clone(), wire, typmod)
+            })
+            .collect()
+    }
+
     /// The row description of a set operation, which PostgreSQL takes from the
     /// LEFT side -- column names and types both.
     ///
@@ -37196,15 +37220,7 @@ impl PgHandler {
                     self.field_mod(name.clone(), wire, *typmod)
                 })
                 .collect()),
-            Statement::ValuesConstant(vc) => Ok(vc
-                .names
-                .iter()
-                .zip(&vc.types)
-                .map(|(name, ty)| {
-                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field(name.clone(), wire)
-                })
-                .collect()),
+            Statement::ValuesConstant(vc) => Ok(self.values_fields(vc)),
             Statement::SetOp(inner) => self.set_op_fields(&inner.left),
             _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -37321,15 +37337,7 @@ impl PgHandler {
                 Ok((schema, rows))
             }
             Statement::ValuesConstant(vc) => {
-                let schema = vc
-                    .names
-                    .iter()
-                    .zip(&vc.types)
-                    .map(|(name, ty)| {
-                        let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                        self.field(name.clone(), wire)
-                    })
-                    .collect::<Vec<_>>();
+                let schema = self.values_fields(vc);
                 let rows = vc
                     .rows
                     .iter()
@@ -37456,7 +37464,20 @@ impl PgHandler {
                 }
                 ty
             };
-            schema.push(self.field(l.name().to_string(), ty));
+            // `select_common_typmod`: the sides' shared modifier when both
+            // already have the column's type; an untyped literal side, or
+            // one converted to the common type, has none (RP-493).
+            let typed_mod = |f: &FieldInfo, untyped: bool| {
+                (!untyped && *f.datatype() == ty).then(|| f.type_modifier())
+            };
+            let typmod = match (
+                typed_mod(l, flag(&left_nulls, i) || flag(&left_strs, i)),
+                typed_mod(r, flag(&right_nulls, i) || flag(&right_strs, i)),
+            ) {
+                (Some(a), Some(b)) if a == b => a,
+                _ => -1,
+            };
+            schema.push(self.field_mod(l.name().to_string(), ty, typmod));
         }
         let (mut left, mut right) = (left, right);
         if !retype.is_empty() {
@@ -38976,7 +38997,14 @@ impl PgHandler {
                         format!("relation \"{table}\" already exists"),
                     ))));
                 }
-                let fields = self.copy_query_fields(&query)?;
+                // `WITH NO DATA` reads its columns from the analysed query
+                // (`create_ctas_nodata`), unfolded; a populating CREATE
+                // TABLE AS from the planned one (`intorel_startup`).
+                let fields = if with_data {
+                    self.copy_query_fields(&query)?
+                } else {
+                    secantus_pgplan::with_analysed_typmods(|| self.copy_query_fields(&query))?
+                };
                 if column_names.len() > fields.len() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -44747,16 +44775,7 @@ impl PgHandler {
 
             Statement::ValuesConstant(vc) => {
                 // A fixed set of literal rows, no storage touched.
-                let schema = Arc::new(
-                    vc.names
-                        .iter()
-                        .zip(&vc.types)
-                        .map(|(name, ty)| {
-                            let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                            self.field(name.clone(), wire)
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                let schema = Arc::new(self.values_fields(&vc));
                 let schema_ref = schema.clone();
                 let rows = stream::iter(vc.rows).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -52133,6 +52152,7 @@ impl PgHandler {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed);
+        let analysed = secantus_pgplan::analysed_typmods();
         let valid =
             |(v, g, r, _): &DescribeEntry| *v == catalog_version && *g == generation && *r == role;
         {
@@ -52142,13 +52162,20 @@ impl PgHandler {
                     && k.1 == n_params
                     && k.2.as_slice() == param_types
                     && k.3 == binary
+                    && k.4 == analysed
                     && valid(entry)
                 {
                     return Ok(entry.3.clone());
                 }
             }
         }
-        let key: DescribeKey = (sql.to_string(), n_params, param_types.to_vec(), binary);
+        let key: DescribeKey = (
+            sql.to_string(),
+            n_params,
+            param_types.to_vec(),
+            binary,
+            analysed,
+        );
         let hit = self
             .describe_cache
             .lock()
@@ -52287,8 +52314,22 @@ impl PgHandler {
                 })
                 .collect::<Vec<_>>(),
             // The output columns of a set operation are the LEFT side's, as
-            // PostgreSQL has it -- names and types both.
-            Statement::SetOp(set) => self.set_op_fields(&set.left)?,
+            // PostgreSQL has it -- names and types both -- and each modifier
+            // the two sides' common one (`select_common_typmod`, RP-493).
+            Statement::SetOp(set) => {
+                let def = secantus_pgplan::set_op_output_def(&set, &|n| self.lookup(n)).ok();
+                self.set_op_fields(&set.left)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let typmod = def
+                            .as_ref()
+                            .and_then(|d| d.columns.get(i))
+                            .map_or(-1, |c| c.typmod);
+                        f.with_type_modifier(typmod)
+                    })
+                    .collect()
+            }
             Statement::Select(sel) => {
                 let def = self.select_def(&sel)?;
                 self.row_schema(&def, &sel.columns, &sel.casts)
@@ -52377,15 +52418,7 @@ impl PgHandler {
                     self.field_mod(name.clone(), wire, *typmod)
                 })
                 .collect(),
-            Statement::ValuesConstant(vc) => vc
-                .names
-                .iter()
-                .zip(&vc.types)
-                .map(|(name, ty)| {
-                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field(name.clone(), wire)
-                })
-                .collect(),
+            Statement::ValuesConstant(vc) => self.values_fields(&vc),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
             _ => return Ok(None),
         }))
@@ -52554,19 +52587,22 @@ impl ExtendedQueryHandler for PgHandler {
         self.install_user_types();
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
-        // Positioned as from a simple query (RP-012).
-        let fields = self
-            .describe_fields(&target.statement.sql, param_types.len(), &param_types)
-            .map_err(|e| {
-                let map = self.string_map(&target.statement.sql);
-                Self::restore_position(
-                    self.column_hinted(
-                        Self::syntax_positioned(e, &target.statement.sql),
-                        &target.statement.sql,
-                    ),
-                    map.as_ref(),
-                )
-            })?;
+        // Positioned as from a simple query (RP-012). A statement's
+        // description is its analysed query's, before any constant is folded
+        // (`PlanCacheComputeResultDesc`); a portal's is its plan's (RP-493).
+        let fields = secantus_pgplan::with_analysed_typmods(|| {
+            self.describe_fields(&target.statement.sql, param_types.len(), &param_types)
+        })
+        .map_err(|e| {
+            let map = self.string_map(&target.statement.sql);
+            Self::restore_position(
+                self.column_hinted(
+                    Self::syntax_positioned(e, &target.statement.sql),
+                    &target.statement.sql,
+                ),
+                map.as_ref(),
+            )
+        })?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }
