@@ -86,10 +86,11 @@ def test_star_derived_table_is_typed(rust_pg: Any) -> None:
     ) == [integer_boolean, integer_boolean, integer_boolean]
 
 
-@pytest.mark.backlog("RP-432")
+@pytest.mark.backlog_fixed("RP-432")
 def test_update_and_delete_read_their_ctes(rust_pg: Any) -> None:
-    """An UPDATE or DELETE reads the CTEs of its own WITH, in FROM / USING
-    and in a subquery, and so does a data-modifying CTE the ones before it."""
+    """An UPDATE or DELETE read the CTEs of its own WITH neither in FROM /
+    USING nor in a subquery, and a data-modifying CTE could not read the ones
+    before it: each was 42P01 `relation "t" does not exist`."""
     assert _answers(
         rust_pg,
         [
@@ -108,6 +109,62 @@ def test_update_and_delete_read_their_ctes(rust_pg: Any) -> None:
         ("ok", "DELETE 1"),
         ("ok", [(2,)]),
         ("ok", [(101, "v1")]),
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-432")
+def test_writes_read_their_ctes_everywhere(rust_pg: Any) -> None:
+    """A write's WITH is in scope for the whole write, as PostgreSQL 15.19's
+    `transformWithClause` puts it: a recursive one, an INSERT's VALUES, a
+    SET value, RETURNING, a CTE shadowing a table, a CTE body with its own
+    subquery, and a data-modifying item read in FROM. A CTE in FROM takes
+    part in the unqualified-name check (42702). Each was 42P01."""
+    assert _answers(
+        rust_pg,
+        [
+            "insert into k values (1, 'v1'), (2, 'x'), (3, 'v3'), (7, 'z'), (8, 'q'), (50, 'w')",
+            "with e as (select 3 as a) update k set b = 'shadow' where a in (select a from e)",
+            "with t as (select 2 as a) update k set b = (select 'from-t' || a from t)"
+            " where a = 2 returning a, b, (select a from t) as ta",
+            "with t as (select a from e where a in (select 1)) delete from k using t"
+            " where k.a = t.a returning k.a, t.a",
+            "with t as (select 50 as a) update k set b = 'n' from (select * from t) s"
+            " where k.a = s.a",
+            "with d as (delete from k where a = 7 returning a) update k set b = 'd'"
+            " from d where k.a = d.a + 1",
+            "with recursive r(n) as (select 2 union all select n + 1 from r where n < 3)"
+            " delete from k where a in (select n from r)",
+            "with recursive r(n) as (select 10 union all select n + 1 from r where n < 12)"
+            " insert into k select n, 'r' from r",
+            "with t as (select 20 as a) insert into k values ((select a from t), 'z')",
+            "with t as (select 21 as a), u as (insert into k select a, 'q' from t"
+            " returning a) select * from u",
+            "with t as (select 22 as a), u as (insert into k values ((select a from t), 'q')"
+            " returning a) select * from u",
+            "with t as (select 10 as a) update k set b = 'pub' from public.e t where k.a = t.a",
+            "with t as (select 11 as a) delete from k where exists"
+            " (select 1 from t where t.a = k.a)",
+            "with t(x) as (select 12) delete from k using t where k.a = t.x returning t.x",
+            "with t as (select b from e) delete from k using t where b = 'w'",
+            "select a, b from k order by a",
+        ],
+    ) == [
+        ("ok", "INSERT 0 6"),
+        ("ok", "UPDATE 1"),
+        ("ok", [(2, "from-t2", 2)]),
+        ("ok", [(1, 1)]),
+        ("ok", "UPDATE 1"),
+        ("ok", "UPDATE 1"),
+        ("ok", "DELETE 2"),
+        ("ok", "INSERT 0 3"),
+        ("ok", "INSERT 0 1"),
+        ("ok", [(21,)]),
+        ("ok", [(22,)]),
+        ("ok", "UPDATE 2"),
+        ("ok", "DELETE 1"),
+        ("ok", [(12,)]),
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        ("ok", [(8, "pub"), (10, "pub"), (20, "z"), (21, "q"), (22, "q"), (50, "n")]),
     ]
 
 

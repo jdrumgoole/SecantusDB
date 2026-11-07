@@ -4929,6 +4929,8 @@ fn plan_query_node(
     cancel::check()?;
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
+    inline_dml_ctes(&mut node, lookup, &mut params, run)?;
+    cancel::check()?;
     rewrite_dml_from(&mut node, lookup)?;
     cancel::check()?;
     materialize_recursive_ctes(&mut node, lookup, &mut params, run)?;
@@ -19159,8 +19161,13 @@ fn materialize_dml_ctes(
     let Some(with) = with else {
         return Ok(());
     };
-    for cte in &mut with.ctes {
-        let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
+    for idx in 0..with.ctes.len() {
+        // The items written before this one are in its scope (RP-432):
+        // PostgreSQL's `transformWithClause` analyses a non-recursive WITH's
+        // items in order, each seeing the ones before it. An earlier
+        // data-modifying item is already the VALUES of its rows.
+        let earlier = with.ctes[..idx].to_vec();
+        let Some(N::CommonTableExpr(c)) = with.ctes[idx].node.as_mut() else {
             continue;
         };
         let Some(inner) = c.ctequery.as_deref().and_then(|q| q.node.clone()) else {
@@ -19173,7 +19180,9 @@ fn materialize_dml_ctes(
             continue;
         }
         let mut dml = pg_query::protobuf::Node { node: Some(inner) };
+        attach_outer_ctes(&mut dml, &earlier, with.recursive);
         let mut p = params.clone();
+        inline_dml_ctes(&mut dml, lookup, &mut p, run)?;
         rewrite_dml_from(&mut dml, lookup)?;
         resolve_sublinks(&mut dml, lookup, &mut p, run)?;
         let plan = plan_node(
@@ -19408,6 +19417,19 @@ fn materialize_recursive_ctes(
         })
         .unwrap_or_default();
     let with = s.with_clause.as_mut().expect("checked");
+    materialize_recursive_with(with, &budgets, lookup, params, run)
+}
+
+/// Every CTE of a `WITH RECURSIVE`, run in order and replaced by the rows it
+/// produced (see [`materialize_recursive_ctes`]). `budgets` caps a CTE the
+/// query above reads only so many rows of; a write's WITH has none.
+fn materialize_recursive_with(
+    with: &mut pg_query::protobuf::WithClause,
+    budgets: &[(String, usize)],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
     #[allow(clippy::type_complexity)]
     let mut done: Vec<(
         String,
@@ -19550,9 +19572,24 @@ fn resolve_sublinks(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
+    // A write's own WITH is visible to its subqueries (RP-432); whatever
+    // the arms push is popped here, on every exit.
+    let depth = VISIBLE_CTES.with(|v| v.borrow().len());
+    let out = resolve_sublinks_scoped(node, lookup, params, run);
+    VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
+    out
+}
+
+fn resolve_sublinks_scoped(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
     match node.node.as_mut() {
         Some(N::SelectStmt(s)) => resolve_sublinks_in_select(s, lookup, params, run),
         Some(N::UpdateStmt(u)) => {
+            push_visible_ctes(u.with_clause.as_mut(), true, lookup, params, run)?;
             let outer = outer_columns(&u.relation, lookup);
             let mut clauses: Vec<&mut pg_query::protobuf::Node> = Vec::new();
             if let Some(w) = u.where_clause.as_deref_mut() {
@@ -19573,6 +19610,7 @@ fn resolve_sublinks(
             Ok(())
         }
         Some(N::DeleteStmt(d)) => {
+            push_visible_ctes(d.with_clause.as_mut(), true, lookup, params, run)?;
             let outer = outer_columns(&d.relation, lookup);
             if let Some(w) = d.where_clause.as_deref_mut() {
                 resolve_sublinks_in_expr(w, lookup, params, run, &outer)?;
@@ -19600,7 +19638,13 @@ fn resolve_sublinks(
             {
                 if sel.values_lists.is_empty() {
                     resolve_sublinks_in_select(sel, lookup, params, run)?;
+                    // In scope for RETURNING too; resolved just now.
+                    push_visible_ctes(sel.with_clause.as_mut(), false, lookup, params, run)?;
                 } else {
+                    // The INSERT's WITH, moved onto its VALUES list
+                    // (`materialize_dml_ctes`), for the subqueries in it
+                    // and in RETURNING (RP-432).
+                    push_visible_ctes(sel.with_clause.as_mut(), true, lookup, params, run)?;
                     // `INSERT ... VALUES (1, (SELECT ...))`: a VALUES item
                     // cannot see the target's columns, and every row's
                     // subquery reads the snapshot from before the statement
@@ -21689,11 +21733,25 @@ fn inline_ctes(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf:
     // (name, body, column aliases). Built in declared order, because a CTE may
     // reference the ones written before it -- and only those: PostgreSQL scopes
     // a non-recursive WITH that way too.
-    let mut defs: Vec<(
+    let defs = cte_defs(with)?;
+    let mut out = substitute_ctes(s, &defs);
+    out.with_clause = None;
+    Ok(out)
+}
+
+/// A non-recursive WITH's CTEs as `(name, flat body, column aliases)`, in
+/// declared order, each body with the CTEs before it already substituted.
+#[allow(clippy::type_complexity)]
+fn cte_defs(
+    with: &pg_query::protobuf::WithClause,
+) -> Result<
+    Vec<(
         String,
         pg_query::protobuf::SelectStmt,
         Vec<pg_query::protobuf::Node>,
-    )> = Vec::new();
+    )>,
+> {
+    let mut defs = Vec::new();
     for cte in &with.ctes {
         let Some(N::CommonTableExpr(c)) = cte.node.as_ref() else {
             return Err(Error::Unsupported("this WITH item".into()));
@@ -21708,9 +21766,139 @@ fn inline_ctes(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf:
         let body = substitute_ctes(&body, &defs);
         defs.push((c.ctename.clone(), body, c.aliascolnames.clone()));
     }
-    let mut out = substitute_ctes(s, &defs);
-    out.with_clause = None;
-    Ok(out)
+    Ok(defs)
+}
+
+/// The WITH of an UPDATE, a DELETE or an INSERT, read where the statement
+/// reads it (RP-432). PostgreSQL's `transformWithClause` puts a write's CTEs
+/// in scope for its whole query, as a SELECT's; here a SELECT's are inlined
+/// by `plan_select`, which a write never reaches, so a reference to one was
+/// `relation "t" does not exist`.
+///
+/// A recursive WITH is run first, as a SELECT's is. A reference in the
+/// UPDATE's FROM or the DELETE's USING then becomes the FROM-subquery it is
+/// shorthand for, BEFORE `rewrite_dml_from` reads those lists, so the
+/// columns a CTE exposes take part in its ambiguity checks. The statement's
+/// own subqueries see the CTEs through `VISIBLE_CTES` (`resolve_sublinks`),
+/// so the WITH stays on the statement. Runs after `materialize_dml_ctes`,
+/// which leaves a data-modifying item as the VALUES of its RETURNING rows.
+fn inline_dml_ctes(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    let (with, from) = match node.node.as_mut() {
+        Some(N::UpdateStmt(u)) => {
+            let u = &mut **u;
+            (u.with_clause.as_mut(), Some(&mut u.from_clause))
+        }
+        Some(N::DeleteStmt(d)) => {
+            let d = &mut **d;
+            (d.with_clause.as_mut(), Some(&mut d.using_clause))
+        }
+        // An INSERT's WITH is on its SELECT by now (`materialize_dml_ctes`),
+        // which `plan_select` inlines, but a recursive one is run only for
+        // a top-level SELECT.
+        Some(N::InsertStmt(i)) => (
+            i.select_stmt
+                .as_deref_mut()
+                .and_then(|n| n.node.as_mut())
+                .and_then(|n| match n {
+                    N::SelectStmt(s) => s.with_clause.as_mut(),
+                    _ => None,
+                }),
+            None,
+        ),
+        _ => return Ok(()),
+    };
+    let Some(with) = with else {
+        return Ok(());
+    };
+    if with.recursive {
+        materialize_recursive_with(with, &[], lookup, params, run)?;
+    }
+    let Some(from) = from else {
+        return Ok(());
+    };
+    if from.is_empty() {
+        return Ok(());
+    }
+    let defs = cte_defs(with)?;
+    for item in from.iter_mut() {
+        substitute_in_from(item, &defs);
+    }
+    Ok(())
+}
+
+/// `ctes`, the WITH items written before a data-modifying one, in scope for
+/// that item's own statement, behind its own WITH (whose names win, as
+/// `resolve_one_sublink` orders them).
+fn attach_outer_ctes(
+    node: &mut pg_query::protobuf::Node,
+    ctes: &[pg_query::protobuf::Node],
+    recursive: bool,
+) {
+    if ctes.is_empty() {
+        return;
+    }
+    let with = match node.node.as_mut() {
+        Some(N::UpdateStmt(u)) => &mut u.with_clause,
+        Some(N::DeleteStmt(d)) => &mut d.with_clause,
+        Some(N::InsertStmt(i)) => {
+            let own = i.with_clause.take();
+            let Some(N::SelectStmt(sel)) =
+                i.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut())
+            else {
+                i.with_clause = own;
+                return;
+            };
+            if let Some(own) = own {
+                let w = sel.with_clause.get_or_insert_with(Default::default);
+                w.recursive |= own.recursive;
+                w.ctes.extend(own.ctes);
+            }
+            &mut sel.with_clause
+        }
+        _ => return,
+    };
+    let w = with.get_or_insert_with(Default::default);
+    // Items of a recursive WITH are run by `inline_dml_ctes`, as they are
+    // for the statement around them.
+    w.recursive |= recursive;
+    w.ctes.extend(ctes.iter().cloned());
+}
+
+/// Push a WITH's items onto `VISIBLE_CTES` for the subqueries resolved
+/// next; `resolve` resolves their bodies' own subqueries first, which a
+/// caller that has already resolved them skips. The caller truncates.
+fn push_visible_ctes(
+    with: Option<&mut pg_query::protobuf::WithClause>,
+    resolve: bool,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+) -> Result<()> {
+    let Some(with) = with else {
+        return Ok(());
+    };
+    if with.recursive {
+        return Ok(());
+    }
+    if resolve {
+        for cte in &mut with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    c.ctequery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    resolve_sublinks_in_select(body, lookup, params, run)?;
+                }
+            }
+        }
+    }
+    let ctes = with.ctes.clone();
+    VISIBLE_CTES.with(|v| v.borrow_mut().extend(ctes));
+    Ok(())
 }
 
 /// Replace every FROM reference to one of `defs` with the subquery it names.

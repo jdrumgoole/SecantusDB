@@ -1632,17 +1632,34 @@ a regression test.
       a private 15.19 cluster (found while working RP-427).
       Verify: tests/backlog/test_rp_analysis_order.py::test_star_derived_table_is_typed
       Backlog-ID: RP-431
-- [ ] **An UPDATE or DELETE cannot read the CTEs of its own WITH.** `with t
-      as (select b from e) update k set a = a + 100 from t where k.b =
-      t.b`, `... update k ... where a in (select a from t)`, `with t as
-      (select 50 as a) delete from k using t where k.a = t.a` and a
-      data-modifying CTE reading an earlier one (`with t as (...), u as
-      (delete from k where a in (select a from t) returning a) select *
-      from u`) each answer 42P01 `relation "t" does not exist`; PostgreSQL
-      15.19 runs them (UPDATE 1, UPDATE 1, DELETE 1, one row). Measured
-      on a private 15.19 cluster (found while working RP-427).
-      Verify: tests/backlog/test_rp_analysis_order.py::test_update_and_delete_read_their_ctes
-      Backlog-ID: RP-432
+- [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
+      Scan of the target alone.** The statement is rewritten into
+      correlated subqueries over its FROM items (`rewrite_dml_from`), and
+      EXPLAIN prints that rewrite's scan: `explain (costs off) delete from k
+      using (select 50 as a) t where k.a = t.a` (and the UPDATE ... FROM
+      form) is `Seq Scan on k`, where PostgreSQL 15.19 pulls the subquery
+      up into `Index Scan using k_pkey on k` with `Index Cond: (a = 50)`;
+      `delete from k using e where k.a = e.a` prints no join, where
+      PostgreSQL prints a `Hash Join` with `Hash Cond: (e.a = k.a)` over
+      both tables. Measured on a private 15.19 cluster with `e(a int, b
+      text)` and `k(a int primary key, b text)` (found while working
+      RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_explain_prints_the_join_and_the_index_scan
+      Backlog-ID: RP-435
+- [ ] **An UPDATE ... FROM or DELETE ... USING reports an ambiguous name
+      ahead of a missing column written before it.** `rewrite_dml_from`'s
+      42702 check reads every expression of the statement before anything
+      else is resolved; PostgreSQL 15.19's `transformUpdateStmt` analyses
+      the WHERE before the SET list, each left to right, and stops at the
+      first bad column. So `update k set a = a from (select 1 as a) t where
+      t.nosuch = 1`, `update k set b = b from e where e.nosuch = 1` and
+      `update k set b = 'x' from e where nosuch = 1 and b = 'y'` are 42702
+      `column reference "a"` / `"b" is ambiguous` here and 42703 `column
+      t.nosuch` / `e.nosuch` / `"nosuch" does not exist` there. A name
+      written before the missing one keeps its 42702 on both. Measured on a
+      private 15.19 cluster (found while working RP-432).
+      Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
+      Backlog-ID: RP-436
 - [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
       missing function or a bad literal.** PostgreSQL 15.19 analyses the
       statement before `ExplainQuery` reads an option, so `explain (bogus)

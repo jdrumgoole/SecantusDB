@@ -3738,6 +3738,34 @@ fn analysed(sql: &str) -> Result<Statement> {
 }
 
 #[test]
+fn a_write_reads_the_ctes_of_its_own_with() {
+    // `transformWithClause` puts a write's CTEs in scope for the whole
+    // write, as a SELECT's (RP-432). Each of these was 42P01 `relation "c"
+    // does not exist`.
+    for q in [
+        "with c as (select 1 as id) delete from t using c where t.id = c.id",
+        "with c as (select 'x'::text as z) update t set n = 1 from c where t.name = c.z",
+        "with c as (select 1 as id) update t set n = 1 where id in (select id from c)",
+        "with c as (select 1 as id) delete from t where exists (select 1 from c where c.id = t.id)",
+        "with c as (select 1 as id) insert into t (id) values ((select id from c))",
+        "with recursive r(k) as (select 1 union all select k + 1 from r where k < 3) \
+         delete from t where id in (select k from r)",
+        "with c as (select 1 as id), d as (delete from t where id in (select id from c) \
+         returning id) select * from d",
+        "with c as (select 1 as id), d as (insert into t (id) select id from c returning id) \
+         select * from d",
+    ] {
+        if let Err(e) = analysed(q) {
+            panic!("{q}: {e}");
+        }
+    }
+    // A CTE in USING exposes its columns to the unqualified-name check.
+    let err = analysed("with c as (select name from t) delete from t using c where name = 'x'")
+        .expect_err("ambiguous");
+    assert_eq!(err.sqlstate(), "42702", "{err}");
+}
+
+#[test]
 fn an_insert_query_and_every_cte_body_are_type_checked() {
     // `transformWithClause` analyses each CTE's query, used or not, and
     // `transformInsertStmt` its SELECT: an operator with no overload for its
