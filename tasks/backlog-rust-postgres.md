@@ -969,6 +969,40 @@ one beside it.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
+## Found by a CI run (2026-11-07)
+
+- [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
+      once; not reproduced.** Commit `f96fc90d`, job 128491514608
+      (`pg-oracle (differential)`),
+      `tests/test_rust_pg_corpora.py::test_corpus_answers_as_postgresql_does[sqlalchemy_catalog]`.
+      The setup ran `COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'`, and
+      `SELECT obj_description('sa35_s.sa35_d_ix'::regclass, 'pg_class')`
+      then answered NULL where PostgreSQL answers `ix comment`. About 2,000
+      local runs, including runs under load and runs with forced
+      interleavings, never reproduced it. Two things that could each
+      produce exactly this symptom were found and fixed.
+      First, every storage read on the comment path answered a failure
+      with "no comment", and the publication was then recorded as current
+      for that catalog version. Those reads were the index comments, the
+      catalog, each table's index list, and `COMMENT ON INDEX`'s own lookup.
+      Second, the corpus test ignored a failed setup statement.
+      Since 2026-11-07 those reads raise `XX000` naming the storage error.
+      The publication is not recorded, and a failed corpus setup statement
+      fails its test with its error (regression test:
+      `crates/secantus-pg/tests/embedded.rs::a_failed_comment_read_is_an_error_not_a_null`).
+      **If it recurs, the job log names the cause.** Read the failing
+      statement's error, or the setup statement the test now reports. A
+      NULL with no error would mean the comment was never written, or was
+      published to a planner thread that missed it, and the transient
+      storage read is ruled out.
+      Some reads under `object_comments` still answer a failure as "none":
+      the constraint, text-search, conversion, opclass, subscription and
+      transform comment helpers, and `shobj_description`'s
+      `shared_comments`. They were not on this corpus's path, and their
+      first failure should be made to surface the same way.
+      Backlog-ID: RP-499
+      Verify: none -- seen once in CI, not reproduced; a recurrence now names its cause in the job log
+
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`
@@ -1641,16 +1675,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A subquery in a CREATE TABLE AS or CREATE MATERIALIZED VIEW is
-      refused.** `create table ct as select (select 1) x from e` is 0A000
-      `SubLink is not supported yet`, uncorrelated or correlated (`(select
-      e.a + 1)`, `exists(select ... where f.a = e.a)`), and so is `create
-      materialized view mv as select (select a + 1) from e`; PostgreSQL
-      15.19 makes each table with its rows. `select ... into` of the same
-      list is made. Measured on a private 15.19 cluster with `e(a int, b
-      text)` (found while working RP-449).
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_subquery_in_create_table_as
-      Backlog-ID: RP-466
 - [ ] **A missing relation named by a string literal for a `regclass`
       parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
       untyped literal argument to its parameter's type during analysis
@@ -1850,20 +1874,6 @@ and `fs(a int, c text)`, one row each.
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_subquery_is_analysed
       Backlog-ID: RP-459
 
-## Found while working RP-453 (2026-11-07)
-
-- [ ] **An UPDATE ... FROM's or a DELETE ... USING's RETURNING subquery
-      cannot read the FROM.** `update fe set b = 'w' from fs returning
-      (select fs.a from fe limit 1)` answers 1 on PostgreSQL 15.19, `delete
-      from fe using fs returning (select fs.c from fe limit 1)` `y`, and the
-      same through an alias (`from fs x ... x.c`); the FROM and USING items
-      are relations of the statement's own level. Here each is 42P01
-      `missing FROM-clause entry for table "fs"` (or `"x"`). A subquery over
-      the write's target alone already reads it. Measured on PostgreSQL
-      15.19.
-      Backlog-ID: RP-457
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_returning_subquery_reads_the_from
-
 ## Found while working RP-455 (2026-11-07)
 
 - [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as
@@ -1890,54 +1900,98 @@ and `fs(a int, c text)`, one row each.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 `fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
 
-- [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
-      declare x int := 3; begin return blk.x + p; end` answers 10 for
-      `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table
-      "blk"`. The function's own name, the label of the block its
-      parameters are declared in, qualifies them since RP-451; a label the
-      body writes does not.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_block_label_qualifies_a_variable
-      Backlog-ID: RP-463
-- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
-      `check_function_bodies` on, its default, PostgreSQL parses and
-      analyses each statement at CREATE: a body `select gx.q` is 42P01
-      `missing FROM-clause entry for table "gx"` at 65, `select nosuch`
-      42703 `column "nosuch" does not exist` at 65, `select 1 from nosuch`
-      42P01 `relation "nosuch" does not exist` at 72. Here each CREATE
-      succeeds and the error waits for the first call.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
-      Backlog-ID: RP-465
+## Found while working RP-465 (2026-11-07)
 
-## Found while working RP-461 (2026-11-07)
+Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A function with one OUT parameter names its FROM column after the
-      function.** `gto(out t int)` and `gtt() returns table (t int)` give
-      `select * from gto()` one column `t` on PostgreSQL 15.19, so `select
-      t from gto()`, `select g.t from gto() as g` and `select t from gtt()`
-      answer their row; here the column is `gto` (or the alias `g`), and
-      each is 42703. Two or more OUT columns are already named by their
-      parameters. A SQL function body naming such a column now meets the
-      same 42703, where it read a parameter of that name before RP-461.
-      Measured on PostgreSQL 15.19.
-      Backlog-ID: RP-477
-      Verify: tests/backlog/test_rp_function_bodies.py::test_one_out_parameter_names_the_column
+- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check a literal's input,
+      the body's result type, a CALL, or a SQL-standard body with
+      `check_function_bodies` off.** Since RP-465 a body's statements are
+      analysed at CREATE, but only for the class-42 errors names and types
+      raise. PostgreSQL 15.19 (`fmgr_sql_validator`) also refuses, on
+      `create function gx(p int) returns int language sql as $$ ... $$`: a
+      body `select 'x'::int` or `select 'a' = 1` with 22P02 `invalid input
+      syntax for type integer` at 65 (`transformTypeCast` reads a constant's
+      input); `select 'abc'` or `select 1, 2` with 42P13 `return type
+      mismatch in function declared to return integer`, no position, CONTEXT
+      `SQL function "gx"` (`check_sql_fn_retval`); a body `call nosuchproc()`
+      with 42883 `procedure nosuchproc() does not exist` at 60 (`transformCallStmt`;
+      a CALL is planned here only when it runs). And a SQL-standard body
+      (`begin atomic select nosuch; end`) is analysed as it is parsed,
+      `check_function_bodies` off or on, 42703 at 55; here only with it on.
+      Here each CREATE succeeds. A body's `nextval('nosuchseq')` (42P01 at
+      73 there) is RP-458's shape. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_literals_and_result
+      Backlog-ID: RP-500
+- [ ] **A column reference in a VALUES list is refused as a gap, and a CTE
+      no statement reads is not analysed.** `values (nosuch)` and `values
+      (1), (nosuch)` are 0A000 `ColumnRef is not supported yet` here; on
+      PostgreSQL 15.19 42703 `column "nosuch" does not exist` at 9 and 14.
+      `with w as (select nosuch) select 1` and `with w as (select 1 from
+      nosuch) select 1` answer `1` here; PostgreSQL analyses every CTE
+      (`transformWithClause`) and answers 42703 at 19 and 42P01 `relation
+      "nosuch" does not exist` at 26. A statement PostgreSQL refuses runs.
+      The same holds in a SQL function's body at CREATE (RP-465).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_values_and_unread_cte_are_analysed
+      Backlog-ID: RP-501
+- [ ] **A SQL function's array parameter cannot be subscripted.** `create
+      function h2(v int[]) returns int language sql as $$ select v[1] $$`:
+      `select h2(array[4,5])` is 22P02 `invalid input syntax for type
+      integer: "{4,5}"` here and `4` on PostgreSQL 15.19, and `select v[1] +
+      1` is 0A000 `operator + on these operands is not supported yet` (5
+      there). `sql_fn_params::bind_parameter_names` rewrites the name to
+      `$1::` and its array type, so `v[1]` becomes a cast to an array type
+      with a bound (`$1::int[][1]`), not a subscript; a parameter followed
+      by `[` needs its cast in parentheses. A prepared `$1[1]` answers.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_array_parameter_subscript
+      Backlog-ID: RP-502
+
+## Found while working RP-486 (2026-11-07)
+
+- [ ] **A syntax error in a DO block the interpreter compiles carries no
+      position.** A body with a DECLARE section or a label is compiled by
+      the function interpreter, and its 42601 reaches the client with no
+      statement position: `do $$ declare x int; begin raise notice 'z' end
+      $$` is `syntax error at or near "end"` at 45 on PostgreSQL 15.19,
+      `do $$ <<blk>> begin raise notice 'z' end $$` the same at 38, and
+      `do $$ <<blk>> begin raise notice 'z'; end nope $$` `end label "nope"
+      differs from block's label "blk"` at 43. Here each message matches
+      and no position is sent. (The fast path for a plain `begin ... end`
+      body already points at the token.)
+      Verify: tests/backlog/test_rp_do_compile_errors.py::test_compile_error_has_a_position
+      Backlog-ID: RP-492
+
+## Found while working RP-463 (2026-11-07)
+
+- [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
+      no internal position.** `do $$ declare x int; begin raise notice '%',
+      nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends
+      `internal_query` `nosuch.x` and `internal_position` 1 (psql prints
+      `LINE 1: nosuch.x` and `QUERY:`); here neither field is sent. Called
+      as a function (`return nosuch.x` in `lbe()`), the error here instead
+      carries a statement position, 8, into `select lbe()`, where
+      PostgreSQL sends none. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
+      Backlog-ID: RP-488
+
+## Found while working RP-483 (2026-11-07)
+
+- [ ] **A call in a schema that does not exist is reported as a missing
+      function.** On PostgreSQL 15.19 `select nosuch_schema.nosuch()` is
+      3F000 `schema "nosuch_schema" does not exist` at 8
+      (`LookupExplicitNamespace`, before any function is looked up), and
+      `select pg_temp.nosuch()` the same for `pg_temp` in a session that has
+      made no temporary object yet. Here each is 42883 `function nosuch()
+      does not exist` (the schema dropped from the name, at the parenthesis,
+      22) or `function pg_temp.nosuch() does not exist`, with the
+      no-matching-function HINT. Once the session has a temp table both
+      servers answer 42883 for `pg_temp`. Measured on a private 15.19
+      cluster.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_call_in_a_missing_schema
+      Backlog-ID: RP-485
 
 ## Found while working RP-472 (2026-11-07)
 
-- [ ] **A scan sees the rows a function the same statement ran wrote.**
-      With `fq()` a SQL function whose body is `insert into t values (7);
-      select 1`, over `t` holding 1, 2, 3: `select * from t, fq()`, `select
-      * from fq(), t`, `select * from t x, lateral fq()` and `select * from
-      t where a < (select * from fq()) + 10` each answer t's three rows on
-      PostgreSQL 15.19, as the statement's snapshot predates the call; here
-      each answers four, 7 included. The function runs once (RP-472), but
-      a FROM function and an uncorrelated subquery are run while the
-      statement is PLANNED, before its scan, and the scan reads everything
-      committed by then. The faithful fix is PostgreSQL's: the statement
-      reads at its own snapshot and command id, which a volatile
-      function's writes come after.
-      Backlog-ID: RP-473
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_scan_does_not_see_the_functions_write
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
       PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
       off) select * from fq()`, a scalar or a SETOF SQL function alike.
@@ -1985,35 +2039,56 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 
 ## Found while working RP-470 (2026-11-07)
 
-- [ ] **A whole-row reference is still refused in three shapes.** On
-      PostgreSQL 15.19, `select l from fs join lateral (select fs.a) l on
-      true` answers `(1)` (and NULL for a LATERAL side an outer join
-      NULL-extends), `select (select fs) from fs` and the same over `fs,
+- [ ] **A whole-row reference is still refused in two shapes.** On
+      PostgreSQL 15.19, `select (select fs) from fs` and the same over `fs,
       fe` answer `(1,y)`, and `select (fs).* from fs, fe order by 1`
-      answers `1, y`. Here the first two are 42703 `column "l" (or "fs")
-      does not exist` -- a LATERAL leaf (`lateral_leaf`) carries no row
-      column, and a subquery's correlation does not bind an outer FROM
-      item's whole row -- and the last is 0A000 `this field selection is
-      not supported yet`: `ORDER BY 1` copies the `(fs).*` target before
-      the join expands it. Since RP-470 a table's or a plain subquery's
-      whole row over a join works, built at its scan.
+      answers `1, y`. Here the first is 42703 `column "fs" does not exist`
+      -- a subquery's correlation does not bind an outer FROM item's whole
+      row -- and the last is 0A000 `this field selection is not supported
+      yet`: `ORDER BY 1` copies the `(fs).*` target before the join expands
+      it. Since RP-470 a table's or a plain subquery's whole row over a
+      join works, built at its scan, and since RP-477 a LATERAL leaf's
+      (`select l from fs join lateral (select fs.a) l on true`) does too.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
       Backlog-ID: RP-479
-- [ ] **A whole row is typed as a record, or as varchar.** `select x from
-      fs as x(p, q)`, alone or over a join, is of `fs`'s row type on
-      PostgreSQL 15.19 (psycopg reads `(1,y)`); here it is a `record`, as
-      `column_alias_rewrite` turns the table into a subquery first. A
-      view's whole row (`select v from v`, alone or over a join) has the
-      right value, but its RowDescription's type OID is 1043, varchar,
-      where PostgreSQL sends the view's row type (`'v'::regtype`).
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_under_column_aliases, tests/backlog/test_rp_subquery_scope.py::test_whole_row_of_a_view_is_its_row_type
-      Backlog-ID: RP-480
 - [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
       15.19 reports `column "a" specified in USING clause does not exist in
       left table` with no position; here it points into the statement (41,
       33 in the gap test's two statements).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
+
+## Found while working RP-489 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **CREATE TABLE AS over a `bit` or `varbit` column is refused.**
+      `create table t as select B'101'::bit(3) b` makes a `bit(3)` column
+      on PostgreSQL; here it is 0A000 `CREATE TABLE AS over a column of
+      type bit is not supported yet`, as `internal_type_name` has no name
+      for oids 1560 and 1562.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_ctas_over_a_bit_column
+      Backlog-ID: RP-494
+
+## Found while working RP-493 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A scalar subquery's column, and a CASE folded by a computed
+      constant, lose their type modifier.** `select (select
+      2.5::numeric(5,2))` carries 327686 in every reader on PostgreSQL (the
+      subquery's first column, `exprTypmod` of its SubLink); here it is -1
+      everywhere. And `eval_const_expressions` simplifies a CASE whose WHEN
+      folds to a constant before the planned readers (a portal's Describe,
+      a populating CREATE TABLE AS, a SELECT from a view) see it, so `case
+      1 when 1 then 'a'::varchar(3) end` and `case when 1 = 1 then
+      'a'::varchar(3) end` describe 7 there (-1 in a prepared statement's
+      Describe, a view's columns and WITH NO DATA, as here). Since RP-493
+      only a literal `true` / `false` / `null` condition, or a literal
+      COALESCE argument, is folded (`expr_typmod.rs`); a computed one needs
+      the constant evaluator's own verdict on what folds.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_from_scalar_subquery_and_computed_constants
+      Backlog-ID: RP-497
 
 ## Found while working RP-316 (2026-11-02)
 
@@ -2059,6 +2134,24 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       `pgbench -i -s 1` in 22 s, as does the commit before it.
       Backlog-ID: RP-380
       Verify: none -- seen once in CI; a timing that does not fail on demand
+
+## Found fixing the READ COMMITTED move race (2026-11-07)
+
+- [ ] **A move made inside a running statement still has the write window.**
+      A READ COMMITTED block's move to a new snapshot now installs its guard
+      and rolls back holding the write lock of every collection it has
+      written, so no writer is between its guard check and its write
+      (`rebase_user_transaction_to`, crates/secantus-storage/src/lib.rs). A
+      move made mid-statement -- `rebase_active_transaction_to`, from a
+      PL/pgSQL EXCEPTION block -- skips those locks, because the statement
+      may already hold one of them (they are not re-entrant). There a writer
+      past its check can still write a guarded row after the rollback, and
+      the mover's replay then fails with 40001 after its hundred attempts,
+      an answer PostgreSQL never gives at READ COMMITTED. Measured only for
+      the statement-start move, where a forced interleaving reproduced the
+      CI failure in all six writer shapes.
+      Verify: none -- a timing window reachable only by forcing the interleaving through the storage test hook (`secantus_storage::set_test_hook`, as embedded.rs::a_write_cannot_slip_in_under_a_moving_transactions_guard does); no client-side gap test can hit it
+      Backlog-ID: RP-495
 
 ## Found by batch 34 (2026-10-23)
 

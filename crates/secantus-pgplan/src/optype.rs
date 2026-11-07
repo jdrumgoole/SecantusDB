@@ -1915,9 +1915,126 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 check_select(sel, &cx.ctes, cx.lookup, rs.lateral.then_some(scope))?;
             }
         }
+        N::AIndirection(ind) => {
+            if let Some(arg) = ind.arg.as_deref() {
+                walk(arg, scope, cx)?;
+                column_notation_on_base_type(ind, arg, scope)?;
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// `(expr).field` or `(expr).*` over a value of a base type is refused when
+/// the statement is analysed, whatever the rows: `transformIndirection` hands
+/// a field name to `ParseFuncOrColumn`, whose column notation over a type
+/// that is not composite is 42809 `column notation .t applied to type
+/// integer, which is not a composite type` at the operand
+/// (`exprLocation`), and `ExpandRowReference` refuses a star with `type
+/// integer is not composite`, with no position. A function with one OUT
+/// parameter returns that parameter's type, a scalar (`(gto()).t`, RP-483).
+///
+/// Only a type known to be a built-in base type (or an array, never
+/// composite) is judged; a record, a composite, a domain over one, a user
+/// type or a type this pass cannot settle is left to the planner. A `$n`
+/// is left too: the server's own rewrites bind values through parameters
+/// whose declared type is not always the value's.
+fn column_notation_on_base_type(
+    ind: &pg_query::protobuf::AIndirection,
+    arg: &pg_query::protobuf::Node,
+    scope: &Scope,
+) -> Result<()> {
+    let field = match ind.indirection.first().and_then(|i| i.node.as_ref()) {
+        Some(N::String(s)) => Some(s.sval.as_str()),
+        Some(N::AStar(_)) => None,
+        _ => return Ok(()),
+    };
+    let Some(ty) = notation_operand_type(arg, scope) else {
+        return Ok(());
+    };
+    let ty = crate::domains::domain_base(&ty).unwrap_or(ty);
+    if crate::pgtypes::PSEUDO_TYPES.iter().any(|(_, n)| *n == ty)
+        || crate::pgtypes::oid_of_name(&ty).is_none()
+    {
+        return Ok(());
+    }
+    let shown = crate::display_type(&ty);
+    match field {
+        Some(field) => {
+            if let Some(loc) = crate::expr_location(arg) {
+                set_error_location(loc);
+            }
+            Err(Error::Sqlstate(
+                "42809",
+                format!(
+                    "column notation .{field} applied to type {shown}, which is not a composite type"
+                ),
+            ))
+        }
+        None => Err(Error::Sqlstate(
+            "42809",
+            format!("type {shown} is not composite"),
+        )),
+    }
+}
+
+/// The type of a column notation's operand, where this pass knows it: a
+/// user function's call is of its declared result type (its one OUT
+/// parameter's, for a function with one), a cast of the type it names, an
+/// `ARRAY[...]` of its elements' type's array, anything else as
+/// [`operand_type`] types it.
+fn notation_operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    match n.node.as_ref()? {
+        N::ParamRef(_) => None,
+        N::FuncCall(f) => {
+            let name = func_name(f)?;
+            if !correlated::user_function_named(&name) {
+                if let Some(t) = operand_type(n, scope) {
+                    return Some(t);
+                }
+                // A set-returning built-in's element type (`unnest`,
+                // `generate_series`), which `operand_type` leaves alone.
+                if f.over.is_some() || f.agg_star || f.funcname.len() > 2 {
+                    return None;
+                }
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| match a.node.as_ref() {
+                        Some(N::AConst(c))
+                            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                        {
+                            Some(String::new())
+                        }
+                        _ => notation_operand_type(a, scope),
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                return crate::funcsig::set_result_type(&name, &args);
+            }
+            if f.over.is_some() || f.agg_star || !f.agg_order.is_empty() {
+                return None;
+            }
+            let u = correlated::user_function_for(&name, &f.args)?;
+            (u.columns.len() <= 1).then(|| u.return_type.clone())
+        }
+        N::TypeCast(tc) => Some(type_name_of(tc.type_name.as_ref()?)),
+        // A multidimensional array is of the same array type as its
+        // elements (`ARRAY[ARRAY[1]]` is `integer[]`).
+        N::AArrayExpr(a) => {
+            let mut types = a.elements.iter().map(|e| notation_operand_type(e, scope));
+            let first = types.next()??;
+            if !types.all(|t| t.as_deref() == Some(first.as_str())) {
+                return None;
+            }
+            Some(if first.ends_with("[]") {
+                first
+            } else {
+                format!("{first}[]")
+            })
+        }
+        _ => operand_type(n, scope),
+    }
 }
 
 fn check_select(

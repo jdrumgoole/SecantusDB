@@ -2037,7 +2037,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             } else {
                 0
             };
-            Ok(crate::object_comment(oid, subid).map_or(Bson::Null, Bson::String))
+            Ok(crate::object_comment(oid, subid)?.map_or(Bson::Null, Bson::String))
         }
         // `pg_get_expr(adbin, adrelid)` renders a stored expression. This
         // server keeps `adbin` as the rendered TEXT already (see the

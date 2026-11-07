@@ -121,6 +121,7 @@ mod serializable;
 mod server;
 mod sql_fn_params;
 mod ssi;
+mod statement_views;
 mod statistic;
 mod stream_join;
 mod subscriptions;
@@ -1701,6 +1702,67 @@ impl PlHost<'_> {
     }
 }
 
+/// A polymorphic pseudo-type (`IsPolymorphicType`).
+fn is_polymorphic_type(ty: &str) -> bool {
+    matches!(
+        ty.trim().to_ascii_lowercase().as_str(),
+        "anyelement"
+            | "anyarray"
+            | "anynonarray"
+            | "anyenum"
+            | "anyrange"
+            | "anymultirange"
+            | "anycompatible"
+            | "anycompatiblearray"
+            | "anycompatiblenonarray"
+            | "anycompatiblerange"
+            | "anycompatiblemultirange"
+    )
+}
+
+/// The position, counted in characters from 1, an error carries.
+fn err_position(e: &PgWireError) -> Option<usize> {
+    match e {
+        PgWireError::UserError(info) => info
+            .position
+            .as_deref()
+            .and_then(|p| p.parse().ok())
+            .filter(|p| *p > 0),
+        _ => None,
+    }
+}
+
+/// The byte offset of character `n` (from 0) of `s`, its end past the last.
+fn char_to_byte(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+}
+
+/// Where statement `index` of the query string `source` starts, in
+/// characters: the offset `run_batch` counts that statement's error
+/// positions from (none for a string run as one statement).
+fn statement_offset_in_source(source: &str, index: usize) -> usize {
+    let Ok(stmts) = secantus_pgplan::split_statements(source) else {
+        return 0;
+    };
+    if stmts.len() <= 1 {
+        return 0;
+    }
+    let mut cursor = 0usize;
+    for (i, sql) in stmts.iter().enumerate() {
+        let Some(at) = source
+            .get(cursor..)
+            .and_then(|rest| rest.find(sql.as_str()))
+        else {
+            return 0;
+        };
+        if i == index {
+            return source[..cursor + at].chars().count();
+        }
+        cursor += at + sql.len();
+    }
+    0
+}
+
 thread_local! {
     /// Whether the innermost user function running on this thread is
     /// STABLE or IMMUTABLE: PostgreSQL runs such a body read-only, and any
@@ -2089,6 +2151,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let (schema, rows) = self.joined(|| {
             self.atomic(|| {
                 let stmt = self.plan(sql, params, types)?;
@@ -2117,6 +2181,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<u64, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
         let changes_catalog = PgHandler::may_change_catalog(&stmt);
         let _nested = NestedStatement::enter(self.h);
@@ -2164,6 +2230,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
         let (columns, rows) = self.joined(|| {
             self.atomic(|| {
@@ -2183,6 +2251,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<(Vec<(usize, String)>, Vec<Bson>), plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let Statement::Call {
             name,
             args,
@@ -5436,11 +5506,13 @@ impl PgHandler {
             serial,
             search_path,
         );
-        self.publish_user_types();
+        let complete = self.publish_user_types();
         // A view assembled from reads taken under a transaction's own
         // snapshot is that block's private one and is not reusable (see
         // `may_fill_catalog_cache`): publish it, but do not record it.
-        let record = self.may_fill_catalog_cache(version);
+        // Nor one a read failed in: the failure is published in its place,
+        // for this statement to raise, and the next statement reads again.
+        let record = complete && self.may_fill_catalog_cache(version);
         INSTALLED_USER_TYPES.with(|c| *c.borrow_mut() = record.then_some(held));
     }
 
@@ -5484,7 +5556,20 @@ impl PgHandler {
 
     /// Build the planner's user-type tables from the catalog and publish
     /// them to this thread. `install_user_types` is the gate in front.
-    fn publish_user_types(&self) {
+    /// False when a read the publication needs failed: the planner then holds
+    /// that error where the table would be (the comments, so far), and the
+    /// publication must not be recorded as current.
+    ///
+    /// The error is published rather than returned: several of the callers
+    /// that install the tables can carry no error (preparing a statement's
+    /// record, a `pg_shdepend` read, server start, and after a DDL statement
+    /// has already committed), and every other table must still be
+    /// published -- this thread's are otherwise another session's. A
+    /// statement that reads a comment raises the read's own error. A caller
+    /// outside `install_user_types` records nothing, so it may ignore the
+    /// flag: the failure stays published for a reader to raise.
+    fn publish_user_types(&self) -> bool {
+        let mut complete = true;
         // Views ride the same per-version gate: a view is expanded by the
         // planner, which cannot read the catalog itself.
         // A partition is read and written as a view over its parent (see
@@ -5669,7 +5754,9 @@ impl PgHandler {
                 })
                 .collect(),
         );
-        secantus_pgplan::set_object_comments(self.object_comments());
+        let comments = self.object_comments();
+        complete &= comments.is_ok();
+        secantus_pgplan::set_object_comments(comments.map_err(Self::plan_error_of));
         secantus_pgplan::set_shared_comments(self.read_in_block(|| self.shared_comments()));
         secantus_pgplan::domains::set_user_domains(self.domains().unwrap_or_default());
         secantus_pgplan::user_agg::set_user_aggregates(self.user_aggregates().unwrap_or_default());
@@ -5917,6 +6004,7 @@ impl PgHandler {
                 .chain(self.views().unwrap_or_default().into_iter().map(|(n, _)| n))
                 .collect(),
         );
+        complete
     }
 
     /// `information_schema.columns`' `data_type` and `udt_name` for a column
@@ -6078,8 +6166,45 @@ impl PgHandler {
                 schema,
             ));
         }
-        let (schema, bare, oid, fields) = self.composite_with_schema_named(pg_type).ok()??;
+        if let Some((schema, bare, oid, fields)) = self.composite_with_schema_named(pg_type).ok()? {
+            return self.composite_type(&schema, &bare, oid, &fields);
+        }
+        // A view's row type (`select v from v`) reports the oid `pg_type`
+        // lists it with, as a table's does, not varchar (RP-480).
+        let (schema, bare, oid, fields) = self.view_row_type_named(pg_type)?;
         self.composite_type(&schema, &bare, oid, &fields)
+    }
+
+    /// A view's row type by its resolution name (`name` in public, else
+    /// `schema.name`): its schema, bare name, `pg_type` oid and fields, as
+    /// `set_user_composites` hands them to the planner.
+    fn view_row_type_named(
+        &self,
+        resolution: &str,
+    ) -> Option<(String, String, i64, CompositeFields)> {
+        self.type_catalog_docs(Self::VIEW_COLLECTION)
+            .ok()?
+            .iter()
+            .find_map(|d| {
+                let (Ok(view), Ok(row)) = (d.get_str("_id"), d.get_array("row_fields")) else {
+                    return None;
+                };
+                let (schema, bare) = secantus_pgplan::schemas::split_key(view);
+                if Self::type_resolution(&schema, &bare) != resolution {
+                    return None;
+                }
+                let fields: CompositeFields = row
+                    .iter()
+                    .filter_map(|f| {
+                        let f = f.as_array()?;
+                        Some((
+                            f.first()?.as_str()?.to_string(),
+                            f.get(1)?.as_str()?.to_string(),
+                        ))
+                    })
+                    .collect();
+                Some((schema, bare, self.view_type_relid(view), fields))
+            })
     }
 
     /// The wire `Type` for a DEFINED base type or its array, by resolution
@@ -6823,7 +6948,7 @@ impl PgHandler {
 
     /// One table's rows as documents, virtual or stored, unfiltered.
     fn table_docs(&self, table: &str) -> PgWireResult<Vec<Document>> {
-        if let Some(docs) = self.virtual_rows(table, &Document::new()) {
+        if let Some(docs) = self.virtual_rows_checked(table, &Document::new())? {
             return Ok(docs);
         }
         let raw = self
@@ -7237,9 +7362,9 @@ impl PgHandler {
                     }
                 }
             }
-            None if Self::virtual_table(&agg.table).is_some() => {
-                self.virtual_rows(&agg.table, &agg.filter).expect("checked")
-            }
+            None if Self::virtual_table(&agg.table).is_some() => self
+                .virtual_rows_checked(&agg.table, &agg.filter)?
+                .expect("checked"),
             None if agg.group_by.is_empty() && agg.grouping_sets.is_none() => {
                 match self.ungrouped_in_bounded_memory(agg)? {
                     Some(vals) => {
@@ -12238,11 +12363,20 @@ impl PgHandler {
         Some((ctids, not_visible))
     }
 
+    /// [`Self::try_index_relations`], a failed catalog or index-list read
+    /// answered as no indexes. Kept for the callers that cannot yet carry the
+    /// error; a reader whose wrong answer would be silent (the comments,
+    /// `COMMENT ON INDEX`) uses the fallible form.
     fn index_relations(&self) -> Vec<IndexRelation> {
+        self.try_index_relations().unwrap_or_default()
+    }
+
+    /// Every index relation `pg_class` / `pg_index` list, in oid order. A
+    /// failed read of the catalog or of a table's index list is the error,
+    /// never an empty list.
+    fn try_index_relations(&self) -> PgWireResult<Vec<IndexRelation>> {
         let mut out = Vec::new();
-        let Ok(defs) = self.all_table_defs() else {
-            return out;
-        };
+        let defs = self.all_table_defs()?;
         let defs_all = defs.clone();
         let defs_partitions = |all: &[TableDef], parent: &str| -> Vec<TableDef> {
             all.iter()
@@ -12299,7 +12433,7 @@ impl PgHandler {
             let stored = self
                 .storage
                 .list_indexes(self.db(), &t.name)
-                .unwrap_or_default();
+                .map_err(|e| Self::storage_err("could not read the index list", e))?;
             let mut names = std::collections::HashSet::new();
             for ix in stored {
                 let Ok(name) = ix.get_str("name") else {
@@ -12444,7 +12578,7 @@ impl PgHandler {
         out.extend(derived_ix);
         // pg_index's physical order is creation order, which the oids follow.
         out.sort_by_key(|ix| ix.oid);
-        out
+        Ok(out)
     }
 
     /// Stamp each column of `def` with where it is read from, for the
@@ -13387,6 +13521,15 @@ impl PgHandler {
             self.mint_global_oids(1)?
         };
         doc.insert("oid", oid);
+        // The row an OR REPLACE replaces, as stored.
+        let replaced = if exists && def.replace && def.language == "sql" {
+            self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
+                .iter()
+                .find(|d| d.get_str("_id") == Ok(key.as_str()))
+                .cloned()
+        } else {
+            None
+        };
         if exists {
             if !def.replace {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -13401,11 +13544,160 @@ impl PgHandler {
             self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
         }
         self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, doc)?;
+        // The validator runs once the routine is in the catalog, so a body
+        // calling itself resolves (`ProcedureCreate`, then
+        // `fmgr_sql_validator`). A statement outside a block is not undone
+        // as a whole here, so a body it refuses takes its row back out by
+        // hand, and puts back the routine an OR REPLACE replaced.
+        if def.language == "sql" {
+            bump_catalog_version();
+            if let Err(e) = self.check_sql_function_body(&def.name, &read_back) {
+                self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
+                if let Some(old) = replaced {
+                    self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, old)?;
+                }
+                bump_catalog_version();
+                return Err(e);
+            }
+        }
         Ok(vec![Response::Execution(Tag::new(if def.is_procedure {
             "CREATE PROCEDURE"
         } else {
             "CREATE FUNCTION"
         }))])
+    }
+
+    /// `fmgr_sql_validator` with `check_function_bodies` on: each statement
+    /// of a LANGUAGE sql body that PostgreSQL parse-analyses (the ones
+    /// `transformStmt` transforms rather than wraps as a utility) is
+    /// planned against the catalog as it now stands, its parameters bound
+    /// by name and type, without being run. An error analysis raises is the
+    /// CREATE's, placed in the CREATE's text as
+    /// `function_parse_error_transpose` places it. A body with a polymorphic
+    /// argument is not analysed (its types are the call's), and an error
+    /// only execution raises -- a division by zero, a privilege, a
+    /// constraint -- is left to the call, as there.
+    fn check_sql_function_body(&self, fname: &str, doc: &Document) -> PgWireResult<()> {
+        let checks = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("check_function_bodies")
+            .is_none_or(|v| v != "off");
+        if !checks {
+            return Ok(());
+        }
+        let strings = |key: &str| -> Vec<String> {
+            doc.get_array(key)
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let types = strings("param_types");
+        if types.iter().any(|t| is_polymorphic_type(t)) {
+            return Ok(());
+        }
+        let names: Vec<String> = strings("params")
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        let body = doc.get_str("body").unwrap_or_default();
+        let Ok(statements) = pg_query::split_with_parser(body) else {
+            return Ok(());
+        };
+        self.install_user_types();
+        let tz = self.session_timezone();
+        let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
+        let params = vec![Bson::Null; types.len()];
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let failure = self.with_sql_fn_lookups(|look| {
+            for stmt in &statements {
+                if !sql_fn_params::analysed_at_create(stmt) {
+                    continue;
+                }
+                let (bound, spans) =
+                    sql_fn_params::bind_parameter_names_mapped(stmt, fname, &names, &types, look);
+                // Planned as a PREPARE plans: no user function is called (one
+                // in FROM is otherwise answered while planning), no sequence
+                // drawn and no volatile subquery run, so nothing the body
+                // would do happens.
+                let planned = secantus_pgplan::planning_without_running(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        &bound,
+                        &|n| self.lookup(n),
+                        &params,
+                        &declared,
+                        &tz,
+                        Some(&run),
+                    )
+                });
+                let Err(e) = planned else {
+                    continue;
+                };
+                let mut err = Self::err_in(&e, &bound);
+                // An error `err` gave another code (a function this server
+                // lacks is 42883) is placed by that code.
+                if let PgWireError::UserError(info) = &mut err {
+                    if info.position.is_none() {
+                        info.position =
+                            secantus_pgplan::error_position(&bound, &info.code, &info.message)
+                                .map(|p| p.to_string());
+                    }
+                }
+                let err = self.column_hinted(err, &bound);
+                // Class 42 (an unknown name, a type mismatch, an ambiguity)
+                // and a missing schema are what analysis raises; a refused
+                // privilege is checked when the statement runs.
+                let analysis = match &err {
+                    PgWireError::UserError(info) => {
+                        info.code.starts_with("42") && info.code != "42501" || info.code == "3F000"
+                    }
+                    _ => false,
+                };
+                if !analysis {
+                    continue;
+                }
+                // The error's place in the body, counted in characters
+                // from 1, as the parser's cursor position is.
+                let at_in_body = err_position(&err).map(|p| {
+                    let byte = char_to_byte(&bound, p - 1);
+                    let in_stmt = sql_fn_params::original_offset(&spans, byte);
+                    let stmt_start = stmt.as_ptr() as usize - body.as_ptr() as usize;
+                    body[..stmt_start + in_stmt.min(stmt.len())].chars().count() + 1
+                });
+                return Some((err, at_in_body));
+            }
+            None
+        });
+        let Some((mut err, at_in_body)) = failure else {
+            return Ok(());
+        };
+        if let PgWireError::UserError(info) = &mut err {
+            match at_in_body {
+                Some(at) => {
+                    let (source, index) = self
+                        .statement_source
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        .unwrap_or_default();
+                    info.position = sql_fn_params::match_prosrc_to_query(body, &source, at)
+                        .and_then(|p| p.checked_sub(statement_offset_in_source(&source, index)))
+                        .filter(|p| *p > 0)
+                        .map(|p| p.to_string());
+                }
+                // An error with no place gets the routine's frame
+                // (`sql_function_parse_error_callback`).
+                None => {
+                    info.position = None;
+                    info.where_context = Some(format!("SQL function \"{fname}\""));
+                }
+            }
+        }
+        Err(err)
     }
 
     /// The view an `ALTER VIEW` names, checked the way PostgreSQL does: it
@@ -13919,6 +14211,10 @@ impl PgHandler {
         }
         let started = std::time::Instant::now();
         NESTED.with(|n| n.borrow_mut().push(0));
+        // What a volatile function writes, the statement calling it does
+        // not see (RP-473); a stable or immutable one writes nothing.
+        let _viewed = (doc.get_str("volatility").unwrap_or("volatile") == "volatile")
+            .then(|| statement_views::ViewedCall::enter(self));
         let out = self.with_call_depth(|| self.run_user_function(&doc, u, args));
         let total = started.elapsed().as_micros() as i64;
         let inner = NESTED.with(|n| {
@@ -14104,9 +14400,16 @@ impl PgHandler {
                     .collect()
             })
             .unwrap_or_default();
-        // The name a parameter may be qualified by (`fname.p`), and what
-        // decides whether a relation of that name has the column instead.
+        // The name a parameter may be qualified by (`fname.p`).
         let fname = doc.get_str("name").unwrap_or_default();
+        self.with_sql_fn_lookups(|look| {
+            self.call_sql_function_bound(doc, u, args, fname, &names, look)
+        })
+    }
+
+    /// What decides, for [`sql_fn_params::bind_parameter_names`], whether a
+    /// name in a SQL function's body is a column rather than a parameter.
+    fn with_sql_fn_lookups<R>(&self, f: impl FnOnce(&sql_fn_params::Lookups<'_>) -> R) -> R {
         let table_has_column = |table: &str, column: &str| match self.lookup(table) {
             Some(d) => Some(d.column(column).is_some()),
             // A view's columns are its query's output.
@@ -14133,11 +14436,22 @@ impl PgHandler {
             }
         };
         let function_columns = |name: &str| self.function_result_columns(name);
-        let look = sql_fn_params::Lookups {
+        f(&sql_fn_params::Lookups {
             table_has_column: &table_has_column,
             function_columns: &function_columns,
             type_has_field: &type_has_field,
-        };
+        })
+    }
+
+    fn call_sql_function_bound(
+        &self,
+        doc: &Document,
+        u: &secantus_pgplan::UserFn,
+        args: &[Bson],
+        fname: &str,
+        names: &[String],
+        look: &sql_fn_params::Lookups<'_>,
+    ) -> PgWireResult<secantus_pgplan::FnResult> {
         let body = doc.get_str("body").unwrap_or_default();
         let statements = pg_query::split_with_parser(body).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -14163,7 +14477,7 @@ impl PgHandler {
         if NON_VOLATILE.with(|v| v.get()) && doc.get_str("call_sql").is_err() {
             for stmt in &statements {
                 let sql =
-                    sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
+                    sql_fn_params::bind_parameter_names(stmt, fname, names, &u.arg_types, look);
                 let plan = || {
                     host.plan(&sql, args, &u.arg_types)
                         .ok()
@@ -14204,7 +14518,7 @@ impl PgHandler {
                 && doc.get_str("volatility").unwrap_or("volatile") == "immutable");
         let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
-            let sql = sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
+            let sql = sql_fn_params::bind_parameter_names(stmt, fname, names, &u.arg_types, look);
             let head = sql.trim_start().to_ascii_lowercase();
             let is_query = head.starts_with("select")
                 || head.starts_with("with")
@@ -17389,8 +17703,9 @@ impl PgHandler {
                     },
                     [] => (None, String::new()),
                 };
-                // An unqualified name is the index the search path finds.
-                let indexes = self.index_relations();
+                // An unqualified name is the index the search path finds. A
+                // failed read is the error, not "relation does not exist".
+                let indexes = self.try_index_relations()?;
                 let found = match &schema {
                     Some(s) => indexes.iter().find(|ix| {
                         ix.name == name
@@ -19792,21 +20107,18 @@ impl PgHandler {
 
     /// Every stored comment as pg_description keys it: `(object oid,
     /// sub-id, text)`, the sub-id a column's number or 0. Objects with no
-    /// oid here (a sequence, a schema) are not listed.
-    pub(crate) fn object_comments(&self) -> Vec<(i64, i32, String)> {
+    /// oid here (a sequence, a schema) are not listed. A failed read of the
+    /// stores the comments live in is the error: answered as "no comment" it
+    /// was a silent NULL from `obj_description` (CI, 2026-11-07).
+    pub(crate) fn object_comments(&self) -> PgWireResult<Vec<(i64, i32, String)>> {
         let mut out = Vec::new();
         // An extension's description is its control file's `comment`.
-        for (i, (name, _, _)) in self
-            .extensions()
-            .unwrap_or_default()
-            .into_iter()
-            .enumerate()
-        {
+        for (i, (name, _, _)) in self.extensions()?.into_iter().enumerate() {
             if let Some(c) = catalog_fill::extension_description(&name) {
                 out.push((crate::extension_oid(i), 0, c.to_string()));
             }
         }
-        for def in self.all_table_defs().unwrap_or_default() {
+        for def in self.all_table_defs()? {
             let Some(oid) = self.relation_oid(&def.name) else {
                 continue;
             };
@@ -19827,12 +20139,12 @@ impl PgHandler {
         let index_comments: Vec<Document> = self
             .storage
             .find_matching(self.db(), Self::INDEX_COMMENT_COLLECTION, &Document::new())
-            .unwrap_or_default()
+            .map_err(|e| Self::storage_err("could not read the index comments", e))?
             .iter()
             .filter_map(|b| decode_doc(b).ok())
             .collect();
         if !index_comments.is_empty() {
-            for ix in self.index_relations() {
+            for ix in self.try_index_relations()? {
                 if let Some(c) = index_comments
                     .iter()
                     .find(|d| d.get_str("_id") == Ok(Self::index_comment_key(&ix).as_str()))
@@ -19842,11 +20154,7 @@ impl PgHandler {
                 }
             }
         }
-        for d in self
-            .type_catalog_docs(Self::DOMAIN_COLLECTION)
-            .map(|d| d.as_ref().clone())
-            .unwrap_or_default()
-        {
+        for d in self.type_catalog_docs(Self::DOMAIN_COLLECTION)?.iter() {
             if let (Ok(c), Some(oid)) = (d.get_str("comment"), d.get("oid").and_then(bson_i64)) {
                 out.push((oid, 0, c.to_string()));
             }
@@ -19879,7 +20187,7 @@ impl PgHandler {
         );
         // COMMENT ON FUNCTION / PROCEDURE, kept on the function's record,
         // under the oid `pg_proc` gives it.
-        for d in self.user_function_docs().unwrap_or_default() {
+        for d in self.user_function_docs()? {
             if let Ok(c) = d.get_str("comment") {
                 let key = d.get_str("_id").unwrap_or_default();
                 out.push((self.function_oid(key), 0, c.to_string()));
@@ -19888,7 +20196,7 @@ impl PgHandler {
         for d in self
             .storage
             .find_matching(self.db(), Self::COMMENT_COLLECTION, &Document::new())
-            .unwrap_or_default()
+            .map_err(|e| Self::storage_err("could not read the comments", e))?
             .iter()
             .filter_map(|b| decode_doc(b).ok())
         {
@@ -19899,7 +20207,7 @@ impl PgHandler {
                 out.push((oid, 0, c.to_string()));
             }
         }
-        out
+        Ok(out)
     }
 
     /// Mint an enum / composite oid the way PostgreSQL mints an OID: from a
@@ -20881,6 +21189,23 @@ impl PgHandler {
             .any(|r| r.get(&field).and_then(bson_i64) == Some(oid))
     }
 
+    /// [`Self::virtual_rows`] for a reader that hands the rows to a client:
+    /// a catalog read that failed while they were built
+    /// ([`note_catalog_fill_error`]) is the reader's error, not rows that
+    /// silently lack what the read would have found.
+    fn virtual_rows_checked(
+        &self,
+        name: &str,
+        filter: &Document,
+    ) -> PgWireResult<Option<Vec<Document>>> {
+        let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
+        let rows = self.virtual_rows(name, filter);
+        match CATALOG_FILL_ERROR.with(|e| e.replace(outer)) {
+            Some(e) => Err(e),
+            None => Ok(rows),
+        }
+    }
+
     /// The rows of one virtual table, already filtered.
     ///
     /// A catalog relation's rows are computed once per message cycle: a
@@ -20940,11 +21265,26 @@ impl PgHandler {
         let rows = match hit {
             Some(rows) => rows,
             None => {
-                let rows = Arc::new(self.virtual_rows_uncached(name, &Document::new())?);
-                self.virtual_cache
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(name.to_string(), (key.0, key.1, key.2, Arc::clone(&rows)));
+                // Rows a read failed in are not kept: the next reader builds
+                // them again (and the failure stays noted for this one's).
+                let outer = CATALOG_FILL_ERROR.with(|e| e.borrow_mut().take());
+                let rows = self.virtual_rows_uncached(name, &Document::new());
+                let failed = CATALOG_FILL_ERROR.with(|e| {
+                    let mut e = e.borrow_mut();
+                    if e.is_none() {
+                        *e = outer;
+                        false
+                    } else {
+                        true
+                    }
+                });
+                let rows = Arc::new(rows?);
+                if !failed {
+                    self.virtual_cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(name.to_string(), (key.0, key.1, key.2, Arc::clone(&rows)));
+                }
                 rows
             }
         };
@@ -23275,10 +23615,44 @@ impl PgHandler {
                     for n in t.dropped_attnums() {
                         rows.push(Self::dropped_attribute_row(&def, relid, i32::from(n)));
                     }
+                    // Every relation with storage -- a table, a partitioned
+                    // table, a materialized view -- has the system columns
+                    // as rows with negative attnums (`AddNewAttributeTuples`
+                    // skips only a view and a composite type).
+                    rows.extend(Self::system_attribute_rows(&def, relid));
                 }
-                // A view's and a materialized view's columns are its output
-                // columns; an index's are its key columns, in key order
-                // (psql's `\d view` / `\d index` read them here).
+                // A sequence is a relation with storage too, its one row's
+                // three columns fixed by `sequence.c`'s `DefineSequence`
+                // (each NOT NULL), plus the system columns. Read from the
+                // same documents `pg_class` lists its relkind 'S' rows from.
+                for s in self.all_sequence_docs().ok()? {
+                    let relid = self.sequence_relid(s.get_str("_id").unwrap_or_default());
+                    const SEQUENCE_COLUMNS: [(&str, i64, i32); 3] = [
+                        ("last_value", 20, 1),
+                        ("log_cnt", 20, 2),
+                        ("is_called", 16, 3),
+                    ];
+                    for (name, atttypid, attnum) in SEQUENCE_COLUMNS {
+                        let mut d = Document::new();
+                        let f = |c: &str| def.field_of(c).expect("column");
+                        d.insert(f("attrelid"), Bson::Int64(relid));
+                        d.insert(f("attname"), name);
+                        d.insert(f("atttypid"), Bson::Int64(atttypid));
+                        d.insert(f("attnum"), Bson::Int32(attnum));
+                        d.insert(f("attisdropped"), Bson::Boolean(false));
+                        d.insert(f("attnotnull"), Bson::Boolean(true));
+                        d.insert(f("atttypmod"), Bson::Int32(-1));
+                        d.insert(f("atthasdef"), Bson::Boolean(false));
+                        d.insert(f("attgenerated"), "");
+                        rows.push(d);
+                    }
+                    rows.extend(Self::system_attribute_rows(&def, relid));
+                }
+                // A view's columns are its output columns; an index's are its
+                // key columns, in key order (psql's `\d view` / `\d index`
+                // read them here). A materialized view's are its table's, as
+                // PostgreSQL stores its rows in one: the loop above listed
+                // them, so it is not listed again here (RP-484).
                 let plain = |relid: i64, name: &str, atttypid: i64, attnum: usize| {
                     let mut d = Document::new();
                     d.insert(
@@ -23314,24 +23688,21 @@ impl PgHandler {
                     .views()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|(n, _)| (self.view_relid(&n), n))
-                    .chain(
-                        self.matviews()
-                            .unwrap_or_default()
-                            .into_iter()
-                            .filter_map(|(n, _, _)| Some((self.relation_oid(&n)?, n))),
-                    );
+                    .map(|(n, _)| (self.view_relid(&n), n));
                 for (relid, name) in views {
                     // The output columns' types AND modifiers: a view over
-                    // `x::numeric(5,2)` reports `numeric(5,2)`.
-                    let Ok(fields) = self
-                        .plan_internal(&format!(
+                    // `x::numeric(5,2)` reports `numeric(5,2)`. They are the
+                    // analysed query's (`DefineView`), with no constant
+                    // folded: `case when true then 'a'::varchar(3) end` is
+                    // -1 here though a SELECT from the view describes 7.
+                    let Ok(fields) = secantus_pgplan::with_analysed_typmods(|| {
+                        self.plan_internal(&format!(
                             "SELECT * FROM {} LIMIT 0",
                             secantus_pgplan::scalar::quote_identifier(&name)
                         ))
                         .and_then(|stmt| self.rows_with_schema(&stmt))
                         .map(|(fields, _)| fields)
-                    else {
+                    }) else {
                         continue;
                     };
                     for (i, f) in fields.iter().enumerate() {
@@ -25319,9 +25690,11 @@ impl PgHandler {
     }
 }
 
-/// `(statement text, parameter count, parameter types, binary results)`:
-/// a column's described FORMAT follows the Bind's result format.
-type DescribeKey = (String, usize, Vec<Option<String>>, bool);
+/// `(statement text, parameter count, parameter types, binary results,
+/// analysed modifiers)`: a column's described FORMAT follows the Bind's
+/// result format, and its modifier whether a statement or a portal is
+/// described (`secantus_pgplan::analysed_typmods`).
+type DescribeKey = (String, usize, Vec<Option<String>>, bool, bool);
 /// `(statement text, parameter types, the values' BSON element types)`.
 type PlanKey = (String, Vec<Option<String>>, Vec<u8>);
 /// `(catalog version, settings generation, role, the template -- its
@@ -25832,6 +26205,39 @@ impl PgHandler {
         d.insert(f("atthasdef"), Bson::Boolean(false));
         d.insert(f("attgenerated"), "");
         d
+    }
+
+    /// The system columns' `pg_attribute` rows for relation `relid`, as
+    /// `heap.c`'s `SysAtt` table defines them: each NOT NULL, with no type
+    /// modifier or default. The columns the fill derives from the type
+    /// (`attlen`, `attbyval`, `attalign`, `attstorage`) come out as
+    /// PostgreSQL's, and `attstattarget` is 0 for a negative attnum.
+    fn system_attribute_rows(def: &TableDef, relid: i64) -> Vec<Document> {
+        const SYSTEM_COLUMNS: [(&str, i64, i32); 6] = [
+            ("ctid", 27, -1),
+            ("xmin", 28, -2),
+            ("cmin", 29, -3),
+            ("xmax", 28, -4),
+            ("cmax", 29, -5),
+            ("tableoid", 26, -6),
+        ];
+        let f = |c: &str| def.field_of(c).expect("column");
+        SYSTEM_COLUMNS
+            .iter()
+            .map(|(name, atttypid, attnum)| {
+                let mut d = Document::new();
+                d.insert(f("attrelid"), Bson::Int64(relid));
+                d.insert(f("attname"), *name);
+                d.insert(f("atttypid"), Bson::Int64(*atttypid));
+                d.insert(f("attnum"), Bson::Int32(*attnum));
+                d.insert(f("attisdropped"), Bson::Boolean(false));
+                d.insert(f("attnotnull"), Bson::Boolean(true));
+                d.insert(f("atttypmod"), Bson::Int32(-1));
+                d.insert(f("atthasdef"), Bson::Boolean(false));
+                d.insert(f("attgenerated"), "");
+                d
+            })
+            .collect()
     }
 
     /// `key`'s current value came from `source`.
@@ -28047,6 +28453,12 @@ impl PgHandler {
 
     /// The output columns of a `COPY (query) TO STDOUT`, from the same code
     /// that describes the query anywhere else.
+    ///
+    /// Each field carries its column's type modifier (`exprTypmod` of the
+    /// target), which `CREATE TABLE AS` and `CREATE MATERIALIZED VIEW`
+    /// store as the new column's `atttypmod` (`intorel_startup` takes the
+    /// query's tuple descriptor whole, RP-489). COPY reads only the names
+    /// and types.
     fn copy_query_fields(&self, inner: &Statement) -> PgWireResult<Vec<FieldInfo>> {
         match inner {
             // `COPY (SELECT 1) TO STDOUT` -- a query with no FROM at all. A
@@ -28054,18 +28466,27 @@ impl PgHandler {
             Statement::SelectConstant(sc) => Ok(sc
                 .columns
                 .iter()
-                .map(|(name, _, ty, _)| {
+                .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
                     FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
+                        .with_type_modifier(*typmod)
                 })
                 .collect()),
             Statement::ValuesConstant(vc) => Ok(vc
                 .names
                 .iter()
                 .zip(&vc.types)
-                .map(|(name, ty)| {
+                .enumerate()
+                .map(|(i, (name, ty))| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                    // The rows' common modifier (`select_common_typmod`).
+                    let typmod = vc
+                        .typmods
+                        .as_ref()
+                        .and_then(|m| m.get(i).copied())
+                        .unwrap_or(-1);
                     FieldInfo::new(name.clone(), None, None, wire, FieldFormat::Text)
+                        .with_type_modifier(typmod)
                 })
                 .collect()),
             // The query's own description, in TEXT: COPY output is text (or
@@ -28083,6 +28504,7 @@ impl PgHandler {
                         f.datatype().clone(),
                         FieldFormat::Text,
                     )
+                    .with_type_modifier(f.type_modifier())
                 })
                 .collect()),
             // Any other query -- an aggregate, a join, a set operation -- by
@@ -28096,6 +28518,7 @@ impl PgHandler {
                             .user_wire_type(&c.pg_type)
                             .unwrap_or_else(|| wire_type(&c.pg_type));
                         FieldInfo::new(c.name.clone(), None, None, wire, FieldFormat::Text)
+                            .with_type_modifier(c.typmod)
                     })
                     .collect()),
                 Err(_) => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -32113,6 +32536,8 @@ impl PgHandler {
         if is_empty_query(sql) {
             return Ok(vec![Response::EmptyQuery]);
         }
+        // A new client statement: no call's writes are hidden from it yet.
+        self.reset_statement_views();
         struct Snapshotless<'a>(&'a AtomicBool);
         impl Drop for Snapshotless<'_> {
             fn drop(&mut self) {
@@ -36249,7 +36674,7 @@ impl PgHandler {
                 // described as 4, which is also what the output padding below
                 // reads. A computed column (a cast or a call) keeps -1.
                 let typmod = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(expr) => secantus_pgplan::column_expr_typmod(expr),
+                    Some(expr) => secantus_pgplan::column_expr_typmod(expr, def),
                     None => def
                         .columns
                         .iter()
@@ -36457,7 +36882,9 @@ impl PgHandler {
                 (docs, series_table_def(series))
             }
             (None, _) if Self::virtual_table(&sel.table).is_some() => {
-                let docs = self.virtual_rows(&sel.table, &sel.filter).expect("checked");
+                let docs = self
+                    .virtual_rows_checked(&sel.table, &sel.filter)?
+                    .expect("checked");
                 (docs, Self::virtual_table(&sel.table).expect("checked"))
             }
             // A sequence read as a relation: its one row, built from the
@@ -37111,6 +37538,25 @@ impl PgHandler {
         ))))
     }
 
+    /// A VALUES list's fields, each with its rows' common modifier
+    /// (`select_common_typmod`).
+    fn values_fields(&self, vc: &secantus_pgplan::ValuesConstant) -> Vec<FieldInfo> {
+        vc.names
+            .iter()
+            .zip(&vc.types)
+            .enumerate()
+            .map(|(i, (name, ty))| {
+                let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
+                let typmod = vc
+                    .typmods
+                    .as_ref()
+                    .and_then(|m| m.get(i).copied())
+                    .unwrap_or(-1);
+                self.field_mod(name.clone(), wire, typmod)
+            })
+            .collect()
+    }
+
     /// The row description of a set operation, which PostgreSQL takes from the
     /// LEFT side -- column names and types both.
     ///
@@ -37131,15 +37577,7 @@ impl PgHandler {
                     self.field_mod(name.clone(), wire, *typmod)
                 })
                 .collect()),
-            Statement::ValuesConstant(vc) => Ok(vc
-                .names
-                .iter()
-                .zip(&vc.types)
-                .map(|(name, ty)| {
-                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field(name.clone(), wire)
-                })
-                .collect()),
+            Statement::ValuesConstant(vc) => Ok(self.values_fields(vc)),
             Statement::SetOp(inner) => self.set_op_fields(&inner.left),
             _ => Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".into(),
@@ -37256,15 +37694,7 @@ impl PgHandler {
                 Ok((schema, rows))
             }
             Statement::ValuesConstant(vc) => {
-                let schema = vc
-                    .names
-                    .iter()
-                    .zip(&vc.types)
-                    .map(|(name, ty)| {
-                        let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                        self.field(name.clone(), wire)
-                    })
-                    .collect::<Vec<_>>();
+                let schema = self.values_fields(vc);
                 let rows = vc
                     .rows
                     .iter()
@@ -37391,7 +37821,20 @@ impl PgHandler {
                 }
                 ty
             };
-            schema.push(self.field(l.name().to_string(), ty));
+            // `select_common_typmod`: the sides' shared modifier when both
+            // already have the column's type; an untyped literal side, or
+            // one converted to the common type, has none (RP-493).
+            let typed_mod = |f: &FieldInfo, untyped: bool| {
+                (!untyped && *f.datatype() == ty).then(|| f.type_modifier())
+            };
+            let typmod = match (
+                typed_mod(l, flag(&left_nulls, i) || flag(&left_strs, i)),
+                typed_mod(r, flag(&right_nulls, i) || flag(&right_strs, i)),
+            ) {
+                (Some(a), Some(b)) if a == b => a,
+                _ => -1,
+            };
+            schema.push(self.field_mod(l.name().to_string(), ty, typmod));
         }
         let (mut left, mut right) = (left, right);
         if !retype.is_empty() {
@@ -38911,7 +39354,14 @@ impl PgHandler {
                         format!("relation \"{table}\" already exists"),
                     ))));
                 }
-                let fields = self.copy_query_fields(&query)?;
+                // `WITH NO DATA` reads its columns from the analysed query
+                // (`create_ctas_nodata`), unfolded; a populating CREATE
+                // TABLE AS from the planned one (`intorel_startup`).
+                let fields = if with_data {
+                    self.copy_query_fields(&query)?
+                } else {
+                    secantus_pgplan::with_analysed_typmods(|| self.copy_query_fields(&query))?
+                };
                 if column_names.len() > fields.len() {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -38946,7 +39396,12 @@ impl PgHandler {
                                 ),
                             )))
                         })?;
-                        Ok(secantus_pgcatalog::Column::new(&name, &pg_type, false))
+                        // The query's own modifier (`exprTypmod`): `2.5::numeric(5,2)`
+                        // makes a `numeric(5,2)` column, as `intorel_startup`
+                        // copies the query's tuple descriptor (RP-489).
+                        let mut column = secantus_pgcatalog::Column::new(&name, &pg_type, false);
+                        column.typmod = f.type_modifier();
+                        Ok(column)
                     })
                     .collect::<PgWireResult<Vec<_>>>()?;
                 let mut def = TableDef::new(&table, columns);
@@ -44677,16 +45132,7 @@ impl PgHandler {
 
             Statement::ValuesConstant(vc) => {
                 // A fixed set of literal rows, no storage touched.
-                let schema = Arc::new(
-                    vc.names
-                        .iter()
-                        .zip(&vc.types)
-                        .map(|(name, ty)| {
-                            let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                            self.field(name.clone(), wire)
-                        })
-                        .collect::<Vec<_>>(),
-                );
+                let schema = Arc::new(self.values_fields(&vc));
                 let schema_ref = schema.clone();
                 let rows = stream::iter(vc.rows).map(move |vals| {
                     let mut enc = DataRowEncoder::new(schema_ref.clone());
@@ -48566,6 +49012,23 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
 }
 
 thread_local! {
+    /// A catalog read that failed while a virtual catalog's rows were being
+    /// built (`virtual_rows_uncached` has no error channel): raised by the
+    /// reader of those rows (`virtual_rows_checked`), and it keeps the rows
+    /// out of the per-message cache.
+    static CATALOG_FILL_ERROR: std::cell::RefCell<Option<PgWireError>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Note `e`, a read a virtual catalog's rows needed, for the statement
+/// reading them to raise. The first failure is the one reported.
+pub(crate) fn note_catalog_fill_error(e: PgWireError) {
+    CATALOG_FILL_ERROR.with(|slot| {
+        slot.borrow_mut().get_or_insert(e);
+    });
+}
+
+thread_local! {
     /// Set by `float_sum` when an addition overflowed; read (and cleared)
     /// by whoever turns the aggregate's value into a statement result.
     static FLOAT_SUM_OVERFLOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -52063,6 +52526,7 @@ impl PgHandler {
         let binary = self
             .binary_results
             .load(std::sync::atomic::Ordering::Relaxed);
+        let analysed = secantus_pgplan::analysed_typmods();
         let valid =
             |(v, g, r, _): &DescribeEntry| *v == catalog_version && *g == generation && *r == role;
         {
@@ -52072,13 +52536,20 @@ impl PgHandler {
                     && k.1 == n_params
                     && k.2.as_slice() == param_types
                     && k.3 == binary
+                    && k.4 == analysed
                     && valid(entry)
                 {
                     return Ok(entry.3.clone());
                 }
             }
         }
-        let key: DescribeKey = (sql.to_string(), n_params, param_types.to_vec(), binary);
+        let key: DescribeKey = (
+            sql.to_string(),
+            n_params,
+            param_types.to_vec(),
+            binary,
+            analysed,
+        );
         let hit = self
             .describe_cache
             .lock()
@@ -52217,8 +52688,22 @@ impl PgHandler {
                 })
                 .collect::<Vec<_>>(),
             // The output columns of a set operation are the LEFT side's, as
-            // PostgreSQL has it -- names and types both.
-            Statement::SetOp(set) => self.set_op_fields(&set.left)?,
+            // PostgreSQL has it -- names and types both -- and each modifier
+            // the two sides' common one (`select_common_typmod`, RP-493).
+            Statement::SetOp(set) => {
+                let def = secantus_pgplan::set_op_output_def(&set, &|n| self.lookup(n)).ok();
+                self.set_op_fields(&set.left)?
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, f)| {
+                        let typmod = def
+                            .as_ref()
+                            .and_then(|d| d.columns.get(i))
+                            .map_or(-1, |c| c.typmod);
+                        f.with_type_modifier(typmod)
+                    })
+                    .collect()
+            }
             Statement::Select(sel) => {
                 let def = self.select_def(&sel)?;
                 self.row_schema(&def, &sel.columns, &sel.casts)
@@ -52307,15 +52792,7 @@ impl PgHandler {
                     self.field_mod(name.clone(), wire, *typmod)
                 })
                 .collect(),
-            Statement::ValuesConstant(vc) => vc
-                .names
-                .iter()
-                .zip(&vc.types)
-                .map(|(name, ty)| {
-                    let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field(name.clone(), wire)
-                })
-                .collect(),
+            Statement::ValuesConstant(vc) => self.values_fields(&vc),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
             _ => return Ok(None),
         }))
@@ -52484,19 +52961,22 @@ impl ExtendedQueryHandler for PgHandler {
         self.install_user_types();
         let declared = &target.parameter_types;
         let param_types = self.param_type_names(target);
-        // Positioned as from a simple query (RP-012).
-        let fields = self
-            .describe_fields(&target.statement.sql, param_types.len(), &param_types)
-            .map_err(|e| {
-                let map = self.string_map(&target.statement.sql);
-                Self::restore_position(
-                    self.column_hinted(
-                        Self::syntax_positioned(e, &target.statement.sql),
-                        &target.statement.sql,
-                    ),
-                    map.as_ref(),
-                )
-            })?;
+        // Positioned as from a simple query (RP-012). A statement's
+        // description is its analysed query's, before any constant is folded
+        // (`PlanCacheComputeResultDesc`); a portal's is its plan's (RP-493).
+        let fields = secantus_pgplan::with_analysed_typmods(|| {
+            self.describe_fields(&target.statement.sql, param_types.len(), &param_types)
+        })
+        .map_err(|e| {
+            let map = self.string_map(&target.statement.sql);
+            Self::restore_position(
+                self.column_hinted(
+                    Self::syntax_positioned(e, &target.statement.sql),
+                    &target.statement.sql,
+                ),
+                map.as_ref(),
+            )
+        })?;
         if let Some(fields) = &fields {
             check_field_names(self.client_encoding(), fields)?;
         }

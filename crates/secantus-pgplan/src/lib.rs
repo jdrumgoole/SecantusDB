@@ -25,6 +25,8 @@ pub use colhint::missing_column_hint;
 pub mod colstats;
 pub mod costsize;
 mod expr_memo;
+mod expr_typmod;
+pub use expr_typmod::{analysed_typmods, with_analysed_typmods};
 mod expr_where;
 mod filter_sublink;
 mod fromless;
@@ -4870,6 +4872,43 @@ fn plan_with_subqueries_parsed(
             return Ok(declare_cursor(d, inner));
         }
     }
+    // So is a CREATE TABLE AS's or a CREATE MATERIALIZED VIEW's (RP-466):
+    // PostgreSQL analyses it as the SELECT it is (`transformCreateTableAsStmt`
+    // hands it to `transformStmt`), so its subqueries, views and CTEs are
+    // resolved as a bare SELECT's are. (`SELECT ... INTO` is a SelectStmt,
+    // which takes that path already.)
+    //
+    // The query is analysed and planned but never run when it fills nothing:
+    // `WITH NO DATA`, or a relation of that name already there, which an
+    // `IF NOT EXISTS` skips (`CreateTableAsRelExists`) and anything else
+    // refuses with 42P07 before the executor starts. So its subqueries
+    // draw no sequence and call no function, as PostgreSQL's initplans,
+    // run at first use, are never reached.
+    if let Some(N::CreateTableAsStmt(c)) = node.node.as_ref() {
+        if let Some(N::SelectStmt(_)) = c.query.as_ref().and_then(|q| q.node.as_ref()) {
+            let fills = c.into.as_ref().is_some_and(|i| {
+                !i.skip_data && i.rel.as_ref().is_none_or(|r| lookup(&r.relname).is_none())
+            });
+            let plan =
+                |q: &pg_query::protobuf::Node| plan_query_node(sql, q.clone(), lookup, params, run);
+            return if fills {
+                plan_create_table_as_with(c, plan)
+            } else {
+                planning_without_running(|| plan_create_table_as_with(c, plan))
+            };
+        }
+    }
+    // `SELECT ... INTO` a relation already there is the same 42P07.
+    if let Some(N::SelectStmt(s)) = node.node.as_ref() {
+        let exists = s
+            .into_clause
+            .as_ref()
+            .and_then(|i| i.rel.as_ref())
+            .is_some_and(|r| lookup(&r.relname).is_some());
+        if exists {
+            return planning_without_running(|| plan_query_node(sql, node, lookup, params, run));
+        }
+    }
     plan_query_node(sql, node, lookup, params, run)
 }
 
@@ -4953,6 +4992,7 @@ fn plan_query_node(
     if DEPTH.with(|d| d.replace(d.get() + 1)) == 0 {
         EXPANDED_VIEWS.with(|e| e.borrow_mut().clear());
         EXPANDED_SYSTEM_VIEWS.with(|e| e.borrow_mut().clear());
+        ALIASED_TABLES.with(|e| e.borrow_mut().clear());
     }
     let _nested = Nested;
     // Views expand BEFORE subqueries resolve: a view's body may hold a
@@ -6975,23 +7015,6 @@ fn typmod_ival(node: &pg_query::protobuf::Node) -> Option<i32> {
     }
 }
 
-/// PostgreSQL's wire type-modifier (`atttypmod`) for a declared cast type such
-/// as `varchar(10)` (-> 14) or `numeric(10,2)` (-> 655366), or `-1` for a bare
-/// type or one whose modifier this server does not encode.
-///
-/// DESCRIPTION metadata only: it feeds the `RowDescription`, from which clients
-/// derive `precision` / `scale` / `display_size`. It never changes how a value
-/// is decoded.
-fn cast_typmod(node: &pg_query::protobuf::Node) -> i32 {
-    let Some(N::TypeCast(tc)) = node.node.as_ref() else {
-        return -1;
-    };
-    let Some(tn) = tc.type_name.as_ref() else {
-        return -1;
-    };
-    declared_typmod(tn)
-}
-
 /// The `atttypmod` a declared type carries, or -1 for an unmodified type.
 pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)
@@ -7103,13 +7126,29 @@ fn type_name(names: &[pg_query::protobuf::Node]) -> String {
     }
 }
 
-/// `CREATE TABLE ... AS <query>`. Only a table target: a materialized view
-/// (`objtype` OBJECT_MATVIEW) is a refreshable relation this server has no
-/// catalog for, and `SELECT ... INTO` is the same statement in older clothes.
+/// `CREATE TABLE ... AS <query>` or `CREATE MATERIALIZED VIEW ... AS
+/// <query>`, its query planned as a bare SELECT; `SELECT ... INTO` is the
+/// same statement in older clothes. With a subquery runner the planner
+/// takes [`plan_create_table_as_with`] instead, from
+/// `plan_with_subqueries_parsed`.
 fn plan_create_table_as(
     c: &pg_query::protobuf::CreateTableAsStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
+) -> Result<Statement> {
+    plan_create_table_as_with(c, |q| match q.node.as_ref() {
+        Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params),
+        Some(other) => Err(Error::Unsupported(disc(other))),
+        None => Err(Error::Parse("CREATE TABLE AS without a query".into())),
+    })
+}
+
+/// [`plan_create_table_as`] with the query planned by `plan_query`: the
+/// subquery-resolving pipeline when the caller has a runner, the bare
+/// SELECT planner when it has not.
+fn plan_create_table_as_with(
+    c: &pg_query::protobuf::CreateTableAsStmt,
+    plan_query: impl FnOnce(&pg_query::protobuf::Node) -> Result<Statement>,
 ) -> Result<Statement> {
     use pg_query::protobuf::ObjectType;
     let matview = c.objtype == ObjectType::ObjectMatview as i32;
@@ -7124,9 +7163,11 @@ fn plan_create_table_as(
         .rel
         .as_ref()
         .ok_or_else(|| Error::Parse("CREATE TABLE AS without a relation".into()))?;
-    let query = match c.query.as_ref().and_then(|q| q.node.as_ref()) {
-        Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params)?,
-        Some(other) => return Err(Error::Unsupported(disc(other))),
+    // `WITH NO DATA` takes its columns from the analysed query, not a
+    // planned one (`create_ctas_nodata`), so no constant is folded first.
+    let query = match c.query.as_deref() {
+        Some(q) if into.skip_data => with_analysed_typmods(|| plan_query(q))?,
+        Some(q) => plan_query(q)?,
         None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
     };
     let matview_sql = if matview {
@@ -9582,8 +9623,10 @@ thread_local! {
 thread_local! {
     /// `COMMENT ON` text: `(object oid, sub-id, comment)`, the sub-id a
     /// column's number or 0 for the object itself -- pg_description's key.
-    static OBJECT_COMMENTS: std::cell::RefCell<Vec<(i64, i32, String)>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    /// The error instead when the server could not read them: a lookup then
+    /// raises it, never answers NULL for a comment it did not read.
+    static OBJECT_COMMENTS: std::cell::RefCell<Result<Vec<(i64, i32, String)>>> =
+        const { std::cell::RefCell::new(Ok(Vec::new())) };
 }
 
 /// Install the comments `obj_description` / `col_description` answer from.
@@ -9615,17 +9658,22 @@ pub(crate) fn shared_comment(oid: i64, catalog: &str) -> Option<String> {
     })
 }
 
-pub fn set_object_comments(comments: Vec<(i64, i32, String)>) {
+/// Install the comments `obj_description` / `col_description` answer from,
+/// or the error the server's read of them failed with -- which every lookup
+/// then raises.
+pub fn set_object_comments(comments: Result<Vec<(i64, i32, String)>>) {
     OBJECT_COMMENTS.with(|c| *c.borrow_mut() = comments);
 }
 
-/// The comment on object `oid` (column `subid`, or 0 for the object).
-pub(crate) fn object_comment(oid: i64, subid: i32) -> Option<String> {
-    OBJECT_COMMENTS.with(|c| {
-        c.borrow()
+/// The comment on object `oid` (column `subid`, or 0 for the object); the
+/// read's error when the comments could not be read.
+pub(crate) fn object_comment(oid: i64, subid: i32) -> Result<Option<String>> {
+    OBJECT_COMMENTS.with(|c| match &*c.borrow() {
+        Ok(comments) => Ok(comments
             .iter()
             .find(|(o, s, _)| *o == oid && *s == subid)
-            .map(|(_, _, t)| t.clone())
+            .map(|(_, _, t)| t.clone())),
+        Err(e) => Err(e.clone()),
     })
 }
 
@@ -14100,20 +14148,11 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
     for (n, given) in names.iter_mut().zip(&colnames) {
         *n = given.clone();
     }
-    if colnames.is_empty() && names.len() == 1 && !alias.is_empty() {
-        names[0] = alias.clone();
-    }
-    // A function whose one column is a named OUT parameter keeps that name
-    // in FROM, whatever the alias: `pg_partition_ancestors(...)` is `relid`,
-    // and `json_array_elements(...)` is `value`.
-    if colnames.is_empty() && names.len() == 1 {
-        match name.as_str() {
-            "pg_partition_ancestors" => names[0] = "relid".into(),
-            "json_array_elements"
-            | "json_array_elements_text"
-            | "jsonb_array_elements"
-            | "jsonb_array_elements_text" => names[0] = "value".into(),
-            _ => {}
+    if colnames.is_empty() && names.len() == 1 && calls.len() == 1 {
+        if let Some(own) = function_column_name(&call) {
+            names[0] = own;
+        } else if !alias.is_empty() {
+            names[0] = alias.clone();
         }
     }
     let plan = Statement::ValuesConstant(ValuesConstant {
@@ -14138,6 +14177,38 @@ fn srf_from_clause(from: &pg_query::protobuf::Node, params: &[Bson]) -> Result<O
         def,
         unread: Vec::new(),
     }))
+}
+
+/// The name a FROM function's ONE column keeps whatever the item's alias,
+/// or `None` for a scalar result, whose column the alias names (or, with
+/// none, the function). PostgreSQL's `addRangeTableEntryForFunction`: a
+/// composite result's column is its type's field (`returns c1` is `k`), and
+/// `chooseScalarFunctionAlias` names a scalar one by its single named OUT
+/// parameter ahead of the alias (`get_func_result_name`) -- an OUT, INOUT
+/// or `RETURNS TABLE` one alike: `gto(out t int)` is `t` in `from gto() g`.
+/// Among the built-ins this server materialises, `pg_partition_ancestors`
+/// is `relid` and the `json[b]_array_elements[_text]` are `value`.
+pub(crate) fn function_column_name(call: &pg_query::protobuf::FuncCall) -> Option<String> {
+    let name = func_name(call)?;
+    if let Some(u) = correlated::user_function_for(&name, &call.args) {
+        return match u.columns.as_slice() {
+            [] => user_composite(&u.return_type).and_then(|(_, fields)| match fields.as_slice() {
+                [(field, _)] => Some(field.clone()),
+                _ => None,
+            }),
+            // An unnamed OUT parameter leaves the column to the alias.
+            [(out, _)] if !out.is_empty() => Some(out.clone()),
+            _ => None,
+        };
+    }
+    match name.as_str() {
+        "pg_partition_ancestors" => Some("relid".into()),
+        "json_array_elements"
+        | "json_array_elements_text"
+        | "jsonb_array_elements"
+        | "jsonb_array_elements_text" => Some("value".into()),
+        _ => None,
+    }
 }
 
 /// A JSON value as a SQL value of type `ty`: json / jsonb keep it as JSON,
@@ -20005,16 +20076,79 @@ fn rewrite_dml_from(
             ..Default::default()
         }
     }
+    /// Whether a subquery reads a FROM item of the statement around it
+    /// (RP-457): the FROM and USING items are relations of the write's own
+    /// level, so PostgreSQL resolves a subquery's reference to them as it
+    /// resolves one to the target. A qualifier the subquery's own FROM does
+    /// not name (`correlated::inner_names`, the aliased-relation rule
+    /// included) is an outer reference, and so is a bare name none of the
+    /// subquery's own tables has.
+    fn sublink_reads_from_items(
+        sl: &pg_query::protobuf::SubLink,
+        names: &[String],
+        from_only: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> bool {
+        let Some(body @ N::SelectStmt(s)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref())
+        else {
+            return false;
+        };
+        let inner = correlated::inner_names(s);
+        let mut inner_columns: Vec<String> = Vec::new();
+        for (n, _, _, _) in body.nodes() {
+            match n {
+                pg_query::NodeRef::RangeVar(r) => {
+                    if let Some(def) = lookup(&r.relname) {
+                        inner_columns.extend(def.columns.iter().map(|c| c.name.clone()));
+                    }
+                }
+                // A derived table's columns, where they can be told without
+                // planning it (a function's cannot: it hides nothing here).
+                pg_query::NodeRef::RangeSubselect(rs) => {
+                    let item = pg_query::protobuf::Node {
+                        node: Some(N::RangeSubselect(Box::new(rs.clone()))),
+                    };
+                    inner_columns.extend(from_item_columns(&item, lookup).unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+        body.nodes().into_iter().any(|(n, _, _, _)| {
+            let pg_query::NodeRef::ColumnRef(c) = n else {
+                return false;
+            };
+            let parts: Vec<&str> = c
+                .fields
+                .iter()
+                .filter_map(|f| match f.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .collect();
+            match parts.as_slice() {
+                [one] => {
+                    from_only.iter().any(|c| c == one) && !inner_columns.iter().any(|c| c == one)
+                }
+                [.., q, _] => names.iter().any(|x| x == q) && !inner.iter().any(|x| x == q),
+                _ => false,
+            }
+        })
+    }
     /// Whether `n` reads a FROM item: a reference qualified by one of its
-    /// names, or an unqualified one only a FROM item has.
+    /// names, or an unqualified one only a FROM item has -- in `n` itself or
+    /// in a subquery inside it.
     fn reads_from_items(
         n: &pg_query::protobuf::Node,
         names: &[String],
         from_only: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) -> Result<bool> {
         let mut found = false;
         let mut n = n.clone();
         walk_expr(&mut n, &mut |node| {
+            if let Some(N::SubLink(sl)) = node.node.as_ref() {
+                found |= sublink_reads_from_items(sl, names, from_only, lookup);
+            }
             if let Some(N::ColumnRef(c)) = node.node.as_ref() {
                 let parts: Vec<&str> = c
                     .fields
@@ -20048,6 +20182,7 @@ fn rewrite_dml_from(
         from_only: &[String],
         target_names: &[String],
         changed: &[String],
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
     ) -> Result<()> {
         let mut cond_reads_changed = false;
         if let Some(c) = cond {
@@ -20078,7 +20213,7 @@ fn rewrite_dml_from(
                 continue;
             };
             let Some(v) = rt.val.as_deref() else { continue };
-            if !reads_from_items(v, names, from_only)? {
+            if !reads_from_items(v, names, from_only, lookup)? {
                 continue;
             }
             if cond_reads_changed {
@@ -20237,6 +20372,7 @@ fn rewrite_dml_from(
                 &from_only,
                 &target_names,
                 &changed,
+                lookup,
             )?;
             for t in &mut u.target_list {
                 let Some(N::ResTarget(rt)) = t.node.as_mut() else {
@@ -20291,6 +20427,7 @@ fn rewrite_dml_from(
                 &from_only,
                 &target_names,
                 &[],
+                lookup,
             )?;
             d.where_clause = Some(Box::new(sublink(
                 SubLinkType::ExistsSublink,
@@ -23807,6 +23944,36 @@ fn alias_field_rewrite(
     Ok(changed.then_some(out))
 }
 
+thread_local! {
+    /// The FROM subqueries `column_alias_rewrite` made of a table with a
+    /// column-alias list: `(alias, subquery, table)`.
+    static ALIASED_TABLES: std::cell::RefCell<Vec<(String, pg_query::protobuf::SelectStmt, String)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The table a FROM subquery under `alias` was written as, when
+/// `column_alias_rewrite` made it of `t alias(a, b)`: its whole row is the
+/// table's row type, with the table's own field names (RP-480).
+fn aliased_table(alias: &str, sub: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    ALIASED_TABLES.with(|t| {
+        t.borrow()
+            .iter()
+            .rev()
+            .find(|(a, s, _)| a == alias && s == sub)
+            .map(|(_, _, table)| table.clone())
+    })
+}
+
+/// A table's row type by name: one named after a built-in type (`tid`) is
+/// `public.tid`, as the bare name is pg_catalog's.
+fn table_rowtype(name: String) -> String {
+    if pgtypes::shadowed_by_catalog(&name) {
+        format!("public.{name}")
+    } else {
+        name
+    }
+}
+
 /// A table in FROM with a column-alias list (`t r(a, b)`) as the subquery
 /// it is shorthand for, `(SELECT id AS a, g AS b, v FROM t) r`, so every
 /// planner path sees ordinary column names. `None` when there is none.
@@ -23878,6 +24045,15 @@ fn column_alias_rewrite(
                     ..Default::default()
                 };
                 let aliasname = alias.aliasname.clone();
+                // The subquery is still the table to its whole row, which
+                // is of the table's row type (RP-480).
+                ALIASED_TABLES.with(|t| {
+                    let mut t = t.borrow_mut();
+                    if t.len() >= 64 {
+                        t.clear();
+                    }
+                    t.push((aliasname.clone(), sub.clone(), relation_name(rv)));
+                });
                 *n = pg_query::protobuf::Node {
                     node: Some(N::RangeSubselect(Box::new(
                         pg_query::protobuf::RangeSubselect {
@@ -24125,10 +24301,21 @@ fn plan_select(
     let planned = if joins::is_join(s) {
         // A locking JOIN takes the general path, whose rows carry what the
         // executor needs to find the base rows to lock (`lock_targets`).
-        let narrow = if s.locking_clause.is_empty() {
-            plan_select_rest(s, lookup, params)
-        } else {
+        let narrow = if !s.locking_clause.is_empty() {
             Err(Error::Unsupported("a locking join".into()))
+        } else if from_calls_volatile(s) {
+            // The narrow path plans a subquery side -- running its calls --
+            // before it refuses a shape, and the general planner then plans
+            // that subquery again, which ran a volatile function twice
+            // (RP-496): PostgreSQL runs it once, in its executor. So the
+            // narrow attempt is made with calls switched off first, and made
+            // for real only when it will stand.
+            match correlated::without_calls(|| plan_select_rest(s, lookup, params)) {
+                Err(Error::Unsupported(m)) => Err(Error::Unsupported(m)),
+                _ => plan_select_rest(s, lookup, params),
+            }
+        } else {
+            plan_select_rest(s, lookup, params)
         };
         match narrow {
             Err(Error::Unsupported(_)) => joins::plan_join_source(s, lookup, params)
@@ -24208,7 +24395,7 @@ fn plan_select(
 /// function called as a FROM item (a user function left at that default, a
 /// built-in such as `nextval`; only a volatile SQL function may write), or
 /// anywhere in a FROM subquery or a joined item, which are planned -- and
-/// their calls run -- with the statement? (RP-476)
+/// their calls run -- with the statement? (RP-476, RP-496)
 fn from_calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
     fn select(s: &pg_query::protobuf::SelectStmt) -> bool {
         s.from_clause.iter().any(item)
@@ -26049,33 +26236,18 @@ pub fn sub_plan_def(
         Statement::JoinRows(j) => Ok(j.def.clone()),
         Statement::Aggregate(agg) => aggregate_output_def(agg),
         Statement::Select(sel) => select_output_def(sel, lookup),
-        Statement::SetOp(set) => {
-            // The column NAMES are the left side's; each TYPE is the two
-            // sides' common type, as the executor reports it on the wire.
-            let mut left = sub_plan_def(&set.left, lookup)?;
-            let Ok(right) = sub_plan_def(&set.right, lookup) else {
-                return Ok(left);
-            };
-            let untyped = |stmt: &Statement, i: usize| match stmt {
-                Statement::SelectConstant(sc) => sc.untyped.get(i).copied().unwrap_or(false),
-                _ => false,
-            };
-            for (i, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
-                l.pg_type = if untyped(&set.left, i) {
-                    r.pg_type.clone()
-                } else if untyped(&set.right, i) {
-                    l.pg_type.clone()
-                } else {
-                    set_op_common_type(&l.pg_type, &r.pg_type)
-                };
-            }
-            Ok(left)
-        }
+        Statement::SetOp(set) => set_op_output_def(set, lookup),
+        // Each column keeps its modifier: `(select 2.5::numeric(5,2) z) s`
+        // reads back as a `numeric(5,2)` column (RP-493).
         Statement::SelectConstant(sc) => Ok(TableDef::new(
             "",
             sc.columns
                 .iter()
-                .map(|(name, _, ty, _)| Column::new(name, ty, false))
+                .map(|(name, _, ty, typmod)| {
+                    let mut c = Column::new(name, ty, false);
+                    c.typmod = *typmod;
+                    c
+                })
                 .collect(),
         )),
         Statement::ValuesConstant(vc) => Ok(TableDef::new(
@@ -26083,11 +26255,64 @@ pub fn sub_plan_def(
             vc.names
                 .iter()
                 .zip(&vc.types)
-                .map(|(name, ty)| Column::new(name, ty, false))
+                .enumerate()
+                .map(|(i, (name, ty))| {
+                    let mut c = Column::new(name, ty, false);
+                    c.typmod = vc
+                        .typmods
+                        .as_ref()
+                        .and_then(|m| m.get(i).copied())
+                        .unwrap_or(-1);
+                    c
+                })
                 .collect(),
         )),
         _ => Err(Error::Unsupported("this subquery shape".into())),
     }
+}
+
+/// The output def of a set operation: the column NAMES are the left side's;
+/// each TYPE is the two sides' common type, as the executor reports it on
+/// the wire, and each modifier their common one (`select_common_typmod`).
+pub fn set_op_output_def(
+    set: &SetOpSelect,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Result<TableDef> {
+    let mut left = sub_plan_def(&set.left, lookup)?;
+    let Ok(right) = sub_plan_def(&set.right, lookup) else {
+        return Ok(left);
+    };
+    let untyped = |stmt: &Statement, i: usize| match stmt {
+        Statement::SelectConstant(sc) => sc.untyped.get(i).copied().unwrap_or(false),
+        _ => false,
+    };
+    for (i, (l, r)) in left.columns.iter_mut().zip(&right.columns).enumerate() {
+        let common = if untyped(&set.left, i) {
+            r.pg_type.clone()
+        } else if untyped(&set.right, i) {
+            l.pg_type.clone()
+        } else {
+            set_op_common_type(&l.pg_type, &r.pg_type)
+        };
+        // `select_common_typmod`: an untyped literal side is
+        // `unknown`, coerced to the common type with no modifier.
+        fn side(untyped: bool, c: &Column) -> (&str, i32) {
+            if untyped {
+                ("unknown", -1)
+            } else {
+                (c.pg_type.as_str(), c.typmod)
+            }
+        }
+        l.typmod = expr_typmod::common_typmod(
+            &common,
+            &[
+                side(untyped(&set.left, i), l),
+                side(untyped(&set.right, i), r),
+            ],
+        );
+        l.pg_type = common;
+    }
+    Ok(left)
 }
 
 /// Two set-operation sides' common column type, PostgreSQL's
@@ -26189,7 +26414,7 @@ pub fn select_output_def(
                     col.source = c.source;
                 }
             }
-            Some(e) => col.typmod = column_expr_typmod(e),
+            Some(e) => col.typmod = column_expr_typmod(e, &source),
         }
         columns.push(col);
     }
@@ -26218,11 +26443,11 @@ pub fn join_output_def(
         // coalesce and a constant are computed, which PostgreSQL reports as
         // table 0 / column 0 (measured 16).
         let expr = join.exprs.get(i).and_then(|e| e.as_ref());
-        let (ty, source) = match expr {
+        let (ty, source, typmod) = match expr {
             Some(ColumnExpr::Casts { .. })
             | Some(ColumnExpr::Call { .. })
             | Some(ColumnExpr::Const { .. }) => {
-                (column_expr_type(expr.expect("some")).to_string(), None)
+                (column_expr_type(expr.expect("some")).to_string(), None, -1)
             }
             _ => {
                 let side_def = if *alias == join.left.1 {
@@ -26237,14 +26462,29 @@ pub fn join_output_def(
                 let c = side_def
                     .column(col)
                     .ok_or_else(|| Error::UndefinedColumn(col.clone()))?;
+                // A column read through keeps its modifier, and so does a
+                // COALESCE whose fallbacks are all NULL constants, which
+                // `simplify_coalesce` drops; a non-NULL fallback is a constant
+                // with no modifier (RP-493).
+                let typmod = match expr {
+                    None => c.typmod,
+                    Some(ColumnExpr::Coalesce { args })
+                        if args.iter().flatten().all(|a| *a == Bson::Null) =>
+                    {
+                        c.typmod
+                    }
+                    Some(_) => -1,
+                };
                 (
                     c.pg_type.clone(),
                     expr.is_none().then_some(c.source).flatten(),
+                    typmod,
                 )
             }
         };
         let mut column = Column::new(&keys[i], &ty, false);
         column.source = source;
+        column.typmod = typmod;
         columns.push(column);
     }
     Ok(TableDef::new("", columns))
@@ -28828,6 +29068,19 @@ fn plan_select_unnest(
         return Ok(None);
     };
     let name = func_name(f).unwrap_or_default();
+    // The column is named after the function as written, its last name
+    // part (FigureColname), whatever the FROM form calls its column:
+    // `select json_array_elements(j)` is `json_array_elements`, not
+    // `value`, and a call of `f() returns table (t int)` is `f` (RP-483).
+    let figured = f
+        .funcname
+        .iter()
+        .rev()
+        .find_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| name.clone());
     // A populate_recordset function names its row type by its first
     // argument; each row is a record of that type. The single-record
     // populate functions are scalar (`populate_composite`).
@@ -28874,7 +29127,7 @@ fn plan_select_unnest(
             .collect();
         return Ok(Some(Statement::ValuesConstant(ValuesConstant {
             names: vec![if rt.name.is_empty() {
-                name
+                figured
             } else {
                 rt.name.clone()
             }],
@@ -28884,7 +29137,7 @@ fn plan_select_unnest(
         })));
     }
     let names = vec![if rt.name.is_empty() {
-        names.into_iter().next().unwrap_or(name)
+        figured
     } else {
         rt.name.clone()
     }];
@@ -28970,19 +29223,22 @@ fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
         }
     }
     // The common typmod of each column (`select_common_typmod`): the one
-    // every row's expression carries, else -1.
+    // every row's expression carries with the column's common type, else -1
+    // (a row of another type is coerced, which drops its modifier).
     let typmods = (0..width)
         .map(|i| {
-            let mut mods = s.values_lists.iter().map(|vl| match vl.node.as_ref() {
-                Some(N::List(l)) => l.items.get(i).map_or(-1, cast_typmod),
-                _ => -1,
-            });
-            let first = mods.next().unwrap_or(-1);
-            if mods.all(|m| m == first) {
-                first
-            } else {
-                -1
+            let mut sides = Vec::new();
+            for vl in &s.values_lists {
+                let Some(N::List(l)) = vl.node.as_ref() else {
+                    return -1;
+                };
+                match l.items.get(i).and_then(expr_typmod::analysed_expr_typed) {
+                    Some(typed) => sides.push(typed),
+                    None => return -1,
+                }
             }
+            let sides: Vec<(&str, i32)> = sides.iter().map(|(t, m)| (t.as_str(), *m)).collect();
+            expr_typmod::common_typmod(&types[i], &sides)
         })
         .collect();
     let names = (1..=width).map(|i| format!("column{i}")).collect();
@@ -29792,11 +30048,13 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             .trim_start_matches("SVFOP_")
                             .trim_end_matches("_N")
                             .to_ascii_lowercase();
+                        // `current_time(3)` carries its precision as its
+                        // modifier (RP-493).
                         columns.push((
                             if rt.name.is_empty() { name } else { rt.name.clone() },
                             ConstCol::Value(sql_value_function(svf)?),
                             sql_value_function_type(svf).to_string(),
-                            -1,
+                            svf.typmod.max(-1),
                         ));
                         continue;
                     }
@@ -29849,7 +30107,9 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 let v = const_value(val, params)?;
                 let t = static_type(val, &v);
                 let _ = node;
-                let typmod = cast_typmod(val);
+                // `exprTypmod`: a cast's modifier, or one every operand of a
+                // CASE / COALESCE / ARRAY shares (RP-493).
+                let typmod = expr_typmod::raw_expr_typmod(val, &|_| None);
                 (expression_column_name(val), ConstCol::Value(v), t, typmod)
             }
             Some(other) => return Err(Error::Unsupported(disc(other))),
@@ -33570,11 +33830,18 @@ pub fn apply_column_expr(expr: &ColumnExpr, value: Bson, tz: &TimeZoneSetting) -
     }
 }
 
-/// The type modifier a ColumnExpr's column carries: a top-level cast's
-/// (`x::numeric(5,2)`), else -1.
-pub fn column_expr_typmod(expr: &ColumnExpr) -> i32 {
+/// The type modifier a ColumnExpr's column carries (`exprTypmod`, see
+/// `expr_typmod`), its columns' read from `def`, the source it is computed
+/// over: a cast's (`x::numeric(5,2)`), or one a CASE's, a COALESCE's or an
+/// ARRAY's operands share; else -1.
+pub fn column_expr_typmod(expr: &ColumnExpr, def: &TableDef) -> i32 {
     match expr {
-        ColumnExpr::Row { expr, .. } => cast_typmod(expr),
+        ColumnExpr::Row {
+            expr,
+            fields,
+            params,
+            ..
+        } => expr_typmod::row_expr_typmod(expr, fields, params.len(), def),
         _ => -1,
     }
 }
@@ -37220,7 +37487,53 @@ fn whole_row_rewrite(
     // A table's whole row is its composite ROWTYPE (typed by the table's
     // name); a subquery's is an anonymous record.
     let mut rowtype: Option<String> = None;
+    // A scalar function's whole row is its one value, not a row of it.
+    let mut scalar = false;
+    // The row's field names, where they are not the names the query reads
+    // its columns by: a row type's own, under a column-alias list.
+    let mut field_names: Option<Vec<String>> = None;
     let (alias, columns): (String, Vec<String>) = match item.node.as_ref() {
+        // A function's whole row (PostgreSQL's whole-row Var over its RTE):
+        // its composite result, or the value of a scalar one. Only a
+        // function that names its own one column needs rewriting: a scalar
+        // one the alias names is already read by that name, the column
+        // winning as it does in PostgreSQL.
+        Some(N::RangeFunction(rf))
+            if rf.functions.len() == 1 && !rf.ordinality && rf.coldeflist.is_empty() =>
+        {
+            let Some(call) = joins::range_function_call(rf) else {
+                return Ok(None);
+            };
+            let Some(own) = function_column_name(call) else {
+                return Ok(None);
+            };
+            let Some(alias) = rf
+                .alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .filter(|a| !a.is_empty())
+                .or_else(|| func_name(call))
+            else {
+                return Ok(None);
+            };
+            if !names_alias(s, &alias)? {
+                return Ok(None);
+            }
+            let column = rf
+                .alias
+                .as_ref()
+                .and_then(|a| a.colnames.first())
+                .and_then(alias_colname)
+                .unwrap_or(own);
+            match func_name(call)
+                .and_then(|n| correlated::user_function_for(&n, &call.args))
+                .filter(|u| u.columns.is_empty() && user_composite(&u.return_type).is_some())
+            {
+                Some(u) => rowtype = Some(u.return_type),
+                None => scalar = true,
+            }
+            (alias, vec![column])
+        }
         Some(N::RangeVar(r)) => {
             let alias = r
                 .alias
@@ -37234,14 +37547,7 @@ fn whole_row_rewrite(
             }
             match lookup(&relation_name(r)) {
                 Some(def) => {
-                    // A table named after a built-in type (`tid`) has the
-                    // row type `public.tid`: the bare name is pg_catalog's.
-                    let name = relation_name(r);
-                    rowtype = Some(if pgtypes::shadowed_by_catalog(&name) {
-                        format!("public.{name}")
-                    } else {
-                        name
-                    });
+                    rowtype = Some(table_rowtype(relation_name(r)));
                     (alias, def.columns.iter().map(|c| c.name.clone()).collect())
                 }
                 None => return Ok(None),
@@ -37275,6 +37581,8 @@ fn whole_row_rewrite(
                 plan_select(sub, lookup, params).and_then(|stmt| sub_plan_def(&stmt, lookup))
             })?;
             let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+            // A view's row keeps the view's own field names under `v(a, b)`.
+            let own = cols.clone();
             // `s(a, b)` column aliases rename the subquery's outputs.
             if let Some(a) = rs.alias.as_ref() {
                 for (i, c) in a.colnames.iter().enumerate() {
@@ -37293,6 +37601,15 @@ fn whole_row_rewrite(
             });
             if let Some(view) = view.filter(|v| user_composite(v).is_some()) {
                 rowtype = Some(view);
+                field_names = Some(own);
+            }
+            // A table under a column-alias list: its row type, and its own
+            // column names as the row's field names (RP-480).
+            if let Some(table) = aliased_table(&alias, sub) {
+                if let Some(t) = lookup(&table) {
+                    field_names = Some(t.columns.iter().map(|c| c.name.clone()).collect());
+                    rowtype = Some(table_rowtype(table));
+                }
             }
             (alias, cols)
         }
@@ -37344,13 +37661,18 @@ fn whole_row_rewrite(
                 location: 0,
             })),
         };
+        if scalar {
+            return col_node(&arg_names[0]);
+        }
         let row = pg_query::protobuf::Node {
             node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
                 xpr: None,
                 args: arg_names.iter().map(|c| col_node(c)).collect(),
                 row_typeid: 0,
                 row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
-                colnames: columns
+                colnames: field_names
+                    .as_ref()
+                    .unwrap_or(&columns)
                     .iter()
                     .map(|c| pg_query::protobuf::Node {
                         node: Some(N::String(pg_query::protobuf::String { sval: c.clone() })),

@@ -856,6 +856,49 @@ pub(crate) fn selected_result_type(name: &str, args: &[String]) -> Option<String
     }
 }
 
+/// The element type a SET-RETURNING built-in yields, where the overload its
+/// argument types select settles it: a concrete type (`json_array_elements`
+/// is `json`), or `anyelement` resolved from an `anyarray` argument
+/// (`unnest(int4[])` is `int4`, as `enforce_generic_type_consistency`
+/// resolves it). `None` for a record, another polymorphic result, or a
+/// choice that is not one overload. Where `func_select_candidate` is not
+/// needed -- one overload accepts the arguments at all, a polymorphic one or
+/// one taking an untyped literal (`""`) included -- that one is the call's.
+pub(crate) fn set_result_type(name: &str, args: &[String]) -> Option<String> {
+    let candidates = match select_candidates(name, args) {
+        Some(c) => c,
+        None => sigs()
+            .get(name)?
+            .iter()
+            .filter(|s| sig_accepts(s, args))
+            .collect(),
+    };
+    let [s] = candidates.as_slice() else {
+        return None;
+    };
+    if !s.retset {
+        return None;
+    }
+    if s.ret == "anyelement" {
+        let mut elements = s
+            .args
+            .iter()
+            .zip(args)
+            .filter(|(p, _)| p.as_str() == "anyarray")
+            .map(|(_, a)| a.strip_suffix("[]").map(str::to_string));
+        let first = elements.next()??;
+        return elements
+            .all(|e| e.as_deref() == Some(first.as_str()))
+            .then_some(first);
+    }
+    (!s.ret.starts_with("any")
+        && !matches!(
+            s.ret.as_str(),
+            "record" | "void" | "internal" | "trigger" | "unknown"
+        ))
+    .then(|| s.ret.clone())
+}
+
 fn sig_accepts(s: &Sig, args: &[String]) -> bool {
     {
         let n = args.len();

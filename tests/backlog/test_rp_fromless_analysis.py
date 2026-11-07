@@ -1,7 +1,8 @@
 """Parse-analysis errors of statements with no FROM, found while working
 RP-439: a missing column inside an expression was refused as a gap (RP-441,
 fixed), and a cast literal's input error is reported after the operator's
-(RP-442, open).
+(RP-442, open); and found while working RP-465, a VALUES list's reference
+and an unread CTE are not analysed (RP-501, open).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. Each was measured on PostgreSQL 15.19; none needs
@@ -353,3 +354,27 @@ KEYWORD_OPERANDS = {
 def test_keyword_function_operand_is_name(query: str, rust_pg: Any) -> None:
     """The operand is named `text` in the message here."""
     assert answer(rust_pg, query) == KEYWORD_OPERANDS[query]
+
+
+# Found while working RP-465: a VALUES list's column reference, and a CTE no
+# statement reads, are analysed like the rest of the statement
+# (`transformValuesClause`, `transformWithClause`).
+VALUES_AND_UNREAD_CTE = {
+    "values (nosuch)": _missing("9"),
+    "values (1), (nosuch)": _missing("14"),
+    "with w as (select nosuch) select 1": _missing("19"),
+    "with w as (select 1 from nosuch) select 1": (
+        "42P01",
+        'relation "nosuch" does not exist',
+        None,
+        "26",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-501")
+@pytest.mark.parametrize("query", list(VALUES_AND_UNREAD_CTE))
+def test_values_and_unread_cte_are_analysed(query: str, rust_pg: Any) -> None:
+    """A VALUES list's reference is 0A000 here, and an unread CTE's
+    errors are never raised."""
+    assert answer(rust_pg, query) == VALUES_AND_UNREAD_CTE[query]

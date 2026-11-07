@@ -606,3 +606,348 @@ fn a_block_reads_sequences_as_they_stand() {
     });
     server.stop();
 }
+
+/// A transaction moving onto a new snapshot guards its rows across the moment
+/// its old transaction lets them go (`MoveGuard`). A writer that had already
+/// been through the guard's check could write one of them right then: its
+/// write stood in WiredTiger, uncommitted, while the guard turned the writer
+/// away at its next check, so the writer waited for the mover and the mover's
+/// replay collided with the writer's write for as long as it waited -- a cycle
+/// PostgreSQL has no counterpart of, ended only by the replay giving up with a
+/// 40001 (`concurrent_writers_under_the_read_committed_move`, once in CI).
+/// The move now installs the guard and rolls back holding the write lock of
+/// every collection it has written, which a writer holds from its check to
+/// its write, so no writer is ever between the two.
+///
+/// The interleaving is forced: the writer is held between its check and its
+/// write while the mover's block is moved. It is released when the move has
+/// either begun to wait for the collection's lock (the move now) or already
+/// rolled back (a move that does not take it): the writer then writes, into
+/// the gap only if there is one.
+#[test]
+fn a_write_cannot_slip_in_under_a_moving_transactions_guard() {
+    // One test, the cases in turn: the hook is process-wide. The writer's
+    // statement is a lone autocommit one, the first write of a block, or a
+    // write after others in its block: the server waits for the holder in a
+    // different place for each.
+    for isolation in ["read committed", "repeatable read"] {
+        for writer in [
+            "UPDATE rc_gap_hot SET n = n + 10 WHERE id = 1",
+            "BEGIN; UPDATE rc_gap_hot SET n = n + 10 WHERE id = 1; COMMIT",
+            "BEGIN; INSERT INTO rc_gap_noise VALUES (1); \
+             UPDATE rc_gap_hot SET n = n + 10 WHERE id = 1; COMMIT",
+        ] {
+            a_write_slips_under_a_guard(isolation, writer);
+        }
+    }
+}
+
+fn a_write_slips_under_a_guard(writer_isolation: &str, writer_sql: &str) {
+    use secantus_storage::{set_test_hook, TestPoint};
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    const T: &str = "rc_gap_hot";
+    #[derive(Default)]
+    struct Stage {
+        armed: bool,
+        parked: bool,
+        go: bool,
+        refused: bool,
+    }
+    let stage = Arc::new((Mutex::new(Stage::default()), Condvar::new()));
+    let wait_until = {
+        // Wait up to 20 s for `ready` (a stuck test fails, it does not hang).
+        |stage: &Arc<(Mutex<Stage>, Condvar)>, ready: &dyn Fn(&Stage) -> bool| -> bool {
+            let (lock, cv) = &**stage;
+            let mut g = lock.lock().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !ready(&g) {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                g = cv.wait_timeout(g, left).unwrap().0;
+            }
+            true
+        }
+    };
+    let hook_stage = Arc::clone(&stage);
+    let hook = Arc::new(move |point: TestPoint, row: &(String, String, i64)| {
+        if row.1 != T {
+            return;
+        }
+        match point {
+            TestPoint::AfterRowCheck => {
+                let park = {
+                    let (lock, cv) = &*hook_stage;
+                    let mut g = lock.lock().unwrap();
+                    let park = g.armed;
+                    if park {
+                        g.armed = false;
+                        g.parked = true;
+                        cv.notify_all();
+                    }
+                    park
+                };
+                if park {
+                    wait_until(&hook_stage, &|g| g.go);
+                }
+            }
+            TestPoint::AfterRollback => {
+                let release = {
+                    let (lock, cv) = &*hook_stage;
+                    let mut g = lock.lock().unwrap();
+                    let release = g.parked && !g.go;
+                    if release {
+                        g.go = true;
+                        cv.notify_all();
+                    }
+                    release
+                };
+                if release {
+                    // The writer writes its row now, into the gap, and is
+                    // turned away by the guard at its next check.
+                    wait_until(&hook_stage, &|g| g.refused);
+                }
+            }
+            TestPoint::MoveLockWait => {
+                let (lock, cv) = &*hook_stage;
+                let mut g = lock.lock().unwrap();
+                if g.parked {
+                    g.go = true;
+                    cv.notify_all();
+                }
+            }
+            TestPoint::GuardedConflict => {
+                let (lock, cv) = &*hook_stage;
+                let mut g = lock.lock().unwrap();
+                if g.go {
+                    g.refused = true;
+                    cv.notify_all();
+                }
+            }
+        }
+    });
+    struct Unhook;
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            set_test_hook(None);
+        }
+    }
+
+    let dir = TempDir::new().expect("tempdir");
+    let mut server = start(dir.path());
+    let rt = Runtime::new().expect("runtime");
+    run(
+        &rt,
+        &server,
+        &[
+            "CREATE TABLE rc_gap_hot (id int PRIMARY KEY, n int)",
+            "CREATE TABLE rc_gap_noise (k int)",
+            "INSERT INTO rc_gap_hot VALUES (1, 0), (2, 0), (3, 0)",
+        ],
+    );
+    let dsn = server.dsn();
+    let _unhook = Unhook;
+    set_test_hook(Some(hook));
+    let rows = rt.block_on(async {
+        async fn connect(dsn: &str) -> tokio_postgres::Client {
+            let (c, conn) = tokio_postgres::connect(dsn, tokio_postgres::NoTls)
+                .await
+                .expect("connect");
+            tokio::spawn(async move {
+                let _ = conn.await;
+            });
+            c
+        }
+        let mover = connect(&dsn).await;
+        let writer = connect(&dsn).await;
+        writer
+            .batch_execute(&format!(
+                "SET default_transaction_isolation = '{writer_isolation}'"
+            ))
+            .await
+            .expect("the writer's isolation level");
+        let other = connect(&dsn).await;
+        // The mover's block holds row 1.
+        mover.batch_execute("BEGIN").await.expect("begin");
+        mover
+            .batch_execute("UPDATE rc_gap_hot SET n = n + 1 WHERE id = 1")
+            .await
+            .expect("the mover's first update");
+        // A commit to the table: the mover's next statement must read a new
+        // snapshot, so its block is moved.
+        other
+            .batch_execute("UPDATE rc_gap_hot SET n = n + 1 WHERE id = 2")
+            .await
+            .expect("another session's commit");
+        // The writer wants row 1 too: held between its check and its write
+        // (holding the store's write lock, so nothing else writes meanwhile).
+        stage.0.lock().unwrap().armed = true;
+        let sql = writer_sql.to_string();
+        let writer_task = tokio::spawn(async move { writer.batch_execute(&sql).await });
+        let s = Arc::clone(&stage);
+        assert!(
+            tokio::task::spawn_blocking(move || wait_until(&s, &|g| g.parked))
+                .await
+                .unwrap(),
+            "the writer never reached its check"
+        );
+        let moved = mover
+            .batch_execute("UPDATE rc_gap_hot SET n = n + 1 WHERE id = 3")
+            .await;
+        assert!(
+            moved.is_ok(),
+            "the mover's block could not be moved: {moved:?}"
+        );
+        mover.batch_execute("COMMIT").await.expect("commit");
+        let written = writer_task.await.expect("writer task");
+        if writer_isolation == "read committed" {
+            written.expect("the writer's statement runs once the mover has committed");
+        } else {
+            // PostgreSQL's answer to a REPEATABLE READ writer whose row the
+            // mover committed meanwhile.
+            let err = written.expect_err("the writer's row changed under its snapshot");
+            assert_eq!(
+                err.code().map(|c| c.code()),
+                Some("40001"),
+                "a writer at {writer_isolation} ({writer_sql}): {err:?}"
+            );
+        }
+        let rows = other
+            .query("SELECT id, n FROM rc_gap_hot ORDER BY id", &[])
+            .await
+            .expect("read back");
+        rows.iter()
+            .map(|r| (r.get::<_, i32>(0), r.get::<_, i32>(1)))
+            .collect::<Vec<_>>()
+    });
+    // Read committed: both updates of row 1 applied (1 + 10), once each.
+    // Repeatable read: the writer's was refused, the mover's stands.
+    let row_1 = if writer_isolation == "read committed" {
+        11
+    } else {
+        1
+    };
+    assert_eq!(
+        rows,
+        vec![(1, row_1), (2, 1), (3, 1)],
+        "a writer at {writer_isolation} ({writer_sql})"
+    );
+    drop(rt);
+    server.stop();
+}
+
+/// A failed read of the stored comments is the statement's error, never a
+/// NULL comment (CI, 2026-11-07: `obj_description` of a commented index
+/// answered NULL once on the `pg-oracle` job, and every read on the comment
+/// path answered a failure as "no comment"). The fault fails every scan of
+/// the index-comment collection in this test's own database, as a
+/// WiredTiger `WT_ROLLBACK` would; the other tests in this binary use other
+/// databases, so the process-wide fault never reaches them.
+#[test]
+fn a_failed_comment_read_is_an_error_not_a_null() {
+    use secantus_storage::{set_read_fault, StorageError, WtError};
+
+    const DB: &str = "comment_fault";
+    struct Unfault;
+    impl Drop for Unfault {
+        fn drop(&mut self) {
+            set_read_fault(None);
+        }
+    }
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fault_armed = Arc::clone(&armed);
+    let fault = Arc::new(move |db: &str, coll: &str| {
+        (fault_armed.load(std::sync::atomic::Ordering::SeqCst)
+            && db == DB
+            && coll == "__sql_index_comments__")
+            .then(|| {
+                StorageError::Wt(WtError {
+                    code: -31800,
+                    message: "WT_ROLLBACK: injected by the test".into(),
+                })
+            })
+    });
+
+    let dir = TempDir::new().expect("tempdir");
+    let storage = Storage::open(dir.path().to_str().expect("utf-8 home")).expect("open storage");
+    let databases = Arc::new(DatabaseRegistry::new("postgres", vec![DB.to_string()]));
+    let mut server = bind("127.0.0.1:0", storage, databases).expect("bind");
+    let a = server.address();
+    let dsn = format!(
+        "host={} port={} dbname={DB} user=postgres",
+        a.ip(),
+        a.port()
+    );
+    let _unfault = Unfault;
+    set_read_fault(Some(fault));
+    let rt = Runtime::new().expect("runtime");
+    rt.block_on(async {
+        let (client, conn) = tokio_postgres::connect(&dsn, tokio_postgres::NoTls)
+            .await
+            .expect("connect");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client
+            .batch_execute(
+                "CREATE TABLE cf (id int PRIMARY KEY, d int);
+                 CREATE INDEX cf_d_ix ON cf (d);
+                 COMMENT ON INDEX cf_d_ix IS 'ix comment'",
+            )
+            .await
+            .expect("setup");
+        let comment = "SELECT obj_description('cf_d_ix'::regclass, 'pg_class')";
+        let described = "SELECT description FROM pg_description \
+                         WHERE objoid = 'cf_d_ix'::regclass";
+        let read = |sql: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .query_one(sql, &[])
+                    .await
+                    .map(|r| r.get::<_, Option<String>>(0))
+            }
+        };
+        assert_eq!(
+            read(comment).await.expect("unfaulted").as_deref(),
+            Some("ix comment")
+        );
+
+        armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        // A catalog change, so the next statement publishes the comments
+        // afresh (and reads them under the fault).
+        client
+            .batch_execute("CREATE TABLE cf_bump (k int)")
+            .await
+            .expect("a statement that reads no comment is not failed");
+        for sql in [comment, described] {
+            let err = read(sql)
+                .await
+                .expect_err("a failed comment read must be an error, not NULL");
+            let db = err.as_db_error().expect("a server error");
+            assert_eq!(db.code().code(), "XX000", "{sql}: {db:?}");
+            assert!(
+                db.message().contains("could not read the index comments")
+                    && db.message().contains("WT_ROLLBACK: injected by the test"),
+                "{sql}: the error names its cause: {}",
+                db.message()
+            );
+        }
+
+        // The failed publication was not recorded as current: with the
+        // fault gone, the same catalog version reads the comment.
+        armed.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            read(comment).await.expect("unfaulted").as_deref(),
+            Some("ix comment")
+        );
+        assert_eq!(
+            read(described).await.expect("unfaulted").as_deref(),
+            Some("ix comment")
+        );
+    });
+    server.stop();
+}

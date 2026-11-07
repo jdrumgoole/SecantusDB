@@ -96,6 +96,7 @@ pub struct QueryOut {
 }
 
 /// What the interpreter asks of the server.
+mod block_scope;
 mod open_cursor;
 
 pub trait Host {
@@ -289,6 +290,10 @@ struct Interp<'a> {
     set_rows: Vec<Vec<Bson>>,
     row_count: u64,
     found_no: Option<usize>,
+    /// The datums of the function's own level end here: the parameters,
+    /// FOUND, and a trigger's NEW and OLD, which libpg_query's compile makes
+    /// after FOUND. `None` without a FOUND.
+    function_level: Option<usize>,
     /// The error a handler is running for: `RAISE;` re-raises it.
     handling: Option<PlError>,
     /// Bound cursors' queries, by datum number (`open_cursor`).
@@ -300,6 +305,13 @@ struct Interp<'a> {
     label: String,
     /// The text of the EXECUTE statement being run, for its CONTEXT frame.
     dyn_text: Option<String>,
+    /// Each block's namespace level, by the `__scope` number on the block.
+    scopes: Vec<block_scope::Scope>,
+    /// Each variable's declared default (`default_val`), by datum number.
+    defaults: HashMap<usize, Value>,
+    /// The levels of the blocks and labelled FOR loops being run, outermost
+    /// first: what a `label.name` is looked up in.
+    active: Vec<block_scope::Scope>,
 }
 
 impl Interp<'_> {
@@ -390,11 +402,12 @@ fn parsed(create_sql: &str) -> Result<Value, PlError> {
                 .to_string(),
         )
     })?;
-    let f = v
+    let mut f = v
         .get(0)
         .and_then(|f| f.get("PLpgSQL_function"))
         .cloned()
         .ok_or_else(|| PlError::new("42601", "the function body did not parse"))?;
+    block_scope::annotate(&mut f, &rewritten);
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -739,11 +752,33 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         set_rows: Vec::new(),
         row_count: 0,
         found_no,
+        function_level: found_no.map(|found| {
+            ["new_varno", "old_varno"]
+                .iter()
+                .filter_map(|k| f.get(*k).and_then(Value::as_u64))
+                .map(|n| n as usize + 1)
+                .fold(found + 1, usize::max)
+        }),
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
         cursor_options: open_cursor::cursor_options(&f),
         label: function_label(create_sql),
         dyn_text: None,
+        scopes: block_scope::scopes(&f),
+        defaults: f
+            .get("datums")
+            .and_then(Value::as_array)
+            .map(|ds| {
+                ds.iter()
+                    .enumerate()
+                    .filter_map(|(i, d)| {
+                        let e = d.get("PLpgSQL_var")?.get("default_val")?;
+                        Some((i, e.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        active: Vec::new(),
     };
     if let Some(t) = &inv.trigger {
         let new_no = f
@@ -760,21 +795,23 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             }
         }
     }
-    // Declared defaults, in declaration order: `x int := a * 2` may read a
-    // parameter or an earlier variable.
-    let defaults: Vec<(usize, Value)> = f
-        .get("datums")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
+    // A block initialises the variables it declares each time it is
+    // entered (`Interp::enter_block`). Only a default no rebuilt level owns
+    // (a body that does not scan) is set here, before the body runs, in
+    // declaration order: `x int := a * 2` may read a parameter or an
+    // earlier variable.
+    let owned: std::collections::HashSet<usize> = interp
+        .scopes
         .iter()
-        .enumerate()
-        .filter_map(|(i, d)| {
-            d.get("PLpgSQL_var")
-                .and_then(|v| v.get("default_val"))
-                .map(|e| (i, e.clone()))
-        })
+        .flat_map(|s| s.init.iter().copied())
         .collect();
+    let mut defaults: Vec<(usize, Value)> = interp
+        .defaults
+        .iter()
+        .filter(|(i, _)| !owned.contains(i))
+        .map(|(i, e)| (*i, e.clone()))
+        .collect();
+    defaults.sort_by_key(|(i, _)| *i);
     for (i, e) in defaults {
         let v = interp.eval_typed(&e, i)?;
         interp.set_var(i, v)?;
@@ -1068,6 +1105,22 @@ fn expr_frame(
     None
 }
 
+/// A record as a whole, as a value of its row type.
+fn record_value(rec: &Record) -> Bson {
+    let mut d = bson::Document::new();
+    d.insert(secantus_pgplan::RECORD_KEY, Bson::Array(rec.values.clone()));
+    d.insert(
+        secantus_pgplan::RECORD_TYPES_KEY,
+        Bson::Array(
+            rec.columns
+                .iter()
+                .map(|(_, t)| Bson::String(t.clone()))
+                .collect(),
+        ),
+    );
+    Bson::Document(d)
+}
+
 fn expr_query(e: &Value) -> Option<(&str, u64)> {
     let e = e.get("PLpgSQL_expr")?;
     Some((
@@ -1143,11 +1196,32 @@ impl Interp<'_> {
                             e.from_sql = true;
                             return Err(e);
                         } else if !matches!(tok(i + 3), Some(".") | Some("(")) {
-                            // `fname.p`: a variable of the function's own
-                            // block, labelled with its name -- not
-                            // `fname.r.f`, a field of a record parameter.
-                            if let Some((v, ty)) = self.function_level(&name, &field) {
+                            // `blk.x`: a variable of a block (or FOR loop)
+                            // labelled `blk`, innermost first; then `fname.p`,
+                            // a variable of the function's own block,
+                            // labelled with its name -- not `fname.r.f`, a
+                            // field of a record parameter.
+                            if let Some((v, ty)) = self
+                                .labelled(&name, &field)
+                                .and_then(|d| self.datum_value(d))
+                                .or_else(|| self.function_level(&name, &field))
+                            {
                                 bound = Some((v, ty, i + 2));
+                            }
+                        } else if tok(i + 3) == Some(".") && tok(i + 5) != Some("(") {
+                            // `blk.r.f`: a field of a record block `blk`
+                            // declares.
+                            let rec = self.labelled(&name, &field).and_then(|d| {
+                                match self.datums.get(d) {
+                                    Some(Datum::Rec { rec: Some(r), .. }) => Some(r),
+                                    _ => None,
+                                }
+                            });
+                            if let Some((v, ty)) = ident(i + 4)
+                                .and_then(|f2| rec.and_then(|r| r.get(&f2)))
+                                .map(|(v, ty)| (v.clone(), ty.to_string()))
+                            {
+                                bound = Some((v, ty, i + 4));
                             }
                         }
                     }
@@ -1156,18 +1230,7 @@ impl Interp<'_> {
                         bound = Some((v, ty, i));
                     } else if let Some(rec) = self.record(&name) {
                         // A record as a whole: a value of its row type.
-                        let mut d = bson::Document::new();
-                        d.insert(secantus_pgplan::RECORD_KEY, Bson::Array(rec.values.clone()));
-                        d.insert(
-                            secantus_pgplan::RECORD_TYPES_KEY,
-                            Bson::Array(
-                                rec.columns
-                                    .iter()
-                                    .map(|(_, t)| Bson::String(t.clone()))
-                                    .collect(),
-                            ),
-                        );
-                        bound = Some((Bson::Document(d), "record".into(), i));
+                        bound = Some((record_value(rec), "record".into(), i));
                     } else if self.unassigned_record(&name) {
                         // Unassigned, it is NULL as a whole (only a field of
                         // it is 55000).
@@ -1236,20 +1299,27 @@ impl Interp<'_> {
         Ok((out, params, types))
     }
 
+    /// The value of a variable, or of a record as a whole (NULL while
+    /// nothing has filled it), by datum number.
+    fn datum_value(&self, d: usize) -> Option<(Bson, String)> {
+        match self.datums.get(d)? {
+            Datum::Var { ty, value, .. } => Some((value.clone(), ty.clone())),
+            Datum::Rec { rec: Some(r), .. } => Some((record_value(r), "record".into())),
+            Datum::Rec { rec: None, .. } => Some((Bson::Null, "record".into())),
+            _ => None,
+        }
+    }
+
     fn scalar(&self, name: &str) -> Option<(Bson, String)> {
         // The TG_ variables come first: PL/pgSQL declares them as datums of
         // a trigger function, which would otherwise shadow them with NULL.
         if let Some(v) = self.trigger_scalar(name) {
             return Some(v);
         }
-        for d in self.datums.iter().rev() {
-            if let Datum::Var { name: n, ty, value } = d {
-                if n == name {
-                    return Some((value.clone(), ty.clone()));
-                }
-            }
+        match self.datums.get(self.named(name)?)? {
+            Datum::Var { ty, value, .. } => Some((value.clone(), ty.clone())),
+            _ => None,
         }
-        None
     }
 
     /// `label.name` where `label` is the function's own name: the variables
@@ -1311,10 +1381,10 @@ impl Interp<'_> {
     }
 
     fn record(&self, name: &str) -> Option<&Record> {
-        self.datums.iter().rev().find_map(|d| match d {
-            Datum::Rec { name: n, rec } if n == name => rec.as_ref(),
+        match self.datums.get(self.named(name)?)? {
+            Datum::Rec { rec, .. } => rec.as_ref(),
             _ => None,
-        })
+        }
     }
 
     /// The type of `field` in a trigger's NEW or OLD that this operation
@@ -1348,11 +1418,10 @@ impl Interp<'_> {
     /// innermost one of that name)?
     fn unassigned_record(&self, name: &str) -> bool {
         self.trigger.is_none()
-            && self.datums.iter().rev().find_map(|d| match d {
-                Datum::Rec { name: n, rec } if n == name => Some(rec.is_none()),
-                Datum::Var { name: n, .. } if n == name => Some(false),
-                _ => None,
-            }) == Some(true)
+            && matches!(
+                self.named(name).and_then(|d| self.datums.get(d)),
+                Some(Datum::Rec { rec: None, .. })
+            )
     }
 
     fn record_field(&self, name: &str, field: &str) -> Option<(Bson, String)> {
@@ -1614,6 +1683,118 @@ impl Interp<'_> {
         Err(e)
     }
 
+    /// Enter a block: push its namespace level and give each variable it
+    /// declares its default, or NULL, as `exec_stmt_block` does on every
+    /// entry -- a block inside a loop starts afresh each pass, and a
+    /// default reads the state at that moment. A default is read in the
+    /// levels being run plus the names its own level declares before it.
+    /// Its error carries the block's `during statement block local variable
+    /// initialization` frame.
+    fn enter_block(&mut self, body: &Value, level: block_scope::Scope) -> Result<(), PlError> {
+        let vars = level.vars.clone();
+        self.active.push(block_scope::Scope {
+            vars: Vec::new(),
+            ..level
+        });
+        for (name, d) in vars {
+            if self.active.last().is_some_and(|l| l.init.contains(&d)) {
+                let value = match self.defaults.get(&d).cloned() {
+                    Some(e) => Some(self.eval_typed(&e, d).map_err(|mut e| {
+                        if !e.framed {
+                            let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);
+                            e.push_context(format!(
+                                "PL/pgSQL function {} line {line} during statement block \
+                                 local variable initialization",
+                                self.label
+                            ));
+                            e.framed = true;
+                        }
+                        e
+                    })?),
+                    None => None,
+                };
+                match (self.datums.get_mut(d), value) {
+                    (Some(Datum::Rec { rec, .. }), _) => *rec = None,
+                    (Some(Datum::Var { value: slot, .. }), None) => *slot = Bson::Null,
+                    (Some(Datum::Var { .. }), Some(v)) => self.set_var(d, v)?,
+                    _ => {}
+                }
+            }
+            if let Some(own) = self.active.last_mut() {
+                own.vars.push((name, d));
+            }
+        }
+        Ok(())
+    }
+
+    /// Run a block's statements; with EXCEPTION handlers, as a
+    /// subtransaction whose handler runs for an error it catches.
+    fn block(&mut self, body: &Value, label: Option<String>) -> Result<Flow, PlError> {
+        let handlers = body
+            .get("exceptions")
+            .and_then(|e| e.get("PLpgSQL_exception_block"))
+            .and_then(|b| b.get("exc_list"))
+            .and_then(Value::as_array)
+            .cloned();
+        // A block with handlers runs as a subtransaction: an error it
+        // catches undoes the block's writes, as PostgreSQL has it.
+        let token = match handlers {
+            Some(_) => {
+                self.subtxn_depth += 1;
+                match self.host.subtxn_begin() {
+                    Ok(t) => Some(t),
+                    Err(e) => {
+                        self.subtxn_depth -= 1;
+                        return Err(e);
+                    }
+                }
+            }
+            None => None,
+        };
+        let result = self.stmts(body.get("body").unwrap_or(&Value::Null));
+        if let Some(t) = token {
+            self.subtxn_depth -= 1;
+            self.host.subtxn_end(t, result.is_err())?;
+        }
+        let Some(handlers) = handlers else {
+            return match result? {
+                Flow::Exit(Some(l)) if label.as_deref() == Some(l.as_str()) => Ok(Flow::Next),
+                other => Ok(other),
+            };
+        };
+        match result {
+            Ok(flow) => Ok(flow),
+            Err(err) => {
+                for h in &handlers {
+                    let h = h.get("PLpgSQL_exception").cloned().unwrap_or(Value::Null);
+                    let conds = h
+                        .get("conditions")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    if conds.iter().any(|c| condition_matches(c, &err.sqlstate)) {
+                        // SQLSTATE and SQLERRM are a level of their own,
+                        // which the handler runs in.
+                        let depth = self.active.len();
+                        if let Some(level) =
+                            block_scope::scope_of(body).and_then(|k| self.handler_level(k))
+                        {
+                            self.active.push(level);
+                        }
+                        self.set_named("sqlstate", Bson::String(err.sqlstate.clone()));
+                        self.set_named("sqlerrm", Bson::String(err.message.clone()));
+                        let previous = self.handling.replace(err.clone());
+                        let flow = self.stmts(h.get("action").unwrap_or(&Value::Null));
+                        self.handling = previous;
+                        self.active.truncate(depth);
+                        return flow;
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
     fn stmt_inner(&mut self, s: &Value) -> Result<Flow, PlError> {
         let Some((kind, body)) = s.as_object().and_then(|o| o.iter().next()) else {
             return Ok(Flow::Next);
@@ -1624,62 +1805,18 @@ impl Interp<'_> {
             .map(str::to_string);
         match kind.as_str() {
             "PLpgSQL_stmt_block" => {
-                let handlers = body
-                    .get("exceptions")
-                    .and_then(|e| e.get("PLpgSQL_exception_block"))
-                    .and_then(|b| b.get("exc_list"))
-                    .and_then(Value::as_array)
-                    .cloned();
-                // A block with handlers runs as a subtransaction: an error it
-                // catches undoes the block's writes, as PostgreSQL has it.
-                let token = match handlers {
-                    Some(_) => {
-                        self.subtxn_depth += 1;
-                        match self.host.subtxn_begin() {
-                            Ok(t) => Some(t),
-                            Err(e) => {
-                                self.subtxn_depth -= 1;
-                                return Err(e);
-                            }
-                        }
-                    }
-                    None => None,
+                // The block's level stays active through its handlers; a
+                // level an error left behind inside it goes with it.
+                let depth = self.active.len();
+                let level = block_scope::scope_of(body).and_then(|k| self.scopes.get(k).cloned());
+                let out = match level {
+                    Some(level) => self
+                        .enter_block(body, level)
+                        .and_then(|()| self.block(body, label)),
+                    None => self.block(body, label),
                 };
-                let result = self.stmts(body.get("body").unwrap_or(&Value::Null));
-                if let Some(t) = token {
-                    self.subtxn_depth -= 1;
-                    self.host.subtxn_end(t, result.is_err())?;
-                }
-                let Some(handlers) = handlers else {
-                    return match result? {
-                        Flow::Exit(Some(l)) if label.as_deref() == Some(l.as_str()) => {
-                            Ok(Flow::Next)
-                        }
-                        other => Ok(other),
-                    };
-                };
-                match result {
-                    Ok(flow) => Ok(flow),
-                    Err(err) => {
-                        for h in &handlers {
-                            let h = h.get("PLpgSQL_exception").cloned().unwrap_or(Value::Null);
-                            let conds = h
-                                .get("conditions")
-                                .and_then(Value::as_array)
-                                .cloned()
-                                .unwrap_or_default();
-                            if conds.iter().any(|c| condition_matches(c, &err.sqlstate)) {
-                                self.set_named("sqlstate", Bson::String(err.sqlstate.clone()));
-                                self.set_named("sqlerrm", Bson::String(err.message.clone()));
-                                let previous = self.handling.replace(err.clone());
-                                let flow = self.stmts(h.get("action").unwrap_or(&Value::Null));
-                                self.handling = previous;
-                                return flow;
-                            }
-                        }
-                        Err(err)
-                    }
-                }
+                self.active.truncate(depth);
+                out
             }
             "PLpgSQL_stmt_assign" => {
                 let no = body.get("varno").and_then(Value::as_u64).unwrap_or(0) as usize;
@@ -1826,11 +1963,20 @@ impl Interp<'_> {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 self.datums.push(Datum::Var {
-                    name,
+                    name: name.clone(),
                     ty: "int4".into(),
                     value: Bson::Null,
                 });
                 let slot = self.datums.len() - 1;
+                // The loop's own level: its label qualifies the variable.
+                let depth = self.active.len();
+                self.active.push(block_scope::Scope {
+                    label: label.clone(),
+                    vars: vec![(name, slot)],
+                    parent: None,
+                    handler: Vec::new(),
+                    init: Vec::new(),
+                });
                 let mut i = lower;
                 let result = loop {
                     if (!reverse && i > upper) || (reverse && i < upper) {
@@ -1839,7 +1985,11 @@ impl Interp<'_> {
                     if let Some(Datum::Var { value, .. }) = self.datums.get_mut(slot) {
                         *value = Bson::Int32(i32::try_from(i).unwrap_or(i32::MAX));
                     }
-                    match self.stmts(body.get("body").unwrap_or(&Value::Null))? {
+                    let flow = match self.stmts(body.get("body").unwrap_or(&Value::Null)) {
+                        Ok(flow) => flow,
+                        Err(e) => break Err(e),
+                    };
+                    match flow {
                         Flow::Exit(l) if Self::label_matches(&l, label.as_deref()) => {
                             break Ok(Flow::Next)
                         }
@@ -1849,6 +1999,7 @@ impl Interp<'_> {
                     }
                     i = if reverse { i - step } else { i + step };
                 };
+                self.active.truncate(depth);
                 self.datums.truncate(slot);
                 result
             }
@@ -2132,10 +2283,10 @@ impl Interp<'_> {
                         ));
                     };
                     let value = values.get(k).cloned().unwrap_or(Bson::Null);
-                    let ty = self.datums.iter().rev().find_map(|d| match d {
-                        Datum::Var { name, ty, .. } if name == var => Some(ty.clone()),
+                    let ty = match self.named(var).and_then(|d| self.datums.get(d)) {
+                        Some(Datum::Var { ty, .. }) => Some(ty.clone()),
                         _ => None,
-                    });
+                    };
                     let value = match (ty, &value) {
                         (_, Bson::Null) | (None, _) => value,
                         (Some(t), _) => self.cast(value, &t)?,
@@ -2170,17 +2321,12 @@ impl Interp<'_> {
         }
     }
 
+    /// Set the variable a bare `name` names where the statement runs.
     fn set_named(&mut self, name: &str, value: Bson) {
-        for d in self.datums.iter_mut().rev() {
-            if let Datum::Var {
-                name: n, value: v, ..
-            } = d
-            {
-                if n == name {
-                    *v = value;
-                    return;
-                }
-            }
+        if let Some(Datum::Var { value: v, .. }) =
+            self.named(name).and_then(|d| self.datums.get_mut(d))
+        {
+            *v = value;
         }
     }
 
