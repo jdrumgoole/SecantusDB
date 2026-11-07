@@ -974,12 +974,13 @@ def test_a_read_of_a_time_series_collection_counts_what_it_examined(
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_creating_a_view_inserts_its_definition(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 creates a view by inserting its definition into
     `system.views`, and its `create` line counts that key
-    (`keysInserted: 1`, measured 2026-10-27). This server keeps a view in
-    its catalog and inserts nothing."""
+    (`keysInserted: 1`, measured 2026-10-27). This server kept a view in
+    its catalog and counted nothing; it now counts the `_id` key of the
+    `system.views` document it presents for it."""
     got = _both(
         rust_mongo,
         mongod_rs,
@@ -988,6 +989,93 @@ def test_creating_a_view_inserts_its_definition(rust_mongo: Any, mongod_rs: Any)
     answers = {s: _line(lines, "create").get("keysInserted") for s, (lines, _) in got.items()}
     assert answers["mongod"] == 1
     assert answers["rust"] == answers["mongod"]
+
+
+_KEYS = ("keysInserted", "keysDeleted")
+
+
+def _with_view(db: Any) -> None:
+    seed(db)
+    db.command("create", "v", viewOn="c", pipeline=[])
+
+
+def _with_ts(db: Any) -> None:
+    db.create_collection("ts", timeseries={"timeField": "t"})
+
+
+_DEFINITIONS = {
+    "drop of a view": (_with_view, lambda d: d.drop_collection("v"), "drop"),
+    "collMod of a view": (
+        _with_view,
+        lambda d: d.command("collMod", "v", viewOn="c", pipeline=[{"$match": {}}]),
+        "collMod",
+    ),
+    "create of a time series": (
+        lambda d: None,
+        lambda d: d.command("create", "ts", timeseries={"timeField": "t", "metaField": "m"}),
+        "create",
+    ),
+    "drop of a time series": (_with_ts, lambda d: d.drop_collection("ts"), "drop"),
+    "create of an existing view": (
+        _with_view,
+        lambda d: d.command("create", "v", viewOn="c", pipeline=[]),
+        "create",
+    ),
+    "create of a collection": (lambda d: None, lambda d: d.create_collection("p"), "create"),
+    "drop of a collection": (seed, lambda d: d.drop_collection("c"), "drop"),
+}
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_definition_in_system_views_counts_its_key(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 keeps a view, and a time-series collection (a view over
+    its buckets), as a `system.views` document: creating one inserts its
+    `_id` key, dropping it deletes the key, and a `collMod` of a view
+    updates it in place (`keysInserted: 0, keysDeleted: 0`). A plain
+    collection's `create` and `drop`, and a `create` that finds the view
+    there, count none (measured 2026-11-07)."""
+    answers = {}
+    for name, (setup, op, command) in _DEFINITIONS.items():
+        got = _both(rust_mongo, mongod_rs, op, setup)
+        answers[name] = {
+            s: {k: _line(lines, command)[k] for k in _KEYS if k in _line(lines, command)}
+            for s, (lines, _) in got.items()
+        }
+    assert answers["drop of a view"]["mongod"] == {"keysDeleted": 1}
+    assert answers["collMod of a view"]["mongod"] == {"keysInserted": 0, "keysDeleted": 0}
+    for name, a in answers.items():
+        assert a["rust"] == a["mongod"], name
+
+
+_PLANNED_APART = {
+    "count": lambda d: d.command("count", "c"),
+    "count with an empty query": lambda d: d.command("count", "c", query={}),
+    "count of a missing collection": lambda d: d.command("count", "nope"),
+    "find of a missing collection": lambda d: list(d.nope.find({"x": 1})),
+}
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_plan_settled_without_the_planner_is_timed(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 plans a `count` with no query (`RECORD_STORE_FAST_COUNT`)
+    and a read of a collection that is not there (`EOF`) like any other, and
+    their line and profile entry carry `planningTimeMicros` (measured
+    2026-11-07). This server settled both without its planner and printed
+    none."""
+    answers = {}
+    for name, op in _PLANNED_APART.items():
+        got = _both(rust_mongo, mongod_rs, op)
+        command = "find" if name.startswith("find") else "count"
+        answers[name] = {
+            s: (
+                "planningTimeMicros" in _line(lines, command),
+                ["planningTimeMicros" in e for e in entries],
+            )
+            for s, (lines, entries) in got.items()
+        }
+    for name, a in answers.items():
+        assert a["mongod"] == (True, [True]), name
+        assert a["rust"] == a["mongod"], name
 
 
 # ------------------------------------------------------------- RM-364 --

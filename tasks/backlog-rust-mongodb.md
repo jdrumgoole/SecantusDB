@@ -724,24 +724,38 @@ These are explicit non-goals. Don't add them without a reason.
       working RM-362, 2026-11-07.
       Backlog-ID: RM-381
       Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_says_how_long_it_planned
+- [ ] **A `dropDatabase` line names `<db>.$cmd`.** mongod 8.2.11's `Slow
+      query` line for a `dropDatabase` names the database alone (`ns:
+      "<db>"`); this server's names `<db>.$cmd`, as it does for a command
+      that runs on no collection. Found while working RM-363, 2026-11-07.
+      Verify: tests/backlog/test_rm_drop_reports.py::test_a_drop_database_line_names_the_database
+      Backlog-ID: RM-383
+- [ ] **Dropping a view writes no profile entry.** mongod 8.2.11 profiles a
+      `drop` of a view as it profiles a `drop` of a collection (`{op:
+      "command", ns: "<db>.v", command: {drop: "v"}}`); this server writes
+      the `drop` line and no entry. Found while working RM-363, 2026-11-07.
+      Verify: tests/backlog/test_rm_drop_reports.py::test_dropping_a_view_is_profiled
+      Backlog-ID: RM-384
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
-      - a read two or more plans could serve, which mongod chooses by trial
-        (RM-349 streams it); its documents come from the store's router;
-      - a time-series collection's read (RM-348) and a geo, `$near` or
-        `$text` read;
-      - a `count` with an empty query has no `planningTimeMicros` (this
-        server answers it from the record count without planning), nor a
-        `find` of a collection that does not exist (mongod plans an `EOF`);
-      - creating a view or a time-series collection counts no
-        `keysInserted`: mongod inserts the definition into `system.views`
-        (`keysInserted: 1`), this server keeps it in its catalog.
-      Measured 2026-10-27.
+      - a read two or more plans could serve, which mongod chooses by trial;
+        its documents come from the store's router. mongod's `find` line
+        counts what the winner examined in its trial, the trial's results
+        buffered for the batches after it (`keysExamined: 12, docsExamined:
+        12` on the first batch of two and 0 on each `getMore`, over twelve
+        documents); counting it is streaming the winner after that buffer,
+        which is RM-349;
+      - a time-series collection's read and a geo, `$near` or `$text` read.
+        mongod counts the buckets its cursor stage buffered (all 15 of 300
+        measurements in the first batch of 101, 0 after); counting them
+        needs the buckets this server derives to be read as mongod reads
+        them, which is RM-348.
+      Measured 2026-10-27 and 2026-11-07.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_creating_a_view_inserts_its_definition
+      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
 - [ ] **WiredTiger 11's statistics are not on the line.** mongod 8.2.11's
       WiredTiger keeps two that the one vendored here (mongodb-7.0.33) does
       not: the share of a cache wait spent in interruptible eviction
