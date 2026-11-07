@@ -321,7 +321,7 @@ fn projection(
     let aliases: std::collections::HashSet<&str> = scope
         .cols
         .iter()
-        .map(|c| c.alias.as_str())
+        .flat_map(|c| [c.alias.as_str(), c.qual.as_str()])
         .chain(scope.aliases.iter().map(String::as_str))
         .collect();
     let classify = |parts: &[Option<&str>]| match parts {
@@ -369,12 +369,26 @@ struct ScopeCol {
     star: bool,
     /// The base column it reads, for the RowDescription (RP-087).
     source: Option<(i64, i16)>,
+    /// The qualifier a reference names it by: its FROM item's alias, the
+    /// alias of an aliased JOIN above it, a USING join's alias for a merged
+    /// column, or empty when no qualifier reaches it (a merged column of a
+    /// join with no alias, a column an aliased JOIN does not list). `alias`
+    /// stays the leaf's, which its key is built from.
+    qual: String,
 }
 
 #[derive(Debug, Clone, Default)]
 struct Scope {
     cols: Vec<ScopeCol>,
     aliases: Vec<String>,
+    /// The names of FROM items an aliased JOIN hides (`(a join b) as j`
+    /// hides `a` and `b`): PostgreSQL's "invalid reference to FROM-clause
+    /// entry", as the range table still has them (`errorMissingRTE`).
+    hidden: Vec<String>,
+    /// Which of `aliases` are a USING join's alias (`join b using (x) as
+    /// u`), which is no range table entry: an aliased JOIN above it drops
+    /// it rather than hiding it.
+    using_aliases: Vec<String>,
 }
 
 impl Scope {
@@ -412,20 +426,47 @@ impl Scope {
             }
             Some(alias) => {
                 if !self.aliases.contains(alias) {
-                    return Err(Error::Sqlstate(
-                        "42P01",
-                        format!("missing FROM-clause entry for table \"{alias}\""),
-                    ));
+                    return Err(self.missing_entry(alias));
                 }
-                self.cols
+                let hits: Vec<&ScopeCol> = self
+                    .cols
                     .iter()
-                    .find(|c| &c.alias == alias && &c.name == name)
-                    .map(|c| Some(c.key.clone()))
-                    .ok_or_else(|| {
-                        Error::Sqlstate("42703", format!("column {alias}.{name} does not exist"))
-                    })
+                    .filter(|c| &c.qual == alias && &c.name == name)
+                    .collect();
+                match hits.as_slice() {
+                    [] => Err(Error::Sqlstate(
+                        "42703",
+                        format!("column {alias}.{name} does not exist"),
+                    )),
+                    [one] => Ok(Some(one.key.clone())),
+                    // An aliased JOIN lists a name each side has twice
+                    // (`scanNSItemForColumn`).
+                    _ => Err(Error::Sqlstate(
+                        "42702",
+                        format!("column reference \"{name}\" is ambiguous"),
+                    )),
+                }
             }
         }
+    }
+
+    /// The 42P01 for a qualifier this scope has no visible entry for: an
+    /// entry an aliased JOIN hides is PostgreSQL's "invalid reference"
+    /// (`errorMissingRTE` finds it in the range table), any other a missing
+    /// one.
+    fn missing_entry(&self, alias: &str) -> Error {
+        if self.hidden.iter().any(|h| h == alias) {
+            return Error::Sqlstate(
+                "42P01",
+                format!(
+                    "invalid reference to FROM-clause entry for table \"{alias}\"\nHint: There is an entry for table \"{alias}\", but it cannot be referenced from this part of the query."
+                ),
+            );
+        }
+        Error::Sqlstate(
+            "42P01",
+            format!("missing FROM-clause entry for table \"{alias}\""),
+        )
     }
 }
 
@@ -557,6 +598,10 @@ fn build_tree(
         let left = (!items.is_empty()).then(|| scope.clone());
         let (node, item_scope) = build(item, lookup, params, &mut scope.aliases, left.as_ref())?;
         scope.cols.extend(item_scope.cols.iter().cloned());
+        scope.hidden.extend(item_scope.hidden.iter().cloned());
+        scope
+            .using_aliases
+            .extend(item_scope.using_aliases.iter().cloned());
         items.push((node, item_scope.cols));
     }
     if items.is_empty() {
@@ -1192,6 +1237,7 @@ fn lateral_leaf(
             format!("table name \"{alias}\" specified more than once"),
         ));
     }
+    hidden_reuse(aliases, &alias)?;
     aliases.push(alias.clone());
     let sql = pg_query::protobuf::Node {
         node: Some(N::SelectStmt(Box::new(inner))),
@@ -1201,6 +1247,7 @@ fn lateral_leaf(
     let mut scope = Scope {
         cols: Vec::new(),
         aliases: vec![alias.clone()],
+        ..Default::default()
     };
     let mut columns = Vec::new();
     for (i, c) in def.columns.iter().enumerate() {
@@ -1215,6 +1262,7 @@ fn lateral_leaf(
             bare: true,
             star: true,
             source: c.source,
+            qual: alias.clone(),
         });
     }
     Ok(Some((
@@ -1550,10 +1598,12 @@ fn leaf_with_names(
             format!("table name \"{alias}\" specified more than once"),
         ));
     }
+    hidden_reuse(aliases, alias)?;
     aliases.push(alias.to_string());
     let mut scope = Scope {
         cols: Vec::new(),
         aliases: vec![alias.to_string()],
+        ..Default::default()
     };
     let mut columns = Vec::new();
     for (i, name) in names.iter().enumerate() {
@@ -1567,6 +1617,7 @@ fn leaf_with_names(
             bare: true,
             star: true,
             source: typed.columns[i].source,
+            qual: alias.to_string(),
         });
     }
     Ok((
@@ -1587,9 +1638,10 @@ fn build_join(
     outer_left: Option<&Scope>,
 ) -> Result<(JoinNode, Scope)> {
     use pg_query::protobuf::JoinType;
-    if j.alias.is_some() {
-        return Err(Error::Unsupported("an aliased JOIN".into()));
-    }
+    // An aliased join's sides register their names apart: the alias hides
+    // them (`transformFromClauseItem` gives the join's namespace only its
+    // own item), so they conflict with nothing outside it.
+    let mut outer_registry = j.alias.is_some().then(|| std::mem::take(aliases));
     let kind = match JoinType::try_from(j.jointype) {
         Ok(JoinType::JoinInner) => JoinKind::Inner,
         Ok(JoinType::JoinLeft) => JoinKind::Left,
@@ -1676,7 +1728,10 @@ fn build_join(
     let nonnullable = |scope: &Scope| {
         NONNULLABLE.with(|n| {
             let n = n.borrow();
-            scope.cols.iter().any(|c| n.contains(&c.alias))
+            scope
+                .cols
+                .iter()
+                .any(|c| n.contains(&c.alias) || (!c.qual.is_empty() && n.contains(&c.qual)))
         })
     };
     let kind = match kind {
@@ -1766,6 +1821,13 @@ fn build_join(
             bare: true,
             star: true,
             source,
+            // `join ... using (a) as u` names its merged columns `u.a`
+            // (PostgreSQL 14's `join_using_alias`); nothing else does.
+            qual: j
+                .join_using_alias
+                .as_ref()
+                .map(|a| a.aliasname.clone())
+                .unwrap_or_default(),
         });
     }
     let mut scope = Scope {
@@ -1776,7 +1838,32 @@ fn build_join(
             .chain(&rscope.aliases)
             .cloned()
             .collect(),
+        hidden: lscope
+            .hidden
+            .iter()
+            .chain(&rscope.hidden)
+            .cloned()
+            .collect(),
+        using_aliases: lscope
+            .using_aliases
+            .iter()
+            .chain(&rscope.using_aliases)
+            .cloned()
+            .collect(),
     };
+    if let Some(u) = j.join_using_alias.as_ref() {
+        // The USING alias is an entry of the join's namespace beside its
+        // sides' (`checkNameSpaceConflicts`).
+        if aliases.contains(&u.aliasname) {
+            return Err(Error::Sqlstate(
+                "42712",
+                format!("table name \"{}\" specified more than once", u.aliasname),
+            ));
+        }
+        aliases.push(u.aliasname.clone());
+        scope.aliases.push(u.aliasname.clone());
+        scope.using_aliases.push(u.aliasname.clone());
+    }
     for c in lscope.cols.iter().chain(&rscope.cols) {
         let mut c = c.clone();
         if hidden.contains(&c.key) {
@@ -1819,14 +1906,16 @@ fn build_join(
         }
         Some(quals) => {
             let mut q = quals.clone();
+            // A join with an ON has no merged columns of its own; a nested
+            // USING join's are visible in it, as any column of its sides is
+            // (`transformJoinOnClause`): `(a join b using (x)) as j join c on
+            // j.x = c.x`, and `a join b using (x) join c on x = c.x` is
+            // 42702.
             let side_scope = Scope {
-                cols: scope
-                    .cols
-                    .iter()
-                    .filter(|c| !c.key.starts_with(SEP))
-                    .cloned()
-                    .collect(),
+                cols: scope.cols.clone(),
                 aliases: scope.aliases.clone(),
+                hidden: scope.hidden.clone(),
+                using_aliases: scope.using_aliases.clone(),
             };
             rewrite_expr(&mut q, &side_scope, &[])?;
             on_aliases = key_aliases(&q);
@@ -1900,6 +1989,10 @@ fn build_join(
     } else {
         (kind, left, right, left_keys, right_keys)
     };
+    if let (Some(alias), Some(outer)) = (j.alias.as_ref(), outer_registry.as_mut()) {
+        apply_join_alias(alias, &mut scope, aliases, outer)?;
+        *aliases = std::mem::take(outer);
+    }
     Ok((
         JoinNode::Join {
             kind,
@@ -1926,6 +2019,100 @@ fn build_join(
             right_keys,
         },
         scope,
+    ))
+}
+
+/// `(a join b) as j(x, ...)`: the join becomes one entry named `j`, its
+/// columns those `*` lists (the merged ones, then each side's others),
+/// renamed in order by the column aliases given (`transformFromClauseItem`).
+/// The sides' own names are hidden from everything outside the join; a
+/// column `*` does not list (a side's copy of a USING column) is reached
+/// by no name at all. Keys are untouched: the join reads its rows as before.
+fn apply_join_alias(
+    alias: &pg_query::protobuf::Alias,
+    scope: &mut Scope,
+    own: &[String],
+    registry: &mut Vec<String>,
+) -> Result<()> {
+    let name = &alias.aliasname;
+    let renames: Vec<String> = alias
+        .colnames
+        .iter()
+        .filter_map(|n| match n.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    let available = scope.cols.iter().filter(|c| c.star).count();
+    if renames.len() > available {
+        return Err(Error::Sqlstate(
+            "42P10",
+            format!(
+                "join expression \"{name}\" has {available} columns available but {} columns specified",
+                renames.len()
+            ),
+        ));
+    }
+    // The sides' entries leave the namespace: a table's is marked, not
+    // dropped, so that another FROM item of its name is caught (see
+    // `hidden_reuse`); a USING alias, no table, simply goes.
+    for entry in own {
+        if scope.using_aliases.contains(entry) {
+            continue;
+        }
+        let name = entry.strip_prefix(SEP).unwrap_or(entry);
+        if registry
+            .iter()
+            .any(|e| e.strip_prefix(SEP).unwrap_or(e) == name)
+        {
+            return Err(hidden_reuse_error(name));
+        }
+        registry.push(format!("{SEP}{name}"));
+    }
+    if registry.contains(name) {
+        return Err(Error::Sqlstate(
+            "42712",
+            format!("table name \"{name}\" specified more than once"),
+        ));
+    }
+    registry.push(name.clone());
+    let mut renames = renames.into_iter();
+    for c in &mut scope.cols {
+        if c.star {
+            if let Some(r) = renames.next() {
+                c.name = r;
+            }
+            c.qual = name.clone();
+            c.bare = true;
+        } else {
+            c.qual = String::new();
+            c.bare = false;
+        }
+    }
+    let using = std::mem::take(&mut scope.using_aliases);
+    let mut hidden: Vec<String> = std::mem::take(&mut scope.aliases)
+        .into_iter()
+        .filter(|a| !using.contains(a))
+        .collect();
+    hidden.append(&mut scope.hidden);
+    scope.hidden = hidden;
+    scope.aliases = vec![name.clone()];
+    Ok(())
+}
+
+/// A FROM item's name that an aliased JOIN beside it hides: the two leaves'
+/// keys would be one, so it is refused by name rather than read from the
+/// wrong rows (PostgreSQL allows it: `(a join b) as j, a`).
+fn hidden_reuse(registry: &[String], alias: &str) -> Result<()> {
+    if registry.iter().any(|e| e.strip_prefix(SEP) == Some(alias)) {
+        return Err(hidden_reuse_error(alias));
+    }
+    Ok(())
+}
+
+fn hidden_reuse_error(name: &str) -> Error {
+    Error::Unsupported(format!(
+        "a FROM item named \"{name}\" beside an aliased JOIN that hides that name"
     ))
 }
 
@@ -2283,16 +2470,13 @@ fn rewrite_query(s: &mut pg_query::protobuf::SelectStmt, scope: &Scope) -> Resul
             };
             if let Some(a) = &alias {
                 if !scope.aliases.contains(a) {
-                    return Err(Error::Sqlstate(
-                        "42P01",
-                        format!("missing FROM-clause entry for table \"{a}\""),
-                    ));
+                    return Err(scope.missing_entry(a));
                 }
             }
             for c in &scope.cols {
                 let take = match &alias {
                     None => c.star,
-                    Some(a) => &c.alias == a,
+                    Some(a) => &c.qual == a,
                 };
                 if take {
                     targets.push(pg_query::protobuf::Node {
@@ -2624,7 +2808,12 @@ pub(crate) fn hoist_inner_on_conjuncts(
         let Some(N::JoinExpr(j)) = item.node.as_mut() else {
             return;
         };
-        if j.jointype != pg_query::protobuf::JoinType::JoinInner as i32 || j.is_natural {
+        // An aliased JOIN's leaves are hidden from the WHERE, so none of
+        // its conjuncts (or those below it) can be written there.
+        if j.jointype != pg_query::protobuf::JoinType::JoinInner as i32
+            || j.is_natural
+            || j.alias.is_some()
+        {
             return;
         }
         for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
@@ -2785,6 +2974,9 @@ fn and_of(args: Vec<pg_query::protobuf::Node>) -> Option<pg_query::protobuf::Nod
 /// table not renamed column by column (`build`'s `RangeVar` arm).
 fn filtered_leaves(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
     match item.node.as_ref() {
+        // An aliased JOIN hides its leaves' names: a conjunct naming one is
+        // PostgreSQL's 42P01, which planning the WHERE reports, not a filter.
+        Some(N::JoinExpr(j)) if j.alias.is_some() => {}
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 filtered_leaves(side, out);
@@ -3157,6 +3349,7 @@ fn subtree_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
             }
         }
         Some(N::JoinExpr(j)) => {
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 subtree_aliases(side, out);
             }
@@ -3190,6 +3383,9 @@ fn stored_tables(
             out.push((alias, def));
             true
         }
+        // An aliased JOIN's columns are its own, perhaps renamed: a bare
+        // name is not looked up through it here.
+        Some(N::JoinExpr(j)) if j.alias.is_some() => false,
         Some(N::JoinExpr(j)) => {
             j.larg
                 .as_deref()
@@ -3214,6 +3410,9 @@ fn table_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
                 .unwrap_or_else(|| r.relname.clone()),
         ),
         Some(N::JoinExpr(j)) => {
+            // An aliased JOIN answers to its alias too (`where j.b is not
+            // null` proves its rows non-NULL).
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 table_aliases(side, out);
             }
@@ -3239,6 +3438,8 @@ fn preserved_aliases(
                 .filter(|a| !a.is_empty())
                 .unwrap_or_else(|| r.relname.clone()),
         ),
+        // A WHERE conjunct cannot name a leaf an aliased JOIN hides.
+        Some(N::JoinExpr(j)) if j.alias.is_some() => {}
         Some(N::JoinExpr(j)) => {
             let (l, r) = match JoinType::try_from(j.jointype) {
                 Ok(JoinType::JoinInner) => (false, false),

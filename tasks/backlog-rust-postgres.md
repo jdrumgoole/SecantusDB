@@ -1819,17 +1819,6 @@ and most of RP-193 in batch 48; their tests there are regression tests.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`, one row each.
 
-- [ ] **A join's alias is refused or not found.** `select u.a from fs join
-      fe using (a) as u` (the `USING ... AS` alias PostgreSQL 14 added) and
-      `select j.a from (fs join fe using (a)) as j` answer 1 on PostgreSQL
-      15.19. Here the first is 42P01 `missing FROM-clause entry for table
-      "u"`, the second 0A000 `an aliased JOIN is not supported yet`
-      (`joins.rs`), and inside a subquery the USING alias reaches the
-      correlated rewrite: `select (select u.a from fs join fe using (a) as
-      u limit 1)` is 42883 `function \x1fcorrelated(...) does not exist`,
-      naming the rewrite's internal function.
-      Backlog-ID: RP-454
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_join_alias
 
 ## Found while working RP-444 (2026-11-07)
 
@@ -1939,6 +1928,57 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       it too. Measured on PostgreSQL 15.19.
       Backlog-ID: RP-472
       Verify: tests/backlog/test_rp_from_function_runs_once.py::test_from_function_runs_once
+
+## Found while working RP-454 (2026-11-07)
+
+- [ ] **A FROM item named as a table an aliased JOIN hides is refused.**
+      An aliased JOIN hides its sides' names, so PostgreSQL 15.19 lets
+      another FROM item reuse one: `select * from (fs join fe using (a)) as
+      j, fs` and `select * from fs, (fs join fe using (a)) as j` each answer
+      their row. Here each is 0A000 `a FROM item named "fs" beside an
+      aliased JOIN that hides that name is not supported yet`: a joined row
+      is keyed by its table's alias (`alias<U+001F>column`), so the two `fs`
+      leaves would share their keys. Fixing it needs leaf keys that are not
+      the alias the query wrote.
+      Backlog-ID: RP-469
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused
+- [ ] **A whole-row reference to a joined table is not found.** `select fs
+      from fs, fe` and `select fs from fs join fe using (a)` answer `(1,y)`
+      on PostgreSQL 15.19, `select fe.*::text from fs join fe using (a)`
+      `(1,x)`, and `select j from (fs join fe using (a)) as j` the join's
+      row. Here the first two and the last are 42703 `column "fs" does not
+      exist`, and the cast star 42P01 `invalid reference to FROM-clause
+      entry for table "fe"`. A lone table's whole row already works.
+      Backlog-ID: RP-470
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_over_a_join
+- [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
+      above the join.** PostgreSQL flattens a join alias's columns to the
+      sides' own (`flatten_join_alias_vars`), so `explain (costs off)
+      select j.c from (fs join fe on fs.a = fe.a) as j where j.b = 'x'`
+      prints the unaliased query's plan: `Hash Cond: (fs.a = fe.a)` and
+      `Filter: (b = 'x'::text)` on `fe`'s scan. Here neither line is
+      printed: the WHERE pushdown and the equivalence classes
+      (`pushdown_filters`) stop at an aliased JOIN, as a conjunct naming
+      `j` has no leaf to go to. The rows are right; the plan text is not.
+      Backlog-ID: RP-471
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
+- [ ] **`pg_get_viewdef` of an aliased JOIN returns the view's text.**
+      PostgreSQL 15.19 prints `(fs JOIN fe USING (a)) j` with its alias, a
+      column list when the join's names repeat (`j(a, c, a_1, b)` over an
+      ON join), and a USING alias's column by the left side's name
+      (`SELECT fs.a FROM (fs JOIN fe USING (a) AS u)`). `ruleutils.rs`
+      gives up on an aliased JOIN (`collect_rtes`) and falls back to the
+      statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
+      Backlog-ID: RP-467
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
+- [ ] **A correlated subquery reading a join's column gets text.** `select
+      (select fs.a from fe where fe.a = fs.a) from fs join fe using (a)`
+      answers the integer 1 on PostgreSQL 15.19, as do the same read through
+      a join's alias (`j.a`) and a USING alias (`u.a`). Here each is the text
+      `'1'`: RP-453's lookup of an outer reference's type covers tables,
+      FROM-subqueries, CTEs and a write's target, not a column of a join.
+      Backlog-ID: RP-468
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_join_column_in_a_subquery_keeps_its_type
 
 ## Found while working RP-316 (2026-11-02)
 
