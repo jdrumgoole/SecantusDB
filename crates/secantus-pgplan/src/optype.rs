@@ -48,6 +48,10 @@ type Lookup<'p> = &'p dyn Fn(&str) -> Option<TableDef>;
 struct Scope<'p> {
     tables: Vec<(String, TableDef)>,
     complete: bool,
+    /// A FROM relation the catalog lookup did not find -- missing, or one
+    /// this check does not type. PostgreSQL resolves the FROM list before
+    /// the clauses, so a missing relation's 42P01 comes first.
+    unresolved: bool,
     parent: Option<&'p Scope<'p>>,
     /// The catalog and CTEs in view, to type a scalar subquery's column.
     lookup: Option<Lookup<'p>>,
@@ -64,6 +68,7 @@ impl<'p> Scope<'p> {
         let mut scope = Scope {
             tables: Vec::new(),
             complete: true,
+            unresolved: false,
             parent,
             lookup: Some(lookup),
             ctes: ctes.to_vec(),
@@ -72,6 +77,12 @@ impl<'p> Scope<'p> {
             scope.add(item, ctes, lookup);
         }
         scope
+    }
+
+    /// Does this scope, or one it is nested in, have a FROM relation the
+    /// lookup did not find?
+    fn relation_unresolved(&self) -> bool {
+        self.unresolved || self.parent.is_some_and(|p| p.relation_unresolved())
     }
 
     fn add(
@@ -141,7 +152,10 @@ impl<'p> Scope<'p> {
                             .unwrap_or_else(|| r.relname.clone());
                         self.tables.push((alias, def));
                     }
-                    None => self.complete = false,
+                    None => {
+                        self.complete = false;
+                        self.unresolved = true;
+                    }
                 }
             }
             // A function in FROM: typed by planning `SELECT * FROM f(...)`,
@@ -1137,6 +1151,13 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
     let Some(node) = n.node.as_ref() else {
         return Ok(());
     };
+    // `ParseFuncOrColumn` coerces an aggregate's FILTER before it looks the
+    // function up.
+    if let N::FuncCall(f) = node {
+        if let Some(filter) = f.agg_filter.as_deref() {
+            unknown_as_boolean(filter, scope)?;
+        }
+    }
     match node {
         N::AExpr(e) => {
             check_aexpr(e, scope)?;
@@ -1269,6 +1290,17 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             }
         }
         N::CaseExpr(c) => {
+            // A searched CASE coerces each WHEN to boolean as it is
+            // transformed, before the results' common type is chosen.
+            if c.arg.is_none() {
+                for w in &c.args {
+                    if let Some(N::CaseWhen(w)) = w.node.as_ref() {
+                        if let Some(e) = w.expr.as_deref() {
+                            unknown_as_boolean(e, scope)?;
+                        }
+                    }
+                }
+            }
             // PostgreSQL resolves the ELSE first, then each THEN in order.
             let mut parts: Vec<&pg_query::protobuf::Node> =
                 c.defresult.as_deref().into_iter().collect();
@@ -1302,6 +1334,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 let mut on = Scope {
                     tables: Vec::new(),
                     complete: true,
+                    unresolved: false,
                     parent: scope.parent,
                     lookup: Some(cx.lookup),
                     ctes: cx.ctes.clone(),
@@ -1310,6 +1343,9 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                     on.add(side, &cx.ctes, cx.lookup);
                 }
                 walk(q, &on, cx)?;
+                // Judged in the whole FROM list's scope: a relation missing
+                // anywhere in it leaves the literal to the planner.
+                unknown_as_boolean(q, scope)?;
             }
         }
         N::SubLink(sl) => {
@@ -2102,8 +2138,11 @@ fn common_type_check(
 /// token, after the clause's own expression was analysed (PostgreSQL's
 /// `transformWhereClause` transforms it first). Lowered as it stood, the
 /// clause matched no row and the statement answered an empty result. An
-/// untyped literal or NULL, or a type this does not judge, is left alone.
+/// untyped literal that is no boolean is `boolin`'s 22P02; NULL, or a type
+/// this does not judge, is left alone.
 fn clause_is_boolean(n: &pg_query::protobuf::Node, scope: &Scope, clause: &str) -> Result<()> {
+    // An untyped literal is read by `boolin` (RP-424, `bool_clauses`).
+    unknown_as_boolean(n, scope)?;
     let Some(t) = operand_type(n, scope) else {
         return Ok(());
     };
@@ -2120,6 +2159,17 @@ fn clause_is_boolean(n: &pg_query::protobuf::Node, scope: &Scope, clause: &str) 
     )))
 }
 
+/// `coerce_to_boolean` of an untyped literal: 22P02 when `boolin` cannot
+/// read it (`bool_clauses`). Not in a scope whose FROM list has a relation
+/// the lookup did not find, whose own error comes first; the planner reads
+/// the literal there.
+fn unknown_as_boolean(n: &pg_query::protobuf::Node, scope: &Scope) -> Result<()> {
+    if scope.relation_unresolved() {
+        return Ok(());
+    }
+    crate::bool_clauses::check(n)
+}
+
 /// An argument of AND / OR / NOT must be boolean: a typed operand of
 /// another built-in type is 42804 at that operand.
 fn bool_argument(
@@ -2128,6 +2178,7 @@ fn bool_argument(
     scope: &Scope,
 ) -> Result<()> {
     use pg_query::protobuf::BoolExprType;
+    unknown_as_boolean(arg, scope)?;
     let Some(t) = operand_type(arg, scope) else {
         return Ok(());
     };

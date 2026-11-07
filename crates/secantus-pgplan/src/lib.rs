@@ -54,6 +54,7 @@ mod typmod_cast;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
+mod bool_clauses;
 mod builtin_alias;
 mod builtins;
 mod builtins_regex;
@@ -4669,6 +4670,8 @@ fn rewrite_statement(node: &mut N) -> Result<()> {
     unknown_args::check_ambiguous(node)?;
     cancel::check()?;
     unknown_args::rewrite(node);
+    cancel::check()?;
+    bool_clauses::rewrite(node);
     cancel::check()?;
     srf_place::check(node)?;
     cancel::check()?;
@@ -34657,11 +34660,10 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         "bool" | "boolean" => match &value {
             Bson::Boolean(_) => Ok(value),
             Bson::Int32(i) => Ok(Bson::Boolean(*i != 0)),
-            Bson::String(s) => match s.trim().to_ascii_lowercase().as_str() {
-                "t" | "true" | "y" | "yes" | "on" | "1" => Ok(Bson::Boolean(true)),
-                "f" | "false" | "n" | "no" | "off" | "0" => Ok(Bson::Boolean(false)),
-                _ => Err(bad("boolean", &value)),
-            },
+            // `boolin`: a prefix of `true` / `false` / `yes` reads too.
+            Bson::String(s) => bool_clauses::bool_in(s)
+                .map(Bson::Boolean)
+                .ok_or_else(|| bad("boolean", &value)),
             // PostgreSQL casts only `integer` and text to boolean; a bigint,
             // numeric, double or date has no cast at all (42846), which is a
             // different error from a text that will not parse (22P02).
@@ -39433,6 +39435,9 @@ fn lower_where_plain(
         Some(N::AConst(_) | N::TypeCast(_) | N::ParamRef(_))
     ) && !references_columns(node)
     {
+        // An untyped literal `boolin` cannot read, where analysis did not
+        // judge it (RP-424): one that reads was rewritten to its boolean.
+        bool_clauses::check(node)?;
         return Ok(match const_value(node, params)? {
             Bson::Boolean(true) => Document::new(),
             Bson::Boolean(false) | Bson::Null => doc! { "_id": { "$in": [] } },
