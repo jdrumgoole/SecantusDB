@@ -290,6 +290,10 @@ struct Interp<'a> {
     set_rows: Vec<Vec<Bson>>,
     row_count: u64,
     found_no: Option<usize>,
+    /// The datums of the function's own level end here: the parameters,
+    /// FOUND, and a trigger's NEW and OLD, which libpg_query's compile makes
+    /// after FOUND. `None` without a FOUND.
+    function_level: Option<usize>,
     /// The error a handler is running for: `RAISE;` re-raises it.
     handling: Option<PlError>,
     /// Bound cursors' queries, by datum number (`open_cursor`).
@@ -746,6 +750,13 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         set_rows: Vec::new(),
         row_count: 0,
         found_no,
+        function_level: found_no.map(|found| {
+            ["new_varno", "old_varno"]
+                .iter()
+                .filter_map(|k| f.get(*k).and_then(Value::as_u64))
+                .map(|n| n as usize + 1)
+                .fold(found + 1, usize::max)
+        }),
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
         cursor_options: open_cursor::cursor_options(&f),
@@ -791,6 +802,13 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
             .iter()
             .position(|s| s.vars.iter().any(|(_, d)| *d == i));
         interp.active = block.map(|k| interp.chain(k)).unwrap_or_default();
+        // Its own level holds only what is declared before it: in
+        // `declare y int := x; x int;` the `x` is an outer one.
+        if let Some(own) = interp.active.last_mut() {
+            if let Some(at) = own.vars.iter().position(|(_, d)| *d == i) {
+                own.vars.truncate(at);
+            }
+        }
         let v = interp.eval_typed(&e, i);
         interp.active.clear();
         interp.set_var(i, v?)?;
@@ -1295,14 +1313,10 @@ impl Interp<'_> {
         if let Some(v) = self.trigger_scalar(name) {
             return Some(v);
         }
-        for d in self.datums.iter().rev() {
-            if let Datum::Var { name: n, ty, value } = d {
-                if n == name {
-                    return Some((value.clone(), ty.clone()));
-                }
-            }
+        match self.datums.get(self.named(name)?)? {
+            Datum::Var { ty, value, .. } => Some((value.clone(), ty.clone())),
+            _ => None,
         }
-        None
     }
 
     /// `label.name` where `label` is the function's own name: the variables
@@ -1364,10 +1378,10 @@ impl Interp<'_> {
     }
 
     fn record(&self, name: &str) -> Option<&Record> {
-        self.datums.iter().rev().find_map(|d| match d {
-            Datum::Rec { name: n, rec } if n == name => rec.as_ref(),
+        match self.datums.get(self.named(name)?)? {
+            Datum::Rec { rec, .. } => rec.as_ref(),
             _ => None,
-        })
+        }
     }
 
     /// The type of `field` in a trigger's NEW or OLD that this operation
@@ -1401,11 +1415,10 @@ impl Interp<'_> {
     /// innermost one of that name)?
     fn unassigned_record(&self, name: &str) -> bool {
         self.trigger.is_none()
-            && self.datums.iter().rev().find_map(|d| match d {
-                Datum::Rec { name: n, rec } if n == name => Some(rec.is_none()),
-                Datum::Var { name: n, .. } if n == name => Some(false),
-                _ => None,
-            }) == Some(true)
+            && matches!(
+                self.named(name).and_then(|d| self.datums.get(d)),
+                Some(Datum::Rec { rec: None, .. })
+            )
     }
 
     fn record_field(&self, name: &str, field: &str) -> Option<(Bson, String)> {
@@ -1713,11 +1726,20 @@ impl Interp<'_> {
                         .cloned()
                         .unwrap_or_default();
                     if conds.iter().any(|c| condition_matches(c, &err.sqlstate)) {
+                        // SQLSTATE and SQLERRM are a level of their own,
+                        // which the handler runs in.
+                        let depth = self.active.len();
+                        if let Some(level) =
+                            block_scope::scope_of(body).and_then(|k| self.handler_level(k))
+                        {
+                            self.active.push(level);
+                        }
                         self.set_named("sqlstate", Bson::String(err.sqlstate.clone()));
                         self.set_named("sqlerrm", Bson::String(err.message.clone()));
                         let previous = self.handling.replace(err.clone());
                         let flow = self.stmts(h.get("action").unwrap_or(&Value::Null));
                         self.handling = previous;
+                        self.active.truncate(depth);
                         return flow;
                     }
                 }
@@ -1902,6 +1924,7 @@ impl Interp<'_> {
                     label: label.clone(),
                     vars: vec![(name, slot)],
                     parent: None,
+                    handler: Vec::new(),
                 });
                 let mut i = lower;
                 let result = loop {
@@ -2209,10 +2232,10 @@ impl Interp<'_> {
                         ));
                     };
                     let value = values.get(k).cloned().unwrap_or(Bson::Null);
-                    let ty = self.datums.iter().rev().find_map(|d| match d {
-                        Datum::Var { name, ty, .. } if name == var => Some(ty.clone()),
+                    let ty = match self.named(var).and_then(|d| self.datums.get(d)) {
+                        Some(Datum::Var { ty, .. }) => Some(ty.clone()),
                         _ => None,
-                    });
+                    };
                     let value = match (ty, &value) {
                         (_, Bson::Null) | (None, _) => value,
                         (Some(t), _) => self.cast(value, &t)?,
@@ -2247,17 +2270,12 @@ impl Interp<'_> {
         }
     }
 
+    /// Set the variable a bare `name` names where the statement runs.
     fn set_named(&mut self, name: &str, value: Bson) {
-        for d in self.datums.iter_mut().rev() {
-            if let Datum::Var {
-                name: n, value: v, ..
-            } = d
-            {
-                if n == name {
-                    *v = value;
-                    return;
-                }
-            }
+        if let Some(Datum::Var { value: v, .. }) =
+            self.named(name).and_then(|d| self.datums.get_mut(d))
+        {
+            *v = value;
         }
     }
 

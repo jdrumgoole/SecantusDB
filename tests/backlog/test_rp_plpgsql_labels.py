@@ -3,10 +3,12 @@
 RP-463 (fixed): a block's label qualifies the variables its DECLARE section
 declares, and a FOR loop's label its loop variable, as `plpgsql_ns_lookup`
 searches the namespace from the innermost level out. Found while working
-it: RP-486 (a DO block with a label is a syntax error), RP-487 (a bare name
-read after an inner block or a FOR loop ends is the inner level's variable) and RP-488
-(an expression's error in a PL/pgSQL statement carries no QUERY and no
-internal position).
+it: RP-486 (a DO block with a label is a syntax error), RP-487 (fixed: a
+bare name read after an inner block or a FOR loop ends was the inner
+level's variable) and RP-488 (an expression's error in a PL/pgSQL statement
+carries no QUERY and no internal position). Found while working RP-487:
+RP-491 (a block's variables are initialised once, when the function starts,
+not each time the block is entered).
 
 An answer is the rows, or `(sqlstate, message)` for an error. The expected
 answers were measured on a private, freshly initdb'd PostgreSQL 15.19
@@ -61,6 +63,22 @@ _BODIES = {
     # A handler outside a FOR loop reads the block's i, not the loop's.
     "lb22()": "declare i int := 7; begin begin for i in 1..1 loop"
     " perform 1/0; end loop; exception when others then return i; end; end",
+    # A default reads its own level's names declared before it only.
+    "lb23()": "declare x int := 1; begin declare y int := x; x int := 3;"
+    " begin return y || ',' || x; end; end",
+    # SQLSTATE after a nested handler ends is the outer handler's.
+    "lb24()": "begin begin perform 1/0; exception when others then begin raise"
+    " exception 'inner'; exception when others then null; end; return sqlstate; end; end",
+    # A name only an ended block declared is no variable at all.
+    "lb25()": "begin declare z int := 1; begin null; end; return z; end",
+    # RP-491: a block's variables are initialised each time it is entered.
+    "lb30()": "declare x int := 1; begin x := 5; declare y int := x; begin return y; end; end",
+    "lb31()": "declare s text := ''; begin for i in 1..3 loop declare c int := 0;"
+    " begin c := c + 1; s := s || c; end; end loop; return s; end",
+    "lb32()": "declare s text := ''; begin for i in 1..2 loop declare c int;"
+    " begin s := s || coalesce(c, -1); c := 9; end; end loop; return s; end",
+    "lb33()": "declare s text := ''; begin for i in 1..2 loop declare c int := i * 10;"
+    " begin s := s || c || ';'; end; end loop; return s; end",
 }
 
 _SETUP = [
@@ -117,13 +135,40 @@ INNER_BLOCK_ENDED = {
     "select lb20()": [("1",)],
     "select lb21()": [("1",)],
     "select lb22()": [("7",)],
+    "select lb23()": [("1,3",)],
+    "select lb24()": [("22012",)],
+    "select lb25()": ("42703", 'column "z" does not exist'),
 }
 
 
-@pytest.mark.backlog("RP-487")
+@pytest.mark.backlog_fixed("RP-487")
 @pytest.mark.parametrize("query", list(INNER_BLOCK_ENDED))
 def test_bare_name_after_inner_block(query: str, dsn: str) -> None:
+    """Was the inner level's variable (2, NULL, 1, P0001, 1 in turn): the
+    interpreter resolved a bare name against one flat list of datums, the
+    last of that name winning, so a block's variable outlived the block.
+    A bare name now goes through the levels being run, innermost first,
+    then the function's own, as `plpgsql_ns_lookup` does."""
     assert answer(dsn, query) == INNER_BLOCK_ENDED[query]
+
+
+BLOCK_ENTRY = {
+    "select lb30()": [("5",)],
+    "select lb31()": [("111",)],
+    "select lb32()": [("-1-1",)],
+    "select lb33()": [("10;20;",)],
+}
+
+
+@pytest.mark.backlog("RP-491")
+@pytest.mark.parametrize("query", list(BLOCK_ENTRY))
+def test_block_initialises_its_variables_on_entry(query: str, dsn: str) -> None:
+    """`exec_stmt_block` sets each variable the block declares to its
+    default (or NULL) every time the block is entered. Here every default
+    is evaluated once, before the body runs: 1, 123, -19, and 42703
+    `column "i" does not exist` for a default reading a FOR loop's
+    variable."""
+    assert answer(dsn, query) == BLOCK_ENTRY[query]
 
 
 def _do(dsn: str, body: str) -> Any:

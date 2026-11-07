@@ -1888,20 +1888,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       reads labels (RP-463) -- the same body as a function runs.
       Verify: tests/backlog/test_rp_plpgsql_labels.py::test_do_block_with_a_label
       Backlog-ID: RP-486
-- [ ] **After an inner block ends, a bare name reads the inner block's
-      variable.** `<<o>> declare x int := 1; begin declare x int := 2; begin
-      null; end; return x; end` returns 1 on PostgreSQL 15.19 and 2 here, a
-      silent wrong answer; and `declare i int := 7; begin begin for i in
-      1..1 loop perform 1/0; end loop; exception when others then return
-      i; end; end` returns 7 there and NULL here, the loop's own `i`. The
-      interpreter resolves an unqualified name
-      against one flat list of datums, the last of that name winning
-      (`Interp::scalar`), so a block's variable outlives the block. Since
-      RP-463 the run keeps PostgreSQL's namespace levels (`block_scope`)
-      for labels; the faithful fix resolves a bare name through them too,
-      innermost level first, as `plpgsql_ns_lookup` does.
-      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_bare_name_after_inner_block
-      Backlog-ID: RP-487
 - [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
       no internal position.** `do $$ declare x int; begin raise notice '%',
       nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends
@@ -1912,6 +1898,23 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       PostgreSQL sends none. Measured on a private 15.19 cluster.
       Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
       Backlog-ID: RP-488
+
+## Found while working RP-487 (2026-11-07)
+
+- [ ] **A block's variables are set once, when the function starts, not
+      each time the block is entered.** `exec_stmt_block` gives every
+      variable a block declares its default (or NULL) on each entry, so a
+      default reads the state at that moment and a block inside a loop
+      starts afresh each time. Here every default is evaluated before the
+      body runs: `declare x int := 1; begin x := 5; declare y int := x;
+      begin return y; end; end` returns 1 (PostgreSQL 15.19: 5); a loop
+      over a block declaring `c int := 0` that adds one to it returns
+      `123` (`111`); one declaring `c int` without a default sees the last
+      pass's value (`-19`, PostgreSQL `-1-1`); and a default reading the
+      loop's variable, `c int := i * 10`, is 42703 `column "i" does not
+      exist` (`10;20;`). Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_block_initialises_its_variables_on_entry
+      Backlog-ID: RP-491
 
 ## Found while working RP-483 (2026-11-07)
 

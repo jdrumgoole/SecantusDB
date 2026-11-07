@@ -16,8 +16,13 @@
 //! body, an EXCEPTION section's `sqlstate` / `sqlerrm` after the body.
 //!
 //! The result is stored in the parsed function: `__scopes`, one entry per
-//! block (`label`, `vars`: `[name, datum]` pairs, `parent`), and a
+//! block (`label`, `vars`: `[name, datum]` pairs, `parent`, and `handler`:
+//! the `sqlstate` / `sqlerrm` its EXCEPTION section declares), and a
 //! `__scope` index on each block statement, so a copy of the tree keeps it.
+//!
+//! The levels decide a bare name too: `x` is the variable of the innermost
+//! level being run that declares it, then the function's own (`Interp::named`),
+//! so a block's variable goes out of scope when the block ends.
 
 use super::*;
 
@@ -28,6 +33,9 @@ pub(super) struct Scope {
     pub(super) label: Option<String>,
     pub(super) vars: Vec<(String, usize)>,
     pub(super) parent: Option<usize>,
+    /// `sqlstate` and `sqlerrm`, which `pl_gram.y` declares at the block's
+    /// EXCEPTION in a level of their own: the one a handler runs in.
+    pub(super) handler: Vec<(String, usize)>,
 }
 
 /// What one DECLARE section declares, in order: each name, and for an
@@ -225,6 +233,7 @@ impl Builder<'_> {
                         .map(str::to_string),
                     vars: Vec::new(),
                     parent,
+                    handler: Vec::new(),
                 };
                 for (name, alias) in decls.0 {
                     let datum = match alias {
@@ -247,8 +256,11 @@ impl Builder<'_> {
                 {
                     // Made at EXCEPTION, after the body; a level of their
                     // own, which the block's label does not reach.
-                    self.take("sqlstate");
-                    self.take("sqlerrm");
+                    for name in ["sqlstate", "sqlerrm"] {
+                        if let Some(d) = self.take(name) {
+                            self.scopes[k].handler.push((name.to_string(), d));
+                        }
+                    }
                     if let Some(Value::Array(list)) = handlers.get_mut("exc_list") {
                         for h in list {
                             let action = h
@@ -336,6 +348,7 @@ pub(super) fn annotate(f: &mut Value, create_sql: &str) {
                 "label": s.label,
                 "vars": s.vars.iter().map(|(n, d)| serde_json::json!([n, d])).collect::<Vec<_>>(),
                 "parent": s.parent,
+                "handler": s.handler.iter().map(|(n, d)| serde_json::json!([n, d])).collect::<Vec<_>>(),
             })
         })
         .collect();
@@ -350,23 +363,28 @@ pub(super) fn scopes(f: &Value) -> Vec<Scope> {
         .and_then(Value::as_array)
         .map(|list| {
             list.iter()
-                .map(|s| Scope {
-                    label: s.get("label").and_then(Value::as_str).map(str::to_string),
-                    vars: s
-                        .get("vars")
-                        .and_then(Value::as_array)
-                        .map(|vs| {
-                            vs.iter()
-                                .filter_map(|v| {
-                                    Some((
-                                        v.get(0)?.as_str()?.to_string(),
-                                        v.get(1)?.as_u64()? as usize,
-                                    ))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                    parent: s.get("parent").and_then(Value::as_u64).map(|p| p as usize),
+                .map(|s| {
+                    let pairs = |key: &str| -> Vec<(String, usize)> {
+                        s.get(key)
+                            .and_then(Value::as_array)
+                            .map(|vs| {
+                                vs.iter()
+                                    .filter_map(|v| {
+                                        Some((
+                                            v.get(0)?.as_str()?.to_string(),
+                                            v.get(1)?.as_u64()? as usize,
+                                        ))
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    };
+                    Scope {
+                        label: s.get("label").and_then(Value::as_str).map(str::to_string),
+                        vars: pairs("vars"),
+                        parent: s.get("parent").and_then(Value::as_u64).map(|p| p as usize),
+                        handler: pairs("handler"),
+                    }
                 })
                 .collect()
         })
@@ -393,6 +411,42 @@ impl Interp<'_> {
                 .rev()
                 .find(|(n, _)| n == name)
                 .map(|(_, d)| *d)
+        })
+    }
+
+    /// A bare `name`: the datum of the innermost level being run that
+    /// declares it, then of the function's own level (`function_level`), as `plpgsql_ns_lookup` searches outwards
+    /// with no qualifier. A variable of a block that has ended is in no
+    /// level, and so is not found. Without rebuilt levels (a body that does
+    /// not scan) it is the last datum of that name.
+    pub(super) fn named(&self, name: &str) -> Option<usize> {
+        let is = |d: &Datum| match d {
+            Datum::Var { name: n, .. } | Datum::Rec { name: n, .. } => n == name,
+            _ => false,
+        };
+        let (false, Some(end)) = (self.scopes.is_empty(), self.function_level) else {
+            return self.datums.iter().rposition(is);
+        };
+        if let Some(d) = self.active.iter().rev().find_map(|s| {
+            s.vars
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .map(|(_, d)| *d)
+        }) {
+            return Some(d);
+        }
+        self.datums.get(..end)?.iter().rposition(is)
+    }
+
+    /// The level a handler of block `k` runs in, beyond the block's own.
+    pub(super) fn handler_level(&self, k: usize) -> Option<Scope> {
+        let s = self.scopes.get(k)?;
+        (!s.handler.is_empty()).then(|| Scope {
+            label: None,
+            vars: s.handler.clone(),
+            parent: None,
+            handler: Vec::new(),
         })
     }
 
@@ -452,6 +506,30 @@ mod tests {
              begin perform 1/0; return '0'; exception when others then return o.x; end $$",
         );
         assert_eq!(l, vec![(Some("o".into()), vec![("x".into(), 1)])]);
+    }
+
+    #[test]
+    fn a_handler_level_holds_its_blocks_sqlstate_and_sqlerrm() {
+        // Three blocks: the outer one (x), a middle one with a handler, and
+        // the innermost (y) with its own. Datums: found, x, y, then the
+        // innermost EXCEPTION's sqlstate and sqlerrm (3, 4), made before the
+        // middle one's (5, 6), as the grammar reads the text.
+        let f = super::super::parsed(
+            "create function f() returns text language plpgsql as $$ declare x int; \
+             begin begin declare y int; begin perform 1/0; exception when others then null; end; \
+             exception when others then return sqlstate; end; end $$",
+        )
+        .unwrap();
+        let handlers: Vec<Vec<(String, usize)>> =
+            scopes(&f).into_iter().map(|s| s.handler).collect();
+        assert_eq!(
+            handlers,
+            vec![
+                vec![],
+                vec![("sqlstate".into(), 5), ("sqlerrm".into(), 6)],
+                vec![("sqlstate".into(), 3), ("sqlerrm".into(), 4)],
+            ]
+        );
     }
 
     #[test]
