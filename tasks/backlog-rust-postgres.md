@@ -1610,19 +1610,6 @@ a regression test.
       while working RP-424).
       Verify: tests/backlog/test_rp_where_types.py::test_target_list_is_analysed_before_where
       Backlog-ID: RP-429
-- [ ] **A simple CASE whose WHEN is typed in another category than its
-      argument is refused as a gap.** `select case 1 when true then 1
-      end`, `case b when 1` over a text `b` and `case a when b` over an
-      integer `a` and a text `b` answer `0A000 comparing int32 with boolean
-      using = is not supported yet` (and the string / int32 forms);
-      PostgreSQL 15.19's `transformCaseExpr` builds `CaseTestExpr = warg`
-      with `make_op`, which finds no operator and is 42883 `operator does
-      not exist: integer = boolean` (`text = integer`, `integer = text`) at
-      the WHEN, position 15. `optype`'s CASE arm checks only the untyped
-      WHEN literals against the argument (RP-433), not the typed ones'
-      category. Measured on PostgreSQL 15.19 (found while working RP-433).
-      Verify: tests/backlog/test_rp_where_types.py::test_simple_case_when_of_another_category_is_42883
-      Backlog-ID: RP-439
 - [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
       Scan of the target alone.** The statement is rewritten into
       correlated subqueries over its FROM items (`rewrite_dml_from`), and
@@ -1651,6 +1638,32 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
+- [ ] **A missing column inside an expression of a SELECT with no FROM is
+      refused as a gap.** A bare `select nosuch` is 42703 on both, but
+      `select 1 + nosuch`, `select -nosuch`, `select coalesce(nosuch, 1)`
+      and a CASE naming it as argument, WHEN or THEN answer `0A000
+      ColumnRef is not supported yet`, and `select abs(nosuch)` 42883
+      `function abs(text) does not exist` (the name read as an untyped
+      value). PostgreSQL 15.19's `transformColumnRef` finds nothing in the
+      empty range table: 42703 `column "nosuch" does not exist` at the
+      name, no HINT. A client matching on the class reads a missing
+      feature where it made a mistake. Measured on PostgreSQL 15.19 (found
+      while working RP-439).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_in_an_expression_with_no_from
+      Backlog-ID: RP-441
+- [ ] **A cast literal's input error is reported after the operator
+      around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
+      input function as the cast is transformed, before `make_op` looks the
+      operator up, so `select 'x'::int = true` is 22P02 `invalid input
+      syntax for type integer: "x"` at 8, `select 1 = 'x'::uuid` 22P02 at
+      12 and `select '2020-13-01'::date = 1` 22008 at 8; here each is the
+      operator's 42883 (`integer = boolean`, `integer = uuid`, `date =
+      integer`), from `optype` checking operand types before any cast's
+      value is read. The same in a simple CASE (`case 'x'::uuid when 1`).
+      A lone cast is 22P02 on both. Measured on PostgreSQL 15.19 (found
+      while working RP-439).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_cast_literal_input_error_before_operator
+      Backlog-ID: RP-442
 - [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
       missing function or a bad literal.** PostgreSQL 15.19 analyses the
       statement before `ExplainQuery` reads an option, so `explain (bogus)

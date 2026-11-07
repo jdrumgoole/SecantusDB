@@ -2485,6 +2485,64 @@ fn simple_case_reads_an_untyped_when_as_its_argument_type() {
     );
 }
 
+/// A simple CASE resolves `argument = WHEN` against `pg_operator`, so a
+/// TYPED WHEN of another category has no operator: 42883 at the WHEN keyword
+/// (RP-439), as `transformCaseExpr`'s `make_op` answers. Each measured on
+/// PostgreSQL 15.19 (`position` there is this 0-based location plus one);
+/// every one was 0A000 `comparing ... is not supported yet` before.
+#[test]
+fn simple_case_refuses_a_when_with_no_equality_to_its_argument() {
+    for (sql, want, at) in [
+        (
+            "select case 1 when true then 1 end",
+            "operator does not exist: integer = boolean",
+            14,
+        ),
+        (
+            "select case 'a'::text when 1 then 1 end",
+            "operator does not exist: text = integer",
+            22,
+        ),
+        // An untyped argument is coerced to text first.
+        (
+            "select case 'a' when 1 then 1 end",
+            "operator does not exist: text = integer",
+            16,
+        ),
+        // The first WHEN with no operator, in order.
+        (
+            "select case 1 when 2 then 1 when true then 2 end",
+            "operator does not exist: integer = boolean",
+            28,
+        ),
+        (
+            "select case 1 when null::bool then 1 else 0 end",
+            "operator does not exist: integer = boolean",
+            14,
+        ),
+        (
+            "select case true when 1 then 1 end",
+            "operator does not exist: boolean = integer",
+            17,
+        ),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42883", "for {sql} (got {err})");
+        assert!(err.to_string().contains(want), "for {sql}: {err}");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // Types an `=` joins still compare, across a category's members.
+    for sql in [
+        "select case 1::int2 when 1::int8 then 1 else 0 end",
+        "select case 'x'::varchar when 'x'::text then 1 else 0 end",
+        "select case 1::numeric when 1::float8 then 1 else 0 end",
+        "select case 1 when null then 1 else 0 end",
+    ] {
+        assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+}
+
 /// A built-in's RESULT TYPE is as much of the answer as its value.
 ///
 /// `sign` answers `float8` even for an integer argument; `nullif` answers its

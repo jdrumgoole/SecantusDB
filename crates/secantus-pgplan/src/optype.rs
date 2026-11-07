@@ -1600,12 +1600,47 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             // `make_op`), so an untyped WHEN literal takes the argument's
             // type, read by its input function as the WHEN is transformed:
             // `case a when 't'` over an integer is 22P02 at the literal,
-            // whether or not a row reaches it (RP-433).
-            if let Some(ty) = c.arg.as_deref().and_then(|a| operand_type(a, scope)) {
+            // whether or not a row reaches it (RP-433). A TYPED WHEN is
+            // resolved against `pg_operator` as `make_op` resolves it: no
+            // `=` between the two types (`case 1 when true`, a text
+            // argument against an integer WHEN) is 42883 at the WHEN
+            // (RP-439), where the evaluator's comparison was a 0A000.
+            // An untyped argument is coerced to text first (`case 'a' when
+            // 1` is `text = integer`).
+            let arg_type = c.arg.as_deref().and_then(|a| match a.node.as_ref() {
+                Some(N::AConst(k))
+                    if matches!(k.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                {
+                    Some("text".to_string())
+                }
+                _ => operand_type(a, scope),
+            });
+            if let Some(ty) = arg_type {
                 for w in &c.args {
                     if let Some(N::CaseWhen(w)) = w.node.as_ref() {
                         if let Some(e) = w.expr.as_deref() {
                             literal_fits(e, &ty)?;
+                            let untyped = matches!(e.node.as_ref(), Some(N::AConst(k))
+                                if matches!(k.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
+                            let wty = operand_type(e, scope)
+                                .filter(|_| !untyped && !user_ops::defines("="));
+                            if let Some(wty) = wty {
+                                if crate::funcsig::operator_resolves("=", &ty, &wty) == Some(false)
+                                {
+                                    return Err(mismatch("=", &ty, &wty, w.location));
+                                }
+                                if crate::funcsig::operator_ambiguous("=", &ty, &wty) {
+                                    set_error_location(w.location);
+                                    return Err(Error::Sqlstate(
+                                        "42725",
+                                        format!(
+                                            "operator is not unique: {} = {}",
+                                            display_type(&ty),
+                                            display_type(&wty)
+                                        ),
+                                    ));
+                                }
+                            }
                         }
                     }
                 }

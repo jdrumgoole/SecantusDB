@@ -248,22 +248,29 @@ def test_simple_case_types_untyped_when_from_its_argument(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-439")
+@pytest.mark.backlog_fixed("RP-439")
 def test_simple_case_when_of_another_category_is_42883(rust_pg: Any) -> None:
-    """A simple CASE's `CaseTestExpr = warg` has no operator when the WHEN
-    is typed in another category than the argument: PostgreSQL 15.19
-    refuses it at parse analysis with 42883, positioned at the WHEN."""
+    """A simple CASE's `CaseTestExpr = warg` had no operator when the WHEN
+    was typed in another category than the argument, and PostgreSQL 15.19
+    refuses it at parse analysis with 42883, positioned at the WHEN; an
+    untyped argument is coerced to text first, and the first WHEN with no
+    operator is the one named. Each was 0A000 `comparing ... is not
+    supported yet` before RP-439."""
     assert _positioned(
         rust_pg,
         [
             "select case 1 when true then 1 end",
             "select case b when 1 then 1 end from e",
             "select case a when b then 1 end from e",
+            "select case 'a' when 1 then 1 end",
+            "select case 1 when 2 then 1 when true then 2 end",
         ],
     ) == [
         ("err", "42883", "operator does not exist: integer = boolean", "15"),
         ("err", "42883", "operator does not exist: text = integer", "15"),
         ("err", "42883", "operator does not exist: integer = text", "15"),
+        ("err", "42883", "operator does not exist: text = integer", "17"),
+        ("err", "42883", "operator does not exist: integer = boolean", "29"),
     ]
 
 
