@@ -3677,3 +3677,94 @@ fn explain_refuses_what_parse_analysis_refuses() {
         assert_eq!(err.sqlstate(), want, "for {sql} (got {err})");
     }
 }
+
+#[test]
+fn a_join_on_after_a_comma_item_is_type_checked_in_its_own_scope() {
+    // RP-416: an ON sees only its join's two sides, so in `FROM e, s JOIN
+    // k ON b = k.a` the bare `b` is `k.b` (text) -- `e.b` is not in view
+    // -- and PostgreSQL 15.19 answers 42883 `text = integer`. Judged in
+    // the whole FROM's scope, `b` read as ambiguous and the ON ran.
+    let three = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "e" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+            "s" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            "k" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+                Column::new("bc", "int4", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    // The server's entry point: `plan` alone runs no operator check.
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> { Ok(Vec::new()) };
+    let plan = |q: &str, lookup: &dyn Fn(&str) -> Option<TableDef>| {
+        plan_with_subqueries(q, lookup, &[], &run)
+    };
+    for q in [
+        "select * from e, s join k on b = k.a",
+        "select * from s join k on b = k.a",
+        "select * from e, (s join k on b = k.a) j",
+        "select * from s join (e cross join k) on k.bc = s.c",
+    ] {
+        match plan(q, &three) {
+            Err(Error::UndefinedFunction(m)) => {
+                assert!(m.starts_with("operator does not exist: "), "{q}: {m}")
+            }
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+    // What must still plan: a well-typed ON after a comma item, and a
+    // later join's ON over the sides an earlier join built.
+    for q in [
+        "select * from e, s join k on c = k.b",
+        "select * from e, s join k on s.a = k.a",
+        "select * from e join s on e.a = s.a join k on k.b = e.b",
+    ] {
+        assert!(plan(q, &three).is_ok(), "{q}: {:?}", plan(q, &three).err());
+    }
+}
+
+/// A statement planned as the server plans it, parse analysis first.
+fn analysed(sql: &str) -> Result<Statement> {
+    plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new()))
+}
+
+#[test]
+fn an_insert_query_and_every_cte_body_are_type_checked() {
+    // `transformWithClause` analyses each CTE's query, used or not, and
+    // `transformInsertStmt` its SELECT: an operator with no overload for its
+    // operands is 42883 there as in a bare SELECT (RP-427). These planned,
+    // and answered no rows.
+    for q in [
+        "insert into t select * from t where n = true",
+        "with c as (select * from t where n = true) select * from c",
+        "with c as (select * from t where n = true) select 1",
+        "with c as (select name from t), d as (select * from c where name = 1) select 1",
+        "with c as (select name as z from t) insert into t (name) select z from c where z = 1",
+        "with c as (select * from t where n = true) update t set name = 'x'",
+        "with c as (select * from t where n = true) delete from t",
+        "with c as (update t set name = 'q' where n = true returning *) select * from c",
+        "select * from t where exists (with c as (select 1 as x where t.n = true) select * from c)",
+    ] {
+        let err = analysed(q).expect_err(q).to_string();
+        assert!(err.contains("operator does not exist"), "{q}: {err}");
+    }
+    // A CTE's own name, a shadowing CTE and a recursive one stay in view.
+    for q in [
+        "with recursive r(k) as (select 1 union all select k + 1 from r where k < 5) select * from r",
+        "with t as (select 'x'::text as a) select * from t where a = 'y'",
+        "with c as (select n from t) insert into t (n) select n from c where n > 8",
+    ] {
+        if let Err(e) = analysed(q) {
+            assert!(!e.to_string().contains("operator does not exist"), "{q}: {e}");
+        }
+    }
+}

@@ -2,7 +2,8 @@
 RP-408: RP-413 (a function in FROM leaves a 42703 with no HINT), RP-414 (a
 42703 names the wrong reference or drops its qualifier), RP-415 (a column
 in an INSERT's VALUES is refused as a gap) and RP-416 (a join's ON after a
-comma item is not type-checked).
+comma item was not type-checked; fixed), and RP-430, found while fixing
+RP-416 (a subquery's join ON cannot name the outer query).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. The expected answers were measured on a private,
@@ -162,13 +163,38 @@ _NO_OPERATOR = (
 )
 
 JOIN_ON = {
+    # An ON sees only its own join's sides, so `b` is `k.b` alone.
     "select * from e, s join k on b = k.a": (*_NO_OPERATOR, "32"),
+    "select * from e, (s join k on b = k.a) j": (*_NO_OPERATOR, "33"),
     # The same ON with no comma item before it, refused already.
     "select * from s join k on b = k.a": (*_NO_OPERATOR, "29"),
+    # A well-typed ON after a comma item still runs.
+    "select * from e, s join k on c = k.b": None,
 }
 
 
-@pytest.mark.backlog("RP-416")
+@pytest.mark.backlog_fixed("RP-416")
 @pytest.mark.parametrize("query", list(JOIN_ON))
 def test_join_on_after_comma_item_is_type_checked(query: str, dsn: str) -> None:
+    """A join's ON after a comma item was judged in the whole FROM's
+    scope, where `b` named both `e.b` and `k.b`, so its `text = integer`
+    went unchecked and the query answered rows (or failed at run time
+    with a 0A000 once there were any)."""
     assert answer(dsn, query) == JOIN_ON[query]
+
+
+SUBQUERY_ON = [
+    "select * from e where exists (select 1 from s join k on s.a = k.a and k.b = e.b)",
+    "select * from e where exists (select 1 from s join k on k.b = e.b)",
+    "select * from e where e.a in (select s.a from s left join k on k.b = e.b)",
+]
+
+
+@pytest.mark.backlog("RP-430")
+@pytest.mark.parametrize("query", SUBQUERY_ON)
+def test_subquery_join_on_sees_the_outer_query(query: str, dsn: str) -> None:
+    """A subquery's join ON may name the enclosing query's columns, as its
+    WHERE may; PostgreSQL 15.19 runs all three. Here the first is 42P01
+    `missing FROM-clause entry for table "e"` and the other two 42703
+    `column "b" does not exist`."""
+    assert answer(dsn, query) is None
