@@ -6,10 +6,9 @@
 //!
 //! `saslSupportedMechs` lists the queried user's own SCRAM mechanisms.
 //! **Deferred:** `speculativeAuthenticate` (folding a SCRAM client-first into
-//! `hello`), and
-//! stashing the driver's `client` metadata into the connection registry for
-//! `currentOp`. The non-auth handshake path — the default, and what most
-//! conformance suites exercise — is complete here.
+//! `hello`). The driver's `client` metadata is kept for `currentOp` and
+//! logged as mongod logs it. The non-auth handshake path — the default, and
+//! what most conformance suites exercise — is complete here.
 
 use std::sync::OnceLock;
 
@@ -89,6 +88,9 @@ pub fn hello(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `speculativeAuthenticate` are looked at: an error from either of those
     // still leaves the new compressors in place (mongod 8.2.11, 2026-10-15).
     let compression = negotiate_compression(doc, ctx);
+    if let Some(Bson::Document(client)) = doc.get("client") {
+        log_client_metadata(client, compression.as_deref().unwrap_or_default(), ctx);
+    }
 
     // `saslSupportedMechs: "<db>.<user>"` — drivers ask which mechanisms to
     // attempt for a principal. mongod 8.2.11 lists the user's own SCRAM
@@ -322,6 +324,76 @@ fn validate_hello_arguments(doc: &Document) -> Result<bool, CommandError> {
 /// Settling the list does not decide what the connection may send: mongod
 /// decompresses a request under any compressor it has enabled, negotiated or
 /// not, and answers it under the same one (`secantus-server`).
+/// mongod 8.2.11's `client metadata` line (NETWORK 51800), written when a
+/// connection's first `hello` brings the driver's document, after the
+/// compressors are settled and before anything else in the request can fail
+/// (measured 2026-11-07: a `saslSupportedMechs` refusal still logs it; a
+/// `hello` with no `client` logs nothing).
+fn log_client_metadata(client: &Document, compressors: &[String], ctx: &CommandContext) {
+    let Some(logs) = ctx.logs.as_ref() else {
+        return;
+    };
+    let remote = ctx
+        .conn_auth
+        .as_ref()
+        .and_then(|a| a.lock().ok().and_then(|g| g.peer_address.clone()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let thread = format!("conn{}", ctx.connection_id);
+    logs.log(
+        crate::logbuf::LogEntry::new("I", "NETWORK", 51800, thread.clone(), "client metadata")
+            .attr(doc! {
+                "remote": remote,
+                "client": thread,
+                "negotiatedCompressors": compressors,
+                "doc": client.clone(),
+            }),
+    );
+}
+
+/// mongod's `Received first command on ingress connection since session
+/// start or auth handshake` (NETWORK 6788700), from its
+/// `IngressHandshakeMetrics` (measured 8.2.11, 2026-11-07). A handshake
+/// command -- `hello` / `isMaster`, or an authentication step -- restarts
+/// the clock, which starts when the connection does; the first command of
+/// any other kind writes the line, once a connection, with the milliseconds
+/// since. A command neither server knows does not count (`{nosuchcmd: 1}`
+/// leaves the line to the next command). Called as a request arrives.
+pub(crate) fn note_command(name: &str, ctx: &CommandContext, received: std::time::Instant) {
+    let known = crate::lookup(name).is_some() || crate::mongod_commands::row(name).is_some();
+    if !known {
+        return;
+    }
+    let Some(mut guard) = ctx.conn_auth.as_ref().and_then(|a| a.lock().ok()) else {
+        return;
+    };
+    let Some(since) = guard.awaiting_first_command else {
+        return;
+    };
+    if matches!(
+        name,
+        "hello" | "isMaster" | "ismaster" | "saslStart" | "saslContinue" | "authenticate"
+    ) {
+        guard.awaiting_first_command = Some(received);
+        return;
+    }
+    guard.awaiting_first_command = None;
+    drop(guard);
+    if let Some(logs) = ctx.logs.as_ref() {
+        let elapsed = received.saturating_duration_since(since).as_millis() as i64;
+        logs.log(
+            crate::logbuf::LogEntry::new(
+                "I",
+                "NETWORK",
+                6788700,
+                format!("conn{}", ctx.connection_id),
+                "Received first command on ingress connection since session start or auth \
+                 handshake",
+            )
+            .attr(doc! {"elapsedMillis": elapsed}),
+        );
+    }
+}
+
 fn negotiate_compression(doc: &Document, ctx: &CommandContext) -> Option<Vec<String>> {
     let offered = match doc.get("compression") {
         Some(Bson::Array(names)) => Some(
@@ -885,6 +957,73 @@ mod tests {
         assert_eq!(r.get_f64("ok").unwrap(), 0.0);
         assert_eq!(r.get_str("codeName").unwrap(), "NoReplicationEnabled");
         assert!(r.get("members").is_none(), "no roster for a standalone");
+    }
+
+    fn logging_ctx() -> (CommandContext, std::sync::Arc<crate::logbuf::LogBuffer>) {
+        let logs = std::sync::Arc::new(crate::logbuf::LogBuffer::new());
+        let mut auth = crate::auth::ConnectionAuth::new();
+        auth.peer_address = Some("127.0.0.1:5000".to_string());
+        let ctx = CommandContext::new(7)
+            .with_logs(logs.clone())
+            .with_conn_auth(std::sync::Arc::new(std::sync::Mutex::new(auth)));
+        (ctx, logs)
+    }
+
+    fn ids(logs: &crate::logbuf::LogBuffer) -> Vec<(i32, String)> {
+        logs.tail(None)
+            .iter()
+            .map(|e| (e.id, e.ctx.clone()))
+            .collect()
+    }
+
+    /// mongod 8.2.11 logs the first `hello`'s `client` document (51800) with
+    /// the compressors it settled on, and a `hello` with none logs nothing
+    /// (RM-305).
+    #[test]
+    fn the_first_hellos_client_metadata_is_logged() {
+        let (mut ctx, logs) = logging_ctx();
+        let client = doc! {"driver": {"name": "d", "version": "1"}, "os": {"type": "Darwin"}};
+        hello(
+            &doc! {"hello": 1, "client": client.clone(), "compression": ["zlib"]},
+            &mut ctx,
+        )
+        .unwrap();
+        let tail = logs.tail(None);
+        assert_eq!(tail.len(), 1);
+        assert_eq!((tail[0].id, tail[0].ctx.as_str()), (51800, "conn7"));
+        assert_eq!(
+            tail[0].attr,
+            Some(doc! {
+                "remote": "127.0.0.1:5000",
+                "client": "conn7",
+                "negotiatedCompressors": ["zlib"],
+                "doc": client,
+            })
+        );
+        let (mut ctx, logs) = logging_ctx();
+        hello(&doc! {"hello": 1}, &mut ctx).unwrap();
+        assert!(logs.is_empty());
+    }
+
+    /// The first command that is not part of the handshake writes 6788700,
+    /// once, timed from the last handshake command; a command no server knows
+    /// is passed over (mongod 8.2.11, RM-305).
+    #[test]
+    fn the_first_command_after_the_handshake_is_logged_once() {
+        let (ctx, logs) = logging_ctx();
+        let start = std::time::Instant::now();
+        let later = |ms| start + std::time::Duration::from_millis(ms);
+        note_command("hello", &ctx, later(100));
+        note_command("saslStart", &ctx, later(200));
+        note_command("nosuchcmd", &ctx, later(300));
+        assert!(logs.is_empty());
+        note_command("ping", &ctx, later(450));
+        note_command("find", &ctx, later(900));
+        assert_eq!(ids(&logs), vec![(6788700, "conn7".to_string())]);
+        assert_eq!(
+            logs.tail(None)[0].attr,
+            Some(doc! {"elapsedMillis": 250_i64})
+        );
     }
 
     /// The topologyVersion processId must be identical across calls — a changing
