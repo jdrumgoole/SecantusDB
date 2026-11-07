@@ -1886,15 +1886,51 @@ and `fs(a int, c text)`, one row each.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 `fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
 
-- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
-      `check_function_bodies` on, its default, PostgreSQL parses and
-      analyses each statement at CREATE: a body `select gx.q` is 42P01
-      `missing FROM-clause entry for table "gx"` at 65, `select nosuch`
-      42703 `column "nosuch" does not exist` at 65, `select 1 from nosuch`
-      42P01 `relation "nosuch" does not exist` at 72. Here each CREATE
-      succeeds and the error waits for the first call.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
-      Backlog-ID: RP-465
+## Found while working RP-465 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check a literal's input,
+      the body's result type, a CALL, or a SQL-standard body with
+      `check_function_bodies` off.** Since RP-465 a body's statements are
+      analysed at CREATE, but only for the class-42 errors names and types
+      raise. PostgreSQL 15.19 (`fmgr_sql_validator`) also refuses, on
+      `create function gx(p int) returns int language sql as $$ ... $$`: a
+      body `select 'x'::int` or `select 'a' = 1` with 22P02 `invalid input
+      syntax for type integer` at 65 (`transformTypeCast` reads a constant's
+      input); `select 'abc'` or `select 1, 2` with 42P13 `return type
+      mismatch in function declared to return integer`, no position, CONTEXT
+      `SQL function "gx"` (`check_sql_fn_retval`); a body `call nosuchproc()`
+      with 42883 `procedure nosuchproc() does not exist` at 60 (`transformCallStmt`;
+      a CALL is planned here only when it runs). And a SQL-standard body
+      (`begin atomic select nosuch; end`) is analysed as it is parsed,
+      `check_function_bodies` off or on, 42703 at 55; here only with it on.
+      Here each CREATE succeeds. A body's `nextval('nosuchseq')` (42P01 at
+      73 there) is RP-458's shape. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_literals_and_result
+      Backlog-ID: RP-500
+- [ ] **A column reference in a VALUES list is refused as a gap, and a CTE
+      no statement reads is not analysed.** `values (nosuch)` and `values
+      (1), (nosuch)` are 0A000 `ColumnRef is not supported yet` here; on
+      PostgreSQL 15.19 42703 `column "nosuch" does not exist` at 9 and 14.
+      `with w as (select nosuch) select 1` and `with w as (select 1 from
+      nosuch) select 1` answer `1` here; PostgreSQL analyses every CTE
+      (`transformWithClause`) and answers 42703 at 19 and 42P01 `relation
+      "nosuch" does not exist` at 26. A statement PostgreSQL refuses runs.
+      The same holds in a SQL function's body at CREATE (RP-465).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_values_and_unread_cte_are_analysed
+      Backlog-ID: RP-501
+- [ ] **A SQL function's array parameter cannot be subscripted.** `create
+      function h2(v int[]) returns int language sql as $$ select v[1] $$`:
+      `select h2(array[4,5])` is 22P02 `invalid input syntax for type
+      integer: "{4,5}"` here and `4` on PostgreSQL 15.19, and `select v[1] +
+      1` is 0A000 `operator + on these operands is not supported yet` (5
+      there). `sql_fn_params::bind_parameter_names` rewrites the name to
+      `$1::` and its array type, so `v[1]` becomes a cast to an array type
+      with a bound (`$1::int[][1]`), not a subscript; a parameter followed
+      by `[` needs its cast in parentheses. A prepared `$1[1]` answers.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_array_parameter_subscript
+      Backlog-ID: RP-502
 
 ## Found while working RP-486 (2026-11-07)
 

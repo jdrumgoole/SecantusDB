@@ -1702,6 +1702,67 @@ impl PlHost<'_> {
     }
 }
 
+/// A polymorphic pseudo-type (`IsPolymorphicType`).
+fn is_polymorphic_type(ty: &str) -> bool {
+    matches!(
+        ty.trim().to_ascii_lowercase().as_str(),
+        "anyelement"
+            | "anyarray"
+            | "anynonarray"
+            | "anyenum"
+            | "anyrange"
+            | "anymultirange"
+            | "anycompatible"
+            | "anycompatiblearray"
+            | "anycompatiblenonarray"
+            | "anycompatiblerange"
+            | "anycompatiblemultirange"
+    )
+}
+
+/// The position, counted in characters from 1, an error carries.
+fn err_position(e: &PgWireError) -> Option<usize> {
+    match e {
+        PgWireError::UserError(info) => info
+            .position
+            .as_deref()
+            .and_then(|p| p.parse().ok())
+            .filter(|p| *p > 0),
+        _ => None,
+    }
+}
+
+/// The byte offset of character `n` (from 0) of `s`, its end past the last.
+fn char_to_byte(s: &str, n: usize) -> usize {
+    s.char_indices().nth(n).map_or(s.len(), |(i, _)| i)
+}
+
+/// Where statement `index` of the query string `source` starts, in
+/// characters: the offset `run_batch` counts that statement's error
+/// positions from (none for a string run as one statement).
+fn statement_offset_in_source(source: &str, index: usize) -> usize {
+    let Ok(stmts) = secantus_pgplan::split_statements(source) else {
+        return 0;
+    };
+    if stmts.len() <= 1 {
+        return 0;
+    }
+    let mut cursor = 0usize;
+    for (i, sql) in stmts.iter().enumerate() {
+        let Some(at) = source
+            .get(cursor..)
+            .and_then(|rest| rest.find(sql.as_str()))
+        else {
+            return 0;
+        };
+        if i == index {
+            return source[..cursor + at].chars().count();
+        }
+        cursor += at + sql.len();
+    }
+    0
+}
+
 thread_local! {
     /// Whether the innermost user function running on this thread is
     /// STABLE or IMMUTABLE: PostgreSQL runs such a body read-only, and any
@@ -13460,6 +13521,15 @@ impl PgHandler {
             self.mint_global_oids(1)?
         };
         doc.insert("oid", oid);
+        // The row an OR REPLACE replaces, as stored.
+        let replaced = if exists && def.replace && def.language == "sql" {
+            self.type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
+                .iter()
+                .find(|d| d.get_str("_id") == Ok(key.as_str()))
+                .cloned()
+        } else {
+            None
+        };
         if exists {
             if !def.replace {
                 return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -13474,11 +13544,160 @@ impl PgHandler {
             self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
         }
         self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, doc)?;
+        // The validator runs once the routine is in the catalog, so a body
+        // calling itself resolves (`ProcedureCreate`, then
+        // `fmgr_sql_validator`). A statement outside a block is not undone
+        // as a whole here, so a body it refuses takes its row back out by
+        // hand, and puts back the routine an OR REPLACE replaced.
+        if def.language == "sql" {
+            bump_catalog_version();
+            if let Err(e) = self.check_sql_function_body(&def.name, &read_back) {
+                self.delete_type_doc(Self::FUNCTION_COLLECTION, &key)?;
+                if let Some(old) = replaced {
+                    self.insert_type_doc(Self::FUNCTION_COLLECTION, &key, old)?;
+                }
+                bump_catalog_version();
+                return Err(e);
+            }
+        }
         Ok(vec![Response::Execution(Tag::new(if def.is_procedure {
             "CREATE PROCEDURE"
         } else {
             "CREATE FUNCTION"
         }))])
+    }
+
+    /// `fmgr_sql_validator` with `check_function_bodies` on: each statement
+    /// of a LANGUAGE sql body that PostgreSQL parse-analyses (the ones
+    /// `transformStmt` transforms rather than wraps as a utility) is
+    /// planned against the catalog as it now stands, its parameters bound
+    /// by name and type, without being run. An error analysis raises is the
+    /// CREATE's, placed in the CREATE's text as
+    /// `function_parse_error_transpose` places it. A body with a polymorphic
+    /// argument is not analysed (its types are the call's), and an error
+    /// only execution raises -- a division by zero, a privilege, a
+    /// constraint -- is left to the call, as there.
+    fn check_sql_function_body(&self, fname: &str, doc: &Document) -> PgWireResult<()> {
+        let checks = self
+            .settings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("check_function_bodies")
+            .is_none_or(|v| v != "off");
+        if !checks {
+            return Ok(());
+        }
+        let strings = |key: &str| -> Vec<String> {
+            doc.get_array(key)
+                .map(|a| {
+                    a.iter()
+                        .map(|v| v.as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let types = strings("param_types");
+        if types.iter().any(|t| is_polymorphic_type(t)) {
+            return Ok(());
+        }
+        let names: Vec<String> = strings("params")
+            .iter()
+            .map(|n| n.to_ascii_lowercase())
+            .collect();
+        let body = doc.get_str("body").unwrap_or_default();
+        let Ok(statements) = pg_query::split_with_parser(body) else {
+            return Ok(());
+        };
+        self.install_user_types();
+        let tz = self.session_timezone();
+        let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
+        let params = vec![Bson::Null; types.len()];
+        let run = |stmt: &Statement| self.subquery_rows(stmt);
+        let failure = self.with_sql_fn_lookups(|look| {
+            for stmt in &statements {
+                if !sql_fn_params::analysed_at_create(stmt) {
+                    continue;
+                }
+                let (bound, spans) =
+                    sql_fn_params::bind_parameter_names_mapped(stmt, fname, &names, &types, look);
+                // Planned as a PREPARE plans: no user function is called (one
+                // in FROM is otherwise answered while planning), no sequence
+                // drawn and no volatile subquery run, so nothing the body
+                // would do happens.
+                let planned = secantus_pgplan::planning_without_running(|| {
+                    secantus_pgplan::plan_with_session_types_and_subqueries(
+                        &bound,
+                        &|n| self.lookup(n),
+                        &params,
+                        &declared,
+                        &tz,
+                        Some(&run),
+                    )
+                });
+                let Err(e) = planned else {
+                    continue;
+                };
+                let mut err = Self::err_in(&e, &bound);
+                // An error `err` gave another code (a function this server
+                // lacks is 42883) is placed by that code.
+                if let PgWireError::UserError(info) = &mut err {
+                    if info.position.is_none() {
+                        info.position =
+                            secantus_pgplan::error_position(&bound, &info.code, &info.message)
+                                .map(|p| p.to_string());
+                    }
+                }
+                let err = self.column_hinted(err, &bound);
+                // Class 42 (an unknown name, a type mismatch, an ambiguity)
+                // and a missing schema are what analysis raises; a refused
+                // privilege is checked when the statement runs.
+                let analysis = match &err {
+                    PgWireError::UserError(info) => {
+                        info.code.starts_with("42") && info.code != "42501" || info.code == "3F000"
+                    }
+                    _ => false,
+                };
+                if !analysis {
+                    continue;
+                }
+                // The error's place in the body, counted in characters
+                // from 1, as the parser's cursor position is.
+                let at_in_body = err_position(&err).map(|p| {
+                    let byte = char_to_byte(&bound, p - 1);
+                    let in_stmt = sql_fn_params::original_offset(&spans, byte);
+                    let stmt_start = stmt.as_ptr() as usize - body.as_ptr() as usize;
+                    body[..stmt_start + in_stmt.min(stmt.len())].chars().count() + 1
+                });
+                return Some((err, at_in_body));
+            }
+            None
+        });
+        let Some((mut err, at_in_body)) = failure else {
+            return Ok(());
+        };
+        if let PgWireError::UserError(info) = &mut err {
+            match at_in_body {
+                Some(at) => {
+                    let (source, index) = self
+                        .statement_source
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone()
+                        .unwrap_or_default();
+                    info.position = sql_fn_params::match_prosrc_to_query(body, &source, at)
+                        .and_then(|p| p.checked_sub(statement_offset_in_source(&source, index)))
+                        .filter(|p| *p > 0)
+                        .map(|p| p.to_string());
+                }
+                // An error with no place gets the routine's frame
+                // (`sql_function_parse_error_callback`).
+                None => {
+                    info.position = None;
+                    info.where_context = Some(format!("SQL function \"{fname}\""));
+                }
+            }
+        }
+        Err(err)
     }
 
     /// The view an `ALTER VIEW` names, checked the way PostgreSQL does: it
@@ -14181,9 +14400,16 @@ impl PgHandler {
                     .collect()
             })
             .unwrap_or_default();
-        // The name a parameter may be qualified by (`fname.p`), and what
-        // decides whether a relation of that name has the column instead.
+        // The name a parameter may be qualified by (`fname.p`).
         let fname = doc.get_str("name").unwrap_or_default();
+        self.with_sql_fn_lookups(|look| {
+            self.call_sql_function_bound(doc, u, args, fname, &names, look)
+        })
+    }
+
+    /// What decides, for [`sql_fn_params::bind_parameter_names`], whether a
+    /// name in a SQL function's body is a column rather than a parameter.
+    fn with_sql_fn_lookups<R>(&self, f: impl FnOnce(&sql_fn_params::Lookups<'_>) -> R) -> R {
         let table_has_column = |table: &str, column: &str| match self.lookup(table) {
             Some(d) => Some(d.column(column).is_some()),
             // A view's columns are its query's output.
@@ -14210,11 +14436,22 @@ impl PgHandler {
             }
         };
         let function_columns = |name: &str| self.function_result_columns(name);
-        let look = sql_fn_params::Lookups {
+        f(&sql_fn_params::Lookups {
             table_has_column: &table_has_column,
             function_columns: &function_columns,
             type_has_field: &type_has_field,
-        };
+        })
+    }
+
+    fn call_sql_function_bound(
+        &self,
+        doc: &Document,
+        u: &secantus_pgplan::UserFn,
+        args: &[Bson],
+        fname: &str,
+        names: &[String],
+        look: &sql_fn_params::Lookups<'_>,
+    ) -> PgWireResult<secantus_pgplan::FnResult> {
         let body = doc.get_str("body").unwrap_or_default();
         let statements = pg_query::split_with_parser(body).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -14240,7 +14477,7 @@ impl PgHandler {
         if NON_VOLATILE.with(|v| v.get()) && doc.get_str("call_sql").is_err() {
             for stmt in &statements {
                 let sql =
-                    sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
+                    sql_fn_params::bind_parameter_names(stmt, fname, names, &u.arg_types, look);
                 let plan = || {
                     host.plan(&sql, args, &u.arg_types)
                         .ok()
@@ -14281,7 +14518,7 @@ impl PgHandler {
                 && doc.get_str("volatility").unwrap_or("volatile") == "immutable");
         let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
-            let sql = sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
+            let sql = sql_fn_params::bind_parameter_names(stmt, fname, names, &u.arg_types, look);
             let head = sql.trim_start().to_ascii_lowercase();
             let is_query = head.starts_with("select")
                 || head.starts_with("with")

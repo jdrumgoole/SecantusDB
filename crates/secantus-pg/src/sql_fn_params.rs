@@ -821,6 +821,25 @@ fn analysed(kind: &str) -> bool {
     )
 }
 
+/// Whether `fmgr_sql_validator` parse-analyses this statement of a body at
+/// CREATE: one `transformStmt` transforms (a utility statement, which it
+/// wraps, is analysed only when it runs): a query or a write.
+pub(crate) fn analysed_at_create(sql: &str) -> bool {
+    let Ok(tree) = pg_query::parse(sql) else {
+        return false;
+    };
+    tree.protobuf.stmts.iter().all(|raw| {
+        serde_json::to_value(&raw.stmt).is_ok_and(|v| {
+            tagged(&v).is_some_and(|(k, _)| {
+                matches!(
+                    k,
+                    "SelectStmt" | "InsertStmt" | "UpdateStmt" | "DeleteStmt" | "MergeStmt"
+                )
+            })
+        })
+    }) && !tree.protobuf.stmts.is_empty()
+}
+
 /// One statement of a SQL function's body with each reference to a
 /// parameter by name -- `p`, or `fname.p` -- rewritten to `$n::type`.
 /// `names` are the parameters' names, `types` their types.
@@ -831,11 +850,49 @@ pub(crate) fn bind_parameter_names(
     types: &[String],
     look: &Lookups<'_>,
 ) -> String {
+    bind_parameter_names_mapped(sql, fname, names, types, look).0
+}
+
+/// One replacement [`bind_parameter_names_mapped`] made: the bytes
+/// `original` of the statement as written became the bytes `bound` of the
+/// text it returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BoundSpan {
+    pub(crate) original: std::ops::Range<usize>,
+    pub(crate) bound: std::ops::Range<usize>,
+}
+
+/// The byte offset in the statement as written of byte `at` of the text
+/// [`bind_parameter_names_mapped`] returned: inside a replacement, the
+/// reference it replaced.
+pub(crate) fn original_offset(spans: &[BoundSpan], at: usize) -> usize {
+    let mut shift: isize = 0;
+    for s in spans {
+        if at < s.bound.start {
+            break;
+        }
+        if at < s.bound.end {
+            return s.original.start;
+        }
+        shift = s.bound.end as isize - s.original.end as isize;
+    }
+    (at as isize - shift).max(0) as usize
+}
+
+/// [`bind_parameter_names`], with the spans it replaced, so a position in
+/// the text it returned can be put back into the statement as written.
+pub(crate) fn bind_parameter_names_mapped(
+    sql: &str,
+    fname: &str,
+    names: &[String],
+    types: &[String],
+    look: &Lookups<'_>,
+) -> (String, Vec<BoundSpan>) {
     if names.iter().all(String::is_empty) {
-        return sql.to_string();
+        return (sql.to_string(), Vec::new());
     }
     let (Ok(tree), Ok(scan)) = (pg_query::parse(sql), pg_query::scan(sql)) else {
-        return sql.to_string();
+        return (sql.to_string(), Vec::new());
     };
     let mut b = Binder {
         fname,
@@ -848,7 +905,7 @@ pub(crate) fn bind_parameter_names(
     };
     for raw in &tree.protobuf.stmts {
         let Ok(v) = serde_json::to_value(&raw.stmt) else {
-            return sql.to_string();
+            return (sql.to_string(), Vec::new());
         };
         if tagged(&v).is_some_and(|(k, _)| analysed(k)) {
             b.walk(&v);
@@ -859,6 +916,7 @@ pub(crate) fn bind_parameter_names(
     binds.dedup_by_key(|b| b.0);
     let tokens = scan.tokens;
     let mut out = String::new();
+    let mut spans = Vec::new();
     let mut cursor = 0usize;
     let text = |i: usize| {
         tokens
@@ -882,19 +940,127 @@ pub(crate) fn bind_parameter_names(
         };
         let ty = types.get(pos).map_or("text", String::as_str);
         out.push_str(&sql[cursor..location]);
+        let start = out.len();
         out.push_str(&match what {
             Bound::Value => format!("${}::{ty}", pos + 1),
             Bound::Field => format!("(${}::{ty}).", pos + 1),
         });
         cursor = end.end as usize;
+        spans.push(BoundSpan {
+            original: location..cursor,
+            bound: start..out.len(),
+        });
     }
     out.push_str(&sql[cursor..]);
-    out
+    (out, spans)
+}
+
+/// `match_prosrc_to_query` (`pg_proc.c`): where in `query`, counted in
+/// characters from 1, character `cursor` (from 1) of a routine's source
+/// `prosrc` is, found as the one dollar-quoted or quoted literal holding
+/// it; `None` when there is no such literal, or more than one.
+pub(crate) fn match_prosrc_to_query(prosrc: &str, query: &str, cursor: usize) -> Option<usize> {
+    let q = query.as_bytes();
+    let n = prosrc.len();
+    let mut found = None;
+    for (at, &b) in q.iter().enumerate() {
+        if at + n >= q.len() {
+            break;
+        }
+        let matched = if b == b'$'
+            && query.get(at + 1..at + 1 + n) == Some(prosrc)
+            && q[at + 1 + n] == b'$'
+        {
+            Some(query[..at + 1].chars().count() + cursor)
+        } else if b == b'\'' {
+            match_prosrc_to_literal(prosrc, &query[at + 1..], cursor)
+                .map(|c| query[..at + 1].chars().count() + c)
+        } else {
+            None
+        };
+        if let Some(p) = matched {
+            if found.is_some() {
+                return None;
+            }
+            found = Some(p);
+        }
+    }
+    found
+}
+
+/// `match_prosrc_to_literal`: whether `literal` (just past its opening
+/// quote) spells `prosrc`, a backslash or a doubled quote before each
+/// character it escapes, and ends there; the cursor moved past each
+/// escape that precedes it.
+fn match_prosrc_to_literal(prosrc: &str, literal: &str, cursor: usize) -> Option<usize> {
+    let lit = literal.as_bytes();
+    let mut i = 0usize;
+    let mut left = cursor as isize;
+    let mut moved = cursor;
+    for ch in prosrc.chars() {
+        left -= 1;
+        match lit.get(i) {
+            Some(b'\\') => {
+                i += 1;
+                if left > 0 {
+                    moved += 1;
+                }
+            }
+            Some(b'\'') => {
+                if lit.get(i + 1) != Some(&b'\'') {
+                    return None;
+                }
+                i += 1;
+                if left > 0 {
+                    moved += 1;
+                }
+            }
+            _ => {}
+        }
+        let len = ch.len_utf8();
+        if literal.get(i..i + len)? != ch.encode_utf8(&mut [0; 4]) {
+            return None;
+        }
+        i += len;
+    }
+    (lit.get(i) == Some(&b'\'') && lit.get(i + 1) != Some(&b'\'')).then_some(moved)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prosrc_is_found_in_its_dollar_quoted_or_quoted_literal() {
+        // PostgreSQL 15.19's positions for `select nosuch` / `select 'x' ||
+        // nosuch` bodies (RP-465).
+        let q = "create function gx(p int) returns int language sql as $$ select nosuch $$";
+        assert_eq!(match_prosrc_to_query(" select nosuch ", q, 9), Some(65));
+        let q = "create function gx(p int) returns int language sql as $f$select nosuch$f$";
+        assert_eq!(match_prosrc_to_query("select nosuch", q, 8), Some(65));
+        let q = "create function gx(p int) returns int language sql as 'select ''x'' || nosuch'";
+        assert_eq!(
+            match_prosrc_to_query("select 'x' || nosuch", q, 15),
+            Some(72)
+        );
+        // Two literals spelling it: no place (`match_prosrc_to_query`'s
+        // "multiple matches, fail").
+        let q = "select $$ x $$, $$ x $$";
+        assert_eq!(match_prosrc_to_query(" x ", q, 2), None);
+        assert_eq!(match_prosrc_to_query("select 1", "select 2", 1), None);
+    }
+
+    #[test]
+    fn a_position_in_the_bound_text_maps_back() {
+        // `select p + q` with `p` bound: `select $1::integer + q`.
+        let spans = vec![BoundSpan {
+            original: 7..8,
+            bound: 7..18,
+        }];
+        assert_eq!(original_offset(&spans, 0), 0);
+        assert_eq!(original_offset(&spans, 10), 7);
+        assert_eq!(original_offset(&spans, 21), 11);
+    }
 
     fn bind(sql: &str, params: &[&str]) -> String {
         let names: Vec<String> = params.iter().map(|p| p.to_string()).collect();

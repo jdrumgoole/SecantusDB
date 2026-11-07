@@ -3,13 +3,16 @@ RP-461 (a SQL function's bare parameter name was replaced wherever it was
 a word; fixed), RP-462 (a composite parameter's field was not read; fixed), RP-463 (a
 PL/pgSQL block label did not qualify its variables; fixed), RP-464 (a SQL
 function ending in a write's RETURNING returned NULL; fixed) and RP-465 (CREATE
-FUNCTION does not check a SQL body); and found while working RP-461,
+FUNCTION did not check a SQL body; fixed); and found while working RP-461,
 RP-477 (a function with one OUT parameter, called in FROM, named its
 column after the function; fixed), found while working RP-477, RP-483
 (the same function's call in a select list was named after its parameter,
 and a field of its scalar result was not refused; fixed), and found while
 working RP-483, RP-485 (a call in a schema that does not exist is a missing
-function, not a missing schema).
+function, not a missing schema); and found while working RP-465, RP-500
+(CREATE does not check a literal's input, the result type, a CALL, or a
+SQL-standard body with `check_function_bodies` off) and RP-502 (an array
+parameter cannot be subscripted).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -265,10 +268,250 @@ CREATE_CHECKS_THE_BODY = {
 }
 
 
-@pytest.mark.backlog("RP-465")
+@pytest.mark.backlog_fixed("RP-465")
 @pytest.mark.parametrize("query", list(CREATE_CHECKS_THE_BODY))
 def test_create_checks_the_body(query: str, dsn: str) -> None:
+    """Each CREATE succeeded, and the error waited for the first call."""
     assert answer(dsn, query) == CREATE_CHECKS_THE_BODY[query]
+
+
+def _missing_column(position: str) -> tuple[str, str, None, str]:
+    return ("42703", 'column "nosuch" does not exist', None, position)
+
+
+# RP-465's further shapes, each measured on the same cluster: the position
+# counted into the CREATE's text through a quoted body's doubled quotes, a
+# later statement and a parameter bound by name; a body calling itself, a
+# polymorphic one (analysed only when called) and a utility statement's
+# names (resolved when it runs); `check_function_bodies` off.
+_CREATE_GX_QUOTED = "create function gx(p int) returns int language sql as '{}'"
+CREATE_CHECKS_MORE = {
+    _CREATE_GX_QUOTED.format("select ''x'' || nosuch"): _missing_column("72"),
+    _CREATE_GX.format("select 1; select nosuch"): _missing_column("75"),
+    "create function gx(p int) returns int language sql as $$select 1;\n"
+    "  select a from fe where b = p and zz = 1 $$": (
+        "42883",
+        "operator does not exist: text = integer",
+        "No operator matches the given name and argument types."
+        " You might need to add explicit type casts.",
+        "94",
+    ),
+    _CREATE_GX.format("select nosuchfn(p)"): (
+        "42883",
+        "function nosuchfn(integer) does not exist",
+        "No function matches the given name and argument types."
+        " You might need to add explicit type casts.",
+        "65",
+    ),
+    _CREATE_GX.format("select a from fe, fs"): (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "65",
+    ),
+    _CREATE_GX.format("select (select nosuch)"): _missing_column("73"),
+    _CREATE_GX.format("update fe set nosuch = 1 returning 1"): (
+        "42703",
+        'column "nosuch" of relation "fe" does not exist',
+        None,
+        "72",
+    ),
+    _CREATE_GX.format("create table t9 (a int); select a from t9"): (
+        "42P01",
+        'relation "t9" does not exist',
+        None,
+        "97",
+    ),
+    "create procedure gxp(p int) language sql as $$ select nosuch $$": _missing_column("55"),
+    _CREATE_GX.format("select case when p <= 1 then 1 else p * gx(p - 1) end"): ("rowcount", -1),
+    "create function gx(p anyelement) returns int language sql as $$ select nosuch $$": (
+        "rowcount",
+        -1,
+    ),
+    "create function gx(p int) returns void language sql as $$ drop table nosuch $$": (
+        "rowcount",
+        -1,
+    ),
+    _CREATE_GX.format("select 1/0"): ("rowcount", -1),
+    "set check_function_bodies = off; " + _CREATE_GX.format("select nosuch"): ("rowcount", -1),
+}
+
+
+@pytest.mark.backlog_fixed("RP-465")
+@pytest.mark.parametrize("query", list(CREATE_CHECKS_MORE))
+def test_create_checks_more_bodies(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("drop function if exists gx(anyelement)")
+        c.execute("drop procedure if exists gxp(int)")
+        c.execute("drop table if exists t9")
+        try:
+            last = query
+            if query.startswith("set "):
+                setting, last = query.split("; ", 1)
+                c.execute(setting)
+            c.execute(last)
+            got: Any = ("rowcount", -1)
+        except psycopg.Error as e:
+            got = (
+                e.sqlstate,
+                e.diag.message_primary,
+                e.diag.message_hint,
+                e.diag.statement_position,
+            )
+        finally:
+            c.execute("drop function if exists gx(int)")
+            c.execute("drop function if exists gx(anyelement)")
+            c.execute("drop procedure if exists gxp(int)")
+            c.execute("drop table if exists t9")
+    assert got == CREATE_CHECKS_MORE[query]
+
+
+@pytest.mark.backlog_fixed("RP-465")
+def test_refused_create_leaves_no_routine(dsn: str) -> None:
+    """A refused CREATE left its row in `pg_proc`, and a refused OR REPLACE
+    lost the routine it replaced; measured on the same cluster."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop function if exists gr()")
+        c.execute("drop function if exists gnew()")
+        c.execute("create function gr() returns int language sql as $$ select 1 $$")
+        bad = "returns int language sql as $$ select nosuch $$"
+        refused = []
+        for q in (f"create or replace function gr() {bad}", f"create function gnew() {bad}"):
+            try:
+                c.execute(q)
+            except psycopg.Error as e:
+                refused.append(e.sqlstate)
+        got = (
+            refused,
+            c.execute("select gr()").fetchall(),
+            c.execute("select count(*) from pg_proc where proname = 'gnew'").fetchall(),
+        )
+        c.execute("drop function if exists gr()")
+    assert got == (["42703", "42703"], [(1,)], [(0,)])
+
+
+@pytest.mark.backlog_fixed("RP-465")
+def test_create_runs_nothing_in_the_body(dsn: str) -> None:
+    """Checking a body plans it, and planning answers a function in FROM by
+    calling it: the check must not call it, draw a sequence or run a
+    volatile subquery. Measured on the same cluster: no row, no value
+    drawn."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop function if exists gw2(), gw1()")
+        c.execute("drop table if exists tw")
+        c.execute("drop sequence if exists sw")
+        c.execute("create table tw (a int)")
+        c.execute("create sequence sw")
+        c.execute(
+            "create function gw1() returns int language sql"
+            " as $$ insert into tw values (7); select 1 $$"
+        )
+        c.execute(
+            "create function gw2() returns bigint language sql as $$ select count(*)"
+            " from tw, gw1() where (select nextval('sw')) > 0 $$"
+        )
+        got = (
+            c.execute("select count(*) from tw").fetchall(),
+            c.execute("select last_value, is_called from sw").fetchall(),
+        )
+        c.execute("drop function if exists gw2(), gw1()")
+        c.execute("drop table if exists tw")
+        c.execute("drop sequence if exists sw")
+    assert got == ([(0,)], [(1, False)])
+
+
+# Found while working RP-465: what PostgreSQL 15.19's validator also
+# refuses at CREATE, measured on the same cluster. A pair is `(setting,
+# CREATE)`; the setting runs first when there is one.
+CREATE_CHECKS_LITERALS_AND_RESULT = {
+    (None, _CREATE_GX.format("select 'x'::int")): (
+        "22P02",
+        'invalid input syntax for type integer: "x"',
+        None,
+        "65",
+    ),
+    (None, _CREATE_GX.format("select 'a' = 1")): (
+        "22P02",
+        'invalid input syntax for type integer: "a"',
+        None,
+        "65",
+    ),
+    (None, _CREATE_GX.format("select 'abc'")): (
+        "42P13",
+        "return type mismatch in function declared to return integer",
+        None,
+        None,
+    ),
+    (None, _CREATE_GX.format("select 1, 2")): (
+        "42P13",
+        "return type mismatch in function declared to return integer",
+        None,
+        None,
+    ),
+    (None, "create function gc1() returns void language sql as $$ call nosuchproc() $$"): (
+        "42883",
+        "procedure nosuchproc() does not exist",
+        "No procedure matches the given name and argument types."
+        " You might need to add explicit type casts.",
+        "60",
+    ),
+    (
+        "set check_function_bodies = off",
+        "create function gc2() returns int begin atomic select nosuch; end",
+    ): _missing_column("55"),
+}
+
+
+@pytest.mark.backlog("RP-500")
+@pytest.mark.parametrize("case", list(CREATE_CHECKS_LITERALS_AND_RESULT))
+def test_create_checks_literals_and_result(case: tuple[str | None, str], dsn: str) -> None:
+    setting, create = case
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for f in ("gx(int)", "gc1()", "gc2()"):
+            c.execute(f"drop function if exists {f}")
+        if setting:
+            c.execute(setting)
+        try:
+            c.execute(create)
+            got: Any = ("rowcount", -1)
+        except psycopg.Error as e:
+            got = (
+                e.sqlstate,
+                e.diag.message_primary,
+                e.diag.message_hint,
+                e.diag.statement_position,
+            )
+        finally:
+            for f in ("gx(int)", "gc1()", "gc2()"):
+                c.execute(f"drop function if exists {f}")
+    assert got == CREATE_CHECKS_LITERALS_AND_RESULT[case]
+
+
+# Found while working RP-465: an array parameter's subscript, measured on
+# the same cluster.
+ARRAY_PARAMETER_SUBSCRIPT = {
+    "create function h1(v int[]) returns int language sql as $$ select v[1] $$": [(4,)],
+    "create function h1(v int[]) returns int language sql as $$ select v[1] + 1 $$": [(5,)],
+    "create function h1(v int[]) returns int language sql"
+    " as $$ select v[2] + array_length(v, 1) $$": [(7,)],
+}
+
+
+@pytest.mark.backlog("RP-502")
+@pytest.mark.parametrize("create", list(ARRAY_PARAMETER_SUBSCRIPT))
+def test_array_parameter_subscript(create: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop function if exists h1(int[])")
+        c.execute(create)
+        try:
+            got: Any = c.execute("select h1(array[4,5])").fetchall()
+        except psycopg.Error as e:
+            got = (e.sqlstate, e.diag.message_primary)
+        finally:
+            c.execute("drop function if exists h1(int[])")
+    assert got == ARRAY_PARAMETER_SUBSCRIPT[create]
 
 
 # Found while working RP-461: a function with one OUT parameter, or a
