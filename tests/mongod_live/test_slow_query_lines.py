@@ -13,8 +13,8 @@ operation ran.
 Left out of the comparison, each an open backlog item with a gap test of
 its own: `queryShapeHash` (RM-358), `numInterruptChecks` (RM-360), `queues`
 (RM-355), a profile entry's `execStats` (RM-359), `resolvedViews`
-(RM-362), `totalOplogSlotDurationMicros` (RM-361), and a write's `locks`
-and `flowControl` (RM-357). The `storage` section is compared for its
+(RM-362), `totalOplogSlotDurationMicros` (RM-361), and the `locks` of
+the writes RM-357 has left (`KNOWN_GAPS`). The `storage` section is compared for its
 shape only: mongod's always has `storageExecutionMicros` (RM-355), and what
 each engine reads from disk is its own.
 """
@@ -43,12 +43,37 @@ UNMODELLED = frozenset(
     }
 )
 
+#: The locks of the writes RM-357 has left: a write that writes nothing
+#: (mongod reads the latest optime for the client's last op under the
+#: global IS), the session row each statement of an update or delete keeps
+#: under its own locks, a profiled statement's entry counted in its
+#: command's locks, the image of a retryable findAndModify and the one
+#: round of one that removes, and `$documents`, which takes no lock.
+_WRITE_LOCKS = frozenset({"locks"})
+
 #: Fields one scenario leaves out, each an open item: mongod plans an `EOF`
 #: for a collection that does not exist, where this server plans nothing
-#: (RM-363); `$documents` takes no lock on mongod (RM-357).
+#: (RM-363); the locks above (RM-357).
 KNOWN_GAPS: dict[str, frozenset[str]] = {
     "find of a collection not there": frozenset({"planningTimeMicros"}),
-    "aggregate of $documents": frozenset({"locks"}),
+    "aggregate of $documents": _WRITE_LOCKS,
+    "insert of a duplicate": _WRITE_LOCKS,
+    "update_one": _WRITE_LOCKS,
+    "update_many": _WRITE_LOCKS,
+    "update of nothing": _WRITE_LOCKS,
+    "upsert": _WRITE_LOCKS,
+    "replace by _id": _WRITE_LOCKS,
+    "update making a key multikey": _WRITE_LOCKS,
+    # Its statements' rounds are taken before the first runs, so the first
+    # statement's line counts both tickets.
+    "update of two statements": _WRITE_LOCKS | {"flowControl"},
+    "update that fails": _WRITE_LOCKS,
+    "delete_one": _WRITE_LOCKS,
+    "delete_many": _WRITE_LOCKS,
+    "delete by _id": _WRITE_LOCKS,
+    "findAndModify": _WRITE_LOCKS,
+    "findAndModify with a sort": _WRITE_LOCKS,
+    "findAndModify remove": _WRITE_LOCKS,
 }
 
 #: Fields compared exactly.
@@ -83,6 +108,7 @@ EXACT = (
     "readConcern",
     "writeConcern",
     "protocol",
+    "flowControl",
 )
 
 #: Fields that hold a time or a size: an integer, and not negative.
@@ -111,14 +137,8 @@ STORAGE = {
 }
 
 
-def _wrote(doc: dict) -> bool:
-    counts = doc.get("locks", {}).get("Global", {}).get("acquireCount", {})
-    return "w" in counts or "W" in counts
-
-
 def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list[str]:
     problems = []
-    # A write's locks and flow control are RM-357.
     leave_out = set(UNMODELLED) | gaps
     # mongod yields a read every 10 ms of work, and takes its locks again
     # when it does: a busy machine makes a small read yield. This server
@@ -128,8 +148,6 @@ def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list
         leave_out |= {"locks"}
         ours = {k: v for k, v in ours.items() if k not in ("numYields", "numYield")}
         theirs = {k: v for k, v in theirs.items() if k not in ("numYields", "numYield")}
-    if _wrote(theirs):
-        leave_out |= {"locks", "flowControl"}
     # The journal wait is printed once it reaches a millisecond, so whether
     # it is there follows each machine's sync time (macOS mongod 8.2.11:
     # 4-8 ms, on every write; Linux 8.2.12: on none). Its presence is not
@@ -139,7 +157,7 @@ def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list
     if a != b:
         problems.append(f"{label}: fields\n    ours:   {a}\n    mongod: {b}")
     for field in EXACT:
-        if ours.get(field) != theirs.get(field):
+        if field not in leave_out and ours.get(field) != theirs.get(field):
             problems.append(
                 f"{label}: {field}: ours {ours.get(field)!r}, mongod {theirs.get(field)!r}"
             )

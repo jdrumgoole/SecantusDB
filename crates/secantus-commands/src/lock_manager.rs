@@ -293,6 +293,7 @@ impl LockManager {
     ) -> Result<(), MaxTimeMsExpired> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let began = Instant::now();
+        let ticket_first = takes_flow_control_ticket(&inner, owner, resource, mode);
         // First come first served (RM-138): a request that finds others
         // waiting queues behind them, so a `drop` waiting on live writers is
         // not overtaken by every writer that comes after it. An owner that
@@ -303,6 +304,9 @@ impl LockManager {
             if !head.blocks(owner, mode) && (head.queue.is_empty() || head.holds(owner)) {
                 head.holders.push((owner, mode));
                 drop(inner);
+                if ticket_first {
+                    note_flow_control_ticket();
+                }
                 self.count(resource, mode, None);
                 note_taken(resource);
                 return Ok(());
@@ -329,6 +333,9 @@ impl LockManager {
                 head.queue.retain(|(t, _, _)| *t != ticket);
                 head.holders.push((owner, mode));
                 drop(inner);
+                if ticket_first {
+                    note_flow_control_ticket();
+                }
                 // Those queued behind may now be grantable beside it.
                 self.changed.notify_all();
                 self.count(resource, mode, Some(began.elapsed()));
@@ -592,7 +599,7 @@ impl Facts for StorageFacts<'_> {
 /// - `insert` a round of IX on the state transition, global, database and
 ///   collection locks, three when it creates the collection; `update` and
 ///   `delete` a round per statement; `findAndModify` a round without the
-///   collection, then a full one;
+///   collection, and a full one inside it;
 /// - `create` a write round, and a round that reads the collection when it
 ///   exists already; `drop` / `dropIndexes` a write round and then one with
 ///   the collection in X, or the database round alone when there is no
@@ -745,9 +752,14 @@ pub fn statement_rounds(
             };
             Some((0..statements(key)).map(|_| write_round(Some(c))).collect())
         }
+        // The full round is taken inside the first, which it holds: the
+        // write takes one flow control ticket where `drop`'s two rounds
+        // take two (measured 8.2.11).
         "findAndModify" | "findandmodify" => {
             let c = coll?;
-            Some(vec![write_round(None), write_round(Some(c))])
+            let mut nested = write_round(None);
+            nested.extend(write_round(Some(c)));
+            Some(vec![nested])
         }
         "create" => {
             let c = coll?;
@@ -898,6 +910,41 @@ fn note_taken(resource: &Resource) {
 }
 
 thread_local! {
+    /// The flow control tickets the operation running on this thread has
+    /// taken: mongod's per-operation `flowControl.acquireCount` (RM-357).
+    static FLOW_CONTROL: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `owner`'s request for `mode` on `resource` takes a flow control
+/// ticket, as mongod's `Locker::getFlowControlTicket` decides: the global
+/// lock in IX, by an owner not holding it already (a nested acquisition
+/// takes none), outside a multi-document transaction (which does not
+/// take part in flow control: a transaction's statement counts `{}`,
+/// measured 8.2.11). This server is always a replica set's primary, and
+/// mongod's flow control is on there by default. Its lag is a single
+/// member's, never past the threshold, so a ticket is always free: each
+/// one is counted and none is waited for.
+fn takes_flow_control_ticket(inner: &Inner, owner: Owner, resource: &Resource, mode: Mode) -> bool {
+    matches!(resource, Resource::Global)
+        && mode == Mode::Ix
+        && matches!(owner, Owner::Statement(_))
+        && !inner.heads.get(resource).is_some_and(|h| h.holds(owner))
+}
+
+fn note_flow_control_ticket() {
+    FLOW_CONTROL.with(|n| n.set(n.get() + 1));
+}
+
+/// The flow control tickets the operation running on this thread has taken
+/// so far: what mongod prints as `flowControl: {acquireCount: n}` on a
+/// write's line and entry (measured 8.2.11: an insert's 1, one more for
+/// each write round it takes apart -- 3 for an insert that creates its
+/// collection, one per statement of an `update`).
+pub fn flow_control_tickets() -> i64 {
+    FLOW_CONTROL.with(std::cell::Cell::get)
+}
+
+thread_local! {
     /// The locks the operation running on this thread has taken, by
     /// resource kind and mode, and how many of them waited: mongod's
     /// per-operation `lockStats`, which its `Slow query` line and profile
@@ -983,6 +1030,7 @@ pub fn operation_locks(extra_global_is: bool) -> bson::Document {
 pub fn begin_operation() {
     TOOK_GLOBAL.with(|t| t.set(false));
     OP_LOCKS.with(|l| l.borrow_mut().clear());
+    FLOW_CONTROL.with(|n| n.set(0));
 }
 
 /// Whether the operation this thread runs has taken the global lock.
@@ -1211,6 +1259,121 @@ impl Guard {
 impl Drop for Guard {
     fn drop(&mut self) {
         STATEMENT_OWNER.with(|o| o.set(self.previous_owner));
+        let kept = HELD_TO_END.with(|h| match h.borrow_mut().as_mut() {
+            Some(held) => {
+                held.push((self.lm.clone(), self.owner));
+                true
+            }
+            None => false,
+        });
+        if !kept {
+            self.lm.release(self.owner);
+        }
+    }
+}
+
+/// Statement holds kept past their statement's end: whose, by which owner.
+type KeptHolds = Vec<(std::sync::Arc<LockManager>, Owner)>;
+
+thread_local! {
+    /// The statement holds a [`HeldToEnd`] scope keeps past their
+    /// statement's end, latest last.
+    static HELD_TO_END: std::cell::RefCell<Option<KeptHolds>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// While alive, a statement's locks outlast the statement: they are let go
+/// when this drops. A retryable write keeps its session's row in
+/// `config.transactions` in the write's own unit of work, under the write's
+/// locks, as mongod's `onWriteOpCompletedOnPrimary` does.
+pub struct HeldToEnd {
+    previous: Option<KeptHolds>,
+}
+
+/// Keep the statement locks taken from here until the scope drops.
+pub fn hold_to_end() -> HeldToEnd {
+    HeldToEnd {
+        previous: HELD_TO_END.with(|h| h.replace(Some(Vec::new()))),
+    }
+}
+
+impl HeldToEnd {
+    /// A write round on `db.coll` inside the held statement's locks, kept
+    /// with them: the write of the session's row. The transition and global
+    /// locks are taken again by their holder, so the round takes no flow
+    /// control ticket of its own (measured 8.2.11: a retryable insert takes
+    /// one, as any insert). Nothing when no statement lock is held.
+    pub fn write_round(&self, db: &str, coll: &str) -> Result<(), MaxTimeMsExpired> {
+        let Some((lm, owner)) = HELD_TO_END.with(|h| h.borrow().as_ref()?.last().cloned()) else {
+            return Ok(());
+        };
+        let round = [
+            (Resource::ReplicationStateTransition, Mode::Ix),
+            (Resource::Global, Mode::Ix),
+            (Resource::Database(db.to_string()), Mode::Ix),
+            (Resource::Collection(format!("{db}.{coll}")), Mode::Ix),
+        ];
+        for (res, mode) in &round {
+            lm.acquire(owner, res, *mode)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for HeldToEnd {
+    fn drop(&mut self) {
+        let held = HELD_TO_END.with(|h| h.replace(self.previous.take()));
+        for (lm, owner) in held.into_iter().flatten().rev() {
+            lm.release(owner);
+        }
+    }
+}
+
+/// The replication state transition lock in IX, taken and let go, that a
+/// retryable write takes beside its rounds: one per command, whether or not
+/// it writes, with no global lock (measured 8.2.11: a retryable insert
+/// counts three of it to the two global IX of its write and its session's
+/// row; an `update` matching nothing two to its one).
+pub fn retryable_write_transition_lock(lm: Option<&std::sync::Arc<LockManager>>) {
+    let Some(lm) = lm else { return };
+    let owner = lm.statement_owner();
+    // Refused only by a spent deadline behind a stepdown's X, which this
+    // server never takes.
+    if lm
+        .acquire(owner, &Resource::ReplicationStateTransition, Mode::Ix)
+        .is_ok()
+    {
+        lm.release(owner);
+    }
+}
+
+/// The locks a write's wait for its journal takes: the transition lock in
+/// IX and the global lock in IS, held while the journal is flushed and let
+/// go (measured 8.2.11: `j: true` and `w: "majority"` each add one of each
+/// to a write's `locks`, `w: 1` none). Taken whether or not the write wrote,
+/// as mongod's are for a duplicate key.
+pub fn journal_wait(lm: Option<&std::sync::Arc<LockManager>>) -> Option<JournalWait> {
+    let lm = lm?;
+    let owner = lm.statement_owner();
+    let chain = [
+        (Resource::ReplicationStateTransition, Mode::Ix),
+        (Resource::Global, Mode::Is),
+    ];
+    acquire_chain(lm, owner, &chain).ok()?;
+    Some(JournalWait {
+        lm: lm.clone(),
+        owner,
+    })
+}
+
+/// The journal wait's locks, let go on drop.
+pub struct JournalWait {
+    lm: std::sync::Arc<LockManager>,
+    owner: Owner,
+}
+
+impl Drop for JournalWait {
+    fn drop(&mut self) {
         self.lm.release(self.owner);
     }
 }
@@ -1393,5 +1556,96 @@ mod tests {
         let rows = lm.server_status_locks();
         let row = rows.iter().find(|r| r.kind == "Collection").unwrap();
         assert_eq!(row.acquire_count, [("r", 2)]);
+    }
+
+    /// RM-357: a flow control ticket for each global IX a statement takes
+    /// without holding the global lock already; none for a nested one, a
+    /// transaction's or an intent-shared one.
+    #[test]
+    fn a_ticket_for_each_global_ix_taken_apart() {
+        use super::{begin_operation, flow_control_tickets, LockManager, Mode, Resource};
+        let lm = LockManager::new();
+        begin_operation();
+        let o = lm.statement_owner();
+        lm.acquire(o, &Resource::Global, Mode::Ix).unwrap();
+        lm.acquire(o, &Resource::Global, Mode::Ix).unwrap();
+        assert_eq!(flow_control_tickets(), 1);
+        lm.release(o);
+        let o = lm.statement_owner();
+        lm.acquire(o, &Resource::Global, Mode::Ix).unwrap();
+        lm.release(o);
+        assert_eq!(flow_control_tickets(), 2);
+        let t = lm.transaction_owner();
+        lm.acquire(t, &Resource::Global, Mode::Ix).unwrap();
+        lm.release(t);
+        let r = lm.statement_owner();
+        lm.acquire(r, &Resource::Global, Mode::Is).unwrap();
+        lm.release(r);
+        assert_eq!(flow_control_tickets(), 2);
+        begin_operation();
+        assert_eq!(flow_control_tickets(), 0);
+    }
+
+    /// RM-357: `findAndModify` takes its full round inside the first, so
+    /// its write takes one ticket.
+    #[test]
+    fn find_and_modify_nests_its_rounds() {
+        use super::{statement_rounds, Resource, StorageFacts};
+        let facts = StorageFacts {
+            storage: None,
+            db: "db",
+        };
+        let rounds = statement_rounds(&bson::doc! {"findAndModify": "c"}, "db", &facts).unwrap();
+        assert_eq!(rounds.len(), 1);
+        let globals = rounds[0]
+            .iter()
+            .filter(|(r, _)| *r == Resource::Global)
+            .count();
+        assert_eq!(globals, 2);
+        assert_eq!(
+            rounds[0].last().unwrap().0,
+            Resource::Collection("db.c".into())
+        );
+    }
+
+    /// RM-357: under `hold_to_end` a statement's locks outlast it, and a
+    /// write round taken inside them is nested: no ticket of its own, and
+    /// all of it let go when the scope ends.
+    #[test]
+    fn held_statement_locks_take_the_session_row_inside_them() {
+        use super::{
+            begin_operation, flow_control_tickets, hold_to_end, Guard, LockManager, Mode, Resource,
+            StorageFacts,
+        };
+        let lm = std::sync::Arc::new(LockManager::new());
+        let facts = StorageFacts {
+            storage: None,
+            db: "db",
+        };
+        begin_operation();
+        let held = hold_to_end();
+        let doc = bson::doc! {"insert": "c", "documents": [{}]};
+        drop(
+            Guard::statement(Some(&lm), &doc, "db", &facts)
+                .unwrap()
+                .unwrap(),
+        );
+        held.write_round("config", "transactions").unwrap();
+        assert_eq!(flow_control_tickets(), 1);
+        // The collection is still held in IX: an X waits.
+        let other = lm.statement_owner();
+        let _deadline = secantus_core::deadline::arm(Some(20));
+        let coll = Resource::Collection("db.c".into());
+        assert!(lm.acquire(other, &coll, Mode::X).is_err());
+        drop(held);
+        assert!(lm.acquire(other, &coll, Mode::X).is_ok());
+        assert!(lm
+            .acquire(
+                other,
+                &Resource::Collection("config.transactions".into()),
+                Mode::X
+            )
+            .is_ok());
+        lm.release(other);
     }
 }

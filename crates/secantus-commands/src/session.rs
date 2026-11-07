@@ -1152,6 +1152,9 @@ fn retryable_write(
         Ok(done) => done,
         Err(reply) => return reply,
     };
+    crate::lock_manager::retryable_write_transition_lock(ctx.locks.as_ref());
+    // The write's locks are held until its session's row is kept.
+    let held = crate::lock_manager::hold_to_end();
     registry.set_owner(lsid, user_digest(&authenticated(ctx)));
     // A retryable write names its session and statements in its oplog
     // entries, as mongod's do (RM-224); a `bulkWrite` names each op's
@@ -1192,6 +1195,8 @@ fn retryable_write(
                 Ok(())
             };
             let kept = kept.and_then(|()| {
+                held.write_round("config", "transactions")
+                    .map_err(|_| CommandError::max_time_expired())?;
                 record_session_transaction(s.as_ref(), session, txn_number, ts, None)
             });
             if let Err(e) = kept {
@@ -1199,6 +1204,7 @@ fn retryable_write(
             }
         }
     }
+    drop(held);
     registry.record_statements(lsid, txn_number, records);
     reply
 }

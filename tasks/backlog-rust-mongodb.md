@@ -549,22 +549,32 @@ These are explicit non-goals. Don't add them without a reason.
       RM-170's decision did for the delinquency counters.
       Backlog-ID: RM-355
       Verify: tests/backlog/test_rm_355_364.py::test_a_line_says_what_execution_control_admitted, tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
-- [ ] **A write's `locks` and `flowControl` are not mongod's.** Since RM-023
-      a line and a profile entry carry the locks the operation took from
-      this server's lock manager, by resource and mode (and, in the entry,
-      the global IS mongod takes to read the storage statistics). A read's
-      are mongod's (`Global: {r: 1}`, `{r: 2}` in the entry); a write's are
-      not: mongod 8.2.11's insert takes `ReplicationStateTransition` w 4,
-      `Global` r 1 w 2, `Database` and `Collection` w 2, where this server's
-      lock rounds (RM-299) take one of each; a statement of a transaction
-      shows `{}` on mongod's line and the transaction's initial locks in its
-      entry; an `aggregate` of `$documents` takes no lock on mongod, and the
-      global IS here. mongod also counts each write's flow control tickets
-      (`flowControl: {acquireCount: 1}`); this server has no flow control
-      and leaves the field off a write (a read's `flowControl: {}` is
-      printed as mongod prints it). Measured 2026-10-27.
+- [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
+      counts mongod's flow control tickets (one per global IX taken apart)
+      and a retryable write's session checkout and session row, and a
+      journal wait (`j`, `w: "majority"`) its transition lock and global
+      IS, so an insert, `drop` or `create` reads as mongod 8.2.11's. Still
+      different, measured against a one-member replica set:
+      - a write that writes nothing (a duplicate key, an `update` or
+        `delete` matching nothing, `create` of a collection there): mongod
+        reads the latest optime for the client's last op under the global IS
+        with the transition lock, twice for an insert, update or delete (the
+        write path and the command), once for another command;
+      - an `update` or `delete` keeps its session row per statement, under
+        the statement's own locks, and takes each statement's round as the
+        statement runs (this server takes every round first and writes the
+        row once, after); a profiled statement's own entry is counted in its
+        command's locks (`Metadata: {W: 1}`, one more global IX);
+      - a retryable `findAndModify` writes its image under its locks (one
+        more transition, global and collection IX), and one that removes
+        takes a single round;
+      - `collMod` and `$out` take more transition locks than this server's
+        rounds (`$out`'s were measured on a standalone, RM-185);
+      - a statement of a transaction shows `{}` on mongod's line and the
+        transaction's initial locks in its entry; an `aggregate` of
+        `$documents` takes no lock on mongod, and the global IS here.
       Backlog-ID: RM-357
-      Verify: tests/backlog/test_rm_355_364.py::test_a_write_reports_mongods_locks_and_flow_control
+      Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
 - [ ] **No `queryShapeHash` on a line or a profile entry.** mongod 8.2.11
       prints the SHA-256 of a `find`'s, `aggregate`'s or `distinct`'s
       representative query shape (`queryShapeHash`) on its line and entry,

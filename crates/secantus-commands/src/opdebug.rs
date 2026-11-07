@@ -231,6 +231,13 @@ pub(crate) fn wrote_something(name: &str, reply: &Document) -> bool {
     }
 }
 
+/// An operation's `flowControl` when it took a ticket: `{acquireCount: n}`
+/// (RM-357). mongod prints none on the line of an operation that took
+/// none, and `{}` in its profile entry when it wrote nothing.
+pub(crate) fn flow_control(tickets: i64) -> Option<Document> {
+    (tickets > 0).then(|| doc! { "acquireCount": tickets })
+}
+
 /// Whether an operation that took `locks` wrote: it took the global lock
 /// in an exclusive mode.
 pub(crate) fn wrote(locks: &Document) -> bool {

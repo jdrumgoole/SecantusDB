@@ -363,6 +363,9 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     out.insert("numYields", 0_i64);
     out.insert("reslen", response_length(reply, ctx));
     out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
+    if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
+        out.insert("flowControl", fc);
+    }
     // A member of a replica set prints the concerns; a standalone has none
     // (measured 8.2.11).
     let replicated = ctx.replica_set_name.is_some();
