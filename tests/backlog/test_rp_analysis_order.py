@@ -71,10 +71,11 @@ def test_insert_select_and_cte_are_type_checked(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-431")
+@pytest.mark.backlog_fixed("RP-431")
 def test_star_derived_table_is_typed(rust_pg: Any) -> None:
-    """A FROM subquery or CTE written `select *` has its relation's column
-    types, so a comparison over them is 42883 at parse analysis."""
+    """A FROM subquery or CTE written `select *` was untyped, so a
+    comparison over its columns returned no rows; it has its relation's
+    column types, and the comparison is 42883 at parse analysis."""
     integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
     assert _answers(
         rust_pg,
@@ -84,6 +85,87 @@ def test_star_derived_table_is_typed(rust_pg: Any) -> None:
             "with t as (select * from e) insert into k select * from t where a = true",
         ],
     ) == [integer_boolean, integer_boolean, integer_boolean]
+
+
+@pytest.mark.backlog_fixed("RP-431")
+def test_star_derived_table_expands_as_postgres_does(rust_pg: Any) -> None:
+    """A `*` or `t.*` lists its FROM items' columns in order
+    (`ExpandColumnRefStar`), a USING or NATURAL join's merged columns once
+    and first, renamed by an alias list -- a CTE's own and then its FROM
+    alias's -- and a name it lists twice is ambiguous, not typed."""
+    integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
+    text_integer = ("err", "42883", "operator does not exist: text = integer")
+    assert _answers(
+        rust_pg,
+        [
+            "insert into k values (5, 'w')",
+            "select * from (select e.* from e) t where a = true",
+            "select * from (select * from e) t(x, y) where y = 1",
+            "select * from (select *, a + 1 as c from e) t where c = true",
+            "select * from (select a as z, * from e) t where b = 1",
+            "select * from (select k.* from e, k) t where b = 1",
+            "select * from (select * from (select * from e) u) t where a = true",
+            "select * from (select * from e join k using (a)) t where a = true",
+            "select * from (select * from e full join k using (a)) t where a = true",
+            "select * from (select * from e natural join k) t where b = 1",
+            "with t(x, y) as (select * from e) select * from t where y = 1",
+            "with t(x) as (select * from e) select * from t u(p) where p = true",
+            "select * from (select * from e, k) t where b = 1",
+            "select * from (select *, * from e) t where b = 'v1'",
+            "select * from (select * from e join k using (a)) t where a = 5",
+            "with t(x, y) as (select * from e) select x from t where y = 'v5'",
+            "select * from (select * from e) t where nosuch = 1",
+            "select ctid from (select * from e) t",
+        ],
+    ) == [
+        ("ok", "INSERT 0 1"),
+        integer_boolean,
+        text_integer,
+        integer_boolean,
+        text_integer,
+        text_integer,
+        integer_boolean,
+        integer_boolean,
+        integer_boolean,
+        text_integer,
+        text_integer,
+        integer_boolean,
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        ("ok", [(5, "v5", "w")]),
+        ("ok", [(5,)]),
+        ("err", "42703", 'column "nosuch" does not exist'),
+        ("err", "42703", 'column "ctid" does not exist'),
+    ]
+
+
+@pytest.mark.backlog("RP-434")
+def test_lateral_view_values_and_using_columns_are_typed(rust_pg: Any) -> None:
+    """A LATERAL subquery's columns, a view's, a VALUES column of untyped
+    literals (`text`, as `select_common_type` resolves `unknown`) and a USING
+    join's merged column of two types (their common type) are typed, so a
+    comparison over them is 42883 at parse analysis."""
+    integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
+    text_integer = ("err", "42883", "operator does not exist: text = integer")
+    bigint_boolean = ("err", "42883", "operator does not exist: bigint = boolean")
+    assert _answers(
+        rust_pg,
+        [
+            "create table n (a bigint, c text)",
+            "create view v as select * from e",
+            "select * from e cross join lateral (select e.a + 1 as c) l where c = true",
+            "select * from v where a = true",
+            "select * from (values (1, 'x')) w where column2 = 1",
+            "select * from e join n using (a) where a = true",
+        ],
+    ) == [
+        ("ok", "CREATE TABLE"),
+        ("ok", "CREATE VIEW"),
+        integer_boolean,
+        integer_boolean,
+        text_integer,
+        bigint_boolean,
+    ]
 
 
 @pytest.mark.backlog_fixed("RP-432")

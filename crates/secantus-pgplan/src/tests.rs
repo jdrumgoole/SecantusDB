@@ -3842,3 +3842,36 @@ fn a_subquerys_join_on_may_name_the_outer_query() {
     .expect_err("an unknown qualifier");
     assert_eq!(err.sqlstate(), "42P01", "{err}");
 }
+
+#[test]
+fn a_star_derived_table_is_type_checked() {
+    // A FROM subquery or CTE written `select *` has its FROM items' column
+    // types (`ExpandColumnRefStar`), renamed by an alias list, a USING join's
+    // merged column listed once (RP-431). These planned, and answered no rows.
+    for q in [
+        "select * from (select * from t) s where n = true",
+        "select * from (select t.* from t) s where name = 1",
+        "select * from (select * from t) s(x, y, z) where z = true",
+        "select * from (select id as k, * from t) s where name = 1",
+        "with c as (select * from t) select * from c where n = true",
+        "with c(x, y) as (select * from t) select * from c where y = 1",
+        "select * from (select * from t join t u using (id)) s where id = true",
+        "select * from (select * from (select * from t) u) s where n = true",
+    ] {
+        let err = analysed(q).expect_err(q).to_string();
+        assert!(err.contains("operator does not exist"), "{q}: {err}");
+    }
+    // A name the expansion lists twice is ambiguous, never typed as either.
+    for q in [
+        "select * from (select * from t, t u) s where name = 1",
+        "select * from (select *, * from t) s where name = 1",
+        "select * from (select * from t) s where n = 5",
+    ] {
+        if let Err(e) = analysed(q) {
+            assert!(
+                !e.to_string().contains("operator does not exist"),
+                "{q}: {e}"
+            );
+        }
+    }
+}

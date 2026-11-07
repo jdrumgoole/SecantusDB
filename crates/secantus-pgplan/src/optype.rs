@@ -39,8 +39,15 @@ fn category(ty: &str) -> Option<&'static str> {
 /// qualifier uses; `complete` when every FROM item is one of them, so an
 /// unqualified column resolves among them alone. A subquery's scope has
 /// its enclosing query's as `parent`, where a name it does not have resolves.
-/// A CTE in scope: its name and, when it is a plain SELECT, its query.
-type Cte = (String, Option<pg_query::protobuf::SelectStmt>);
+/// A CTE in scope: its name and, when it is a plain SELECT, its query and
+/// the column names written after its name (`with t(x, y) as ...`).
+type Cte = (
+    String,
+    Option<(
+        pg_query::protobuf::SelectStmt,
+        Vec<pg_query::protobuf::Node>,
+    )>,
+);
 
 /// The catalog: a relation's definition by name.
 type Lookup<'p> = &'p dyn Fn(&str) -> Option<TableDef>;
@@ -108,13 +115,19 @@ impl<'p> Scope<'p> {
                     .map(|a| a.aliasname.clone())
                     .filter(|a| !a.is_empty())
                     .unwrap_or_else(|| r.relname.clone());
-                let colnames = r
+                let aliased = r
                     .alias
                     .as_ref()
                     .map(|a| a.colnames.clone())
                     .unwrap_or_default();
                 match def {
-                    Some(q) => self.add_derived(alias, &colnames, q, ctes, lookup),
+                    // The FROM alias's names first, then the CTE's own.
+                    Some((q, named)) => {
+                        let colnames: Vec<_> = (0..aliased.len().max(named.len()))
+                            .filter_map(|i| aliased.get(i).or(named.get(i)).cloned())
+                            .collect();
+                        self.add_derived(alias, &colnames, q, ctes, lookup)
+                    }
                     None => self.complete = false,
                 }
             }
@@ -281,7 +294,7 @@ impl<'p> Scope<'p> {
             return;
         }
         let mut columns = Vec::new();
-        for (i, t) in q.target_list.iter().enumerate() {
+        for t in &q.target_list {
             let Some(N::ResTarget(rt)) = t.node.as_ref() else {
                 self.complete = false;
                 return;
@@ -290,13 +303,26 @@ impl<'p> Scope<'p> {
                 self.complete = false;
                 return;
             };
-            // `*` expands to columns this does not list.
+            // `*` / `t.*`: the FROM items' columns, in order
+            // (`ExpandColumnRefStar`), named by the alias list by position.
             if let Some(N::ColumnRef(c)) = val.node.as_ref() {
                 if c.fields.iter().any(|f| matches!(f.node, Some(N::AStar(_)))) {
-                    self.complete = false;
-                    return;
+                    let Some(expanded) = star_columns(c, &inner, &q.from_clause) else {
+                        self.complete = false;
+                        return;
+                    };
+                    for col in expanded {
+                        let name = colnames
+                            .get(columns.len())
+                            .and_then(named)
+                            .unwrap_or_else(|| col.name.clone());
+                        columns.push(Column::new(&name, &col.pg_type, true));
+                    }
+                    continue;
                 }
             }
+            // The output position, past what a `*` before it expanded to.
+            let i = columns.len();
             let name = colnames
                 .get(i)
                 .and_then(named)
@@ -309,6 +335,14 @@ impl<'p> Scope<'p> {
                 .unwrap_or_else(|| "?column?".to_string());
             let ty = operand_type(val, &inner).unwrap_or_default();
             columns.push(Column::new(&name, &ty, true));
+        }
+        // A name the derived table has twice is ambiguous to a reference
+        // (42702), not a column of either type: judged by neither.
+        let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        for c in &mut columns {
+            if names.iter().filter(|n| **n == c.name).count() > 1 {
+                c.pg_type.clear();
+            }
         }
         self.tables
             .push((alias.clone(), TableDef::new(&alias, columns)));
@@ -365,6 +399,91 @@ impl<'p> Scope<'p> {
             _ => None,
         }
     }
+}
+
+/// What a `*` or `t.*` in a derived table's select list expands to: every
+/// column of the FROM items in order, or of the one named
+/// (`ExpandColumnRefStar`). `None` when this cannot list them exactly: a
+/// FROM item it does not see into, or a join whose columns it cannot tell.
+fn star_columns(
+    c: &pg_query::protobuf::ColumnRef,
+    inner: &Scope,
+    from: &[pg_query::protobuf::Node],
+) -> Option<Vec<Column>> {
+    if !inner.complete {
+        return None;
+    }
+    let parts: Vec<Option<&str>> = c
+        .fields
+        .iter()
+        .map(|f| match f.node.as_ref() {
+            Some(N::String(s)) => Some(s.sval.as_str()),
+            _ => None,
+        })
+        .collect();
+    match parts.as_slice() {
+        [None] => {
+            // A complete scope holds one table per FROM leaf, in order.
+            let mut leaves = inner.tables.iter().map(|(_, d)| d);
+            let mut out = Vec::new();
+            for item in from {
+                out.extend(item_columns(item, &mut leaves)?);
+            }
+            Some(out)
+        }
+        [Some(q), None] => Some(inner.tables.iter().find(|(a, _)| a == q)?.1.columns.clone()),
+        _ => None,
+    }
+}
+
+/// A FROM item's columns as `*` lists them (`expandRTE`). A USING or
+/// NATURAL join's merged columns come first, once, then each side's others
+/// (`transformFromClauseItem`); a merged column is typed only when both
+/// sides agree, as `select_common_type` would otherwise choose.
+fn item_columns(
+    item: &pg_query::protobuf::Node,
+    leaves: &mut dyn Iterator<Item = &TableDef>,
+) -> Option<Vec<Column>> {
+    let Some(N::JoinExpr(j)) = item.node.as_ref() else {
+        return Some(leaves.next()?.columns.clone());
+    };
+    // Renamed by an alias list: not followed here.
+    if j.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
+        return None;
+    }
+    let left = item_columns(j.larg.as_deref()?, leaves)?;
+    let right = item_columns(j.rarg.as_deref()?, leaves)?;
+    let using: Vec<String> = if j.is_natural {
+        left.iter()
+            .filter(|l| right.iter().any(|r| r.name == l.name))
+            .map(|l| l.name.clone())
+            .collect()
+    } else {
+        j.using_clause
+            .iter()
+            .map(|n| match n.node.as_ref() {
+                Some(N::String(s)) => Some(s.sval.clone()),
+                _ => None,
+            })
+            .collect::<Option<_>>()?
+    };
+    let mut out = Vec::new();
+    for u in &using {
+        let one = |side: &[Column]| {
+            let mut it = side.iter().filter(|c| c.name == *u);
+            match (it.next(), it.next()) {
+                (Some(c), None) => Some(c.pg_type.clone()),
+                _ => None,
+            }
+        };
+        let (l, r) = (one(&left)?, one(&right)?);
+        let ty = if l == r { l } else { String::new() };
+        out.push(Column::new(u, &ty, true));
+    }
+    let others = |side: Vec<Column>| side.into_iter().filter(|c| !using.contains(&c.name));
+    out.extend(others(left));
+    out.extend(others(right));
+    Some(out)
 }
 
 /// The static type of `expr` in the FROM scope of `sel` (a subquery's
@@ -1443,21 +1562,6 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
     Ok(())
 }
 
-/// A CTE's query with its column list (`WITH w(x) AS (...)`) applied, so
-/// it is typed under the names the statement uses.
-fn cte_named(
-    q: &pg_query::protobuf::SelectStmt,
-    names: &[pg_query::protobuf::Node],
-) -> pg_query::protobuf::SelectStmt {
-    let mut q = q.clone();
-    for (t, n) in q.target_list.iter_mut().zip(names) {
-        if let (Some(N::ResTarget(rt)), Some(N::String(s))) = (t.node.as_mut(), n.node.as_ref()) {
-            rt.name = s.sval.clone();
-        }
-    }
-    q
-}
-
 fn check_select(
     s: &pg_query::protobuf::SelectStmt,
     outer_ctes: &[Cte],
@@ -1997,7 +2101,7 @@ fn with_ctes(
         }
         if !w.recursive {
             let query = match c.ctequery.as_deref().and_then(|n| n.node.as_ref()) {
-                Some(N::SelectStmt(q)) => Some(cte_named(q, &c.aliascolnames)),
+                Some(N::SelectStmt(q)) => Some(((**q).clone(), c.aliascolnames.clone())),
                 _ => None,
             };
             ctes.push((c.ctename.clone(), query));
