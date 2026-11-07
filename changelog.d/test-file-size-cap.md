@@ -27,3 +27,13 @@ the machine then failed with "No space left on device".
   a non-Python child writing past a lowered limit dies of SIGXFSZ.
 - `tests/test_clean_pytest_tmp.py`: the sweep's mongod cases, and the
   reference mongod's prefix pinned to the sweep's.
+
+#### Fixed
+
+- `tests/backlog/test_rp_named_parse_cancel.py` (RP-303's regression test)
+  failed this PR's CI on a trial its cancel never met: the Parse answered
+  0.007 s after the cancel left, sooner than the cancel's own connection
+  reaches the server. A trial whose cancel left under 0.1 s before an
+  answered Parse is now aimed again, like one that left after it, and the
+  "cut short" check allows the same margin. A cancel that leaves in time and
+  is lost still fails.
