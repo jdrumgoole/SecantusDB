@@ -1949,21 +1949,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Backlog-ID: RP-475
       Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
 
-## Found while working RP-474 (2026-11-07)
-
-- [ ] **A function in FROM runs twice under an aggregate whose WHERE has a
-      conjunct that reads no column.** With `fz()` a SETOF SQL function
-      whose body inserts a row, `select count(*) from fz() where 1 = 1`,
-      `select max(x) from fz() as f(x) where x > 0 and 1 = 1` and `select
-      x, count(*) from fz() as f(x) where 1 = 1 group by x` each insert
-      twice here; PostgreSQL 15.19 runs the function once. A scalar
-      function (`fq()`) the same, and a `$1 = 1` WHERE under the extended
-      protocol too. `where true`, `where x = 1` and no WHERE run it once.
-      Its rows are right; its side effects are doubled. Measured on a
-      private 15.19 cluster.
-      Backlog-ID: RP-476
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_aggregate_over_where_runs_the_function_once
-
 ## Found while working RP-454 (2026-11-07)
 
 - [ ] **A FROM item named as a table an aliased JOIN hides is refused.**
@@ -2029,19 +2014,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       33 in the gap test's two statements).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
-
-## Found while working RP-478 (2026-11-07)
-
-- [ ] **A LATERAL subquery draws a `nextval` once more than its rows.**
-      `select a, n from fe, lateral (select nextval('lq') + fe.a as n) s`,
-      over `fe` holding one row, answers `(1, 2)` and leaves `lq` at 1 on
-      PostgreSQL 15.19; here it answers `(1, 3)` and leaves it at 2, the
-      bare form (`+ a`) the same. `lateral_leaf` plans the item once over
-      sample values for its output's shape, and planning a FROM-less body
-      evaluates its targets, so the sequence is drawn there before each
-      left row draws its own. Measured on a private 15.19 cluster.
-      Backlog-ID: RP-482
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_lateral_subquery_draws_once_per_row
 
 ## Found while working RP-316 (2026-11-02)
 
