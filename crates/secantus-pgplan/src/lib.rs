@@ -4867,6 +4867,20 @@ fn plan_with_subqueries_parsed(
     plan_query_node(sql, node, lookup, params, run)
 }
 
+/// The refusals PostgreSQL makes at parse analysis, before anything is
+/// planned: an untyped value (42P18 / 42804), an operator with no overload
+/// for its operands' types (42883) and an ambiguous ORDER BY name (42702).
+fn analysis_refusals(inner: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
+    func_cast::refuse_unresolved(inner)?;
+    cancel::check()?;
+    optype::check(inner, lookup)?;
+    cancel::check()?;
+    if let N::SelectStmt(sel) = inner {
+        order_by_ambiguity(sel)?;
+    }
+    Ok(())
+}
+
 /// [`plan_with_subqueries`] for one parsed statement.
 fn plan_query_node(
     sql: &str,
@@ -4902,13 +4916,7 @@ fn plan_query_node(
     }
     cancel::check()?;
     if let Some(inner) = node.node.as_ref() {
-        func_cast::refuse_unresolved(inner)?;
-        cancel::check()?;
-        optype::check(inner, lookup)?;
-        cancel::check()?;
-        if let N::SelectStmt(sel) = inner {
-            order_by_ambiguity(sel)?;
-        }
+        analysis_refusals(inner, lookup)?;
     }
     cancel::check()?;
     if let Some(inner) = node.node.as_mut() {
@@ -10067,6 +10075,13 @@ fn plan_explain(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
+    // `transformExplainStmt` analyses the statement before `ExplainQuery`
+    // reads a single option, so a statement PostgreSQL refuses is refused
+    // under every EXPLAIN form, ANALYZE included, ahead of an option's own
+    // error (RP-419).
+    if let Some(q) = e.query.as_deref().and_then(|q| q.node.as_ref()) {
+        analysis_refusals(q, lookup)?;
+    }
     let mut options = ExplainOptions {
         analyze: false,
         verbose: false,

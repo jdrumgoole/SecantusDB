@@ -1618,14 +1618,30 @@ a regression test.
       RP-409).
       Verify: tests/backlog/test_rp_where_types.py::test_where_must_be_boolean
       Backlog-ID: RP-418
-- [ ] **EXPLAIN plans a statement PostgreSQL refuses for an operator
-      type.** `explain select * from e where a = true` (an integer `a`) is
-      42883 `operator does not exist: integer = boolean` on PostgreSQL
-      15.19, as the SELECT alone is here too; EXPLAIN here prints `Seq
-      Scan on e` with no Filter at all. Measured on a private 15.19
-      cluster (found while working RP-409).
-      Verify: tests/backlog/test_rp_where_types.py::test_explain_checks_operator_types
-      Backlog-ID: RP-419
+- [ ] **An INSERT's SELECT and a WITH query are not type-checked.**
+      `insert into k select * from e where a = true` (an integer `a`)
+      inserts nothing here, and `with t as (select * from e where a = true)
+      select * from t` returns no rows; PostgreSQL 15.19 refuses both at
+      parse analysis, 42883 `operator does not exist: integer = boolean`,
+      as this server does for the SELECT alone. `optype::check` discards
+      the INSERT's `check_select` result (`let _ =`) and never walks a CTE
+      body. A confident empty answer to a statement PostgreSQL rejects.
+      Measured on a private 15.19 cluster (found while working RP-419).
+      Backlog-ID: RP-427
+      Verify: tests/backlog/test_rp_analysis_order.py::test_insert_select_and_cte_are_type_checked
+- [ ] **EXPLAIN reports its option's error ahead of a missing relation, a
+      missing function or a bad literal.** PostgreSQL 15.19 analyses the
+      statement before `ExplainQuery` reads an option, so `explain (bogus)
+      select * from nosuch` is 42P01, `explain (bogus) select nosuchfn(a)
+      from e` 42883 and `explain (bogus) select * from e where a = 'x'`
+      22P02; here each is 42601 `unrecognized EXPLAIN option "bogus"`.
+      Since RP-419 the operator-type, untyped-value and ORDER BY checks run
+      first; these are resolved while planning, after the options. A
+      planner-time error (`explain (bogus) select 1/0`) correctly stays
+      behind the option's. Measured on a private 15.19 cluster (found
+      while working RP-419).
+      Backlog-ID: RP-428
+      Verify: tests/backlog/test_rp_analysis_order.py::test_explain_resolves_names_before_options
 - [ ] **A node above a dummy relation prints no estimate, and a dummy
       join no width.** Since RP-409 a WHERE that folds to constant false
       plans a `Result` with `One-Time Filter: false`, costing nothing, as
