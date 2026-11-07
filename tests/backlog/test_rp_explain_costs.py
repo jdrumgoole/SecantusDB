@@ -2329,9 +2329,10 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
             "  Filter: ((b <> 'v3'::text) AND ((a < 15) OR (a > 55)))",
         ],
     ),
-    # A strict operator over a NULL constant folds to NULL
+    # A strict operator over a NULL constant folded to NULL
     # (`eval_const_expressions`), and a NULL qual is a constant false:
-    # no scan at all (found while working RP-399).
+    # no scan at all (found while working RP-399). The table has no
+    # primary key, and the plan named `e_pkey`.
     "a comparison with a null constant is a false one-time filter": (
         "RP-409",
         _ANALYSED,
@@ -2343,6 +2344,110 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         _ANALYSED,
         "explain (costs off) select * from e where a between null and 15 and b <> 'v3'",
         ["Result", "  One-Time Filter: false"],
+    ),
+    # The rest of RP-409's simplification, each measured on a private
+    # 15.19 cluster: an OR drops a NULL arm and is gone with a TRUE one,
+    # an AND with a FALSE is false, a null test of a NULL is TRUE, and
+    # the dummy relation sits under an Aggregate, a join or a DELETE.
+    "an or drops its null arm": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a = null or b = 'v3'",
+        ["Seq Scan on e", "  Filter: (b = 'v3'::text)"],
+    ),
+    "an or with a true arm is no filter": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a > 5 or true",
+        ["Seq Scan on e"],
+    ),
+    "an and with a false arm is a false one-time filter": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a > 5 and false",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "a constant false where on a table without a primary key": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where false",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "a null test of a null comparison is true": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a = null is null",
+        ["Seq Scan on e"],
+    ),
+    "an aggregate over a dummy relation": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select count(*) from e where a = null",
+        ["Aggregate", "  ->  Result", "        One-Time Filter: false"],
+    ),
+    "a join with a null comparison is dummy": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e join k on e.a = k.a where k.a = null",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "a delete with a null comparison scans nothing": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) delete from e where a = null",
+        ["Delete on e", "  ->  Result", "        One-Time Filter: false"],
+    ),
+    "two constants and a null are one false filter": (
+        "RP-409",
+        _ANALYSED,
+        "explain (costs off) select * from e where a = 1 and a = 2 and null",
+        ["Result", "  One-Time Filter: false"],
+    ),
+    "analyze of a dummy relation": (
+        "RP-409",
+        _ANALYSED,
+        "explain (analyze, costs off, timing off, summary off) select * from e where a = null",
+        ["Result (actual rows=0 loops=1)", "  One-Time Filter: false"],
+    ),
+    # Nodes above a dummy relation are still priced, and its Result keeps
+    # a join's width (found while working RP-409).
+    "an aggregate over a dummy relation is priced": (
+        "RP-420",
+        _ANALYSED,
+        "explain select count(*) from e where a = null",
+        [
+            "Aggregate  (cost=0.00..0.01 rows=1 width=8)",
+            "  ->  Result  (cost=0.00..0.00 rows=0 width=0)",
+            "        One-Time Filter: false",
+        ],
+    ),
+    "a dummy join keeps its width": (
+        "RP-420",
+        _ANALYSED,
+        "explain select * from e, k where e.a = null",
+        ["Result  (cost=0.00..0.00 rows=0 width=14)", "  One-Time Filter: false"],
+    ),
+    # `eval_const_expressions` folds a COALESCE's constant arguments
+    # (found while working RP-409).
+    "a coalesce drops its null arguments": (
+        "RP-421",
+        _ANALYSED,
+        "explain (costs off) select * from e where coalesce(null, a) = 1",
+        ["Seq Scan on e", "  Filter: (COALESCE(a) = 1)"],
+    ),
+    "a coalesce of a constant first folds": (
+        "RP-421",
+        _ANALYSED,
+        "explain (costs off) select * from e where coalesce(1, a) = 1",
+        ["Seq Scan on e"],
+    ),
+    # `pull_up_subqueries` merges a simple FROM-subquery into its parent
+    # (found while working RP-409).
+    "a plain from-subquery is pulled up": (
+        "RP-422",
+        _ANALYSED,
+        "explain (costs off) select * from (select * from e where a > 5) s",
+        ["Seq Scan on e", "  Filter: (a > 5)"],
     ),
     # A table whose only index is a composite one, its WHERE constraining
     # both columns (found while working RP-399).
@@ -2394,6 +2499,14 @@ SCENARIOS: dict[str, tuple[str, list[str], str, list[str]]] = {
         _ANALYSED_THIRTY,
         "explain (costs off) select * from e where not (a > 15 or b = 'v3')",
         ["Seq Scan on e", "  Filter: ((a <= 15) AND (b <> 'v3'::text))"],
+    ),
+    # With a NULL arm the negated arms' AND is constant false (found
+    # while working RP-409).
+    "a not over an or with a null arm is a false one-time filter": (
+        "RP-412",
+        _ANALYSED,
+        "explain (costs off) select * from e where not (a > 1 or null)",
+        ["Result", "  One-Time Filter: false"],
     ),
     "a not over a between is the or of its negators": (
         "RP-412",
@@ -3353,6 +3466,7 @@ def _marked(name: str, item: str) -> Any:
         "RP-403",
         "RP-404",
         "RP-405",
+        "RP-409",
     )
     mark = pytest.mark.backlog_fixed if fixed else pytest.mark.backlog
     return pytest.param(name, marks=mark(item), id=name)
