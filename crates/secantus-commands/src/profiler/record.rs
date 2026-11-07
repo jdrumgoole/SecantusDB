@@ -34,6 +34,14 @@ thread_local! {
     static MODIFIED: Cell<Option<i64>> = const { Cell::new(None) };
     /// The namespace the handler says the operation is profiled under.
     static NAMESPACE: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The operation running on this thread is profiled.
+    static PROFILED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether the operation running on this thread is profiled: what only its
+/// profile entry reports (`execStats`) is worked out only then.
+pub(crate) fn profiled() -> bool {
+    PROFILED.with(Cell::get)
 }
 
 /// The operation running on this thread is profiled under `ns` (a command
@@ -64,6 +72,7 @@ pub(crate) struct Pending {
 pub(crate) fn begin(name: &str, doc: &Document, ctx: &CommandContext) -> Option<Pending> {
     // What this operation spills is its own (RM-211).
     secantus_core::memlimit::reset_report();
+    PROFILED.with(|p| p.set(false));
     // How many documents a `findAndModify` changed: its line says too.
     if matches!(name, "findAndModify" | "findandmodify") {
         MODIFIED.with(|m| m.set(Some(0)));
@@ -84,6 +93,7 @@ pub(crate) fn begin(name: &str, doc: &Document, ctx: &CommandContext) -> Option<
     if matches!(name, "update" | "delete") || merges {
         STATEMENTS.with(|s| *s.borrow_mut() = Some(Vec::new()));
     }
+    PROFILED.with(|p| p.set(true));
     let existed = name == "create"
         && ctx.storage.as_ref().is_some_and(|s| {
             let coll = ns.split_once('.').map_or("", |(_, c)| c);
@@ -297,12 +307,50 @@ pub(crate) fn finish(
             entry.insert("planSummary", summary);
         }
         execution(name, doc, ok, ctx, &mut entry);
+        // A `findAndModify`'s stages: its write's, over the read of its
+        // document (RM-359).
+        if let Some(run) = exec.and_then(|e| e.write_run.as_ref()) {
+            if let Some(stages) = run.exec_stats(&find_and_modify_wrote(doc, reply, modified)) {
+                entry.insert("execStats", stages);
+            }
+        }
         who.append(&mut entry);
         let entry = crate::opdebug::reorder(entry, crate::opdebug::PROFILE_ORDER);
         logged |= decide(&pending.db, settings, &entry, millis, ctx);
     }
     if pending.settings.is_some_and(|s| s.filter.is_some()) {
         ctx.slow_log = Some(logged);
+    }
+}
+
+/// What a `findAndModify`'s write did, from its reply: the document it
+/// matched or removed, the one it upserted, and whether it handed one back.
+fn find_and_modify_wrote(
+    doc: &Document,
+    reply: &Document,
+    modified: Option<i64>,
+) -> crate::explain::stream::Wrote {
+    let last = reply.get_document("lastErrorObject").ok();
+    let n = last
+        .and_then(|l| l.get("n"))
+        .and_then(crate::util::as_i64)
+        .unwrap_or(0);
+    let upserted = i64::from(last.is_some_and(|l| l.contains_key("upserted")));
+    let returned = reply.get("value").is_some_and(|v| !matches!(v, Bson::Null));
+    if doc.get_bool("remove").unwrap_or(false) {
+        return crate::explain::stream::Wrote {
+            deleted: n,
+            returned,
+            ..Default::default()
+        };
+    }
+    let matched = n - upserted;
+    crate::explain::stream::Wrote {
+        matched,
+        modified: modified.unwrap_or(matched),
+        upserted,
+        returned,
+        ..Default::default()
     }
 }
 
@@ -566,6 +614,9 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
         entry.insert("keysExamined", e.keys_examined);
         entry.insert("docsExamined", e.docs_examined);
+        if let Some(stages) = &e.exec_stages {
+            entry.insert("execStats", stages.clone());
+        }
     }
     if ok {
         crate::slowop::spills(
@@ -896,6 +947,8 @@ struct Ran {
     cpu_nanos: Option<i64>,
     storage: Option<Document>,
     remote: Option<String>,
+    /// Its plan's stages, as they ran (`execStats`, RM-359).
+    exec_stats: Option<Document>,
 }
 
 enum StatementOutcome {
@@ -1037,8 +1090,34 @@ impl Statement {
             entry.insert("storage", storage.clone());
         }
         entry.insert("millis", int32(self.millis));
+        if let Some(stages) = &self.ran.exec_stats {
+            entry.insert("execStats", stages.clone());
+        }
         who.append(&mut entry);
         crate::opdebug::reorder(entry, crate::opdebug::PROFILE_ORDER)
+    }
+}
+
+impl StatementOutcome {
+    /// What the statement's write stage did; none for one that failed.
+    fn wrote(&self) -> Option<crate::explain::stream::Wrote> {
+        match self {
+            StatementOutcome::Updated {
+                matched,
+                modified,
+                upserted,
+            } => Some(crate::explain::stream::Wrote {
+                matched: *matched,
+                modified: *modified,
+                upserted: *upserted,
+                ..Default::default()
+            }),
+            StatementOutcome::Deleted(n) => Some(crate::explain::stream::Wrote {
+                deleted: *n,
+                ..Default::default()
+            }),
+            StatementOutcome::Failed(_) => None,
+        }
     }
 }
 
@@ -1083,6 +1162,8 @@ pub(crate) struct StatementExec {
     pub summary: Option<String>,
     pub keys_examined: i64,
     pub docs_examined: i64,
+    /// The read of its documents, which its `execStats` completes.
+    pub run: Option<crate::explain::stream::WriteRun>,
 }
 
 thread_local! {
@@ -1171,7 +1252,7 @@ impl<'a> Statements<'a> {
 
     /// How the open statement ran: what it counted since it started, the
     /// command's locks and storage statistics so far.
-    fn ran(&self, open: &Open) -> Ran {
+    fn ran(&self, open: &Open, outcome: &StatementOutcome) -> Ran {
         let since = |now: Option<i64>, then: Option<i64>| now.map(|a| a - then.unwrap_or(0));
         let now = self.storage.as_ref().and_then(|s| s.operation_counts());
         let then = open.counts;
@@ -1219,6 +1300,11 @@ impl<'a> Statements<'a> {
                 .map(|(a, b)| b - a),
             storage: now.as_ref().and_then(crate::opdebug::storage_section),
             remote: crate::slowop::remote(),
+            exec_stats: exec
+                .as_ref()
+                .and_then(|e| e.run.as_ref())
+                .zip(outcome.wrote())
+                .and_then(|(run, wrote)| run.exec_stats(&wrote)),
         }
     }
 
@@ -1257,7 +1343,7 @@ impl<'a> Statements<'a> {
             self.planning_mark = crate::explain::planning_spent();
             return;
         }
-        let mut ran = self.ran(&open);
+        let mut ran = self.ran(&open, &outcome);
         // mongod prints the keys an update inserted and deleted when it
         // matched a document, the keys an upsert inserted, and the keys a
         // delete deleted (measured 8.2.11).

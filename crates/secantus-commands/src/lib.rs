@@ -327,6 +327,11 @@ pub struct ExecStats {
     /// The plan sorts in memory (`hasSortStage`), which every batch of its
     /// cursor reports.
     pub has_sort_stage: bool,
+    /// What each stage of the plan did so far: the profile entry's
+    /// `execStats` (RM-359), worked out only for a profiled operation.
+    pub exec_stages: Option<Document>,
+    /// A `findAndModify`'s read, whose `execStats` its write completes.
+    pub(crate) write_run: Option<Box<crate::explain::stream::WriteRun>>,
 }
 
 #[derive(Clone)]

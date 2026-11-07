@@ -1081,6 +1081,11 @@ pub(crate) fn sort_stats(
     if ran.is_err() {
         return;
     }
+    sort_extra(extra, &report);
+}
+
+/// A `SORT`'s memory and spill counters from what its sorter reported.
+pub(crate) fn sort_extra(extra: &mut Document, report: &secantus_core::memlimit::SpillReport) {
     // `appendNumber`: an int32 while the count fits (measured 8.2.11, the
     // trial's SORT in `allPlansExecution`).
     extra.insert("totalDataSizeSorted", num(report.sort_total_data_size));

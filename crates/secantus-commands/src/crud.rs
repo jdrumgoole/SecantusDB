@@ -1246,6 +1246,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 summary: Some(sel.summary.clone()),
                 keys_examined: sel.keys_examined,
                 docs_examined: sel.docs_examined,
+                run: sel.run.clone(),
             });
         }
         // A delete of ONE document removes the first its query matches in
@@ -1510,6 +1511,9 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // read took the skip and limit itself.
     let mut examined: Option<(i64, i64)> = None;
     let mut paged = false;
+    // Its stages (`execStats`, RM-359), and whether it read the record count.
+    let mut stages: Option<Document> = None;
+    let mut fast_count = false;
     let mut n = if view_on.is_some() {
         // Run on the VIEW: the aggregation resolves it, through any views
         // beneath it, and a view may hold a stage only a view may hold.
@@ -1636,8 +1640,9 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 crate::util::read_error_on_namespace(e, "count", &format!("{}.{coll}", ctx.db_name))
             })?
         };
-        if let Some((counted, keys, docs)) = counted {
+        if let Some((counted, keys, docs, run)) = counted {
             examined = Some((keys, docs));
+            stages = run;
             paged = true;
             counted
         } else if filter.is_empty() {
@@ -1646,6 +1651,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // a document -- and so counting another transaction's
             // uncommitted insert, as mongod 8.2.11 does (RM-191, RM-087).
             examined = Some((0, 0));
+            fast_count = true;
             storage
                 .collection_sizes(&ctx.db_name, &coll)
                 .map_err(|e| {
@@ -1709,6 +1715,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             crate::explain::order::Uses::Count,
         );
     }
+    let records = n;
     if skip > 0 && !paged {
         n = n.saturating_sub(skip).max(0);
     }
@@ -1718,10 +1725,18 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if limit > 0 && !paged {
         n = n.min(limit);
     }
+    if fast_count && crate::profiler::profiled() {
+        // One work, which reads the count (measured 8.2.11).
+        stages = Some(crate::explain::stream::fast_count_stats(
+            n,
+            skip.max(0).min(records),
+        ));
+    }
     if let Some((keys_examined, docs_examined)) = examined {
         ctx.exec_stats = Some(crate::ExecStats {
             keys_examined,
             docs_examined,
+            exec_stages: stages,
             ..Default::default()
         });
     }
@@ -1729,14 +1744,16 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 }
 
 /// A `count` run as mongod's plan for it runs, when a stream can run it
-/// (RM-023): how many documents it counts after `skip`, up to `limit`, and
-/// the keys and documents it examined. `None`: count as before.
+/// (RM-023): how many documents it counts after `skip`, up to `limit`, the
+/// keys and documents it examined, and its stages (`execStats`, RM-359).
+/// `None`: count as before.
+#[allow(clippy::type_complexity)]
 fn count_read(
     storage: &dyn crate::Storage,
     ask: &crate::explain::order::Ask,
     skip: i64,
     limit: i64,
-) -> Result<Option<(i64, i64, i64)>, StorageError> {
+) -> Result<Option<(i64, i64, i64, Option<Document>)>, StorageError> {
     let planned = crate::explain::order::Planned::Count { skip, limit };
     let Some(plan) = crate::explain::order::counted_plan(storage, ask, planned)? else {
         return Ok(None);
@@ -1755,7 +1772,11 @@ fn count_read(
     else {
         return Ok(None);
     };
-    stream.count(storage, skip, limit).map(Some)
+    let (n, keys, docs) = stream.count(storage, skip, limit)?;
+    let stages = crate::profiler::profiled()
+        .then(|| stream.count_stats(&plan, n))
+        .flatten();
+    Ok(Some((n, keys, docs, stages)))
 }
 
 /// Stages allowed in a pipeline-form (`u: [...]`) update
@@ -2374,6 +2395,7 @@ pub(crate) fn update_in(
                 summary: Some(sel.summary.clone()),
                 keys_examined: sel.keys_examined,
                 docs_examined: sel.docs_examined,
+                run: sel.run.clone(),
             });
         }
         // An update of ONE document changes the first its query matches in

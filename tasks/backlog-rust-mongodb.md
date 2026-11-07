@@ -215,7 +215,7 @@ These are explicit non-goals. Don't add them without a reason.
 - **`$where`** — runs JavaScript. We don't ship a JS runtime (confirmed by Joe 2026-10-16; MongoDB deprecated it in 8.0).
 - **`$function`, `$accumulator`** (aggregation expressions) — same reason: both evaluate user-supplied JavaScript and need an embedded JS engine + sandbox + BSON↔JS shim layer. Would also require a `--javascriptEnabled` gate (mongod gates JS behind this; many prod deployments disable it). Adding the runtime would let us implement these three operators + `mapReduce` together for ~600–1000 LOC + a heavyweight binary dep (PythonMonkey / QuickJS / V8 — each with maintenance trade-offs). Most pipelines that reach for `$function` can be expressed in the existing aggregation expression library. **`lang: "python"` as a SecantusDB extension was considered and rejected (May 2026)**: would break the conformance contract (pipelines that work locally would explode in production with `Unrecognized lang value: 'python'`), and CPython's sandboxing story is worse than embedded JS engines. If a real user need ever surfaces, the right escape hatch is a server-side trusted-plugin registry — `{$secantusFunction: {name: "<pre-registered>", args: [...]}}` — not user code at query time.
 - **`mapReduce`** — same JS-runtime dependency as `$where` / `$function` / `$accumulator`, and deprecated by MongoDB (removed from the Stable API in 5.0). **WILL NOT BUILD** (decided 2026-09-27). The canonical `emit(this.<field>, 1)` + `values.length` "count by field" pattern is translated to an equivalent `$group` aggregation; anything else, a named `out: "<coll>"` included, is refused as a `--noscripting` mongod 8.2.11 refuses it (31264, re-measured 2026-10-20). mongo-java-driver's `testMapReduceWithGenerics` writes to a NAMED output collection and so fails permanently; that failure is accepted rather than tracked.
-- **Profiling: execution statistics in `system.profile` entries** — no longer out of scope: decided in scope 2026-10-16 (Joe), counted during execution; done in RM-023 (2026-10-27) but for a profile entry's per-stage `execStats` (RM-359). A `$jsonSchema` profile filter still reads back as given, where mongod expands it.
+- **Profiling: execution statistics in `system.profile` entries** — no longer out of scope: decided in scope 2026-10-16 (Joe), counted during execution; done in RM-023 (2026-10-27), and a profile entry's per-stage `execStats` in RM-359 (2026-11-07). A `$jsonSchema` profile filter still reads back as given, where mongod expands it.
 
 ## 5. Known bugs and edge cases to watch
 
@@ -602,15 +602,51 @@ These are explicit non-goals. Don't add them without a reason.
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **A profile entry has no `execStats`.** mongod 8.2.11's entry for a
-      read or a write statement carries the plan's stages with what each
-      did (`works`, `advanced`, `keysExamined`, ...), from the run itself.
-      This server's streaming executor counts keys and documents examined
-      per batch (RM-023) but keeps no per-stage statistics, and the
-      `explain` walk's stage statistics are not to stand in for a run's
-      (decided 2026-10-16 for RM-023).
-      Backlog-ID: RM-359
-      Verify: tests/backlog/test_rm_355_364.py::test_a_profile_entry_carries_the_execution_stats
+- [ ] **A DISTINCT_SCAN examines one key fewer than mongod's.** mongod
+      8.2.11's DISTINCT_SCAN for `distinct("x", {x: {$lt: 4}})` over keys
+      0 to 11 examines five keys -- the four it returns and the one past
+      its bounds that its last seek lands on -- in the entry's and the
+      line's `keysExamined` and its `execStats`. This server's scan ends at
+      the bound without counting that key (four). Found 2026-11-07 (RM-359).
+      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_distinct_scan_examines_the_key_past_its_bounds
+      Backlog-ID: RM-377
+- [ ] **A projection is not where mongod's plan puts it.** mongod 8.2.11
+      projects below a blocking SORT (`SORT` over `PROJECTION_SIMPLE` or
+      `PROJECTION_COVERED`, so the SORT sorts the projected documents:
+      `totalDataSizeSorted` 318 where whole documents are 402), and the
+      projection over a SORT_MERGE whose keys hold the projected fields is
+      `PROJECTION_DEFAULT`. This server's plan projects above the SORT and
+      calls that projection `PROJECTION_COVERED`, in `explain` and in a
+      profile entry's `execStats` alike. Found 2026-11-07 (RM-359).
+      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_projection_is_where_mongods_plan_puts_it
+      Backlog-ID: RM-373
+- [ ] **A SORT with a limit of 1 counts the data it sorted.** mongod
+      8.2.11's SORT keeps its one best document and reports
+      `totalDataSizeSorted: 0` (a `find`'s and a `findAndModify`'s, in a
+      profile entry's `execStats` and in `explain`; a limit of 3 counts
+      201). This server's sorter counts the document it kept (67).
+      Found 2026-11-07 (RM-359).
+      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_sort_of_one_document_counts_no_data_sorted
+      Backlog-ID: RM-374
+- [ ] **Two updates are planned as an `_id` express write where mongod's
+      are not.** mongod 8.2.11 plans an update with a `sort` (8.0) as
+      UPDATE over a SORT over its read (`planSummary: COLLSCAN`, 0 keys
+      and 12 documents examined for `{q: {z: 0}, sort: {y: -1}}`), and an
+      update of `{_id: 3}` under a non-simple collation as UPDATE, FETCH,
+      IXSCAN (`IXSCAN { _id: 1 }`). This server's statement reports
+      `EXPRESS_IXSCAN { _id: 1 },EXPRESS_UPDATE` for both, one key and one
+      document examined, and an EXPRESS_UPDATE `execStats`. Found
+      2026-11-07 (RM-359).
+      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_an_update_is_planned_as_mongod_plans_it
+      Backlog-ID: RM-376
+- [ ] **A SORT of index keys reports no `totalDataSizeSorted`.** mongod
+      8.2.11's SORT below a FETCH (`type: "default"`) counts the data it
+      sorted in a profile entry's `execStats` (780 for the twelve `{y, x}`
+      keys of `find({y: {$gte: 0}}).sort({x: 1})`). This server sorts the
+      index keys without its sorter and counts none; the stage's works are
+      mongod's. Found 2026-11-07 (RM-359).
+      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_sort_of_index_keys_counts_the_data_it_sorted
+      Backlog-ID: RM-375
 - [ ] **No `numInterruptChecks` on a line.** mongod 8.2.11 counts the times
       an operation checked whether it had been killed (5 for a ten-document
       `find` through an index) and prints it on every command's line. This
@@ -668,7 +704,9 @@ These are explicit non-goals. Don't add them without a reason.
       Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_a_view_names_the_view_it_resolved
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
-      mongod's plan counts its keys and documents examined; these do not:
+      mongod's plan counts its keys and documents examined, and since
+      RM-359 its profile entry carries its stages (`execStats`); these do
+      neither:
       - a read two or more plans could serve, which mongod chooses by trial
         (RM-349 streams it); its documents come from the store's router;
       - a time-series collection's read (RM-348) and a geo, `$near` or

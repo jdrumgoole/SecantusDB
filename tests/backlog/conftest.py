@@ -194,11 +194,26 @@ def mongod() -> Iterator[Any]:
 @pytest.fixture(scope="module")
 def mongod_rs() -> Iterator[Any]:
     """A throwaway single-node replica set: the reference for change streams
-    and retryable writes, which a standalone mongod refuses."""
+    and retryable writes, which a standalone mongod refuses.
+
+    Its execution control reports an operation that held a ticket past
+    `delinquentAcquisitionIntervalMillis` (30 ms, startup only) as
+    `delinquencyInfo` on its `Slow query` line, which load decides: a
+    three-document `find` printed it in the RM gate (2026-11-07), and any
+    `find` holding its ticket longer does on an idle machine. This server
+    has no execution control (RM-355), so the interval is out of reach and
+    the lines compared are the operation's own."""
     from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
-    proc, uri, dbpath = _start_mongod(extra_args=("--replSet", "backlog"))
+    proc, uri, dbpath = _start_mongod(
+        extra_args=(
+            "--replSet",
+            "backlog",
+            "--setParameter",
+            "delinquentAcquisitionIntervalMillis=86400000",
+        )
+    )
     try:
         boot = pymongo.MongoClient(uri, directConnection=True, serverSelectionTimeoutMS=10_000)
         host, port = _host_port(uri)

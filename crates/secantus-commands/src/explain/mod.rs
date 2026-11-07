@@ -49,7 +49,7 @@ use plan::{Hint, Query};
 use secantus_core::collation::Collation;
 use secantus_core::query::bson_type_name;
 use shape::{Kind, Shape};
-use std::rc::Rc;
+use std::sync::Arc;
 
 fn err(code: i32, name: &str, msg: impl Into<String>) -> CommandError {
     CommandError::new(code, name, msg.into())
@@ -198,7 +198,7 @@ fn hint_refusal(ns: &str, s: &Shape) -> CommandError {
     )
 }
 
-fn resolve_hint(hint: Option<&Bson>, catalog: &[Rc<IndexInfo>]) -> Result<Hint, CommandError> {
+fn resolve_hint(hint: Option<&Bson>, catalog: &[Arc<IndexInfo>]) -> Result<Hint, CommandError> {
     match hint {
         None | Some(Bson::Null) => Ok(Hint::None),
         Some(given @ Bson::String(name)) => catalog
@@ -372,7 +372,7 @@ pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery
 struct Target {
     exists: bool,
     docs: Vec<Document>,
-    catalog: Vec<Rc<IndexInfo>>,
+    catalog: Vec<Arc<IndexInfo>>,
 }
 
 fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
@@ -414,7 +414,7 @@ fn catalog(
     db: &str,
     coll: &str,
     docs: Option<&[Document]>,
-) -> Result<Vec<Rc<IndexInfo>>, crate::storage::StorageError> {
+) -> Result<Vec<Arc<IndexInfo>>, crate::storage::StorageError> {
     let mut catalog = Vec::new();
     // Without the documents, the store's one read of specs and paths.
     let listed: Vec<(Document, Option<Vec<Vec<String>>>)> = match docs {
@@ -466,7 +466,7 @@ fn catalog(
             paths.resize(key.len(), vec![]);
             paths
         };
-        catalog.push(Rc::new(IndexInfo {
+        catalog.push(Arc::new(IndexInfo {
             unique: name == "_id_" || spec.get_bool("unique").unwrap_or(false),
             sparse: spec.get_bool("sparse").unwrap_or(false),
             partial: spec.get_document("partialFilterExpression").ok().cloned(),
@@ -870,7 +870,7 @@ pub(crate) fn distinct_group_read(
 fn distinct_group_with(
     s: &Shape,
     collation: Option<&Collation>,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
     plan: impl Fn(&Shape) -> Result<(Node, Vec<plan::Ranked>), CommandError>,
 ) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
     let path = |v: &Bson| match v {
@@ -955,7 +955,7 @@ fn distinct_group_with(
     let filter_fields = query_fields(&s.filter);
     // The field leads the index, or follows fields the query names (an
     // equality on `a` and `a_1_b_1` for `b`).
-    let serves = |ix: &&Rc<IndexInfo>| {
+    let serves = |ix: &&Arc<IndexInfo>| {
         let Some(at) = ix.position(&field) else {
             return false;
         };
@@ -972,14 +972,14 @@ fn distinct_group_with(
             && sorted_by(ix).is_some()
     };
     let holds = |ix: &IndexInfo| reads.iter().all(|f| ix.position(f).is_some());
-    let candidates: Vec<&Rc<IndexInfo>> = catalog.iter().filter(serves).collect();
-    fn fewest(list: Vec<&Rc<IndexInfo>>) -> Option<&Rc<IndexInfo>> {
+    let candidates: Vec<&Arc<IndexInfo>> = catalog.iter().filter(serves).collect();
+    fn fewest(list: Vec<&Arc<IndexInfo>>) -> Option<&Arc<IndexInfo>> {
         list.into_iter().fold(None, |best, ix| match best {
             Some(b) if b.key.len() <= ix.key.len() => Some(b),
             _ => Some(ix),
         })
     }
-    let holding: Vec<&Rc<IndexInfo>> = candidates.iter().copied().filter(|ix| holds(ix)).collect();
+    let holding: Vec<&Arc<IndexInfo>> = candidates.iter().copied().filter(|ix| holds(ix)).collect();
     let Some(chosen) = fewest(holding).or_else(|| fewest(candidates)).cloned() else {
         return Ok(None);
     };

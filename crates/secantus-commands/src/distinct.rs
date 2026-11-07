@@ -143,6 +143,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // storage answered `[]` for every `distinct` on a view.
     // What the plan examined as it read (RM-023).
     let mut examined: Option<(i64, i64)> = None;
+    let mut stages: Option<Document> = None;
     let mut values: Vec<Bson> = if on_view {
         crate::views::check_hint(storage, &ctx.db_name, &coll, hint, &filter)?;
         if crate::notablescan::enabled(ctx) {
@@ -212,8 +213,9 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         // A plan that is a DISTINCT_SCAN answers from the index's keys.
         let streamed = streamed_values(storage, &ask, &key).map_err(read_error)?;
         let scanned = match streamed {
-            Some((values, keys, docs)) => {
+            Some((values, keys, docs, run)) => {
                 examined = Some((keys, docs));
+                stages = run;
                 Some(values)
             }
             None => {
@@ -258,6 +260,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ctx.exec_stats = Some(crate::ExecStats {
             keys_examined,
             docs_examined,
+            exec_stages: stages,
             ..Default::default()
         });
     }
@@ -269,11 +272,12 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// from its keys (or, through a collated index, from the first document of
 /// each), any other plan's from the documents it returns. `None`: the plan
 /// is not one a stream runs, and the values are read as before.
+#[allow(clippy::type_complexity)]
 fn streamed_values(
     storage: &dyn crate::Storage,
     ask: &crate::explain::order::Ask,
     key: &str,
-) -> Result<Option<(Vec<Bson>, i64, i64)>, crate::storage::StorageError> {
+) -> Result<Option<(Vec<Bson>, i64, i64, Option<Document>)>, crate::storage::StorageError> {
     use crate::explain::Node;
     let planned = crate::explain::order::Planned::Distinct(key);
     let Some(plan) = crate::explain::order::counted_plan(storage, ask, planned)? else {
@@ -297,6 +301,10 @@ fn streamed_values(
         return Ok(None);
     };
     let all = stream.read_all(storage)?;
+    // Its stages, as its profile entry gives them (RM-359).
+    let stages = crate::profiler::profiled()
+        .then(|| stream.exec_stats(&plan))
+        .flatten();
     let mut values = Vec::new();
     if from_keys {
         for k in all.keys {
@@ -315,7 +323,7 @@ fn streamed_values(
         }
         values = document_values(&decoded, key);
     }
-    Ok(Some((values, all.keys_examined, all.docs_examined)))
+    Ok(Some((values, all.keys_examined, all.docs_examined, stages)))
 }
 
 /// Every value `key` reaches in `documents`, through arrays of documents on

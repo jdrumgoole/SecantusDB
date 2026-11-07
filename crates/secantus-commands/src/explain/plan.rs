@@ -16,7 +16,7 @@ use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 thread_local! {
     /// Whether the operation running on this thread times its planning,
@@ -351,7 +351,7 @@ struct Access {
     /// The scan reads index keys, so documents need a FETCH.
     indexed: bool,
     /// The one index read, when there is exactly one.
-    index: Option<Rc<IndexInfo>>,
+    index: Option<Arc<IndexInfo>>,
     /// The scan already returns documents in the sort order.
     sorted: bool,
     subplan: bool,
@@ -472,7 +472,7 @@ fn collation_differs(index: &IndexInfo, query: Option<&Collation>) -> bool {
 
 /// What one index does for a conjunction.
 struct IndexUse {
-    index: Rc<IndexInfo>,
+    index: Arc<IndexInfo>,
     bounds: Vec<Vec<Interval>>,
     /// Clauses the bounds decide outright.
     covered: BTreeSet<usize>,
@@ -483,7 +483,7 @@ struct IndexUse {
     bounded_fields: usize,
 }
 
-fn use_index(index: &Rc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Query) -> IndexUse {
+fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Query) -> IndexUse {
     let collated = collation_differs(index, q.collation);
     let mut bounds = Vec::new();
     let mut covered = BTreeSet::new();
@@ -736,7 +736,7 @@ fn candidate_uses(
     leaves: &[Leaf],
     parts: &[Document],
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
 ) -> Vec<IndexUse> {
     let uses: Vec<IndexUse> = catalog
         .iter()
@@ -762,7 +762,7 @@ fn candidate_uses(
 }
 
 /// The index access for a conjunction, if any index is worth reading.
-fn index_access(parts: &[Document], q: &Query, catalog: &[Rc<IndexInfo>]) -> Option<Access> {
+fn index_access(parts: &[Document], q: &Query, catalog: &[Arc<IndexInfo>]) -> Option<Access> {
     let leaves = leaves_of(parts);
     let hinted = match &q.hint {
         Hint::Index(name) => catalog.iter().find(|ix| &ix.name == name),
@@ -855,7 +855,7 @@ fn or_access(
     branches: &[Bson],
     outer: &[Document],
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
 ) -> Option<(Node, Option<Document>)> {
     let plain = Query {
         sort: None,
@@ -882,7 +882,7 @@ fn or_access(
         } else {
             assemble(parts.clone())?
         };
-        let usable: Vec<Rc<IndexInfo>> = if outer.is_empty() {
+        let usable: Vec<Arc<IndexInfo>> = if outer.is_empty() {
             catalog.to_vec()
         } else {
             catalog
@@ -924,7 +924,7 @@ fn or_access(
         let at = access
             .index
             .as_ref()
-            .and_then(|ix| catalog.iter().position(|c| Rc::ptr_eq(c, ix)));
+            .and_then(|ix| catalog.iter().position(|c| Arc::ptr_eq(c, ix)));
         match (access.scan, at) {
             (Node::IxScan(ix), Some(at))
                 if own_parts == 1
@@ -1029,7 +1029,7 @@ fn merge_branches(inputs: &[Node], sort: &Document, q: &Query) -> Option<Node> {
     })
 }
 
-fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
+fn access(q: &Query, catalog: &[Arc<IndexInfo>]) -> Access {
     let always = q.canonical.len() == 1 && q.canonical.contains_key("$alwaysTrue");
     // Through `assemble`, which leaves out the twins `$expr` derives.
     let whole = || {
@@ -1117,14 +1117,14 @@ fn access(q: &Query, catalog: &[Rc<IndexInfo>]) -> Access {
 /// each one checked against the query, in catalog order.
 fn sort_walks(
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
     filter: Option<Document>,
     subplan: bool,
 ) -> Vec<Access> {
     let Some(sort) = sort_of(q) else {
         return Vec::new();
     };
-    let full = |ix: &Rc<IndexInfo>| vec![vec![Interval::all()]; ix.key.len()];
+    let full = |ix: &Arc<IndexInfo>| vec![vec![Interval::all()]; ix.key.len()];
     catalog
         .iter()
         .filter_map(|ix| {
@@ -1148,7 +1148,7 @@ fn sort_walks(
 /// The first walk of a whole index that returns the sort order.
 fn sort_provider(
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
     filter: Option<Document>,
     subplan: bool,
 ) -> Option<Access> {
@@ -1162,7 +1162,7 @@ fn sort_provider(
 fn candidates(
     parts: &[Document],
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
     filter: Option<Document>,
 ) -> Vec<(Access, Option<Preference>)> {
     if q.hint != Hint::None || q.min_max || q.keys_only || q.wanted.is_some() {
@@ -1282,7 +1282,7 @@ fn candidates(
             // Two scans of one index are intersected only all together,
             // above (an `$all` over a multikey index).
             let same = match (&out[x].0.index, &out[y].0.index) {
-                (Some(a), Some(b)) => Rc::ptr_eq(a, b),
+                (Some(a), Some(b)) => Arc::ptr_eq(a, b),
                 _ => false,
             };
             if same {
@@ -1352,7 +1352,7 @@ fn candidates(
 
 /// Whether mongod has more than one plan to try for the query, and so
 /// which it reads depends on its trial.
-pub(crate) fn contested(q: &Query, catalog: &[Rc<IndexInfo>]) -> bool {
+pub(crate) fn contested(q: &Query, catalog: &[Arc<IndexInfo>]) -> bool {
     let parts = clauses(q.canonical);
     if let [only] = parts.as_slice() {
         // An `$or` is planned branch by branch, each with its own trial
@@ -1381,7 +1381,7 @@ pub(crate) fn contested(q: &Query, catalog: &[Rc<IndexInfo>]) -> bool {
 fn tried(
     parts: &[Document],
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
     trial: &Trial,
     filter: Option<Document>,
 ) -> Option<Access> {
@@ -1612,7 +1612,7 @@ fn unfetched(node: Node) -> Node {
 }
 
 /// The plan for `count`.
-pub(crate) fn count(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
+pub(crate) fn count(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     let _timing = timing();
     if q.canonical.is_empty() && q.hint == Hint::None {
         return Node::FastCount;
@@ -1652,7 +1652,7 @@ pub(crate) fn count(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
 /// - an index with a collation holds collation keys, which cannot be read
 ///   back as values: its DISTINCT_SCAN fetches the first document of each
 ///   key, and nothing is projected.
-pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str, asked: bool) -> Node {
+pub(crate) fn distinct(q: &Query, catalog: &[Arc<IndexInfo>], key: &str, asked: bool) -> Node {
     let _timing = timing();
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
@@ -1692,7 +1692,7 @@ pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str, asked: b
         return wrap(access(&bare, catalog), &bare);
     }
     if parts.is_empty() {
-        let hinted = |ix: &&Rc<IndexInfo>| match &q.hint {
+        let hinted = |ix: &&Arc<IndexInfo>| match &q.hint {
             Hint::Index(name) => &ix.name == name,
             _ => true,
         };
@@ -1742,7 +1742,7 @@ pub(crate) fn distinct(q: &Query, catalog: &[Rc<IndexInfo>], key: &str, asked: b
 /// one document back and honours a sort.
 pub(crate) fn write(
     q: &Query,
-    catalog: &[Rc<IndexInfo>],
+    catalog: &[Arc<IndexInfo>],
     delete: bool,
     multi: bool,
     upsert: bool,
@@ -1811,7 +1811,7 @@ pub(crate) fn write(
 }
 
 /// The plan for a `find`-shaped query over a collection that exists.
-pub(crate) fn plan(q: &Query, catalog: &[Rc<IndexInfo>]) -> Node {
+pub(crate) fn plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     let _timing = timing();
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");

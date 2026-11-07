@@ -68,6 +68,12 @@ pub trait StreamCursor: Send {
     fn has_sort_stage(&self) -> bool {
         false
     }
+    /// What each stage of the cursor's plan has done, as the last batch's
+    /// profile entry gives it (`execStats`); `None` where mongod gives none
+    /// (an aggregation's).
+    fn exec_stages(&self) -> Option<Document> {
+        None
+    }
     /// The command a cursor opened with a first batch of none runs at its
     /// first `getMore`, when it has run nothing yet.
     fn deferred(&self) -> Option<Document> {
@@ -1326,6 +1332,12 @@ fn stream_get_more(
         plan_summary: stream.plan_summary(),
         originating_command: Some(stream.originating_command()),
         has_sort_stage: stream.has_sort_stage(),
+        exec_stages: ctx
+            .profiling
+            .is_some()
+            .then(|| stream.exec_stages())
+            .flatten(),
+        write_run: None,
     });
     cursors.return_stream(cursor_id, stream, batch.exhausted);
     ctx.pending_batch = Some(crate::PendingBatch {
@@ -1404,6 +1416,8 @@ fn deferred_get_more(
         plan_summary: None,
         originating_command: Some(command),
         has_sort_stage: false,
+        exec_stages: None,
+        write_run: None,
     });
     let id = Bson::Int64(if opened == 0 { 0 } else { cursor_id });
     // A batch the pipeline streamed rides beside the reply.

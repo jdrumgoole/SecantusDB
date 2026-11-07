@@ -732,7 +732,7 @@ fn wildcard_covers(index: &IndexInfo, path: &str) -> bool {
 
 /// The indexes mongod discriminates by: the planner's catalog.
 pub(crate) struct Indexability<'a> {
-    pub catalog: &'a [std::rc::Rc<IndexInfo>],
+    pub catalog: &'a [std::sync::Arc<IndexInfo>],
     pub collation: Option<&'a Collation>,
     /// Whether the whole query implies a partial index's filter.
     pub implies: &'a dyn Fn(&Document) -> bool,
@@ -799,7 +799,7 @@ impl Indexability<'_> {
     /// then each node's.
     pub(crate) fn encode(&self, e: &Expr) -> String {
         let mut out = String::new();
-        let partial: Vec<&std::rc::Rc<IndexInfo>> = self
+        let partial: Vec<&std::sync::Arc<IndexInfo>> = self
             .catalog
             .iter()
             .filter(|ix| ix.partial.is_some())

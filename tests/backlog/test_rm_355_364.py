@@ -8,13 +8,14 @@ its item names with mongod 8.2's.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import pymongo
 import pytest
 from pymongo.write_concern import WriteConcern
 
-from tests.backlog.opdebug import fresh, logged, seed
+from tests.backlog.opdebug import fresh, logged, no_timed_yields, seed
 
 
 def _both(
@@ -480,11 +481,11 @@ def test_a_query_of_every_kind_names_its_query_shape(rust_mongo: Any, mongod_rs:
 # ------------------------------------------------------------- RM-359 --
 
 
-@pytest.mark.backlog("RM-359")
+@pytest.mark.backlog_fixed("RM-359")
 def test_a_profile_entry_carries_the_execution_stats(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's profile entry for a `find` carries `execStats`, the
     plan's stages with what each did (`FETCH` over `IXSCAN`, measured
-    2026-10-27). This server's entry has none."""
+    2026-10-27). This server's entry had none."""
 
     def stages(stats: Any) -> list:
         out = []
@@ -497,6 +498,207 @@ def test_a_profile_entry_carries_the_execution_stats(rust_mongo: Any, mongod_rs:
     answers = {s: [stages(e.get("execStats")) for e in entries] for s, (_, entries) in got.items()}
     assert answers["mongod"] == [["FETCH", "IXSCAN"]]
     assert answers["rust"] == answers["mongod"]
+
+
+def _timeless(stats: Any) -> Any:
+    """`execStats` with each stage's time as its type: a coarse clock's
+    milliseconds, which two servers do not share."""
+    if isinstance(stats, dict):
+        return {
+            k: (type(v).__name__ if k == "executionTimeMillisEstimate" else _timeless(v))
+            for k, v in stats.items()
+        }
+    if isinstance(stats, list):
+        return [_timeless(v) for v in stats]
+    return stats
+
+
+def _two_indexes(d: Any) -> None:
+    seed(d)
+    d.c.create_index([("y", 1), ("x", 1)])
+
+
+def _merge_only(d: Any) -> None:
+    d.c.insert_many([{"_id": n, "x": n, "y": n % 3, "z": n % 2} for n in range(12)])
+    d.c.create_index([("y", 1), ("x", 1)])
+
+
+def _many(d: Any) -> None:
+    d.c.insert_many([{"_id": n, "x": n, "y": n % 3, "z": n % 2} for n in range(45)])
+    d.c.create_index("x")
+
+
+#: Operations whose stages this server runs as mongod's plan runs them, each
+#: with its setup: mongod 8.2.11's profile entries for each (a `getMore`'s
+#: too) carry the same `execStats`, stage by stage and count by count
+#: (measured 2026-11-07).
+_RUNS: dict[str, tuple[Any, Any]] = {
+    "find_ixscan": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}))),
+    "find_collscan": (seed, lambda d: list(d.c.find({"z": 0}))),
+    "find_all": (seed, lambda d: list(d.c.find({}))),
+    "find_none": (seed, lambda d: list(d.c.find({"x": {"$gt": 100}}))),
+    "find_id": (seed, lambda d: list(d.c.find({"_id": 3}))),
+    "find_id_in": (seed, lambda d: list(d.c.find({"_id": {"$in": [1, 3, 5]}}))),
+    "find_sort": (seed, lambda d: list(d.c.find({"z": 0}).sort("y", 1))),
+    "find_sort_limit": (seed, lambda d: list(d.c.find({"z": 0}).sort("y", 1).limit(2))),
+    "find_sort_batches": (seed, lambda d: list(d.c.find({"z": 0}).sort("y", 1).batch_size(2))),
+    "find_backward": (seed, lambda d: list(d.c.find({"x": {"$gt": 6}}).sort("x", -1))),
+    "find_limit": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}).limit(3))),
+    "find_limit_is_batch": (
+        seed,
+        lambda d: list(d.c.find({"x": {"$gt": 1}}).limit(3).batch_size(3)),
+    ),
+    "find_limit_in_get_more": (
+        seed,
+        lambda d: list(d.c.find({"x": {"$gt": 1}}).limit(5).batch_size(2)),
+    ),
+    "find_batches": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}).batch_size(2))),
+    "find_full_batch": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}).batch_size(10))),
+    "find_collscan_batches": (seed, lambda d: list(d.c.find({"z": 0}).batch_size(2))),
+    "find_skip": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}).skip(2))),
+    "find_skip_limit": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}).skip(2).limit(3))),
+    "find_skip_filtered": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}, "z": 0}).skip(1))),
+    "find_covered": (seed, lambda d: list(d.c.find({"x": {"$gt": 1}}, {"x": 1, "_id": 0}))),
+    "find_projected": (seed, lambda d: list(d.c.find({"x": {"$gt": 6}}, {"y": 1}))),
+    "find_or": (_two_indexes, lambda d: list(d.c.find({"$or": [{"x": {"$lt": 3}}, {"y": 2}]}))),
+    "find_or_batches": (
+        _two_indexes,
+        lambda d: list(d.c.find({"$or": [{"x": {"$lt": 3}}, {"y": 2}]}).batch_size(2)),
+    ),
+    "find_sort_merge": (
+        _two_indexes,
+        lambda d: list(d.c.find({"y": {"$in": [0, 1]}}).sort("x", 1)),
+    ),
+    "find_sort_merge_batches": (
+        _two_indexes,
+        lambda d: list(d.c.find({"y": {"$in": [0, 1]}}).sort("x", 1).batch_size(3)),
+    ),
+    "count": (seed, lambda d: d.command("count", "c", query={"x": {"$gt": 3}})),
+    "count_skip_limit": (
+        seed,
+        lambda d: d.command("count", "c", query={"x": {"$gt": 1}}, skip=2, limit=3),
+    ),
+    "count_fetch_limit": (
+        seed,
+        lambda d: d.command("count", "c", query={"x": {"$gt": 1}, "z": 0}, limit=2),
+    ),
+    "count_collscan": (seed, lambda d: d.command("count", "c", query={"z": 1})),
+    "count_records": (seed, lambda d: d.command("count", "c", skip=3, limit=4)),
+    "distinct": (seed, lambda d: d.c.distinct("y", {"x": {"$lt": 7}})),
+    "update_many": (seed, lambda d: d.c.update_many({"x": {"$gt": 8}}, {"$set": {"w": 1}})),
+    "update_many_some_unchanged": (
+        seed,
+        lambda d: d.c.update_many({"x": {"$gt": 8}}, {"$set": {"z": 0}}),
+    ),
+    "update_many_collscan": (seed, lambda d: d.c.update_many({"z": 1}, {"$set": {"w": 1}})),
+    "update_many_none": (seed, lambda d: d.c.update_many({"x": {"$gt": 80}}, {"$set": {"w": 1}})),
+    "update_one": (seed, lambda d: d.c.update_one({"x": 5}, {"$set": {"w": 1}})),
+    "update_one_collscan": (seed, lambda d: d.c.update_one({"z": 1, "y": 2}, {"$set": {"w": 1}})),
+    "update_one_none": (seed, lambda d: d.c.update_one({"x": 80}, {"$set": {"w": 1}})),
+    "upsert": (seed, lambda d: d.c.update_one({"x": 80}, {"$set": {"w": 1}}, upsert=True)),
+    "update_by_id": (seed, lambda d: d.c.update_one({"_id": 3}, {"$set": {"w": 1}})),
+    "update_by_id_hinted": (
+        seed,
+        lambda d: d.c.update_one({"_id": 3}, {"$set": {"w": 1}}, hint="_id_"),
+    ),
+    "delete_by_id": (seed, lambda d: d.c.delete_one({"_id": 3})),
+    "delete_by_id_none": (seed, lambda d: d.c.delete_one({"_id": 300})),
+    "find_and_update_by_id": (
+        seed,
+        lambda d: d.c.find_one_and_update({"_id": 3}, {"$set": {"w": 1}}),
+    ),
+    "find_and_delete_by_id": (seed, lambda d: d.c.find_one_and_delete({"_id": 3})),
+    "delete_many": (seed, lambda d: d.c.delete_many({"x": {"$lt": 2}})),
+    "delete_many_batches": (_many, lambda d: d.c.delete_many({"x": {"$gte": 0}})),
+    "delete_many_none": (seed, lambda d: d.c.delete_many({"x": {"$gt": 50}})),
+    "delete_one": (seed, lambda d: d.c.delete_one({"x": {"$gt": 5}})),
+    "delete_one_collscan": (seed, lambda d: d.c.delete_one({"z": 1, "y": 2})),
+    "find_and_update": (seed, lambda d: d.c.find_one_and_update({"x": 4}, {"$set": {"w": 1}})),
+    "find_and_delete": (seed, lambda d: d.c.find_one_and_delete({"x": {"$gt": 5}})),
+    "find_and_update_none": (
+        seed,
+        lambda d: d.c.find_one_and_update({"x": 50}, {"$set": {"w": 1}}),
+    ),
+    "find_and_upsert": (
+        seed,
+        lambda d: d.c.find_one_and_update({"x": 77}, {"$set": {"w": 1}}, upsert=True),
+    ),
+}
+
+
+@pytest.fixture
+def steady_mongod(mongod_rs: Any) -> Iterator[Any]:
+    """The reference with its time-based plan yields off
+    (`opdebug.no_timed_yields`), which would add a save and a restore to
+    every stage of a run slowed by load."""
+    with no_timed_yields(mongod_rs):
+        yield mongod_rs
+
+
+@pytest.mark.backlog_fixed("RM-359")
+@pytest.mark.parametrize("name", list(_RUNS))
+def test_a_profile_entry_reports_each_stage_as_it_ran(
+    rust_mongo: Any, steady_mongod: Any, name: str
+) -> None:
+    """mongod 8.2.11's profile entry for a read, each batch of its cursor,
+    a `count`, a `distinct`, each update and delete statement and a
+    `findAndModify` carries `execStats`: every stage's works, results, the
+    works that needed more time, its saves and restores, whether it is at
+    its end, and what it examined -- counted as the plan ran, not
+    re-derived (a FETCH over a SORT_MERGE works once more than the merge;
+    `find`'s LIMIT works once past its last result and a `getMore`'s does
+    not; a write's input yields around each document it writes, a
+    BATCHED_DELETE's once per ten). Measured 2026-11-07; this server's
+    entries had none."""
+    setup, op = _RUNS[name]
+    got = _both(rust_mongo, steady_mongod, op, setup)
+    answers = {
+        s: [_timeless(e.get("execStats")) for e in entries] for s, (_, entries) in got.items()
+    }
+    assert answers["mongod"] and all(answers["mongod"]), answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-359")
+def test_a_sort_of_index_keys_reports_its_works(rust_mongo: Any, steady_mongod: Any) -> None:
+    """mongod 8.2.11's FETCH over a SORT of index keys (`type: "default"`)
+    over an IXSCAN: the SORT works each key in, once per result out and
+    once to find its end, by batch (measured 2026-11-07). Its
+    `totalDataSizeSorted` is left out: this server sorts the keys without
+    its sorter and counts none (RM-375)."""
+
+    def sizeless(stats: Any) -> Any:
+        if isinstance(stats, dict):
+            return {k: sizeless(v) for k, v in stats.items() if k != "totalDataSizeSorted"}
+        return stats
+
+    got = _both(
+        rust_mongo,
+        steady_mongod,
+        lambda d: list(d.c.find({"y": {"$gte": 1}}).sort("x", 1).batch_size(3)),
+        _merge_only,
+    )
+    answers = {
+        s: [sizeless(_timeless(e.get("execStats"))) for e in entries]
+        for s, (_, entries) in got.items()
+    }
+    assert [e["inputStage"]["stage"] for e in answers["mongod"]] == ["SORT"] * 3
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-359")
+def test_an_aggregate_or_an_insert_has_no_execution_stats(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 gives an `aggregate`'s and an insert's profile entry no
+    `execStats` (measured 2026-11-07)."""
+    ops = {
+        "aggregate": lambda d: list(d.c.aggregate([{"$match": {"x": {"$gte": 4}}}])),
+        "insert": lambda d: d.c.insert_one({"_id": 100}),
+    }
+    for name, op in ops.items():
+        got = _both(rust_mongo, mongod_rs, op)
+        answers = {s: ["execStats" in e for e in entries] for s, (_, entries) in got.items()}
+        assert answers["mongod"] == [False], name
+        assert answers["rust"] == answers["mongod"], name
 
 
 # ------------------------------------------------------------- RM-360 --

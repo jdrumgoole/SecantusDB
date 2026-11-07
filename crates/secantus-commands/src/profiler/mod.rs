@@ -23,8 +23,8 @@ pub mod filter;
 mod record;
 
 pub(crate) use record::{
-    begin, finish, mark_reached, note_modified, note_namespace, note_statement_exec, Pending,
-    StatementExec, Statements,
+    begin, finish, mark_reached, note_modified, note_namespace, note_statement_exec, profiled,
+    Pending, StatementExec, Statements,
 };
 
 use std::collections::HashMap;
