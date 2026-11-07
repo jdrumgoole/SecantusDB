@@ -402,6 +402,36 @@ mod tests {
         assert_eq!(reply.get_str("info").unwrap(), "attempting to kill op");
     }
 
+    /// While a `bulkWrite` runs one of its ops, `currentOp` lists the op
+    /// under the command's opid, on the op's clock; when it ends the command's
+    /// own listing comes back (mongod 8.2.11 pushes a CurOp per op, RM-324).
+    #[test]
+    fn a_listing_pushed_for_an_op_is_popped_after_it() {
+        let ops = std::sync::Arc::new(crate::ops::OpRegistry::new());
+        let command = doc! {"bulkWrite": 1, "ops": [], "nsInfo": []};
+        let running = crate::ops::begin(&ops, &command, &ctx());
+        let row = |ops: &crate::ops::OpRegistry| ops.snapshot()[0].describe("h");
+        let before = row(&ops);
+        assert_eq!(before.get_str("op").unwrap(), "command");
+        assert_eq!(before.get_str("ns").unwrap(), "admin.$cmd");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let listed = crate::ops::list_current_as("bulkWrite", "d.c".into(), doc! {"update": 0})
+            .expect("an operation is registered");
+        let during = row(&ops);
+        assert_eq!(during.get_str("op").unwrap(), "bulkWrite");
+        assert_eq!(during.get_str("ns").unwrap(), "d.c");
+        assert_eq!(during.get_document("command").unwrap(), &doc! {"update": 0});
+        assert_eq!(during.get_i64("opid"), before.get_i64("opid"));
+        assert!(during.get_i64("microsecs_running").unwrap() < 20_000);
+        drop(listed);
+        let after = row(&ops);
+        assert_eq!(after.get_str("op").unwrap(), "command");
+        assert_eq!(after.get_document("command").unwrap(), &command);
+        assert!(after.get_i64("microsecs_running").unwrap() >= 20_000);
+        drop(running);
+        assert!(crate::ops::list_current_as("bulkWrite", "d.c".into(), doc! {}).is_none());
+    }
+
     /// The kill-session commands interrupt the operations running on the
     /// sessions they kill, and no other (RM-313): mongod 8.2.11 ends an
     /// update running on a session `killSessions` names with 11601, and

@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
 use bson::{doc, Bson, Document};
@@ -23,12 +23,10 @@ pub struct RunningOp {
     /// The client's address, `host:port`.
     pub client: Option<String>,
     pub client_metadata: Option<Document>,
-    /// mongod's `op`: `command`, `query`, `getmore`, `insert`, `update` or
-    /// `remove`.
-    pub op: &'static str,
-    pub ns: String,
-    pub command: Document,
-    pub started: Instant,
+    /// What `currentOp` lists the operation as: the command's own listing,
+    /// or, while a `bulkWrite` runs one of its ops, that op's
+    /// ([`list_current_as`]).
+    listing: Mutex<Listing>,
     /// Set by `killOp`; installed with `deadline` while the operation runs,
     /// so every scan's deadline poll sees it.
     killed: Arc<AtomicBool>,
@@ -40,6 +38,26 @@ pub struct RunningOp {
     /// `IndexBuildsCoordinatorMongod-N`): its `desc`, and what `killOp`
     /// does to it -- asks the build to abort (RM-187).
     build: Option<BuildOp>,
+}
+
+/// How `currentOp` lists an operation: mongod's `op` (`command`, `query`,
+/// `getmore`, `insert`, `update`, `remove` or `bulkWrite`), its namespace,
+/// its command and when it started.
+#[derive(Clone)]
+pub struct Listing {
+    pub op: &'static str,
+    pub ns: String,
+    pub command: Document,
+    pub started: Instant,
+}
+
+impl Listing {
+    /// The cursor a `getMore` reads.
+    fn cursor_id(&self) -> Option<i64> {
+        (self.op == "getmore")
+            .then(|| self.command.get("getMore").and_then(crate::util::as_i64))
+            .flatten()
+    }
 }
 
 /// What an index build's operation adds to a running operation.
@@ -55,16 +73,31 @@ impl RunningOp {
         self.killed.load(Ordering::Acquire)
     }
 
+    /// How `currentOp` lists the operation now.
+    pub fn listing(&self) -> Listing {
+        self.listing_lock().clone()
+    }
+
+    fn listing_lock(&self) -> MutexGuard<'_, Listing> {
+        self.listing.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// The cursor a `getMore` reads.
     pub fn cursor_id(&self) -> Option<i64> {
-        (self.op == "getmore")
-            .then(|| self.command.get("getMore").and_then(crate::util::as_i64))
-            .flatten()
+        self.listing_lock().cursor_id()
     }
 
     /// The operation as `currentOp` lists it, in mongod's field order.
     pub fn describe(&self, host: &str) -> Document {
-        let elapsed = self.started.elapsed();
+        let listing = self.listing();
+        let cursor_id = listing.cursor_id();
+        let Listing {
+            op,
+            ns,
+            command,
+            started,
+        } = listing;
+        let elapsed = started.elapsed();
         if let Some(build) = &self.build {
             // An index build runs on a thread of its own, from no client
             // (mongod 8.2.11's row for it).
@@ -77,10 +110,10 @@ impl RunningOp {
                 "opid": Bson::Int64(self.opid),
                 "secs_running": Bson::Int64(elapsed.as_secs() as i64),
                 "microsecs_running": Bson::Int64(elapsed.as_micros() as i64),
-                "op": "command",
-                "ns": self.ns.clone(),
+                "op": op,
+                "ns": ns,
                 "redacted": false,
-                "command": self.command.clone(),
+                "command": command,
             };
             if self.killed() {
                 out.insert("killPending", true);
@@ -110,10 +143,10 @@ impl RunningOp {
         out.insert("opid", Bson::Int64(self.opid));
         out.insert("secs_running", Bson::Int64(elapsed.as_secs() as i64));
         out.insert("microsecs_running", Bson::Int64(elapsed.as_micros() as i64));
-        out.insert("op", self.op);
-        out.insert("ns", self.ns.clone());
-        out.insert("command", self.command.clone());
-        if let Some(id) = self.cursor_id() {
+        out.insert("op", op);
+        out.insert("ns", ns);
+        out.insert("command", command);
+        if let Some(id) = cursor_id {
             out.insert(
                 "cursor",
                 doc! {"cursorId": Bson::Int64(id), "operationUsingCursorId": Bson::Int64(self.opid)},
@@ -208,10 +241,12 @@ impl OpRegistry {
             connection_id: 0,
             client: None,
             client_metadata: None,
-            op: "command",
-            ns,
-            command,
-            started: Instant::now(),
+            listing: Mutex::new(Listing {
+                op: "command",
+                ns,
+                command,
+                started: Instant::now(),
+            }),
             killed: Arc::new(AtomicBool::new(false)),
             // The build's thread runs on no session: a kill of the
             // command's session interrupts the command, which aborts the
@@ -356,10 +391,12 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         connection_id: ctx.connection_id,
         client,
         client_metadata,
-        op,
-        ns,
-        command: doc.clone(),
-        started: Instant::now(),
+        listing: Mutex::new(Listing {
+            op,
+            ns,
+            command: doc.clone(),
+            started: Instant::now(),
+        }),
         killed: Arc::new(AtomicBool::new(false)),
         session,
         build: None,
@@ -388,6 +425,43 @@ pub fn begin(registry: &Arc<OpRegistry>, doc: &Document, ctx: &crate::CommandCon
         opid,
         previous,
         _interrupt: interrupt,
+    }
+}
+
+/// List the operation running on this thread as `op` on `ns`, running
+/// `command`, from now until the guard drops, when its own listing comes
+/// back. mongod 8.2.11 runs each op of a `bulkWrite` under a CurOp of its
+/// own pushed on the command's: `currentOp` lists it as op `bulkWrite`, on
+/// the op's namespace, with the op as its `command` and its clock started
+/// at the op, under the command's opid (measured 2026-11-07, RM-324).
+/// `None` off-server, with no operation registered.
+pub fn list_current_as(op: &'static str, ns: String, command: Document) -> Option<ListingGuard> {
+    CURRENT.with(|c| {
+        let c = c.borrow();
+        let running = c.as_ref()?.op.clone();
+        let previous = std::mem::replace(
+            &mut *running.listing_lock(),
+            Listing {
+                op,
+                ns,
+                command,
+                started: Instant::now(),
+            },
+        );
+        Some(ListingGuard { running, previous })
+    })
+}
+
+/// Puts an operation's own listing back on drop.
+#[must_use = "the listing is put back when this guard drops"]
+pub struct ListingGuard {
+    running: Arc<RunningOp>,
+    previous: Listing,
+}
+
+impl Drop for ListingGuard {
+    fn drop(&mut self) {
+        *self.running.listing_lock() = self.previous.clone();
     }
 }
 

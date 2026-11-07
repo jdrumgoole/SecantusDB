@@ -287,6 +287,55 @@ fn op_fields(kind: &str) -> &'static [(&'static str, Want, bool)] {
     }
 }
 
+/// The `command` `currentOp` lists while op `op` runs (a group of inserts,
+/// `group`, runs as one), as mongod 8.2.11 lists it (measured 2026-11-07,
+/// RM-324): the op's fields in declaration order, `multi` and `upsert` with
+/// their defaults, an empty `hint` left out and a named one as `{$hint:
+/// name}`, then the command's `comment`. A group of inserts is listed as
+/// one, `{insert: <nsInfo index>, documents: [...]}`.
+fn op_listing(
+    kind: &str,
+    op: &Document,
+    group: &[usize],
+    ops: &[Bson],
+    comment: Option<&Bson>,
+) -> Document {
+    let mut out = Document::new();
+    let index = op
+        .get(kind)
+        .and_then(whole_number)
+        .map_or(Bson::Null, |i| Bson::Int32(i as i32));
+    out.insert(kind, index);
+    if kind == "insert" {
+        let documents: Vec<Bson> = group
+            .iter()
+            .map(|i| {
+                ops[*i]
+                    .as_document()
+                    .and_then(|o| o.get("document"))
+                    .cloned()
+                    .unwrap_or(Bson::Null)
+            })
+            .collect();
+        out.insert("documents", documents);
+    } else {
+        for (name, _, _) in op_fields(kind).iter().skip(1) {
+            let value = match (*name, op.get(*name)) {
+                ("multi" | "upsert", None) => Bson::Boolean(false),
+                (_, None) => continue,
+                ("hint", Some(Bson::Document(h))) if h.is_empty() => continue,
+                ("hint", Some(Bson::String(name))) => Bson::Document(doc! {"$hint": name}),
+                (_, Some(v)) => v.clone(),
+            };
+            out.insert(*name, value);
+        }
+    }
+    if let Some(comment) = comment {
+        out.insert("comment", comment.clone());
+    }
+    out
+}
+
 fn wrong_type(path: &str, value: &Bson, expected: &str) -> CommandError {
     CommandError::new(
         14,
@@ -828,6 +877,12 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             cmd.insert("bypassDocumentValidation", v.clone());
         }
 
+        // `currentOp` lists the op, not the command, while it runs.
+        let listed = crate::ops::list_current_as(
+            "bulkWrite",
+            format!("{db_name}.{coll}"),
+            op_listing(kind, op, &group, ops, doc.get("comment")),
+        );
         // Run the op through the ordinary single-write handler, with the
         // context rebound to that op's database, so bulk semantics cannot drift
         // from single-write semantics.
@@ -838,6 +893,7 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             _ => crud::delete(&cmd, ctx),
         };
         ctx.db_name = outer_db.clone();
+        drop(listed);
 
         let reply = match reply {
             Ok(r) => r,
@@ -1044,4 +1100,61 @@ pub fn bulk_write(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     reply.insert("ok", 1.0);
     Ok(reply)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `currentOp` lists a running op the way mongod 8.2.11 does (measured
+    /// 2026-11-07, RM-324): its fields in declaration order whatever order
+    /// they came in, the defaults of `multi` and `upsert`, a named hint as
+    /// `{$hint: name}`, an empty one left out, then the command's comment.
+    #[test]
+    fn a_running_op_is_listed_in_mongods_shape() {
+        let update = doc! {
+            "update": 1_i64, "collation": {"locale": "simple"}, "constants": {"z": 1},
+            "hint": {"_id": 1}, "upsertSupplied": false, "updateMods": [{"$set": {"q": "$$z"}}],
+            "sort": {"_id": 1}, "filter": {"a": 1},
+        };
+        let comment = Bson::String("cc".into());
+        assert_eq!(
+            op_listing("update", &update, &[0], &[], Some(&comment)),
+            doc! {
+                "update": 1, "filter": {"a": 1}, "sort": {"_id": 1}, "multi": false,
+                "updateMods": [{"$set": {"q": "$$z"}}], "upsert": false, "upsertSupplied": false,
+                "hint": {"_id": 1}, "constants": {"z": 1}, "collation": {"locale": "simple"},
+                "comment": "cc",
+            }
+        );
+        let delete =
+            doc! {"delete": 0, "collation": {}, "hint": "_id_", "multi": true, "filter": {}};
+        assert_eq!(
+            op_listing("delete", &delete, &[0], &[], Some(&Bson::Null)),
+            doc! {
+                "delete": 0, "filter": {}, "multi": true, "hint": {"$hint": "_id_"},
+                "collation": {}, "comment": Bson::Null,
+            }
+        );
+        let delete = doc! {"delete": 0, "filter": {}, "hint": {}};
+        assert_eq!(
+            op_listing("delete", &delete, &[0], &[], None),
+            doc! {"delete": 0, "filter": {}, "multi": false}
+        );
+    }
+
+    /// A group of inserts is listed as one insert of every document in it,
+    /// under the `nsInfo` index its ops name.
+    #[test]
+    fn a_group_of_inserts_is_listed_as_one() {
+        let ops: Vec<Bson> = [10, 11, 12]
+            .iter()
+            .map(|id| Bson::Document(doc! {"insert": 1, "document": {"_id": id}}))
+            .collect();
+        let first = ops[1].as_document().unwrap();
+        assert_eq!(
+            op_listing("insert", first, &[1, 2], &ops, None),
+            doc! {"insert": 1, "documents": [{"_id": 11}, {"_id": 12}]}
+        );
+    }
 }
