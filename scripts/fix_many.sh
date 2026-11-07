@@ -123,8 +123,11 @@ lane() {
         if [[ $rc -eq 0 && -n $into ]]; then
             local sha
             # The report is markdown, so the branch and sha may be in
-            # backticks (2026-11-07: "landed on `rm-batch` at `b2ab0554`").
-            sha=$(grep -oE "landed on \`?$into\`? at \`?[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
+            # backticks or bold (2026-11-07: "landed on `rm-batch` at
+            # `b2ab0554`", and "landed on `pg-batch` at **2bc9d4dc**", which
+            # stopped a batch over a fix that had landed).
+            m='[`*_]*'
+            sha=$(grep -oE "landed on $m$into$m at $m[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
                 grep -oE '[0-9a-f]{7,}$')
             git fetch -q origin "$into"
             if [[ -z $sha ]] || ! git merge-base --is-ancestor "$sha" "origin/$into" 2>/dev/null; then
@@ -133,7 +136,7 @@ lane() {
             fi
         fi
         local pr
-        pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at `?[0-9a-f]+' "$out/$n.log" | tail -1 | tr -d '`')
+        pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at [`*_]*[0-9a-f]+' "$out/$n.log" | tail -1 | tr -d '`*_')
         echo "$(date '+%F %T') item $n (lane $k) exit $rc ${pr:-no PR}" >>"$out/summary.txt"
         if [[ $rc -ne 0 ]]; then
             echo "$n" >"$out/STOP"
