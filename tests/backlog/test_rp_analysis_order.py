@@ -139,12 +139,12 @@ def test_star_derived_table_expands_as_postgres_does(rust_pg: Any) -> None:
     ]
 
 
-@pytest.mark.backlog("RP-434")
+@pytest.mark.backlog_fixed("RP-434")
 def test_lateral_view_values_and_using_columns_are_typed(rust_pg: Any) -> None:
     """A LATERAL subquery's columns, a view's, a VALUES column of untyped
     literals (`text`, as `select_common_type` resolves `unknown`) and a USING
-    join's merged column of two types (their common type) are typed, so a
-    comparison over them is 42883 at parse analysis."""
+    join's merged column of two types (their common type) were untyped, so a
+    comparison over them returned no rows; each is 42883 at parse analysis."""
     integer_boolean = ("err", "42883", "operator does not exist: integer = boolean")
     text_integer = ("err", "42883", "operator does not exist: text = integer")
     bigint_boolean = ("err", "42883", "operator does not exist: bigint = boolean")
@@ -165,6 +165,77 @@ def test_lateral_view_values_and_using_columns_are_typed(rust_pg: Any) -> None:
         integer_boolean,
         text_integer,
         bigint_boolean,
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-434")
+def test_common_type_is_select_common_types(rust_pg: Any) -> None:
+    """`select_common_type`'s answer types a VALUES column, a CASE, COALESCE
+    or GREATEST and a merged USING / NATURAL column: inputs that are all
+    untyped literals or NULL resolve as text, a number meets another along
+    the implicit casts (`numeric` and `real` are `real`), and among strings
+    a leading `text` stays, `name` takes over from the rest and otherwise
+    the first stays; a merged column hides its sides' own, the outermost
+    join's when they nest, but not a sibling FROM item's. A LATERAL subquery reads the
+    items before it, unqualified too. Each measured on PostgreSQL 15.19."""
+
+    def no_op(left: str, right: str) -> tuple:
+        return ("err", "42883", f"operator does not exist: {left} = {right}")
+
+    assert _answers(
+        rust_pg,
+        [
+            "select coalesce(null, null) = 1",
+            "select case when true then 'a' end = 1",
+            "select greatest('a', 'b') = 1",
+            "select 1 where case when true then 't' end",
+            "select * from (values (null)) w where column1 = 1",
+            "select * from (values (null), (1)) v where column1 = true",
+            "select * from (values (1.5::numeric), (2::float4)) w where column1 = true",
+            "select * from (values (1::int2), (2::float4), (3::numeric)) v where column1 = true",
+            "select * from (values ('a'::varchar), ('b'::char(1))) v where column1 = 1",
+            "select * from (values ('b'::char(1)), ('a'::varchar)) v where column1 = 1",
+            "select * from (values ('a'::varchar), ('b'::name)) v where column1 = 1",
+            "select * from (values ('a'::varchar), ('b'::text)) v where column1 = 1",
+            "select * from (values ('a'::name), ('b'::text)) v where column1 = 1",
+            "select * from (select 1::float4 as a) x join (select 2::numeric as a) y"
+            " using (a) where a = true",
+            "select * from (select 1::int as a) x natural join (select 2::numeric as a) y"
+            " where a = true",
+            "select * from ((select 1::int2 as a) x join (select 1::int4 as a) y using (a))"
+            " join (select 1::int8 as a) z using (a) where a = true",
+            "select * from (select * from (select 1::int4 as a) x join (select 2::int8 as a) y"
+            " using (a)) t where a = true",
+            "select * from (select 1::int as a) x join (select 2::int as a) y using (a),"
+            " (select 3::text as a) z where a = 1",
+            "select * from (select 1::int as a, 'x'::text as b) x join"
+            " (select 2::int as a, 'y'::varchar as b) y using (a) where b = 1",
+            "select * from (select 1::int as q) s cross join lateral (select q as c) l"
+            " where c = true",
+            "select * from (select 1::int as q) s, lateral (select s.q::text as c) l where c = 1",
+        ],
+    ) == [
+        no_op("text", "integer"),
+        no_op("text", "integer"),
+        no_op("text", "integer"),
+        ("err", "42804", "argument of WHERE must be type boolean, not type text"),
+        no_op("text", "integer"),
+        no_op("integer", "boolean"),
+        no_op("real", "boolean"),
+        no_op("real", "boolean"),
+        no_op("character varying", "integer"),
+        no_op("character", "integer"),
+        no_op("name", "integer"),
+        no_op("character varying", "integer"),
+        no_op("name", "integer"),
+        no_op("real", "boolean"),
+        no_op("numeric", "boolean"),
+        no_op("bigint", "boolean"),
+        no_op("bigint", "boolean"),
+        ("err", "42702", 'column reference "a" is ambiguous'),
+        ("err", "42702", 'column reference "b" is ambiguous'),
+        no_op("integer", "boolean"),
+        no_op("text", "integer"),
     ]
 
 

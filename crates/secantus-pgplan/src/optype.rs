@@ -63,6 +63,11 @@ struct Scope<'p> {
     /// The catalog and CTEs in view, to type a scalar subquery's column.
     lookup: Option<Lookup<'p>>,
     ctes: Vec<Cte>,
+    /// A USING or NATURAL join's merged columns, with the range of `tables`
+    /// (the join's leaves) whose own columns of that name it hides from an
+    /// unqualified reference: PostgreSQL resolves one through the join's
+    /// RTE, whose merged column has the sides' common type.
+    merged: Vec<(Column, std::ops::Range<usize>)>,
 }
 
 impl<'p> Scope<'p> {
@@ -79,6 +84,7 @@ impl<'p> Scope<'p> {
             parent,
             lookup: Some(lookup),
             ctes: ctes.to_vec(),
+            merged: Vec::new(),
         };
         for item in items {
             scope.add(item, ctes, lookup);
@@ -126,12 +132,12 @@ impl<'p> Scope<'p> {
                         let colnames: Vec<_> = (0..aliased.len().max(named.len()))
                             .filter_map(|i| aliased.get(i).or(named.get(i)).cloned())
                             .collect();
-                        self.add_derived(alias, &colnames, q, ctes, lookup)
+                        self.add_derived(alias, &colnames, q, ctes, lookup, None)
                     }
                     None => self.complete = false,
                 }
             }
-            Some(N::RangeSubselect(rs)) if !rs.lateral => {
+            Some(N::RangeSubselect(rs)) => {
                 let alias = rs
                     .alias
                     .as_ref()
@@ -143,8 +149,15 @@ impl<'p> Scope<'p> {
                     .map(|a| a.colnames.clone())
                     .unwrap_or_default();
                 match rs.subquery.as_deref().and_then(|n| n.node.as_ref()) {
+                    // A LATERAL subquery sees the FROM items before it, and
+                    // the queries around this one (`transformFromClauseItem`
+                    // puts the left items in its namespace, lateral-only).
+                    Some(N::SelectStmt(q)) if !alias.is_empty() && rs.lateral => {
+                        let left = self.snapshot();
+                        self.add_derived(alias, &colnames, q, ctes, lookup, Some(&left))
+                    }
                     Some(N::SelectStmt(q)) if !alias.is_empty() => {
-                        self.add_derived(alias, &colnames, q, ctes, lookup)
+                        self.add_derived(alias, &colnames, q, ctes, lookup, None)
                     }
                     _ => self.complete = false,
                 }
@@ -165,10 +178,38 @@ impl<'p> Scope<'p> {
                             .unwrap_or_else(|| r.relname.clone());
                         self.tables.push((alias, def));
                     }
-                    None => {
-                        self.complete = false;
-                        self.unresolved = true;
-                    }
+                    // A view: an RTE_SUBQUERY over its stored query, whose
+                    // columns `DefineView` typed from that query, analysed
+                    // on its own (no CTE of this statement reaches it).
+                    None => match view_select(r) {
+                        Some(q) => {
+                            let alias = r
+                                .alias
+                                .as_ref()
+                                .map(|a| a.aliasname.clone())
+                                .filter(|a| !a.is_empty())
+                                .unwrap_or_else(|| r.relname.clone());
+                            let colnames = r
+                                .alias
+                                .as_ref()
+                                .map(|a| a.colnames.clone())
+                                .unwrap_or_default();
+                            // A view whose definition reaches itself (only
+                            // through OR REPLACE) is the planner's to refuse.
+                            let depth = VIEW_DEPTH.with(|d| d.get());
+                            if depth > 32 {
+                                self.complete = false;
+                            } else {
+                                VIEW_DEPTH.with(|d| d.set(depth + 1));
+                                self.add_derived(alias, &colnames, &q, &[], lookup, None);
+                                VIEW_DEPTH.with(|d| d.set(depth));
+                            }
+                        }
+                        None => {
+                            self.complete = false;
+                            self.unresolved = true;
+                        }
+                    },
                 }
             }
             // A function in FROM: typed by planning `SELECT * FROM f(...)`,
@@ -227,23 +268,54 @@ impl<'p> Scope<'p> {
                 }
             }
             Some(N::JoinExpr(j)) => {
-                // A USING / NATURAL join merges columns; their types are the
-                // sides' own, which is what an unqualified lookup finds.
+                let start = self.tables.len();
                 if let Some(l) = j.larg.as_deref() {
                     self.add(l, ctes, lookup);
                 }
                 if let Some(r) = j.rarg.as_deref() {
                     self.add(r, ctes, lookup);
                 }
+                // A USING / NATURAL join merges columns: an unqualified name
+                // reads the merged one, typed by `select_common_type` over
+                // the sides', not either side's own. Only when every leaf of
+                // the join was typed, one table each, so the leaves line up.
+                if (j.is_natural || !j.using_clause.is_empty())
+                    && self.tables.len() - start == leaf_count(item)
+                {
+                    let mut leaves = self.tables[start..].iter().map(|(_, d)| d);
+                    let sides = j
+                        .larg
+                        .as_deref()
+                        .and_then(|l| item_columns(l, &mut leaves))
+                        .zip(j.rarg.as_deref().and_then(|r| item_columns(r, &mut leaves)));
+                    if let Some((n, cols)) = sides.and_then(|(l, r)| merge_using(j, l, r)) {
+                        let range = start..self.tables.len();
+                        self.merged
+                            .extend(cols.into_iter().take(n).map(|c| (c, range.clone())));
+                    }
+                }
             }
             _ => self.complete = false,
+        }
+    }
+
+    /// This scope as it stands, for a LATERAL item to see the ones before it.
+    fn snapshot(&self) -> Scope<'p> {
+        Scope {
+            tables: self.tables.clone(),
+            complete: self.complete,
+            unresolved: self.unresolved,
+            parent: self.parent,
+            lookup: self.lookup,
+            ctes: self.ctes.clone(),
+            merged: self.merged.clone(),
         }
     }
 
     /// A derived table -- a FROM subquery or a CTE -- whose columns are
     /// typed from its select list. A column this cannot type is still a
     /// column (so an unqualified name resolves among the known ones); it is
-    /// just never judged.
+    /// just never judged. `parent` is what a LATERAL one sees around it.
     fn add_derived(
         &mut self,
         alias: String,
@@ -251,12 +323,13 @@ impl<'p> Scope<'p> {
         q: &pg_query::protobuf::SelectStmt,
         ctes: &[Cte],
         lookup: &dyn Fn(&str) -> Option<TableDef>,
+        parent: Option<&Scope>,
     ) {
         if q.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
             self.complete = false;
             return;
         }
-        let inner = Scope::new(&q.from_clause, ctes, lookup, None);
+        let inner = Scope::new(&q.from_clause, ctes, lookup, parent);
         let named = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
             Some(N::String(s)) => Some(s.sval.clone()),
             _ => None,
@@ -378,10 +451,24 @@ impl<'p> Scope<'p> {
             .collect::<Option<_>>()?;
         match parts.as_slice() {
             [col] => {
-                let mut found = self
-                    .tables
-                    .iter()
-                    .filter_map(|(_, d)| d.column(col).map(|c| c.pg_type.clone()));
+                // A join's merged column hides its leaves' own; of merged
+                // columns nested in one another, the outermost join's is
+                // the one named.
+                let merged: Vec<&(Column, std::ops::Range<usize>)> =
+                    self.merged.iter().filter(|(c, _)| c.name == *col).collect();
+                let hidden = |i: usize| merged.iter().any(|(_, r)| r.contains(&i));
+                let outermost = merged.iter().filter(|(_, r)| {
+                    !merged
+                        .iter()
+                        .any(|(_, o)| o != r && o.start <= r.start && r.end <= o.end)
+                });
+                let mut found = outermost.map(|(c, _)| c.pg_type.clone()).chain(
+                    self.tables
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| !hidden(*i))
+                        .filter_map(|(_, (_, d))| d.column(col).map(|c| c.pg_type.clone())),
+                );
                 match found.next() {
                     // Named by more than one side, or possibly by a FROM item
                     // this cannot see into: not ours to judge.
@@ -447,12 +534,25 @@ fn item_columns(
     let Some(N::JoinExpr(j)) = item.node.as_ref() else {
         return Some(leaves.next()?.columns.clone());
     };
+    let left = item_columns(j.larg.as_deref()?, leaves)?;
+    let right = item_columns(j.rarg.as_deref()?, leaves)?;
+    Some(merge_using(j, left, right)?.1)
+}
+
+/// A join's columns from its sides' (`transformFromClauseItem`): the merged
+/// USING / NATURAL columns first, once each, typed by `select_common_type`
+/// over the two sides' (untyped when they are not of one category, which is
+/// PostgreSQL's 42804 at the join), then each side's others. With how many
+/// are merged. `None` when a merged name is not one column on each side.
+fn merge_using(
+    j: &pg_query::protobuf::JoinExpr,
+    left: Vec<Column>,
+    right: Vec<Column>,
+) -> Option<(usize, Vec<Column>)> {
     // Renamed by an alias list: not followed here.
     if j.alias.as_ref().is_some_and(|a| !a.colnames.is_empty()) {
         return None;
     }
-    let left = item_columns(j.larg.as_deref()?, leaves)?;
-    let right = item_columns(j.rarg.as_deref()?, leaves)?;
     let using: Vec<String> = if j.is_natural {
         left.iter()
             .filter(|l| right.iter().any(|r| r.name == l.name))
@@ -477,13 +577,88 @@ fn item_columns(
             }
         };
         let (l, r) = (one(&left)?, one(&right)?);
-        let ty = if l == r { l } else { String::new() };
+        let ty = if l.is_empty() || r.is_empty() {
+            String::new()
+        } else {
+            select_common(&l, &r).unwrap_or_default()
+        };
         out.push(Column::new(u, &ty, true));
     }
+    let merged = out.len();
     let others = |side: Vec<Column>| side.into_iter().filter(|c| !using.contains(&c.name));
     out.extend(others(left));
     out.extend(others(right));
-    Some(out)
+    Some((merged, out))
+}
+
+/// How many FROM leaves a FROM item holds: one, or a join's sides' sum.
+fn leaf_count(item: &pg_query::protobuf::Node) -> usize {
+    match item.node.as_ref() {
+        Some(N::JoinExpr(j)) => {
+            j.larg.as_deref().map_or(0, leaf_count) + j.rarg.as_deref().map_or(0, leaf_count)
+        }
+        _ => 1,
+    }
+}
+
+thread_local! {
+    /// How deep `Scope::add` is in views' definitions.
+    static VIEW_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The stored query of a user view `r` names, when it is one.
+fn view_select(r: &pg_query::protobuf::RangeVar) -> Option<pg_query::protobuf::SelectStmt> {
+    if !r.catalogname.is_empty() || !(r.schemaname.is_empty() || r.schemaname == "public") {
+        return None;
+    }
+    let definition = crate::view_definition(&r.relname)?;
+    match pg_query::parse(&definition)
+        .ok()?
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?
+    {
+        N::SelectStmt(q) => Some((**q).clone()),
+        _ => None,
+    }
+}
+
+/// The type `select_common_type` resolves two typed inputs to, in that
+/// order. Its loop keeps the first unless that one is not its category's
+/// preferred type (`text`, `float8`) and casts implicitly to the second but
+/// not back: so numbers climb `int2` -> `int4` -> `int8` -> `numeric` ->
+/// `float4` -> `float8`, and among strings a leading `text` stays, `name`
+/// takes over from `varchar` / `bpchar` (each casts to it, it to neither),
+/// and otherwise the first stays, as `text`, `varchar` and `bpchar` cast
+/// each way. `"char"` meets none of them; `None` across categories.
+fn select_common(o: &str, t: &str) -> Option<String> {
+    if o == t {
+        return Some(o.to_string());
+    }
+    let (po, pt) = (pgtypes::oid_of_name(o)?, pgtypes::oid_of_name(t)?);
+    if po == pt {
+        return Some(o.to_string());
+    }
+    match (category(o)?, category(t)?) {
+        ("numeric", "numeric") => {
+            let rank = |oid: i64| [21, 23, 20, 1700, 700, 701].iter().position(|r| *r == oid);
+            Some(if rank(pt)? > rank(po)? { t } else { o }.to_string())
+        }
+        ("string", "string") => {
+            if po == 18 || pt == 18 {
+                None
+            } else if po != 25 && pt == 19 {
+                Some(t.to_string())
+            } else {
+                Some(o.to_string())
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The static type of `expr` in the FROM scope of `sel` (a subquery's
@@ -1472,6 +1647,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                     parent: scope.parent,
                     lookup: Some(cx.lookup),
                     ctes: cx.ctes.clone(),
+                    merged: Vec::new(),
                 };
                 for side in j.larg.iter().chain(j.rarg.iter()) {
                     on.add(side, &cx.ctes, cx.lookup);
@@ -2158,17 +2334,15 @@ fn common_type(parts: &[&pg_query::protobuf::Node], scope: &Scope) -> Option<Str
         };
         out = Some(match out {
             None => t,
-            Some(o) if o == t => o,
-            Some(o) if category(&o) == Some("numeric") && category(&t) == Some("numeric") => {
-                numeric_meet(&o, &t)
-            }
-            Some(o) if category(&o) == Some("string") && category(&t) == Some("string") => {
-                "text".into()
-            }
-            _ => return None,
+            Some(o) => select_common(&o, &t)?,
         });
     }
-    out
+    // Every input an untyped literal (or NULL): `select_common_type`
+    // resolves them as text.
+    match out {
+        None if !parts.is_empty() => Some("text".into()),
+        out => out,
+    }
 }
 
 /// A bare column in HAVING that no FROM item (nor an enclosing query) has is
@@ -2399,4 +2573,38 @@ fn literals_fit(args: &[&pg_query::protobuf::Node], scope: &Scope) -> Result<()>
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_common;
+
+    /// `select_common_type` over two typed inputs, as PostgreSQL 15.19
+    /// answers it (each pair measured as a two-row VALUES column).
+    #[test]
+    fn select_common_follows_the_implicit_casts() {
+        for (a, b, want) in [
+            ("int4", "int8", Some("int8")),
+            ("int8", "int4", Some("int8")),
+            ("numeric", "float4", Some("float4")),
+            ("int2", "float4", Some("float4")),
+            ("float4", "float8", Some("float8")),
+            ("varchar", "bpchar", Some("varchar")),
+            ("bpchar", "varchar", Some("bpchar")),
+            ("varchar", "name", Some("name")),
+            ("bpchar", "name", Some("name")),
+            ("name", "varchar", Some("name")),
+            ("name", "text", Some("name")),
+            ("text", "name", Some("text")),
+            ("text", "varchar", Some("text")),
+            ("varchar", "text", Some("varchar")),
+            ("bpchar", "text", Some("bpchar")),
+            ("char", "text", None),
+            ("text", "char", None),
+            ("int4", "text", None),
+            ("bool", "int4", None),
+        ] {
+            assert_eq!(select_common(a, b).as_deref(), want, "{a} with {b}");
+        }
+    }
 }

@@ -1623,24 +1623,6 @@ a regression test.
       category. Measured on PostgreSQL 15.19 (found while working RP-433).
       Verify: tests/backlog/test_rp_where_types.py::test_simple_case_when_of_another_category_is_42883
       Backlog-ID: RP-439
-- [ ] **A LATERAL subquery's columns, a view's, a VALUES column of
-      literals and a USING join's merged column of two types are not
-      type-checked.** Each comparison below returns no rows here;
-      PostgreSQL 15.19 refuses it at parse analysis with 42883: `select *
-      from e cross join lateral (select e.a + 1 as c) l where c = true`
-      (`integer = boolean`), `select * from v where a = true` over `create
-      view v as select * from e`, `select * from (values (1, 'x')) w where
-      column2 = 1` (`text = integer`: `select_common_type` resolves the
-      untyped literals to text) and `select * from e join n using (a)
-      where a = true` with `n.a` a bigint (`bigint = boolean`, the merged
-      column's common type). `optype`'s `Scope::add` gives up on a LATERAL
-      item and a relation its lookup does not type, `common_type` skips an
-      untyped literal, and a merged column is typed only when both sides
-      agree. The same holds inside a derived table and through a `*` over
-      one. Measured on a private 15.19 cluster (found while working
-      RP-431).
-      Verify: tests/backlog/test_rp_analysis_order.py::test_lateral_view_values_and_using_columns_are_typed
-      Backlog-ID: RP-434
 - [ ] **EXPLAIN of an UPDATE ... FROM or a DELETE ... USING prints a Seq
       Scan of the target alone.** The statement is rewritten into
       correlated subqueries over its FROM items (`rewrite_dml_from`), and
