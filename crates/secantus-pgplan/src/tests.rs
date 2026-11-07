@@ -4017,6 +4017,58 @@ fn a_join_on_may_hold_a_subquery() {
 }
 
 #[test]
+fn an_exists_subquery_is_analysed_before_its_list_is_dropped() {
+    // `transformSubLink` resolves every name in an EXISTS subquery's list,
+    // ORDER BY and DISTINCT ON before `simplify_EXISTS_query` drops them
+    // (RP-444): each of these planned, and answered, here. (The position
+    // the client sees is pinned by tests/backlog/test_rp_fromless_analysis.py.)
+    for sql in [
+        "select exists (select nosuch)",
+        "select exists (select nosuch from t)",
+        "select exists (select abs(nosuch) from t)",
+        "select exists (select t.id, nosuch from t)",
+        "select exists (select 1 from t order by nosuch)",
+        "select exists (select distinct on (nosuch) 1 from t)",
+        // The one-table, one-equality shape rewritten to an IN.
+        "select id from t where exists (select nosuch from t x where x.id = t.id)",
+    ] {
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42703", "for {sql} (got {err})");
+    }
+    // Names the subquery's own table answers, an output column the ORDER
+    // BY names, and a value never computed: the list is still dropped.
+    for sql in [
+        "select exists (select name from t)",
+        "select exists (select t.n + id from t order by name)",
+        "select exists (select id as x from t order by x)",
+        "select exists (select 1/0)",
+    ] {
+        analysed(sql).expect("analysed clean");
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(outer)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        let Some(N::ResTarget(rt)) = outer.target_list[0].node.as_ref() else {
+            panic!("a target");
+        };
+        let Some(N::SubLink(sl)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            panic!("an EXISTS");
+        };
+        let Some(N::SelectStmt(sub)) = sl.subselect.as_deref().and_then(|q| q.node.as_ref()) else {
+            panic!("its subquery");
+        };
+        assert!(
+            exists_target_refs_to_analyse(sub, &lookup).is_empty(),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn a_column_reference_with_no_from_names_nothing() {
     // `transformColumnRef` over an empty range table (RP-441): 42703 for a
     // bare name, 42P01 for a qualified one, at the reference's own token,

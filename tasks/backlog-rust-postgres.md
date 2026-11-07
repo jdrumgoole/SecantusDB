@@ -1641,15 +1641,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **An EXISTS subquery's target list is not analysed.** `select
-      exists (select nosuch)`, `select 1 where exists (select nosuch)` and
-      `select exists (select nosuch from (select 1) s)` answer `true` / a
-      row here; PostgreSQL 15.19 analyses the subquery whole before the
-      planner drops its targets, so each is 42703 `column "nosuch" does not
-      exist` at the name. A statement PostgreSQL refuses runs. Measured on
-      PostgreSQL 15.19 (found while working RP-441).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_list_is_analysed
-      Backlog-ID: RP-444
 - [ ] **A correlated subquery whose target is an expression names its
       column `\x1fcorrelated`.** `select (select a + 1) from (select 1 a)
       t` answers its row (2) under the column name `\x1fcorrelated`, the
@@ -1882,6 +1873,22 @@ and `fs(a int, c text)`, one row each.
       naming the rewrite's internal function.
       Backlog-ID: RP-454
       Verify: tests/backlog/test_rp_subquery_scope.py::test_join_alias
+
+## Found while working RP-444 (2026-11-07)
+
+- [ ] **A subquery inside an EXISTS subquery's select list is not
+      analysed.** `select exists (select (select nosuch))` and `select
+      exists (select 1 + (select nosuch))` answer `true` here; PostgreSQL
+      15.19's `transformSubLink` analyses the inner subquery with the rest
+      of the list, so each is 42703 `column "nosuch" does not exist` at 31
+      and 35. A statement PostgreSQL refuses runs. Since RP-444 a column
+      reference in the list, ORDER BY or DISTINCT ON is kept for the
+      planner when the subquery's own tables do not answer it; a nested
+      subquery cannot simply be kept, as it would then RUN (`exists (select
+      (select 1/0))` is `true` on PostgreSQL), so it needs an analysis that
+      plans without executing. Measured on PostgreSQL 15.19.
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_subquery_is_analysed
+      Backlog-ID: RP-459
 
 ## Found while working RP-453 (2026-11-07)
 

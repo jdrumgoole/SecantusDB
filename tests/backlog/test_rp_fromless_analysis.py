@@ -173,20 +173,110 @@ def test_cast_literal_input_error_before_operator(query: str, rust_pg: Any) -> N
 
 
 # Found while working RP-441, each measured on PostgreSQL 15.19.
+# `transformSubLink` analyses an EXISTS subquery whole; only the planner's
+# `simplify_EXISTS_query` drops its list, ORDER BY and DISTINCT ON.
 
 EXISTS_TARGETS = {
     "select exists (select nosuch)": _missing("23"),
     "select 1 where exists (select nosuch)": _missing("31"),
     "select exists (select nosuch from (select 1) s)": _missing("23"),
+    "select exists (select 1 order by nosuch)": _missing("34"),
+    "select exists (select distinct on (nosuch) 1)": _missing("36"),
+    # An output column the ORDER BY names, and a value never computed.
+    "select exists (select 1 as x order by x)": None,
+    "select exists (select 1/0)": None,
 }
 
 
-@pytest.mark.backlog("RP-444")
+@pytest.mark.backlog_fixed("RP-444")
 @pytest.mark.parametrize("query", list(EXISTS_TARGETS))
 def test_exists_target_list_is_analysed(query: str, rust_pg: Any) -> None:
-    """The subquery's targets are dropped unanalysed, so the statement
-    runs (`true`, or a row) where PostgreSQL refuses it."""
+    """The subquery's list, ORDER BY and DISTINCT ON were dropped
+    unanalysed, so the statement ran (`true`, or a row) where PostgreSQL
+    refuses it."""
     assert answer(rust_pg, query) == EXISTS_TARGETS[query]
+
+
+# The same over tables, measured on a private PostgreSQL 15.19 cluster
+# (the shared reference holds no tables of ours): a name the subquery's
+# own table answers is still dropped, one only an outer level has is a
+# correlation, and a name in more than one table is 42702. The last four
+# are the one-table, one-equality shape rewritten to an IN.
+EXISTS_TABLES_SETUP = [
+    "drop table if exists rp444_t, rp444_u",
+    "create table rp444_t (a int, b int)",
+    "create table rp444_u (a int, c int)",
+    "insert into rp444_t values (1, 10), (2, 20)",
+    "insert into rp444_u values (1, 100), (3, 300)",
+]
+EXISTS_TABLES: dict[str, object] = {
+    "select exists (select nosuch from rp444_t)": _missing("23"),
+    "select exists (select rp444_t.nosuch from rp444_t)": (
+        "42703",
+        "column rp444_t.nosuch does not exist",
+        None,
+        "23",
+    ),
+    "select exists (select abs(nosuch) from rp444_t)": _missing("27"),
+    "select exists (select a from rp444_t, rp444_u)": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "23",
+    ),
+    "select exists (select c from rp444_t, rp444_u)": [(True,)],
+    "select exists (select x.a from rp444_t x)": [(True,)],
+    "select exists (select z from rp444_t) from (select 1 z) o": [(True,)],
+    "select exists (select a from rp444_t order by nosuch)": _missing("47"),
+    "select a from rp444_t where exists "
+    "(select nosuch from rp444_u where rp444_u.a = rp444_t.a)": _missing("44"),
+    "select a from rp444_t where exists "
+    "(select c from rp444_u where rp444_u.a = rp444_t.a order by nosuch)": _missing("96"),
+    "select a from rp444_t where exists "
+    "(select b from rp444_u where rp444_u.a = rp444_t.a) order by 1": [(1,)],
+    "select a from rp444_t where not exists "
+    "(select b from rp444_u where rp444_u.a = rp444_t.a) order by 1": [(2,)],
+}
+
+
+def answer_over_tables(server: Any, query: str) -> object:
+    with psycopg.connect(_dsn(server) + " dbname=postgres", autocommit=True) as c:
+        for statement in EXISTS_TABLES_SETUP:
+            c.execute(statement)
+        try:
+            return c.execute(query).fetchall()
+        except psycopg.Error as e:
+            return (
+                e.sqlstate,
+                e.diag.message_primary,
+                e.diag.message_hint,
+                e.diag.statement_position,
+            )
+
+
+@pytest.mark.backlog_fixed("RP-444")
+@pytest.mark.parametrize("query", list(EXISTS_TABLES))
+def test_exists_target_list_is_analysed_over_tables(query: str, rust_pg: Any) -> None:
+    """Each name was dropped with the list unresolved, so a missing or
+    ambiguous one answered a row."""
+    assert answer_over_tables(rust_pg, query) == EXISTS_TABLES[query]
+
+
+# Found while working RP-444, measured on PostgreSQL 15.19.
+EXISTS_NESTED = {
+    "select exists (select (select nosuch))": _missing("31"),
+    "select exists (select 1 + (select nosuch))": _missing("35"),
+    "select exists (select (select 1/0))": None,
+}
+
+
+@pytest.mark.backlog("RP-459")
+@pytest.mark.parametrize("query", list(EXISTS_NESTED))
+def test_exists_target_subquery_is_analysed(query: str, rust_pg: Any) -> None:
+    """A subquery inside an EXISTS subquery's list is dropped with the list
+    unanalysed, so a name it cannot resolve answers `true`. Kept, it would
+    run, and `(select 1/0)` is never run on PostgreSQL."""
+    assert answer(rust_pg, query) == EXISTS_NESTED[query]
 
 
 TWO_LEVELS_DOWN = {
