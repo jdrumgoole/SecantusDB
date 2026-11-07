@@ -1610,15 +1610,26 @@ a regression test.
       private 15.19 cluster (found while working RP-416).
       Backlog-ID: RP-430
       Verify: tests/backlog/test_rp_column_errors.py::test_subquery_join_on_sees_the_outer_query
-- [ ] **A WHERE of a bare string literal is refused as text.** A string
-      literal is of type UNKNOWN, and PostgreSQL 15.19's
-      `coerce_to_boolean` reads it as a boolean: `select count(*) from e
-      where 't'` counts every row and `where 'x'` is 22P02 `invalid input
-      syntax for type boolean: "x"`. Here both are 42804 `argument of
-      WHERE must be type boolean, not type text`. Measured on a private
-      15.19 cluster (found while working RP-418).
-      Verify: tests/backlog/test_rp_where_types.py::test_where_untyped_literal_reads_as_boolean
-      Backlog-ID: RP-424
+- [ ] **A missing output column is reported after the WHERE's errors.**
+      PostgreSQL 15.19's `transformSelectStmt` transforms the target list
+      before the WHERE, so `select nosuch from e where 1`, `... where a =
+      true` and `... where 'x'` are each 42703 `column "nosuch" does not
+      exist` at 8; here the WHERE's 42804, 42883 or 22P02 comes first. The
+      FROM list, a JOIN's ON included, is analysed before both, which this
+      server already matches. Measured on a private 15.19 cluster (found
+      while working RP-424).
+      Verify: tests/backlog/test_rp_where_types.py::test_target_list_is_analysed_before_where
+      Backlog-ID: RP-429
+- [ ] **A simple CASE refuses an untyped WHEN literal over a non-text
+      argument.** `select case 1 when '1' then 'y' else 'n' end` and
+      `sum(case a when '1' then 1 else 0 end)` over an integer `a` answer
+      `0A000 comparing int32 with string using = is not supported yet`;
+      PostgreSQL 15.19 compares the argument to each WHEN with `=`, so the
+      literal takes the integer type (`'y'`, and 1), and `case a when 't'`
+      is 22P02 `invalid input syntax for type integer: "t"` at 24. Measured
+      on a private 15.19 cluster (found while working RP-424).
+      Verify: tests/backlog/test_rp_where_types.py::test_simple_case_types_untyped_when_from_its_argument
+      Backlog-ID: RP-433
 - [ ] **A FROM subquery or CTE written `select *` is not type-checked.**
       `select * from (select * from e) t where a = true` (an integer `a`)
       returns no rows here, as do the same comparison over `with t as
