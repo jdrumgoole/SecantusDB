@@ -1302,6 +1302,10 @@ impl CmdStorage for StorageAdapter {
         Ok(())
     }
 
+    fn set_pre_image_expire_after_seconds(&self, secs: Option<i64>) {
+        self.inner.set_pre_image_expire_after_seconds(secs);
+    }
+
     fn set_oplog_min_retention_seconds(&self, secs: i64) -> Result<(), StorageError> {
         self.inner.set_oplog_min_retention_seconds(secs);
         Ok(())

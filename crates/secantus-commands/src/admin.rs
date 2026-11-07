@@ -1905,7 +1905,17 @@ pub(crate) fn listed_indexes(
     // single entry carrying `clustered: true` (with the user's name) in place of
     // the synthesised `_id_`. Mirrors commands.py.
     let options = storage.get_collection_options(db, coll).unwrap_or_default();
-    if let Ok(ci) = options.get_document("clusteredIndex") {
+    // mongod's own clustered collections (`config.system.preimages`) carry
+    // the legacy form, `clusteredIndex: true`, whose index is the default
+    // one (measured 8.2.11).
+    let legacy = options.get_bool("clusteredIndex") == Ok(true);
+    let legacy_spec = Document::new();
+    let clustered_spec = if legacy {
+        Ok(&legacy_spec)
+    } else {
+        options.get_document("clusteredIndex")
+    };
+    if let Ok(ci) = clustered_spec {
         let mut clustered = doc! {
             "v": ci.get_i32("v").unwrap_or(2),
             "key": { "_id": 1i32 },

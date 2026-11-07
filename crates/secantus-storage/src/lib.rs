@@ -1948,7 +1948,15 @@ fn count_oplog_entries(session: &Session) -> i64 {
     }
     total
 }
+/// Where builds before RM-366 kept change stream pre-images: oplog seq ->
+/// the pre-image's bytes. Read once, at open, into
+/// `config.system.preimages` (`migrate_legacy_pre_images`) and emptied.
 const PREIMAGE_TABLE: &str = "table:secantus_preimages";
+/// The collection mongod 8.2.11 keeps change stream pre-images in: a
+/// clustered `config.system.preimages`, one document per pre-image, `{_id:
+/// {nsUUID, ts, applyOpsIndex}, operationTime, preImage}` (RM-366).
+pub const PRE_IMAGES_DB: &str = "config";
+pub const PRE_IMAGES_COLL: &str = "system.preimages";
 const OPLOG_META_TABLE: &str = "table:secantus_oplog_meta";
 
 // Auth / profiling tables. Users + roles are `(db, name) -> bson(record)` (key
@@ -2563,8 +2571,8 @@ const BOOTSTRAP: &[(&str, &str)] = &[
         "table:secantus_natural_seq",
         "key_format=SSu,value_format=q",
     ),
-    // NOTE: table:secantus_oplog + table:secantus_preimages are created in
-    // `open_with_config_durable` (their config depends on `oplog_table_cfg()`).
+    // NOTE: table:secantus_oplog is created in `open_with_config_durable`
+    // (its config depends on `oplog_table_cfg()`).
     ("table:secantus_oplog_meta", "key_format=S,value_format=u"),
     ("table:secantus_users", "key_format=SS,value_format=u"),
     ("table:secantus_roles", "key_format=SS,value_format=u"),
@@ -5256,7 +5264,8 @@ pub struct Storage {
     /// Every collection's record count, data size and index sizes, kept
     /// current by every write: mongod's size storer (RM-191, see
     /// [`sizes`]).
-    sizes: sizes::SizeStorer,
+    /// Shared with the oplog pruner, which removes expired pre-images.
+    sizes: Arc<sizes::SizeStorer>,
     /// Index builds in progress (RM-187): what writes to their collections
     /// must also record, and what `listIndexes` / `currentOp` show.
     index_builds: index_build::Registry,
@@ -6204,8 +6213,7 @@ struct DrainBatch {
     start_seq: i64,
     shard: String,
     blobs: Vec<Vec<u8>>,
-    preimages: Vec<Option<Vec<u8>>>,
-    /// Total bytes this batch holds (blobs + pre-images) — the amount reserved
+    /// Total bytes this batch holds — the amount reserved
     /// against [`Backpressure`] at enqueue and released after it is persisted.
     bytes: usize,
 }
@@ -6295,6 +6303,8 @@ fn async_oplog_fault(faults: &Mutex<Vec<String>>, what: String) {
 /// `Arc` the drainers hold.
 struct PruneCtx {
     conn: Arc<Connection>,
+    /// The store's size counters, which an expired pre-image's removal moves.
+    sizes: Arc<sizes::SizeStorer>,
     oplog: Arc<Mutex<OplogState>>,
     /// Sweep exclusivity (NOT the storage global lock — see
     /// [`prune_oplog_sweep`]'s lock-order note).
@@ -6306,6 +6316,15 @@ struct PruneCtx {
     /// `replSetResizeOplog`'s `minRetentionHours`, in seconds: no entry
     /// younger than this is pruned, whatever the entry cap (0: no floor).
     min_retention_seconds: AtomicI64,
+    /// `changeStreamOptions.preAndPostImages.expireAfterSeconds`; -1 when
+    /// `"off"`, mongod's default.
+    pre_image_expire_after_seconds: AtomicI64,
+    /// The time of the newest oplog entry a sweep has removed (0: none
+    /// yet): every pre-image at or before it is of an entry gone. A seq and
+    /// its time are minted together, so the removed prefix is a time prefix
+    /// too -- unlike "older than the oldest entry left", which an entry the
+    /// asynchronous oplog has not written yet would fool.
+    pruned_through_ts: AtomicU64,
     archive_dir: Mutex<Option<String>>,
     /// Phase A' pieces: the sweep clamp below the stable checkpoint marker and
     /// the demand-checkpoint signal when the clamp blocks a cap excess.
@@ -6450,7 +6469,7 @@ fn spawn_oplog_drainer(
     })
 }
 
-/// Write one contiguous batch of oplog entries (+ pre-images) to its shard, in a
+/// Write one contiguous batch of oplog entries to its shard, in a
 /// single WT transaction so a partial batch never becomes visible.
 fn write_drain_batch(
     session: &Session,
@@ -6464,23 +6483,12 @@ fn write_drain_batch(
         // `ensure_oplog_shard`).
         ensure_oplog_shard(shards_created, session, batch.start_seq, oplog_nonlogged)?;
         let cur = session.open_cursor(&batch.shard, None)?;
-        let mut pre_cur: Option<Cursor> = None;
         for (i, blob) in batch.blobs.iter().enumerate() {
             let seq = batch.start_seq + i as i64;
             cur.reset()?;
             cur.set_key_q(seq);
             cur.set_value_u(blob);
             cur.insert()?;
-            if let Some(pre) = &batch.preimages[i] {
-                if pre_cur.is_none() {
-                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
-                }
-                let pc = pre_cur.as_ref().unwrap();
-                pc.reset()?;
-                pc.set_key_q(seq);
-                pc.set_value_u(pre);
-                pc.insert()?;
-            }
         }
         Ok(())
     })();
@@ -6553,7 +6561,6 @@ fn write_drain_batches(
     session.begin_transaction(None)?;
     let res = (|| -> Result<()> {
         let mut curs: HashMap<&str, Cursor> = HashMap::new();
-        let mut pre_cur: Option<Cursor> = None;
         for batch in batches {
             let cur = match curs.entry(batch.shard.as_str()) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -6569,16 +6576,6 @@ fn write_drain_batches(
                 cur.set_key_q(seq);
                 cur.set_value_u(blob);
                 cur.insert()?;
-                if let Some(pre) = &batch.preimages[i] {
-                    if pre_cur.is_none() {
-                        pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
-                    }
-                    let pc = pre_cur.as_ref().unwrap();
-                    pc.reset()?;
-                    pc.set_key_q(seq);
-                    pc.set_value_u(pre);
-                    pc.insert()?;
-                }
             }
         }
         Ok(())
@@ -7566,7 +7563,6 @@ impl Storage {
             // SECANTUS_OPLOG_NONLOGGED (see `oplog_table_cfg`).
             let opcfg = oplog_table_cfg(oplog_nonlogged);
             boot.create(OPLOG_TABLE, &opcfg)?;
-            boot.create(PREIMAGE_TABLE, &opcfg)?;
             // The documents shards (DOC_SHARDS) and oplog shards (OPLOG_SHARDS) are
             // NO LONGER created eagerly here. A documents shard is made on first
             // creation of a collection that hashes to it (`ensure_collection`); an
@@ -7646,13 +7642,17 @@ impl Storage {
         };
         let stable_seq = Arc::new(AtomicI64::new(marker.map(|(s, _)| s).unwrap_or(0)));
         let checkpoint_requested = Arc::new(AtomicBool::new(false));
+        let sizes = Arc::new(sizes::SizeStorer::default());
         let prune_ctx = Arc::new(PruneCtx {
             conn: conn.clone(),
+            sizes: sizes.clone(),
             oplog: oplog.clone(),
             prune_lock: Mutex::new(()),
             retention_seconds: AtomicI64::new(3600),
             max_entries: AtomicUsize::new(100_000),
             min_retention_seconds: AtomicI64::new(0),
+            pre_image_expire_after_seconds: AtomicI64::new(-1),
+            pruned_through_ts: AtomicU64::new(0),
             archive_dir: Mutex::new(None),
             data_nonlogged,
             stable_seq: stable_seq.clone(),
@@ -7738,7 +7738,7 @@ impl Storage {
             compaction: compact::Compaction::default(),
             user_write_block: std::sync::RwLock::new(None),
             insert_groups: AtomicI64::new(0),
-            sizes: sizes::SizeStorer::default(),
+            sizes,
             index_builds: index_build::Registry::default(),
         };
         // Before the store takes any write -- crash recovery's replay and the
@@ -7748,6 +7748,9 @@ impl Storage {
         // by `_id`.
         storage.upgrade_number_keys()?;
         storage.upgrade_id_keys()?;
+        // Before recovery's replay, which records the pre-images of the
+        // writes it replays beside them.
+        storage.migrate_legacy_pre_images()?;
         if storage.data_nonlogged {
             // Crash recovery: the data tables rolled back to the last stable
             // checkpoint; the (WAL-logged) oplog has everything. Replay the
@@ -7803,6 +7806,15 @@ impl Storage {
         self.prune_ctx
             .retention_seconds
             .store(secs, Ordering::Relaxed);
+    }
+
+    /// Expire `config.system.preimages` documents recorded more than `secs`
+    /// ago, as well as with the oplog (`changeStreamOptions.preAndPostImages.
+    /// expireAfterSeconds`; `None` is `"off"`). The next sweep applies it.
+    pub fn set_pre_image_expire_after_seconds(&self, secs: Option<i64>) {
+        self.prune_ctx
+            .pre_image_expire_after_seconds
+            .store(secs.map_or(-1, |s| s.max(0)), Ordering::Relaxed);
     }
 
     /// Keep every oplog entry younger than `secs`, whatever the entry cap
@@ -8636,12 +8648,22 @@ impl Storage {
             self.oplog_nonlogged,
         )?;
         let cur = session.open_cursor(&op_shard, None)?;
-        let mut pre_cur: Option<Cursor> = None;
         let wall_millis = now_millis();
         let wall = Bson::DateTime(bson::DateTime::from_millis(wall_millis));
+        let slots = pre_image_slots(&entries, &ts, &pre_images);
+        let mut records: Vec<Vec<u8>> = Vec::new();
         let mut last = 0i64;
         for (i, entry) in entries.into_iter().enumerate() {
             let seq = start + i as i64;
+            if let (Some(pre), Some(slot)) = (&pre_images[i], slots[i]) {
+                records.push(pre_image_record(
+                    &oplog_entry_ui(&entry, seq)?,
+                    slot,
+                    wall_millis,
+                    pre,
+                )?);
+            }
+            let entry = stamp_pre_image_slot(entry, slots[i]);
             // Stamp `ts` + `wall` (appended last, matching the historical field
             // order `[…, o2, ts, wall]`) and produce the entry's BSON bytes. The
             // `Raw` path splices the pre-encoded body straight through; the `Doc`
@@ -8658,18 +8680,10 @@ impl Storage {
             cur.set_key_q(seq);
             cur.set_value_u(&blob);
             cur.insert()?;
-            if let Some(pre) = &pre_images[i] {
-                if pre_cur.is_none() {
-                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
-                }
-                let pc = pre_cur.as_ref().unwrap();
-                pc.reset()?;
-                pc.set_key_q(seq);
-                pc.set_value_u(pre);
-                pc.insert()?;
-            }
             last = seq;
         }
+        // In the write's own transaction, as mongod records a pre-image.
+        self.write_pre_image_records(session, &records)?;
         // Bare autocommit emit: every cursor insert above committed on its own,
         // so the minted range resolves here — deregister it from the in-flight
         // window and wake any tailable getMore blocked in `wait_for_oplog` (the
@@ -8751,9 +8765,25 @@ impl Storage {
             LAST_RETRYABLE_TS.with(|t| t.set(Some(ts[i])));
         }
         let wall_millis = now_millis();
+        let (entries, pre_images): (Vec<OplogEntry>, Vec<Option<Vec<u8>>>) =
+            pending.into_iter().unzip();
+        let slots = pre_image_slots(&entries, &ts, &pre_images);
+        let mut records: Vec<Vec<u8>> = Vec::new();
         let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(n);
-        let mut preimages: Vec<Option<Vec<u8>>> = Vec::with_capacity(n);
-        for (i, (entry, pre)) in pending.into_iter().enumerate() {
+        for (i, entry) in entries.into_iter().enumerate() {
+            if let (Some(pre), Some(slot)) = (&pre_images[i], slots[i]) {
+                let seq = start + i as i64;
+                match oplog_entry_ui(&entry, seq)
+                    .and_then(|ui| pre_image_record(&ui, slot, wall_millis, pre))
+                {
+                    Ok(record) => records.push(record),
+                    Err(e) => async_oplog_fault(
+                        &async_h.faults,
+                        format!("the pre-image of the entry at seq {seq} was not recorded: {e:?}"),
+                    ),
+                }
+            }
+            let entry = stamp_pre_image_slot(entry, slots[i]);
             let blob = match entry {
                 OplogEntry::Doc(mut d) => {
                     d.insert("ts", Bson::Timestamp(ts[i]));
@@ -8779,7 +8809,14 @@ impl Storage {
                 OplogEntry::Raw(buf) => append_ts_wall(buf.into_bytes(), ts[i], wall_millis),
             };
             blobs.push(blob);
-            preimages.push(pre);
+        }
+        // Recorded before the drainer can make the entries visible, so a
+        // change stream that reads one finds its pre-image.
+        if let Err(e) = self.write_pre_image_records_alone(&records) {
+            async_oplog_fault(
+                &async_h.faults,
+                format!("the pre-images of the entries from seq {start} were not recorded: {e:?}"),
+            );
         }
         // The opportunistic prune cadence lives with the DRAINERS in async
         // mode (`record_persisted` — the sweep can only doom persisted rows,
@@ -8789,16 +8826,11 @@ impl Storage {
             let mut g = self.oplog.lock().unwrap_or_else(|e| e.into_inner());
             g.live_count += n as i64;
         }
-        let bytes: usize = blobs.iter().map(Vec::len).sum::<usize>()
-            + preimages
-                .iter()
-                .filter_map(|p| p.as_ref().map(Vec::len))
-                .sum::<usize>();
+        let bytes: usize = blobs.iter().map(Vec::len).sum::<usize>();
         let batch = DrainBatch {
             start_seq: start,
             shard: oplog_shard_for_batch(start),
             blobs,
-            preimages,
             bytes,
         };
         // Backpressure: reserve this batch's bytes before enqueuing. If the
@@ -9318,7 +9350,20 @@ impl Storage {
                 }
                 // The replayed write commits at its entry's own timestamp.
                 REPLAY_TS.with(|c| c.set(if self.timestamped { ts } else { 0 }));
-                let outcome = self.apply_replay_entry_idempotent(&entry);
+                // The pre-image the write recorded: its document as it stands
+                // before the replay, as mongod's oplog application records one.
+                let before = if was_enabled {
+                    self.replayed_pre_image(*seq, &entry)
+                } else {
+                    Ok(None)
+                };
+                let outcome = before.and_then(|before| {
+                    let applied = self.apply_replay_entry_idempotent(&entry)?;
+                    if let (true, Some(record)) = (applied, before) {
+                        self.write_pre_image_records_alone(&[record])?;
+                    }
+                    Ok(applied)
+                });
                 REPLAY_TS.with(|c| c.set(0));
                 match outcome {
                     Ok(true) => applied += 1,
@@ -9343,6 +9388,52 @@ impl Storage {
         // Re-anchor so the next crash replays only its own gap (and the prune
         // clamp releases the window just replayed).
         self.stable_checkpoint()
+    }
+
+    /// The `config.system.preimages` document crash recovery records for
+    /// the update or delete stored at `seq`, when its collection records
+    /// pre-images: the document it changes, as it is before the replay.
+    fn replayed_pre_image(&self, seq: i64, entry: &Document) -> Result<Option<Vec<u8>>> {
+        let id = match entry.get_str("op") {
+            Ok("u") => entry.get_document("o2").ok().and_then(|o2| o2.get("_id")),
+            Ok("d") => entry.get_document("o").ok().and_then(|o| o.get("_id")),
+            _ => return Ok(None),
+        };
+        let Some(id) = id else { return Ok(None) };
+        let (db, coll) = entry
+            .get_str("ns")
+            .ok()
+            .and_then(|ns| ns.split_once('.'))
+            .unwrap_or(("", ""));
+        if !self.pre_post_images_enabled(db, coll)? {
+            return Ok(None);
+        }
+        let Some(pre) = self.find_by_id(db, coll, id)? else {
+            return Ok(None);
+        };
+        let slot = if entry.contains_key(PRE_IMAGE_SLOT_FIELD) {
+            None
+        } else {
+            Some(legacy_pre_image_slot(seq, entry, &mut |s| {
+                self.stored_entry(s)
+            })?)
+        };
+        let (Some(id), Ok(wall)) = (pre_image_id_of(entry, slot), entry.get_datetime("wall"))
+        else {
+            return Ok(None);
+        };
+        let slot = (
+            id.get_timestamp("ts")
+                .map_err(|e| StorageError::Bson(e.to_string()))?,
+            id.get_i64("applyOpsIndex").unwrap_or(0),
+        );
+        let ui = id.get("nsUUID").cloned().unwrap_or(Bson::Null);
+        Ok(Some(pre_image_record(
+            &ui,
+            slot,
+            wall.timestamp_millis(),
+            &pre,
+        )?))
     }
 
     /// One replay entry, idempotently: a duplicate-`_id` insert means the
@@ -9630,35 +9721,27 @@ impl Storage {
                 Err(e) => return Err(e.into()),
             });
         }
-        let pre_cur = session.open_cursor(PREIMAGE_TABLE, None)?;
-        let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
-        for &seq in doomed_sorted {
-            let mut blob: Option<Vec<u8>> = None;
+        let read_at = |s: i64| -> Result<Option<Document>> {
             for op_cur in op_curs.iter().flatten() {
                 op_cur.reset()?;
-                op_cur.set_key_q(seq);
+                op_cur.set_key_q(s);
                 if op_cur.search().is_ok() {
-                    blob = Some(op_cur.get_value_u()?);
-                    break;
-                }
-            }
-            let Some(blob) = blob else { continue };
-            if blob.is_empty() {
-                continue;
-            }
-            let entry = decode_doc(&blob)?;
-            pre_cur.reset()?;
-            pre_cur.set_key_q(seq);
-            let pre = match pre_cur.search() {
-                Ok(()) => {
-                    let pb = pre_cur.get_value_u()?;
-                    if pb.is_empty() {
-                        None
+                    let blob = op_cur.get_value_u()?;
+                    return if blob.is_empty() {
+                        Ok(None)
                     } else {
-                        Some(decode_doc(&pb)?)
-                    }
+                        Ok(Some(decode_doc(&blob)?))
+                    };
                 }
-                Err(_) => None,
+            }
+            Ok(None)
+        };
+        let mut rows: Vec<(i64, Document, Option<Document>)> = Vec::new();
+        for &seq in doomed_sorted {
+            let Some(entry) = read_at(seq)? else { continue };
+            let pre = match pre_image_of_entry(session, seq, &entry, &mut |s| read_at(s))? {
+                Some(pb) => Some(decode_doc(&pb)?),
+                None => None,
             };
             rows.push((seq, entry, pre));
         }
@@ -9839,25 +9922,223 @@ impl Storage {
         pre_post_images_enabled(&session, db, coll)
     }
 
-    /// The pre-image document bytes stored for oplog `seq`, or `None`. Fresh
-    /// session for cross-thread visibility. Mirrors `storage.read_preimage`.
+    /// The pre-image the write logged at oplog `seq` recorded, as the bytes
+    /// of the document it changed, or `None`: read from
+    /// `config.system.preimages` by the `_id` the entry names (RM-366).
+    /// Fresh session for cross-thread visibility.
     pub fn read_preimage(&self, seq: i64) -> Result<Option<Vec<u8>>> {
+        let Some(entry) = self.stored_entry(seq)? else {
+            return Ok(None);
+        };
+        self.read_pre_image_of(seq, &entry)
+    }
+
+    /// [`Self::read_preimage`] for the entry stored at `seq`, already read.
+    pub fn read_pre_image_of(&self, seq: i64, entry: &Document) -> Result<Option<Vec<u8>>> {
         // Lock-free cross-thread read on a fresh MVCC session (see `read_oplog`).
         let session = self.conn.open_session()?;
-        let cur = session.open_cursor(PREIMAGE_TABLE, None)?;
-        cur.set_key_q(seq);
-        match cur.search() {
-            Ok(()) => {
-                let b = cur.get_value_u()?;
-                Ok(if b.is_empty() { None } else { Some(b) })
+        pre_image_of_entry(&session, seq, entry, &mut |s| self.stored_entry(s))
+    }
+
+    /// The oplog entry stored at `seq`, decoded, or `None`.
+    fn stored_entry(&self, seq: i64) -> Result<Option<Document>> {
+        match self.read_oplog(seq, 1)?.into_iter().next() {
+            Some((s, blob)) if s == seq && !blob.is_empty() => Ok(Some(decode_doc(&blob)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Record `records` -- encoded `config.system.preimages` documents --
+    /// on `session`, in the transaction it has open, creating the collection
+    /// first when it is missing (as a set member's step-up does). They are
+    /// written with no oplog entry: mongod writes pre-images on each node
+    /// and does not replicate them. A record whose `_id` is there already is
+    /// left as it is: crash recovery rebuilds what a checkpoint may hold.
+    fn write_pre_image_records(&self, session: &Session, records: &[Vec<u8>]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
+        if !collection_registered(session, db, coll)? {
+            ensure_collection(session, db, coll, self.data_nonlogged)?;
+            write_coll_options(session, db, coll, &bson::doc! {"clusteredIndex": true})?;
+        }
+        let doc_cur = session.open_cursor(&doc_table_for(db, coll), Some("overwrite=false"))?;
+        let nat_cur = session.open_cursor(NAT_SEQ_TABLE, Some("overwrite=false"))?;
+        for blob in records {
+            let id = bson::RawDocument::from_bytes(blob)
+                .and_then(|d| d.get("_id"))
+                .map_err(|e| StorageError::Bson(e.to_string()))?
+                .ok_or_else(|| StorageError::Internal("a pre-image record has no _id".into()))?;
+            let id =
+                Bson::try_from(id.to_raw_bson()).map_err(|e| StorageError::Bson(e.to_string()))?;
+            let key = id_key(&id)?;
+            let recordid = match self.write_nat_entry_with(&nat_cur, db, coll, &key) {
+                Ok(r) => r,
+                Err(StorageError::DuplicateId) => continue,
+                Err(e) => return Err(e),
+            };
+            doc_cur.reset()?;
+            doc_cur.set_key_ssq(db, coll, recordid);
+            doc_cur.set_value_u(&frame_doc_value(&key, blob));
+            doc_cur.insert()?;
+            self.sizes
+                .adjust(session, db, coll, Delta::insert(key.len(), blob.len()));
+        }
+        Ok(())
+    }
+
+    /// [`Self::write_pre_image_records`] in a transaction of their own, on
+    /// a session of their own: a write that has committed already (the
+    /// asynchronous oplog's) or a replayed one. Retried on a write conflict,
+    /// which two writers creating the collection at once can meet.
+    fn write_pre_image_records_alone(&self, records: &[Vec<u8>]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let session = self.conn.open_session()?;
+        let mut attempt = 0u32;
+        loop {
+            session.begin_transaction(None)?;
+            let res = self.write_pre_image_records(&session, records);
+            let res = match res {
+                Ok(()) => match self.commit_stamp(&[]) {
+                    Some((ts, reserved)) => {
+                        let out = session
+                            .timestamp_transaction(&format!("commit_timestamp={ts:x}"))
+                            .and_then(|()| session.commit_transaction(None))
+                            .map_err(Into::into);
+                        if reserved {
+                            release_stamp(&self.oplog, ts);
+                        }
+                        out
+                    }
+                    None => session.commit_transaction(None).map_err(Into::into),
+                },
+                Err(e) => {
+                    let _ = session.rollback_transaction(None);
+                    Err(e)
+                }
+            };
+            match res {
+                Err(StorageError::WriteConflict) if attempt < 100 => attempt += 1,
+                other => return other,
             }
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The `config.system.preimages` documents of `rows`' pre-images,
+    /// `pre_images` holding each one's bytes by the seq of its entry.
+    fn pre_image_records_of(
+        rows: &[(i64, Document)],
+        pre_images: &std::collections::HashMap<i64, Vec<u8>>,
+    ) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        let mut run: Option<(EntryGroup, i64, PreImageSlot)> = None;
+        for (seq, entry) in rows {
+            let group = entry_group_of(entry);
+            let ts = entry.get_timestamp("ts").ok();
+            // A run of one group's entries, consecutive in seq, shares its
+            // first entry's time.
+            let slot = match (&group, &run, ts) {
+                (Some(g), Some((cur, last, (first, i))), _) if g == cur && *last + 1 == *seq => {
+                    Some((*first, i + 1))
+                }
+                (_, _, Some(ts)) => Some((ts, 0)),
+                _ => None,
+            };
+            run = match (group, slot) {
+                (Some(g), Some(slot)) => Some((g, *seq, slot)),
+                _ => None,
+            };
+            let Some(pre) = pre_images.get(seq) else {
+                continue;
+            };
+            let id = pre_image_id_of(entry, slot);
+            let (Some(id), Ok(wall)) = (id, entry.get_datetime("wall")) else {
+                return Err(StorageError::Internal(format!(
+                    "the oplog entry at seq {seq} has a pre-image but no ui, ts or wall"
+                )));
+            };
+            let ui = id.get("nsUUID").cloned().unwrap_or(Bson::Null);
+            let slot = (
+                id.get_timestamp("ts").unwrap_or(bson::Timestamp {
+                    time: 0,
+                    increment: 0,
+                }),
+                id.get_i64("applyOpsIndex").unwrap_or(0),
+            );
+            out.push(pre_image_record(&ui, slot, wall.timestamp_millis(), pre)?);
+        }
+        Ok(out)
+    }
+
+    /// One-time: move the pre-images a build before RM-366 kept in
+    /// [`PREIMAGE_TABLE`] (by oplog seq) into `config.system.preimages`,
+    /// then empty the table. A checkpoint sits between the two, so the
+    /// documents are on disk -- in a store whose data tables are not logged
+    /// too -- before the rows they came from go.
+    fn migrate_legacy_pre_images(&self) -> Result<()> {
+        let session = self.conn.open_session()?;
+        let cur = match session.open_cursor(PREIMAGE_TABLE, None) {
+            Ok(c) => c,
+            Err(e) if e.is_missing_table() => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut legacy: Vec<(i64, Vec<u8>)> = Vec::new();
+        while cur.next()? {
+            let seq = cur.get_key_q()?;
+            let pre = cur.get_value_u()?;
+            if !pre.is_empty() {
+                legacy.push((seq, pre));
+            }
+        }
+        drop(cur);
+        if legacy.is_empty() {
+            return Ok(());
+        }
+        let mut records = Vec::with_capacity(legacy.len());
+        for (seq, pre) in &legacy {
+            // An entry pruned already took its pre-image's reason to be kept.
+            let Some(entry) = self.stored_entry(*seq)? else {
+                continue;
+            };
+            let slot = legacy_pre_image_slot(*seq, &entry, &mut |s| self.stored_entry(s))?;
+            let (Some(ui), Ok(wall)) = (entry.get("ui"), entry.get_datetime("wall")) else {
+                continue;
+            };
+            records.push(pre_image_record(ui, slot, wall.timestamp_millis(), pre)?);
+        }
+        for chunk in records.chunks(1000) {
+            self.write_pre_image_records_alone(chunk)?;
+        }
+        self.checkpoint_now()?;
+        let del = session.open_cursor(PREIMAGE_TABLE, None)?;
+        session.begin_transaction(None)?;
+        let removed = (|| -> Result<()> {
+            for (seq, _) in &legacy {
+                del.reset()?;
+                del.set_key_q(*seq);
+                match del.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Ok(())
+        })();
+        match removed {
+            Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped),
+            Err(e) => {
+                let _ = session.rollback_transaction(None);
+                Err(e)
+            }
         }
     }
 
     /// Write **verbatim** oplog rows `(seq, entry)` (carrying their original seq /
-    /// ts / wall) plus any pre-images into the oplog tables, and advance the seq +
+    /// ts / wall) into the oplog tables, and any pre-images (by seq) into
+    /// `config.system.preimages`, and advance the seq +
     /// cluster clock past them — so a restored store continues a pre-existing
     /// timeline and a change stream there can resume from a token minted before
     /// the restore point. Unlike `emit_oplog` this does NOT mint new seqs (the
@@ -9886,7 +10167,9 @@ impl Storage {
             self.oplog_nonlogged,
         )?;
         let cur = session.open_cursor(&op_shard, None)?;
-        let mut pre_cur: Option<Cursor> = None;
+        // The pre-images go to `config.system.preimages` under the `_id`s
+        // the rows name, before the rows are visible.
+        self.write_pre_image_records_alone(&Self::pre_image_records_of(rows, pre_images)?)?;
         let mut max_seq = 0i64;
         let mut best = (0i64, 0i64);
         for (seq, entry) in rows {
@@ -9895,16 +10178,6 @@ impl Storage {
             cur.set_key_q(*seq);
             cur.set_value_u(&blob);
             cur.insert()?;
-            if let Some(pre) = pre_images.get(seq) {
-                if pre_cur.is_none() {
-                    pre_cur = Some(session.open_cursor(PREIMAGE_TABLE, None)?);
-                }
-                let pc = pre_cur.as_ref().unwrap();
-                pc.reset()?;
-                pc.set_key_q(*seq);
-                pc.set_value_u(pre);
-                pc.insert()?;
-            }
             if *seq > max_seq {
                 max_seq = *seq;
             }
@@ -10008,6 +10281,34 @@ const PRUNE_DELETE_BATCH: usize = 1024;
 
 fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let _p = ctx.prune_lock.lock().unwrap_or_else(|e| e.into_inner());
+    let pruned = prune_oplog_rows(ctx, now)?;
+    prune_pre_images(ctx, now)?;
+    Ok(pruned)
+}
+
+/// Expire `config.system.preimages` as mongod's pre-image remover does:
+/// each pre-image of an oplog entry the sweeps have removed (its `_id.ts`
+/// at or before the newest one removed), and, under
+/// `changeStreamOptions.preAndPostImages.expireAfterSeconds`, each recorded
+/// longer ago than that. Caller holds `prune_lock`.
+fn prune_pre_images(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
+    let through = ctx.pruned_through_ts.load(Ordering::Relaxed);
+    let expire = ctx.pre_image_expire_after_seconds.load(Ordering::Relaxed);
+    if through == 0 && expire < 0 {
+        return Ok(0);
+    }
+    let session = ctx.conn.open_session()?;
+    let before = (expire >= 0).then(|| {
+        let now_ms = now.map_or_else(now_millis, |secs| secs * 1000);
+        now_ms - expire * 1000
+    });
+    remove_expired_pre_images(&session, &ctx.sizes, u64_ts(through), before, &|s| {
+        commit_stamped(s, &ctx.oplog, ctx.data_nonlogged)
+    })
+}
+
+/// The oplog half of [`prune_oplog_sweep`]. Caller holds `prune_lock`.
+fn prune_oplog_rows(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     let existing = ctx.shards_created.load(Ordering::Relaxed);
     let session = ctx.conn.open_session()?;
     let when = now.unwrap_or_else(now_secs);
@@ -10105,8 +10406,8 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // Phase 2: the deletes. Sweep exclusivity is already held
     // (`prune_lock`, taken at the top); no other lock is needed —
     // concurrent writers only ever append higher seqs. Each doomed row is
-    // removed from its exact source table (the phase-1 tag). Pre-images stay
-    // in one table.
+    // removed from its exact source table (the phase-1 tag). Their
+    // pre-images go after (`prune_pre_images`).
     //
     // The deletes are grouped into transactions of `PRUNE_DELETE_BATCH`
     // rows. Run one autocommit remove at a time they were one LOGGED commit
@@ -10119,7 +10420,20 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
     // leaves whole batches undone, and those rows are doomed again by the
     // next sweep; the archive above is written before any batch commits.
     let mut del_curs: Vec<Option<Cursor>> = tables.iter().map(|_| None).collect();
-    let pre_del = session.open_cursor(PREIMAGE_TABLE, None)?;
+    // The time of the newest doomed entry, for the pre-images of the
+    // entries going (`prune_pre_images`): read before it goes.
+    let doomed_through = match doomed.iter().max_by_key(|(seq, _)| *seq) {
+        Some((seq, tbl)) => {
+            let cur = session.open_cursor(&tables[*tbl], None)?;
+            cur.set_key_q(*seq);
+            match cur.search() {
+                Ok(()) => peek_entry_ts(&cur.get_value_u()?).map_or(0, ts_u64),
+                Err(e) if e.is_not_found() => 0,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        None => 0,
+    };
     let mut pruned = 0usize;
     for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
         session.begin_transaction(None)?;
@@ -10132,13 +10446,6 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
                 op_del.reset()?;
                 op_del.set_key_q(*seq);
                 match op_del.remove() {
-                    Ok(()) => {}
-                    Err(e) if e.is_not_found() => {}
-                    Err(e) => return Err(e.into()),
-                }
-                pre_del.reset()?;
-                pre_del.set_key_q(*seq);
-                match pre_del.remove() {
                     Ok(()) => {}
                     Err(e) if e.is_not_found() => {}
                     Err(e) => return Err(e.into()),
@@ -10163,6 +10470,8 @@ fn prune_oplog_sweep(ctx: &PruneCtx, now: Option<i64>) -> Result<usize> {
             .unwrap_or_else(|e| e.into_inner())
             .live_count -= batch.len() as i64;
     }
+    ctx.pruned_through_ts
+        .fetch_max(doomed_through, Ordering::Relaxed);
     Ok(pruned)
 }
 
@@ -24046,6 +24355,380 @@ fn append_ts_wall(mut b: Vec<u8>, ts: bson::Timestamp, wall_millis: i64) -> Vec<
     b
 }
 
+/// The group of stored entries the oplog view shows as one `applyOps`
+/// entry ([`oplog_view_entries`]): a transaction's writes, by session and
+/// transaction number, or the inserts or deletes of one batch.
+#[derive(Clone, PartialEq)]
+enum EntryGroup {
+    Txn(Vec<u8>, i64),
+    Batch(i64),
+}
+
+/// The [`EntryGroup`] of a stored entry, by the view's own rule: a
+/// transaction's first (`txn_of`), then a batch's (`bg.g`).
+fn entry_group_of(d: &Document) -> Option<EntryGroup> {
+    if let Some((lsid, txn)) = txn_of(d) {
+        let lsid = secantus_core::bsondoc::to_vec(&lsid).unwrap_or_default();
+        return Some(EntryGroup::Txn(lsid, txn));
+    }
+    d.get_document("bg")
+        .ok()
+        .and_then(|bg| bg.get_i64("g").ok())
+        .map(EntryGroup::Batch)
+}
+
+/// [`entry_group_of`] for an entry not yet stored.
+fn oplog_entry_group(e: &OplogEntry) -> Option<EntryGroup> {
+    match e {
+        OplogEntry::Doc(d) => entry_group_of(d),
+        OplogEntry::Raw(buf) => {
+            if buf
+                .get_str("op")
+                .is_ok_and(|op| matches!(op, "i" | "u" | "d"))
+            {
+                if let (Ok(lsid), Ok(txn)) = (buf.get_document("lsid"), buf.get_i64("txnNumber")) {
+                    return Some(EntryGroup::Txn(lsid.as_bytes().to_vec(), txn));
+                }
+            }
+            buf.get_document("bg")
+                .ok()
+                .and_then(|bg| bg.get_i64("g").ok())
+                .map(EntryGroup::Batch)
+        }
+    }
+}
+
+/// Where `config.system.preimages` files a pre-image, beside its
+/// collection's UUID: the time of the oplog entry mongod writes for the
+/// write -- for a write inside an `applyOps`, that entry's -- and the
+/// write's place among the `applyOps`' operations (0 outside one).
+type PreImageSlot = (bson::Timestamp, i64);
+
+/// The field of a stored entry in a group that names its pre-image's
+/// [`PreImageSlot`]: `{ts, i}`. Only such an entry carries it, since the
+/// slot of one is not its own `ts`; the oplog view, which shows a group as
+/// one `applyOps` entry of chosen fields, never shows it.
+const PRE_IMAGE_SLOT_FIELD: &str = "pi";
+
+/// The [`PreImageSlot`] of each entry minted together with a pre-image (the
+/// others' are `None`): a run of entries of one [`EntryGroup`] shares the
+/// first one's time, as the one `applyOps` entry mongod writes for it does.
+fn pre_image_slots(
+    entries: &[OplogEntry],
+    ts: &[bson::Timestamp],
+    pre_images: &[Option<Vec<u8>>],
+) -> Vec<Option<PreImageSlot>> {
+    // Most writes record none: their entries are not read at all.
+    if pre_images.iter().all(Option::is_none) {
+        return vec![None; entries.len()];
+    }
+    let mut out = Vec::with_capacity(entries.len());
+    let mut run: Option<(EntryGroup, usize)> = None;
+    for (i, entry) in entries.iter().enumerate() {
+        let group = oplog_entry_group(entry);
+        let start = match (&group, &run) {
+            (Some(g), Some((cur, start))) if g == cur => *start,
+            (Some(g), _) => {
+                run = Some((g.clone(), i));
+                i
+            }
+            (None, _) => {
+                run = None;
+                i
+            }
+        };
+        out.push(
+            pre_images
+                .get(i)
+                .and_then(Option::as_ref)
+                .map(|_| (ts[start], (i - start) as i64)),
+        );
+    }
+    out
+}
+
+/// `entry` with its pre-image's slot recorded on it when it is in a group
+/// (see [`PRE_IMAGE_SLOT_FIELD`]).
+fn stamp_pre_image_slot(entry: OplogEntry, slot: Option<PreImageSlot>) -> OplogEntry {
+    let Some((ts, index)) = slot else {
+        return entry;
+    };
+    if oplog_entry_group(&entry).is_none() {
+        return entry;
+    }
+    match entry {
+        OplogEntry::Doc(mut d) => {
+            d.insert(
+                PRE_IMAGE_SLOT_FIELD,
+                bson::doc! {"ts": Bson::Timestamp(ts), "i": index},
+            );
+            OplogEntry::Doc(d)
+        }
+        OplogEntry::Raw(mut buf) => {
+            let mut slot = bson::RawDocumentBuf::new();
+            slot.append("ts", bson::RawBson::Timestamp(ts));
+            slot.append("i", bson::RawBson::Int64(index));
+            buf.append(PRE_IMAGE_SLOT_FIELD, bson::RawBson::Document(slot));
+            OplogEntry::Raw(buf)
+        }
+    }
+}
+
+/// A `config.system.preimages` document as mongod 8.2.11 writes it:
+/// `{_id: {nsUUID, ts, applyOpsIndex}, operationTime, preImage}`, the
+/// operation time being the oplog entry's `wall`.
+fn pre_image_record(
+    ns_uuid: &Bson,
+    (ts, index): PreImageSlot,
+    wall_millis: i64,
+    pre: &[u8],
+) -> Result<Vec<u8>> {
+    let mut id = bson::RawDocumentBuf::new();
+    id.append(
+        "nsUUID",
+        bson::RawBson::try_from(ns_uuid.clone()).map_err(|e| StorageError::Bson(e.to_string()))?,
+    );
+    id.append("ts", bson::RawBson::Timestamp(ts));
+    id.append("applyOpsIndex", bson::RawBson::Int64(index));
+    let pre = bson::RawDocumentBuf::from_bytes(pre.to_vec())
+        .map_err(|e| StorageError::Bson(e.to_string()))?;
+    let mut out = bson::RawDocumentBuf::new();
+    out.append("_id", bson::RawBson::Document(id));
+    out.append(
+        "operationTime",
+        bson::RawBson::DateTime(bson::DateTime::from_millis(wall_millis)),
+    );
+    out.append("preImage", bson::RawBson::Document(pre));
+    Ok(out.into_bytes())
+}
+
+/// The `config.system.preimages` `_id` of the pre-image a stored entry's
+/// write recorded, when the entry carries what it needs: its collection's
+/// `ui` and its time, or its group's slot ([`PRE_IMAGE_SLOT_FIELD`]).
+fn pre_image_id_of(entry: &Document, slot: Option<PreImageSlot>) -> Option<Document> {
+    let ui = entry.get("ui")?.clone();
+    let (ts, index) = match entry.get_document(PRE_IMAGE_SLOT_FIELD) {
+        Ok(stamped) => (
+            stamped.get_timestamp("ts").ok()?,
+            stamped.get_i64("i").ok()?,
+        ),
+        Err(_) => slot.or_else(|| Some((entry.get_timestamp("ts").ok()?, 0)))?,
+    };
+    Some(bson::doc! {"nsUUID": ui, "ts": Bson::Timestamp(ts), "applyOpsIndex": index})
+}
+
+/// The collection UUID (`ui`) of an entry that recorded a pre-image, which
+/// every write that records one names.
+fn oplog_entry_ui(entry: &OplogEntry, seq: i64) -> Result<Bson> {
+    let ui = match entry {
+        OplogEntry::Doc(d) => d.get("ui").cloned(),
+        OplogEntry::Raw(buf) => buf
+            .get("ui")
+            .ok()
+            .flatten()
+            .and_then(|v| Bson::try_from(v.to_raw_bson()).ok()),
+    };
+    ui.ok_or_else(|| {
+        StorageError::Internal(format!(
+            "the oplog entry at seq {seq} recorded a pre-image but names no collection UUID"
+        ))
+    })
+}
+
+/// The [`PreImageSlot`] of a stored entry in a group that carries none (a
+/// build before RM-366 wrote it): the time of the group's first entry, read
+/// back through `read_at` seq by seq, and the entry's place after it.
+fn legacy_pre_image_slot(
+    seq: i64,
+    entry: &Document,
+    read_at: &mut dyn FnMut(i64) -> Result<Option<Document>>,
+) -> Result<PreImageSlot> {
+    let group = entry_group_of(entry);
+    let mut first = entry
+        .get_timestamp("ts")
+        .map_err(|e| StorageError::Bson(e.to_string()))?;
+    let mut index = 0i64;
+    if group.is_some() {
+        let mut s = seq - 1;
+        while s > 0 {
+            let Some(prev) = read_at(s)? else { break };
+            if entry_group_of(&prev) != group {
+                break;
+            }
+            let Ok(ts) = prev.get_timestamp("ts") else {
+                break;
+            };
+            first = ts;
+            index += 1;
+            s -= 1;
+        }
+    }
+    Ok((first, index))
+}
+
+/// The pre-image the write stored at `seq` (`entry`) recorded in
+/// `config.system.preimages`, as the bytes of the document it changed, or
+/// `None`. `read_at` reads other stored entries, which only an entry a
+/// build before RM-366 wrote in a group needs.
+fn pre_image_of_entry(
+    session: &Session,
+    seq: i64,
+    entry: &Document,
+    read_at: &mut dyn FnMut(i64) -> Result<Option<Document>>,
+) -> Result<Option<Vec<u8>>> {
+    if entry
+        .get_str("op")
+        .is_ok_and(|op| op == "i" || op == "c" || op == "n")
+    {
+        return Ok(None);
+    }
+    let slot = if entry.contains_key(PRE_IMAGE_SLOT_FIELD) || entry_group_of(entry).is_none() {
+        None
+    } else {
+        Some(legacy_pre_image_slot(seq, entry, read_at)?)
+    };
+    let Some(id) = pre_image_id_of(entry, slot) else {
+        return Ok(None);
+    };
+    let Some(record) = pre_image_record_by_id(session, &id)? else {
+        return Ok(None);
+    };
+    let raw =
+        bson::RawDocument::from_bytes(&record).map_err(|e| StorageError::Bson(e.to_string()))?;
+    match raw.get_document("preImage") {
+        Ok(pre) => Ok(Some(pre.as_bytes().to_vec())),
+        Err(_) => Ok(None),
+    }
+}
+
+/// The `config.system.preimages` document `_id` names, as stored, or
+/// `None`.
+fn pre_image_record_by_id(session: &Session, id: &Document) -> Result<Option<Vec<u8>>> {
+    let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
+    let key = id_key(&Bson::Document(id.clone()))?;
+    let rev = match session.open_cursor(NAT_SEQ_TABLE, None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    rev.set_key_ssu(db, &key_coll(db, coll), &key);
+    let recordid = match rev.search() {
+        Ok(()) => rev.get_value_q()?,
+        Err(e) if e.is_not_found() => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    cur.set_key_ssq(db, coll, recordid);
+    match cur.search() {
+        Ok(()) => {
+            let value = cur.get_value_u()?;
+            let (_idk, blob) = unframe_doc_value(&value)?;
+            Ok(Some(blob.to_vec()))
+        }
+        Err(e) if e.is_not_found() => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Remove from `config.system.preimages`, in RecordId order, the documents
+/// whose pre-images have expired, stopping at the first that has not: one
+/// whose `_id.ts` is at or before `through` (the newest oplog entry pruned;
+/// none when it is 0), or, when `expire_before_millis` is given, whose
+/// `operationTime` is before it -- mongod's two expiry rules
+/// (`changeStreamOptions.preAndPostImages`'s `expireAfterSeconds`).
+/// Returns how many went.
+fn remove_expired_pre_images(
+    session: &Session,
+    sizes: &sizes::SizeStorer,
+    through: bson::Timestamp,
+    expire_before_millis: Option<i64>,
+    commit: &dyn Fn(&Session) -> Result<()>,
+) -> Result<usize> {
+    let (db, coll) = (PRE_IMAGES_DB, PRE_IMAGES_COLL);
+    let cur = match session.open_cursor(&doc_table_for(db, coll), None) {
+        Ok(c) => c,
+        Err(e) if e.is_missing_table() => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let expired = |blob: &[u8]| -> bool {
+        let Ok(raw) = bson::RawDocument::from_bytes(blob) else {
+            return false;
+        };
+        let by_oplog = raw
+            .get_document("_id")
+            .and_then(|id| id.get_timestamp("ts"))
+            .is_ok_and(|ts| ts_u64(ts) <= ts_u64(through) && ts_u64(through) != 0);
+        let by_age = match (raw.get_datetime("operationTime"), expire_before_millis) {
+            (Ok(at), Some(before)) => at.timestamp_millis() < before,
+            _ => false,
+        };
+        by_oplog || by_age
+    };
+    let mut doomed: Vec<(i64, Vec<u8>, usize)> = Vec::new();
+    cur.set_key_ssq(db, coll, i64::MIN);
+    let mut more = match cur.search_near() {
+        Ok(cmp) if cmp < 0 => cur.next()?,
+        Ok(_) => true,
+        Err(e) if e.is_not_found() => false,
+        Err(e) => return Err(e.into()),
+    };
+    while more {
+        let (d, c, rid) = cur.get_key_ssq()?;
+        if d != db || c != coll {
+            break;
+        }
+        let value = cur.get_value_u()?;
+        let (idk, blob) = unframe_doc_value(&value)?;
+        if !expired(blob) {
+            break;
+        }
+        doomed.push((rid, idk.to_vec(), blob.len()));
+        more = cur.next()?;
+    }
+    drop(cur);
+    if doomed.is_empty() {
+        return Ok(0);
+    }
+    let docs = session.open_cursor(&doc_table_for(db, coll), None)?;
+    let rev = session.open_cursor(NAT_SEQ_TABLE, None)?;
+    for batch in doomed.chunks(PRUNE_DELETE_BATCH) {
+        session.begin_transaction(None)?;
+        let removed = (|| -> Result<()> {
+            for (rid, idk, len) in batch {
+                docs.reset()?;
+                docs.set_key_ssq(db, coll, *rid);
+                match docs.remove() {
+                    Ok(()) => {}
+                    // A user removed it first.
+                    Err(e) if e.is_not_found() => continue,
+                    Err(e) => return Err(e.into()),
+                }
+                rev.reset()?;
+                rev.set_key_ssu(db, &key_coll(db, coll), idk);
+                match rev.remove() {
+                    Ok(()) => {}
+                    Err(e) if e.is_not_found() => {}
+                    Err(e) => return Err(e.into()),
+                }
+                sizes.adjust(session, db, coll, Delta::remove(idk.len(), *len));
+            }
+            Ok(())
+        })();
+        if let Err(e) = removed {
+            if let Err(rb) = session.rollback_transaction(None) {
+                eprintln!("secantus-storage: pre-image expiry rollback failed: {rb:?}");
+            }
+            return Err(e);
+        }
+        commit(session)?;
+    }
+    Ok(doomed.len())
+}
+
 fn has_retryable_stamp(e: &OplogEntry) -> bool {
     match e {
         OplogEntry::Raw(buf) => {
@@ -25016,6 +25699,71 @@ mod tests {
     //! `test_indexes.py` sees identical bytes. No WiredTiger needed.
     use super::*;
     use bson::doc;
+
+    /// A build before RM-366 kept a pre-image in `table:secantus_preimages`
+    /// by oplog seq. Opening such a store moves it into
+    /// `config.system.preimages` under the `_id` its entry names, where it
+    /// is read from, and empties the table.
+    #[test]
+    fn a_legacy_pre_image_moves_to_config_system_preimages() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        let enc = |d: &Document| encode_doc(d).unwrap();
+        let seq;
+        {
+            let mut st = Storage::open(home).unwrap();
+            st.set_enable_oplog(true);
+            st.create_collection("app", "c").unwrap();
+            st.set_collection_options(
+                "app",
+                "c",
+                &doc! {"changeStreamPreAndPostImages": {"enabled": true}},
+            )
+            .unwrap();
+            st.insert_one("app", "c", &enc(&doc! {"_id": 1, "v": "old"}))
+                .unwrap();
+            st.replace_by_id("app", "c", &Bson::Int32(1), &enc(&doc! {"v": "new"}))
+                .unwrap();
+            st.flush_oplog();
+            seq = st.oplog_tail_seq();
+            let pre = st.read_preimage(seq).unwrap().expect("recorded");
+            // The store as the old build left it.
+            st.set_enable_oplog(false);
+            st.delete_matching(
+                PRE_IMAGES_DB,
+                PRE_IMAGES_COLL,
+                &Document::new(),
+                0,
+                &Document::new(),
+                None,
+            )
+            .unwrap();
+            assert!(st.read_preimage(seq).unwrap().is_none());
+            let session = st.conn.open_session().unwrap();
+            session
+                .create(PREIMAGE_TABLE, &oplog_table_cfg(false))
+                .unwrap();
+            let cur = session.open_cursor(PREIMAGE_TABLE, None).unwrap();
+            cur.set_key_q(seq);
+            cur.set_value_u(&pre);
+            cur.insert().unwrap();
+            drop(cur);
+            drop(session);
+            st.close().unwrap();
+        }
+        let st = Storage::open(home).unwrap();
+        let pre = st.read_preimage(seq).unwrap().expect("moved");
+        assert_eq!(decode_doc(&pre).unwrap(), doc! {"_id": 1, "v": "old"});
+        assert_eq!(
+            st.scan_collection(PRE_IMAGES_DB, PRE_IMAGES_COLL)
+                .unwrap()
+                .len(),
+            1
+        );
+        let session = st.conn.open_session().unwrap();
+        let cur = session.open_cursor(PREIMAGE_TABLE, None).unwrap();
+        assert!(!cur.next().unwrap(), "the legacy table was emptied");
+    }
 
     /// A fixture's raw writes, as one transaction committed without a
     /// timestamp when dropped: they stand for a store an older build wrote,

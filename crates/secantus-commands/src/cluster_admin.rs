@@ -225,10 +225,10 @@ const STEP_UP_TTL_COLLECTIONS: [(&str, &str); 3] = [
 /// `config.image_collection`; and the others it creates then (RM-366):
 /// `config.system.indexBuilds`, where it records the index builds it would
 /// resume, and the query sampler's three, each with its `expireAt` TTL
-/// index. Here that is when the server starts on a store that lacks them;
-/// one already there is left as it is. (`config.system.preimages`, which
-/// mongod also creates, is where it keeps change stream pre-images; this
-/// server keeps them elsewhere, and RM-366 moves them there.)
+/// index; and `config.system.preimages`, where it keeps change stream
+/// pre-images, clustered by `_id` in the legacy form and not replicated.
+/// Here that is when the server starts on a store that lacks them; one
+/// already there is left as it is.
 pub fn record_session_state_collections(
     storage: &dyn crate::storage::Storage,
 ) -> Result<(), crate::storage::StorageError> {
@@ -244,6 +244,14 @@ pub fn record_session_state_collections(
     }
     if !storage.collection_exists(SESSIONS_DB, "image_collection")? {
         storage.create_collection(SESSIONS_DB, "image_collection")?;
+    }
+    if !storage.collection_exists(SESSIONS_DB, "system.preimages")? {
+        let _unreplicated = storage.unreplicated();
+        storage.create_collection_with_options(
+            SESSIONS_DB,
+            "system.preimages",
+            &doc! {"clusteredIndex": true},
+        )?;
     }
     if !storage.collection_exists(SESSIONS_DB, "system.indexBuilds")? {
         storage.create_collection(SESSIONS_DB, "system.indexBuilds")?;

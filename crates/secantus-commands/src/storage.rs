@@ -1122,6 +1122,12 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Expire change stream pre-images recorded more than `secs` ago as
+    /// well as with the oplog: `changeStreamOptions.preAndPostImages.
+    /// expireAfterSeconds` (`None`: `"off"`). Default: a backend that
+    /// records none.
+    fn set_pre_image_expire_after_seconds(&self, _secs: Option<i64>) {}
+
     /// Keep every oplog entry younger than `secs` (`replSetResizeOplog`'s
     /// `minRetentionHours`). Default: unsupported, a backend with no oplog.
     fn set_oplog_min_retention_seconds(&self, _secs: i64) -> Result<(), StorageError> {
