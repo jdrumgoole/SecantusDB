@@ -465,6 +465,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `aggregate` return the same cursor-reply shape. Mirrors commands._find.
     let is_view = {
         let storage = ctx.storage()?;
+        crate::opdebug::note_resolved_views(storage, &ctx.db_name, Some(&coll), &[]);
         storage
             .get_collection_options(&ctx.db_name, &coll)
             .map(|o| o.contains_key("viewOn"))

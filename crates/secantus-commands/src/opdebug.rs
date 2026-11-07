@@ -179,6 +179,115 @@ pub(crate) fn take_examined() -> Option<crate::ExecStats> {
     EXAMINED.with(|e| e.borrow_mut().take())
 }
 
+thread_local! {
+    /// The views the command running on this thread resolved, by name
+    /// (RM-362); `dispatch` takes them.
+    static RESOLVED_VIEWS: std::cell::RefCell<std::collections::BTreeMap<String, Document>> =
+        const { std::cell::RefCell::new(std::collections::BTreeMap::new()) };
+}
+
+/// The running command resolved the namespaces it reads: `own`, the one it
+/// names, and every one `pipeline` involves. mongod does this once it has
+/// parsed the command's stages and before it parses their expressions, and
+/// its line and profile entry name each view it resolved
+/// ([`resolved_views`]), whether or not the command then succeeds (measured
+/// 8.2.1, 2026-11-07).
+pub(crate) fn note_resolved_views(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    own: Option<&str>,
+    pipeline: &[Bson],
+) {
+    let found = resolved_views(storage, db, own, pipeline);
+    RESOLVED_VIEWS.with(|r| r.borrow_mut().extend(found));
+}
+
+/// What [`note_resolved_views`] noted for the command, taken, as mongod's
+/// `resolvedViews` prints them: `None` when it resolved no view.
+pub(crate) fn take_resolved_views() -> Option<Vec<Bson>> {
+    let found = RESOLVED_VIEWS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    (!found.is_empty()).then(|| found.into_values().map(Bson::Document).collect())
+}
+
+/// Every view among `own` and the namespaces `pipeline` involves, and among
+/// those the views' own pipelines involve, as mongod's `resolvedViews`
+/// lists them: `{viewNamespace, dependencyChain, resolvedPipeline}` --
+/// the view's name, the names of the chain beneath it down to its
+/// collection, and the pipeline it resolved to, its innermost view's stages
+/// first -- ordered by name (mongod keeps them in a map). A time-series
+/// collection is a view over its buckets. mongod looks up a `$out` or
+/// `$merge` target given as `{db, coll}` by its `coll` in the command's own
+/// database, and so does this (measured 8.2.1).
+pub(crate) fn resolved_views(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    own: Option<&str>,
+    pipeline: &[Bson],
+) -> std::collections::BTreeMap<String, Document> {
+    let mut pending: Vec<(String, String)> = Vec::new();
+    crate::views::involved_namespaces(pipeline, db, &mut pending);
+    pending.extend(own.map(|own| (db.to_string(), own.to_string())));
+    let mut out = std::collections::BTreeMap::new();
+    let mut seen = std::collections::HashSet::new();
+    while let Some((_, coll)) = pending.pop() {
+        if !seen.insert(coll.clone()) {
+            continue;
+        }
+        let Some((chain, resolved)) = view_chain(storage, db, &coll) else {
+            continue;
+        };
+        crate::views::involved_namespaces(&resolved, db, &mut pending);
+        out.insert(
+            coll.clone(),
+            doc! {
+                "viewNamespace": format!("{db}.{coll}"),
+                "dependencyChain": chain,
+                "resolvedPipeline": resolved,
+            },
+        );
+    }
+    out
+}
+
+/// The chain of names beneath the view `db.coll`, itself first, and the
+/// pipeline it resolves to; `None` when it is no view, or is one past
+/// mongod's depth limit or in a cycle (the command that reads it fails).
+fn view_chain(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+) -> Option<(Vec<String>, Vec<Bson>)> {
+    let mut chain = vec![coll.to_string()];
+    let mut pipeline: Vec<Bson> = Vec::new();
+    loop {
+        let current = chain.last()?.clone();
+        let Ok(options) = storage.get_collection_options(db, &current) else {
+            break;
+        };
+        // A namespace this server reads as a view of itself (`system.views`,
+        // a time-series collection's buckets) is a collection on mongod.
+        if let Some(view_on) = options.get_str("viewOn").ok().filter(|v| *v != current) {
+            let mut stages = options
+                .get_array("viewPipeline")
+                .map(|a| a.to_vec())
+                .unwrap_or_default();
+            stages.append(&mut pipeline);
+            pipeline = stages;
+            if chain.iter().any(|c| c == view_on) || chain.len() > crate::views::MAX_VIEW_DEPTH {
+                return None;
+            }
+            chain.push(view_on.to_string());
+        } else if let Ok(ts) = options.get_document("timeseries") {
+            pipeline.insert(0, Bson::Document(crate::ts_buckets::unpack_stage(ts)));
+            chain.push(format!("{}{current}", crate::ts_buckets::BUCKETS_PREFIX));
+            break;
+        } else {
+            break;
+        }
+    }
+    (chain.len() > 1).then_some((chain, pipeline))
+}
+
 /// The request a command's plan is made for, as `explain` shapes it: a
 /// `findAndModify`'s query, sort and hint as a `find`; any other command
 /// itself.

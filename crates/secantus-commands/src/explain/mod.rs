@@ -1813,6 +1813,17 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     let echo = shape::echo(&inner, &db);
+    // The views the explained read resolves are on the explain's line
+    // (RM-362, measured 8.2.1).
+    if let (Ok(storage), Some(Bson::String(coll))) = (ctx.storage(), inner.get(&name)) {
+        if matches!(name.as_str(), "find" | "count" | "distinct" | "aggregate") {
+            let pipeline = inner
+                .get_array("pipeline")
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            crate::opdebug::note_resolved_views(storage, &db, Some(coll), pipeline);
+        }
+    }
 
     let lowered = name.to_ascii_lowercase();
     let shape = match name.as_str() {

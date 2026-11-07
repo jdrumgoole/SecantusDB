@@ -705,14 +705,25 @@ These are explicit non-goals. Don't add them without a reason.
       RM-361, 2026-11-07.
       Backlog-ID: RM-378
       Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_rename_line_names_the_collection_it_renames
-- [ ] **A read of a view or a time-series collection has no
-      `resolvedViews`.** mongod 8.2.11's line and entry name the view it
-      resolved: `{viewNamespace, dependencyChain: [view, ..., collection],
-      resolvedPipeline}` (a time-series collection's pipeline is its
-      `$_internalUnpackBucket`). This server resolves the view and prints
-      nothing of it.
-      Backlog-ID: RM-362
-      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_a_view_names_the_view_it_resolved
+- [ ] **A line names the wrong namespace or kind around a view.**
+      mongod 8.2.1's `Slow query` line for a `getMore` of a cursor over a
+      view, and for a `findAndModify` of a view (which it refuses), says
+      `collectionType: "normal"`, where this server's says `view`; its
+      line for an `explain` of a `find` of a view names `<db>.v`, `view`,
+      where this server's names `<db>.$cmd`, `normal`; and its line for a
+      read of a view that fails once it runs names the collection beneath
+      the view (`<db>.c`, `normal`), where this server's names the view.
+      (An `aggregate` of a view refused for an unknown stage wrote no line
+      on mongod and one here; not pinned.) Found while working RM-362,
+      2026-11-07.
+      Backlog-ID: RM-380
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_get_more_of_a_view_is_of_a_normal_collection, tests/backlog/test_rm_view_lines.py::test_a_find_and_modify_of_a_view_is_of_a_normal_collection, tests/backlog/test_rm_view_lines.py::test_an_explain_line_names_what_it_explains, tests/backlog/test_rm_view_lines.py::test_a_read_of_a_view_that_fails_names_its_collection
+- [ ] **A `distinct` of a view says nothing of its planning.** mongod
+      8.2.1's line for a `distinct` of a view carries `planningTimeMicros`,
+      as one of a collection does; this server's has none. Found while
+      working RM-362, 2026-11-07.
+      Backlog-ID: RM-381
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_says_how_long_it_planned
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since

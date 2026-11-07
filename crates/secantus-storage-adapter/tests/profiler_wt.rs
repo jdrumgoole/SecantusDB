@@ -735,3 +735,85 @@ fn response_length_is_the_reply_on_the_wire() {
         assert_eq!(profiled[0].get_i32("responseLength"), Ok(body + 21));
     });
 }
+
+#[test]
+fn a_read_names_every_view_it_resolved() {
+    // mongod 8.2.1's entries (2026-11-07): a view on a view, a view whose
+    // pipeline reads another view, and a time-series collection, which is a
+    // view over its buckets; ordered by name; a `getMore` names none.
+    with_wt(|c| {
+        on(
+            "rv",
+            &doc! {"insert": "c", "documents": [{"_id": 1, "x": 1}, {"_id": 2, "x": 2}]},
+            c,
+        );
+        on(
+            "rv",
+            &doc! {"insert": "d", "documents": [{"_id": 1, "k": 1}]},
+            c,
+        );
+        on(
+            "rv",
+            &doc! {"create": "v", "viewOn": "c", "pipeline": [{"$match": {"x": {"$gte": 1}}}]},
+            c,
+        );
+        on(
+            "rv",
+            &doc! {"create": "w", "viewOn": "v", "pipeline": [{"$project": {"y": 0}}]},
+            c,
+        );
+        on(
+            "rv",
+            &doc! {"create": "vd", "viewOn": "d", "pipeline": []},
+            c,
+        );
+        on(
+            "rv",
+            &doc! {"create": "vl", "viewOn": "c", "pipeline": [{"$lookup": {"from": "vd", "pipeline": [], "as": "j"}}]},
+            c,
+        );
+        on(
+            "rv",
+            &doc! {"create": "ts", "timeseries": {"timeField": "t", "metaField": "m"}},
+            c,
+        );
+        on("rv", &doc! {"profile": 2}, c);
+        on("rv", &doc! {"find": "w", "batchSize": 1}, c);
+        on("rv", &doc! {"find": "vl"}, c);
+        on(
+            "rv",
+            &doc! {"aggregate": "c", "pipeline": [{"$unionWith": "ts"}], "cursor": {}},
+            c,
+        );
+        on("rv", &doc! {"find": "c"}, c);
+        let profiled = stop("rv", c);
+        let views = |e: &Document| e.get_array("resolvedViews").ok().cloned();
+        let w = doc! {
+            "viewNamespace": "rv.w",
+            "dependencyChain": ["w", "v", "c"],
+            "resolvedPipeline": [{"$match": {"x": {"$gte": 1}}}, {"$project": {"y": 0}}],
+        };
+        assert_eq!(views(&profiled[0]), Some(vec![Bson::Document(w)]));
+        let after = keys(&profiled[0]);
+        let at = after.iter().position(|k| *k == "resolvedViews").unwrap();
+        assert_eq!(after[at - 1], "command");
+        let vd =
+            doc! {"viewNamespace": "rv.vd", "dependencyChain": ["vd", "d"], "resolvedPipeline": []};
+        let vl = doc! {
+            "viewNamespace": "rv.vl",
+            "dependencyChain": ["vl", "c"],
+            "resolvedPipeline": [{"$lookup": {"from": "vd", "pipeline": [], "as": "j"}}],
+        };
+        assert_eq!(
+            views(&profiled[1]),
+            Some(vec![Bson::Document(vd), Bson::Document(vl)])
+        );
+        let ts = doc! {
+            "viewNamespace": "rv.ts",
+            "dependencyChain": ["ts", "system.buckets.ts"],
+            "resolvedPipeline": [{"$_internalUnpackBucket": {"timeField": "t", "metaField": "m", "bucketMaxSpanSeconds": 3600}}],
+        };
+        assert_eq!(views(&profiled[2]), Some(vec![Bson::Document(ts)]));
+        assert_eq!(views(&profiled[3]), None);
+    });
+}

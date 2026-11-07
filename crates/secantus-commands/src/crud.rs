@@ -1503,6 +1503,7 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `$match`) through the aggregation engine. estimatedDocumentCount (the
     // drivers' "estimatedDocumentCount works correctly on views" tests) leans on
     // this. Mirrors `commands.py::_count`.
+    crate::opdebug::note_resolved_views(storage, &ctx.db_name, Some(&coll), &[]);
     let view_on = storage
         .get_collection_options(&ctx.db_name, &coll)
         .ok()

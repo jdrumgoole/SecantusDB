@@ -282,6 +282,9 @@ pub struct CommandContext {
     /// The time spent planning the operation's query, for the line's and
     /// profile entry's `planningTimeMicros`.
     pub planning_micros: Option<i64>,
+    /// The views the operation resolved, as its line's and profile entry's
+    /// `resolvedViews` list them (RM-362).
+    pub resolved_views: Option<Vec<Bson>>,
     /// How many documents a `findAndModify` changed, for its line.
     pub modified: Option<i64>,
     /// How long the operation waited for its write concern, in ms.
@@ -381,6 +384,7 @@ impl CommandContext {
             op_locks: None,
             flow_control_tickets: 0,
             planning_micros: None,
+            resolved_views: None,
             modified: None,
             write_concern_wait: None,
             cpu_nanos: None,
@@ -884,10 +888,12 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     let planning = explain::planning_scope();
     let cpu_started = opdebug::thread_cpu_nanos();
     opdebug::take_examined();
+    opdebug::take_resolved_views();
     ctx.op_counts = None;
     ctx.op_locks = None;
     ctx.flow_control_tickets = 0;
     ctx.planning_micros = None;
+    ctx.resolved_views = None;
     ctx.modified = None;
     ctx.write_concern_wait = None;
     ctx.cpu_nanos = None;
@@ -983,6 +989,7 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.op_locks = Some(lock_manager::operation_locks(false));
     ctx.flow_control_tickets = lock_manager::flow_control_tickets();
     ctx.planning_micros = planning.micros();
+    ctx.resolved_views = opdebug::take_resolved_views();
     ctx.cpu_nanos = cpu_started
         .zip(opdebug::thread_cpu_nanos())
         .map(|(began, now)| now - began);

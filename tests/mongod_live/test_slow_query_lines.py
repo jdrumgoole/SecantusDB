@@ -12,8 +12,7 @@ operation ran.
 
 Left out of the comparison, each an open backlog item with a gap test of
 its own: `queryShapeHash` (RM-358), `numInterruptChecks` (RM-360), `queues`
-(RM-355), a profile entry's `execStats` (RM-359), `resolvedViews`
-(RM-362), and the `locks` of
+(RM-355), a profile entry's `execStats` (RM-359), and the `locks` of
 the writes RM-357 has left (`KNOWN_GAPS`). The `storage` section is compared for its
 shape only: mongod's always has `storageExecutionMicros` (RM-355), and what
 each engine reads from disk is its own.
@@ -37,7 +36,6 @@ UNMODELLED = frozenset(
         "numInterruptChecks",
         "queues",
         "execStats",
-        "resolvedViews",
         "storage",
     }
 )

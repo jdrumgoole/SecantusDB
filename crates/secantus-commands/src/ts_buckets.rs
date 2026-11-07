@@ -695,20 +695,26 @@ pub(crate) fn view_definitions(
                 entry.insert("collation", collation.clone());
             }
         } else if let Ok(ts) = options.get_document("timeseries") {
-            let mut unpack = Document::new();
-            for field in ["timeField", "metaField", "bucketMaxSpanSeconds"] {
-                if let Some(v) = ts.get(field) {
-                    unpack.insert(field, v.clone());
-                }
-            }
             entry.insert("viewOn", format!("{BUCKETS_PREFIX}{name}"));
-            entry.insert("pipeline", vec![doc! { "$_internalUnpackBucket": unpack }]);
+            entry.insert("pipeline", vec![unpack_stage(ts)]);
         } else {
             continue;
         }
         out.push(entry);
     }
     Ok(out)
+}
+
+/// The stage `mongod`'s view of a time-series collection with the options
+/// `ts` unpacks its buckets with.
+pub(crate) fn unpack_stage(ts: &Document) -> Document {
+    let mut unpack = Document::new();
+    for field in ["timeField", "metaField", "bucketMaxSpanSeconds"] {
+        if let Some(v) = ts.get(field) {
+            unpack.insert(field, v.clone());
+        }
+    }
+    doc! { "$_internalUnpackBucket": unpack }
 }
 
 /// The validator `mongod` gives `system.buckets.<name>`.
