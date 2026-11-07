@@ -1491,6 +1491,9 @@ impl PgHandler {
                                     Bson::Boolean(parents == 0 || declared)
                                 }
                             }
+                            // A system column's statistics target is 0
+                            // (`heap.c`'s `SysAtt`), a user column's -1.
+                            "attstattarget" if int(get(row, "attnum")) < 0 => Bson::Int32(0),
                             "attstattarget" | "attcacheoff" => Bson::Int32(-1),
                             "attbyval" | "attalign" => {
                                 let col = if c == "attbyval" {

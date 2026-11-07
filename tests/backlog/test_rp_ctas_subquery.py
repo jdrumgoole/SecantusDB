@@ -2,9 +2,11 @@
 VIEW select list (RP-466, found while working RP-449), and of the columns
 such a relation lists in `pg_attribute` (RP-484) and the type modifier
 each takes from its query (RP-489) -- through a subquery, a CTE, a join, a
-set operation and the expressions whose operands share one (RP-493).
-RP-490, found while working RP-484, is still open, and so are RP-494, found
-while working RP-489, and RP-497, found while working RP-493.
+set operation and the expressions whose operands share one (RP-493) --
+and the system columns it lists for every relation with storage (RP-490,
+found while working RP-484). RP-494, found while working RP-489, RP-497,
+found while working RP-493, and RP-498, found while working RP-490, are
+still open.
 
 Each answer was measured on a private, freshly initdb'd PostgreSQL 15.19
 cluster with this module's table, as the shared reference must not be given
@@ -431,13 +433,13 @@ def test_ctas_over_a_bit_column(rust_pg: Any) -> None:
     assert got == [("bit(3)",), ("bit varying(5)",)]
 
 
-@pytest.mark.backlog("RP-490")
+@pytest.mark.backlog_fixed("RP-490")
 def test_pg_attribute_lists_system_columns(rust_pg: Any) -> None:
     """A table's system columns are `pg_attribute` rows with negative
     attnums on a private PostgreSQL 15.19 cluster: `tableoid` -6, `cmax`
     -5, `xmax` -4, `cmin` -3, `xmin` -2, `ctid` -1, each `attnotnull`. A
-    materialized view has them too. Here none is listed, though `select
-    ctid from t` answers."""
+    materialized view has them too. None was listed, though `select ctid
+    from t` answered."""
     with rust_pg.connect() as c:
         c.autocommit = True
         c.execute("create table rp490_t (a int)")
@@ -458,4 +460,85 @@ def test_pg_attribute_lists_system_columns(rust_pg: Any) -> None:
     ]
     assert rows == [
         (rel, name, typ, num, True) for rel in ("rp490_mv", "rp490_t") for name, typ, num in system
+    ]
+
+
+@pytest.mark.backlog_fixed("RP-490")
+def test_system_columns_by_relation_kind(rust_pg: Any) -> None:
+    """Every relation with storage has the six system columns, and a view,
+    a composite type and an index have none (`AddNewAttributeTuples` skips
+    a view and a composite type; an index is not made through it). Each
+    system column's facts are `heap.c`'s `SysAtt`: `ctid` is 6 bytes, not
+    by value, `s`-aligned; the rest 4 bytes by value, `i`-aligned; every
+    one plain storage with statistics target 0. Measured on a private
+    PostgreSQL 15.19 cluster; the statistics target was -1 here, for
+    PostgreSQL's own catalogs' system columns too."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        c.execute("create table rp490_k_t (a int)")
+        c.execute("create table rp490_k_p (a int) partition by range (a)")
+        c.execute("create table rp490_k_p1 partition of rp490_k_p for values from (0) to (10)")
+        c.execute("create materialized view rp490_k_mv as select 1 n")
+        c.execute("create view rp490_k_v as select 1 x")
+        c.execute("create type rp490_k_ct as (x int)")
+        c.execute("create index rp490_k_i on rp490_k_t (a)")
+        counts = c.execute(
+            "select c.relname::text, count(*) filter (where attnum < 0)"
+            " from pg_class c join pg_attribute a on a.attrelid = c.oid"
+            " where c.relname::text like 'rp490_k_%' group by 1 order by 1"
+        ).fetchall()
+        facts = c.execute(
+            "select attrelid::regclass::text, attname::text, attlen, attbyval,"
+            " attalign::text, attstorage::text, attstattarget, atthasdef,"
+            " attisdropped, attislocal, attinhcount, attcollation::int8"
+            " from pg_attribute where attrelid in"
+            " ('rp490_k_p1'::regclass, 'pg_class'::regclass) and attnum < 0"
+            " order by attrelid::int8 desc, attnum"
+        ).fetchall()
+    assert counts == [
+        ("rp490_k_ct", 0),
+        ("rp490_k_i", 0),
+        ("rp490_k_mv", 6),
+        ("rp490_k_p", 6),
+        ("rp490_k_p1", 6),
+        ("rp490_k_t", 6),
+        ("rp490_k_v", 0),
+    ]
+    sysatt = [
+        ("tableoid", 4, True, "i"),
+        ("cmax", 4, True, "i"),
+        ("xmax", 4, True, "i"),
+        ("cmin", 4, True, "i"),
+        ("xmin", 4, True, "i"),
+        ("ctid", 6, False, "s"),
+    ]
+    assert facts == [
+        (rel, name, length, byval, align, "p", 0, False, False, True, 0, 0)
+        for rel in ("rp490_k_p1", "pg_class")
+        for name, length, byval, align in sysatt
+    ]
+
+
+@pytest.mark.backlog("RP-498")
+def test_pg_attribute_lists_sequence_columns(rust_pg: Any) -> None:
+    """A sequence is a relation with storage: on a private PostgreSQL 15.19
+    cluster `pg_attribute` lists its three columns and the six system
+    columns. Here it lists no row for a sequence at all."""
+    with rust_pg.connect() as c:
+        c.autocommit = True
+        c.execute("create sequence rp498_s")
+        rows = c.execute(
+            "select attname::text, attnum, atttypid::regtype::text, attnotnull"
+            " from pg_attribute where attrelid = 'rp498_s'::regclass order by attnum"
+        ).fetchall()
+    assert rows == [
+        ("tableoid", -6, "oid", True),
+        ("cmax", -5, "cid", True),
+        ("xmax", -4, "xid", True),
+        ("cmin", -3, "cid", True),
+        ("xmin", -2, "xid", True),
+        ("ctid", -1, "tid", True),
+        ("last_value", 1, "bigint", True),
+        ("log_cnt", 2, "bigint", True),
+        ("is_called", 3, "boolean", True),
     ]

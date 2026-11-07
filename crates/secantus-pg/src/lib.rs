@@ -23325,6 +23325,11 @@ impl PgHandler {
                     for n in t.dropped_attnums() {
                         rows.push(Self::dropped_attribute_row(&def, relid, i32::from(n)));
                     }
+                    // Every relation with storage -- a table, a partitioned
+                    // table, a materialized view -- has the system columns
+                    // as rows with negative attnums (`AddNewAttributeTuples`
+                    // skips only a view and a composite type).
+                    rows.extend(Self::system_attribute_rows(&def, relid));
                 }
                 // A view's columns are its output columns; an index's are its
                 // key columns, in key order (psql's `\d view` / `\d index`
@@ -25883,6 +25888,39 @@ impl PgHandler {
         d.insert(f("atthasdef"), Bson::Boolean(false));
         d.insert(f("attgenerated"), "");
         d
+    }
+
+    /// The system columns' `pg_attribute` rows for relation `relid`, as
+    /// `heap.c`'s `SysAtt` table defines them: each NOT NULL, with no type
+    /// modifier or default. The columns the fill derives from the type
+    /// (`attlen`, `attbyval`, `attalign`, `attstorage`) come out as
+    /// PostgreSQL's, and `attstattarget` is 0 for a negative attnum.
+    fn system_attribute_rows(def: &TableDef, relid: i64) -> Vec<Document> {
+        const SYSTEM_COLUMNS: [(&str, i64, i32); 6] = [
+            ("ctid", 27, -1),
+            ("xmin", 28, -2),
+            ("cmin", 29, -3),
+            ("xmax", 28, -4),
+            ("cmax", 29, -5),
+            ("tableoid", 26, -6),
+        ];
+        let f = |c: &str| def.field_of(c).expect("column");
+        SYSTEM_COLUMNS
+            .iter()
+            .map(|(name, atttypid, attnum)| {
+                let mut d = Document::new();
+                d.insert(f("attrelid"), Bson::Int64(relid));
+                d.insert(f("attname"), *name);
+                d.insert(f("atttypid"), Bson::Int64(*atttypid));
+                d.insert(f("attnum"), Bson::Int32(*attnum));
+                d.insert(f("attisdropped"), Bson::Boolean(false));
+                d.insert(f("attnotnull"), Bson::Boolean(true));
+                d.insert(f("atttypmod"), Bson::Int32(-1));
+                d.insert(f("atthasdef"), Bson::Boolean(false));
+                d.insert(f("attgenerated"), "");
+                d
+            })
+            .collect()
     }
 
     /// `key`'s current value came from `source`.
