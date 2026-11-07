@@ -50,7 +50,7 @@ pub(crate) fn check_row(
             Ok(())
         });
         if let Some(c) = found {
-            return Err(reference_error(&c, target, target_def, lookup));
+            return Err(reference_error(&c, Some((target, target_def)), lookup));
         }
         walked?;
     }
@@ -58,11 +58,12 @@ pub(crate) fn check_row(
 }
 
 /// `transformColumnRef`'s failure for `c` where nothing is in the
-/// namespace.
-fn reference_error(
+/// namespace. `target` is the one relation in the range table, an
+/// INSERT's; `None` is an empty range table, a select with no FROM
+/// (RP-441).
+pub(crate) fn reference_error(
     c: &pb::ColumnRef,
-    target: &pb::RangeVar,
-    target_def: &TableDef,
+    target: Option<(&pb::RangeVar, &TableDef)>,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Error {
     let parts: Vec<Option<&str>> = c
@@ -84,11 +85,11 @@ fn reference_error(
     set_error_location(c.location);
     match parts.as_slice() {
         [Some(name)] => Error::UndefinedColumn((*name).to_string()),
-        [Some(rel), _] => missing_rte(None, rel, target, target_def, lookup),
-        [Some(schema), Some(rel), _] => missing_rte(Some(*schema), rel, target, target_def, lookup),
+        [Some(rel), _] => missing_rte(None, rel, target, lookup),
+        [Some(schema), Some(rel), _] => missing_rte(Some(*schema), rel, target, lookup),
         [Some(db), Some(schema), Some(rel), _] => {
             if *db == session_database() {
-                missing_rte(Some(*schema), rel, target, target_def, lookup)
+                missing_rte(Some(*schema), rel, target, lookup)
             } else {
                 Error::FeatureNotSupported(format!(
                     "cross-database references are not implemented: {}",
@@ -117,10 +118,15 @@ fn reference_error(
 fn missing_rte(
     schema: Option<&str>,
     rel: &str,
-    target: &pb::RangeVar,
-    target_def: &TableDef,
+    target: Option<(&pb::RangeVar, &TableDef)>,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Error {
+    let Some((target, target_def)) = target else {
+        return Error::Sqlstate(
+            "42P01",
+            format!("missing FROM-clause entry for table \"{rel}\""),
+        );
+    };
     let alias = target
         .alias
         .as_ref()

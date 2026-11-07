@@ -4015,3 +4015,49 @@ fn a_join_on_may_hold_a_subquery() {
     assert!(planned.is_ok(), "{q}: {:?}", planned.err());
     assert_eq!(ran.get(), 0, "{q}");
 }
+
+#[test]
+fn a_column_reference_with_no_from_names_nothing() {
+    // `transformColumnRef` over an empty range table (RP-441): 42703 for a
+    // bare name, 42P01 for a qualified one, at the reference's own token,
+    // in whichever clause it is. Each was 0A000 `ColumnRef is not
+    // supported yet`, or planned with the ORDER BY / GROUP BY name ignored.
+    for (sql, state, at) in [
+        ("select 1 + nosuch", "42703", 11),
+        ("select abs(nosuch)", "42703", 11),
+        ("select case nosuch when 1 then 1 end", "42703", 12),
+        ("select 1 where 1 + nosuch = 2", "42703", 19),
+        ("select 1 as x order by x + 1", "42703", 23),
+        ("select 1 group by nosuch", "42703", 18),
+        ("select 1 offset nosuch limit nosuch2", "42703", 16),
+        ("select nosuch.a + 1", "42P01", 7),
+        ("select 1 + x.y.z", "42P01", 11),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // A bare ORDER BY / GROUP BY name may name an output column.
+    for sql in [
+        "select 1 as x order by x",
+        "select abs(1) order by abs",
+        "select 1 x group by x order by x",
+    ] {
+        analysed(sql).expect("an output column");
+    }
+    // An untyped literal's input function runs as its cast is analysed,
+    // before the reference to its right.
+    let err = analysed("select 'x'::int, 1 + nosuch").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "22P02", "{err}");
+    // A call is looked up as it is analysed: the planner's refusal of a
+    // function PostgreSQL lacks, which the server answers as 42883.
+    let err = analysed("select nosuchfn(1), nosuch").expect_err("should refuse");
+    assert!(
+        matches!(&err, Error::Unsupported(m) if m == "function nosuchfn(integer)"),
+        "{err:?}"
+    );
+    // An aggregate exists, so the reference after it is what fails.
+    let err = analysed("select count(1), nosuch").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42703", "{err}");
+}

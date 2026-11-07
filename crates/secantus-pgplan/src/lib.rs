@@ -27,6 +27,7 @@ pub mod costsize;
 mod expr_memo;
 mod expr_where;
 mod filter_sublink;
+mod fromless;
 mod functional_grouping;
 mod guc_args;
 pub mod hashagg;
@@ -23094,6 +23095,10 @@ fn plan_select(
         return plan_select(&inline_ctes(&s)?, lookup, params);
     }
     cancel::check()?;
+    // With no FROM a column reference names nothing (RP-441): checked as
+    // parse analysis would, before any rewrite folds the expression it is
+    // in away.
+    fromless::check_column_refs(s, params)?;
     // A view is shorthand for the subquery it was defined as, so it is
     // rewritten away here, before any shape check looks at the FROM list.
     // The `tableoid` system column, before the views it may name expand.

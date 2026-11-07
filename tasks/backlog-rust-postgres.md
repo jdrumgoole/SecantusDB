@@ -1644,19 +1644,52 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A missing column inside an expression of a SELECT with no FROM is
-      refused as a gap.** A bare `select nosuch` is 42703 on both, but
-      `select 1 + nosuch`, `select -nosuch`, `select coalesce(nosuch, 1)`
-      and a CASE naming it as argument, WHEN or THEN answer `0A000
-      ColumnRef is not supported yet`, and `select abs(nosuch)` 42883
-      `function abs(text) does not exist` (the name read as an untyped
-      value). PostgreSQL 15.19's `transformColumnRef` finds nothing in the
-      empty range table: 42703 `column "nosuch" does not exist` at the
-      name, no HINT. A client matching on the class reads a missing
-      feature where it made a mistake. Measured on PostgreSQL 15.19 (found
-      while working RP-439).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_in_an_expression_with_no_from
-      Backlog-ID: RP-441
+- [ ] **An EXISTS subquery's target list is not analysed.** `select
+      exists (select nosuch)`, `select 1 where exists (select nosuch)` and
+      `select exists (select nosuch from (select 1) s)` answer `true` / a
+      row here; PostgreSQL 15.19 analyses the subquery whole before the
+      planner drops its targets, so each is 42703 `column "nosuch" does not
+      exist` at the name. A statement PostgreSQL refuses runs. Measured on
+      PostgreSQL 15.19 (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_list_is_analysed
+      Backlog-ID: RP-444
+- [ ] **A FROM-less subquery inside a FROM-less subquery cannot read the
+      outer query's columns.** `select (select (select a)) from (select 1
+      a) t` is 42703 `column "a" does not exist` with the HINT that it
+      cannot be referenced from there, and `select (select (select t.a))
+      from (select 1 a) t` leaks this server's internal call, 42883
+      `function \x1fcorrelated(integer, ...) does not exist`; PostgreSQL
+      15.19 resolves both to the outer row and answers 1. One level (`select
+      (select a) from ...`) already works. Measured on PostgreSQL 15.19
+      (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_fromless_subquery_two_levels_down_reads_the_outer_row
+      Backlog-ID: RP-445
+- [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
+      `0A000 this target is not supported yet`; PostgreSQL 15.19's
+      `transformTargetList` answers 42601 `SELECT * with no tables
+      specified is not valid` at the `*`. Measured on PostgreSQL 15.19
+      (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_star_with_no_from
+      Backlog-ID: RP-446
+- [ ] **An operator's type error is reported ahead of a missing column to
+      its left.** `select nosuch + (1 + true)` is 42883 `operator does not
+      exist: integer + boolean` here, from `optype` checking every operator
+      before the planner meets the column; PostgreSQL 15.19 analyses the
+      left operand first and answers 42703 `column "nosuch" does not exist`
+      at 8. The operator to the reference's LEFT already comes first on
+      both (`select (1 + true) + nosuch`). The same pass as RP-442. Measured
+      on PostgreSQL 15.19 (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_missing_column_before_operator_to_its_right
+      Backlog-ID: RP-447
+- [ ] **An operator over `current_user` or `current_schema` names its
+      operand `text`, not `name`.** `select 1 + current_user` is 42883
+      `operator does not exist: integer + text` here and `integer + name`
+      on PostgreSQL 15.19 (`select current_schema + 1` likewise);
+      `pg_typeof` of each is `name` on both, so only the operator check's
+      typing of the keyword functions differs. Measured on PostgreSQL 15.19
+      (found while working RP-441).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_keyword_function_operand_is_name
+      Backlog-ID: RP-448
 - [ ] **A cast literal's input error is reported after the operator
       around it.** PostgreSQL 15.19's `transformTypeCast` runs a constant's
       input function as the cast is transformed, before `make_op` looks the
