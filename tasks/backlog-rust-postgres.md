@@ -1920,17 +1920,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       The same holds in a SQL function's body at CREATE (RP-465).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_values_and_unread_cte_are_analysed
       Backlog-ID: RP-501
-- [ ] **A SQL function's array parameter cannot be subscripted.** `create
-      function h2(v int[]) returns int language sql as $$ select v[1] $$`:
-      `select h2(array[4,5])` is 22P02 `invalid input syntax for type
-      integer: "{4,5}"` here and `4` on PostgreSQL 15.19, and `select v[1] +
-      1` is 0A000 `operator + on these operands is not supported yet` (5
-      there). `sql_fn_params::bind_parameter_names` rewrites the name to
-      `$1::` and its array type, so `v[1]` becomes a cast to an array type
-      with a bound (`$1::int[][1]`), not a subscript; a parameter followed
-      by `[` needs its cast in parentheses. A prepared `$1[1]` answers.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_array_parameter_subscript
-      Backlog-ID: RP-502
 
 ## Found while working RP-486 (2026-11-07)
 
