@@ -1866,14 +1866,6 @@ and `fs(a int, c text)`, one row each.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 `fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
 
-- [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
-      declare x int := 3; begin return blk.x + p; end` answers 10 for
-      `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table
-      "blk"`. The function's own name, the label of the block its
-      parameters are declared in, qualifies them since RP-451; a label the
-      body writes does not.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_block_label_qualifies_a_variable
-      Backlog-ID: RP-463
 - [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
       `check_function_bodies` on, its default, PostgreSQL parses and
       analyses each statement at CREATE: a body `select gx.q` is 42P01
@@ -1883,6 +1875,43 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       succeeds and the error waits for the first call.
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
       Backlog-ID: RP-465
+
+## Found while working RP-463 (2026-11-07)
+
+- [ ] **A DO block with a label is a syntax error.** `do $$ <<blk>> begin
+      raise notice 'z'; end $$` is 42601 `syntax error at or near "<"` at 7
+      here, and a labelled FOR loop inside one (`begin <<l>> for i in 1..2
+      loop ... end loop; end`) is 42601 `syntax error at end of input`;
+      PostgreSQL 15.19 runs each. `plpgsql_do::parse`, the DO block's own
+      fast path, answers a syntax error for a `<<` it does not read,
+      instead of handing the block to the function interpreter, which
+      reads labels (RP-463) -- the same body as a function runs.
+      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_do_block_with_a_label
+      Backlog-ID: RP-486
+- [ ] **After an inner block ends, a bare name reads the inner block's
+      variable.** `<<o>> declare x int := 1; begin declare x int := 2; begin
+      null; end; return x; end` returns 1 on PostgreSQL 15.19 and 2 here, a
+      silent wrong answer; and `declare i int := 7; begin begin for i in
+      1..1 loop perform 1/0; end loop; exception when others then return
+      i; end; end` returns 7 there and NULL here, the loop's own `i`. The
+      interpreter resolves an unqualified name
+      against one flat list of datums, the last of that name winning
+      (`Interp::scalar`), so a block's variable outlives the block. Since
+      RP-463 the run keeps PostgreSQL's namespace levels (`block_scope`)
+      for labels; the faithful fix resolves a bare name through them too,
+      innermost level first, as `plpgsql_ns_lookup` does.
+      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_bare_name_after_inner_block
+      Backlog-ID: RP-487
+- [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
+      no internal position.** `do $$ declare x int; begin raise notice '%',
+      nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends
+      `internal_query` `nosuch.x` and `internal_position` 1 (psql prints
+      `LINE 1: nosuch.x` and `QUERY:`); here neither field is sent. Called
+      as a function (`return nosuch.x` in `lbe()`), the error here instead
+      carries a statement position, 8, into `select lbe()`, where
+      PostgreSQL sends none. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
+      Backlog-ID: RP-488
 
 ## Found while working RP-483 (2026-11-07)
 
