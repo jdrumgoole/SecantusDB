@@ -733,6 +733,74 @@ def test_a_write_says_how_long_it_held_its_oplog_slot(rust_mongo: Any, mongod_rs
     assert answers["rust"] == answers["mongod"]
 
 
+@pytest.fixture(scope="module")
+def rust_mongo_async(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
+    """A `secantusd-rs` of this module's own, on the asynchronous oplog.
+
+    `--data-logged` as well: a store whose data tables are not logged (the
+    default) stamps each write with its oplog timestamp, so it keeps the
+    synchronous oplog and says so at start ("the asynchronous oplog is not
+    used ..."); without it this fixture would test the synchronous one."""
+    import subprocess
+
+    from tests.backlog.conftest import _RS_BANNER, RS_BINARY, drain_output
+
+    assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
+    store = tmp_path_factory.mktemp("rust-mongo-async")
+    proc = subprocess.Popen(
+        [
+            str(RS_BINARY),
+            "--port",
+            "0",
+            "--storage-path",
+            str(store),
+            "--oplog-async",
+            "--data-logged",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        assert proc.stdout is not None
+        line, m = "", None
+        for _ in range(20):
+            line = proc.stdout.readline()
+            m = _RS_BANNER.search(line)
+            if m or not line:
+                break
+        assert m, f"secantusd-rs --oplog-async did not start: {line!r}"
+        drain_output(proc)
+        client = pymongo.MongoClient(
+            host=m.group(1), port=int(m.group(2)), serverSelectionTimeoutMS=10_000
+        )
+        yield client
+        client.close()
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+@pytest.mark.backlog("RM-379")
+def test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot(
+    rust_mongo_async: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for an insert carries
+    `totalOplogSlotDurationMicros` (RM-361). On the asynchronous oplog
+    (`--oplog-async`) this server mints a write's entries only after the
+    write commits, so no slot is open inside it and the line has no field."""
+    got = _both(rust_mongo_async, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
+    answers = {
+        s: ("totalOplogSlotDurationMicros" in _line(lines, "insert"))
+        for s, (lines, _) in got.items()
+    }
+    assert answers["mongod"] is True
+    assert answers["rust"] == answers["mongod"]
+
+
 # ------------------------------------------------------------- RM-362 --
 
 

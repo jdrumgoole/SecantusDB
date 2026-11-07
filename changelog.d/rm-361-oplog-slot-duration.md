@@ -37,5 +37,6 @@ mongod printed for each of those cases.
 - Fixes RM-361
   (tests/backlog/test_rm_355_364.py::test_a_write_says_how_long_it_held_its_oplog_slot,
   crates/secantus-storage/tests/oplog.rs::a_write_counts_how_long_it_held_its_oplog_slots).
+- Filed RM-379: on the asynchronous oplog (`--oplog-async`) a write's line has no `totalOplogSlotDurationMicros`, because the write's entries are minted after it commits. RM-361's storage tests pin the synchronous oplog.
 - Filed RM-378: the `Slow query` line of a `renameCollection` names
   `admin.<db>.c` where mongod names `<db>.c`.

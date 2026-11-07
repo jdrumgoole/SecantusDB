@@ -4,7 +4,7 @@
 //! across a close/reopen. Against real WiredTiger.
 
 use bson::{doc, Bson, Document};
-use secantus_storage::Storage;
+use secantus_storage::{Storage, StorageOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -513,11 +513,36 @@ fn slot_micros(scope: &secantus_storage::OperationScope) -> i64 {
     scope.counts().oplog_slot_micros
 }
 
+/// `with_db` on the SYNCHRONOUS oplog. The slot tests time the in-flight
+/// window, which only the synchronous oplog has: the asynchronous one mints
+/// a write's entries after it commits, so no slot is open inside it (RM-379).
+/// Pinned with the option, which beats the env var, so the CI lane that sets
+/// `SECANTUS_OPLOG_ASYNC=1` still checks the synchronous timing, as
+/// `oplog_visibility.rs` does.
+fn with_sync_db(body: impl FnOnce(&Storage)) {
+    let home = temp_home();
+    let mut st = Storage::open_with_options(
+        home.to_str().unwrap(),
+        &StorageOptions {
+            oplog_async: Some(false),
+            ..StorageOptions::default()
+        },
+    )
+    .unwrap();
+    st.set_enable_oplog(false);
+    st.create_collection("app", "c").unwrap();
+    st.create_collection("app", "other").unwrap();
+    st.set_enable_oplog(true);
+    body(&st);
+    drop(st);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 #[test]
 fn a_write_counts_how_long_it_held_its_oplog_slots() {
     // mongod's `totalOplogSlotDurationMicros` (RM-361): each slot is timed
     // from its reservation to the commit of the write that took it.
-    with_db(|st| {
+    with_sync_db(|st| {
         let docs: Vec<Vec<u8>> = (0..200).map(|i| enc(&doc! {"_id": i, "x": i})).collect();
         let scope = secantus_storage::operation_scope();
         st.insert("app", "c", docs, true).unwrap();
@@ -527,7 +552,7 @@ fn a_write_counts_how_long_it_held_its_oplog_slots() {
 
 #[test]
 fn a_write_that_rolls_back_or_mints_nothing_counts_no_slot() {
-    with_db(|st| {
+    with_sync_db(|st| {
         st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
         // A duplicate key rolls its write back: mongod counts nothing.
         let scope = secantus_storage::operation_scope();
@@ -545,7 +570,7 @@ fn a_write_that_rolls_back_or_mints_nothing_counts_no_slot() {
 fn a_transactions_slots_are_its_commits() {
     // mongod reserves a transaction's slots when it commits, so its
     // statements count none and `commitTransaction` counts them.
-    with_db(|st| {
+    with_sync_db(|st| {
         let mut txn = st.begin_user_transaction().unwrap();
         let statement = secantus_storage::operation_scope();
         st.with_user_transaction(&mut txn, || {
@@ -564,7 +589,7 @@ fn a_transactions_slots_are_its_commits() {
 
 #[test]
 fn an_operation_inside_another_adds_its_slots_to_it() {
-    with_db(|st| {
+    with_sync_db(|st| {
         let outer = secantus_storage::operation_scope();
         {
             let _inner = secantus_storage::operation_scope();
