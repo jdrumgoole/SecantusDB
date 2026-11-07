@@ -4,8 +4,8 @@
 //! priority alone, so which of two candidates of equal priority comes out
 //! first is decided by the heap's own sift steps. That decides which cells
 //! end up in a covering once it reaches its cell limit, so the queue here is
-//! [`crate::heap::Heap`], a transcription of libc++'s heap, the library
-//! the reference mongod (8.2.11 on macOS) is built with.
+//! [`crate::heap::Heap`], a transcription of libstdc++'s heap, the library
+//! mongod's Linux build -- the exemplar -- is built with.
 
 use super::cell::Cell;
 use super::cellid::CellId;

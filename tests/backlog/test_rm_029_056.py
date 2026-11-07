@@ -475,19 +475,56 @@ def test_geo_within_in_2d_scan_order(rust_mongo: Any, mongod: Any) -> None:
     assert run(rust_mongo) == run(mongod)
 
 
-@pytest.mark.backlog("RM-231")
+@pytest.mark.backlog_fixed("RM-231")
 def test_near_ties_in_scan_order(rust_mongo: Any) -> None:
-    """Four points at one distance from a `$near`: mongod returns them in its
-    scan's order, and that order depends on the build. Linux x86-64 8.2.12
-    (CI, 2026-10-21) answers [2, 1, 3, 0]; macOS arm64 8.2.11 and 8.2.12
-    answer [2, 3, 0, 1], which this server returns. The Linux build is the
-    exemplar (Joe, 2026-10-21), so its answer is recorded here rather than
-    asked of whichever mongod is on PATH. Was RM-041's regression test."""
+    """Four points at one distance from a `$near`: mongod returns them in the
+    order its `std::priority_queue` leaves them, which is the C++ library's.
+    Linux 8.2.12 (libstdc++; x86-64 on CI, 2026-10-21, and x86-64 and arm64
+    in containers, 2026-11-07) answers [2, 1, 3, 0]; macOS arm64 8.2.11 and
+    8.2.12 (libc++) answer [2, 3, 0, 1], which this server returned. The
+    Linux build is the exemplar (Joe, 2026-10-21), so its answer is recorded
+    here rather than asked of whichever mongod is on PATH. Was RM-041's
+    regression test."""
     docs = [{"_id": 0, "loc": [1, 0]}, {"_id": 1, "loc": [0, 1]}, {"_id": 2, "loc": [-1, 0]}]
     docs.append({"_id": 3, "loc": [0, -1]})
     command = {"find": "c", "filter": {"loc": {"$near": [0, 0]}}}
     got = _ids(_seed(rust_mongo, "rm041n", docs, [_index({"loc": "2d"})]), command)
     assert got == ("ok", [2, 1, 3, 0])
+
+
+@pytest.mark.backlog_fixed("RM-231")
+def test_std_dev_group_rounds_as_the_linux_build(rust_mongo: Any) -> None:
+    """mongod's Linux build rounds Welford's `m2 += delta * (x - mean)` twice;
+    its macOS arm64 build fuses it into one rounding, which this server
+    copied, and the last digit differed on 60 of 300 random sets. Linux
+    x86-64 8.2.12 (2026-11-07): `$stdDevPop` 90.2285562652279 over these
+    four doubles; macOS 8.2.1 answers 90.22855626522788."""
+    xs = [128.7365862667732, 238.01918634710773, -7.171009773016408, 63.44049316037126]
+    pipeline = [
+        {"$documents": [{"v": x} for x in xs]},
+        {"$group": {"_id": None, "p": {"$stdDevPop": "$v"}, "s": {"$stdDevSamp": "$v"}}},
+    ]
+    got = mongo_answer(lambda: list(rust_mongo.admin.aggregate(pipeline)))
+    assert got == ("ok", [{"_id": None, "p": 90.2285562652279, "s": 104.18696249664123}])
+
+
+@pytest.mark.backlog_fixed("RM-231")
+def test_2d_geo_near_distance_as_the_linux_build(rust_mongo: Any) -> None:
+    """A `2d` `$geoNear`'s distance is mongod's `distance()`:
+    `sqrt((a * a) + (b * b))`, rounded after each step on the Linux build
+    (the macOS build fuses the add). This server took `hypot`, which
+    matched neither (18 of 300 random points off Linux's last digit).
+    Linux x86-64 8.2.12 (2026-11-07): 50.22569270871164; macOS 8.2.1 answers
+    50.225692708711634."""
+    db = _seed(
+        rust_mongo,
+        "rm231d",
+        [{"_id": 0, "loc": [47.41284194920739, 18.106904708733637]}],
+        [_index({"loc": "2d"})],
+    )
+    stage = {"$geoNear": {"near": [0.3, 0.7], "distanceField": "d"}}
+    got = mongo_answer(lambda: [d["d"] for d in db.c.aggregate([stage])])
+    assert got == ("ok", [50.22569270871164])
 
 
 @pytest.mark.backlog_fixed("RM-042")

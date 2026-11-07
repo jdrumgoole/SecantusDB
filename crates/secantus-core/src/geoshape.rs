@@ -897,7 +897,9 @@ impl Near {
                     Some(sphere::distance(g, self.centre) * EARTH_RADIUS_METERS)
                 } else {
                     match g {
-                        Geom::Point(p) => Some((p.0 - self.centre.0).hypot(p.1 - self.centre.1)),
+                        Geom::Point(p) => {
+                            Some(crate::geoorder::near::flat_distance(*p, self.centre))
+                        }
                         _ => None,
                     }
                 }

@@ -329,7 +329,7 @@ pub(crate) enum Work {
 /// mongod keeps one head per child in a `std::priority_queue` whose
 /// comparator is "sorts after", so the top is the least. Heads that compare
 /// equal come out in the order the heap's sift steps leave them
-/// (`secantus_core::heap`, libc++'s).
+/// (`secantus_core::heap`, libstdc++'s, as on the Linux build).
 pub(crate) struct Head {
     key: Vec<Vec<u8>>,
     pub row: usize,

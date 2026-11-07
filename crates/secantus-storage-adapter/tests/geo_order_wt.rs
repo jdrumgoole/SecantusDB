@@ -257,7 +257,7 @@ fn a_near_hinted_elsewhere_is_refused() {
         // Hinted to its own index, it is the search's order.
         assert_eq!(
             ids(&dispatch_full(&hinted("geo".into()), c)),
-            [1, 11, 6, 20, 4, 17, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
+            [1, 11, 6, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
         );
         // The same for `$geoNear`, whose hint is the aggregate's.
         let stage = |hint: Bson| {
@@ -277,7 +277,7 @@ fn a_near_hinted_elsewhere_is_refused() {
         );
         assert_eq!(
             ids(&dispatch_full(&stage("geo".into()), c)),
-            [1, 11, 6, 20, 4, 17, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
+            [1, 11, 6, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
         );
     });
 }
@@ -291,22 +291,26 @@ fn near_returns_ties_in_its_searchs_order() {
             spec.extend(extra);
             doc! { "loc": { "$near": spec } }
         };
-        // 20 and 4 are one point, and 17 holds it: mongod's queue hands back
-        // 20 first.
+        // 20 and 4 are one point, and 17 holds it: the Linux build's queue
+        // (libstdc++'s heap) hands back 17 first, then 4 and 20 (mongod
+        // 8.2.12; the macOS build's libc++ heap: 20, 4, 17). Linux answers
+        // 6, 1, 11 for the first three: it measures the line 6 at distance
+        // 0, where this server's S2 arithmetic, the macOS build's, puts it
+        // 6.4e-12 m out (RM-393).
         assert_eq!(
             find(c, near(doc! {})),
-            [1, 11, 6, 20, 4, 17, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
+            [1, 11, 6, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
         );
         // The rest of the query filters what the search returns.
         let mut filter = near(doc! {});
         filter.insert("k", "a");
-        assert_eq!(find(c, filter), [11, 4, 17, 13, 19, 9, 7, 8, 12]);
+        assert_eq!(find(c, filter), [11, 17, 4, 13, 19, 9, 7, 8, 12]);
         let reply = dispatch_full(
             &doc! { "aggregate": "c", "cursor": {}, "pipeline": [{ "$geoNear": {
             "near": point(0.0, 0.0), "distanceField": "d", "query": { "k": "a" } } }] },
             c,
         );
-        assert_eq!(ids(&reply), [11, 4, 17, 13, 19, 9, 7, 8, 12]);
+        assert_eq!(ids(&reply), [11, 17, 4, 13, 19, 9, 7, 8, 12]);
 
         // Four points at one distance from the centre of a `2d` search.
         seed(
@@ -319,12 +323,12 @@ fn near_returns_ties_in_its_searchs_order() {
             ],
             vec![geo("2d")],
         );
-        assert_eq!(find(c, doc! { "loc": { "$near": [0, 0] } }), [2, 3, 0, 1]);
+        assert_eq!(find(c, doc! { "loc": { "$near": [0, 0] } }), [2, 1, 3, 0]);
 
         seed(c, flat(), vec![geo("2d")]);
         assert_eq!(
             find(c, doc! { "loc": { "$near": [0, 0] } }),
-            [1, 4, 17, 20, 13, 21, 19, 2, 18, 9, 3, 7, 8, 5, 12]
+            [1, 4, 20, 17, 13, 19, 21, 2, 18, 9, 3, 7, 8, 5, 12]
         );
         // A sort over the search keeps its ties in the search's order.
         let sorted = dispatch_full(
@@ -333,7 +337,7 @@ fn near_returns_ties_in_its_searchs_order() {
         );
         assert_eq!(
             ids(&sorted),
-            [4, 17, 13, 21, 19, 9, 7, 8, 12, 1, 20, 2, 18, 3, 5]
+            [4, 17, 13, 19, 21, 9, 7, 8, 12, 1, 20, 2, 18, 3, 5]
         );
     });
 }
