@@ -2,9 +2,10 @@
 while working RP-472 (2026-11-07).
 
 - RP-473: a scan sees the rows a function the same statement ran wrote.
-- RP-474: a scalar user function in FROM is refused under an aggregate,
-  an alias column list with a WHERE, and ROWS FROM.
+- RP-474 (fixed): a scalar user function in FROM was refused under an
+  aggregate, an alias column list with a WHERE, and ROWS FROM.
 - RP-475: EXPLAIN of a user function in FROM prints no Function Scan.
+- RP-476: a function in FROM under an aggregate and a WHERE runs twice.
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each scenario runs after.
@@ -89,13 +90,40 @@ SCALAR_FUNCTION_IN_FROM = {
     "select count(*) from fq473()": ([(1,)], [([1, 2, 3, 7],)]),
     "select * from fq473() as f(x) where x = 1": ([(1,)], [([1, 2, 3, 7],)]),
     "select * from rows from (fq473(), fz473())": ([(1, 1)], [([1, 2, 3, 7, 100],)]),
+    "select * from fq473() f where f = 1": ([(1,)], [([1, 2, 3, 7],)]),
+    "select fq473 + 1 from fq473()": ([(2,)], [([1, 2, 3, 7],)]),
 }
 
 
-@pytest.mark.backlog("RP-474")
+@pytest.mark.backlog_fixed("RP-474")
 @pytest.mark.parametrize("call", list(SCALAR_FUNCTION_IN_FROM))
 def test_scalar_function_in_from(call: str, dsn: str) -> None:
+    """A scalar function in FROM was a row source only in the shapes with a
+    path of their own; it is now one row wherever a SETOF function is a
+    source, and still runs once."""
     assert answer(dsn, call) == SCALAR_FUNCTION_IN_FROM[call]
+
+
+# An aggregate over a WHERE with a conjunct that reads no column: each
+# function still runs once, its insert in the table once.
+AGGREGATE_OVER_WHERE = {
+    "select count(*) from fq473() where 1 = 1": ([(1,)], [([1, 2, 3, 7],)]),
+    "select count(*) from fz473() where 1 = 1": ([(1,)], [([1, 2, 3, 100],)]),
+    "select max(x) from fz473() as f(x) where x > 0 and 1 = 1": (
+        [(1,)],
+        [([1, 2, 3, 100],)],
+    ),
+    "select x, count(*) from fz473() as f(x) where 1 = 1 group by x": (
+        [(1, 1)],
+        [([1, 2, 3, 100],)],
+    ),
+}
+
+
+@pytest.mark.backlog("RP-476")
+@pytest.mark.parametrize("call", list(AGGREGATE_OVER_WHERE))
+def test_aggregate_over_where_runs_the_function_once(call: str, dsn: str) -> None:
+    assert answer(dsn, call) == AGGREGATE_OVER_WHERE[call]
 
 
 FUNCTION_SCAN_PLAN = {

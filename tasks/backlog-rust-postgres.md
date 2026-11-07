@@ -1925,24 +1925,31 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       function's writes come after.
       Backlog-ID: RP-473
       Verify: tests/backlog/test_rp_from_function_scan.py::test_scan_does_not_see_the_functions_write
-- [ ] **A scalar user function in FROM is refused in three shapes.** With
-      `fq()` returning `int` (not SETOF): `select count(*) from fq()` is
-      0A000 `RangeFunction is not supported yet`, `select * from fq() as
-      f(x) where x = 1` 0A000 `ColumnRef is not supported yet`, and `select
-      * from rows from (fq(), fz())` 0A000 `fq() in ROWS FROM is not
-      supported yet`. PostgreSQL 15.19 answers 1, 1 and `(1, 1)`. The same
-      shapes over a SETOF function or `generate_series` already work.
-      Backlog-ID: RP-474
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_scalar_function_in_from
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
       PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
       off) select * from fq()`, a scalar or a SETOF SQL function alike.
-      Here a scalar one prints `Result`, and a SETOF one `Subquery Scan on
-      fz` over `Values Scan on "*VALUES*"`: the call is answered at plan
-      time and its rows planned as a VALUES list. A built-in
+      Here each prints `Subquery Scan on fq` over `Values Scan on
+      "*VALUES*"` (a scalar one printed `Result` until RP-474 made it a
+      row source): the call is answered at plan time and its rows planned
+      as a VALUES list. A built-in
       (`generate_series`) already prints its Function Scan.
       Backlog-ID: RP-475
       Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
+
+## Found while working RP-474 (2026-11-07)
+
+- [ ] **A function in FROM runs twice under an aggregate whose WHERE has a
+      conjunct that reads no column.** With `fz()` a SETOF SQL function
+      whose body inserts a row, `select count(*) from fz() where 1 = 1`,
+      `select max(x) from fz() as f(x) where x > 0 and 1 = 1` and `select
+      x, count(*) from fz() as f(x) where 1 = 1 group by x` each insert
+      twice here; PostgreSQL 15.19 runs the function once. A scalar
+      function (`fq()`) the same, and a `$1 = 1` WHERE under the extended
+      protocol too. `where true`, `where x = 1` and no WHERE run it once.
+      Its rows are right; its side effects are doubled. Measured on a
+      private 15.19 cluster.
+      Backlog-ID: RP-476
+      Verify: tests/backlog/test_rp_from_function_scan.py::test_aggregate_over_where_runs_the_function_once
 
 ## Found while working RP-454 (2026-11-07)
 

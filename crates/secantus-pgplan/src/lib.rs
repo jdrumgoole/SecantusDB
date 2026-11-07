@@ -14528,8 +14528,12 @@ fn srf_rows(
     };
     // A plain function with OUT parameters returns ONE row of them.
     let out_row = |u: &correlated::UserFn| !u.returns_set && !u.columns.is_empty();
+    // In FROM every function is a row source, a scalar one too: PostgreSQL's
+    // Function Scan yields its one result as one row (`ExecMakeTableFunctionResult`
+    // stores a non-set result once), so `count(*) from f()` is 1 and a WHERE
+    // or a ROWS FROM over it reads that row.
     if let Some(u) = correlated::user_function_for(name, &call.args)
-        .filter(|u| u.returns_set || composite(u).is_some() || (expand && out_row(u)))
+        .filter(|u| u.returns_set || composite(u).is_some() || expand)
     {
         let a: Vec<Bson> = call
             .args
