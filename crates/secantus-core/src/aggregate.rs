@@ -24,7 +24,9 @@ use std::cmp::Ordering;
 
 use crate::collation::Collation;
 use crate::numeric::{as_int_like, int_to_bson};
-use crate::{deadline, densify, expressions, fill, group, order, paths, query, windowfields};
+use crate::{
+    deadline, densify, expressions, fill, group, memlimit, order, paths, query, windowfields,
+};
 
 pub use crate::fallback::Fallback;
 
@@ -60,8 +62,19 @@ pub fn apply_pipeline(
         DOWNSTREAM.with(|d| all.extend(d.borrow().iter().cloned()));
         group::downstream_fields(&all)
     };
+    // The query layer's `$sort` when it spilled: what it counted, and the
+    // stage its executor's documents reach through the cursor stage (RM-326).
+    // Its sizes are those of the documents that reach that stage.
+    let mut cursor_read: Option<memlimit::CursorRead> = None;
+    let note_read = |read: &mut Option<memlimit::CursorRead>, i: usize, docs: &[Document]| {
+        if let Some(mut read) = read.take_if(|read| read.at == i) {
+            read.sizes = docs.iter().map(memlimit::bson_len).collect();
+            memlimit::note_cursor_read(read);
+        }
+    };
     let mut i = 0;
     while i < pipeline.len() {
+        note_read(&mut cursor_read, i, &docs);
         let Bson::Document(s) = &pipeline[i] else {
             return Err(Fallback::Defer);
         };
@@ -90,7 +103,19 @@ pub fn apply_pipeline(
                     crate::sorter::SortSource::QueryLayer => None,
                     _ => scanned.as_ref(),
                 };
-                window_sort_budget(&docs, spec, vars, source, fields)?;
+                let before = memlimit::report();
+                let sorted = window_sort_budget(&docs, spec, vars, source, fields)?;
+                let sort = memlimit::report().less(&before);
+                if source == crate::sorter::SortSource::QueryLayer && sort.sort_spills > 0 {
+                    // The executor hands the stage its documents sorted.
+                    let sizes = sorted.iter().map(|(_, d)| memlimit::bson_len(d)).collect();
+                    memlimit::note_cursor_read(memlimit::CursorRead {
+                        sort,
+                        sizes,
+                        at: i,
+                        limited: false,
+                    });
+                }
             }
             let (out, next) = window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll)?;
             docs = out;
@@ -125,6 +150,7 @@ pub fn apply_pipeline(
                 .and_then(|st| st.get("$limit"))
                 .and_then(as_int_like)
                 .and_then(|n| usize::try_from(n).ok());
+            let before = memlimit::report();
             docs = match source {
                 None => sort_stage(docs, spec)?,
                 Some(source) => {
@@ -138,12 +164,35 @@ pub fn apply_pipeline(
                     budgeted_sort_stage(docs, spec, source, fields, added, limit)?
                 }
             };
+            let sort = memlimit::report().less(&before);
+            if source == Some(crate::sorter::SortSource::QueryLayer) && sort.sort_spills > 0 {
+                // The stages after it the query layer also takes.
+                let mut at = i + 1;
+                while pipeline.get(at).is_some_and(|st| {
+                    matches!(
+                        stage_name_of(st),
+                        "$match" | "$skip" | "$limit" | "$project" | "$unset"
+                    )
+                }) {
+                    at += 1;
+                }
+                let limited = pipeline[i + 1..at]
+                    .iter()
+                    .any(|st| stage_name_of(st) == "$limit");
+                cursor_read = Some(memlimit::CursorRead {
+                    sort,
+                    sizes: Vec::new(),
+                    at,
+                    limited,
+                });
+            }
             i += 1;
             continue;
         }
         docs = apply_stage(name, spec, docs, vars, coll)?;
         i += 1;
     }
+    note_read(&mut cursor_read, pipeline.len(), &docs);
     deadline::check_now()?;
     Ok(docs)
 }
@@ -293,9 +342,9 @@ fn window_sort_budget(
     vars: &Document,
     source: crate::sorter::SortSource,
     fields: Option<&std::collections::BTreeSet<String>>,
-) -> R<()> {
+) -> R<Vec<(Vec<Bson>, Document)>> {
     let Some(spec) = spec.as_document() else {
-        return Ok(());
+        return Ok(Vec::new());
     };
     let by = spec.get("partitionBy");
     let sort = match spec.get("sortBy") {
@@ -303,7 +352,7 @@ fn window_sort_budget(
         _ => Vec::new(),
     };
     if by.is_none() && sort.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut items: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
@@ -337,8 +386,7 @@ fn window_sort_budget(
         budget: crate::memlimit::budgets().sort,
         added: None,
     };
-    crate::sorter::blocking_sort(items, &cmp, &sizing, None)?;
-    Ok(())
+    crate::sorter::blocking_sort(items, &cmp, &sizing, None)
 }
 
 /// The stages that take one document and give back at most one, which run

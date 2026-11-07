@@ -312,9 +312,19 @@ fn write_run(items: impl Iterator<Item = Held>, sizing: &Sizing) -> R<Run> {
     }
     let written = out.done().map_err(|e| io_error(&path, e))?;
     if bucket_auto {
-        memlimit::record_bucket_auto_spill(run.records as i64, written.bytes, written.stored);
+        memlimit::record_bucket_auto_spill(
+            run.records as i64,
+            written.bytes,
+            written.stored,
+            written.chunks,
+        );
     } else {
-        memlimit::record_sort_spill(run.records as i64, written.bytes, written.stored);
+        memlimit::record_sort_spill(
+            run.records as i64,
+            written.bytes,
+            written.stored,
+            written.chunks,
+        );
     }
     Ok(run)
 }

@@ -180,6 +180,7 @@ thread_local! {
     }) };
     static ALLOW_DISK_USE: Cell<bool> = const { Cell::new(true) };
     static REPORT: RefCell<SpillReport> = RefCell::new(SpillReport::default());
+    static CURSOR_READ: RefCell<Option<CursorRead>> = const { RefCell::new(None) };
     static SPILL_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
@@ -298,8 +299,9 @@ pub(crate) fn record_sort(keys: i64, bytes: i64) {
     SORT_METRICS.total_bytes_sorted.add(bytes);
 }
 
-/// A sort wrote a run (a spill, or a merge of runs) of `records`.
-pub(crate) fn record_sort_spill(records: i64, bytes: i64, storage: i64) {
+/// A sort wrote a run (a spill, or a merge of runs) of `records`, as
+/// `chunks` chunks of its file.
+pub(crate) fn record_sort_spill(records: i64, bytes: i64, storage: i64, chunks: i64) {
     REPORT.with(|r| {
         let mut r = r.borrow_mut();
         r.used_disk = true;
@@ -308,14 +310,18 @@ pub(crate) fn record_sort_spill(records: i64, bytes: i64, storage: i64) {
         r.sort_spilled_bytes += bytes;
         r.sort_spilled_data_storage_size += storage;
     });
-    SORT_METRICS.spill_to_disk.add(1);
+    SORT_METRICS.spill_to_disk.add(chunks);
     SORT_METRICS.spill_to_disk_bytes.add(storage);
 }
 
-/// `$bucketAuto`'s sorter wrote a run: counted as the stage's own.
-pub(crate) fn record_bucket_auto_spill(records: i64, bytes: i64, storage: i64) {
+/// `$bucketAuto`'s sorter wrote a run: counted as the stage's own, and its
+/// chunks as every sorter's (mongod 8.2.11: `metrics.query.sort` counts
+/// what the sorter's file writer writes, whichever stage it sorts for).
+pub(crate) fn record_bucket_auto_spill(records: i64, bytes: i64, storage: i64, chunks: i64) {
     REPORT.with(|r| r.borrow_mut().used_disk = true);
     BUCKET_AUTO_METRICS.add(1, records, bytes, storage);
+    SORT_METRICS.spill_to_disk.add(chunks);
+    SORT_METRICS.spill_to_disk_bytes.add(storage);
 }
 
 /// `$setWindowFields` spilled its partition cache.
@@ -346,6 +352,44 @@ pub fn disk_allowed() -> bool {
 /// Forget what an earlier operation on this thread spilled.
 pub fn reset_report() {
     REPORT.with(|r| *r.borrow_mut() = SpillReport::default());
+    CURSOR_READ.with(|c| c.borrow_mut().take());
+}
+
+/// A query-layer sort that spilled, read by the stages after it through
+/// mongod's cursor stage (RM-326). mongod 8.2.11's cursor stage adds its
+/// executor's summary to its own at every buffer it loads, and never resets
+/// the sort's counts there, so the operation reports them once per load.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CursorRead {
+    /// What the sort counted, once.
+    pub sort: SpillReport,
+    /// The size of each document the executor hands over, in order.
+    pub sizes: Vec<usize>,
+    /// The stage of the pipeline the cursor stage feeds.
+    pub at: usize,
+    /// The query layer took a `$limit` after the sort.
+    pub limited: bool,
+}
+
+pub(crate) fn note_cursor_read(read: CursorRead) {
+    CURSOR_READ.with(|c| *c.borrow_mut() = Some(read));
+}
+
+/// The query-layer sort of the pipeline just run, when it spilled.
+pub fn take_cursor_read() -> Option<CursorRead> {
+    CURSOR_READ.with(|c| c.borrow_mut().take())
+}
+
+/// Count `sort`'s counts `times` more in the operation's report.
+pub fn add_sort_counts(sort: &SpillReport, times: i64) {
+    REPORT.with(|r| {
+        let mut r = r.borrow_mut();
+        r.sort_spills += sort.sort_spills * times;
+        r.sort_spilled_records += sort.sort_spilled_records * times;
+        r.sort_spilled_bytes += sort.sort_spilled_bytes * times;
+        r.sort_spilled_data_storage_size += sort.sort_spilled_data_storage_size * times;
+        r.sort_total_data_size += sort.sort_total_data_size * times;
+    });
 }
 
 /// What the operation has spilled so far.

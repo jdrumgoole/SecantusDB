@@ -225,10 +225,11 @@ def _per_batch(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-326")
+@pytest.mark.backlog_fixed("RM-326")
 def test_sort_profile_per_batch(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 profiles the sort in front of a `$setWindowFields` once
-    per cursor-stage batch: `sortSpills: 52` for a sort that spilled 13."""
+    """mongod 8.2.11 profiled the sort in front of a `$setWindowFields` once
+    per cursor-stage batch: `sortSpills: 52` for a sort that spilled 13, and
+    `spillToDisk` counted the 20 chunks its runs were written as."""
     assert _per_batch(rust_mongo) == _per_batch(mongod)
 
 

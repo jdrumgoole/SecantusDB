@@ -986,6 +986,8 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The pipeline's engine markers switch to SBE and back; whatever they
     // leave, the command ends in the classic engine.
     let _engine = secantus_core::sbe::enter(false);
+    // Whatever an earlier run on this thread left unread.
+    secantus_core::memlimit::take_cursor_read();
     let result = run_segmented(
         input,
         &working_pipeline,
@@ -1015,8 +1017,31 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // The pipeline has read its leading-sort verdict, or never will.
     drop(leading_guard);
     let prefix = format!("Executor error during aggregate command on namespace: {ns}");
+    let total = result.len();
     let (first_batch, mut cursor_id) =
         split_docs_into_cursor_checked(result, batch_size, &ns, cursors, false, Some(&prefix))?;
+    // A query-layer sort that spilled is reported once for each buffer the
+    // cursor stage loaded from it for this batch (RM-326): in the
+    // operation's own counts, never in what `explain` says of its stages.
+    let read = secantus_core::memlimit::take_cursor_read()
+        .filter(|_| !crate::explain::order::is_uncounted());
+    if let Some(read) = read {
+        let wanted = if batch_size < 0 {
+            DEFAULT_BATCH_SIZE as usize
+        } else {
+            batch_size as usize
+        };
+        // A batch that came up short asked the pipeline for one more.
+        let pulls = first_batch.len() + usize::from(first_batch.len() == total && total < wanted);
+        let downstream = working_pipeline.get(read.at..).unwrap_or_default();
+        if !downstream.is_empty() {
+            let loads =
+                crate::agg_executor::cursor_loads(downstream, &read.sizes, read.limited, pulls);
+            if let Some(more) = loads.and_then(|n| n.checked_sub(1)).filter(|n| *n > 0) {
+                secantus_core::memlimit::add_sort_counts(&read.sort, more as i64);
+            }
+        }
+    }
     // `batchSize: 0` asks for the cursor and no documents, and mongod opens
     // one even over nothing -- a missing collection included.
     if batch_size == 0 && cursor_id == 0 {

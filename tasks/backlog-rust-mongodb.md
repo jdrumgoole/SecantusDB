@@ -1014,16 +1014,52 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       cannot reach today.
       Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
-- [ ] **A sort under a cursor stage reports its spills once, not per
-      batch.** When a query-layer sort feeds later stages through
-      mongod's cursor stage, 8.2.11's profile adds the sort's counters
-      again for every batch that stage reads: a `$setWindowFields` over 300
-      documents, whose sort spills 13 times (as its `explain` says), is
-      profiled with `sortSpills: 52` -- four batches of 32, 64, 128 and 256.
-      `metrics.query.sort.spillToDisk` also counts differently from the
-      spills (`+26` for a sort of 29). This server reports each sort once.
+- [ ] **A sort under a cursor stage is counted once behind stages whose
+      reads depend on the documents.** mongod 8.2.11's cursor stage adds
+      its executor's sort counts to its own at every buffer it loads
+      (`DocumentSourceCursor::loadBatch`), so a query-layer sort that
+      spilled is profiled once per load: this server counts the loads where
+      the stages after the cursor stage read a number of documents known
+      from the batch (one-for-one stages, `$skip`, `$limit`, a stage that
+      reads everything, a window that reaches its end). Behind an
+      `$unwind`, a `$match` that does not read to the end, a `$rank` or a
+      bounded window, or a partitioned `$setWindowFields`, what they read
+      for the first batch depends on the documents, and the sort is counted
+      once: `sortSpills: 13` where mongod says 39 (an `$unwind` of strings,
+      a `$rank`), or 42 (a partitioned window). Following those needs what
+      each stage read of its input, which the eager pipeline does not keep.
       Backlog-ID: RM-326
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_sort_profile_per_batch
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sort_counts_per_load_through_stages_that_filter
+- [ ] **A `getMore` reports none of its cursor's sort counts, and the
+      sort counters count each sort once.** mongod 8.2.11 profiles every
+      `getMore` of a cursor whose plan sorted with the sort's counts so far
+      (`sortSpills: 52` on the `getMore` after an aggregate that reported
+      52; 29 on a `find`'s), and adds an operation's `keysSorted` and
+      `sortTotalDataSizeBytes` to `metrics.query.sort.totalKeysSorted` /
+      `totalBytesSorted` when it ends (`curop_metrics.cpp`), each `getMore`
+      included: 2400 keys for a sort of 300 read through four loads and one
+      `getMore`, 600 for a `find` of 300 and its `getMore`. This server's
+      `getMore` entries carry no sort counts, and it adds each sort's keys
+      and bytes once, as it sorts.
+      Backlog-ID: RM-400
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_get_more_sort_counts
+- [ ] **An SBE sort counts its bytes in `totalBytesSorted`.** mongod
+      8.2.11's slot-based sort in front of a `$group` (`[{$sort: {n: 1}},
+      {$group: {_id: "$k", f: {$first: "$n"}}}]` over 300 documents) adds
+      its 300 keys to `metrics.query.sort.totalKeysSorted` and nothing to
+      `totalBytesSorted`. This server adds 17700 bytes.
+      Backlog-ID: RM-398
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_bytes
+- [ ] **A sort with a limit spills as mongod's top-k sorter does not.**
+      Over its budget mongod 8.2.11 spills a sort with a limit
+      (`TopKSorter`): `[$sort, {$limit: 200}, $addFields]` over 300 1-KB
+      documents spills 13 runs of 900 records under a 50000-byte budget,
+      where this server's limited sort spills nothing. A `$limit` mongod
+      moves into the sort past an `$addFields` (`extractLimitForPushdown`)
+      is not taken in here, so that sort spills as a whole sort would: 900
+      records where mongod's spill 592.
+      Backlog-ID: RM-399
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_top_k_sort_spills
 - [ ] **`$setWindowFields` refuses at slightly the wrong budget for some
       windows.** The partition cache and the functions are counted as mongod
       8.2.11 counts them for whole-partition, `["unbounded", "current"]` and

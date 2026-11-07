@@ -390,11 +390,13 @@ fn document_to_bson(at: &mut Cursor, out: &mut Vec<u8>) -> R<()> {
 // --------------------------------------------------------------- files --
 
 /// What a run wrote: `bytes` before compression (`spilledBytes`), `stored`
-/// on disk (`spilledDataStorageSize`).
+/// on disk (`spilledDataStorageSize`), and the `chunks` it was written in
+/// (`metrics.query.sort.spillToDisk` counts them, RM-326).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Written {
     pub bytes: i64,
     pub stored: i64,
+    pub chunks: i64,
 }
 
 /// `SortedFileWriter`: records into chunks, chunks into a file.
@@ -449,6 +451,7 @@ impl Writer {
             .and_then(|()| self.out.write_all(payload))
             .map_err(|e| err("write", e))?;
         self.written.stored += 4 + payload.len() as i64;
+        self.written.chunks += 1;
         self.buffer.clear();
         Ok(())
     }
