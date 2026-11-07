@@ -121,6 +121,7 @@ mod serializable;
 mod server;
 mod sql_fn_params;
 mod ssi;
+mod statement_views;
 mod statistic;
 mod stream_join;
 mod subscriptions;
@@ -2089,6 +2090,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let (schema, rows) = self.joined(|| {
             self.atomic(|| {
                 let stmt = self.plan(sql, params, types)?;
@@ -2117,6 +2120,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<u64, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
         let changes_catalog = PgHandler::may_change_catalog(&stmt);
         let _nested = NestedStatement::enter(self.h);
@@ -2164,6 +2169,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<plpgsql_fn::QueryOut, plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let stmt = self.plan(sql, params, types)?;
         let (columns, rows) = self.joined(|| {
             self.atomic(|| {
@@ -2183,6 +2190,8 @@ impl plpgsql_fn::Host for PlHost<'_> {
         types: &[String],
     ) -> Result<(Vec<(usize, String)>, Vec<Bson>), plpgsql_fn::PlError> {
         self.check_volatility(sql, params, types)?;
+        // A statement of its own: it sees what the body wrote before it.
+        let _level = statement_views::StatementLevel::enter(self.h);
         let Statement::Call {
             name,
             args,
@@ -13956,6 +13965,10 @@ impl PgHandler {
         }
         let started = std::time::Instant::now();
         NESTED.with(|n| n.borrow_mut().push(0));
+        // What a volatile function writes, the statement calling it does
+        // not see (RP-473); a stable or immutable one writes nothing.
+        let _viewed = (doc.get_str("volatility").unwrap_or("volatile") == "volatile")
+            .then(|| statement_views::ViewedCall::enter(self));
         let out = self.with_call_depth(|| self.run_user_function(&doc, u, args));
         let total = started.elapsed().as_micros() as i64;
         let inner = NESTED.with(|n| {
@@ -32163,6 +32176,8 @@ impl PgHandler {
         if is_empty_query(sql) {
             return Ok(vec![Response::EmptyQuery]);
         }
+        // A new client statement: no call's writes are hidden from it yet.
+        self.reset_statement_views();
         struct Snapshotless<'a>(&'a AtomicBool);
         impl Drop for Snapshotless<'_> {
             fn drop(&mut self) {

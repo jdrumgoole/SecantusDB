@@ -244,11 +244,25 @@ pub fn with_read_overlay<T>(overlays: ReadOverlays, f: impl FnOnce() -> T) -> T 
 }
 
 fn overlay_for(db: &str, coll: &str) -> Option<TableOverlay> {
-    READ_OVERLAY.with(|o| {
+    let installed = READ_OVERLAY.with(|o| {
         o.borrow()
             .as_ref()
             .and_then(|m| m.get(&(db.to_string(), coll.to_string())).cloned())
-    })
+    });
+    // The running statement's view of the rows its calls wrote (RP-473)
+    // goes over the block's own: it is what they were before the calls.
+    let Some(held) = active_held_rows() else {
+        return installed;
+    };
+    let h = held.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(view) = h.views.overlay(db, coll) else {
+        return installed;
+    };
+    let mut out = installed.unwrap_or_default();
+    for (k, row) in &view.rows {
+        out.rows.insert(k.clone(), row.clone());
+    }
+    Some(out)
 }
 
 /// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
@@ -5386,6 +5400,118 @@ pub struct Held {
     /// [`UndoJournal`]). Not emptied by [`Held::clear`]: a move onto a new
     /// WiredTiger transaction keeps the savepoints, and the journal with them.
     pub undo: UndoJournal,
+    /// What each running statement reads its own transaction's rows as (see
+    /// [`StatementViews`]). Kept across a move onto a new WiredTiger
+    /// transaction, as the journal is.
+    pub views: StatementViews,
+}
+
+/// The rows a statement's reads see of the transaction's own writes made by
+/// user code the statement called (RP-473): PostgreSQL's statement snapshot
+/// and its command id, under which a row a volatile function wrote is
+/// invisible to the statement that called it, as its `cmin` is not below
+/// the snapshot's `curcid` (`HeapTupleSatisfiesMVCC`) -- and a row the
+/// function updated or deleted is still seen as it was.
+///
+/// One level per statement running (the client's, then each statement a
+/// function body runs inside it). A level gets a view the first time it
+/// calls a volatile user function; while one of its calls runs, the first
+/// write of each row records the row as it was ([`undo_note_row`], the same
+/// sites the [`UndoJournal`] records at), in every level calling. The
+/// level's own reads, once no call of its own is running, lay those rows
+/// over what they read ([`with_read_overlay`]'s overlay): the statement
+/// reads its tables as they were before its calls wrote them. A statement's
+/// own writes are not recorded; the executor reads before it writes.
+#[derive(Debug, Default)]
+pub struct StatementViews {
+    levels: Vec<ViewLevel>,
+}
+
+#[derive(Debug, Default)]
+struct ViewLevel {
+    /// How many of this level's user-function calls are running.
+    calling: usize,
+    /// Whether the level has called a volatile function at all.
+    viewing: bool,
+    /// Each row the calls wrote, as it was before their first write of it:
+    /// by `(db, collection)`, then `_id` key, `None` for a row inserted.
+    rows: HashMap<(String, String), TableOverlay>,
+}
+
+impl StatementViews {
+    /// A new client statement starts: no level has a view.
+    pub fn reset(&mut self) {
+        self.levels.clear();
+    }
+
+    /// A statement a function body runs starts; the token ends it.
+    pub fn enter_statement(&mut self) -> usize {
+        self.base();
+        self.levels.push(ViewLevel::default());
+        self.levels.len() - 1
+    }
+
+    /// The statement [`Self::enter_statement`] started has ended.
+    pub fn leave_statement(&mut self, token: usize) {
+        self.levels.truncate(token.max(1));
+    }
+
+    /// The running statement calls a volatile user function; the token
+    /// ends the call.
+    pub fn enter_call(&mut self) -> usize {
+        self.base();
+        let at = self.levels.len() - 1;
+        let level = &mut self.levels[at];
+        level.calling += 1;
+        level.viewing = true;
+        at
+    }
+
+    /// The call [`Self::enter_call`] started has returned.
+    pub fn leave_call(&mut self, token: usize) {
+        self.levels.truncate(token + 1);
+        if let Some(level) = self.levels.get_mut(token) {
+            level.calling = level.calling.saturating_sub(1);
+        }
+    }
+
+    fn base(&mut self) {
+        if self.levels.is_empty() {
+            self.levels.push(ViewLevel::default());
+        }
+    }
+
+    /// Record a row's first write by a running call, in every level
+    /// calling: `prior` is the row before it, with its RecordId.
+    fn note(&mut self, db: &str, coll: &str, idk: &[u8], prior: Option<(i64, &[u8])>) {
+        for level in self.levels.iter_mut().filter(|l| l.calling > 0) {
+            level
+                .rows
+                .entry((db.to_string(), coll.to_string()))
+                .or_default()
+                .rows
+                .entry(idk.to_vec())
+                .or_insert_with(|| prior.map(|(r, b)| (r, b.to_vec())));
+        }
+    }
+
+    fn recording(&self) -> bool {
+        self.levels.iter().any(|l| l.calling > 0)
+    }
+
+    /// What the running statement's reads of `(db, coll)` lay over the
+    /// table: its calls' rows as they were, unless one of its calls is
+    /// running (that call's reads are its own statements').
+    fn overlay(&self, db: &str, coll: &str) -> Option<&TableOverlay> {
+        let level = self.levels.last()?;
+        if !level.viewing || level.calling > 0 {
+            return None;
+        }
+        level
+            .rows
+            .get(&(db.to_string(), coll.to_string()))
+            .filter(|ov| !ov.rows.is_empty())
+    }
 }
 
 /// A savepoint's undo journal: the first write of each document row after
@@ -5468,6 +5594,19 @@ fn undo_id_key(id: &Bson) -> Vec<u8> {
     id_key(id).unwrap_or_else(|_| format!("{id:?}").into_bytes())
 }
 
+/// The `_id` key of the raw document `doc`, as an overlay knows its rows.
+fn raw_id_key(doc: &[u8]) -> Result<Vec<u8>> {
+    let id: Bson = bson::RawDocument::from_bytes(doc)
+        .map_err(|e| StorageError::Bson(e.to_string()))?
+        .get("_id")
+        .map_err(|e| StorageError::Bson(e.to_string()))?
+        .ok_or_else(|| StorageError::Internal("a row without _id".into()))?
+        .to_raw_bson()
+        .try_into()
+        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+    id_key(&id)
+}
+
 impl UndoJournal {
     /// Open a frame for savepoint `id`.
     pub fn open(&mut self, id: u64) {
@@ -5544,7 +5683,7 @@ fn undo_note_row(
     db: &str,
     coll: &str,
     id_k: &[u8],
-    prior: Option<&[u8]>,
+    prior: Option<(i64, &[u8])>,
     id_src: &[u8],
 ) -> Result<()> {
     if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
@@ -5555,6 +5694,12 @@ fn undo_note_row(
             return Ok(());
         };
         let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        if h.undo.paused == 0 && h.views.recording() {
+            let src = prior.map_or(id_src, |(_, b)| b);
+            let idk = raw_id_key(src)?;
+            h.views.note(db, coll, &idk, prior);
+        }
+        let prior = prior.map(|(_, b)| b);
         if !h.undo.recording() {
             return Ok(());
         }
@@ -12597,7 +12742,7 @@ impl Storage {
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 note_row(db, coll, recordid)?;
-                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
+                undo_note_row(db, coll, &key, Some((recordid, &old_blob)), &old_blob)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
@@ -12685,7 +12830,7 @@ impl Storage {
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
-                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
+                undo_note_row(db, coll, &key, Some((recordid, &old_blob)), &old_blob)?;
                 cur.remove()?;
                 self.sizes.adjust(
                     &session,
@@ -18238,7 +18383,7 @@ impl Storage {
                 for (recordid, id_k, blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
-                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+                    undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.remove()?;
                     self.sizes
@@ -20842,7 +20987,7 @@ impl Storage {
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
             note_row(db, coll, recordid)?;
-            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+            undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
@@ -21021,7 +21166,7 @@ impl Storage {
                         // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                         note_row(db, coll, recordid)?;
-                        undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+                        undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
@@ -21603,7 +21748,7 @@ impl Storage {
             // reader ordering rationale.
             cur.reset()?;
             note_row(db, coll, recordid)?;
-            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+            undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             self.sizes
@@ -21693,7 +21838,7 @@ impl Storage {
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
-                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+                    undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.sizes

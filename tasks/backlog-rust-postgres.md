@@ -1908,20 +1908,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 
 ## Found while working RP-472 (2026-11-07)
 
-- [ ] **A scan sees the rows a function the same statement ran wrote.**
-      With `fq()` a SQL function whose body is `insert into t values (7);
-      select 1`, over `t` holding 1, 2, 3: `select * from t, fq()`, `select
-      * from fq(), t`, `select * from t x, lateral fq()` and `select * from
-      t where a < (select * from fq()) + 10` each answer t's three rows on
-      PostgreSQL 15.19, as the statement's snapshot predates the call; here
-      each answers four, 7 included. The function runs once (RP-472), but
-      a FROM function and an uncorrelated subquery are run while the
-      statement is PLANNED, before its scan, and the scan reads everything
-      committed by then. The faithful fix is PostgreSQL's: the statement
-      reads at its own snapshot and command id, which a volatile
-      function's writes come after.
-      Backlog-ID: RP-473
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_scan_does_not_see_the_functions_write
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
       PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
       off) select * from fq()`, a scalar or a SETOF SQL function alike.
@@ -1932,6 +1918,20 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       (`generate_series`) already prints its Function Scan.
       Backlog-ID: RP-475
       Verify: tests/backlog/test_rp_from_function_scan.py::test_function_scan_plan
+
+## Found while working RP-473 (2026-11-07)
+
+- [ ] **A volatile function in a FROM subquery or a CTE joined to a table
+      runs twice.** With `fq()` a SQL function whose body is `insert into t
+      values (7); select 1`: `select * from t, (select fq()) s`, `with w as
+      (select fq()) select * from t, w` (`materialized` or not) and `with w
+      as (select * from fq()) select * from t, w` each insert one 7 on
+      PostgreSQL 15.19 and two here. Alone (`with w as (select fq()) select
+      * from w`) it runs once. Not traced yet; RP-472 found the same shape
+      (a planning probe that calls the function) in the operator-type check
+      and the whole-row rewrite.
+      Verify: tests/backlog/test_rp_from_function_scan.py::test_joined_subquery_runs_its_function_once
+      Backlog-ID: RP-496
 
 ## Found while working RP-454 (2026-11-07)
 
