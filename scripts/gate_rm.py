@@ -154,6 +154,13 @@ def main() -> int:
         # a run against a stale one rather than let it measure old code.
         g.step("binary-build", ["./inv", "rust-binary-build"])
         g.step("server-build", ["./inv", "rust-server-build"])
+        # tools/provenance.py refuses a run while ANY artifact it knows is
+        # stale, not only the ones this gate launches. A lane that once ran
+        # `gate_pg.sh --storage` holds a `secantusd-pg`, so rebuild it too
+        # (2026-11-07: RM-361's gate aborted every pytest step on one built
+        # before a rebase).
+        if (root / "crates/secantus-pg/target/debug/secantusd-pg").exists():
+            g.step("pg-build", ["./inv", "rust-pgserver-build"])
 
     pytest = [str(py), "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rs"]
     timeouts = ["--timeout=120", "--timeout-method=thread", "--max-worker-restart=3"]
