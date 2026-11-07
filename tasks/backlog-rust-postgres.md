@@ -1609,15 +1609,15 @@ a regression test.
       private 15.19 cluster (found while working RP-408).
       Backlog-ID: RP-416
       Verify: tests/backlog/test_rp_column_errors.py::test_join_on_after_comma_item_is_type_checked
-- [ ] **A WHERE that is not boolean answers rows instead of 42804.**
-      PostgreSQL 15.19's `coerce_to_boolean` refuses the clause at parse
-      analysis: `select count(*) from e where a::text` is 42804 `argument
-      of WHERE must be type boolean, not type text`, and `where null::int`
-      is the same for `integer`. Here both count 0. (`where 1` is refused
-      already.) Measured on a private 15.19 cluster (found while working
-      RP-409).
-      Verify: tests/backlog/test_rp_where_types.py::test_where_must_be_boolean
-      Backlog-ID: RP-418
+- [ ] **A WHERE of a bare string literal is refused as text.** A string
+      literal is of type UNKNOWN, and PostgreSQL 15.19's
+      `coerce_to_boolean` reads it as a boolean: `select count(*) from e
+      where 't'` counts every row and `where 'x'` is 22P02 `invalid input
+      syntax for type boolean: "x"`. Here both are 42804 `argument of
+      WHERE must be type boolean, not type text`. Measured on a private
+      15.19 cluster (found while working RP-418).
+      Verify: tests/backlog/test_rp_where_types.py::test_where_untyped_literal_reads_as_boolean
+      Backlog-ID: RP-424
 - [ ] **An INSERT's SELECT and a WITH query are not type-checked.**
       `insert into k select * from e where a = true` (an integer `a`)
       inserts nothing here, and `with t as (select * from e where a = true)

@@ -1445,10 +1445,12 @@ fn check_select(
             no_aggregate_in_where(w)?;
         }
         walk(w, &scope, &cx)?;
+        clause_is_boolean(w, &scope, "WHERE")?;
     }
     if let Some(h) = s.having_clause.as_deref() {
         having_names_resolve(h, &scope)?;
         walk(h, &scope, &cx)?;
+        clause_is_boolean(h, &scope, "HAVING")?;
     }
     for w in &s.window_clause {
         if let Some(N::WindowDef(w)) = w.node.as_ref() {
@@ -1877,7 +1879,8 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
             match u.where_clause.as_deref() {
                 Some(w) => {
                     no_aggregate_in_where(w)?;
-                    walk(w, &scope, &cx)
+                    walk(w, &scope, &cx)?;
+                    clause_is_boolean(w, &scope, "WHERE")
                 }
                 None => Ok(()),
             }
@@ -1895,7 +1898,8 @@ pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Resu
             match d.where_clause.as_deref() {
                 Some(w) => {
                     no_aggregate_in_where(w)?;
-                    walk(w, &scope, &cx)
+                    walk(w, &scope, &cx)?;
+                    clause_is_boolean(w, &scope, "WHERE")
                 }
                 None => Ok(()),
             }
@@ -2029,6 +2033,29 @@ fn common_type_check(
         }
     }
     Ok(())
+}
+
+/// `coerce_to_boolean`: a clause of a typed, non-boolean built-in type --
+/// `WHERE a::text`, `WHERE null::int` -- is 42804 at the clause's leftmost
+/// token, after the clause's own expression was analysed (PostgreSQL's
+/// `transformWhereClause` transforms it first). Lowered as it stood, the
+/// clause matched no row and the statement answered an empty result. An
+/// untyped literal or NULL, or a type this does not judge, is left alone.
+fn clause_is_boolean(n: &pg_query::protobuf::Node, scope: &Scope, clause: &str) -> Result<()> {
+    let Some(t) = operand_type(n, scope) else {
+        return Ok(());
+    };
+    if matches!(t.as_str(), "bool" | "boolean") || category(&t).is_none() {
+        return Ok(());
+    }
+    let loc = crate::srf_place::leftmost(n);
+    if loc >= 0 {
+        set_error_location(loc);
+    }
+    Err(Error::DatatypeMismatch(format!(
+        "argument of {clause} must be type boolean, not type {}",
+        display_type(&t)
+    )))
 }
 
 /// An argument of AND / OR / NOT must be boolean: a typed operand of
