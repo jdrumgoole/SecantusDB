@@ -28,6 +28,7 @@ use std::cmp::Ordering;
 
 use bson::{doc, Bson, Document};
 
+use crate::storage::{Storage, StorageError};
 use crate::{CommandContext, CommandError, HandlerResult};
 
 const PARAMS_DB: &str = "config";
@@ -492,6 +493,32 @@ fn check_change_stream_options(value: &Document) -> Result<(), CommandError> {
     }
 }
 
+/// The `expireAfterSeconds` a `changeStreamOptions` document sets, `None`
+/// for `"off"`.
+fn pre_image_expiry(stored: Option<&Document>) -> Option<i64> {
+    stored
+        .and_then(|d| d.get_document("preAndPostImages").ok())
+        .and_then(|d| d.get("expireAfterSeconds"))
+        .and_then(safe_int64)
+}
+
+/// Hand the stored `changeStreamOptions` to the storage, which expires
+/// pre-images by it: at startup, as mongod reads its cluster parameters.
+pub fn apply_change_stream_options(storage: &dyn Storage) -> Result<(), StorageError> {
+    let rows = storage.find(
+        PARAMS_DB,
+        PARAMS_COLL,
+        &doc! {"_id": CHANGE_STREAM_OPTIONS},
+        None,
+        None,
+    )?;
+    let stored = rows
+        .first()
+        .and_then(|raw| crate::bsondoc::from_bytes(raw).ok());
+    storage.set_pre_image_expire_after_seconds(pre_image_expiry(stored.as_ref()));
+    Ok(())
+}
+
 /// `changeStreamOptions` as `getClusterParameter` reports it.
 fn parsed_change_stream_options(stored: Option<&Document>) -> Document {
     let expire = stored
@@ -600,6 +627,9 @@ pub fn set_cluster_parameter(doc: &Document, ctx: &mut CommandContext) -> Handle
             true,
         )
         .map_err(crate::util::command_error)?;
+    if param.name == CHANGE_STREAM_OPTIONS {
+        storage.set_pre_image_expire_after_seconds(pre_image_expiry(Some(value)));
+    }
     Ok(doc! {"ok": 1.0})
 }
 

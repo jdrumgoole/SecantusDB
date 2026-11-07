@@ -12,7 +12,8 @@
 //!
 //! Pre-image / post-image lookup is the only I/O: [`project`] takes a [`Storage`]
 //! and may call `find_matching` for `fullDocument: "updateLookup"` or
-//! `read_preimage` for `fullDocumentBeforeChange`.
+//! `read_pre_image_of` (`config.system.preimages`) for
+//! `fullDocumentBeforeChange`.
 
 use bson::{Bson, Document, Timestamp};
 
@@ -261,7 +262,7 @@ fn stored_post_image(
     oplog_entry: &Document,
     storage: &Storage,
 ) -> Result<Option<Document>> {
-    let Some(pre) = storage.read_preimage(seq)? else {
+    let Some(pre) = storage.read_pre_image_of(seq, oplog_entry)? else {
         return Ok(None);
     };
     let Ok(diff) = oplog_entry
@@ -278,13 +279,14 @@ fn stored_post_image(
 fn attach_full_document_before_change(
     event: &mut Document,
     seq: i64,
+    oplog_entry: &Document,
     storage: &Storage,
     mode: &str,
 ) -> Result<()> {
     if mode == FULL_DOC_DEFAULT || mode == FULL_DOC_OFF || mode.is_empty() {
         return Ok(());
     }
-    match storage.read_preimage(seq)? {
+    match storage.read_pre_image_of(seq, oplog_entry)? {
         Some(pre) => {
             event.insert(
                 "fullDocumentBeforeChange",
@@ -539,6 +541,7 @@ fn project_unordered(
             attach_full_document_before_change(
                 &mut event,
                 seq,
+                oplog_entry,
                 storage,
                 full_document_before_change_mode,
             )?;

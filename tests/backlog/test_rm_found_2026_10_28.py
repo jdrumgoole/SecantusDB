@@ -79,12 +79,12 @@ def _pre_image_record(client: Any) -> Any:
     return mongo_answer(read)
 
 
-@pytest.mark.backlog("RM-366")
+@pytest.mark.backlog_fixed("RM-366")
 def test_pre_images_are_kept_in_config_system_preimages(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 keeps a change stream pre-image as a document of the
     clustered `config.system.preimages`: `{_id: {nsUUID, ts,
     applyOpsIndex}, operationTime, preImage}`, which a user can read. This
-    server keeps pre-images in a table of its own, and has no such
+    server kept pre-images in a table of its own, and had no such
     collection."""
     theirs = _pre_image_record(mongod_rs)
     assert theirs == (
@@ -99,3 +99,68 @@ def test_pre_images_are_kept_in_config_system_preimages(rust_mongo: Any, mongod_
         ],
     ), theirs  # the reference, as measured
     assert _pre_image_record(rust_mongo) == theirs
+
+
+def _pre_images_catalog(client: Any) -> list:
+    """`config.system.preimages` as `listCollections` (less its UUID) and
+    `listIndexes` describe it."""
+    entry = next(
+        (c for c in client.config.list_collections() if c["name"] == "system.preimages"), None
+    )
+    if entry is None:
+        return [None]
+    entry.get("info", {}).pop("uuid", None)
+    indexes = list(client.config["system.preimages"].list_indexes())
+    return [_canonical(entry), _canonical(indexes)]
+
+
+@pytest.mark.backlog_fixed("RM-366")
+def test_config_system_preimages_is_listed_as_mongod_lists_it(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 creates `config.system.preimages` as a member steps up,
+    clustered in the legacy form (`clusteredIndex: true`), with one
+    clustered `_id_` index. This server had no such collection."""
+    theirs = _pre_images_catalog(mongod_rs)
+    assert theirs[0] is not None, theirs  # the reference
+    assert _pre_images_catalog(rust_mongo) == theirs
+
+
+def _transaction_pre_images(client: Any) -> Any:
+    """Update two documents of a collection that records pre-images in one
+    transaction, and read back the two pre-images: their places in the
+    transaction's `applyOps` entry, the documents, and whether each one's
+    `_id.ts` is that entry's time in `local.oplog.rs`."""
+    db = client.rm366txn
+    db.drop_collection("t")
+    db.create_collection("t", changeStreamPreAndPostImages={"enabled": True})
+    db.t.insert_many([{"_id": 1, "x": 1}, {"_id": 2, "x": 2}])
+    with client.start_session() as s, s.start_transaction():
+        db.t.update_one({"_id": 1}, {"$set": {"x": 10}}, session=s)
+        db.t.update_one({"_id": 2}, {"$set": {"x": 20}}, session=s)
+    uuid = next(c for c in db.list_collections() if c["name"] == "t")["info"]["uuid"]
+    entry = next(
+        client.local["oplog.rs"]
+        .find({"o.applyOps.ui": uuid, "lsid": {"$exists": True}})
+        .sort("$natural", -1)
+        .limit(1)
+    )
+    found = client.config["system.preimages"].find({"_id.nsUUID": uuid})
+    return sorted(
+        (d["_id"]["applyOpsIndex"], d["preImage"], d["_id"]["ts"] == entry["ts"]) for d in found
+    )
+
+
+@pytest.mark.backlog_fixed("RM-366")
+def test_a_transaction_s_pre_images_share_its_applyops_entry_s_time(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 files the pre-images of a transaction's writes under
+    the time of the one `applyOps` entry it logs, numbering each write's
+    place in it (`applyOpsIndex`)."""
+    theirs = _transaction_pre_images(mongod_rs)
+    assert theirs == [
+        (0, {"_id": 1, "x": 1}, True),
+        (1, {"_id": 2, "x": 2}, True),
+    ], theirs  # the reference, as measured
+    assert _transaction_pre_images(rust_mongo) == theirs

@@ -404,6 +404,9 @@ pub fn bind(
         secantus_commands::cluster_admin::record_session_state_collections(storage.as_ref())
             .map_err(|e| io::Error::other(format!("creating the session collections: {e:?}")))?;
     }
+    // How long pre-images are kept, as `changeStreamOptions` last set it.
+    secantus_commands::cluster_params::apply_change_stream_options(storage.as_ref())
+        .map_err(|e| io::Error::other(format!("reading changeStreamOptions: {e:?}")))?;
     // Users stored before they carried a `userId` get one (RM-031).
     secantus_commands::auth::backfill_user_ids(storage.as_ref())
         .map_err(|e| io::Error::other(format!("minting user ids: {e:?}")))?;
