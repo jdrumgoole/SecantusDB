@@ -5,7 +5,7 @@ in an INSERT's VALUES was refused as a gap; fixed) and RP-416 (a join's ON
 after a comma item was not type-checked; fixed); RP-430, found while fixing
 RP-416 (a subquery's join ON could not name the outer query; fixed); and
 RP-443, found while fixing RP-415 (a subquery's qualifier naming no FROM
-entry is not 42P01).
+entry was not 42P01; fixed).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. The expected answers were measured on a private,
@@ -467,7 +467,87 @@ SUBQUERY_QUALIFIER = {
 }
 
 
-@pytest.mark.backlog("RP-443")
+@pytest.mark.backlog_fixed("RP-443")
 @pytest.mark.parametrize("query", list(SUBQUERY_QUALIFIER))
 def test_subquery_qualifier_naming_nothing(query: str, dsn: str) -> None:
+    """A subquery's qualifier no query level had was taken for an outer
+    reference: the EXISTS answered rows, the scalar subquery a 42883 naming
+    the correlated rewrite's function, and the INSERT's error was placed at
+    the subquery rather than at the reference."""
     assert answer(dsn, query) == SUBQUERY_QUALIFIER[query]
+
+
+def _missing(table: str, position: str) -> Answer:
+    return ("42P01", f'missing FROM-clause entry for table "{table}"', None, position)
+
+
+# The same in every clause a subquery's qualifier can sit in, and under
+# every path a subquery takes here: the semi-join rewrite of an EXISTS over
+# one equality, a nested EXISTS, NOT EXISTS, a write's subquery. Measured on
+# a private PostgreSQL 15.19 cluster with `_SETUP`.
+SUBQUERY_QUALIFIER_CLAUSES = {
+    "select 1 from k where exists (select x.a from s where s.a = k.a)": _missing("x", "38"),
+    "select 1 from k where not exists (select x.a from s where s.a = k.a)": _missing("x", "42"),
+    "select 1 from k where exists (select x.a from s limit 1)": _missing("x", "38"),
+    "select 1 from k where exists (select 1 from s where exists (select x.a from e))": _missing(
+        "x", "68"
+    ),
+    "select 1 from k where exists (select 1 from s order by x.a)": _missing("x", "56"),
+    "select 1 from k where exists (select 1 from s join e on e.a = x.a)": _missing("x", "63"),
+    "select 1 from k where exists (select 1 from generate_series(1, x.a))": _missing("x", "64"),
+    "select 1 from k where k.a = any(select x.a from s)": _missing("x", "40"),
+    "select array(select x.a from s)": _missing("x", "21"),
+    "select (select public.x.a from s limit 1)": _missing("x", "16"),
+    "update e set a = (select x.a from s limit 1)": _missing("x", "26"),
+    "delete from e where exists (select x.a from s)": _missing("x", "36"),
+    # The subquery's own aliased table, by its name: found first, and named
+    # with the alias that hides it.
+    "select 1 from k where exists (select s.c from s x where x.a = k.a)": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "s"',
+        'Perhaps you meant to reference the table alias "x".',
+        "38",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-443")
+@pytest.mark.parametrize("query", list(SUBQUERY_QUALIFIER_CLAUSES))
+def test_subquery_qualifier_naming_nothing_in_every_clause(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == SUBQUERY_QUALIFIER_CLAUSES[query]
+
+
+# A qualifier an enclosing level DOES have stays a correlation, the EXISTS
+# rewritten to a semi-join included. PostgreSQL 15.19's rows with
+# `_ROWS_SETUP`.
+SUBQUERY_QUALIFIER_ROWS = {
+    "select ok.a, ok.bc from ok where exists (select ok.b from os where os.a = ok.a) order by 2": [
+        (1, 10),
+        (2, 20),
+        (2, 30),
+        (3, 40),
+        (5, 50),
+    ],
+    "select ok.bc from ok where not exists (select ok.b from os where os.a = ok.a) order by 1": [],
+    "select x.bc, (select x.a from os where os.a = x.a) from ok as x order by 1": [
+        (10, 1),
+        (20, 2),
+        (30, 2),
+        (40, 3),
+        (50, 5),
+    ],
+    "select bc from ok where exists (select 1 from os where exists"
+    " (select ok.a from oe where oe.a = os.a and os.a = ok.a)) order by 1": [
+        (10,),
+        (20,),
+        (30,),
+        (40,),
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RP-443")
+@pytest.mark.parametrize("query", list(SUBQUERY_QUALIFIER_ROWS))
+def test_subquery_qualifier_of_an_outer_level_correlates(query: str, rows_dsn: str) -> None:
+    with psycopg.connect(rows_dsn, autocommit=True) as c:
+        assert c.execute(query).fetchall() == SUBQUERY_QUALIFIER_ROWS[query]

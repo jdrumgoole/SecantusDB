@@ -1589,23 +1589,6 @@ a regression test.
       (found while working RP-408).
       Backlog-ID: RP-414
       Verify: tests/backlog/test_rp_column_errors.py::test_missing_column_reported_as_written
-- [ ] **A subquery's qualifier naming no FROM entry is not 42P01.**
-      PostgreSQL 15.19 refuses `select (select x.a from s limit 1)` and
-      `select 1 from k where exists (select x.a from s)` with 42P01
-      `missing FROM-clause entry for table "x"` at the reference (16, 38).
-      Here the first is 42883 `function \x1fcorrelated(integer, unknown,
-      ...) does not exist`, naming the correlated rewrite's internal
-      function, and the EXISTS answers rows. The qualifier looks to be
-      taken for an outer reference (`foreign_qualifier`) though no
-      enclosing level holds it; not yet confirmed in the code. In an INSERT's
-      VALUES (since RP-415) the message is right, but at the subquery's
-      position, 23, where PostgreSQL's is the reference's, 31 (`insert into
-      e values ((select x.a from s limit 1), 'x')`, and `invalid reference
-      to FROM-clause entry for table "e"` for `e.a`). Measured on a private
-      15.19 cluster with `e(a int, b text)`, `s(a int, c text)`, `k(a int,
-      b text, bc int)` (found while working RP-415).
-      Backlog-ID: RP-443
-      Verify: tests/backlog/test_rp_column_errors.py::test_subquery_qualifier_naming_nothing
 - [ ] **A missing output column is reported after the WHERE's errors.**
       PostgreSQL 15.19's `transformSelectStmt` transforms the target list
       before the WHERE, so `select nosuch from e where 1`, `... where a =
@@ -1838,6 +1821,62 @@ scenarios in `tests/backlog/test_rp_batch46.py`, measured on a private 15.19
 cluster. RP-194 was found and fixed in the same batch, RP-192 in batch 47
 and most of RP-193 in batch 48; their tests there are regression tests.
 
+
+## Found while working RP-443 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
+and `fs(a int, c text)`, one row each.
+
+- [ ] **A parameter qualified by its function's name is not bound.**
+      PostgreSQL resolves `fq1.p` in a function `fq1(p int)` as its
+      parameter (`sql_fn_post_column_ref`, `plpgsql_post_column_ref`), at
+      any depth of subquery: `select fq1.p` in a SQL function's body
+      answers 7 for `fq1(7)`, and so do `select (select fq2.p from fs
+      limit 1)`, `select exists (select fq3.p from fs)` (true) and the
+      PL/pgSQL `return (select fq4.p from fs limit 1)`. Here a SQL body's
+      parameters are bound by name token by token (`bind_parameter_names`)
+      and a dotted name is skipped: the first is 42703 `column "fq1" does
+      not exist`, the others 42P01 `missing FROM-clause entry for table
+      "fq2"`. The EXISTS form answered true before RP-443 only because the
+      select list it drops was never read.
+      Backlog-ID: RP-451
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_function_qualified_parameter
+- [ ] **An UPDATE's or DELETE's target is not an enclosing relation to its
+      subqueries.** In PostgreSQL the target is a relation of the
+      statement's own level, so `update fe set a = (select fe.a from fe x
+      limit 1)` reads the target's `fe.a` (UPDATE 1), and with the target
+      aliased its table name is hidden: `update fe x set a = (select fe.a
+      from fs limit 1)` and `delete from fe x where exists (select fe.a
+      from fs)` are 42P01 `invalid reference to FROM-clause entry for table
+      "fe"`, hint `Perhaps you meant to reference the table alias "x".`, at
+      29 and 39. Here the first is that 42P01 (the subquery's own `fe x`
+      taken for the name), and the other two update and delete a row: the
+      write's target is not pushed as an outer relation
+      (`OUTER_RELATIONS`) the way a SELECT's FROM is.
+      Backlog-ID: RP-455
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_target_scope_in_a_subquery
+- [ ] **A correlated subquery's value read from a CTE or a write's target
+      comes out text.** `with c as (select 1 as a) select (select c.a from
+      fs limit 1) from c` and `insert into fe values (2, 'x') returning
+      (select fe.a from fs limit 1)` answer the integer 1 and 2 on
+      PostgreSQL; here the strings `'1'` and `'2'`. The correlated
+      rewrite types its parameters by the outer FROM's columns
+      (`typed_probe`), which finds no columns for a CTE or for an INSERT's
+      RETURNING, so the untyped `$n` stays text. The same over a table in
+      the outer FROM is right.
+      Backlog-ID: RP-453
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_correlated_value_keeps_its_type
+- [ ] **A join's alias is refused or not found.** `select u.a from fs join
+      fe using (a) as u` (the `USING ... AS` alias PostgreSQL 14 added) and
+      `select j.a from (fs join fe using (a)) as j` answer 1 on PostgreSQL
+      15.19. Here the first is 42P01 `missing FROM-clause entry for table
+      "u"`, the second 0A000 `an aliased JOIN is not supported yet`
+      (`joins.rs`), and inside a subquery the USING alias reaches the
+      correlated rewrite: `select (select u.a from fs join fe using (a) as
+      u limit 1)` is 42883 `function \x1fcorrelated(...) does not exist`,
+      naming the rewrite's internal function.
+      Backlog-ID: RP-454
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_join_alias
 
 ## Found while working RP-316 (2026-11-02)
 

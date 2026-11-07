@@ -503,6 +503,11 @@ pub(crate) fn correlate(
     // Qualified references whose qualifier names nothing inside.
     let names = inner_names(inner);
     let mut outer_refs: Vec<Vec<String>> = Vec::new();
+    // Where each reference was first written, for the argument it becomes:
+    // an error resolving it in the outer query (42P01, 42703) is reported
+    // at the reference, as PostgreSQL's `transformColumnRef` reports it,
+    // not at the subquery around it (RP-443).
+    let mut locations: Vec<i32> = Vec::new();
     let mut probe = inner.clone();
     walk_select(&mut probe, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
@@ -515,6 +520,7 @@ pub(crate) fn correlate(
                     && !outer_refs.contains(&parts)
                 {
                     outer_refs.push(parts);
+                    locations.push(c.location);
                 }
             }
         }
@@ -624,7 +630,13 @@ pub(crate) fn correlate(
             })),
         });
     }
-    for parts in &outer_refs {
+    for (i, parts) in outer_refs.iter().enumerate() {
+        // A reference found by planning has no location of its own here.
+        let location = locations
+            .get(i)
+            .copied()
+            .filter(|l| *l >= 0)
+            .unwrap_or(sl.location);
         args.push(pg_query::protobuf::Node {
             node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                 fields: parts
@@ -633,7 +645,7 @@ pub(crate) fn correlate(
                         node: Some(N::String(pg_query::protobuf::String { sval: p.clone() })),
                     })
                     .collect(),
-                location: sl.location,
+                location,
             })),
         });
     }

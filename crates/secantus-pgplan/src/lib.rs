@@ -19596,7 +19596,34 @@ fn resolve_sublinks(
     // A write's own WITH is visible to its subqueries (RP-432); whatever
     // the arms push is popped here, on every exit.
     let depth = VISIBLE_CTES.with(|v| v.borrow().len());
+    // So do the names in its range table (RP-443): a write's target, and an
+    // UPDATE's FROM or a DELETE's USING, for a subquery's qualifier.
+    let range_depth = match node.node.as_ref() {
+        Some(N::UpdateStmt(u)) => push_outer_range_names(
+            &u.from_clause,
+            &[u.relation.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        Some(N::DeleteStmt(d)) => push_outer_range_names(
+            &d.using_clause,
+            &[d.relation.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        Some(N::InsertStmt(i)) => push_outer_range_names(
+            [],
+            &[i.relation.as_ref()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>(),
+        ),
+        _ => push_outer_range_names([], &[]),
+    };
     let out = resolve_sublinks_scoped(node, lookup, params, run);
+    pop_outer_range_names(range_depth);
     VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
     out
 }
@@ -20247,7 +20274,9 @@ fn resolve_sublinks_in_select(
         d
     });
     let from_depth = correlated::push_outer_from(&s.from_clause);
+    let range_depth = push_outer_range_names(&s.from_clause, &[]);
     let out = resolve_sublinks_in_select_scoped(s, lookup, params, run);
+    pop_outer_range_names(range_depth);
     correlated::pop_outer_from(from_depth);
     OUTER_RELATIONS.with(|o| o.borrow_mut().truncate(outer_depth));
     VISIBLE_CTES.with(|v| v.borrow_mut().truncate(depth));
@@ -21126,6 +21155,9 @@ fn resolve_one_sublink(
     // A subquery may itself contain subqueries and CTEs; both are resolved
     // before it is planned, innermost first.
     let mut inner = (**inner).clone();
+    // A qualifier no level has is an error before anything else is done
+    // with the subquery -- before an EXISTS drops the select list holding it.
+    check_subquery_qualifiers(&inner)?;
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
         simplify_exists(&mut inner);
     }
@@ -21633,6 +21665,243 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
         }
     }
     None
+}
+
+thread_local! {
+    /// Every name an ENCLOSING query level's range table answers to while
+    /// its subqueries are resolved: a FROM item's alias, an aliased table's
+    /// own name, a join's alias, an UPDATE's / DELETE's / INSERT's target.
+    /// Wider than `OUTER_RELATIONS` (the names a subquery may correlate
+    /// with): a name here that is not visible is PostgreSQL's "invalid
+    /// reference", which planning already reports, not a missing one.
+    static OUTER_RANGE_NAMES: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Push the names `from` puts in its level's range table onto
+/// `OUTER_RANGE_NAMES`; the depth to truncate back to is returned.
+fn push_outer_range_names<'a>(
+    from: impl IntoIterator<Item = &'a pg_query::protobuf::Node>,
+    targets: &[&pg_query::protobuf::RangeVar],
+) -> usize {
+    let mut names = Vec::new();
+    for item in from {
+        collect_range_names(item, &mut names);
+    }
+    for t in targets {
+        names.push(t.relname.clone());
+        names.extend(t.alias.as_ref().map(|a| a.aliasname.clone()));
+    }
+    OUTER_RANGE_NAMES.with(|o| {
+        let mut o = o.borrow_mut();
+        let depth = o.len();
+        o.extend(names);
+        depth
+    })
+}
+
+fn pop_outer_range_names(depth: usize) {
+    OUTER_RANGE_NAMES.with(|o| o.borrow_mut().truncate(depth));
+}
+
+/// `collect_from_names`, with a join's own alias (`(a join b) as j`,
+/// `join b using (x) as u`), which is an entry of the range table too.
+fn collect_range_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+    collect_from_names(item, out);
+    fn join_aliases(item: &pg_query::protobuf::Node, out: &mut Vec<String>) {
+        if let Some(N::JoinExpr(j)) = item.node.as_ref() {
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+            out.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                join_aliases(side, out);
+            }
+        }
+    }
+    join_aliases(item, out);
+}
+
+/// PostgreSQL's `errorMissingRTE` for a subquery's qualified column
+/// reference whose qualifier no range table in reach has (RP-443).
+///
+/// `transformColumnRef` looks a qualifier up in this query level and then
+/// in each enclosing one (`refnameNamespaceItem`); one found nowhere is
+/// 42P01 `missing FROM-clause entry for table "x"` at the reference, and
+/// the statement goes no further. Here a qualifier the subquery's own FROM
+/// does not have is taken for an OUTER reference (`foreign_qualifier`),
+/// so without this check one naming nothing at all was carried into the
+/// correlated rewrite: `exists (select x.a from s)` answered rows (the
+/// select list an EXISTS drops is dropped before it was ever resolved) and
+/// `select (select x.a from s)` a 42883 naming the rewrite's internal
+/// function. The subquery's own aliased table named by its table name is
+/// `errorMissingRTE`'s "invalid reference", with the alias as its hint,
+/// reported here for the same reason (`exists (select s.c from s x)`
+/// answered rows). Any other qualifier some level has, visible or not, is
+/// left to planning, which reports the other "invalid reference" forms.
+///
+/// The clauses are read in `transformSelectStmt`'s order -- FROM (a join's
+/// ON, a function's arguments), the select list, WHERE, HAVING, ORDER BY,
+/// GROUP BY, DISTINCT, LIMIT / OFFSET, WINDOW -- and a nested subquery's
+/// body is not read here: it is its own level, checked when it is resolved.
+/// A reference of two names is `rel.col`, of three `schema.rel.col` (a
+/// composite column's field needs parentheses); longer ones keep the
+/// errors they have.
+fn check_subquery_qualifiers(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
+    let mut known: Vec<String> = Vec::new();
+    for item in &s.from_clause {
+        collect_range_names(item, &mut known);
+    }
+    if let Some(with) = s.with_clause.as_ref() {
+        for cte in &with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_ref() {
+                known.push(c.ctename.clone());
+            }
+        }
+    }
+    // The names that resolve a qualifier here: this level's visible ones,
+    // and those of the levels around it.
+    let mut visible: Vec<String> = Vec::new();
+    for item in &s.from_clause {
+        collect_visible_names(item, &mut visible);
+    }
+    // An aliased table of this level's FROM, by its own name: found by
+    // `searchRangeTableForRel`, innermost level first, so it is the entry
+    // the error names, with the alias that is visible in its place.
+    fn aliased(item: &pg_query::protobuf::Node, out: &mut Vec<(String, String)>) {
+        match item.node.as_ref() {
+            Some(N::RangeVar(r)) => {
+                if let Some(a) = r.alias.as_ref() {
+                    out.push((r.relname.clone(), a.aliasname.clone()));
+                }
+            }
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    aliased(side, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hidden: Vec<(String, String)> = Vec::new();
+    for item in &s.from_clause {
+        aliased(item, &mut hidden);
+    }
+    let in_reach = |q: &str| {
+        known.iter().any(|n| n == q)
+            || OUTER_RANGE_NAMES.with(|o| o.borrow().iter().any(|n| n == q))
+    };
+    let resolves = |q: &str| {
+        visible.iter().any(|n| n == q)
+            || OUTER_RELATIONS.with(|o| o.borrow().iter().any(|n| n == q))
+    };
+    // (qualifier, the alias hiding it if it is this level's aliased table,
+    // location)
+    let mut bad: Option<(String, Option<String>, i32)> = None;
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if bad.is_some() {
+            return Ok(());
+        }
+        let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+            return Ok(());
+        };
+        let qualifier = match c.fields.len() {
+            2 | 3 => c.fields[c.fields.len() - 2].node.as_ref(),
+            _ => None,
+        };
+        let Some(N::String(q)) = qualifier else {
+            return Ok(());
+        };
+        let q = q.sval.as_str();
+        if resolves(q) {
+            return Ok(());
+        }
+        if let Some((_, alias)) = hidden.iter().find(|(rel, _)| rel == q) {
+            bad = Some((q.to_string(), Some(alias.clone()), c.location));
+        } else if !in_reach(q) {
+            bad = Some((q.to_string(), None, c.location));
+        }
+        Ok(())
+    };
+    let mut probe = s.clone();
+    fn from_exprs(
+        item: &mut pg_query::protobuf::Node,
+        visit: &mut dyn FnMut(&mut pg_query::protobuf::Node) -> Result<()>,
+    ) -> Result<()> {
+        match item.node.as_mut() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    from_exprs(side, visit)?;
+                }
+                if let Some(q) = j.quals.as_deref_mut() {
+                    walk_expr(q, visit)?;
+                }
+                Ok(())
+            }
+            Some(N::RangeFunction(rf)) => {
+                for f in &mut rf.functions {
+                    if let Some(N::List(l)) = f.node.as_mut() {
+                        for call in &mut l.items {
+                            walk_expr(call, visit)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    for item in &mut probe.from_clause {
+        from_exprs(item, &mut visit)?;
+    }
+    for n in probe.target_list.iter_mut() {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in [
+        probe.where_clause.as_deref_mut(),
+        probe.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in probe
+        .sort_clause
+        .iter_mut()
+        .chain(probe.group_clause.iter_mut())
+        .chain(probe.distinct_clause.iter_mut())
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in [
+        probe.limit_count.as_deref_mut(),
+        probe.limit_offset.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        walk_expr(n, &mut visit)?;
+    }
+    for n in probe.window_clause.iter_mut() {
+        walk_expr(n, &mut visit)?;
+    }
+    match bad {
+        Some((q, alias, location)) => {
+            set_error_location(location);
+            Err(Error::Sqlstate(
+                "42P01",
+                match alias {
+                    Some(alias) => format!(
+                        "invalid reference to FROM-clause entry for table \"{q}\"\nHint: Perhaps you meant to reference the table alias \"{alias}\"."
+                    ),
+                    None => format!("missing FROM-clause entry for table \"{q}\""),
+                },
+            ))
+        }
+        None => Ok(()),
+    }
 }
 
 fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> {
