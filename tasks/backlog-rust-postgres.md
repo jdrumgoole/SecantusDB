@@ -2033,18 +2033,6 @@ Measured on a private PostgreSQL 15.19 cluster.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
 
-## Found while working RP-489 (2026-11-07)
-
-Measured on a private PostgreSQL 15.19 cluster.
-
-- [ ] **CREATE TABLE AS over a `bit` or `varbit` column is refused.**
-      `create table t as select B'101'::bit(3) b` makes a `bit(3)` column
-      on PostgreSQL; here it is 0A000 `CREATE TABLE AS over a column of
-      type bit is not supported yet`, as `internal_type_name` has no name
-      for oids 1560 and 1562.
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_ctas_over_a_bit_column
-      Backlog-ID: RP-494
-
 ## Found while working RP-493 (2026-11-07)
 
 Measured on a private PostgreSQL 15.19 cluster.
