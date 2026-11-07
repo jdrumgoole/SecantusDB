@@ -119,6 +119,7 @@ mod schema_rows;
 mod scram_binding;
 mod serializable;
 mod server;
+mod sql_fn_params;
 mod ssi;
 mod statistic;
 mod stream_join;
@@ -1532,44 +1533,6 @@ pub(crate) fn normalize_function_doc(d: &Document) -> Document {
     out
 }
 
-/// A SQL function body's references to its parameters BY NAME, rewritten to
-/// `$n` -- token by token, so a column that happens to share a name inside
-/// a string literal is untouched.
-fn bind_parameter_names(sql: &str, names: &[String], types: &[String]) -> String {
-    let Ok(scan) = pg_query::scan(sql) else {
-        return sql.to_string();
-    };
-    let mut out = String::new();
-    let mut cursor = 0usize;
-    let tokens = scan.tokens;
-    for (i, t) in tokens.iter().enumerate() {
-        let (start, end) = (t.start as usize, t.end as usize);
-        let word = &sql[start..end];
-        let is_word = t.token == pg_query::protobuf::Token::Ident as i32
-            || t.keyword_kind == pg_query::protobuf::KeywordKind::UnreservedKeyword as i32;
-        let prev_dot =
-            i > 0 && &sql[tokens[i - 1].start as usize..tokens[i - 1].end as usize] == ".";
-        let next = tokens
-            .get(i + 1)
-            .map(|n| &sql[n.start as usize..n.end as usize]);
-        if !is_word || prev_dot || next == Some("(") || next == Some(".") {
-            continue;
-        }
-        let lower = word.trim_matches('"').to_ascii_lowercase();
-        if let Some(pos) = names.iter().position(|n| !n.is_empty() && *n == lower) {
-            out.push_str(&sql[cursor..start]);
-            out.push_str(&format!(
-                "${}::{}",
-                pos + 1,
-                types.get(pos).map_or("text", String::as_str)
-            ));
-            cursor = end;
-        }
-    }
-    out.push_str(&sql[cursor..]);
-    out
-}
-
 /// A stored function document as the planner's `UserFn`.
 /// A result row's `i`th column description. A row wider than its
 /// description is an internal fault; it is reported as one rather than
@@ -1903,6 +1866,30 @@ fn transaction_statement_tag(sql: &str) -> Option<&'static str> {
         K::TransStmtRollbackPrepared => "ROLLBACK PREPARED",
         _ => return None,
     })
+}
+
+/// Whether `sql` is an INSERT, UPDATE or DELETE with a RETURNING list: in a
+/// `LANGUAGE sql` body such a statement yields rows, and as the last one
+/// its rows are the function's result (`functions.c`'s
+/// `check_sql_fn_retval` takes the final statement's targetlist, its
+/// RETURNING list for a write).
+fn write_with_returning(sql: &str) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return false;
+    };
+    match parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    {
+        Some(N::InsertStmt(s)) => !s.returning_list.is_empty(),
+        Some(N::UpdateStmt(s)) => !s.returning_list.is_empty(),
+        Some(N::DeleteStmt(s)) => !s.returning_list.is_empty(),
+        _ => false,
+    }
 }
 
 /// Whether `sql` ends a transaction block (`IsTransactionExitStmt`): COMMIT,
@@ -14037,6 +14024,72 @@ impl PgHandler {
     /// A `LANGUAGE sql` function: its statements run in order with the
     /// arguments bound (by `$n` or by parameter name); the LAST one's result
     /// is the function's.
+    /// The columns of what the function `name` returns when it is called
+    /// in FROM, over all its overloads (built-in and the user's):
+    /// `addRangeTableEntryForFunction`'s result description, from its OUT
+    /// parameters, its composite result type, or its one scalar column.
+    fn function_result_columns(&self, name: &str) -> sql_fn_params::FnColumns {
+        use sql_fn_params::FnColumns;
+        let mut shapes: Vec<FnColumns> = Vec::new();
+        for (ret, out) in catalog_facts::builtin_result_columns(name) {
+            let composite = catalog_facts::builtin()
+                .types
+                .get(ret)
+                .is_some_and(|t| t.typtype == 'c');
+            shapes.push(if !out.is_empty() {
+                FnColumns::Named(out.clone())
+            } else if *ret == 2249 || composite {
+                FnColumns::Unknown
+            } else {
+                FnColumns::Scalar
+            });
+        }
+        if let Ok(docs) = self.type_catalog_docs(Self::FUNCTION_COLLECTION) {
+            for d in docs.iter().filter(|d| d.get_str("name") == Ok(name)) {
+                let named: Vec<String> = d
+                    .get_array("table_columns")
+                    .map(|c| {
+                        c.iter()
+                            .filter_map(|c| c.as_document()?.get_str("name").ok())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ret = d.get_str("return_tag").unwrap_or_default();
+                shapes.push(if !named.is_empty() {
+                    FnColumns::Named(named)
+                } else if ret == "record" {
+                    FnColumns::Unknown
+                } else if let Some(t) = self.lookup(ret) {
+                    FnColumns::Named(t.columns.iter().map(|c| c.name.clone()).collect())
+                } else if let Some((_, _, fields)) = self
+                    .composites()
+                    .ok()
+                    .and_then(|c| c.into_iter().find(|(n, _, _)| n == ret))
+                {
+                    FnColumns::Named(fields.into_iter().map(|(n, _)| n).collect())
+                } else {
+                    FnColumns::Scalar
+                });
+            }
+        }
+        // Overloads that disagree leave the columns to the call's own.
+        let mut names: Vec<String> = Vec::new();
+        let (mut scalar, mut unknown) = (false, shapes.is_empty());
+        for s in shapes {
+            match s {
+                FnColumns::Scalar => scalar = true,
+                FnColumns::Named(n) => names.extend(n),
+                FnColumns::Unknown => unknown = true,
+            }
+        }
+        match (scalar, names.is_empty(), unknown) {
+            (_, _, true) | (true, false, _) => FnColumns::Unknown,
+            (true, true, false) => FnColumns::Scalar,
+            (false, _, false) => FnColumns::Named(names),
+        }
+    }
+
     fn call_sql_function(
         &self,
         doc: &Document,
@@ -14051,6 +14104,40 @@ impl PgHandler {
                     .collect()
             })
             .unwrap_or_default();
+        // The name a parameter may be qualified by (`fname.p`), and what
+        // decides whether a relation of that name has the column instead.
+        let fname = doc.get_str("name").unwrap_or_default();
+        let table_has_column = |table: &str, column: &str| match self.lookup(table) {
+            Some(d) => Some(d.column(column).is_some()),
+            // A view's columns are its query's output.
+            None => {
+                let definition = self
+                    .view_doc(table)?
+                    .get_str("definition")
+                    .ok()?
+                    .to_string();
+                let fields = self.describe_fields(&definition, 0, &[]).ok()??;
+                Some(fields.iter().any(|f| f.name() == column))
+            }
+        };
+        // Whether a parameter's type is a row type with that field: a
+        // table's (or view's) row type, or a composite of CREATE TYPE.
+        let type_has_field = |ty: &str, field: &str| {
+            let bare = ty.strip_prefix("public.").unwrap_or(ty);
+            match self.lookup(bare) {
+                Some(d) => d.column(field).is_some(),
+                None => self.composites().is_ok_and(|all| {
+                    all.iter()
+                        .any(|(n, _, fields)| n == bare && fields.iter().any(|(f, _)| f == field))
+                }),
+            }
+        };
+        let function_columns = |name: &str| self.function_result_columns(name);
+        let look = sql_fn_params::Lookups {
+            table_has_column: &table_has_column,
+            function_columns: &function_columns,
+            type_has_field: &type_has_field,
+        };
         let body = doc.get_str("body").unwrap_or_default();
         let statements = pg_query::split_with_parser(body).map_err(|e| {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -14075,7 +14162,8 @@ impl PgHandler {
         // runs, as `functions.c` checks it at the function's startup.
         if NON_VOLATILE.with(|v| v.get()) && doc.get_str("call_sql").is_err() {
             for stmt in &statements {
-                let sql = bind_parameter_names(stmt, &names, &u.arg_types);
+                let sql =
+                    sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
                 let plan = || {
                     host.plan(&sql, args, &u.arg_types)
                         .ok()
@@ -14116,7 +14204,7 @@ impl PgHandler {
                 && doc.get_str("volatility").unwrap_or("volatile") == "immutable");
         let _body = FunctionBody::enter();
         for (i, stmt) in statements.iter().enumerate() {
-            let sql = bind_parameter_names(stmt, &names, &u.arg_types);
+            let sql = sql_fn_params::bind_parameter_names(stmt, fname, &names, &u.arg_types, &look);
             let head = sql.trim_start().to_ascii_lowercase();
             let is_query = head.starts_with("select")
                 || head.starts_with("with")
@@ -14154,6 +14242,14 @@ impl PgHandler {
             if is_query {
                 last = Some(
                     plpgsql_fn::Host::query(&host, &sql, args, &u.arg_types).map_err(to_wire)?,
+                );
+            } else if write_with_returning(&sql) {
+                // A write's RETURNING rows are its result, as a SELECT's
+                // are; it runs to completion even when only the first row
+                // is the function's value.
+                last = Some(
+                    plpgsql_fn::Host::returning(&host, &sql, args, &u.arg_types)
+                        .map_err(to_wire)?,
                 );
             } else {
                 plpgsql_fn::Host::execute(&host, &sql, args, &u.arg_types).map_err(to_wire)?;

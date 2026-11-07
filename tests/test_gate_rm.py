@@ -74,3 +74,11 @@ def test_a_panic_is_read_from_test_logs_not_build_logs(tmp_path: Path) -> None:
     (tmp_path / "storage-test.log").write_text("ok\n")
     (tmp_path / "ci-selected.log").write_text("[WT_PANIC: WiredTiger library panic]\n")
     assert _gate_rm().panicked_logs(tmp_path) == ["ci-selected.log"]
+
+
+def test_rebuilds_the_core_extension_before_the_suites() -> None:
+    """`_secantus_core` is rebuilt from HEAD (`./inv sync`) with the binaries,
+    so provenance does not abort the suites after an amend or a rebase."""
+    src = (ROOT / "scripts/gate_rm.py").read_text()
+    assert 'g.step("core-sync", ["./inv", "sync"])' in src
+    assert src.index('"core-sync"') < src.index('"ci-selected"')

@@ -29,6 +29,13 @@ Usage::
                than an assertion: the check is not measuring the gap. Fix it.
 ``SKIPPED``    ``--skip ID`` named it, so its gap tests did not run; never
                counted as passing (the caller says why).
+``ELSEWHERE``  a gap test skipped itself as ``platform: ...``: mongod's own
+               answer differs by platform, and on this machine's platform
+               this server already gives it (Joe, 2026-11-07: each
+               platform's mongod is the reference). The gap is checked on the
+               platform it names, in CI. ``tests/backlog/conftest.py``'s
+               ``only_on`` is the one way to say it; a regression test that
+               skips the same way is not ``REGRESSED``.
 ``UNCHECKED``  the item has ``Verify: none -- ...`` (by design) or no Verify
                line at all (a defect in the backlog: write one).
 
@@ -51,6 +58,7 @@ import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -195,6 +203,24 @@ def selected(files: list[str] | None, ids: list[str] | None) -> list[Item]:
     return out
 
 
+#: How a gap or regression test that only means something on another
+#: platform says so (``tests/backlog/conftest.py``'s ``only_on``).
+PLATFORM_SKIP = "platform:"
+
+
+def elsewhere(rec: dict) -> bool:
+    """The test skipped itself because what it checks is on another platform."""
+    return rec["outcome"] == "skipped" and rec.get("message", "").startswith(PLATFORM_SKIP)
+
+
+def regressions_failed(results: Iterable[dict]) -> list[dict]:
+    """The regression (``backlog_fixed``) tests that did not pass, a skip for
+    another platform aside."""
+    return [
+        r for r in results if r.get("fixed_ids") and r["outcome"] != "passed" and not elsewhere(r)
+    ]
+
+
 def verify(
     items: list[Item],
     regressions: bool = True,
@@ -267,6 +293,9 @@ def verify(
             elif it.id not in rec.get("ids", []):
                 statuses.append("BROKEN")
                 detail.append(f"{t}: not marked backlog({it.id!r})")
+            elif elsewhere(rec):
+                statuses.append("ELSEWHERE")
+                detail.append(f"{t}: {rec['message'][:160]}")
             elif rec["outcome"] == "passed":
                 statuses.append("FIXED?")
                 detail.append(f"{t}: passed")
@@ -275,12 +304,11 @@ def verify(
             else:
                 statuses.append("BROKEN")
                 detail.append(f"{t}: {rec['outcome']} {rec.get('message', '')[:160]}")
-        for s in ("BROKEN", "FIXED?", "OPEN"):
+        for s in ("BROKEN", "FIXED?", "OPEN", "ELSEWHERE"):
             if s in statuses:
                 verdicts.append(Verdict(it, s, detail))
                 break
-    regressed = [r for r in results.values() if r.get("fixed_ids") and r["outcome"] != "passed"]
-    return verdicts, regressed
+    return verdicts, regressions_failed(results.values())
 
 
 def main() -> int:
@@ -347,7 +375,7 @@ def main() -> int:
         for v in verdicts
         if v.status != "SKIPPED" and (v.status != "UNCHECKED" or v.item.verify is None)
     ]
-    return 0 if all(v.status == "OPEN" for v in checked) and not regressed else 1
+    return 0 if all(v.status in ("OPEN", "ELSEWHERE") for v in checked) and not regressed else 1
 
 
 if __name__ == "__main__":

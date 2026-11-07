@@ -116,15 +116,38 @@ lane() {
         # (scripts/wait_for_load.sh has the 2026-11-02 numbers).
         scripts/wait_for_load.sh "fix_many item $n" 2>>"$out/summary.txt"
         [[ -e $out/STOP ]] && return 0
+        # A reused lane's cargo targets grow with every item: cargo keeps
+        # each build's incremental state and never removes a stale one. On
+        # 2026-11-07 two lanes reached 41 and 50 GB after about six items
+        # each (36 GB of it incremental) and filled the disk mid-gate. The
+        # incremental state is a cache: clear it before each item (the
+        # compiled dependencies stay, so the next build is not cold), and
+        # stop the batch rather than start an item on a disk below the floor.
+        if [[ -n $wt ]]; then
+            rm -rf "$wt"/crates/target/*/incremental "$wt"/crates/*/target/*/incremental
+        fi
+        local free_gb
+        free_gb=$(df -g "${wt:-.}" | awk 'NR == 2 { print $4 }')
+        if [[ $free_gb -lt ${SECANTUS_MIN_FREE_GB:-40} ]]; then
+            echo "$(date '+%F %T') STOPPING: item $n: ${free_gb} GB free, under SECANTUS_MIN_FREE_GB (${SECANTUS_MIN_FREE_GB:-40})" >>"$out/summary.txt"
+            echo "disk" >"$out/STOP"
+            return 0
+        fi
         local id=
         [[ -n $list ]] && id=$(grep -vE '^[[:space:]]*(#|$)' "$list" | sed -n "${n}p" | awk '{print $1}')
         scripts/fix_one.sh -p "$backlog" $id ${into:+into "$into"} ${wt:+lane "$wt"} >"$out/$n.log" 2>&1
         local rc=$?
         if [[ $rc -eq 0 && -n $into ]]; then
             local sha
-            # The report is markdown, so the branch and sha may be in
-            # backticks (2026-11-07: "landed on `rm-batch` at `b2ab0554`").
-            sha=$(grep -oE "landed on \`?$into\`? at \`?[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
+            # The report is prose in markdown, so the sha may be in backticks
+            # or bold, and "landed" may be worded otherwise. Each of these
+            # stopped a batch over a fix that HAD landed (2026-11-07):
+            # "landed on `rm-batch` at `b2ab0554`", "landed on `pg-batch` at
+            # **2bc9d4dc**", "the fix is on `pg-batch` at `2edf432c`". Take
+            # any "on <branch> at <sha>"; the ancestry check below is what
+            # proves the landing.
+            m='[`*_]*'
+            sha=$(grep -oE "on $m$into$m at $m[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
                 grep -oE '[0-9a-f]{7,}$')
             git fetch -q origin "$into"
             if [[ -z $sha ]] || ! git merge-base --is-ancestor "$sha" "origin/$into" 2>/dev/null; then
@@ -133,7 +156,7 @@ lane() {
             fi
         fi
         local pr
-        pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at `?[0-9a-f]+' "$out/$n.log" | tail -1 | tr -d '`')
+        pr=$(grep -oE 'pull/[0-9]+|PR #[0-9]+|landed on [^ ]+ at [`*_]*[0-9a-f]+' "$out/$n.log" | tail -1 | tr -d '`*_')
         echo "$(date '+%F %T') item $n (lane $k) exit $rc ${pr:-no PR}" >>"$out/summary.txt"
         if [[ $rc -ne 0 ]]; then
             echo "$n" >"$out/STOP"

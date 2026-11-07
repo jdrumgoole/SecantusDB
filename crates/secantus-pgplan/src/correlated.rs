@@ -41,7 +41,7 @@ thread_local! {
 /// RP-445) is a NULL of its type, never run, as the probe's NULL bindings
 /// are not the row it will see and the probe may be a Describe's, with no
 /// executor to run it.
-fn probing<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn probing<R>(f: impl FnOnce() -> R) -> R {
     let previous = PROBING.with(|p| p.replace(true));
     let out = f();
     PROBING.with(|p| p.set(previous));
@@ -275,7 +275,11 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
                     .map(|a| a.aliasname.clone())
                     .unwrap_or_else(|| r.relname.clone()),
             ),
-            Some(N::JoinExpr(_)) => {}
+            // A join's own names: its alias, and a USING join's alias.
+            Some(N::JoinExpr(j)) => {
+                names.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+                names.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
+            }
             _ => collect_from_names(item, names),
         }
         match item.node.as_ref() {
@@ -286,10 +290,22 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
                     select(body, names);
                 }
             }
-            Some(N::JoinExpr(j)) => {
+            Some(N::JoinExpr(j)) if j.alias.is_none() => {
                 for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                     from_item(side, names);
                 }
+            }
+            // An aliased JOIN hides its sides' names: `fs.a` over `(fs join
+            // fe using (a)) as j` is the enclosing query's `fs` -- unless no
+            // enclosing query has one, when it is this hidden entry, which
+            // planning reports as PostgreSQL's "invalid reference".
+            Some(N::JoinExpr(j)) => {
+                let mut hidden = Vec::new();
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    from_item(side, &mut hidden);
+                }
+                let outer = OUTER_RELATIONS.with(|o| o.borrow().clone());
+                names.extend(hidden.into_iter().filter(|n| !outer.contains(n)));
             }
             _ => {}
         }
@@ -756,6 +772,13 @@ fn outer_ref_type(
             } else if let Some(N::RangeSubselect(rs)) = item.node.as_ref() {
                 if qualifier.is_some_and(|q| rs.alias.as_ref().is_none_or(|a| &a.aliasname != q)) {
                     continue;
+                }
+            } else if let Some(N::JoinExpr(_)) = item.node.as_ref() {
+                // A join's column: a leaf's, a merged USING one, or one
+                // of the join's alias (RP-468).
+                match crate::optype::join_column_type(item, parts, lookup) {
+                    Some(ty) => return ty,
+                    None => continue,
                 }
             } else {
                 continue;

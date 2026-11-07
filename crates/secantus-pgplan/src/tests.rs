@@ -3828,6 +3828,72 @@ fn a_join_on_after_a_comma_item_is_type_checked_in_its_own_scope() {
     }
 }
 
+#[test]
+fn an_aliased_join_resolves_names_as_postgresql_does() {
+    // RP-454: `(fs join fe using (a)) as j` names the join's columns and
+    // hides its sides' names; `join ... using (a) as u` names the merged
+    // column beside them. Each answer measured on PostgreSQL 15.19.
+    let tables = |name: &str| -> Option<TableDef> {
+        let cols = match name {
+            "fe" => vec![
+                Column::new("a", "int4", false),
+                Column::new("b", "text", false),
+            ],
+            "fs" => vec![
+                Column::new("a", "int4", false),
+                Column::new("c", "text", false),
+            ],
+            _ => return None,
+        };
+        Some(TableDef::new(name, cols))
+    };
+    let run = |_: &Statement| -> Result<Vec<Vec<Bson>>> { Ok(Vec::new()) };
+    let plan = |q: &str| plan_with_subqueries(q, &tables, &[], &run);
+    for q in [
+        "select u.a from fs join fe using (a) as u",
+        "select u.*, fs.c, fe.b from fs join fe using (a) as u",
+        "select j.a, j.c, j.b from (fs join fe using (a)) as j",
+        "select j.x, y, b from (fs join fe using (a)) as j(x, y)",
+        "select j.c from (fs join fe using (a)) as j join fe x on j.a = x.a",
+        "select (select j.a from (fs join fe using (a)) as j limit 1)",
+        "select (select fs.a from (fs join fe using (a)) as j) from fs",
+    ] {
+        assert!(plan(q).is_ok(), "{q}: {:?}", plan(q).err());
+    }
+    for (q, want) in [
+        // A hidden side's name is an "invalid reference", not a missing one.
+        ("select fs.a from (fs join fe using (a)) as j", "42P01"),
+        (
+            "select j.c from (fs join fe using (a)) as j join fe x on fs.a = x.a",
+            "42P01",
+        ),
+        ("select u.c from fs join fe using (a) as u", "42703"),
+        ("select u.a from (fs join fe using (a) as u) as x", "42P01"),
+        ("select j.a from (fs join fe on fs.a = fe.a) as j", "42702"),
+        ("select a from (fs join fe using (a)) as j(x)", "42703"),
+        (
+            "select * from (fs join fe using (a)) as j(x, y, z, w)",
+            "42P10",
+        ),
+        ("select * from fs join fe using (a) as fs", "42712"),
+        (
+            "select * from (fs join fe using (a)) as j where j.b = 1",
+            "42883",
+        ),
+        // A nested USING join's merged column is visible in an enclosing ON.
+        (
+            "select * from fs join fe using (a) join fe x on a = x.a",
+            "42702",
+        ),
+        // PostgreSQL answers these (RP-469): the two leaves' keys would be one.
+        ("select * from (fs join fe using (a)) as j, fs", "0A000"),
+        ("select * from fs, (fs join fe using (a)) as j", "0A000"),
+    ] {
+        let err = plan(q).expect_err(q);
+        assert_eq!(err.sqlstate(), want, "for {q} (got {err})");
+    }
+}
+
 /// A statement planned as the server plans it, parse analysis first.
 fn analysed(sql: &str) -> Result<Statement> {
     plan_with_subqueries(sql, &lookup, &[], &|_| Ok(Vec::new()))
@@ -4112,6 +4178,32 @@ fn a_column_reference_with_no_from_names_nothing() {
     // An aggregate exists, so the reference after it is what fails.
     let err = analysed("select count(1), nosuch").expect_err("should refuse");
     assert_eq!(err.sqlstate(), "42703", "{err}");
+}
+
+#[test]
+fn a_subquery_target_is_named_as_written() {
+    // FigureColname names a target from the expression as written (RP-449):
+    // a correlated subquery's per-row call named it `\x1fcorrelated`, and a
+    // cast over a scalar subquery took its type's name. Answers measured on
+    // PostgreSQL 15.19.
+    for (q, want) in [
+        ("select (select id + 1) from t", "?column?"),
+        ("select (select (select id) + 1) from t", "?column?"),
+        ("select (select id + 1)::int8 from t", "?column?"),
+        ("select (select id)::int8 from t", "id"),
+        ("select (select abs(id))::text from t", "abs"),
+        ("select (select id + 1 as z) from t", "z"),
+        ("select exists(select id)::int from t", "exists"),
+    ] {
+        match analysed(q) {
+            Ok(Statement::Select(s)) => assert_eq!(
+                s.columns.first().map(|(out, _)| out.as_str()),
+                Some(want),
+                "for {q}"
+            ),
+            other => panic!("{q}: {other:?}"),
+        }
+    }
 }
 
 #[test]

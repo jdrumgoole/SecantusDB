@@ -164,6 +164,7 @@ pub mod pgp;
 pub mod pgp_pub;
 pub mod privileges;
 mod prune_outputs;
+pub use prune_outputs::figure_colname;
 mod pullup;
 pub mod read_apart;
 pub mod regobj;
@@ -14527,8 +14528,12 @@ fn srf_rows(
     };
     // A plain function with OUT parameters returns ONE row of them.
     let out_row = |u: &correlated::UserFn| !u.returns_set && !u.columns.is_empty();
+    // In FROM every function is a row source, a scalar one too: PostgreSQL's
+    // Function Scan yields its one result as one row (`ExecMakeTableFunctionResult`
+    // stores a non-set result once), so `count(*) from f()` is 1 and a WHERE
+    // or a ROWS FROM over it reads that row.
     if let Some(u) = correlated::user_function_for(name, &call.args)
-        .filter(|u| u.returns_set || composite(u).is_some() || (expand && out_row(u)))
+        .filter(|u| u.returns_set || composite(u).is_some() || expand)
     {
         let a: Vec<Bson> = call
             .args
@@ -15962,7 +15967,17 @@ fn order_by_ambiguity(s: &pg_query::protobuf::SelectStmt) -> Result<()> {
 /// function's, anything else is `?column?`.
 fn expression_column_name(node: &pg_query::protobuf::Node) -> String {
     match node.node.as_ref() {
-        Some(N::ColumnRef(c)) => column_ref_name(c).unwrap_or_else(|| "?column?".to_string()),
+        // The last field NAME, a trailing `*` ignored (`t.*` is `t`), as
+        // FigureColnameInternal reads a ColumnRef.
+        Some(N::ColumnRef(c)) => c
+            .fields
+            .iter()
+            .rev()
+            .find_map(|f| match f.node.as_ref() {
+                Some(N::String(st)) => Some(st.sval.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "?column?".to_string()),
         // A cast keeps a column's or a call's name (`id::int8` is `id`,
         // `abs(n)::int8` is `abs`) and otherwise takes the TARGET type's bare
         // name: `(1 + 2)::int8` is `int8`, `x::varchar(3)` is `varchar`.
@@ -16121,6 +16136,14 @@ fn cast_source_names_column(node: &pg_query::protobuf::Node) -> bool {
                 || ind.arg.as_deref().is_some_and(cast_source_names_column)
         }
         Some(N::TypeCast(tc)) => tc.arg.as_deref().is_some_and(cast_source_names_column),
+        // A scalar subquery always names its column (its one target's
+        // `resname`, `?column?` included), as EXISTS and ARRAY(...) do: so
+        // `(select 1 + 1)::int` is `?column?` and `(select a)::int` is `a`.
+        // ANY / ALL / a row comparison names nothing.
+        Some(N::SubLink(sl)) => matches!(
+            SubLinkType::try_from(sl.sub_link_type),
+            Ok(SubLinkType::ExprSublink | SubLinkType::ExistsSublink | SubLinkType::ArraySublink)
+        ),
         _ => false,
     }
 }
@@ -19792,8 +19815,8 @@ fn resolve_sublinks_scoped(
                 clauses.push(w);
             }
             // A SET value may be a subquery too: `SET n = (SELECT ...)`, and
-            // so may a RETURNING item.
-            for t in u.target_list.iter_mut().chain(u.returning_list.iter_mut()) {
+            // so may a RETURNING item (named as written, below).
+            for t in u.target_list.iter_mut() {
                 if let Some(N::ResTarget(rt)) = t.node.as_mut() {
                     if let Some(v) = rt.val.as_deref_mut() {
                         clauses.push(v);
@@ -19802,6 +19825,11 @@ fn resolve_sublinks_scoped(
             }
             for c in clauses {
                 resolve_sublinks_in_expr(c, lookup, params, run, &outer)?;
+            }
+            for t in &mut u.returning_list {
+                if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                    resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
+                }
             }
             Ok(())
         }
@@ -19813,9 +19841,7 @@ fn resolve_sublinks_scoped(
             }
             for n in &mut d.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
-                    if let Some(v) = rt.val.as_deref_mut() {
-                        resolve_sublinks_in_expr(v, lookup, params, run, &outer)?;
-                    }
+                    resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
                 }
             }
             Ok(())
@@ -19869,11 +19895,9 @@ fn resolve_sublinks_scoped(
             let mut out = Ok(());
             for n in &mut i.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
-                    if let Some(v) = rt.val.as_deref_mut() {
-                        out = resolve_sublinks_in_expr(v, lookup, params, run, &outer);
-                        if out.is_err() {
-                            break;
-                        }
+                    out = resolve_sublinks_in_target(rt, lookup, params, run, &outer);
+                    if out.is_err() {
+                        break;
                     }
                 }
             }
@@ -20547,8 +20571,19 @@ fn resolve_sublinks_in_select_scoped(
     {
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
+    // Each item's columns, for the LATERAL items after it.
+    let item_columns: Vec<Vec<String>> = s
+        .from_clause
+        .iter()
+        .map(|item| {
+            let mut cols = Vec::new();
+            collect_from_columns(item, lookup, &mut cols);
+            cols
+        })
+        .collect();
     for (i, item) in s.from_clause.iter_mut().enumerate() {
-        resolve_sublinks_in_from(item, i > 0, lookup, params, run, &outer)?;
+        let left: Vec<String> = item_columns[..i].concat();
+        resolve_sublinks_in_from(item, i > 0, &left, lookup, params, run, &outer)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -20557,18 +20592,7 @@ fn resolve_sublinks_in_select_scoped(
     semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
-            if let Some(v) = rt.val.as_deref_mut() {
-                // A subquery target is named after the subquery (its
-                // column, or `exists` / `array`), which the value it is
-                // replaced by would not carry.
-                if rt.name.is_empty() && matches!(v.node.as_ref(), Some(N::SubLink(_))) {
-                    let name = expression_column_name(v);
-                    if name != "?column?" {
-                        rt.name = name;
-                    }
-                }
-                resolve_sublinks_in_expr(v, lookup, params, run, &outer)?;
-            }
+            resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
         }
     }
     for clause in [
@@ -20591,11 +20615,13 @@ fn resolve_sublinks_in_select_scoped(
 }
 
 /// `has_left`: a FROM item stands to this one's left (see
-/// `rowsfrom::rewrite`). `outer`: the columns the query's FROM exposes, which
-/// a subquery in a join's ON may read.
+/// `rowsfrom::rewrite`); `left`: the columns those items expose, which a
+/// LATERAL subquery reads. `outer`: the columns the query's FROM exposes,
+/// which a subquery in a join's ON may read.
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
     has_left: bool,
+    left: &[String],
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
@@ -20615,7 +20641,24 @@ fn resolve_sublinks_in_from(
     }
     match item.node.as_mut() {
         Some(N::RangeSubselect(rs)) => {
+            let lateral = rs.lateral;
             match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
+                // A LATERAL subquery's left siblings are the next namespace
+                // out for the subqueries inside it, as an enclosing query's
+                // FROM is: `lateral (select (select b) from fs)` reads the
+                // left side's `b` (RP-478). Any other FROM-subquery sees no
+                // sibling.
+                Some(N::SelectStmt(inner)) if lateral && !left.is_empty() => {
+                    let enclosing = ENCLOSING_COLUMNS.with(|e| {
+                        let mut e = e.borrow_mut();
+                        let d = e.len();
+                        e.extend(left.iter().cloned());
+                        d
+                    });
+                    let resolved = resolve_sublinks_in_select(inner, lookup, params, run);
+                    ENCLOSING_COLUMNS.with(|e| e.borrow_mut().truncate(enclosing));
+                    resolved
+                }
                 Some(N::SelectStmt(inner)) => {
                     resolve_sublinks_in_select(inner, lookup, params, run)
                 }
@@ -20635,11 +20678,17 @@ fn resolve_sublinks_in_from(
             Ok(())
         }
         Some(N::JoinExpr(j)) => {
+            // The right side's left is everything left of the join and the
+            // join's left side.
+            let mut right_left = left.to_vec();
+            if let Some(l) = j.larg.as_deref() {
+                collect_from_columns(l, lookup, &mut right_left);
+            }
             if let Some(l) = j.larg.as_deref_mut() {
-                resolve_sublinks_in_from(l, has_left, lookup, params, run, outer)?;
+                resolve_sublinks_in_from(l, has_left, left, lookup, params, run, outer)?;
             }
             if let Some(r) = j.rarg.as_deref_mut() {
-                resolve_sublinks_in_from(r, true, lookup, params, run, outer)?;
+                resolve_sublinks_in_from(r, true, &right_left, lookup, params, run, outer)?;
             }
             // A subquery in the ON is evaluated as one in a WHERE is
             // (PostgreSQL's `transformJoinOnClause` analyses it with the
@@ -20723,6 +20772,37 @@ fn collect_from_columns(
         }
         _ => {}
     }
+}
+
+/// Resolve the subqueries inside one OUTPUT target -- a select-list item or
+/// a RETURNING one -- keeping the name its written expression gives it.
+///
+/// A target is named by what was written (FigureColname over the raw
+/// expression): a subquery after its column, or `exists` / `array`, through
+/// any cast around it. The value a subquery is replaced by would not carry
+/// that name -- a correlated one's per-row call would name the column
+/// `\x1fcorrelated` (RP-449) -- so a target whose name the replacement
+/// changes keeps the written one, `?column?` included.
+fn resolve_sublinks_in_target(
+    rt: &mut pg_query::protobuf::ResTarget,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &mut Vec<Bson>,
+    run: SubqueryRunner<'_>,
+    outer: &[String],
+) -> Result<()> {
+    let Some(v) = rt.val.as_deref_mut() else {
+        return Ok(());
+    };
+    let star = matches!(v.node.as_ref(), Some(N::ColumnRef(c))
+        if c.fields.iter().any(|f| matches!(f.node.as_ref(), Some(N::AStar(_)))));
+    let written = (rt.name.is_empty() && !star).then(|| expression_column_name(v));
+    resolve_sublinks_in_expr(v, lookup, params, run, outer)?;
+    if let Some(name) = written {
+        if expression_column_name(v) != name {
+            rt.name = name;
+        }
+    }
+    Ok(())
 }
 
 /// Resolve the subqueries inside one expression.
@@ -22348,10 +22428,16 @@ fn collect_visible_names(item: &pg_query::protobuf::Node, out: &mut Vec<String>)
                 .map(|a| a.aliasname.clone())
                 .unwrap_or_else(|| r.relname.clone()),
         ),
+        // An aliased JOIN is named by its alias alone; its sides' names,
+        // a USING alias among them, are hidden.
+        Some(N::JoinExpr(j)) if j.alias.is_some() => {
+            out.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+        }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
                 collect_visible_names(side, out);
             }
+            out.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
         }
         _ => collect_from_names(item, out),
     }
@@ -23572,7 +23658,11 @@ fn alias_field_rewrite(
                     op: pg_query::protobuf::SetOperation::SetopNone as i32,
                     ..Default::default()
                 };
-                let def = plan_select(&probe, lookup, &[]).and_then(|p| sub_plan_def(&p, lookup));
+                // Typed, not run: the function is called once, by the
+                // statement's own plan (RP-472).
+                let def = correlated::without_calls(|| {
+                    plan_select(&probe, lookup, &[]).and_then(|p| sub_plan_def(&p, lookup))
+                });
                 match def.as_ref().map(|d| d.columns.as_slice()) {
                     Ok([one]) => {
                         out.push((a.aliasname.clone(), Some(format!("\u{1}{}", one.pg_type))))
@@ -24046,6 +24136,16 @@ fn plan_select(
                 .map_err(joins::unmangle),
             other => other,
         }
+    } else if (has_aggregate(s) || !s.group_clause.is_empty()) && from_calls_volatile(s) {
+        // A function in FROM runs when its source is planned. An aggregate
+        // this first attempt refuses is planned again by a rewrite below,
+        // which would run the function a second time (RP-476): PostgreSQL's
+        // Function Scan runs it once. So the attempt is made with calls
+        // switched off first, and made for real only when it will stand.
+        match correlated::without_calls(|| plan_select_rest(s, lookup, params)) {
+            Err(Error::Unsupported(m)) => Err(Error::Unsupported(m)),
+            _ => plan_select_rest(s, lookup, params),
+        }
     } else {
         plan_select_rest(s, lookup, params)
     };
@@ -24102,6 +24202,41 @@ fn plan_select(
     planned
         .map_err(|e| qualify_undefined_column(e, s))
         .map_err(|e| invalid_from_reference(e, s))
+}
+
+/// Does planning `s`'s FROM run something with a side effect: a VOLATILE
+/// function called as a FROM item (a user function left at that default, a
+/// built-in such as `nextval`; only a volatile SQL function may write), or
+/// anywhere in a FROM subquery or a joined item, which are planned -- and
+/// their calls run -- with the statement? (RP-476)
+fn from_calls_volatile(s: &pg_query::protobuf::SelectStmt) -> bool {
+    fn select(s: &pg_query::protobuf::SelectStmt) -> bool {
+        s.from_clause.iter().any(item)
+            || s.target_list.iter().any(correlated::has_volatile_call)
+            || s.where_clause
+                .as_deref()
+                .is_some_and(correlated::has_volatile_call)
+            || s.larg.as_deref().is_some_and(select)
+            || s.rarg.as_deref().is_some_and(select)
+    }
+    fn item(n: &pg_query::protobuf::Node) -> bool {
+        match n.node.as_ref() {
+            Some(N::RangeFunction(rf)) => rf.functions.iter().any(|f| match f.node.as_ref() {
+                Some(N::List(l)) => l.items.iter().any(correlated::has_volatile_call),
+                _ => correlated::has_volatile_call(f),
+            }),
+            Some(N::RangeSubselect(rs)) => match rs.subquery.as_ref().and_then(|q| q.node.as_ref())
+            {
+                Some(N::SelectStmt(inner)) => select(inner),
+                _ => false,
+            },
+            Some(N::JoinExpr(j)) => {
+                j.larg.as_deref().is_some_and(item) || j.rarg.as_deref().is_some_and(item)
+            }
+            _ => false,
+        }
+    }
+    s.from_clause.iter().any(item)
 }
 
 thread_local! {
@@ -25539,6 +25674,42 @@ fn plan_join_select(
     }
     if right_sub.is_none() {
         lookup(&right.0).ok_or_else(|| Error::UndefinedTable(right.0.clone()))?;
+    }
+    // A side's name alone is its whole row (unless a table side has a column
+    // of that name, which wins). This path resolves a bare name only as a
+    // column; the general join planner builds the row (RP-470).
+    let has_column = |side: &(String, String), sub: &Option<Box<Statement>>, name: &str| {
+        sub.is_none() && lookup(&side.0).is_some_and(|d| d.columns.iter().any(|c| c.name == name))
+    };
+    // An aliased JOIN's name is its whole row too.
+    let join_alias = match s.from_clause.as_slice() {
+        [one] => match one.node.as_ref() {
+            Some(N::JoinExpr(j)) => j.alias.as_ref().map(|a| a.aliasname.clone()),
+            _ => None,
+        },
+        _ => None,
+    };
+    let whole_row = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => match c.fields.as_slice() {
+            [f] => matches!(f.node.as_ref(), Some(N::String(sv))
+                if (sv.sval == left.1 || sv.sval == right.1
+                    || join_alias.as_deref() == Some(sv.sval.as_str()))
+                    && !has_column(&left, &left_sub, &sv.sval)
+                    && !has_column(&right, &right_sub, &sv.sval)),
+            _ => false,
+        },
+        _ => false,
+    };
+    if s.target_list
+        .iter()
+        .chain(s.where_clause.as_deref())
+        .chain(s.sort_clause.iter())
+        .chain(s.distinct_clause.iter())
+        .any(|n| expr_any(n, &whole_row))
+    {
+        return Err(Error::Unsupported(
+            "a whole-row reference on this path".into(),
+        ));
     }
 
     // ON a.x = b.y, either order.
@@ -37097,8 +37268,12 @@ fn whole_row_rewrite(
                     return Ok(None);
                 }
             }
-            let stmt = plan_select(sub, lookup, params)?;
-            let def = sub_plan_def(&stmt, lookup)?;
+            // Planned only for its output NAMES: nothing in it may be
+            // called, or a function in its FROM runs once more than the
+            // statement runs it (RP-472).
+            let def = correlated::without_calls(|| {
+                plan_select(sub, lookup, params).and_then(|stmt| sub_plan_def(&stmt, lookup))
+            })?;
             let mut cols: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
             // `s(a, b)` column aliases rename the subquery's outputs.
             if let Some(a) = rs.alias.as_ref() {
@@ -37315,7 +37490,16 @@ fn whole_row_rewrite(
                 continue;
             }
             if let Some(v) = rt.val.as_deref_mut() {
+                // An unnamed target keeps the name it was written with
+                // (`t::text` is `t`), not the row constructor's (`row`).
+                let written = expression_column_name(v);
                 rewrite(v, true)?;
+                if rt.name.is_empty()
+                    && written != "?column?"
+                    && expression_column_name(v) != written
+                {
+                    rt.name = written;
+                }
             }
         }
         targets.push(t);
