@@ -122,12 +122,15 @@ lane() {
         local rc=$?
         if [[ $rc -eq 0 && -n $into ]]; then
             local sha
-            # The report is markdown, so the branch and sha may be in
-            # backticks or bold (2026-11-07: "landed on `rm-batch` at
-            # `b2ab0554`", and "landed on `pg-batch` at **2bc9d4dc**", which
-            # stopped a batch over a fix that had landed).
+            # The report is prose in markdown, so the sha may be in backticks
+            # or bold, and "landed" may be worded otherwise. Each of these
+            # stopped a batch over a fix that HAD landed (2026-11-07):
+            # "landed on `rm-batch` at `b2ab0554`", "landed on `pg-batch` at
+            # **2bc9d4dc**", "the fix is on `pg-batch` at `2edf432c`". Take
+            # any "on <branch> at <sha>"; the ancestry check below is what
+            # proves the landing.
             m='[`*_]*'
-            sha=$(grep -oE "landed on $m$into$m at $m[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
+            sha=$(grep -oE "on $m$into$m at $m[0-9a-f]{7,}" "$out/$n.log" | tail -1 |
                 grep -oE '[0-9a-f]{7,}$')
             git fetch -q origin "$into"
             if [[ -z $sha ]] || ! git merge-base --is-ancestor "$sha" "origin/$into" 2>/dev/null; then
