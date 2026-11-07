@@ -260,9 +260,10 @@ fn level_two_writes_each_operation_in_mongods_shape() {
         // mongod 8.2.11 writes the plan and its planning time after
         // `millis` (2026-10-24), the counts of the read after the command,
         // and the plan cache key, the engine, the locks and the read
-        // concern after them (RM-023, 2026-10-27). Its `queryShapeHash`
-        // (RM-358) and `execStats` (RM-359) are not written here, nor a
-        // `storage` section when WiredTiger counted nothing.
+        // concern after them (RM-023, 2026-10-27), and the query shape's
+        // hash after the plan cache key (RM-358). Its `execStats` (RM-359)
+        // is not written here, nor a `storage` section when WiredTiger
+        // counted nothing.
         let mut want = with(&[
             "op",
             "ns",
@@ -276,6 +277,7 @@ fn level_two_writes_each_operation_in_mongods_shape() {
             "planCacheShapeHash",
             "queryHash",
             "planCacheKey",
+            "queryShapeHash",
             "queryFramework",
             "locks",
             "flowControl",

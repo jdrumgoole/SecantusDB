@@ -87,6 +87,7 @@ pub mod params;
 mod privileges;
 mod procstats;
 pub mod profiler;
+mod query_shape;
 pub mod rbac;
 mod replset_admin;
 mod resume_keystring;

@@ -1713,7 +1713,33 @@ fn dry(inner: &Document, name: &str) -> Document {
 }
 
 /// `explain`.
+/// `explain`, with the explained query's `queryShapeHash` after its plan
+/// (`queryPlanner`, `executionStats` or `stages`), where mongod 8.2.1 puts
+/// it (RM-358).
 pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let reply = explain_reply(doc, ctx)?;
+    let Some(shape) = doc
+        .get_document("explain")
+        .ok()
+        .and_then(|inner| crate::query_shape::hash(&ctx.db_name, inner))
+    else {
+        return Ok(reply);
+    };
+    let after = ["executionStats", "queryPlanner", "stages"]
+        .into_iter()
+        .find(|k| reply.contains_key(*k));
+    let mut out = Document::new();
+    for (k, v) in reply {
+        let here = after == Some(k.as_str());
+        out.insert(k, v);
+        if here {
+            out.insert("queryShapeHash", shape.clone());
+        }
+    }
+    Ok(out)
+}
+
+fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
     let inner = match doc.get("explain") {
         None | Some(Bson::Null) => {
