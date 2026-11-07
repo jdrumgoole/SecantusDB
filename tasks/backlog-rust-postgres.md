@@ -1975,15 +1975,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       the alias the query wrote.
       Backlog-ID: RP-469
       Verify: tests/backlog/test_rp_subquery_scope.py::test_hidden_join_name_reused
-- [ ] **A whole-row reference to a joined table is not found.** `select fs
-      from fs, fe` and `select fs from fs join fe using (a)` answer `(1,y)`
-      on PostgreSQL 15.19, `select fe.*::text from fs join fe using (a)`
-      `(1,x)`, and `select j from (fs join fe using (a)) as j` the join's
-      row. Here the first two and the last are 42703 `column "fs" does not
-      exist`, and the cast star 42P01 `invalid reference to FROM-clause
-      entry for table "fe"`. A lone table's whole row already works.
-      Backlog-ID: RP-470
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_over_a_join
 - [ ] **EXPLAIN of an aliased JOIN prints no Hash Cond and keeps its WHERE
       above the join.** PostgreSQL flattens a join alias's columns to the
       sides' own (`flatten_join_alias_vars`), so `explain (costs off)
@@ -2004,6 +1995,38 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
       Backlog-ID: RP-467
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
+
+## Found while working RP-470 (2026-11-07)
+
+- [ ] **A whole-row reference is still refused in three shapes.** On
+      PostgreSQL 15.19, `select l from fs join lateral (select fs.a) l on
+      true` answers `(1)` (and NULL for a LATERAL side an outer join
+      NULL-extends), `select (select fs) from fs` and the same over `fs,
+      fe` answer `(1,y)`, and `select (fs).* from fs, fe order by 1`
+      answers `1, y`. Here the first two are 42703 `column "l" (or "fs")
+      does not exist` -- a LATERAL leaf (`lateral_leaf`) carries no row
+      column, and a subquery's correlation does not bind an outer FROM
+      item's whole row -- and the last is 0A000 `this field selection is
+      not supported yet`: `ORDER BY 1` copies the `(fs).*` target before
+      the join expands it. Since RP-470 a table's or a plain subquery's
+      whole row over a join works, built at its scan.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
+      Backlog-ID: RP-479
+- [ ] **A whole row is typed as a record, or as varchar.** `select x from
+      fs as x(p, q)`, alone or over a join, is of `fs`'s row type on
+      PostgreSQL 15.19 (psycopg reads `(1,y)`); here it is a `record`, as
+      `column_alias_rewrite` turns the table into a subquery first. A
+      view's whole row (`select v from v`, alone or over a join) has the
+      right value, but its RowDescription's type OID is 1043, varchar,
+      where PostgreSQL sends the view's row type (`'v'::regtype`).
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_under_column_aliases, tests/backlog/test_rp_subquery_scope.py::test_whole_row_of_a_view_is_its_row_type
+      Backlog-ID: RP-480
+- [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
+      15.19 reports `column "a" specified in USING clause does not exist in
+      left table` with no position; here it points into the statement (41,
+      33 in the gap test's two statements).
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
+      Backlog-ID: RP-481
 
 ## Found while working RP-316 (2026-11-02)
 

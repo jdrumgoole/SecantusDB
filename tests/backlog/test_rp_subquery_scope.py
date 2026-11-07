@@ -10,11 +10,14 @@ enclosing level's hidden table name was not `errorMissingRTE`'s "invalid
 reference"); found while working RP-455, RP-460 (a subquery inside a
 FROM-subquery is offered a sibling's alias as its hint); and found while
 working RP-454, RP-469 (a FROM item named as a table an aliased JOIN hides
-is refused), RP-470 (a whole-row reference to a joined table), RP-471
-(EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an aliased JOIN)
-and RP-468 (a correlated subquery reading a join's column got text;
-fixed); and found while working RP-461, RP-478 (a LATERAL subquery's bare
-name for an earlier FROM item's column is not found).
+is refused), RP-470 (a whole-row reference to a joined table was not found;
+fixed), RP-471 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an
+aliased JOIN) and RP-468 (a correlated subquery reading a join's column got
+text; fixed); found while working RP-461, RP-478 (a LATERAL subquery's bare
+name for an earlier FROM item's column is not found); and found while
+working RP-470, RP-479 (a whole-row reference still refused in three
+shapes), RP-480 (a whole row typed as a record or as varchar) and RP-481 (a
+USING column's 42703 carries a position).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -392,19 +395,122 @@ def test_hidden_join_name_reused(query: str, dsn: str) -> None:
 
 
 # A FROM item's name alone is its whole row; over a join it was 42703
-# (or, for `fe.*` cast, 42P01 invalid reference).
+# (or, for `fe.*` cast, 42P01 invalid reference). A table's or subquery's
+# row is built at its scan, so the NULL-extended side of an outer join has
+# a NULL row, not a row of NULLs; an aliased JOIN's (or a USING alias's)
+# is a record of its columns, NULLs and all.
 WHOLE_ROW_OVER_A_JOIN = {
     "select fs from fs, fe": [("(1,y)",)],
     "select fs from fs join fe using (a)": [("(1,y)",)],
     "select fe.*::text from fs join fe using (a)": [("(1,x)",)],
     "select j from (fs join fe using (a)) as j": [(("1", "y", "x"),)],
+    "select fe from fs left join fe on false": [(None,)],
+    "select s from fs left join (select a, b from fe) s on false": [(None,)],
+    "select count(fe) from fs left join fe on false": [(0,)],
+    "select j from fe left join (fs join fe as f2 using (a)) as j on false": [
+        ((None, None, None),)
+    ],
+    "select u from fs join fe using (a) as u": [(("1",),)],
+    "select (fs).c, (fs.*).c from fs join fe using (a)": [("y", "y")],
+    "select fe::text from fs join fe using (a) order by 1": [("(1,x)",)],
+    "select fs.a from fs join fe on fe = row(1, 'x')::fe": [(1,)],
+    "select row(fs.*, fe.b) from fs join fe using (a)": [(("1", "y", "x"),)],
+    "select s from fe, (select 1 as x, 2 as x) s": [(("1", "2"),)],
 }
 
 
-@pytest.mark.backlog("RP-470")
+@pytest.mark.backlog_fixed("RP-470")
 @pytest.mark.parametrize("query", list(WHOLE_ROW_OVER_A_JOIN))
 def test_whole_row_over_a_join(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WHOLE_ROW_OVER_A_JOIN[query]
+
+
+@pytest.mark.backlog_fixed("RP-470")
+def test_whole_row_output_names(dsn: str) -> None:
+    """A cast whole row is named after the FROM item (FigureColname), not
+    `row`: it was over a join, and over one table for `t::text`."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        cur = c.execute("select fe.*::text, fe::text, (fs.*)::text from fs join fe using (a)")
+        names = [d.name for d in cur.description]
+        lone = c.execute("select fe::text, (fe.*)::text from fe").description
+    assert names == ["fe", "fe", "fs"]
+    assert [d.name for d in lone] == ["fe", "fe"]
+
+
+# Found while working RP-470. A LATERAL subquery's alias, a whole row named
+# inside a subquery, and `(t).*` under an ORDER BY of its position.
+WHOLE_ROW_REMAINDER = {
+    "select l from fs join lateral (select fs.a) l on true": [(("1",),)],
+    "select l from fe left join lateral (select fe.a from fs where false) l on true": [(None,)],
+    "select (select fs) from fs, fe": [("(1,y)",)],
+    "select (select fs) from fs": [("(1,y)",)],
+    "select (fs).* from fs, fe order by 1": [(1, "y")],
+}
+
+
+@pytest.mark.backlog("RP-479")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_REMAINDER))
+def test_whole_row_remainder(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_REMAINDER[query]
+
+
+# Found while working RP-470. A table's whole row is of its row type even
+# under a column-alias list; psycopg reads an unknown composite as text and
+# a record as a tuple.
+WHOLE_ROW_COLUMN_ALIASES = {
+    "select x from fs as x(p, q)": [("(1,y)",)],
+    "select x from fs as x(p, q), fe": [("(1,y)",)],
+}
+
+
+@pytest.mark.backlog("RP-480")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_COLUMN_ALIASES))
+def test_whole_row_under_column_aliases(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_COLUMN_ALIASES[query]
+
+
+@pytest.mark.backlog("RP-480")
+def test_whole_row_of_a_view_is_its_row_type(dsn: str) -> None:
+    """A view's whole row is of the view's row type (the RowDescription's
+    type OID is `'v'::regtype`), alone or over a join; here it was 1043,
+    varchar."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("create view rp_wv as select a, c from fs")
+        try:
+            lone = c.execute("select rp_wv from rp_wv").description[0].type_code
+            joined = c.execute("select rp_wv from rp_wv, fe").description[0].type_code
+            row = c.execute("select 'rp_wv'::regtype::oid").fetchone()
+        finally:
+            c.execute("drop view rp_wv")
+    assert row is not None and (lone, joined) == (row[0], row[0])
+
+
+# Found while working RP-470. PostgreSQL 15.19 reports a missing USING
+# column's 42703 with no position; here it points into the statement.
+USING_COLUMN_MISSING = {
+    "select * from fs as x(p) join fe using (a)": (
+        "42703",
+        'column "a" specified in USING clause does not exist in left table',
+        None,
+        None,
+    ),
+    "select * from fs join fe using (nosuch)": (
+        "42703",
+        'column "nosuch" specified in USING clause does not exist in left table',
+        None,
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog("RP-481")
+@pytest.mark.parametrize("query", list(USING_COLUMN_MISSING))
+def test_using_column_missing_has_no_position(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == USING_COLUMN_MISSING[query]
 
 
 _JOIN_PLAN = [
