@@ -686,14 +686,14 @@ These are explicit non-goals. Don't add them without a reason.
       mongod's number; (c) leave it open, as RM-170's decision did.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_a_line_counts_its_interrupt_checks
-- [ ] **A write has no `totalOplogSlotDurationMicros`.** mongod 8.2.11's
-      line and entry for an insert, a write statement, a `create` or a
-      `drop` say how long the write held its oplog timestamp before it
-      committed (97 us for an insert, 20 ms for a `create`). This server's
-      storage mints the timestamp inside the write's transaction and does
-      not time it.
-      Backlog-ID: RM-361
-      Verify: tests/backlog/test_rm_355_364.py::test_a_write_says_how_long_it_held_its_oplog_slot
+- [ ] **A `renameCollection` line names the wrong namespace.** mongod
+      8.2.1's `Slow query` line for a `renameCollection` (which runs
+      against `admin`) names the collection it renames, `ns: "<db>.c"`;
+      this server's names `admin.<db>.c` -- the command's database joined to
+      its argument, which is already a full namespace. Found while working
+      RM-361, 2026-11-07.
+      Backlog-ID: RM-378
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_rename_line_names_the_collection_it_renames
 - [ ] **A read of a view or a time-series collection has no
       `resolvedViews`.** mongod 8.2.11's line and entry name the view it
       resolved: `{viewNamespace, dependencyChain: [view, ..., collection],

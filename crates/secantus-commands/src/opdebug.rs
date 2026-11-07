@@ -256,6 +256,28 @@ pub(crate) fn wrote(locks: &Document) -> bool {
     })
 }
 
+/// How long the operation held oplog slots open before the writes that
+/// minted them committed (`totalOplogSlotDurationMicros`, RM-361), as
+/// mongod prints it: only when it is more than zero -- a write that minted
+/// no entry (an update that changed nothing, a statement of a transaction,
+/// whose entries are minted when it commits) or rolled back has none
+/// (measured 8.2.11).
+pub(crate) fn oplog_slot_micros(c: Option<&OperationCounts>) -> Option<Bson> {
+    let micros = c.map_or(0, |c| c.oplog_slot_micros);
+    (micros > 0).then(|| append_number(micros))
+}
+
+/// `n` as mongod's `BSONObjBuilder::appendNumber` stores a `long long`: an
+/// int32 within 2^30 of zero, else an int64.
+pub(crate) fn append_number(n: i64) -> Bson {
+    const MAX_INT: i64 = 1 << 30;
+    if (-MAX_INT..=MAX_INT).contains(&n) {
+        Bson::Int32(n as i32)
+    } else {
+        Bson::Int64(n)
+    }
+}
+
 /// `doc`'s fields in `order`; any field `order` does not name keeps its
 /// place relative to the others, after them.
 pub(crate) fn reorder(mut doc: Document, order: &[&str]) -> Document {
@@ -457,6 +479,19 @@ mod tests {
                 "timeWaitingMicros": { "cacheMicros": 2551_i64 },
             })
         );
+    }
+
+    #[test]
+    fn an_oplog_slot_is_shown_only_when_it_was_held() {
+        assert_eq!(oplog_slot_micros(None), None);
+        assert_eq!(oplog_slot_micros(Some(&OperationCounts::default())), None);
+        let c = OperationCounts {
+            oplog_slot_micros: 97,
+            ..Default::default()
+        };
+        assert_eq!(oplog_slot_micros(Some(&c)), Some(Bson::Int32(97)));
+        assert_eq!(append_number(1 << 30), Bson::Int32(1 << 30));
+        assert_eq!(append_number((1 << 30) + 1), Bson::Int64((1 << 30) + 1));
     }
 
     #[test]

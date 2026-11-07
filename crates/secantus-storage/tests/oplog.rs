@@ -507,3 +507,70 @@ fn cluster_time_monotonic_across_reopen() {
     drop(st);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// How long the operation counted in `scope` held oplog slots open.
+fn slot_micros(scope: &secantus_storage::OperationScope) -> i64 {
+    scope.counts().oplog_slot_micros
+}
+
+#[test]
+fn a_write_counts_how_long_it_held_its_oplog_slots() {
+    // mongod's `totalOplogSlotDurationMicros` (RM-361): each slot is timed
+    // from its reservation to the commit of the write that took it.
+    with_db(|st| {
+        let docs: Vec<Vec<u8>> = (0..200).map(|i| enc(&doc! {"_id": i, "x": i})).collect();
+        let scope = secantus_storage::operation_scope();
+        st.insert("app", "c", docs, true).unwrap();
+        assert!(slot_micros(&scope) > 0);
+    });
+}
+
+#[test]
+fn a_write_that_rolls_back_or_mints_nothing_counts_no_slot() {
+    with_db(|st| {
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
+        // A duplicate key rolls its write back: mongod counts nothing.
+        let scope = secantus_storage::operation_scope();
+        assert!(st.insert_one("app", "c", &enc(&doc! {"_id": 1})).is_err());
+        assert_eq!(slot_micros(&scope), 0);
+        drop(scope);
+        // A read takes no slot.
+        let scope = secantus_storage::operation_scope();
+        st.scan_collection("app", "c").unwrap();
+        assert_eq!(slot_micros(&scope), 0);
+    });
+}
+
+#[test]
+fn a_transactions_slots_are_its_commits() {
+    // mongod reserves a transaction's slots when it commits, so its
+    // statements count none and `commitTransaction` counts them.
+    with_db(|st| {
+        let mut txn = st.begin_user_transaction().unwrap();
+        let statement = secantus_storage::operation_scope();
+        st.with_user_transaction(&mut txn, || {
+            for i in 0..50 {
+                st.insert_one("app", "c", &enc(&doc! {"_id": i})).unwrap();
+            }
+        })
+        .unwrap();
+        assert_eq!(slot_micros(&statement), 0);
+        drop(statement);
+        let commit = secantus_storage::operation_scope();
+        st.commit_user_transaction(&mut txn).unwrap();
+        assert!(slot_micros(&commit) > 0);
+    });
+}
+
+#[test]
+fn an_operation_inside_another_adds_its_slots_to_it() {
+    with_db(|st| {
+        let outer = secantus_storage::operation_scope();
+        {
+            let _inner = secantus_storage::operation_scope();
+            let docs: Vec<Vec<u8>> = (0..200).map(|i| enc(&doc! {"_id": i})).collect();
+            st.insert("app", "c", docs, true).unwrap();
+        }
+        assert!(slot_micros(&outer) > 0);
+    });
+}

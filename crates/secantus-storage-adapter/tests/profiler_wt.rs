@@ -417,8 +417,8 @@ fn update_and_delete_are_profiled_by_statement() {
         );
         // What the statement's plan examined and the keys it wrote, its plan
         // cache key, locks and read concern, then its plan after `millis`
-        // (RM-023, mongod 8.2.11's order). A write's flow control is
-        // RM-357's.
+        // and how long it held its oplog slot (RM-023, RM-361, mongod
+        // 8.2.11's order). A write's flow control is RM-357's.
         let mut want = vec![
             "op",
             "ns",
@@ -438,6 +438,7 @@ fn update_and_delete_are_profiled_by_statement() {
             "millis",
             "planSummary",
             "planningTimeMicros",
+            "totalOplogSlotDurationMicros",
             "execStats",
             "ts",
             "client",

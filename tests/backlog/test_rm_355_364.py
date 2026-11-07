@@ -150,11 +150,10 @@ def test_a_line_names_its_engine_concerns_and_collection(rust_mongo: Any, mongod
         "protocol",
     )
     leave_out = {
-        # RM-355, RM-358, RM-360, RM-361, RM-357 and the times.
+        # RM-355, RM-358, RM-360, RM-357 and the times.
         "queues",
         "queryShapeHash",
         "numInterruptChecks",
-        "totalOplogSlotDurationMicros",
         "locks",
         "flowControl",
         "storage",
@@ -718,11 +717,13 @@ def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> 
 # ------------------------------------------------------------- RM-361 --
 
 
-@pytest.mark.backlog("RM-361")
+@pytest.mark.backlog_fixed("RM-361")
 def test_a_write_says_how_long_it_held_its_oplog_slot(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line and profile entry for an insert carry
     `totalOplogSlotDurationMicros`: how long the write held its oplog
-    timestamp before committing (measured 2026-10-27)."""
+    timestamp before committing (measured 2026-10-27). This server's had
+    none; its storage now times each minted run of oplog seqs from its
+    mint to its transaction's commit."""
     got = _both(rust_mongo, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
     answers = {
         s: ("totalOplogSlotDurationMicros" in _line(lines, "insert"))
