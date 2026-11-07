@@ -4115,6 +4115,32 @@ fn a_column_reference_with_no_from_names_nothing() {
 }
 
 #[test]
+fn a_subquery_target_is_named_as_written() {
+    // FigureColname names a target from the expression as written (RP-449):
+    // a correlated subquery's per-row call named it `\x1fcorrelated`, and a
+    // cast over a scalar subquery took its type's name. Answers measured on
+    // PostgreSQL 15.19.
+    for (q, want) in [
+        ("select (select id + 1) from t", "?column?"),
+        ("select (select (select id) + 1) from t", "?column?"),
+        ("select (select id + 1)::int8 from t", "?column?"),
+        ("select (select id)::int8 from t", "id"),
+        ("select (select abs(id))::text from t", "abs"),
+        ("select (select id + 1 as z) from t", "z"),
+        ("select exists(select id)::int from t", "exists"),
+    ] {
+        match analysed(q) {
+            Ok(Statement::Select(s)) => assert_eq!(
+                s.columns.first().map(|(out, _)| out.as_str()),
+                Some(want),
+                "for {q}"
+            ),
+            other => panic!("{q}: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn a_subquery_two_levels_down_reads_the_outer_row() {
     // `colNameToVar` searches every enclosing level, nearest first (RP-445):
     // a FROM-less subquery in between hid the outer row, as 42703 or a

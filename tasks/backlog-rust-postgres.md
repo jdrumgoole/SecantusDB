@@ -1627,17 +1627,16 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A correlated subquery whose target is an expression names its
-      column `\x1fcorrelated`.** `select (select a + 1) from (select 1 a)
-      t` answers its row (2) under the column name `\x1fcorrelated`, the
-      internal per-row call the subquery was rewritten into; PostgreSQL
-      15.19's `FigureColname` names it `?column?`, as it does `(select (select
-      a) + 1)` and `(select a + 1 from (select 2 b) u)`. A target that is a
-      bare column (`(select a)`) is already named after it. A client that
-      reads columns by name sees the internal one. Measured on PostgreSQL
-      15.19 (found while working RP-445).
-      Verify: tests/backlog/test_rp_correlated_subquery.py::test_expression_target_is_named_column
-      Backlog-ID: RP-449
+- [ ] **A subquery in a CREATE TABLE AS or CREATE MATERIALIZED VIEW is
+      refused.** `create table ct as select (select 1) x from e` is 0A000
+      `SubLink is not supported yet`, uncorrelated or correlated (`(select
+      e.a + 1)`, `exists(select ... where f.a = e.a)`), and so is `create
+      materialized view mv as select (select a + 1) from e`; PostgreSQL
+      15.19 makes each table with its rows. `select ... into` of the same
+      list is made. Measured on a private 15.19 cluster with `e(a int, b
+      text)` (found while working RP-449).
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_subquery_in_create_table_as
+      Backlog-ID: RP-466
 - [ ] **A missing relation named by a string literal for a `regclass`
       parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
       untyped literal argument to its parameter's type during analysis
