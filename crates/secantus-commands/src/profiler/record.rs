@@ -560,6 +560,9 @@ fn outcome(
 /// write concern, and WiredTiger's statistics for its sessions. Placed in
 /// mongod's order by `opdebug::PROFILE_ORDER`.
 fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: &mut Document) {
+    if let Some(shape) = crate::query_shape::hash(&ctx.db_name, doc) {
+        entry.insert("queryShapeHash", shape);
+    }
     if let (true, Some(e)) = (ok, &ctx.exec_stats) {
         entry.insert("keysExamined", e.keys_examined);
         entry.insert("docsExamined", e.docs_examined);

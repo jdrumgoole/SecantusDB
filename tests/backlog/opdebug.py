@@ -54,10 +54,12 @@ def logged(
     setup: Callable[[Any], Any],
     op: Callable[[Any], Any],
     prefix: str = "opdebug",
+    name: str | None = None,
 ) -> tuple[list[tuple[str, dict]], list[dict]]:
     """`op`'s `Slow query` lines, as `(component, attr)`, and its database's
-    profile entries."""
-    db = client[fresh(prefix)]
+    profile entries. `name` names the database, for a comparison of what
+    depends on it (a query shape's hash covers its namespace)."""
+    db = client[name or fresh(prefix)]
     setup(db)
     log = client.admin.command("getLog", "global")["log"]
     last = log[-1] if log else None

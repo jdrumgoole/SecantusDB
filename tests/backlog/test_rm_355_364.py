@@ -14,13 +14,15 @@ import pymongo
 import pytest
 from pymongo.write_concern import WriteConcern
 
-from tests.backlog.opdebug import logged, seed
+from tests.backlog.opdebug import fresh, logged, seed
 
 
-def _both(rust_mongo: Any, mongod_rs: Any, op: Any, setup: Any = seed) -> dict:
+def _both(
+    rust_mongo: Any, mongod_rs: Any, op: Any, setup: Any = seed, name: str | None = None
+) -> dict:
     return {
-        "rust": logged(rust_mongo, False, setup, op),
-        "mongod": logged(mongod_rs, True, setup, op),
+        "rust": logged(rust_mongo, False, setup, op, name=name),
+        "mongod": logged(mongod_rs, True, setup, op, name=name),
     }
 
 
@@ -400,14 +402,78 @@ def test_more_writes_report_mongods_locks(rust_mongo: Any, mongod_rs: Any, name:
 # ------------------------------------------------------------- RM-358 --
 
 
-@pytest.mark.backlog("RM-358")
+@pytest.mark.backlog_fixed("RM-358")
 def test_a_read_names_its_query_shape(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11's line and profile entry for a `find` carry
-    `queryShapeHash`, the SHA-256 of the query's representative shape
-    (measured 2026-10-27). This server computes no query shape."""
-    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
-    answers = {s: _line(lines, "find").get("queryShapeHash") for s, (lines, _) in got.items()}
-    assert answers["mongod"]
+    """mongod 8.2.11's line and profile entry for a `find`, a `distinct` and
+    an `aggregate` carry `queryShapeHash`, the SHA-256 of the query's
+    representative shape (measured 2026-10-27), which covers the namespace:
+    both servers run it in a database of the same name. This server
+    computed no query shape."""
+    reads = {
+        "find": lambda d: list(d.c.find({"x": {"$gt": 1}})),
+        "distinct": lambda d: d.c.distinct("y", {"x": {"$lt": 7}}),
+        "aggregate": lambda d: list(d.c.aggregate([{"$match": {"x": {"$gte": 4}}}])),
+    }
+    answers = {}
+    for command, op in reads.items():
+        got = _both(rust_mongo, mongod_rs, op, name=fresh("qshape"))
+        answers[command] = {
+            s: (
+                _line(lines, command).get("queryShapeHash"),
+                [e.get("queryShapeHash") for e in entries],
+            )
+            for s, (lines, entries) in got.items()
+        }
+    for command, both in answers.items():
+        assert both["mongod"][0], command
+        assert both["mongod"][1] == [both["mongod"][0]], command
+    ours = {c: b["rust"] for c, b in answers.items()}
+    assert ours == {c: b["mongod"] for c, b in answers.items()}
+
+
+_UNSHAPED = {
+    "a geo predicate": {
+        "find": "c",
+        "filter": {"loc": {"$geoWithin": {"$center": [[0, 0], 5]}}},
+    },
+    "an expression outside the nary operators": {
+        "aggregate": "c",
+        "pipeline": [{"$project": {"d": {"$dateToString": {"date": "$t", "format": "%Y"}}}}],
+        "cursor": {},
+    },
+    "a stage outside the shaped ones": {
+        "aggregate": "c",
+        "pipeline": [{"$facet": {"a": [{"$match": {"x": 1}}]}}],
+        "cursor": {},
+    },
+    "a $lookup with a pipeline": {
+        "aggregate": "c",
+        "pipeline": [{"$lookup": {"from": "c", "pipeline": [{"$match": {"x": 1}}], "as": "j"}}],
+        "cursor": {},
+    },
+}
+
+
+@pytest.mark.backlog("RM-358")
+def test_a_query_of_every_kind_names_its_query_shape(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.1's `explain` (as its line and profile entry) carries a
+    `queryShapeHash` for every `find`, `distinct` and `aggregate` it parses
+    (measured 2026-11-07). This server shapes the common operators and
+    stages (`tests/mongod_live/test_query_shape_hash.py`) and prints none
+    for the rest: geo and text predicates, `$where`, `$jsonSchema`, the
+    aggregation operators with a serialization of their own, and stages
+    beyond the shaped list."""
+    name = fresh("qshape")
+    answers = {}
+    for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        db = client[name]
+        db.c.insert_one({"x": 1, "loc": [0, 0]})
+        answers[server] = {
+            what: db.command("explain", cmd, verbosity="queryPlanner").get("queryShapeHash")
+            for what, cmd in _UNSHAPED.items()
+        }
+        client.drop_database(name)
+    assert all(answers["mongod"].values()), answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 

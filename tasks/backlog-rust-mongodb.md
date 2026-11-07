@@ -575,13 +575,33 @@ These are explicit non-goals. Don't add them without a reason.
         `$documents` takes no lock on mongod, and the global IS here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
-- [ ] **No `queryShapeHash` on a line or a profile entry.** mongod 8.2.11
-      prints the SHA-256 of a `find`'s, `aggregate`'s or `distinct`'s
-      representative query shape (`queryShapeHash`) on its line and entry,
-      as its `explain` and `$queryStats` do; this server computes no query
-      shape (see the `$queryStats` item, which needs the same hash).
+- [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
+      `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
+      `explain` carry mongod's `queryShapeHash` (`secantus-commands`
+      `query_shape.rs`, 130 shapes matching mongod 8.2.1 in
+      `tests/mongod_live/test_query_shape_hash.py`). A query using
+      something the module does not shape prints none, where mongod
+      prints one:
+      - geo (`$geoWithin`, `$geoIntersects`, `$near`) and `$text`
+        predicates, `$where`, `$jsonSchema`, `$sampleRate`;
+      - aggregation operators that serialize their own way (the date
+        operators, `$convert` and the `$toX` family, `$let`, `$map`,
+        `$filter`, `$reduce`, `$switch`, the regex and trim operators,
+        `$getField`, `$setField`, `$sortArray`, `$zip`, `$meta`, ...), and
+        accumulators other than `$sum`, `$avg`, `$min`, `$max`, `$first`,
+        `$last`, `$push`, `$addToSet`, `$stdDevPop`, `$stdDevSamp`,
+        `$count`;
+      - stages other than `$match`, `$sort`, `$limit`, `$skip`, `$count`,
+        `$group`, `$project`, `$addFields`, `$set`, `$unset`, `$unwind`,
+        `$replaceRoot`, `$replaceWith`, `$sample`, `$sortByCount` and a
+        `$lookup` on `localField` / `foreignField`, and a collectionless
+        `aggregate: 1`;
+      - a DBPointer literal (the bson crate cannot build mongod's
+        representative one).
+      Each is mongod's serializer for that node, transcribed and checked as
+      the shaped ones were.
       Backlog-ID: RM-358
-      Verify: tests/backlog/test_rm_355_364.py::test_a_read_names_its_query_shape
+      Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
 - [ ] **A profile entry has no `execStats`.** mongod 8.2.11's entry for a
       read or a write statement carries the plan's stages with what each
       did (`works`, `advanced`, `keysExamined`, ...), from the run itself.
@@ -899,10 +919,9 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       on a one-member replica set (an empty result on a fresh one, filling
       as queries run, so an empty answer here would be a stand-in). It needs
       mongod's query-shape statistics: the query stats store, keyed by the
-      representative query shape's SHA-256 (`queryShapeHash`, which mongod's
-      `explain` of a find, distinct or aggregate also prints and this
-      server's does not), which RM-170 (`includeQueryStatsMetrics`) also
-      lacks. The plan cache's shape (`planCacheShapeHash`) is a different
+      representative query shape's SHA-256 (`queryShapeHash`, which this
+      server computes since 2026-11-07 for the shapes RM-358 covers), which
+      RM-170 (`includeQueryStatsMetrics`) also lacks. The plan cache's shape (`planCacheShapeHash`) is a different
       shape and does not serve it. (`$listSampledQueries` landed 2026-10-20,
       and `$planCacheStats` 2026-10-27 with the plan cache, RM-154.)
       Backlog-ID: RM-215
@@ -927,10 +946,10 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       an error of its own:
       - diagnostics: `getDiagnosticData` (mongod's FTDC sample);
       - settings: `setQuerySettings` / `removeQuerySettings` (each setting
-        is keyed by mongod's `queryShapeHash`, which is not a plain SHA-256
-        of the shape's BSON -- the debug shape, representative literals and
-        likely extra fields were tried, 2026-10-20 -- so the hash needs
-        mongod's own shape serialization first).
+        is keyed by mongod's `queryShapeHash`; a `find`'s and a
+        `distinct`'s hash a buffer of their own, an `aggregate`'s its
+        shape's BSON, all of which `query_shape.rs` reproduces since
+        2026-11-07 for the shapes RM-358 covers).
 
       `filemd5` with `partialOk` is refused by name (115): its `md5state` is
       mongod's own MD5 implementation's state. `autoCompact` landed
@@ -2500,6 +2519,21 @@ touched:
   the change that makes this diagnosable.
   Backlog-ID: RM-254
   Verify: none -- an intermittent CI stall whose hung test is unknown
+- [ ] **RM-008's limiter test reads mongod's answer under load as a
+  different answer.** `test_ingress_rate_limiter_admits_queues_and_closes`
+  opens six connections against each server with the limiter at one a
+  second and a burst of one, and compares which were answered. In the
+  local RM gate's `backlog verify` step (2026-11-07, load average about
+  11 on 12 cores) mongod answered two connections with no queue, where
+  it answers one: the six connects took longer than a second to land, so
+  the bucket refilled. The test passed three runs out of three on its own
+  at low load. The test depends on six connects landing within one
+  second, so it is flaky by construction: it needs a measurement that
+  load cannot change (connect all six behind a barrier and record how
+  long they took to land, or compare with the answer mongod gives when
+  they land within the second), not a retry.
+  Backlog-ID: RM-372
+  Verify: none -- a timing flake under load; the test passes when the connects land within a second
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 

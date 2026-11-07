@@ -256,6 +256,10 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
         crate::opdebug::collection_type(ctx, &ctx.db_name, coll)
     };
     out.insert("collectionType", kind);
+    // A query that parsed has its shape, whether or not it then ran (RM-358).
+    if let Some(shape) = crate::query_shape::hash(&ctx.db_name, request) {
+        out.insert("queryShapeHash", shape);
+    }
     let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
     let exec = ctx.exec_stats.as_ref().filter(|_| ok);
     if ok {
