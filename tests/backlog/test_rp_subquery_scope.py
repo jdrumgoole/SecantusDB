@@ -12,7 +12,8 @@ FROM-subquery is offered a sibling's alias as its hint); and found while
 working RP-454, RP-469 (a FROM item named as a table an aliased JOIN hides
 is refused), RP-470 (a whole-row reference to a joined table), RP-471
 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an aliased JOIN)
-and RP-468 (a correlated subquery reading a join's column gets text).
+and RP-468 (a correlated subquery reading a join's column got text;
+fixed).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -463,16 +464,27 @@ def test_aliased_join_viewdef(query: str, dsn: str) -> None:
 
 
 # A correlated subquery's value read from a join's column has that
-# column's type, `integer`; it came out text, as RP-453's lookup of the
-# outer reference's type does not reach into a join.
+# column's type: a leaf's own, a USING join's merged one (the sides' common
+# type, `bigint` over int4 and int8), or one of the join's alias. It came
+# out text, as RP-453's lookup of the outer reference's type did not reach
+# into a join. A CTE leaf is the CTE, ahead of the table of its name.
 JOIN_COLUMN_IN_A_SUBQUERY = {
     "select (select fs.a from fe where fe.a = fs.a) from fs join fe using (a)": [(1,)],
     "select (select j.a from fe limit 1) from (fs join fe using (a)) as j": [(1,)],
     "select (select u.a from fe limit 1) from fs join fe using (a) as u": [(1,)],
+    "select (select u.a from fe limit 1)"
+    " from fs join (select 1::int8 a, 2.5::numeric d) g using (a) as u": [(1,)],
+    "select (select g.d from fe limit 1)"
+    " from fs join (select 1::int8 a, 2.5::numeric d) g using (a)": [(Decimal("2.5"),)],
+    "select (select j.x from fe limit 1) from (fs join fe using (a)) as j(x, y, z)": [(1,)],
+    "with fs as (select 'q'::text as a)"
+    " select (select fs.a from fe limit 1) from fs join fe on true": [("q",)],
+    "select (select fs.a * 2 from fe limit 1) from fs cross join fe": [(2,)],
+    "select (select fe.a from fs limit 1) from fs join (fe join fs x using (a)) using (a)": [(1,)],
 }
 
 
-@pytest.mark.backlog("RP-468")
+@pytest.mark.backlog_fixed("RP-468")
 @pytest.mark.parametrize("query", list(JOIN_COLUMN_IN_A_SUBQUERY))
 def test_join_column_in_a_subquery_keeps_its_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == JOIN_COLUMN_IN_A_SUBQUERY[query]
