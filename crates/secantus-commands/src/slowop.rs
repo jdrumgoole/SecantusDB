@@ -260,6 +260,10 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     if let Some(shape) = crate::query_shape::hash(&ctx.db_name, request) {
         out.insert("queryShapeHash", shape);
     }
+    // The views it resolved, whether or not it then failed (RM-362).
+    if let Some(views) = &ctx.resolved_views {
+        out.insert("resolvedViews", views.clone());
+    }
     let ok = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
     let exec = ctx.exec_stats.as_ref().filter(|_| ok);
     if ok {

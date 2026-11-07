@@ -295,6 +295,9 @@ pub(crate) fn finish(
         if let Some(command) = exec.and_then(|e| e.originating_command.as_ref()) {
             entry.insert("originatingCommand", abbreviated(command));
         }
+        if let Some(views) = &ctx.resolved_views {
+            entry.insert("resolvedViews", views.clone());
+        }
         outcome(name, doc, inner_n, modified, reply, ctx, &mut entry);
         entry.insert("responseLength", response_length(reply, ctx));
         entry.insert("protocol", if ctx.op_query { "op_query" } else { "op_msg" });

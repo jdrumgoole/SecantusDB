@@ -287,7 +287,7 @@ pub(crate) const MAX_VIEW_DEPTH: usize = 20;
 /// `from` only as a string -- the `{db, coll}` form is refused elsewhere),
 /// `$out` / `$merge` targets, and those of every sub-pipeline (`$lookup`,
 /// `$unionWith`, `$facet`).
-fn involved_namespaces(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
+pub(crate) fn involved_namespaces(pipeline: &[Bson], db: &str, out: &mut Vec<(String, String)>) {
     for stage in pipeline.iter().filter_map(Bson::as_document) {
         let Some((name, spec)) = stage.iter().next() else {
             continue;

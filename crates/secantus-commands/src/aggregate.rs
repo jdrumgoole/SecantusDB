@@ -211,6 +211,11 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Err(e) = validate_stage_names(&pipeline) {
         return Ok(e.into_reply());
     }
+    // mongod resolves the namespaces the stages read once it knows the
+    // stages, before it parses their expressions (RM-362).
+    if let Ok(storage) = ctx.storage() {
+        crate::opdebug::note_resolved_views(storage, &ctx.db_name, coll.as_deref(), &pipeline);
+    }
     // `$score`, `$rankFusion` and `$scoreFusion`, as the stages that run them.
     let pipeline = if crate::hybrid::mentions_hybrid(&pipeline) {
         match crate::hybrid::prepare(pipeline, coll.as_deref()) {

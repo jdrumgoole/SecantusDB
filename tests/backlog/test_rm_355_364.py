@@ -804,11 +804,12 @@ def test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot(
 # ------------------------------------------------------------- RM-362 --
 
 
-@pytest.mark.backlog("RM-362")
+@pytest.mark.backlog_fixed("RM-362")
 def test_a_read_of_a_view_names_the_view_it_resolved(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `find` of a view carries
     `resolvedViews`: the view, its chain of namespaces and the pipeline it
-    resolved to (measured 2026-10-27)."""
+    resolved to (measured 2026-10-27). This server resolved the view and
+    printed nothing of it."""
 
     def setup(db: Any) -> None:
         seed(db)
@@ -823,6 +824,118 @@ def test_a_read_of_a_view_names_the_view_it_resolved(rust_mongo: Any, mongod_rs:
         ]
     assert answers["mongod"] == [(["v", "c"], [])]
     assert answers["rust"] == answers["mongod"]
+
+
+def _views_setup(db: Any) -> None:
+    seed(db)
+    db.d.insert_many([{"_id": n, "k": n} for n in range(3)])
+    db.command("create", "v", viewOn="c", pipeline=[{"$match": {"x": {"$gte": 1}}}])
+    db.command("create", "w", viewOn="v", pipeline=[{"$project": {"y": 0}}])
+    db.command("create", "vd", viewOn="d", pipeline=[{"$match": {"k": {"$gte": 0}}}])
+    db.command(
+        "create",
+        "vl",
+        viewOn="c",
+        pipeline=[{"$lookup": {"from": "vd", "localField": "x", "foreignField": "k", "as": "j"}}],
+    )
+    db.create_collection("ts", timeseries={"timeField": "t", "metaField": "m"})
+    db.create_collection("tsg", timeseries={"timeField": "t", "granularity": "minutes"})
+    db.command("create", "vts", viewOn="ts", pipeline=[{"$match": {"m": 1}}])
+
+
+_VIEW_READS = {
+    "nested view": lambda d: list(d.w.find()),
+    "aggregate of a view": lambda d: list(d.w.aggregate([{"$match": {"x": 2}}])),
+    "count of a view": lambda d: d.command("count", "v", query={}),
+    "distinct of a view": lambda d: d.v.distinct("y"),
+    "a view's own $lookup": lambda d: list(d.vl.find()),
+    "time-series": lambda d: list(d.ts.find()),
+    "time-series by granularity": lambda d: list(d.tsg.find()),
+    "view of a time-series": lambda d: list(d.vts.find()),
+    "$lookup, $unionWith, $facet": lambda d: list(
+        d.w.aggregate(
+            [
+                {"$lookup": {"from": "vd", "localField": "x", "foreignField": "k", "as": "j"}},
+                {"$unionWith": {"coll": "d", "pipeline": [{"$unionWith": "vts"}]}},
+                {"$facet": {"a": [{"$lookup": {"from": "vl", "pipeline": [], "as": "q"}}]}},
+            ]
+        )
+    ),
+    "$graphLookup": lambda d: list(
+        d.c.aggregate(
+            [
+                {
+                    "$graphLookup": {
+                        "from": "vd",
+                        "startWith": "$x",
+                        "connectFromField": "k",
+                        "connectToField": "k",
+                        "as": "j",
+                    }
+                }
+            ]
+        )
+    ),
+    "$merge target named in another database": lambda d: (
+        list(d.c.aggregate([{"$merge": {"into": {"db": d.name + "_other", "coll": "v"}}}])),
+        d.client.drop_database(d.name + "_other"),
+    ),
+    "explain": lambda d: d.command("explain", {"find": "v", "filter": {}}),
+    "getMore": lambda d: list(d.v.find(batch_size=2)),
+    "a read that fails as it runs": lambda d: list(
+        d.v.find({"$expr": {"$divide": [1, {"$subtract": ["$x", "$x"]}]}})
+    ),
+    "no view": lambda d: list(
+        d.c.aggregate([{"$lookup": {"from": "nope", "pipeline": [], "as": "j"}}])
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-362")
+def test_every_view_a_read_resolves_is_named(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2's line and profile entry name every view among the
+    namespaces a read reads -- its own, its stages' (`$lookup`,
+    `$graphLookup`, `$unionWith`, `$facet`, a `$merge` target, looked up by
+    its name in the command's database), and those of the views' own
+    pipelines -- by name, each with its chain down to its collection and the
+    pipeline it resolved to (a time-series collection's is its
+    `$_internalUnpackBucket`). A `getMore` names none, a read that fails
+    once it ran still does. Measured 8.2.1, 2026-11-07. (Where the field
+    sits is `opdebug::LINE_ORDER` / `PROFILE_ORDER`'s.)"""
+    answers = {}
+    for case, op in _VIEW_READS.items():
+        got = _both(rust_mongo, mongod_rs, op, _views_setup)
+        answers[case] = {}
+        for server, (lines, entries) in got.items():
+            seen = []
+            for attrs in [a for _, a in lines] + entries:
+                views = attrs.get("resolvedViews")
+                seen.append(
+                    (
+                        next(iter(attrs.get("command", {})), ""),
+                        [
+                            (
+                                v["viewNamespace"].split(".", 1)[1],
+                                v["dependencyChain"],
+                                v["resolvedPipeline"],
+                            )
+                            for v in views or []
+                        ],
+                    )
+                )
+            answers[case][server] = seen
+    assert answers["nested view"]["mongod"][0][1] == [
+        ("w", ["w", "v", "c"], [{"$match": {"x": {"$gte": 1}}}, {"$project": {"y": 0}}])
+    ]
+    assert answers["time-series by granularity"]["mongod"][0][1] == [
+        (
+            "tsg",
+            ["tsg", "system.buckets.tsg"],
+            [{"$_internalUnpackBucket": {"timeField": "t", "bucketMaxSpanSeconds": 86400}}],
+        )
+    ]
+    for case, a in answers.items():
+        assert a["rust"] == a["mongod"], case
 
 
 # ------------------------------------------------------------- RM-363 --

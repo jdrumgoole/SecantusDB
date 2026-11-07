@@ -133,6 +133,7 @@ pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // A time-series collection is a view over its buckets on mongod, and
     // answers as one.
     crate::timeseries::check_hint(storage, &ctx.db_name, &coll, &filter, hint)?;
+    crate::opdebug::note_resolved_views(storage, &ctx.db_name, Some(&coll), &[]);
     let on_view = crate::views::is_view(storage, &ctx.db_name, &coll);
     let as_view = on_view
         || storage
