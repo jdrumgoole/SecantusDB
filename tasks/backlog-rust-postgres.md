@@ -2016,19 +2016,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
 
-## Found while working RP-478 (2026-11-07)
-
-- [ ] **A LATERAL subquery draws a `nextval` once more than its rows.**
-      `select a, n from fe, lateral (select nextval('lq') + fe.a as n) s`,
-      over `fe` holding one row, answers `(1, 2)` and leaves `lq` at 1 on
-      PostgreSQL 15.19; here it answers `(1, 3)` and leaves it at 2, the
-      bare form (`+ a`) the same. `lateral_leaf` plans the item once over
-      sample values for its output's shape, and planning a FROM-less body
-      evaluates its targets, so the sequence is drawn there before each
-      left row draws its own. Measured on a private 15.19 cluster.
-      Backlog-ID: RP-482
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_lateral_subquery_draws_once_per_row
-
 ## Found while working RP-316 (2026-11-02)
 
 - [ ] **Every CREATE VIEW takes over a second.** Each one rebuilds

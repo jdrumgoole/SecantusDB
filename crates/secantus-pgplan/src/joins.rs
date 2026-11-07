@@ -1425,10 +1425,14 @@ fn lateral_leaf(
         return Ok(None);
     }
     // Planned once over typed sample values, for the output's shape; each left
-    // row re-plans it with its own.
+    // row re-plans it with its own. Only the shape is wanted, so no user
+    // function is called and no sequence drawn: planning a FROM-less body
+    // evaluates its targets, and a call here would run once more than the
+    // left side has rows.
     let mut sample_params = params.to_vec();
     sample_params.extend(types.iter().map(|t| sample_value_for_type(t)));
-    let plan = match plan_select(&inner, lookup, &sample_params) {
+    let planned = crate::correlated::without_calls(|| plan_select(&inner, lookup, &sample_params));
+    let plan = match planned {
         // It names a column nothing has: PostgreSQL's 42703, where the
         // planner could only say it cannot read the reference.
         Err(Error::Unsupported(_)) if unresolved.is_some() => {

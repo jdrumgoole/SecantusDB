@@ -652,9 +652,9 @@ def test_lateral_subquery_reads_an_earlier_item_by_bare_name(query: str, dsn: st
     assert answer(dsn, query) == LATERAL_BARE_NAME[query]
 
 
-# Found while working RP-478: a LATERAL subquery is planned once over
-# sample values for its output's shape, and that planning evaluates a
-# FROM-less body's targets, so a `nextval` in one is drawn once more than
+# Found while working RP-478: a LATERAL subquery was planned once over
+# sample values for its output's shape, and that planning evaluated a
+# FROM-less body's targets, so a `nextval` in one was drawn once more than
 # the left side has rows. The qualified form (`fe.a`) and the bare one
 # (`a`, since RP-478) alike.
 LATERAL_DRAWS = [
@@ -663,7 +663,7 @@ LATERAL_DRAWS = [
 ]
 
 
-@pytest.mark.backlog("RP-482")
+@pytest.mark.backlog_fixed("RP-482")
 @pytest.mark.parametrize("query", LATERAL_DRAWS)
 def test_lateral_subquery_draws_once_per_row(query: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
@@ -677,3 +677,43 @@ def test_lateral_subquery_draws_once_per_row(query: str, dsn: str) -> None:
         finally:
             c.execute("drop sequence lq")
     assert (rows, drawn) == ([(1, 2)], [(1,)])
+
+
+# The same shape planning called a user function in a LATERAL item once
+# more than the left side has rows: a function in FROM (implicitly
+# lateral), a LATERAL one, and one called in a LATERAL subquery's select
+# list each wrote its row twice for fe's one. PostgreSQL 15.19, on a
+# private cluster: once each.
+LATERAL_CALLS = {
+    "select * from fe, lateral lz(fe.a)": [(1, "x", 1)],
+    "select * from fe, lz(a)": [(1, "x", 1)],
+    "select * from fe, lateral ly(fe.a)": [(1, "x", 1)],
+    "select a, n from fe, lateral (select ly(fe.a) as n) s": [(1, 1)],
+    "select a, n from fe, lateral (select x + 1 as n from lz(fe.a) x) s": [(1, 2)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-482")
+@pytest.mark.parametrize("query", list(LATERAL_CALLS))
+def test_lateral_item_calls_once_per_row(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("drop table if exists lcalls")
+        c.execute("create table lcalls (x int)")
+        c.execute(
+            "create or replace function lz(i int) returns setof int language sql"
+            " as $$ insert into lcalls values (i); select i $$"
+        )
+        c.execute(
+            "create or replace function ly(i int) returns int language sql"
+            " as $$ insert into lcalls values (i); select i $$"
+        )
+        try:
+            rows = c.execute(query).fetchall()
+            calls = c.execute("select count(*) from lcalls").fetchall()
+        finally:
+            c.execute("drop function lz(int)")
+            c.execute("drop function ly(int)")
+            c.execute("drop table lcalls")
+    assert (rows, calls) == (LATERAL_CALLS[query], [(1,)])
