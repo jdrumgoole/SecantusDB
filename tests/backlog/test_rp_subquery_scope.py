@@ -14,7 +14,7 @@ is refused), RP-470 (a whole-row reference to a joined table was not found;
 fixed), RP-471 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an
 aliased JOIN) and RP-468 (a correlated subquery reading a join's column got
 text; fixed); found while working RP-461, RP-478 (a LATERAL subquery's bare
-name for an earlier FROM item's column is not found); and found while
+name for an earlier FROM item's column was not found; fixed); and found while
 working RP-470, RP-479 (a whole-row reference still refused in three
 shapes), RP-480 (a whole row typed as a record or as varchar) and RP-481 (a
 USING column's 42703 carries a position).
@@ -598,16 +598,82 @@ def test_join_column_in_a_subquery_keeps_its_type(query: str, dsn: str) -> None:
 
 
 # Found while working RP-461: a LATERAL subquery reads the FROM items
-# before it by their bare column names too; here only a qualified name
-# (`fe.b`) is found, and a bare one is 42703. A LATERAL function already
-# reads them.
+# before it by their bare column names too, after its own levels'
+# (`colNameToVar` searches innermost first), and an aggregate over only
+# those names belongs to the level whose FROM it sits in (42803). Only a
+# qualified name (`fe.b`) was found, and a bare one was 42703.
 LATERAL_BARE_NAME = {
     "select x from fe, lateral (select b as x) s": [("x",)],
     "select x from fe join lateral (select b || c as x from fs) s on true": [("xy",)],
+    # In a subquery inside it, at any depth.
+    "select x from fe, lateral (select (select b) as x from fs) s": [("x",)],
+    "select x from fe, lateral (select (select (select b)) as x) s": [("x",)],
+    "select x from fe, lateral (select x from (select b as x) d) s": [("x",)],
+    "select c from fe, lateral (select c from fs where b = 'x') s": [("y",)],
+    "select x from fe, lateral (select b || g as x from generate_series(1, 2) g) s order by x": [
+        ("x1",),
+        ("x2",),
+    ],
+    "select x from fe, lateral (select b as x union all select c from fs) s order by x": [
+        ("x",),
+        ("y",),
+    ],
+    # A nearer level's own column of that name wins.
+    "select x from fe, lateral (select b || q as x from (select 'w' as q) d) s": [("xw",)],
+    "select x from fe, lateral (select b as x from (select 'w' as b) d) s": [("w",)],
+    "select x from fe, lateral (select b as x from fs t(b)) s": [(1,)],
+    # Two left items with the name, or none.
+    "select * from fe, fs, lateral (select a) s": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "39",
+    ),
+    "select * from fe, lateral (select zz) s": ("42703", 'column "zz" does not exist', None, "35"),
+    # An aggregate over only the left side's columns.
+    "select x from fe, lateral (select string_agg(b, ',') as x from generate_series(1, 2)) s": (
+        "42803",
+        "aggregate functions are not allowed in FROM clause of their own query level",
+        None,
+        "35",
+    ),
+    "select x from fe, lateral (select string_agg(b, ',') as x from generate_series(1, a)) s": (
+        "42803",
+        "aggregate functions are not allowed in FROM clause of their own query level",
+        None,
+        "35",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-478")
+@pytest.mark.backlog_fixed("RP-478")
 @pytest.mark.parametrize("query", list(LATERAL_BARE_NAME))
 def test_lateral_subquery_reads_an_earlier_item_by_bare_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LATERAL_BARE_NAME[query]
+
+
+# Found while working RP-478: a LATERAL subquery is planned once over
+# sample values for its output's shape, and that planning evaluates a
+# FROM-less body's targets, so a `nextval` in one is drawn once more than
+# the left side has rows. The qualified form (`fe.a`) and the bare one
+# (`a`, since RP-478) alike.
+LATERAL_DRAWS = [
+    "select a, n from fe, lateral (select nextval('lq') + fe.a as n) s",
+    "select a, n from fe, lateral (select nextval('lq') + a as n) s",
+]
+
+
+@pytest.mark.backlog("RP-482")
+@pytest.mark.parametrize("query", LATERAL_DRAWS)
+def test_lateral_subquery_draws_once_per_row(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("drop sequence if exists lq")
+        c.execute("create sequence lq")
+        try:
+            rows = c.execute(query).fetchall()
+            drawn = c.execute("select last_value from lq").fetchall()
+        finally:
+            c.execute("drop sequence lq")
+    assert (rows, drawn) == ([(1, 2)], [(1,)])

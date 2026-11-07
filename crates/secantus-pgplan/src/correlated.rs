@@ -41,7 +41,7 @@ thread_local! {
 /// RP-445) is a NULL of its type, never run, as the probe's NULL bindings
 /// are not the row it will see and the probe may be a Describe's, with no
 /// executor to run it.
-fn probing<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn probing<R>(f: impl FnOnce() -> R) -> R {
     let previous = PROBING.with(|p| p.replace(true));
     let out = f();
     PROBING.with(|p| p.set(previous));
