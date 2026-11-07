@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.conftest import mongo_answer
+from tests.backlog.conftest import PLATFORM, mongo_answer, only_on
 
 DEFAULT = 104_857_600
 
@@ -92,8 +92,24 @@ def test_spill_file_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """A sorter's spill file was this server's own; it is now mongod 8.2's:
     64 KiB chunks of `serializeForSorter` records, each snappy-compressed by
     mongod's compressor, so a sort's and `$bucketAuto`'s
-    `spilledDataStorageSize` are mongod's to the byte."""
-    assert _sort_storage_sizes(rust_mongo) == _sort_storage_sizes(mongod)
+    `spilledDataStorageSize` are mongod's to the byte -- each platform's
+    mongod, whose sizes differ (the in-order sort: 130545 bytes on arm64,
+    131252 on x86_64). On x86_64 the `after $project` case is RM-402's gap."""
+    ours, theirs = _sort_storage_sizes(rust_mongo), _sort_storage_sizes(mongod)
+    if PLATFORM == "x86_64":
+        ours.pop("after $project")
+        theirs.pop("after $project")
+    assert ours == theirs
+
+
+@pytest.mark.backlog("RM-402")
+def test_x86_spill_after_project_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """On x86_64 mongod 8.2 stores 122253 bytes for the 29 spills of a sort
+    after `$project`; this server stores 122288 (CI, 2026-11-07). On arm64
+    the two agree, pinned by RM-325's regression test."""
+    only_on("x86_64", why="the arm64 sizes agree (RM-325's regression test)")
+    ours = _sort_storage_sizes(rust_mongo)["after $project"]
+    assert ours == _sort_storage_sizes(mongod)["after $project"]
 
 
 def _storage_sizes(client: Any) -> dict:
@@ -197,8 +213,10 @@ def _group_sum_spilled_bytes(client: Any) -> Any:
 
 @pytest.mark.backlog("RM-397")
 def test_group_sum_spilled_bytes(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2 counts a `$group` of `$sum` and `$count` as 115200 bytes
-    over its 22 spills; this server counts 110400."""
+    """mongod 8.2 on arm64 counts a `$group` of `$sum` and `$count` as
+    115200 bytes over its 22 spills; this server counts 110400. On x86_64
+    mongod and this server agree (CI, 2026-11-07)."""
+    only_on("arm64", why="x86_64 mongod and this server agree")
     assert _group_sum_spilled_bytes(rust_mongo) == _group_sum_spilled_bytes(mongod)
 
 

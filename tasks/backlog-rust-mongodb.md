@@ -1110,11 +1110,23 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       these.
       Backlog-ID: RM-396
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_added_fields_sort_spill_storage_size
+- [ ] **On x86_64 a sort after `$project` stores 35 bytes more spill than
+      mongod.** mongod 8.2's spill sizes differ by platform (the in-order
+      sort stores 130545 bytes on arm64 and 131252 on x86_64), and each
+      platform's mongod is the reference (Joe, 2026-11-07). On arm64 this
+      server agrees on every RM-325 case. On CI's x86_64 Linux the 29
+      spills of `[{$project: {s: 1, k: 1}}, {$sort: {k: -1, s: 1}}]` store
+      122288 bytes where mongod stores 122253. Checked on x86_64 only, by
+      CI. Found 2026-11-07, snapshot PR #2447.
+      Backlog-ID: RM-402
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_x86_spill_after_project_storage_size
 - [ ] **A `$group` of `$sum` and `$count` counts less memory than mongod.**
       Spilling 300 groups of `{t: {$sum: "$n"}, c: {$count: {}}}` 22 times,
       mongod 8.2.1 reports `groupSpilledBytes: 115200` and this server
       110400: the spills and records agree, so each group's accumulators
-      are counted 16 bytes short.
+      are counted 16 bytes short. That is mongod on arm64: on CI's x86_64
+      Linux mongod and this server agree (2026-11-07), so the gap test runs
+      on arm64 only.
       Backlog-ID: RM-397
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_sum_spilled_bytes
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
