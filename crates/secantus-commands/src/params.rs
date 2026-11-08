@@ -213,6 +213,9 @@ const SETTABLE: &[(&str, ParamKind)] = &[
         ParamKind::Int32AtLeast(0),
     ),
     ("internalQueryMaxPushBytes", ParamKind::IntAbove(0, true)),
+    // How long a plan executor runs between yields, each its interrupt
+    // check (`secantus_core::deadline::check`, RM-360).
+    ("internalQueryExecYieldPeriodMS", ParamKind::Int32AtLeast(0)),
     // An index build's sorters keep at most this much in memory before
     // spilling to `<dbpath>/_tmp` (RM-187), read by every build.
     (
@@ -884,6 +887,9 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                     if let Some(transactions) = &ctx.transactions {
                         transactions.set_lifetime_seconds(f64::from(*secs));
                     }
+                }
+                ("internalQueryExecYieldPeriodMS", Bson::Int32(ms)) => {
+                    secantus_core::deadline::set_yield_period_ms(i64::from(*ms));
                 }
                 ("notablescan", Bson::Boolean(on)) => {
                     if let Some(s) = store.as_ref() {

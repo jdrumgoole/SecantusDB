@@ -685,45 +685,47 @@ These are explicit non-goals. Don't add them without a reason.
       mongod's. Found 2026-11-07 (RM-359).
       Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_sort_of_index_keys_counts_the_data_it_sorted
       Backlog-ID: RM-375
-- [ ] **No `numInterruptChecks` on a line.** mongod 8.2.11 counts the times
-      an operation checked whether it had been killed (5 for a ten-document
-      `find` through an index) and prints it on every command's line. This
-      server's interrupt polls (`secantus_core::deadline`) are its own,
-      placed where its reads loop, not where mongod's are; their count
-      would be a different number. `includeQueryStatsMetrics` needs it too
-      (RM-170).
-      **Decided (Joe, 2026-11-08): move this server's interrupt checks to where mongod's are, the faithful option (a read checks only at a yield, as mongod's does), so `numInterruptChecks` counts real checks and matches mongod's numbers.** Measured when it was asked (2026-11-07): the count is mongod's code structure,
-      not the work done. Measured on mongod 8.2.11 (single-node set, this
-      Mac, three runs each, identical): `ping` 1; `listIndexes` and a
-      `count` with no query 3; a `find` of a collection that does not exist
-      3; a `find` through a collection scan, by `_id`, with a blocking sort,
-      a `distinct` or a `$group` 4; a `find` through an index (with or
-      without a match), a `count` with a query, and the `find` and each full
-      `getMore` of a cursor 5 (its last, empty `getMore` 4); an `insert` (one
-      document or five) and a `create` 13; an `update` or `delete` command
-      15 (16 for an update of an empty collection); `findAndModify` and
-      `drop` 17; a `createIndexes` 73. It does not grow with documents: a
-      `find` of 20,000 by an index or a scan stays at 5 / 4 with
-      `numYields: 0`. It grows with yields: an `update` of 2,500 documents
-      yielded twice and counted 25, of 20,000 yielded seven times and
-      counted 50 (yields are mongod's 1,000-iteration / 10 ms interval, so
-      that part is timing-dependent on mongod too). Profile entries carry
-      no `numInterruptChecks`; only the line does. This server polls
-      `secantus_core::deadline::check` once per document in its scans,
-      pipelines and index builds (the clock read every 64th call), so its
-      own count would scale with documents (some 20,000 for that `find`).
-      The options: (a, recommended, the faithful one) move this server's
-      interrupt points to mongod's -- command dispatch, each acquisition,
-      the executor's yield-interval check, the write path's retry and
-      commit points -- each command's transcribed from mongod 8.2's
-      `checkForInterrupt` callers and checked against a probe per command,
-      as RM-358's query-shape serializers were, and count those checks; it
-      changes where `maxTimeMS` and `killOp` take effect to where mongod's
-      do (mongod checks a read only at a yield); (b) count this server's own
-      polls where they are -- the real mechanism of this server, never
-      mongod's number; (c) leave it open, as RM-170's decision did.
+- [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
+      server checks for interrupt where mongod 8.2 does, and counts it
+      (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
+      each lock it is granted, once per index scan of its one plan and once
+      when planning is done, in the express executor, in a `getMore` once
+      it has its cursor, as a cursor left open is checked back in, at the
+      lock it takes to read the line's storage statistics, and at each
+      yield (two: the yield's, and the locks it takes again), the
+      per-document polls having become mongod's yield every
+      `internalQueryExecYieldPeriodMS` (10 ms, a parameter here too). The
+      line of a `find`, `count` or `distinct` of a collection with one
+      candidate plan, a `getMore` of a `find`, `listIndexes`,
+      `listCollections`, `collStats`, `ping` and `buildInfo` prints mongod's
+      count (26 shapes in `tests/mongod_live/test_interrupt_checks.py`).
+      Every other line prints none, where mongod prints one:
+      - a read with more than one candidate plan, a plan from the plan
+        cache, or a subplanned `$or`: mongod checks once per index scan of
+        every plan its `PlanEnumerator` builds (with indexes on `x` and
+        `y`, `{x: {$gt: 1}, y: 1}` checks 8 times on mongod: four leaves,
+        its index intersections' included; three indexes 13) and not at
+        all for a cached plan, and this planner's candidates are not its
+        enumeration;
+      - an `aggregate` and a `getMore` of its cursor: every pipeline stage's
+        `getNext` ticks mongod's `ExpressionContext` interrupt checker,
+        which checks every 128th tick (an `$unwind` of 900 documents counted
+        17), and its stages are not this server's;
+      - writes and DDL (`insert` and `create` 13, `update` and `delete` 15,
+        `findAndModify` and `drop` 17, `createIndexes` 73, measured
+        2026-11-07): their write units, retries, write concern waits and
+        index build phases check where this server has not been made to;
+        the coarse `deadline::check_now` polls of the pipeline, the index
+        build and `findAndModify` are this server's own, uncounted;
+      - a statement inside a transaction, a lock granted after a wait
+        (mongod checks at each wake), and the commands not probed.
+      A yield here counts the re-take of the statement's locks without
+      releasing them, so a request waiting on them is not let in by the
+      yield as mongod's is. `includeQueryStatsMetrics` needs the count too
+      (RM-170). The remainder follows the decision recorded on this item in
+      e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
-      Verify: tests/backlog/test_rm_355_364.py::test_a_line_counts_its_interrupt_checks
+      Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
 - [ ] **On the asynchronous oplog a write's line has no
       `totalOplogSlotDurationMicros`.** mongod 8.2.11 times each oplog slot
       from its reservation to the commit of the write that took it (RM-361).

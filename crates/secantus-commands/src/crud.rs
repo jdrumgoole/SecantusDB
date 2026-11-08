@@ -1480,11 +1480,16 @@ pub fn count(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     }
     let storage = ctx.storage()?;
     let filter = doc_field(doc, "query");
-    // A `$text` count of a collection that does not exist is 0.
-    if storage
+    let exists = storage
         .collection_exists(&ctx.db_name, &coll)
-        .unwrap_or(false)
-    {
+        .unwrap_or(false);
+    // A collection that is not there is counted by mongod's EOF plan,
+    // which plans nothing (RM-360).
+    if !exists {
+        crate::explain::plans_nothing();
+    }
+    // A `$text` count of a collection that does not exist is 0.
+    if exists {
         if let Some((code, msg)) = text_query_problem(storage, &ctx.db_name, &coll, &filter) {
             return Err(CommandError::new(
                 code,

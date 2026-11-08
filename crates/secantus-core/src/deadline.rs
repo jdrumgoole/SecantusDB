@@ -61,7 +61,6 @@ impl std::error::Error for MaxTimeMsExpired {}
 #[derive(Clone, Copy)]
 struct Armed {
     deadline: Instant,
-    ticks: u32,
 }
 
 thread_local! {
@@ -78,6 +77,132 @@ thread_local! {
     /// Whether a poll has failed in the running command (see [`tripped`]):
     /// an interrupt some caller turned into a value is still its answer.
     static TRIPPED: Cell<bool> = const { Cell::new(false) };
+    /// The running operation's interrupt checks (see [`check_for_interrupt`]).
+    static CHECKS: Cell<i64> = const { Cell::new(0) };
+    /// When the running operation last yielded, or began (see [`check`]).
+    static YIELD_MARK: Cell<Option<Instant>> = const { Cell::new(None) };
+    /// The running operation's yields (see [`check`]).
+    static YIELDS: Cell<i64> = const { Cell::new(0) };
+    /// What a yield does besides its check, while a statement may yield
+    /// (see [`yield_with`]).
+    static YIELD_HOOK: std::cell::RefCell<Option<Relock>> =
+        const { std::cell::RefCell::new(None) };
+    /// Calls to [`check_expression`] until it next checks.
+    static EXPRESSION_TICK: Cell<u32> = const { Cell::new(EXPRESSION_CHECK_PERIOD) };
+    /// Whether a check of the running operation was made somewhere mongod
+    /// makes none, or one mongod makes is not made here (see [`unmatched`]).
+    static UNMATCHED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// What a statement does at a yield besides its check (see [`yield_with`]).
+pub type Relock = std::rc::Rc<dyn Fn() -> Result<(), MaxTimeMsExpired>>;
+
+/// mongod's `internalQueryExecYieldPeriodMS`: a plan executor yields --
+/// and checks for interrupt -- once this long has passed since it last
+/// yielded (`PlanYieldPolicy`, 8.2; `internalQueryExecYieldIterations` is
+/// -1 there, so time is the only trigger).
+static YIELD_PERIOD_MS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(10);
+
+/// mongod's `ExpressionContext::InterruptChecker::kInterruptCheckPeriod`.
+const EXPRESSION_CHECK_PERIOD: u32 = 128;
+
+/// The yield period (`internalQueryExecYieldPeriodMS`), in milliseconds.
+pub fn yield_period_ms() -> i64 {
+    YIELD_PERIOD_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the yield period, as `setParameter` does; returns the old one.
+pub fn set_yield_period_ms(ms: i64) -> i64 {
+    YIELD_PERIOD_MS.swap(ms, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An operation begins on this thread: no interrupt checks, no yields, and
+/// its yield clock starts now.
+pub fn begin_operation() {
+    CHECKS.with(|c| c.set(0));
+    YIELDS.with(|c| c.set(0));
+    YIELD_MARK.with(|m| m.set(Some(Instant::now())));
+    INTERRUPT_TICKS.with(|t| t.set(0));
+    EXPRESSION_TICK.with(|t| t.set(EXPRESSION_CHECK_PERIOD));
+    UNMATCHED.with(|u| u.set(false));
+}
+
+/// mongod's `OperationContext::checkForInterruptNoAssert`: counts one
+/// check of the running operation (its line's `numInterruptChecks`), then
+/// fails if it was killed or its budget is spent. mongod makes these at
+/// fixed points -- dispatch, each lock it is granted, planning, a yield,
+/// a cursor's check-in -- and its count is theirs (RM-360).
+pub fn check_for_interrupt() -> Result<(), MaxTimeMsExpired> {
+    CHECKS.with(|c| c.set(c.get() + 1));
+    if interrupted() || expired() {
+        return Err(trip());
+    }
+    Ok(())
+}
+
+/// A [`check_for_interrupt`] whose failure its caller handles: counted, and
+/// `true` when the operation was killed or its budget spent, without
+/// failing the command ([`tripped`]) -- mongod's check of a cursor checked
+/// back in, which kills the cursor and still answers (RM-360).
+pub fn check_quietly() -> bool {
+    CHECKS.with(|c| c.set(c.get() + 1));
+    interrupted() || expired()
+}
+
+/// Count a check its caller makes against its own clock: an admission
+/// queue's waiter, which checks each time it wakes, as mongod's
+/// `TicketHolder` does (RM-360).
+pub fn count_check() {
+    CHECKS.with(|c| c.set(c.get() + 1));
+}
+
+/// The running operation's interrupt checks so far.
+pub fn interrupt_checks() -> i64 {
+    CHECKS.with(Cell::get)
+}
+
+/// The running operation's yields so far (its line's `numYields`).
+pub fn yields() -> i64 {
+    YIELDS.with(Cell::get)
+}
+
+/// The running operation reached a check mongod makes that this server
+/// does not make in the same place yet, so its count is not mongod's and
+/// its line prints none (RM-360).
+pub fn unmatched() {
+    UNMATCHED.with(|u| u.set(true));
+}
+
+/// Whether [`unmatched`] was called since the operation began.
+pub fn is_unmatched() -> bool {
+    UNMATCHED.with(Cell::get)
+}
+
+/// Restores the previous yield behaviour when dropped.
+#[must_use = "the statement stops yielding when this guard drops"]
+pub struct YieldGuard(Option<Relock>);
+
+impl Drop for YieldGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        YIELD_HOOK.with(|h| *h.borrow_mut() = previous);
+    }
+}
+
+/// Let the running statement yield: at each yield [`check`] runs `relock`
+/// after its check -- mongod releases the statement's locks and takes them
+/// again, and each grant checks for interrupt too. Without one (a
+/// statement inside a transaction, whose locks cannot be released) a yield
+/// is mongod's `INTERRUPT_ONLY` policy: the check alone, and no yield
+/// counted.
+pub fn yield_with(relock: Relock) -> YieldGuard {
+    YieldGuard(YIELD_HOOK.with(|h| h.borrow_mut().replace(relock)))
+}
+
+/// No yields until the guard drops: a statement that cannot release its
+/// locks, mongod's `INTERRUPT_ONLY`.
+pub fn no_yields() -> YieldGuard {
+    YieldGuard(YIELD_HOOK.with(|h| h.borrow_mut().take()))
 }
 
 /// Whether one of this command's polls has failed -- a kill or a spent
@@ -117,15 +242,30 @@ pub fn opaque() -> OpaqueGuard {
     OpaqueGuard(())
 }
 
-/// [`check`] from inside an expression: one element of a `$map`, `$filter`
-/// or `$reduce`, where a single evaluation can run for seconds. mongod checks
-/// its operation for interrupt there too (8.2.11 interrupts a filter's
-/// `$reduce` within a few milliseconds of a kill), except under [`opaque`].
+/// The check from inside an expression: one element of a `$map`, `$filter`
+/// or `$reduce`, where a single evaluation can run for seconds. It is
+/// mongod's `ExpressionContext::checkForInterrupt`, which checks the
+/// operation every 128th call (`InterruptChecker`, 8.2), except under
+/// [`opaque`].
 pub fn check_expression() -> Result<(), MaxTimeMsExpired> {
     if OPAQUE.with(Cell::get) > 0 {
         return Ok(());
     }
-    check()
+    let due = EXPRESSION_TICK.with(|t| {
+        let n = t.get() - 1;
+        if n == 0 {
+            t.set(EXPRESSION_CHECK_PERIOD);
+            true
+        } else {
+            t.set(n);
+            false
+        }
+    });
+    if due {
+        check_for_interrupt()
+    } else {
+        Ok(())
+    }
 }
 
 /// Restores the previous kill flag when dropped.
@@ -202,7 +342,6 @@ pub fn arm(max_time_ms: Option<i64>) -> Guard {
     if let Some(ms) = max_time_ms.filter(|ms| *ms > 0) {
         let armed = Armed {
             deadline: Instant::now() + Duration::from_millis(ms as u64),
-            ticks: 0,
         };
         CURRENT.with(|c| c.set(Some(armed)));
     }
@@ -217,7 +356,6 @@ pub fn arm_since(since: Instant, max_time_ms: Option<i64>) -> Guard {
     if let Some(ms) = max_time_ms.filter(|ms| *ms > 0) {
         let armed = Armed {
             deadline: since + Duration::from_millis(ms as u64),
-            ticks: 0,
         };
         CURRENT.with(|c| c.set(Some(armed)));
     }
@@ -257,32 +395,53 @@ pub fn remaining_ms() -> Option<f64> {
     })
 }
 
-/// Error if the budget is spent.
+/// The plan executor's yield point, called from every loop whose length is
+/// driven by the data -- the storage scans, the pipeline, the sorter, the
+/// index build.
 ///
-/// Call it from any loop whose length is driven by the size of the data. Cheap
-/// enough for a per-document call: it reads the clock once every
-/// [`POLL_EVERY`] invocations, and returns on a single thread-local read when
-/// no deadline is armed at all.
+/// It is mongod's `PlanYieldPolicy::shouldYieldOrInterrupt`: once
+/// [`yield_period_ms`] (`internalQueryExecYieldPeriodMS`, 10 ms) has passed
+/// since the operation began or last yielded, the operation yields, and
+/// the yield is where it checks for interrupt ([`check_for_interrupt`]) --
+/// mongod checks a read for `killOp` and `maxTimeMS` nowhere else while it
+/// runs (RM-360). A yield also counts in `numYields` and takes the
+/// statement's locks again ([`yield_with`]). The clock is read every
+/// [`POLL_EVERY`] calls, so the poll costs a thread-local increment.
 pub fn check() -> Result<(), MaxTimeMsExpired> {
-    // The kill flag, every POLL_EVERY calls whether or not a budget is armed.
     let tick = INTERRUPT_TICKS.with(|t| {
         let n = t.get().wrapping_add(1);
         t.set(n);
         n
     });
-    if tick.is_multiple_of(POLL_EVERY) && interrupted() {
-        return Err(trip());
+    if !tick.is_multiple_of(POLL_EVERY) {
+        return Ok(());
     }
-    CURRENT.with(|c| {
-        let Some(mut a) = c.get() else { return Ok(()) };
-        a.ticks = a.ticks.wrapping_add(1);
-        let due = a.ticks % POLL_EVERY == 0;
-        c.set(Some(a));
-        if due && Instant::now() >= a.deadline {
-            return Err(trip());
+    let period = yield_period_ms();
+    if period < 0 {
+        return Ok(());
+    }
+    let now = Instant::now();
+    let due = YIELD_MARK.with(|m| match m.get() {
+        Some(last) if now.duration_since(last) >= Duration::from_millis(period as u64) => {
+            m.set(Some(now));
+            true
         }
-        Ok(())
-    })
+        Some(_) => false,
+        None => {
+            m.set(Some(now));
+            false
+        }
+    });
+    if !due {
+        return Ok(());
+    }
+    check_for_interrupt()?;
+    let relock = YIELD_HOOK.with(|h| h.borrow().clone());
+    if let Some(relock) = relock {
+        YIELDS.with(|y| y.set(y.get() + 1));
+        relock()?;
+    }
+    Ok(())
 }
 
 /// [`check`] without the poll interval — for coarse call sites.
@@ -343,17 +502,48 @@ mod tests {
         assert_eq!(check_now(), Err(MaxTimeMsExpired));
     }
 
-    /// The poll interval is the whole reason `check` is affordable per
-    /// document, so it is pinned: an expired budget is NOT reported until the
-    /// interval comes round.
+    /// `check` is mongod's yield point: a spent budget is reported only at
+    /// a yield, once the yield period has passed since the operation began,
+    /// and only on a call that reads the clock (every `POLL_EVERY`th).
     #[test]
-    fn check_polls_every_poll_every_calls() {
+    fn check_reports_a_spent_budget_only_at_a_yield() {
+        begin_operation();
         let _g = arm(Some(1));
         std::thread::sleep(Duration::from_millis(5));
-        for i in 1..POLL_EVERY {
-            assert_eq!(check(), Ok(()), "call {i} is before the first poll");
+        for _ in 0..POLL_EVERY * 4 {
+            assert_eq!(check(), Ok(()), "no yield before the period passes");
         }
-        assert_eq!(check(), Err(MaxTimeMsExpired), "the Nth call polls");
+        assert_eq!(interrupt_checks(), 0);
+        std::thread::sleep(Duration::from_millis(yield_period_ms() as u64 + 2));
+        let failed = (0..POLL_EVERY).position(|_| check().is_err());
+        assert!(
+            failed.is_some(),
+            "the first poll past the period yields and checks"
+        );
+        assert_eq!(interrupt_checks(), 1, "a yield checks once");
+        assert_eq!(
+            yields(),
+            0,
+            "with no statement locks to retake, nothing is yielded"
+        );
+    }
+
+    /// A statement that can yield counts the yield and retakes its locks,
+    /// each grant a check of its own.
+    #[test]
+    fn a_yield_retakes_the_statements_locks() {
+        begin_operation();
+        let relocks = std::rc::Rc::new(Cell::new(0));
+        let seen = relocks.clone();
+        let _y = yield_with(std::rc::Rc::new(move || {
+            seen.set(seen.get() + 1);
+            check_for_interrupt()
+        }));
+        std::thread::sleep(Duration::from_millis(yield_period_ms() as u64 + 2));
+        for _ in 0..POLL_EVERY {
+            check().unwrap();
+        }
+        assert_eq!((yields(), relocks.get(), interrupt_checks()), (1, 1, 2));
     }
 
     /// A nested command must not be able to widen the budget it runs under,
@@ -420,8 +610,8 @@ mod tests {
                 assert_eq!(check_expression(), Ok(()), "a validator is not interrupted");
             }
         }
-        let failed = (0..POLL_EVERY).any(|_| check_expression().is_err());
-        assert!(failed, "the kill is read within one poll interval");
+        let failed = (0..EXPRESSION_CHECK_PERIOD).any(|_| check_expression().is_err());
+        assert!(failed, "the kill is read within mongod's 128 calls");
     }
 
     /// A failed poll is remembered for the command, even when its caller

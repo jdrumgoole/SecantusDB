@@ -28,6 +28,63 @@ thread_local! {
     /// How deep in the planner the thread is: a plan made inside another
     /// is part of the outer one's time.
     static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Whether the operation has made its planning's interrupt checks
+    /// ([`planning_checks`]): it plans many times, mongod once.
+    static CHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An operation begins on this thread: it has planned nothing.
+pub(crate) fn begin_operation() {
+    CHECKED.with(|c| c.set(false));
+}
+
+/// The interrupt checks mongod's planning makes, once per operation, from
+/// the outermost call into the planner (RM-360): one per index scan the
+/// access planner builds (`QueryPlannerAccess::makeLeafNode`) and one when
+/// it is done (`PrepareExecutionHelper::prepare`), or the express
+/// executor's one; none for a `RECORD_STORE_FAST_COUNT` or a `DISTINCT_SCAN`
+/// without a query (measured 8.2.11, 2026-11-08). A failed check trips the
+/// command (`deadline::tripped`). A plan with more than one candidate
+/// ([`candidates`]) has the leaves of all of mongod's enumerated plans,
+/// which this planner does not build, so its count is not mongod's.
+fn planning_checks(node: &Node, distinct_without_query: bool) {
+    if DEPTH.with(std::cell::Cell::get) != 1 || CHECKED.with(|c| c.replace(true)) {
+        return;
+    }
+    fn leaves(node: &Node) -> Option<usize> {
+        match node {
+            Node::CollScan { .. } => Some(0),
+            Node::IxScan(_) | Node::CountScan(_) => Some(1),
+            Node::Fetch { input, .. }
+            | Node::Sort { input, .. }
+            | Node::Skip(_, input)
+            | Node::Limit(_, input)
+            | Node::Projection { input, .. }
+            | Node::ReturnKey(input)
+            | Node::Count(input) => leaves(input),
+            _ => None,
+        }
+    }
+    use secantus_core::deadline::{check_for_interrupt, unmatched};
+    let checks = match node {
+        Node::FastCount => Some(0),
+        Node::DistinctScan(..) if distinct_without_query => Some(0),
+        Node::Projection { input, .. }
+            if distinct_without_query && matches!(**input, Node::DistinctScan(..)) =>
+        {
+            Some(0)
+        }
+        Node::Express { .. } => Some(1),
+        other => leaves(other).map(|n| n + 1),
+    };
+    match checks {
+        Some(n) => {
+            for _ in 0..n {
+                let _ = check_for_interrupt();
+            }
+        }
+        None => unmatched(),
+    }
 }
 
 /// Times one call into the planner, when the outermost.
@@ -39,7 +96,15 @@ pub(crate) struct Timing(Option<std::time::Instant>);
 /// `RECORD_STORE_FAST_COUNT` for a `count` with no query. Its line and
 /// entry carry the `planningTimeMicros` (measured 8.2.11, RM-363).
 pub(crate) fn planned_apart() -> Timing {
+    plans_nothing();
     timing()
+}
+
+/// The operation makes no planning checks (RM-360): its plan was settled
+/// without the planner ([`planned_apart`]), or it is a `getMore`, which
+/// runs the plan its cursor has and plans nothing on mongod.
+pub(crate) fn plans_nothing() {
+    CHECKED.with(|c| c.set(true));
 }
 
 fn timing() -> Timing {
@@ -1464,6 +1529,11 @@ fn candidates(
                 .map(|w| (w, None)),
         );
     }
+    // mongod's planning checks once per scan of every plan it enumerates,
+    // and its enumerator is not this one (RM-360).
+    if out.len() > 1 {
+        secantus_core::deadline::unmatched();
+    }
     out
 }
 
@@ -1751,6 +1821,12 @@ fn unfetched(node: Node) -> Node {
 /// The plan for `count`.
 pub(crate) fn count(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     let _timing = timing();
+    let node = count_plan(q, catalog);
+    planning_checks(&node, false);
+    node
+}
+
+fn count_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     if q.canonical.is_empty() && q.hint == Hint::None {
         return Node::FastCount;
     }
@@ -1791,6 +1867,12 @@ pub(crate) fn count(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
 ///   key, and nothing is projected.
 pub(crate) fn distinct(q: &Query, catalog: &[Arc<IndexInfo>], key: &str, asked: bool) -> Node {
     let _timing = timing();
+    let node = distinct_plan(q, catalog, key, asked);
+    planning_checks(&node, !asked);
+    node
+}
+
+fn distinct_plan(q: &Query, catalog: &[Arc<IndexInfo>], key: &str, asked: bool) -> Node {
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }
@@ -1950,6 +2032,12 @@ pub(crate) fn write(
 /// The plan for a `find`-shaped query over a collection that exists.
 pub(crate) fn plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     let _timing = timing();
+    let node = find_plan(q, catalog);
+    planning_checks(&node, false);
+    node
+}
+
+fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     if never(q) {
         return Node::Eof("predicateEvalsToFalse");
     }

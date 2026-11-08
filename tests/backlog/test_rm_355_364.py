@@ -703,15 +703,53 @@ def test_an_aggregate_or_an_insert_has_no_execution_stats(rust_mongo: Any, mongo
 # ------------------------------------------------------------- RM-360 --
 
 
-@pytest.mark.backlog("RM-360")
+@pytest.mark.backlog_fixed("RM-360")
 def test_a_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a command carries `numInterruptChecks`,
     how many times it checked whether it had been killed (5 for a `find`
-    of ten documents through an index, measured 2026-10-27)."""
+    of ten documents through an index, measured 2026-10-27). This server's
+    had none; it now checks where mongod does, and counts
+    (`tests/mongod_live/test_interrupt_checks.py`)."""
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
-    answers = {s: "numInterruptChecks" in _line(lines, "find") for s, (lines, _) in got.items()}
-    assert answers["mongod"] is True
+    answers = {s: _line(lines, "find").get("numInterruptChecks") for s, (lines, _) in got.items()}
+    assert answers["mongod"] is not None
     assert answers["rust"] == answers["mongod"]
+
+
+def _two_indexes(db: Any) -> None:
+    seed(db)
+    db.c.create_index("y")
+
+
+_UNCOUNTED = {
+    "find": (_two_indexes, lambda d: list(d.c.find({"x": {"$gt": 1}, "y": 1}))),
+    "aggregate": (seed, lambda d: list(d.c.aggregate([{"$match": {"x": {"$gte": 4}}}]))),
+    "insert": (seed, lambda d: d.c.insert_one({"_id": 100})),
+    "update": (seed, lambda d: d.c.update_one({"_id": 1}, {"$set": {"q": 1}})),
+    "createIndexes": (seed, lambda d: d.c.create_index("z")),
+}
+
+
+@pytest.mark.backlog("RM-360")
+def test_every_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11's line for every command carries `numInterruptChecks`
+    (measured 2026-11-08, time-based yields off: a `find` with two
+    candidate plans 8, an `aggregate` 5, an `insert` 13, an `update` 15, a
+    `createIndexes` 73). This server counts its reads with one candidate
+    plan and prints none here: mongod's planner checks once per index scan
+    of every plan it enumerates, its pipeline stages every 128th document,
+    and its writes and DDL at points this server does not check yet."""
+    for name, (setup, op) in _UNCOUNTED.items():
+        answers = {}
+        for server, client, is_mongod in (
+            ("rust", rust_mongo, False),
+            ("mongod", mongod_rs, True),
+        ):
+            with no_timed_yields(client):
+                lines, _ = logged(client, is_mongod, setup, op)
+            answers[server] = _line(lines, name).get("numInterruptChecks")
+        assert answers["mongod"] is not None, name
+        assert answers["rust"] == answers["mongod"], name
 
 
 # ------------------------------------------------------------- RM-361 --

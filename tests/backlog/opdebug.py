@@ -105,8 +105,9 @@ def no_timed_yields(mongod: Any) -> Iterator[None]:
     decides: a `delete_many` of six documents yielded once in 60 runs under
     six concurrent writers (`numYields: 1`, a third write lock round,
     `flowControl: {acquireCount: 2}`) and in none of 120 with the period off
-    (2026-11-07). This server keeps no such clock, so the reference runs
-    without it and its counts are the operation's own."""
+    (2026-11-07). Run without it, the counts are the operation's own.
+    This server's plan executors keep the same period since RM-360, so a
+    test of what a yield changes turns it off on both servers."""
     was = mongod.admin.command("setParameter", 1, internalQueryExecYieldPeriodMS=86_400_000)
     try:
         yield

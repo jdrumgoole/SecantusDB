@@ -1003,7 +1003,7 @@ impl Statement {
                 crate::slowop::failure(&reply, &mut attr);
             }
         }
-        attr.insert("numYields", 0_i64);
+        attr.insert("numYields", secantus_core::deadline::yields());
         attr.insert("locks", self.ran.locks.clone());
         if let Some(fc) = crate::opdebug::flow_control(self.ran.flow_control) {
             attr.insert("flowControl", fc);
