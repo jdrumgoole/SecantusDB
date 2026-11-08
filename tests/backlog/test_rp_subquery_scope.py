@@ -1096,20 +1096,95 @@ def test_whole_row_against_untyped_record(query: str, dsn: str) -> None:
 
 # Found while working RP-516. An aliased write target is hidden by its
 # alias: `fs.c` under `update fs x` is `errorMissingRTE`'s 42P01 with the
-# alias as its HINT. Here the table's name still reads the row.
+# alias as its HINT, and a qualifier nothing in the write has is `missing
+# FROM-clause entry`, in its SET, WHERE and RETURNING, with or without a
+# FROM, and in an INSERT's RETURNING. The table's name, or any name at
+# all, read the target's row (RP-523).
 _ALIAS_HINT = 'Perhaps you meant to reference the table alias "x".'
 _HIDDEN = 'invalid reference to FROM-clause entry for table "fs"'
 ALIASED_WRITE_TARGET_NAME = {
     "update fs x set c = fs.c returning c": ("42P01", _HIDDEN, _ALIAS_HINT, "21"),
     "delete from fs x where fs.a = 1 returning a": ("42P01", _HIDDEN, _ALIAS_HINT, "24"),
     "update fs x set c = 'q' returning fs.c": ("42P01", _HIDDEN, _ALIAS_HINT, "35"),
+    "update fs x set c = 'q' where fs.a = 1": ("42P01", _HIDDEN, _ALIAS_HINT, "31"),
+    "update fs x set (a, c) = (fs.a, 'q')": ("42P01", _HIDDEN, _ALIAS_HINT, "27"),
+    "update fs x set c = 'q' from fe where fe.a = x.a returning fs.c": (
+        "42P01",
+        _HIDDEN,
+        _ALIAS_HINT,
+        "60",
+    ),
+    "delete from fs x using fe where fe.a = x.a returning fs.a": (
+        "42P01",
+        _HIDDEN,
+        _ALIAS_HINT,
+        "54",
+    ),
+    "insert into fs as x values (2,'z') returning fs.a": ("42P01", _HIDDEN, _ALIAS_HINT, "46"),
+    "update fs set c = zz.c": ("42P01", 'missing FROM-clause entry for table "zz"', None, "19"),
+    "delete from fs where fe.a = 1": (
+        "42P01",
+        'missing FROM-clause entry for table "fe"',
+        None,
+        "22",
+    ),
+    "insert into fs values (2,'z') returning excluded.a": (
+        "42P01",
+        'missing FROM-clause entry for table "excluded"',
+        None,
+        "41",
+    ),
+    "update fs x set c = x.c || 'z' where x.a = 1 returning x.*": [(1, "yz")],
 }
 
 
-@pytest.mark.backlog("RP-523")
+@pytest.mark.backlog_fixed("RP-523")
 @pytest.mark.parametrize("query", list(ALIASED_WRITE_TARGET_NAME))
 def test_aliased_write_target_hides_its_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ALIASED_WRITE_TARGET_NAME[query]
+
+
+# Found while working RP-523 (RP-527). A qualifier of three names is
+# `schema.rel`: `refnameNamespaceItem` takes it to an UNALIASED entry of
+# that relation, and `searchRangeTableForRel` to an entry of that relation
+# or with `rel` as its alias name. Here the schema is not read, so a
+# schema that does not hold the table still finds it.
+_FS_ENTRY_HINT = (
+    'There is an entry for table "fs", but it cannot be referenced from this part of the query.'
+)
+SCHEMA_QUALIFIED_REFERENCE = {
+    "select other.fs.c from fs": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "8",
+    ),
+    "select pg_catalog.fs.c from fs x": (
+        "42P01",
+        'missing FROM-clause entry for table "fs"',
+        None,
+        "8",
+    ),
+    "update fs set c = other.fs.c": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "19",
+    ),
+    "update fs x set c = pg_catalog.fs.c": (
+        "42P01",
+        'missing FROM-clause entry for table "fs"',
+        None,
+        "21",
+    ),
+    "select public.fs.c from fs": [("y",)],
+}
+
+
+@pytest.mark.backlog("RP-527")
+@pytest.mark.parametrize("query", list(SCHEMA_QUALIFIED_REFERENCE))
+def test_schema_qualified_reference(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == SCHEMA_QUALIFIED_REFERENCE[query]
 
 
 # Found while working RP-516. A write's name error is reported at the
