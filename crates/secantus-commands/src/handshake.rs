@@ -633,11 +633,19 @@ pub fn repl_set_get_status(_doc: &Document, ctx: &mut CommandContext) -> Handler
 /// so drivers enable the right feature flags; `secantusVersion` marks the actual
 /// build (the crate version here; `commands.py` reads `secantus.__version__`).
 pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
+    let mut reply = build_info_document();
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// What `buildInfo` reports, without its `ok`: also the `buildinfo` of each
+/// `local.startup_log` record, as mongod writes both from one builder.
+pub fn build_info_document() -> Document {
     // mongod's keys in mongod's order (8.2.11), each saying what is true of
     // THIS build: no source modules, no script engine, a Rust compiler, and
     // WiredTiger as the one storage engine. `maxBsonObjectSize` is an int64
     // here and an int32 in `hello`, as on mongod.
-    Ok(doc! {
+    doc! {
         "version": SERVER_VERSION,
         "secantusVersion": env!("CARGO_PKG_VERSION"),
         "versionArray": SERVER_VERSION_ARRAY.iter().map(|n| Bson::Int32(*n)).collect::<Vec<_>>(),
@@ -663,8 +671,7 @@ pub fn build_info(_doc: &Document, _ctx: &mut CommandContext) -> HandlerResult {
         "debug": cfg!(debug_assertions),
         "maxBsonObjectSize": Bson::Int64(i64::from(MAX_BSON_OBJECT_SIZE)),
         "storageEngines": ["wiredTiger"],
-        "ok": 1.0,
-    })
+    }
 }
 
 /// `maxAwaitTimeMS` as mongod reads it: any number, truncated toward zero.

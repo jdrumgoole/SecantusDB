@@ -291,6 +291,100 @@ pub fn record_replset_config(
     Ok(())
 }
 
+/// The size mongod gives the capped `local.startup_log` (10 MB).
+const STARTUP_LOG_SIZE: i64 = 10 * 1024 * 1024;
+
+/// Record this start in `local.startup_log`, as mongod's `logStartup` does
+/// on every start (measured 8.2.1, 2026-11-08): the capped collection is
+/// created at 10 MB when the store has none, and one document is added with
+/// `_id` `<hostname>-<milliseconds>`, `hostname`, `startTime` (to the
+/// second), `startTimeLocal` (`ctime` to the millisecond, without the year),
+/// `cmdLine` (what `getCmdLineOpts` reports as `parsed`), `pid` and
+/// `buildinfo` (`buildInfo` without its `ok`).
+pub fn record_startup(
+    storage: &dyn crate::storage::Storage,
+    require_auth: bool,
+) -> Result<(), crate::storage::StorageError> {
+    let internal = |e: String| crate::storage::StorageError::Internal(e);
+    if !storage.collection_exists("local", "startup_log")? {
+        storage.create_collection_with_options(
+            "local",
+            "startup_log",
+            &doc! {"capped": true, "size": STARTUP_LOG_SIZE},
+        )?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| internal(e.to_string()))?;
+    let millis = i64::try_from(now.as_millis()).map_err(|e| internal(e.to_string()))?;
+    let hostname = crate::dbhash::host_name();
+    let record = doc! {
+        "_id": format!("{hostname}-{millis}"),
+        "hostname": hostname,
+        "startTime": bson::DateTime::from_millis(millis - millis.rem_euclid(1000)),
+        "startTimeLocal": ctime_millis(millis),
+        "cmdLine": crate::diagnostics::parsed_options(require_auth),
+        "pid": i64::from(std::process::id()),
+        "buildinfo": crate::handshake::build_info_document(),
+    };
+    let bytes = crate::bsondoc::to_vec(&record).map_err(|e| internal(e.to_string()))?;
+    let (_, errors) = storage.insert("local", "startup_log", vec![bytes], true)?;
+    match errors.first() {
+        Some(e) => Err(internal(format!(
+            "recording the start in local.startup_log: {e}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// mongod's `dateToCtimeString`: the first 19 characters of `ctime` in local
+/// time (`Sun Nov  8 07:01:19`) and the milliseconds, the year left out.
+fn ctime_millis(millis: i64) -> String {
+    #[cfg(unix)]
+    {
+        let ms = millis.rem_euclid(1000);
+        let t: libc::time_t = millis.div_euclid(1000) as libc::time_t;
+        let mut buf = [0 as libc::c_char; 64];
+        // SAFETY: `ctime_r` writes at most 26 bytes into a 64-byte buffer.
+        let out = unsafe { libc::ctime_r(&t, buf.as_mut_ptr()) };
+        if !out.is_null() {
+            // SAFETY: on success `buf` holds a NUL-terminated string.
+            let text = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+            if let Some(head) = text.get(..19) {
+                return format!("{head}.{ms:03}");
+            }
+        }
+    }
+    ctime_utc(millis)
+}
+
+/// `ctime_millis` in UTC, where there is no `ctime_r` (days to a civil date
+/// by Howard Hinnant's `civil_from_days`).
+fn ctime_utc(millis: i64) -> String {
+    let secs = millis.div_euclid(1000);
+    let ms = millis.rem_euclid(1000);
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (days, tod) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    let z = days + 719_468;
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    format!(
+        "{} {} {day:>2} {:02}:{:02}:{:02}.{ms:03}",
+        DAYS[days.rem_euclid(7) as usize],
+        MONTHS[(month - 1) as usize],
+        tod / 3600,
+        tod % 3600 / 60,
+        tod % 60,
+    )
+}
+
 /// `replSetGetConfig`: the one-member set `hello` describes, in the shape
 /// of a configuration nobody has changed. A server run without a set name
 /// answers as a standalone does.
@@ -813,6 +907,20 @@ pub fn get_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_log_time_is_ctime_to_the_millisecond_without_the_year() {
+        // mongod 8.2.1 wrote `Sun Nov  8 07:01:19.040` for 1794121279040.
+        assert_eq!(
+            super::ctime_utc(1_794_121_279_040),
+            "Sun Nov  8 07:01:19.040"
+        );
+        assert_eq!(super::ctime_utc(0), "Thu Jan  1 00:00:00.000");
+        assert_eq!(super::ctime_utc(951_782_400_007), "Tue Feb 29 00:00:00.007");
+        let local = super::ctime_millis(1_794_121_279_040);
+        assert_eq!(local.len(), 23, "{local}");
+        assert!(local.ends_with(":19.040"), "{local}");
+    }
 
     fn ctx() -> CommandContext {
         let mut ctx = CommandContext::new(1);

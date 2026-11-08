@@ -426,6 +426,10 @@ pub fn bind(
         .map_err(|e| io::Error::other(format!("recording the replica-set configuration: {e:?}")))?;
     }
 
+    // ... and records each start in `local.startup_log`.
+    secantus_commands::serverinfo::record_startup(storage.as_ref(), config.require_auth)
+        .map_err(|e| io::Error::other(format!("recording the start: {e:?}")))?;
+
     // Build the rustls config up front so a bad cert / key fails `bind`, not the
     // first connection.
     let tls = match &config.tls {
