@@ -1775,14 +1775,27 @@ Still different, all 77:
       of mongod's own memory are not state this server has.
       Backlog-ID: RM-341
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size
-- [ ] **No plan is cached for a collection over 2,000 documents.** mongod
-      tries the candidate plans whatever the collection's size (each for at
-      most `max(10000, 0.3 * documents)` works) and caches the winner. The
-      trial here reads the whole collection into memory, so it runs over at
-      most 2,000 documents (`order::TRIAL_COLLECTION`); past that the fixed
-      order of preference picks the plan and nothing is cached.
-      Backlog-ID: RM-342
-      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_a_collection_over_2000_documents_is_cached
+- [ ] **A compound index scan whose second field has several intervals
+      examines a key more than mongod's for each value of the first.**
+      Over `a_1_c_1` (2,000 documents, `a: i % 100`, `c: i % 7`), mongod
+      8.2.11 scans `{a: {$in: [3, 60]}, c: {$in: [1, 5]}}` examining 16 keys
+      with 5 seeks and `{a: 3, c: {$in: [1, 5]}}` 7 with 2; this server's
+      scan model (`exec::Scan`, which the trial steps) counts 18 with 7 and
+      8 with 3, in `explain` and in a plan cache entry's
+      `creationExecStats`, where the extra works also move the scores.
+      Found 2026-11-08 (RM-342).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_a_scan_of_two_in_lists_examines_mongods_keys
+      Backlog-ID: RM-433
+- [ ] **`explain`'s winning plan has no work accounting.** mongod 8.2.11's
+      `executionStats` gives each stage its `works`, `advanced`, `needTime`,
+      `needYield`, `isEOF` and timings, a FETCH its `alreadyHasObj`, an
+      IXSCAN its `seeks`, `dupsTested` and `dupsDropped`. This server's
+      `executionStages` give a stage only its `nReturned` and examined
+      counts (`allPlansExecution` and `$planCacheStats` do carry the
+      accounting the trial counted). `tools/probes/explain_commands.py`
+      leaves these fields out of its comparison. Found 2026-11-08 (RM-342).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting
+      Backlog-ID: RM-434
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
