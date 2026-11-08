@@ -373,8 +373,14 @@ jobs:
       # covers only the WiredTiger C build, not cargo. The action keys on
       # Cargo.lock + the rustc version, so a dependency bump busts it correctly
       # while a change to our own sources only rebuilds our own crates.
-      # `cache-on-failure` still populates it when clippy/test go red, so a
-      # red-then-fix cycle doesn't pay the full compile twice.
+      # `cache-on-failure` still populates it when clippy/test go red.
+      #
+      # Saved from `main` only (`save-if`). A cache saved by a PR is readable
+      # by that PR alone, and PRs restore main's anyway; on 2026-11-08 the
+      # PR-scoped copies of this cache and rust-storage's held 3.2 GB of the
+      # repo's 10 GB, evicting caches every job reads. The action keeps only
+      # third-party crates, so a PR's own copy differed from main's only
+      # when the PR changed Cargo.lock.
       - name: Cache cargo registry + target (clean workspace)
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
         with:
@@ -382,6 +388,7 @@ jobs:
             crates
             crates/secantus-pgwire
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo fmt / clippy / unit tests
         # Run across the whole Rust workspace (the pure-engine `secantus-core`
@@ -662,6 +669,8 @@ jobs:
             crates/secantusdb -> ../wt-target
             crates/secantus-pg -> ../wt-target
           cache-on-failure: true
+          # Saved from main only: see the ``rust`` job's cache step.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Cargo fmt / clippy / test (secantus-storage)
         working-directory: crates/secantus-storage
@@ -1440,6 +1449,24 @@ jobs:
 
       - name: Sync dependencies
         run: uv sync --extra dev --extra admin
+
+      # Until 2026-11-08 this job had no cargo cache, so each of the three
+      # shards compiled every third-party crate on every run: "Build
+      # secantusd-pg" took 108-153s, "Build secantusd-rs" 65s and the cargo
+      # tests' build most of their 99s, in the job that sets the PR's CI
+      # time. One cache serves all three shards (`shared-key`). Only the
+      # `server` shard builds all of it (both binaries and the test
+      # targets), so only that shard saves, and only on main (see the
+      # ``rust`` job's cache step for why not from PRs).
+      - name: Cache cargo registry + target (secantus-pg, secantusdb)
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          shared-key: pg-oracle
+          workspaces: |
+            crates/secantus-pg
+            crates/secantusdb
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'server' }}
 
       # Build the standalone Rust PostgreSQL server. Without it BOTH
       # tests/test_rust_pgserver_slice.py and tests/test_rust_pgserver_differential.py
