@@ -55,6 +55,7 @@ mod ts_thesaurus;
 pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
+mod unread_ctes;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -22099,6 +22100,10 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
     {
         let _ = walk_expr(clause, &mut check);
     }
+    // A VALUES list's rows are this query level's expressions too.
+    for row in &mut s.values_lists {
+        let _ = walk_expr(row, &mut check);
+    }
     for item in &mut s.sort_clause {
         if let Some(N::SortBy(sb)) = item.node.as_mut() {
             if let Some(n) = sb.node.as_deref_mut() {
@@ -22675,9 +22680,10 @@ fn inline_ctes(s: &pg_query::protobuf::SelectStmt) -> Result<pg_query::protobuf:
     // reference the ones written before it -- and only those: PostgreSQL scopes
     // a non-recursive WITH that way too.
     let defs = cte_defs(with)?;
-    let mut out = substitute_ctes(s, &defs);
-    out.with_clause = None;
-    Ok(out)
+    // Its own items are the ones substituted, so they hide nothing.
+    let mut bare = s.clone();
+    bare.with_clause = None;
+    Ok(substitute_ctes(&bare, &defs))
 }
 
 /// A non-recursive WITH's CTEs as `(name, flat body, column aliases)`, in
@@ -22729,6 +22735,38 @@ fn inline_dml_ctes(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
+    // A WITH item that no part of the statement reads is analysed all the
+    // same, first (RP-501). An INSERT's WITH is on its SELECT by now, which
+    // `plan_select` analyses unless it is a VALUES list.
+    fn values_select(
+        i: &mut pg_query::protobuf::InsertStmt,
+    ) -> Option<&mut pg_query::protobuf::SelectStmt> {
+        match i.select_stmt.as_deref_mut().and_then(|n| n.node.as_mut()) {
+            Some(N::SelectStmt(s)) if !s.values_lists.is_empty() => Some(s),
+            _ => None,
+        }
+    }
+    let has_with = match node.node.as_ref() {
+        Some(N::UpdateStmt(u)) => u.with_clause.is_some(),
+        Some(N::DeleteStmt(d)) => d.with_clause.is_some(),
+        Some(N::InsertStmt(i)) => matches!(
+            i.select_stmt.as_deref().and_then(|n| n.node.as_ref()),
+            Some(N::SelectStmt(s)) if s.with_clause.is_some() && !s.values_lists.is_empty()
+        ),
+        _ => false,
+    };
+    if has_with {
+        let mut rest = node.clone();
+        let own_with = match rest.node.as_mut() {
+            Some(N::UpdateStmt(u)) => u.with_clause.take(),
+            Some(N::DeleteStmt(d)) => d.with_clause.take(),
+            Some(N::InsertStmt(i)) => values_select(i).and_then(|s| s.with_clause.take()),
+            _ => None,
+        };
+        if let Some(with) = own_with {
+            unread_ctes::analyse_with(&with, &rest, lookup, params)?;
+        }
+    }
     let (with, from) = match node.node.as_mut() {
         Some(N::UpdateStmt(u)) => {
             let u = &mut **u;
@@ -22914,6 +22952,31 @@ fn substitute_ctes(
         return s.clone();
     }
     let mut out = s.clone();
+    // The statement's own WITH: each item's body sees the enclosing CTEs,
+    // and an item hides an enclosing CTE of its name from the items after
+    // it and from the statement, as PostgreSQL's namespace search finds the
+    // nearest (RP-501: an unread item reading an enclosing CTE is planned
+    // on its own). A recursive WITH's items see one another throughout and
+    // are run before the statement is planned, so only its names hide.
+    let mut shadowed: Vec<String> = Vec::new();
+    if let Some(with) = out.with_clause.as_mut() {
+        let recursive = with.recursive;
+        for cte in &mut with.ctes {
+            let Some(N::CommonTableExpr(c)) = cte.node.as_mut() else {
+                continue;
+            };
+            if !recursive {
+                if let Some(N::SelectStmt(body)) =
+                    c.ctequery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    **body = substitute_ctes(body, &unshadowed_ctes(defs, &shadowed));
+                }
+            }
+            shadowed.push(c.ctename.clone());
+        }
+    }
+    let visible = unshadowed_ctes(defs, &shadowed);
+    let defs: &[_] = &visible;
     for item in &mut out.from_clause {
         substitute_in_from(item, defs);
     }
@@ -22924,6 +22987,35 @@ fn substitute_ctes(
         **side = substitute_ctes(side, defs);
     }
     out
+}
+
+/// The CTEs of `defs` no name in `shadowed` hides; borrowed when none is.
+#[allow(clippy::type_complexity)]
+fn unshadowed_ctes<'a>(
+    defs: &'a [(
+        String,
+        pg_query::protobuf::SelectStmt,
+        Vec<pg_query::protobuf::Node>,
+    )],
+    shadowed: &[String],
+) -> std::borrow::Cow<
+    'a,
+    [(
+        String,
+        pg_query::protobuf::SelectStmt,
+        Vec<pg_query::protobuf::Node>,
+    )],
+> {
+    if defs.iter().any(|(n, _, _)| shadowed.contains(n)) {
+        std::borrow::Cow::Owned(
+            defs.iter()
+                .filter(|(n, _, _)| !shadowed.contains(n))
+                .cloned()
+                .collect(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(defs)
+    }
 }
 
 /// One FROM item, rewritten in place: a bare reference to a CTE becomes the
@@ -24106,6 +24198,9 @@ fn plan_select(
             return plan_select(&rewritten, lookup, params);
         }
         let s = locking_past_ctes(s)?;
+        // Every item is analysed, read or not, before the statement
+        // (RP-501); inlining drops one nothing reads.
+        unread_ctes::analyse(&s, lookup, params)?;
         return plan_select(&inline_ctes(&s)?, lookup, params);
     }
     cancel::check()?;
@@ -29157,6 +29252,22 @@ fn plan_select_unnest(
 /// cases a client actually sends, including `VALUES (1, NULL), (2, 3)` where
 /// the second row is what types the nullable column).
 fn plan_values_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> Result<Statement> {
+    // Parse analysis first, row by row (RP-501): a row's column reference
+    // fails before its length is compared, and before any row is
+    // evaluated. A row of the wrong length stops the walk; the loop below
+    // reports it, as nothing before it had a reference.
+    let mut analysed_width: Option<usize> = None;
+    for vl in &s.values_lists {
+        let Some(N::List(l)) = vl.node.as_ref() else {
+            break;
+        };
+        fromless::check_values_row(&l.items, params)?;
+        match analysed_width {
+            None => analysed_width = Some(l.items.len()),
+            Some(w) if w != l.items.len() => break,
+            Some(_) => {}
+        }
+    }
     let mut rows: Vec<Vec<Bson>> = Vec::with_capacity(s.values_lists.len());
     let mut types: Vec<String> = Vec::new();
     let mut width = 0usize;

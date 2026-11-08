@@ -196,6 +196,10 @@ pub(crate) fn walk_select(
     {
         expr(n, visit)?;
     }
+    // A VALUES list's rows are expressions of this query level too.
+    for row in &mut s.values_lists {
+        expr(row, visit)?;
+    }
     for item in &mut s.from_clause {
         walk_from(item, visit)?;
     }

@@ -1718,6 +1718,7 @@ fn bind_bare_name(
         .chain(s.window_clause.iter_mut())
         .chain(s.where_clause.as_deref_mut())
         .chain(s.having_clause.as_deref_mut())
+        .chain(s.values_lists.iter_mut())
     {
         let _ = walk_expr(n, &mut visit);
     }

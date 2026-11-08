@@ -1923,17 +1923,44 @@ Measured on a private PostgreSQL 15.19 cluster.
       73 there) is RP-458's shape. Measured on a private 15.19 cluster.
       Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_literals_and_result
       Backlog-ID: RP-500
-- [ ] **A column reference in a VALUES list is refused as a gap, and a CTE
-      no statement reads is not analysed.** `values (nosuch)` and `values
-      (1), (nosuch)` are 0A000 `ColumnRef is not supported yet` here; on
-      PostgreSQL 15.19 42703 `column "nosuch" does not exist` at 9 and 14.
-      `with w as (select nosuch) select 1` and `with w as (select 1 from
-      nosuch) select 1` answer `1` here; PostgreSQL analyses every CTE
-      (`transformWithClause`) and answers 42703 at 19 and 42P01 `relation
-      "nosuch" does not exist` at 26. A statement PostgreSQL refuses runs.
-      The same holds in a SQL function's body at CREATE (RP-465).
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_values_and_unread_cte_are_analysed
-      Backlog-ID: RP-501
+
+## Found while working RP-501 (2026-11-07)
+
+Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
+
+- [ ] **A failed statement keeps the writes of its data-modifying WITH
+      items.** `with x as (delete from t returning a) select nosuch from x`
+      is 42703 on both, but here the rows are deleted all the same, in
+      autocommit; an INSERT or UPDATE item, or a later division by zero,
+      the same. PostgreSQL undoes every write of a statement that fails.
+      Here a data-modifying item is run (`materialize_dml_ctes`) before the
+      rest of the statement is planned, and nothing takes its write back
+      when the rest then fails. A statement reported as failed has changed
+      the table.
+      Verify: tests/backlog/test_rp_dml_cte_atomicity.py::test_failed_statement_keeps_no_write
+      Backlog-ID: RP-503
+- [ ] **What `transformWithClause` checks of a WITH is not all checked.**
+      Since RP-501 an unread item is planned without being run, so its
+      names and types are checked, but not: an unread item's literal input
+      (`with w as (select 'x'::int) select 1` is 22P02 at 19 there, `1`
+      here); an item of a WITH inside a subquery expression (`select (with
+      w as (select nosuch) select 1)`, 42703 at 27 there, `1` here); the
+      forward reference's HINT `Use WITH RECURSIVE, or re-order the WITH
+      items to remove forward references.`; an alias list longer than the
+      item's columns (`with w(x, y) as (select 1)`, 42P10 `WITH query "w"
+      has 1 columns available but 2 columns specified` at 6 there; here
+      42601 `table "w" ...` with no position when read, and nothing when
+      not); and a name given twice (42712 `WITH query name "w" specified
+      more than once` at the second, 25; here the first wins).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_clause_checks
+      Backlog-ID: RP-504
+- [ ] **A subquery's bare name for a column of an outer set-operation FROM
+      item is not found.** `select (select a) from (select 1 a union select
+      2) t` answers 1 and 2 on PostgreSQL; here it is 42703 `column "a" does
+      not exist` with the cannot-be-referenced HINT, the same through a
+      `(values (a))`. Qualified, `(select t.a)`, it works.
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_correlation_over_a_set_operation
+      Backlog-ID: RP-505
 
 ## Found while working RP-486 (2026-11-07)
 
