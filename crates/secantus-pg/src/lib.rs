@@ -12903,15 +12903,66 @@ impl PgHandler {
     /// `FuncnameGetCandidates` (RP-143). A session's temp routine answers
     /// to its bare name too, as it did before schemas were told apart.
     fn routines_named<'a>(functions: &'a [UserFunction], name: &str) -> Vec<&'a UserFunction> {
+        Self::routines_named_where(functions, name, |_| true)
+    }
+
+    /// The routines a DROP or ALTER of `kind` (`function`, `procedure` or
+    /// `routine`) reaches by a name with no argument list. PostgreSQL's
+    /// `LookupFuncWithArgs` passes the statement's object type to
+    /// `LookupFuncNameInternal` then, which skips a procedure for FUNCTION
+    /// and anything else for PROCEDURE, so the other kind is missing rather
+    /// than the wrong kind (RP-508). With an argument list it looks among
+    /// every routine and reports the wrong kind as 42809.
+    pub(crate) fn routines_of_kind<'a>(
+        functions: &'a [UserFunction],
+        name: &str,
+        kind: &str,
+    ) -> Vec<&'a UserFunction> {
+        Self::routines_named_where(functions, name, |f| match kind {
+            "procedure" => f.is_procedure,
+            "function" => !f.is_procedure,
+            _ => true,
+        })
+    }
+
+    /// `LookupFuncWithArgs`'s errors for a routine of `kind` named with no
+    /// argument list that no routine of that kind answers (42883), or more
+    /// than one does (42725).
+    pub(crate) fn routine_lookup_error(kind: &str, name: &str, found: usize) -> PgWireError {
+        if found == 0 {
+            let noun = if kind == "procedure" {
+                "procedure"
+            } else {
+                "function"
+            };
+            return Self::user_error("42883", format!("could not find a {noun} named \"{name}\""));
+        }
+        let mut info = ErrorInfo::new(
+            "ERROR".into(),
+            "42725".into(), // ambiguous_function
+            format!("{kind} name \"{name}\" is not unique"),
+        );
+        info.hint = Some(format!(
+            "Specify the argument list to select the {kind} unambiguously."
+        ));
+        PgWireError::UserError(Box::new(info))
+    }
+
+    fn routines_named_where<'a>(
+        functions: &'a [UserFunction],
+        name: &str,
+        keep: impl Fn(&UserFunction) -> bool,
+    ) -> Vec<&'a UserFunction> {
         if let Some(bare) = name.strip_prefix("pg_temp.") {
             return functions
                 .iter()
-                .filter(|f| f.name == bare && f.schema.starts_with("pg_temp"))
+                .filter(|f| keep(f) && f.name == bare && f.schema.starts_with("pg_temp"))
                 .collect();
         }
         let path = secantus_pgplan::schemas::search_path();
         let ranked: Vec<(usize, &UserFunction)> = functions
             .iter()
+            .filter(|f| keep(f))
             .filter_map(|f| {
                 secantus_pgplan::schemas::routine_rank(name, &f.schema, &f.name, &path)
                     .map(|r| (r, f))
@@ -12926,7 +12977,7 @@ impl PgHandler {
         }
         functions
             .iter()
-            .filter(|f| f.name == name && f.schema.starts_with("pg_temp"))
+            .filter(|f| keep(f) && f.name == name && f.schema.starts_with("pg_temp"))
             .collect()
     }
 
@@ -40887,6 +40938,12 @@ impl PgHandler {
                 } else {
                     "function"
                 };
+                // `does_not_exist_skipping` names the statement's own kind,
+                // DROP ROUTINE's "routine" included.
+                let skipped = match kind.as_str() {
+                    "procedure" | "routine" => kind.as_str(),
+                    _ => "function",
+                };
                 let tag = || Ok(vec![Response::Execution(Tag::new(tag_text))]);
                 if let Err(e) = self.require_routine_schema(&name) {
                     if !if_exists {
@@ -40974,7 +41031,7 @@ impl PgHandler {
                                 let written = written_args.clone().unwrap_or_default();
                                 self.notice(
                                     "00000",
-                                    format!("{noun} {name}({written}) does not exist, skipping"),
+                                    format!("{skipped} {name}({written}) does not exist, skipping"),
                                     None,
                                 );
                                 return tag();
@@ -40987,36 +41044,17 @@ impl PgHandler {
                         };
                         (*f).clone()
                     }
-                    None => match candidates.as_slice() {
-                        [] => {
-                            if if_exists {
-                                self.notice(
-                                    "00000",
-                                    format!("{noun} {name}() does not exist, skipping"),
-                                    None,
-                                );
-                                return tag();
-                            }
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".into(),
-                                "42883".into(),
-                                format!("could not find a {noun} named \"{name}\""),
-                            ))));
+                    None => match Self::routines_of_kind(&functions, &name, &kind).as_slice() {
+                        [] if if_exists => {
+                            self.notice(
+                                "00000",
+                                format!("{skipped} {name}() does not exist, skipping"),
+                                None,
+                            );
+                            return tag();
                         }
                         [one] => (*one).clone(),
-                        _ => {
-                            let mut info = ErrorInfo::new(
-                                "ERROR".into(),
-                                "42725".into(), // ambiguous_function
-                                format!("function name \"{name}\" is not unique"),
-                            );
-                            info.hint = Some(
-                                "Specify the argument list to select the function \
-                                 unambiguously."
-                                    .to_string(),
-                            );
-                            return Err(PgWireError::UserError(Box::new(info)));
-                        }
+                        found => return Err(Self::routine_lookup_error(&kind, &name, found.len())),
                     },
                 };
                 let sig = self.function_signature(&target);

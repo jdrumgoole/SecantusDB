@@ -2036,6 +2036,37 @@ holding `(1, 'y')`.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_outer_star_in_subquery
       Backlog-ID: RP-517
 
+## Found while working RP-508 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp508.py`.
+
+- [ ] **GRANT and COMMENT ON a routine named without arguments look among
+      every kind.** PostgreSQL 15.19 resolves both through
+      `LookupFuncWithArgs`, which with no argument list looks among the
+      statement's kind only (as DROP and ALTER do since RP-508). With a
+      procedure `gq(int)`, `grant execute on function gq to public` is
+      42883 `could not find a function named "gq"` there, 42809 `gq(integer)
+      is not a function` here, and `comment on function gq is 'x'` is the
+      same 42883 there and succeeds here (likewise PROCEDURE over a
+      function). Over a function `gm(int)` and a procedure `gm(text)`,
+      `grant execute on function gm` and `comment on function gm` succeed
+      there and are 42725 here; `grant ... on routine gm`'s 42725 says
+      `routine name "gm" is not unique` there, `function name` here.
+      `object_acl.rs` and the COMMENT path take every routine of the name;
+      `routines_of_kind` and `routine_lookup_error` (lib.rs) are the
+      lookup DROP and ALTER use.
+      Verify: tests/backlog/test_rp_found_rp508.py::test_grant_and_comment_look_up_by_kind
+      Backlog-ID: RP-514
+- [ ] **`pg_get_function_arguments` and `pg_get_function_identity_arguments`
+      of a procedure print no argument modes.** PostgreSQL 15.19's
+      `print_function_arguments` prints every mode of a procedure's
+      arguments, IN included: `create procedure gk(a int, inout b text)`
+      prints `IN a integer, INOUT b text` in both; here `a integer, b text`.
+      (A function's IN is left out on both servers.)
+      Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
+      Backlog-ID: RP-515
+
 ## Found while working RP-500 (2026-11-07)
 
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
@@ -2055,21 +2086,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       the same shape (RP-511).
       Backlog-ID: RP-507
       Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
-- [ ] **DROP FUNCTION or DROP PROCEDURE with no argument list, over a
-      routine of the other kind, is 42809.** With a procedure `gq(int)`,
-      PostgreSQL 15.19 answers `drop function if exists gq` with the notice
-      `function gq() does not exist, skipping` and `drop function gq` with
-      42883 `could not find a function named "gq"`, and likewise `procedure
-      gq2() does not exist, skipping` / `could not find a procedure named
-      "gq2"` over a function `gq2(int)`. A name without arguments is looked
-      up among routines of the statement's kind only (`LookupFuncWithArgs`
-      with its `objtype`). Here each is 42809 `gq(integer) is not a
-      function` (or `... is not a procedure`), IF EXISTS or not. With an
-      argument list both servers answer 42809. And `drop routine if exists
-      nosuchr(int)`'s notice is `routine nosuchr(pg_catalog.int4) does not
-      exist, skipping` there, `function ...` here.
-      Backlog-ID: RP-508
-      Verify: tests/backlog/test_rp_found_rp500.py::test_drop_without_arguments_over_the_other_kind
 - [ ] **A malformed range literal's 22P02 has no DETAIL.** PostgreSQL
       15.19's `range_parse` explains each one: `select '[1,2'::int4range`
       has DETAIL `Unexpected end of input.`, `'[1,2]x'` `Junk after right
