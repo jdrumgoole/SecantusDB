@@ -1709,21 +1709,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A missing relation named by a string literal for a `regclass`
-      parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
-      untyped literal argument to its parameter's type during analysis
-      (`coerce_type` runs `regclassin`), so a relation it names that does
-      not exist is 42P01 `relation "nosuchseq" does not exist` at the
-      literal wherever the call sits: `select 1 where false and
-      nextval('nosuchseq') > 0` (zero rows here), `select (select
-      nextval('nosuchseq') where false)` (a NULL here), `select (select
-      nextval('nosuchseq'), 2)` (here the subquery's 42601 width error,
-      since RP-452) and `select nextval('nosuchseq') + (1 + true)` (here
-      the operator's 42883). An explicit `'nosuchseq'::regclass` is already
-      42P01 as it is planned. A statement PostgreSQL refuses runs.
-      Measured on PostgreSQL 15.19 (found while working RP-452).
-      Verify: tests/backlog/test_rp_regclass_literal.py::test_regclass_literal_is_resolved_at_analysis
-      Backlog-ID: RP-458
 - [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
       `0A000 this target is not supported yet`; PostgreSQL 15.19's
       `transformTargetList` answers 42601 `SELECT * with no tables
@@ -2409,17 +2394,6 @@ int`, `t655(a d655, b int)` holding `(-1, -1)` and `(5, 5)`, then `alter
 domain d655 add constraint d655_pos check (value > 0) not valid`. The gap
 tests are in `tests/backlog/test_rp_found_rp655.py`.
 
-- [ ] **A write re-checks a domain value it does not coerce into the
-      domain.** On PostgreSQL 15.19 `update t655 set b = b where b < 0`,
-      `update t655 set a = a where b < 0` and `insert into t655 select a, 9
-      from t655 where b < 0` each succeed: the column an UPDATE does not
-      assign is stored as it was, and a value already of the column's domain
-      is no coercion, so neither checks the domain. Here each is 23514 on the
-      `-1` stored before the CHECK: `check_row_constraints` checks every
-      domain column of the row being written. Only a value coerced into the
-      domain should be (`update t655 set a = -5` is 23514 on both).
-      Verify: tests/backlog/test_rp_found_rp655.py::test_write_checks_only_what_it_coerces_into_a_domain
-      Backlog-ID: RP-664
 - [ ] **A scalar subquery over a domain column is typed by the domain's
       base.** `select pg_typeof((select a from t655 where b < 0))` is
       `d655` on PostgreSQL 15.19 (`exprType` of the SubLink is its column's);
@@ -2459,6 +2433,31 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
       RP-659 takes away.
       Verify: tests/backlog/test_rp_found_rp656.py::test_min_max_over_char_n_keep_its_blanks
       Backlog-ID: RP-671
+
+## Found while working RP-664 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp664.py`.
+
+- [ ] **An `UPDATE ... FROM` a subquery over the target whose WHERE names
+      the target is 42P01.** `update t664 set a = x.a from (select a from
+      t664 where b < 0) x where t664.b < 0` is `UPDATE 1` on PostgreSQL
+      15.19, with or without a domain column; here it is 42P01 `missing
+      FROM-clause entry for table "t664"`. Without the subquery's own
+      WHERE the statement runs, so the rewrite of an UPDATE ... FROM into
+      correlated subqueries (`rewrite_dml_from`) loses the target's name
+      when the FROM subquery has a WHERE of its own.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_update_from_subquery_over_the_target
+      Backlog-ID: RP-668
+- [ ] **A PL/pgSQL assignment to a record's field does not check the
+      field's domain.** In a BEFORE trigger on `t664t(a d664t, b int)`,
+      whose domain has a CHECK `value > 0`, `new.a := -5; new.a := 7;
+      return new;` is 23514 on PostgreSQL 15.19 for an INSERT or an UPDATE
+      (the assignment coerces `-5` into the column's domain); here the row
+      is written with `a` = 7. Only the value the trigger leaves in the row
+      is checked, after it returns (RP-664).
+      Verify: tests/backlog/test_rp_found_rp664.py::test_plpgsql_assignment_to_a_record_field_checks_its_domain
+      Backlog-ID: RP-670
 
 ## Found while working RP-570 (2026-11-08)
 
@@ -2907,3 +2906,39 @@ keeps; what follows is what that lookup does not yet check.
       is 42601 with none. (A DO block's syntax errors are RP-492.)
       Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
       Backlog-ID: RP-621
+
+## Found while working RP-458 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none needs an object.
+
+- [ ] **`regclassin` reports a missing schema as a missing relation, and a
+      quoted name's 42P01 has no position.** `select 'nosuch.s'::regclass`
+      and `pg_relation_size('nosuch.s')` are 3F000 `schema "nosuch" does not
+      exist` at the literal (8, 25) on PostgreSQL (`RangeVarGetRelid` looks
+      the schema up first); here they are 42P01 `relation "nosuch.s" does
+      not exist`. And `select '"Nosuch"'::regclass` and `select
+      nextval($$nosuchseq$$)` are 42P01 at the literal (8, 16) there and
+      have no position here: the server places a 42P01 by searching the
+      statement for the name (`err_in`, `identifier_position`), which a
+      quoted or dollar-quoted name does not match.
+      Verify: tests/backlog/test_rp_found_rp458.py::test_regclassin_errors
+      Backlog-ID: RP-675
+- [ ] **The sequence functions over a relation that is not a sequence
+      answer 42P01.** `nextval('pg_class')`, `currval('pg_class')`,
+      `setval('pg_class', 1)` and `nextval('pg_class'::regclass)` are 42809
+      `"pg_class" is not a sequence` with no position on PostgreSQL 15.19
+      (`init_sequence` opens the relation, then checks its relkind), and
+      `nextval(1234)` is XX000 `could not open relation with OID 1234`.
+      Here each is 42P01 `relation "pg_class"` / `"1234" does not exist`,
+      at the argument.
+      Verify: tests/backlog/test_rp_found_rp458.py::test_sequence_function_over_a_relation_not_a_sequence
+      Backlog-ID: RP-676
+- [ ] **A named argument to a built-in whose parameters have no names is
+      refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
+      `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>
+      unknown) does not exist` (`x => unknown`) at 8 with the
+      no-function-matches HINT on PostgreSQL 15.19 (`proargnames` is NULL
+      for `nextval`, so no candidate takes a named argument); here they are
+      0A000 `NamedArgExpr is not supported yet` with no position.
+      Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
+      Backlog-ID: RP-677

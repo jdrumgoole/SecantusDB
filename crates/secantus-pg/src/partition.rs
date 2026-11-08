@@ -651,7 +651,9 @@ impl PgHandler {
                 Some(p) => {
                     let shaped = Self::reshape_rows(def, &p, std::slice::from_ref(row))?;
                     if let Some(r) = shaped.first() {
-                        self.check_row_constraints(&p, r)?;
+                        // A partition's columns are of the parent's types,
+                        // whose domains the write has checked already.
+                        self.check_row_constraints_with(&p, r, crate::DomainChecks::Only(&[]))?;
                     }
                     level = p;
                 }

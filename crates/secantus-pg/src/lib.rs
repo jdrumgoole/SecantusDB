@@ -25237,7 +25237,12 @@ impl PgHandler {
                     decode_doc(bytes).map_err(|e| Self::storage_err("could not decode a row", e))?
                 }
             };
-            let secantus_pgplan::ConflictAction::Update { set_exprs, filter } = &oc.action else {
+            let secantus_pgplan::ConflictAction::Update {
+                set_exprs,
+                of_domain,
+                filter,
+            } = &oc.action
+            else {
                 continue; // DO NOTHING: skipped, and not counted.
             };
             // A row this command inserted or updated: PostgreSQL refuses
@@ -25277,7 +25282,14 @@ impl PgHandler {
             for k in &unset {
                 after.remove(k);
             }
-            self.check_row_constraints(def, &after)?;
+            // Only the columns DO UPDATE assigns are coerced; the others are
+            // the existing row's as stored.
+            let assigned: Vec<String> = set_exprs
+                .iter()
+                .map(|(f, ..)| f.clone())
+                .filter(|f| !of_domain.contains(f))
+                .collect();
+            self.check_row_constraints_with(def, &after, DomainChecks::Only(&assigned))?;
             self.check_computed_uniques(def, std::slice::from_ref(&after), &[row_id(&existing)])?;
             self.check_foreign_keys(def, std::slice::from_ref(&after))?;
             let id = row_id(&existing);
@@ -39832,6 +39844,7 @@ impl PgHandler {
                             overriding_system: false,
                             overriding_user: false,
                             source_targets: Vec::new(),
+                            source_domains: Vec::new(),
                         }),
                         max_rows,
                     );
@@ -39857,9 +39870,24 @@ impl PgHandler {
                 let def = self
                     .lookup_ref(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
+                // The domain columns whose source value is already of their
+                // domain: no coercion, so not checked (RP-664).
+                let mut of_domain: Vec<String> = Vec::new();
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
+                    for (target, src) in ins.targets.iter().zip(&ins.source_domains) {
+                        let (Some(col), Some(src)) = (def.column(target), src) else {
+                            continue;
+                        };
+                        if col
+                            .extra
+                            .get_str("domain_type")
+                            .is_ok_and(|d| secantus_pgplan::domains::same_domain(src, d))
+                        {
+                            of_domain.push(col.field());
+                        }
+                    }
                     let mut source_types = self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
@@ -39919,14 +39947,33 @@ impl PgHandler {
                 // BEFORE triggers see each row with its defaults, and may
                 // rewrite or drop it before any constraint is checked.
                 let triggered = self.has_triggers(&ins.table)?;
+                // With BEFORE triggers, the domain fields each row is checked
+                // in afterwards: the ones its triggers changed.
+                let mut trigger_changed: Option<Vec<Vec<String>>> = None;
                 if triggered {
                     self.fire_statement_triggers(&ins.table, "BEFORE", "INSERT")?;
-                    ins.rows = self.before_insert_rows(&def, std::mem::take(&mut ins.rows))?;
+                    // A value is coerced into its domain, and checked, where
+                    // the row is formed: before a trigger sees it (RP-664).
+                    for row in &ins.rows {
+                        self.check_domains(&def, row, DomainChecks::Except(&of_domain))?;
+                    }
+                    let formed = std::mem::take(&mut ins.rows);
+                    let fired = self.before_insert_rows_from(&def, formed.clone())?;
+                    let mut changed = Vec::with_capacity(fired.len());
+                    for (i, row) in fired {
+                        changed.push(Self::changed_domain_fields(&def, &formed[i], &row));
+                        ins.rows.push(row);
+                    }
+                    trigger_changed = Some(changed);
                 }
                 // Every constraint is checked BEFORE the first write, so a
                 // violation on any row leaves none of them inserted.
-                for row in &ins.rows {
-                    self.check_row_constraints(&def, row)?;
+                for (n, row) in ins.rows.iter().enumerate() {
+                    let domains = match &trigger_changed {
+                        Some(changed) => DomainChecks::Only(&changed[n]),
+                        None => DomainChecks::Except(&of_domain),
+                    };
+                    self.check_row_constraints_with(&def, row, domains)?;
                     self.check_view_conditions(&def, row, &ins.view_checks)?;
                     self.check_partition_route(&def, row)?;
                 }
@@ -45626,6 +45673,17 @@ impl PgHandler {
                     }
                     _ => Vec::new(),
                 };
+                // The domain columns the SET list coerces into their domain:
+                // those it assigns a value not already of the domain. The
+                // others are stored as they were, and not checked (RP-664).
+                let coerced: Vec<String> = upd
+                    .set
+                    .keys()
+                    .cloned()
+                    .chain(upd.set_exprs.iter().map(|(f, ..)| f.clone()))
+                    .chain(upd.set_subscripts.iter().map(|a| a.field.clone()))
+                    .filter(|f| !upd.of_domain.contains(f))
+                    .collect();
                 if triggered {
                     self.fire_statement_triggers(&upd.table, "BEFORE", "UPDATE")?;
                 }
@@ -45677,6 +45735,11 @@ impl PgHandler {
                                 .map_err(|e| Self::err(&e))?
                         };
                         let mut rekeyed: Option<Document> = None;
+                        // The domain fields checked against the row as
+                        // written: the SET list's coerced ones, or -- with a
+                        // BEFORE trigger, which sees them checked already --
+                        // the ones the trigger changed.
+                        let mut checked = std::borrow::Cow::Borrowed(coerced.as_slice());
                         if def.is_some() || upd.returning.is_some() {
                             let mut after = row.clone();
                             for (k, v) in &set {
@@ -45689,12 +45752,26 @@ impl PgHandler {
                                 // A BEFORE trigger may skip the row or
                                 // rewrite it; the write is then the whole
                                 // row it returned.
+                                // A value is coerced into its domain, and
+                                // checked, where the SET list is evaluated:
+                                // before the trigger sees the row (RP-664).
+                                self.check_domains(def, &after, DomainChecks::Only(&coerced))?;
+                                let planned = after.clone();
+                                checked = std::borrow::Cow::Owned(Vec::new());
                                 let Some(fired) =
                                     self.before_update_row(def, &targets, &row, after)?
                                 else {
                                     continue;
                                 };
                                 after = fired;
+                                for c in &def.columns {
+                                    let f = c.field();
+                                    if c.extra.get_str("domain_type").is_ok()
+                                        && after.get(&f) != planned.get(&f)
+                                    {
+                                        checked.to_mut().push(f);
+                                    }
+                                }
                                 set = Document::new();
                                 for (k, v) in &after {
                                     if k != "_id" && !k.starts_with("_id.") {
@@ -45748,7 +45825,11 @@ impl PgHandler {
                                         }
                                     }
                                 }
-                                self.check_row_constraints(def, &after)?;
+                                self.check_row_constraints_with(
+                                    def,
+                                    &after,
+                                    DomainChecks::Only(&checked),
+                                )?;
                                 self.check_view_conditions(def, &after, &view_checks)?;
                                 self.check_partition_route(def, &after)?;
                             }
@@ -46382,6 +46463,33 @@ impl PgHandler {
 /// Whether an UPDATE of `def` must look at each row it writes: a NOT NULL
 /// column, a domain column, a CHECK, or a FOREIGN KEY can all be violated by
 /// the new value.
+/// Which domain columns of a row being written are checked against their
+/// domain. PostgreSQL checks a domain where a value is COERCED into it
+/// (`coerce_to_domain`, run by the expression the write evaluates): a
+/// column an UPDATE does not assign is stored as it was, and a value
+/// already of the column's domain is no coercion, so neither checks
+/// anything. A row stored before a CHECK added `NOT VALID` can therefore
+/// still be updated and copied (RP-664).
+#[derive(Clone, Copy)]
+pub(crate) enum DomainChecks<'a> {
+    /// Every domain column: each value was coerced (VALUES, COPY, defaults).
+    All,
+    /// Every domain column but these stored fields.
+    Except(&'a [String]),
+    /// Only these stored fields.
+    Only(&'a [String]),
+}
+
+impl DomainChecks<'_> {
+    fn checks(&self, field: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Except(f) => !f.iter().any(|x| x == field),
+            Self::Only(f) => f.iter().any(|x| x == field),
+        }
+    }
+}
+
 fn table_has_row_constraints(def: &TableDef) -> bool {
     // A partitioned table routes each written row.
     partition::is_partitioned(def)
@@ -46742,14 +46850,51 @@ impl PgHandler {
     /// order: every NOT NULL column first, then the CHECK constraints by
     /// name. A CHECK that evaluates to NULL passes (SQL's rule).
     fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
-        // A domain column's value is coerced into the domain -- and checked
-        // against it -- before any table constraint runs.
+        self.check_row_constraints_with(def, row, DomainChecks::All)
+    }
+
+    /// The domain columns of `row` that `domains` names, each against its
+    /// domain's NOT NULL and CHECKs.
+    fn check_domains(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        domains: DomainChecks<'_>,
+    ) -> PgWireResult<()> {
         for c in &def.columns {
             if let Ok(domain) = c.extra.get_str("domain_type") {
+                if !domains.checks(&c.field()) {
+                    continue;
+                }
                 let v = row.get(c.field()).cloned().unwrap_or(Bson::Null);
                 secantus_pgplan::domains::domain_check(domain, &v).map_err(|e| Self::err(&e))?;
             }
         }
+        Ok(())
+    }
+
+    /// The stored fields of `def`'s domain columns whose value differs
+    /// between `before` and `after`.
+    fn changed_domain_fields(def: &TableDef, before: &Document, after: &Document) -> Vec<String> {
+        def.columns
+            .iter()
+            .filter(|c| c.extra.get_str("domain_type").is_ok())
+            .map(|c| c.field())
+            .filter(|f| before.get(f) != after.get(f))
+            .collect()
+    }
+
+    /// `check_row_constraints`, checking only the domain columns `domains`
+    /// says the write coerced into their domain.
+    pub(crate) fn check_row_constraints_with(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        domains: DomainChecks<'_>,
+    ) -> PgWireResult<()> {
+        // A domain column's value is coerced into the domain -- and checked
+        // against it -- before any table constraint runs.
+        self.check_domains(def, row, domains)?;
         for c in &def.columns {
             // A PRIMARY KEY column is NOT NULL, the single-column key (the
             // document's `_id`) included: a row written without one would
@@ -47154,7 +47299,8 @@ impl PgHandler {
                 for (k, v) in &set {
                     r.insert(k.clone(), v.clone());
                 }
-                self.check_row_constraints(child, &r)?;
+                // Only the key columns the action assigns are coerced.
+                self.check_row_constraints_with(child, &r, DomainChecks::Only(fields))?;
                 after.push(r);
             }
             if fk.ref_table == child.name || matches!(action, Some("SET DEFAULT")) {
