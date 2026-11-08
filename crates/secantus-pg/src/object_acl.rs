@@ -410,7 +410,7 @@ impl PgHandler {
                 // Already the catalog key: the planner resolved the RangeVar.
                 "sequence" => object.clone(),
                 _ => {
-                    let key = self.function_acl_key(object)?;
+                    let key = self.function_acl_key(object, written_kind)?;
                     self.check_routine_kind(&key, written_kind)?;
                     key
                 }
@@ -471,7 +471,7 @@ impl PgHandler {
 
     /// `LookupFuncWithArgs`' kind check: `ON FUNCTION` names no procedure
     /// and `ON PROCEDURE` no function (42809).
-    fn check_routine_kind(&self, key: &str, written_kind: &str) -> PgWireResult<()> {
+    pub(crate) fn check_routine_kind(&self, key: &str, written_kind: &str) -> PgWireResult<()> {
         let Some(f) = self.functions()?.into_iter().find(|f| f.key == key) else {
             return Ok(());
         };
@@ -506,11 +506,18 @@ impl PgHandler {
         }
     }
 
-    /// The ACL key of the routine a GRANT names (`f(int4)`, or bare `f`
-    /// when it is the only one of that name): its catalog key. 42883 when no
-    /// such signature exists, 42725 for an ambiguous bare name. A built-in
-    /// has no catalog document and is keyed `name(types)`.
-    pub(crate) fn function_acl_key(&self, signature: &str) -> PgWireResult<String> {
+    /// The ACL key of the routine a GRANT or COMMENT of `kind` (`function`,
+    /// `procedure` or `routine`) names (`f(int4)`, or bare `f` when it is
+    /// the only one of that name and kind): its catalog key, found as
+    /// PostgreSQL's `LookupFuncWithArgs` finds it. A bare name looks among
+    /// the statement's kind only (RP-514, as DROP and ALTER do since
+    /// RP-508): the other kind is missing (42883), and more than one of the
+    /// kind is 42725. A signature looks among every routine, and the caller's
+    /// `check_routine_kind` reports the wrong kind (42809); a missing one is
+    /// 42883 `procedure ... does not exist` for PROCEDURE, `function ...`
+    /// otherwise. A built-in has no catalog document and is keyed
+    /// `name(types)`.
+    pub(crate) fn function_acl_key(&self, signature: &str, kind: &str) -> PgWireResult<String> {
         // Already a catalog key (`ON ALL FUNCTIONS IN SCHEMA` expanded it).
         if let Some(key) = signature.strip_prefix('\0') {
             return Ok(key.to_string());
@@ -518,13 +525,15 @@ impl PgHandler {
         let (name, args) = split_signature(signature);
         self.require_routine_schema(&name)?;
         let functions = self.functions()?;
-        let candidates = Self::routines_named(&functions, &name);
+        // A built-in is a function: PROCEDURE never reaches one.
+        let builtin = kind != "procedure" && secantus_pgplan::is_known_function(&name);
         match args {
             Some(types) => {
+                let candidates = Self::routines_named(&functions, &name);
                 if let Some(f) = candidates.iter().find(|f| f.param_types == types) {
                     return Ok(f.key.clone());
                 }
-                if candidates.is_empty() && secantus_pgplan::is_known_function(&name) {
+                if candidates.is_empty() && builtin {
                     // Keyed by the full signature, so `abs(int4)` and
                     // `abs(numeric)` hold separate grants as in PostgreSQL.
                     return Ok(format!("{name}({})", types.join(",")));
@@ -533,29 +542,20 @@ impl PgHandler {
                     .iter()
                     .map(|t| secantus_pgplan::display_type(t))
                     .collect();
+                let noun = if kind == "procedure" {
+                    "procedure"
+                } else {
+                    "function"
+                };
                 Err(Self::user_error(
                     "42883",
-                    format!("function {name}({}) does not exist", shown.join(", ")),
+                    format!("{noun} {name}({}) does not exist", shown.join(", ")),
                 ))
             }
-            None => match candidates.as_slice() {
+            None => match Self::routines_of_kind(&functions, &name, kind).as_slice() {
                 [one] => Ok(one.key.clone()),
-                [] if secantus_pgplan::is_known_function(&name) => Ok(name),
-                [] => Err(Self::user_error(
-                    "42883",
-                    format!("could not find a function named \"{name}\""),
-                )),
-                _ => {
-                    let mut info = pgwire::error::ErrorInfo::new(
-                        "ERROR".into(),
-                        "42725".into(),
-                        format!("function name \"{name}\" is not unique"),
-                    );
-                    info.hint = Some(
-                        "Specify the argument list to select the function unambiguously.".into(),
-                    );
-                    Err(pgwire::error::PgWireError::UserError(Box::new(info)))
-                }
+                [] if builtin => Ok(name),
+                found => Err(Self::routine_lookup_error(kind, &name, found.len())),
             },
         }
     }
@@ -1011,7 +1011,7 @@ impl PgHandler {
                     ));
                 }
                 let key = self
-                    .function_acl_key(&Self::normalized_signature(&written)?)
+                    .function_acl_key(&Self::normalized_signature(&written)?, "function")
                     .map_err(|_| {
                         Self::user_error("42883", format!("function \"{written}\" does not exist"))
                     })?;

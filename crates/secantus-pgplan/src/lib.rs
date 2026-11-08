@@ -23636,6 +23636,34 @@ fn role_spec_name(r: &pg_query::protobuf::RoleSpec) -> String {
     }
 }
 
+/// A routine a GRANT or COMMENT names, as its signature: `f(int4,text)`, or
+/// bare `f` when the statement left the argument list off (the executor's
+/// `function_acl_key` resolves it as `LookupFuncWithArgs` does).
+fn routine_signature(ow: &pg_query::protobuf::ObjectWithArgs) -> Option<String> {
+    let name = schemas::routine_name(
+        ow.objname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(st) => Some(st.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter(),
+    )?;
+    if ow.args_unspecified {
+        return Some(name);
+    }
+    let args: Vec<String> = ow
+        .objargs
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::TypeName(tn) => Some(type_name_of(tn)),
+            _ => None,
+        })
+        .collect();
+    Some(format!("{name}({})", args.join(",")))
+}
+
 /// `GRANT` / `REVOKE` on objects.
 fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
     use pg_query::protobuf::{GrantTargetType as T, ObjectType as O};
@@ -23668,32 +23696,8 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
             }
             Some(N::RangeVar(rv)) => Some(relation_name(rv)),
             Some(N::String(st)) => Some(st.sval.clone()),
-            // A routine keeps its signature, `f(int4,text)` (bare `f` when
-            // the GRANT left it off): its privileges are per overload.
-            Some(N::ObjectWithArgs(ow)) => schemas::routine_name(
-                ow.objname
-                    .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        N::String(st) => Some(st.sval.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            )
-            .map(|name| {
-                if ow.args_unspecified {
-                    return name;
-                }
-                let args: Vec<String> = ow
-                    .objargs
-                    .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        N::TypeName(tn) => Some(type_name_of(tn)),
-                        _ => None,
-                    })
-                    .collect();
-                format!("{name}({})", args.join(","))
-            }),
+            // A routine keeps its signature: its privileges are per overload.
+            Some(N::ObjectWithArgs(ow)) => routine_signature(ow),
             Some(N::TypeName(t)) => t.names.last().and_then(|n| match n.node.as_ref() {
                 Some(N::String(st)) => Some(st.sval.clone()),
                 _ => None,
@@ -23922,6 +23926,7 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectSchema) => "schema",
         Ok(O::ObjectFunction) => "function",
         Ok(O::ObjectProcedure) => "procedure",
+        Ok(O::ObjectRoutine) => "routine",
         Ok(O::ObjectType) => "type",
         Ok(O::ObjectDomain) => "domain",
         Ok(O::ObjectDatabase) => "database",
@@ -23947,8 +23952,17 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         }
     }
     let mut names = Vec::new();
-    if let Some(o) = c.object.as_deref() {
-        strings(o, &mut names);
+    match c.object.as_deref().and_then(|o| o.node.as_ref()) {
+        // A routine is named by its signature, so an overload is found by
+        // its argument types and a schema-qualified name keeps its schema.
+        Some(N::ObjectWithArgs(ow)) if matches!(kind, "function" | "procedure" | "routine") => {
+            names.extend(routine_signature(ow));
+        }
+        _ => {
+            if let Some(o) = c.object.as_deref() {
+                strings(o, &mut names);
+            }
+        }
     }
     if names.is_empty() {
         return Err(Error::Unsupported("COMMENT ON this object".into()));

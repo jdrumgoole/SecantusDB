@@ -17894,35 +17894,25 @@ impl PgHandler {
                     comment.map(|c| bson::doc! {"_id": &key, "comment": c}),
                 )
             }
-            "function" | "procedure" => {
-                let fname = names
-                    .last()
+            "function" | "procedure" | "routine" => {
+                // `get_object_address` resolves the routine through
+                // `LookupFuncWithArgs`, as GRANT does (RP-514).
+                let signature = names.first().map_or("", String::as_str);
+                let key = self.function_acl_key(signature, kind)?;
+                self.check_routine_kind(&key, kind)?;
+                let Some(mut doc) = self
+                    .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+                    .iter()
+                    .find(|d| d.get_str("_id") == Ok(key.as_str()))
                     .cloned()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                let docs: Vec<Document> = self
-                    .user_function_docs()?
-                    .into_iter()
-                    .filter(|d| d.get_str("name").map(str::to_ascii_lowercase) == Ok(fname.clone()))
-                    .collect();
-                let mut doc = match docs.as_slice() {
-                    [one] => one.clone(),
-                    [] => {
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".into(),
-                            "42883".into(),
-                            format!("function {fname}() does not exist"),
-                        ))))
-                    }
-                    _ => {
-                        return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".into(),
-                            "42725".into(),
-                            format!("function name \"{fname}\" is not unique"),
-                        ))))
-                    }
+                else {
+                    // A built-in routine has no catalog document to hold it.
+                    return Err(Self::user_error(
+                        "0A000",
+                        format!("COMMENT ON a built-in {kind} ({key}) is not supported"),
+                    ));
                 };
-                let id = doc.get_str("_id").unwrap_or_default().to_string();
+                let id = key;
                 match comment {
                     Some(text) => {
                         doc.insert("comment", text);

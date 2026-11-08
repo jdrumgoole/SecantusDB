@@ -2032,23 +2032,6 @@ holding `(1, 'y')`.
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp508.py`.
 
-- [ ] **GRANT and COMMENT ON a routine named without arguments look among
-      every kind.** PostgreSQL 15.19 resolves both through
-      `LookupFuncWithArgs`, which with no argument list looks among the
-      statement's kind only (as DROP and ALTER do since RP-508). With a
-      procedure `gq(int)`, `grant execute on function gq to public` is
-      42883 `could not find a function named "gq"` there, 42809 `gq(integer)
-      is not a function` here, and `comment on function gq is 'x'` is the
-      same 42883 there and succeeds here (likewise PROCEDURE over a
-      function). Over a function `gm(int)` and a procedure `gm(text)`,
-      `grant execute on function gm` and `comment on function gm` succeed
-      there and are 42725 here; `grant ... on routine gm`'s 42725 says
-      `routine name "gm" is not unique` there, `function name` here.
-      `object_acl.rs` and the COMMENT path take every routine of the name;
-      `routines_of_kind` and `routine_lookup_error` (lib.rs) are the
-      lookup DROP and ALTER use.
-      Verify: tests/backlog/test_rp_found_rp508.py::test_grant_and_comment_look_up_by_kind
-      Backlog-ID: RP-514
 - [ ] **`pg_get_function_arguments` and `pg_get_function_identity_arguments`
       of a procedure print no argument modes.** PostgreSQL 15.19's
       `print_function_arguments` prints every mode of a procedure's
@@ -2070,6 +2053,45 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       15.19 cluster.
       Backlog-ID: RP-512
       Verify: tests/backlog/test_rp_found_rp467.py::test_view_star_over_an_aliased_column_list
+
+## Found while working RP-514 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp514.py`.
+
+- [ ] **A COMMENT ON FUNCTION is not seen by its own transaction.**
+      PostgreSQL 15.19's `obj_description` reads `pg_description` under the
+      transaction's snapshot, so `begin; comment on function gc(int) is 'w';
+      select obj_description('gc(int)'::regprocedure, 'pg_proc')` answers
+      `w`. Here it answers NULL until the transaction commits (a COMMENT ON
+      TABLE is already seen). The comment is kept on the function's record,
+      which `put_comment_doc` writes straight to storage, while the function
+      catalog is read through `type_catalog_docs`' cache and its pending
+      overlay (`self.pending.types()`), which the write does not reach.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_function_comment_seen_in_its_transaction
+      Backlog-ID: RP-518
+- [ ] **A built-in routine is not looked up among its overloads or its
+      kind.** PostgreSQL 15.19 looks a built-in up in `pg_proc` like any
+      routine: `grant execute on function lower to public` and `comment on
+      function lower is 'x'` are 42725 `function name "lower" is not unique`
+      (`comment on routine abs` says `routine name`), and `grant execute on
+      procedure abs(int)` and `comment on procedure abs(int)` are 42809
+      `abs(integer) is not a procedure`. Here the bare-name GRANT succeeds,
+      the PROCEDURE forms are 42883 `procedure abs(integer) does not exist`,
+      and every COMMENT ON a built-in routine is refused as 0A000 (PostgreSQL
+      records `comment on function abs(int)`). `function_acl_key`
+      (object_acl.rs) knows a built-in only by `is_known_function(name)`:
+      the fix needs the built-in's overloads, and a place to keep a
+      built-in's comment.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
+      Backlog-ID: RP-519
+- [ ] **GRANT's 42883 for a signature no routine has carries a position.**
+      PostgreSQL 15.19's `LookupFuncWithArgs` raises `function gc(boolean)
+      does not exist` (and `procedure ...` for PROCEDURE) with no position;
+      here it carries one, at the routine's name (27, 28). COMMENT's same
+      error has none.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_grant_missing_signature_has_no_position
+      Backlog-ID: RP-520
 
 ## Found while working RP-500 (2026-11-07)
 
