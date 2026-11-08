@@ -2359,6 +2359,8 @@ pub enum AlterTableAction {
         column: String,
         pg_type: String,
         typmod: i32,
+        /// The new type's declared array dimensions (`attndims`).
+        ndims: i32,
         /// `USING <expr>`: the new value computed from the row, as SQL
         /// (planned by the executor over the table), instead of a cast.
         using: Option<String>,
@@ -5248,8 +5250,17 @@ fn plan_node(
                 None => None,
             };
             let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
+            let like_columns = like_column_names(&c, lookup);
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
+                // A column PostgreSQL defines from a type OID -- one LIKE
+                // (a partition's too) or `OF type` brings -- has no array
+                // bounds written, so no `attndims` (`makeTypeNameFromOid`).
+                for col in def.columns.iter_mut() {
+                    if of_type.is_some() || like_columns.contains(&col.name) {
+                        col.set_ndims(0);
+                    }
+                }
                 def.extra.extend(extra);
                 if let Some(ty) = of_type {
                     def.extra.insert(typed_tables::OF_TYPE_KEY, ty);
@@ -7403,6 +7414,13 @@ pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)
 }
 
+/// The array dimensions a type name is written with -- `int[][]` 2, `int
+/// ARRAY[4]` 1, `_int4` 0 -- which `pg_attribute.attndims` records
+/// (`BuildDescForRelation`: `list_length(typeName->arrayBounds)`).
+fn declared_ndims(tn: &pg_query::protobuf::TypeName) -> i32 {
+    i32::try_from(tn.array_bounds.len()).unwrap_or(i32::MAX)
+}
+
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
     match expr_memo::type_name(tn, || {
         (type_name_of_uncached(tn), declared_typmod_uncached(tn))
@@ -8040,6 +8058,7 @@ fn plan_alter_action(
                 column: cmd.name.clone(),
                 pg_type: ty,
                 typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                ndims: cd.type_name.as_ref().map_or(0, declared_ndims),
                 using,
             })
         }
@@ -8564,6 +8583,7 @@ fn plan_added_column(
         column.sequence = Some(format!("{table}_{}_seq", cd.colname));
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+    column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -8965,11 +8985,13 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             column,
             pg_type,
             typmod,
+            ndims,
             ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
                 c.typmod = *typmod;
+                c.set_ndims(*ndims);
             }
         }
         AlterTableAction::AddCheck(check) => {
@@ -11093,6 +11115,22 @@ fn write_target_missing(table: &str, what: &str) -> Error {
     }
 }
 
+/// The columns the LIKE clauses of `c` bring, by name.
+fn like_column_names(
+    c: &pg_query::protobuf::CreateStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<String> {
+    c.table_elts
+        .iter()
+        .filter_map(|e| match e.node.as_ref() {
+            Some(N::TableLikeClause(like)) => like.relation.as_ref(),
+            _ => None,
+        })
+        .filter_map(|rel| lookup(&relation_name(rel)))
+        .flat_map(|def| def.columns.into_iter().map(|col| col.name))
+        .collect()
+}
+
 /// `CREATE TABLE t (LIKE src [INCLUDING ...], ...)`: the LIKE clause
 /// replaced by `src`'s column definitions, rendered as SQL and parsed back.
 /// Column names, types and NOT NULL always come across (as in PostgreSQL);
@@ -11299,6 +11337,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 // 4 rather than as an unsized `text` -- and so the Python
                 // server, which shares this catalog, reads the same type.
                 column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+                column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
                 // `s text COLLATE x`: recorded, and honoured wherever the
                 // column is ordered or compared (`enum_order`). It used to be
                 // dropped, so the column compared by bytes whatever it said.
@@ -17518,8 +17557,11 @@ fn plan_table_targets(
             // it the way every expression sees it.
             // A cast carrying a modifier (`::numeric(5,1)`, `::varchar(3)`)
             // takes the general path too, which rounds and truncates to it.
+            // A cast that is no coercion takes the general path too, which
+            // knows not to check the column's own domain (RP-655).
             Some(N::TypeCast(tc))
                 if !cast_chain_has_typmod(tc)
+                    && !cast_chain_has_relabel(tc)
                     && cast_chain_over_column(tc).is_ok_and(|(col, chain)| {
                         def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
                             && !user_casts::in_chain(
@@ -22245,6 +22287,42 @@ fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     }
 }
 
+/// The `TypeName.location` that marks a cast as no coercion: the parser
+/// never writes a location below -1.
+const RELABEL_LOCATION: i32 = i32::MIN;
+
+/// A cast to `ty` of an expression that is ALREADY of `ty` -- a domain
+/// column to its own domain, a subquery's value to its column's domain.
+/// `coerce_type` returns such an expression as it is (its `exprType` is the
+/// target), so it checks no constraint; here the cast still says the type
+/// and reads the value as the base type at its modifier, and checks
+/// nothing (`domains::relabel`, RP-655).
+fn relabel_cast(arg: pg_query::protobuf::Node, ty: &str) -> pg_query::protobuf::Node {
+    let mut type_name = type_name_node(ty);
+    type_name.location = RELABEL_LOCATION;
+    pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(arg)),
+            type_name: Some(type_name),
+            location: -1,
+        }))),
+    }
+}
+
+/// Whether `tc` is a `relabel_cast`.
+fn is_relabel(tc: &pg_query::protobuf::TypeCast) -> bool {
+    tc.type_name
+        .as_ref()
+        .is_some_and(|t| t.location == RELABEL_LOCATION)
+}
+
+/// Whether a chain of casts has a `relabel_cast` in it.
+fn cast_chain_has_relabel(tc: &pg_query::protobuf::TypeCast) -> bool {
+    is_relabel(tc)
+        || matches!(tc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::TypeCast(inner)) if cast_chain_has_relabel(inner))
+}
+
 /// The functions whose call is a side effect or differs per call.
 const VOLATILE_FUNCTIONS: &[&str] = &[
     "nextval",
@@ -22511,6 +22589,14 @@ fn resolve_one_sublink(
                         declare_sublink_param(params.len() - 1, t);
                     }
                     Ok(match ty.as_deref() {
+                        // The value is already of the column's domain, so
+                        // the cast checks none of its constraints (RP-655).
+                        Some(ty)
+                            if domains::user_domain(ty.strip_suffix("[]").unwrap_or(ty))
+                                .is_some() =>
+                        {
+                            relabel_cast(node, ty)
+                        }
                         Some(ty) if cast(ty) => pg_query::protobuf::Node {
                             node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                                 arg: Some(Box::new(node)),
@@ -22585,6 +22671,11 @@ fn resolve_one_sublink(
             {
                 declare_sublink_param(params.len() - 1, &array);
                 return Ok(node);
+            }
+            // Each element is already of the column's domain, so the cast
+            // checks none of its constraints (RP-655).
+            if domain {
+                return Ok(relabel_cast(node, &array));
             }
             Ok(pg_query::protobuf::Node {
                 node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
@@ -24234,6 +24325,7 @@ fn rewrite_domain_typeof(
                     changed |= cast_domain_column(e, alias, domains);
                 }
             }
+            Some(N::TypeCast(tc)) => changed |= relabel_own_domain_cast(tc, alias, domains),
             _ => {}
         }
         Ok(())
@@ -24252,10 +24344,9 @@ fn rewrite_domain_typeof(
 
 /// The domain-typed columns of `s`'s one FROM table, by name, with the name
 /// the table is referred to by: `None` unless the FROM is one table that is
-/// not a WITH's. A domain with a CHECK added `NOT VALID` is left out: the
-/// cast to it checks its constraints, which a value stored before the CHECK
-/// may fail, where PostgreSQL's column is already of the domain and checks
-/// nothing (RP-655).
+/// not a WITH's. The cast to such a column's domain is a `relabel_cast`,
+/// which checks nothing: a value stored before a CHECK added `NOT VALID`
+/// may fail it, where PostgreSQL's column is already of the domain (RP-655).
 fn domain_columns_of_from(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -24271,18 +24362,7 @@ fn domain_columns_of_from(
         return None;
     }
     let def = lookup(&relation_name(rv))?;
-    let domains: std::collections::HashMap<String, String> = def
-        .columns
-        .iter()
-        .filter_map(|c| {
-            let d = c.extra.get_str("domain_type").ok()?;
-            let (_, _, chain) = domains::base_type_and_typmod(d)?;
-            chain
-                .iter()
-                .all(|d| d.not_valid.is_empty())
-                .then(|| (c.name.clone(), d.to_string()))
-        })
-        .collect();
+    let domains = domain_columns_of(&def);
     if domains.is_empty() {
         return None;
     }
@@ -24291,6 +24371,18 @@ fn domain_columns_of_from(
         .as_ref()
         .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
     Some((alias, domains))
+}
+
+/// `def`'s domain-typed columns: each one's name and its domain's.
+fn domain_columns_of(def: &TableDef) -> std::collections::HashMap<String, String> {
+    def.columns
+        .iter()
+        .filter_map(|c| {
+            let d = c.extra.get_str("domain_type").ok()?;
+            domains::base_type_and_typmod(d)?;
+            Some((c.name.clone(), d.to_string()))
+        })
+        .collect()
 }
 
 /// `ARRAY(select c from t)` over a domain column `c` is the domain's array,
@@ -24329,29 +24421,95 @@ fn cast_domain_column(
     alias: &str,
     domains: &std::collections::HashMap<String, String>,
 ) -> bool {
-    let Some(N::ColumnRef(c)) = node.node.as_ref() else {
+    let Some(domain) = domain_column_ref(node, alias, domains).map(str::to_string) else {
         return false;
+    };
+    *node = relabel_cast(node.clone(), &domain);
+    true
+}
+
+/// `c::d` over a column of domain `d` is no coercion: the column is already
+/// of `d`, so the cast becomes a `relabel_cast` (RP-655). Whether it did.
+fn relabel_own_domain_cast(
+    tc: &mut pg_query::protobuf::TypeCast,
+    alias: &str,
+    domains: &std::collections::HashMap<String, String>,
+) -> bool {
+    if is_relabel(tc) {
+        return false;
+    }
+    let plain = tc.type_name.as_ref().is_some_and(|t| {
+        t.typmods.is_empty() && t.array_bounds.is_empty() && !t.setof && !t.pct_type
+    });
+    let own = plain
+        && tc
+            .arg
+            .as_deref()
+            .and_then(|a| domain_column_ref(a, alias, domains))
+            .is_some_and(|d| tc.type_name.as_ref().map(type_name_of).as_deref() == Some(d));
+    match tc.type_name.as_mut() {
+        Some(t) if own => {
+            t.location = RELABEL_LOCATION;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The casts of an UPDATE's or a DELETE's expressions (`exprs`) that are
+/// no coercion, over the target table's domain columns, made
+/// `relabel_cast`s (RP-655). Not with a FROM or USING list, whose tables
+/// share the scope.
+fn relabel_write_target_casts(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    def: &TableDef,
+    others: bool,
+    exprs: Vec<&mut pg_query::protobuf::Node>,
+) -> Result<()> {
+    let Some(rv) = relation else {
+        return Ok(());
+    };
+    let domains = domain_columns_of(def);
+    if others || domains.is_empty() {
+        return Ok(());
+    }
+    let alias = rv
+        .alias
+        .as_ref()
+        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if let Some(N::TypeCast(tc)) = n.node.as_mut() {
+            relabel_own_domain_cast(tc, &alias, &domains);
+        }
+        Ok(())
+    };
+    for e in exprs {
+        walk_expr(e, &mut visit)?;
+    }
+    Ok(())
+}
+
+/// The domain of the column `node` is a bare reference to, when it is one
+/// of `domains` (unqualified, or qualified by `alias`).
+fn domain_column_ref<'a>(
+    node: &pg_query::protobuf::Node,
+    alias: &str,
+    domains: &'a std::collections::HashMap<String, String>,
+) -> Option<&'a str> {
+    let Some(N::ColumnRef(c)) = node.node.as_ref() else {
+        return None;
     };
     let qualifier_ok = match c.fields.as_slice() {
         [_] => true,
         [q, _] => matches!(q.node.as_ref(), Some(N::String(q)) if q.sval == alias),
         _ => false,
     };
-    let Some(domain) = column_ref_name(c).and_then(|name| domains.get(&name)) else {
-        return false;
-    };
     if !qualifier_ok {
-        return false;
+        return None;
     }
-    let arg = node.clone();
-    *node = pg_query::protobuf::Node {
-        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-            arg: Some(Box::new(arg)),
-            type_name: Some(type_name_node(domain)),
-            location: -1,
-        }))),
-    };
-    true
+    column_ref_name(c)
+        .and_then(|name| domains.get(&name))
+        .map(String::as_str)
 }
 
 /// A role specification's name: `PUBLIC`, a role, or the session role
@@ -41699,6 +41857,26 @@ fn plan_update(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("UPDATE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "UPDATE of"))?;
+    // A cast of a domain column to its own domain checks nothing (RP-655).
+    let relabelled;
+    let u = if domain_columns_of(&def).is_empty() {
+        u
+    } else {
+        let mut w = u.clone();
+        let relation = w.relation.clone();
+        let others = !w.from_clause.is_empty();
+        let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+            w.where_clause.as_deref_mut().into_iter().collect();
+        for t in &mut w.target_list {
+            if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                exprs.extend(rt.val.as_deref_mut());
+            }
+        }
+        exprs.extend(returning_exprs(&mut w.returning_list));
+        relabel_write_target_casts(relation.as_ref(), &def, others, exprs)?;
+        relabelled = w;
+        &relabelled
+    };
     // The target named as a whole row (RP-516).
     let target_rows;
     let u = {
@@ -42330,6 +42508,21 @@ fn plan_delete(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("DELETE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "DELETE from"))?;
+    // A cast of a domain column to its own domain checks nothing (RP-655).
+    let relabelled;
+    let d = if domain_columns_of(&def).is_empty() {
+        d
+    } else {
+        let mut w = d.clone();
+        let relation = w.relation.clone();
+        let others = !w.using_clause.is_empty();
+        let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+            w.where_clause.as_deref_mut().into_iter().collect();
+        exprs.extend(returning_exprs(&mut w.returning_list));
+        relabel_write_target_casts(relation.as_ref(), &def, others, exprs)?;
+        relabelled = w;
+        &relabelled
+    };
     // The target named as a whole row (RP-516).
     let target_rows;
     let d = {
@@ -43125,6 +43318,10 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
+        // A cast that is no coercion checks no domain constraint (RP-655).
+        if is_relabel(tc) && !domains::relabelling() {
+            return domains::relabel(|| const_value_node(node, params));
+        }
         let arg = tc
             .arg
             .as_ref()

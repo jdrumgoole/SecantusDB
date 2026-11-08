@@ -1,8 +1,9 @@
 """Gap tests of the divergences found while working RP-569 (an array built
 from a domain-typed column is the domain's array):
 
-- a cast of a domain column to its own domain checks the domain's
-  constraints, so a row stored before a `NOT VALID` CHECK fails it;
+- a cast of a domain column to its own domain checked the domain's
+  constraints, so a row stored before a `NOT VALID` CHECK failed it
+  (fixed, RP-655);
 - an `ARRAY(select c ...)` subquery over a `char(n)` column drops the
   column's blanks;
 - a domain column read through a join, a WITH or a set operation is
@@ -72,16 +73,22 @@ _INT4 = 23
 # A column declared with a domain is already OF the domain, so a cast to it
 # is no coercion at all (`coerce_type` returns the expression as it is) and
 # checks nothing: a value stored before a CHECK added NOT VALID reads back,
-# under the domain's name, and in the domain's array.
+# under the domain's name, and in the domain's array -- in a WHERE, through
+# an ARRAY or scalar subquery, and in a DELETE's RETURNING too. These
+# failed with 23514 before RP-655 was fixed.
 OWN_DOMAIN = {
     "select pg_typeof(a) from t569nv order by a": (_REGTYPE, [("d569nv",), ("d569nv",)]),
     "select a::d569nv from t569nv order by a": (_INT4, [(-1,), (5,)]),
     "select array[a] from t569nv order by a": ("d569nv", ["{-1}", "{5}"]),
     "select array[a::d569nv] from t569nv order by a": ("d569nv", ["{-1}", "{5}"]),
+    "select a::d569nv from t569nv where a::d569nv < 0": (_INT4, [(-1,)]),
+    "select array(select a from t569nv order by a)": ("d569nv", ["{-1,5}"]),
+    "select (select a from t569nv where a::d569nv < 0)": (_INT4, [(-1,)]),
+    "delete from t569nv where a::d569nv < 0 returning a::d569nv": (_INT4, [(-1,)]),
 }
 
 
-@pytest.mark.backlog("RP-655")
+@pytest.mark.backlog_fixed("RP-655")
 @pytest.mark.parametrize("query", list(OWN_DOMAIN))
 def test_cast_of_a_domain_column_to_its_domain_checks_nothing(query: str, dsn: str) -> None:
     ty, rows = OWN_DOMAIN[query]

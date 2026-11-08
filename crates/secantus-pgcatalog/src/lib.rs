@@ -52,6 +52,9 @@ pub fn field_for(column: &str, pk: bool) -> String {
     }
 }
 
+/// The `Column::extra` key of a column's declared array dimensions.
+pub const ATTNDIMS_KEY: &str = "attndims";
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Column {
     pub name: String,
@@ -256,6 +259,23 @@ impl Column {
             None => {
                 self.extra.remove("default_sql");
             }
+        }
+    }
+
+    /// `pg_attribute.attndims`: how many `[]` the column's type was WRITTEN
+    /// with (`BuildDescForRelation` counts `typeName->arrayBounds`), not
+    /// whether it is an array: `_int4` is 0, `int[][]` 2, `int[3]` 1. A
+    /// column whose definition PostgreSQL builds from a type oid (LIKE, a
+    /// partition's, an inherited one, `OF type`) has none.
+    pub fn ndims(&self) -> i32 {
+        self.extra.get_i32(ATTNDIMS_KEY).unwrap_or(0)
+    }
+
+    pub fn set_ndims(&mut self, ndims: i32) {
+        if ndims > 0 {
+            self.extra.insert(ATTNDIMS_KEY, ndims);
+        } else {
+            self.extra.remove(ATTNDIMS_KEY);
         }
     }
 
