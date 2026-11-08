@@ -18900,6 +18900,16 @@ impl PgHandler {
         let mut out = Vec::new();
         for d in self.type_catalog_docs(Self::DOMAIN_COLLECTION)?.iter() {
             let name = d.get_str("domain").unwrap_or_default().to_string();
+            let not_valid = d
+                .get_array("checks")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.as_document())
+                        .filter(|c| c.get_bool("not_valid") == Ok(true))
+                        .filter_map(|c| Some(c.get_str("name").ok()?.to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
             let checks = d
                 .get_array("checks")
                 .map(|a| {
@@ -18938,6 +18948,7 @@ impl PgHandler {
                 typmod: d.get_i32("typmod").unwrap_or(-1),
                 not_null: d.get_bool("not_null").unwrap_or(false),
                 checks,
+                not_valid,
                 default_sql,
             });
         }
@@ -18952,7 +18963,13 @@ impl PgHandler {
             "base_tag": &d.base,
             "not_null": d.not_null,
             "checks": d.checks.iter()
-                .map(|(n, e)| Bson::Document(bson::doc! {"name": n, "expression": e}))
+                .map(|(n, e)| {
+                    let mut c = bson::doc! {"name": n, "expression": e};
+                    if d.not_valid.contains(n) {
+                        c.insert("not_valid", true);
+                    }
+                    Bson::Document(c)
+                })
                 .collect::<Vec<_>>(),
             "has_default": d.default_sql.is_some(),
             "default": Bson::Null,
@@ -19069,7 +19086,11 @@ impl PgHandler {
                 }
                 d.not_null = on;
             }
-            C::AddCheck(cname, expr) => {
+            C::AddCheck {
+                name: cname,
+                expr,
+                not_valid,
+            } => {
                 if d.checks.iter().any(|(n, _)| *n == cname) {
                     return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".into(),
@@ -19077,37 +19098,30 @@ impl PgHandler {
                         format!("constraint \"{cname}\" for domain \"{name}\" already exists"),
                     ))));
                 }
-                // The existing values must satisfy it: checked against a
-                // domain holding only the new constraint.
-                let mut probe = d.clone();
-                probe.checks = vec![(cname.clone(), expr.clone())];
-                probe.not_null = false;
-                let mut all = self.domains()?;
-                all.retain(|x| x.name != name);
-                all.push(probe);
-                secantus_pgplan::domains::set_user_domains(all);
-                let mut failure = None;
-                'tables: for (def, col) in self.domain_columns(name)? {
-                    let field = def.field_of(&col).unwrap_or_default();
-                    for r in self.table_docs(&def.name)? {
-                        let v = r.get(&field).cloned().unwrap_or(Bson::Null);
-                        if secantus_pgplan::domains::domain_check(name, &v).is_err() {
-                            failure = Some((def.name.clone(), col.clone()));
-                            break 'tables;
-                        }
-                    }
-                }
-                secantus_pgplan::domains::set_user_domains(self.domains()?);
-                if let Some((table, col)) = failure {
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".into(),
-                        "23514".into(),
-                        format!(
-                            "column \"{col}\" of table \"{table}\" contains values that violate the new constraint"
-                        ),
-                    ))));
+                // `AlterDomainAddConstraint`: the stored values are checked
+                // unless the constraint is added NOT VALID.
+                if !not_valid {
+                    self.validate_domain_constraint(&d, &cname, &expr)?;
+                } else {
+                    d.not_valid.push(cname.clone());
                 }
                 d.checks.push((cname, expr));
+            }
+            C::Validate(cname) => {
+                // `AlterDomainValidateConstraint`: a constraint already
+                // validated is left as it is.
+                let Some((_, expr)) = d.checks.iter().find(|(n, _)| *n == cname).cloned() else {
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        "42704".into(),
+                        format!("constraint \"{cname}\" of domain \"{name}\" does not exist"),
+                    ))));
+                };
+                if !d.not_valid.contains(&cname) {
+                    return Ok(());
+                }
+                self.validate_domain_constraint(&d, &cname, &expr)?;
+                d.not_valid.retain(|n| *n != cname);
             }
             C::DropConstraint {
                 name: cname,
@@ -19115,6 +19129,7 @@ impl PgHandler {
             } => {
                 let before = d.checks.len();
                 d.checks.retain(|(n, _)| *n != cname);
+                d.not_valid.retain(|n| *n != cname);
                 if d.checks.len() == before {
                     if missing_ok {
                         self.notice(
@@ -19142,6 +19157,51 @@ impl PgHandler {
         }
         self.delete_type_doc(Self::DOMAIN_COLLECTION, name)?;
         self.insert_type_doc(Self::DOMAIN_COLLECTION, name, doc)
+    }
+
+    /// PostgreSQL 15.19's `validateDomainConstraint`: every stored value of
+    /// a column of domain `d` must satisfy CHECK `cname` (`expr`) alone, or
+    /// 23514 names the first column holding one that does not.
+    fn validate_domain_constraint(
+        &self,
+        d: &secantus_pgplan::domains::Domain,
+        cname: &str,
+        expr: &str,
+    ) -> PgWireResult<()> {
+        // Checked against a domain holding only this constraint.
+        let mut probe = d.clone();
+        probe.checks = vec![(cname.to_string(), expr.to_string())];
+        probe.not_valid = Vec::new();
+        probe.not_null = false;
+        let mut all = self.domains()?;
+        all.retain(|x| x.name != d.name);
+        all.push(probe);
+        secantus_pgplan::domains::set_user_domains(all);
+        let scan = || -> PgWireResult<Option<(String, String)>> {
+            for (def, col) in self.domain_columns(&d.name)? {
+                let field = def.field_of(&col).unwrap_or_default();
+                for r in self.table_docs(&def.name)? {
+                    let v = r.get(&field).cloned().unwrap_or(Bson::Null);
+                    if secantus_pgplan::domains::domain_check(&d.name, &v).is_err() {
+                        return Ok(Some((def.name.clone(), col.clone())));
+                    }
+                }
+            }
+            Ok(None)
+        };
+        let failure = scan();
+        // The real constraints again, whatever the scan answered.
+        secantus_pgplan::domains::set_user_domains(self.domains()?);
+        if let Some((table, col)) = failure? {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".into(),
+                "23514".into(),
+                format!(
+                    "column \"{col}\" of table \"{table}\" contains values that violate the new constraint"
+                ),
+            ))));
+        }
+        Ok(())
     }
 
     /// Domain `name`'s stored catalog document.
@@ -19506,7 +19566,13 @@ impl PgHandler {
                     .into_iter()
                     .map(|(name, expr)| {
                         let oid = Self::index_oid(&format!("domcon:{}:{name}", d.name));
-                        let text = format!("CHECK (({}))", upper_value(&expr));
+                        // `pg_get_constraintdef_worker` marks an unvalidated one.
+                        let suffix = if d.not_valid.contains(&name) {
+                            " NOT VALID"
+                        } else {
+                            ""
+                        };
+                        let text = format!("CHECK (({})){suffix}", upper_value(&expr));
                         (oid, name, type_oid, d.name.clone(), text)
                     })
                     .collect::<Vec<_>>()
@@ -24515,7 +24581,10 @@ impl PgHandler {
                     d.insert(field("contype"), "c");
                     d.insert(field("condeferrable"), Bson::Boolean(false));
                     d.insert(field("condeferred"), Bson::Boolean(false));
-                    d.insert(field("convalidated"), Bson::Boolean(true));
+                    d.insert(
+                        field("convalidated"),
+                        Bson::Boolean(!text.ends_with(" NOT VALID")),
+                    );
                     d.insert(field("conrelid"), Bson::Int64(0));
                     d.insert(field("contypid"), Bson::Int64(type_oid));
                     d.insert(field("conindid"), Bson::Int64(0));

@@ -2235,13 +2235,6 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       aggregate outside a subquery answer as PostgreSQL.
       Backlog-ID: RP-554
       Verify: tests/backlog/test_rp_found_rp529.py::test_scalar_subquery_row_type_array
-- [ ] **`ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` checks the rows.**
-      PostgreSQL 15.19 adds the constraint unchecked (`convalidated` false)
-      when a `dnv` column holds a value it refuses; here it is 23514
-      `column "a" of table "fnv" contains values that violate the new
-      constraint` and nothing is added.
-      Backlog-ID: RP-555
-      Verify: tests/backlog/test_rp_found_rp529.py::test_domain_constraint_not_valid
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19

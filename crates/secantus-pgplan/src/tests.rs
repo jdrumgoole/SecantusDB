@@ -4849,6 +4849,7 @@ fn a_domain_over_char_n_coerces_to_its_base_width() {
         typmod,
         not_null: false,
         checks: Vec::new(),
+        not_valid: Vec::new(),
         default_sql: None,
     };
     domains::set_user_domains(vec![
@@ -4877,4 +4878,38 @@ fn a_domain_over_char_n_coerces_to_its_base_width() {
         other => panic!("wrong statement: {other:?}"),
     }
     domains::set_user_domains(Vec::new());
+}
+
+/// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
+/// (`skip_validation`), which a plain ADD does not, and `VALIDATE
+/// CONSTRAINT` names the constraint (RP-555).
+#[test]
+fn alter_domain_not_valid_and_validate() {
+    use domains::DomainChange as C;
+    let change = |sql: &str| match plan_ok(sql) {
+        Statement::AlterDomain { name, change } => {
+            assert_eq!(name, "dnv");
+            change
+        }
+        other => panic!("wrong statement: {other:?}"),
+    };
+    assert_eq!(
+        change("ALTER DOMAIN dnv ADD CONSTRAINT big CHECK (value > 5) NOT VALID"),
+        C::AddCheck {
+            name: "big".into(),
+            expr: "value > 5".into(),
+            not_valid: true,
+        }
+    );
+    assert!(matches!(
+        change("ALTER DOMAIN dnv ADD CONSTRAINT big CHECK (value > 5)"),
+        C::AddCheck {
+            not_valid: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        change("ALTER DOMAIN dnv VALIDATE CONSTRAINT big"),
+        C::Validate("big".into())
+    );
 }

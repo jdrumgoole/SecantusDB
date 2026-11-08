@@ -22,6 +22,10 @@ pub struct Domain {
     pub not_null: bool,
     /// `(constraint name, expression SQL)` in declared order.
     pub checks: Vec<(String, String)>,
+    /// The names of the `checks` added `NOT VALID` and not validated since
+    /// (`pg_constraint.convalidated` false): the values already stored were
+    /// not checked against them, though every new one is.
+    pub not_valid: Vec<String>,
     /// The DEFAULT expression's SQL.
     pub default_sql: Option<String>,
 }
@@ -83,6 +87,7 @@ pub fn system_domains() -> &'static [Domain] {
                     .iter()
                     .map(|(n, e)| (n.to_string(), e.to_string()))
                     .collect(),
+                not_valid: Vec::new(),
                 default_sql: default.map(str::to_string),
             }
         };
@@ -404,6 +409,7 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
         typmod: declared_typmod(tn),
         not_null: not_null.unwrap_or(false),
         checks,
+        not_valid: Vec::new(),
         default_sql,
     }))
 }
@@ -413,8 +419,19 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
 pub enum DomainChange {
     SetDefault(Option<String>),
     NotNull(bool),
-    AddCheck(String, String),
-    DropConstraint { name: String, missing_ok: bool },
+    /// `ADD CONSTRAINT name CHECK (expr) [NOT VALID]`.
+    AddCheck {
+        name: String,
+        expr: String,
+        /// `NOT VALID`: the stored values are not checked.
+        not_valid: bool,
+    },
+    /// `VALIDATE CONSTRAINT name`.
+    Validate(String),
+    DropConstraint {
+        name: String,
+        missing_ok: bool,
+    },
 }
 
 /// `ALTER DOMAIN name ...`.
@@ -437,8 +454,17 @@ pub(crate) fn plan_alter_domain(a: &pg_query::protobuf::AlterDomainStmt) -> Resu
             let (cname, expr) = checks
                 .pop()
                 .ok_or_else(|| Error::Unsupported("this ALTER DOMAIN constraint".into()))?;
-            DomainChange::AddCheck(cname, expr)
+            // `initially_valid` is `!skip_validation` (`transformConstraintAttrs`).
+            let not_valid = nodes
+                .iter()
+                .any(|n| matches!(n.node.as_ref(), Some(N::Constraint(k)) if k.skip_validation));
+            DomainChange::AddCheck {
+                name: cname,
+                expr,
+                not_valid,
+            }
         }
+        "V" => DomainChange::Validate(a.name.clone()),
         "X" => DomainChange::DropConstraint {
             name: a.name.clone(),
             missing_ok: a.missing_ok,

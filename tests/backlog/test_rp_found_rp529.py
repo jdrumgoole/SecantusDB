@@ -4,7 +4,7 @@ over `char(n)` was not blank-padded; fixed), RP-552 (a domain's CHECK error insi
 record literal carries no position), RP-553 (a schema's domain names its
 CHECK after the qualified name), RP-554 (a scalar subquery's array of a row
 type is described as `text[]`), RP-555 (`ALTER DOMAIN ... NOT VALID`
-validates the rows) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
+validated the rows; fixed) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
 column's type is refused).
 
 An answer is the rows, the command tag for a statement that returns none,
@@ -188,14 +188,76 @@ def _then(dsn: str, statement: str, query: str) -> Any:
         return tag, c.execute(query).fetchall()
 
 
-# NOT VALID adds the constraint without checking the rows already there.
-@pytest.mark.backlog("RP-555")
+# NOT VALID added the constraint without checking the rows already there.
+@pytest.mark.backlog_fixed("RP-555")
 def test_domain_constraint_not_valid(dsn: str) -> None:
     assert _then(
         dsn,
         "alter domain dnv add constraint big check (value > 5) not valid",
         "select convalidated from pg_constraint where conname = 'big'",
     ) == ("ALTER DOMAIN", [(False,)])
+
+
+_BIG = (
+    "select convalidated, pg_get_constraintdef(oid),"
+    " pg_get_constraintdef(oid, true) from pg_constraint where conname = 'big'"
+)
+
+# A NOT VALID constraint still checks every new value; VALIDATE CONSTRAINT
+# checks the stored ones (`validateDomainConstraint`), then marks it
+# validated, and its definition loses the NOT VALID. `fnv` holds 1.
+NOT_VALID_THEN_VALIDATE = [
+    ("alter domain dnv add constraint big check (value > 5) not valid", "ALTER DOMAIN"),
+    (
+        _BIG,
+        [(False, "CHECK ((VALUE > 5)) NOT VALID", "CHECK (VALUE > 5) NOT VALID")],
+    ),
+    (
+        "insert into fnv values (2)",
+        ("23514", 'value for domain dnv violates check constraint "big"'),
+    ),
+    ("insert into fnv values (7)", "INSERT 0 1"),
+    (
+        "alter domain dnv validate constraint big",
+        (
+            "23514",
+            'column "a" of table "fnv" contains values that violate the new constraint',
+        ),
+    ),
+    (
+        "alter domain dnv validate constraint nosuch",
+        ("42704", 'constraint "nosuch" of domain "dnv" does not exist'),
+    ),
+    ("delete from fnv where a < 5", "DELETE 1"),
+    ("alter domain dnv validate constraint big", "ALTER DOMAIN"),
+    (_BIG, [(True, "CHECK ((VALUE > 5))", "CHECK (VALUE > 5)")]),
+    # Validating a validated constraint does nothing.
+    ("alter domain dnv validate constraint big", "ALTER DOMAIN"),
+    ("alter domain dnv drop constraint big", "ALTER DOMAIN"),
+    ("select count(*) from pg_constraint where conname = 'big'", [(0,)]),
+]
+
+
+def _in_order(dsn: str, steps: list[str]) -> list[Any]:
+    """Each statement's answer after `_SETUP`, in order on one connection."""
+    out: list[Any] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        for q in steps:
+            try:
+                cur = c.execute(q)
+            except psycopg.Error as e:
+                out.append((e.sqlstate, e.diag.message_primary))
+                continue
+            out.append(cur.fetchall() if cur.description else cur.statusmessage)
+    return out
+
+
+@pytest.mark.backlog_fixed("RP-555")
+def test_domain_constraint_not_valid_then_validate(dsn: str) -> None:
+    steps = [q for q, _ in NOT_VALID_THEN_VALIDATE]
+    assert _in_order(dsn, steps) == [a for _, a in NOT_VALID_THEN_VALIDATE]
 
 
 # A column retyped to a domain over its own type needs no USING.
