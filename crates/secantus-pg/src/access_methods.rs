@@ -197,6 +197,7 @@ impl PgHandler {
                             secantus_pgplan::Statement::DropMatView {
                                 names: vec![rel.clone()],
                                 if_exists: true,
+                                cascade: true,
                             }
                         } else {
                             secantus_pgplan::Statement::DropTable(secantus_pgplan::DropTable {

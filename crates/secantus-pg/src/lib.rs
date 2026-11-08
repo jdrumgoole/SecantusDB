@@ -14904,19 +14904,39 @@ impl PgHandler {
 
     /// PostgreSQL's 2BP01 for a RESTRICT drop that something depends on: one
     /// DETAIL line per dependant.
-    fn dependants_error(what: &str, dependants: &[String]) -> PgWireError {
-        let mut info = ErrorInfo::new(
-            "ERROR".into(),
-            "2BP01".into(), // dependent_objects_still_exist
-            format!("cannot drop {what} because other objects depend on it"),
-        );
-        let lines: Vec<String> = dependants
-            .iter()
-            .map(|d| format!("view {d} depends on {what}"))
-            .collect();
-        info.detail = Some(lines.join("\n"));
-        info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
-        PgWireError::UserError(Box::new(info))
+    /// A DROP of view or materialized view `name` (of `kind`) over what
+    /// `rule_dependents` found reading it: RESTRICT refuses, naming each;
+    /// CASCADE names them in one notice and drops them, the last found
+    /// first, so each goes after what reads it.
+    fn drop_rule_dependents(
+        &self,
+        kind: &str,
+        name: &str,
+        dependants: &[RuleDependent],
+        cascade: bool,
+        max_rows: usize,
+    ) -> PgWireResult<()> {
+        if dependants.is_empty() {
+            return Ok(());
+        }
+        let raw = |k: &str| k.to_string();
+        if !cascade {
+            let mut info = ErrorInfo::new(
+                "ERROR".into(),
+                "2BP01".into(), // dependent_objects_still_exist
+                format!("cannot drop {kind} {name} because other objects depend on it"),
+            );
+            let lines: Vec<String> = dependants.iter().map(|d| d.line(raw)).collect();
+            info.detail = Some(lines.join("\n"));
+            info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
+            return Err(PgWireError::UserError(Box::new(info)));
+        }
+        let descs: Vec<String> = dependants.iter().map(|d| d.desc(raw)).collect();
+        self.cascade_notice(&descs);
+        for d in dependants.iter().rev() {
+            self.drop_rule_dependent(d, max_rows)?;
+        }
+        Ok(())
     }
 
     /// Every view: `(name, stored definition)`, name-sorted, with this
@@ -26236,6 +26256,34 @@ const HIDDEN_SETTINGS: [&str; 6] = [
     "default_with_oids",
 ];
 
+/// One reader `rule_dependents` found: a view or materialized view `key`
+/// and the relation `on_key` (of `on_kind`) it depends on.
+struct RuleDependent {
+    kind: &'static str,
+    key: String,
+    on_kind: &'static str,
+    on_key: String,
+}
+
+impl RuleDependent {
+    /// DROP's DETAIL line, `view v depends on table t`, with each name as
+    /// `name` shows it.
+    fn line(&self, name: impl Fn(&str) -> String) -> String {
+        format!(
+            "{} {} depends on {} {}",
+            self.kind,
+            name(&self.key),
+            self.on_kind,
+            name(&self.on_key)
+        )
+    }
+
+    /// The reader as a CASCADE notice names it.
+    fn desc(&self, name: impl Fn(&str) -> String) -> String {
+        format!("{} {}", self.kind, name(&self.key))
+    }
+}
+
 impl PgHandler {
     /// `find_option`'s answer for a name a statement sets, resets or ALTERs:
     /// PostgreSQL knows its own parameters and takes any dotted (custom)
@@ -26365,18 +26413,44 @@ impl PgHandler {
         }))
     }
 
-    /// The views over relation `key` (of `kind`) not already in `seen`,
-    /// each followed by the views over it, as DROP's DETAIL nests them:
-    /// `(view v, view v depends on table t)`.
-    fn view_dependents(
-        views: &[(String, String)],
-        kind: &str,
+    /// What reads relation `key` (of `kind`) through a view's or a
+    /// materialized view's `_RETURN` rule, as `findDependentObjects`
+    /// reaches it: each reader, then what reads that reader, depth first,
+    /// one relation's readers in the order they were made (by oid). A
+    /// materialized view is a dependent exactly as a view is; only its
+    /// description differs (RP-525). Names in `seen` are skipped (and each
+    /// reader found joins them), so a DROP's own targets are not their own
+    /// dependents.
+    fn rule_dependents(
+        &self,
+        kind: &'static str,
         key: &str,
         seen: &mut Vec<String>,
-        out: &mut Vec<(String, String)>,
+    ) -> PgWireResult<Vec<RuleDependent>> {
+        let mut readers: Vec<(i64, &'static str, String, String)> = Vec::new();
+        for (v, definition) in self.views_shared()?.iter() {
+            let oid = self.relation_oid(v).unwrap_or_else(|| self.view_relid(v));
+            readers.push((oid, "view", v.clone(), definition.clone()));
+        }
+        for (m, definition, _) in self.matviews()? {
+            let oid = self.relation_oid(&m).unwrap_or(i64::MAX);
+            readers.push((oid, "materialized view", m, definition));
+        }
+        readers.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.2.cmp(&b.2)));
+        let mut out = Vec::new();
+        Self::rule_dependents_of(&readers, kind, key, seen, &mut out);
+        Ok(out)
+    }
+
+    fn rule_dependents_of(
+        readers: &[(i64, &'static str, String, String)],
+        kind: &'static str,
+        key: &str,
+        seen: &mut Vec<String>,
+        out: &mut Vec<RuleDependent>,
     ) {
-        for (view, definition) in views {
-            if seen.contains(view) {
+        for (_, reader_kind, reader, definition) in readers {
+            if seen.contains(reader) {
                 continue;
             }
             let reads = secantus_pgplan::privileges::sql_relations(definition)
@@ -26385,17 +26459,43 @@ impl PgHandler {
             if !reads {
                 continue;
             }
-            seen.push(view.clone());
-            let shown = secantus_pgplan::schemas::visible_name(view);
-            out.push((
-                format!("view {shown}"),
-                format!(
-                    "view {shown} depends on {kind} {}",
-                    secantus_pgplan::schemas::visible_name(key)
-                ),
-            ));
-            Self::view_dependents(views, "view", view, seen, out);
+            seen.push(reader.clone());
+            out.push(RuleDependent {
+                kind: reader_kind,
+                key: reader.clone(),
+                on_kind: kind,
+                on_key: key.to_string(),
+            });
+            Self::rule_dependents_of(readers, reader_kind, reader, seen, out);
         }
+    }
+
+    /// Drop one of `rule_dependents`' readers, whose own readers are gone
+    /// already: a view's definition, or a materialized view's definition
+    /// and the relation holding its rows.
+    fn drop_rule_dependent(&self, d: &RuleDependent, max_rows: usize) -> PgWireResult<()> {
+        if d.kind == "view" {
+            return self.delete_view(&d.key);
+        }
+        self.drop_matview_relation(&d.key, max_rows)
+    }
+
+    /// A materialized view's definition and the relation holding its rows.
+    fn drop_matview_relation(&self, name: &str, max_rows: usize) -> PgWireResult<()> {
+        self.delete_type_doc(Self::MATVIEW_COLLECTION, name)?;
+        // The DROP TABLE below walks what reads the relation again: the
+        // readers this statement has just dropped must be gone from the
+        // catalog it reads, not still in the cached copy.
+        bump_catalog_version();
+        self.execute(
+            Statement::DropTable(secantus_pgplan::DropTable {
+                tables: vec![name.to_string()],
+                if_exists: true,
+                cascade: false,
+            }),
+            max_rows,
+        )?;
+        Ok(())
     }
 
     /// `pg_attribute`'s row for a dropped column's slot, `n`.
@@ -28912,6 +29012,9 @@ impl PgHandler {
             Statement::DropTable(d) => {
                 let mut v = d.tables.clone();
                 v.push(CATALOG_COLLECTION.to_string());
+                // CASCADE reaches the views and materialized views over it.
+                v.push(Self::VIEW_COLLECTION.to_string());
+                v.push(Self::MATVIEW_COLLECTION.to_string());
                 v.push(SEQUENCE_COLLECTION.to_string());
                 v.push(Self::COMPOSITE_COLLECTION.to_string());
                 v.push(triggers::TRIGGER_COLLECTION.to_string());
@@ -28927,7 +29030,10 @@ impl PgHandler {
             Statement::CreateEnum { .. } => vec![Self::ENUM_COLLECTION.to_string()],
             Statement::CreateView(_) => vec![Self::VIEW_COLLECTION.to_string()],
             Statement::DropView { .. } => {
-                let mut v = vec![Self::VIEW_COLLECTION.to_string()];
+                let mut v = vec![
+                    Self::VIEW_COLLECTION.to_string(),
+                    Self::MATVIEW_COLLECTION.to_string(),
+                ];
                 v.extend(Self::grant_collections().map(String::from));
                 v
             }
@@ -28991,6 +29097,7 @@ impl PgHandler {
             Statement::DropMatView { names, .. } => {
                 let mut v = names.clone();
                 v.push(Self::MATVIEW_COLLECTION.to_string());
+                v.push(Self::VIEW_COLLECTION.to_string());
                 v.push(CATALOG_COLLECTION.to_string());
                 v
             }
@@ -40213,9 +40320,9 @@ impl PgHandler {
                     ));
                 }
                 // Each member, then what depends on it in turn, depth first:
-                // a view elsewhere over one of its relations, and a view over
-                // that view (`(description, depends-on line)`).
-                let views = self.views_shared()?;
+                // a view or materialized view elsewhere over one of its
+                // relations, and what reads that (`(description, depends-on
+                // line)`).
                 let members: Vec<String> = held
                     .iter()
                     .flat_map(|(_, h)| h.relations.iter().map(|(_, k)| k.clone()))
@@ -40228,7 +40335,10 @@ impl PgHandler {
                         if let Some((kind, key)) =
                             h.relations.iter().find(|(k, r)| format!("{k} {r}") == *d)
                         {
-                            Self::view_dependents(&views, kind, key, &mut seen, &mut tree);
+                            let shown = secantus_pgplan::schemas::visible_name;
+                            for dep in self.rule_dependents(kind, key, &mut seen)? {
+                                tree.push((dep.desc(shown), dep.line(shown)));
+                            }
                         }
                     }
                 }
@@ -43168,24 +43278,9 @@ impl PgHandler {
                             format!("view \"{name}\" does not exist"),
                         ))));
                     }
-                    let dependants: Vec<String> = secantus_pgplan::views_reading(name)
-                        .into_iter()
-                        .filter(|d| !names.contains(d))
-                        .collect();
-                    if !dependants.is_empty() {
-                        if !cascade {
-                            return Err(Self::dependants_error(
-                                &format!("view {name}"),
-                                &dependants,
-                            ));
-                        }
-                        let descs: Vec<String> =
-                            dependants.iter().map(|d| format!("view {d}")).collect();
-                        self.cascade_notice(&descs);
-                        for d in &dependants {
-                            self.delete_view(d)?;
-                        }
-                    }
+                    let mut seen = names.clone();
+                    let dependants = self.rule_dependents("view", name, &mut seen)?;
+                    self.drop_rule_dependents("view", name, &dependants, cascade, max_rows)?;
                     self.delete_view(name)?;
                     self.drop_grants(name)?;
                 }
@@ -43239,25 +43334,11 @@ impl PgHandler {
                                 child.name != *table && !drop.tables.contains(&child.name)
                             })
                             .collect();
-                        // (view, what it depends on), breadth first.
-                        let mut views: Vec<(String, String)> = Vec::new();
-                        let mut frontier = vec![format!("table {table}")];
-                        let mut names = vec![table.clone()];
-                        while let Some(on) = names.first().cloned() {
-                            names.remove(0);
-                            let what = frontier.remove(0);
-                            for v in secantus_pgplan::views_reading(&on) {
-                                if self.is_partition(&v)
-                                    || children.contains(&v)
-                                    || views.iter().any(|(n, _)| *n == v)
-                                {
-                                    continue;
-                                }
-                                views.push((v.clone(), what.clone()));
-                                names.push(v.clone());
-                                frontier.push(format!("view {v}"));
-                            }
-                        }
+                        // The views and materialized views over it, and over
+                        // those, depth first (RP-525).
+                        let mut seen = vec![table.clone()];
+                        seen.extend(children.iter().cloned());
+                        let views = self.rule_dependents("table", table, &mut seen)?;
                         // Inheritance children (and theirs) depend on it too.
                         let mut kids: Vec<(String, String)> = Vec::new();
                         let mut stack = vec![table.clone()];
@@ -43282,11 +43363,12 @@ impl PgHandler {
                                     format!("table {table}"),
                                 )
                             }))
-                            .chain(
-                                views
-                                    .iter()
-                                    .map(|(v, on)| (format!("view {v}"), on.clone())),
-                            )
+                            .chain(views.iter().map(|d| {
+                                (
+                                    d.desc(str::to_string),
+                                    format!("{} {}", d.on_kind, d.on_key),
+                                )
+                            }))
                             .collect();
                         if !objects.is_empty() {
                             if !drop.cascade {
@@ -43318,8 +43400,8 @@ impl PgHandler {
                                 def.foreign_keys.retain(|f| f.name != fk.name);
                                 self.rewrite_catalog(&child.name, &def)?;
                             }
-                            for (v, _) in views.iter().rev() {
-                                self.delete_view(v)?;
+                            for d in views.iter().rev() {
+                                self.drop_rule_dependent(d, max_rows)?;
                             }
                             for (k, _) in kids.iter().rev() {
                                 if self.lookup(k).is_some() {
@@ -43919,7 +44001,11 @@ impl PgHandler {
                     "REFRESH MATERIALIZED VIEW",
                 ))])
             }
-            Statement::DropMatView { names, if_exists } => {
+            Statement::DropMatView {
+                names,
+                if_exists,
+                cascade,
+            } => {
                 let existing = self.matviews()?;
                 for name in &names {
                     if !existing.iter().any(|(n, _, _)| n == name) {
@@ -43940,15 +44026,17 @@ impl PgHandler {
                             format!("materialized view \"{name}\" does not exist"),
                         ))));
                     }
-                    self.delete_type_doc(Self::MATVIEW_COLLECTION, name)?;
-                    self.execute(
-                        Statement::DropTable(secantus_pgplan::DropTable {
-                            tables: vec![name.clone()],
-                            if_exists: true,
-                            cascade: false,
-                        }),
+                    // What reads it goes first, or refuses the drop.
+                    let mut seen = names.clone();
+                    let dependants = self.rule_dependents("materialized view", name, &mut seen)?;
+                    self.drop_rule_dependents(
+                        "materialized view",
+                        name,
+                        &dependants,
+                        cascade,
                         max_rows,
                     )?;
+                    self.drop_matview_relation(name, max_rows)?;
                 }
                 Ok(vec![Response::Execution(Tag::new(
                     "DROP MATERIALIZED VIEW",
