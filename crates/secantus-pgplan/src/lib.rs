@@ -29853,10 +29853,22 @@ pub fn display_type(internal: &str) -> String {
 /// casts (`generate_series(1, 2)::int4`, `...::int4::text`).
 ///
 /// Returns the underlying `FuncCall` plus the cast chain, innermost-first, so
-/// Does any cast in a chain of casts carry a type modifier?
+/// Does any cast in a chain of casts carry a type modifier, written in the
+/// cast (`::varchar(3)`) or the domain's own (`::d`, `::d[]`, `d` a domain
+/// over `char(3)`)? `coerce_to_domain` coerces to the base type at the
+/// domain's modifier (`getBaseTypeAndTypmod`), the same for a bare column
+/// as for a constant, so such a cast takes the general path that applies it
+/// (RP-580).
 fn cast_chain_has_typmod(tc: &pg_query::protobuf::TypeCast) -> bool {
-    if tc.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty()) {
-        return true;
+    if let Some(t) = tc.type_name.as_ref() {
+        if !t.typmods.is_empty() {
+            return true;
+        }
+        let name = type_name_of(t);
+        let element = name.strip_suffix("[]").unwrap_or(&name);
+        if domains::base_type_and_typmod(element).is_some_and(|(_, typmod, _)| typmod >= 0) {
+            return true;
+        }
     }
     match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
         Some(N::TypeCast(inner)) => cast_chain_has_typmod(inner),

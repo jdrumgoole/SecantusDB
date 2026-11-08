@@ -5259,3 +5259,57 @@ fn composite_column_against_another_record_type_is_per_row() {
     set_user_types(Vec::new());
     set_user_composites(Vec::new());
 }
+
+/// RP-580: a cast to a domain whose base type carries a modifier counts as a
+/// cast with a modifier, so a bare column's cast to it takes the general
+/// path, which coerces to the base type at the domain's modifier, as
+/// PostgreSQL 15.19's `coerce_to_domain` does (`t::d` over `char(3)` pads
+/// `ab` to `ab `). A domain with no modifier, at any depth, does not.
+#[test]
+fn a_cast_to_a_domain_with_a_modifier_has_a_typmod() {
+    let domain = |name: &str, oid, base: &str, typmod| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        default_sql: None,
+        not_valid: Vec::new(),
+    };
+    domains::set_user_domains(vec![
+        domain("dm3", 90021, "bpchar", 7),
+        domain("dm3c", 90022, "dm3", -1),
+        domain("dmi", 90023, "int4", -1),
+    ]);
+    let has_typmod = |sql: &str| -> bool {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("no target");
+        };
+        let Some(N::TypeCast(tc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            panic!("not a cast: {sql}");
+        };
+        cast_chain_has_typmod(tc)
+    };
+    let cases = [
+        ("select t::dm3 from x", true),
+        ("select t::dm3c from x", true),
+        ("select t::dm3[] from x", true),
+        ("select t::dm3::text from x", true),
+        ("select t::varchar(3) from x", true),
+        ("select t::dmi from x", false),
+        ("select t::text from x", false),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(has_typmod(sql), want, "{sql}");
+    }
+    domains::set_user_domains(Vec::new());
+}

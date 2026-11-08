@@ -2312,16 +2312,6 @@ char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
 and `(2, 'abcd', '{abcd}')`. The gap tests are in
 `tests/backlog/test_rp_found_rp570.py`.
 
-- [ ] **A cast of a bare column to a domain with a modifier ignores it.**
-      `select t::d570c from t570` is `ab ` and `abc` on PostgreSQL 15.19,
-      and `ta::d570c[]` is `{"ab "}` and `{abc}`. Here each value comes
-      back as stored. A cast of a constant, or of an expression over the
-      row (`array[t]::d570c[]`), applies the modifier (RP-551, RP-570); a
-      cast of a bare column takes `ColumnExpr::Casts`, which
-      `cast_chain_has_typmod` lets through because the cast writes no
-      modifier of its own.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_column_cast_to_domain_applies_typmod
-      Backlog-ID: RP-580
 - [ ] **A domain array literal's input error has no position.** `select
       '{abcd}'::d570c[]` is 22001 at 8 on PostgreSQL 15.19 (`array_in` runs
       `domain_in` while it reads the literal, as `'x'::int` is positioned
@@ -2329,6 +2319,24 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       by its SQLSTATE and message, and an assignment's 22001 has none.
       Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
       Backlog-ID: RP-581
+
+## Found while working RP-580 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d607a as
+char(3)` and `create domain d607b as d607a check (value <> 'abc')`. The gap
+test is in `tests/backlog/test_rp_found_rp580.py`.
+
+- [ ] **DROP DOMAIN drops a domain another domain is over.** `drop domain
+      d607a` and `drop domain d607a restrict` are 2BP01 `cannot drop type
+      d607a because other objects depend on it` (DETAIL `type d607b depends
+      on type d607a`, the CASCADE HINT) on PostgreSQL 15.19, and `drop
+      domain d607a cascade` drops both. Here each of the three drops
+      `d607a` alone and leaves `d607b` over a type that no longer exists.
+      `drop type d607a` is refused as PostgreSQL refuses it, but `drop type
+      d607a cascade` drops `d607b`, then fails 42704 `type "d607a" does
+      not exist` and leaves `d607a` in place.
+      Verify: tests/backlog/test_rp_found_rp580.py::test_drop_of_a_domain_another_domain_is_over
+      Backlog-ID: RP-607
 
 ## Found while working RP-575 (2026-11-08)
 
