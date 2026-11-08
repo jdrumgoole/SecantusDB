@@ -20382,6 +20382,9 @@ fn rewrite_dml_from(
             )),
         })),
     };
+    // A write's own qualified references, against its namespace as
+    // written (RP-523).
+    check_write_qualifiers(node)?;
     // A write whose target is a VIEW becomes the same write on its base
     // table (automatically updatable views).
     view_dml::rewrite(node, lookup)?;
@@ -22768,6 +22771,135 @@ fn missing_rte_hint(levels: &[RangeLevel], q: &str) -> Option<MissingRteHint> {
         }
     }
     Some(MissingRteHint::Entry(entry.eref.clone()))
+}
+
+/// PostgreSQL's `errorMissingRTE` for a write's OWN qualified column
+/// references (RP-523): those of its SET values, WHERE and RETURNING (an
+/// INSERT's ON CONFLICT DO UPDATE and RETURNING), each looked up as
+/// `transformColumnRef` looks it up, in the namespace `setTargetTable` and
+/// `transformFromClause` built. An aliased target is visible by its alias
+/// alone, so `update fs x set c = fs.c` is 42P01 `invalid reference to
+/// FROM-clause entry for table "fs"`, HINT `Perhaps you meant to reference
+/// the table alias "x".`; a qualifier no entry has is `missing FROM-clause
+/// entry`. Without this the lowering, which resolves a column by its last
+/// name part, read the target's column for either. An INSERT's EXCLUDED
+/// is in the range table throughout but in the namespace only for the ON
+/// CONFLICT clause (`transformOnConflictClause` takes it out before
+/// RETURNING).
+///
+/// The clauses are read in the order PostgreSQL transforms them: an
+/// UPDATE's WHERE, RETURNING, then SET (`transformUpdateStmt`), a DELETE's
+/// WHERE then RETURNING, an INSERT's ON CONFLICT then RETURNING. A
+/// subquery's body is its own level, checked when it is resolved; a FROM
+/// item's expressions belong to the SELECT the FROM is rewritten into. A
+/// reference of two names is `rel.col`, of three `schema.rel.col`; longer
+/// ones keep the errors they have.
+fn check_write_qualifiers(node: &pg_query::protobuf::Node) -> Result<()> {
+    fn values(list: &[pg_query::protobuf::Node]) -> Vec<pg_query::protobuf::Node> {
+        list.iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => match rt.val.as_deref() {
+                    // `SET (a, b) = (x, y)`: each column's target holds the
+                    // whole source; it is read once, with its first column.
+                    Some(pg_query::protobuf::Node {
+                        node: Some(N::MultiAssignRef(m)),
+                    }) if m.colno != 1 => None,
+                    Some(pg_query::protobuf::Node {
+                        node: Some(N::MultiAssignRef(m)),
+                    }) => m.source.as_deref().cloned(),
+                    v => v.cloned(),
+                },
+                _ => None,
+            })
+            .collect()
+    }
+    // (the clauses, in transform order, each with the names its namespace
+    // adds beside the target's own)
+    let (target, from, phases): (_, &[pg_query::protobuf::Node], Vec<_>) = match node.node.as_ref()
+    {
+        Some(N::UpdateStmt(u)) => {
+            let mut clauses: Vec<_> = u.where_clause.as_deref().cloned().into_iter().collect();
+            clauses.extend(values(&u.returning_list));
+            clauses.extend(values(&u.target_list));
+            (u.relation.as_ref(), &u.from_clause, vec![(clauses, false)])
+        }
+        Some(N::DeleteStmt(d)) => {
+            let mut clauses: Vec<_> = d.where_clause.as_deref().cloned().into_iter().collect();
+            clauses.extend(values(&d.returning_list));
+            (d.relation.as_ref(), &d.using_clause, vec![(clauses, false)])
+        }
+        Some(N::InsertStmt(i)) => {
+            let mut conflict = Vec::new();
+            if let Some(c) = i.on_conflict_clause.as_deref() {
+                conflict.extend(values(&c.target_list));
+                conflict.extend(c.where_clause.as_deref().cloned());
+            }
+            let phases = vec![(conflict, true), (values(&i.returning_list), false)];
+            (i.relation.as_ref(), &[][..], phases)
+        }
+        _ => return Ok(()),
+    };
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let mut level = range_level(from, &[target], true);
+    let excluded =
+        matches!(node.node.as_ref(), Some(N::InsertStmt(i)) if i.on_conflict_clause.is_some());
+    if excluded {
+        level.names.push("excluded".into());
+        level.entries.push(RangeEntry {
+            relname: None,
+            eref: "excluded".into(),
+            aliased: true,
+        });
+    }
+    for (clauses, with_excluded) in phases {
+        let mut levels = vec![level.clone()];
+        if with_excluded {
+            levels[0].visible.push("excluded".into());
+        }
+        let mut bad: Option<(String, Option<MissingRteHint>, i32)> = None;
+        let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+            if bad.is_some() {
+                return Ok(());
+            }
+            let Some(N::ColumnRef(c)) = n.node.as_ref() else {
+                return Ok(());
+            };
+            let qualifier = match c.fields.len() {
+                2 | 3 => c.fields[c.fields.len() - 2].node.as_ref(),
+                _ => None,
+            };
+            let Some(N::String(q)) = qualifier else {
+                return Ok(());
+            };
+            let q = q.sval.as_str();
+            if levels[0].visible.iter().any(|v| v == q) {
+                return Ok(());
+            }
+            bad = Some((q.to_string(), missing_rte_hint(&levels, q), c.location));
+            Ok(())
+        };
+        for mut clause in clauses {
+            walk_expr(&mut clause, &mut visit)?;
+        }
+        if let Some((q, hint, location)) = bad {
+            set_error_location(location);
+            return Err(Error::Sqlstate(
+                "42P01",
+                match hint {
+                    Some(MissingRteHint::Alias(alias)) => format!(
+                        "invalid reference to FROM-clause entry for table \"{q}\"\nHint: Perhaps you meant to reference the table alias \"{alias}\"."
+                    ),
+                    Some(MissingRteHint::Entry(eref)) => format!(
+                        "invalid reference to FROM-clause entry for table \"{q}\"\nHint: There is an entry for table \"{eref}\", but it cannot be referenced from this part of the query."
+                    ),
+                    None => format!("missing FROM-clause entry for table \"{q}\""),
+                },
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> {

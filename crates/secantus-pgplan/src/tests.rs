@@ -4526,3 +4526,66 @@ fn a_writes_target_is_its_own_whole_row() {
     );
     assert_eq!(write_target_row("update t set t = t", &own), (false, None));
 }
+
+/// What `check_write_qualifiers` says of `sql`'s one write: `None` when
+/// every qualifier is in its namespace, else the 42P01 message.
+fn write_qualifier_error(sql: &str) -> Option<String> {
+    let parsed = pg_query::parse(sql).unwrap();
+    let node = parsed.protobuf.stmts[0].stmt.as_deref().unwrap();
+    match check_write_qualifiers(node) {
+        Ok(()) => None,
+        Err(Error::Sqlstate("42P01", m)) => Some(m),
+        Err(e) => panic!("{sql}: {e:?}"),
+    }
+}
+
+#[test]
+fn a_writes_qualifiers_are_looked_up_in_its_namespace() {
+    // PostgreSQL 15.19: an aliased target answers to its alias alone, and
+    // a qualifier nothing in the statement has is missing (RP-523).
+    let hidden = "invalid reference to FROM-clause entry for table \"fs\"\nHint: Perhaps you meant to reference the table alias \"x\".";
+    for sql in [
+        "update fs x set c = fs.c",
+        "update fs x set c = 'q' where fs.a = 1",
+        "update fs x set c = 'q' returning fs.c",
+        "update fs x set c = 'q' returning fs.*",
+        "update fs x set (a, c) = (fs.a, 'q')",
+        "update fs x set c = 'q' from fe where fe.a = x.a returning fs.c",
+        "update public.fs x set c = public.fs.c",
+        "delete from fs x where fs.a = 1",
+        "delete from fs x using fe where fe.a = x.a returning fs.a",
+        "insert into fs as x values (2, 'z') returning fs.a",
+    ] {
+        assert_eq!(write_qualifier_error(sql).as_deref(), Some(hidden), "{sql}");
+    }
+    for (sql, q) in [
+        ("update fs set c = zz.c", "zz"),
+        ("update fs set c = fe.b", "fe"),
+        ("delete from fs where fe.a = 1", "fe"),
+        ("insert into fs values (2, 'z') returning zz.a", "zz"),
+    ] {
+        assert_eq!(
+            write_qualifier_error(sql),
+            Some(format!("missing FROM-clause entry for table \"{q}\"")),
+            "{sql}"
+        );
+    }
+    // EXCLUDED is in the range table, but in the namespace only for the
+    // ON CONFLICT clause.
+    assert_eq!(
+        write_qualifier_error("insert into fs values (2, 'z') on conflict (a) do update set c = excluded.c returning excluded.a")
+            .as_deref(),
+        Some("invalid reference to FROM-clause entry for table \"excluded\"\nHint: There is an entry for table \"excluded\", but it cannot be referenced from this part of the query.")
+    );
+    for sql in [
+        "update fs x set c = x.c where x.a = 1 returning x.*",
+        "update fs set c = fs.c returning public.fs.c",
+        "update fs set c = 'q' from fe e where e.a = fs.a returning e.b",
+        "update fs x set c = 'q' where x.a in (select fs.a from fs)",
+        "delete from fs x where exists (select 1 from fe where fe.a = fs.a)",
+        "insert into fs values (1, 'z') on conflict (a) do update set c = excluded.c where fs.a = 1",
+        "insert into fs as x values (1, 'z') returning x.a",
+    ] {
+        assert_eq!(write_qualifier_error(sql), None, "{sql}");
+    }
+}

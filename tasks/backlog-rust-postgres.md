@@ -2108,16 +2108,6 @@ and `fs(a int, c text)`.
       `fs = row(1,'y')::fs` agrees on both.
       Backlog-ID: RP-522
       Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_against_untyped_record
-- [ ] **An aliased write target still answers to its table's name.**
-      Under `update fs x` or `delete from fs x`, PostgreSQL 15.19 reads
-      `fs.c` as `errorMissingRTE`'s 42P01 `invalid reference to FROM-clause
-      entry for table "fs"`, HINT `Perhaps you meant to reference the table
-      alias "x".`, at the reference (`update fs x set c = fs.c`, `delete
-      from fs x where fs.a = 1`, `update fs x set c = 'q' returning fs.c`).
-      Here each reads the row and answers. A SELECT's alias already hides
-      its table's name.
-      Backlog-ID: RP-523
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_write_target_hides_its_name
 - [ ] **A write's name error is reported away from the reference.**
       PostgreSQL 15.19 positions each at the name as written. Here `update
       fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
@@ -2128,6 +2118,24 @@ and `fs(a int, c text)`.
       RP-414 has the reference's name and qualifier; this is where it is.
       Backlog-ID: RP-524
       Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
+
+## Found while working RP-523 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`.
+
+- [ ] **A column reference's schema is not read.** In `schema.rel.col`,
+      PostgreSQL 15.19's `refnameNamespaceItem` takes `schema.rel` to an
+      UNALIASED entry of that relation, and `errorMissingRTE` finds an
+      entry of that relation or with `rel` as its alias name. So `select
+      other.fs.c from fs` and `update fs set c = other.fs.c` are 42P01
+      `invalid reference to FROM-clause entry for table "fs"` (HINT `There
+      is an entry for table "fs", but it cannot be referenced from this
+      part of the query.`), and under an alias `x`, `pg_catalog.fs.c` is
+      `missing FROM-clause entry for table "fs"`. Here the qualifier is
+      matched by its relation name alone: the first two answer the row,
+      and the last is the alias's `invalid reference`.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_schema_qualified_reference
+      Backlog-ID: RP-527
 
 ## Found while working RP-500 (2026-11-07)
 
