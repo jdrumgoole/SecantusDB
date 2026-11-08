@@ -1,9 +1,10 @@
 """Gap tests of the divergences found while working RP-570 (a cast to a
 domain's array coerces each element through the domain's modifier, which
 `test_expression_cast_to_domain_array` pins over a row's expression): a cast
-to an array with a type modifier of its own ignores it, a cast of a COLUMN
-to such a domain ignores the domain's modifier, a domain array literal's
-input error carries no position, and a numeric overflow has no DETAIL.
+of a COLUMN to such a domain ignores the domain's modifier, and a domain
+array literal's input error carries no position. A cast to an array with a
+type modifier of its own ignored it until RP-579, and a numeric overflow had
+no DETAIL until RP-582; their tests are the regression tests.
 
 An answer is the rows, or `(sqlstate, message, detail, position)` for an
 error. The expected answers were measured on a private, freshly initdb'd
@@ -65,6 +66,7 @@ _OVERFLOW = (
 # length coercion over each element (`coerce_type_typmod` of the array), so
 # it truncates and pads as the scalar cast does; `numeric(5,2)` rounds, and
 # refuses what does not fit, with apply_typmod's DETAIL and no position.
+# Every element came back as written until RP-579.
 TYPMOD_ARRAYS = {
     "select '{ab}'::char(3)[]::text": [('{"ab "}',)],
     "select '{abcd}'::char(3)[]::text": [("{abc}",)],
@@ -73,10 +75,16 @@ TYPMOD_ARRAYS = {
     "select '{1.234}'::numeric(5,2)[]::text": [("{1.23}",)],
     "select (array[1.234]::numeric(5,2)[])::text": [("{1.23}",)],
     "select '{123456}'::numeric(5,2)[] is null": _OVERFLOW,
+    # The bounds and the nesting are kept, and a NULL element stays NULL.
+    "select '[0:1]={abcd,x}'::char(2)[]::text": [('[0:1]={ab,"x "}',)],
+    "select '{{abcd,x},{y,NULL}}'::char(2)[]::text": [('{{ab,"x "},{"y ",NULL}}',)],
+    # Per row, over an array of the row: each element coerced the same way.
+    "select ta::char(3)[]::text from (values (1, '{ab}'::text[]), (2, '{abcd}')) v (k, ta)"
+    " order by k": [('{"ab "}',), ("{abc}",)],
 }
 
 
-@pytest.mark.backlog("RP-579")
+@pytest.mark.backlog_fixed("RP-579")
 @pytest.mark.parametrize("query", list(TYPMOD_ARRAYS))
 def test_cast_to_typmod_array(query: str, dsn: str) -> None:
     assert answer(dsn, query) == TYPMOD_ARRAYS[query]
@@ -139,14 +147,15 @@ def test_domain_array_literal_error_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LITERAL_ERRORS[query]
 
 
-# apply_typmod's 22003 explains the overflow in its DETAIL.
+# apply_typmod's 22003 explains the overflow in its DETAIL, which the
+# server's 22003 lacked until RP-582.
 OVERFLOWS = {
     "select '123456'::numeric(5,2)": _OVERFLOW,
     "select 123456::numeric(5,2)": _OVERFLOW,
 }
 
 
-@pytest.mark.backlog("RP-582")
+@pytest.mark.backlog_fixed("RP-582")
 @pytest.mark.parametrize("query", list(OVERFLOWS))
 def test_numeric_overflow_detail(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OVERFLOWS[query]

@@ -14952,33 +14952,29 @@ impl PgHandler {
     ) -> PgWireResult<()> {
         // The routines and casts over its row type, which is made with the
         // view and so named first (RP-546).
-        let row_type = self.row_type_dependents(name)?;
-        if dependants.is_empty() && row_type.lines.is_empty() {
+        let mut row_type = self.row_type_dependents(name)?;
+        // Each reader, then what names ITS row type (RP-568).
+        let mut objects = row_type.lines.clone();
+        objects.extend(self.reader_lines(dependants, &mut row_type)?);
+        let objects = row_type_depends::last_reached(objects);
+        if objects.is_empty() {
             return Ok(());
         }
-        let raw = |k: &str| k.to_string();
         if !cascade {
             let mut info = ErrorInfo::new(
                 "ERROR".into(),
                 "2BP01".into(), // dependent_objects_still_exist
                 format!("cannot drop {kind} {name} because other objects depend on it"),
             );
-            let lines: Vec<String> = row_type
-                .lines
+            let lines: Vec<String> = objects
                 .iter()
                 .map(|(o, on)| format!("{o} depends on {on}"))
-                .chain(dependants.iter().map(|d| d.line(raw)))
                 .collect();
             info.detail = Some(lines.join("\n"));
             info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
             return Err(PgWireError::UserError(Box::new(info)));
         }
-        let descs: Vec<String> = row_type
-            .lines
-            .iter()
-            .map(|(o, _)| o.clone())
-            .chain(dependants.iter().map(|d| d.desc(raw)))
-            .collect();
+        let descs: Vec<String> = objects.into_iter().map(|(o, _)| o).collect();
         self.cascade_notice(&descs);
         self.drop_row_type_dependents(&row_type)?;
         for d in dependants.iter().rev() {
@@ -26591,6 +26587,28 @@ impl PgHandler {
             });
             Self::rule_dependents_of(readers, reader_kind, reader, seen, out);
         }
+    }
+
+    /// The DETAIL pairs `(object, what it depends on)` for `readers`, as
+    /// `findDependentObjects` reaches them: each reader, then what names its
+    /// row type (that type is part of the reader, made with it, so what
+    /// names it comes ahead of the reader's own readers); an object named
+    /// twice is settled by [`row_type_depends::last_reached`]. What names the readers' row types joins `row_type`, so a CASCADE
+    /// drops it with them (RP-568).
+    fn reader_lines(
+        &self,
+        readers: &[RuleDependent],
+        row_type: &mut row_type_depends::RowTypeDependents,
+    ) -> PgWireResult<Vec<(String, String)>> {
+        let mut out = Vec::new();
+        for d in readers {
+            out.push((
+                d.desc(str::to_string),
+                format!("{} {}", d.on_kind, d.on_key),
+            ));
+            out.extend(row_type.absorb(self.row_type_dependents(&d.key)?));
+        }
+        Ok(out)
     }
 
     /// Drop one of `rule_dependents`' readers, whose own readers are gone
@@ -43470,11 +43488,12 @@ impl PgHandler {
                         }
                         // The routines and casts over its row type come
                         // first: that type is made with the table (RP-546).
-                        let row_type = self.row_type_dependents(table)?;
-                        let objects: Vec<(String, String)> = row_type
-                            .lines
-                            .iter()
-                            .cloned()
+                        let mut row_type = self.row_type_dependents(table)?;
+                        // Each view, then what names ITS row type (RP-568).
+                        let table_lines = row_type.lines.clone();
+                        let view_lines = self.reader_lines(&views, &mut row_type)?;
+                        let objects: Vec<(String, String)> = table_lines
+                            .into_iter()
                             .chain(
                                 kids.iter()
                                     .map(|(k, p)| (format!("table {k}"), format!("table {p}"))),
@@ -43485,13 +43504,9 @@ impl PgHandler {
                                     format!("table {table}"),
                                 )
                             }))
-                            .chain(views.iter().map(|d| {
-                                (
-                                    d.desc(str::to_string),
-                                    format!("{} {}", d.on_kind, d.on_key),
-                                )
-                            }))
+                            .chain(view_lines)
                             .collect();
+                        let objects = row_type_depends::last_reached(objects);
                         if !objects.is_empty() {
                             if !drop.cascade {
                                 let mut info = ErrorInfo::new(

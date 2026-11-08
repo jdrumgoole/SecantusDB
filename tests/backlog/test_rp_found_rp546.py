@@ -321,10 +321,9 @@ def test_regprocedure_quotes_as_format_procedure(dsn: str) -> None:
 
 # A view dropped by DROP TABLE ... CASCADE takes what names its row type
 # with it: `drop table w568` names `function w568f(w568v) depends on type
-# w568v` after the view, and CASCADE drops the function. Here the DETAIL
-# names only the view and the function outlives it. A direct DROP VIEW or
-# DROP MATERIALIZED VIEW already answers as PostgreSQL does (RP-546).
-@pytest.mark.backlog("RP-568")
+# w568v` after the view, and CASCADE drops the function. The DETAIL named
+# only the view and the function outlived it, until RP-568.
+@pytest.mark.backlog_fixed("RP-568")
 def test_cascaded_view_takes_its_row_type_dependants(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop table if exists w568 cascade")
@@ -348,4 +347,94 @@ def test_cascaded_view_takes_its_row_type_dependants(dsn: str) -> None:
         ),
         "ok",
         [(0,)],
+    ]
+
+
+# What names a view's row type is named after the view, ahead of the
+# view's own readers, by DROP TABLE and by DROP VIEW and DROP MATERIALIZED
+# VIEW of a relation under it; an object two row types reach is named once,
+# under the newer relation (`reportDependentObjects` reads
+# `findDependentObjects`' newest-first record backwards), and CASCADE drops
+# it. Measured on a private PostgreSQL 15.19 cluster.
+@pytest.mark.backlog_fixed("RP-568")
+def test_row_type_dependants_through_nested_and_shared_views(dsn: str) -> None:
+    sql = "language sql as $$ select 1 $$"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for t in ("x568", "y568", "z568"):
+            c.execute(f"drop table if exists {t} cascade")
+        c.execute("create table x568 (a int)")
+        c.execute("create view x568v as select * from x568")
+        c.execute("create view x568w as select * from x568v")
+        c.execute(f"create function x568f(x568w) returns int {sql}")
+        c.execute(f"create function x568g(x568v) returns int {sql}")
+        c.execute("create table y568 (a int)")
+        c.execute("create view y568v as select * from y568")
+        c.execute("create view y568w as select * from y568")
+        c.execute(f"create function y568f(y568v, y568w) returns int {sql}")
+        c.execute("create function y568t(y568) returns y568v language sql as $$ select $1.a $$")
+        c.execute("create table z568 (a int)")
+        c.execute("create materialized view z568m as select * from z568")
+        c.execute(f"create function z568f(z568m[]) returns int {sql}")
+        c.execute("create view z568v as select * from z568m")
+        c.execute(f"create function z568g(z568v) returns int {sql}")
+        try:
+            got = [
+                _run(c, "drop table x568"),
+                _run(c, "drop view x568v"),
+                _run(c, "drop view x568v cascade"),
+                _run(c, "drop table y568"),
+                _run(c, "drop table y568 cascade"),
+                _run(c, "drop table z568"),
+                _run(c, "drop materialized view z568m"),
+                _run(c, "drop table z568 cascade"),
+                _run(
+                    c,
+                    "select proname from pg_proc where proname in "
+                    "('x568f', 'x568g', 'y568f', 'y568t', 'z568f', 'z568g')",
+                ),
+            ]
+        finally:
+            for t in ("x568", "y568", "z568"):
+                c.execute(f"drop table if exists {t} cascade")
+    message = "cannot drop {} because other objects depend on it"
+    assert got == [
+        _refused(
+            "x568",
+            "view x568v depends on table x568",
+            "function x568g(x568v) depends on type x568v",
+            "view x568w depends on view x568v",
+            "function x568f(x568w) depends on type x568w",
+        ),
+        (
+            "2BP01",
+            message.format("view x568v"),
+            "function x568g(x568v) depends on type x568v\n"
+            "view x568w depends on view x568v\n"
+            "function x568f(x568w) depends on type x568w",
+        ),
+        "ok",
+        _refused(
+            "y568",
+            "view y568v depends on table y568",
+            "function y568t(y568) depends on type y568v",
+            "view y568w depends on table y568",
+            "function y568f(y568v,y568w) depends on type y568w",
+        ),
+        "ok",
+        _refused(
+            "z568",
+            "materialized view z568m depends on table z568",
+            "function z568f(z568m[]) depends on type z568m[]",
+            "view z568v depends on materialized view z568m",
+            "function z568g(z568v) depends on type z568v",
+        ),
+        (
+            "2BP01",
+            message.format("materialized view z568m"),
+            "function z568f(z568m[]) depends on type z568m[]\n"
+            "view z568v depends on materialized view z568m\n"
+            "function z568g(z568v) depends on type z568v",
+        ),
+        "ok",
+        [],
     ]

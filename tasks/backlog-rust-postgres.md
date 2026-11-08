@@ -2202,16 +2202,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `pg_describe_object` of a routine shares that text.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
-- [ ] **A view dropped by CASCADE leaves the routines over its row type.**
-      On PostgreSQL 15.19 `drop table w568`, with a view `w568v` over it and
-      `w568f(w568v)`, names `view w568v depends on table w568` and then
-      `function w568f(w568v) depends on type w568v`, and CASCADE drops the
-      function too. Here the DETAIL names only the view, and the function
-      outlives it (`drop_rule_dependent` removes the view without asking
-      `row_type_dependents`). A direct DROP VIEW or DROP MATERIALIZED VIEW
-      answers as PostgreSQL does since RP-546.
-      Backlog-ID: RP-568
-      Verify: tests/backlog/test_rp_found_rp546.py::test_cascaded_view_takes_its_row_type_dependants
 
 ## Found while working RP-527 (2026-11-08)
 
@@ -2344,18 +2334,6 @@ char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
 and `(2, 'abcd', '{abcd}')`. The gap tests are in
 `tests/backlog/test_rp_found_rp570.py`.
 
-- [ ] **A cast to an array with a type modifier ignores the modifier.**
-      `select '{ab}'::char(3)[]` is `{"ab "}` on PostgreSQL 15.19, and
-      `'{abcd}'::char(3)[]`, `array['abcd']::char(3)[]` and
-      `'{abcd}'::varchar(3)[]` are `{abc}`: `array_in` reads at typmod -1
-      and `coerce_type_typmod` then runs the explicit length coercion over
-      each element. `'{1.234}'::numeric(5,2)[]` is `{1.23}` and
-      `'{123456}'::numeric(5,2)[]` 22003. Here every element comes back as
-      written. Since RP-570 a cast to a DOMAIN's array applies the domain's
-      modifier (`domain_array_cast`); `const_value_node` applies a written
-      modifier only to a scalar `bpchar` / `varchar` / `numeric` target.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_cast_to_typmod_array
-      Backlog-ID: RP-579
 - [ ] **A cast of a bare column to a domain with a modifier ignores it.**
       `select t::d570c from t570` is `ab ` and `abc` on PostgreSQL 15.19,
       and `ta::d570c[]` is `{"ab "}` and `{abc}`. Here each value comes
@@ -2373,13 +2351,6 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       by its SQLSTATE and message, and an assignment's 22001 has none.
       Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
       Backlog-ID: RP-581
-- [ ] **A numeric overflow's 22003 has no DETAIL.** `select
-      '123456'::numeric(5,2)` and `123456::numeric(5,2)` are 22003
-      `numeric field overflow` with DETAIL `A field with precision 5, scale
-      2 must round to an absolute value less than 10^3.` on PostgreSQL
-      15.19 (`apply_typmod`); here the DETAIL is empty.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_numeric_overflow_detail
-      Backlog-ID: RP-582
 
 ## Found while working RP-575 (2026-11-08)
 

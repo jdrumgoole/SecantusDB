@@ -56,6 +56,44 @@ pub(crate) struct RowTypeDependents {
     transforms: Vec<String>,
 }
 
+impl RowTypeDependents {
+    /// Take in `more`, what names another relation's row type that this
+    /// statement drops, so a CASCADE drops it too, and answer its DETAIL
+    /// lines (RP-568). An object named twice is left for [`last_reached`]
+    /// to settle.
+    pub(crate) fn absorb(&mut self, more: RowTypeDependents) -> Vec<(String, String)> {
+        for (mine, theirs) in [
+            (&mut self.functions, more.functions),
+            (&mut self.casts, more.casts),
+            (&mut self.transforms, more.transforms),
+        ] {
+            for key in theirs {
+                if !mine.contains(&key) {
+                    mine.push(key);
+                }
+            }
+        }
+        more.lines
+    }
+}
+
+/// A DROP's DETAIL pairs `(object, what it depends on)` with each object
+/// named once, at its LAST place (RP-568). `findDependentObjects` visits a
+/// relation's dependants newest first and records each object the first
+/// time it reaches it, and `reportDependentObjects` reads that record
+/// backwards: so the lines come out oldest first, and an object two of
+/// them reach (`f(v1, v2)`, `f(t) returns v`) under the newer one -- as
+/// measured on PostgreSQL 15.19 (`function f(v1,v2) depends on type v2`).
+pub(crate) fn last_reached(lines: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        if !lines[i + 1..].iter().any(|(o, _)| *o == line.0) {
+            out.push(line.clone());
+        }
+    }
+    out
+}
+
 /// `getObjectDescription` of a routine: `function`, a procedure's too, then
 /// `format_procedure`'s signature -- the name, qualified when its schema is
 /// off the search path, and each input argument's `format_type_be`, joined
