@@ -549,6 +549,105 @@ pub fn validate(create_sql: &str) -> Result<(), PlError> {
     parsed(create_sql).map(|_| ())
 }
 
+/// A variable a DECLARE section (or a cursor's argument list) declares:
+/// its line in the body, its name as PL/pgSQL records it, and its type's
+/// text exactly as written (libpg_query keeps `read_datatype`'s source
+/// text, `%TYPE` and `%ROWTYPE` included, and no location).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Declared {
+    pub lineno: usize,
+    pub refname: String,
+    pub typname: String,
+}
+
+/// Every variable the body declares, in the order PL/pgSQL compiles them
+/// (its datums). The routine's parameters (no line) and the variables the
+/// compiler makes itself -- `found`, a FOR loop's integer, an exception
+/// block's `sqlstate` / `sqlerrm`, a cursor's `refcursor` -- are left out:
+/// their types are the compiler's, not text the body wrote. Empty when the
+/// body does not parse (`validate` reports that).
+pub fn declared_types(create_sql: &str) -> Vec<Declared> {
+    const COMPILER_TYPES: &[&str] = &[
+        "pg_catalog.\"boolean\"",
+        "pg_catalog.boolean",
+        "pg_catalog.\"integer\"",
+        "pg_catalog.integer",
+        "pg_catalog.text",
+        "pg_catalog.refcursor",
+    ];
+    let Ok(f) = parsed(create_sql) else {
+        return Vec::new();
+    };
+    f.get("datums")
+        .and_then(Value::as_array)
+        .map(|ds| {
+            ds.iter()
+                .filter_map(|d| {
+                    let v = d.get("PLpgSQL_var")?;
+                    let lineno = v.get("lineno").and_then(Value::as_u64)? as usize;
+                    let typname = v
+                        .get("datatype")?
+                        .get("PLpgSQL_type")?
+                        .get("typname")?
+                        .as_str()?;
+                    if COMPILER_TYPES.contains(&typname) {
+                        return None;
+                    }
+                    Some(Declared {
+                        lineno,
+                        refname: v.get("refname")?.as_str()?.to_string(),
+                        typname: typname.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Where in `body` (a byte offset) the type of `d` begins: the first place
+/// from the start of its line where its text follows its name, with an
+/// optional `CONSTANT` between, as the declaration (`decl_varname
+/// decl_const decl_datatype`) or cursor argument wrote it. `None` when it
+/// cannot be found that way.
+pub fn declared_type_offset(body: &str, d: &Declared) -> Option<usize> {
+    let line_start = if d.lineno <= 1 {
+        0
+    } else {
+        body.match_indices('\n').nth(d.lineno - 2)?.0 + 1
+    };
+    let text = d.typname.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let ends_with_word = |s: &str, w: &str| -> Option<usize> {
+        let cut = s.len().checked_sub(w.len())?;
+        let tail = s.get(cut..)?;
+        let before = s[..cut].chars().next_back();
+        (tail.eq_ignore_ascii_case(w) && !before.is_some_and(is_ident)).then_some(cut)
+    };
+    let quoted = format!("\"{}\"", d.refname.replace('"', "\"\""));
+    for (i, _) in body[line_start..].match_indices(text) {
+        let at = line_start + i;
+        let before = &body[..at];
+        let head = before.trim_end();
+        if head.len() == before.len() {
+            continue;
+        }
+        let head = match ends_with_word(head, "constant") {
+            Some(cut) if head[..cut].len() > head[..cut].trim_end().len() => head[..cut].trim_end(),
+            _ => head,
+        };
+        let named = head.ends_with(&quoted)
+            || (d.refname == d.refname.to_lowercase()
+                && ends_with_word(head, &d.refname).is_some());
+        if named {
+            return Some(at);
+        }
+    }
+    None
+}
+
 /// A type name as PL/pgSQL records it (`pg_catalog.int4`, `int `,
 /// `pg_catalog."integer"`) in the server's canonical spelling.
 fn canonical_type(raw: &str) -> String {
@@ -2538,4 +2637,48 @@ fn call_arguments(text: &str) -> Vec<Option<String>> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod rp573_declarations {
+    use super::*;
+
+    /// The variables a body declares, with their type text as written and
+    /// their line; a routine's parameters and the compiler's own variables
+    /// are not among them (RP-573).
+    #[test]
+    fn declared_types_are_the_bodys() {
+        let sql = "create function f573(a int) returns int language plpgsql as $$\n\
+                   declare x nosuch573[]; \"Y\" constant t573%rowtype := 1;\n \
+                   c cursor (q nosuch) for select 1;\n\
+                   begin declare v s.t; begin for i in 1..2 loop null; end loop; return 1; \
+                   exception when others then return 2; end; end $$";
+        let got: Vec<(usize, String, String)> = declared_types(sql)
+            .into_iter()
+            .map(|d| (d.lineno, d.refname, d.typname))
+            .collect();
+        let want = [
+            (2, "x", "nosuch573[]"),
+            (2, "Y", "t573%rowtype "),
+            (3, "q", "nosuch"),
+            (4, "v", "s.t"),
+        ];
+        assert_eq!(got, want.map(|(l, n, t)| (l, n.to_string(), t.to_string())));
+    }
+
+    /// A declared type is found after its variable's name, past a
+    /// `CONSTANT`, from the start of its line.
+    #[test]
+    fn a_declared_type_is_found_after_its_name() {
+        let d = |lineno: usize, refname: &str, typname: &str| Declared {
+            lineno,
+            refname: refname.into(),
+            typname: typname.into(),
+        };
+        let body = " declare nosuch int; x nosuch; \"Y\" CONSTANT nosuch := 1;\n  c cursor (a nosuch) for select 1;";
+        assert_eq!(declared_type_offset(body, &d(1, "x", "nosuch")), Some(23));
+        assert_eq!(declared_type_offset(body, &d(1, "Y", "nosuch ")), Some(44));
+        assert_eq!(declared_type_offset(body, &d(2, "a", "nosuch")), Some(71));
+        assert_eq!(declared_type_offset(body, &d(1, "z", "nosuch")), None);
+    }
 }
