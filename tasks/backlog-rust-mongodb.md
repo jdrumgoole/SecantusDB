@@ -542,7 +542,7 @@ These are explicit non-goals. Don't add them without a reason.
       is WiredTiger's per-session statistics alone (RM-023), absent when
       they counted nothing. A stand-in number is not to be printed; the
       field follows the mechanism, if one is built.
-      **Decision needed (2026-11-07):** building the mechanism changes the
+      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** Measured when it was asked (2026-11-07): building the mechanism changes the
       server's default concurrency. Measured on mongod 8.2.11 (single-node
       set, this Mac): `storageEngineConcurrencyAdjustmentAlgorithm:
       throughputProbing` (initial concurrency 0 = from the cores, min 4,
@@ -678,7 +678,7 @@ These are explicit non-goals. Don't add them without a reason.
       placed where its reads loop, not where mongod's are; their count
       would be a different number. `includeQueryStatsMetrics` needs it too
       (RM-170).
-      **Decision needed (2026-11-07):** the count is mongod's code structure,
+      **Decided (Joe, 2026-11-08): move this server's interrupt checks to where mongod's are, the faithful option (a read checks only at a yield, as mongod's does), so `numInterruptChecks` counts real checks and matches mongod's numbers.** Measured when it was asked (2026-11-07): the count is mongod's code structure,
       not the work done. Measured on mongod 8.2.11 (single-node set, this
       Mac, three runs each, identical): `ping` 1; `listIndexes` and a
       `count` with no query 3; a `find` of a collection that does not exist
@@ -1747,7 +1747,7 @@ Still different, all 77:
       gives each entry the bytes it takes in mongod's memory: the C++
       sizes of the entry, its plan and its debug information. The field is
       left out here rather than given a value that is not mongod's.
-      **Decision needed (2026-11-08):** the number is mongod's C++ object
+      **Decided (Joe, 2026-11-08): port mongod's `_estimateObjectSizeInBytes` with a layout table per mongod build, the faithful option: libc++ / arm64 for macOS, libstdc++ / x86_64 for Linux, chosen by the target the server is built for, each fitted by probing that platform's mongod 8.2.11 (CI or a container for Linux; `only_on` for the per-platform gap tests).** Measured when it was asked (2026-11-08): the number is mongod's C++ object
       layout, and mongod gives two of them. It is
       `PlanCacheEntryBase::_estimateObjectSizeInBytes` (r8.2.11
       `plan_cache.h`): `sizeof` the entry, plus `SolutionCacheData` and
