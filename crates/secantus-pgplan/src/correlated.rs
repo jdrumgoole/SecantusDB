@@ -493,7 +493,8 @@ pub(crate) fn fromless_outer_ref(inner: &pg_query::protobuf::SelectStmt, outer: 
     let _ = walk_select(&mut probe, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = parts_of(c) {
-                found |= parts.len() == 1 && outer.contains(&parts[0]);
+                found |= parts.len() == 1
+                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
             }
         }
         Ok(())
@@ -535,8 +536,9 @@ pub(crate) fn correlate(
             if let Some(parts) = parts_of(c) {
                 // With no FROM of its own, a bare name can only be the
                 // outer row's (`SET v = (SELECT v + 1)`).
-                let bare_outer =
-                    parts.len() == 1 && inner.from_clause.is_empty() && outer.contains(&parts[0]);
+                let bare_outer = parts.len() == 1
+                    && inner.from_clause.is_empty()
+                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
                 if (bare_outer || parts.len() >= 2 && !names.contains(&parts[parts.len() - 2]))
                     && !outer_refs.contains(&parts)
                 {
@@ -560,7 +562,8 @@ pub(crate) fn correlate(
         match probing(|| without_calls(|| plan_select(&body, lookup, &probe_params))) {
             Ok(p) => break (p, body),
             Err(Error::UndefinedColumn(name))
-                if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
+                if (outer.contains(&name) || crate::outer_whole_row(&name))
+                    && !outer_refs.contains(&vec![name.clone()]) =>
             {
                 outer_refs.push(vec![name]);
             }
@@ -801,7 +804,41 @@ fn outer_ref_type(
             }
         }
     }
-    None
+    // No level has the bare name as a column, so it is a FROM item's whole
+    // row (RP-479): a table's is of the table's row type, a subquery's a
+    // record.
+    if qualifier.is_some() {
+        return None;
+    }
+    fn whole_row_type(
+        item: &pg_query::protobuf::Node,
+        name: &str,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> Option<String> {
+        match item.node.as_ref()? {
+            N::RangeVar(r) => {
+                let visible = r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname);
+                (visible == name && lookup(&relation_name(r)).is_some())
+                    .then(|| table_rowtype(relation_name(r)))
+            }
+            // A subquery's is an anonymous record.
+            N::RangeSubselect(rs) => rs
+                .alias
+                .as_ref()
+                .is_some_and(|a| a.aliasname == name)
+                .then(|| "record".to_string()),
+            N::JoinExpr(j) if j.alias.is_none() => [j.larg.as_deref(), j.rarg.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|side| whole_row_type(side, name, lookup)),
+            _ => None,
+        }
+    }
+    levels
+        .iter()
+        .rev()
+        .flat_map(|level| level.iter())
+        .find_map(|item| whole_row_type(item, col, lookup))
 }
 
 /// `inner` planned with each outer reference a `$N` cast to its type.

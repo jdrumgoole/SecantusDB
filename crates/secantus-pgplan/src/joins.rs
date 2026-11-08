@@ -3356,6 +3356,27 @@ fn rewrite_query(s: &mut pg_query::protobuf::SelectStmt, scope: &Scope) -> Resul
                     location: c.location,
                 }))
             }
+            // `(alias).*` over a FROM item's whole row is `alias.*`, its
+            // columns (`ExpandRowReference` expands a whole-row Var as
+            // `ExpandSingleTable`), so an ORDER BY or GROUP BY position counts
+            // them (RP-479). A column of that name is not a whole row.
+            Some(N::AIndirection(ind)) => match (ind.arg.as_deref(), ind.indirection.as_slice()) {
+                (Some(arg), [star]) if matches!(star.node.as_ref(), Some(N::AStar(_))) => {
+                    match arg.node.as_ref() {
+                        Some(N::ColumnRef(c)) => match names_of(c).as_deref() {
+                            Some([name])
+                                if scope.resolve(std::slice::from_ref(name))?.is_none()
+                                    && scope.whole_row(name).is_some() =>
+                            {
+                                Some(Some(vec![name.clone()]))
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
             _ => None,
         };
         if let Some(prefix) = star {

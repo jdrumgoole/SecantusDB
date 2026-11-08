@@ -15,9 +15,12 @@ fixed), RP-471 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an
 aliased JOIN) and RP-468 (a correlated subquery reading a join's column got
 text; fixed); found while working RP-461, RP-478 (a LATERAL subquery's bare
 name for an earlier FROM item's column was not found; fixed); and found while
-working RP-470, RP-479 (a whole-row reference still refused in three
-shapes), RP-480 (a whole row was typed as a record or as varchar; fixed)
-and RP-481 (a USING column's 42703 carries a position).
+working RP-470, RP-479 (a whole-row reference was still refused in three
+shapes, and an ORDER BY position past a star sorted by the wrong column;
+fixed), RP-480 (a whole row was typed as a record or as varchar; fixed)
+and RP-481 (a USING column's 42703 carries a position); and found while
+working RP-479, RP-516 (an UPDATE's or DELETE's target is not a whole row)
+and RP-517 (`v.*` in a subquery over an outer FROM item is 42P01).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -442,7 +445,11 @@ def test_whole_row_output_names(dsn: str) -> None:
 
 
 # Found while working RP-470. A LATERAL subquery's alias, a whole row named
-# inside a subquery, and `(t).*` under an ORDER BY of its position.
+# inside a subquery, and `(t).*` under an ORDER BY of its position. A
+# subquery's bare `fs` that no level has as a column was 42703: it is the
+# outer row (`transformColumnRef` tries a relation after the columns), of
+# `fs`'s row type, which psycopg reads as text. `ORDER BY 1` copied the
+# unexpanded `(fs).*` target, 0A000.
 WHOLE_ROW_REMAINDER = {
     "select l from fs join lateral (select fs.a) l on true": [(("1",),)],
     "select l from fe left join lateral (select fe.a from fs where false) l on true": [(None,)],
@@ -452,10 +459,66 @@ WHOLE_ROW_REMAINDER = {
 }
 
 
-@pytest.mark.backlog("RP-479")
+@pytest.mark.backlog_fixed("RP-479")
 @pytest.mark.parametrize("query", list(WHOLE_ROW_REMAINDER))
 def test_whole_row_remainder(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WHOLE_ROW_REMAINDER[query]
+
+
+# Fixed with RP-479: an outer FROM item's whole row read in a subquery --
+# bare, as a field selection's argument or a call's -- and its type, the
+# table's row type or, for a subquery, a record (which psycopg reads as a
+# tuple of text). Each was 42703 `column "..." does not exist`.
+OUTER_WHOLE_ROW = {
+    "select (select (fs).c) from fs, fe": [("y",)],
+    "select (select row_to_json(fs)) from fs": [({"a": 1, "c": "y"},)],
+    "select (select fs from fe) from fs": [("(1,y)",)],
+    "select (select (select fs)) from fs": [("(1,y)",)],
+    "select pg_typeof((select fs)) from fs": [("fs",)],
+    "select exists (select fs) from fs": [(True,)],
+    "select (select s) from (select 1 a, 'y' c) s": [(("1", "y"),)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-479")
+@pytest.mark.parametrize("query", list(OUTER_WHOLE_ROW))
+def test_subquery_reads_an_outer_whole_row(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == OUTER_WHOLE_ROW[query]
+
+
+# Fixed with RP-479: an ORDER BY position counts each `*`, `t.*` or `(t).*`
+# as its columns (`transformTargetList` expands them first). A position
+# past one was read against the unexpanded list, so `select ob.*, -a from
+# ob order by 2` sorted by `-a` -- the wrong order, no error -- and
+# `order by 3` sorted by nothing. Rows chosen so that `c`, `-a` and `a`
+# each order them differently.
+STAR_POSITIONS = {
+    "select ob.*, -a from ob order by 2": [(3, 10, -3), (1, 20, -1), (2, 30, -2)],
+    "select *, -a from ob order by 3": [(3, 10, -3), (2, 30, -2), (1, 20, -1)],
+    "select (ob).*, -a from ob order by 2": [(3, 10, -3), (1, 20, -1), (2, 30, -2)],
+    "select -a, * from ob order by 3": [(-3, 3, 10), (-1, 1, 20), (-2, 2, 30)],
+    "select ob.*, -ob.a from ob, fe order by 2": [(3, 10, -3), (1, 20, -1), (2, 30, -2)],
+    "select (ob).*, -ob.a from ob, fe order by 2": [(3, 10, -3), (1, 20, -1), (2, 30, -2)],
+    "select ob.*, -ob.a from ob join fe on true order by 3": [
+        (3, 10, -3),
+        (2, 30, -2),
+        (1, 20, -1),
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RP-479")
+@pytest.mark.parametrize("query", list(STAR_POSITIONS))
+def test_order_by_position_counts_star_columns(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists ob")
+        c.execute("create table ob (a int, c int)")
+        c.execute("insert into ob values (1, 20), (2, 30), (3, 10)")
+    try:
+        assert answer(dsn, query) == STAR_POSITIONS[query]
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute("drop table if exists ob")
 
 
 # Found while working RP-470. A table's whole row is of its row type even
@@ -736,3 +799,43 @@ def test_lateral_item_calls_once_per_row(query: str, dsn: str) -> None:
             c.execute("drop function ly(int)")
             c.execute("drop table lcalls")
     assert (rows, calls) == (LATERAL_CALLS[query], [(1,)])
+
+
+# Found while working RP-479. An UPDATE's or DELETE's target table is a
+# whole row to its own SET, WHERE and RETURNING and to their subqueries, as
+# a SELECT's FROM item is. Here each is 42703 `column "fs" does not exist`;
+# an UPDATE ... FROM's other table already answers (`where fe is not null`).
+DML_TARGET_WHOLE_ROW = {
+    "update fs set c = fs::text returning c": [("(1,y)",)],
+    "update fs set c = (select fs::text) returning c": [("(1,y)",)],
+    "delete from fs where fs is null returning a": [],
+}
+
+
+@pytest.mark.backlog("RP-516")
+@pytest.mark.parametrize("query", list(DML_TARGET_WHOLE_ROW))
+def test_dml_target_whole_row(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == DML_TARGET_WHOLE_ROW[query]
+
+
+# Found while working RP-479. `v.*` in a subquery's select list, where `v`
+# is an outer FROM item, is that item's columns (PostgreSQL expands the
+# star with the outer level's RTE): one column answers, two are the
+# sublink's width error. Here each is 42P01 `missing FROM-clause entry for
+# table "v"` at 16. Measured on PostgreSQL 15.19.
+OUTER_STAR_IN_SUBQUERY = {
+    "select (select v.*) from (values (1)) v(a)": [(1,)],
+    "select (select v.*) from (values (1,'y')) v(a,c)": (
+        "42601",
+        "subquery must return only one column",
+        None,
+        "8",
+    ),
+    "select (select v.* limit 1) + 1 from (values (2)) v(a)": [(3,)],
+}
+
+
+@pytest.mark.backlog("RP-517")
+@pytest.mark.parametrize("query", list(OUTER_STAR_IN_SUBQUERY))
+def test_outer_star_in_subquery(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == OUTER_STAR_IN_SUBQUERY[query]

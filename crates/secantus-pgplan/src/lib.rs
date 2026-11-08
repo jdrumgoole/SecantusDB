@@ -20738,6 +20738,14 @@ fn resolve_sublinks_in_select(
     out
 }
 
+/// Is `name` a FROM item an enclosing query makes visible? A subquery's
+/// bare name that no level has as a column then reads that item's whole
+/// row, as `transformColumnRef` tries a relation after every level's
+/// columns: `select (select t) from t` is `t`'s row (RP-479).
+pub(crate) fn outer_whole_row(name: &str) -> bool {
+    OUTER_RELATIONS.with(|o| o.borrow().iter().any(|n| n == name))
+}
+
 thread_local! {
     /// Relation names the enclosing queries' FROM clauses make visible,
     /// outermost first, while their subqueries are resolved.
@@ -21923,7 +21931,7 @@ fn resolve_one_sublink(
         // A column the subquery's own FROM does not have, but the query
         // AROUND it does, is a correlation too. A name the outer query does
         // not have either is an ordinary typo and keeps its 42703.
-        Err(Error::UndefinedColumn(name)) if outer.contains(&name) => {
+        Err(Error::UndefinedColumn(name)) if outer.contains(&name) || outer_whole_row(&name) => {
             let test = sl.testexpr.as_deref().cloned();
             let mut sl = sl.clone();
             if let Some(mut t) = test {
@@ -23966,6 +23974,7 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
 /// planners place.
 fn order_by_output_exprs(
     s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Option<pg_query::protobuf::SelectStmt> {
     if s.sort_clause.is_empty() || !s.group_clause.is_empty() || has_aggregate(s) {
         return None;
@@ -23981,6 +23990,43 @@ fn order_by_output_exprs(
             _ => None,
         })
         .collect();
+    // A position counts the select list as `transformTargetList` leaves it,
+    // each `*`, `t.*` or `(t).*` expanded into its columns (RP-479): `select
+    // t.*, -a from t order by 2` sorts by `t`'s second column, not `-a`.
+    // Each target's first position and width; `None` from a star whose
+    // width is not known here -- over a join, whose stars `joins` expands
+    // before this runs again on the rewritten statement.
+    let widths: Vec<Option<usize>> = targets
+        .iter()
+        .map(|(_, v)| match star_target_alias(v) {
+            None => Some(1),
+            Some(_) if joins::is_join(s) => None,
+            Some(alias) => {
+                let item = s.from_clause.first()?;
+                let mut visible = Vec::new();
+                collect_visible_names(item, &mut visible);
+                if alias.as_ref().is_some_and(|a| !visible.contains(a)) {
+                    return None;
+                }
+                let mut cols = Vec::new();
+                collect_from_columns(item, lookup, &[], &mut cols);
+                (!cols.is_empty()).then_some(cols.len())
+            }
+        })
+        .collect();
+    let target_at = |pos: usize| -> Option<usize> {
+        let mut start = 0;
+        for (i, w) in widths.iter().enumerate() {
+            let w = (*w)?;
+            if pos < start + w {
+                // Inside a star it is a plain column, which the planner
+                // sorts by itself.
+                return (star_target_alias(targets[i].1).is_none()).then_some(i);
+            }
+            start += w;
+        }
+        None
+    };
     let rewritable = |val: &pg_query::protobuf::Node| -> bool {
         if matches!(val.node.as_ref(), Some(N::ColumnRef(_))) {
             return false;
@@ -24027,8 +24073,8 @@ fn order_by_output_exprs(
             Some(N::AConst(c)) => match c.val.as_ref() {
                 Some(a_const::Val::Ival(v)) => usize::try_from(v.ival)
                     .ok()
-                    .filter(|n| *n >= 1 && *n <= targets.len())
-                    .map(|n| n - 1),
+                    .filter(|n| *n >= 1)
+                    .and_then(|n| target_at(n - 1)),
                 _ => None,
             },
             Some(N::ColumnRef(c)) if c.fields.len() == 1 => {
@@ -24071,6 +24117,36 @@ fn order_by_output_exprs(
         changed = true;
     }
     changed.then_some(out)
+}
+
+/// A select-list star: `Some(None)` for `*`, `Some(Some(alias))` for
+/// `alias.*` or `(alias).*`.
+fn star_target_alias(v: &pg_query::protobuf::Node) -> Option<Option<String>> {
+    let is_star = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AStar(_)));
+    match v.node.as_ref()? {
+        N::ColumnRef(c) if c.fields.last().is_some_and(is_star) => {
+            Some(match &c.fields[..c.fields.len() - 1] {
+                [] => None,
+                [.., q] => match q.node.as_ref() {
+                    Some(N::String(sv)) => Some(sv.sval.clone()),
+                    _ => return None,
+                },
+            })
+        }
+        N::AIndirection(ind) if matches!(ind.indirection.as_slice(), [star] if is_star(star)) => {
+            match ind.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                Some(N::ColumnRef(c)) => match c.fields.as_slice() {
+                    [q] => match q.node.as_ref() {
+                        Some(N::String(sv)) => Some(Some(sv.sval.clone())),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// `(alias).field`, where `alias` names a FROM item rather than a column, as
@@ -24608,7 +24684,7 @@ fn plan_select(
     cancel::check()?;
     // `ORDER BY 1` / `ORDER BY alias` over a COMPUTED output column sorts by
     // the computed value (see `order_by_output_exprs`).
-    if let Some(rewritten) = order_by_output_exprs(s) {
+    if let Some(rewritten) = order_by_output_exprs(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
     cancel::check()?;
