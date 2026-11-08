@@ -752,6 +752,9 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int32(104_857_600),
         ),
+        // mongod's yield period, which this server's plan executors keep
+        // (RM-360).
+        ("internalQueryExecYieldPeriodMS", true, Bson::Int32(10)),
         ("internalQueryMaxPushBytes", true, Bson::Int32(104_857_600)),
         (
             "internalQueryMaxSetUnionBytes",

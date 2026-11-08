@@ -378,7 +378,7 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     if let Some(micros) = crate::opdebug::oplog_slot_micros(ctx.op_counts.as_ref()) {
         out.insert("totalOplogSlotDurationMicros", micros);
     }
-    out.insert("numYields", 0_i64);
+    out.insert("numYields", secantus_core::deadline::yields());
     out.insert("reslen", response_length(reply, ctx));
     out.insert("locks", ctx.op_locks.clone().unwrap_or_default());
     if let Some(fc) = crate::opdebug::flow_control(ctx.flow_control_tickets) {
@@ -516,6 +516,45 @@ pub fn attributes(
     attr.insert("workingMillis", worked.as_millis() as i64);
     attr.insert("durationMillis", total.as_millis() as i64);
     crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER)
+}
+
+/// The line's `numInterruptChecks`, read once the operation's checks are
+/// all made -- the storage-statistics lock's included, as mongod reads it
+/// after taking that lock (`CurOp::completeAndLogOperation`) -- for the
+/// commands whose checks are all where mongod's are (RM-360): a read of a
+/// collection by `find`, `count` or `distinct`, a `getMore` of a `find`'s
+/// cursor, `listIndexes`, `listCollections`, `collStats`, `ping` and
+/// `buildInfo`, outside a transaction. Others print none until theirs are:
+/// a pipeline's stages, writes and DDL check where mongod's do not yet.
+pub fn with_interrupt_checks(
+    request: &Document,
+    ctx: &CommandContext,
+    mut attr: Document,
+) -> Document {
+    let name = request.keys().next().map(String::as_str).unwrap_or("");
+    let of_collection = |coll: Option<&str>| {
+        coll.is_some_and(|c| crate::opdebug::collection_type(ctx, &ctx.db_name, c) != "view")
+    };
+    let counted = !request.contains_key("autocommit")
+        && match name {
+            "find" | "count" | "distinct" => of_collection(target_collection(name, request)),
+            "getMore" => ctx
+                .exec_stats
+                .as_ref()
+                .and_then(|e| e.originating_command.as_ref())
+                .and_then(|o| o.get_str("find").ok())
+                .is_some_and(|coll| of_collection(Some(coll))),
+            "listIndexes" | "listCollections" | "collStats" | "ping" | "buildInfo" => true,
+            _ => false,
+        };
+    if counted && !secantus_core::deadline::is_unmatched() {
+        attr.insert(
+            "numInterruptChecks",
+            secantus_core::deadline::interrupt_checks(),
+        );
+        attr = crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER);
+    }
+    attr
 }
 
 #[cfg(test)]

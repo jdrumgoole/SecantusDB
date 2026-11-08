@@ -2269,6 +2269,8 @@ fn admit_ingress(name: &str, doc: &Document, ctx: &mut CommandContext) -> Result
         b => b,
     };
     let mut interrupted = || {
+        // mongod's waiter checks its operation each time it wakes (RM-360).
+        secantus_core::deadline::count_check();
         if ops::current_killed() {
             return Err(CommandError::new(
                 11601,
@@ -2306,6 +2308,11 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         ctx.exec_started.unwrap_or_else(std::time::Instant::now),
         (budget > 0).then_some(budget),
     );
+    // mongod checks every command for interrupt once its budget is set and
+    // before it runs (`ExecCommandDatabase::_initiateCommand`, RM-360).
+    if let Err(e) = deadline::check_for_interrupt() {
+        return CommandError::from(e).into_reply();
+    }
     let _write_block_bypass = misc_admin::write_block_bypass(ctx);
     // Expressions are parsed under the feature compatibility version.
     let _fcv = secantus_core::expressions::gate_fcv(
@@ -2334,6 +2341,12 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
             None => None,
         }
     };
+    // A statement that holds its locks itself yields at mongod's interval;
+    // one in a transaction only checks for interrupt there (RM-360).
+    let _yields = match &_locks {
+        Some(guard) => guard.yields(),
+        None => Some(deadline::no_yields()),
+    };
     let _current = lock_manager::enter(ctx.locks.as_ref());
     // The command's write statements log themselves when slow, as mongod's do.
     let _slow = slowop::enter(ctx);
@@ -2361,6 +2374,7 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
                 }
                 mark_time_limited_cursor(&reply, ctx);
             }
+            check_in_cursor(&reply, ctx);
             reply
         }
         Err(mut e) => {
@@ -2370,6 +2384,23 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
                 }
             }
             e.into_reply()
+        }
+    }
+}
+
+/// mongod checks an operation for interrupt as it checks the cursor it
+/// leaves open back in (`CursorManager::checkInCursor`), and kills the
+/// cursor if the operation was interrupted; the reply stands (RM-360).
+fn check_in_cursor(reply: &Document, ctx: &CommandContext) {
+    let id = reply
+        .get_document("cursor")
+        .ok()
+        .and_then(|c| c.get("id"))
+        .and_then(crate::util::as_i64)
+        .unwrap_or(0);
+    if id != 0 && secantus_core::deadline::check_quietly() {
+        if let Ok(cursors) = ctx.cursors() {
+            cursors.kill(&[id]);
         }
     }
 }

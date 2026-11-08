@@ -1105,6 +1105,12 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
         .into_reply());
     }
+    // mongod checks the operation for interrupt once it has the cursor
+    // pinned, unless the cursor waits for data (`getmore_cmd.cpp`, RM-360).
+    if !(info.tailable && info.await_data) {
+        secantus_core::deadline::check_for_interrupt()?;
+    }
+    crate::explain::plans_nothing();
     // The collection was dropped out from under a plain tailable cursor: say so
     // before anything else, since any buffered rows are stale. mongod kills the
     // plan executor with QueryPlanKilled (175) and names the namespace;

@@ -1302,6 +1302,7 @@ fn run_dispatch(
         if secantus_commands::lock_manager::took_global() {
             secantus_commands::lock_manager::log_lock(&shared.locks);
         }
+        let attr = secantus_commands::slowop::with_interrupt_checks(request, &ctx, attr);
         let entry = LogEntry::new(
             "I",
             "COMMAND",

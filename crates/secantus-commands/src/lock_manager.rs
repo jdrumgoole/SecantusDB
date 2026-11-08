@@ -302,6 +302,7 @@ impl LockManager {
         {
             let head = inner.heads.entry(resource.clone()).or_default();
             if !head.blocks(owner, mode) && (head.queue.is_empty() || head.holds(owner)) {
+                let first = !head.holds(owner);
                 head.holders.push((owner, mode));
                 drop(inner);
                 if ticket_first {
@@ -309,6 +310,17 @@ impl LockManager {
                 }
                 self.count(resource, mode, None);
                 note_taken(resource);
+                // mongod's `Locker::_lockBegin`: a lock granted at once is
+                // not granted to an operation that was killed or ran out of
+                // time, and the check counts (RM-360). A re-take by the
+                // owner already holding it (`recursiveCount` > 1) checks
+                // nothing.
+                if first {
+                    if let Err(e) = secantus_core::deadline::check_for_interrupt() {
+                        self.release_one(owner, resource);
+                        return Err(e);
+                    }
+                }
                 return Ok(());
             }
         }
@@ -317,6 +329,10 @@ impl LockManager {
             .get(resource)
             .is_some_and(|head| head.holds(owner));
         let ticket = self.next_ticket.fetch_add(1, Ordering::Relaxed);
+        // mongod checks for interrupt each time a waiting request wakes
+        // (`CondVarLockGrantNotification::wait`), which its timing decides;
+        // this wait polls on its own clock, so the count is not mongod's.
+        secantus_core::deadline::unmatched();
         if !converting {
             if let Some(head) = inner.heads.get_mut(resource) {
                 head.queue.push_back((ticket, owner, mode));
@@ -358,6 +374,18 @@ impl LockManager {
                 .unwrap_or_else(|e| e.into_inner());
             inner = guard;
         }
+    }
+
+    /// Release `owner`'s latest hold on `resource`, waking waiters.
+    fn release_one(&self, owner: Owner, resource: &Resource) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(head) = inner.heads.get_mut(resource) {
+            if let Some(at) = head.holders.iter().rposition(|(o, _)| *o == owner) {
+                head.holders.remove(at);
+            }
+        }
+        drop(inner);
+        self.changed.notify_all();
     }
 
     /// Release every hold `owner` has, waking waiters.
@@ -1082,6 +1110,8 @@ pub fn operation_locks(extra_global_is: bool) -> bson::Document {
 
 /// An operation starts on this thread: it has taken no global lock yet.
 pub fn begin_operation() {
+    secantus_core::deadline::begin_operation();
+    crate::explain::begin_operation();
     TOOK_GLOBAL.with(|t| t.set(false));
     OP_LOCKS.with(|l| l.borrow_mut().clear());
     FLOW_CONTROL.with(|n| n.set(0));
@@ -1179,6 +1209,7 @@ pub fn write_rounds(db: &str, coll: &str, n: usize) -> Option<Guard> {
         owner,
         // Not the statement's own chain: whose the statement is stays as it was.
         previous_owner: STATEMENT_OWNER.with(std::cell::Cell::get),
+        chain: round,
     })
 }
 
@@ -1274,6 +1305,7 @@ pub struct Guard {
     lm: std::sync::Arc<LockManager>,
     owner: Owner,
     previous_owner: Option<Owner>,
+    chain: Vec<(Resource, Mode)>,
 }
 
 impl Guard {
@@ -1304,9 +1336,40 @@ impl Guard {
                 lm: lm.clone(),
                 owner,
                 previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
+                chain,
             })),
             Err(_) => Some(Err(crate::CommandError::max_time_expired())),
         }
+    }
+}
+
+impl Guard {
+    /// Let the statement yield (`deadline::check`): at each yield mongod
+    /// releases the statement's locks and takes them again, each grant
+    /// counted and checked for interrupt (RM-360). The re-take is counted
+    /// and checked here; the locks stay held across it, so a request
+    /// waiting on them is not let in by the yield as mongod's is (RM-360).
+    pub fn yields(&self) -> Option<secantus_core::deadline::YieldGuard> {
+        if self.chain.is_empty() {
+            return None;
+        }
+        let lm = self.lm.clone();
+        let chain = self.chain.clone();
+        Some(secantus_core::deadline::yield_with(std::rc::Rc::new(
+            move || lm.count_retake(&chain),
+        )))
+    }
+}
+
+impl LockManager {
+    /// Count a re-take of `chain` as a yield's (see [`Guard::yields`]).
+    fn count_retake(&self, chain: &[(Resource, Mode)]) -> Result<(), MaxTimeMsExpired> {
+        for (resource, mode) in chain {
+            self.count(resource, *mode, None);
+            note_taken(resource);
+            secantus_core::deadline::check_for_interrupt()?;
+        }
+        Ok(())
     }
 }
 
@@ -1688,9 +1751,13 @@ mod tests {
         assert_eq!(flow_control_tickets(), 1);
         // The collection is still held in IX: an X waits.
         let other = lm.statement_owner();
-        let _deadline = secantus_core::deadline::arm(Some(20));
         let coll = Resource::Collection("db.c".into());
-        assert!(lm.acquire(other, &coll, Mode::X).is_err());
+        {
+            // The budget bounds this wait only: a grant to an operation
+            // whose budget is spent fails its interrupt check (RM-360).
+            let _deadline = secantus_core::deadline::arm(Some(20));
+            assert!(lm.acquire(other, &coll, Mode::X).is_err());
+        }
         drop(held);
         assert!(lm.acquire(other, &coll, Mode::X).is_ok());
         assert!(lm
