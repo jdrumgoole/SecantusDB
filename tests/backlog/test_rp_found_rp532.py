@@ -52,8 +52,9 @@ def answer(dsn: str, query: str) -> Any:
 
 # A composite value IS NULL when every field is, and IS NOT NULL when none
 # is (`ExecEvalRowNull`): a stored composite column, a subquery's row
-# output, and a grouped whole row alike. The select-list test already
-# answers so; a WHERE or HAVING tests whether the value itself is null.
+# output, and a grouped whole row alike. A WHERE or HAVING tested whether
+# the value itself was null, through a `{x: null}` filter, until RP-534
+# evaluated the test per row, as the select list already did.
 COMPOSITE_NULL_TEST = {
     "select count(*) from fk where k is not null": [(1,)],
     "select count(*) from fk where k is null": [(2,)],
@@ -63,7 +64,7 @@ COMPOSITE_NULL_TEST = {
 }
 
 
-@pytest.mark.backlog("RP-534")
+@pytest.mark.backlog_fixed("RP-534")
 @pytest.mark.parametrize("query", list(COMPOSITE_NULL_TEST))
 def test_composite_null_test_in_a_clause(query: str, dsn: str) -> None:
     assert answer(dsn, query) == COMPOSITE_NULL_TEST[query]

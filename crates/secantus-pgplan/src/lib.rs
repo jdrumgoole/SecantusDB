@@ -41924,6 +41924,7 @@ fn lower_where_plain(
         }
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
+            composite_null_test_is_per_row(def, &field)?;
             // A SQL NULL is either an explicit null or an absent field here,
             // and MQL's `null` / `$ne: null` match exactly that pair.
             match NullTestType::try_from(t.nulltesttype) {
@@ -45015,6 +45016,7 @@ fn lower_negated(
         },
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
+            composite_null_test_is_per_row(def, &field)?;
             match NullTestType::try_from(t.nulltesttype) {
                 Ok(NullTestType::IsNull) => Ok(doc! { field: { "$ne": Bson::Null } }),
                 Ok(NullTestType::IsNotNull) => Ok(doc! { field: Bson::Null }),
@@ -45107,6 +45109,28 @@ fn column_field(node: Option<&pg_query::protobuf::Node>, def: &TableDef) -> Resu
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("missing operand".into())),
     }
+}
+
+/// `Unsupported` for `x IS [NOT] NULL` over a column of a composite type,
+/// which the filter cannot express: PostgreSQL's `ExecEvalRowNull` makes a
+/// row IS NULL when every field is null and IS NOT NULL when none is, so
+/// `row(1, null)` is neither, where `{x: null}` tests only whether the value
+/// itself is (RP-534). Evaluated per row it reads the fields, as the select
+/// list does -- and as PostgreSQL, whose index quals refuse an `argisrow`
+/// null test (`match_clause_to_indexcol`), always does.
+fn composite_null_test_is_per_row(def: &TableDef, field: &str) -> Result<()> {
+    match field_type(def, field) {
+        Some(t) if type_is_rowtype(t) => Err(Error::Unsupported(
+            "IS [NOT] NULL over a composite column".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a declared type is a row type (`type_is_rowtype`): `record`, or a
+/// composite -- a table's, a view's or a `CREATE TYPE ... AS` one.
+fn type_is_rowtype(t: &str) -> bool {
+    t.eq_ignore_ascii_case("record") || user_composite(t).is_some()
 }
 
 /// A filter that matches nothing. `{}` matches every document, so NOR of it

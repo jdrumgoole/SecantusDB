@@ -2158,18 +2158,6 @@ holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
 holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
 gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 
-- [ ] **A composite value's IS NULL in a WHERE or HAVING tests the value,
-      not its fields.** PostgreSQL 15.19's `ExecEvalRowNull` makes a row
-      IS NULL when every field is null and IS NOT NULL when none is, so
-      `select count(*) from fk where k is not null` is 1 and `... where k
-      is null` 2, `select count(*) from (select fs x from fs) s where x is
-      not null` is 3, and `select count(*) from fs group by fs having fs
-      is null` is 1. Here they are 3, 1, 4 and no row: the clause tests
-      whether the stored value is null. The select-list `k is not null`
-      already answers as PostgreSQL does, and so does a WHERE over the
-      table's own whole row (`where fs is not null`).
-      Backlog-ID: RP-534
-      Verify: tests/backlog/test_rp_found_rp532.py::test_composite_null_test_in_a_clause
 - [ ] **An ungrouped whole row's 42803 names its first column, with no
       position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
       whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
@@ -2261,6 +2249,23 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       `column "a" cannot be cast automatically to type pint`.
       Backlog-ID: RP-556
       Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
+
+## Found while working RP-534 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
+`create domain dfs as fs` and `fd(k dfs)` holding `row(null, null)`,
+`row(1, null)`, `row(1, 'a')` and `null`.
+
+- [ ] **A domain over a table's row type is refused.** `create domain dfs
+      as fs` over a table `fs` is 42704 `type "fs" does not exist` here;
+      PostgreSQL 15.19 creates it (a domain may be over a composite since
+      PostgreSQL 11), and a column of it holds rows: `select count(*) from
+      fd where k is not null` is 1 and `... where k is null` 2, the null
+      test reading the fields because `type_is_rowtype` is true of the
+      domain. RP-534's per-row null test asks `type_is_rowtype` of the
+      column's declared type, so it needs to see through the domain then.
+      Backlog-ID: RP-538
+      Verify: tests/backlog/test_rp_found_rp534.py::test_domain_over_a_table_row_type
 
 ## Found while working RP-500 (2026-11-07)
 

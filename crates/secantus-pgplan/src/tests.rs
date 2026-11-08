@@ -3714,6 +3714,47 @@ fn float8_against_numeric_lowers_as_float8() {
     }
 }
 
+/// `x IS [NOT] NULL` over a composite column tests its FIELDS
+/// (`ExecEvalRowNull`: `row(1, null)` is neither), which no `{x: null}`
+/// filter expresses, so it is evaluated per row (RP-534); over a scalar
+/// column it stays a filter.
+#[test]
+fn composite_null_test_is_evaluated_per_row() {
+    set_user_composites(vec![(
+        "fs".into(),
+        67_010,
+        vec![("a".into(), "int4".into()), ("c".into(), "text".into())],
+    )]);
+    let def = || {
+        TableDef::new(
+            "fk",
+            vec![
+                Column::new("k", "fs", false),
+                Column::new("r", "record", false),
+                Column::new("n", "int4", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "fk").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select n from fk where k is null",
+        "select n from fk where k is not null",
+        "select n from fk where not (k is null)",
+        "select n from fk where r is not null",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    let (filter, residual) = lowered("select n from fk where n is null");
+    assert!(!residual, "a scalar null test is a filter: {filter:?}");
+    assert_eq!(filter, doc! { "n": Bson::Null });
+    set_user_composites(Vec::new());
+}
+
 /// A strict WHERE on a LEFT join's nullable side drops every
 /// NULL-extended row, so the narrow path plans an inner join
 /// (`reduce_outer_joins`, RP-365); `NOT col` is not strict and keeps the
