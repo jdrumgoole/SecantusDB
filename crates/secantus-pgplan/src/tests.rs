@@ -4913,3 +4913,45 @@ fn alter_domain_not_valid_and_validate() {
         C::Validate("big".into())
     );
 }
+
+/// `select_common_type` over an ARRAY constructor (RP-559): elements all of
+/// one domain make that domain's array, and any other mix -- another type, or
+/// an `unknown` NULL or string -- smashes each domain to its base first.
+#[test]
+fn an_array_of_one_domain_is_the_domains_array() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "di".to_string(),
+        oid: 90011,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: None,
+    }]);
+    let array_type = |sql: &str| {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("a target");
+        };
+        static_type(rt.val.as_deref().expect("an expression"), &Bson::Null)
+    };
+    for (sql, expected) in [
+        ("select array[1::di, 2::di]", "di[]"),
+        ("select array[null::di]", "di[]"),
+        ("select array[array[1::di]]", "di[]"),
+        ("select array[1::di, 2]", "int4[]"),
+        ("select array[null, 1::di]", "int4[]"),
+        ("select array['1', 1::di]", "int4[]"),
+    ] {
+        assert_eq!(array_type(sql), expected, "{sql}");
+    }
+    domains::set_user_domains(Vec::new());
+}
