@@ -35,6 +35,7 @@ use super::{catalog, parsed, resolve_hint};
 use crate::storage::{Pulled, RawHint, Storage, StorageError};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -57,8 +58,8 @@ pub(crate) struct Ask<'a> {
 }
 
 /// The largest collection read whole to count what each candidate plan
-/// examines. Past it the predicate's index is kept, as it is when it is
-/// selective.
+/// examines. Past it a trial reads only what the plans reach
+/// ([`Lazy::reached`]).
 const TRIAL_COLLECTION: usize = 2000;
 
 type Rows = Vec<(i64, Vec<u8>)>;
@@ -295,7 +296,10 @@ fn already_in_order(plan: &Node, via: &str) -> bool {
     })
 }
 
-/// The whole of a small collection, read the first time a count needs it.
+/// The documents a trial of candidate plans runs over, read the first time
+/// one needs them: the whole of a small collection, or of a large one what
+/// each candidate's scans read from the store in the works asked for, as
+/// mongod's trial reads only what its plans reach.
 ///
 /// Which documents match is known, so the candidates' filters are not run
 /// and the documents need only their indexed fields. A partial index tests
@@ -311,19 +315,27 @@ struct Lazy<'a> {
     partial: bool,
     /// The top-level fields the indexes are keyed on.
     fields: BTreeSet<String>,
-    loaded: OnceCell<Option<Loaded>>,
+    /// The whole collection, when it is small (or a plan's scan cannot be
+    /// read from the store a work at a time).
+    whole: OnceCell<Whole>,
 }
 
 /// A collection's documents, and for each whether the query matches it
 /// (absent when a partial index has its own filter to run).
 type Loaded = (Vec<Document>, Option<Vec<bool>>);
 
+/// What [`Lazy`] holds of the whole collection.
+enum Whole {
+    All(Loaded),
+    /// Too large to read whole for a trial.
+    Large,
+    /// Not to hand.
+    Unread,
+}
+
 impl Lazy<'_> {
-    fn read(&self) -> Option<Loaded> {
-        let all = self
-            .storage
-            .collection_at_most(self.ask.db, self.ask.coll, TRIAL_COLLECTION)
-            .ok()??;
+    /// `all` (RecordId, document) decoded as the trial reads them.
+    fn decode(&self, all: &[(i64, Vec<u8>)]) -> Option<Loaded> {
         let docs: Option<Vec<Document>> = all
             .iter()
             .map(|(_, blob)| {
@@ -338,21 +350,167 @@ impl Lazy<'_> {
         let known: Vec<bool> = all.iter().map(|(r, _)| matched.contains(r)).collect();
         Some((docs?, (!self.partial).then_some(known)))
     }
+
+    /// The whole collection, when it holds no more than `cap` documents.
+    fn read(&self, cap: usize) -> Whole {
+        let all = match self
+            .storage
+            .collection_at_most(self.ask.db, self.ask.coll, cap)
+        {
+            Ok(Some(all)) => all,
+            Ok(None) if cap < usize::MAX => return Whole::Large,
+            _ => return Whole::Unread,
+        };
+        match self.decode(&all) {
+            Some(loaded) => Whole::All(loaded),
+            None => Whole::Unread,
+        }
+    }
+
+    fn all<'s>(&'s self, loaded: &'s Loaded) -> plan::Docs<'s> {
+        plan::Docs {
+            docs: Cow::Borrowed(loaded.0.as_slice()),
+            known: loaded.1.as_deref().map(Cow::Borrowed),
+            collation: self.ask.collation,
+            reach: None,
+            total: Some(loaded.0.len()),
+        }
+    }
+
+    /// The documents `plans` read from the store in their first `works`
+    /// works each: every entry each index scan reads, inside its bounds or
+    /// not, and the first `works` documents of a collection scan. Over these
+    /// the plans do what they do over the whole collection, for that many
+    /// works. `Err(())`: a scan the store does not read a work at a time.
+    fn reached(&self, plans: &[&Node], works: i64) -> Result<Option<plan::Docs<'_>>, ()> {
+        let (db, coll) = (self.ask.db, self.ask.coll);
+        let mut leaves = Vec::new();
+        if !plans.iter().all(|p| trial_leaves(p, &mut leaves)) {
+            return Ok(None);
+        }
+        let mut ended = true;
+        let mut blobs: std::collections::BTreeMap<i64, Option<Vec<u8>>> = Default::default();
+        for leaf in leaves {
+            let (ix, width) = match leaf {
+                Node::CollScan { backward, .. } => {
+                    let want = works as usize + 1;
+                    let Ok(Some(rows)) =
+                        self.storage.records_after(db, coll, None, want, *backward)
+                    else {
+                        return Ok(None);
+                    };
+                    ended &= rows.len() < want;
+                    for (rid, blob) in rows {
+                        blobs.insert(rid, Some(blob));
+                    }
+                    continue;
+                }
+                Node::IxScan(ix) => (ix, None),
+                Node::DistinctScan(ix, width, _) => (ix, Some(*width)),
+                _ => return Ok(None),
+            };
+            match super::stream::scan_reach(self.storage, db, coll, ix, width, works) {
+                Ok(Some((rids, end))) => {
+                    ended &= end;
+                    for rid in rids {
+                        blobs.entry(rid).or_insert(None);
+                    }
+                }
+                Ok(None) => return Err(()),
+                Err(_) => return Ok(None),
+            }
+        }
+        let missing: Vec<i64> = blobs
+            .iter()
+            .filter(|(_, b)| b.is_none())
+            .map(|(rid, _)| *rid)
+            .collect();
+        if !missing.is_empty() {
+            let Ok(Some(found)) = self.storage.records_by_id(db, coll, &missing) else {
+                return Ok(None);
+            };
+            for (rid, blob) in missing.iter().zip(found) {
+                match blob {
+                    Some(blob) => blobs.insert(*rid, Some(blob)),
+                    None => blobs.remove(rid),
+                };
+            }
+        }
+        let all: Vec<(i64, Vec<u8>)> = blobs
+            .into_iter()
+            .filter_map(|(rid, blob)| Some((rid, blob?)))
+            .collect();
+        let Some((docs, known)) = self.decode(&all) else {
+            return Ok(None);
+        };
+        // The collection's size sets a trial's length only past
+        // `internalQueryPlanEvaluationWorks`.
+        let total = if works >= super::trial::max_works(0) {
+            match self.storage.collection_count_at_most(db, coll, usize::MAX) {
+                Ok(Some(n)) => Some(n),
+                _ => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Ok(Some(plan::Docs {
+            docs: Cow::Owned(docs),
+            known: known.map(Cow::Owned),
+            collation: self.ask.collation,
+            reach: (!ended).then_some(works),
+            total,
+        }))
+    }
+}
+
+/// The scans and collection scans `node`'s trial reads, into `out`; `false`
+/// for a stage the trial does not step (`trial::Stage::new`).
+fn trial_leaves<'n>(node: &'n Node, out: &mut Vec<&'n Node>) -> bool {
+    match node {
+        Node::IxScan(_) | Node::CollScan { .. } | Node::DistinctScan(..) => {
+            out.push(node);
+            true
+        }
+        Node::Fetch { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Projection { input, .. }
+        | Node::Skip(_, input)
+        | Node::Limit(_, input)
+        | Node::ReturnKey(input)
+        | Node::Subplan(input) => trial_leaves(input, out),
+        Node::Or(inputs) | Node::AndSorted(inputs) | Node::SortMerge { inputs, .. } => {
+            inputs.iter().all(|n| trial_leaves(n, out))
+        }
+        _ => false,
+    }
 }
 
 impl plan::Whole for Lazy<'_> {
-    fn env(&self) -> Option<Env<'_>> {
-        let (docs, known) = self.loaded.get_or_init(|| self.read()).as_ref()?;
-        Some(Env {
-            docs,
-            collation: self.ask.collation,
-            skip: 0,
-            limit: 0,
-            multi: true,
-            upsert: false,
-            returns: false,
-            known: known.as_deref(),
-        })
+    fn docs(&self, plans: &[&Node], works: i64) -> Option<plan::Docs<'_>> {
+        match self.whole.get_or_init(|| self.read(TRIAL_COLLECTION)) {
+            Whole::All(loaded) => return Some(self.all(loaded)),
+            Whole::Unread => return None,
+            Whole::Large => {}
+        }
+        match self.reached(plans, works) {
+            Ok(docs) => docs,
+            // A scan the store cannot read a work at a time: the trial runs
+            // over the whole collection, read for it alone.
+            Err(()) => match self.read(usize::MAX) {
+                Whole::All(loaded) => {
+                    let docs = loaded.0.len();
+                    let known = loaded.1.map(Cow::Owned);
+                    Some(plan::Docs {
+                        docs: Cow::Owned(loaded.0),
+                        known,
+                        collation: self.ask.collation,
+                        reach: None,
+                        total: Some(docs),
+                    })
+                }
+                _ => None,
+            },
+        }
     }
 }
 
@@ -503,7 +661,7 @@ fn consult<'a>(
             .flat_map(|ix| ix.key.keys())
             .map(|field| field.split('.').next().unwrap_or(field).to_string())
             .collect(),
-        loaded: OnceCell::new(),
+        whole: OnceCell::new(),
     };
     let trial = plan::Trial {
         total: None,
@@ -1078,38 +1236,35 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
     let sorts = has_sort(&plan);
     if sorts || plan::contested(&query(None), &catalog) {
         // The count serves only the walk against a sort, which can be
-        // decided without reading the documents; otherwise reading them
-        // finds a collection too large on its own.
+        // decided without reading the documents.
         let total = if sorts {
             storage.collection_count_at_most(ask.db, ask.coll, TRIAL_COLLECTION)?
         } else {
             None
         };
-        if total.is_some() || !sorts {
-            let whole = Lazy {
-                storage,
-                ask,
-                rows: &rows,
-                partial: catalog.iter().any(|ix| ix.partial.is_some())
-                    || (canonical.len() == 1 && canonical.contains_key("$or"))
-                    || ask.sort.is_some_and(|s| !s.is_empty()),
-                fields: catalog
-                    .iter()
-                    .flat_map(|ix| ix.key.keys())
-                    .map(|field| field.split('.').next().unwrap_or(field).to_string())
-                    .collect(),
-                loaded: OnceCell::new(),
-            };
-            // The plans the read chose through the plan cache.
-            let trial = plan::Trial {
-                total,
-                matched: Some(rows.len()),
-                whole: &whole,
-                ranked: Default::default(),
-                cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
-            };
-            plan = plan::plan(&query(Some(&trial)), &catalog);
-        }
+        let whole = Lazy {
+            storage,
+            ask,
+            rows: &rows,
+            partial: catalog.iter().any(|ix| ix.partial.is_some())
+                || (canonical.len() == 1 && canonical.contains_key("$or"))
+                || ask.sort.is_some_and(|s| !s.is_empty()),
+            fields: catalog
+                .iter()
+                .flat_map(|ix| ix.key.keys())
+                .map(|field| field.split('.').next().unwrap_or(field).to_string())
+                .collect(),
+            whole: OnceCell::new(),
+        };
+        // The plans the read chose through the plan cache.
+        let trial = plan::Trial {
+            total,
+            matched: Some(rows.len()),
+            whole: &whole,
+            ranked: Default::default(),
+            cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
+        };
+        plan = plan::plan(&query(Some(&trial)), &catalog);
     }
 
     if let Some(via) = &via {

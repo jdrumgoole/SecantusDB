@@ -1,5 +1,5 @@
 """The plan cache against mongod 8.2.11 live: what it did not reproduce
-(RM-341, RM-342) and what it now does (RM-340)."""
+(RM-341) and what it now does (RM-340, RM-342)."""
 
 from __future__ import annotations
 
@@ -162,9 +162,10 @@ def _large(client: Any) -> Any:
     return _summary(col)
 
 
-@pytest.mark.backlog("RM-342")
+@pytest.mark.backlog_fixed("RM-342")
 def test_a_collection_over_2000_documents_is_cached(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 tries the candidate plans, and caches the winner,
-    whatever the collection's size; here the trial runs over at most 2000
-    documents, and past that nothing is cached."""
+    whatever the collection's size; the trial here ran over at most 2000
+    documents, and past that nothing was cached. It now reads, past that
+    size, what the candidates' scans reach in the store."""
     assert _large(rust_mongo) == _large(mongod)

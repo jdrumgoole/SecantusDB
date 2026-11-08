@@ -312,6 +312,8 @@ struct IndexScan {
     ended: bool,
     /// How many entries the next read of the store takes.
     chunk: usize,
+    /// Every RecordId read from the store, when asked for ([`scan_reach`]).
+    read: Option<Vec<i64>>,
     t: Tally,
 }
 
@@ -400,6 +402,9 @@ impl IndexScan {
             ))
         };
         for (raw, rid) in rows {
+            if let Some(read) = self.read.as_mut() {
+                read.push(rid);
+            }
             let asc: Vec<Vec<u8>> = if self.meta.id {
                 vec![raw.clone()]
             } else {
@@ -1529,8 +1534,51 @@ fn index_scan(ix: &IxScan, opts: &Options) -> Result<Option<IndexScan>, StorageE
         count_scan: false,
         ended: false,
         chunk: FIRST_CHUNK,
+        read: None,
         t: Tally::default(),
     }))
+}
+
+/// The RecordIds of every entry a scan of `ix` reads from the store in its
+/// first `works` units of work -- inside the bounds, sought past or
+/// ending it -- and whether it came to its end within them: what a trial of
+/// the plan over a large collection needs of it ([`super::order`]).
+/// `width`: a DISTINCT_SCAN of that many leading fields. `None`: the index
+/// does not stream.
+pub(crate) fn scan_reach(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    ix: &IxScan,
+    width: Option<usize>,
+    works: i64,
+) -> Result<Option<(Vec<i64>, bool)>, StorageError> {
+    if !ix.index.plain {
+        return Ok(None);
+    }
+    let Some(mut scan) = index_scan(ix, &Options::default())? else {
+        return Ok(None);
+    };
+    scan.distinct = width;
+    scan.read = Some(Vec::new());
+    let vars = Document::new();
+    let mut cx = Cx {
+        storage,
+        db,
+        coll,
+        vars: &vars,
+        keys: 0,
+        docs: 0,
+        want: 0,
+    };
+    let mut ended = false;
+    for _ in 0..works {
+        if matches!(scan.work(&mut cx)?, Step::End) {
+            ended = true;
+            break;
+        }
+    }
+    Ok(Some((scan.read.take().unwrap_or_default(), ended)))
 }
 
 /// Whether an index scan can stream (see the module's doc).

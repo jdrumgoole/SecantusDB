@@ -546,16 +546,13 @@ struct Held<'a> {
 }
 
 impl plan::Whole for Held<'_> {
-    fn env(&self) -> Option<exec::Env<'_>> {
-        Some(exec::Env {
-            docs: self.docs,
-            collation: self.collation,
-            skip: 0,
-            limit: 0,
-            multi: true,
-            upsert: false,
-            returns: false,
+    fn docs(&self, _plans: &[&Node], _works: i64) -> Option<plan::Docs<'_>> {
+        Some(plan::Docs {
+            docs: std::borrow::Cow::Borrowed(self.docs),
             known: None,
+            collation: self.collation,
+            reach: None,
+            total: Some(self.docs.len()),
         })
     }
 }

@@ -14,6 +14,7 @@ use super::exec::Env;
 use super::node::{IndexInfo, IxScan, Node, Stats};
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -353,9 +354,72 @@ pub(crate) struct Ranked {
     pub stats: Stats,
 }
 
-/// A collection's documents, for a plan to be run over.
+/// A collection's documents, for candidate plans to be run over.
 pub(crate) trait Whole {
-    fn env(&self) -> Option<Env<'_>>;
+    /// The documents `plans` read in their first `works` works each: every
+    /// document of a small collection, or of a large one those reached
+    /// (`Docs::reach`). `None`: the collection is not to hand.
+    fn docs(&self, plans: &[&Node], works: i64) -> Option<Docs<'_>>;
+}
+
+/// The documents a trial runs over.
+pub(crate) struct Docs<'a> {
+    pub docs: Cow<'a, [Document]>,
+    /// Per document, whether the query matches it (`Env::known`).
+    pub known: Option<Cow<'a, [bool]>>,
+    pub collation: Option<&'a Collation>,
+    /// The works these documents serve: within that many, each plan reads
+    /// only documents held here, so it does what it would over the whole
+    /// collection. `None`: any number (they are the whole collection, or
+    /// every scan came to its end).
+    pub reach: Option<i64>,
+    /// How many documents the collection holds; `None` when not counted,
+    /// which serves a trial shorter than `internalQueryPlanEvaluationWorks`.
+    pub total: Option<usize>,
+}
+
+impl Docs<'_> {
+    pub(crate) fn env(&self) -> Env<'_> {
+        Env {
+            docs: &self.docs,
+            collation: self.collation,
+            skip: 0,
+            limit: 0,
+            multi: true,
+            upsert: false,
+            returns: false,
+            known: self.known.as_deref(),
+        }
+    }
+}
+
+/// The works a trial over a large collection first reads for: a trial that
+/// ends at 101 documents seldom takes more.
+const FIRST_REACH: i64 = 512;
+
+/// `go` run over the documents `plans` read, as many as it turns out to
+/// need. `go` answers with the works it took; when that reached what the
+/// documents serve, it is run again over eight times as many, so its answer
+/// is the one the whole collection gives. `None`: the collection is not to
+/// hand, or `go` could not run.
+fn over_reach<T>(
+    whole: &dyn Whole,
+    plans: &[&Node],
+    mut go: impl FnMut(&Docs) -> Option<(T, i64)>,
+) -> Option<T> {
+    let mut works = FIRST_REACH;
+    loop {
+        let docs = whole.docs(plans, works)?;
+        let (out, used) = go(&docs)?;
+        let short = docs.reach.is_some_and(|r| used >= r);
+        // A trial as long as `internalQueryPlanEvaluationWorks` may have
+        // been cut short by an uncounted collection's budget.
+        let uncounted = docs.total.is_none() && used >= super::trial::max_works(0);
+        if !(short || uncounted) {
+            return Some(out);
+        }
+        works = works.saturating_mul(8).max(used.saturating_add(1));
+    }
 }
 
 /// The scan a query reads through, before sort, paging and projection.
@@ -1460,14 +1524,19 @@ fn tried(
             if let Some(at) = plans.iter().position(|p| signature(p) == *sig) {
                 let fits = l.branch
                     || l.trusted
-                    || trial.whole.env().is_none_or(|env| {
+                    || over_reach(trial.whole, &[&plans[at]], |docs| {
                         let within = if q.sbe {
                             super::trial::within_reads
                         } else {
                             super::trial::within
                         };
-                        within(&plans[at], &env, trial_need(q), works * 10) != Some(false)
-                    });
+                        match within(&plans[at], &docs.env(), trial_need(q), works * 10) {
+                            Some((fits, used)) => Some((Some(fits), used)),
+                            None => Some((None, 0)),
+                        }
+                    })
+                    .flatten()
+                        != Some(false);
                 if fits {
                     trial.ranked.borrow_mut().clear();
                     cache.chose(l, sig.clone());
@@ -1534,10 +1603,15 @@ fn trial_need(q: &Query) -> i64 {
 /// on `trial` for `explain`, which lists the plans as they were tried, the
 /// winner swapped with the first.
 fn pick(plans: Vec<Node>, q: &Query, trial: &Trial) -> Option<(usize, super::trial::Outcome)> {
-    let env = trial.whole.env()?;
+    let all: Vec<&Node> = plans.iter().collect();
     // Counted where the plan hands documents over, past any skip (measured
     // 8.2.11: `skip: 1, limit: 2` ends the trial at two documents).
-    let outcome = super::trial::run(&plans, &env, trial_need(q))?;
+    let outcome = over_reach(trial.whole, &all, |docs| {
+        let total = docs.total.unwrap_or(0);
+        let outcome = super::trial::run(&plans, &docs.env(), trial_need(q), total)?;
+        let works = outcome.works;
+        Some((outcome, works))
+    })?;
     // The best score, mongod's tie-breaking bonuses included; between
     // plans those leave equal, the first.
     let at = outcome.order[0];

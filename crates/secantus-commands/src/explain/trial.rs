@@ -436,18 +436,27 @@ pub(crate) struct Outcome {
 /// `kBonusEpsilon`.
 const BONUS: f64 = 1e-4;
 
+/// The most rounds a trial runs over a collection of `total` documents
+/// (`trial_period::getTrialPeriodMaxWorks`): `internalQueryPlanEvaluationWorks`
+/// (10,000), or `internalQueryPlanEvaluationCollFraction` (0.3) of the
+/// collection when that is more.
+pub(crate) fn max_works(total: usize) -> i64 {
+    10_000i64.max((total as f64 * 0.3) as i64)
+}
+
 /// Each plan's score after mongod's trial over `env` (`pickBestPlan` in
 /// `plan_ranker_util.h`), with what its stages counted during the trial.
-/// `need`: the documents a plan hands over to end the trial. `None`: a plan
-/// holds a stage this does not step.
-pub(crate) fn run(plans: &[Node], env: &Env, need: i64) -> Option<Outcome> {
+/// `need`: the documents a plan hands over to end the trial; `total`: the
+/// documents the collection holds, which set the trial's length. `None`: a
+/// plan holds a stage this does not step.
+pub(crate) fn run(plans: &[Node], env: &Env, need: i64, total: usize) -> Option<Outcome> {
     // An index's entries, built once for every scan of it.
     let mut cache = Entries::new();
     let mut stages: Vec<Stage> = plans
         .iter()
         .map(|p| Stage::new(p, env, &mut cache))
         .collect::<Option<_>>()?;
-    let max_works = 10_000i64.max((env.docs.len() as f64 * 0.3) as i64);
+    let max_works = max_works(total);
     let mut works = 0i64;
     while works < max_works {
         works += 1;
@@ -695,18 +704,19 @@ fn index_prefix_winners(solutions: &[&Node]) -> Vec<usize> {
 
 /// mongod's `CachedPlanStage::pickBestPlan`: the cached plan is worked
 /// until it hands over `need` documents or runs out, within `budget`
-/// works. Whether it did; `None`: a stage this does not step.
-pub(crate) fn within(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<bool> {
+/// works. Whether it did, and the works it took; `None`: a stage this does
+/// not step.
+pub(crate) fn within(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<(bool, i64)> {
     let mut cache = Entries::new();
     let mut stage = Stage::new(plan, env, &mut cache)?;
     for _ in 0..budget {
         match stage.work(env) {
-            Work::Advanced(_) if stage.returned >= need => return Some(true),
-            Work::Eof => return Some(true),
+            Work::Advanced(_) if stage.returned >= need => return Some((true, stage.works)),
+            Work::Eof => return Some((true, stage.works)),
             _ => {}
         }
     }
-    Some(false)
+    Some((false, stage.works))
 }
 
 /// The cached plan as SBE runs it (`classic_runtime_planner_for_sbe`'s
@@ -714,18 +724,19 @@ pub(crate) fn within(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<b
 /// out, and given up when the keys and documents it has read reach
 /// `budget` first (measured 8.2.11, 2026-11-08: a plan cached at 200 reads
 /// that runs out after 1,960 is kept, one that runs out after 2,000 is
-/// replanned). Whether it finished; `None`: a stage this does not step.
-pub(crate) fn within_reads(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<bool> {
+/// replanned). Whether it finished, and the works it took; `None`: a stage
+/// this does not step.
+pub(crate) fn within_reads(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<(bool, i64)> {
     let mut cache = Entries::new();
     let mut stage = Stage::new(plan, env, &mut cache)?;
     loop {
         let work = stage.work(env);
         if stage.reads() >= budget {
-            return Some(false);
+            return Some((false, stage.works));
         }
         match work {
-            Work::Advanced(_) if stage.returned >= need => return Some(true),
-            Work::Eof => return Some(true),
+            Work::Advanced(_) if stage.returned >= need => return Some((true, stage.works)),
+            Work::Eof => return Some((true, stage.works)),
             _ => {}
         }
     }
