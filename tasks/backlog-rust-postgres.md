@@ -355,6 +355,23 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **NOT REPRODUCED -- left open as a watch item. A `CREATE VIEW`
+  went unanswered for 10 s once (2026-11-08).** `tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
+  (a regression test) failed in CI's `pg-oracle (backlog)` lane on
+  snapshot PR #2497 (`b8976e15`): `TimeoutError: timed out` in
+  `pgwire_raw.py`'s `_until_ready`, waiting for ReadyForQuery after the
+  test's `CREATE VIEW rp_v ... FROM rp_tab1 JOIN rp_tab2` (traceback line
+  328). The raw client's socket timeout is 10 s, so the server sent
+  nothing for 10 s after a DDL statement. The `rust_pg` server is shared
+  by the module's tests under `-n 4`, so one explanation is DDL waiting on
+  a lock another test held, but that was not measured. The snapshot's only
+  change was RM-342, in `secantus-commands`, which the PG server does not
+  link. It did not fail in the 24 previous runs of that lane; a rerun was
+  started. Found by the MongoDB batch; not worked from that side. On a
+  recurrence, capture `pg_locks` / the server's lock waits at the moment
+  of the stall and which other test was running.
+  Backlog-ID: RP-606
+  Verify: none -- intermittent, not reproduced; the regression test is the check
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
   parse was honoured 0.65 s late once, RP-002's pre-fix signature
   (2026-11-08).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
