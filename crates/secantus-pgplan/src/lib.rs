@@ -19991,11 +19991,11 @@ fn resolve_sublinks_scoped(
                 }
             }
             for c in clauses {
-                resolve_sublinks_in_expr(c, lookup, params, run, &outer)?;
+                resolve_sublinks_in_expr(c, lookup, params, run, Outer::Names(&outer))?;
             }
             for t in &mut u.returning_list {
                 if let Some(N::ResTarget(rt)) = t.node.as_mut() {
-                    resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
+                    resolve_sublinks_in_target(rt, lookup, params, run, Outer::Names(&outer))?;
                 }
             }
             Ok(())
@@ -20004,11 +20004,11 @@ fn resolve_sublinks_scoped(
             push_visible_ctes(d.with_clause.as_mut(), true, lookup, params, run)?;
             let outer = outer_columns(&d.relation, lookup);
             if let Some(w) = d.where_clause.as_deref_mut() {
-                resolve_sublinks_in_expr(w, lookup, params, run, &outer)?;
+                resolve_sublinks_in_expr(w, lookup, params, run, Outer::Names(&outer))?;
             }
             for n in &mut d.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
-                    resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
+                    resolve_sublinks_in_target(rt, lookup, params, run, Outer::Names(&outer))?;
                 }
             }
             Ok(())
@@ -20043,7 +20043,13 @@ fn resolve_sublinks_scoped(
                     for vl in &mut sel.values_lists {
                         if let Some(N::List(l)) = vl.node.as_mut() {
                             for item in &mut l.items {
-                                resolve_sublinks_in_expr(item, lookup, params, run, &[])?;
+                                resolve_sublinks_in_expr(
+                                    item,
+                                    lookup,
+                                    params,
+                                    run,
+                                    Outer::Names(&[]),
+                                )?;
                             }
                         }
                     }
@@ -20062,7 +20068,7 @@ fn resolve_sublinks_scoped(
             let mut out = Ok(());
             for n in &mut i.returning_list {
                 if let Some(N::ResTarget(rt)) = n.node.as_mut() {
-                    out = resolve_sublinks_in_target(rt, lookup, params, run, &outer);
+                    out = resolve_sublinks_in_target(rt, lookup, params, run, Outer::Names(&outer));
                     if out.is_err() {
                         break;
                     }
@@ -20751,28 +20757,6 @@ fn resolve_sublinks_in_select_scoped(
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
 ) -> Result<()> {
-    // Every column the query's own FROM exposes. A reference inside a
-    // subquery to one of THESE is a correlation; a reference to anything else
-    // is a typo, and must keep answering 42703 rather than being reported as
-    // an unsupported correlation.
-    let mut outer: Vec<String> = Vec::new();
-    for item in &s.from_clause {
-        collect_from_columns(item, lookup, &mut outer);
-    }
-    // ...and every column the queries AROUND it expose: PostgreSQL's
-    // `colNameToVar` searches the namespace of each enclosing level in turn,
-    // nearest first, so `(select (select a)) from t` reads `t.a` two levels
-    // up (RP-445). The nearer level still wins: the per-row call a
-    // subquery becomes names the column at the level around it, which
-    // resolves it against its own FROM before looking further out.
-    ENCLOSING_COLUMNS.with(|e| {
-        for c in e.borrow().iter() {
-            if !outer.contains(c) {
-                outer.push(c.clone());
-            }
-        }
-    });
-
     // A CTE body is a select in its own right, and is resolved BEFORE the
     // query that references it -- the inlining that expands `WITH` runs later,
     // inside `plan_select`, so a subquery left in a CTE body here would reach
@@ -20796,6 +20780,24 @@ fn resolve_sublinks_in_select_scoped(
             VISIBLE_CTES.with(|v| v.borrow_mut().extend(ctes));
         }
     }
+    // The WITH items this query's FROM may name, its own included: a
+    // recursive one too, which a subquery is not given to copy in.
+    let mut ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    if let Some(with) = s.with_clause.as_ref().filter(|w| w.recursive) {
+        ctes.extend(with.ctes.iter().cloned());
+    }
+    // The columns this level's FROM items expose, and with them the names
+    // its subqueries may read of it, as they stand now: read only when a
+    // subquery asks (`LevelNames`).
+    let names = LevelNames {
+        from: s.from_clause.clone(),
+        ctes,
+        enclosing: ENCLOSING_COLUMNS.with(|e| e.borrow().clone()),
+        lookup,
+        items: std::cell::OnceCell::new(),
+        outer: std::cell::OnceCell::new(),
+    };
+    let outer = Outer::Level(&names);
     // A set operation's sides, and a FROM-subquery's body, are selects in
     // their own right.
     for side in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
@@ -20804,19 +20806,13 @@ fn resolve_sublinks_in_select_scoped(
     {
         resolve_sublinks_in_select(side, lookup, params, run)?;
     }
-    // Each item's columns, for the LATERAL items after it.
-    let item_columns: Vec<Vec<String>> = s
-        .from_clause
-        .iter()
-        .map(|item| {
-            let mut cols = Vec::new();
-            collect_from_columns(item, lookup, &mut cols);
-            cols
-        })
-        .collect();
     for (i, item) in s.from_clause.iter_mut().enumerate() {
-        let left: Vec<String> = item_columns[..i].concat();
-        resolve_sublinks_in_from(item, i > 0, &left, lookup, params, run, &outer)?;
+        let from = FromScope {
+            level: &names,
+            before: i,
+            joined: Vec::new(),
+        };
+        resolve_sublinks_in_from(item, i > 0, &from, lookup, params, run)?;
     }
 
     // A FILTER holding a subquery, as the CASE argument it is equivalent to.
@@ -20825,7 +20821,7 @@ fn resolve_sublinks_in_select_scoped(
     semijoin::rewrite(s, lookup);
     for t in &mut s.target_list {
         if let Some(N::ResTarget(rt)) = t.node.as_mut() {
-            resolve_sublinks_in_target(rt, lookup, params, run, &outer)?;
+            resolve_sublinks_in_target(rt, lookup, params, run, outer)?;
         }
     }
     for clause in [
@@ -20835,31 +20831,124 @@ fn resolve_sublinks_in_select_scoped(
     .into_iter()
     .flatten()
     {
-        resolve_sublinks_in_expr(clause, lookup, params, run, &outer)?;
+        resolve_sublinks_in_expr(clause, lookup, params, run, outer)?;
     }
     for item in &mut s.sort_clause {
         if let Some(N::SortBy(sb)) = item.node.as_mut() {
             if let Some(n) = sb.node.as_deref_mut() {
-                resolve_sublinks_in_expr(n, lookup, params, run, &outer)?;
+                resolve_sublinks_in_expr(n, lookup, params, run, outer)?;
             }
         }
     }
     Ok(())
 }
 
+/// The columns one query level's FROM items expose (`collect_from_columns`)
+/// and the names its subqueries may read of it, each read on first use: a
+/// FROM function's columns are planned, and a level with no subquery never
+/// needs them. Built from the FROM list and the enclosing levels' names as
+/// they stood when the level began, so a late read sees what an early one
+/// would have.
+struct LevelNames<'a> {
+    from: Vec<pg_query::protobuf::Node>,
+    /// The WITH items its FROM may name, outermost first.
+    ctes: Vec<pg_query::protobuf::Node>,
+    /// `ENCLOSING_COLUMNS` when the level began.
+    enclosing: Vec<String>,
+    lookup: &'a dyn Fn(&str) -> Option<TableDef>,
+    items: std::cell::OnceCell<Vec<Vec<String>>>,
+    outer: std::cell::OnceCell<Vec<String>>,
+}
+
+impl LevelNames<'_> {
+    /// Each FROM item's columns, in order.
+    fn items(&self) -> &[Vec<String>] {
+        self.items.get_or_init(|| {
+            self.from
+                .iter()
+                .map(|item| {
+                    let mut cols = Vec::new();
+                    collect_from_columns(item, self.lookup, &self.ctes, &mut cols);
+                    cols
+                })
+                .collect()
+        })
+    }
+
+    /// Every column the query's own FROM exposes. A reference inside a
+    /// subquery to one of THESE is a correlation; a reference to anything
+    /// else is a typo, and must keep answering 42703 rather than being
+    /// reported as an unsupported correlation. Then every column the
+    /// queries AROUND it expose: PostgreSQL's `colNameToVar` searches the
+    /// namespace of each enclosing level in turn, nearest first, so
+    /// `(select (select a)) from t` reads `t.a` two levels up (RP-445). The
+    /// nearer level still wins: the per-row call a subquery becomes names
+    /// the column at the level around it, which resolves it against its own
+    /// FROM before looking further out.
+    fn outer(&self) -> &[String] {
+        self.outer.get_or_init(|| {
+            let mut outer = self.items().concat();
+            for c in &self.enclosing {
+                if !outer.contains(c) {
+                    outer.push(c.clone());
+                }
+            }
+            outer
+        })
+    }
+}
+
+/// The names a subquery may read of the levels around it: given, or a
+/// level's, read when the first subquery asks.
+#[derive(Clone, Copy)]
+enum Outer<'a> {
+    Names(&'a [String]),
+    Level(&'a LevelNames<'a>),
+}
+
+impl<'a> Outer<'a> {
+    fn names(self) -> &'a [String] {
+        match self {
+            Outer::Names(n) => n,
+            Outer::Level(l) => l.outer(),
+        }
+    }
+}
+
+/// What a FROM item's subqueries may read of the query around it.
+struct FromScope<'a> {
+    level: &'a LevelNames<'a>,
+    /// How many of the level's FROM items stand to its left.
+    before: usize,
+    /// The left sides of the joins it is the right side of, outermost first.
+    joined: Vec<pg_query::protobuf::Node>,
+}
+
+impl FromScope<'_> {
+    /// The columns the items to its left expose, which a LATERAL subquery
+    /// reads.
+    fn left(&self) -> Vec<String> {
+        let mut left = self.level.items()[..self.before].concat();
+        for l in &self.joined {
+            collect_from_columns(l, self.level.lookup, &self.level.ctes, &mut left);
+        }
+        left
+    }
+}
+
 /// `has_left`: a FROM item stands to this one's left (see
-/// `rowsfrom::rewrite`); `left`: the columns those items expose, which a
-/// LATERAL subquery reads. `outer`: the columns the query's FROM exposes,
-/// which a subquery in a join's ON may read.
+/// `rowsfrom::rewrite`).
 fn resolve_sublinks_in_from(
     item: &mut pg_query::protobuf::Node,
     has_left: bool,
-    left: &[String],
+    scope: &FromScope<'_>,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
-    outer: &[String],
 ) -> Result<()> {
+    // The columns the query's FROM exposes, which a subquery in a join's ON
+    // may read.
+    let outer = Outer::Level(scope.level);
     // `WITH ORDINALITY` / a several-function `ROWS FROM` become the
     // subqueries they mean first, so the subqueries THAT introduces
     // (`ARRAY(SELECT f(...))`) are resolved with the rest.
@@ -20881,11 +20970,15 @@ fn resolve_sublinks_in_from(
                 // FROM is: `lateral (select (select b) from fs)` reads the
                 // left side's `b` (RP-478). Any other FROM-subquery sees no
                 // sibling.
-                Some(N::SelectStmt(inner)) if lateral && !left.is_empty() => {
+                Some(N::SelectStmt(inner)) if lateral => {
+                    let left = scope.left();
+                    if left.is_empty() {
+                        return resolve_sublinks_in_select(inner, lookup, params, run);
+                    }
                     let enclosing = ENCLOSING_COLUMNS.with(|e| {
                         let mut e = e.borrow_mut();
                         let d = e.len();
-                        e.extend(left.iter().cloned());
+                        e.extend(left);
                         d
                     });
                     let resolved = resolve_sublinks_in_select(inner, lookup, params, run);
@@ -20904,7 +20997,7 @@ fn resolve_sublinks_in_from(
             for f in &mut rf.functions {
                 if let Some(N::List(l)) = f.node.as_mut() {
                     if let Some(call) = l.items.first_mut() {
-                        resolve_sublinks_in_expr(call, lookup, params, run, &[])?;
+                        resolve_sublinks_in_expr(call, lookup, params, run, Outer::Names(&[]))?;
                     }
                 }
             }
@@ -20912,16 +21005,19 @@ fn resolve_sublinks_in_from(
         }
         Some(N::JoinExpr(j)) => {
             // The right side's left is everything left of the join and the
-            // join's left side.
-            let mut right_left = left.to_vec();
-            if let Some(l) = j.larg.as_deref() {
-                collect_from_columns(l, lookup, &mut right_left);
-            }
+            // join's left side, as it was written.
+            let mut joined = scope.joined.clone();
+            joined.extend(j.larg.as_deref().cloned());
             if let Some(l) = j.larg.as_deref_mut() {
-                resolve_sublinks_in_from(l, has_left, left, lookup, params, run, outer)?;
+                resolve_sublinks_in_from(l, has_left, scope, lookup, params, run)?;
             }
             if let Some(r) = j.rarg.as_deref_mut() {
-                resolve_sublinks_in_from(r, true, &right_left, lookup, params, run, outer)?;
+                let right = FromScope {
+                    level: scope.level,
+                    before: scope.before,
+                    joined,
+                };
+                resolve_sublinks_in_from(r, true, &right, lookup, params, run)?;
             }
             // A subquery in the ON is evaluated as one in a WHERE is
             // (PostgreSQL's `transformJoinOnClause` analyses it with the
@@ -20935,13 +21031,28 @@ fn resolve_sublinks_in_from(
     }
 }
 
-/// The columns a FROM item exposes, by name. A subquery's are its select
-/// list's output names, which is enough to recognise a correlation.
+/// The columns a FROM item exposes, by name, which is enough to recognise a
+/// correlation. `ctes` are the WITH items in scope, outermost first.
+///
+/// They are its range table entry's (`colhint::from_item_columns`): a WITH
+/// item's, which hides a table of its name; a FROM-subquery's output names;
+/// a function's, as the planner names its result; a USING join's merged
+/// ones (RP-505, RP-506). Where those cannot be told, as best the written
+/// statement tells.
 fn collect_from_columns(
     item: &pg_query::protobuf::Node,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ctes: &[pg_query::protobuf::Node],
     out: &mut Vec<String>,
 ) {
+    let columns =
+        |name: &str| lookup(name).map(|d| d.columns.into_iter().map(|c| c.name).collect());
+    let functions =
+        |rf: &pg_query::protobuf::RangeFunction| joins::function_columns(rf, lookup, &[]);
+    if let Some(cols) = colhint::from_item_columns(item, &columns, &functions, ctes) {
+        out.extend(cols);
+        return;
+    }
     match item.node.as_ref() {
         Some(N::RangeVar(r)) => {
             if let Some(def) = lookup(&r.relname) {
@@ -20950,24 +21061,10 @@ fn collect_from_columns(
         }
         Some(N::JoinExpr(j)) => {
             for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
-                collect_from_columns(side, lookup, out);
+                collect_from_columns(side, lookup, ctes, out);
             }
         }
         Some(N::RangeSubselect(rs)) => {
-            // The body's output names, as PostgreSQL's range table entry
-            // has them (RP-505): a set operation's leftmost leaf's, a star
-            // expanded, an unnamed target's FigureColname, and only the
-            // leading ones renamed by an alias's column list.
-            if let Some(N::SelectStmt(inner)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref()) {
-                let columns = |name: &str| {
-                    lookup(name).map(|d| d.columns.into_iter().map(|c| c.name).collect())
-                };
-                if let Some(cols) = colhint::select_output_columns(inner, &columns) {
-                    out.extend(colhint::renamed_by_alias(cols, rs.alias.as_ref()));
-                    return;
-                }
-            }
-            // Otherwise, as best the written list tells.
             // `(values (...)) v(a)`: the alias names the columns.
             let aliased: Vec<String> = rs
                 .alias
@@ -21035,7 +21132,7 @@ fn resolve_sublinks_in_target(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
-    outer: &[String],
+    outer: Outer<'_>,
 ) -> Result<()> {
     let Some(v) = rt.val.as_deref_mut() else {
         return Ok(());
@@ -21058,7 +21155,7 @@ fn resolve_sublinks_in_expr(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
-    outer: &[String],
+    outer: Outer<'_>,
 ) -> Result<()> {
     // A field of a scalar subquery's ROW() has no name to find, before the
     // subquery is replaced by its value (`record_fields`).
@@ -21754,11 +21851,14 @@ fn resolve_one_sublink(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &mut Vec<Bson>,
     run: SubqueryRunner<'_>,
-    outer: &[String],
+    outer: Outer<'_>,
 ) -> Result<pg_query::protobuf::Node> {
     let Some(N::SelectStmt(inner)) = sl.subselect.as_ref().and_then(|q| q.node.as_ref()) else {
         return Err(Error::Unsupported("this subquery".into()));
     };
+    // The names of the levels around it, read here, where a subquery first
+    // needs them (`LevelNames`).
+    let outer = outer.names();
     // A subquery may itself contain subqueries and CTEs; both are resolved
     // before it is planned, innermost first.
     let mut inner = (**inner).clone();
@@ -21788,16 +21888,10 @@ fn resolve_one_sublink(
     let resolved = resolve_sublinks_in_select(&mut inner, lookup, params, run);
     ENCLOSING_COLUMNS.with(|e| e.borrow_mut().truncate(enclosing));
     resolved?;
-    // The enclosing statements' CTEs are in scope, behind the subquery's own
-    // (inlining takes the first definition of a name, so its own win). Added
-    // AFTER the subquery's own resolution: they are already resolved.
-    let visible = VISIBLE_CTES.with(|v| v.borrow().clone());
-    if !visible.is_empty() {
-        let mut with = inner.with_clause.clone().unwrap_or_default();
-        with.ctes.extend(visible);
-        inner.with_clause = Some(with);
-    }
-    let inner = inline_ctes(&inner)?;
+    // The enclosing statements' CTEs are in scope, as an outer scope its own
+    // WITH items see and hide (`under_visible_ctes`). Added AFTER the
+    // subquery's own resolution: they are already resolved.
+    let inner = under_visible_ctes(&inner)?;
 
     // A QUALIFIED reference to something outside the subquery has to be
     // caught BEFORE planning, because planning cannot see it: the lowering
@@ -21819,7 +21913,7 @@ fn resolve_one_sublink(
         let test = sl.testexpr.as_deref().cloned();
         let mut sl = sl.clone();
         if let Some(mut t) = test {
-            resolve_sublinks_in_expr(&mut t, lookup, params, run, outer)?;
+            resolve_sublinks_in_expr(&mut t, lookup, params, run, Outer::Names(outer))?;
             sl.testexpr = Some(Box::new(t));
         }
         return correlated::correlate(&sl, shape, &inner, lookup, params, outer);
@@ -21833,7 +21927,7 @@ fn resolve_one_sublink(
             let test = sl.testexpr.as_deref().cloned();
             let mut sl = sl.clone();
             if let Some(mut t) = test {
-                resolve_sublinks_in_expr(&mut t, lookup, params, run, outer)?;
+                resolve_sublinks_in_expr(&mut t, lookup, params, run, Outer::Names(outer))?;
                 sl.testexpr = Some(Box::new(t));
             }
             return correlated::correlate(&sl, shape, &inner, lookup, params, outer);
@@ -22005,7 +22099,7 @@ fn resolve_one_sublink(
             // subquery in it (`(select 1) in (select ...)`) has to be resolved
             // here -- the walk that got us here replaced this whole SubLink
             // and will not descend into what we build.
-            resolve_sublinks_in_expr(&mut test, lookup, params, run, outer)?;
+            resolve_sublinks_in_expr(&mut test, lookup, params, run, Outer::Names(outer))?;
             // `x IN (subquery)` is `x = ANY (...)` and `x NOT IN (subquery)`
             // is `x <> ALL (...)`; PostgreSQL parses them into exactly these
             // two nodes, so the operator comes off the SubLink rather than
@@ -22059,7 +22153,7 @@ fn row_subquery_comparison(
     outer: &[String],
 ) -> Result<pg_query::protobuf::Node> {
     let mut test = sl.testexpr.as_deref().cloned().expect("checked");
-    resolve_sublinks_in_expr(&mut test, lookup, params, run, outer)?;
+    resolve_sublinks_in_expr(&mut test, lookup, params, run, Outer::Names(outer))?;
     let Some(N::RowExpr(row)) = test.node.as_ref() else {
         return Err(Error::Unsupported("this row comparison".into()));
     };
@@ -23014,6 +23108,27 @@ pub(crate) fn visible_cte_def(
     let flat = inline_ctes(&s).ok()?;
     let planned = correlated::without_side_effects(|| plan_select(&flat, lookup, params)).ok()?;
     sub_plan_def(&planned, lookup).ok()
+}
+
+/// `s` with the enclosing statements' CTEs in scope and every CTE inlined:
+/// what a query nested in a statement is planned as. The enclosing ones are
+/// an outer scope, as PostgreSQL's namespace search has them: `s`'s own WITH
+/// items read them, and an own item hides one of its name from the items
+/// after it and from `s` (`substitute_ctes`). Appended behind `s`'s own
+/// WITH instead, an own item reading one was `relation does not exist`
+/// (`(with w2 as (select * from w) select a from w2)`, RP-506).
+pub(crate) fn under_visible_ctes(
+    s: &pg_query::protobuf::SelectStmt,
+) -> Result<pg_query::protobuf::SelectStmt> {
+    let visible = VISIBLE_CTES.with(|v| v.borrow().clone());
+    if visible.is_empty() {
+        return inline_ctes(s);
+    }
+    let defs = cte_defs(&pg_query::protobuf::WithClause {
+        ctes: visible,
+        ..Default::default()
+    })?;
+    inline_ctes(&substitute_ctes(s, &defs))
 }
 
 /// Push a WITH's items onto `VISIBLE_CTES` for the subqueries resolved

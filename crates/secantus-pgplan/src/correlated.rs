@@ -741,7 +741,11 @@ pub(crate) fn from_item_def(
             else {
                 return None;
             };
-            let planned = without_side_effects(|| plan_select(b, lookup, params)).ok()?;
+            // Planned as the statement plans it, with the WITH items around
+            // it in scope: `(select * from w) t` reads a CTE's columns
+            // (RP-506).
+            let b = crate::under_visible_ctes(b).ok()?;
+            let planned = without_side_effects(|| plan_select(&b, lookup, params)).ok()?;
             let mut def = sub_plan_def(&planned, lookup).ok()?;
             for (c, n) in def.columns.iter_mut().zip(&alias.colnames) {
                 if let Some(N::String(s)) = n.node.as_ref() {
