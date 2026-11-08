@@ -25,13 +25,14 @@ def dsn(rust_pg: object) -> Iterator[str]:
         c.execute("drop table if exists t658z")
 
 
-@pytest.mark.backlog("RP-662")
+@pytest.mark.backlog_fixed("RP-662")
 def test_alter_type_between_array_types(dsn: str) -> None:
     """An array's assignment cast is its element's (`find_coercion_pathway`
     over `typelem`, an `array_coerce` path), so on PostgreSQL 15.19 `int[]`
     to `int8[]`, `smallint[]` to `int[]` and `int8[]` to `numeric[]` each
     ALTER without USING and keep the values; only a pair with no element
-    cast (`text` to `int[]`) is 42804."""
+    cast (`text` to `int[]`) is 42804. Each of the first three was refused
+    42804 until RP-662 ported `find_coercion_pathway`."""
     with psycopg.connect(dsn, autocommit=True) as c:
         c.execute("drop table if exists t658z")
         c.execute("create table t658z (a int[], s smallint[], t text)")

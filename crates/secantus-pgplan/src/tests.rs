@@ -5560,3 +5560,38 @@ fn a_column_records_its_declared_array_dimensions() {
     let got: Vec<i32> = def.columns.iter().map(|c| c.ndims()).collect();
     assert_eq!(got, vec![1, 2, 0, 1, 1, 0]);
 }
+
+/// `ALTER COLUMN TYPE` with no USING is `find_coercion_pathway` in the
+/// ASSIGNMENT context (RP-662). Each answer measured on PostgreSQL 15.19,
+/// across 2025 type pairs on a fresh cluster.
+#[test]
+fn alter_column_type_follows_the_assignment_pathway() {
+    for (from, to, ok) in [
+        // An array's path is its element's (`array_coerce`).
+        ("int4[]", "int8[]", true),
+        ("int2[]", "int4[]", true),
+        ("int8[]", "numeric[]", true),
+        ("int4[][]", "int8[]", true),
+        ("text[]", "int4[]", false),
+        // An assignment to a string type goes through I/O; nothing else does.
+        ("int4[]", "text", true),
+        ("text", "int4[]", false),
+        ("text", "int4", false),
+        // `pg_cast` rows decide by their context alone.
+        ("int8", "int4", true),
+        ("int4", "oid", true),
+        ("int4", "money", true),
+        ("int4", QUOTED_CHAR, false),
+        ("int4", "bool", false),
+        ("date", "time", false),
+        ("timestamp", "date", true),
+        ("json", "jsonb", true),
+        // A vector type is an array source by its element, but the element
+        // rule never targets one (no `pg_cast` row joins them).
+        ("int2vector", "int2[]", true),
+        ("int2[]", "int2vector", false),
+        ("int8[]", "int2vector", false),
+    ] {
+        assert_eq!(alter_type_is_automatic(from, to), ok, "{from} -> {to}");
+    }
+}
