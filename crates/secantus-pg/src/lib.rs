@@ -30822,14 +30822,21 @@ impl PgHandler {
     /// `[name, type, null]` (the Python server's shape) and, apart, the
     /// width of each `char(n)` column (`null` for any other), which a text
     /// literal cast to the row type pads to.
+    ///
+    /// A domain column's field is of the DOMAIN, as its `pg_attribute`
+    /// row is (`atttypid`), not of the base type the column stores: a
+    /// whole row's field type is what `record_eq` compares (`fd = row(1)`
+    /// is 42804 on 15.19, RP-529), what `pg_typeof((fd).a)` names, and a
+    /// cast to the row type checks the domain's constraints.
     fn row_type_fields(def: &TableDef) -> (Vec<Bson>, Vec<Bson>) {
         def.columns
             .iter()
             .map(|c| {
+                let ty = c.extra.get_str("domain_type").unwrap_or(&c.pg_type);
                 (
                     Bson::Array(vec![
                         Bson::String(c.name.clone()),
-                        Bson::String(c.pg_type.clone()),
+                        Bson::String(ty.to_string()),
                         Bson::Null,
                     ]),
                     if c.pg_type == "bpchar" && c.typmod > 4 {

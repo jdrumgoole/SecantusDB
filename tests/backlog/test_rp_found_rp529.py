@@ -1,0 +1,177 @@
+"""Gap tests of the divergences found while working RP-529 (a domain
+column's whole row is typed by the domain): RP-551 (a cast to a domain
+over `char(n)` is not blank-padded), RP-552 (a domain's CHECK error inside a
+record literal carries no position), RP-553 (a schema's domain names its
+CHECK after the qualified name), RP-554 (a scalar subquery's array of a row
+type is described as `text[]`), RP-555 (`ALTER DOMAIN ... NOT VALID`
+validates the rows) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
+column's type is refused).
+
+An answer is the rows, the command tag for a statement that returns none,
+or `(sqlstate, message, hint, position)` for an error. The expected answers
+were measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with
+`_SETUP`, which each statement runs after.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from typing import Any
+
+import psycopg
+import pytest
+
+from tests.backlog.test_rp_batch26 import _dsn
+
+_SETUP = [
+    "drop type if exists ctp",
+    "drop table if exists fc, fcn, fnv, falt, fs cascade",
+    "drop domain if exists dc3n, dc3, dnv, pint cascade",
+    "drop schema if exists s cascade",
+    "create domain dc3 as char(3)",
+    "create domain dc3n as dc3",
+    "create domain dnv as int",
+    "create domain pint as int check (value > 0)",
+    "create schema s",
+    "create domain s.sd as int check (value < 100)",
+    "create table fc (a dc3, b int)",
+    "create table fcn (a dc3n)",
+    "create table fnv (a dnv)",
+    "create table falt (a int)",
+    "create table fs (a int, c text)",
+    "insert into fc values ('ab', 1)",
+    "insert into fcn values ('ab')",
+    "insert into fnv values (1)",
+    "insert into falt values (3)",
+    "insert into fs values (1, 'y')",
+    "create type ctp as (a pint, b text)",
+]
+
+
+@pytest.fixture(scope="module")
+def dsn(rust_pg: object) -> Iterator[str]:
+    yield _dsn(rust_pg) + " dbname=postgres"
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        for q in _SETUP[:4]:
+            c.execute(q)
+
+
+def answer(dsn: str, query: str) -> Any:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        try:
+            cur = c.execute(query)
+        except psycopg.Error as e:
+            return (
+                e.sqlstate,
+                e.diag.message_primary,
+                e.diag.message_hint,
+                e.diag.statement_position,
+            )
+        return cur.fetchall() if cur.description else cur.statusmessage
+
+
+# A cast to a domain over `char(3)` is a cast to `char(3)` first: the value
+# is blank-padded to the width, through a domain over the domain too, so the
+# padded column's whole row equals a record of the cast.
+CHAR_DOMAIN = {
+    "select octet_length('ab'::dc3)": [(3,)],
+    "select 'ab'::dc3": [("ab ",)],
+    "select octet_length('ab'::dc3n)": [(3,)],
+    "select octet_length(a) from fcn": [(3,)],
+    "select fcn from fcn": [('("ab ")',)],
+    "select fc = row('ab '::dc3, 1) from fc": [(True,)],
+}
+
+
+@pytest.mark.backlog("RP-551")
+@pytest.mark.parametrize("query", list(CHAR_DOMAIN))
+def test_char_domain_cast_pads(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == CHAR_DOMAIN[query]
+
+
+# A field's domain CHECK failing in a record literal is reported at the
+# literal, as its other input errors are.
+@pytest.mark.backlog("RP-552")
+def test_record_literal_domain_error_position(dsn: str) -> None:
+    assert answer(dsn, "select '(0,x)'::ctp") == (
+        "23514",
+        'value for domain pint violates check constraint "pint_check"',
+        None,
+        "8",
+    )
+
+
+# An unnamed CHECK of a domain in a schema is named after the domain's own
+# name, not its qualified one.
+SCHEMA_DOMAIN = {
+    "select 200::s.sd": (
+        "23514",
+        'value for domain s.sd violates check constraint "sd_check"',
+        None,
+        None,
+    ),
+    "select conname from pg_constraint where contypid = 's.sd'::regtype": [("sd_check",)],
+}
+
+
+@pytest.mark.backlog("RP-553")
+@pytest.mark.parametrize("query", list(SCHEMA_DOMAIN))
+def test_schema_domain_check_name(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == SCHEMA_DOMAIN[query]
+
+
+# A scalar subquery's `array_agg` of a whole row is an array of the row
+# type, as the same aggregate outside a subquery is described here already.
+@pytest.mark.backlog("RP-554")
+@pytest.mark.parametrize(
+    "query",
+    [
+        "select (select array_agg(x) from (select fs as x from fs) q)",
+        "select (select array_agg(fs) from fs)",
+    ],
+)
+def test_scalar_subquery_row_type_array(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        fs_array = c.execute("select 'fs[]'::regtype::oid").fetchone()[0]
+        cur = c.execute(query)
+        assert [d.type_code for d in cur.description] == [fs_array]
+        assert cur.fetchall() == [('{"(1,y)"}',)]
+    assert answer(dsn, f"select pg_typeof(({query[7:]}))") == [("fs[]",)]
+
+
+def _then(dsn: str, statement: str, query: str) -> Any:
+    """`statement`'s answer after `_SETUP`, then `query`'s on the same
+    connection when the statement succeeded."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        try:
+            tag = c.execute(statement).statusmessage
+        except psycopg.Error as e:
+            return (e.sqlstate, e.diag.message_primary)
+        return tag, c.execute(query).fetchall()
+
+
+# NOT VALID adds the constraint without checking the rows already there.
+@pytest.mark.backlog("RP-555")
+def test_domain_constraint_not_valid(dsn: str) -> None:
+    assert _then(
+        dsn,
+        "alter domain dnv add constraint big check (value > 5) not valid",
+        "select convalidated from pg_constraint where conname = 'big'",
+    ) == ("ALTER DOMAIN", [(False,)])
+
+
+# A column retyped to a domain over its own type needs no USING.
+@pytest.mark.backlog("RP-556")
+def test_alter_column_type_to_domain(dsn: str) -> None:
+    assert _then(
+        dsn,
+        "alter table falt alter column a type pint",
+        "select atttypid::regtype::text from pg_attribute"
+        " where attrelid = 'falt'::regclass and attname = 'a'",
+    ) == ("ALTER TABLE", [("pint",)])

@@ -70,7 +70,9 @@ def test_composite_null_test_in_a_clause(query: str, dsn: str) -> None:
 
 
 # A row sorts by `btrecordcmp`, field by field, its NULL fields last: DESC
-# reverses that order, the all-NULL row first.
+# reverses that order, the all-NULL row first. Two records had no order at
+# all, so a sort kept the input order: `fs` is inserted ascending, which hid
+# it for ASC, while `fk`'s rows are not, so its ASC sort pins it too.
 ROW_ORDER_DESC = {
     "select fs from fs order by fs desc": [("(,)",), ("(2,z)",), ("(1,y)",), ("(1,y)",)],
     "select count(*) from fs group by row(a, c) order by row(a, c) desc": [
@@ -78,10 +80,12 @@ ROW_ORDER_DESC = {
         (1,),
         (2,),
     ],
+    "select k from fk order by k": [("(1,a)",), ("(1,)",), ("(,)",), (None,)],
+    "select k from fk order by k desc nulls last": [("(,)",), ("(1,)",), ("(1,a)",), (None,)],
 }
 
 
-@pytest.mark.backlog("RP-535")
+@pytest.mark.backlog_fixed("RP-535")
 @pytest.mark.parametrize("query", list(ROW_ORDER_DESC))
 def test_row_order_desc(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ROW_ORDER_DESC[query]

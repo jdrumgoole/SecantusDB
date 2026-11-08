@@ -2155,17 +2155,6 @@ Measured on a private PostgreSQL 15.19 cluster with `create domain dint as
 int`, `fs(a int, c text)` holding `(1, 'y')` and `fd(a dint)` holding `1`.
 The gap tests are in `tests/backlog/test_rp_found_rp522.py`.
 
-- [ ] **A domain column's whole row is typed by its base type.** A table's
-      row type records a domain column under the domain's base type
-      (`row_type_fields`, `pg_type`; the domain is in `extra.domain_type`),
-      so `fd = row(1)` and `fd = row(2)` answer where PostgreSQL 15.19's
-      `record_eq` refuses each, 42804 `cannot compare dissimilar column
-      types dint and integer at record column 1`. Since RP-522 the field
-      check reads a domain as its base type, so `fd = row(1::dint)` still
-      answers true as on PostgreSQL; a row type that keeps the domain lets
-      the check drop that.
-      Backlog-ID: RP-529
-      Verify: tests/backlog/test_rp_found_rp522.py::test_domain_field_of_a_whole_row
 - [ ] **A record compared with a scalar is 0A000, not 42883.** `select fs
       = (1) from fs`, `(1) = fs` and `fs::text = (1,'y')` are 42883
       `operator does not exist: fs = integer` (`integer = fs`, `text =
@@ -2195,14 +2184,6 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
       table's own whole row (`where fs is not null`).
       Backlog-ID: RP-534
       Verify: tests/backlog/test_rp_found_rp532.py::test_composite_null_test_in_a_clause
-- [ ] **ORDER BY a row DESC sorts it ascending.** `select fs from fs order
-      by fs desc` is `(,)`, `(2,z)`, `(1,y)`, `(1,y)` on PostgreSQL 15.19
-      (`btrecordcmp`, reversed), and `group by row(a, c) order by row(a,
-      c) desc` puts its counts in the same order; here both come back in
-      ascending order, the direction dropped. A scalar column's DESC
-      sorts as PostgreSQL does.
-      Backlog-ID: RP-535
-      Verify: tests/backlog/test_rp_found_rp532.py::test_row_order_desc
 - [ ] **An ungrouped whole row's 42803 names its first column, with no
       position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
       whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
@@ -2220,6 +2201,58 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
       `column "x.fs" must appear in the GROUP BY clause ...` at 22.
       Backlog-ID: RP-537
       Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
+
+## Found while working RP-529 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
+char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
+`tests/backlog/test_rp_found_rp529.py`.
+
+- [ ] **A cast to a domain over `char(n)` is not blank-padded.** `select
+      'ab'::dc3` is `ab ` on PostgreSQL 15.19 (`octet_length` 3), and so
+      is a column of a domain over that domain (`dc3n`, where the width
+      is not inherited at all: the column stores `ab`); here both are `ab`.
+      A wrong answer follows: `fc = row('ab '::dc3, 1)` against a `dc3`
+      column's padded whole row is false here, true on PostgreSQL. A
+      `dc3` column and its row type's field do pad (RP-529).
+      Backlog-ID: RP-551
+      Verify: tests/backlog/test_rp_found_rp529.py::test_char_domain_cast_pads
+- [ ] **A domain's CHECK failing inside a record literal carries no
+      position.** `select '(0,x)'::ctp`, `ctp` a composite with a `pint`
+      field, is 23514 at 8 on PostgreSQL 15.19, at the literal as its other
+      input errors are (`'(abcd,1)'::fc` is 22001 at 8 here too); here the
+      23514 has no position.
+      Backlog-ID: RP-552
+      Verify: tests/backlog/test_rp_found_rp529.py::test_record_literal_domain_error_position
+- [ ] **A schema's domain reports its CHECK under the qualified name.**
+      `select 200::s.sd` is 23514 `value for domain s.sd violates check
+      constraint "sd_check"` on PostgreSQL 15.19; here the constraint is
+      `"s.sd_check"`, though `pg_constraint.conname` is `sd_check` in both.
+      Backlog-ID: RP-553
+      Verify: tests/backlog/test_rp_found_rp529.py::test_schema_domain_check_name
+- [ ] **A scalar subquery's array of a row type is described as `text[]`.**
+      `select (select array_agg(fs) from fs)` and the same over a
+      FROM-subquery's whole-row column describe `fs[]` on PostgreSQL 15.19
+      and `pg_typeof` names it; here the column is `text[]` (1009), so
+      psycopg reads `[None]`, and `pg_typeof` of it is 42P18 `could not
+      determine data type of parameter $1`. The `::text` of it and the
+      aggregate outside a subquery answer as PostgreSQL.
+      Backlog-ID: RP-554
+      Verify: tests/backlog/test_rp_found_rp529.py::test_scalar_subquery_row_type_array
+- [ ] **`ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` checks the rows.**
+      PostgreSQL 15.19 adds the constraint unchecked (`convalidated` false)
+      when a `dnv` column holds a value it refuses; here it is 23514
+      `column "a" of table "fnv" contains values that violate the new
+      constraint` and nothing is added.
+      Backlog-ID: RP-555
+      Verify: tests/backlog/test_rp_found_rp529.py::test_domain_constraint_not_valid
+- [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
+      refused.** `alter table falt alter column a type pint`, `a int` and
+      `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
+      (an implicit cast to the domain, no USING needed); here it is 42804
+      `column "a" cannot be cast automatically to type pint`.
+      Backlog-ID: RP-556
+      Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
 
 ## Found while working RP-500 (2026-11-07)
 
