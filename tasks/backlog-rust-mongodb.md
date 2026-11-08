@@ -1297,17 +1297,14 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       RM-330.
       Backlog-ID: RM-421
       Verify: tests/backlog/test_rm_found_2026_11_08_rm330.py::test_all_takes_a_dollar_object_as_a_value
-- [ ] **explain's bounds on a multikey index from two range predicates on
-      one field.** Over a multikey index mongod does not intersect `$gte`
-      and `$lte` on one field and bounds the scan by one of them: for
-      `{s: {$gte: "aé", $lte: "\U0010ffff"}}` it is the `$gte`
-      (`["aé", {})`, the `$lte` left as the filter), for `{$gte: "a",
-      $lte: "b"}` the `$lte`. This server always takes the `$lte`. Which
-      one mongod keeps is its plan ranking's choice between the two
-      single-predicate plans; measured on 8.2.11, 2026-10-27, while
-      working RM-222.
-      Backlog-ID: RM-331
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_multikey_bounds_from_two_range_predicates
+- [ ] **A hinted index that no predicate bounds sorts its FETCH filter by
+      path.** mongod 8.2.1 keeps the canonical order there: `{s: {$gte:
+      "a", $lte: "z"}, t: 1}` hinted to `u_1` fetches with `[t $eq, s $lte,
+      s $gte]`, this server with `[s $lte, s $gte, t $eq]`. Over an index
+      that does bound a predicate mongod sorts the rest by path, as this
+      server does. Found 2026-11-08 while working RM-331.
+      Backlog-ID: RM-422
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm331.py::test_a_hint_that_bounds_nothing_keeps_the_canonical_filter_order
 - [ ] **A sort on two arrays of one document is not refused.** mongod
       8.2.11 refuses `{$sort: {a: 1, b: 1}}` over `{a: [1, 2], b: [3, 4]}`
       with 2 "cannot sort with keys that are parallel arrays" (and a

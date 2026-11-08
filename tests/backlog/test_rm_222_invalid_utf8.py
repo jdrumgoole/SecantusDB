@@ -262,12 +262,13 @@ def _multikey_bounds(client: Any, flt: dict) -> list:
     return plan.get("indexBounds", {}).get("s", [])
 
 
-@pytest.mark.backlog("RM-331")
+@pytest.mark.backlog_fixed("RM-331")
 def test_multikey_bounds_from_two_range_predicates(rust_mongo: Any, mongod: Any) -> None:
     """Over a multikey index mongod 8.2.11 does not intersect `$gte` and
     `$lte` on one field; it bounds the scan by one of them, and for
     `{$gte: "aé", $lte: "\\U0010ffff"}` it is the `$gte`
-    (`["aé", {})`), where the Rust server takes the `$lte`."""
+    (`["aé", {})`). A hint to the index still ran that trial; the Rust
+    server took the `$lte` without one."""
     flt = {"s": {"$gte": "aé", "$lte": "\U0010ffff"}}
     assert _multikey_bounds(rust_mongo, flt) == _multikey_bounds(mongod, flt)
 

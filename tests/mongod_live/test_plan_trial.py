@@ -7,7 +7,8 @@ mongod enumerates. These cases pin the shapes whose trial the plan cache
 work found off (2026-10-27, mongod 8.2.11): an index intersection over a
 multikey index, a sort an index cannot return by exploding its points
 behind a range, a scan whose first interval starts exclusive, a tie broken
-by the documents examined and the index prefix, and a limit above 101.
+by the documents examined and the index prefix, a limit above 101, and a
+hint to a multikey index (RM-331).
 `explain` with `allPlansExecution` lists the plans tried; the winner's own
 run (`executionStages`) is not compared, nor timings and yields.
 """
@@ -68,6 +69,12 @@ CASES = [
     {"filter": {"a": {"$gte": 3}, "b": 2}, "sort": {"a": 1}},
     # A trial of more than 1000 calls into the plans, which yields.
     {"filter": {"a": {"$gte": 0}, "b": {"$gte": 0}, "z": 1}},
+    # A hint to the multikey `t_1` still tries one plan per predicate on it,
+    # and their intersection, but no other index and no walk for the sort
+    # (RM-331).
+    {"filter": {"t": {"$gte": 1, "$lte": 3}}, "hint": "t_1"},
+    {"filter": {"t": {"$gt": 0, "$lt": 4}, "a": 4}, "hint": "t_1", "sort": {"b": 1}},
+    {"filter": {"t": {"$all": [1, 2]}}, "hint": "t_1"},
 ]
 
 
