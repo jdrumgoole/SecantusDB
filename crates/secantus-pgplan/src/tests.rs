@@ -1801,6 +1801,36 @@ fn a_lone_command_is_what_the_parser_would_split_off() {
     }
 }
 
+/// A statement whose WITH writes is told apart from one whose WITH only
+/// reads (RP-503): the first needs a transaction of its own, because its
+/// item writes while it is planned.
+#[test]
+fn a_data_modifying_with_is_found_at_the_top_of_each_command() {
+    for sql in [
+        "with x as (delete from t returning id) select * from x",
+        "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT 1",
+        "with x as (update t set n = 1 returning id) select nosuch from x",
+        "with r as (select 1), x as (delete from t returning id) select 1",
+        "with x as (delete from t returning id) insert into u select id from x",
+        "insert into u with x as (delete from t returning id) select id from x",
+        "with x as (delete from t returning id) update u set b = 1",
+        "with x as (delete from t returning id) delete from u",
+    ] {
+        assert!(has_data_modifying_with(sql), "for {sql:?}");
+    }
+    for sql in [
+        "select 1",
+        "delete from t",
+        "select 'with x as (delete from t returning id)'",
+        "with x as (select 1) select * from x",
+        "with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select * from r",
+        "select * from t where name = 'without'",
+        "selct with",
+    ] {
+        assert!(!has_data_modifying_with(sql), "for {sql:?}");
+    }
+}
+
 /// The extended protocol takes ONE command: it has a single parameter list and
 /// a single row description, which two commands cannot share. PostgreSQL says
 /// so with 42601, not with "not supported".
