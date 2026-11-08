@@ -2097,16 +2097,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`.
 
-- [ ] **A subquery that reads an outer whole row where nothing types it is
-      42P18.** `select 1 from fs where exists (select 1 where fs is not
-      null)` and `select (select fs is null) from fs` answer on PostgreSQL
-      (`1`, `false`), and so do the same EXISTS in an UPDATE's or DELETE's
-      WHERE; here each is 42P18 `could not determine data type of parameter
-      $1`. The per-row call's body keeps a bare `$N` for the outer row,
-      which only a cast (`fs::text`) or a select-list `(select fs)` types;
-      PostgreSQL's outer Var carries the row type.
-      Backlog-ID: RP-521
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_untyped_outer_whole_row
 - [ ] **A whole row compared with a row of untyped literals is answered,
       not 42804.** PostgreSQL 15.19's `record_eq` refuses `fs = (1,'y')`
       with 42804 `cannot compare dissimilar column types text and unknown

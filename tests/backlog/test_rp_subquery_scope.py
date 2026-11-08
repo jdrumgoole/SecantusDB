@@ -22,7 +22,7 @@ and RP-481 (a USING column's 42703 carries a position); and found while
 working RP-479, RP-516 (an UPDATE's or DELETE's target was not a whole
 row; fixed) and RP-517 (`v.*` in a subquery over an outer FROM item is
 42P01); and found while working RP-516, RP-521 (a subquery reading an outer
-whole row with no type is 42P18), RP-522 (a whole row compared with an
+whole row with no type was 42P18; fixed), RP-522 (a whole row compared with an
 untyped record is not 42804), RP-523 (an aliased write target answers to
 its table's name) and RP-524 (a write's name errors carry the wrong
 position).
@@ -1041,11 +1041,13 @@ def test_outer_star_in_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OUTER_STAR_IN_SUBQUERY[query]
 
 
-# Found while working RP-516. A subquery that reads an outer whole row only
-# where nothing gives the row a type (`fs is not null`) is planned with an
-# untyped parameter, and the per-row call cannot run it: 42P18 `could not
-# determine data type of parameter $1`. A cast (`fs::text`) or a bare
-# `(select fs)` already answers.
+# Found while working RP-516, fixed by RP-521. A subquery that reads an
+# outer whole row only where nothing gives the row a type (`fs is not null`)
+# was planned with an untyped parameter, and the per-row call could not run
+# it: 42P18 `could not determine data type of parameter $1`. The whole row
+# now reaches the per-row call as a parameter of its row type, as
+# PostgreSQL's outer Var carries it; a FROM-subquery's is a record (the last
+# two, measured on the shared 15.19 reference, which they create nothing on).
 UNTYPED_OUTER_WHOLE_ROW = {
     "select 1 from fs where exists (select 1 where fs is not null)": [(1,)],
     "select (select fs is null) from fs": [(False,)],
@@ -1053,10 +1055,15 @@ UNTYPED_OUTER_WHOLE_ROW = {
     "update fs set c = 'q' where exists (select 1 from fe where fs is not null) returning a": [
         (1,)
     ],
+    "select (select v is null) from (select 1 a) v": [(False,)],
+    "select (select v is not null) from (values (1, 'y'), (null, null)) v(a, c)": [
+        (True,),
+        (False,),
+    ],
 }
 
 
-@pytest.mark.backlog("RP-521")
+@pytest.mark.backlog_fixed("RP-521")
 @pytest.mark.parametrize("query", list(UNTYPED_OUTER_WHOLE_ROW))
 def test_untyped_outer_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNTYPED_OUTER_WHOLE_ROW[query]
