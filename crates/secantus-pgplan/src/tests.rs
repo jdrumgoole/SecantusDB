@@ -5335,3 +5335,45 @@ fn oidvector_key_orders_as_btoidvectorcmp() {
         Some(Bson::Null)
     );
 }
+
+/// RP-611: an `oidvector[]`'s order key orders as `array_cmp` with
+/// `btoidvectorcmp` for its elements -- element by element, a NULL element
+/// after every other, the array whose elements run out first first, then
+/// the number of dimensions -- and carries the array's text after its `|`,
+/// which `greatest` / `least` / `max` / `min` read back.
+#[test]
+fn oidvector_array_key_orders_as_array_cmp() {
+    let key =
+        |text: &str| match crate::range_ops::sort_key(&Bson::String(text.into()), "oidvector[]") {
+            Ok(Bson::String(k)) => k,
+            other => panic!("for {text:?}: {other:?}"),
+        };
+    let ordered = [
+        "{}",
+        "{3}",
+        "{{3}}",
+        "{3,\"1 2\"}",
+        "{3,NULL}",
+        "{\"1 2\"}",
+        "{\"1 2\",3}",
+        "{NULL}",
+    ];
+    for pair in ordered.windows(2) {
+        assert!(key(pair[0]) < key(pair[1]), "{:?} < {:?}", pair[0], pair[1]);
+    }
+    assert_eq!(
+        key("{{\"1 2\"},{3}}").rsplit_once('|').map(|(_, t)| t),
+        Some("{{\"1 2\"},{\"3\"}}")
+    );
+    assert_eq!(
+        crate::range_ops::sort_key(
+            &Bson::Array(vec![Bson::String("1 2".into()), Bson::Null]),
+            crate::range_ops::OIDVECTOR_ELEMENTS
+        )
+        .ok(),
+        Some(Bson::Array(vec![
+            Bson::String("000000020000000100000002|1 2".into()),
+            Bson::Null
+        ]))
+    );
+}

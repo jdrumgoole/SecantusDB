@@ -2443,17 +2443,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp603.py`.
 
-- [ ] **An array of `oidvector`s orders its elements as int arrays.**
-      `array_cmp` compares elements with the element type's B-tree support
-      function, so on PostgreSQL 15.19 `array['1 2'::oidvector] <
-      array['3'::oidvector]` is false, as is `'1 2'::oidvector < any(vs)`
-      over an `oidvector[]` that is not an `ARRAY[...]` written in place;
-      here both are true. Since RP-603 an `oidvector` operand, and each
-      element of an `ARRAY[...]` under ANY / ALL, compares by its
-      `btoidvectorcmp` key; a whole `oidvector[]` reaches
-      `compare_constants`, which has no type to go by.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_array_orders_by_btoidvectorcmp
-      Backlog-ID: RP-611
 - [ ] **`oidvector`'s comparison functions are refused.**
       `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
       `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
@@ -2461,6 +2450,25 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       functions of the byte-ordered types only.
       Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
       Backlog-ID: RP-612
+
+## Found while working RP-611 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp611.py`.
+
+- [ ] **An ORDER BY naming a window function over a keyed window is
+      refused.** `select v::text t, row_number() over (order by v) from
+      (values ('[1,2]'::int4range), ('[0,5]')) s(v) order by 2` (or `...
+      r ... order by r`) answers on PostgreSQL 15.19; here it is `function
+      row_number() is not supported yet`. The same query without the outer
+      ORDER BY answers, as does one whose window orders by a collation. It
+      fails when the window's ORDER BY is a range, a multirange or an
+      `oidvector`, which `sort_by` keys by `__range_sortkey`. A likely
+      cause, read from the code and not proven: `rewrite` resolves an
+      ORDER BY position or alias to its target and copies any target that
+      is not a column -- the window call too -- into the sort clause.
+      Verify: tests/backlog/test_rp_found_rp611.py::test_order_by_a_window_target_over_a_keyed_window
+      Backlog-ID: RP-652
 
 ## Found while working RP-529 (2026-11-08)
 

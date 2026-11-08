@@ -658,12 +658,23 @@ fn one_range_key(r: &Range, element: &str) -> String {
 /// within a key of the same length) the vector's own text, which
 /// `greatest` / `least` read the value back from (RP-603).
 fn oidvector_key(v: &Bson) -> Result<Bson> {
+    Ok(Bson::String(oidvector_keyed(&oidvector_oids(v)?)))
+}
+
+/// `oidvector_key` of the oids themselves.
+fn oidvector_keyed(oids: &[u32]) -> String {
+    let text: Vec<String> = oids.iter().map(u32::to_string).collect();
+    format!("{}|{}", oidvector_hex(oids), text.join(" "))
+}
+
+/// An `oidvector`'s oids, each unsigned.
+fn oidvector_oids(v: &Bson) -> Result<Vec<u32>> {
     let Bson::Array(items) = crate::cast_value(v.clone(), "oidvector")? else {
         return Err(Error::Unsupported(
             "an oidvector that is not an array".into(),
         ));
     };
-    let oids = items
+    items
         .iter()
         .map(|item| match item {
             Bson::Int32(n) => Ok(*n as u32),
@@ -674,27 +685,146 @@ fn oidvector_key(v: &Bson) -> Result<Bson> {
                 "an oidvector element that is not an oid: {other}"
             ))),
         })
-        .collect::<Result<Vec<u32>>>()?;
+        .collect()
+}
+
+/// The ordered part of an `oidvector`'s key: eight hex digits of its
+/// length, then eight of each oid.
+fn oidvector_hex(oids: &[u32]) -> String {
     let mut key = format!("{:08x}", oids.len());
-    for oid in &oids {
+    for oid in oids {
         key.push_str(&format!("{oid:08x}"));
     }
+    key
+}
+
+/// The `__range_sortkey` type tag of an `oidvector[]` keyed element by
+/// element, for `ANY` / `ALL` (RP-611).
+pub const OIDVECTOR_ELEMENTS: &str = "oidvector[] elements";
+
+/// An `oidvector[]` taken apart for its order key.
+struct OidvectorArray {
+    /// Its elements in storage order, each an `oidvector`'s oids or NULL.
+    leaves: Vec<Option<Vec<u32>>>,
+    /// The length of each dimension; none for an empty array.
+    dims: Vec<usize>,
+    /// Its text, as `array_out` prints it.
+    text: String,
+}
+
+/// An `oidvector[]`'s elements in storage order, its dimensions and its
+/// text.
+fn oidvector_array(v: &Bson) -> Result<OidvectorArray> {
+    fn walk(
+        items: &[Bson],
+        depth: usize,
+        dims: &mut Vec<usize>,
+        leaves: &mut Vec<Option<Vec<u32>>>,
+    ) -> Result<String> {
+        if dims.len() == depth {
+            dims.push(items.len());
+        }
+        let mut parts = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Bson::Null => {
+                    leaves.push(None);
+                    parts.push("NULL".to_string());
+                }
+                // An `oidvector` is held as its text or as an array of its
+                // oids; an array of anything else is a sub-array.
+                Bson::Array(sub)
+                    if sub
+                        .iter()
+                        .any(|x| !matches!(x, Bson::Int32(_) | Bson::Int64(_))) =>
+                {
+                    parts.push(walk(sub, depth + 1, dims, leaves)?);
+                }
+                other => {
+                    let oids = oidvector_oids(other)?;
+                    let text: Vec<String> = oids.iter().map(u32::to_string).collect();
+                    parts.push(format!("\"{}\"", text.join(" ")));
+                    leaves.push(Some(oids));
+                }
+            }
+        }
+        Ok(format!("{{{}}}", parts.join(",")))
+    }
+    let Bson::Array(items) = crate::cast_value(v.clone(), "oidvector[]")? else {
+        return Err(Error::Unsupported(
+            "an oidvector[] that is not an array".into(),
+        ));
+    };
+    let (mut dims, mut leaves) = (Vec::new(), Vec::new());
+    let text = walk(&items, 0, &mut dims, &mut leaves)?;
+    if leaves.is_empty() {
+        dims.clear();
+    }
+    Ok(OidvectorArray { leaves, dims, text })
+}
+
+/// An `oidvector[]`'s order key: a string whose order is `array_cmp`'s
+/// with `btoidvectorcmp` for its elements, as `array_cmp` looks up the
+/// element type's B-tree support function. Element by element in storage
+/// order, each a `1` and its `oidvector` key, a NULL a `2` (`array_cmp`
+/// puts a NULL element after every other); then a `0`, so the array whose
+/// elements ran out first sorts first, then the number of dimensions and
+/// each one's length, which `array_cmp` compares next. After a `|` the
+/// array's text, which `greatest` / `least` / `max` / `min` read the value
+/// back from (RP-611).
+fn oidvector_array_key(v: &Bson) -> Result<Bson> {
+    let OidvectorArray { leaves, dims, text } = oidvector_array(v)?;
+    let mut key = String::new();
+    for leaf in &leaves {
+        match leaf {
+            Some(oids) => {
+                key.push('1');
+                key.push_str(&oidvector_hex(oids));
+            }
+            None => key.push('2'),
+        }
+    }
+    key.push_str(&format!("0{:02x}", dims.len()));
+    for d in &dims {
+        key.push_str(&format!("{d:08x}"));
+    }
     key.push('|');
-    let text: Vec<String> = oids.iter().map(u32::to_string).collect();
-    key.push_str(&text.join(" "));
+    key.push_str(&text);
     Ok(Bson::String(key))
+}
+
+/// Each element of an `oidvector[]` as its `oidvector` key, for an `ANY` /
+/// `ALL` over it (RP-611).
+fn oidvector_element_keys(v: &Bson) -> Result<Bson> {
+    let leaves = oidvector_array(v)?.leaves;
+    Ok(Bson::Array(
+        leaves
+            .into_iter()
+            .map(|leaf| match leaf {
+                Some(oids) => Bson::String(oidvector_keyed(&oids)),
+                None => Bson::Null,
+            })
+            .collect(),
+    ))
 }
 
 /// `__range_sortkey(value, type)`: a string whose order is `range_cmp` for a
 /// range, `multirange_cmp` for a multirange (range by range, a shorter one
-/// first), `charlt` for a `"char"` and `btoidvectorcmp` for an `oidvector`,
-/// so ORDER BY can sort the value by it.
+/// first), `charlt` for a `"char"`, `btoidvectorcmp` for an `oidvector` and
+/// `array_cmp` over it for an `oidvector[]`, so ORDER BY can sort the value
+/// by it.
 pub fn sort_key(v: &Bson, ty: &str) -> Result<Bson> {
     if *v == Bson::Null {
         return Ok(Bson::Null);
     }
     if ty == "oidvector" {
         return oidvector_key(v);
+    }
+    if ty == "oidvector[]" {
+        return oidvector_array_key(v);
+    }
+    if ty == OIDVECTOR_ELEMENTS {
+        return oidvector_element_keys(v);
     }
     // A `"char"`: its one byte, which its text spells `\ooo` when the high
     // bit is set (and as nothing for the zero byte).
