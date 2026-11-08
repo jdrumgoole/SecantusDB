@@ -1,5 +1,5 @@
-//! SBE stages (`exec/sbe/stages/`): `scan`, `project` and `group`
-//! (`HashAggStage`), run over a collection's documents with the statistics
+//! SBE stages (`exec/sbe/stages/`): `scan`, `filter`, `limit` /
+//! `limitskip`, `project` and `group` (`HashAggStage`), run over a collection's documents with the statistics
 //! each one keeps (`PlanStageStats` / `SpecificStats`), and printed as
 //! mongod's `debugPrint` prints them.
 
@@ -139,6 +139,20 @@ pub(crate) enum Stage {
         fields: Vec<(String, Slot)>,
         uuid: String,
     },
+    /// `FilterStage`: the rows its predicate holds of.
+    Filter {
+        node: u32,
+        predicate: Expr,
+        input: Box<Stage>,
+    },
+    /// `LimitSkipStage`: each amount and the slot its constant is in.
+    /// Printed `limit` when it only limits, else `limitskip`.
+    LimitSkip {
+        node: u32,
+        limit: Option<(Slot, i64)>,
+        skip: Option<(Slot, i64)>,
+        input: Box<Stage>,
+    },
     /// `ProjectStage`.
     Project {
         node: u32,
@@ -159,6 +173,10 @@ pub(crate) enum Stage {
 pub(crate) struct Counted {
     pub returned: i64,
     pub reads: i64,
+    /// A filter's `numTested`.
+    pub tested: i64,
+    /// The stage was asked for a row after its last one.
+    pub eof: bool,
     pub input: Option<Box<Counted>>,
 }
 
@@ -203,15 +221,19 @@ fn eval(e: &Expr, row: &Row) -> Value {
 impl Stage {
     pub fn node(&self) -> u32 {
         match self {
-            Stage::Scan { node, .. } | Stage::Project { node, .. } | Stage::Group { node, .. } => {
-                *node
-            }
+            Stage::Scan { node, .. }
+            | Stage::Filter { node, .. }
+            | Stage::LimitSkip { node, .. }
+            | Stage::Project { node, .. }
+            | Stage::Group { node, .. } => *node,
         }
     }
 
-    /// Run the stage over `docs` (the collection in record order): the rows
-    /// it returns and what each stage under it counted.
-    pub fn run(&self, docs: &[Document]) -> (Vec<Row>, Counted) {
+    /// Run the stage over `docs` (the collection in record order), as a
+    /// consumer that stops after `demand` rows pulls it: the rows it returns
+    /// and what each stage under it counted. A stage stopped by its demand
+    /// was never asked past its last row, so it is not at EOF.
+    pub fn run(&self, docs: &[Document], demand: Option<usize>) -> (Vec<Row>, Counted) {
         match self {
             Stage::Scan {
                 record,
@@ -219,7 +241,9 @@ impl Stage {
                 fields,
                 ..
             } => {
-                let rows: Vec<Row> = docs
+                let take = demand.map_or(docs.len(), |d| d.min(docs.len()));
+                let eof = demand.is_none_or(|d| docs.len() < d);
+                let rows: Vec<Row> = docs[..take]
                     .iter()
                     .enumerate()
                     .map(|(i, d)| {
@@ -238,12 +262,74 @@ impl Stage {
                     Counted {
                         returned: n,
                         reads: n,
+                        eof,
                         input: None,
+                        ..Counted::default()
+                    },
+                )
+            }
+            Stage::Filter {
+                predicate, input, ..
+            } => {
+                // The filter pulls a row at a time: run what is under it
+                // in full, then count only as far as it read.
+                let (rows, mut below) = input.run(docs, None);
+                let mut out = Vec::new();
+                let mut tested = 0;
+                for row in rows {
+                    if demand.is_some_and(|d| out.len() >= d) {
+                        break;
+                    }
+                    tested += 1;
+                    if eval(predicate, &row) == Some(Bson::Boolean(true)) {
+                        out.push(row);
+                    }
+                }
+                let exhausted = tested == below.returned;
+                let eof = exhausted && demand.is_none_or(|d| out.len() < d);
+                below.trim(tested, eof);
+                let n = out.len() as i64;
+                (
+                    out,
+                    Counted {
+                        returned: n,
+                        tested,
+                        eof,
+                        input: Some(Box::new(below)),
+                        ..Counted::default()
+                    },
+                )
+            }
+            Stage::LimitSkip {
+                limit, skip, input, ..
+            } => {
+                let skip = skip.map_or(0, |(_, n)| n.max(0) as usize);
+                let limit = limit.map(|(_, n)| n.max(0) as usize);
+                let mine = match (limit, demand) {
+                    (Some(l), Some(d)) => Some(l.min(d)),
+                    (l, d) => l.or(d),
+                };
+                let (rows, below) = input.run(docs, mine.map(|m| m + skip));
+                let out: Vec<Row> = rows
+                    .into_iter()
+                    .skip(skip)
+                    .take(mine.unwrap_or(usize::MAX))
+                    .collect();
+                // At its limit it answers EOF without asking what is under it.
+                let eof = below.eof || limit.is_some_and(|l| out.len() >= l);
+                let n = out.len() as i64;
+                (
+                    out,
+                    Counted {
+                        returned: n,
+                        eof: eof && demand.is_none_or(|d| (n as usize) < d),
+                        input: Some(Box::new(below)),
+                        ..Counted::default()
                     },
                 )
             }
             Stage::Project { binds, input, .. } => {
-                let (mut rows, below) = input.run(docs);
+                let (mut rows, below) = input.run(docs, demand);
                 for row in &mut rows {
                     for (slot, e) in binds {
                         let v = eval(e, row);
@@ -255,15 +341,16 @@ impl Stage {
                     rows,
                     Counted {
                         returned: n,
-                        reads: 0,
+                        eof: below.eof,
                         input: Some(Box::new(below)),
+                        ..Counted::default()
                     },
                 )
             }
             Stage::Group {
                 keys, aggs, input, ..
             } => {
-                let (rows, below) = input.run(docs);
+                let (rows, below) = input.run(docs, None);
                 // `HashAggStage` keeps its groups in a hash table: one per
                 // distinct key, none over no rows.
                 let mut table: BTreeMap<Key, (usize, Vec<Value>)> = BTreeMap::new();
@@ -298,12 +385,25 @@ impl Stage {
                     out,
                     Counted {
                         returned: n,
-                        reads: 0,
+                        eof: true,
                         input: Some(Box::new(below)),
+                        ..Counted::default()
                     },
                 )
             }
         }
+    }
+}
+
+impl Counted {
+    /// What a scan counted when its consumer read only its first `n` rows:
+    /// it produced those, and is at EOF only if it was asked past them.
+    fn trim(&mut self, n: i64, eof: bool) {
+        self.returned = n;
+        if self.reads > n {
+            self.reads = n;
+        }
+        self.eof = eof;
     }
 }
 
@@ -312,6 +412,9 @@ impl Stage {
     pub fn name(&self) -> &'static str {
         match self {
             Stage::Scan { .. } => "scan",
+            Stage::Filter { .. } => "filter",
+            Stage::LimitSkip { skip: None, .. } => "limit",
+            Stage::LimitSkip { .. } => "limitskip",
             Stage::Project { .. } => "project",
             Stage::Group { .. } => "group",
         }
@@ -320,7 +423,10 @@ impl Stage {
     pub fn input(&self) -> Option<&Stage> {
         match self {
             Stage::Scan { .. } => None,
-            Stage::Project { input, .. } | Stage::Group { input, .. } => Some(input),
+            Stage::Filter { input, .. }
+            | Stage::LimitSkip { input, .. }
+            | Stage::Project { input, .. }
+            | Stage::Group { input, .. } => Some(input),
         }
     }
 }
@@ -333,5 +439,50 @@ impl Agg {
             args.push(Expr::Const(Some(Bson::Int32(cap))));
         }
         Expr::Func(self.func.name(), args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::expr::{BinOp, Expr};
+    use super::Stage;
+    use bson::{doc, Bson};
+
+    /// `[{$match: {a: {$gt: 1}}}, {$limit: 2}, ...]` over `a` 0..5: the
+    /// filter stops after the second match, so it tested four rows and the
+    /// scan read four, neither at EOF; the limit is (mongod 8.2.11,
+    /// measured 2026-11-08).
+    #[test]
+    fn a_limit_stops_what_is_under_it() {
+        let docs: Vec<_> = (0..5).map(|i| doc! { "a": i }).collect();
+        let scan = Stage::Scan {
+            node: 1,
+            record: 1,
+            record_id: 2,
+            fields: vec![("a".into(), 3)],
+            uuid: String::new(),
+        };
+        let predicate = Expr::fill_empty(
+            Expr::bin(BinOp::Gt, Expr::Slot(3), Expr::Const(Some(Bson::Int32(1)))),
+            Expr::Const(Some(Bson::Boolean(false))),
+        );
+        let filter = Stage::Filter {
+            node: 1,
+            predicate,
+            input: Box::new(scan),
+        };
+        let limit = Stage::LimitSkip {
+            node: 2,
+            limit: Some((4, 2)),
+            skip: None,
+            input: Box::new(filter),
+        };
+        let (rows, top) = limit.run(&docs, None);
+        assert_eq!(rows.len(), 2);
+        assert!(top.eof);
+        let f = top.input.as_deref().unwrap();
+        assert_eq!((f.returned, f.tested, f.eof), (2, 4, false));
+        let s = f.input.as_deref().unwrap();
+        assert_eq!((s.returned, s.reads, s.eof), (4, 4, false));
     }
 }

@@ -2017,26 +2017,33 @@ What is left, all on the RUST MongoDB server:
       into SBE and explains them with `explainVersion: "2"`, a
       `winningPlan` of `{queryPlan, slotBasedPlan}` and executionStats made
       of SBE stages. Since 2026-11-08 (`explain/sbe/`) this server builds,
-      prints and RUNS that plan for a `$group` over a whole-collection scan
-      (no filter, sort, paging, hint or collation) whose `_id` is a field
-      path, `$$ROOT`, a scalar constant or an object of those, whose
-      arguments are field paths or `$$ROOT` (numeric constants for `$sum`),
-      with `$sum`, `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`,
-      `$push` and `$addToSet`, and at most one distinct dotted path; and
-      the `limit 0` / `coscan` plan over a collection that does not exist.
-      Still the classic `$cursor` / `stages` shape: a filtered, sorted,
-      paged or projected front (the filter's `traverseF` program, index
-      scans), `$lookup`, `$count` / `$sortByCount` / `$bucket` (not
-      desugared before `secantus_core::sbe::pushdown`, which the executor
-      shares), any other accumulator or expression (the expression
-      compiler of `gen_expression.cpp`), a collation (its env slot), and
-      two or more distinct dotted paths (mongod orders their slots by an
+      prints and RUNS that plan for a `$group`, or the `$group` a `$count`
+      is, over a forward collection scan with no sort, projection, hint or
+      collation, whose filter is `$eq` / `$lt` / `$lte` / `$gt` / `$gte` of
+      a number, string or boolean on a path of named fields and the `$and`s
+      of those (`explain/sbe/filter.rs`), with a skip and a limit where the
+      group reads no field (RM-072); whose `_id` is a field path, `$$ROOT`,
+      a scalar constant or an object of those, whose arguments are field
+      paths or `$$ROOT` (numeric constants for `$sum`), with `$sum`,
+      `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
+      `$addToSet`, and at most one distinct dotted path; and the `limit 0`
+      / `coscan` plan over a collection that does not exist. Still the
+      classic `$cursor` / `stages` shape: any other filter (`{a: null}`'s
+      `typeMatch`, `$in`'s `isMember`, `$ne`'s `!`, `$or`, ...), a sorted,
+      projected or index-served front (`COUNT_SCAN`, `IXSCAN` /
+      `FETCH`), a skip or limit with a group that reads a field (mongod
+      puts its dependency projection among them), `$lookup`,
+      `$sortByCount` / `$bucket` (not desugared before
+      `secantus_core::sbe::pushdown`, which the executor shares), any other
+      accumulator or expression (the expression compiler of
+      `gen_expression.cpp`), a collation (its env slot), and two or more
+      distinct dotted paths (mongod orders their slots by an
       `absl::flat_hash_map` salted per process, so its own order varies
       from run to run). The SBE stages never spill here (`usedDisk` is
       always false), and the `$cursor` batches are capped by count only,
       not by `internalDocumentSourceCursorBatchSizeBytes`.
       `explain_commands.py` replies (0-based steps, measured 2026-11-08):
-      `aggregate: stages after the cursor` 6, 7, 8, 11; `aggregate: $group
+      `aggregate: stages after the cursor` 7, 8, 11; `aggregate: $group
       and $lookup` 2, 5, 6, 7; `executionStats: aggregate` 6. Also open in listings: mongod
       constant-folds (`{$abs: -1}` is `{$const: 1}`) and orders the fields
       of object-form operators its own way (`$dateToString`).
@@ -2045,15 +2052,21 @@ What is left, all on the RUST MongoDB server:
       slot programs, so `queryPlan`, `slotBasedPlan` and the SBE execution
       stats all come from running the plan. Not a printed stand-in.
       Backlog-ID: RM-071
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query
-- [ ] **`count` on a view** is explained by mongod 8.2.11 as an SBE plan
-      (`explainVersion: "2"`, a `queryPlan` of `GROUP` over the view's
-      scan); this server reports the classic cursor and the `$count`
-      stage. The same decision as RM-071. `distinct` and `aggregate` on a
-      view match mongod. `explain_commands.py`: `a view` 4 and 5.
+      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_group_pushed_into_the_query, tests/backlog/test_rm_057_084.py::test_explain_of_a_filter_sbe_runs_beyond_comparisons
+- [ ] **`count` on a view whose filter an index serves** is explained by
+      mongod 8.2.11 as an SBE plan (`explainVersion: "2"`, a `queryPlan` of
+      `GROUP` over a `COUNT_SCAN` where the count reads no field, over
+      `FETCH` / `IXSCAN` where a filter is left); this server reports the
+      classic cursor with `FETCH` / `IXSCAN` and the `$count`'s `$group`.
+      Over a collection scan it matches mongod since 2026-11-08
+      (`tests/mongod_live/test_sbe_filtered_front_explain.py`). Needs the
+      SBE index scan stages, and the `COUNT_SCAN` a `$count` that reads no
+      field gets (also `aggregate: stages after the cursor` 7 and
+      `executionStats: aggregate` 6, under RM-071). `explain_commands.py`:
+      `a view` 4 and 5.
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view
+      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
 - [ ] **`explain` of a sorted or filtered DISTINCT_SCAN `$group` lists no
       `rejectedPlans`.** mongod 8.2.11 tries each index that could answer
       it (with `$first` of `y` over `x_1`, `x_1_y_1` and `x_1_z_1`, after a

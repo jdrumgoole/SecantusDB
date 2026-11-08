@@ -1653,25 +1653,42 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             .collect();
         planner.insert("rejectedPlans", rejected);
     }
-    if let Some((pushed, group)) = pushed_down {
+    if let Some(front) = pushed_down {
         let built = if t.exists {
-            let whole_scan = match &plan {
-                Node::CollScan { filter, backward } => filter.is_none() && !backward,
-                Node::Projection { input, .. } => {
-                    matches!(
-                        &**input,
-                        Node::CollScan {
-                            filter: None,
-                            backward: false
-                        }
-                    )
+            // The plan the trial chose is a forward collection scan: the
+            // query in front of the group is that scan's filter and paging.
+            let mut scan = &plan;
+            loop {
+                scan = match scan {
+                    Node::Projection { input, .. }
+                    | Node::Skip(_, input)
+                    | Node::Limit(_, input) => input,
+                    _ => break,
+                };
+            }
+            let forward_scan = matches!(
+                scan,
+                Node::CollScan {
+                    backward: false,
+                    ..
                 }
-                _ => false,
+            );
+            let parsed = parsed::parsed_query(&s.filter);
+            let filter = sbe::Filter::parse(&parsed);
+            let on = sbe::Front {
+                parsed,
+                filter,
+                skip: s.skip,
+                limit: s.limit,
             };
+            let filtered = s.filter.is_empty() || on.filter.is_some();
             let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
-            group
-                .filter(|_| whole_scan)
-                .and_then(|g| sbe::group_plan(&g, &uuid, s.rest.len() == pushed))
+            let last = front.tail.is_empty() && s.rest.len() == front.pushed;
+            front
+                .group
+                .as_ref()
+                .filter(|_| forward_scan && filtered)
+                .and_then(|g| sbe::group_plan(g, &uuid, last, &on))
         } else {
             Some(sbe::eof_plan())
         };
@@ -1679,7 +1696,8 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             let is_cached = cache.as_ref().is_some_and(|c| c.cached(&plan));
             let sbe = Pushed {
                 plan: &built,
-                pushed,
+                pushed: front.pushed,
+                tail: &front.tail,
                 is_cached,
                 docs: &t.docs,
                 stage_counts: &stage_counts,
@@ -1766,12 +1784,26 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     Ok(reply)
 }
 
+/// What mongod runs in SBE after the query a pipeline's leading stages
+/// make.
+struct SbeFront {
+    /// How many of the stages after the query it runs.
+    pushed: usize,
+    /// The `$group` among them that is built here (RM-071), the one a
+    /// `$count` is included (RM-072).
+    group: Option<Document>,
+    /// The classic stages a pushed stage leaves after the plan: a
+    /// `$count`'s `$project`.
+    tail: Vec<Document>,
+}
+
 /// How many of the stages after the query mongod runs in SBE with it, and
 /// the `$group` among them that is built here (RM-071): only where the
-/// query is a whole-collection scan and the `$group` is the one stage
-/// pushed. Over a collection that does not exist any pushed pipeline is
-/// the same EOF plan. `$lookup`, a filtered or sorted front and a
-/// collation are still explained in the classic shape.
+/// `$group`, or a `$count`, is the one stage pushed, and the query has no
+/// sort, projection, hint or collation (its filter and paging are checked
+/// against the plan, [`sbe::group_plan`]). Over a collection that does not
+/// exist any pushed pipeline is the same EOF plan. `$lookup`, a sorted
+/// front and a collation are still explained in the classic shape.
 fn sbe_front(
     storage: &dyn crate::storage::Storage,
     db: &str,
@@ -1779,7 +1811,7 @@ fn sbe_front(
     collation: Option<&Collation>,
     pipeline: &[Document],
     exists: bool,
-) -> Option<(usize, Option<Document>)> {
+) -> Option<SbeFront> {
     let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
     let hoisted = hoist::hoist_matches(&stages);
     let n = sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation)?;
@@ -1788,18 +1820,28 @@ fn sbe_front(
     if pushed == 0 {
         return None;
     }
-    let group = s.rest.first()?.get_document("$group").ok().cloned();
+    let first = s.rest.first()?;
+    // `$count: name` is `$group: {_id: null, name: {$sum: 1}}` and then
+    // `$project: {name: true, _id: false}`, which stays classic.
+    let (group, tail) = match (first.get_document("$group"), first.get_str("$count")) {
+        (Ok(g), _) => (Some(g.clone()), vec![]),
+        (_, Ok(name)) => (
+            Some(doc! { "_id": Bson::Null, name: { "$sum": 1 } }),
+            shape::listed_stage(first, db).into_iter().skip(1).collect(),
+        ),
+        _ => (None, vec![]),
+    };
     let plain = group.is_some()
-        && taken == 0
         && pushed == 1
-        && s.filter.is_empty()
         && s.sort.is_none()
-        && s.skip == 0
-        && s.limit == 0
         && s.projection_stage.is_none()
         && s.hint.is_none()
         && collation.is_none();
-    (plain || !exists).then_some((pushed, group))
+    (plain || !exists).then_some(SbeFront {
+        pushed,
+        group,
+        tail,
+    })
 }
 
 /// A slot-based plan ready to report, with the per-stage counts of the
@@ -1808,6 +1850,8 @@ struct Pushed<'a> {
     plan: &'a sbe::Plan,
     /// How many of the stages after the query the plan runs.
     pushed: usize,
+    /// The classic stages the last of them leaves after the plan.
+    tail: &'a [Document],
     is_cached: bool,
     docs: &'a [Document],
     stage_counts: &'a [i64],
@@ -1826,7 +1870,7 @@ fn sbe_reply(
 ) -> HandlerResult {
     let s = &r.shape;
     let db = ctx.db_name.clone();
-    let whole = s.rest.len() == p.pushed;
+    let whole = s.rest.len() == p.pushed && p.tail.is_empty();
     let mut qp = Document::new();
     for (k, v) in planner {
         if k == "maxIndexedOrSolutionsReached" && whole {
@@ -1862,6 +1906,7 @@ fn sbe_reply(
         let limit = s
             .rest
             .get(p.pushed)
+            .filter(|_| p.tail.is_empty())
             .and_then(|st| st.get("$limit"))
             .and_then(as_i64);
         let (stats, produced) =
@@ -1880,6 +1925,13 @@ fn sbe_reply(
         counted(&mut first, n);
     }
     let mut stages = vec![Bson::Document(first)];
+    for listed in p.tail {
+        let mut listed = listed.clone();
+        if let Some(n) = p.stage_counts.get(p.pushed - 1) {
+            counted(&mut listed, *n);
+        }
+        stages.push(Bson::Document(listed));
+    }
     for (i, stage) in s.rest.iter().enumerate().skip(p.pushed) {
         for mut listed in shape::listed_stage(stage, &db) {
             if let Some(spilled) = p.stage_spills.get(i) {

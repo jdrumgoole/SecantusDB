@@ -174,8 +174,13 @@ fn op_text(op: BinOp) -> &'static str {
     match op {
         BinOp::FillEmpty => "?:",
         BinOp::Eq => "==",
+        BinOp::Lt => "<",
+        BinOp::Lte => "<=",
+        BinOp::Gt => ">",
+        BinOp::Gte => ">=",
         BinOp::Div => "/",
         BinOp::LogicOr => "||",
+        BinOp::LogicAnd => "&&",
     }
 }
 
@@ -217,6 +222,32 @@ fn stage(st: &Stage, lines: &mut Vec<String>) {
                 "[{node}] scan s{record} s{record_id} none none none none none none [{}] @\"{uuid}\" true false ",
                 fields.join(", ")
             ));
+        }
+        Stage::Filter {
+            node,
+            predicate,
+            input,
+        } => {
+            lines.push(format!("[{node}] filter {{{}}} ", expression(predicate)));
+            stage(input, lines);
+        }
+        Stage::LimitSkip {
+            node,
+            limit,
+            skip,
+            input,
+        } => {
+            let slot =
+                |a: &Option<(u32, i64)>| a.map_or("none".to_string(), |(s, _)| format!("s{s}"));
+            match skip {
+                None => lines.push(format!("[{node}] limit {} ", slot(limit))),
+                Some(_) => lines.push(format!(
+                    "[{node}] limitskip {} {} ",
+                    slot(limit),
+                    slot(skip)
+                )),
+            }
+            stage(input, lines);
         }
         Stage::Project { node, binds, input } => {
             let binds: Vec<String> = binds
@@ -280,6 +311,18 @@ pub(super) fn specific_stats(st: &Stage, counted: &Counted, out: &mut Document) 
             let slots: Vec<Bson> = fields.iter().map(|(_, s)| Bson::Int64(*s as i64)).collect();
             out.insert("scanFieldNames", names);
             out.insert("scanFieldSlots", slots);
+        }
+        Stage::Filter { predicate, .. } => {
+            out.insert("numTested", super::number(counted.tested));
+            out.insert("filter", listed(predicate));
+        }
+        Stage::LimitSkip { limit, skip, .. } => {
+            if let Some((_, n)) = limit {
+                out.insert("limit", super::number(*n));
+            }
+            if let Some((_, n)) = skip {
+                out.insert("skip", super::number(*n));
+            }
         }
         Stage::Project { binds, .. } => {
             let mut p = Document::new();
