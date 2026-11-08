@@ -41,8 +41,15 @@ pub const MAX_BYTES: usize = 104_857_600;
 /// (measured 8.2.11: a `{_id, s}` of 1,000,022 BSON bytes is 1,000,126).
 pub const DOCUMENT_OVERHEAD: usize = 104;
 
+/// What a document's metadata adds once `$sort` attaches its sort key,
+/// beyond the key's own `Value`: `sizeof(MetadataHolder)` and the empty
+/// fields `DocumentMetadataFields::getApproximateSize` counts. Measured on
+/// mongod 8.2.1 (macOS arm64) and 8.2.12 (Linux x86-64 and arm64), which
+/// agree: a document a `$rank` caches is its BSON + 104 + 255 + its key.
+pub const SORT_KEY_METADATA: usize = 255;
+
 /// `sizeof(Value)` in the classic engine.
-const VALUE: usize = 16;
+pub(crate) const VALUE: usize = 16;
 /// `sizeof(RCString)`: refcount, size and vtable (measured: a classic
 /// string `Value` of n bytes is n + 40).
 const RC_STRING: usize = 24;
