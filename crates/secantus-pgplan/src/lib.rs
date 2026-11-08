@@ -20,6 +20,7 @@ mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
 mod colhint;
+mod schema_refs;
 mod values_refs;
 pub use colhint::missing_column_hint;
 pub mod colstats;
@@ -4745,6 +4746,9 @@ fn rewrite_statement(node: &mut N) -> Result<()> {
     srf_place::check(node)?;
     cancel::check()?;
     collation::check_clauses(node)?;
+    cancel::check()?;
+    // Before `qualify`, which drops a schema it folds into a FROM item.
+    schema_refs::check(node)?;
     cancel::check()?;
     schemas::qualify(node)
 }
@@ -20422,6 +20426,10 @@ fn rewrite_dml_from(
             lookup,
             &[],
         )?,
+        // An INSERT's `RETURNING t.*` came back as one composite column.
+        Some(N::InsertStmt(i)) => {
+            returning_star::expand(&mut i.returning_list, i.relation.as_ref(), &[], lookup, &[])?
+        }
         _ => {}
     }
     if let Some(N::UpdateStmt(u)) = node.node.as_mut() {
@@ -32472,6 +32480,19 @@ fn resolve_regclass(text: &str) -> Result<i64> {
             )))
         }
     };
+    relation_oid(schema, name).ok_or_else(|| {
+        Error::UndefinedTable(match schema {
+            Some(s) => format!("{s}.{name}"),
+            None => name.to_string(),
+        })
+    })
+}
+
+/// The oid of the relation `[schema.]name` names, as `resolve_regclass`
+/// looks it up (`RangeVarGetRelid` with `missing_ok`): an unqualified name
+/// by the search path, a qualified one in that schema alone. `None` when
+/// there is no such relation, or no such schema.
+pub(crate) fn relation_oid(schema: Option<&str>, name: &str) -> Option<i64> {
     let user = |stored: &str, temp: Option<bool>| -> Option<i64> {
         PLAN_USER_RELATIONS.with(|t| {
             t.borrow()
@@ -32487,7 +32508,7 @@ fn resolve_regclass(text: &str) -> Result<i64> {
             .map(|(_, oid)| *oid)
     };
     let own_temp = schemas::temp_schema().map(|t| schemas::relation_key(&t, name));
-    let found = match schema {
+    match schema {
         None => own_temp
             .as_deref()
             .and_then(|k| user(k, Some(true)))
@@ -32510,13 +32531,7 @@ fn resolve_regclass(text: &str) -> Result<i64> {
         Some(s @ ("information_schema" | "pg_toast")) => system_relation(s, name),
         // A table in another schema is stored under `schema.name`.
         Some(s) => user(&format!("{s}.{name}"), Some(false)),
-    };
-    found.ok_or_else(|| {
-        Error::UndefinedTable(match schema {
-            Some(s) => format!("{s}.{name}"),
-            None => name.to_string(),
-        })
-    })
+    }
 }
 
 /// Keys of the composite `cast_value` returns for a timestamp that carries
