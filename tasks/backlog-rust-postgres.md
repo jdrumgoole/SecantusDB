@@ -2373,14 +2373,6 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
 as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **A column of a domain's array type is missing from `pg_attribute`.**
-      After `create table t607q (x d607q[], y int)`, PostgreSQL 15.19's
-      `pg_attribute` has `x` (attnum 1, `d607q[]`) and `y`; here it has
-      `y` alone, so `\d t607q` shows one column, though `select *` and
-      `information_schema.columns` see both. DROP DOMAIN finds the column
-      (RP-607), so the catalog row is what is missing.
-      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_array_column_in_pg_attribute
-      Backlog-ID: RP-653
 - [ ] **A domain over another domain's array type is refused.** `create
       domain d607s as d607q[]` is made on PostgreSQL 15.19, with
       `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
@@ -2389,6 +2381,20 @@ as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
       type's array. The DROP side follows such a domain already (RP-607).
       Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
       Backlog-ID: RP-654
+
+## Found while working RP-653 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d653n as
+int`. The gap test is in `tests/backlog/test_rp_found_rp653.py`.
+
+- [ ] **A user column's `attndims` is always 0.** `attndims` is the number
+      of dimensions a column was declared with (`ColumnDef`'s
+      `arrayBounds`): after `create table t653n (a int[], b int[][], c int,
+      d int[3], e d653n[])` PostgreSQL 15.19's `pg_attribute` has 1, 2, 0,
+      1 and 1; here every column is 0 (`catalog_fill.rs` writes a constant
+      for a user table), so a client reading it sees no array column.
+      Verify: tests/backlog/test_rp_found_rp653.py::test_array_column_attndims
+      Backlog-ID: RP-658
 
 ## Found while working RP-575 (2026-11-08)
 
