@@ -175,6 +175,10 @@ struct Printer<'a> {
     /// EXPLAIN's join helpers: a JOIN's inputs stay plain entries of the
     /// level, and an aliased JOIN is not modelled (`None`).
     legacy_joins: bool,
+    /// Whether the statement wrote the alias of each `RangeVar` of the text
+    /// being printed, by its location there (`rte->alias != NULL`); see
+    /// [`Printer::alias_written`].
+    written_alias: std::rc::Rc<std::collections::HashMap<i32, bool>>,
 }
 
 /// What a sub-expression is printed inside, for `isSimpleNode`.
@@ -349,7 +353,29 @@ impl<'a> Printer<'a> {
             fold_consts: false,
             markers: false,
             legacy_joins: false,
+            written_alias: std::rc::Rc::default(),
         }
+    }
+
+    /// `rte->alias != NULL` for a FROM reference of the printed text. A
+    /// reference qualification folded to its `schema.name` key carries its
+    /// bare name as an alias that was not written (`schemas::add_alias`),
+    /// which the text cannot tell from one that was: the definition's
+    /// [`crate::schemas::written_aliases`], when known, says which. Without
+    /// them (a definition stored before they were kept), an alias that is
+    /// the bare name of a `schema.name` key is taken for the added one.
+    fn alias_written(&self, rv: &pg_query::protobuf::RangeVar) -> bool {
+        let Some(alias) = rv.alias.as_ref() else {
+            return false;
+        };
+        if let Some(&written) = self.written_alias.get(&rv.location) {
+            return written;
+        }
+        !(alias.colnames.is_empty()
+            && rv
+                .relname
+                .split_once('.')
+                .is_some_and(|(_, bare)| bare == alias.aliasname))
     }
 
     /// A list item whose line wrap [`render_wrapped`] decides: `kind` is
@@ -2408,6 +2434,7 @@ impl<'a> Printer<'a> {
     fn subquery(&mut self, sub: &Node) -> Option<()> {
         let mut inner = Printer::new(self.cat, self.indent);
         inner.col_names_visible = false;
+        inner.written_alias = std::rc::Rc::clone(&self.written_alias);
         inner.scopes = self.scopes.clone();
         inner.ctes = self.ctes.clone();
         inner.depth = self.depth + 1;
@@ -2421,6 +2448,7 @@ impl<'a> Printer<'a> {
     fn subquery_visible(&mut self, sub: &Node) -> Option<()> {
         let mut inner = Printer::new(self.cat, self.indent);
         inner.scopes = self.scopes.clone();
+        inner.written_alias = std::rc::Rc::clone(&self.written_alias);
         inner.ctes = self.ctes.clone();
         inner.depth = self.depth + 1;
         inner.pretty = self.pretty;
@@ -2433,6 +2461,7 @@ impl<'a> Printer<'a> {
     fn subquery_columns(&mut self, sub: &Node) -> Option<Vec<(String, String)>> {
         let mut inner = Printer::new(self.cat, 0);
         inner.scopes = self.scopes.clone();
+        inner.written_alias = std::rc::Rc::clone(&self.written_alias);
         inner.ctes = self.ctes.clone();
         inner.depth = self.depth + 1;
         inner.pretty = self.pretty;
@@ -3209,6 +3238,7 @@ impl Printer<'_> {
             self.keyword("", 0, 0, 0);
             let mut inner = Printer::new(self.cat, self.indent);
             inner.scopes = self.scopes.clone();
+            inner.written_alias = std::rc::Rc::clone(&self.written_alias);
             inner.ctes = self.ctes.clone();
             inner.depth = self.depth + 1;
             inner.pretty = self.pretty;
@@ -3272,6 +3302,7 @@ impl Printer<'_> {
             };
             let mut inner = Printer::new(self.cat, self.indent);
             inner.scopes = self.scopes.clone();
+            inner.written_alias = std::rc::Rc::clone(&self.written_alias);
             inner.ctes = self.ctes.clone();
             inner.depth = self.depth + 1;
             inner.pretty = self.pretty;
@@ -3671,10 +3702,13 @@ impl Printer<'_> {
                 // A table of another schema is stored `schema.name`: printed
                 // qualified while its schema is off the search path (as
                 // `generate_relation_name` does), its alias compared with
-                // the bare name.
+                // the bare name. The session's own temporary schema is
+                // searched first whether or not the path lists it.
                 let bare = match rv.relname.split_once('.') {
                     Some((schema, bare)) => {
-                        if !crate::schemas::search_path().iter().any(|s| s == schema) {
+                        let on_path = crate::schemas::temp_schema().as_deref() == Some(schema)
+                            || crate::schemas::search_path().iter().any(|s| s == schema);
+                        if !on_path {
                             self.buf.push_str(&q(schema));
                             self.buf.push('.');
                         }
@@ -3696,7 +3730,7 @@ impl Printer<'_> {
                 self.buf.push_str(&q(&bare));
                 // `get_rte_alias`: a written alias, an alias the column
                 // aliases need, or a name `set_rtable_names` changed.
-                let shown = rv.alias.is_some()
+                let shown = self.alias_written(rv)
                     || rte.print_aliases
                     || if rv.relname.contains('.') {
                         rte.refname != bare
@@ -4093,23 +4127,57 @@ fn column_ref(parts: &[&str]) -> Node {
 
 /// `pg_get_viewdef(view)`: the view's `SELECT` as ruleutils prints it, with
 /// its leading space and trailing semicolon; `None` for a shape this does
-/// not reproduce.
-pub fn viewdef(sql: &str, cat: &Catalog<'_>) -> Option<String> {
-    viewdef_with(sql, cat, false)
+/// not reproduce. `written_aliases` is the definition's
+/// [`crate::schemas::written_aliases`], when it was kept.
+pub fn viewdef(sql: &str, written_aliases: Option<&[bool]>, cat: &Catalog<'_>) -> Option<String> {
+    viewdef_with(sql, written_aliases, cat, false, false)
 }
 
 /// `pg_get_viewdef(view, true)`: parentheses only where precedence needs
 /// them (PRETTYFLAG_PAREN).
-pub fn viewdef_pretty(sql: &str, cat: &Catalog<'_>) -> Option<String> {
-    viewdef_with(sql, cat, true)
+pub fn viewdef_pretty(
+    sql: &str,
+    written_aliases: Option<&[bool]>,
+    cat: &Catalog<'_>,
+) -> Option<String> {
+    viewdef_with(sql, written_aliases, cat, true, false)
 }
 
-fn viewdef_with(sql: &str, cat: &Catalog<'_>, pretty: bool) -> Option<String> {
+fn viewdef_with(
+    sql: &str,
+    written_aliases: Option<&[bool]>,
+    cat: &Catalog<'_>,
+    pretty: bool,
+    markers: bool,
+) -> Option<String> {
     let node = parse_select(sql)?;
     let mut p = Printer::new(cat, 0);
     p.pretty = pretty;
+    p.markers = markers;
+    p.written_alias = std::rc::Rc::new(written_alias_at(&node, written_aliases));
     p.query(&node, None)?;
     Some(format!("{};", p.buf))
+}
+
+/// `written`, one flag per `RangeVar` of `node` in `nodes()` order, keyed
+/// by each one's location in the text `node` was parsed from. Nothing when
+/// the counts differ: the flags were not taken from this text's tree.
+fn written_alias_at(node: &Node, written: Option<&[bool]>) -> std::collections::HashMap<i32, bool> {
+    let (Some(written), Some(n)) = (written, node.node.as_ref()) else {
+        return Default::default();
+    };
+    let locations: Vec<i32> = n
+        .nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::RangeVar(r) => Some(r.location),
+            _ => None,
+        })
+        .collect();
+    if locations.len() != written.len() {
+        return Default::default();
+    }
+    locations.into_iter().zip(written.iter().copied()).collect()
 }
 
 const MARK_OPEN: char = '\u{1}';
@@ -4188,13 +4256,12 @@ fn render_level(s: &[char], wrap: i64) -> String {
 }
 
 /// `viewdef_pretty` with each wrap decision left to [`render_wrapped`].
-pub fn viewdef_marked(sql: &str, cat: &Catalog<'_>) -> Option<String> {
-    let node = parse_select(sql)?;
-    let mut p = Printer::new(cat, 0);
-    p.pretty = true;
-    p.markers = true;
-    p.query(&node, None)?;
-    Some(format!("{};", p.buf))
+pub fn viewdef_marked(
+    sql: &str,
+    written_aliases: Option<&[bool]>,
+    cat: &Catalog<'_>,
+) -> Option<String> {
+    viewdef_with(sql, written_aliases, cat, true, true)
 }
 
 /// `isSimpleNode` for a boolean expression of type `own` under `parent`.
@@ -5356,17 +5423,50 @@ mod tests {
                     Column::new("w", "text", false),
                 ],
             )),
+            "vd_s.vd_t" => Some(TableDef::new(
+                "vd_s.vd_t",
+                vec![Column::new("id", "int4", false)],
+            )),
             _ => None,
         }
     }
 
     fn render(sql: &str) -> Option<String> {
+        render_written(sql, None)
+    }
+
+    fn render_written(sql: &str, written: Option<&[bool]>) -> Option<String> {
         let none = |_: &str| None;
         let cat = Catalog {
             lookup: &cat_lookup,
             view_sql: &none,
         };
-        viewdef(sql, &cat)
+        viewdef(sql, written, &cat)
+    }
+
+    // A reference stored under its `schema.name` key carries its bare name
+    // as an alias, which prints only when the statement wrote it
+    // (`get_rte_alias`); the definition's `written_aliases` say which.
+    // Without them, an alias that is the bare name is the supplied one.
+    // Measured on PostgreSQL 15.19 (`FROM b41a.t` / `FROM b41a.t t`).
+    #[test]
+    fn a_qualified_reference_prints_only_a_written_alias() {
+        let sql = "SELECT vd_t.id FROM \"vd_s.vd_t\" vd_t";
+        let bare = " SELECT vd_t.id\n   FROM vd_s.vd_t;";
+        let aliased = " SELECT vd_t.id\n   FROM vd_s.vd_t vd_t;";
+        assert_eq!(render_written(sql, Some(&[false])).as_deref(), Some(bare));
+        assert_eq!(render_written(sql, Some(&[true])).as_deref(), Some(aliased));
+        assert_eq!(render_written(sql, None).as_deref(), Some(bare));
+        // Flags for another tree are not read.
+        assert_eq!(
+            render_written(sql, Some(&[true, true])).as_deref(),
+            Some(bare)
+        );
+        // Any other alias is a written one.
+        assert_eq!(
+            render_written("SELECT x.id FROM \"vd_s.vd_t\" x", None).as_deref(),
+            Some(" SELECT x.id\n   FROM vd_s.vd_t x;")
+        );
     }
 
     #[test]

@@ -35,6 +35,20 @@ it gave up on any aliased JOIN and returned the statement as written
   parenthesised.
   Regression tests: tests/backlog/test_rp_subquery_scope.py::test_join_viewdef_names_columns,
   and `ruleutils::tests::a_join_names_its_columns_as_ruleutils_does`.
+- A table of another schema, one the search path finds outside `public`,
+  or a temporary table prints its alias only when the statement wrote one
+  (`rte->alias`), as `get_rte_alias` decides: `FROM b41a.t`, not `FROM
+  b41a.t t`, while `FROM b41a.t t` as written still prints its `t`. Such a
+  reference is stored under its `schema.name` key and carries its bare
+  name as an alias qualification supplied; that alias is now marked as
+  supplied, and a view or materialized view keeps, beside its definition,
+  which aliases were written (`written_aliases`). A definition stored
+  before this has no such record, and an alias there equal to the bare
+  name is taken for a supplied one. A `public.t` written qualified no
+  longer prints `t t`, and the session's own temporary tables print bare
+  (`FROM tt`), not as `pg_temp_3.tt`.
+  Regression test: tests/backlog/test_rp_subquery_scope.py::test_viewdef_qualified_relation_alias
+  (it also holds the `b41_fixes` corpus's two lines that RP-467 broke).
 
 #### Found
 
@@ -42,3 +56,11 @@ it gave up on any aliased JOIN and returned the statement as written
   (`select * from fs f(x, y)`) is created, and every read of it is 42703,
   because CREATE VIEW expands the `*` to the table's own column names
   (tests/backlog/test_rp_found_rp467.py).
+- RP-525: a materialized view is not a dependent of what it reads: a
+  plain DROP of its table succeeds, and DROP ... CASCADE of the table or
+  its schema leaves it behind
+  (tests/backlog/test_rp_found_rp467.py::test_drop_reaches_a_dependent_materialized_view).
+- RP-526: two schemas' unaliased tables of one name in a FROM are 42712,
+  where PostgreSQL allows them, and an alias equal to another schema's
+  unaliased table is accepted in a view
+  (tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from).

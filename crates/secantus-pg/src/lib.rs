@@ -15788,20 +15788,38 @@ impl PgHandler {
             lookup: &lookup,
             view_sql: &view_sql,
         };
+        // Each one's `written_aliases`, where its document keeps them.
+        let mut written: HashMap<String, Vec<bool>> = HashMap::new();
+        for (collection, key) in [
+            (Self::VIEW_COLLECTION, "view"),
+            (Self::MATVIEW_COLLECTION, "matview"),
+        ] {
+            for d in self
+                .type_catalog_docs(collection)
+                .unwrap_or_default()
+                .iter()
+            {
+                let name = d.get_str(key).or_else(|_| d.get_str("_id"));
+                if let (Ok(name), Some(flags)) = (name, Self::written_aliases_of(d)) {
+                    written.insert(name.to_string(), flags);
+                }
+            }
+        }
         views
             .iter()
             .cloned()
             .chain(matviews)
             .map(|(name, definition)| {
+                let aliases = written.get(&name).map(Vec::as_slice);
                 let oid = self
                     .relation_oid(&name)
                     .unwrap_or_else(|| self.view_relid(&name));
                 // As ruleutils prints the analysed query; the definition as
                 // written for a shape the printer does not reproduce.
                 let text = match mode {
-                    1 => secantus_pgplan::ruleutils::viewdef_pretty(&definition, &cat),
-                    2 => secantus_pgplan::ruleutils::viewdef_marked(&definition, &cat),
-                    _ => secantus_pgplan::ruleutils::viewdef(&definition, &cat),
+                    1 => secantus_pgplan::ruleutils::viewdef_pretty(&definition, aliases, &cat),
+                    2 => secantus_pgplan::ruleutils::viewdef_marked(&definition, aliases, &cat),
+                    _ => secantus_pgplan::ruleutils::viewdef(&definition, aliases, &cat),
                 }
                 .unwrap_or_else(|| format!(" {definition};"));
                 (oid, name, text)
@@ -16958,6 +16976,9 @@ impl PgHandler {
             "oid": relid,
             "type_oid": type_oid,
             "rule_oid": rule_oid,
+            // Which of its relation references had their alias written, for
+            // ruleutils (the text cannot say).
+            "written_aliases": cv.written_aliases.clone(),
         };
         // Its `_RETURN` rule's trees, analysed now as `DefineView` does
         // (RP-203).
@@ -19350,6 +19371,26 @@ impl PgHandler {
     }
 
     /// This database's materialized views: `(name, definition, populated)`.
+    /// A view's or materialized view's `written_aliases`, where its
+    /// document keeps them (one made before they were kept has none).
+    fn written_aliases_of(doc: &Document) -> Option<Vec<bool>> {
+        doc.get_array("written_aliases")
+            .ok()?
+            .iter()
+            .map(Bson::as_bool)
+            .collect()
+    }
+
+    /// A materialized view's `written_aliases`, which a refresh or a rename
+    /// keeps with its definition.
+    fn matview_written_aliases(&self, name: &str) -> Option<Vec<bool>> {
+        self.type_catalog_docs(Self::MATVIEW_COLLECTION)
+            .ok()?
+            .iter()
+            .find(|d| d.get_str("matview") == Ok(name))
+            .and_then(Self::written_aliases_of)
+    }
+
     fn matviews(&self) -> PgWireResult<Vec<(String, String, bool)>> {
         Ok(self
             .type_catalog_docs(Self::MATVIEW_COLLECTION)?
@@ -19364,13 +19405,15 @@ impl PgHandler {
             .collect())
     }
 
-    /// `trees` are its `_RETURN` rule's `(ev_qual, ev_action)` (RP-203).
+    /// `trees` are its `_RETURN` rule's `(ev_qual, ev_action)` (RP-203);
+    /// `written` its definition's `written_aliases`, when known.
     fn put_matview(
         &self,
         name: &str,
         definition: &str,
         populated: bool,
         trees: Option<(String, String)>,
+        written: Option<&[bool]>,
     ) -> PgWireResult<()> {
         self.ensure_collection(Self::MATVIEW_COLLECTION)?;
         if self.matviews()?.iter().any(|(n, _, _)| n == name) {
@@ -19380,6 +19423,9 @@ impl PgHandler {
         if let Some((qual, action)) = trees {
             doc.insert("ev_qual", qual);
             doc.insert("ev_action", action);
+        }
+        if let Some(written) = written {
+            doc.insert("written_aliases", written.to_vec());
         }
         self.insert_type_doc(Self::MATVIEW_COLLECTION, name, doc)
     }
@@ -19675,7 +19721,8 @@ impl PgHandler {
             })?;
         }
         let trees = self.matview_trees(name);
-        self.put_matview(name, &definition, with_data, trees)
+        let written = self.matview_written_aliases(name);
+        self.put_matview(name, &definition, with_data, trees, written.as_deref())
     }
 
     /// Every recorded policy document.
@@ -39505,6 +39552,7 @@ impl PgHandler {
                 query,
                 with_data,
                 matview_sql,
+                matview_aliases,
                 access_method,
             } => {
                 // What PostgreSQL's analysis of the query refuses, before
@@ -39604,7 +39652,7 @@ impl PgHandler {
                 if !with_data {
                     if let Some(sql) = &matview_sql {
                         let trees = self.new_matview_trees(&table);
-                        self.put_matview(&table, sql, false, trees)?;
+                        self.put_matview(&table, sql, false, trees, Some(&matview_aliases))?;
                     }
                     return Ok(vec![Response::Execution(Tag::new(
                         if matview_sql.is_some() {
@@ -39643,7 +39691,7 @@ impl PgHandler {
                 // path, which refuses a materialized view.
                 if let Some(sql) = &matview_sql {
                     let trees = self.new_matview_trees(&table);
-                    self.put_matview(&table, sql, true, trees)?;
+                    self.put_matview(&table, sql, true, trees, Some(&matview_aliases))?;
                 }
                 Ok(vec![Response::Execution(
                     Tag::new("SELECT").with_rows(written),
@@ -45145,8 +45193,9 @@ impl PgHandler {
                     max_rows,
                 )?;
                 let trees = self.matview_trees(&matview);
+                let written = self.matview_written_aliases(&matview);
                 self.delete_type_doc(Self::MATVIEW_COLLECTION, &matview)?;
-                self.put_matview(&to, &definition, populated, trees)?;
+                self.put_matview(&to, &definition, populated, trees, written.as_deref())?;
                 Ok(vec![Response::Execution(Tag::new(
                     "ALTER MATERIALIZED VIEW",
                 ))])

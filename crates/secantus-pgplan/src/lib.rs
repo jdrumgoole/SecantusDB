@@ -1226,6 +1226,9 @@ pub enum Statement {
         /// `CREATE MATERIALIZED VIEW`: the query's SQL, kept so `REFRESH`
         /// can run it again.
         matview_sql: Option<String>,
+        /// Its query's `schemas::written_aliases`, kept beside
+        /// `matview_sql` for ruleutils (as `CreateView::written_aliases`).
+        matview_aliases: Vec<bool>,
         /// `USING am`: one of the database's own table access methods
         /// (`heap` is `None`).
         access_method: Option<String>,
@@ -3633,6 +3636,11 @@ pub struct CreateView {
     pub replace: bool,
     /// `LOCAL` / `CASCADED` for `WITH CHECK OPTION`.
     pub check_option: Option<String>,
+    /// Whether each `RangeVar` of the definition, in `nodes()` order, had
+    /// its alias written (`schemas::written_aliases`): the text cannot say
+    /// which aliases qualification added, and ruleutils prints only the
+    /// written ones.
+    pub written_aliases: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7266,16 +7274,20 @@ fn plan_create_table_as_with(
         Some(q) => plan_query(q)?,
         None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
     };
-    let matview_sql = if matview {
-        Some(
-            c.query
-                .as_deref()
-                .ok_or_else(|| Error::Parse("CREATE MATERIALIZED VIEW without a query".into()))?
-                .deparse()
-                .map_err(|e| Error::Parse(e.to_string()))?,
+    let (matview_sql, matview_aliases) = if matview {
+        let q = c
+            .query
+            .as_deref()
+            .ok_or_else(|| Error::Parse("CREATE MATERIALIZED VIEW without a query".into()))?;
+        (
+            Some(q.deparse().map_err(|e| Error::Parse(e.to_string()))?),
+            q.node
+                .as_ref()
+                .map(schemas::written_aliases)
+                .unwrap_or_default(),
         )
     } else {
-        None
+        (None, Vec::new())
     };
     Ok(Statement::CreateTableAs {
         table: rel.relname.clone(),
@@ -7286,6 +7298,7 @@ fn plan_create_table_as_with(
         query: Box::new(query),
         with_data: !into.skip_data,
         matview_sql,
+        matview_aliases,
         access_method: misc_alter::table_access_method(&into.access_method)?,
     })
 }
@@ -10506,6 +10519,11 @@ fn plan_create_view(v: &pg_query::protobuf::ViewStmt) -> Result<Statement> {
         columns,
         replace: v.replace,
         check_option,
+        written_aliases: query
+            .node
+            .as_ref()
+            .map(schemas::written_aliases)
+            .unwrap_or_default(),
     }))
 }
 

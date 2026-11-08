@@ -736,6 +736,100 @@ def test_join_viewdef_names_columns(case: tuple[str, bool], dsn: str) -> None:
     assert got == JOIN_VIEWDEF[case]
 
 
+# ruleutils prints a relation's alias when the statement wrote one
+# (`rte->alias`), when its column aliases need it, or when its name had to
+# change -- not otherwise. A reference to another schema's table, to one the
+# search path finds outside `public`, or to a temporary table is stored
+# under its `schema.name` key and carries its bare name as an alias that
+# qualification supplied; RP-467 printed that alias as written (`FROM
+# rq467a.t t`, the b41_fixes corpus). Each answer is PostgreSQL 15.19's, on
+# a private cluster: `(search_path when the view is made, the view's query,
+# materialized?) -> (pg_get_viewdef there, and again under the default
+# path)`.
+_QUALIFIED_SETUP = (
+    "drop schema if exists rq467a, rq467b cascade",
+    "drop table if exists rq467p cascade",
+    "create schema rq467a",
+    "create schema rq467b",
+    "create table rq467a.t (a int, b text)",
+    "create table rq467b.t (a int)",
+    "create table rq467p (a int)",
+)
+QUALIFIED_RELATION_ALIAS = {
+    ("", "select a, b from rq467a.t where a > 1", False): (
+        " SELECT t.a,\n    t.b\n   FROM rq467a.t\n  WHERE (t.a > 1);",
+        None,
+    ),
+    ("", "select t.a from rq467a.t join rq467b.t u on u.a = t.a", False): (
+        " SELECT t.a\n   FROM (rq467a.t\n     JOIN rq467b.t u ON ((u.a = t.a)));",
+        None,
+    ),
+    # A written alias that is the bare name prints; so does any other.
+    ("", "select t.a from rq467a.t t", False): (" SELECT t.a\n   FROM rq467a.t t;", None),
+    ("", "select x.a from rq467a.t x", False): (" SELECT x.a\n   FROM rq467a.t x;", None),
+    ("", "select rq467p.a from public.rq467p", False): (
+        " SELECT rq467p.a\n   FROM rq467p;",
+        None,
+    ),
+    ("", "select rq467p.a from rq467p rq467p", False): (
+        " SELECT rq467p.a\n   FROM rq467p rq467p;",
+        None,
+    ),
+    ("rq467a, public", "select t.a from t", False): (
+        " SELECT t.a\n   FROM t;",
+        " SELECT t.a\n   FROM rq467a.t;",
+    ),
+    ("rq467a, public", "select t.a from t t", False): (
+        " SELECT t.a\n   FROM t t;",
+        " SELECT t.a\n   FROM rq467a.t t;",
+    ),
+    ("rq467a, public", "select a from t where a > 1", False): (
+        " SELECT t.a\n   FROM t\n  WHERE (t.a > 1);",
+        " SELECT t.a\n   FROM rq467a.t\n  WHERE (t.a > 1);",
+    ),
+    # The session's temporary schema is searched first: its tables print
+    # bare.
+    ("temp", "select tt.a from tt", False): (" SELECT tt.a\n   FROM tt;", None),
+    ("temp", "select tt.a from tt tt", False): (" SELECT tt.a\n   FROM tt tt;", None),
+    ("temp", "select tt.a from pg_temp.tt", False): (" SELECT tt.a\n   FROM tt;", None),
+    ("temp", "select x.a from pg_temp.tt x", False): (" SELECT x.a\n   FROM tt x;", None),
+    ("", "select t.a from rq467a.t", True): (" SELECT t.a\n   FROM rq467a.t;", None),
+    ("", "select t.a from rq467a.t t", True): (" SELECT t.a\n   FROM rq467a.t t;", None),
+}
+
+
+@pytest.mark.backlog_fixed("RP-467")
+@pytest.mark.parametrize("case", list(QUALIFIED_RELATION_ALIAS))
+def test_viewdef_qualified_relation_alias(case: tuple[str, str, bool], dsn: str) -> None:
+    path, query, materialized = case
+    kind = "materialized view" if materialized else "view"
+    got: Any
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _QUALIFIED_SETUP:
+            c.execute(q)
+        try:
+            if path == "temp":
+                c.execute("create temp table tt (a int)")
+            elif path:
+                c.execute(f"set search_path = {path}")
+            c.execute(f"create {kind} rq467v as {query}")
+            row = c.execute("select pg_get_viewdef('rq467v'::regclass)").fetchone()
+            c.execute("reset search_path")
+            again = None
+            if path and path != "temp":
+                again = c.execute("select pg_get_viewdef('rq467a.rq467v'::regclass)").fetchone()
+            got = (row[0] if row else None, again[0] if again else None)
+        except psycopg.Error as e:
+            got = (e.sqlstate, e.diag.message_primary)
+        finally:
+            c.execute("reset search_path")
+            schema = "rq467a." if path and path != "temp" else ""
+            c.execute(f"drop {kind} if exists {schema}rq467v")
+            c.execute(_QUALIFIED_SETUP[0])
+            c.execute(_QUALIFIED_SETUP[1])
+    assert got == QUALIFIED_RELATION_ALIAS[case]
+
+
 # A correlated subquery's value read from a join's column has that
 # column's type: a leaf's own, a USING join's merged one (the sides' common
 # type, `bigint` over int4 and int8), or one of the join's alias. It came

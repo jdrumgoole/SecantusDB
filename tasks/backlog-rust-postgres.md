@@ -2031,6 +2031,32 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
       Backlog-ID: RP-515
 
+## Found while working RP-467 (2026-11-08)
+
+- [ ] **A materialized view is not a dependent of the relations it
+      reads.** With `create materialized view mv as select a from s.t`, a
+      plain `drop table s.t` succeeds where PostgreSQL 15.19 refuses it
+      (2BP01 `cannot drop table s.t because other objects depend on it`,
+      DETAIL `materialized view mv depends on table s.t`), and `drop table
+      s.t cascade` or `drop schema s cascade` leaves `mv` behind where
+      PostgreSQL drops it with them. A view is followed; a materialized
+      view is not. Found by RP-467's regression test, whose cleanup relied
+      on the cascade. Measured on a private 15.19 cluster.
+      Backlog-ID: RP-525
+      Verify: tests/backlog/test_rp_found_rp467.py::test_drop_reaches_a_dependent_materialized_view
+- [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
+      exception.** PostgreSQL lets two unaliased FROM items share a name
+      when they are different relations (`select 1 from s1.t join s2.t on
+      true` runs, and only a `t.a` naming both is ambiguous), and refuses an
+      alias equal to another item's name (42712 `table name "t" specified
+      more than once`). Here the join of two unaliased `t` is that 42712,
+      since a joined row is keyed by the bare name, and `create view v as
+      select t.a from s1.t t join s2.t on s2.t.a = t.a` is accepted, its
+      definition then reading `t.a = t.a`. Measured on a private 15.19
+      cluster.
+      Backlog-ID: RP-526
+      Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
+
 ## Found while working RP-514 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
