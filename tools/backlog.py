@@ -16,6 +16,7 @@ note, a CI behaviour).
 Usage::
 
     python tools/backlog.py ids              # give every open item an ID
+                                             # (each reserved on origin first)
     python tools/backlog.py list [--file F]  # ID, verify, headline
     python tools/backlog.py verify [--file F] [--id ID ...]
     python tools/backlog.py verify --file F --regressions   # what CI runs
@@ -55,6 +56,8 @@ import json
 import os
 import pathlib
 import re
+import secrets
+import socket
 import subprocess
 import sys
 import tempfile
@@ -149,22 +152,114 @@ def retired_ids(prefix: str) -> list[int]:
     return found
 
 
-def assign_ids() -> int:
-    """Give every open item without a Backlog-ID the next free one."""
+#: Where a new ID is claimed: one ref per ID on the remote, each pointing at
+#: a parentless commit of its own. Pushing a ref that already exists with
+#: another commit is rejected (non-fast-forward), so two checkouts can never
+#: both hold one number -- the same guarantee a pushed claim branch gives.
+#:
+#: Why (2026-11-08): IDs were "one past the highest in this checkout's file".
+#: The pg-batch lanes branch from main when a batch starts and the other
+#: session files on main, so neither saw the other's new IDs for hours.
+#: RP-571 and then RP-606 were each handed out twice within the day, and the
+#: second pair reached main, where test_backlog_markers failed for everyone
+#: until one was renumbered by hand.
+RESERVED = "refs/backlog-ids/"
+REMOTE = "origin"
+
+
+class ReservationError(RuntimeError):
+    """An ID could not be reserved for a reason other than another checkout
+    holding it: no network, no such remote, no permission to push."""
+
+
+def _git(
+    repo: pathlib.Path, *args: str, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def pushed_ids(
+    prefix: str, name: str, repo: pathlib.Path = REPO, remote: str = REMOTE
+) -> list[int]:
+    """Every `prefix` number already taken on the remote: the reserved refs,
+    and every number in each of its branches' copy of the backlog file
+    `name`. The branches cover IDs filed before reservation existed and by a
+    checkout still running an older copy of this tool."""
+    fetch = _git(repo, "fetch", "--quiet", remote)
+    if fetch.returncode:
+        raise ReservationError(f"git fetch {remote}: {fetch.stderr.strip()}")
+    ls = _git(repo, "ls-remote", remote, f"{RESERVED}{prefix}-*")
+    if ls.returncode:
+        raise ReservationError(f"git ls-remote {remote}: {ls.stderr.strip()}")
+    found = [int(n) for n in re.findall(rf"{re.escape(RESERVED + prefix)}-(\d+)$", ls.stdout, re.M)]
+    refs = _git(
+        repo, "for-each-ref", "--format=%(refname)", f"refs/remotes/{remote}"
+    ).stdout.split()
+    if refs:
+        blobs = _git(
+            repo, "cat-file", "--batch", stdin="".join(f"{r}:tasks/{name}\n" for r in refs)
+        )
+        found += [int(n) for n in re.findall(rf"\b{re.escape(prefix)}-(\d+)\b", blobs.stdout)]
+    return found
+
+
+def reserve(ident: str, repo: pathlib.Path = REPO, remote: str = REMOTE) -> bool:
+    """Claim `ident` on the remote: True if this checkout now holds it, False
+    if another checkout already does. Anything else raises."""
+    tree = _git(repo, "mktree", stdin="")
+    if tree.returncode:
+        raise ReservationError(f"git mktree: {tree.stderr.strip()}")
+    branch = _git(repo, "branch", "--show-current").stdout.strip() or "(detached)"
+    # The nonce makes every claim its own commit. Two claims with the same
+    # identity, host, pid, branch and second would otherwise hash alike, and
+    # the second push would read "up to date" -- both callers holding it.
+    who = f"{socket.gethostname()} pid {os.getpid()} on {branch}, nonce {secrets.token_hex(8)}"
+    commit = _git(repo, "commit-tree", tree.stdout.strip(), "-m", f"Reserve {ident}\n\n{who}")
+    if commit.returncode:
+        raise ReservationError(f"git commit-tree: {commit.stderr.strip()}")
+    sha = commit.stdout.strip()
+    push = _git(repo, "push", "--quiet", remote, f"{sha}:{RESERVED}{ident}")
+    if push.returncode == 0:
+        return True
+    # Rejected because someone holds it, or failed? Ask who holds it now. A
+    # push that landed but whose reply was lost shows our own commit.
+    ls = _git(repo, "ls-remote", remote, f"{RESERVED}{ident}")
+    if ls.returncode == 0 and ls.stdout.strip():
+        return ls.stdout.split()[0] == sha
+    raise ReservationError(f"git push {remote} {RESERVED}{ident}: {push.stderr.strip()}")
+
+
+def assign_ids(repo: pathlib.Path = REPO, remote: str = REMOTE) -> int:
+    """Give every open item without a Backlog-ID the next free one, each
+    reserved on `remote` before it is written."""
     added = 0
     for name, prefix in FILES.items():
         path = TASKS / name
         items = parse(name)
+        missing = sorted((it for it in items if not it.id), key=lambda it: it.line)
+        if not missing:
+            continue
         used = [int(it.id.split("-")[1]) for it in items if it.id]
         # An ID is permanent and never reused, and a closed item's lives on
         # only in its regression test's marker and the changelogs: counting
         # the open items alone handed RP-029 out a second time.
         used += retired_ids(prefix)
+        used += pushed_ids(prefix, name, repo, remote)
         nxt = max(used, default=0) + 1
         lines = path.read_text(encoding="utf-8").splitlines()
         # Number top-down; insert bottom-up so earlier line numbers hold.
         new = []
-        for it in sorted((it for it in items if not it.id), key=lambda it: it.line):
+        for it in missing:
+            while not reserve(f"{prefix}-{nxt:03d}", repo, remote):
+                nxt += 1
             new.append((it, f"{prefix}-{nxt:03d}"))
             nxt += 1
         for it, ident in reversed(new):
@@ -334,7 +429,12 @@ def main() -> int:
     )
     args = ap.parse_args()
     if args.cmd == "ids":
-        print(f"assigned {assign_ids()} IDs")
+        try:
+            print(f"assigned {assign_ids()} IDs")
+        except ReservationError as exc:
+            # No unreserved ID is ever written: that is how duplicates happen.
+            print(f"backlog.py ids: could not reserve an ID: {exc}", file=sys.stderr)
+            return 1
         return 0
     items = selected(args.file, args.id)
     if args.cmd == "list":

@@ -39,7 +39,14 @@ Rust servers goes in both files, each copy with its own ID and test.
   reads as finished unless it leads with `**OPEN —`, and on a Rust item
   without `Backlog-ID` or `Verify`).
 - **`Backlog-ID`** is permanent and never reused. `python tools/backlog.py
-  ids` gives the next free one to every item without.
+  ids` gives the next free one to every item without, and RESERVES each on
+  origin first (`refs/backlog-ids/RP-nnn`, one parentless commit per ID; a
+  second claim on a ref is rejected). Never write an ID by hand: the
+  pg-batch lanes and another session filing on main each counted only
+  their own file, and RP-571 and RP-606 were each issued twice on
+  2026-11-08 -- the second pair reached main and failed
+  `test_backlog_markers` for every PR. With no network `ids` refuses
+  rather than write an unreserved ID; file the item later.
 - **`Verify:`** names the gap test(s), comma separated -- or `none --
   <reason>` when no test can check it: a performance budget, a CI or
   tooling behaviour, a crash needing a hard reboot, a design decision. Not
