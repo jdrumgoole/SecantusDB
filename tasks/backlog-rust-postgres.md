@@ -2368,13 +2368,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       or `concat` prints it through `typeout`, which cannot fail.
       Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
       Backlog-ID: RP-602
-- [ ] **`oidvector`'s `<` and `>` compare element by element.**
-      `btoidvectorcmp` orders a shorter vector first, then by elements, so
-      on PostgreSQL 15.19 `'1 2'::oidvector < '3'::oidvector` is false and
-      `'3'::oidvector < '1 2'::oidvector` true; here they are the other way
-      round, the vectors compared as int arrays.
-      Verify: tests/backlog/test_rp_found_rp575.py::test_oidvector_orders_by_length_first
-      Backlog-ID: RP-603
 - [ ] **A parameter declared `int2vector[]` or `oidvector[]` has no type.**
       A Bind of `{"1 2",3}` with type oid 1006 is `int2vector[]` to
       `pg_typeof($1)` on PostgreSQL 15.19, `($1)[2]::text` is `3` and
@@ -2392,6 +2385,40 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       15.19. Here the message quotes `"70000"`.
       Verify: tests/backlog/test_rp_found_rp575.py::test_int2vector_range_error_quotes_the_rest
       Backlog-ID: RP-605
+
+## Found while working RP-603 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp603.py`.
+
+- [ ] **A network type's BETWEEN compares its text.** `'10.0.0.10'::inet
+      between '10.0.0.2' and '10.0.0.20'` is true on PostgreSQL 15.19
+      (`network_cmp` orders 10.0.0.10 after 10.0.0.2), and so is the `cidr`
+      form; here both are false, and a column's `WHERE a BETWEEN ...` keeps
+      no row. The rewrite in `enum_order` keys an `inet` / `cidr` operand of
+      `<`, `=`, `IN` and `greatest` with `__net_sortkey`, but its BETWEEN
+      arm is the enums' and the collations' only, so the bounds compare as
+      strings.
+      Verify: tests/backlog/test_rp_found_rp603.py::test_network_between_orders_by_network_cmp
+      Backlog-ID: RP-610
+- [ ] **An array of `oidvector`s orders its elements as int arrays.**
+      `array_cmp` compares elements with the element type's B-tree support
+      function, so on PostgreSQL 15.19 `array['1 2'::oidvector] <
+      array['3'::oidvector]` is false, as is `'1 2'::oidvector < any(vs)`
+      over an `oidvector[]` that is not an `ARRAY[...]` written in place;
+      here both are true. Since RP-603 an `oidvector` operand, and each
+      element of an `ARRAY[...]` under ANY / ALL, compares by its
+      `btoidvectorcmp` key; a whole `oidvector[]` reaches
+      `compare_constants`, which has no type to go by.
+      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_array_orders_by_btoidvectorcmp
+      Backlog-ID: RP-611
+- [ ] **`oidvector`'s comparison functions are refused.**
+      `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
+      `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
+      `function ... is not supported yet`. `cmpfn` has the B-tree support
+      functions of the byte-ordered types only.
+      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
+      Backlog-ID: RP-612
 
 ## Found while working RP-529 (2026-11-08)
 

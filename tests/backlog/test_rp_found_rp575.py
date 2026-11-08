@@ -1,7 +1,7 @@
 """Gap tests of the divergences found while working RP-575 (an array of
 `int2vector` or `oidvector` was a two-dimensional int array): RP-601 (the
 array built-ins refuse a vector), RP-602 (a two-dimensional `int2vector`
-prints as text), RP-603 (`oidvector`'s `<` compares element by element),
+prints as text), RP-603 (`oidvector`'s `<` compared element by element, fixed),
 RP-604 (a parameter declared `int2vector[]` has no type) and RP-605 (an
 `int2vector` input's out-of-range error quotes only its number).
 
@@ -60,14 +60,82 @@ def test_two_dimensional_vector_text(query: str, dsn: str) -> None:
         assert pg_answer(c, query) == ("err", "42804", "array is not a valid int2vector")
 
 
-@pytest.mark.backlog("RP-603")
+@pytest.mark.backlog_fixed("RP-603")
 def test_oidvector_orders_by_length_first(dsn: str) -> None:
+    """`oidvector`'s `<` and `>` compared its vectors as int arrays, element
+    by element, where `btoidvectorcmp` orders the shorter vector first."""
     query = (
         "select '1 2'::oidvector < '3'::oidvector, '3'::oidvector < '1 2'::oidvector, "
         "'1 3'::oidvector > '2 2'::oidvector"
     )
     with psycopg.connect(dsn, autocommit=True) as c:
         assert pg_answer(c, query) == ("ok", [(False, True, False)])
+
+
+# Each answer measured on PostgreSQL 15.19 over this table: the shorter
+# vector first, then oid by oid, each unsigned (4294967295 after 5).
+_VECTORS = "(1, '1 2'), (2, '3'), (3, '2 1'), (4, ''), (5, '1 1 1'), (6, '4294967295'), (7, '5')"
+OIDVECTOR_COLUMN: dict[str, list[tuple[object, ...]]] = {
+    "select k from t603 order by v, k": [(4,), (2,), (7,), (6,), (1,), (3,), (5,)],
+    "select k from t603 order by v desc, k": [(5,), (3,), (1,), (6,), (7,), (2,), (4,)],
+    "select k from t603 where v < '2 0' order by k": [(1,), (2,), (4,), (6,), (7,)],
+    "select k from t603 where v > '3' order by k": [(1,), (3,), (5,), (6,), (7,)],
+    "select k from t603 where v between '3' and '1 1' order by k": [(2,), (6,), (7,)],
+    "select k from t603 where v not between '3' and '1 1' order by k": [
+        (1,),
+        (3,),
+        (4,),
+        (5,),
+    ],
+    "select k from t603 where '3' < v order by k": [(1,), (3,), (5,), (6,), (7,)],
+    "select k, v < '3' from t603 order by k": [
+        (1, False),
+        (2, False),
+        (3, False),
+        (4, True),
+        (5, False),
+        (6, False),
+        (7, False),
+    ],
+    "select k from t603 where v < any(array['2 0'::oidvector]) order by k": [
+        (1,),
+        (2,),
+        (4,),
+        (6,),
+        (7,),
+    ],
+    "select k, rank() over (order by v) from t603 order by k": [
+        (1, 5),
+        (2, 2),
+        (3, 6),
+        (4, 1),
+        (5, 7),
+        (6, 4),
+        (7, 3),
+    ],
+    "select greatest(v, '2 0')::text from t603 where k in (3, 5) order by k": [
+        ("2 1",),
+        ("1 1 1",),
+    ],
+    "select least(v, '1')::text from t603 where k in (1, 4) order by k": [("1",), ("",)],
+    # `max` / `min` are `array_larger` / `array_smaller` over anyarray: an
+    # array's order, element by element, on PostgreSQL too.
+    "select max(v)::text, min(v)::text from t603": [("4294967295", "")],
+}
+
+
+@pytest.mark.backlog_fixed("RP-603")
+@pytest.mark.parametrize("query", list(OIDVECTOR_COLUMN))
+def test_oidvector_column_orders_by_length_first(query: str, dsn: str) -> None:
+    """A column's sort, comparisons, BETWEEN, ANY and `greatest` / `least`
+    ordered as int arrays too, with or without an index on it."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists t603")
+        c.execute("create table t603 (k int, v oidvector)")
+        c.execute(f"insert into t603 values {_VECTORS}")
+        assert pg_answer(c, query) == ("ok", OIDVECTOR_COLUMN[query])
+        c.execute("create index on t603 (v)")
+        assert pg_answer(c, query) == ("ok", OIDVECTOR_COLUMN[query])
 
 
 def _int2vector(nums: list[int]) -> bytes:

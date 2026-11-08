@@ -5313,3 +5313,25 @@ fn a_cast_to_a_domain_with_a_modifier_has_a_typmod() {
     }
     domains::set_user_domains(Vec::new());
 }
+
+/// RP-603: an `oidvector`'s order key orders as `btoidvectorcmp` -- the
+/// shorter vector first, then oid by oid, each unsigned -- and carries the
+/// vector's text after its `|`, which `greatest` / `least` read back.
+#[test]
+fn oidvector_key_orders_as_btoidvectorcmp() {
+    let key = |text: &str| match crate::range_ops::sort_key(&Bson::String(text.into()), "oidvector")
+    {
+        Ok(Bson::String(k)) => k,
+        other => panic!("for {text:?}: {other:?}"),
+    };
+    let ordered = ["", "3", "5", "4294967295", "1 2", "2 1", "1 1 1"];
+    for pair in ordered.windows(2) {
+        assert!(key(pair[0]) < key(pair[1]), "{:?} < {:?}", pair[0], pair[1]);
+    }
+    assert_eq!(key("1 2"), key("1  2"));
+    assert_eq!(key("1 2").rsplit_once('|').map(|(_, t)| t), Some("1 2"));
+    assert_eq!(
+        crate::range_ops::sort_key(&Bson::Null, "oidvector").ok(),
+        Some(Bson::Null)
+    );
+}
