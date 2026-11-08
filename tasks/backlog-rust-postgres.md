@@ -2367,14 +2367,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `t569c(c char(3))` holding `'xy'`; `d569c` over `char(3)` and `t569d(a
 d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
 
-- [ ] **An `ARRAY(select c ...)` over a `char(n)` column drops its
-      blanks.** On PostgreSQL 15.19 `select array(select c from t569c)` is
-      `{"xy "}`, as `array[c]` and `array_agg(c)` are; here it is `{xy}`,
-      through a WITH and a UNION ALL too. The subquery's value is cast to
-      its column's array type without the column's modifier (`bpchar[]`),
-      and the value is stored without its padding.
-      Verify: tests/backlog/test_rp_found_rp569.py::test_array_subquery_keeps_char_padding
-      Backlog-ID: RP-656
 - [ ] **A domain column reached through a join, a WITH or a set operation
       is typed by its base in an array.** On PostgreSQL 15.19 `select
       array[a] from t569d x join t569c on true`, `array(select a from t569d
@@ -2413,6 +2405,30 @@ tests are in `tests/backlog/test_rp_found_rp655.py`.
       cast to its domain (`cast_array_subquery_column`).
       Verify: tests/backlog/test_rp_found_rp655.py::test_scalar_subquery_over_a_domain_column_is_of_the_domain
       Backlog-ID: RP-665
+
+## Found while working RP-656 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp656.py`: `t656(c char(3), v varchar(4), n
+numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
+
+- [ ] **A scalar subquery over a `char(n)` column drops its blanks.**
+      `select (select c from t656)` is `xy ` on PostgreSQL 15.19 and
+      `octet_length((select c from t656))` 3; here they are `xy` and 2.
+      The subquery's value, stored without its padding, is cast to the
+      column's type without its modifier (`bpchar`), where the ARRAY
+      sublink is cast at it since RP-656. Its RowDescription modifier is
+      RP-497's.
+      Verify: tests/backlog/test_rp_found_rp656.py::test_scalar_subquery_keeps_char_padding
+      Backlog-ID: RP-666
+- [ ] **An `ARRAY(select n ...)` over a `numeric(p,s)` column describes no
+      modifier.** `select array(select n from t656)` describes `numeric[]`
+      327686 on PostgreSQL 15.19 (`exprTypmod` of an ARRAY sublink is its
+      column's); here it is -1. Since RP-656 a `char(n)` or `varchar(n)`
+      column's array is cast at its modifier and describes it; a numeric
+      one is declared as `numeric[]`, which carries none.
+      Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
+      Backlog-ID: RP-667
 
 ## Found while working RP-570 (2026-11-08)
 

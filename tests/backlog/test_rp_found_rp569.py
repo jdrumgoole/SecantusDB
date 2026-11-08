@@ -4,8 +4,8 @@ from a domain-typed column is the domain's array):
 - a cast of a domain column to its own domain checked the domain's
   constraints, so a row stored before a `NOT VALID` CHECK failed it
   (fixed, RP-655);
-- an `ARRAY(select c ...)` subquery over a `char(n)` column drops the
-  column's blanks;
+- an `ARRAY(select c ...)` subquery over a `char(n)` column dropped the
+  column's blanks (fixed, RP-656);
 - a domain column read through a join, a WITH or a set operation is
   typed by its base type in an array.
 
@@ -103,7 +103,8 @@ _BPCHAR_ARRAY = 1014
 
 # An ARRAY subquery is the array of its column's type, the column's
 # modifier included: a `char(3)` value keeps its blanks in it, as it does
-# in `ARRAY[c]` and `array_agg(c)`.
+# in `ARRAY[c]` and `array_agg(c)`. The values were cast to `bpchar[]`, so
+# they lost them, until RP-656 cast them to `character(3)[]`.
 CHAR_ARRAYS = {
     "select array(select c from t569c)": (_BPCHAR_ARRAY, [(["xy "],)]),
     "with q as (select c from t569c) select array(select c from q)": (
@@ -117,7 +118,7 @@ CHAR_ARRAYS = {
 }
 
 
-@pytest.mark.backlog("RP-656")
+@pytest.mark.backlog_fixed("RP-656")
 @pytest.mark.parametrize("query", list(CHAR_ARRAYS))
 def test_array_subquery_keeps_char_padding(query: str, dsn: str) -> None:
     with _connect(dsn) as c:

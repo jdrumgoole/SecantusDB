@@ -22266,6 +22266,24 @@ fn declare_sublink_param(at: usize, t: &str) {
     });
 }
 
+/// The `typmods` a `TypeName` of length type `base` (`bpchar`, `varchar`)
+/// spells `typmod` with, as the parser leaves them for `character(3)`: the
+/// declared length, the varlena header taken off. Empty for any other type
+/// or no modifier.
+fn length_typmods(base: &str, typmod: i32) -> Vec<pg_query::protobuf::Node> {
+    if !matches!(base, "bpchar" | "varchar") || typmod < 4 {
+        return Vec::new();
+    }
+    vec![pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Ival(
+                pg_query::protobuf::Integer { ival: typmod - 4 },
+            )),
+            ..Default::default()
+        })),
+    }]
+}
+
 /// A `TypeName` for an internal type name (`int4`, `text[]`).
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
@@ -22631,9 +22649,11 @@ fn resolve_one_sublink(
         }
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
-            let ty = sub_plan_def(&plan, lookup)
+            let column = sub_plan_def(&plan, lookup)
                 .ok()
-                .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+                .and_then(|d| d.columns.first().map(|c| (c.pg_type.clone(), c.typmod)));
+            let typmod = column.as_ref().map_or(-1, |(_, m)| *m);
+            let ty = column.map(|(t, _)| t);
             // An `int2vector` / `oidvector` row value is one element of the
             // array, carried as its text there: as the int array it is
             // carried as, it read as one more dimension of ints (RP-575).
@@ -22677,10 +22697,17 @@ fn resolve_one_sublink(
             if domain {
                 return Ok(relabel_cast(node, &array));
             }
+            // The array is of the column's type at the column's modifier
+            // (`exprTypmod` of an ARRAY sublink is its column's): a
+            // `char(n)` value is stored without its blanks, and the cast
+            // to `character(n)[]` gives them back, as `array[c]` and
+            // `array_agg(c)` have them (RP-656).
+            let mut type_name = type_name_node(&array);
+            type_name.typmods = length_typmods(base, typmod);
             Ok(pg_query::protobuf::Node {
                 node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                     arg: Some(Box::new(node)),
-                    type_name: Some(type_name_node(&array)),
+                    type_name: Some(type_name),
                     location: -1,
                 }))),
             })
