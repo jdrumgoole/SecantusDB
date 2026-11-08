@@ -2171,16 +2171,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       `pg_describe_object` of a routine shares that text.
       Backlog-ID: RP-567
       Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
-- [ ] **A view dropped by CASCADE leaves the routines over its row type.**
-      On PostgreSQL 15.19 `drop table w568`, with a view `w568v` over it and
-      `w568f(w568v)`, names `view w568v depends on table w568` and then
-      `function w568f(w568v) depends on type w568v`, and CASCADE drops the
-      function too. Here the DETAIL names only the view, and the function
-      outlives it (`drop_rule_dependent` removes the view without asking
-      `row_type_dependents`). A direct DROP VIEW or DROP MATERIALIZED VIEW
-      answers as PostgreSQL does since RP-546.
-      Backlog-ID: RP-568
-      Verify: tests/backlog/test_rp_found_rp546.py::test_cascaded_view_takes_its_row_type_dependants
 
 ## Found while working RP-527 (2026-11-08)
 
