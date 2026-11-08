@@ -534,23 +534,15 @@ resolved typed values of a `SELECT` source are captured and re-encoded through
 `encode_field_value` / `encode_binary`, with the FETCH's `RowDescription`
 reporting the binary format). Companion planner fix:
 `select generate_series(...)::type` (a cast over a FROM-less set-returning
-target) is now planned as a per-row cast; a WHERE over such a series is refused
-rather than silently dropped. Two of the sixteen remain open — see below.
+target) is now planned as a per-row cast, and (2026-09-27) a WHERE or HAVING
+over such a series is evaluated as the constant predicate it can only be — no
+column is in scope, so an output alias there is `42703` at the reference, as
+PostgreSQL has it (`test_cast_predicates_and_from_less_series_references`;
+`test_cursor_server.py::test_no_result`'s shape answers `[]` with one column).
+One of the sixteen remains open — see below.
 
-- [ ] **OPEN — a WHERE clause over a FROM-less `generate_series` target is
-      refused, not evaluated (`select generate_series(1,3) where false`).**
-      This blocks `test_cursor_server.py::test_no_result` (2 cases: sync +
-      async), which expects `[]`. As of 2026-09-08 `plan_select_srf` refuses a
-      WHERE with `0A000` (matching the sibling `plan_series_select`, which
-      refuses `FROM generate_series(...) WHERE ...` for the same reason) — an
-      honest error rather than the previous silent divergence, but still a
-      failure against PG, which returns the filtered rows. A real fix must
-      evaluate the predicate over the synthetic series column (plan the
-      `where_clause` into the `Select.filter` and apply it to the generated
-      docs, which the series executor path does not do today). Sized as a
-      planner/executor slice, not a state check — deferred from this batch.
-      Binary server cursors over non-`SELECT` DECLARE sources (VALUES /
-      aggregate / FROM-less constant) are likewise not re-encodable: only a
+- [ ] **OPEN — binary server cursors over non-`SELECT` DECLARE sources
+      (VALUES / aggregate / FROM-less constant) are not re-encodable.** Only a
       `SELECT` source captures typed values, so a binary FETCH of those falls
       back to the text bytes. Untested by the psycopg suite; note if a gauge
       ever exercises it.
@@ -648,68 +640,26 @@ remain open:
       on — `create table t (x int); do $$ begin execute 'insert into t
       values (1)'; raise exception 'boom'; end $$; select count(*) from t`
       is `0` on PG and `1` here.
-- [ ] **OPEN — RUST pgserver: a non-boolean constant WHERE over
-      `generate_series` carries no error POSITION (2026-09-09).** `select 1
-      from generate_series(1,3) where 1` is `42804 argument of WHERE must be
-      type boolean, not type integer` on both, but PG 16.15 sets `P` = 42
-      (the `1`) and the Rust server sends no position; the planner has no
-      positioned-error channel beyond `identifier_position` for `42P01`.
-- [ ] **OPEN — RUST pgserver: an UNQUOTED reserved word is accepted as a
-      `regtype` name (2026-09-09).** With a type named `"order"`,
-      `'order'::regtype` is `42601 syntax error at or near "order"` (context
-      `invalid type name "order"`, position at the literal) on PG 16.15; the
-      Rust server resolves it to `"order"`. Only the quoted spelling
-      `'"order"'::regtype` should resolve.
-- [ ] **OPEN — RUST pgserver: `DROP TABLE IF EXISTS` on a missing table is
-      silent (2026-09-09).** PG 16.15 emits `NOTICE: table "t" does not
-      exist, skipping`; the Rust server sends no `NoticeResponse`. The
-      notice seam now exists (added for `RAISE`), so this is a one-site fix.
-- [ ] **OPEN — RUST pgserver: residuals of the wide-`numeric` slice
-      (2026-09-09).** Values wider than Decimal128 now store exactly as
-      `{__numeric: <canonical text>, __numkey: <byte-sortable key>}`
-      (`secantus-pgplan/src/numeric.rs`); round-trip, `::text`, comparison,
-      ORDER BY, `+ - * /`, `sum` / `min` / `max` and the numeric PRIMARY KEY
-      path all match PG 16.15. Left open, each measured:
-  - `numeric(p, s)` typmod is parsed and ignored: `create table t (n
-    numeric(5, 2))` stores `1.234` as `1.234`; PG rounds to `1.23` and
-    refuses a value with more than `p - s` integer digits (22003).
-  - `avg(numeric)` is unsupported (`sum` / `min` / `max` / `count` are);
-    PG returns numeric at the division scale rule.
-  - a bare string literal against a numeric column is not coerced in WHERE:
-    `where n = 'NaN'` / `where n > '1e40'` compare as text; PG coerces the
-    unknown-typed literal to numeric. Cast it (`'NaN'::numeric`) or bind a
-    parameter.
-  - a numeric-column predicate lowers to an `$or` of a Decimal128 arm and a
-    `__numkey` arm (plus a NaN arm for `>` / `>=`), so it never IXSCANs a
-    secondary index — moot today because `CREATE INDEX` is itself
-    unsupported on the Rust pgserver (`IndexStmt is not supported yet`); the
-    `_id` index (numeric PRIMARY KEY) does resolve by value.
-  - `UPDATE t SET pk = <wide value>` on a numeric PRIMARY KEY bypasses the
-    value-equality duplicate precheck that INSERT runs (`UPDATE` of a
-    primary-key column is refused with 0A000 today, so unreachable until
-    that lands — keep the two together).
-  - `float4` / `float8` columns keep MQL's NaN placement (below every
-    number) in WHERE; PG puts NaN above infinity for floats too. Only
-    `numeric` was moved in this slice.
-- [ ] **OPEN — RUST pgserver: no `pg_constraint` virtual table, and multi-column
-      FOREIGN KEYs / `ON DELETE SET DEFAULT` are refused `0A000` (2026-09-09).**
-      NOT NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog + enforcement;
-      the same catalog document shape the Python server writes). `pg_constraint`
-      queries still answer `42P01`.
-
-      **The column-level `UNIQUE` half of this entry was FIXED 2026-09-18.** It
-      had been accepted and silently not enforced — a second equal value
-      inserted where PostgreSQL answers `23505`, which is silent data
-      corruption rather than a missing feature. It is now backed by a storage
-      unique index carrying a partial filter that excludes NULL from every
-      column (SQL NULLs are distinct; `sparse` would NOT do it, because a SQL
-      NULL is stored as an explicit null rather than a missing field). Error
-      surface probed against **PostgreSQL 14.13**, not the PG 16 this entry
-      used to cite — 16 is not installed on this box. Two adjacent bugs went
-      with it: `DEFERRABLE` attached to the most recent FOREIGN KEY whatever it
-      actually qualified, and the UPDATE path never reached the PostgreSQL
-      error renderer at all, so any unique violation there (the PRIMARY KEY one
-      included) leaked `E11000` with no SQLSTATE.
+- [ ] **OPEN — RUST pgserver: a `numeric`-column predicate never IXSCANs
+      (2026-09-09, re-measured 2026-09-23).** Values wider than Decimal128
+      store exactly as `{__numeric: <canonical text>, __numkey: <byte-sortable
+      key>}` (`secantus-pgplan/src/numeric.rs`); round-trip, `::text`,
+      comparison, ORDER BY, `+ - * /`, `sum` / `avg` / `min` / `max`, the
+      numeric PRIMARY KEY path, unknown-literal coercion in WHERE, NaN
+      placement, and the `numeric(p, s)` typmod (rounding to `s`, `22003`
+      above `p - s` integer digits, on INSERT, UPDATE and casts) all match PG
+      16.15. Left open: a numeric-column predicate lowers to an `$or` of a
+      Decimal128 arm and a `__numkey` arm (plus a NaN arm for `>` / `>=`), so
+      it never IXSCANs a secondary index — moot today because `CREATE INDEX`
+      is itself unsupported on the Rust pgserver (`IndexStmt is not supported
+      yet`); the `_id` index (numeric PRIMARY KEY) does resolve by value.
+- [ ] **OPEN — RUST pgserver: multi-column FOREIGN KEYs and `ON DELETE SET
+      DEFAULT` are refused `0A000` (2026-09-09, re-measured 2026-09-23).**
+      NOT NULL / CHECK / FOREIGN KEY / UNIQUE all landed (catalog +
+      enforcement; the same catalog document shape the Python server writes),
+      and `pg_constraint` / `pg_index` / `pg_indexes` / `pg_get_constraintdef`
+      / `pg_get_indexdef` now reflect them. Only the two multi-column / SET
+      DEFAULT shapes remain unsupported.
 - [ ] **OPEN — RUST pgserver: a write that conflicts with a prepared
       transaction is not a lock wait (2026-09-17).** Two-phase commit landed
       (`PREPARE TRANSACTION` / `COMMIT PREPARED` / `ROLLBACK PREPARED` /
@@ -749,27 +699,6 @@ remain open:
       TABLE DROP COLUMN` to drop them with, so the CASCADE form is refused
       `0A000` ("drop the table first"). Without CASCADE the dependency is
       refused `2BP01` as PG does.
-- [ ] **OPEN — RUST pgserver: `timestamptz::timestamp` keeps the UTC clock
-      (2026-09-17).** PG converts the instant to the SESSION zone's wall
-      clock (`'2030-01-01 12:00:00+02'::timestamptz::timestamp` is
-      `11:00:00` under `Europe/Berlin`); this server answers `10:00:00`,
-      both for a constant and for a stored column. The `::text` twin was
-      fixed with the role catalog (the cast chain now carries the source
-      type); the `timestamp` target still sees only the UTC carrier.
-- [ ] **OPEN — RUST pgserver: `SELECT *` / `t.*` over a JOIN or a comma
-      FROM (2026-09-10).** `select * from t1, t2` and `select t1.*, t2.f3
-      from t1 join t2 on ...` are 0A000 `this subquery target`; the join
-      planner expands only named targets. (The comma FROM itself, `regclass`
-      and the RowDescription's `ftable` / `ftablecol` landed with
-      `test_ftable_and_col`; a table created before row types were recorded
-      has no relation oid and still reports 0 / 0, and aggregate outputs
-      report 0 / 0 without measuring PostgreSQL.)
-- [ ] **OPEN — RUST pgserver: a cast to an unknown type is 0A000, not 42704
-      (2026-09-09).** `select 1::no_such_type` is `0A000 a cast to
-      no_such_type is not supported yet`; PostgreSQL 16 is `42704 type
-      "no_such_type" does not exist`. The cast dispatcher falls through to
-      "unsupported" for every name it has no arm for, so a real unknown type
-      and a real-but-unimplemented type are indistinguishable to the client.
 - [ ] **OPEN — RUST pgserver: a session inside a transaction block does not
       see a table another connection committed AFTER the block opened
       (2026-09-09).** `a: begin; ... b: create table t; ... a: select * from
@@ -2094,46 +2023,47 @@ These work end-to-end but cut corners.
   clause at all, so the query is 42P01. Only reached by a client that
   introspects a sequence directly — `nextval` / `currval` / `setval` and
   `information_schema.sequences` all work.
-- [ ] **OPEN — the RUST pgserver has none of the Python side's assignment /
-  coercion error codes (noted 2026-09-01, NOT measured against a running Rust
-  server).** The Python server gained `42804` for an unassignable
-  `UPDATE … SET`, and split datetime coercion into `22007` (unparseable) /
-  `22008` (datetime-shaped, field out of range), keeping `22P02` for the
-  numeric types. `grep` over `crates/` finds **no `42804`, `22007` or `22008`
-  at all** — only the shared `invalid input syntax for type …` wording in
-  `secantus-pgserver/src/lib.rs` and `secantus-pgplan/src/lib.rs` — so the Rust
-  server most likely answers one code for all of these and does no assignment
-  typecheck.
-
-  This is the exact shape CLAUDE.md warns about: a fix lands on one side and
-  nothing but a grep tells the other. **Confirm by running the shapes in
-  `tests/test_sql_assignment_types.py` against the Rust pgserver before
-  building anything** — the Python side's own history here is that a filed
-  description was wrong twice in one session. Deliberately not fixed in the
-  same batch: `rust-pgserver-date-time` was an active branch when this was
-  written and owns that surface.
+- [ ] **OPEN — RUST pgserver: two residual assignment-typing shapes (measured
+  2026-09-27 against PostgreSQL 16.15).** The 2026-09-01 claim that the Rust
+  server had "none of" the assignment / coercion error codes was measured on
+  2026-09-27 over 52 shapes (`UPDATE … SET` and `INSERT … VALUES` of literals,
+  columns, casts, subqueries into every column family) and was wrong: every
+  `42804` / `22P02` / `22007` / `22008` / `42601` code and message already
+  matched, and the 13 differences were all POSITIONS (`UPDATE t SET i = 'abc'`
+  and `INSERT … VALUES ('abc')` are positioned at the literal; the two INSERT
+  column-count `42601`s point at the first excess expression / first unfilled
+  target column) plus the scalar-subquery typecheck (`SET i = (select 'x')`
+  is 42804 "expression is of type text" at the `(`, not 22P02 on the value it
+  yields) — all fixed the same day, 0 of 52 diverge. The same sweep found
+  `42703` unpositioned everywhere and unqualified for `a.nosuch` (PG says
+  `column a.nosuch does not exist`, unquoted, at the qualifier), a JOIN's
+  `ON a.nosuch = b.i` raised at execution time instead of plan time, and
+  `WHERE a.i IS NULL` resolving the QUALIFIER as the column (`column "a"
+  does not exist`) — all fixed the same day, 0 of 27 diverge
+  (`tests/test_rust_pgserver_slice.py::test_undefined_column_is_positioned_and_qualified_like_postgresql`).
+  `INSERT INTO t (i) SELECT (select 'x')` (no plan-time assignment typecheck
+  on the INSERT..SELECT path) and `(select $1)` inside SET (`0A000 SubLink`
+  where PG is `42P02 there is no parameter $1`) were fixed 2026-09-27: the
+  INSERT..SELECT items are checked like VALUES items, and an unbound `$n`
+  is `42P02` at the reference on every path, resolved before the function
+  lookup and grouping and after relation / earlier-column faults
+  (`test_insert_select_typechecks_literal_and_subquery_items`,
+  `test_unbound_parameter_is_42p02_at_the_reference`). The non-boolean
+  constant WHERE over `generate_series` (`where 'x'` wants 22P02 at P=44)
+  seen in the same sweep was fixed the same day with the FROM-less series
+  predicates.
 
 - [ ] **OPEN — RUST pgserver: a wide-year / BC `timestamptz` is not rendered
-  with its tz offset (noted 2026-09-07).** `rust-pgserver-timestamp` added
-  pass-through for PostgreSQL's out-of-Python-range date/timestamp values
-  (`infinity` / `-infinity`, years > 9999, BC, and the `epoch` keyword), and
-  canonicalises a wide/BC *plain* `timestamp` to `HH:MM:SS` text. `infinity`
-  is tz-independent and correct for `timestamptz` too, but a wide/BC
-  `timestamptz` still returns the no-offset form: PG renders
-  `'10000-01-01 12:00'::timestamptz::text` as `10000-01-01 12:00:00+00` and a
-  BC one with a full historical LMT offset (`... -00:01:15 BC` under GB), which
-  needs real session-tz math this batch did not attempt. Only `::timestamp`
-  shapes are in the differential lane; the `::timestamptz` wide/BC offset is
-  unproven. `special_timestamp_text` / `canonical_wide_timestamp` in
-  `secantus-pgplan/src/lib.rs` are where it would land. Also NOT handled: the
-  clock-dependent input keywords `now` / `today` / `tomorrow` / `yesterday`
-  (only the constant `epoch` is). **2026-09-09:** the BINARY form of a
-  wide/BC `timestamptz` is now byte-identical to PostgreSQL 16
-  (`10000-01-01 12:00:00` → `0380e715a0273000`, `1000-01-01 12:00+00:00 BC` →
-  `feafc61e5374f000`; `timestamp_text_to_pg_micros`), so binary cursors read
-  them correctly; only the TEXT offset is still open — re-measured: PG renders
-  `10000-01-01 12:00:00+00` (UTC) / `+01` (Europe/Rome) and the BC one as
-  `1000-01-01 12:00:00+00:49:56 BC` under Rome; ours has no offset on either.
+  with its tz offset (noted 2026-09-07, re-measured 2026-09-23).** PG renders
+  `'10000-01-01 12:00'::timestamptz::text` as `10000-01-01 12:00:00+00` (UTC)
+  / `+01` (Europe/Rome) and a BC one with a full historical LMT offset
+  (`1000-01-01 12:00:00+00:49:56 BC` under Rome); ours has no offset on
+  either. The BINARY form is byte-identical to PostgreSQL 16
+  (`timestamp_text_to_pg_micros`), so binary cursors read them correctly;
+  only the TEXT offset is open. `special_timestamp_text` /
+  `canonical_wide_timestamp` in `secantus-pgplan/src/lib.rs` are where it
+  would land. (`now` / `today` / `tomorrow` / `yesterday` / `epoch` input
+  keywords landed 2026-09-23.)
 
 - [ ] **OPEN — RUST pgserver: named-zone `timestamptz` LOADING — the 6
   `test_load_datetimetz_tz[Europe/Rome ...]` failures noted 2026-09-08 PASS as
@@ -2159,28 +2089,6 @@ These work end-to-end but cut corners.
   `secantus-pgplan`, which threads the session zone through the result
   render; the paragraph is kept for the array-DateStyle gap only.)
 
-- [ ] **OPEN — RUST pgserver column metadata (`typmod` / `typlen`): landed
-  for constant SELECTs, deferred for table columns and computed expressions
-  (measured 2026-09-08 against PostgreSQL 16, PR for `pgserver-column`).** The
-  `RowDescription` now sends a real per-type `typlen` (`type_size`) for every
-  wire type and the declared `atttypmod` (`type_modifier`) of a
-  `select null::type(mod)` cast — `numeric(p,s)`, `varchar(n)` / `char(n)`,
-  `bit(n)` / `varbit(n)`, `time` / `timestamp` / `interval` precision — matching
-  PG field-for-field; `bit` / `varbit` now carry oids 1560 / 1562. This cleared
-  all 46 failing `test_column.py` cases (53/53). **`typlen` is right EVERYWHERE**
-  (a pure OID lookup in `field()`), so `internal_size` is correct on every
-  path. **`typmod` is threaded ONLY through the `SelectConstant` cast path**
-  (`cast_typmod` in `secantus-pgplan`, the 4th tuple element on
-  `SelectConstant.columns`). Still `-1` (no modifier) for: a modifier declared
-  on a **table column** (`create table t (a numeric(10,2))` then `select a` —
-  the catalog `pg_type` string drops the `(10,2)`), and a modifier on a
-  **computed/aliased expression** in a SELECT with a FROM (the `Select` /
-  `Aggregate` describe paths at `lib.rs:~3690` / `~5660` still call `field(...)`
-  with no typmod). Propagating those needs the modifier carried on the catalog
-  column definition and on `ColumnExpr`, which this batch did not attempt.
-  Value decoding is unchanged (description metadata only). Non-null `::bit` /
-  `::varbit` casts remain unsupported at the value layer (`cast_value` —
-  pre-existing, separate item).
 
 - [ ] **OPEN — RUST pgserver `client_encoding`: two result-OID gaps and binary
   text ARRAYS remain (LATIN1 / LATIN9 transcoding landed, PR #1413, measured
@@ -2909,87 +2817,18 @@ These are explicit non-goals. Don't add them without a reason.
 
 ## 5. Known bugs and edge cases to watch
 
-- **Rust PG server: an `inet[]` / `cidr[]` cast to TEXT keeps a max-length
-  mask** (`{127.0.0.1/32}`) where PostgreSQL's `inet_out` drops it
-  (`{127.0.0.1}`). The array text renderer (`render_array_element`) is
-  type-blind, so it cannot apply the `net::text_out` rule the scalar column
-  path uses. The inet/cidr COLUMN round-trip and binary-array params are
-  unaffected (0-divergence); only the explicit `::text` cast of an array
-  diverges. Needs element-type threading into `render_array`. (2026-09-07)
 
-- [ ] **OPEN — RUST pgserver range family, what is left (measured 2026-09-09).**
-  psycopg's `tests/types/test_range.py` + `test_multirange.py` are at 479
-  passed / 1 failed / 24 xfailed against the Rust PG server (was 72 failed);
-  the one failure is `test_literal_invalid_name[order]`, the reserved-keyword
-  `regtype` quoting item below. Shipped 2026-09-09: literal-beside-range-array
-  param typing (the 36-test `test_dump_builtin_array_wrapper` campaign, built
-  the canonicalising way — `'{"[1,5]"}' = [Int4Range(1,6,'[)')]` is True and
-  `= [Int4Range(1,5,'[)')]` is False, both formats), untyped binary range /
-  multirange params typed from context (comparison operand or `$1::int4range`
-  cast), custom range value round-trip in every format (constructor, casts,
-  binary codec, schema-qualified names, `testmultirange`), `range_out` quoting
-  fidelity, range accessors, three-valued `AND`/`OR`/`NOT` in a constant
-  select, and COPY canonical form. Still open, all pre-existing and measured
-  against PG 16:
-  - `isempty(%s)` with an UNTYPED parameter is PG `42725 function
-    isempty(unknown) is not unique`; ours is `0A000`.
-  - A malformed range literal error carries only the first line; PG adds the
-    `LINE 1:` context and, for a bad bound, a `DETAIL:` line.
-  - `RangeSubselect` (`from (select ...)`) is unsupported in the range
-    corpus's few subquery shapes — a general planner gap, not a range one.
-
-- [ ] **OPEN — RUST pgserver prepared-statement / uuid / string campaign, what
-  is left (measured 2026-09-09).** psycopg's `tests/test_prepared.py` +
-  `tests/types/test_uuid.py` + `tests/types/test_string.py` are at 190
-  passed / 0 failed against the Rust PG server (was 45 failed). Shipped:
-  `pg_prepared_statements` (session registry of NAMED Parse statements —
-  `parameter_types` / `result_types` as regtype display names, `prepare_time`
-  timestamptz, `from_sql` false, generic / custom plan counts; protocol
-  `Close`, `DEALLOCATE <name>` (26000 when missing) and `DEALLOCATE ALL`
-  remove rows), `NOTIFY` (a no-op tag then; since 2026-09-09 LISTEN / UNLISTEN /
-  NOTIFY / `pg_notify` deliver asynchronously across connections — before the
-  statement's ReadyForQuery outside a block, at COMMIT inside one, unprompted
-  to an idle listener), a zero-oid Parse of `$1::uuid`
-  described from the cast, `uuid_in`'s hyphen-after-any-hex-group and brace
-  forms, uuid / bytea / `uuid[]` / `bytea[]` BINARY results, a NUL byte in a
-  binary text parameter as 22021, `inet` / `cidr` and their arrays as BINARY
-  results too (psycopg decodes a whole row with column 0's format, so one text
-  column in a binary row was "unexpected number of dimensions"), `inet[]` text
-  dropping a host address's full mask (`{::1}`, not `{::1/128}` — PG's
-  `inet_out` per element), `format` / `concat` / `concat_ws` /
-  `num_nulls` / `num_nonnulls` / `json(b)_build_*` with an untyped parameter
-  as 42P18 naming PG's parameter, COPY OUT mid-stream errors no longer
-  followed by a CopyFail (the client then said "you cannot mix COPY with
-  other operations"), `UPDATE … SET col = <row expression>` (`num * 2`,
-  `upper(s)`, `s || 'x'`, `coalesce(num, 0)`, `num::text`), and savepoint
-  restore of a CREATE TYPE on a store with no committed tables (the restore
-  read the catalog through a fresh WT session blind to the transaction's own
-  collection creation). Still open, all pre-existing and measured against PG
-  16:
-  - `select $1 is null` with an untyped parameter: PG `42P18 could not
-    determine data type of parameter $1`; ours `NullTest is not supported
-    yet` / 0A000 (the same `NullTest` gap as the `pg_sleep` item).
-  - `select $1 = 1` bound with `'a'`: PG resolves `$1` as integer and fails
-    22P02 `invalid input syntax for type integer: "a"`; ours 0A000
-    `comparing string with int32`.
-  - `to_json($1)` / `to_jsonb($1)` untyped: PG 42804 `could not determine
-    polymorphic type because input has type unknown`; ours 0A000 (`to_json`
-    is not implemented at all — `select to_json('a'::text)` is 0A000 too).
-  - `format($1, 'b')`: PG evaluates (`'x'`); ours 0A000 — `format()` is
-    unimplemented, only its untyped-parameter refusal is in place.
-  - `text * integer` (`update ut set num = s * 2`, `select s * 2 from ut`):
-    PG 42883 `operator does not exist: text * integer`; ours 0A000.
-  - A row expression over a `timestamp` column loses the sub-millisecond
-    remainder: `select ts + interval '1 hour' from ut` and `ts::text` over a
-    stored `00:00:00.123456` answer `.123`; `apply_row_expr` reads the bare
-    BSON date, not the companion field. Same for UPDATE SET.
-  - `UPDATE ut SET id = id + 1` on the primary-key column: PG performs it
-    (`UPDATE 1`); ours 0A000 `UPDATE of a PRIMARY KEY column is not supported yet`.
-  - `DEALLOCATE` clears the handler's registry but not pgwire's statement
-    store, so a later `EXECUTE`-by-name over the protocol still finds the
-    statement (psycopg never does this — it re-prepares).
-  - `information_schema.columns` for a catalog VIEW (`where table_name =
-    'pg_prepared_statements'`) is `relation "columns" does not exist`.
+- [ ] **OPEN — RUST pgserver range family, what is left (measured 2026-09-09,
+  re-measured 2026-09-23).** psycopg's `tests/types/test_range.py` +
+  `test_multirange.py` are at 479 passed / 1 failed / 24 xfailed against the
+  Rust PG server; that one failure, `test_literal_invalid_name[order]`, was
+  the reserved-keyword `regtype` quoting bug, fixed 2026-09-27 (the three
+  parametrizations pass). `isempty(%s)` untyped (42725) and `RangeSubselect`
+  landed 2026-09-23. Still open:
+  - A malformed range literal error carries only the first line; PG adds a
+    `DETAIL:` line for a bad bound (`Unexpected end of input.` / `Missing left
+    parenthesis or bracket.`) and the statement position (`LINE 1:` context,
+    `diag.statement_position`); ours sends neither.
 
 - [ ] **OPEN — RUST pgserver `DROP SCHEMA ... CASCADE` drops only the schema
   record (measured 2026-09-09).** Types created in the schema (range, enum,
@@ -3549,17 +3388,6 @@ most of what was fixed has no counterpart there at all (no window functions,
 no `quote_ident`, no `trim_scale` / `min_scale`, no `LOCALTIME`). Where there
 IS a counterpart the results were not uniform, which is the point of looking:
 
-- [ ] **`concat` / `concat_ws` render a boolean as `true`** in
-      `crates/secantus-pgplan/src/scalar.rs`'s `text()` — the SAME bug fixed on
-      the Python side, where Postgres renders `t` through the type's output
-      function. One-line fix in `text()`, but note `text()` is shared, so check
-      each caller wants the output-function spelling before changing it.
-- [ ] **`split_part` REJECTS a negative field position** ("field position must
-      be greater than zero"). Postgres 14+ counts from the end, and the Python
-      server has done so for a while — so this is a *different* defect from the
-      one sweep nine fixed there, not the same one. Its empty-delimiter
-      behaviour also differs from both (Rust's `split("")` yields boundary
-      empties rather than the whole string).
 - **`initcap` was already CORRECT in Rust** (it uses `is_alphanumeric`, which is
       Postgres' word rule) while Python's used `str.title()` and broke words at
       digits. Worth recording because it is the reverse of the usual direction:
@@ -3591,10 +3419,6 @@ one; that surface needs no work. What is still open:
       The row-constructor forms landed in this sweep; the subquery one cannot
       use the same expansion (each column would re-run the query) and still
       answers `0A000`.
-- [ ] **`abs(-2147483648)` answers 2147483648.** Postgres raises `22003 integer
-      out of range` -- the negation does not fit int4. The arithmetic operators
-      overflow-check (`SELECT a + 1` at int4 max is `22003` on both servers);
-      `abs` does not.
 - [ ] **`upper` / `lower` use Python's FULL case mapping, Postgres uses the
       simple one.** `upper('ß')` is `SS` here and `ß` there. **This one cannot
       be settled on this box**: its PostgreSQL runs `lc_ctype=C`, which does not
@@ -6016,11 +5840,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   day validation. STILL OPEN: a wide/BC `timestamptz` is not rendered with its
   session-tz offset (`infinity` is correct for it), and the clock-dependent
   input keywords `now` / `today` / `tomorrow` / `yesterday` are not handled.
-- **Rust PG server: `numeric` DIVISION is refused (`0A000`).** Add, subtract and
-  multiply are exact with PostgreSQL's measured scale rules; division's result
-  scale depends on the operands' weights (`1.5 / 3` is `0.50000000000000000000`,
-  twenty places) in a way not yet measured, and emitting a plausible-but-wrong
-  number of decimal places would be a wrong answer.
 - **Rust PG server: array comparison does not require matching element types.**
   PostgreSQL has no `integer[] = smallint[]` operator — array operators need
   identical element types and do not widen — so `select array[1,2,3] = %s` with
@@ -6131,7 +5950,24 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   (`select generate_series(1, 10)`, with alias / ORDER BY / LIMIT / OFFSET), but
   only as the SOLE target: `select 1, generate_series(1,3)` — which repeats the
   other columns across the generated rows — is refused, as is more than one
-  set-returning target in one list.
+  set-returning target in one list, and so is a scalar call WRAPPING one
+  (`pg_typeof(generate_series(1,3))`, which PG answers one row per element).
+  The series' ELEMENT type is right as of 2026-09-27 (int4 / int8 / numeric /
+  timestamp / timestamptz, resolved through the signature table, with the
+  int8 and numeric and instant series all landed).
+- **Rust PG server: two sort-term shapes are still refused `0A000` (measured
+  2026-09-27 against PostgreSQL 16.15).** Everything else in an `ORDER BY` /
+  `GROUP BY` / `DISTINCT ON` now matches PG including the error positions
+  (`tests/test_rust_pgserver_slice.py::test_order_by_and_group_by_item_faults_are_positioned_at_the_item`);
+  what is left is:
+  - `ORDER BY (select 1)` — a scalar subquery as a sort term is `0A000
+    SELECT 1 here is not supported yet`; PG evaluates it (a constant one once,
+    a correlated one per row) and sorts by the result.
+  - `DISTINCT ON (n + 1)` — an EXPRESSION key is `0A000 DISTINCT ON over an
+    expression is not supported yet`. `Distinct::On` carries stored FIELD
+    names, so an expression key needs the evaluated-expression form the
+    ORDER BY keys already have (`OrderKey::expr`), and the executor's dedup
+    taught to read it.
 - **Rust PG server — psycopg CURSOR gaps (map, 2026-09-08).** Ran psycopg 3's own
   `test_cursor*.py` against `secantusd-pg` (~151 failures before). The task's
   `cursor.rowcount`-tag theory did **not** hold — the row-count tags
@@ -6144,29 +5980,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   - `ColumnExpr::Const` — a literal select-list column (`SELECT 1 FROM t`,
     `SELECT 1 FROM generate_series(...)`), named `?column?`, one value per row.
 
-  **DEFERRED (mapped, not started):**
-  - **`INSERT INTO t SELECT <query>`** (e.g. `... SELECT generate_series(1, 42)`)
-    inserts nothing / reports `INSERT 0 0`: `plan_insert` only reads
-    `sel.values_lists`. Needs the executor to run the inner SELECT and stream its
-    rows into the insert (cross-layer). Blocks `test_rowcount` (×3) and
-    `test_executemany_returning`-adjacent shapes.
-  - **`generate_series(...)::int4` and other casts over a SRF projection** — a
-    `TypeCast`/`FuncCall` wrapping the series target in the SELECT LIST is refused
-    (`function generate_series() is not supported yet`). Blocks `test_description`,
-    `test_binary_cursor_execute`, `test_execute_binary`, `test_binary_cursor_text_override`.
-  - **WITHOUT HOLD cursors are not dropped on COMMIT/ROLLBACK** — `test_no_hold`
-    expects a post-commit `fetch` to raise `InvalidCursorName`; our cursors
-    persist across transaction boundaries (task-flagged as deferrable).
-  - **`NO SCROLL` is not enforced** — `test_non_scrollable` expects a backward
-    scroll on a `NO SCROLL` cursor to raise `OperationalError`; every cursor is
-    materialised and scrolls both ways. (`is_scrollable` is now REPORTED
-    correctly in `pg_cursors`, just not enforced on FETCH/MOVE.)
-  - **Streaming / no-column cursors** — `server sent data ("D") without prior row
-    description ("T")` on `test_stream_no_col`; `at least one column expected` on
-    `test_row_maker_returns_none`.
-  - `test_leak` failures are a randomised memory-leak probe round-tripping random
-    values — type-fidelity noise, not cursor mechanics; the failing params shuffle
-    per run.
+  **The rest landed too (re-measured 2026-09-23 against PostgreSQL 16.15):**
+  `INSERT INTO t SELECT <query>` (a SRF or a query over another table),
+  casts over a SRF projection (`generate_series(1, 3)::int4`), `WITHOUT
+  HOLD` cursors dropped at `COMMIT` / `ROLLBACK`, and `NO SCROLL` enforced
+  on a backward `FETCH` (`55000` with PostgreSQL's HINT). The five sync
+  cursor files (`test_cursor.py`, `_common`, `_server`, `_client`, `_raw`)
+  are 574 passed / 0 failed / 8 skipped (2026-09-23).
 - **Rust PG server: DDL IS NOT TRANSACTIONAL.** `CREATE TABLE` inside a
   transaction survives a `ROLLBACK` (and so do rows inserted into it);
   `DROP TABLE` inside one stays dropped. PostgreSQL rolls both back. Measured
@@ -6181,27 +6001,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   What DOES work as of 2026-09-05: a table created or dropped in a transaction
   is correctly VISIBLE (or hidden) to later statements in that same
   transaction, which is what 184 psycopg failures were waiting on.
-- **Rust PG server: SAVEPOINTs are refused (`0A000`), and that now costs more
-  than it did.** `SAVEPOINT` / `ROLLBACK TO` / `RELEASE` need nested
-  transactions in the storage layer; emulating them would silently lose the
-  semantics a client is relying on, so they are refused. Since the transaction
-  STATUS became correct (2026-09-05), psycopg reaches for a savepoint whenever
-  a `conn.transaction()` block nests inside an open transaction -- which it can
-  now see -- so tests that used to pass by never noticing the outer transaction
-  fail here instead. It is the next blocker in `test_transaction.py`.
-- **Rust PG server: `generate_series` with EVERY bound a small-int parameter is
-  accepted where PostgreSQL refuses it as ambiguous.** `generate_series(%s, %s,
-  %s)` with `(1, 10, 3)` sends three `int2`s, and PostgreSQL answers `42725`
-  *"function generate_series(smallint, smallint, smallint) is not unique"* --
-  it cannot choose between the int4 / int8 / numeric overloads. This server
-  answers rows. Matching it needs the parameters' DECLARED OIDS threaded into
-  the planner, which today sees only decoded values; every other argument shape
-  matches (19-case probe, 2026-09-05).
-- **Rust PG server: `generate_series` over `numeric` is refused (`0A000`).**
-  PostgreSQL has a `generate_series(numeric, numeric [, numeric])` overload, so
-  `generate_series(1, 3, 0.5)` walks by halves there and is refused here. The
-  series carries `i64` bounds; a numeric series needs decimal bounds and a
-  decimal-valued output column.
 - **Rust PG server: a SAVEPOINT captures whole tables, so its cost is the size
   of what the block writes.** WiredTiger has no savepoint, so one here is a set
   of pre-images: the first write to a table after a savepoint copies that
@@ -6209,14 +6008,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   a write to a large table copies the whole table into memory. Lazy capture is
   what keeps the common case free (a savepoint nobody writes through costs
   nothing), and a per-row undo log would be the fix if the cost ever bites.
-- **Rust PG server: a scalar function OVER A COLUMN in a table select list is
-  refused, and the refusal comes out as a GROUPING error.** psycopg's
-  `test_prepared.py` reads `regexp_replace(statement, ...) as statement FROM
-  pg_prepared_statements` (20 tests); `has_aggregate` treats the unknown call
-  as an aggregate, routes to the aggregate planner, and the user sees `column
-  "name" must appear in the GROUP BY clause` -- wrong error for a real gap.
-  Computed columns over table reads exist now for CAST CHAINS (`casts` on
-  `Select`); widening them to scalar calls is the natural next step.
 - **Rust PG server: `pg_type` is 37 builtin rows and nothing else.** No user
   types (the enum campaign needs `pg_enum` and CREATE TYPE), no `typtype` /
   `typnamespace` / `typrelid` columns. (`pg_prepared_statements` lists the
@@ -6237,18 +6028,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   tests. The chain: `internal_type_name` drops an unknown (enum) param oid, so
   the declared type is lost before the passthrough column can echo it. The
   CAST form (`select %s::mood`) already reports the enum oid and passes.
-- **Rust PG server: range and multirange OPERATORS are unsupported.** Both type
-  families themselves (literals, constructors, casts, canonicalisation, merging,
-  parameters in both wire formats) are in; `@>` / `<@` / `&&` / `-|-` and the
-  multirange set operators are not.
-- **Rust PG server: the `oid` cast is unsupported**, and binary parameters of
-  that oid with it
-  (the binary decoder covers `numeric` / `date` / `time` / `timestamp` /
-  arrays / ranges / multiranges; a type it does not have cannot be decoded into
-  one — what remains unhandled there is `json`, a missing TYPE not a decoder
-  gap; `uuid` shipped 2026-09-07 as a text-valued type, so its BINARY parameter
-  form is the remaining gap. `inet` / `cidr` shipped 2026-09-07 WITH their
-  binary parameter + result form).
 - [ ] **Rust PG server: the inet/cidr scalar FUNCTIONS are not implemented**
   (noted 2026-09-07, when the inet/cidr TYPES + binary wire shipped). The
   Python server's `src/secantus/sql/net.py` has `host` / `masklen` / `network`
@@ -6278,12 +6057,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   cursor's schema is the one both `Describe` and `FETCH` report). Making it
   honour the FETCH's format means keeping the cursor's rows as VALUES and
   encoding per fetch, rather than materialising `DataRow`s once.
-- **Rust PG server: a bare boolean column in WHERE is unsupported (`0A000`
-  ColumnRef).** `WHERE attisdropped` and `WHERE NOT attisdropped` are how
-  PostgreSQL filters a bool column; `attisdropped = false` works. Needed by
-  `CompositeInfo.fetch`'s inner subquery (`AND NOT a.attisdropped`). lower_where
-  handles comparisons and BoolExpr(AND/OR/NOT of comparisons) but not a bare
-  ColumnRef or `NOT <ColumnRef>` as a truth test.
 - [ ] **OPEN — Rust PG server: an array's dimension decoration is dropped
   on the way back out.** `select '[0:1]={a,b}'::text[]::text` is
   `[0:1]={a,b}` on PostgreSQL 16 and `{a,b}` here: the literal parser
@@ -6299,42 +6072,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   `00000001000003ef00000024000000010000000000000017000000020000000100000004000000010000000400000002`.
   (The range / date fields it also used to refuse match PostgreSQL as of
   2026-09-09.)
-- [ ] **OPEN — RUST pgserver: an ARRAY constructor mixing a typed element
-  and an unknown literal keeps the value-derived type where PostgreSQL
-  coerces the literal to the typed element's type.** Measured 2026-09-09
-  against PostgreSQL 16: `array[1, '2']` is `{1,2}` of `int4[]`;
-  `array['2020-01-01'::date, '2000-01-01']` is a `date[]`; `array[1, 'a']` is
-  `22P02` (the literal is coerced to `integer` and fails). Ours answers a
-  `text[]` for all three, and in one shape LOSES DATA: `array[1, '2']` came
-  back `{1,NULL}` through a text cursor and `cannot send this value as a
-  binary text` through a binary one. Mixed NUMERIC types are handled -- they
-  widen in PostgreSQL's order (2026-09-05 probe). Repro:
-  `conn.cursor(binary=True).execute("select array['2020-01-01'::date, '2000-01-01']")`
-  → PG `00000001000000000000043a00000002000000010000000400001c890000000400000000`.
-- [ ] **OPEN — RUST pgserver: the INSERT half of the assignment rule is not
-  checked — a typed non-json expression is accepted into a `jsonb` column.**
-  Measured 2026-09-09 against PostgreSQL 16 with `create table testjson(data
-  jsonb)`: `insert into testjson (data) values (42)` and `... values
-  ('{}'::text)` are `42804 column "data" is of type jsonb but expression is of
-  type integer` / `... of type text`, and so is psycopg's binary `%b` with a
-  `str` (it declares oid 25). Ours inserts all three. The untyped `%t` / `%s`
-  (oid 0) forms succeed on both, correctly. This is what fails
-  `tests/test_adapt.py::test_return_untyped[b]` on the Rust server (the
-  Python server fixed its copy on 2026-09-01, see §9525); it never passed on
-  the Rust side — there is no assignment typecheck in `secantus-pgplan` or
-  `secantus-pgserver` at all (grep `is of type` finds nothing). The binary
-  parameter typing added 2026-09-09 (`type_untyped_binary_params`) only fires
-  for oid-0 binary parameters, so it is not what admits the typed ones.
-- [ ] **OPEN — RUST pgserver: a `bytea`-typed parameter cast to another type
-  leaks the Rust `Debug` rendering into a `22P02` where PostgreSQL refuses the
-  CAST with `42846`.** `cur.execute("select %b::int4range", [b"\x00"])` is
-  `42846 cannot cast type bytea to int4range` on PostgreSQL 16 and
-  `select %b::int + 1` is `42846 cannot cast type bytea to integer`; ours
-  answers `22P02 malformed range literal: "Binary { subtype: Generic, bytes:
-  [0] }"` / `invalid input syntax for type integer: "Binary { ... }"`. Two
-  bugs: the cast should fail on the declared TYPE before any parse, and a
-  binary value must never be rendered with `{:?}`. The `Bson::Binary` →
-  text path in `cast_value` is where both land.
 - [ ] **OPEN — RUST pgserver: an UNTYPED binary parameter in a bare `select
   %b` is echoed as text bytes where PostgreSQL rejects it as non-UTF-8.**
   `cur.execute("select %b", [Multirange([])])` (oid 0, binary, payload
@@ -6344,18 +6081,6 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   select-list shape is open; the same parameter in `insert ... values (%b)`
   is typed from its column on both servers as of 2026-09-09
   (`test_an_empty_multirange_binary_parameter_is_typed_from_its_column`).
-- [ ] **OPEN — RUST pgserver: an explicit `::text` CAST of a `tstzrange` /
-  `tstzmultirange` / `timestamptz[]` renders the bounds in UTC WITHOUT an
-  offset; the same value uncasted renders correctly.** Under `set timezone to
-  'Europe/Rome'`, PostgreSQL 16 gives
-  `["2020-01-01 01:00:00+01","2020-06-01 12:00:00+02")` for
-  `tstzrange('2020-01-01 00:00+00','2020-06-01 10:00+00')::text` and
-  `{"2020-01-01 12:00:00+01"}` for `array['2020-01-01 12:00'::timestamptz]::text`;
-  ours gives `["2020-01-01 00:00:00","2020-06-01 10:00:00")` and
-  `{"2020-01-01 11:00:00"}`. Without the `::text` both servers agree
-  (`test_tstz_ranges_and_arrays_render_in_the_session_zone` pins that). The
-  cast goes through `cast_value(_, "text")` which has no session zone; the
-  result-render path does.
 - [ ] **OPEN — CHORE, RUST pgserver: two vendored `pgwire` unit tests need
   TLS fixtures that are gitignored.** `cd crates/vendor/pgwire && cargo test
   --lib` fails `tokio::tls::...` ×2 for a missing `examples/ssl/server.key`
@@ -6363,15 +6088,13 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   generate a throwaway self-signed pair in the test or `#[ignore]` the two
   until one exists. Noted 2026-09-09 while running the crate's tests after
   the `put_cstring` / `cstring_body_len` patch.
-- **Rust PG server: `DROP` of anything but a table leaks Rust debug
-  formatting into the client-facing message** — `DROP of Ok(ObjectType) is not
-  supported yet`. Whatever the eventual support, the MESSAGE is a bug on its
-  own: a `{:?}` of a protobuf enum reached the wire. 207 psycopg tests block on
-  the missing feature behind it (`DROP TYPE` / `DROP SCHEMA` / `DROP FUNCTION`).
-- **Rust PG server: `DEALLOCATE <name>` is refused (`0A000`).** `DEALLOCATE ALL`
-  is supported; the named form would need the wire layer's prepared-statement
-  store, and PostgreSQL answers `26000` for a name that does not exist, so
-  accepting it as a no-op would be a wrong answer.
+- **Rust PG server: `CREATE VIEW` and `CREATE INDEX` are refused (`0A000
+  ViewStmt is not supported yet`, measured 2026-09-23).** Every `DROP` form
+  (`TABLE` / `VIEW` / `SEQUENCE` / `INDEX` / `TYPE` / `SCHEMA` / `FUNCTION` /
+  `EXTENSION` / `ROLE`) answers PG's missing-object code and `IF EXISTS`
+  notice; sequences are created, altered and dropped for real. A `DROP VIEW`
+  / `DROP INDEX` can only ever be the "does not exist" case until the
+  matching `CREATE` lands.
 - **Rust PG server: `aclitem` knows one role (2026-09-09).** The parser is
   PostgreSQL 16's, but there is no role catalog, so the only grantee /
   grantor it resolves is the session user (`'nobody=r/test'::aclitem` is
@@ -6382,86 +6105,33 @@ End-to-end review of the secantus-admin web UI on `main` (May 2026, before the `
   superuser (`jd=r/postgres`), with the same WARNING. Stored as text, so
   `'x=r/x'::aclitem::oid` is `22P02` where PostgreSQL has no such cast
   (`42846`).
-- [ ] **OPEN — Rust PG server: `box = box` is refused (2026-09-09).**
-  `select '(1,2),(3,4)'::box = '(3,4),(1,2)'::box` is `comparing document
-  with document using = is not supported yet`; PostgreSQL 16 answers `t`
-  (box equality is by AREA — `box_eq` compares areas, so `'(0,0),(1,1)'::box
-  = '(0,0),(2,0.5)'::box` is `t` too; probe before assuming corner-wise).
-  `box < box` and friends compare areas likewise; `box && box` overlaps.
-- [ ] **OPEN — Rust PG server: SQL value functions only at the top of a
-  select list, and only the identity ones (2026-09-09).** `select user` /
-  `current_user` / `session_user` / `current_role` / `current_catalog` /
-  `current_schema` work; `select pg_typeof(user)` (the function nested in
-  an argument) is `SqlvalueFunction is not supported yet`, and every
-  date/time one except `current_timestamp` — `current_date`,
-  `current_time`, `localtime`, `localtimestamp` (with or without a
-  precision) — is `current_date is not supported yet`. Landed 2026-09-09:
-  `now()` / `transaction_timestamp()` / `statement_timestamp()` /
-  `clock_timestamp()` and `current_timestamp` (bare and inside an
-  expression, `current_timestamp::text`), typed `timestamptz` and rendered
-  with the session-zone offset; all four `now`-family functions answer the
-  STATEMENT time where PG's `now()` is the transaction start.
-  PostgreSQL 16: `current_date` is a `date` (1082), `current_timestamp` a
-  `timestamptz` (1184) named after its keyword.
-- [ ] **OPEN — Rust PG server: subscripting a constant array (2026-09-09).**
-  `select (array[1,2])[1]` and `select ('{1,2}'::int[])[2]` are `this field
-  selection is not supported yet` (0A000); PostgreSQL 16 answers `1` / `2`,
-  named `array` / `int4`. `AIndirection` on the constant path handles only a
-  single field NAME (`(row(1,2)).f1`); an `A_Indices` element needs the
-  1-based (out-of-range → NULL) subscript, and slices `[1:2]`.
-- [ ] **OPEN — Rust PG server: sequence values roll back with the
-  transaction (2026-09-09).** `begin; insert into t (serial col) …;
-  rollback; insert …` reuses the value the rolled-back insert drew;
-  PostgreSQL never reuses a sequence value (`nextval` is non-transactional).
-  The sequence doc in `__sql_sequences__` is written inside the statement's
-  transaction, so an abort restores it.
-- [ ] **OPEN — Rust PG server: NOT NULL is not enforced — on a serial column
-  OR an explicit `int not null` (re-measured 2026-09-09).** `create table t
-  (id int not null); insert into t (id) values (null)` stores a NULL id;
-  PostgreSQL 16 is `23502 null value in column "id" of relation "t" violates
-  not-null constraint`. Same for `serial` (which implies `NOT NULL`). Part of
-  the "NOT NULL / CHECK / FOREIGN KEY constraints are not enforced" entry in
-  the psycopg gauge section; the catalog does not record the constraint.
-- [ ] **OPEN — Rust PG server: `timestamp + interval` on a STORED timestamp
-  loses sub-millisecond precision (2026-09-09).** A `timestamp` column
-  holding `2021-01-01 00:00:00.123456` answers `…00.123` for `ts + interval
-  '1 day'`; the literal form `'2021-01-01 00:00:00.123456'::timestamp +
-  interval '1 day'` keeps the micros. The stored value goes through a
-  millisecond `Bson::DateTime` on the arithmetic path where the literal
-  path keeps its micros.
-- [ ] **OPEN — Rust PG server: column DEFAULT expressions (2026-09-09).**
-  Only a literal DEFAULT is stored and applied — the planner evaluates the
-  DEFAULT once at CREATE time and stores the VALUE, so a volatile function
-  is refused on purpose (`default_is_volatile`): accepting `ts timestamptz
-  default now()` would freeze the table's creation instant into every later
-  row where PostgreSQL 16 stamps each INSERT. Fixing this means storing the
-  expression and evaluating it per INSERT. `create table t (n int default
-  now())` is refused 0A000 where PostgreSQL 16 is `42804 column "n" is of
-  type integer but default expression is of type timestamp with time zone`;
-  `ts timestamptz default now()` / `n text default now()` are accepted there
-  and refused here (re-measured 2026-09-09);
-  `insert into t values (default)` and `insert into t default values` are
-  both unsupported (`SetToDefault` / an empty VALUES); DEFAULTs are not
-  applied to columns omitted by `COPY … FROM STDIN`; and a `default_expr`
-  written by the PYTHON server's catalog is ignored by the Rust catalog
-  reader (it reads only the literal form it writes).
-- [ ] **OPEN — Rust PG server: `pg_sleep` only as a bare select-list call
-  (2026-09-09).** `select pg_sleep(1) is null`, `select coalesce(pg_sleep(0),
-  '')` and other nestings are `NullTest is not supported yet` / 0A000 —
-  the sleep is a `ConstCol::Sleep` column, not a value the expression
-  evaluator can nest.
-- [ ] **OPEN — Rust PG server: `float4` (real) text is Rust's shortest
-  form, not `float4out` (2026-09-09).** `float8` now renders exactly as
-  `float8out` (`1e+20`, `1e-07`, `Infinity`, `{1.5,2}`); `float4` still
-  goes through ryu, so `1e20::float4` is `1e20` where PostgreSQL 16 prints
-  `1e+20`. Same fix as `geo::float8_text`, with float4's 6-digit shortest
-  round-trip.
 - **Rust PG server: psycopg's `test_array.py` is 158/158 (2026-09-09).**
   Multidimensional arrays round-trip in text and binary both ways,
   `INSERT … RETURNING`, the `box` type and its `;` array separator all
   land, a table's row type is a composite (`test_array_register`) and
   `aclitem` parses (`test_array_of_unknown_builtin`), both 2026-09-09.
-
+- [ ] **OPEN — Rust PG server: `ALTER TABLE` residuals (measured 2026-09-23
+  against PostgreSQL 16.15).** `RENAME TO`, `ALTER COLUMN TYPE`, `ADD` /
+  `DROP` / `RENAME CONSTRAINT`, `OWNER TO`, `ADD COLUMN` with column-level
+  constraints, `DROP COLUMN` (constraints follow) and `RENAME COLUMN`
+  (UNIQUE and FOREIGN KEY follow) all landed. Still refused, each with its
+  own `0A000` message naming the shape:
+  - `ALTER TABLE t SET SCHEMA s` (`AlterObjectSchemaStmt is not supported
+    yet`).
+  - `RENAME COLUMN` of a column a CHECK constraint mentions (`renaming
+    column "n", which a CHECK constraint of "ob" depends on, is not
+    supported yet`) — PostgreSQL rewrites the expression (`CHECK ((m > 0))`).
+  - `DROP CONSTRAINT t_pkey` (`dropping the PRIMARY KEY constraint is not
+    supported yet`) and hence `ADD PRIMARY KEY` on a table that already has
+    one (correctly `multiple primary keys for table "ob" are not allowed`).
+  - after `RENAME TO ob2` the primary-key constraint is listed as `ob2_pkey`;
+    PostgreSQL keeps the name the constraint was created with (`ob_pkey`).
+- [ ] **OPEN — Rust PG server: `pg_index.indkey` is not an `int2vector`
+  (2026-09-23).** The column renders as PostgreSQL's `1` / `1 2` text, but
+  `indkey[0]` answers NULL (PostgreSQL: `1`, the vector is 0-based) and
+  `unnest(indkey)` is `function unnest() is not supported yet`. An index
+  name is not a relation either: `'ob_pkey'::regclass` is `42P01` where
+  PostgreSQL resolves it to the index's oid (`= pg_index.indexrelid`).
 - [x] **Five probes never compared the Rust server — instrumented 2026-09-02.**
   `tools/probes/_servers.py` is now the shared `probe_targets()` helper, and
   `update_operators`, `arg_types_documents`, `update_path_conflicts` and
@@ -10411,66 +10081,6 @@ shared storage engine or building large new protocol subsystems:
   Separately, the same query failed with 0A000 on its 7th run under psycopg's
   auto-prepare (Describe typed `pg_sleep` as text, Execute as void). That is
   fixed in #1514 and is not this flake: pgx does not revalidate the plan.
-- [ ] **Rust PG server: `ORDER BY <position>` over a GROUPED aggregate is
-  0A000** (measured 2026-09-20, and PRE-EXISTING -- it fails with or without
-  DISTINCT, so it is not a regression from that work). `select count(*) from t
-  group by g order by 1` is refused where PostgreSQL answers the counts;
-  `order by g` (a grouping column) works. The aggregate planner resolves an
-  ORDER BY term against the table's columns, and a position refers to the
-  OUTPUT list, which for an aggregate is a mix of group keys and aggregate
-  results. `AggOrderKey` would need to name an output column the way
-  `SetOpOrder` now does.
-- [ ] **Rust PG server: `DISTINCT ON` over an aggregate is 0A000**
-  (2026-09-20). `select distinct on (g) g, count(*) from t group by g` is
-  refused -- honestly, with `DISTINCT ON with an aggregate` -- because the
-  keys would have to resolve against the GROUP BY output rather than the
-  table. Plain `SELECT DISTINCT` over an aggregate IS supported.
-- [ ] **Rust PG server: an in-aggregate `ORDER BY` over an EXPRESSION**
-  (2026-09-22). `array_agg(s ORDER BY length(s))` is refused: the sort keys
-  resolve against the table's columns, so a computed key has nowhere to come
-  from. Plain-column keys (`array_agg(s ORDER BY id DESC)`) work.
-  This is the last open item from what was a long aggregate list. The rest
-  closed: `bool_and` / `bool_or` on 2026-09-20; `HAVING`, `FILTER (WHERE ...)`,
-  `avg()`, `string_agg()` and a plain-column `ORDER BY` inside an aggregate on
-  2026-09-22; and **aggregates inside an expression** (`count(*) + 1`,
-  `coalesce(sum(n), 0)`, `sum(n) + 0`) on 2026-09-22 -- `OutputCol` grew an
-  `Expr` arm, the aggregates inside are extracted as ordinary items and the
-  arithmetic runs over their results. `avg` divides the exact sum by the count
-  through the same `decimal_arith` the `/` operator uses, so PostgreSQL's
-  result scale came for free rather than being approximated.
-- [ ] **Rust PG server: `min` / `max` of a BOOLEAN are answered, where
-  PostgreSQL refuses** (2026-09-20). `select max(ok) from b` gives `true`;
-  PostgreSQL 14.24 raises `42883 function max(boolean) does not exist`. Being
-  permissive where the oracle refuses -- the opposite direction to the rest of
-  this list, and harmless to a correct client, but it is a divergence.
-- [ ] **Rust PG server: the rest of `char(n)`'s output-form rules**
-  (2026-09-20; the storage, width and comparison halves are done -- a
-  `char(n)` column now carries its `atttypmod` through the shared catalog and
-  onto the wire, its value is blank-padded on output, and a WHERE comparison
-  ignores trailing blanks on both sides). What is left is where PostgreSQL
-  hands a `bpchar` to something through its OUTPUT function, padded, rather
-  than as `text`, stripped. The Python server has all of this and is the map:
-  `planner._pad_bpchar_match_operands` and `_strip_bpchar_literals`.
-  - Functions that see the PADDED form: `octet_length`, `concat`, `concat_ws`,
-    `format`, `to_json`, `to_jsonb` -- while `length`, `upper`, `md5`, `left`
-    and `position` see the stripped one. That list is measured, not inferred.
-  - `LIKE` / `ILIKE` / `SIMILAR TO` / `~` match against the padded form, so a
-    `char(5)` holding `ab` does NOT match `LIKE 'ab'`. The pattern cannot be
-    adjusted instead -- `'ab   ' LIKE 'ab%'` is true and `LIKE 'ab_'` is
-    false -- so the VALUE has to be padded.
-  - A comparison in the SELECT LIST (`select c = 'ab  '`) still answers false:
-    the literal is stripped when lowering a WHERE, and the projection path
-    needs the same.
-  - `'abc'::char(2)` does not truncate. The cast chain carries type NAMES with
-    no modifier, so the width would have to be threaded into the evaluation --
-    today `cast_typmod` is description metadata only.
-  - **DONE 2026-09-22 -- the AGGREGATE half.** `array_agg`, `min` and `max`
-    see the PADDED value, because those take the column's own type;
-    `string_agg` does not (its argument is coerced to `text`, which strips)
-    and the counting aggregates cannot tell. `min`/`max` carry the typmod so
-    the ENCODER pads on output rather than the value being padded in place --
-    padding the value made `min(c) || '|'` answer with the blanks, which
-    PostgreSQL strips through `||`. All measured on 14.24.
 - [ ] **Rust PG server: 45 wrong-VALUE divergences across the existing
   `pg_corpora/`** (swept 2026-09-20 with the new
   `tools/probes/pg_differential.py --server=rust`, against PostgreSQL 14.24;
@@ -10508,20 +10118,6 @@ shared storage engine or building large new protocol subsystems:
   directly works -- 327 tests pass across `test_cursor` / `test_sql` /
   `test_typing` -- so it is the fixture, not the server. The number CLAUDE.md
   quotes comes from a Linux run.
-- [ ] **Rust PG server: two set-operation type rules still differ from
-  PostgreSQL** (2026-09-20, after DISTINCT and the set operations landed;
-  every other differential case matches 14.24). Both concern the reported
-  TYPE, never the rows:
-  - Two DIFFERENT string types keep the LEFT side's type, where PostgreSQL's
-    own choice is quirky and not first-wins: `varchar UNION name` is `name`,
-    `bpchar UNION text` is `bpchar` (measured). Every string type encodes the
-    same on the wire, so this is the reported oid only.
-  - An explicitly cast NULL (`select null::text union select 1`) is accepted
-    where PostgreSQL raises 42804. The planner records a bare `null` and
-    `null::text` identically -- a `ConstCol::Value(Bson::Null)` typed `text`
-    -- and the set operation treats a constant NULL column as untyped so that
-    `select 1 union select null` answers `integer`, as PostgreSQL does.
-    Telling the two apart needs the cast to survive planning.
 - [ ] **Rust PG server slice tests: 9 fail on a Windows dev box** (measured
   2026-09-20, the first time they have ever RUN there -- `BINARY` in
   `tests/test_rust_pgserver_slice.py` lacked the `.exe` suffix, so all 1,194
@@ -13896,7 +13492,8 @@ shared storage engine or building large new protocol subsystems:
   index's predicate isn't reversed back to a `WHERE` clause in `indexdef` (the `partial` flag is tracked
   but the expression text isn't rendered); expression/functional index columns reflect only when every
   key field maps to a declared column (index over a raw field is skipped); no `INCLUDE`/opclass/collation
-  detail in `indexdef`. Not ported to the Rust server.
+  detail in `indexdef`. Ported to the Rust server 2026-09-23 (`pg_indexes` /
+  `pg_index` / `pg_get_indexdef` / `pg_get_constraintdef` over PK + UNIQUE indexes).
 - [x] **Advisory locks landed** (#135, b175): the `pg_advisory_lock` family — `pg_advisory_lock` /
   `pg_advisory_unlock` / `pg_advisory_unlock_all` plus the `_shared`, `_xact_`, and `pg_try_*` variants
   (eleven functions total) — as **session-tracked single-node no-op locking**. All parse as `exp.Anonymous`;

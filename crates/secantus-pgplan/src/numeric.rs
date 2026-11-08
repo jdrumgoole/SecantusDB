@@ -674,6 +674,79 @@ impl Dec {
     }
 }
 
+/// The `(precision, scale)` a `numeric(p, s)` typmod packs, or `None` for an
+/// unconstrained `numeric`. PostgreSQL 15+ keeps a SIGNED scale in the low
+/// 11 bits (`numeric(5, -2)` is legal), which is unpacked here.
+pub fn typmod_precision_scale(typmod: i32) -> Option<(i32, i32)> {
+    if typmod < 4 {
+        return None;
+    }
+    let packed = typmod - 4;
+    let precision = (packed >> 16) & 0xFFFF;
+    let mut scale = packed & 0x7FF;
+    if scale >= 0x400 {
+        scale -= 0x800;
+    }
+    Some((precision, scale))
+}
+
+/// PostgreSQL's `apply_typmod`: a numeric held to a declared `(p, s)` is
+/// rounded half away from zero to `s` places and refused (22003) when more
+/// than `p - s` digits remain before the point. Measured on 16.15:
+/// `1.235::numeric(5,2)` is `1.24`, `'1.999'::numeric(5,2)` is `2.00`,
+/// `1e5::numeric(5,-2)` is `100000`, `12345::numeric(5,2)` overflows, `NaN`
+/// passes untouched, and an infinity is its own 22003.
+pub fn apply_typmod(value: Bson, typmod: i32) -> Result<Bson> {
+    let Some((precision, scale)) = typmod_precision_scale(typmod) else {
+        return Ok(value);
+    };
+    let Some(text) = numeric_text(&value) else {
+        return Ok(value);
+    };
+    let overflow = |detail: String| {
+        Error::NumericOutOfRange(format!("numeric field overflow\nDetail: {detail}"))
+    };
+    if text == "NaN" {
+        return Ok(value);
+    }
+    if text.ends_with("Infinity") {
+        return Err(overflow(format!(
+            "A field with precision {precision}, scale {scale} cannot hold an infinite value."
+        )));
+    }
+    let Some(dec) = Dec::parse(&text) else {
+        return Ok(value);
+    };
+    let rounded = if scale >= 0 {
+        dec.round_to(scale as u32)
+    } else {
+        // A negative scale rounds to a power of ten above the point and
+        // renders with that many trailing zeros.
+        let unit = BigInt::from(10u32).pow((-scale) as u32);
+        let lifted = dec.round_to(0);
+        let q = round_half_away(&lifted.unscaled.abs(), &unit) * &unit;
+        Dec {
+            unscaled: if lifted.is_negative() { -q } else { q },
+            scale: 0,
+        }
+    };
+    let rendered = rounded.render();
+    let int_digits = rendered
+        .trim_start_matches('-')
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('0')
+        .len();
+    if int_digits as i32 > precision - scale {
+        return Err(overflow(format!(
+            "A field with precision {precision}, scale {scale} must round to an absolute value less than 10^{}.",
+            precision - scale
+        )));
+    }
+    Ok(numeric_bson(&rendered))
+}
+
 fn round_half_away(num: &BigInt, den: &BigInt) -> BigInt {
     // Both non-negative.
     let (q, r) = (num / den, num % den);
@@ -740,6 +813,19 @@ pub fn decimal_arith(op: &str, a: &str, b: &str) -> Option<Result<Bson>> {
             unscaled: &x.unscaled * &y.unscaled,
             scale: x.scale + y.scale,
         },
+        // `%` keeps the dividend's sign and the wider scale (`-7.5 % 2` is
+        // `-1.5`, `1.50 % 1` is `0.50`, measured 16).
+        "%" => {
+            if y.is_zero() {
+                return Some(Err(Error::DivisionByZero));
+            }
+            let scale = x.scale.max(y.scale);
+            let (xa, ya) = (x.lift(scale), y.lift(scale));
+            Dec {
+                unscaled: xa % ya,
+                scale,
+            }
+        }
         "/" => {
             if y.is_zero() {
                 return Some(Err(Error::DivisionByZero));
@@ -773,7 +859,7 @@ fn non_finite_arith(op: &str, a: &str, b: &str) -> Option<Option<Result<String>>
     let (ca, cb) = (non_finite_class(a), non_finite_class(b));
     if ca.is_none() && cb.is_none() {
         return match op {
-            "+" | "-" | "*" | "/" => Some(None),
+            "+" | "-" | "*" | "/" | "%" => Some(None),
             _ => None,
         };
     }
@@ -829,6 +915,12 @@ fn non_finite_arith(op: &str, a: &str, b: &str) -> Option<Option<Result<String>>
                 }
             }
             (None, Some(_)) => Ok("0".to_string()),
+            _ => unreachable!(),
+        },
+        // `Infinity % x` is NaN; `x % Infinity` is x (measured 16).
+        "%" => match (ca, cb) {
+            (Some(_), _) => Ok("NaN".to_string()),
+            (None, Some(_)) => Ok(a.to_string()),
             _ => unreachable!(),
         },
         _ => return None,
@@ -909,4 +1001,630 @@ pub fn sum_numeric_texts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Option
 /// `i128` form of a rounded integer, for the fixed-width integer casts.
 pub fn bigint_to_i128(n: &BigInt) -> Option<i128> {
     n.to_i128()
+}
+
+// ---------------------------------------------------------------------------
+// `numeric ^ numeric`
+//
+// A port of PostgreSQL's `numeric_power` / `power_var` / `power_var_int`
+// (numeric.c), including their result-scale selection, which is what makes
+// `2 ^ 0.5` render as `1.4142135623730950` and `10 ^ 2.5` as
+// `316.22776601683793`: the scale is chosen so the result carries about
+// sixteen significant digits, never fewer places than either operand, and
+// for an integer exponent the base is multiplied out by repeated squaring at
+// a bounded number of significant digits rather than exactly (an exact
+// `1.0000001 ^ 100000000` would have seven hundred million places).
+//
+// The transcendental half (`ln` / `exp`, needed for a fractional exponent)
+// is fixed-point BigInt arithmetic with guard digits; PostgreSQL's own is
+// the same shape, so the two agree to the displayed scale.
+// ---------------------------------------------------------------------------
+
+/// `NUMERIC_MIN_SIG_DIGITS`.
+const POWER_MIN_SIG_DIGITS: i64 = 16;
+/// `NUMERIC_MAX_DISPLAY_SCALE`.
+const POWER_MAX_DISPLAY_SCALE: i64 = 1000;
+/// `NUMERIC_MAX_RESULT_SCALE`: `exp_var`'s overflow guard is `3 *` this on
+/// the natural-log argument, `power_var`'s is `3.01 *` it.
+const POWER_MAX_RESULT_SCALE: f64 = 2000.0;
+
+impl Dec {
+    fn from_bigint(n: BigInt) -> Dec {
+        Dec {
+            unscaled: n,
+            scale: 0,
+        }
+    }
+
+    fn is_negative(&self) -> bool {
+        self.unscaled.is_negative()
+    }
+
+    fn abs(&self) -> Dec {
+        Dec {
+            unscaled: self.unscaled.abs(),
+            scale: self.scale,
+        }
+    }
+
+    /// Value rounded half away from zero to `scale` places (`round_var`).
+    fn round_to(&self, scale: u32) -> Dec {
+        if scale >= self.scale {
+            return Dec {
+                unscaled: self.lift(scale),
+                scale,
+            };
+        }
+        let den = BigInt::from(10u32).pow(self.scale - scale);
+        let q = round_half_away(&self.unscaled.abs(), &den);
+        Dec {
+            unscaled: if self.is_negative() { -q } else { q },
+            scale,
+        }
+    }
+
+    /// Exact product rounded to `scale` places (`mul_var`).
+    fn mul_round(&self, other: &Dec, scale: u32) -> Dec {
+        Dec {
+            unscaled: &self.unscaled * &other.unscaled,
+            scale: self.scale + other.scale,
+        }
+        .round_to(scale)
+    }
+
+    /// `self / other` rounded to `scale` places (`div_var` with rounding);
+    /// `other` must be non-zero.
+    fn div_round(&self, other: &Dec, scale: u32) -> Dec {
+        let num = self.unscaled.abs() * BigInt::from(10u32).pow(other.scale + scale);
+        let den = other.unscaled.abs() * BigInt::from(10u32).pow(self.scale);
+        let q = round_half_away(&num, &den);
+        Dec {
+            unscaled: if self.is_negative() != other.is_negative() {
+                -q
+            } else {
+                q
+            },
+            scale,
+        }
+    }
+
+    /// The integer digits of the absolute value (0 for a pure fraction).
+    fn int_digits(&self) -> usize {
+        let digits = self.unscaled.abs().to_string();
+        digits.len().saturating_sub(self.scale as usize)
+    }
+
+    /// PostgreSQL's `weight`: the base-10000 position of the leading group.
+    fn weight(&self) -> i64 {
+        self.weight_and_first_group().0
+    }
+
+    fn to_f64(&self) -> f64 {
+        self.render().parse::<f64>().unwrap_or(0.0)
+    }
+
+    /// `numeric_is_integral`: no non-zero digit after the point.
+    fn is_integral(&self) -> bool {
+        self.scale == 0 || (&self.unscaled % BigInt::from(10u32).pow(self.scale)).is_zero()
+    }
+
+    fn is_one(&self) -> bool {
+        self.abs_cmp_one() == Ordering::Equal && !self.is_negative()
+    }
+
+    fn abs_cmp_one(&self) -> Ordering {
+        self.unscaled
+            .abs()
+            .cmp(&BigInt::from(10u32).pow(self.scale))
+    }
+}
+
+fn power_overflow() -> Error {
+    Error::NumericOutOfRange("value overflows numeric format".to_string())
+}
+
+fn zero_with_scale(scale: i64) -> Dec {
+    Dec {
+        unscaled: BigInt::zero(),
+        scale: scale.clamp(0, POWER_MAX_DISPLAY_SCALE) as u32,
+    }
+}
+
+/// `estimate_ln_dweight`: the decimal weight of `ln(x)`, from the leading
+/// digits alone -- unless `x` is within a tenth of one, where `ln(1 + d) ~= d`
+/// gives a usable (possibly very negative) estimate instead.
+fn estimate_ln_dweight(x: &Dec) -> i64 {
+    let nine_tenths = Dec::parse("0.9").expect("literal");
+    let eleven_tenths = Dec::parse("1.1").expect("literal");
+    if compare_dec(x, &nine_tenths) != Ordering::Less
+        && compare_dec(x, &eleven_tenths) != Ordering::Greater
+    {
+        let scale = x.scale;
+        let diff = Dec {
+            unscaled: &x.unscaled - BigInt::from(10u32).pow(scale),
+            scale,
+        };
+        if diff.is_zero() {
+            return 0;
+        }
+        let (weight, first) = diff.weight_and_first_group();
+        return weight * 4 + (first as f64).log10() as i64;
+    }
+    let (weight, groups) = digit_groups(x);
+    let mut approx = groups.first().copied().unwrap_or(0) as f64;
+    let mut dweight = weight * 4;
+    if let Some(second) = groups.get(1) {
+        approx = approx * 10000.0 + *second as f64;
+        dweight -= 4;
+    }
+    let ln = approx.ln() + dweight as f64 * std::f64::consts::LN_10;
+    ln.abs().log10() as i64
+}
+
+/// `x` as PostgreSQL stores it: the base-10000 digit groups from the first
+/// non-zero one, and the weight (base-10000 position) of that group.
+fn digit_groups(x: &Dec) -> (i64, Vec<i64>) {
+    let text = x.abs().render();
+    let (int, frac) = text.split_once('.').unwrap_or((text.as_str(), ""));
+    let int = int.trim_start_matches('0');
+    // Groups are aligned to the decimal point: the integer part is grouped
+    // from the right, the fraction from the left.
+    let mut groups: Vec<i64> = Vec::new();
+    if !int.is_empty() {
+        let pad = (4 - int.len() % 4) % 4;
+        let padded = format!("{}{}", "0".repeat(pad), int);
+        for k in (0..padded.len()).step_by(4) {
+            groups.push(padded[k..k + 4].parse().unwrap_or(0));
+        }
+    }
+    let int_groups = groups.len() as i64;
+    let mut k = 0;
+    while k < frac.len() {
+        let g = &frac[k..(k + 4).min(frac.len())];
+        groups.push(format!("{g:0<4}").parse().unwrap_or(0));
+        k += 4;
+    }
+    let Some(first) = groups.iter().position(|g| *g != 0) else {
+        return (0, Vec::new());
+    };
+    (int_groups - 1 - first as i64, groups.split_off(first))
+}
+
+fn compare_dec(a: &Dec, b: &Dec) -> Ordering {
+    let scale = a.scale.max(b.scale);
+    a.lift(scale).cmp(&b.lift(scale))
+}
+
+/// Fixed-point value `n / 10^scale` helpers for the transcendental half.
+struct Fixed {
+    n: BigInt,
+    scale: u32,
+}
+
+impl Fixed {
+    fn one(scale: u32) -> Fixed {
+        Fixed {
+            n: BigInt::from(10u32).pow(scale),
+            scale,
+        }
+    }
+
+    fn from_dec(d: &Dec, scale: u32) -> Fixed {
+        let n = if scale >= d.scale {
+            d.lift(scale)
+        } else {
+            &d.unscaled / BigInt::from(10u32).pow(d.scale - scale)
+        };
+        Fixed { n, scale }
+    }
+
+    fn mul(&self, other: &Fixed) -> Fixed {
+        Fixed {
+            n: (&self.n * &other.n) / BigInt::from(10u32).pow(other.scale),
+            scale: self.scale,
+        }
+    }
+
+    fn div(&self, other: &Fixed) -> Fixed {
+        Fixed {
+            n: (&self.n * BigInt::from(10u32).pow(other.scale)) / &other.n,
+            scale: self.scale,
+        }
+    }
+
+    fn to_dec(&self) -> Dec {
+        Dec {
+            unscaled: self.n.clone(),
+            scale: self.scale,
+        }
+    }
+}
+
+/// `ln(x)` for `x > 0` at `scale` places, computed with ten guard digits:
+/// `x = m * 10^e`, `m` halved into `[1, 2)`, then the `atanh` series.
+fn ln_fixed(x: &Dec, scale: u32) -> Dec {
+    let work = scale + 12;
+    let ten = BigInt::from(10u32);
+    let one = ten.pow(work);
+    // Split off the power of ten so that m is in [1, 10): shift the DECIMAL
+    // first, so a tiny x is not truncated to zero on the way in.
+    let e = if x.int_digits() > 0 {
+        x.int_digits() as i64 - 1
+    } else {
+        let frac = x.abs().render();
+        let frac = frac.split_once('.').map(|(_, f)| f).unwrap_or("");
+        -(frac.chars().take_while(|c| *c == '0').count() as i64 + 1)
+    };
+    let mantissa = if e >= 0 {
+        Dec {
+            unscaled: x.unscaled.clone(),
+            scale: x.scale + e as u32,
+        }
+    } else {
+        Dec {
+            unscaled: x.unscaled.clone(),
+            scale: x.scale - e.unsigned_abs() as u32,
+        }
+    };
+    let mut m = Fixed::from_dec(&mantissa, work);
+    // m in [1, 10): halve into [1, 2).
+    let two = BigInt::from(2u32);
+    let mut halvings = 0i64;
+    while m.n >= &one * &two {
+        m.n /= &two;
+        halvings += 1;
+    }
+    let ln2 = ln_series(
+        &Fixed {
+            n: &one * 2u32,
+            scale: work,
+        },
+        work,
+    );
+    let ln10 = {
+        // ln(10) = 3 ln(2) + ln(1.25)
+        let five_quarters = Fixed {
+            n: &one * 5u32 / 4u32,
+            scale: work,
+        };
+        &ln2 * 3u32 + ln_series(&five_quarters, work)
+    };
+    let mut total = ln_series(&m, work);
+    total += &ln2 * halvings;
+    total += &ln10 * e;
+    Dec {
+        unscaled: total,
+        scale: work,
+    }
+    .round_to(scale)
+}
+
+/// `ln(m)` for `m` in `[1, 2]` as a fixed-point integer at `scale`:
+/// `2 * atanh(y)`, `y = (m - 1) / (m + 1)`.
+fn ln_series(m: &Fixed, scale: u32) -> BigInt {
+    let one = Fixed::one(scale);
+    let y = Fixed {
+        n: (&m.n - &one.n) * BigInt::from(10u32).pow(scale) / (&m.n + &one.n),
+        scale,
+    };
+    let y2 = y.mul(&y);
+    let mut term = y.n.clone();
+    let mut sum = BigInt::zero();
+    let mut k = 1u32;
+    while !term.is_zero() {
+        sum += &term / BigInt::from(k);
+        term = &term * &y2.n / BigInt::from(10u32).pow(scale);
+        k += 2;
+    }
+    sum * 2u32
+}
+
+/// `exp(z)` rounded to `scale` places (`exp_var`). `None` is an overflow.
+fn exp_fixed(z: &Dec, scale: u32) -> Option<Dec> {
+    let val = z.to_f64();
+    if val.abs() >= POWER_MAX_RESULT_SCALE * 3.0 {
+        return if val > 0.0 {
+            None
+        } else {
+            Some(zero_with_scale(i64::from(scale)))
+        };
+    }
+    let magnitude = (val * std::f64::consts::LOG10_E).abs().ceil() as u32 + 1;
+    let work = scale + 16 + 2 * magnitude;
+    let ten = BigInt::from(10u32);
+    let one = ten.pow(work);
+    // z = i + f with 0 <= f < 1.
+    let zf = Fixed::from_dec(z, work);
+    let i: BigInt = if zf.n.is_negative() {
+        -((-&zf.n + &one - 1u32) / &one)
+    } else {
+        &zf.n / &one
+    };
+    let f = Fixed {
+        n: &zf.n - &i * &one,
+        scale: work,
+    };
+    // e^f by Taylor series.
+    let mut term = one.clone();
+    let mut sum = one.clone();
+    let mut k = 1u32;
+    while !term.is_zero() {
+        term = &term * &f.n / &one / BigInt::from(k);
+        sum += &term;
+        k += 1;
+    }
+    let exp_f = Fixed {
+        n: sum,
+        scale: work,
+    };
+    // e^|i| by squaring, then invert for a negative i.
+    let e = {
+        let mut term = one.clone();
+        let mut sum = one.clone();
+        let mut k = 1u32;
+        while !term.is_zero() {
+            term /= BigInt::from(k);
+            sum += &term;
+            k += 1;
+        }
+        Fixed {
+            n: sum,
+            scale: work,
+        }
+    };
+    let mut exponent = i.abs().to_u64().unwrap_or(u64::MAX);
+    let mut acc = Fixed::one(work);
+    let mut base = e;
+    while exponent > 0 {
+        if exponent & 1 == 1 {
+            acc = acc.mul(&base);
+        }
+        exponent >>= 1;
+        if exponent > 0 {
+            base = base.mul(&base);
+        }
+    }
+    let exp_i = if i.is_negative() {
+        Fixed::one(work).div(&acc)
+    } else {
+        acc
+    };
+    let result = exp_i.mul(&exp_f).to_dec().round_to(scale);
+    if result.int_digits() > MAX_INT_DIGITS {
+        return None;
+    }
+    Some(result)
+}
+
+/// `power_var_int`: an integer exponent that fits `i32`.
+fn power_int(base: &Dec, exp: i32, exp_dscale: u32) -> Result<Dec> {
+    // Approximate the decimal weight of the result from the leading digits.
+    let f = if base.is_zero() {
+        0.0
+    } else {
+        // base ~= approx * 10^p, from its first sixteen digits.
+        let (weight, groups) = digit_groups(base);
+        let mut approx = groups.first().copied().unwrap_or(0) as f64;
+        let mut p = weight * 4;
+        for group in groups.iter().skip(1).take(3) {
+            approx = approx * 10000.0 + *group as f64;
+            p -= 4;
+        }
+        f64::from(exp) * (approx.log10() + p as f64)
+    };
+    if f > 3.0 * 32767.0 * 4.0 {
+        return Err(power_overflow());
+    }
+    let rscale = (POWER_MIN_SIG_DIGITS - f as i64)
+        .max(i64::from(base.scale))
+        .max(i64::from(exp_dscale))
+        .clamp(0, POWER_MAX_DISPLAY_SCALE);
+    if f + 1.0 < -(rscale as f64) {
+        return Ok(zero_with_scale(rscale));
+    }
+    let rscale = rscale as u32;
+    match exp {
+        0 => return Ok(Dec::from_bigint(BigInt::one()).round_to(rscale)),
+        1 => return Ok(base.round_to(rscale)),
+        -1 => return Ok(Dec::from_bigint(BigInt::one()).div_round(base, rscale)),
+        2 => return Ok(base.mul_round(base, rscale)),
+        _ => {}
+    }
+    if base.is_zero() {
+        return Ok(zero_with_scale(i64::from(rscale)));
+    }
+    // Repeated squaring at a fixed number of significant digits: enough for
+    // the result scale plus a margin for the error the multiplications
+    // introduce (PostgreSQL sizes that margin with a NATURAL log).
+    let sig_digits = 1 + i64::from(rscale) + f as i64 + f64::from(exp).abs().ln() as i64 + 8;
+    let neg = exp < 0;
+    let mut mask = exp.unsigned_abs();
+    let mut base_prod = base.clone();
+    let mut result = if mask & 1 == 1 {
+        base.clone()
+    } else {
+        Dec::from_bigint(BigInt::one())
+    };
+    loop {
+        mask >>= 1;
+        if mask == 0 {
+            break;
+        }
+        let local = (sig_digits - 2 * base_prod.weight() * 4)
+            .min(2 * i64::from(base_prod.scale))
+            .max(0) as u32;
+        base_prod = base_prod.mul_round(&base_prod, local);
+        if mask & 1 == 1 {
+            let local = (sig_digits - (base_prod.weight() + result.weight()) * 4)
+                .min(i64::from(base_prod.scale) + i64::from(result.scale))
+                .max(0) as u32;
+            result = base_prod.mul_round(&result, local);
+        }
+        if base_prod.weight() > 32767 || result.weight() > 32767 {
+            // Overflow -- unless the exponent is negative, where the
+            // reciprocal underflows to zero instead.
+            if !neg {
+                return Err(power_overflow());
+            }
+            return Ok(zero_with_scale(i64::from(rscale)));
+        }
+    }
+    Ok(if neg {
+        Dec::from_bigint(BigInt::one()).div_round(&result, rscale)
+    } else {
+        result.round_to(rscale)
+    })
+}
+
+/// `power_var`: a base with a fractional exponent, via `exp(ln(base) * exp)`.
+fn power_general(base: &Dec, exp: &Dec) -> Result<Dec> {
+    if base.is_zero() {
+        return Ok(zero_with_scale(POWER_MIN_SIG_DIGITS));
+    }
+    let abs_base = base.abs();
+    // A negative base needs an integral exponent (too large for `i32`, or
+    // the integer path would have taken it); the sign follows its parity.
+    let negative_result = base.is_negative()
+        && (&exp.round_to(0).unscaled % BigInt::from(2u32)).abs() == BigInt::one();
+    let ln_dweight = estimate_ln_dweight(&abs_base);
+    // This scale may exceed the display maximum when the base is very close
+    // to one; PostgreSQL only floors it.
+    let local = (8 - ln_dweight).max(0) as u32;
+    let ln_base = ln_fixed(&abs_base, local);
+    let ln_num = ln_base.mul_round(exp, local);
+    let val = ln_num.to_f64();
+    if val.abs() > POWER_MAX_RESULT_SCALE * 3.01 {
+        return if val > 0.0 {
+            Err(power_overflow())
+        } else {
+            Ok(zero_with_scale(POWER_MAX_DISPLAY_SCALE))
+        };
+    }
+    // PostgreSQL's own truncated log10(e), kept verbatim so the integer
+    // part of `val` -- which picks the result scale -- agrees with it.
+    #[allow(clippy::approx_constant)]
+    let val = val * 0.434294481903252;
+    let rscale = (POWER_MIN_SIG_DIGITS - val as i64)
+        .max(i64::from(base.scale))
+        .max(i64::from(exp.scale))
+        .clamp(0, POWER_MAX_DISPLAY_SCALE);
+    let sig_digits = (rscale + val as i64).max(0);
+    let local = (sig_digits - ln_dweight + 8).max(0) as u32;
+    let ln_base = ln_fixed(&abs_base, local);
+    let ln_num = ln_base.mul_round(exp, local);
+    let result = exp_fixed(&ln_num, rscale as u32).ok_or_else(power_overflow)?;
+    Ok(if negative_result && !result.is_zero() {
+        Dec {
+            unscaled: -result.unscaled,
+            scale: result.scale,
+        }
+    } else {
+        result
+    })
+}
+
+/// `numeric ^ numeric` with PostgreSQL's result scale. `None` when either
+/// operand is not a numeric text.
+pub fn numeric_power(a: &str, b: &str) -> Option<Result<Bson>> {
+    let (ca, cb) = (
+        canonical_numeric_text(a).ok()?,
+        canonical_numeric_text(b).ok()?,
+    );
+    Some(numeric_power_canonical(&ca, &cb).map(|t| numeric_bson(&t)))
+}
+
+pub(crate) fn numeric_power_canonical(a: &str, b: &str) -> Result<String> {
+    let (ka, kb) = (non_finite_class(a), non_finite_class(b));
+    let complex = || {
+        Error::InvalidArgumentForPower(
+            "a negative number raised to a non-integer power yields a complex result".into(),
+        )
+    };
+    let zero_neg =
+        || Error::InvalidArgumentForPower("zero raised to a negative power is undefined".into());
+    if ka.is_some() || kb.is_some() {
+        // POSIX pow(3): NaN ^ 0 = 1 and 1 ^ NaN = 1, every other NaN is NaN.
+        if ka == Some(0) {
+            let zero_exp = kb.is_none() && Dec::parse(b).is_some_and(|d| d.is_zero());
+            return Ok(if zero_exp { "1" } else { "NaN" }.to_string());
+        }
+        if kb == Some(0) {
+            let one_base = ka.is_none() && Dec::parse(a).is_some_and(|d| d.is_one());
+            return Ok(if one_base { "1" } else { "NaN" }.to_string());
+        }
+        let sign = |k: Option<i8>, text: &str| -> i8 {
+            match k {
+                Some(k) => k,
+                None => match Dec::parse(text) {
+                    Some(d) if d.is_zero() => 0,
+                    Some(d) if d.is_negative() => -1,
+                    _ => 1,
+                },
+            }
+        };
+        let (s1, s2) = (sign(ka, a), sign(kb, b));
+        let exp_integral = kb.is_some() || Dec::parse(b).is_some_and(|d| d.is_integral());
+        if s1 == 0 && s2 < 0 {
+            return Err(zero_neg());
+        }
+        if s1 < 0 && !exp_integral {
+            return Err(complex());
+        }
+        if let Some(k2) = kb {
+            // An infinite exponent: 1 and -1 give 1; |x| < 1 gives 0 for
+            // +Inf and Infinity for -Inf, |x| > 1 the other way round.
+            let base = Dec::parse(a);
+            if base
+                .as_ref()
+                .is_some_and(|d| d.abs_cmp_one() == Ordering::Equal)
+            {
+                return Ok("1".to_string());
+            }
+            let small = base
+                .as_ref()
+                .is_some_and(|d| d.abs_cmp_one() == Ordering::Less);
+            return Ok(if (k2 > 0) == small { "0" } else { "Infinity" }.to_string());
+        }
+        // An infinite base with a finite exponent.
+        if s2 == 0 {
+            return Ok("1".to_string());
+        }
+        if ka == Some(1) {
+            return Ok(if s2 > 0 { "Infinity" } else { "0" }.to_string());
+        }
+        let odd = Dec::parse(b).is_some_and(|d| {
+            d.is_integral() && (d.round_to(0).unscaled % BigInt::from(2u32)).abs() == BigInt::one()
+        });
+        return Ok(if s2 < 0 {
+            "0"
+        } else if odd {
+            "-Infinity"
+        } else {
+            "Infinity"
+        }
+        .to_string());
+    }
+    let (base, exp) = (
+        Dec::parse(a).ok_or_else(|| Error::InvalidText(a.to_string()))?,
+        Dec::parse(b).ok_or_else(|| Error::InvalidText(b.to_string()))?,
+    );
+    if base.is_zero() && exp.is_negative() {
+        return Err(zero_neg());
+    }
+    if base.is_negative() && !exp.is_integral() {
+        return Err(complex());
+    }
+    let result = match exp
+        .is_integral()
+        .then(|| exp.round_to(0).unscaled.to_i32())
+        .flatten()
+    {
+        Some(i) => power_int(&base, i, exp.scale)?,
+        None => power_general(&base, &exp)?,
+    };
+    let text = result.render();
+    if canonical_numeric_text(&text).is_err() {
+        return Err(power_overflow());
+    }
+    Ok(text)
 }

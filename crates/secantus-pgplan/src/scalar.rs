@@ -50,7 +50,10 @@ const SCALAR_NAMES: &[&str] = &[
     "substring",
     "replace",
     "repeat",
+    "lpad",
+    "rpad",
     "reverse",
+    "translate",
     "left",
     "right",
     "strpos",
@@ -59,6 +62,29 @@ const SCALAR_NAMES: &[&str] = &[
     "concat_ws",
     "md5",
     "quote_ident",
+    "quote_literal",
+    "quote_nullable",
+    "to_json",
+    "json_build_array",
+    "jsonb_build_array",
+    "json_build_object",
+    "jsonb_build_object",
+    "to_jsonb",
+    "array_to_string",
+    "array_length",
+    "array_dims",
+    "array_ndims",
+    "array_upper",
+    "array_lower",
+    "cardinality",
+    "format_type",
+    "pg_get_constraintdef",
+    "pg_get_expr",
+    "pg_table_is_visible",
+    "pg_get_userbyid",
+    "pg_type_is_visible",
+    "pg_function_is_visible",
+    "pg_get_indexdef",
     "format",
     "chr",
     "ascii",
@@ -90,6 +116,13 @@ const SCALAR_NAMES: &[&str] = &[
     "transaction_timestamp",
     "statement_timestamp",
     "clock_timestamp",
+    "gen_random_uuid",
+    "random",
+    "pi",
+    "area",
+    "width",
+    "height",
+    "bound_box",
 ];
 
 /// The current instant as a stored `timestamptz` value.
@@ -100,11 +133,7 @@ const SCALAR_NAMES: &[&str] = &[
 /// statement's own time. A transaction that reads `now()` twice sees two
 /// values where PostgreSQL shows one.
 pub fn now_value() -> Bson {
-    let micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    crate::timestamptz_value_from_micros(micros)
+    crate::timestamptz_value_from_micros(crate::transaction_clock_micros())
 }
 
 fn text(v: &Bson) -> String {
@@ -118,7 +147,8 @@ fn text(v: &Bson) -> String {
         // A boolean's text form is `t` / `f`: `concat(true)` is `t`
         // (measured), never `true`.
         Bson::Boolean(b) => (if *b { "t" } else { "f" }).to_string(),
-        other => format!("{other:?}"),
+        // Every other value takes its `::text` form -- never a Debug dump.
+        other => crate::render_value_text(other),
     }
 }
 
@@ -179,12 +209,27 @@ pub fn call(name: &str, args: &[Bson]) -> Option<Result<Bson>> {
 
 fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     // Most scalar built-ins are NULL-propagating: given a NULL argument the
-    // answer is NULL, not an error. Four are not, and all four IGNORE a NULL
-    // argument instead: `concat` and `concat_ws` skip them, and `greatest` /
-    // `least` pick the extreme of what remains, so `greatest(1, NULL)` is 1.
+    // answer is NULL, not an error. The exceptions IGNORE a NULL argument
+    // instead: `concat` and `concat_ws` skip them, and `greatest` /
+    // `least` pick the extreme of what remains, so `greatest(1, NULL)` is 1;
+    // the JSON constructors carry it as a JSON `null` (and refuse it as a
+    // key).
+    // `format_type` is NULL only on a NULL oid: a NULL typmod means "no
+    // modifier", so `format_type(23, NULL)` is `integer`.
     if !matches!(
         name,
-        "concat" | "concat_ws" | "greatest" | "least" | "format"
+        "concat"
+            | "concat_ws"
+            | "greatest"
+            | "least"
+            | "format"
+            | "format_type"
+            | "quote_nullable"
+            | "array_to_string"
+            | "json_build_array"
+            | "jsonb_build_array"
+            | "json_build_object"
+            | "jsonb_build_object"
     ) && args.iter().any(|a| a == &Bson::Null)
     {
         return Ok(Bson::Null);
@@ -200,9 +245,77 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
     };
 
     match name {
-        "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
+        // The box functions. A box argument arrives as its tagged document;
+        // anything else matches no overload (42883). An UNTYPED argument is
+        // refused before the call (`refuse_untyped_any_args`).
+        "area" | "width" | "height" | "bound_box" => {
+            need(if name == "bound_box" { 2 } else { 1 })?;
+            let boxed = |i: usize| -> Result<[f64; 4]> {
+                let v = arg(i);
+                crate::geo::box_coords(&v).ok_or_else(|| {
+                    let t = crate::display_type(crate::inferred_type(&v));
+                    Error::UndefinedFunction(format!("function {name}({t}) does not exist"))
+                })
+            };
+            let a = boxed(0)?;
+            Ok(match name {
+                "area" => Bson::Double((a[0] - a[2]) * (a[1] - a[3])),
+                "width" => Bson::Double(a[0] - a[2]),
+                "height" => Bson::Double(a[1] - a[3]),
+                _ => {
+                    let b = boxed(1)?;
+                    crate::geo::box_value([
+                        a[0].max(b[0]),
+                        a[1].max(b[1]),
+                        a[2].min(b[2]),
+                        a[3].min(b[3]),
+                    ])
+                }
+            })
+        }
+        // Three clocks, as PostgreSQL has them: the transaction's start, the
+        // statement's start, and the wall clock at the call.
+        "now" | "transaction_timestamp" => {
             need(0)?;
             Ok(now_value())
+        }
+        "statement_timestamp" => {
+            need(0)?;
+            Ok(crate::timestamptz_value_from_micros(
+                crate::statement_clock_micros(),
+            ))
+        }
+        "clock_timestamp" => {
+            need(0)?;
+            Ok(crate::timestamptz_value_from_micros(
+                crate::wall_clock_micros(),
+            ))
+        }
+        "pi" => {
+            need(0)?;
+            Ok(Bson::Double(std::f64::consts::PI))
+        }
+        // A uniform `float8` in [0, 1), as `random()` returns.
+        "random" => {
+            need(0)?;
+            Ok(Bson::Double(rand::random::<f64>()))
+        }
+        // A version-4 UUID: 122 random bits under the version and variant
+        // markers, rendered in the canonical lower-case form.
+        "gen_random_uuid" => {
+            need(0)?;
+            let mut b: [u8; 16] = rand::random();
+            b[6] = (b[6] & 0x0f) | 0x40;
+            b[8] = (b[8] & 0x3f) | 0x80;
+            let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+            Ok(Bson::String(format!(
+                "{}-{}-{}-{}-{}",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
+            )))
         }
         "st_geomfromgeojson" => {
             need(1)?;
@@ -353,6 +466,10 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if let Bson::Binary(b) = &arg(0) {
                 return Ok(Bson::Int32(b.bytes.len() as i32));
             }
+            // `length(bit)` is the number of bits.
+            if let Some((digits, _)) = crate::bits::bit_digits(&arg(0)) {
+                return Ok(Bson::Int32(digits.len() as i32));
+            }
             Ok(Bson::Int32(s(0).chars().count() as i32))
         }
         "octet_length" => {
@@ -360,12 +477,18 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             if let Bson::Binary(b) = &arg(0) {
                 return Ok(Bson::Int32(b.bytes.len() as i32));
             }
+            if let Some((digits, _)) = crate::bits::bit_digits(&arg(0)) {
+                return Ok(Bson::Int32(digits.len().div_ceil(8) as i32));
+            }
             Ok(Bson::Int32(s(0).len() as i32))
         }
         "bit_length" => {
             need(1)?;
             if let Bson::Binary(b) = &arg(0) {
                 return Ok(Bson::Int32((b.bytes.len() * 8) as i32));
+            }
+            if let Some((digits, _)) = crate::bits::bit_digits(&arg(0)) {
+                return Ok(Bson::Int32(digits.len() as i32));
             }
             Ok(Bson::Int32((s(0).len() * 8) as i32))
         }
@@ -424,11 +547,43 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             } else {
                 None
             };
+            // `substring(bit ...)` is a bit string of the digits taken.
+            if let Some((digits, varying)) = crate::bits::bit_digits(&arg(0)) {
+                return Ok(crate::bits::bit_value(
+                    substring(digits, start, len),
+                    varying,
+                ));
+            }
             Ok(Bson::String(substring(&s(0), start, len)))
         }
         "replace" => {
             need(3)?;
             Ok(Bson::String(s(0).replace(&s(1), &s(2))))
+        }
+        "lpad" | "rpad" => {
+            if !(2..=3).contains(&args.len()) {
+                return Err(wrong_args(name));
+            }
+            let chars: Vec<char> = s(0).chars().collect();
+            let length = usize::try_from(as_i64(&arg(1)).unwrap_or(0)).unwrap_or(0);
+            let fill: Vec<char> = if args.len() == 3 {
+                s(2).chars().collect()
+            } else {
+                vec![' ']
+            };
+            // Too long is truncated to `length`; too short is padded with
+            // `fill` cycled, unless `fill` is empty (nothing to pad with).
+            if chars.len() >= length || fill.is_empty() {
+                let kept: String = chars.iter().take(length).collect();
+                return Ok(Bson::String(kept));
+            }
+            let padding: String = fill.iter().cycle().take(length - chars.len()).collect();
+            let text: String = chars.iter().collect();
+            Ok(Bson::String(if name == "lpad" {
+                padding + &text
+            } else {
+                text + &padding
+            }))
         }
         "repeat" => {
             need(2)?;
@@ -438,6 +593,23 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         "reverse" => {
             need(1)?;
             Ok(Bson::String(s(0).chars().rev().collect()))
+        }
+        // `translate(s, from, to)`: each character of `from` maps to the
+        // character at the same position in `to`, or is dropped when `to`
+        // is shorter; the FIRST occurrence in `from` decides (`translate(
+        // 'aaa', 'aa', 'xy')` is `xxx`). Measured 16.
+        "translate" => {
+            need(3)?;
+            let from: Vec<char> = s(1).chars().collect();
+            let to: Vec<char> = s(2).chars().collect();
+            let out: String = s(0)
+                .chars()
+                .filter_map(|c| match from.iter().position(|f| *f == c) {
+                    Some(i) => to.get(i).copied(),
+                    None => Some(c),
+                })
+                .collect();
+            Ok(Bson::String(out))
         }
         "left" | "right" => {
             need(2)?;
@@ -494,6 +666,242 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             need(1)?;
             Ok(Bson::String(quote_identifier(&s(0))))
         }
+        "quote_literal" => {
+            need(1)?;
+            Ok(Bson::String(quote_literal(&s(0))))
+        }
+        // `quote_nullable(NULL)` is the bare word NULL, not a NULL answer.
+        "quote_nullable" => {
+            need(1)?;
+            Ok(Bson::String(match arg(0) {
+                Bson::Null => "NULL".to_string(),
+                v => quote_literal(&text(&v)),
+            }))
+        }
+        "to_json" | "to_jsonb" => {
+            need(1)?;
+            Ok(Bson::String(if name == "to_json" {
+                json_text_of(name, &arg(0))?
+            } else {
+                crate::json::render_jsonb(&json_of(name, &arg(0))?)
+            }))
+        }
+        // The constructors. The `json` forms keep each element's own text
+        // (a `json` argument verbatim, everything else compact) and join
+        // with `, ` -- `[1, "a"]`, `{"k" : 1}` -- where the `jsonb` forms
+        // normalise the whole value (measured 16).
+        "json_build_array" => {
+            let items = args
+                .iter()
+                .map(|v| json_text_of(name, v))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Bson::String(format!("[{}]", items.join(", "))))
+        }
+        "jsonb_build_array" => {
+            let items = args
+                .iter()
+                .map(|v| json_of(name, v))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Bson::String(crate::json::render_jsonb(
+                &crate::json::Json::Array(items),
+            )))
+        }
+        "json_build_object" | "jsonb_build_object" => {
+            if !args.len().is_multiple_of(2) {
+                return Err(Error::InvalidParameter(
+                    "argument list must have even number of elements".into(),
+                ));
+            }
+            let mut pairs = Vec::with_capacity(args.len() / 2);
+            for kv in args.chunks(2) {
+                let key = match &kv[0] {
+                    Bson::Null => {
+                        return Err(Error::NullValueNotAllowed(
+                            "null value not allowed for object key".into(),
+                        ))
+                    }
+                    Bson::Array(_) | Bson::Document(_) => {
+                        return Err(Error::InvalidParameter(
+                            "key value must be scalar, not array, composite, or json".into(),
+                        ))
+                    }
+                    // A boolean key is spelled `true` / `false`, not `t` / `f`.
+                    Bson::Boolean(b) => b.to_string(),
+                    k => text(k),
+                };
+                pairs.push((key, &kv[1]));
+            }
+            Ok(Bson::String(if name == "json_build_object" {
+                let members = pairs
+                    .iter()
+                    .map(|(k, v)| {
+                        Ok(format!(
+                            "{} : {}",
+                            crate::json::quote_string(k),
+                            json_text_of(name, v)?
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                format!("{{{}}}", members.join(", "))
+            } else {
+                let members = pairs
+                    .into_iter()
+                    .map(|(k, v)| Ok((k, json_of(name, v)?)))
+                    .collect::<Result<Vec<_>>>()?;
+                crate::json::render_jsonb(&crate::json::Json::Object(members))
+            }))
+        }
+        // `array_to_string(arr, sep[, null_string])`: a NULL array or
+        // separator is a NULL answer; NULL elements are skipped unless the
+        // third argument names their spelling.
+        "array_to_string" => {
+            if !(args.len() == 2 || args.len() == 3) {
+                return Err(wrong_args(name));
+            }
+            let (items, sep) = match (arg(0), arg(1)) {
+                (Bson::Null, _) | (_, Bson::Null) => return Ok(Bson::Null),
+                (Bson::Array(items), sep) => (items, text(&sep)),
+                _ => return Err(wrong_args(name)),
+            };
+            let null_text = match args.get(2) {
+                None | Some(Bson::Null) => None,
+                Some(v) => Some(text(v)),
+            };
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|v| match v {
+                    Bson::Null => null_text.clone(),
+                    v => Some(text(v)),
+                })
+                .collect();
+            Ok(Bson::String(parts.join(&sep)))
+        }
+        // The array-shape functions. Every stored array has a lower bound of
+        // 1 (a `[2:3]=` decoration is not kept), so the bounds are the
+        // lengths; an empty array has no dimensions and answers NULL to all
+        // of them but `cardinality`.
+        "array_dims" | "array_ndims" | "cardinality" => {
+            need(1)?;
+            let Bson::Array(items) = arg(0) else {
+                return Err(wrong_args(name));
+            };
+            let dims = array_shape(&items);
+            Ok(match name {
+                "cardinality" if dims.is_empty() => Bson::Int32(0),
+                "cardinality" => Bson::Int32(dims.iter().product::<usize>() as i32),
+                _ if dims.is_empty() => Bson::Null,
+                "array_ndims" => Bson::Int32(dims.len() as i32),
+                _ => Bson::String(dims.iter().map(|n| format!("[1:{n}]")).collect()),
+            })
+        }
+        "array_length" | "array_upper" | "array_lower" => {
+            need(2)?;
+            let Bson::Array(items) = arg(0) else {
+                return Err(wrong_args(name));
+            };
+            let dim = as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?;
+            let dims = array_shape(&items);
+            let Some(n) = usize::try_from(dim)
+                .ok()
+                .filter(|d| *d >= 1)
+                .and_then(|d| dims.get(d - 1))
+            else {
+                return Ok(Bson::Null);
+            };
+            Ok(Bson::Int32(if name == "array_lower" {
+                1
+            } else {
+                *n as i32
+            }))
+        }
+        "format_type" => {
+            need(2)?;
+            let oid = match arg(0) {
+                Bson::Null => return Ok(Bson::Null),
+                v => crate::regtype_oid(&v)
+                    .or_else(|| as_i64(&v))
+                    .ok_or_else(|| wrong_args(name))?,
+            };
+            let typmod = match arg(1) {
+                Bson::Null => None,
+                v => Some(
+                    as_i64(&v)
+                        .and_then(|m| i32::try_from(m).ok())
+                        .ok_or_else(|| wrong_args(name))?,
+                ),
+            };
+            crate::format_type_text(oid, typmod).map(Bson::String)
+        }
+        // The catalog installs each constraint's / index's rendered
+        // definition per statement; an oid nothing carries is NULL, as
+        // PostgreSQL answers for one it cannot find (measured 16.15).
+        // `pg_get_constraintdef(oid, pretty)` and `pg_get_indexdef(oid,
+        // colno, pretty)` are the three-argument forms psql's `\d` uses;
+        // `pretty` changes nothing in a definition this simple, and a
+        // `colno` above 0 answers the bare expression of that index column
+        // (`c`, not `c DESC`), or `''` past the last one (measured 16.15).
+        "pg_get_constraintdef" | "pg_get_indexdef" => {
+            let is_index = name == "pg_get_indexdef";
+            let extra = if is_index { 2 } else { 1 };
+            if args.len() != 1 && args.len() != 1 + extra {
+                return Err(wrong_args(name));
+            }
+            if args.contains(&Bson::Null) {
+                return Ok(Bson::Null);
+            }
+            let oid = as_i64(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            let text = if is_index {
+                crate::index_def(oid)
+            } else {
+                crate::constraint_def(oid)
+            };
+            let Some(text) = text else {
+                return Ok(Bson::Null);
+            };
+            let colno = if is_index && args.len() == 3 {
+                as_i64(&arg(1)).ok_or_else(|| wrong_args(name))?
+            } else {
+                0
+            };
+            if colno <= 0 {
+                // `pretty` drops the schema of a table on the search path
+                // (PostgreSQL 16: `ON qa` for `public.qa`, `ON qt` for
+                // `pg_temp.qt`); the unpretty form always qualifies.
+                let pretty = is_index && args.len() == 3 && arg(2) == Bson::Boolean(true);
+                if pretty {
+                    if let Some((head, tail)) = text.split_once(" ON ") {
+                        let unqualified = tail
+                            .strip_prefix("public.")
+                            .or_else(|| tail.strip_prefix("pg_temp."))
+                            .unwrap_or(tail);
+                        return Ok(Bson::String(format!("{head} ON {unqualified}")));
+                    }
+                }
+                return Ok(Bson::String(text));
+            }
+            let columns = text
+                .rsplit_once(" (")
+                .and_then(|(_, tail)| tail.strip_suffix(')'))
+                .unwrap_or("");
+            let column = columns
+                .split(", ")
+                .nth(colno as usize - 1)
+                .map(|c| c.strip_suffix(" DESC").unwrap_or(c))
+                .unwrap_or("");
+            Ok(Bson::String(column.to_string()))
+        }
+        // `pg_get_expr(expr, relid [, pretty])`: `pg_attrdef.adbin` and
+        // `pg_constraint.conbin` already hold rendered SQL text, so the
+        // decompilation is the identity.
+        "pg_get_expr" => {
+            if args.len() != 2 && args.len() != 3 {
+                return Err(wrong_args(name));
+            }
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            Ok(Bson::String(s(0)))
+        }
         "format" => {
             if args.is_empty() {
                 return Err(wrong_args(name));
@@ -526,17 +934,55 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             let n = as_i64(&arg(2)).unwrap_or(0);
             let subject = s(0);
             let sep = s(1);
-            let parts: Vec<&str> = subject.split(&sep as &str).collect();
-            let idx = if n > 0 {
-                (n - 1) as usize
+            // An empty delimiter makes the whole string field one; a
+            // negative position counts from the end (PostgreSQL 16).
+            let parts: Vec<&str> = if sep.is_empty() {
+                vec![subject.as_str()]
             } else {
-                return Err(Error::InvalidText(
-                    "field position must be greater than zero".into(),
+                subject.split(&sep as &str).collect()
+            };
+            let idx = if n > 0 {
+                usize::try_from(n - 1).ok()
+            } else if n < 0 {
+                usize::try_from(n.unsigned_abs())
+                    .ok()
+                    .and_then(|k| parts.len().checked_sub(k))
+            } else {
+                return Err(Error::InvalidParameter(
+                    "field position must not be zero".into(),
                 ));
             };
             Ok(Bson::String(
-                parts.get(idx).copied().unwrap_or("").to_string(),
+                idx.and_then(|i| parts.get(i))
+                    .copied()
+                    .unwrap_or("")
+                    .to_string(),
             ))
+        }
+        // Every schema this server has is on the search path (`public`,
+        // `pg_temp`, `pg_catalog`), so any existing object is visible; a
+        // NULL oid is a NULL answer.
+        "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible" => {
+            need(1)?;
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            Ok(Bson::Boolean(true))
+        }
+        // A role's name by oid; one nothing carries is `unknown (OID=n)`
+        // (measured 16.15).
+        "pg_get_userbyid" => {
+            need(1)?;
+            if arg(0) == Bson::Null {
+                return Ok(Bson::Null);
+            }
+            let oid = as_i64(&arg(0)).ok_or_else(|| wrong_args(name))?;
+            let name = crate::role_name(oid).unwrap_or_else(|| match oid {
+                // The pseudo-role that owns `public`.
+                6171 => "pg_database_owner".to_string(),
+                _ => format!("unknown (OID={oid})"),
+            });
+            Ok(Bson::String(name))
         }
         "starts_with" => {
             need(2)?;
@@ -547,9 +993,16 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
         // exact rather than becoming a float.
         "abs" => {
             need(1)?;
+            no_money_function(name, &arg(0))?;
             Ok(match arg(0) {
-                Bson::Int32(i) => Bson::Int32(i.abs()),
-                Bson::Int64(i) => Bson::Int64(i.abs()),
+                Bson::Int32(i) => Bson::Int32(
+                    i.checked_abs()
+                        .ok_or_else(|| Error::NumericOutOfRange("integer out of range".into()))?,
+                ),
+                Bson::Int64(i) => Bson::Int64(
+                    i.checked_abs()
+                        .ok_or_else(|| Error::NumericOutOfRange("bigint out of range".into()))?,
+                ),
                 Bson::Double(d) => Bson::Double(d.abs()),
                 v if crate::is_numeric(&v) => {
                     let t = crate::numeric_text(&v).unwrap_or_default();
@@ -577,11 +1030,27 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
                 _ => Bson::Double(f64::from(out)),
             })
         }
-        "ceil" | "ceiling" | "floor" | "trunc" | "round" => numeric_rounding(name, args),
+        "ceil" | "ceiling" | "floor" | "trunc" | "round" => {
+            if args.is_empty() {
+                return Err(wrong_args(name));
+            }
+            no_money_function(name, &arg(0))?;
+            numeric_rounding(name, args)
+        }
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" => float_math(name, args),
         "mod" => {
             need(2)?;
             match (arg(0), arg(1)) {
+                // `mod(numeric, numeric)` is the numeric `%`: `mod(7.5, 2)`
+                // is `1.5`, not the integer remainder.
+                (a, b) if crate::is_numeric(&a) || crate::is_numeric(&b) => {
+                    let text = crate::numeric::numeric_operand_text;
+                    match (text(&a), text(&b)) {
+                        (Some(x), Some(y)) => crate::numeric::decimal_arith("%", &x, &y)
+                            .unwrap_or_else(|| Err(wrong_args(name))),
+                        _ => Err(wrong_args(name)),
+                    }
+                }
                 (_, b) if as_f64(&b) == Some(0.0) => Err(Error::DivisionByZero),
                 (Bson::Int32(a), b) => Ok(Bson::Int32(
                     a % i32::try_from(as_i64(&b).unwrap_or(1)).unwrap_or(1),
@@ -644,6 +1113,17 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
 ///
 /// `round(numeric)` goes half AWAY FROM ZERO and `round(float8)` goes half TO
 /// EVEN — the same split the integer casts have, and the same trap.
+/// The numeric functions have no money overload: `abs(money)` is 42883
+/// `function abs(money) does not exist` (measured 16).
+fn no_money_function(name: &str, arg: &Bson) -> Result<()> {
+    if crate::money::money_cents(arg).is_some() {
+        return Err(Error::UndefinedFunction(format!(
+            "function {name}(money) does not exist"
+        )));
+    }
+    Ok(())
+}
+
 fn numeric_rounding(name: &str, args: &[Bson]) -> Result<Bson> {
     let subject = args.first().cloned().unwrap_or(Bson::Null);
     // `round(x, n)` is numeric-only in PostgreSQL and keeps n decimal places.
@@ -901,6 +1381,54 @@ fn pg_format(fmt: &str, args: &[Bson]) -> Result<String> {
     Ok(out)
 }
 
+/// A value as JSON, the way `to_json` sees it: numbers keep their text,
+/// booleans and strings map directly, an array maps element-wise. A
+/// date/time value cannot be told from its type here (`to_json` renders a
+/// `timestamp` in ISO 8601 with a `T`, which the text form does not), so
+/// those are refused rather than rendered wrong.
+/// `v` as `json` text: a `json` argument verbatim (`to_json` of a `json`
+/// is the identity, whitespace and all), anything else compact.
+fn json_text_of(name: &str, v: &Bson) -> Result<String> {
+    match crate::json::raw_text(v) {
+        Some(text) => Ok(text.to_string()),
+        None => Ok(crate::json::render_json_compact(&json_of(name, v)?)),
+    }
+}
+
+fn json_of(name: &str, v: &Bson) -> Result<crate::json::Json> {
+    use crate::json::Json;
+    if let Some(text) = crate::json::raw_text(v) {
+        return crate::json::parse(text)
+            .map_err(|e| Error::Internal(format!("stored json failed to parse: {e:?}")));
+    }
+    Ok(match v {
+        Bson::Null => Json::Null,
+        // A bytea's output form, `\x0102`, as a string.
+        Bson::Binary(_) => Json::Str(text(v)),
+        Bson::Boolean(b) => Json::Bool(*b),
+        Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Decimal128(_) => {
+            Json::Number(crate::render_value_text(v))
+        }
+        v if crate::is_wide_numeric(v) => Json::Number(text(v)),
+        Bson::String(s) => Json::Str(s.clone()),
+        Bson::Array(items) => Json::Array(
+            items
+                .iter()
+                .map(|i| json_of(name, i))
+                .collect::<Result<Vec<_>>>()?,
+        ),
+        Bson::DateTime(_) => {
+            return Err(Error::Unsupported(format!("{name} over a date/time value")))
+        }
+        _ => {
+            return Err(Error::Unsupported(format!(
+                "{name} over a {} value",
+                crate::display_type(crate::inferred_type(v))
+            )))
+        }
+    })
+}
+
 /// PostgreSQL's `quote_literal`: single quotes doubled, and a backslash
 /// forces the `E'...'` form with the backslashes doubled too.
 fn quote_literal(text: &str) -> String {
@@ -999,28 +1527,104 @@ fn md5_hex(data: &[u8]) -> String {
         .collect()
 }
 
+/// The length of each dimension of an array: `[]` for an empty one, `[3]`
+/// for `{1,2,3}`, `[2, 2]` for `{{1,2},{3,4}}`. Nested arrays are
+/// rectangular by construction, so the first element's shape is every
+/// element's.
+fn array_shape(items: &[Bson]) -> Vec<usize> {
+    let mut dims = Vec::new();
+    let mut level = items;
+    loop {
+        if level.is_empty() {
+            return dims;
+        }
+        dims.push(level.len());
+        match level.first() {
+            Some(Bson::Array(inner)) => level = inner,
+            _ => return dims,
+        }
+    }
+}
+
 /// The RESULT type of a scalar, for the describe pass -- which sees no value
 /// to infer from. The string functions answer text; the numeric ones vary by
 /// input and fall back to text only when unknown, which is also what an
 /// untyped output column defaults to.
+/// Whether a result of the declared type is carried by a value that reads
+/// as some OTHER type: a `timestamptz` instant is stored like a naive
+/// `timestamp`, and `json` / `jsonb` are carried as their text.
+pub fn value_hides_type(declared: &str) -> bool {
+    matches!(declared, "timestamptz" | "json" | "jsonb" | "uuid" | "name")
+}
+
 pub fn static_result_type(name: &str) -> &'static str {
-    match name {
+    known_result_type(name).unwrap_or("text")
+}
+
+/// The declared result type of a scalar function, or `None` for one this
+/// table does not name -- which `static_result_type` reads as `text`, a
+/// default that is right for the string functions and wrong for
+/// `greatest` / `least`, whose type is their arguments'. A caller judging a
+/// NULL-valued plan-time result needs to know the difference.
+pub fn known_result_type(name: &str) -> Option<&'static str> {
+    Some(match name {
         "length" | "char_length" | "character_length" | "octet_length" | "bit_length"
         | "strpos" | "position" | "ascii" | "get_byte" => "int4",
         "abs" | "ceil" | "ceiling" | "floor" | "round" | "trunc" | "mod" | "div" => "numeric",
         "sqrt" | "exp" | "ln" | "log" | "log10" | "power" | "pow" | "sign" => "float8",
-        "starts_with" => "bool",
+        "starts_with" | "pg_table_is_visible" | "pg_type_is_visible" | "pg_function_is_visible" => {
+            "bool"
+        }
         "set_byte" | "decode" => "bytea",
         "now" | "transaction_timestamp" | "statement_timestamp" | "clock_timestamp" => {
             "timestamptz"
         }
+        "gen_random_uuid" => "uuid",
+        "pg_get_userbyid" => "name",
+        "random" | "pi" => "float8",
         "st_geomfromgeojson" | "st_geomfromtext" | "st_geomfromewkt" => "geometry",
         "st_srid" => "int4",
+        "area" | "width" | "height" => "float8",
+        "bound_box" => "box",
         "hstore" | "delete" => "hstore",
         "akeys" | "avals" => "text[]",
         "exist" | "defined" => "bool",
-        "hstore_to_json" => "json",
-        "hstore_to_jsonb" => "jsonb",
-        _ => "text",
-    }
+        "hstore_to_json" | "to_json" | "json_build_array" | "json_build_object" => "json",
+        "hstore_to_jsonb" | "to_jsonb" | "jsonb_build_array" | "jsonb_build_object" => "jsonb",
+        "upper"
+        | "lower"
+        | "initcap"
+        | "btrim"
+        | "trim"
+        | "ltrim"
+        | "rtrim"
+        | "substr"
+        | "substring"
+        | "replace"
+        | "repeat"
+        | "lpad"
+        | "rpad"
+        | "reverse"
+        | "translate"
+        | "left"
+        | "right"
+        | "concat"
+        | "concat_ws"
+        | "md5"
+        | "quote_ident"
+        | "quote_literal"
+        | "quote_nullable"
+        | "array_to_string"
+        | "format_type"
+        | "format"
+        | "chr"
+        | "split_part"
+        | "encode"
+        | "array_dims"
+        | "pg_get_constraintdef"
+        | "pg_get_indexdef"
+        | "pg_get_expr" => "text",
+        "array_length" | "array_ndims" | "array_upper" | "array_lower" | "cardinality" => "int4",
+        _ => return None,
+    })
 }

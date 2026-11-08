@@ -1370,6 +1370,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "pg_query",
+ "rand",
  "regex",
  "secantus-pgcatalog",
 ]

@@ -233,45 +233,49 @@ def main(setup_path: str, corpus_path: str, *, types: bool, tags: bool, server: 
         host, port = srv.address
         sec = psycopg.connect(host=host, port=port, dbname="db", user="probe", autocommit=True)
     ref = psycopg.connect(os.environ.get("SECANTUS_PG_ORACLE_DSN", DEFAULT_DSN), autocommit=True)
-    scur, rcur = sec.cursor(), ref.cursor()
+    # Tear the servers down on EVERY exit: a corpus line that hangs the
+    # server, or a probe that raises, used to leave a `secantusd-pg` running
+    # (34 were found idling from one afternoon's runs).
+    try:
+        scur, rcur = sec.cursor(), ref.cursor()
 
-    for stmt in _read(setup_path):
-        _run(rcur, stmt, False)
-        got = _run(scur, stmt, False)
-        if got[0] == "err" and not stmt.upper().startswith("DROP"):
-            print(f"SETUP FAILED (secantus): {stmt}\n  -> {got[1]}")
+        for stmt in _read(setup_path):
+            _run(rcur, stmt, False)
+            got = _run(scur, stmt, False)
+            if got[0] == "err" and not stmt.upper().startswith("DROP"):
+                print(f"SETUP FAILED (secantus): {stmt}\n  -> {got[1]}")
 
-    corpus = _read(corpus_path)
-    diffs = 0
-    checks = 0
-    for line in corpus:
-        sql, args = _split_params(line)
-        # A parameterised line is compared once per BINDING MODE, so the report
-        # names which one diverged; a plain line keeps the single comparison.
-        runs = (
-            [
-                (
-                    label,
-                    _run_params(rcur, sql, args, types, prepare=p, binary=b),
-                    _run_params(scur, sql, args, types, prepare=p, binary=b),
-                )
-                for label, p, b in PARAM_MODES
-            ]
-            if args is not None
-            else [("", _run(rcur, sql, types), _run(scur, sql, types))]
-        )
-        for label, want, got in runs:
-            checks += 1
-            diffs += _report(sql, label, want, got, types=types, tags=tags)
+        corpus = _read(corpus_path)
+        diffs = 0
+        checks = 0
+        for line in corpus:
+            sql, args = _split_params(line)
+            # A parameterised line is compared once per BINDING MODE, so the report
+            # names which one diverged; a plain line keeps the single comparison.
+            runs = (
+                [
+                    (
+                        label,
+                        _run_params(rcur, sql, args, types, prepare=p, binary=b),
+                        _run_params(scur, sql, args, types, prepare=p, binary=b),
+                    )
+                    for label, p, b in PARAM_MODES
+                ]
+                if args is not None
+                else [("", _run(rcur, sql, types), _run(scur, sql, types))]
+            )
+            for label, want, got in runs:
+                checks += 1
+                diffs += _report(sql, label, want, got, types=types, tags=tags)
 
-    print(f"\n=== {diffs} divergences out of {checks} checks ({len(corpus)} corpus lines)")
-    sec.close()
-    ref.close()
-    srv.stop()
-    if store is not None:
-        store.close()
-        shutil.rmtree(store_dir, ignore_errors=True)
-        shutil.rmtree(store_dir, ignore_errors=True)
+        print(f"\n=== {diffs} divergences out of {checks} checks ({len(corpus)} corpus lines)")
+    finally:
+        sec.close()
+        ref.close()
+        srv.stop()
+        if store is not None:
+            store.close()
+            shutil.rmtree(store_dir, ignore_errors=True)
     return 1 if diffs else 0
 
 

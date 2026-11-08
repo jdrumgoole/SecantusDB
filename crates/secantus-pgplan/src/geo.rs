@@ -215,12 +215,36 @@ pub fn float8_text(v: f64) -> String {
         return (if v.is_sign_negative() { "-0" } else { "0" }).to_string();
     }
     // Rust's `{:e}` is the shortest round-trip form: `1.2345678901234568e17`.
-    let sci = format!("{:e}", v.abs());
+    shortest_float_text(v < 0.0, format!("{:e}", v.abs()), 15)
+}
+
+/// `float4out`: the same shortest round-trip rendering over the SINGLE
+/// precision value, which has fewer digits (`0.33333334`, `3.1415927`) and
+/// switches to `d.ddde+XX` sooner -- fixed notation only for decimal
+/// exponents in `-4..6`, so `1.234567e+06` where float8 prints `1234567`
+/// (measured on 16: `16777217::float4` is `1.6777216e+07`).
+pub fn float4_text(v: f32) -> String {
+    if v.is_nan() {
+        return "NaN".to_string();
+    }
+    if v.is_infinite() {
+        return (if v > 0.0 { "Infinity" } else { "-Infinity" }).to_string();
+    }
+    if v == 0.0 {
+        return (if v.is_sign_negative() { "-0" } else { "0" }).to_string();
+    }
+    shortest_float_text(v < 0.0, format!("{:e}", v.abs()), 6)
+}
+
+/// Lay out a `d.ddde<exp>` shortest form the way `float8out` / `float4out`
+/// do: fixed notation while the decimal exponent is in `-4..fixed_limit`,
+/// `d.ddde+XX` outside it.
+fn shortest_float_text(negative: bool, sci: String, fixed_limit: i32) -> String {
     let (mantissa, exp) = sci.split_once('e').expect("exponent form");
     let exp: i32 = exp.parse().expect("integer exponent");
     let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let sign = if v < 0.0 { "-" } else { "" };
-    if !(-4..15).contains(&exp) {
+    let sign = if negative { "-" } else { "" };
+    if !(-4..fixed_limit).contains(&exp) {
         let (first, rest) = digits.split_at(1);
         let frac = if rest.is_empty() {
             String::new()
@@ -240,6 +264,141 @@ pub fn float8_text(v: f64) -> String {
         let (int_part, frac) = digits.split_at(point);
         format!("{sign}{int_part}.{frac}")
     }
+}
+
+// ---------------------------------------------------------------------------
+// Box operators.
+//
+// PostgreSQL's geometric comparisons are FUZZY: every one goes through the
+// `FPeq` / `FPlt` / ... macros with `EPSILON 1.0E-06`, so two boxes whose
+// corners differ by less than that are the same box, and `<<` needs a gap
+// wider than it. A NaN coordinate fails every test, as it does in C.
+// Measured on PostgreSQL 16.
+
+const EPSILON: f64 = 1.0e-6;
+
+fn fp_eq(a: f64, b: f64) -> bool {
+    a == b || (a - b).abs() <= EPSILON
+}
+fn fp_lt(a: f64, b: f64) -> bool {
+    (b - a) > EPSILON
+}
+fn fp_gt(a: f64, b: f64) -> bool {
+    (a - b) > EPSILON
+}
+fn fp_le(a: f64, b: f64) -> bool {
+    (b - a) >= -EPSILON
+}
+fn fp_ge(a: f64, b: f64) -> bool {
+    (a - b) >= -EPSILON
+}
+
+/// PostgreSQL's own `pg_hypot`, which is not libm's: it scales by the larger
+/// magnitude and takes one square root, and the last digit differs.
+fn pg_hypot(x: f64, y: f64) -> f64 {
+    if x.is_infinite() || y.is_infinite() {
+        return f64::INFINITY;
+    }
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    let (mut x, mut y) = (x.abs(), y.abs());
+    if x < y {
+        std::mem::swap(&mut x, &mut y);
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    let yx = y / x;
+    x * (1.0 + yx * yx).sqrt()
+}
+
+/// Whether an operator has a `box <op> box` form (`<>` included: it has
+/// none, and the operator error names box on both sides).
+pub fn is_box_operator(op: &str) -> bool {
+    matches!(
+        op,
+        "=" | "<>"
+            | "<"
+            | "<="
+            | ">"
+            | ">="
+            | "&&"
+            | "@>"
+            | "<@"
+            | "<<"
+            | ">>"
+            | "&<"
+            | "&>"
+            | "<<|"
+            | "|>>"
+            | "&<|"
+            | "|&>"
+            | "~="
+            | "<->"
+            | "#"
+    )
+}
+
+/// The result type of `box <op> box`.
+pub fn box_operator_type(op: &str) -> &'static str {
+    match op {
+        "<->" => "float8",
+        "#" => "box",
+        _ => "bool",
+    }
+}
+
+/// `box <op> box`. `a` and `b` are `[high.x, high.y, low.x, low.y]`.
+pub fn box_operator(op: &str, a: &[f64; 4], b: &[f64; 4]) -> Result<Bson> {
+    let (ahx, ahy, alx, aly) = (a[0], a[1], a[2], a[3]);
+    let (bhx, bhy, blx, bly) = (b[0], b[1], b[2], b[3]);
+    let area = |c: &[f64; 4]| (c[0] - c[2]) * (c[1] - c[3]);
+    let overlaps = fp_ge(ahx, blx) && fp_ge(bhx, alx) && fp_ge(ahy, bly) && fp_ge(bhy, aly);
+    let contains = |o: &[f64; 4], i: &[f64; 4]| {
+        fp_ge(o[0], i[0]) && fp_le(o[2], i[2]) && fp_ge(o[1], i[1]) && fp_le(o[3], i[3])
+    };
+    Ok(match op {
+        // Equality and ordering are by AREA, not by corners.
+        "=" => Bson::Boolean(fp_eq(area(a), area(b))),
+        "<" => Bson::Boolean(fp_lt(area(a), area(b))),
+        "<=" => Bson::Boolean(fp_le(area(a), area(b))),
+        ">" => Bson::Boolean(fp_gt(area(a), area(b))),
+        ">=" => Bson::Boolean(fp_ge(area(a), area(b))),
+        "~=" => {
+            Bson::Boolean(fp_eq(ahx, bhx) && fp_eq(alx, blx) && fp_eq(ahy, bhy) && fp_eq(aly, bly))
+        }
+        "&&" => Bson::Boolean(overlaps),
+        "@>" => Bson::Boolean(contains(a, b)),
+        "<@" => Bson::Boolean(contains(b, a)),
+        "<<" => Bson::Boolean(fp_lt(ahx, blx)),
+        "&<" => Bson::Boolean(fp_le(ahx, bhx)),
+        ">>" => Bson::Boolean(fp_gt(alx, bhx)),
+        "&>" => Bson::Boolean(fp_ge(alx, blx)),
+        "<<|" => Bson::Boolean(fp_lt(ahy, bly)),
+        "&<|" => Bson::Boolean(fp_le(ahy, bhy)),
+        "|>>" => Bson::Boolean(fp_gt(aly, bhy)),
+        "|&>" => Bson::Boolean(fp_ge(aly, bly)),
+        // The distance between the two centres.
+        "<->" => {
+            let (ax, ay) = ((ahx + alx) / 2.0, (ahy + aly) / 2.0);
+            let (bx, by) = ((bhx + blx) / 2.0, (bhy + bly) / 2.0);
+            Bson::Double(pg_hypot(ax - bx, ay - by))
+        }
+        // The intersection, or NULL when there is none.
+        "#" => {
+            if !overlaps {
+                Bson::Null
+            } else {
+                box_value([ahx.min(bhx), ahy.min(bhy), alx.max(blx), aly.max(bly)])
+            }
+        }
+        other => {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: box {other} box"
+            )))
+        }
+    })
 }
 
 #[cfg(test)]
@@ -273,6 +432,29 @@ mod tests {
             assert_eq!(float8_text(v), want, "{v}");
         }
         assert_eq!(float8_text(f64::NAN), "NaN");
+    }
+
+    #[test]
+    fn float4_text_matches_float4out() {
+        let cases = [
+            (0.1f32, "0.1"),
+            (1.0 / 3.0, "0.33333334"),
+            (16_777_217.0, "1.6777216e+07"),
+            (123_456_789.0, "1.2345679e+08"),
+            (1_000_000.0, "1e+06"),
+            (999_999.0, "999999"),
+            (100.5, "100.5"),
+            (0.0001, "0.0001"),
+            (0.00001, "1e-05"),
+            (1e20, "1e+20"),
+            (-2.5, "-2.5"),
+            (1.0, "1"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(float4_text(v), want, "{v}");
+        }
+        assert_eq!(float4_text(f32::NAN), "NaN");
+        assert_eq!(float4_text(f32::INFINITY), "Infinity");
     }
 
     #[test]

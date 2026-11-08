@@ -24,3 +24,5 @@ secantus-pgcatalog = { path = "../secantus-pgcatalog" }
 # arbitrary precision, and a sum or product of two wide values has to be exact.
 num-bigint = "0.4"
 num-traits = "0.2"
+# `gen_random_uuid()` -- 122 random bits; the same crate `secantus-core` uses for `$rand`.
+rand = "0.9"

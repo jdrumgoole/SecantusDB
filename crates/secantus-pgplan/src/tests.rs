@@ -143,7 +143,8 @@ fn unsupported_and_undefined_carry_postgres_sqlstates() {
         // A JOIN shape the planner does not reduce to two-table/one-ON is
         // still refused rather than half-run.
         ("SELECT a FROM t JOIN u ON t.id > u.id", "42P01"),
-        ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
+        // `integer ~~ unknown` is an operator PostgreSQL does not have.
+        ("SELECT * FROM t WHERE n LIKE 'x'", "42883"),
         ("SELECT nope FROM t", "42703"),
         ("SELECT * FROM t WHERE nope = 1", "42703"),
         ("SELECT * FROM missing", "42P01"),
@@ -300,9 +301,15 @@ fn update_and_delete_are_planned() {
         }
         other => panic!("wrong statement: {other:?}"),
     }
-    // The PK is the document's `_id`, which storage treats as immutable.
-    let err = plan("UPDATE t SET id = 2 WHERE id = 1", &lookup).expect_err("PK update");
-    assert_eq!(err.sqlstate(), "0A000");
+    // The PK is the document's `_id`: the plan carries it as a `_id` set
+    // and flags it, so the executor can rewrite the row instead of a `$set`.
+    match plan_ok("UPDATE t SET id = 2 WHERE id = 1") {
+        Statement::Update(u) => {
+            assert_eq!(u.set, doc! {"_id": 2i32});
+            assert!(u.changes_pk());
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
 }
 
 #[test]
@@ -397,12 +404,100 @@ fn duplicate_aggregate_names_stay_distinct_columns() {
     }
 }
 
-/// ORDER BY over a column that is neither grouped nor aggregated is refused
-/// rather than silently ignored.
+/// ORDER BY over a column that is neither grouped nor aggregated is
+/// PostgreSQL's 42803, not silently ignored.
 #[test]
 fn order_by_a_non_grouped_column_is_refused() {
     let err = plan("SELECT count(*) FROM t ORDER BY name", &lookup).expect_err("must refuse");
-    assert_eq!(err.sqlstate(), "0A000");
+    assert_eq!(err.sqlstate(), "42803");
+}
+
+/// ORDER BY and DISTINCT ON over an aggregate query resolve to OUTPUT
+/// columns: an alias, a position, a group key, or an aggregate the SELECT
+/// list never projects.
+#[test]
+fn aggregate_order_by_resolves_output_columns() {
+    let cases = [
+        (
+            "SELECT count(*) FROM t GROUP BY name ORDER BY 1",
+            OutputCol::Agg(0),
+        ),
+        (
+            "SELECT name, sum(n) AS total FROM t GROUP BY name ORDER BY total",
+            OutputCol::Agg(0),
+        ),
+        (
+            "SELECT name, count(*) FROM t GROUP BY name ORDER BY sum(n) DESC",
+            OutputCol::Agg(1),
+        ),
+        (
+            "SELECT name, count(*) FROM t GROUP BY name ORDER BY sum(n) + 1",
+            OutputCol::Expr(0),
+        ),
+        (
+            "SELECT name, count(*) FROM t GROUP BY name ORDER BY 1",
+            OutputCol::Group(0),
+        ),
+    ];
+    for (sql, want) in cases {
+        match plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
+            Statement::Aggregate(a) => {
+                assert_eq!(a.order.len(), 1, "{sql}");
+                assert_eq!(a.order[0].col, want, "{sql}");
+            }
+            other => panic!("wrong statement: {other:?}"),
+        }
+    }
+    // `ORDER BY sum(n)` with `sum(n)` unprojected adds the item for it.
+    match plan("SELECT name FROM t GROUP BY name ORDER BY sum(n)", &lookup).unwrap() {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.items.len(), 1);
+            assert_eq!(a.select.len(), 1);
+            assert_eq!(a.order[0].col, OutputCol::Agg(0));
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan(
+        "SELECT DISTINCT ON (name) name, count(*) FROM t GROUP BY name ORDER BY name, 2",
+        &lookup,
+    )
+    .unwrap()
+    {
+        Statement::Aggregate(a) => {
+            assert_eq!(a.distinct_on, vec![OutputCol::Group(0)]);
+            assert!(!a.distinct);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    let err = plan(
+        "SELECT DISTINCT ON (name) name, count(*) FROM t GROUP BY name ORDER BY 2",
+        &lookup,
+    )
+    .expect_err("ON must lead the ORDER BY");
+    assert_eq!(err.sqlstate(), "42P10");
+}
+
+/// `agg(x ORDER BY <expression>)` evaluates the expression per row into a
+/// hidden slot the sort reads.
+#[test]
+fn in_aggregate_order_by_expression_plans_a_slot() {
+    match plan(
+        "SELECT array_agg(name ORDER BY length(name) DESC, name) FROM t",
+        &lookup,
+    )
+    .unwrap()
+    {
+        Statement::Aggregate(a) => {
+            let item = &a.items[0];
+            assert_eq!(item.order.len(), 2);
+            assert_eq!(item.order[0].field, "__aggord0_0");
+            assert!(!item.order[0].ascending);
+            assert_eq!(item.order[1].field, "name");
+            assert_eq!(item.order_exprs.len(), 1);
+            assert_eq!(item.order_exprs[0].0, "__aggord0_0");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
 }
 
 #[test]
@@ -416,7 +511,7 @@ fn group_by_resolves_order_by_index() {
             // `name` is grouped but NOT projected; only the aggregate is.
             assert_eq!(a.select, vec![("count".to_string(), OutputCol::Agg(0))]);
             assert_eq!(a.order.len(), 1);
-            assert_eq!(a.order[0].group_index, 0);
+            assert_eq!(a.order[0].col, OutputCol::Group(0));
             assert!(!a.order[0].ascending);
             // DESC defaults to NULLS FIRST.
             assert_eq!(a.order[0].nulls, Nulls::First);
@@ -478,7 +573,7 @@ fn group_by_an_expression_or_a_position_keys_on_the_expression() {
         match plan(sql, &lookup).unwrap_or_else(|e| panic!("{sql}: {e:?}")) {
             Statement::Aggregate(a) => {
                 assert_eq!(a.order.len(), 1, "{sql}");
-                assert_eq!(a.order[0].group_index, 0);
+                assert_eq!(a.order[0].col, OutputCol::Group(0));
                 assert!(!a.order[0].ascending);
             }
             other => panic!("wrong statement: {other:?}"),
@@ -567,16 +662,10 @@ fn aggregate_refusals_carry_the_right_sqlstate() {
         // A bare column beside an aggregate must be grouped.
         ("SELECT name, count(*) FROM t", "42803"),
         // Deliberately deferred rather than approximated. Keep this naming
-        // something that IS still refused -- `avg` and `string_agg` each sat
-        // here until they landed, and the stale case failed the build.
-        (
-            "SELECT array_agg(name ORDER BY length(name)) FROM t",
-            "0A000",
-        ),
-        // `DISTINCT ON` over an aggregate resolves its keys against the GROUP
-        // BY output, which this slice does not do; plain `count(DISTINCT n)`
-        // IS supported (see `count_distinct_plans_a_distinct_aggregate`).
-        ("SELECT DISTINCT ON (n) count(*) FROM t GROUP BY n", "0A000"),
+        // something that IS still refused -- `avg`, `string_agg`, in-aggregate
+        // `ORDER BY <expr>` and `DISTINCT ON` each sat here until they landed,
+        // and the stale case failed the build.
+        ("SELECT array_agg(name ORDER BY nope) FROM t", "42703"),
         ("SELECT count(nope) FROM t", "42703"),
         ("SELECT sum(nope + 1) FROM t", "42703"),
         ("SELECT count(*) FROM t GROUP BY nope", "42703"),
@@ -606,9 +695,25 @@ fn having_plans_and_adds_the_aggregates_it_needs() {
         }
         other => panic!("wrong statement: {other:?}"),
     }
-    // A shape the lowerer does not cover is refused, not approximated.
+    // An ungrouped column in HAVING is PostgreSQL's 42803 (probed 16.15).
     let err = plan("SELECT count(*) FROM t HAVING count(*) > n", &lookup).expect_err("n in HAVING");
-    assert_eq!(err.sqlstate(), "0A000");
+    assert_eq!(err.sqlstate(), "42803");
+    // A predicate over the group keys, or comparing two grouped values, is a
+    // boolean expression evaluated per group.
+    match plan(
+        "SELECT n FROM t GROUP BY n HAVING n + 1 > 3 AND count(*) > n",
+        &lookup,
+    )
+    .unwrap()
+    {
+        Statement::Aggregate(a) => {
+            assert!(matches!(a.having, Some(Having::And(_))));
+            assert_eq!(a.exprs.len(), 2);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    let err = plan("SELECT n FROM t GROUP BY n HAVING n + 1", &lookup).expect_err("not boolean");
+    assert_eq!(err.sqlstate(), "42804");
 }
 
 /// `count(DISTINCT col)` plans as an aggregate that dedups its input.
@@ -865,7 +970,18 @@ fn select_without_from_answers_session_functions() {
         other => panic!("wrong statement: {other:?}"),
     }
     let err = plan("SELECT nosuchfunc()", &lookup).expect_err("unknown function");
-    assert_eq!(err.sqlstate(), "0A000");
+    assert_eq!(err.sqlstate(), "42883");
+    assert_eq!(
+        err.to_string(),
+        "function nosuchfunc() does not exist\nPosition: 7"
+    );
+    assert_eq!(
+        err.hint(),
+        Some(
+            "No function matches the given name and argument types. You might need to add \
+             explicit type casts."
+        )
+    );
 }
 
 /// A cast DECLARES its column's type, which is not the same as the type of the
@@ -959,12 +1075,28 @@ fn drop_table_is_planned() {
         }
         other => panic!("wrong statement: {other:?}"),
     }
-    // CASCADE would have to chase dependants; behaving as RESTRICT silently
-    // would be the wrong kind of helpful.
-    let err = plan("DROP TABLE t CASCADE", &lookup).expect_err("cascade");
-    assert_eq!(err.sqlstate(), "0A000");
-    // Other DROP targets stay refused rather than dropping the wrong thing.
-    let err = plan("DROP INDEX i", &lookup).expect_err("drop index");
+    // CASCADE rides along for the executor to chase the dependants.
+    match plan_ok("DROP TABLE t CASCADE") {
+        Statement::DropTable(d) => assert!(d.cascade),
+        other => panic!("wrong statement: {other:?}"),
+    }
+    // Other relation kinds are their own statement, so a `DROP INDEX` can
+    // never drop a table of the same name.
+    match plan_ok("DROP INDEX IF EXISTS i") {
+        Statement::DropRelations {
+            kind,
+            names,
+            if_exists,
+            cascade,
+        } => {
+            assert_eq!(kind, DropKind::Index);
+            assert_eq!(names, vec!["i".to_string()]);
+            assert!(if_exists);
+            assert!(!cascade);
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    let err = plan("DROP DOMAIN d", &lookup).expect_err("drop domain");
     assert_eq!(err.sqlstate(), "0A000");
 }
 
@@ -1246,6 +1378,70 @@ fn numeric_canonical_text_matches_postgres() {
             "{bad:?} should be invalid"
         );
     }
+}
+
+/// `numeric ^ numeric` reproduces PostgreSQL's `numeric_power`: the result
+/// scale rule (at least 16 significant digits, widened by the operands'
+/// scales), the integer-exponent fast path, the underflow-to-zero at scale
+/// 1000, the overflow, and the two 2201F refusals. Values from PostgreSQL
+/// 16.15 (2026-09-23).
+#[test]
+fn numeric_power_matches_postgres() {
+    for (a, b, want) in [
+        ("2", "0.5", "1.4142135623730950"),
+        ("2.0", "3", "8.0000000000000000"),
+        ("2", "0.1", "1.0717734625362932"),
+        ("9.99", "9.99", "9675183873.3397141"),
+        ("2", "64.5", "26087635650665564424.7"),
+        ("1.0000001", "100000000", "22026.454781577307"),
+        (
+            "1.5",
+            "0.5000000000000000000000",
+            "1.2247448713915890490986",
+        ),
+        ("0.95", "0.5", "0.9746794344808964"),
+        (
+            "1000",
+            "0.3333333333333333333333333333",
+            "9.9999999999999999999999999977",
+        ),
+        ("5", "3.999999999", "624.99999899410131"),
+        ("1.1", "-40", "0.02209492815217999"),
+        ("0.0", "3", "0.0000000000000000"),
+        ("1", "2147483648.0", "1.0000000000000000"),
+        (
+            "0.00000000000000000001",
+            "2.5",
+            "0.000000000000000000000000000000000000000000000000010000000000000000",
+        ),
+        ("NaN", "0", "1"),
+        ("1", "NaN", "1"),
+        ("NaN", "2", "NaN"),
+        ("-1", "Infinity", "1"),
+        ("2", "-Infinity", "0"),
+        ("-Infinity", "3", "-Infinity"),
+    ] {
+        assert_eq!(
+            numeric::numeric_power_canonical(a, b).unwrap(),
+            want,
+            "for {a} ^ {b}"
+        );
+    }
+    let zero = numeric::numeric_power_canonical("0.5", "8700.5").unwrap();
+    assert!(zero.starts_with("0.000") && zero.len() == 1002, "{zero}");
+    assert!(numeric::numeric_power_canonical("10", "2620.5").is_err());
+    assert_eq!(
+        numeric::numeric_power_canonical("0", "-1")
+            .unwrap_err()
+            .to_string(),
+        "zero raised to a negative power is undefined"
+    );
+    assert_eq!(
+        numeric::numeric_power_canonical("-8", "0.5")
+            .unwrap_err()
+            .to_string(),
+        "a negative number raised to a non-integer power yields a complex result"
+    );
 }
 
 /// The sort key orders bytewise as the numbers order, across widths.
@@ -2275,10 +2471,16 @@ fn json_unicode_escapes_match_postgres() {
     assert_eq!(cast("json", r#""\u0000""#), r#""\u0000""#);
     let err = plan(r#"SELECT '"\ud83d"'::jsonb"#, &lookup).unwrap_err();
     assert_eq!(err.sqlstate(), "22P02");
-    assert_eq!(err.to_string(), "invalid input syntax for type json");
+    assert_eq!(
+        err.to_string(),
+        "invalid input syntax for type json\nPosition: 7"
+    );
     let err = plan(r#"SELECT '"\u0000"'::jsonb"#, &lookup).unwrap_err();
     assert_eq!(err.sqlstate(), "22P05");
-    assert_eq!(err.to_string(), "unsupported Unicode escape sequence");
+    assert_eq!(
+        err.to_string(),
+        "unsupported Unicode escape sequence\nPosition: 7"
+    );
 }
 
 /// The scalar built-ins, every case measured against PostgreSQL 14.
@@ -2307,6 +2509,10 @@ fn scalar_builtins_match_postgres() {
         ("replace('abcabc','b','X')", "aXcaXc"),
         ("repeat('ab',3)", "ababab"),
         ("reverse('abc')", "cba"),
+        ("translate('abcabc', 'ab', 'x')", "xcxc"),
+        ("translate('abc', 'abc', '')", ""),
+        ("translate('aaa', 'aa', 'xy')", "xxx"),
+        ("translate('abc', 'a', 'xyz')", "xbc"),
         // A negative count means "all but this many from the other end".
         ("left('abcde',-2)", "abc"),
         ("right('abcde',-2)", "cde"),
@@ -2562,25 +2768,56 @@ fn malformed_multiranges_are_refused() {
 /// that runs the wrong way for its step is EMPTY rather than reversed.
 #[test]
 fn generate_series_counts_by_its_step() {
-    let vals = |start: i64, stop: i64, step: i64| {
+    let vals = |start: i32, stop: i32, step: i32| {
         crate::Series {
-            start,
-            stop,
-            step,
+            start: Bson::Int32(start),
+            stop: Bson::Int32(stop),
+            step: Bson::Int32(step),
+            element_type: "int4".into(),
             column: "generate_series".into(),
         }
         .values()
     };
-    assert_eq!(vals(1, 5, 1), vec![1, 2, 3, 4, 5]);
-    assert_eq!(vals(1, 10, 3), vec![1, 4, 7, 10]);
-    assert_eq!(vals(5, 1, -2), vec![5, 3, 1]);
+    let ints = |v: &[i32]| v.iter().copied().map(Bson::Int32).collect::<Vec<_>>();
+    assert_eq!(vals(1, 5, 1), ints(&[1, 2, 3, 4, 5]));
+    assert_eq!(vals(1, 10, 3), ints(&[1, 4, 7, 10]));
+    assert_eq!(vals(5, 1, -2), ints(&[5, 3, 1]));
     // Counting up towards a smaller stop produces nothing; it does not reverse.
-    assert_eq!(vals(5, 1, 1), Vec::<i64>::new());
-    assert_eq!(vals(1, 0, 1), Vec::<i64>::new());
-    assert_eq!(vals(3, 3, 1), vec![3]);
+    assert_eq!(vals(5, 1, 1), Vec::<Bson>::new());
+    assert_eq!(vals(1, 0, 1), Vec::<Bson>::new());
+    assert_eq!(vals(3, 3, 1), ints(&[3]));
     // A zero step never terminates, which is why PostgreSQL refuses it before
     // it gets this far.
-    assert_eq!(vals(1, 5, 0), Vec::<i64>::new());
+    assert_eq!(vals(1, 5, 0), Vec::<Bson>::new());
+    // A `numeric` series walks by repeated addition, which is what gives
+    // PostgreSQL's scales: `1, 1.5, 2.0, 2.5, 3.0` (measured 16.15).
+    let numeric = crate::Series {
+        start: crate::numeric::numeric_bson("1"),
+        stop: crate::numeric::numeric_bson("3"),
+        step: crate::numeric::numeric_bson("0.5"),
+        element_type: "numeric".into(),
+        column: "generate_series".into(),
+    };
+    assert_eq!(
+        numeric
+            .values()
+            .iter()
+            .filter_map(crate::numeric::numeric_text)
+            .collect::<Vec<_>>(),
+        vec!["1", "1.5", "2.0", "2.5", "3.0"]
+    );
+    // A NULL bound generates nothing rather than failing.
+    assert_eq!(
+        crate::Series {
+            start: Bson::Int32(1),
+            stop: Bson::Null,
+            step: Bson::Int32(1),
+            element_type: "int4".into(),
+            column: "generate_series".into(),
+        }
+        .values(),
+        Vec::<Bson>::new()
+    );
 }
 
 /// A zero step is `22023` — the argument is a number of the right shape whose
@@ -2647,7 +2884,7 @@ fn a_set_returning_function_in_the_select_list_makes_rows() {
     match plan_ok("SELECT generate_series(1,3)") {
         Statement::Select(sel) => {
             let series = sel.series.expect("a series");
-            assert_eq!(series.values(), vec![1, 2, 3]);
+            assert_eq!(series.values(), [1, 2, 3].map(Bson::Int32).to_vec());
             assert_eq!(series.column, "generate_series");
             assert_eq!(
                 sel.columns,
@@ -2717,18 +2954,18 @@ fn a_numeric_never_renders_in_exponent_notation() {
 fn a_series_reads_its_bounds_from_parameters() {
     let series = |params: &[Bson]| -> Series {
         match plan_with_params("SELECT * FROM generate_series(1, $1)", &lookup, params) {
-            Ok(Statement::Select(sel)) => sel.series.expect("a series"),
+            Ok(Statement::Select(sel)) => *sel.series.expect("a series"),
             other => panic!("wrong statement: {other:?}"),
         }
     };
     assert_eq!(
         series(&[Bson::String("4".into())]).values(),
-        vec![1, 2, 3, 4]
+        [1, 2, 3, 4].map(Bson::Int32).to_vec()
     );
     // Whitespace around a bound is accepted, as PostgreSQL's integer parser is.
     assert_eq!(
         series(&[Bson::String(" 3 ".into())]).values(),
-        vec![1, 2, 3]
+        [1, 2, 3].map(Bson::Int32).to_vec()
     );
     // A NULL bound: zero rows, not an error.
     assert!(series(&[Bson::Null]).values().is_empty());
@@ -2745,13 +2982,14 @@ fn a_series_reads_its_bounds_from_parameters() {
         "invalid input syntax for type integer: \"x\""
     );
 
-    // There is no `generate_series(int, float8)` in PostgreSQL.
+    // There is no `generate_series(int, float8)` in PostgreSQL -- refused at
+    // the call, which the wire layer reports as PostgreSQL's position 15.
     let err = plan("SELECT * FROM generate_series(1, 3::float8)", &lookup)
         .expect_err("no float8 overload");
     assert_eq!(err.sqlstate(), "42883");
     assert_eq!(
         err.to_string(),
-        "function generate_series(integer, double precision) does not exist"
+        "function generate_series(integer, double precision) does not exist\nPosition: 14"
     );
 }
 
@@ -2992,9 +3230,14 @@ fn assigning_a_text_typed_expression_to_a_non_text_column_is_42804() {
     for sql in ["insert into t (n) values ($1)", "update t set n = $1"] {
         let err = plan_typed(sql, &text).expect_err("should refuse");
         assert_eq!(err.sqlstate(), "42804");
+        // ... positioned at the parameter, as PostgreSQL points at the
+        // expression it could not assign.
         assert_eq!(
             err.to_string(),
-            "column \"n\" is of type integer but expression is of type text"
+            format!(
+                "column \"n\" is of type integer but expression is of type text\nPosition: {}",
+                sql.find("$1").expect("has a parameter")
+            )
         );
         assert_eq!(
             err.hint(),
@@ -3004,7 +3247,7 @@ fn assigning_a_text_typed_expression_to_a_non_text_column_is_42804() {
     let err = plan_ok_err("update t set n = '1'::varchar");
     assert_eq!(
         err.to_string(),
-        "column \"n\" is of type integer but expression is of type character varying"
+        "column \"n\" is of type integer but expression is of type character varying\nPosition: 17"
     );
     plan_typed("insert into t (name) values ($1)", &text).expect("text into text");
     plan_typed("insert into t (n) values ($1)", &[Some("int8".to_string())])
@@ -3322,4 +3565,422 @@ fn extension_statements_plan() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+/// Datetime arithmetic, measured on PostgreSQL 16.15 (2026-09-23).
+fn constant_column(sql: &str) -> (Bson, String) {
+    match plan_ok(sql) {
+        Statement::SelectConstant(sc) => {
+            assert_eq!(sc.columns.len(), 1, "{sql}");
+            let (_, ConstCol::Value(v), ty, _) = &sc.columns[0] else {
+                panic!("{sql}: not a value column");
+            };
+            (v.clone(), ty.clone())
+        }
+        other => panic!("{sql}: {other:?}"),
+    }
+}
+
+fn interval_doc(months: i32, days: i32, micros: i64) -> Bson {
+    Bson::Document(doc! {
+        "__ivl_mon": months,
+        "__ivl_day": days,
+        "__ivl_us": micros,
+    })
+}
+
+#[test]
+fn timestamp_minus_timestamp_is_an_interval_of_days_and_time() {
+    // Never months: PG renders '2026-03-01' - '2025-01-01' as 424 days.
+    assert_eq!(
+        constant_column("SELECT '2026-03-01'::timestamp - '2025-01-01'::timestamp"),
+        (interval_doc(0, 424, 0), "interval".to_string())
+    );
+    assert_eq!(
+        constant_column(
+            "SELECT '2026-01-02 03:00:00'::timestamp - '2026-01-01 01:30:00'::timestamp"
+        ),
+        (interval_doc(0, 1, 5_400_000_000), "interval".to_string())
+    );
+}
+
+#[test]
+fn date_plus_time_is_a_timestamp() {
+    assert_eq!(
+        constant_column("SELECT '2026-01-01'::date + '12:30:00'::time"),
+        (
+            Bson::String("2026-01-01 12:30:00".into()),
+            "timestamp".to_string()
+        )
+    );
+    assert_eq!(
+        constant_column("SELECT '2026-01-01'::date + interval '1 day'"),
+        (
+            // An instant carrier, not text: a timestamptz sum has to keep
+            // its zone under `::text`.
+            timestamptz_value_from_micros(parse_timestamp("2026-01-02 00:00:00").unwrap()),
+            "timestamp".to_string()
+        )
+    );
+}
+
+#[test]
+fn time_arithmetic_wraps_at_midnight_and_ignores_the_day_part() {
+    // time + interval uses only the interval's micros: '1 day 2 hours' adds 2h.
+    assert_eq!(
+        constant_column("SELECT '10:00:00'::time + interval '1 day 2 hours'"),
+        (Bson::String("12:00:00".into()), "time".to_string())
+    );
+    assert_eq!(
+        constant_column("SELECT '23:00:00'::time - interval '25 hours'"),
+        (Bson::String("22:00:00".into()), "time".to_string())
+    );
+    assert_eq!(
+        constant_column("SELECT '10:00:00'::time - '08:30:00'::time"),
+        (interval_doc(0, 0, 5_400_000_000), "interval".to_string())
+    );
+}
+
+#[test]
+fn an_unknown_literal_takes_the_type_the_operator_needs() {
+    // timestamp - 'lit': the literal is a timestamp, so the result is an interval.
+    assert_eq!(
+        constant_column("SELECT '2026-01-02'::timestamp - '2026-01-01'"),
+        (interval_doc(0, 1, 0), "interval".to_string())
+    );
+    // time - 'lit': same rule.
+    assert_eq!(
+        constant_column("SELECT '10:00:00'::time - '08:30'"),
+        (interval_doc(0, 0, 5_400_000_000), "interval".to_string())
+    );
+    // timestamp + 'lit': the literal is an interval.
+    assert_eq!(
+        constant_column("SELECT '2026-01-01'::timestamp + '1 day'"),
+        (
+            timestamptz_value_from_micros(parse_timestamp("2026-01-02 00:00:00").unwrap()),
+            "timestamp".to_string()
+        )
+    );
+    // date + 'lit' is ambiguous (date + integer or date + interval).
+    let err = plan_ok_err("SELECT '2026-01-01'::date + '2'");
+    assert_eq!(err.sqlstate(), "42725");
+    assert_eq!(err.to_string(), "operator is not unique: date + unknown");
+    assert_eq!(
+        err.hint(),
+        Some("Could not choose a best candidate operator. You might need to add explicit type casts.")
+    );
+    // date - 'lit' takes a date, so a non-date literal is a bad date.
+    assert_eq!(
+        plan_ok_err("SELECT '2026-01-01'::date - '1 day'").sqlstate(),
+        "22007"
+    );
+}
+
+/// LIKE / ILIKE / SIMILAR TO / `~` over a column lower to a `$regex`, and the
+/// negated forms keep only rows with a value (`NULL NOT LIKE 'x'` is NULL).
+#[test]
+fn pattern_operators_lower_to_regex() {
+    let cases: Vec<(&str, Document)> = vec![
+        (
+            "SELECT * FROM t WHERE name LIKE 'a%'",
+            doc! {"name": {"$regex": "^a.*$", "$options": "s"}},
+        ),
+        (
+            "SELECT * FROM t WHERE name ILIKE 'a_'",
+            doc! {"name": {"$regex": "^a.$", "$options": "si"}},
+        ),
+        (
+            "SELECT * FROM t WHERE name NOT LIKE 'a%'",
+            doc! {"$and": [
+                {"name": {"$ne": Bson::Null}},
+                {"name": {"$not": {"$regex": "^a.*$", "$options": "s"}}},
+            ]},
+        ),
+        (
+            "SELECT * FROM t WHERE NOT (name LIKE 'a%')",
+            doc! {"$and": [
+                {"name": {"$ne": Bson::Null}},
+                {"name": {"$not": {"$regex": "^a.*$", "$options": "s"}}},
+            ]},
+        ),
+        (
+            "SELECT * FROM t WHERE NOT (name NOT ILIKE 'a%')",
+            doc! {"name": {"$regex": "^a.*$", "$options": "si"}},
+        ),
+        (
+            "SELECT * FROM t WHERE name ~ '^a'",
+            doc! {"name": {"$regex": "^a", "$options": "s"}},
+        ),
+        (
+            "SELECT * FROM t WHERE name !~* 'b$'",
+            doc! {"$and": [
+                {"name": {"$ne": Bson::Null}},
+                {"name": {"$not": {"$regex": "b$", "$options": "si"}}},
+            ]},
+        ),
+        (
+            "SELECT * FROM t WHERE name SIMILAR TO '(a|b)%'",
+            doc! {"name": {"$regex": "^(?:(?:a|b).*)$", "$options": "s"}},
+        ),
+        (
+            "SELECT * FROM t WHERE name LIKE 'a#_%' ESCAPE '#'",
+            doc! {"name": {"$regex": "^a_.*$", "$options": "s"}},
+        ),
+        // A constant pattern test folds like `WHERE true` / `WHERE false`.
+        ("SELECT * FROM t WHERE 'abc' LIKE 'a%'", doc! {}),
+        (
+            "SELECT * FROM t WHERE 'abc' NOT LIKE 'a%'",
+            doc! {"$expr": false},
+        ),
+        ("SELECT * FROM t WHERE name LIKE NULL", doc! {"$nor": [{}]}),
+    ];
+    for (sql, want) in cases {
+        match plan_ok(sql) {
+            Statement::Select(s) => assert_eq!(s.filter, want, "for {sql}"),
+            other => panic!("wrong statement for {sql}: {other:?}"),
+        }
+    }
+    assert_eq!(
+        plan_ok_err("SELECT * FROM t WHERE name ~ '('").sqlstate(),
+        "2201B"
+    );
+    assert_eq!(
+        plan_ok_err("SELECT * FROM t WHERE name LIKE 'a' ESCAPE 'xx'").sqlstate(),
+        "22025"
+    );
+    assert_eq!(
+        plan_ok_err("SELECT * FROM t WHERE n ~ 'a'").to_string(),
+        // ... positioned at the operator's byte offset, as PostgreSQL
+        // points `LINE 1: ... ^` at it.
+        "operator does not exist: integer ~ unknown\nPosition: 24"
+    );
+}
+
+#[test]
+fn pattern_operators_fold_over_constants() {
+    for (sql, want) in [
+        ("SELECT 'abc' LIKE 'a%'", true),
+        ("SELECT 'abc' NOT LIKE 'a%'", false),
+        ("SELECT 'ABC' ILIKE 'a%'", true),
+        ("SELECT 'ABC' NOT ILIKE 'a%'", false),
+        ("SELECT 'abc' SIMILAR TO 'a(b|x)c'", true),
+        ("SELECT 'abc' NOT SIMILAR TO 'a(b|x)c'", false),
+        ("SELECT 'abc' ~ 'b'", true),
+        ("SELECT 'abc' ~* 'B'", true),
+        ("SELECT 'abc' !~ 'b'", false),
+        ("SELECT 'abc' !~* 'x'", true),
+        ("SELECT 'a_c' LIKE 'a\\_c'", true),
+        ("SELECT 'abc' LIKE 'a\\_c'", false),
+        ("SELECT 'abc' ~~ 'a%'", true),
+    ] {
+        let (v, ty) = constant_column(sql);
+        assert_eq!(v, Bson::Boolean(want), "{sql}");
+        assert_eq!(ty, "bool", "{sql}");
+    }
+    assert_eq!(constant_column("SELECT NULL LIKE 'a'").0, Bson::Null);
+    assert_eq!(constant_column("SELECT 'a' LIKE NULL").0, Bson::Null);
+    assert_eq!(
+        plan_ok_err("SELECT 1 LIKE 'a'").to_string(),
+        "operator does not exist: integer ~~ unknown\nPosition: 9"
+    );
+    assert_eq!(plan_ok_err("SELECT 'a' LIKE 'a\\'").sqlstate(), "22025");
+}
+
+#[test]
+fn integer_bitwise_operators_fold_over_constants() {
+    // PostgreSQL 16.15: the shift count is masked to the operand's width,
+    // and a bigint on either side widens the result.
+    for (sql, value, ty) in [
+        ("SELECT 65536 | 1", Bson::Int32(65537), "int4"),
+        ("SELECT 6 & 3", Bson::Int32(2), "int4"),
+        ("SELECT 6 # 3", Bson::Int32(5), "int4"),
+        ("SELECT 1 << 31", Bson::Int32(i32::MIN), "int4"),
+        ("SELECT 1 << 32", Bson::Int32(1), "int4"),
+        ("SELECT 1 << -1", Bson::Int32(i32::MIN), "int4"),
+        ("SELECT -8 >> 1", Bson::Int32(-4), "int4"),
+        ("SELECT ~5", Bson::Int32(-6), "int4"),
+        ("SELECT 5 | 2::bigint", Bson::Int64(7), "int8"),
+        ("SELECT 1::bigint << 63", Bson::Int64(i64::MIN), "int8"),
+        ("SELECT ~5::bigint", Bson::Int64(-6), "int8"),
+        ("SELECT '3' | 1", Bson::Int32(3), "int4"),
+        ("SELECT null | 1", Bson::Null, "int4"),
+        ("SELECT ~null::int", Bson::Null, "int4"),
+    ] {
+        assert_eq!(constant_column(sql), (value, ty.to_string()), "{sql}");
+    }
+    let err = plan_ok_err("SELECT 1.5 | 1");
+    assert_eq!(err.sqlstate(), "42883");
+    assert_eq!(
+        err.to_string(),
+        "operator does not exist: numeric | integer\nPosition: 11"
+    );
+    let err = plan_ok_err("SELECT 'a' | 1");
+    assert_eq!(err.sqlstate(), "22P02");
+}
+
+#[test]
+fn between_folds_over_constants_with_three_valued_logic() {
+    for (sql, value) in [
+        ("SELECT 2 BETWEEN 1 AND 3", Bson::Boolean(true)),
+        ("SELECT 2 BETWEEN SYMMETRIC 3 AND 1", Bson::Boolean(true)),
+        ("SELECT 2 NOT BETWEEN 1 AND 3", Bson::Boolean(false)),
+        (
+            "SELECT 2 NOT BETWEEN SYMMETRIC 3 AND 1",
+            Bson::Boolean(false),
+        ),
+        ("SELECT NULL BETWEEN 1 AND 2", Bson::Null),
+        ("SELECT 2 BETWEEN NULL AND 3", Bson::Null),
+        ("SELECT 5 BETWEEN NULL AND 3", Bson::Boolean(false)),
+        ("SELECT 5 NOT BETWEEN NULL AND 3", Bson::Boolean(true)),
+        ("SELECT 0 NOT BETWEEN NULL AND 3", Bson::Null),
+        ("SELECT 5 BETWEEN '1' AND '6'", Bson::Boolean(true)),
+    ] {
+        assert_eq!(constant_column(sql), (value, "bool".to_string()), "{sql}");
+    }
+}
+
+fn join_lookup(name: &str) -> Option<TableDef> {
+    match name {
+        "t" => Some(t()),
+        "u" => Some(TableDef::new(
+            "u",
+            vec![
+                Column::new("id", "int4", true),
+                Column::new("m", "int4", false),
+            ],
+        )),
+        _ => None,
+    }
+}
+
+#[test]
+fn column_references_over_a_join_resolve_or_fail_as_postgres_does() {
+    let err = |sql: &str| plan(sql, &join_lookup).expect_err("should refuse");
+    let e = err("SELECT t.id FROM t JOIN u ON t.id = u.id WHERE id = 1");
+    assert_eq!(e.sqlstate(), "42702");
+    assert_eq!(e.to_string(), "column reference \"id\" is ambiguous");
+    let e = err("SELECT id, count(*) FROM t JOIN u ON t.id = u.id GROUP BY id");
+    assert_eq!(e.sqlstate(), "42702");
+    let e = err("SELECT t.id FROM t JOIN u ON t.id = u.id WHERE t.nope > 0");
+    assert_eq!(e.sqlstate(), "42703");
+    assert_eq!(e.to_string(), "column t.nope does not exist");
+    let e = err("SELECT t.id FROM t JOIN u ON t.id = u.id WHERE nope > 0");
+    assert_eq!(e.sqlstate(), "42703");
+    assert_eq!(e.to_string(), "column \"nope\" does not exist");
+    let e = err("SELECT t.id FROM t JOIN u ON t.id = u.id WHERE zz.m > 0");
+    assert_eq!(e.sqlstate(), "42P01");
+    assert_eq!(
+        e.to_string(),
+        "missing FROM-clause entry for table \"zz\"\nPosition: 47"
+    );
+    // A relation FROM knows only by its alias (measured 16).
+    let e = err("SELECT t.id FROM t AS a JOIN u ON a.id = u.id");
+    assert_eq!(e.sqlstate(), "42P01");
+    assert_eq!(
+        e.to_string(),
+        "invalid reference to FROM-clause entry for table \"t\"\nHint: Perhaps you meant to reference the table alias \"a\".\nPosition: 7"
+    );
+    let e = err("SELECT t.id FROM t JOIN u ON t.id = u.id WHERE t.id + 1");
+    assert_eq!(e.sqlstate(), "42804");
+    let e = err("SELECT n, count(*) FROM t JOIN u ON t.id = u.id");
+    assert_eq!(e.sqlstate(), "42803");
+    assert_eq!(
+        e.to_string(),
+        "column \"t.n\" must appear in the GROUP BY clause or be used in an aggregate function\nPosition: 7"
+    );
+    // A LEFT JOIN's right-side predicate is a post-join residual, not a
+    // per-side filter, and the bare unique column resolves to its side.
+    match plan(
+        "SELECT t.id FROM t LEFT JOIN u ON t.id = u.id WHERE m IS NULL",
+        &join_lookup,
+    )
+    .expect("should plan")
+    {
+        Statement::Select(s) => {
+            let join = s.join.expect("a join");
+            assert!(join.filter.is_empty());
+            assert!(join.residual.is_some());
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    match plan(
+        "SELECT m, count(*) FROM t JOIN u ON t.id = u.id WHERE t.n > 1 GROUP BY m",
+        &join_lookup,
+    )
+    .expect("should plan")
+    {
+        Statement::Aggregate(a) => {
+            let join = a.join.expect("a join");
+            assert_eq!(join.filter.len(), 1);
+            assert_eq!(join.filter[0].alias, "t");
+            assert_eq!(a.group_by[0].name, "u.m");
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+}
+
+#[test]
+fn with_queries_plan_as_the_derived_tables_they_stand_for() {
+    // The plan with the source positions the two spellings differ in blanked.
+    fn shape(stmt: &Statement) -> String {
+        let text = format!("{stmt:?}");
+        let mut out = String::new();
+        let mut rest = text.as_str();
+        while let Some(i) = rest.find("location: ") {
+            out.push_str(&rest[..i + "location: ".len()]);
+            rest = &rest[i + "location: ".len()..];
+            let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+            rest = &rest[digits..];
+        }
+        out.push_str(rest);
+        out
+    }
+    let plan = |sql: &str| shape(&plan(sql, &join_lookup).expect("should plan"));
+    // A CTE is planned exactly as the equivalent derived table.
+    assert_eq!(
+        plan("WITH c AS (SELECT id FROM t) SELECT c.id FROM c"),
+        plan("SELECT c.id FROM (SELECT id FROM t) AS c")
+    );
+    // A CTE's column list and a reference's own alias both rename the body.
+    assert_eq!(
+        plan("WITH c(k) AS (SELECT id FROM t) SELECT z.k FROM c AS z"),
+        plan("SELECT z.k FROM (SELECT id FROM t) AS z(k)")
+    );
+    // Each body sees the CTEs before it; a CTE shadows a table of its own
+    // name in the main query while its body still reads the table.
+    assert_eq!(
+        plan("WITH a AS (SELECT id FROM t), t AS (SELECT id + 1 AS id FROM a) SELECT id FROM t"),
+        plan("SELECT id FROM (SELECT id + 1 AS id FROM (SELECT id FROM t) AS a) AS t")
+    );
+    // An inner WITH shadows the outer one of the same name.
+    assert_eq!(
+        plan("WITH c AS (SELECT id FROM t) SELECT id FROM t WHERE id IN (WITH c AS (SELECT m AS id FROM u) SELECT id FROM c)"),
+        plan("SELECT id FROM t WHERE id IN (SELECT id FROM (SELECT m AS id FROM u) AS c)")
+    );
+    // An error inside a body is the body's own.
+    let e = crate::plan(
+        "WITH c AS (SELECT id FROM zz) SELECT id FROM c",
+        &join_lookup,
+    )
+    .expect_err("should refuse");
+    assert_eq!(e.sqlstate(), "42P01");
+    assert_eq!(e.to_string(), "relation \"zz\" does not exist");
+    // The two shapes a derived table cannot express.
+    let e = crate::plan(
+        "WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) SELECT n FROM r",
+        &join_lookup,
+    )
+    .expect_err("should refuse");
+    assert_eq!(e.sqlstate(), "0A000");
+    assert_eq!(e.to_string(), "recursive WITH queries are not supported");
+    let e = crate::plan(
+        "WITH d AS (DELETE FROM t RETURNING id) SELECT id FROM d",
+        &join_lookup,
+    )
+    .expect_err("should refuse");
+    assert_eq!(e.sqlstate(), "0A000");
+    assert_eq!(
+        e.to_string(),
+        "data-modifying statements in WITH are not supported"
+    );
 }

@@ -687,3 +687,394 @@ pub fn multirange_from_args(args: &[Bson], type_name: &str) -> Result<Vec<Range>
         .collect::<Result<Vec<_>>>()?;
     normalise_multirange(members, &member_type)
 }
+
+// ---------------------------------------------------------------------------
+// Operators.
+//
+// Every range operator reduces to comparisons of BOUNDS, and a bound is more
+// than its value: `[5` starts before `(5`, and `5]` ends after `5)`. So each
+// bound becomes a point on an extended line -- the element value plus an
+// epsilon that says which side of it the bound sits on -- and a range is the
+// half-open interval `[L, U)` of those points. An element `e` is the point
+// `(e, 0)`, which makes "contains" `L <= e < U` and every other operator a
+// comparison of two endpoints. The infinities bracket everything.
+//
+// Measured against PostgreSQL 16.
+
+#[derive(Clone, Debug)]
+enum Key {
+    NegInf,
+    Finite(Bson, u8),
+    PosInf,
+}
+
+fn cmp_keys(a: &Key, b: &Key) -> Result<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    Ok(match (a, b) {
+        (Key::NegInf, Key::NegInf) | (Key::PosInf, Key::PosInf) => Equal,
+        (Key::NegInf, _) | (_, Key::PosInf) => Less,
+        (Key::PosInf, _) | (_, Key::NegInf) => Greater,
+        (Key::Finite(x, xe), Key::Finite(y, ye)) => {
+            match crate::compare_constants(x, y)
+                .ok_or_else(|| Error::Unsupported("comparing range bounds".to_string()))?
+            {
+                Equal => xe.cmp(ye),
+                other => other,
+            }
+        }
+    })
+}
+
+/// The `[L, U)` endpoints of a non-empty range, over `element`.
+fn endpoints(r: &Range, element: &str) -> Result<(Key, Key)> {
+    let value = |t: &str| cast_value(Bson::String(t.to_string()), element);
+    let lower = match &r.lower {
+        None => Key::NegInf,
+        Some(t) => Key::Finite(value(t)?, u8::from(!r.lower_inc)),
+    };
+    let upper = match &r.upper {
+        None => Key::PosInf,
+        Some(t) => Key::Finite(value(t)?, u8::from(r.upper_inc)),
+    };
+    Ok((lower, upper))
+}
+
+/// The range `[lower, upper)` back from its endpoints, canonicalised.
+fn from_endpoints(lower: Key, upper: Key, type_name: &str) -> Result<Range> {
+    let (element, discrete) = range_element(type_name)
+        .ok_or_else(|| Error::Unsupported(format!("the {type_name} type")))?;
+    if cmp_keys(&lower, &upper)? != std::cmp::Ordering::Less {
+        return Ok(Range::empty());
+    }
+    let text = |v: &Bson| crate::render_value_text(v);
+    let (lower, lower_inc) = match lower {
+        Key::Finite(v, e) => (Some(text(&v)), e == 0),
+        _ => (None, false),
+    };
+    let (upper, upper_inc) = match upper {
+        Key::Finite(v, e) => (Some(text(&v)), e == 1),
+        _ => (None, false),
+    };
+    canonicalise(
+        Range {
+            empty: false,
+            lower,
+            upper,
+            lower_inc,
+            upper_inc,
+        },
+        &element,
+        discrete,
+        type_name,
+    )
+}
+
+fn max_key(a: Key, b: Key) -> Result<Key> {
+    Ok(if cmp_keys(&a, &b)? == std::cmp::Ordering::Less {
+        b
+    } else {
+        a
+    })
+}
+
+fn min_key(a: Key, b: Key) -> Result<Key> {
+    Ok(if cmp_keys(&a, &b)? == std::cmp::Ordering::Greater {
+        b
+    } else {
+        a
+    })
+}
+
+/// Does a range family operator exist, whatever its operands?
+pub fn is_operator(op: &str) -> bool {
+    matches!(
+        op,
+        "@>" | "<@" | "&&" | "<<" | ">>" | "&<" | "&>" | "-|-" | "+" | "*" | "-"
+    )
+}
+
+/// The result type of `lhs_type op rhs_type` where at least one side is a
+/// range or a multirange: a boolean for the tests, the (multi)range type for
+/// the set operations.
+pub fn operator_result_type(op: &str, lhs_type: Option<&str>, rhs_type: Option<&str>) -> String {
+    match op {
+        "+" | "*" | "-" => lhs_type.or(rhs_type).unwrap_or("text").to_string(),
+        _ => "bool".to_string(),
+    }
+}
+
+/// One operand of a range operator: a range, a multirange (as its normalised
+/// members), or an element of the range's subtype.
+enum Operand {
+    Range(Range),
+    Multi(Vec<Range>),
+    Element(Bson),
+}
+
+fn operand(
+    value: &Bson,
+    type_name: &str,
+    element: &str,
+    family: &str,
+    mismatch: &dyn Fn() -> Error,
+) -> Result<Operand> {
+    Ok(match type_name {
+        t if is_multirange_type(t) => {
+            Operand::Multi(multirange_from_text(&crate::value_text(value), t)?)
+        }
+        t if is_range_type(t) => Operand::Range(from_text(&crate::value_text(value), t)?),
+        // An UNKNOWN literal beside a range is read as that range type, not
+        // as an element: `int4range(1,5) @> '3'` is a malformed range
+        // literal on PostgreSQL, not a containment test.
+        "unknown" if is_multirange_type(family) => {
+            Operand::Multi(multirange_from_text(&crate::value_text(value), family)?)
+        }
+        "unknown" => Operand::Range(from_text(&crate::value_text(value), family)?),
+        // The element operators are polymorphic (`anyrange @> anyelement`),
+        // so the element must BE the subtype: there is no implicit cast, and
+        // `numrange @> 3` or `int4range @> 3::bigint` resolves no operator.
+        t if t != element => return Err(mismatch()),
+        _ => Operand::Element(cast_value(value.clone(), element)?),
+    })
+}
+
+/// A multirange's covering range, or `None` when it is empty.
+fn hull(members: &[Range], element: &str) -> Result<Option<(Key, Key)>> {
+    let (Some(first), Some(last)) = (members.first(), members.last()) else {
+        return Ok(None);
+    };
+    let (lower, _) = endpoints(first, element)?;
+    let (_, upper) = endpoints(last, element)?;
+    Ok(Some((lower, upper)))
+}
+
+/// Does `[l1,u1)` contain `[l2,u2)`?
+fn covers(a: &(Key, Key), b: &(Key, Key)) -> Result<bool> {
+    use std::cmp::Ordering::*;
+    Ok(cmp_keys(&a.0, &b.0)? != Greater && cmp_keys(&b.1, &a.1)? != Greater)
+}
+
+fn overlaps(a: &(Key, Key), b: &(Key, Key)) -> Result<bool> {
+    use std::cmp::Ordering::*;
+    Ok(cmp_keys(&a.0, &b.1)? == Less && cmp_keys(&b.0, &a.1)? == Less)
+}
+
+/// Evaluate `lhs op rhs` where at least one side is a range or multirange of
+/// the family `range_type` (the RANGE type; a multirange operand names it
+/// through its member type). A NULL operand has already been handled.
+pub fn binary(op: &str, lhs: &Bson, lhs_type: &str, rhs: &Bson, rhs_type: &str) -> Result<Bson> {
+    let is_family = |t: &str| is_range_type(t) || is_multirange_type(t);
+    let family = if is_family(lhs_type) {
+        lhs_type
+    } else {
+        rhs_type
+    };
+    let range_type = multirange_member(family).unwrap_or_else(|| family.to_string());
+    let (element, _) = range_element(&range_type)
+        .ok_or_else(|| Error::Unsupported(format!("the {range_type} type")))?;
+    let element = element.as_str();
+    // PostgreSQL resolves no operator for these operands.
+    let unsupported = || {
+        Error::UndefinedFunction(format!(
+            "operator does not exist: {} {op} {}",
+            crate::display_type(lhs_type),
+            crate::display_type(rhs_type)
+        ))
+    };
+    let l = operand(lhs, lhs_type, element, family, &unsupported)?;
+    let r = operand(rhs, rhs_type, element, family, &unsupported)?;
+
+    // The set of `[L, U)` pieces each side covers: one for a range, each
+    // member for a multirange, and none for an empty one.
+    let pieces = |o: &Operand| -> Result<Vec<(Key, Key)>> {
+        Ok(match o {
+            Operand::Range(r) if r.empty => vec![],
+            Operand::Range(r) => vec![endpoints(r, element)?],
+            Operand::Multi(m) => m
+                .iter()
+                .map(|r| endpoints(r, element))
+                .collect::<Result<Vec<_>>>()?,
+            Operand::Element(v) => {
+                let k = Key::Finite(v.clone(), 0);
+                vec![(k.clone(), Key::Finite(v.clone(), 1))]
+            }
+        })
+    };
+    // Containment of `inner` by `outer`, piece by piece: every piece of the
+    // inner side lies inside some piece of the outer. An empty inner side is
+    // contained by anything; an empty outer contains only an empty inner.
+    let contains = |outer: &Operand, inner: &Operand| -> Result<bool> {
+        let (o, i) = (pieces(outer)?, pieces(inner)?);
+        for piece in &i {
+            let mut found = false;
+            for p in &o {
+                if covers(p, piece)? {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let any_overlap = |a: &Operand, b: &Operand| -> Result<bool> {
+        for x in pieces(a)? {
+            for y in pieces(b)? {
+                if overlaps(&x, &y)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    };
+    // The covering `[L, U)` of a side, `None` when it is empty.
+    let span = |o: &Operand| -> Result<Option<(Key, Key)>> {
+        Ok(match o {
+            Operand::Range(r) if r.empty => None,
+            Operand::Range(r) => Some(endpoints(r, element)?),
+            Operand::Multi(m) => hull(m, element)?,
+            Operand::Element(_) => return Err(unsupported()),
+        })
+    };
+    use std::cmp::Ordering::*;
+    type Spans = Option<((Key, Key), (Key, Key))>;
+    let both = || -> Result<Spans> {
+        if matches!(l, Operand::Element(_)) || matches!(r, Operand::Element(_)) {
+            return Err(unsupported());
+        }
+        Ok(match (span(&l)?, span(&r)?) {
+            (Some(a), Some(b)) => Some((a, b)),
+            _ => None,
+        })
+    };
+    let result = match op {
+        "@>" => {
+            if matches!(l, Operand::Element(_)) {
+                return Err(unsupported());
+            }
+            Bson::Boolean(contains(&l, &r)?)
+        }
+        "<@" => {
+            if matches!(r, Operand::Element(_)) {
+                return Err(unsupported());
+            }
+            Bson::Boolean(contains(&r, &l)?)
+        }
+        "&&" => {
+            if matches!(l, Operand::Element(_)) || matches!(r, Operand::Element(_)) {
+                return Err(unsupported());
+            }
+            Bson::Boolean(any_overlap(&l, &r)?)
+        }
+        // The positional tests are false whenever either side is empty.
+        "<<" | ">>" | "&<" | "&>" | "-|-" => Bson::Boolean(match both()? {
+            None => false,
+            Some((a, b)) => match op {
+                "<<" => cmp_keys(&a.1, &b.0)? != Greater,
+                ">>" => cmp_keys(&b.1, &a.0)? != Greater,
+                "&<" => cmp_keys(&a.1, &b.1)? != Greater,
+                "&>" => cmp_keys(&a.0, &b.0)? != Less,
+                _ => cmp_keys(&a.1, &b.0)? == Equal || cmp_keys(&b.1, &a.0)? == Equal,
+            },
+        }),
+        // The multirange set operations take two multiranges and never a
+        // range (`int4multirange - int4range` resolves no operator on
+        // PostgreSQL 16.15). Union and intersection are piecewise;
+        // difference cuts each left piece by every right piece.
+        "+" | "*" | "-" if matches!((&l, &r), (Operand::Multi(_), Operand::Multi(_))) => {
+            let (a, b) = (pieces(&l)?, pieces(&r)?);
+            let mut out: Vec<Range> = Vec::new();
+            match op {
+                "+" => {
+                    for (lo, hi) in a.into_iter().chain(b) {
+                        out.push(from_endpoints(lo, hi, &range_type)?);
+                    }
+                }
+                "*" => {
+                    for (l1, u1) in &a {
+                        for (l2, u2) in &b {
+                            out.push(from_endpoints(
+                                max_key(l1.clone(), l2.clone())?,
+                                min_key(u1.clone(), u2.clone())?,
+                                &range_type,
+                            )?);
+                        }
+                    }
+                }
+                _ => {
+                    let mut left = a;
+                    for (l2, u2) in &b {
+                        let mut next = Vec::new();
+                        for (l1, u1) in left {
+                            if !overlaps(&(l1.clone(), u1.clone()), &(l2.clone(), u2.clone()))? {
+                                next.push((l1, u1));
+                                continue;
+                            }
+                            if cmp_keys(&l1, l2)? == Less {
+                                next.push((l1.clone(), l2.clone()));
+                            }
+                            if cmp_keys(u2, &u1)? == Less {
+                                next.push((u2.clone(), u1.clone()));
+                            }
+                        }
+                        left = next;
+                    }
+                    for (lo, hi) in left {
+                        out.push(from_endpoints(lo, hi, &range_type)?);
+                    }
+                }
+            }
+            Bson::String(render_multirange(&normalise_multirange(out, &range_type)?))
+        }
+        "+" | "*" | "-" => {
+            let (Operand::Range(a), Operand::Range(b)) = (&l, &r) else {
+                return Err(unsupported());
+            };
+            let out = match (a.empty, b.empty, op) {
+                (true, _, "+") => b.clone(),
+                (_, true, "+") => a.clone(),
+                (true, _, _) | (_, true, "*") => Range::empty(),
+                (_, true, "-") => a.clone(),
+                _ => {
+                    let (l1, u1) = endpoints(a, element)?;
+                    let (l2, u2) = endpoints(b, element)?;
+                    let x = (l1.clone(), u1.clone());
+                    let y = (l2.clone(), u2.clone());
+                    let meet = cmp_keys(&u1, &l2)? == Equal || cmp_keys(&u2, &l1)? == Equal;
+                    match op {
+                        "+" => {
+                            if !overlaps(&x, &y)? && !meet {
+                                return Err(Error::DataException(
+                                    "result of range union would not be contiguous".to_string(),
+                                ));
+                            }
+                            from_endpoints(min_key(l1, l2)?, max_key(u1, u2)?, &range_type)?
+                        }
+                        "*" => from_endpoints(max_key(l1, l2)?, min_key(u1, u2)?, &range_type)?,
+                        _ => {
+                            if !overlaps(&x, &y)? {
+                                a.clone()
+                            } else if cmp_keys(&l1, &l2)? == Less && cmp_keys(&u2, &u1)? == Less {
+                                return Err(Error::DataException(
+                                    "result of range difference would not be contiguous"
+                                        .to_string(),
+                                ));
+                            } else if cmp_keys(&l1, &l2)? == Less {
+                                from_endpoints(l1, l2, &range_type)?
+                            } else if cmp_keys(&u2, &u1)? == Less {
+                                from_endpoints(u2, u1, &range_type)?
+                            } else {
+                                Range::empty()
+                            }
+                        }
+                    }
+                }
+            };
+            Bson::String(render(&out))
+        }
+        _ => return Err(unsupported()),
+    };
+    Ok(result)
+}

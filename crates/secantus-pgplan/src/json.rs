@@ -15,6 +15,7 @@
 //!
 //! All of the above was measured against PostgreSQL 14.
 
+use bson::Bson;
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -261,6 +262,28 @@ fn parse_object(b: &[u8], pos: &mut usize) -> Result<Json, ParseError> {
     }
 }
 
+/// `jsonb || jsonb`: two objects merge (the right side's value wins a shared
+/// key); otherwise each non-array side becomes a one-element array and the
+/// two are appended (`'[1,2]' || '3'` is `[1, 2, 3]`, `'1' || '[2]'` is
+/// `[1, 2]`, `'{"a":1}' || '[2]'` is `[{"a": 1}, 2]`, measured 16).
+pub fn concat(a: Json, b: Json) -> Json {
+    match (a, b) {
+        (Json::Object(mut left), Json::Object(right)) => {
+            left.extend(right);
+            Json::Object(left)
+        }
+        (a, b) => {
+            let items = |v: Json| match v {
+                Json::Array(items) => items,
+                other => vec![other],
+            };
+            let mut out = items(a);
+            out.extend(items(b));
+            Json::Array(out)
+        }
+    }
+}
+
 /// Render as `jsonb` does: object keys sorted, the LAST of any duplicate pair
 /// kept, `": "` after a key and `", "` between elements. Numbers keep their
 /// original text, so `1.10` stays `1.10`.
@@ -392,6 +415,72 @@ pub fn render_json(v: &Json) -> String {
     let mut out = String::new();
     write_json(v, &mut out);
     out
+}
+
+/// Render a `json` value the way `to_json` / `json_build_*` produce one:
+/// no whitespace at all (`[1,2]`, `{"a":1}`), where the `jsonb` form
+/// normalises to `[1, 2]` / `{"a": 1}`.
+pub fn render_json_compact(v: &Json) -> String {
+    let mut out = String::new();
+    write_json_compact(v, &mut out);
+    out
+}
+
+/// The key under which a value ALREADY of type `json` / `jsonb` travels
+/// into a JSON constructor (`to_json`, `json_build_*`): a `Bson::Document`
+/// with just this key, holding the value's text. The constructors take it
+/// as JSON rather than as a string to quote; every other function sees the
+/// document's `::text` form.
+pub const RAW: &str = "__json_raw";
+
+/// `text`, a `json` / `jsonb` value, marked for the JSON constructors.
+pub fn raw(text: String) -> Bson {
+    let mut doc = bson::Document::new();
+    doc.insert(RAW, text);
+    Bson::Document(doc)
+}
+
+/// The JSON text a `raw` marker carries, if `v` is one.
+pub fn raw_text(v: &Bson) -> Option<&str> {
+    match v {
+        Bson::Document(d) if d.len() == 1 => d.get_str(RAW).ok(),
+        _ => None,
+    }
+}
+
+/// A JSON string literal: `s` quoted and escaped.
+pub fn quote_string(s: &str) -> String {
+    let mut out = String::new();
+    write_json_string(s, &mut out);
+    out
+}
+
+fn write_json_compact(v: &Json, out: &mut String) {
+    match v {
+        Json::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_compact(item, out);
+            }
+            out.push(']');
+        }
+        Json::Object(pairs) => {
+            out.push('{');
+            for (i, (k, v)) in pairs.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                write_json_compact(v, out);
+            }
+            out.push('}');
+        }
+        scalar => write_json(scalar, out),
+    }
 }
 
 fn write_json(v: &Json, out: &mut String) {

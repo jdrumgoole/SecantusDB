@@ -258,13 +258,14 @@ def test_duplicate_key_reports_what_postgres_reports(home: Path) -> None:
         ("CREATE TABLE t (id int PRIMARY KEY)", "42P07"),
         # Unsupported must be an honest 0A000 -- never a wrong row. There is no
         # fallback into Python by design.
-        ("SELECT * FROM t JOIN t AS u ON t.id = u.id", "0A000"),
-        ("SELECT array_agg(name ORDER BY length(name)) FROM t", "0A000"),
+        ("SELECT array_agg(name ORDER BY nope) FROM t", "42703"),
         ("SELECT n, count(*) FROM t", "42803"),
-        ("SELECT * FROM t WHERE n LIKE 'x'", "0A000"),
-        ("SELECT * FROM t ORDER BY n + 1", "0A000"),
-        # The PK is the document's `_id`, which storage treats as immutable.
-        ("UPDATE t SET id = 2 WHERE id = 1", "0A000"),
+        # `integer ~~ unknown` has no operator (PostgreSQL 16.15: 42883).
+        ("SELECT * FROM t WHERE n LIKE 'x'", "42883"),
+        ("SELECT * FROM t ORDER BY 'x'", "42601"),
+        ("SELECT DISTINCT n FROM t ORDER BY id", "42P10"),
+        ("SELECT n FROM t GROUP BY n HAVING n + 1", "42804"),
+        ("SELECT count(*) FROM t HAVING count(*) > n", "42803"),
         ("UPDATE t SET nope = 1", "42703"),
         ("DELETE FROM missing", "42P01"),
     ],
@@ -276,6 +277,91 @@ def test_refusals_carry_the_right_sqlstate(home: Path, sql: str, sqlstate: str) 
         with pytest.raises(psycopg.Error) as exc:
             cur.execute(sql)
     assert exc.value.diag.sqlstate == sqlstate
+
+
+def test_order_by_and_having_take_expressions(home: Path) -> None:
+    """ORDER BY and HAVING over computed terms, as PostgreSQL 16.15 has them.
+
+    A sort term may be an expression over the row (`n + 1`, `lower(s)`, a
+    CASE), an output alias (which wins over a table column of the same name),
+    or a position naming a COMPUTED output column -- the last used to sort by
+    the wrong column silently. `SELECT DISTINCT` may order only by what it
+    outputs, matched by structure. Over a grouped query the same terms are
+    expressions over the group keys and aggregate results, in HAVING too.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE ob (id int PRIMARY KEY, n int, s text)")
+        cur.execute("INSERT INTO ob VALUES (1, 5, 'b'), (2, -7, 'a'), (3, 2, 'c'), (4, NULL, 'd')")
+        ids = lambda sql: [r[0] for r in cur.execute(sql).fetchall()]  # noqa: E731
+        assert ids("SELECT id FROM ob ORDER BY n + 1") == [2, 3, 1, 4]
+        assert ids("SELECT id FROM ob ORDER BY n + 1 DESC") == [4, 1, 3, 2]
+        assert ids("SELECT id FROM ob ORDER BY abs(n), id") == [3, 1, 2, 4]
+        assert ids("SELECT id FROM ob ORDER BY lower(s) DESC") == [4, 3, 1, 2]
+        assert ids("SELECT id FROM ob ORDER BY CASE WHEN n < 0 THEN 0 ELSE 1 END, id") == [
+            2,
+            1,
+            3,
+            4,
+        ]
+        # A computed column by position and by alias sorts on its VALUE.
+        assert ids("SELECT id, n * 2 FROM ob ORDER BY 2") == [2, 3, 1, 4]
+        assert ids("SELECT id, n * 2 AS d FROM ob ORDER BY d DESC NULLS LAST") == [1, 3, 2, 4]
+        # An output alias shadows the table column; a qualified name does not.
+        assert ids("SELECT n AS s FROM ob ORDER BY s") == [-7, 2, 5, None]
+        assert ids("SELECT n AS s FROM ob ORDER BY ob.s") == [-7, 5, 2, None]
+        assert ids("SELECT DISTINCT n + 1 FROM ob ORDER BY n + 1") == [-6, 3, 6, None]
+        # Grouped: expressions over the keys, in the select list, ORDER BY
+        # and HAVING, including a GROUP BY expression matched by structure.
+        assert ids("SELECT n + 1 FROM ob GROUP BY n ORDER BY n + 1") == [-6, 3, 6, None]
+        assert ids("SELECT n FROM ob GROUP BY n ORDER BY abs(n) DESC, n") == [None, -7, 5, 2]
+        assert ids("SELECT n FROM ob GROUP BY n HAVING n + 1 > 3 OR n IS NULL ORDER BY n") == [
+            5,
+            None,
+        ]
+        assert ids("SELECT n FROM ob GROUP BY n HAVING n > count(*) ORDER BY n") == [2, 5]
+        assert ids(
+            "SELECT length(s) + 1 FROM ob GROUP BY length(s) HAVING length(s) + 1 > 1 ORDER BY 1"
+        ) == [2]
+        with pytest.raises(psycopg.errors.GroupingError):
+            cur.execute("SELECT n FROM ob GROUP BY n HAVING s = 'a'")
+
+
+def test_update_of_the_primary_key_rewrites_the_row(home: Path) -> None:
+    """An UPDATE that assigns the PRIMARY KEY, as PostgreSQL 16.15 runs it.
+
+    The key is the stored `_id`, which storage cannot rewrite in place, so
+    this used to be a 0A000. It is now a delete and an insert per row, with
+    PostgreSQL's per-row uniqueness check: `SET id = id + 1` over ids 1 and 2
+    fails on the first row because 2 still exists when 1 becomes 2. NOT NULL
+    on the key and a referencing foreign key are checked before any write.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id int PRIMARY KEY, s text)")
+        cur.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")
+        cur.execute("CREATE TABLE c (id int PRIMARY KEY, ref int REFERENCES t(id))")
+        cur.execute("INSERT INTO c VALUES (10, 3)")
+
+        cur.execute("UPDATE t SET id = id + 10, s = 'z' WHERE id = 1 RETURNING id, s")
+        assert cur.fetchall() == [(11, "z")]
+        assert cur.rowcount == 1
+        cur.execute("UPDATE t SET id = id WHERE id = 2")
+        assert cur.rowcount == 1
+        cur.execute("SELECT id, s FROM t ORDER BY id")
+        assert cur.fetchall() == [(2, "b"), (3, "c"), (11, "z")]
+
+        with pytest.raises(psycopg.errors.UniqueViolation) as dup:
+            cur.execute("UPDATE t SET id = id + 1")
+        assert dup.value.diag.constraint_name == "t_pkey"
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            cur.execute("UPDATE t SET id = NULL WHERE id = 2")
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            cur.execute("UPDATE t SET id = 99 WHERE id = 3")
+        with pytest.raises(psycopg.errors.NotNullViolation):
+            cur.execute("INSERT INTO t (s) VALUES ('no key')")
+        cur.execute("SELECT id, s FROM t ORDER BY id")
+        assert cur.fetchall() == [(2, "b"), (3, "c"), (11, "z")]
 
 
 def test_acknowledged_writes_survive_sigterm(home: Path) -> None:
@@ -1513,8 +1599,17 @@ def test_regclass_names_a_relation(home: Path) -> None:
         assert isinstance(oid, int) and oid > 0
         cur.execute("select oid from pg_type where typname = 't1'")
         assert cur.fetchone()[0] == oid
+        # The six system columns come first, as PostgreSQL lists them.
         cur.execute("select attname from pg_attribute where attrelid = 't1'::regclass")
-        assert cur.fetchall() == [("f1",)]
+        assert cur.fetchall() == [
+            ("tableoid",),
+            ("cmax",),
+            ("xmax",),
+            ("cmin",),
+            ("xmin",),
+            ("ctid",),
+            ("f1",),
+        ]
         cur.execute("select 't1'::regclass = 't1'::regclass::oid, %s::regclass::oid", (str(oid),))
         assert cur.fetchone() == (True, oid)
         cur.execute("select 'pg_class'::regclass::oid, '\"Order\"'::regclass::text")
@@ -5375,7 +5470,7 @@ def test_literal_column_defaults(home: Path) -> None:
     """A literal DEFAULT is applied to every column an INSERT omits, whatever
     the INSERT's shape; an explicit NULL is kept; a DEFAULT that will not
     parse as the column's type fails at CREATE. An expression default is
-    refused (0A000) rather than silently dropped. Values are PG 16's."""
+    evaluated per row (`test_column_default_expressions`). Values are PG 16's."""
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
         cur.execute(
@@ -5400,13 +5495,6 @@ def test_literal_column_defaults(home: Path) -> None:
         with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
             cur.execute("create table fp_e (id int, n int default 'a')")
         assert str(ei.value).startswith('invalid input syntax for type integer: "a"')
-        # PostgreSQL accepts a volatile DEFAULT and stamps each INSERT; this
-        # server stores a DEFAULT as one evaluated value, so `now()` would be
-        # frozen at CREATE time. Refused rather than silently wrong.
-        with pytest.raises(psycopg.errors.FeatureNotSupported):
-            cur.execute("create table fp_e (id int, n text default now())")
-        with pytest.raises(psycopg.errors.FeatureNotSupported):
-            cur.execute("create table fp_e (id int, n timestamptz default current_timestamp)")
     # The default survives a restart: it is in the catalog, not the session.
     with _Server(home) as server, server.connect() as conn:
         cur = conn.cursor()
@@ -5479,6 +5567,25 @@ def test_pg_sleep_waits_and_returns_void(home: Path) -> None:
         cur.execute("select pg_sleep(5) where false")
         assert cur.fetchall() == []
         assert time.monotonic() - started < 1
+        # Nested inside an expression (once 0A000) the call still waits, is
+        # `void`, casts to the empty text, and has no operator but through
+        # that cast (PostgreSQL 16.15, 2026-09-23).
+        started = time.monotonic()
+        cur.execute(
+            "select pg_sleep(0.2) is null, coalesce(pg_sleep(0)::text, 'n'), "
+            "pg_typeof(pg_sleep(0))::text, pg_sleep(0) || 'x', pg_sleep(null) is null, "
+            "pg_sleep_for('0 seconds') is null, pg_sleep_until(now()) is null"
+        )
+        assert cur.fetchall() == [(False, "", "void", "x", True, False, False)]
+        assert time.monotonic() - started >= 0.2
+        for sql, message in [
+            ("select pg_sleep(0) = ''", "operator does not exist: void = unknown"),
+            ("select pg_sleep(0) + 1", "operator does not exist: void + integer"),
+            ("select 1 = pg_sleep(0)", "operator does not exist: integer = void"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                cur.execute(sql)
+            assert str(ei.value).startswith(message)
 
 
 def test_crossed_range_inside_an_array_literal_is_a_data_error(home: Path) -> None:
@@ -6840,6 +6947,16 @@ def test_numeric_wider_than_decimal128_compares_and_sorts_exactly(home: Path) ->
         cur.execute("update wpk set tag = 'upd' where n = %s", (_HUGE,))
         assert cur.rowcount == 1
         cur.execute("delete from wpk where n = %s", (_WIDE,))
+        assert cur.rowcount == 1
+        cur.execute("select count(*) from wpk")
+        assert cur.fetchone() == (4,)
+        # UPDATE of the key runs the same by-value duplicate check as INSERT:
+        # a wide value that differs from a stored one only in scale is a
+        # 23505, not a second row.
+        for dup in ("1.50", "10000000000000000000000000000000000000000.0", "NaN"):
+            with pytest.raises(psycopg.errors.UniqueViolation):
+                cur.execute("update wpk set n = %s where tag = 't0'", (Decimal(dup),))
+        cur.execute("update wpk set n = %s where tag = 't0'", (Decimal("-1e40"),))
         assert cur.rowcount == 1
         cur.execute("select count(*) from wpk")
         assert cur.fetchone() == (4,)
@@ -9687,8 +9804,10 @@ def test_distinct_inside_an_aggregate(home: Path) -> None:
 
 def test_select_distinct_over_an_aggregate(home: Path) -> None:
     """`SELECT DISTINCT` over aggregate output: two groups with the same count
-    collapse into one row (PostgreSQL 14.24). `DISTINCT ON` there is refused
-    as unsupported rather than answered wrongly."""
+    collapse into one row. `DISTINCT ON` there keeps the first row of each
+    key in ORDER BY order, and its keys resolve against the OUTPUT -- a group
+    key, an aggregate, an alias -- so `DISTINCT ON (count(*))` names the same
+    item as `ORDER BY count(*)`. Values from PostgreSQL 16 (2026-09-23)."""
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table t (id int, g int, s text)")
         conn.execute("insert into t values (1,1,'a'),(2,1,'b'),(3,2,'a'),(4,2,'b'),(5,3,'c')")
@@ -9698,9 +9817,24 @@ def test_select_distinct_over_an_aggregate(home: Path) -> None:
             ("2", "2"),
             ("3", "1"),
         ]
+        assert _rows(
+            conn, "select distinct on (g) g, count(*) from t group by g order by g desc"
+        ) == [("3", "1"), ("2", "2"), ("1", "2")]
+        assert _rows(
+            conn,
+            "select distinct on (count(*)) count(*), g from t group by g order by count(*), g",
+        ) == [("1", "3"), ("2", "1")]
+        assert _rows(
+            conn,
+            "select distinct on (c) c, g from (select count(*) c, g from t group by g) x "
+            "order by c, g desc",
+        ) == [("1", "3"), ("2", "2")]
+        # ON expressions must lead the ORDER BY, as PostgreSQL insists.
         with pytest.raises(psycopg.Error) as exc:
-            conn.execute("select distinct on (g) g, count(*) from t group by g").fetchall()
-        assert exc.value.sqlstate == "0A000"
+            conn.execute(
+                "select distinct on (g) g, count(*) from t group by g order by 2"
+            ).fetchall()
+        assert exc.value.sqlstate == "42P10"
 
 
 def test_update_and_delete_returning(home: Path) -> None:
@@ -9784,20 +9918,22 @@ def test_an_unsupported_aggregate_refuses_the_same_way_on_an_empty_table(home: P
     where PostgreSQL answers one. Refusing while planning makes the answer the
     same either way.
 
-    The shapes that showed this (`string_agg`, `count(*) + 1`) have since been
-    implemented, so the property is pinned here with one that has not:
-    `ORDER BY` over an EXPRESSION inside an aggregate.
+    The shapes that showed this (`string_agg`, `count(*) + 1`, then `ORDER BY`
+    over an expression inside an aggregate) have all since been implemented,
+    so the property is pinned here with a shape PostgreSQL itself refuses at
+    planning time: an in-aggregate ORDER BY naming a column that does not
+    exist (42703 either way, PostgreSQL 16).
     """
-    sql = "select array_agg(s order by length(s)) from t"
+    sql = "select array_agg(s order by nope) from t"
     with _Server(home) as server, server.connect() as conn:
         conn.execute("create table t (id int primary key, n int, s text)")
         with pytest.raises(psycopg.Error) as empty:
             conn.execute(sql).fetchall()
-        assert empty.value.sqlstate == "0A000"
+        assert empty.value.sqlstate == "42703"
         conn.execute("insert into t values (1, 1, 'a')")
         with pytest.raises(psycopg.Error) as filled:
             conn.execute(sql).fetchall()
-        assert filled.value.sqlstate == "0A000"
+        assert filled.value.sqlstate == "42703"
 
 
 def test_char_n_is_blank_padded_and_carries_its_width(home: Path) -> None:
@@ -10050,10 +10186,25 @@ def test_order_by_inside_an_aggregate(home: Path) -> None:
         assert conn.execute(
             "select g, array_agg(s order by id desc) from t group by g order by g"
         ).fetchall() == [(1, ["a", "b"]), (2, [None, "c"]), (3, ["d"])]
-        # An expression key is refused rather than answered in another order.
-        with pytest.raises(psycopg.Error) as exc:
-            conn.execute("select array_agg(s order by length(s)) from t").fetchall()
-        assert exc.value.sqlstate == "0A000"
+        # An EXPRESSION key is evaluated per row before the group is sorted;
+        # a later key breaks its ties. Values from PostgreSQL 16 (2026-09-23).
+        assert one("select array_agg(s order by length(s), s) from t") == [
+            "a",
+            "b",
+            "c",
+            "d",
+            None,
+        ]
+        assert one("select array_agg(s order by length(s) desc nulls first, id) from t") == [
+            None,
+            "b",
+            "a",
+            "c",
+            "d",
+        ]
+        assert conn.execute(
+            "select g, array_agg(s order by length(s), s) from t group by g order by g"
+        ).fetchall() == [(1, ["a", "b"]), (2, ["c", None]), (3, ["d"])]
 
 
 def test_aggregates_inside_expressions(home: Path) -> None:
@@ -10092,3 +10243,6740 @@ def test_aggregates_inside_expressions(home: Path) -> None:
         cur = conn.execute("select count(*) + 1 from t")
         cur.fetchall()
         assert cur.description[0].type_code == 20  # int8, as PostgreSQL types it
+
+
+def test_join_star_expansion_and_multi_key_order(home: Path) -> None:
+    """`*` and `t.*` over a join expand to the joined tables' columns in FROM
+    order, each with its own oid, and ORDER BY over several qualified keys
+    orders the joined rows. Values and oids from PostgreSQL 16.15 (2026-09-23).
+    """
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t1 (id int primary key, a text)")
+        conn.execute("create table t2 (id int primary key, t1_id int, f3 text)")
+        conn.execute("insert into t1 values (1, 'hello'), (2, 'y')")
+        conn.execute("insert into t2 values (10, 1, 'p'), (11, 2, 'q')")
+        cur = conn.execute("select * from t1, t2 order by t1.id, t2.id")
+        assert cur.fetchall() == [
+            (1, "hello", 10, 1, "p"),
+            (1, "hello", 11, 2, "q"),
+            (2, "y", 10, 1, "p"),
+            (2, "y", 11, 2, "q"),
+        ]
+        assert [d.type_code for d in cur.description] == [23, 25, 23, 23, 25]
+        cur = conn.execute("select t1.*, t2.f3 from t1 join t2 on t2.t1_id = t1.id order by t1.id")
+        assert cur.fetchall() == [(1, "hello", "p"), (2, "y", "q")]
+        assert [d.name for d in cur.description] == ["id", "a", "f3"]
+        cur = conn.execute("select t2.*, t1.a from t1 join t2 on t2.t1_id = t1.id order by t1.id")
+        assert cur.fetchall() == [(10, 1, "p", "hello"), (11, 2, "q", "y")]
+        assert [d.type_code for d in cur.description] == [23, 23, 25, 25]
+        assert conn.execute(
+            "select * from t1 join t2 on t2.t1_id = t1.id order by t1.id"
+        ).fetchall() == [(1, "hello", 10, 1, "p"), (2, "y", 11, 2, "q")]
+
+
+def test_where_takes_a_boolean_and_nothing_else(home: Path) -> None:
+    """A bare boolean column, constant or `NOT` of one is a valid WHERE; a
+    non-boolean operand is 42804 with PostgreSQL's wording and the position of
+    the operand (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b (id int primary key, ok bool, n int)")
+        conn.execute("insert into b values (1, true, 1), (2, false, 2)")
+        conn.execute("create table t1 (id int primary key, a text)")
+        conn.execute("insert into t1 values (1, 'hello'), (2, 'y')")
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        assert rows("select id from b where ok") == [(1,)]
+        assert rows("select id from b where not ok") == [(2,)]
+        assert rows("select id from t1 where true order by id") == [(1,), (2,)]
+        assert rows("select id from t1 where not false order by id") == [(1,), (2,)]
+        assert rows("select id from t1 where not true") == []
+        assert rows("select id from t1 where null") == []
+        assert rows("select id from t1 where not null") == []
+        assert rows("select id, a from t1 where a = 'hello' and true") == [(1, "hello")]
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ei:
+            conn.execute("select 1 from t1 where 1")
+        assert ei.value.diag.message_primary == (
+            "argument of WHERE must be type boolean, not type integer"
+        )
+        assert ei.value.diag.statement_position == "24"
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as ei:
+            conn.execute("select id from t1 where a order by id")
+        assert ei.value.diag.message_primary == (
+            "argument of WHERE must be type boolean, not type text"
+        )
+        assert ei.value.diag.statement_position == "25"
+        with pytest.raises(psycopg.errors.DatatypeMismatch):
+            conn.execute("select 1 from generate_series(1, 3) where 1")
+
+
+def test_unknown_type_and_reserved_regtype_name(home: Path) -> None:
+    """A cast to a type that does not exist is 42704; a reserved word given
+    to `regtype` unquoted is a syntax error, and quoted it resolves (a
+    user-defined type `"order"`). PostgreSQL 16.15, 2026-09-23."""
+    with _Server(home) as server, server.connect() as conn:
+        with pytest.raises(psycopg.errors.UndefinedObject) as ei:
+            conn.execute("select 1::no_such_type")
+        assert ei.value.diag.message_primary == 'type "no_such_type" does not exist'
+        conn.execute("create type \"order\" as enum ('a')")
+        with pytest.raises(psycopg.errors.SyntaxError) as se:
+            conn.execute("select 'order'::regtype")
+        assert se.value.diag.message_primary == 'syntax error at or near "order"'
+        assert conn.execute("select '\"order\"'::regtype::text").fetchone() == ('"order"',)
+        assert conn.execute("select 'inet'::regtype::text").fetchone() == ("inet",)
+
+
+def test_bytea_casts_only_to_text_or_itself(home: Path) -> None:
+    """A bytea (a bound binary parameter is the natural source) renders to
+    text as its `\\x` hex form and casts to itself; every other target is
+    42846 on the declared type, never a 22P02 over the bytes' Debug form.
+    PostgreSQL 16.15, 2026-09-27."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute("select %s::text", (b"ab",)).fetchone() == ("\\x6162",)
+        assert conn.execute("select %s::bytea", (b"ab",)).fetchone() == (b"ab",)
+        for target, shown in [
+            ("int", "integer"),
+            ("int4range", "int4range"),
+            ('"char"', '"char"'),
+            ("timestamp", "timestamp without time zone"),
+        ]:
+            with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+                conn.execute(f"select %s::{target}", (b"ab",))
+            assert ei.value.diag.message_primary == f"cannot cast type bytea to {shown}"
+
+
+def test_scalar_has_no_cast_to_an_array_type(home: Path) -> None:
+    """`1::int[]` is 42846 naming both types, not an input-syntax error
+    (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        for sql, message in [
+            ("select 1::int[]", "cannot cast type integer to integer[]"),
+            ("select 1.5::numeric[]", "cannot cast type numeric to numeric[]"),
+            ("select true::text[]", "cannot cast type boolean to text[]"),
+        ]:
+            with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message
+
+
+def test_array_cast_applies_the_element_type_modifier(home: Path) -> None:
+    """A cast to an array of a MODIFIED type applies the modifier to every
+    element -- a constructed array, a literal, and a nested array alike --
+    and the result is described with that modifier (PostgreSQL 16.15,
+    2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute("select array[1.234]::numeric(5,2)[]")
+        assert cur.fetchone() == ([Decimal("1.23")],)
+        assert (cur.description[0].precision, cur.description[0].scale) == (5, 2)
+        assert conn.execute("select array['abc']::varchar(2)[]").fetchone() == (["ab"],)
+        assert conn.execute("select '{1.234,2}'::numeric(5,2)[]").fetchone() == (
+            [Decimal("1.23"), Decimal("2.00")],
+        )
+        assert conn.execute("select array[array[1.5555]]::numeric(4,2)[]").fetchone() == (
+            [[Decimal("1.56")]],
+        )
+        assert conn.execute("select pg_typeof(array[1.234]::numeric(5,2)[])::text").fetchone() == (
+            "numeric[]",
+        )
+
+
+def test_undefined_column_is_positioned_and_qualified_like_postgresql(
+    home: Path,
+) -> None:
+    """42703 points at the column's first mention; a qualified reference
+    reports `column a.nosuch does not exist` -- unquoted, in the written
+    spelling, positioned at the qualifier -- including inside a JOIN's ON,
+    which is checked when the join is planned rather than when its sides
+    are read. And a qualified `a.i IS NULL` in WHERE resolves the column, not
+    the qualifier (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.rollback()
+        for sql, message, position in [
+            ("select nosuch from asg", 'column "nosuch" does not exist', "8"),
+            ("select i, nosuch from asg", 'column "nosuch" does not exist', "11"),
+            (
+                "select i from asg where nosuch = 1",
+                'column "nosuch" does not exist',
+                "25",
+            ),
+            (
+                "select i from asg order by nosuch",
+                'column "nosuch" does not exist',
+                "28",
+            ),
+            ("update asg set i = nosuch", 'column "nosuch" does not exist', "20"),
+            (
+                "update asg set nosuch = 1",
+                'column "nosuch" of relation "asg" does not exist',
+                "16",
+            ),
+            (
+                "select (select nosuch from asg)",
+                'column "nosuch" does not exist',
+                "16",
+            ),
+            ("select a.nosuch from asg a", "column a.nosuch does not exist", "8"),
+            ('select a."Nosuch" from asg a', "column a.Nosuch does not exist", "8"),
+            (
+                "select i from asg where asg.nosuch = 1",
+                "column asg.nosuch does not exist",
+                "25",
+            ),
+            (
+                "select * from asg a join asg b on a.nosuch = b.i",
+                "column a.nosuch does not exist",
+                "35",
+            ),
+            (
+                "select * from asg a join asg b on a.i = b.nosuch",
+                "column b.nosuch does not exist",
+                "41",
+            ),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+                conn.execute(sql)
+            assert str(ei.value).startswith(message), sql
+            assert ei.value.diag.statement_position == position, sql
+            conn.rollback()
+        for sql, count in [
+            ("select count(*) from asg a where a.i is null", 0),
+            ("select count(*) from asg a where a.i is not null", 1),
+            ("select count(*) from asg where asg.i is null", 0),
+        ]:
+            assert conn.execute(sql).fetchone() == (count,), sql
+
+
+def test_boolean_contexts_are_typed_and_positioned_like_postgresql(
+    home: Path,
+) -> None:
+    """A non-boolean predicate in HAVING, JOIN/ON or a join's WHERE is 42804
+    named after the INNERMOST connective it is an argument of (`argument of
+    AND`, not `of WHERE`) and positioned at the leaf, an arm under an AND the
+    row evaluator would short-circuit past included; a string literal there
+    is read as a boolean (`'true'` passes, `'x'` is 22P02 at the literal); a
+    NULL is UNKNOWN, which keeps no row and makes `NOT NULL` UNKNOWN too;
+    and an unqualified column two join sides supply is 42702 at its first
+    unqualified mention (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.rollback()
+        mismatch = psycopg.errors.DatatypeMismatch
+        bad_text = psycopg.errors.InvalidTextRepresentation
+        ambiguous = psycopg.errors.AmbiguousColumn
+        for sql, exc, message, position in [
+            ("select i from asg group by i having 1", mismatch, "HAVING", "37"),
+            ("select i from asg group by i having i", mismatch, "HAVING", "37"),
+            (
+                "select i from asg group by i having count(*)",
+                mismatch,
+                "argument of HAVING must be type boolean, not type bigint",
+                "37",
+            ),
+            ("select i from asg group by i having i + 1", mismatch, "HAVING", "37"),
+            (
+                "select i from asg group by i having 'x'",
+                bad_text,
+                'invalid input syntax for type boolean: "x"',
+                "37",
+            ),
+            ("select i from asg group by i having i = 1 and 1", mismatch, "AND", "47"),
+            ("select i from asg group by i having not i", mismatch, "NOT", "41"),
+            (
+                "select i from asg group by i having i = 1 or t",
+                mismatch,
+                "argument of OR must be type boolean, not type text",
+                "46",
+            ),
+            ("select a.i from asg a join asg b on 1", mismatch, "JOIN/ON", "37"),
+            (
+                "select a.i from asg a join asg b on a.i = b.i and 1",
+                mismatch,
+                "AND",
+                "51",
+            ),
+            (
+                "select a.i from asg a join asg b on a.t",
+                mismatch,
+                "argument of JOIN/ON must be type boolean, not type text",
+                "37",
+            ),
+            (
+                "select a.i from asg a join asg b on 'x'",
+                bad_text,
+                'invalid input syntax for type boolean: "x"',
+                "37",
+            ),
+            (
+                "select a.i from asg a left join asg b on a.i = b.i and 1",
+                mismatch,
+                "AND",
+                "56",
+            ),
+            (
+                "select a.i from asg a left join asg b on a.i = b.i and b.t",
+                mismatch,
+                "argument of AND must be type boolean, not type text",
+                "56",
+            ),
+            (
+                "select a.i from asg a join asg b on a.i = b.i where 1",
+                mismatch,
+                "WHERE",
+                "53",
+            ),
+            (
+                "select a.i from asg a join asg b on a.i = b.i where a.i = 1 and 1",
+                mismatch,
+                "AND",
+                "65",
+            ),
+            (
+                "select a.i from asg a join asg b on a.i = b.i where 'x'",
+                bad_text,
+                'invalid input syntax for type boolean: "x"',
+                "53",
+            ),
+            (
+                "select a.i from asg a join asg b on a.i = b.i where a.t",
+                mismatch,
+                "argument of WHERE must be type boolean, not type text",
+                "53",
+            ),
+            (
+                "select a.i from asg a join asg b on a.i = b.i where a.i = 1 and a.i = 2 and 1",
+                mismatch,
+                "AND",
+                "77",
+            ),
+            ("select i from asg where 1", mismatch, "WHERE", "25"),
+            ("select i from asg where i = 1 and 1", mismatch, "AND", "35"),
+            (
+                "select i from asg where 'x'",
+                bad_text,
+                'invalid input syntax for type boolean: "x"',
+                "25",
+            ),
+            (
+                "select i from asg a join asg b on a.i = b.i",
+                ambiguous,
+                'column reference "i" is ambiguous',
+                "8",
+            ),
+            (
+                "select a.i, i from asg a join asg b on a.i = b.i",
+                ambiguous,
+                'column reference "i" is ambiguous',
+                "13",
+            ),
+            (
+                "select a.i from asg a join asg b on a.i = b.i where i = 1",
+                ambiguous,
+                'column reference "i" is ambiguous',
+                "53",
+            ),
+            (
+                "select a.i from asg a, asg b where i = 1",
+                ambiguous,
+                'column reference "i" is ambiguous',
+                "36",
+            ),
+        ]:
+            if " " not in message:
+                message = f"argument of {message} must be type boolean, not type integer"
+            with pytest.raises(exc) as ei:
+                conn.execute(sql)
+            assert str(ei.value).startswith(message), sql
+            assert ei.value.diag.statement_position == position, sql
+            conn.rollback()
+        for sql, count in [
+            ("select i from asg group by i having 'true'", 1),
+            ("select i from asg group by i having 'false'", 0),
+            ("select i from asg group by i having null", 0),
+            ("select i from asg group by i having i = 1 and 'true'", 1),
+            ("select i from asg group by i having i = 1 and null", 0),
+            ("select i from asg group by i having i = 1 or null", 1),
+            ("select i from asg group by i having not null", 0),
+            (
+                "select i from asg group by i having not (max(t) filter (where i = 2) = 'x')",
+                0,
+            ),
+            (
+                "select i from asg group by i "
+                "having not (i = 2 or max(t) filter (where i = 2) = 'x')",
+                0,
+            ),
+            ("select a.i from asg a join asg b on 'true'", 1),
+            ("select a.i from asg a join asg b on 'false'", 0),
+            ("select a.i from asg a join asg b on null", 0),
+            ("select a.i from asg a join asg b on a.i = b.i and null", 0),
+            ("select a.i from asg a left join asg b on 'false'", 1),
+            ("select a.i from asg a left join asg b on null", 1),
+            ("select a.i from asg a join asg b on a.i = b.i where 'false'", 0),
+            ("select a.i from asg a join asg b on a.i = b.i where null", 0),
+            ("select a.i from asg a join asg b on a.i = b.i where a.i = 1 and null", 0),
+            ("select i from asg where 'false'", 0),
+            ("select i from asg where null", 0),
+        ]:
+            assert len(conn.execute(sql).fetchall()) == count, sql
+
+
+def test_ungrouped_column_errors_are_positioned_like_postgresql(home: Path) -> None:
+    """A column that is neither grouped nor inside an aggregate is 42803 at
+    the column, wherever it is read -- the select list, HAVING (bare, under
+    a connective, inside a function, under IS NULL) or ORDER BY -- and the
+    message names it by the FROM alias when there is one (`"a.t"`), even for
+    a bare `t`; a qualified `a.t` is 42803 too, never an unknown column
+    (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.rollback()
+        for sql, column, position in [
+            ("select i from asg group by i having t = 'x'", "asg.t", "37"),
+            ("select i, t from asg group by i", "asg.t", "11"),
+            ("select i from asg group by i having max(t) = 'x' and t = 'y'", "asg.t", "54"),
+            ("select i, max(t) from asg group by i having t = 'x' or i = 1", "asg.t", "45"),
+            ("select a.i from asg a group by a.i having a.t = 'x'", "a.t", "43"),
+            ("select i from asg group by i having length(t) > 1", "asg.t", "44"),
+            ("select i from asg group by i having i = 1 order by t", "asg.t", "52"),
+            (
+                "select i, count(*) from asg group by i having sum(i) > 0 and t = 'x'",
+                "asg.t",
+                "62",
+            ),
+            ("select i, t from asg a group by i", "a.t", "11"),
+            ("select a.t from asg a group by a.i", "a.t", "8"),
+            ("select i + 1 from asg group by i having t is null", "asg.t", "41"),
+        ]:
+            with pytest.raises(psycopg.errors.GroupingError) as ei:
+                conn.execute(sql)
+            assert str(ei.value).startswith(
+                f'column "{column}" must appear in the GROUP BY clause '
+                "or be used in an aggregate function"
+            ), sql
+            assert ei.value.diag.statement_position == position, sql
+            conn.rollback()
+
+
+def test_having_over_expressions_and_is_distinct_from_match_postgresql(home: Path) -> None:
+    """HAVING over a NULL test or a CASE that contains an aggregate is the
+    expression's own business (`(max(t) = 'y') is not null`), an unknown
+    column there is 42703 rather than a grouping error, and `IS [NOT]
+    DISTINCT FROM` is the null-safe `=` in every clause -- it had been read
+    as a plain `=`, so `max(t) is distinct from 'x'` kept the row PostgreSQL
+    drops (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.commit()
+        for sql, rows in [
+            ("select i from asg group by i having (i = 1 or null) is null", []),
+            ("select i from asg group by i having (max(t) = 'y') is not null", [(1,)]),
+            (
+                "select i from asg group by i "
+                "having case when max(t) = 'x' then true else false end",
+                [(1,)],
+            ),
+            ("select i from asg group by i having max(t) is distinct from 'x'", []),
+            ("select i from asg group by i having max(t) is not distinct from 'x'", [(1,)]),
+            (
+                "select i from asg group by i "
+                "having max(t) filter (where i = 2) is not distinct from null",
+                [(1,)],
+            ),
+            ("select i from asg group by i having i is distinct from 2", [(1,)]),
+            ("select i is distinct from 2, t is not distinct from 'x' from asg", [(True, True)]),
+            ("select i from asg where i is distinct from 2", [(1,)]),
+            ("select i from asg where t is not distinct from null", []),
+            ("select i from asg where (i + 1) is distinct from 2", []),
+            ("select i from asg order by t is distinct from 'x'", [(1,)]),
+            ("select null::int is distinct from null, 1 is distinct from null", [(False, True)]),
+        ]:
+            assert conn.execute(sql).fetchall() == rows, sql
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            conn.execute("select i from asg group by i having (nosuch) is null")
+        assert str(ei.value).startswith('column "nosuch" does not exist')
+        assert ei.value.diag.statement_position == "38"
+
+
+def test_assignment_errors_are_positioned_like_postgresql(home: Path) -> None:
+    """A literal a column cannot read fails at the literal, the INSERT
+    column-count errors at the first unpaired item, and a scalar subquery is
+    typed by its output column, not by the value it yields: `(select 'x')`
+    into an integer column is 42804 at the `(`, never 22P02 (PostgreSQL
+    16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text, d date)")
+        conn.execute("insert into asg values (1, 'x', '2020-01-01')")
+        conn.rollback()
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("UPDATE asg SET i = 'abc'")
+        assert ei.value.diag.statement_position == "20"
+        conn.rollback()
+        with pytest.raises(psycopg.errors.DatetimeFieldOverflow) as ei:
+            conn.execute("INSERT INTO asg (d) VALUES ('2020-13-45')")
+        assert ei.value.diag.statement_position == "29"
+        conn.rollback()
+        with pytest.raises(psycopg.errors.SyntaxError) as ei:
+            conn.execute("INSERT INTO asg VALUES (1, 'x', '2020-01-01', 9)")
+        assert "more expressions than target columns" in str(ei.value)
+        assert ei.value.diag.statement_position == "47"
+        conn.rollback()
+        with pytest.raises(psycopg.errors.SyntaxError) as ei:
+            conn.execute("INSERT INTO asg (i, t) VALUES (1)")
+        assert "more target columns than expressions" in str(ei.value)
+        assert ei.value.diag.statement_position == "21"
+        conn.rollback()
+        for sql, position in [
+            ("UPDATE asg SET i = (select 'x')", "20"),
+            ("UPDATE asg SET i = (select t from asg limit 1)", "20"),
+            ("UPDATE asg SET i = (select a.t from asg a limit 1)", "20"),
+            ("INSERT INTO asg (i) VALUES ((select 'x'))", "29"),
+        ]:
+            with pytest.raises(psycopg.errors.DatatypeMismatch) as ei:
+                conn.execute(sql)
+            assert str(ei.value).startswith(
+                'column "i" is of type integer but expression is of type text'
+            ), sql
+            assert ei.value.diag.statement_position == position, sql
+            conn.rollback()
+        # A subquery whose column IS assignable still goes through.
+        assert conn.execute("UPDATE asg SET t = (select i from asg limit 1)").rowcount == 1
+        assert conn.execute("UPDATE asg SET i = (select 1.5)").rowcount == 1
+        assert conn.execute("select i, t from asg").fetchone() == (2, "1")
+
+
+def test_timestamptz_to_timestamp_uses_the_session_zone(home: Path) -> None:
+    """`timestamptz::timestamp` is the instant's wall clock in the session's
+    time zone, for a constant and a column alike (PostgreSQL 16.15)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Berlin'")
+        assert conn.execute(
+            "select '2030-01-01 12:00:00+02'::timestamptz::timestamp"
+        ).fetchone() == (dt.datetime(2030, 1, 1, 11, 0),)
+        assert conn.execute(
+            "select '2030-06-01 12:00:00+02'::timestamptz::timestamp::text"
+        ).fetchone() == ("2030-06-01 12:00:00",)
+        conn.execute("create table ts (id int primary key, at timestamptz)")
+        conn.execute("insert into ts values (1, '2030-01-01 12:00:00+02')")
+        assert conn.execute("select at::timestamp from ts").fetchone() == (
+            dt.datetime(2030, 1, 1, 11, 0),
+        )
+        conn.execute("set time zone 'UTC'")
+        assert conn.execute("select at::timestamp from ts").fetchone() == (
+            dt.datetime(2030, 1, 1, 10, 0),
+        )
+
+
+@pytest.mark.parametrize(
+    ("sql", "message"),
+    [
+        ("select 1::point", "cannot cast type integer to point"),
+        ("select 1.5::regtype", "cannot cast type numeric to regtype"),
+        ("select 1::int4range", "cannot cast type integer to int4range"),
+        ("select 1::int2::money", "cannot cast type smallint to money"),
+        ("select true::int2", "cannot cast type boolean to smallint"),
+        ("select true::float8", "cannot cast type boolean to double precision"),
+        ('select 1::"order"', 'cannot cast type integer to "order"'),
+    ],
+)
+def test_impossible_casts_from_numbers_and_booleans(home: Path, sql: str, message: str) -> None:
+    """A cast PostgreSQL has no path for is 42846 with its wording, including
+    from an integer to an enum (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create type \"order\" as enum ('a')")
+        with pytest.raises(psycopg.errors.CannotCoerce) as ei:
+            conn.execute(sql)
+        assert ei.value.diag.message_primary == message
+        # The paths that DO exist still work.
+        assert conn.execute("select true::int, 1::oid::text, 1::int8::float4").fetchone() == (
+            1,
+            "1",
+            1.0,
+        )
+
+
+def test_aggregate_signatures_match_postgres(home: Path) -> None:
+    """`min` / `max` refuse a boolean, `sum` / `avg` refuse text and boolean,
+    `string_agg` refuses an integer — each a 42883 naming the signature — while
+    `bool_and` / `bool_or` / `every` take one (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table b (id int primary key, ok bool, n int)")
+        conn.execute("insert into b values (1, true, 1), (2, false, 2)")
+        conn.execute("create table t1 (id int primary key, a text)")
+        conn.execute("insert into t1 values (1, 'hello'), (2, 'y')")
+        assert conn.execute("select bool_and(ok), bool_or(ok), every(ok) from b").fetchone() == (
+            False,
+            True,
+            False,
+        )
+        assert conn.execute("select min(id), max(a) from t1").fetchone() == (1, "y")
+        assert conn.execute("select min(n) from b").fetchone() == (1,)
+        for sql, message in [
+            ("select min(ok) from b", "function min(boolean) does not exist"),
+            ("select max(ok) from b", "function max(boolean) does not exist"),
+            ("select min(ok), max(ok) from b", "function min(boolean) does not exist"),
+            ("select max(id), min(ok) from b", "function min(boolean) does not exist"),
+            ("select max(ok) from b group by n", "function max(boolean) does not exist"),
+            ("select sum(ok) from b", "function sum(boolean) does not exist"),
+            ("select avg(ok) from b", "function avg(boolean) does not exist"),
+            ("select sum(a) from t1", "function sum(text) does not exist"),
+            ("select avg(a) from t1", "function avg(text) does not exist"),
+            (
+                "select string_agg(id, ',') from t1",
+                "function string_agg(integer, unknown) does not exist",
+            ),
+            ("select n from b group by n having max(ok)", "function max(boolean) does not exist"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+        # A bare boolean aggregate (or boolean group key) is a whole HAVING;
+        # a non-boolean one is 42804 naming its type.
+        conn.execute("insert into b values (3, true, 1)")
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        assert rows("select n from b group by n having bool_and(ok) order by n") == [(1,)]
+        assert rows("select n from b group by n having every(ok) order by n") == [(1,)]
+        assert rows("select n from b group by n having not bool_or(ok)") == [(2,)]
+        assert rows("select ok from b group by ok having ok") == [(True,)]
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as dm:
+            conn.execute("select n from b group by n having count(*)")
+        assert dm.value.diag.message_primary == (
+            "argument of HAVING must be type boolean, not type bigint"
+        )
+
+
+def test_drop_if_exists_of_a_missing_object_notices(home: Path) -> None:
+    """`DROP TABLE / SCHEMA IF EXISTS` on nothing succeeds and raises the
+    `..., skipping` notice PostgreSQL raises."""
+    with _Server(home) as server, server.connect() as conn:
+        seen = _notices(conn)
+        conn.execute("drop table if exists nope_missing")
+        conn.execute("drop schema if exists nope_missing")
+        assert [(n[0], n[2]) for n in seen] == [
+            ("NOTICE", 'table "nope_missing" does not exist, skipping'),
+            ("NOTICE", 'schema "nope_missing" does not exist, skipping'),
+        ]
+        seen.clear()
+        conn.execute("create table present (id int primary key)")
+        conn.execute("drop table if exists present")
+        assert seen == []
+
+
+def test_char_and_varchar_casts_truncate_and_pad(home: Path) -> None:
+    """An explicit `::char(n)` / `::varchar(n)` truncates to n characters,
+    `char(n)` pads its output to n, bare `::char` is `char(1)`, and the
+    one-byte `"char"` keeps the first character with its own oid (18).
+    Values and oids from PostgreSQL 16.15 (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute(
+            "select 'abc'::char, 'abc'::char(2), 123::char, true::char(2), true::varchar,"
+            " 'abc'::\"char\", 'a'::char(3), 'a'::char(3) || 'x', 'abcd'::varchar(2),"
+            " 'ab   '::char(2), length('a'::char(3)), 'ab'::char(4) || 'x',"
+            " 'ab'::varchar(4) || 'x'"
+        )
+        assert cur.fetchall() == [
+            ("a", "ab", "1", "tr", "true", "a", "a  ", "ax", "ab", "ab", 1, "abx", "abx")
+        ]
+        assert [d.type_code for d in cur.description] == [
+            1042,
+            1042,
+            1042,
+            1042,
+            1043,
+            18,
+            1042,
+            25,
+            1043,
+            1042,
+            23,
+            25,
+            25,
+        ]
+        assert cur.description[5].internal_size == 1
+        assert conn.execute(
+            "select pg_typeof('abc'::char)::text, pg_typeof('abc'::\"char\")::text,"
+            " pg_typeof('a'::char(3))::text"
+        ).fetchone() == ("character", '"char"', "character")
+        assert conn.execute("select 'a'::char(3) = 'a'").fetchone() == (True,)
+        conn.execute("create table t1 (id int primary key, a text)")
+        conn.execute("insert into t1 values (1, 'hello'), (2, 'y')")
+        cur = conn.execute("select a::char(1), a::varchar(1), a::char from t1 order by id")
+        assert cur.fetchall() == [("h", "h", "h"), ("y", "y", "y")]
+        assert [d.type_code for d in cur.description] == [1042, 1043, 1042]
+        # The column cast declares the width, so the output is padded to it.
+        assert conn.execute("select a::char(2), a::char(6) from t1 order by id").fetchall() == [
+            ("he", "hello "),
+            ("y ", "y     "),
+        ]
+
+
+def test_wide_integer_literals_and_narrowing_casts(home: Path) -> None:
+    """An integer literal past int4 is typed `bigint` while it fits one
+    (so `4294967295::oid` is a legal cast) and `numeric` beyond that; casts
+    to int4 / int2 enforce their range with PostgreSQL's 22003 wording,
+    which differs for a numeric source and a string one (PostgreSQL 16.15,
+    2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute(
+            "select pg_typeof(2147483648)::text, pg_typeof(9223372036854775808)::text,"
+            " pg_typeof(2147483648.0)::text"
+        ).fetchone() == ("bigint", "numeric", "numeric")
+        cur = conn.execute("select 4294967295::oid, 2147483648 + 1, 2147483647.4::int4")
+        assert cur.fetchone() == (4294967295, 2147483649, 2147483647)
+        assert [d.type_code for d in cur.description] == [26, 20, 23]
+        assert conn.execute("select '  12 '::int2, 32767::int2, (-32768)::int2").fetchone() == (
+            12,
+            32767,
+            -32768,
+        )
+        for sql, sqlstate, message in [
+            ("select 2147483648::int4", "22003", "integer out of range"),
+            ("select 2147483647.5::int4", "22003", "integer out of range"),
+            ("select 1e300::float8::int4", "22003", "integer out of range"),
+            ("select 40000::int2", "22003", "smallint out of range"),
+            ("select (-32769)::int2", "22003", "smallint out of range"),
+            ("select 32767.5::int2", "22003", "smallint out of range"),
+            ("select '40000'::int2", "22003", 'value "40000" is out of range for type smallint'),
+            (
+                "select '2147483648'::int4",
+                "22003",
+                'value "2147483648" is out of range for type integer',
+            ),
+            ("select '1e5'::int2", "22P02", 'invalid input syntax for type smallint: "1e5"'),
+            ("select 4294967296::oid", "22003", "OID out of range"),
+            ("select 12345678901234567890::oid", "42846", "cannot cast type numeric to oid"),
+        ]:
+            with pytest.raises(psycopg.Error) as ei:
+                conn.execute(sql)
+            assert (ei.value.sqlstate, ei.value.diag.message_primary) == (sqlstate, message), sql
+
+
+def _seed_zt(conn) -> None:
+    conn.execute("create table zt (id int primary key, g text, s text, n int)")
+    conn.execute(
+        "insert into zt values (1,'a','xxx',5),(2,'b','y',3),(3,'a','zz',1),(4,'b','wwww',2)"
+    )
+
+
+def test_derived_tables(home: Path) -> None:
+    """A subquery in FROM is a table: its columns can be selected, filtered,
+    ordered, joined and counted (PostgreSQL 16.15, 2026-09-23). Two output
+    columns with one name are the one shape still refused."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_zt(conn)
+        assert conn.execute(
+            "select * from (select g, sum(n) as total from zt group by g) d order by total desc"
+        ).fetchall() == [("a", 6), ("b", 5)]
+        assert conn.execute(
+            "select d.g, d.total from (select g, sum(n) as total from zt group by g) d"
+            " where d.total > 5"
+        ).fetchall() == [("a", 6)]
+        assert conn.execute(
+            "select x.a, y.b from (select 1 as a) x, (select 2 as b) y order by 1, 2"
+        ).fetchall() == [(1, 2)]
+        assert conn.execute("select count(*) from (select distinct g from zt) d").fetchone() == (2,)
+        join = (
+            "select x.g{a}, y.n{b} from (select g from zt where id < 3) x"
+            " join (select n, g from zt where id > 2) y on x.g = y.g order by {o}"
+        )
+        assert conn.execute(join.format(a="", b="", o="2")).fetchall() == [("a", 1), ("b", 2)]
+        assert conn.execute(join.format(a=" as gg", b=" as nn", o="nn desc")).fetchall() == [
+            ("b", 2),
+            ("a", 1),
+        ]
+        with pytest.raises(psycopg.errors.InvalidColumnReference) as ei:
+            conn.execute(join.format(a="", b="", o="3"))
+        assert ei.value.diag.message_primary == "ORDER BY position 3 is not in select list"
+        with pytest.raises(psycopg.errors.FeatureNotSupported):
+            conn.execute("select * from (select id, id from zt) d")
+
+
+def test_pg_typeof_over_columns_and_itself(home: Path) -> None:
+    """`pg_typeof` names a column's declared type, casts to its oid, and is
+    itself a `regtype` (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_zt(conn)
+        cur = conn.execute("select pg_typeof(id), pg_typeof(g), pg_typeof(n) from zt limit 1")
+        assert cur.fetchone() == ("integer", "text", "integer")
+        assert [d.type_code for d in cur.description] == [2206, 2206, 2206]
+        cur = conn.execute("select pg_typeof(id)::oid from zt limit 1")
+        assert cur.fetchone() == (23,)
+        assert cur.description[0].type_code == 26
+        assert conn.execute("select pg_typeof(pg_typeof(1))").fetchone() == ("regtype",)
+
+
+def test_money(home: Path) -> None:
+    """`money` parses currency text, does arithmetic with itself and with
+    numbers, aggregates, and casts to numeric / text; negation is not an
+    operator PostgreSQL has (16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table zm (id int primary key, price money)")
+        conn.execute("insert into zm values (1, '$12.34'), (2, '-5.5')")
+        cur = conn.execute(
+            "select price, price * 2, price + '1.00'::money, price - '1.00'::money, price / 2,"
+            " price = '12.34'::money from zm order by id"
+        )
+        assert cur.fetchall() == [
+            ("$12.34", "$24.68", "$13.34", "$11.34", "$6.17", True),
+            ("-$5.50", "-$11.00", "-$4.50", "-$6.50", "-$2.75", False),
+        ]
+        assert [d.type_code for d in cur.description] == [790, 790, 790, 790, 790, 16]
+        assert conn.execute("select sum(price), min(price), max(price) from zm").fetchone() == (
+            "$6.84",
+            "-$5.50",
+            "$12.34",
+        )
+        rows = conn.execute("select price::numeric, price::text from zm order by id").fetchall()
+        assert rows == [
+            (Decimal("12.34"), "$12.34"),
+            (Decimal("-5.50"), "-$5.50"),
+        ]
+        assert conn.execute("select 12.5::money, '$1,234.56'::money, 3::money").fetchone() == (
+            "$12.50",
+            "$1,234.56",
+            "$3.00",
+        )
+        with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+            conn.execute("select -price from zm")
+        assert ei.value.diag.message_primary == "operator does not exist: - money"
+
+
+def test_bit_strings(home: Path) -> None:
+    """`bit(n)` / `bit varying(n)` constants, bitwise operators, casts, the
+    string functions that take them, and the length checks a column enforces
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table zb (id int primary key, b bit(4), vb bit varying(5))")
+        conn.execute("insert into zb values (1, B'1010', B'101')")
+        cur = conn.execute(
+            "select b, b::text, vb, length(b), b & B'0110', b | B'0101', b # B'1111', ~b,"
+            " b << 1, b >> 1 from zb"
+        )
+        assert cur.fetchone() == (
+            "1010",
+            "1010",
+            "101",
+            4,
+            "0010",
+            "1111",
+            "0101",
+            "0101",
+            "0100",
+            "0101",
+        )
+        assert [d.type_code for d in cur.description] == [
+            1560,
+            25,
+            1562,
+            23,
+            1560,
+            1560,
+            1560,
+            1560,
+            1560,
+            1560,
+        ]
+        cur = conn.execute(
+            "select B'1010'::bit(4), B'10'::bit(4), B'101'::varbit, '1010'::bit(4), 5::bit(4),"
+            " B'1010'::int"
+        )
+        assert cur.fetchone() == ("1010", "1000", "101", "1010", "0101", 10)
+        assert [d.type_code for d in cur.description] == [1560, 1560, 1562, 1560, 1560, 23]
+        cur = conn.execute(
+            "select bit_length(B'1010'), octet_length(B'1010'), position(B'10' in B'0110'),"
+            " substring(B'1010' from 2 for 2), B'10' || B'11'"
+        )
+        assert cur.fetchone() == (4, 1, 3, "01", "1011")
+        assert [d.type_code for d in cur.description] == [23, 23, 23, 1560, 1562]
+        for sql, sqlstate, message in [
+            (
+                "insert into zb values (2, B'11', B'1')",
+                "22026",
+                "bit string length 2 does not match type bit(4)",
+            ),
+            (
+                "insert into zb values (2, B'1010', B'111111')",
+                "22001",
+                "bit string too long for type bit varying(5)",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as ei:
+                conn.execute(sql)
+            assert (ei.value.sqlstate, ei.value.diag.message_primary) == (sqlstate, message), sql
+        conn.execute("insert into zb values (2, B'1010', B'11111')")
+        assert conn.execute("select vb from zb where id = 2").fetchone() == ("11111",)
+
+
+def test_declared_string_widths_are_enforced_on_insert(home: Path) -> None:
+    """A value past a `varchar(n)` / `char(n)` column's width is 22001 on
+    INSERT, while an explicit cast truncates (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table zs (id int primary key, v varchar(3), c char(3))")
+        conn.execute("insert into zs values (1, 'ab', 'x')")
+        assert conn.execute("select v, c from zs").fetchone() == ("ab", "x  ")
+        for sql, message in [
+            (
+                "insert into zs values (2, 'abcd', 'x')",
+                "value too long for type character varying(3)",
+            ),
+            ("insert into zs values (2, 'ab', 'xxxx')", "value too long for type character(3)"),
+        ]:
+            with pytest.raises(psycopg.errors.StringDataRightTruncation) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+        cur = conn.execute(
+            "select 'abcd'::varchar(3), 'abcd'::char(2), 'ab'::char(4), length('ab'::char(4)),"
+            " 'ab'::char(4)::text"
+        )
+        assert cur.fetchone() == ("abc", "ab", "ab  ", 2, "ab")
+        assert [d.type_code for d in cur.description] == [1043, 1042, 1042, 23, 25]
+
+
+def test_split_part_and_abs_edges(home: Path) -> None:
+    """`split_part` counts from the end for a negative position, returns the
+    whole string for an empty delimiter, and refuses zero; `abs` of the most
+    negative integer overflows (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute(
+            "select split_part('a,b,c', ',', 1), split_part('a,b,c', ',', -1),"
+            " split_part('a,b,c', ',', 5), split_part('a,b,c', '', 1), split_part('abc', ',', 1)"
+        ).fetchone() == ("a", "c", "", "a,b,c", "abc")
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as ei:
+            conn.execute("select split_part('a,b,c', ',', 0)")
+        assert ei.value.diag.message_primary == "field position must not be zero"
+        cur = conn.execute(
+            "select abs(-2147483647), abs(-9223372036854775807), abs(-1.5), abs(-1.5::float8)"
+        )
+        assert cur.fetchone() == (2147483647, 9223372036854775807, Decimal("1.5"), 1.5)
+        assert [d.type_code for d in cur.description] == [23, 20, 1700, 701]
+        for sql, message in [
+            ("select abs(-2147483648)", "integer out of range"),
+            ("select abs(-9223372036854775808)", "bigint out of range"),
+        ]:
+            with pytest.raises(psycopg.errors.NumericValueOutOfRange) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+
+
+def test_sql_value_functions(home: Path) -> None:
+    """`current_user` / `user` / `session_user` / `current_role` /
+    `current_catalog` / `current_schema` are `name`-typed values usable bare
+    and inside expressions; the datetime ones carry PostgreSQL's types
+    (16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute(
+            "select current_user = user, session_user = current_user, current_catalog,"
+            " current_schema, pg_typeof(current_date), pg_typeof(current_time),"
+            " pg_typeof(current_timestamp), pg_typeof(localtime), pg_typeof(localtimestamp),"
+            " pg_typeof(current_role)"
+        )
+        assert cur.fetchone() == (
+            True,
+            True,
+            "postgres",
+            "public",
+            "date",
+            "time with time zone",
+            "timestamp with time zone",
+            "time without time zone",
+            "timestamp without time zone",
+            "name",
+        )
+        assert [d.type_code for d in cur.description] == [16, 16, 19, 19] + [2206] * 6
+        cur = conn.execute(
+            "select pg_typeof(user), pg_typeof(current_catalog), pg_typeof(current_schema),"
+            " length(current_user::text) > 0, 'x' || user"
+        )
+        assert cur.fetchone() == ("name", "name", "name", True, "xtest")
+        assert [d.type_code for d in cur.description] == [2206, 2206, 2206, 16, 25]
+        cur = conn.execute(
+            "select current_user, user, session_user, current_role, current_catalog, current_schema"
+        )
+        assert cur.fetchone() == ("test",) * 4 + ("postgres", "public")
+        assert [d.type_code for d in cur.description] == [19] * 6
+
+
+def test_the_clocks(home: Path) -> None:
+    """`now()` / `current_timestamp` / `transaction_timestamp()` are the
+    transaction's start, `statement_timestamp()` the statement's, and
+    `clock_timestamp()` the wall clock; the value functions agree with
+    `now()` (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert (
+            conn.execute(
+                "select current_date = now()::date, current_timestamp = now(),"
+                " localtimestamp = now()::timestamp, now()::date = current_date,"
+                " current_timestamp::date = current_date,"
+                " (now() - interval '1 day')::date < current_date,"
+                " now() = transaction_timestamp(), (now() - now()) = interval '0'"
+            ).fetchone()
+            == (True,) * 8
+        )
+        assert conn.execute(
+            "select pg_typeof(now()::date), pg_typeof(now()::timestamp), pg_typeof(now()::time)"
+        ).fetchone() == ("date", "timestamp without time zone", "time without time zone")
+        with conn.transaction():
+            (first,) = conn.execute("select now()").fetchone()
+            time.sleep(0.05)
+            (again, stmt, wall) = conn.execute(
+                "select now(), statement_timestamp(), clock_timestamp()"
+            ).fetchone()
+        assert again == first
+        assert stmt > first
+        assert wall >= stmt
+
+
+def test_date_and_time_input_from_timestamp_text(home: Path) -> None:
+    """A date or time accepts a timestamp literal and keeps its half; a
+    timestamptz cast to date / time takes the session zone (PostgreSQL
+    16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'UTC'")
+        cur = conn.execute(
+            "select '2026-01-02 03:04:05'::date, '2026-01-02 03:04:05.5'::time,"
+            " '2026-01-02 03:04:05+02'::date, '2026-01-02T03:04:05'::date,"
+            " '2026-01-02 03:04:05+02'::time"
+        )
+        assert cur.fetchone() == (
+            dt.date(2026, 1, 2),
+            dt.time(3, 4, 5, 500000),
+            dt.date(2026, 1, 2),
+            dt.date(2026, 1, 2),
+            dt.time(3, 4, 5),
+        )
+        assert [d.type_code for d in cur.description] == [1082, 1083, 1082, 1082, 1083]
+        assert conn.execute(
+            "select '2026-01-02 03:04:05+00'::timestamptz::date,"
+            " '2026-01-02 03:04:05+00'::timestamptz::time,"
+            " '2026-01-02 03:04:05'::timestamp::date, '2026-01-02 03:04:05'::timestamp::time,"
+            " ('2026-01-02 03:04:05+00'::timestamptz - interval '1 hour')::date,"
+            " ('2026-01-02 03:04:05'::timestamp - interval '1 hour')::time"
+        ).fetchone() == (
+            dt.date(2026, 1, 2),
+            dt.time(3, 4, 5),
+            dt.date(2026, 1, 2),
+            dt.time(3, 4, 5),
+            dt.date(2026, 1, 2),
+            dt.time(2, 4, 5),
+        )
+
+
+def test_datetime_arithmetic(home: Path) -> None:
+    """Instant minus instant is an interval of days and time (never months),
+    `date ± interval` and `date + time` are timestamps, `time ± interval`
+    wraps at midnight using only the interval's time part, and an untyped
+    literal takes the type the operator needs — except `date + 'lit'`, which
+    is ambiguous (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_zt(conn)
+        conn.execute("set time zone 'UTC'")
+        cur = conn.execute(
+            "select pg_typeof(now() - now()), now() - now(),"
+            " '2026-01-02'::timestamp - '2026-01-01'::timestamp,"
+            " '2026-01-02 10:00'::timestamptz - '2026-01-01'::timestamptz,"
+            " '2026-03-01'::timestamp - '2025-01-01'::timestamp,"
+            " '2025-12-25'::timestamp - '2026-01-01 06:00'::timestamp,"
+            " '2026-01-02 10:00:00.5'::timestamp - '2026-01-01 10:00:00.25'::timestamp,"
+            " '2026-01-01'::date - '2025-12-25 06:00'::timestamp"
+        )
+        assert cur.fetchone() == (
+            "interval",
+            dt.timedelta(0),
+            dt.timedelta(days=1),
+            dt.timedelta(days=1, seconds=36000),
+            dt.timedelta(days=424),
+            dt.timedelta(days=-8, seconds=64800),
+            dt.timedelta(days=1, microseconds=250000),
+            dt.timedelta(days=6, seconds=64800),
+        )
+        assert [d.type_code for d in cur.description] == [2206] + [1186] * 7
+        cur = conn.execute(
+            "select '2026-01-01'::date + interval '1 day', '2026-01-01'::date - interval '1 day',"
+            " '2026-01-01'::date + time '01:00', time '01:00' + '2026-01-01'::date,"
+            " '2026-01-01'::date + interval '36 hours', interval '1 day' + '2026-01-01'::date,"
+            " '2026-01-01'::date - '2025-12-25'::date, '2026-01-01'::date - 3"
+        )
+        assert cur.fetchone() == (
+            dt.datetime(2026, 1, 2),
+            dt.datetime(2025, 12, 31),
+            dt.datetime(2026, 1, 1, 1),
+            dt.datetime(2026, 1, 1, 1),
+            dt.datetime(2026, 1, 2, 12),
+            dt.datetime(2026, 1, 2),
+            7,
+            dt.date(2025, 12, 29),
+        )
+        assert [d.type_code for d in cur.description] == [1114] * 6 + [23, 1082]
+        cur = conn.execute(
+            "select time '10:00' - time '08:30', time '10:00' + interval '1 hour',"
+            " time '23:00' + interval '2 hours', time '23:00' - interval '25 hours',"
+            " time '01:00' - time '02:00', '10:00'::time + interval '1 day 2 hours',"
+            " time '10:00' - interval '1 month'"
+        )
+        assert cur.fetchone() == (
+            dt.timedelta(seconds=5400),
+            dt.time(11),
+            dt.time(1),
+            dt.time(22),
+            dt.timedelta(days=-1, seconds=82800),
+            dt.time(12),
+            dt.time(10),
+        )
+        assert [d.type_code for d in cur.description] == [1186, 1083, 1083, 1083, 1186, 1083, 1083]
+        assert conn.execute(
+            "select pg_typeof(now() - interval '1 day'), pg_typeof(now() + interval '1 day'),"
+            " pg_typeof('2026-01-01'::timestamp - interval '1 day'),"
+            " pg_typeof(current_date + 1), pg_typeof(current_date - current_date),"
+            " pg_typeof('2026-01-01'::date + time '01:00'),"
+            " ('2026-01-01'::timestamptz - interval '1 day') = '2025-12-31'::timestamptz"
+        ).fetchone() == (
+            "timestamp with time zone",
+            "timestamp with time zone",
+            "timestamp without time zone",
+            "date",
+            "integer",
+            "timestamp without time zone",
+            True,
+        )
+        # Untyped literals.
+        cur = conn.execute(
+            "select '10:00'::time - '08:30', '2026-01-02'::timestamp - '2026-01-01',"
+            " '2026-01-01'::date - '2025-12-01', '2026-01-02 03:00'::timestamptz - '2026-01-01',"
+            " interval '1 day' + '2026-01-01'::timestamp"
+        )
+        assert cur.fetchone() == (
+            dt.timedelta(seconds=5400),
+            dt.timedelta(days=1),
+            31,
+            dt.timedelta(days=1, seconds=10800),
+            dt.datetime(2026, 1, 2),
+        )
+        assert [d.type_code for d in cur.description] == [1186, 1186, 23, 1186, 1114]
+        with pytest.raises(psycopg.errors.AmbiguousFunction) as ei:
+            conn.execute("select '2026-01-01'::date + '2'")
+        assert ei.value.diag.message_primary == "operator is not unique: date + unknown"
+        assert ei.value.diag.message_hint == (
+            "Could not choose a best candidate operator. You might need to add explicit type casts."
+        )
+        with pytest.raises(psycopg.errors.InvalidDatetimeFormat) as ei:
+            conn.execute("select '2026-01-01'::date - '1 day'")
+        assert ei.value.diag.message_primary == 'invalid input syntax for type date: "1 day"'
+        # A column-free WHERE over a table folds to a constant.
+        assert conn.execute(
+            "select t.id from zt t where now() - interval '1 day' < now() order by t.id limit 1"
+        ).fetchone() == (1,)
+        assert (
+            conn.execute("select id from zt where now() < now() - interval '1 day'").fetchall()
+            == []
+        )
+
+
+def test_constant_array_subscripts(home: Path) -> None:
+    """Subscripting an array constant (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.execute(
+            "select (array[10,20,30])[2], (array[10,20,30])[4], (array['a','b'])[1],"
+            " ('{1,2,3}'::int[])[3], (array[10,20,30])[2:3], (array[[1,2],[3,4]])[2][1]"
+        )
+        assert cur.fetchone() == (20, None, "a", 3, [20, 30], 3)
+        assert [d.type_code for d in cur.description] == [23, 23, 25, 23, 1007, 23]
+
+
+def test_aggregate_order_by_targets(home: Path) -> None:
+    """ORDER BY over a grouped query takes an output position, an alias, or
+    an aggregate expression; a position past the select list is 42P10, an
+    ungrouped column 42803 with its qualified name, an unknown one 42703
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_zt(conn)
+        assert conn.execute(
+            "select g, count(*) from zt group by g order by 2 desc, 1"
+        ).fetchall() == [("a", 2), ("b", 2)]
+        assert conn.execute(
+            "select g, count(*) as c from zt group by g order by c desc, g"
+        ).fetchall() == [("a", 2), ("b", 2)]
+        assert conn.execute("select g from zt group by g order by sum(n) desc").fetchall() == [
+            ("a",),
+            ("b",),
+        ]
+        assert conn.execute(
+            "select g, sum(n) from zt group by g order by max(n) - min(n) desc, g"
+        ).fetchall() == [("a", 6), ("b", 5)]
+        for sql, sqlstate, message in [
+            (
+                "select g, count(*) from zt group by g order by 3",
+                "42P10",
+                "ORDER BY position 3 is not in select list",
+            ),
+            (
+                "select g, count(*) from zt group by g order by s",
+                "42803",
+                'column "zt.s" must appear in the GROUP BY clause'
+                " or be used in an aggregate function",
+            ),
+            (
+                "select g, count(*) from zt group by g order by nope",
+                "42703",
+                'column "nope" does not exist',
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as ei:
+                conn.execute(sql)
+            assert (ei.value.sqlstate, ei.value.diag.message_primary) == (sqlstate, message), sql
+
+
+def test_like_family_and_posix_regex(home: Path) -> None:
+    """LIKE / ILIKE / SIMILAR TO and the POSIX `~` operators, negated and
+    not, over constants and over columns in WHERE and in the select list;
+    an ESCAPE longer than one character is 22025, an unbalanced regex 2201B,
+    a non-string operand 42883 (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table lk (id int primary key, g text)")
+        conn.execute("insert into lk values (1, 'a'), (2, 'b'), (3, null)")
+        assert conn.execute(
+            "select 'abc' like 'a%', 'abc' ilike 'A%', 'abc' not like 'b%', 'abc' ~ '^a',"
+            " 'abc' ~* '^A', 'abc' !~ 'x', 'abc' similar to 'a%', 'a_c' like 'a\\_c',"
+            " 'abc' like 'a_c', 'a%' like 'a#%' escape '#', null like 'a', 'a' like null,"
+            " pg_typeof('a' like 'b')::text"
+        ).fetchone() == (True,) * 10 + (None, None, "boolean")
+        for sql, rows in [
+            ("select g from lk where g like 'a%'", [("a",)]),
+            ("select g from lk where g not like 'a%'", [("b",)]),
+            ("select g from lk where g ilike 'A%'", [("a",)]),
+            ("select g from lk where g ~ '^a'", [("a",)]),
+            ("select g from lk where g !~ '^a'", [("b",)]),
+            ("select g from lk where g similar to '(a|c)'", [("a",)]),
+            ("select g from lk where not (g like 'a%')", [("b",)]),
+            ("select g from lk where g like 'a%' or g like 'b%' order by id", [("a",), ("b",)]),
+            ("select count(*) from lk where g like '%'", [(2,)]),
+            ("select g like 'a%' from lk order by id", [(True,), (False,), (None,)]),
+            ("select g not ilike 'A%' as x from lk order by id", [(False,), (True,), (None,)]),
+        ]:
+            assert conn.execute(sql).fetchall() == rows, sql
+        for sql, sqlstate, message in [
+            (
+                "select id from lk where g like 'a%' escape 'xx'",
+                "22025",
+                "invalid escape string",
+            ),
+            (
+                "select id from lk where g ~ '('",
+                "2201B",
+                "invalid regular expression: parentheses () not balanced",
+            ),
+            ("select 'a' ~ '[a'", "2201B", "invalid regular expression: brackets [] not balanced"),
+            (
+                "select id from lk where id like 'a'",
+                "42883",
+                "operator does not exist: integer ~~ unknown",
+            ),
+            ("select 'a' like 1", "42883", "operator does not exist: unknown ~~ integer"),
+        ]:
+            with pytest.raises(psycopg.Error) as ei:
+                conn.execute(sql)
+            assert (ei.value.sqlstate, ei.value.diag.message_primary) == (sqlstate, message), sql
+
+
+def test_char_n_pattern_matching_uses_the_padded_form(home: Path) -> None:
+    """A `char(n)` column is pattern-matched in its blank-padded output form:
+    `'ab'::char(5) LIKE 'ab'` is false and `LIKE 'ab   '` true, for LIKE,
+    SIMILAR TO and the POSIX operators alike, in WHERE and in the select
+    list. `lpad` / `rpad` pad or truncate to the length, cycling the fill
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table lc (id int primary key, c char(5))")
+        conn.execute("insert into lc values (1, 'ab'), (2, null)")
+        assert conn.execute(
+            "select c like 'ab', c like 'ab%', c like 'ab   ', c ~ 'b$', c ~ 'b  ',"
+            " c similar to 'ab', c similar to 'ab *', c ilike 'AB   ', c not like 'ab'"
+            " from lc where id = 1"
+        ).fetchone() == (False, True, True, False, True, False, True, True, True)
+        for sql, rows in [
+            ("select id from lc where c like 'ab'", []),
+            ("select id from lc where c like 'ab   '", [(1,)]),
+            ("select id from lc where c not like 'ab'", [(1,)]),
+            ("select id from lc where c ~ 'b  '", [(1,)]),
+            ("select id from lc where c !~ 'b$'", [(1,)]),
+            ("select id from lc where c similar to 'ab *'", [(1,)]),
+            ("select id from lc where c like 'ab%' and id = 1", [(1,)]),
+            ("select c like 'ab%' from lc order by id", [(True,), (None,)]),
+        ]:
+            assert conn.execute(sql).fetchall() == rows, sql
+        assert conn.execute(
+            "select rpad('ab', 5, ''), rpad('abcdef', 3), lpad('ab', 5, 'xy'), rpad('ab', -1),"
+            " lpad('ab', 5), rpad(null, 2), rpad('ab', null), rpad('é', 3, 'ü'),"
+            " lpad(c, 7, '.') from lc where id = 1"
+        ).fetchone() == ("ab", "abc", "xyxab", "", "   ab", None, None, "éüü", ".....ab")
+
+
+def _seed_join_pair(conn) -> None:
+    conn.execute("create table vt (id int primary key, ok boolean, g text)")
+    conn.execute("insert into vt values (1, true, 'a'), (2, false, 'b'), (3, true, 'c')")
+    conn.execute("create table vn (id int not null, n int)")
+    conn.execute("insert into vn values (1, 5), (2, null)")
+
+
+def test_join_where_is_evaluated_over_the_joined_row(home: Path) -> None:
+    """A WHERE over a join takes any boolean expression of both sides, and a
+    LEFT JOIN applies a right-side predicate AFTER the join -- so `vn.n > 1`
+    drops the unmatched rows and `vn.n IS NULL` keeps them (PostgreSQL 16.15,
+    2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_join_pair(conn)
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        lj = "from vt left join vn on vt.id = vn.id"
+        ij = "from vt join vn on vt.id = vn.id"
+        assert rows(f"select vt.id, vn.n {lj} where vn.n > 1 order by vt.id") == [(1, 5)]
+        assert rows(f"select vt.id, vn.n {lj} where vn.n is null order by vt.id") == [
+            (2, None),
+            (3, None),
+        ]
+        assert rows(f"select vt.id, vn.n {lj} where vn.n = 5 or vt.id = 3 order by vt.id") == [
+            (1, 5),
+            (3, None),
+        ]
+        assert rows(f"select vt.id {ij} where vt.id + vn.n > 2 order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where vt.g in ('a', 'z') order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where vt.ok order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where not vt.ok order by vt.id") == [(2,)]
+        assert rows(f"select vt.id {ij} where g = 'a' order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where vt.g like 'a%' order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where vn.n between 1 and 6 order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where vn.n not between 1 and 6 order by vt.id") == []
+        assert rows(f"select vt.id {lj} where vn.n between 1 and 6 order by vt.id") == [(1,)]
+        assert rows(f"select vt.id {ij} where vt.id between symmetric 3 and 1") == [(1,), (2,)]
+        assert rows(f"select vt.id {ij} where vt.g between 'a' and 'b' order by vt.id") == [
+            (1,),
+            (2,),
+        ]
+        assert rows(f"select vt.id, coalesce(vn.n, 0) + 1 {lj} order by vt.id") == [
+            (1, 6),
+            (2, 1),
+            (3, 1),
+        ]
+        assert rows(
+            f"select vt.id, case when vn.n > 1 then 'big' else 'small' end {lj} order by vt.id"
+        ) == [(1, "big"), (2, "small"), (3, "small")]
+        assert rows(f"select vt.id + vn.n as s, vt.id * 2 {ij} order by vt.id") == [
+            (6, 2),
+            (None, 4),
+        ]
+        assert rows(f"select pg_typeof(vt.id + vn.n) {ij} limit 1") == [("integer",)]
+        # ORDER BY a bare, unprojected column resolves against the sides.
+        assert rows(f"select vt.id {lj} order by n, id") == [(1,), (2,), (3,)]
+        assert rows(
+            "select 2 between 1 and 3, 2 between symmetric 3 and 1, 2 not between 1 and 3, "
+            "null between 1 and 2, 2 between null and 3, 0 between null and 3, "
+            "5 not between null and 3, 5 between '1' and '6'"
+        ) == [(True, True, False, None, None, None, True, True)]
+
+
+def test_column_reference_errors_over_a_join(home: Path) -> None:
+    """The three ways a column reference fails over a join carry PostgreSQL's
+    codes and wording: ambiguous (42702), a qualified miss (42703, unquoted),
+    a bare miss (42703, quoted) and an unknown qualifier (42P01). A
+    non-boolean WHERE is 42804 there too (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_join_pair(conn)
+        ij = "from vt join vn on vt.id = vn.id"
+        cases = [
+            (
+                f"select vt.id {ij} where id = 1",
+                "AmbiguousColumn",
+                'column reference "id" is ambiguous',
+            ),
+            (
+                f"select id, count(*) {ij} group by id",
+                "AmbiguousColumn",
+                'column reference "id" is ambiguous',
+            ),
+            (
+                f"select vt.id {ij} where nope > 0",
+                "UndefinedColumn",
+                'column "nope" does not exist',
+            ),
+            (
+                f"select vt.id {ij} where vt.nope > 0",
+                "UndefinedColumn",
+                "column vt.nope does not exist",
+            ),
+            (f"select vt.nope + 1 {ij}", "UndefinedColumn", "column vt.nope does not exist"),
+            (f"select vt.id {ij} order by nope", "UndefinedColumn", 'column "nope" does not exist'),
+            (
+                f"select vt.id {ij} where zz.n > 0",
+                "UndefinedTable",
+                'missing FROM-clause entry for table "zz"',
+            ),
+            (
+                f"select vt.id {ij} where vt.id + 1",
+                "DatatypeMismatch",
+                "argument of WHERE must be type boolean, not type integer",
+            ),
+            (
+                f"select ok, count(*) {ij}",
+                "GroupingError",
+                'column "vt.ok" must appear in the GROUP BY clause '
+                "or be used in an aggregate function",
+            ),
+        ]
+        for sql, exc, message in cases:
+            with pytest.raises(getattr(psycopg.errors, exc)) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+
+
+def test_aggregates_directly_over_a_join(home: Path) -> None:
+    """Aggregates run over a JOIN in the FROM clause -- with WHERE, GROUP BY
+    on either side's column (qualified or bare), positional GROUP BY, HAVING
+    over an aggregate or a grouped column -- and count the LEFT JOIN's
+    unmatched rows (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_join_pair(conn)
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        lj = "from vt left join vn on vt.id = vn.id"
+        ij = "from vt join vn on vt.id = vn.id"
+        assert rows(f"select count(*) {ij} where vn.n > 1") == [(1,)]
+        assert rows(f"select count(*) {lj}") == [(3,)]
+        assert rows(f"select count(*) {lj} where vn.n is null") == [(2,)]
+        assert rows(f"select vt.ok, count(*) {lj} group by vt.ok order by vt.ok") == [
+            (False, 1),
+            (True, 2),
+        ]
+        assert rows(f"select ok, count(*) {lj} group by ok order by ok") == [(False, 1), (True, 2)]
+        assert rows(f"select max(vt.id), count(vn.n), sum(vn.n) {lj}") == [(3, 1, 5)]
+        assert rows(
+            f"select vt.g, count(*) {lj} group by vt.g having count(*) > 0 order by vt.g"
+        ) == [("a", 1), ("b", 1), ("c", 1)]
+        assert rows(f"select vt.id, count(*) {lj} group by 1 order by 1") == [
+            (1, 1),
+            (2, 1),
+            (3, 1),
+        ]
+        assert rows(f"select ok, sum(n) {ij} group by ok order by ok") == [(False, None), (True, 5)]
+        assert rows(f"select g, count(n) {lj} group by g having count(n) = 0 order by g") == [
+            ("b", 0),
+            ("c", 0),
+        ]
+        assert rows(f"select n, count(*) {lj} group by n order by n") == [(5, 1), (None, 2)]
+        assert rows(f"select vt.g as gg, count(*) {lj} group by gg order by gg") == [
+            ("a", 1),
+            ("b", 1),
+            ("c", 1),
+        ]
+        assert rows(f"select count(*) {ij} group by ok having ok") == [(1,)]
+        assert rows(f"select vt.id, count(*) {ij} group by vt.id, vt.ok order by vt.id") == [
+            (1, 1),
+            (2, 1),
+        ]
+
+
+def test_integer_bitwise_operators(home: Path) -> None:
+    """`|`, `&`, `#`, `<<`, `>>` and `~` over int4 / int8, with a shift count
+    masked to the width and an unknown literal parsed as the integer beside
+    it; there is no numeric form at all (42883) and a non-integer literal is
+    22P02. Values from PostgreSQL 16.15 (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_join_pair(conn)
+        assert conn.execute(
+            "select 65536|1, 6&3, 6#3, 1<<31, 1<<32, 1<<33, -8>>1, ~5, 5|2::bigint, "
+            "pg_typeof(5|2), pg_typeof(5|2::bigint), 2147483647|0, (1::bigint<<63), "
+            "1<<-1, ~5::bigint"
+        ).fetchone() == (
+            65537,
+            2,
+            5,
+            -2147483648,
+            1,
+            2,
+            -4,
+            -6,
+            7,
+            "integer",
+            "bigint",
+            2147483647,
+            -9223372036854775808,
+            -2147483648,
+            -6,
+        )
+        assert conn.execute("select '3' | 1, null | 1, ~null::int").fetchone() == (3, None, None)
+        assert conn.execute(
+            "select id | 4, id << 2, ~id, id & 1 from vt order by id"
+        ).fetchall() == [
+            (5, 4, -2, 1),
+            (6, 8, -3, 0),
+            (7, 12, -4, 1),
+        ]
+        assert conn.execute("select id from vt where (id & 1) = 1 order by id").fetchall() == [
+            (1,),
+            (3,),
+        ]
+        with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+            conn.execute("select 1.5 | 1")
+        assert ei.value.diag.message_primary == "operator does not exist: numeric | integer"
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("select 'a' | 1")
+        assert ei.value.diag.message_primary == 'invalid input syntax for type integer: "a"'
+
+
+def test_power_operator(home: Path) -> None:
+    """`^` over integers is double precision; a numeric operand makes it the
+    numeric `numeric_power`, whose result carries at least 16 significant
+    digits (widened by the operands' scales) and refuses zero to a negative
+    power and a negative base with a fractional exponent (2201F). It is
+    left-associative and binds looser than unary minus. Values from
+    PostgreSQL 16.15 (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_join_pair(conn)
+        assert conn.execute(
+            "select 2 ^ 3, 2 ^ 0.5, 2.0 ^ 3, 2 ^ 3::float8, 2.5 ^ 2, 10 ^ -2, pg_typeof(2 ^ 3), "
+            "pg_typeof(2 ^ 0.5), pg_typeof(2 ^ 3::float8), pg_typeof(2::bigint ^ 3)"
+        ).fetchone() == (
+            8.0,
+            Decimal("1.4142135623730950"),
+            Decimal("8.0000000000000000"),
+            8.0,
+            Decimal("6.2500000000000000"),
+            0.01,
+            "double precision",
+            "numeric",
+            "double precision",
+            "double precision",
+        )
+        assert conn.execute("select 2 ^ 3 ^ 2, -2 ^ 2, (-2) ^ 2, 2 ^ -1").fetchone() == (
+            64.0,
+            4.0,
+            4.0,
+            0.5,
+        )
+        assert conn.execute(
+            "select 2 ^ null, '2' ^ '3', 2::float8 ^ -1074.5, '2.5' ^ 2, 2 ^ '2.5', '2' ^ 2.5, "
+            "pg_typeof('2' ^ 2.5), '2' ^ 2::bigint"
+        ).fetchone() == (
+            None,
+            8.0,
+            5e-324,
+            6.25,
+            5.656854249492381,
+            Decimal("5.6568542494923802"),
+            "numeric",
+            4.0,
+        )
+        assert conn.execute("select id ^ 2, 2 ^ id from vt order by id").fetchall() == [
+            (1.0, 2.0),
+            (4.0, 4.0),
+            (9.0, 8.0),
+        ]
+        assert conn.execute(
+            "select 9.99 ^ 9.99, 1.0000001 ^ 100000000, 0.00000000000000000001 ^ 2.5, "
+            "1.1 ^ -40, 0.0 ^ 3, 'NaN'::numeric ^ 0, (-1) ^ 'Infinity'::numeric"
+        ).fetchone() == (
+            Decimal("9675183873.3397141"),
+            Decimal("22026.454781577307"),
+            Decimal("1.0000000000000000E-50"),
+            Decimal("0.02209492815217999"),
+            Decimal("0E-16"),
+            Decimal("1"),
+            Decimal("1"),
+        )
+        for sql, message in [
+            ("select 0 ^ -1", "zero raised to a negative power is undefined"),
+            ("select 0.0 ^ -1", "zero raised to a negative power is undefined"),
+            (
+                "select (-8) ^ 0.5",
+                "a negative number raised to a non-integer power yields a complex result",
+            ),
+        ]:
+            with pytest.raises(psycopg.errors.InvalidArgumentForPowerFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message
+        for sql, message in [
+            ("select 'x' ^ 2", 'invalid input syntax for type double precision: "x"'),
+            ("select 'x' ^ 2.5", 'invalid input syntax for type numeric: "x"'),
+        ]:
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message
+        assert conn.execute(
+            "select 0 ^ 0, (-8) ^ 3::float8, 'Infinity'::float8 ^ 2, 2 ^ 'Infinity'::float8, "
+            "'NaN'::float8 ^ 0, 1 ^ 'NaN'::float8, (-1) ^ 'Infinity'::float8, "
+            "'-Infinity'::float8 ^ 3, null ^ null, pg_typeof(null ^ null), 2::float8 ^ 2.5, "
+            "pg_typeof(2::float8 ^ 2.5)"
+        ).fetchone() == (
+            1.0,
+            -512.0,
+            float("inf"),
+            float("inf"),
+            1.0,
+            1.0,
+            1.0,
+            float("-inf"),
+            None,
+            "double precision",
+            5.656854249492381,
+            "double precision",
+        )
+        for sql, message in [
+            ("select 2::float8 ^ 1100", "value out of range: overflow"),
+            ("select 2::float8 ^ -1100", "value out of range: underflow"),
+        ]:
+            with pytest.raises(psycopg.errors.NumericValueOutOfRange) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message
+
+
+def test_operator_resolution_error_codes(home: Path) -> None:
+    """The three ways PostgreSQL refuses an operator over the wrong operand
+    types -- 42883 for a pair no operator takes, 42725 for two unknowns
+    (or a `date + unknown`) that several candidates could take, and 42P18 /
+    42804 for an untyped parameter that nothing resolves -- with the
+    resolutions that DO succeed beside them. A set operation's ORDER BY takes
+    only an output column, by name or ordinal. Measured on PostgreSQL 16.15
+    (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        for sql, params, exc, message in [
+            ("select 'a'::text * 2", None, psycopg.errors.UndefinedFunction, "text * integer"),
+            ("select true + 1", None, psycopg.errors.UndefinedFunction, "boolean + integer"),
+            (
+                "select '2021-01-01'::date * 2",
+                None,
+                psycopg.errors.UndefinedFunction,
+                "date * integer",
+            ),
+            ("select null * null", None, psycopg.errors.AmbiguousFunction, "unknown * unknown"),
+            ("select '1' * '2'", None, psycopg.errors.AmbiguousFunction, "unknown * unknown"),
+            (
+                "select '2021-01-01'::date + null",
+                None,
+                psycopg.errors.AmbiguousFunction,
+                "date + unknown",
+            ),
+            (
+                "select %s is null",
+                (None,),
+                psycopg.errors.IndeterminateDatatype,
+                "could not determine data type of parameter $1",
+            ),
+            (
+                "select 1 where %s is null",
+                (None,),
+                psycopg.errors.IndeterminateDatatype,
+                "could not determine data type of parameter $1",
+            ),
+            (
+                "select to_json(%s)",
+                ("x",),
+                psycopg.errors.DatatypeMismatch,
+                "could not determine polymorphic type because input has type unknown",
+            ),
+            (
+                "select isempty(%s)",
+                ("[1,2)",),
+                psycopg.errors.AmbiguousFunction,
+                "function isempty(unknown) is not unique",
+            ),
+            (
+                "select 1 union select 2 order by 'a'",
+                None,
+                psycopg.errors.SyntaxError,
+                "non-integer constant in ORDER BY",
+            ),
+            (
+                "select 1 union select 2 order by 1+1",
+                None,
+                psycopg.errors.FeatureNotSupported,
+                "invalid UNION/INTERSECT/EXCEPT ORDER BY clause",
+            ),
+        ]:
+            with pytest.raises(exc) as ei:
+                conn.execute(sql, params)
+            primary = ei.value.diag.message_primary
+            assert primary is not None and primary.endswith(message), (sql, primary)
+        assert conn.execute(
+            "select '3' * 2.5, pg_typeof('3' * 2.5), '1 day'::interval * '2', "
+            "'1 day'::interval / '2'"
+        ).fetchone() == (
+            Decimal("7.5"),
+            "numeric",
+            dt.timedelta(days=2),
+            dt.timedelta(seconds=43200),
+        )
+        assert conn.execute("select %s * 2.5", (2,)).fetchone() == (Decimal("5.0"),)
+        assert conn.execute("select 1 as a union select 2 order by a").fetchall() == [(1,), (2,)]
+        assert conn.execute("select 1 as a union select 2 order by 1 desc").fetchall() == [
+            (2,),
+            (1,),
+        ]
+
+
+def test_unknown_literal_beside_an_integer_takes_its_type(home: Path) -> None:
+    """`'3' + 1` is 4 -- the literal is parsed as the integer beside it --
+    while `||` resolves it to text (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute(
+            "select '3' + 1, '3'::text || 1, 2 + '3', '3' - 1, 1 - '3', '3' = 3, 3 <> '4', "
+            "'3'::bigint + '4', 5 + '6'::bigint, '3' || 1, 1 || '3'"
+        ).fetchone() == (4, "31", 5, 2, -2, True, True, 7, 11, "31", "13")
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("select 'x' + 1")
+        assert ei.value.diag.message_primary == 'invalid input syntax for type integer: "x"'
+
+
+def test_age(home: Path) -> None:
+    """`age(later, earlier)` is the calendar difference PostgreSQL computes --
+    months first, then days, borrowing across a month boundary of the EARLIER
+    month's length -- for timestamps, dates, timestamptz and stored columns;
+    the one-argument form measures from today's midnight. Values from
+    PostgreSQL 16.15 (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Dublin'")
+        conn.execute("create table vts (id int primary key, ts timestamp)")
+        conn.execute("insert into vts values (1, '2021-01-01 00:00:00.123456')")
+        one = lambda sql: conn.execute(f"select ({sql})::text").fetchone()[0]  # noqa: E731
+        assert one("age(timestamp '2021-03-01', timestamp '2021-01-31 10:00:00.5')") == (
+            "1 mon 13:59:59.5"
+        )
+        assert one("age(timestamp '2021-01-31 10:00:00.5', timestamp '2021-03-01')") == (
+            "-1 mons -13:59:59.5"
+        )
+        assert one("age(date '2024-03-01', date '2023-02-28')") == "1 year 1 day"
+        assert one("age(timestamptz '2021-03-28 12:00+00', timestamptz '2021-03-27 12:00+00')") == (
+            "1 day 01:00:00"
+        )
+        assert one("age('2021-01-02','2020-01-01')") == "1 year 1 day"
+        assert one("age(timestamp '2000-02-29', timestamp '1999-03-31 23:59:59.999999')") == (
+            "10 mons 28 days 00:00:00.000001"
+        )
+        assert one("age(timestamp '2021-05-31', timestamp '2021-04-30')") == "1 mon 1 day"
+        assert one("age(timestamp '2021-04-30', timestamp '2021-05-31')") == "-1 mons -1 days"
+        assert one("age(timestamp '1900-01-01', timestamp '2100-12-31 23:59:59')") == (
+            "-200 years -11 mons -30 days -23:59:59"
+        )
+        assert one("age(timestamptz '2021-03-28 00:30+00', timestamptz '2021-03-27 23:30+00')") == (
+            "01:00:00"
+        )
+        assert one("age(timestamp '2021-01-01', timestamptz '2021-01-01 00:00+00')") == "00:00:00"
+        assert conn.execute(
+            "select pg_typeof(age(date '2024-03-01', date '2023-02-28'))"
+        ).fetchone() == ("interval",)
+        assert conn.execute("select age(timestamp '2021-01-02', ts)::text from vts").fetchone() == (
+            "23:59:59.876544",
+        )
+        assert conn.execute("select age(ts, timestamp '2021-01-02')::text from vts").fetchone() == (
+            "-23:59:59.876544",
+        )
+        assert conn.execute("select age(null::timestamp)").fetchone() == (None,)
+        # The one-argument form is `age(current_date, x)`, not the reverse.
+        assert conn.execute(
+            "select age(timestamp '2021-01-02') "
+            "= age(current_date::timestamp, timestamp '2021-01-02')"
+        ).fetchone() == (True,)
+        for sql, message in [
+            ("select age(time '10:00')", "function age(time without time zone) does not exist"),
+            ("select age(1,2)", "function age(integer, integer) does not exist"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message
+
+
+def test_extract_date_part_and_date_trunc(home: Path) -> None:
+    """`extract` returns numeric and `date_part` double precision, over every
+    field name PostgreSQL knows; `date_trunc` over the calendar units; an
+    unknown unit is 22023 naming the type (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Dublin'")
+        assert conn.execute(
+            "select extract(year from timestamp '2021-03-04 05:06:07.891'), "
+            "extract(epoch from timestamp '2021-01-01'), date_part('dow', date '2021-03-04'), "
+            "extract(isodow from date '2021-03-07'), extract(week from date '2021-01-01'), "
+            "extract(quarter from date '2021-05-01'), extract(doy from date '2021-12-31'), "
+            "extract(milliseconds from time '05:06:07.891'), "
+            "date_trunc('hour', timestamp '2021-03-04 05:06:07')::text, "
+            "date_trunc('week', date '2021-03-04')::text, "
+            "date_trunc('quarter', timestamp '2021-05-04')::text, "
+            "pg_typeof(extract(year from date '2021-01-01')), "
+            "pg_typeof(date_part('year', date '2021-01-01'))"
+        ).fetchone() == (
+            Decimal("2021"),
+            Decimal("1609459200.000000"),
+            4.0,
+            Decimal("7"),
+            Decimal("53"),
+            Decimal("2"),
+            Decimal("365"),
+            Decimal("7891.000"),
+            "2021-03-04 05:00:00",
+            "2021-03-01 00:00:00+00",
+            "2021-04-01 00:00:00",
+            "numeric",
+            "double precision",
+        )
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as ei:
+            conn.execute("select extract(nope from date '2021-01-01')")
+        assert ei.value.diag.message_primary == 'unit "nope" not recognized for type date'
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as ei:
+            conn.execute("select date_trunc('milli', timestamp '2021-01-01')")
+        assert ei.value.diag.message_primary == (
+            'unit "milli" not recognized for type timestamp without time zone'
+        )
+
+
+def test_stored_timestamps_keep_their_microseconds(home: Path) -> None:
+    """A stored timestamp compares, casts and adds at microsecond precision,
+    and an unknown literal beside a column takes the column's type -- `id =
+    '1'`, `ok = 'yes'`, `ts > '2021-01-01'` -- with a bad literal 22P02
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Dublin'")
+        conn.execute("create table vt (id int primary key, ok boolean, g text)")
+        conn.execute("insert into vt values (1, true, 'a'), (2, false, 'b')")
+        conn.execute("create table vts (id int primary key, ts timestamp)")
+        conn.execute("insert into vts values (1, '2021-01-01 00:00:00.123456')")
+        assert conn.execute(
+            "select ts::text, ts = '2021-01-01 00:00:00.123456', "
+            "ts > '2021-01-01 00:00:00.123455', ts::timestamptz::text, "
+            "(ts + interval '1 day')::text, extract(microseconds from ts), "
+            "ts::timestamp(3)::text from vts"
+        ).fetchone() == (
+            "2021-01-01 00:00:00.123456",
+            True,
+            True,
+            "2021-01-01 00:00:00.123456+00",
+            "2021-01-02 00:00:00.123456",
+            Decimal("123456"),
+            "2021-01-01 00:00:00.123",
+        )
+        assert conn.execute("select id from vt where id = '1'").fetchall() == [(1,)]
+        assert conn.execute("select id from vt where ok = 'yes'").fetchall() == [(1,)]
+        assert conn.execute("select id from vts where ts > '2021-01-01'").fetchall() == [(1,)]
+        assert conn.execute("select id from vts where ts > '2022-01-01'").fetchall() == []
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("select id from vt where id = 'x'")
+        assert ei.value.diag.message_primary == 'invalid input syntax for type integer: "x"'
+
+
+def test_datetime_precision_typmods(home: Path) -> None:
+    """`timestamp(2)`, `timestamptz(1)`, `interval(1)`, `time(0)`, `interval
+    year` and `timetz(2)` round on the way in (half away from zero) and are
+    reflected by `format_type` and `information_schema.columns` with their
+    precision and interval field (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Dublin'")
+        conn.execute(
+            "create table tp(id int primary key, t timestamp(2), z timestamptz(1), "
+            "i interval(1), tm time(0), iy interval year, tz timetz(2))"
+        )
+        conn.execute(
+            "insert into tp values (1, '2021-01-01 00:00:00.126', '2021-01-01 00:00:00.126+00', "
+            "'1.16 sec', '00:00:00.6', '1 year 3 months', '00:00:00.126+01')"
+        )
+        assert conn.execute(
+            "select t::text, z::text, i::text, tm::text, iy::text, tz::text from tp"
+        ).fetchone() == (
+            "2021-01-01 00:00:00.13",
+            "2021-01-01 00:00:00.1+00",
+            "00:00:01.2",
+            "00:00:01",
+            "1 year",
+            "00:00:00.13+01",
+        )
+        assert conn.execute("select pg_typeof(t), pg_typeof(i) from tp").fetchone() == (
+            "timestamp without time zone",
+            "interval",
+        )
+        assert conn.execute(
+            "select format_type(atttypid, atttypmod) from pg_attribute "
+            "where attrelid='tp'::regclass and attname in ('t','i','iy','tz') order by attnum"
+        ).fetchall() == [
+            ("timestamp(2) without time zone",),
+            ("interval(1)",),
+            ("interval year",),
+            ("time(2) with time zone",),
+        ]
+        assert conn.execute(
+            "select data_type, datetime_precision, interval_type from information_schema.columns "
+            "where table_name='tp' order by ordinal_position"
+        ).fetchall() == [
+            ("integer", None, None),
+            ("timestamp without time zone", 2, None),
+            ("timestamp with time zone", 1, None),
+            ("interval", 1, None),
+            ("time without time zone", 0, None),
+            ("interval", 6, "YEAR"),
+            ("time with time zone", 2, None),
+        ]
+        conn.execute("update tp set t = '2021-01-01 00:00:00.1235' where id = 1")
+        assert conn.execute("select t::text from tp").fetchone() == ("2021-01-01 00:00:00.12",)
+
+
+def test_catalog_reflection_of_a_table(home: Path) -> None:
+    """`pg_class`, `pg_namespace`, `pg_attribute`, `regnamespace`,
+    `format_type` and the `information_schema` views describe a user table
+    the way PostgreSQL 16.15 does (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table vt (id int primary key, ok boolean, g text)")
+        conn.execute("create table vc (id int primary key, c char(5))")
+        conn.execute("create schema vsch")
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        assert rows("select relname, relkind from pg_class where relname = 'vt'") == [("vt", "r")]
+        assert rows("select relkind, relpersistence from pg_class where relname = 'vt'") == [
+            ("r", "p")
+        ]
+        assert rows(
+            "select attname, attnum, atttypid::regtype::text, attnotnull, atttypmod "
+            "from pg_attribute where attrelid = 'vt'::regclass and attnum > 0 order by attnum"
+        ) == [
+            ("id", 1, "integer", True, -1),
+            ("ok", 2, "boolean", False, -1),
+            ("g", 3, "text", False, -1),
+        ]
+        assert rows(
+            "select attidentity, attgenerated from pg_attribute "
+            "where attrelid = 'vt'::regclass and attnum = 1"
+        ) == [("", "")]
+        assert rows(
+            "select atttypmod from pg_attribute where attrelid = 'vc'::regclass and attname = 'c'"
+        ) == [(9,)]
+        assert rows(
+            "select column_name, data_type, is_nullable, ordinal_position "
+            "from information_schema.columns where table_name = 'vt' order by ordinal_position"
+        ) == [("id", "integer", "NO", 1), ("ok", "boolean", "YES", 2), ("g", "text", "YES", 3)]
+        assert rows(
+            "select table_name from information_schema.tables "
+            "where table_schema = 'public' and table_name = 'vt'"
+        ) == [("vt",)]
+        assert rows(
+            "select schema_name from information_schema.schemata "
+            "where schema_name in ('public', 'vsch') order by 1"
+        ) == [("public",), ("vsch",)]
+        assert rows("select nspname from pg_namespace where nspname = 'vsch'") == [("vsch",)]
+        assert rows(
+            "select relnamespace::regnamespace::text from pg_class where relname = 'vt'"
+        ) == [("public",)]
+        assert rows(
+            "select 'public'::regnamespace::oid, 2200::regnamespace, 0::regnamespace, "
+            "pg_typeof('public'::regnamespace), 'public'::regnamespace::int4, "
+            "'pg_catalog'::regnamespace::oid, 'information_schema'::regnamespace::oid"
+        ) == [(2200, "public", "-", "regnamespace", 2200, 11, 13474)]
+        assert rows("select 12345::regnamespace") == [("12345",)]
+        assert rows("select 'Public'::regnamespace") == [("public",)]
+        with pytest.raises(psycopg.errors.InvalidSchemaName) as ei:
+            conn.execute("select 'nope'::regnamespace")
+        assert ei.value.diag.message_primary == 'schema "nope" does not exist'
+        assert rows(
+            "select relname from pg_class where relnamespace = 'public'::regnamespace "
+            "and relname = 'vt'"
+        ) == [("vt",)]
+        assert rows(
+            "select n.nspname, c.relname from pg_class c "
+            "join pg_namespace n on c.relnamespace = n.oid where c.relname = 'vt'"
+        ) == [("public", "vt")]
+        assert rows(
+            "select a.attname, a.attnum from pg_attribute a join pg_class c on a.attrelid = c.oid "
+            "where c.relname = 'vt' and a.attnum > 0 order by a.attnum"
+        ) == [("id", 1), ("ok", 2), ("g", 3)]
+        assert rows(
+            "select format_type(1043, 24), format_type(1700, 655366), format_type(1042,-1), "
+            "format_type(23,-1), format_type(1114,3), format_type(1083,2), format_type(1560, 5), "
+            "format_type(1562,7), format_type(25, null), format_type(99999,-1), "
+            "format_type(1007, -1), format_type(1015, 24), format_type(1184, 65536|1), "
+            "format_type(1186, -1), format_type(1186, 2147418114), format_type(1186, 470286339)"
+        ) == [
+            (
+                "character varying(20)",
+                "numeric(10,2)",
+                "bpchar",
+                "integer",
+                "timestamp(3) without time zone",
+                "time(2) without time zone",
+                "bit(5)",
+                "bit varying(7)",
+                "text",
+                "???",
+                "integer[]",
+                "character varying(20)[]",
+                "timestamp(65537) with time zone",
+                "interval",
+                "interval(2)",
+                "interval day to second(3)",
+            )
+        ]
+        # An interval typmod with an impossible field mask is XX000 in
+        # PostgreSQL too (intervaltypmodout, timestamp.c).
+        with pytest.raises(psycopg.errors.InternalError_) as ei:
+            conn.execute("select format_type(1186, 65542)")
+        assert ei.value.diag.message_primary == "invalid INTERVAL typmod: 0x10006"
+
+
+def test_information_schema_columns_lists_catalog_relations(home: Path) -> None:
+    """`information_schema.columns` describes the server's own catalog
+    relations and information_schema views, not just user tables: a client
+    introspecting `pg_prepared_statements` gets PostgreSQL's eight columns.
+    Catalog tables' columns are NOT NULL and updatable; views' columns are
+    nullable and read-only. Measured on PostgreSQL 16.15 (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        rows = conn.execute(
+            "select column_name, data_type, is_nullable, is_updatable, udt_name "
+            "from information_schema.columns where table_name = 'pg_prepared_statements' "
+            "order by ordinal_position"
+        ).fetchall()
+        assert rows == [
+            ("name", "text", "YES", "NO", "text"),
+            ("statement", "text", "YES", "NO", "text"),
+            ("prepare_time", "timestamp with time zone", "YES", "NO", "timestamptz"),
+            ("parameter_types", "ARRAY", "YES", "NO", "_regtype"),
+            ("result_types", "ARRAY", "YES", "NO", "_regtype"),
+            ("from_sql", "boolean", "YES", "NO", "bool"),
+            ("generic_plans", "bigint", "YES", "NO", "int8"),
+            ("custom_plans", "bigint", "YES", "NO", "int8"),
+        ]
+        assert conn.execute(
+            "select table_schema, table_name, column_name, data_type, is_nullable, is_updatable, "
+            "udt_schema, dtd_identifier from information_schema.columns "
+            "where table_name in ('pg_type', 'columns') and ordinal_position = 1 order by 1, 2"
+        ).fetchall() == [
+            (
+                "information_schema",
+                "columns",
+                "table_catalog",
+                "name",
+                "YES",
+                "NO",
+                "pg_catalog",
+                "1",
+            ),
+            ("pg_catalog", "pg_type", "typname", "name", "NO", "YES", "pg_catalog", "1"),
+        ]
+
+
+def test_char_n_output_form_in_functions_and_comparisons(home: Path) -> None:
+    """A `char(n)` reaches `octet_length` / `concat` / `concat_ws` / `format`
+    / `to_json` / `array_to_string` through its OUTPUT function, padded, while
+    `length` / `upper` / `left` / `quote_literal` and `||` see the stripped
+    text; a select-list comparison ignores trailing blanks like a WHERE one
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table vch(id int primary key, c char(5))")
+        conn.execute("insert into vch values (1, 'ab'), (2, 'abcde')")
+        assert conn.execute(
+            "select octet_length(c), length(c), concat(c, '|'), c || '|', "
+            "concat_ws(',', c, 'x'), format('%s|', c), to_json(c)::text, "
+            "array_to_string(array[c], ','), upper(c) || '|', left(c, 3) || '|', "
+            "quote_literal(c) from vch where id = 1"
+        ).fetchone() == (
+            5,
+            2,
+            "ab   |",
+            "ab|",
+            "ab   ,x",
+            "ab   |",
+            '"ab   "',
+            "ab   ",
+            "AB|",
+            "ab|",
+            "'ab'",
+        )
+        assert conn.execute(
+            "select c = 'ab  ', c = 'ab', 'ab  ' = c, c <> 'ab ', c < 'ac', "
+            "case when c = 'ab  ' then 1 else 0 end from vch order by id"
+        ).fetchall() == [(True, True, True, False, True, 1), (False, False, False, True, True, 0)]
+        assert conn.execute(
+            "select id from vch where octet_length(c) = 5 order by id"
+        ).fetchall() == [
+            (1,),
+            (2,),
+        ]
+
+
+def test_to_json_quote_literal_and_array_to_string(home: Path) -> None:
+    """`to_json` / `to_jsonb` over scalars and arrays (typed json / jsonb,
+    `to_json` compact and `to_jsonb` normalised), `quote_literal` /
+    `quote_nullable`, and `array_to_string` with its NULL rules (PostgreSQL
+    16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table vn(id int primary key, n int, s text)")
+        conn.execute("insert into vn values (1, 5, 'a\"b'), (2, null, null)")
+        row = conn.execute(
+            "select to_json(1)::text, to_json(1.50)::text, to_json(true)::text, "
+            "to_json('a\"b'::text)::text, to_json(array[1,2])::text, "
+            "to_json(array['a',null])::text, to_json(null::int), to_jsonb(1.50)::text, "
+            "to_jsonb(array[1,2])::text, to_json(1e30::float8)::text, "
+            "pg_typeof(to_json(1))::text, pg_typeof(to_jsonb(1))::text"
+        ).fetchone()
+        assert row == (
+            "1",
+            "1.50",
+            "true",
+            '"a\\"b"',
+            "[1,2]",
+            '["a",null]',
+            None,
+            "1.50",
+            "[1, 2]",
+            "1e+30",
+            "json",
+            "jsonb",
+        )
+        assert conn.execute("select to_json(1), to_jsonb(array[1, 2])").fetchone() == (1, [1, 2])
+        assert conn.execute(
+            "select to_json(n)::text, to_json(s)::text from vn order by id"
+        ).fetchall() == [
+            ("5", '"a\\"b"'),
+            (None, None),
+        ]
+        assert conn.execute(
+            "select quote_nullable(null), quote_nullable(1), quote_literal(1.5), "
+            "quote_literal('it''s'), quote_literal(null)"
+        ).fetchone() == ("NULL", "'1'", "'1.5'", "'it''s'", None)
+        assert conn.execute(
+            "select array_to_string(array[1,null,3], ',', '*'), "
+            "array_to_string(array[1,null,3], ','), array_to_string(array[true], ','), "
+            "array_to_string('{}'::int[], ','), array_to_string(array[1], null), "
+            "array_to_string(null::int[], ',')"
+        ).fetchone() == ("1,*,3", "1,3", "t", "", None, None)
+        # Once refused; now the ISO-8601 spelling to_json gives a timestamp
+        # (PostgreSQL 16.15, 2026-09-23).
+        assert conn.execute(
+            "select to_json('2021-01-01 10:00'::timestamp)::text, "
+            "to_json('2021-01-01'::date)::text, to_json('1 day'::interval)::text, "
+            "to_jsonb('10:00'::time)::text"
+        ).fetchone() == ('"2021-01-01T10:00:00"', '"2021-01-01"', '"1 day"', '"10:00:00"')
+
+
+def _seed_outer_join_pair(conn) -> None:
+    conn.execute("create table oj_a (id int primary key, n int, s text)")
+    conn.execute("insert into oj_a values (1, 10, 'x'), (2, 20, 'y'), (3, null, 'z'), (4, 40, 'w')")
+    conn.execute("create table oj_b (id int primary key, a_id int, v int)")
+    conn.execute("insert into oj_b values (1, 1, 5), (2, 1, 7), (3, 2, 9), (4, 9, 11)")
+
+
+def test_outer_joins_take_any_on_and_every_join_kind(home: Path) -> None:
+    """LEFT / RIGHT / FULL JOIN with an arbitrary ON, as PostgreSQL 16.15 runs
+    them (2026-09-23).
+
+    A LEFT JOIN's ON may be a non-equality (`a.id < b.id`), an equality plus
+    more arms, an OR, or a bare `true`; it is evaluated per candidate pair
+    BEFORE null-extension, so a left row no candidate satisfies is still kept
+    with NULLs, and a WHERE over the right side is applied AFTER. A RIGHT
+    JOIN preserves the right side; a FULL JOIN both, with the unmatched right
+    rows NULL-extended on the left. An ON that is not boolean is 42804; a
+    qualifier no side has is 42P01.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        _seed_outer_join_pair(conn)
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        lj = "from oj_a a left join oj_b b on a.id = b.a_id"
+        assert rows(
+            "select a.id, b.id from oj_a a left join oj_a b on a.id < b.id order by 1, 2"
+        ) == [
+            (1, 2),
+            (1, 3),
+            (1, 4),
+            (2, 3),
+            (2, 4),
+            (3, 4),
+            (4, None),
+        ]
+        assert rows(f"select a.id, b.v {lj} and b.v > 6 order by a.id, b.v") == [
+            (1, 7),
+            (2, 9),
+            (3, None),
+            (4, None),
+        ]
+        assert rows(f"select a.id, b.v {lj} or b.v = 11 order by a.id, b.v") == [
+            (1, 5),
+            (1, 7),
+            (1, 11),
+            (2, 9),
+            (2, 11),
+            (3, 11),
+            (4, 11),
+        ]
+        assert len(rows("select a.id, b.v from oj_a a left join oj_b b on true")) == 16
+        assert rows(f"select a.id, b.v {lj} where b.v is null order by a.id") == [
+            (3, None),
+            (4, None),
+        ]
+        assert rows(
+            "select a.id, b.id from oj_a a right join oj_b b on a.id = b.a_id order by b.id"
+        ) == [
+            (1, 1),
+            (1, 2),
+            (2, 3),
+            (None, 4),
+        ]
+        fj = "from oj_a a full join oj_b b on a.id = b.a_id"
+        assert rows(f"select a.id, b.id {fj} order by a.id, b.id") == [
+            (1, 1),
+            (1, 2),
+            (2, 3),
+            (3, None),
+            (4, None),
+            (None, 4),
+        ]
+        assert rows(f"select count(*) {fj}") == [(6,)]
+        assert rows(f"select a.id, b.id {fj} where a.id is null or b.id is null order by 1, 2") == [
+            (3, None),
+            (4, None),
+            (None, 4),
+        ]
+        # An inner join's non-equality ON, and an unknown literal beside a
+        # join column takes the column's type.
+        assert rows(
+            "select a.id, b.id from oj_a a join oj_b b on a.id < b.id and b.v > 9 order by 1, 2"
+        ) == [(1, 4), (2, 4), (3, 4)]
+        ij = "from oj_a a join oj_b b on a.id = b.a_id"
+        assert rows(f"select a.id {ij} where a.id = '1'") == [(1,), (1,)]
+        # ORDER BY NULLS FIRST / LAST and DESC over a left join's misses.
+        assert rows(f"select a.id, b.v {lj} order by b.v nulls first, a.id") == [
+            (3, None),
+            (4, None),
+            (1, 5),
+            (1, 7),
+            (2, 9),
+        ]
+        assert rows(f"select a.id, b.v {lj} order by b.v desc, a.id") == [
+            (3, None),
+            (4, None),
+            (2, 9),
+            (1, 7),
+            (1, 5),
+        ]
+        assert rows(f"select a.id, b.v {lj} order by b.v desc nulls last, a.id") == [
+            (2, 9),
+            (1, 7),
+            (1, 5),
+            (3, None),
+            (4, None),
+        ]
+        for sql, exc, message in [
+            (
+                f"select id {ij}",
+                psycopg.errors.AmbiguousColumn,
+                'column reference "id" is ambiguous',
+            ),
+            (
+                "select a.id from oj_a a left join oj_b b on a.n",
+                psycopg.errors.DatatypeMismatch,
+                "argument of JOIN/ON must be type boolean, not type integer",
+            ),
+            (
+                "select a.id from oj_a a left join oj_b b on c.id = b.id",
+                psycopg.errors.UndefinedTable,
+                'missing FROM-clause entry for table "c"',
+            ),
+            (
+                f"select a.id {ij} where a.id = 'q'",
+                psycopg.errors.InvalidTextRepresentation,
+                'invalid input syntax for type integer: "q"',
+            ),
+            (
+                "select a.id from oj_a a join oj_b b on a.id = 'a'::text",
+                psycopg.errors.UndefinedFunction,
+                "operator does not exist: integer = text",
+            ),
+        ]:
+            with pytest.raises(exc) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+
+
+def test_join_using_and_natural_merge_the_key_columns(home: Path) -> None:
+    """`USING (c)` and `NATURAL` joins, as PostgreSQL 16.15 has them
+    (2026-09-23): `*` lists the merged columns first and once, the bare name
+    resolves to the merged column in WHERE / ORDER BY / expressions (typed as
+    the column, coalesced across sides in a FULL JOIN), and a USING column a
+    side lacks is 42703."""
+    with _Server(home) as server, server.connect() as conn:
+        _seed_outer_join_pair(conn)
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        joined = [(1, 10, "x", 1, 5), (2, 20, "y", 1, 7), (3, None, "z", 2, 9), (4, 40, "w", 9, 11)]
+        assert rows("select * from oj_a a join oj_b b using (id) order by id") == joined
+        assert rows("select * from oj_a a natural join oj_b b order by id") == joined
+        assert rows(
+            "select id, n, v from oj_a a left join oj_b b using (id) where id > 2 order by id"
+        ) == [
+            (3, None, 9),
+            (4, 40, 11),
+        ]
+        assert rows("select id from oj_a a full join oj_b b using (id) order by id") == [
+            (1,),
+            (2,),
+            (3,),
+            (4,),
+        ]
+        assert rows("select pg_typeof(id) from oj_a a full join oj_b b using (id) limit 1") == [
+            ("integer",)
+        ]
+        assert rows(
+            "select id, a.n, b.v from oj_a a natural left join oj_b b order by id desc"
+        ) == [
+            (4, 40, 11),
+            (3, None, 9),
+            (2, 20, 7),
+            (1, 10, 5),
+        ]
+        assert rows(
+            "select coalesce(n, 0), id from oj_a a right join oj_b b using (id) order by id"
+        ) == [
+            (10, 1),
+            (20, 2),
+            (0, 3),
+            (40, 4),
+        ]
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            conn.execute("select id from oj_a a join oj_b b using (zz)")
+        assert (
+            ei.value.diag.message_primary
+            == 'column "zz" specified in USING clause does not exist in left table'
+        )
+
+
+def test_array_range_and_box_operators(home: Path) -> None:
+    """The container operators over arrays, ranges, multiranges and boxes, as
+    PostgreSQL 16.15 evaluates them (2026-09-23).
+
+    An ARRAY constructor coerces an unknown literal to the element type
+    beside it (and refuses two typed elements that cannot be matched, 42804);
+    `@>` / `<@` / `&&` test containment and overlap; the range set operations
+    `+` / `*` / `-` refuse a non-contiguous result with 22000; the multirange
+    ones take two multiranges and never a range; a box compares by AREA.
+    """
+    with _Server(home) as server, server.connect() as conn:
+        rows = lambda sql: conn.execute(sql).fetchall()  # noqa: E731
+        assert rows(
+            "select array[1, '2'], pg_typeof(array[1, '2']), array['a', 1::text], "
+            "array[1, 2.5], pg_typeof(array[1, 2.5]), array[null, 1]"
+        ) == [
+            (
+                [1, 2],
+                "integer[]",
+                ["a", "1"],
+                [Decimal("1"), Decimal("2.5")],
+                "numeric[]",
+                [None, 1],
+            )
+        ]
+        assert rows(
+            "select array[1,2,3] @> array[2], array[2] <@ array[1,2,3], array[1,2] && array[2,3], "
+            "array[1,2] && array[3], array[]::int[] @> array[]::int[], array[1,2] @> array[2, 5], "
+            "array['a','b'] @> array['a'], array[1,2] = array[1,2], array[1,2] <> array[2,1], "
+            "array[1,2] < array[1,3]"
+        ) == [(True, True, True, False, True, False, True, True, True, True)]
+        assert rows(
+            "select int4range(1, 5) @> 3, int4range(1, 5) @> int4range(2, 3), "
+            "3 <@ int4range(1, 5), "
+            "int4range(1, 5) && int4range(4, 8), int4range(1, 5) && int4range(5, 8), "
+            "int4range(1, 5) << int4range(6, 8), int4range(6, 8) >> int4range(1, 5), "
+            "int4range(1, 5) -|- int4range(5, 8), int4range(1, 5) = int4range(1, 5), "
+            "int4range(1, 5) < int4range(2, 3), int4range(1,5) &< int4range(3,8), "
+            "int4range(1,5) &> int4range(0,3), numrange(1.5, 2.5) @> 2.0, "
+            "daterange('2021-01-01', '2021-02-01') @> '2021-01-15'::date"
+        ) == [(True, True, True, True, False, True, True, True, True, True, True, True, True, True)]
+        assert rows(
+            "select int4range(1, 5) + int4range(3, 8), int4range(1, 5) * int4range(3, 8), "
+            "int4range(1, 5) - int4range(3, 8)"
+        ) == [(Range(1, 8, "[)"), Range(3, 5, "[)"), Range(1, 3, "[)"))]
+        assert rows(
+            "select int4multirange(int4range(1, 3), int4range(5, 8)) @> 6, "
+            "int4multirange(int4range(1, 3), int4range(5, 8)) + int4multirange(int4range(3, 5)), "
+            "int4multirange(int4range(1, 10)) - int4multirange(int4range(2, 3), int4range(5, 6)), "
+            "int4multirange(int4range(1, 8)) * int4multirange(int4range(2, 3)), "
+            "int4multirange(int4range(1, 3)) * int4multirange(int4range(5, 9)), "
+            "int4multirange(int4range(1, 8)) @> int4range(2, 3), "
+            "pg_typeof(nummultirange(numrange(1, 3)) * nummultirange(numrange(2, 5)))"
+        ) == [
+            (
+                True,
+                Multirange([Range(1, 8, "[)")]),
+                Multirange([Range(1, 2, "[)"), Range(3, 5, "[)"), Range(6, 10, "[)")]),
+                Multirange([Range(2, 3, "[)")]),
+                Multirange([]),
+                True,
+                "nummultirange",
+            )
+        ]
+        assert rows(
+            "select box '((0,0),(2,2))' @> box '((1,1),(1.5,1.5))', "
+            "box '((0,0),(2,2))' && box '((1,1),(3,3))', "
+            "box '((0,0),(2,2))' = box '((0,0),(2,2))', "
+            "box '((0,0),(2,2))' = box '((1,1),(3,3))', box '((0,0),(1,4))' < box '((0,0),(2,2))', "
+            "area(box '((0,0),(2,3))'), width(box '((0,0),(2,3))'), height(box '((0,0),(2,3))'), "
+            "bound_box(box '((0,0),(1,1))', box '((2,2),(3,3))')::text, "
+            "(box '((0,0),(2,2))' # box '((1,1),(3,3))')::text, "
+            "box '((0,0),(2,2))' << box '((3,3),(4,4))'"
+        ) == [(True, True, True, True, False, 6.0, 2.0, 3.0, "(3,3),(0,0)", "(2,2),(1,1)", True)]
+        conn.execute("create table bx (id int primary key, b box)")
+        conn.execute("insert into bx values (1, '((0,0),(2,2))'), (2, '((5,5),(6,6))')")
+        assert rows("select id from bx where b @> box '((1,1),(1,1))' order by id") == [(1,)]
+        assert rows("select id from bx where b && box '((1,1),(5.5,5.5))' order by id") == [
+            (1,),
+            (2,),
+        ]
+        assert rows("select id, area(b) from bx order by id") == [(1, 4.0), (2, 1.0)]
+        for sql, exc, message in [
+            (
+                "select array[1, 'x']",
+                psycopg.errors.InvalidTextRepresentation,
+                'invalid input syntax for type integer: "x"',
+            ),
+            (
+                "select array[1, 'a'::text]",
+                psycopg.errors.DatatypeMismatch,
+                "ARRAY types integer and text cannot be matched",
+            ),
+            (
+                "select int4range(1, 5) + int4range(7, 8)",
+                psycopg.errors.DataException,
+                "result of range union would not be contiguous",
+            ),
+            (
+                "select int4range(1, 5) - int4range(2, 3)",
+                psycopg.errors.DataException,
+                "result of range difference would not be contiguous",
+            ),
+            (
+                "select int4multirange(int4range(1, 3)) + int4range(3, 5)",
+                psycopg.errors.UndefinedFunction,
+                "operator does not exist: int4multirange + int4range",
+            ),
+            (
+                "select '[1,3)' @> 2",
+                psycopg.errors.AmbiguousFunction,
+                "operator is not unique: unknown @> integer",
+            ),
+            (
+                "select int4range(1,5) @> '2'",
+                psycopg.errors.InvalidTextRepresentation,
+                'malformed range literal: "2"',
+            ),
+            (
+                "select area('((0,0),(2,3))')",
+                psycopg.errors.AmbiguousFunction,
+                "function area(unknown) is not unique",
+            ),
+            (
+                "select area(1)",
+                psycopg.errors.UndefinedFunction,
+                "function area(integer) does not exist",
+            ),
+        ]:
+            with pytest.raises(exc) as ei:
+                conn.execute(sql)
+            primary = ei.value.diag.message_primary
+            assert primary is not None and primary.endswith(message), (sql, primary)
+
+
+def test_comparisons_across_types_resolve_no_operator(home: Path) -> None:
+    """A comparison between two types no operator takes is 42883 with
+    PostgreSQL 16.15's operand rendering -- a literal `1 = true`, a column
+    `id = true`, `json = json` (json has no equality; jsonb does), ranges of
+    different subtypes, `now() = 1`, and a `greatest(...)` of text beside an
+    integer (2026-09-23). Beside them, timetz compares by UTC instant AND
+    offset, and `gen_random_uuid()` is a fresh uuid per call."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table cx (id int primary key)")
+        for sql, operands in [
+            ("select 1 = true", "integer = boolean"),
+            ("select 'a'::text < 1::int2", "text < smallint"),
+            ("select '{}'::json = '{}'::json", "json = json"),
+            ("select int4range(1,2) = int8range(1,2)", "int4range = int8range"),
+            ("select now() = 1", "timestamp with time zone = integer"),
+            ("select id from cx where id = true", "integer = boolean"),
+            ("select 1 = greatest('a', 'b')", "integer = text"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == f"operator does not exist: {operands}", sql
+        assert conn.execute(
+            "select '10:00+02'::timetz < '09:30+01'::timetz, "
+            "'10:00+00'::timetz = '11:00+01'::timetz, "
+            "'10:00+02'::timetz::time, '10:00+02'::timetz = '10:00+02'::timetz, "
+            "'10:00+02'::timetz > '10:00+03'::timetz"
+        ).fetchone() == (True, False, dt.time(10, 0), True, True)
+        assert conn.execute(
+            "select pg_typeof(gen_random_uuid()), length(gen_random_uuid()::text), "
+            "gen_random_uuid() = gen_random_uuid(), gen_random_uuid() <> gen_random_uuid()"
+        ).fetchone() == ("uuid", 36, False, True)
+        assert isinstance(conn.execute("select gen_random_uuid()").fetchone()[0], uuid.UUID)
+
+
+def test_column_default_expressions(home: Path) -> None:
+    """A column `DEFAULT` is any expression, evaluated per row in column order
+    at INSERT and at `SET col = DEFAULT` time -- `1 + 2`, `'x' || 'y'`,
+    `now()`, `current_date`, `gen_random_uuid()`, `random()`, `nextval(...)`.
+    The `DEFAULT` keyword stands in for it in a VALUES list and an UPDATE,
+    `DEFAULT VALUES` fills every column, an over- or under-long VALUES list is
+    42601, and a default the column cannot parse is refused at CREATE (22P02).
+    `information_schema.columns` deparses the default the way PostgreSQL does.
+    Every value is PostgreSQL 16.15's (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute(
+            "create table d (id serial primary key, n int default 1 + 2, "
+            "s text default 'x' || 'y', b bool default true, "
+            "ts timestamptz default now(), d date default current_date, "
+            "u uuid default gen_random_uuid(), f float8 default random())"
+        )
+        conn.execute("insert into d default values")
+        conn.execute("insert into d (n) values (default)")
+        conn.execute("insert into d (n, s) values (7, default)")
+        conn.execute("insert into d (n) values (nextval('d_id_seq'))")
+        conn.execute("insert into d (n, s) values (nextval('d_id_seq') + 100, 'q')")
+        assert conn.execute("select id, n, s, b from d order by id").fetchall() == [
+            (1, 3, "xy", True),
+            (2, 3, "xy", True),
+            (3, 7, "xy", True),
+            (4, 5, "xy", True),
+            (6, 107, "q", True),
+        ]
+        assert conn.execute(
+            "select count(*) filter (where ts is not null), "
+            "count(*) filter (where d = current_date), "
+            "count(*) filter (where u is not null), "
+            "count(*) filter (where f >= 0 and f < 1), count(distinct u) from d"
+        ).fetchone() == (5, 5, 5, 5, 5)
+        conn.execute("update d set n = default where id = 1")
+        conn.execute("update d set s = default, b = false where id = 2")
+        conn.execute("update d set n = nextval('d_id_seq') where id = 3")
+        assert conn.execute("select id, n, s, b from d order by id").fetchall() == [
+            (1, 3, "xy", True),
+            (2, 3, "xy", False),
+            (3, 8, "xy", True),
+            (4, 5, "xy", True),
+            (6, 107, "q", True),
+        ]
+        for sql, message in [
+            (
+                "insert into d (n, s) values (default, 6, 7)",
+                "INSERT has more expressions than target columns",
+            ),
+            (
+                "insert into d (n, s) values (default)",
+                "INSERT has more target columns than expressions",
+            ),
+        ]:
+            with pytest.raises(psycopg.errors.SyntaxError) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message
+        assert conn.execute(
+            "select column_name, column_default from information_schema.columns "
+            "where table_name = 'd' order by ordinal_position"
+        ).fetchall() == [
+            ("id", "nextval('d_id_seq'::regclass)"),
+            ("n", "(1 + 2)"),
+            ("s", "('x'::text || 'y'::text)"),
+            ("b", "true"),
+            ("ts", "now()"),
+            ("d", "CURRENT_DATE"),
+            ("u", "gen_random_uuid()"),
+            ("f", "random()"),
+        ]
+        conn.execute(
+            "create table d2 (id int, ts timestamp default now(), "
+            "ts2 timestamp default localtimestamp, t time default current_time, "
+            "i interval default interval '1 day' * 2)"
+        )
+        conn.execute("insert into d2 (id) values (1)")
+        assert conn.execute(
+            "select ts is not null, ts2 is not null, t is not null, i from d2"
+        ).fetchone() == (True, True, True, dt.timedelta(days=2))
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("create table d3 (x int default 'abc')")
+        assert ei.value.diag.message_primary == 'invalid input syntax for type integer: "abc"'
+        conn.execute("create table d4 (x int default null, y text default 'a'::text || 'b')")
+        conn.execute("insert into d4 default values")
+        assert conn.execute("select x, y from d4").fetchone() == (None, "ab")
+
+
+def test_sequence_functions(home: Path) -> None:
+    """`nextval` / `currval` / `lastval` / `setval` over a serial's sequence,
+    named by string, `regclass` or schema-qualified; `pg_get_serial_sequence`;
+    the sequence's `pg_class` row; a value drawn inside a rolled-back
+    transaction is NOT given back; `DROP TABLE` drops the owned sequence; and
+    `setval` outside `1..2147483647` is 22003. PostgreSQL 16.15 values
+    (2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table sq (id serial primary key, v int)")
+        assert conn.execute(
+            "select 'sq_id_seq'::regclass, 'sq_id_seq'::regclass::text, "
+            "pg_typeof('sq_id_seq'::regclass)"
+        ).fetchone() == ("sq_id_seq", "sq_id_seq", "regclass")
+        assert conn.execute("select nextval('sq_id_seq'::regclass)").fetchone() == (1,)
+        assert conn.execute("select nextval('public.sq_id_seq')").fetchone() == (2,)
+        assert conn.execute("select lastval()").fetchone() == (2,)
+        for sql in ("select nextval('nope')", "select currval('nope')"):
+            with pytest.raises(psycopg.errors.UndefinedTable) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == 'relation "nope" does not exist'
+        assert conn.execute("select setval('sq_id_seq', 10)").fetchone() == (10,)
+        assert conn.execute("select setval('sq_id_seq', 20, false)").fetchone() == (20,)
+        assert conn.execute("select nextval('sq_id_seq')").fetchone() == (20,)
+        assert conn.execute("select currval('sq_id_seq'), lastval()").fetchone() == (20, 20)
+        assert conn.execute(
+            "select nextval('sq_id_seq') + 1, pg_typeof(nextval('sq_id_seq'))"
+        ).fetchone() == (22, "bigint")
+        assert conn.execute("select nextval(null), setval('sq_id_seq', null)").fetchone() == (
+            None,
+            None,
+        )
+        assert conn.execute(
+            "select relname, relkind from pg_class where relname = 'sq_id_seq'"
+        ).fetchall() == [("sq_id_seq", "S")]
+        assert conn.execute(
+            "select pg_get_serial_sequence('sq', 'id'), pg_get_serial_sequence('sq', 'v'), "
+            "pg_get_serial_sequence(null, 'id'), pg_typeof(pg_get_serial_sequence('sq', 'id')), "
+            "pg_get_serial_sequence('SQ', 'id')"
+        ).fetchone() == ("public.sq_id_seq", None, None, "text", "public.sq_id_seq")
+        for sql, exc, message in [
+            (
+                "select pg_get_serial_sequence('sq', 'nope')",
+                psycopg.errors.UndefinedColumn,
+                'column "nope" of relation "sq" does not exist',
+            ),
+            (
+                "select pg_get_serial_sequence('sq', 'ID')",
+                psycopg.errors.UndefinedColumn,
+                'column "ID" of relation "sq" does not exist',
+            ),
+            (
+                "select pg_get_serial_sequence('nope', 'id')",
+                psycopg.errors.UndefinedTable,
+                'relation "nope" does not exist',
+            ),
+        ]:
+            with pytest.raises(exc) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+        conn.execute("begin")
+        conn.execute("insert into sq (v) values (1)")
+        conn.execute("rollback")
+        assert conn.execute("insert into sq (v) values (2) returning id").fetchone() == (24,)
+        conn.execute("drop table sq")
+        with pytest.raises(psycopg.errors.UndefinedTable) as ei:
+            conn.execute("select 'sq_id_seq'::regclass")
+        assert ei.value.diag.message_primary == 'relation "sq_id_seq" does not exist'
+        assert conn.execute(
+            "select count(*) from pg_class where relname = 'sq_id_seq'"
+        ).fetchone() == (0,)
+        conn.execute("create table sq (id serial primary key, v int)")
+        conn.execute("insert into sq (id, v) values (nextval('sq_id_seq'), 5)")
+        conn.execute("insert into sq (id, v) values (default, 6)")
+        assert conn.execute("insert into sq (v) values (7) returning id").fetchone() == (3,)
+        conn.execute("update sq set v = default where id = 3")
+        assert conn.execute("select id, v from sq order by id").fetchall() == [
+            (1, 5),
+            (2, 6),
+            (3, None),
+        ]
+        assert conn.execute("select nextval('sq_id_seq'::text)").fetchone() == (4,)
+        assert conn.execute("select nextval('sq_id_seq'::regclass::text)").fetchone() == (5,)
+        for value in ("0", "2147483648"):
+            with pytest.raises(psycopg.errors.NumericValueOutOfRange) as ei:
+                conn.execute(f"select setval('sq_id_seq', {value})")
+            assert ei.value.diag.message_primary == (
+                f'setval: value {value} is out of bounds for sequence "sq_id_seq" (1..2147483647)'
+            )
+        assert conn.execute("select setval('sq_id_seq', 1::int)").fetchone() == (1,)
+
+
+def test_alter_table_column_actions(home: Path) -> None:
+    """`ALTER TABLE` column actions with PostgreSQL 16.15's outcomes and
+    error codes (2026-09-23): ADD COLUMN (null-filled, default-backfilled,
+    NOT NULL over rows 23502, duplicate 42701, IF NOT EXISTS, `serial`
+    numbering the rows, a volatile default evaluated per row), DROP COLUMN
+    (missing 42703, IF EXISTS), SET / DROP DEFAULT, SET / DROP NOT NULL (a
+    primary-key column keeps its NOT NULL: 42P16), RENAME COLUMN, and a bad
+    default 22P02. A failed INSERT still consumes its serial value."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table al (id serial primary key, n int not null, t text)")
+        conn.execute("insert into al (n, t) values (1, 'a'), (2, 'b')")
+        conn.execute("alter table al add column c int")
+        assert conn.execute("select c from al").fetchall() == [(None,), (None,)]
+        conn.execute("alter table al add column d int default 7")
+        assert conn.execute("select d from al").fetchall() == [(7,), (7,)]
+        with pytest.raises(psycopg.errors.NotNullViolation) as ei:
+            conn.execute("alter table al add column e int not null")
+        assert ei.value.diag.message_primary == 'column "e" of relation "al" contains null values'
+        conn.execute("alter table al add column e int not null default 3")
+        with pytest.raises(psycopg.errors.DuplicateColumn) as ei:
+            conn.execute("alter table al add column e int")
+        assert ei.value.diag.message_primary == 'column "e" of relation "al" already exists'
+        conn.execute("alter table al add column if not exists e int")
+        conn.execute("alter table al add column f timestamp default now()")
+        assert conn.execute("select count(*) from al where f is not null").fetchone() == (2,)
+        with pytest.raises(psycopg.errors.UndefinedTable) as ei:
+            conn.execute("alter table nope add column x int")
+        assert ei.value.diag.message_primary == 'relation "nope" does not exist'
+        conn.execute("alter table if exists nope add column x int")
+        conn.execute("alter table al drop column c")
+        for sql, message in [
+            ("alter table al drop column c", 'column "c" of relation "al" does not exist'),
+            ("alter table al drop column zz", 'column "zz" of relation "al" does not exist'),
+            (
+                "alter table al alter column zz set default 1",
+                'column "zz" of relation "al" does not exist',
+            ),
+            ("alter table al rename column zz to q", 'column "zz" does not exist'),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == message, sql
+        conn.execute("alter table al drop column if exists c")
+        conn.execute("alter table al alter column n set default 9")
+        assert conn.execute("insert into al (t) values ('c') returning n").fetchone() == (9,)
+        conn.execute("alter table al alter column n drop default")
+        with pytest.raises(psycopg.errors.NotNullViolation) as ei:
+            conn.execute("insert into al (t) values ('d')")
+        assert ei.value.diag.message_primary == (
+            'null value in column "n" of relation "al" violates not-null constraint'
+        )
+        conn.execute("alter table al alter column t set not null")
+        with pytest.raises(psycopg.errors.NotNullViolation) as ei:
+            conn.execute("insert into al (n) values (5)")
+        assert ei.value.diag.message_primary == (
+            'null value in column "t" of relation "al" violates not-null constraint'
+        )
+        conn.execute("alter table al alter column t drop not null")
+        conn.execute("insert into al (n) values (5)")
+        with pytest.raises(psycopg.errors.InvalidTableDefinition) as ei:
+            conn.execute("alter table al alter column id drop not null")
+        assert ei.value.diag.message_primary == 'column "id" is in a primary key'
+        conn.execute("alter table al rename column t to tt")
+        assert conn.execute("select tt from al order by id").fetchall() == [
+            ("a",),
+            ("b",),
+            ("c",),
+            (None,),
+        ]
+        with pytest.raises(psycopg.errors.DuplicateColumn) as ei:
+            conn.execute("alter table al rename column tt to n")
+        assert ei.value.diag.message_primary == 'column "n" of relation "al" already exists'
+        assert conn.execute(
+            "select column_name, data_type, column_default, is_nullable "
+            "from information_schema.columns where table_name = 'al' and column_name = 'id'"
+        ).fetchone() == ("id", "integer", "nextval('al_id_seq'::regclass)", "NO")
+        conn.execute("alter table al alter column d set default nextval('al_id_seq')")
+        assert conn.execute("insert into al (n) values (1) returning id, d").fetchone() == (7, 8)
+        conn.execute("alter table al add column h float8 default random()")
+        assert conn.execute("select count(distinct h) = count(*) from al").fetchone() == (True,)
+        for sql in (
+            "alter table al alter column e set default 'abc'",
+            "alter table al add column e2 int default 'abc'",
+        ):
+            with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == 'invalid input syntax for type integer: "abc"'
+        conn.execute("alter table al add column i serial")
+        assert conn.execute("select id, i from al order by id").fetchall() == [
+            (1, 1),
+            (2, 2),
+            (3, 3),
+            (6, 4),
+            (7, 5),
+        ]
+
+
+def test_datetime_special_keywords(home: Path) -> None:
+    """The special date/time input strings -- `today`, `tomorrow`,
+    `yesterday`, `now`, `epoch`, `allballs` -- resolve at parse time the way
+    PostgreSQL 16.15 has them (2026-09-23): the day keywords take a time of
+    day, `time` accepts only `now` / `allballs`, and a keyword the type does
+    not take is 22007."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'UTC'")
+        assert conn.execute(
+            "select 'today'::timestamp = date_trunc('day', localtimestamp), "
+            "'tomorrow'::timestamp = date_trunc('day', localtimestamp) + interval '1 day', "
+            "'yesterday'::timestamp = date_trunc('day', localtimestamp) - interval '1 day', "
+            "'today 10:00'::timestamp = date_trunc('day', localtimestamp) + interval '10 hours', "
+            "'tomorrow'::timestamp - 'today'::timestamp, "
+            "'now '::date = current_date, 'today'::date = current_date, "
+            "'tomorrow'::date = current_date + 1, 'yesterday'::date = current_date - 1, "
+            "'now'::timestamptz = now(), 'today'::timestamptz = date_trunc('day', now()), "
+            "'allballs'::time, 'allballs'::timetz, 'epoch'::timestamptz::text"
+        ).fetchone() == (
+            True,
+            True,
+            True,
+            True,
+            dt.timedelta(days=1),
+            True,
+            True,
+            True,
+            True,
+            True,
+            True,
+            dt.time(0, 0),
+            dt.time(0, 0, tzinfo=dt.timezone.utc),
+            "1970-01-01 00:00:00+00",
+        )
+        for sql, literal in [
+            ("select 'tomorrow'::time", "tomorrow"),
+            ("select 'epoch'::time", "epoch"),
+        ]:
+            with pytest.raises(psycopg.errors.InvalidDatetimeFormat) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == (
+                f'invalid input syntax for type time: "{literal}"'
+            )
+
+
+def test_timetz_plus_interval(home: Path) -> None:
+    """`timetz ± interval` keeps the offset and wraps the time of day within
+    it; only the interval's time part counts (PostgreSQL 16.15, 2026-09-23)."""
+    plus1 = dt.timezone(dt.timedelta(hours=1))
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute(
+            "select '23:00:00+01'::timetz + interval '2 hours', "
+            "'10:00+01'::timetz - interval '1 day 2 hours', "
+            "interval '30 min' + '10:00-05:30'::timetz, "
+            "'10:00:00.5+02'::timetz + interval '1.25 sec', "
+            "'00:30+00'::timetz - interval '1 hour', "
+            "('10:00+01'::timetz + interval '1 hour')::text, "
+            "pg_typeof('10:00+01'::timetz + interval '1 hour')"
+        ).fetchone() == (
+            dt.time(1, 0, tzinfo=plus1),
+            dt.time(8, 0, tzinfo=plus1),
+            dt.time(10, 30, tzinfo=dt.timezone(dt.timedelta(hours=-5, minutes=-30))),
+            dt.time(10, 0, 1, 750000, tzinfo=dt.timezone(dt.timedelta(hours=2))),
+            dt.time(23, 30, tzinfo=dt.timezone.utc),
+            "11:00:00+01",
+            "time with time zone",
+        )
+
+
+def test_microsecond_timestamps_sort_group_and_join(home: Path) -> None:
+    """Two stored timestamps one microsecond apart are distinct to ORDER BY,
+    GROUP BY, DISTINCT, DISTINCT ON, a join condition, `min` / `max`,
+    `count(distinct)`, `array_agg` and UNION -- not just to `::text` -- and a
+    timestamptz keeps its microseconds and its `+00` through `+ interval`,
+    a join alias, a comma FROM and a derived table (PostgreSQL 16.15,
+    2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'UTC'")
+        conn.execute("create table tsu (id int primary key, ts timestamptz, t2 timestamp)")
+        conn.execute(
+            "insert into tsu values "
+            "(1, '2020-01-01 00:00:00.000001+00', '2020-01-01 00:00:00.000001'), "
+            "(2, '2020-01-01 00:00:00.000002+00', '2020-01-01 00:00:00.000002'), "
+            "(3, '2020-01-01 00:00:00.000002+00', '2020-01-01 00:00:00.000002')"
+        )
+        t1 = "2020-01-01 00:00:00.000001+00"
+        t2 = "2020-01-01 00:00:00.000002+00"
+        assert conn.execute(
+            "select count(distinct ts), count(distinct t2) from tsu"
+        ).fetchone() == (
+            2,
+            2,
+        )
+        assert conn.execute(
+            "select ts::text, count(*) from tsu group by ts order by 1"
+        ).fetchall() == [(t1, 1), (t2, 2)]
+        assert conn.execute(
+            "select ts::text, count(*) from tsu group by ts having count(*) > 1"
+        ).fetchall() == [(t2, 2)]
+        assert conn.execute("select distinct t2::text from tsu order by 1").fetchall() == [
+            ("2020-01-01 00:00:00.000001",),
+            ("2020-01-01 00:00:00.000002",),
+        ]
+        assert conn.execute("select distinct on (ts) id from tsu order by ts, id").fetchall() == [
+            (1,),
+            (2,),
+        ]
+        assert conn.execute(f"select count(*) from tsu where ts = '{t2}'").fetchone() == (2,)
+        assert conn.execute(f"select id from tsu where ts > '{t1}' order by id").fetchall() == [
+            (2,),
+            (3,),
+        ]
+        assert conn.execute("select id from tsu order by ts desc, id").fetchall() == [
+            (2,),
+            (3,),
+            (1,),
+        ]
+        assert conn.execute(
+            "select a.id, b.id from tsu a join tsu b on a.ts = b.ts order by 1, 2"
+        ).fetchall() == [(1, 1), (2, 2), (2, 3), (3, 2), (3, 3)]
+        assert conn.execute("select min(ts)::text, max(ts)::text from tsu").fetchone() == (t1, t2)
+        assert conn.execute("select array_agg(ts order by id)::text from tsu").fetchone() == (
+            f'{{"{t1}","{t2}","{t2}"}}',
+        )
+        assert conn.execute(
+            "select count(*) from (select ts from tsu union select ts from tsu) u"
+        ).fetchone() == (2,)
+        assert conn.execute(
+            "select ts::text, t2 + interval '1 microsecond' from tsu where id = 1"
+        ).fetchone() == (t1, dt.datetime(2020, 1, 1, 0, 0, 0, 2))
+        assert conn.execute(
+            "select a.ts::text, (a.ts + interval '1 hour')::text, "
+            "(a.ts - interval '1 hour')::text, (a.t2 + interval '1 hour')::text, "
+            "a.ts::timestamp::text, a.ts::date::text, date_trunc('hour', a.ts)::text, "
+            "pg_typeof(a.ts + interval '1 hour') "
+            "from tsu a join tsu b on a.id = b.id where a.id = 1"
+        ).fetchone() == (
+            t1,
+            "2020-01-01 01:00:00.000001+00",
+            "2019-12-31 23:00:00.000001+00",
+            "2020-01-01 01:00:00.000001",
+            "2020-01-01 00:00:00.000001",
+            "2020-01-01",
+            "2020-01-01 00:00:00+00",
+            "timestamp with time zone",
+        )
+        assert conn.execute(
+            "select a.ts::text from tsu a, tsu b where a.id = 1 and b.id = 1"
+        ).fetchone() == (t1,)
+        assert conn.execute(
+            "select x.ts::text, (x.ts + interval '1 hour')::text "
+            "from (select ts from tsu where id = 1) x"
+        ).fetchone() == (t1, "2020-01-01 01:00:00.000001+00")
+
+
+def test_zoned_values_cast_to_text_keep_their_offset(home: Path) -> None:
+    """A `tstzrange`, a `timestamptz[]` and `array_to_string` over one all
+    render in the session zone WITH the offset when cast to text, and the
+    range accessors over a range COLUMN answer the bound's own type rather
+    than the text function of the same name (PostgreSQL 16.15, 2026-09-23)."""
+    from datetime import datetime, timezone
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'UTC'")
+        conn.execute(
+            "create table tz (id int primary key, a timestamptz[], r tstzrange, ir int4range)"
+        )
+        conn.execute(
+            "insert into tz values (1, "
+            "array['2020-01-01 00:00:00.5+00'::timestamptz, '2020-06-01 00:00+02'], "
+            "tstzrange('2020-01-01 00:00+00', '2020-01-02 00:00+00'), int4range(1, 5))"
+        )
+        lo = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        hi = datetime(2020, 1, 2, tzinfo=timezone.utc)
+        assert conn.execute("select r::text, a::text from tz").fetchone() == (
+            '["2020-01-01 00:00:00+00","2020-01-02 00:00:00+00")',
+            '{"2020-01-01 00:00:00.5+00","2020-05-31 22:00:00+00"}',
+        )
+        assert conn.execute(
+            "select tstzrange('2020-01-01 00:00+00', '2020-01-02 00:00+00')::text"
+        ).fetchone() == ('["2020-01-01 00:00:00+00","2020-01-02 00:00:00+00")',)
+        assert conn.execute("select array_to_string(a, ',') from tz").fetchone() == (
+            "2020-01-01 00:00:00.5+00,2020-05-31 22:00:00+00",
+        )
+        assert conn.execute(
+            "select upper(r), lower(r), upper(r)::text, upper_inc(r), isempty(r) from tz"
+        ).fetchone() == (hi, lo, "2020-01-02 00:00:00+00", False, False)
+        assert conn.execute("select upper(ir), lower(ir), upper(ir) + 1 from tz").fetchone() == (
+            5,
+            1,
+            6,
+        )
+        assert conn.execute("select id from tz where upper(r) > '2020-01-01'").fetchone() == (1,)
+
+
+def test_zone_abbreviations_and_bare_date_offsets(home: Path) -> None:
+    """A datetime literal may name its zone by abbreviation (`EST`, `utc`,
+    `GMT`) or carry a colon-less `+0530` offset, a bare date may carry an
+    offset (`'2020-01-01+02'`) which `::timestamp` / `::date` drop, and an
+    offset past what PostgreSQL holds is 22009, not a syntax error
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'UTC'")
+        assert conn.execute(
+            "select '2020-01-01 00:00 UTC'::timestamptz::text, "
+            "'2020-01-01 00:00 est'::timestamptz::text, "
+            "'2020-01-01 12:00:00 PST'::timestamptz::text, "
+            "'2020-01-01T10:00:00.25 GMT'::timestamptz::text, "
+            "'2020-01-01 EST'::timestamptz::text"
+        ).fetchone() == (
+            "2020-01-01 00:00:00+00",
+            "2020-01-01 05:00:00+00",
+            "2020-01-01 20:00:00+00",
+            "2020-01-01 10:00:00.25+00",
+            "2020-01-01 05:00:00+00",
+        )
+        assert conn.execute(
+            "select '2020-01-01+02'::timestamptz::text, '2020-01-01 +02'::timestamptz::text, "
+            "'2020-01-01Z'::timestamptz::text, '2020-01-01+0530'::timestamptz::text, "
+            "'2020-01-01 -05:30'::timestamptz::text, '2020-01-01 00:00+053'::timestamptz::text"
+        ).fetchone() == (
+            "2019-12-31 22:00:00+00",
+            "2019-12-31 22:00:00+00",
+            "2020-01-01 00:00:00+00",
+            "2019-12-31 18:30:00+00",
+            "2020-01-01 05:30:00+00",
+            "2019-12-31 23:07:00+00",
+        )
+        assert conn.execute(
+            "select '2020-01-01+02'::timestamp::text, '2020-01-01+02'::date::text, "
+            "'2020-01-01 UTC'::timestamp::text, '2020-01-01 00:00+02'::date::text, "
+            "'2020-01-01 10:00 EST'::time::text, '2020-01-01 BC'::date::text"
+        ).fetchone() == (
+            "2020-01-01 00:00:00",
+            "2020-01-01",
+            "2020-01-01 00:00:00",
+            "2020-01-01",
+            "10:00:00",
+            "2020-01-01 BC",
+        )
+        for literal, sqlstate in [
+            ("'2020-01-01-05:30'::timestamptz", "22007"),
+            ("'2020-01-01 00:00 XYZ'::timestamptz", "22007"),
+            ("'2020-01-01 00:00+16'::timestamptz", "22009"),
+            ("'2020-01-01 00:00:00+053000'::timestamptz", "22009"),
+            ("'10:00+16'::timetz", "22009"),
+            ("'2020-01-01 25:00'::timestamp", "22008"),
+        ]:
+            with pytest.raises(psycopg.Error) as excinfo:
+                conn.execute(f"select {literal}")
+            assert excinfo.value.sqlstate == sqlstate, literal
+            conn.rollback()
+
+
+def test_real_is_single_precision(home: Path) -> None:
+    """A `real` column holds an f32: its text is `float4out`'s shortest
+    digits, `real op real` stays in single precision, a real beside another
+    numeric type widens to `double precision`, an unknown literal beside a
+    real is a real, unary minus / `abs` / `coalesce` / `greatest` / CASE keep
+    the type, `round` and friends over a float column answer float8, the
+    numeric cast keeps six digits, and the range / syntax errors name the
+    type. Numeric `%` is a numeric, and `%` over a float is 42883
+    (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table f4 (id int primary key, r real)")
+        conn.execute("insert into f4 values (1, 0.1), (2, 3.14159265358979), (3, -2.5)")
+        conn.commit()
+        assert conn.execute("select r::text from f4 order by id").fetchall() == [
+            ("0.1",),
+            ("3.1415927",),
+            ("-2.5",),
+        ]
+        assert conn.execute("select id from f4 where r = 0.1").fetchall() == []
+        assert conn.execute("select id from f4 where r = 0.1::float4").fetchall() == [(1,)]
+        assert conn.execute(
+            "select pg_typeof(r + 1)::text, pg_typeof(r + r)::text, pg_typeof(-r)::text, "
+            "pg_typeof(abs(r))::text, pg_typeof(round(r))::text, "
+            "pg_typeof(coalesce(r, 1.5))::text, "
+            "pg_typeof(greatest(r, 1))::text, pg_typeof(case when r > 0 then r else 0 end)::text, "
+            "pg_typeof(r * '2')::text from f4 where id = 1"
+        ).fetchone() == (
+            "double precision",
+            "real",
+            "real",
+            "real",
+            "double precision",
+            "real",
+            "real",
+            "real",
+            "real",
+        )
+        assert conn.execute(
+            "select (0.1::float4 + 0.2::float4)::text, (0.1::float4 + 0.2)::text, "
+            "(r * '2')::text, (-r)::text, abs(r)::text, r::numeric::text, "
+            "'1e39'::float8::text, (1.0::float4 / 3)::text from f4 where id = 2"
+        ).fetchone() == (
+            "0.3",
+            "0.30000000149011613",
+            "6.2831855",
+            "-3.1415927",
+            "3.1415927",
+            "3.14159",
+            "1e+39",
+            "0.3333333333333333",
+        )
+        assert conn.execute(
+            "select sum(r)::text, array_agg(r order by id)::text, round(r)::text, "
+            "(0.1::float8)::numeric::text from f4 group by r order by r limit 1"
+        ).fetchone() == ("-2.5", "{-2.5}", "-2", "0.1")
+        assert conn.execute("select sum(r)::text from f4").fetchone() == ("0.74159265",)
+        assert conn.execute(
+            "select 7.5 % 2, mod(7.5, 2), -7.5 % 2, 5 % 2.0, pg_typeof(5 % 2.0)::text, "
+            "('NaN'::numeric % 2)::text, (2 % 'Infinity'::numeric)::text"
+        ).fetchone() == (
+            Decimal("1.5"),
+            Decimal("1.5"),
+            Decimal("-1.5"),
+            Decimal("1.0"),
+            "numeric",
+            "NaN",
+            "2",
+        )
+        for statement, sqlstate, message in [
+            ("select '1e39'::float4", "22003", '"1e39" is out of range for type real'),
+            ("select 'abc'::float4", "22P02", 'invalid input syntax for type real: "abc"'),
+            ("select 0.5::float4 * 'abc'", "22P02", 'invalid input syntax for type real: "abc"'),
+            ("select r % 2 from f4", "42883", "operator does not exist: real % integer"),
+            ("select 2.5 % 0", "22012", "division by zero"),
+        ]:
+            with pytest.raises(psycopg.Error) as excinfo:
+                conn.execute(statement)
+            assert excinfo.value.sqlstate == sqlstate, statement
+            assert message in str(excinfo.value), statement
+            conn.rollback()
+
+
+def test_array_shape_functions_and_inet_array_text(home: Path) -> None:
+    """`array_dims` / `array_length` / `array_upper` / `array_lower` /
+    `array_ndims` / `cardinality` describe an array's shape (an empty array
+    has no dimensions and a cardinality of 0), an `inet[]` cast to text
+    renders each element with `inet_out` (so a `/32` mask is dropped, as it
+    is not for `cidr[]`), and `pg_sleep_for` / `pg_sleep_until` return a
+    `void` like `pg_sleep` (PostgreSQL 16.15, 2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        assert conn.execute(
+            "select array_dims(array[1,2,3]), array_dims(array[[1,2],[3,4]]), "
+            "array_dims('{}'::int[]), array_dims(null::int[]), array_length(array[1,2,3], 1), "
+            "array_length(array[[1,2],[3,4]], 2), array_length(array[1], 2), "
+            "array_length('{}'::int[], 1), array_upper(array[1,2], 1), array_lower(array[1,2], 1), "
+            "array_lower(array[1], 2), array_ndims(array[[1],[2]]), array_ndims('{}'::int[]), "
+            "cardinality(array[[1,2],[3,4]]), cardinality('{}'::int[]), cardinality(null::int[])"
+        ).fetchone() == (
+            "[1:3]",
+            "[1:2][1:2]",
+            None,
+            None,
+            3,
+            2,
+            None,
+            None,
+            2,
+            1,
+            None,
+            2,
+            None,
+            4,
+            0,
+            None,
+        )
+        assert conn.execute(
+            "select pg_typeof(array_dims(array[1]))::text, pg_typeof(cardinality(array[1]))::text, "
+            "pg_typeof(array_length(array[1], 1))::text"
+        ).fetchone() == ("text", "integer", "integer")
+        assert conn.execute(
+            "select array['1.2.3.0/24'::inet, '10.0.0.1']::text, array['10.0.0.1/32'::inet]::text, "
+            "array['1.2.3.0/24'::cidr]::text, "
+            "array['10.0.0.1/8'::inet, '::1'::inet, 'fe80::1/64'::inet, null]::text, "
+            "('10.0.0.1/32'::inet)::text"
+        ).fetchone() == (
+            "{1.2.3.0/24,10.0.0.1}",
+            "{10.0.0.1}",
+            "{1.2.3.0/24}",
+            "{10.0.0.1/8,::1,fe80::1/64,NULL}",
+            "10.0.0.1/32",
+        )
+        assert conn.execute(
+            "select pg_sleep_for('10 milliseconds'), pg_sleep_until(now()), pg_sleep_for(null)"
+        ).fetchone() == ("", "", None)
+        assert conn.execute("select pg_sleep_for('10 ms')").description[0].type_code == 2278
+
+
+def test_char_n_padded_forms_and_json_constructors(home: Path) -> None:
+    """A `char(n)` hands its PADDED output form to `::bytea` and to the
+    functions that take `"any"` (`octet_length`, `concat`, `to_json`) --
+    from a column and from a cast literal alike -- where `::text` and the
+    text functions see it stripped. The JSON constructors (`to_json`,
+    `to_jsonb`, `json_build_array` / `_object`, `jsonb_build_*`) take a
+    `json` argument as JSON, a number or boolean as itself, and every other
+    type as its output text, timestamps in ISO 8601 (PostgreSQL 16.15,
+    2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Berlin'")
+        conn.execute("create table vc (id int primary key, c char(5), v varchar(5))")
+        conn.execute("insert into vc values (1, 'ab', 'ab')")
+        assert conn.execute(
+            "select c::bytea, v::bytea, c::text::bytea, octet_length(c), to_json(c), "
+            "concat(c, '|'), format('%s|', c), length(c), c || '|' from vc"
+        ).fetchone() == (b"ab   ", b"ab", b"ab", 5, "ab   ", "ab   |", "ab   |", 2, "ab|")
+        assert conn.execute("select id from vc where c::bytea = 'ab   '::bytea").fetchone() == (1,)
+        assert conn.execute(
+            "select 'ab'::char(5)::bytea, 'ab'::char(5)::text::bytea, octet_length('ab'::char(5)), "
+            "octet_length('abcdefg'::char(3)), to_json('ab'::char(5)), concat('ab'::char(5), '|'), "
+            "concat_ws('-', 'ab'::char(5), 'c'), length('ab'::char(5)), 'ab'::char(5) || 'x'"
+        ).fetchone() == (b"ab   ", b"ab", 5, 3, "ab   ", "ab   |", "ab   -c", 2, "abx")
+        # The constructors, by argument type.
+        assert conn.execute(
+            "select json_build_array(1, 'a', null, true, 1.5), jsonb_build_array(1, 'a'), "
+            "json_build_object('k', 'v', 'n', 1), jsonb_build_object('k', 'v', 'n', null), "
+            "json_build_object(1, 2, true, 3), json_build_array(), json_build_object(), "
+            "jsonb_build_object('b', 1, 'a', 2, 'a', 3)"
+        ).fetchone() == (
+            [1, "a", None, True, 1.5],
+            [1, "a"],
+            {"k": "v", "n": 1},
+            {"k": "v", "n": None},
+            {"1": 2, "true": 3},
+            [],
+            {},
+            {"a": 3, "b": 1},
+        )
+        assert [
+            r[0]
+            for r in conn.execute(
+                "select json_build_object('k', 'v', 'n', 1)::text "
+                "union all select jsonb_build_object('k', 'v', 'n', 1)::text "
+                "union all select json_build_array(1, 'a', array[1,2])::text "
+                "union all select jsonb_build_array(1, 'a', array[1,2])::text "
+                "union all select json_build_array('{\"a\": 1}'::json, "
+                "'{\"a\": 1}'::jsonb, '{\"a\": 1}')::text "
+                "union all select to_json('{\"a\": 1}'::json)::text "
+                "union all select to_jsonb('{\"a\": 1}'::json)::text "
+                "union all select to_json('2021-01-02 03:04:05+00'::timestamptz)::text "
+                "union all select to_json('2021-01-02 03:04:05.5'::timestamp)::text "
+                "union all select to_json('1 day 2 hours'::interval)::text "
+                "union all select to_json('\\x01'::bytea)::text "
+                "union all select to_json('1.2.3.4'::inet)::text "
+                "union all select to_json(1::money)::text "
+                "union all select to_json(1::oid)::text "
+                "union all select to_json(0.1::real)::text "
+                "union all select to_json(array['2021-01-02'::date])::text"
+            ).fetchall()
+        ] == [
+            '{"k" : "v", "n" : 1}',
+            '{"k": "v", "n": 1}',
+            '[1, "a", [1,2]]',
+            '[1, "a", [1, 2]]',
+            '[{"a": 1}, {"a": 1}, "{\\"a\\": 1}"]',
+            '{"a": 1}',
+            '{"a": 1}',
+            '"2021-01-02T04:04:05+01:00"',
+            '"2021-01-02T03:04:05.5"',
+            '"1 day 02:00:00"',
+            '"\\\\x01"',
+            '"1.2.3.4"',
+            '"$1.00"',
+            '"1"',
+            "0.1",
+            '["2021-01-02"]',
+        ]
+        assert conn.execute(
+            "select pg_typeof(json_build_array(1))::text, "
+            "pg_typeof(jsonb_build_object('a', 1))::text, "
+            "pg_typeof(to_json(1))::text, pg_typeof(to_jsonb(1))::text"
+        ).fetchone() == ("json", "jsonb", "json", "jsonb")
+        # Over columns, where only the declared type says what the value is.
+        conn.execute(
+            "create table jj (id int primary key, j json, b jsonb, ts timestamptz, d date, "
+            "r real, u uuid, by bytea, a int[])"
+        )
+        conn.execute(
+            'insert into jj values (1, \'{"a":1}\', \'{"z": 1, "a": [true, null]}\', '
+            "'2021-01-02 03:04:05+00', '2021-01-02', 0.1, "
+            "'123e4567-e89b-12d3-a456-426614174000', '\\x0102', array[1,2])"
+        )
+        assert conn.execute(
+            "select to_json(j)::text, to_json(b)::text, to_jsonb(j)::text, to_json(ts)::text, "
+            "to_json(d)::text, to_json(r)::text, to_json(u)::text, to_json(by)::text, "
+            "to_json(a)::text, json_build_object('id', id, 'j', j, 'u', u)::text, "
+            "jsonb_build_array(ts, r, d)::text, "
+            "json_build_object('n', id + 1, 't', ts)::text from jj"
+        ).fetchone() == (
+            '{"a":1}',
+            '{"a": [true, null], "z": 1}',
+            '{"a": 1}',
+            '"2021-01-02T04:04:05+01:00"',
+            '"2021-01-02"',
+            "0.1",
+            '"123e4567-e89b-12d3-a456-426614174000"',
+            '"\\\\x0102"',
+            "[1,2]",
+            '{"id" : 1, "j" : {"a":1}, "u" : "123e4567-e89b-12d3-a456-426614174000"}',
+            '["2021-01-02T04:04:05+01:00", 0.1, "2021-01-02"]',
+            '{"n" : 2, "t" : "2021-01-02T04:04:05+01:00"}',
+        )
+        for sql, code in [
+            ("select json_build_object('k')", "22023"),
+            ("select json_build_object(null, 1)", "22004"),
+            ("select json_build_object(array[1], 1)", "22023"),
+        ]:
+            try:
+                conn.execute(sql).fetchall()
+            except psycopg.Error as exc:
+                assert exc.sqlstate == code, (sql, exc)
+            else:
+                raise AssertionError(f"{sql} did not fail")
+            conn.rollback()
+
+
+def test_text_concat_operator_and_concat_functions_spell_typed_operands(home: Path) -> None:
+    """`||` outside its array / bytea / bit / jsonb forms is `text ||
+    anynonarray`: the non-text side is spelled by its `::text` cast (a
+    `timestamptz` in the session zone, `0.1` for a real), an unknown literal
+    beside a jsonb / bytea / range is read as that type, and two typed
+    non-text operands have no operator (42883). `concat` / `concat_ws` /
+    `format` spell each argument with its OUTPUT function -- `inet_out`
+    drops a full-host mask where `::text` keeps it (PostgreSQL 16.15,
+    2026-09-23)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("set time zone 'Europe/Berlin'")
+        assert conn.execute(
+            "select '2021-01-02 03:04:05+00'::timestamptz || '', "
+            "'x' || '2021-01-02 03:04:05.5'::timestamp, '1 day'::interval || 'x', "
+            "'2021-01-02'::date || 'x', 0.1::real || '', 1.5::numeric || 'x', "
+            "'[1,2)'::int4range || 'x', 'x' || 1::money, 'x'::varchar || 1, 1 || 'x'::char(3), "
+            "'x' || true, '10.0.0.1'::inet || '', 'x'::text || '{\"a\":1}'::jsonb, "
+            "'x'::text || '\\x01'::bytea, '{\"a\":1}'::json || '{\"b\":2}', "
+            "'a' || 'b' || 1 || 2.5, 'x' || null::int, "
+            "pg_typeof('x' || 1)::text, pg_typeof('x'::text || '\\x01'::bytea)::text"
+        ).fetchone() == (
+            "2021-01-02 04:04:05+01",
+            "x2021-01-02 03:04:05.5",
+            "1 dayx",
+            "2021-01-02x",
+            "0.1",
+            "1.5x",
+            "[1,2)x",
+            "x$1.00",
+            "x1",
+            "1x",
+            "xtrue",
+            "10.0.0.1/32",
+            'x{"a": 1}',
+            "x\\x01",
+            '{"a":1}{"b":2}',
+            "ab12.5",
+            None,
+            "text",
+            "text",
+        )
+        assert conn.execute(
+            "select '\\x01'::bytea || 'x', pg_typeof('\\x01'::bytea || 'x')::text, "
+            "'[1,2]'::jsonb || '3', '1'::jsonb || '[2]', '{\"a\":1}'::jsonb || '[2]', "
+            "'{\"a\":1}'::jsonb || '{\"a\":2,\"b\":[1]}', '[1]'::jsonb || '[[2]]', "
+            "'{\"a\":1}'::jsonb || '{\"b\":2}'::jsonb || '{\"c\":3}', "
+            "pg_typeof('[1]'::jsonb || '[2]')::text, '{\"a\":1}'::jsonb || null"
+        ).fetchone() == (
+            b"\x01x",
+            "bytea",
+            [1, 2, 3],
+            [1, 2],
+            [{"a": 1}, 2],
+            {"a": 2, "b": [1]},
+            [1, [2]],
+            {"a": 1, "b": 2, "c": 3},
+            "jsonb",
+            None,
+        )
+        assert conn.execute(
+            "select concat('10.0.0.1'::inet), format('%s|', '10.0.0.1'::inet), "
+            "concat('2021-01-02 03:04:05+00'::timestamptz), "
+            "format('%s|', '2021-01-02 03:04:05+00'::timestamptz), concat(0.1::real), "
+            "concat_ws(',', 0.1::real, '2021-01-02 03:04:05+00'::timestamptz), "
+            "concat(array['2021-01-02 03:04:05+00'::timestamptz]), "
+            "concat('[2021-01-02 03:04:05+00,)'::tstzrange)"
+        ).fetchone() == (
+            "10.0.0.1",
+            "10.0.0.1|",
+            "2021-01-02 04:04:05+01",
+            "2021-01-02 04:04:05+01|",
+            "0.1",
+            "0.1,2021-01-02 04:04:05+01",
+            '{"2021-01-02 04:04:05+01"}',
+            '["2021-01-02 04:04:05+01",)',
+        )
+        for sql, message in [
+            ("select 1 || 2", "operator does not exist: integer || integer"),
+            (
+                "select '2021-01-02'::date || '03:04'::time",
+                "operator does not exist: date || time without time zone",
+            ),
+            (
+                "select '{\"a\":1}'::json || '{\"b\":2}'::json",
+                "operator does not exist: json || json",
+            ),
+            ("select '{\"a\":1}'::jsonb || 'x'", "invalid input syntax for type json"),
+        ]:
+            assert message in _error_of(conn, sql), sql
+            conn.rollback()
+        # Over columns, where the declared type is the only clue.
+        conn.execute(
+            "create table jz (id int primary key, ts timestamptz, tr tstzrange, i interval, "
+            "r real, n inet, b jsonb, by bytea, x text)"
+        )
+        conn.execute(
+            "insert into jz values (1, '2021-01-02 03:04:05+00', "
+            "'[2021-01-02 03:04:05+00, 2021-01-03 03:04:05+00)', '1 day 2 hours', 0.1, "
+            "'10.0.0.1', '{\"a\":1}', '\\x01', 'x')"
+        )
+        assert conn.execute(
+            "select concat(ts, '|'), format('%s', ts), ts || '', concat(tr), r || '', concat(r), "
+            "n || '', concat(n), b || '{\"b\":2}', x || b, x || by, by || 'x', x || ts, "
+            "i || x, upper(concat(ts)), length(concat(ts)), ts::text = concat(ts) from jz"
+        ).fetchone() == (
+            "2021-01-02 04:04:05+01|",
+            "2021-01-02 04:04:05+01",
+            "2021-01-02 04:04:05+01",
+            '["2021-01-02 04:04:05+01","2021-01-03 04:04:05+01")',
+            "0.1",
+            "0.1",
+            "10.0.0.1/32",
+            "10.0.0.1",
+            {"a": 1, "b": 2},
+            'x{"a": 1}',
+            "x\\x01",
+            b"\x01x",
+            "x2021-01-02 04:04:05+01",
+            "1 day 02:00:00x",
+            "2021-01-02 04:04:05+01",
+            22,
+            True,
+        )
+        assert conn.execute(
+            "select id from jz where concat(ts, '') = '2021-01-02 04:04:05+01'"
+        ).fetchone() == (1,)
+        assert "operator does not exist: integer || integer" in _error_of(
+            conn, "select id || id from jz"
+        )
+        conn.rollback()
+        conn.execute("set time zone 'UTC'")
+        assert conn.execute("select concat(ts, '|'), ts || '' from jz").fetchone() == (
+            "2021-01-02 03:04:05+00|",
+            "2021-01-02 03:04:05+00",
+        )
+
+
+def test_sequences_survive_savepoint_rollback_and_restart_is_transactional(home: Path) -> None:
+    """A sequence is non-transactional EXCEPT where the transaction owns its
+    row (PostgreSQL 16.15, 2026-09-23): a value drawn after a savepoint stays
+    drawn when the savepoint is rolled back, but a TRUNCATE ... RESTART
+    IDENTITY, a table created in the transaction, or a setval on a restarted
+    sequence is undone with the rest of the (sub)transaction. Before the fix
+    a ROLLBACK TO after a serial insert failed with XX000 and a serial insert
+    after an in-transaction restart hung the connection for good."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table sq (id serial primary key, n int)")
+        conn.execute("insert into sq (n) values (1)")
+        # A savepoint rollback keeps the drawn value.
+        conn.execute("begin")
+        conn.execute("savepoint a")
+        conn.execute("insert into sq (n) values (2)")
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (3)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [(1, 1), (3, 3)]
+        # nextval after a savepoint, then currval and nextval after rolling it back.
+        conn.execute("begin")
+        conn.execute("savepoint a")
+        assert conn.execute("select nextval('sq_id_seq')").fetchone() == (4,)
+        conn.execute("rollback to a")
+        assert conn.execute("select currval('sq_id_seq'), nextval('sq_id_seq')").fetchone() == (
+            4,
+            5,
+        )
+        conn.execute("commit")
+        # A restart inside the transaction is undone by ROLLBACK ...
+        conn.execute("begin")
+        conn.execute("truncate sq restart identity")
+        conn.execute("insert into sq (n) values (2)")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [(1, 2)]
+        conn.execute("rollback")
+        conn.execute("insert into sq (n) values (6)")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [
+            (1, 1),
+            (3, 3),
+            (6, 6),
+        ]
+        # ... and by ROLLBACK TO, and a savepoint after the restart still
+        # keeps its drawn value.
+        conn.execute("begin")
+        conn.execute("savepoint a")
+        conn.execute("truncate sq restart identity")
+        conn.execute("insert into sq (n) values (2)")
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (7)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [
+            (1, 1),
+            (3, 3),
+            (6, 6),
+            (7, 7),
+        ]
+        conn.execute("begin")
+        conn.execute("truncate sq restart identity")
+        conn.execute("savepoint a")
+        conn.execute("insert into sq (n) values (5)")
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (8)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [(2, 8)]
+        # A table created after a savepoint goes away with it, its sequence too.
+        conn.execute("begin")
+        conn.execute("savepoint a")
+        conn.execute("create table sq2 (id serial primary key)")
+        conn.execute("insert into sq2 default values")
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (9)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [(2, 8), (3, 9)]
+        assert _error_of(conn, "select nextval('sq2_id_seq')").startswith(
+            'relation "sq2_id_seq" does not exist'
+        )
+        conn.rollback()
+        # A table dropped after a savepoint comes back with its sequence
+        # where it was.
+        conn.execute("begin")
+        conn.execute("savepoint a")
+        conn.execute("drop table sq")
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (10)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [
+            (2, 8),
+            (3, 9),
+            (4, 10),
+        ]
+        # setval, like nextval, is not undone by a savepoint rollback.
+        conn.execute("begin")
+        conn.execute("savepoint a")
+        assert conn.execute("select setval('sq_id_seq', 100)").fetchone() == (100,)
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (11)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq where n = 11").fetchall() == [(101, 11)]
+        # A table created in the transaction owns its sequence: the draw is
+        # rolled back with the savepoint, not kept.
+        conn.execute("drop table sq")
+        conn.execute("begin")
+        conn.execute("create table sq (id serial primary key, n int)")
+        conn.execute("savepoint a")
+        conn.execute("insert into sq (n) values (1)")
+        conn.execute("rollback to a")
+        conn.execute("insert into sq (n) values (2)")
+        conn.execute("commit")
+        assert conn.execute("select id, n from sq order by id").fetchall() == [(2, 2)]
+
+
+def test_float_column_nan_takes_postgres_place_in_where(home: Path) -> None:
+    """A stored float NaN sits ABOVE every number, infinity included, and
+    equals itself -- so `f > 1` and `f >= 'Infinity'` return the NaN row and
+    `f < 'NaN'` returns every other non-null row. MQL's range operators
+    exclude NaN, which is what the `numeric` lowering already corrected and
+    the `float4` / `float8` columns did not. Probed PG 16.15."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table fn (id int primary key, f float4, d float8)")
+        cur.execute(
+            "insert into fn values (1, 'NaN', 'NaN'), (2, 1.5, 1.5), "
+            "(3, 'Infinity', 'Infinity'), (4, '-Infinity', '-Infinity'), (5, null, null)"
+        )
+        expected = {
+            "> 1": [1, 2, 3],
+            ">= 1": [1, 2, 3],
+            "< 1": [4],
+            "<= 1": [4],
+            "= 'NaN'": [1],
+            "<> 'NaN'": [2, 3, 4],
+            "<> 1": [1, 2, 3, 4],
+            "> 'Infinity'": [1],
+            ">= 'Infinity'": [1, 3],
+            "< 'NaN'": [2, 3, 4],
+            "<= 'NaN'": [1, 2, 3, 4],
+            "> 'NaN'": [],
+            "between 1 and 'NaN'": [1, 2, 3],
+            "not between 1 and 'NaN'": [4],
+            "> any(array[1, 2])": [1, 2, 3],
+            "> all(array[1, 2])": [1, 3],
+        }
+        for col in ("f", "d"):
+            for pred, ids in expected.items():
+                cur.execute(f"select id from fn where {col} {pred} order by id")
+                assert [r[0] for r in cur.fetchall()] == ids, f"{col} {pred}"
+            cur.execute(f"select id from fn order by {col}, id")
+            assert [r[0] for r in cur.fetchall()] == [4, 2, 3, 1, 5]
+
+
+def test_translate_maps_characters_by_position(home: Path) -> None:
+    """`translate(s, from, to)` replaces each character of `s` found in `from`
+    with the character at the same position in `to`, or deletes it when `to`
+    is shorter; characters not in `from` pass through. Probed PG 16.15."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "select translate('abcabc', 'ab', 'x'), translate('abc', 'abc', ''), "
+            "translate('héllo', 'é', 'e'), translate('abc', 'a', 'xyz'), "
+            "translate('abc', '', 'x'), translate(null, 'a', 'b') is null, "
+            "translate('aaa', 'aa', 'xy'), pg_typeof(translate('a', 'b', 'c'))::text"
+        )
+        assert cur.fetchall() == [("xcxc", "", "hello", "xbc", "abc", True, "xxx", "text")]
+        cur.execute("create table tr (s text)")
+        cur.execute("insert into tr values ('a-b_c'), (null)")
+        cur.execute("select translate(s, '-_', '  ') from tr order by s")
+        assert cur.fetchall() == [("a b c",), (None,)]
+
+
+def test_create_alter_drop_sequence(home: Path) -> None:
+    """Standalone sequences, with PostgreSQL 16.15's option defaults, bounds
+    checks, CYCLE wrap and `pg_sequence` row (measured 2026-09-23). Before
+    this every one of these statements was 0A000."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create sequence sq1")
+        assert cur.statusmessage == "CREATE SEQUENCE"
+        cur.execute("select nextval('sq1'), nextval('sq1')")
+        assert cur.fetchone() == (1, 2)
+        cur.execute("select currval('sq1')")
+        assert cur.fetchone() == (2,)
+        cur.execute("create sequence sq2 start 10 increment by 5 minvalue 3 maxvalue 21")
+        cur.execute("select nextval('sq2'), nextval('sq2'), nextval('sq2')")
+        assert cur.fetchone() == (10, 15, 20)
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select nextval('sq2')")
+        assert exc.value.diag.sqlstate == "2200H"
+        assert exc.value.diag.message_primary == (
+            'nextval: reached maximum value of sequence "sq2" (21)'
+        )
+        # A descending sequence wraps under CYCLE, and reports its minimum
+        # without it.
+        cur.execute(
+            "create sequence sq3 as smallint increment -1 minvalue -3 maxvalue 2 start 2 cycle"
+        )
+        cur.execute("select array_agg(nextval('sq3')) from generate_series(1, 8)")
+        assert cur.fetchone() == ([2, 1, 0, -1, -2, -3, 2, 1],)
+        cur.execute("create sequence sq3b increment -1 minvalue -1 maxvalue 1")
+        cur.execute("select nextval('sq3b'), nextval('sq3b'), nextval('sq3b')")
+        assert cur.fetchone() == (1, 0, -1)
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select nextval('sq3b')")
+        assert exc.value.diag.message_primary == (
+            'nextval: reached minimum value of sequence "sq3b" (-1)'
+        )
+        # pg_sequence, typed by the AS clause and bounded by it.
+        cur.execute("create sequence sq4 as int")
+        cur.execute(
+            "select seqtypid::regtype::text, seqstart, seqincrement, seqmax, seqmin, seqcache,"
+            " seqcycle from pg_sequence where seqrelid = %s::regclass",
+            ("sq4",),
+        )
+        assert cur.fetchone() == ("integer", 1, 1, 2147483647, 1, 1, False)
+        cur.execute(
+            "select seqtypid::regtype::text, seqstart, seqincrement, seqmax, seqmin, seqcache,"
+            " seqcycle from pg_sequence where seqrelid = 'sq3'::regclass"
+        )
+        assert cur.fetchone() == ("smallint", 2, -1, 2, -3, 1, True)
+        cur.execute(
+            "select seqtypid::regtype::text, seqmax from pg_sequence"
+            " where seqrelid = 'sq1'::regclass"
+        )
+        assert cur.fetchone() == ("bigint", 9223372036854775807)
+        cur.execute("select relkind from pg_class where relname = 'sq1'")
+        assert cur.fetchone() == ("S",)
+        # Duplicates and the option checks.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("create sequence sq1")
+        assert exc.value.diag.sqlstate == "42P07"
+        assert exc.value.diag.message_primary == 'relation "sq1" already exists'
+        notices = _notices(conn)
+        cur.execute("create sequence if not exists sq1")
+        assert cur.statusmessage == "CREATE SEQUENCE"
+        assert notices[-1][2] == 'relation "sq1" already exists, skipping'
+        for sql, message in [
+            (
+                "create sequence sq6 start 5 minvalue 6",
+                "START value (5) cannot be less than MINVALUE (6)",
+            ),
+            (
+                "create sequence sq6 start 5 maxvalue 4",
+                "START value (5) cannot be greater than MAXVALUE (4)",
+            ),
+            (
+                "create sequence sq6 minvalue 6 maxvalue 6",
+                "MINVALUE (6) must be less than MAXVALUE (6)",
+            ),
+            ("create sequence sq6 increment 0", "INCREMENT must not be zero"),
+            ("create sequence sq6 cache 0", "CACHE (0) must be greater than zero"),
+            ("create sequence sq6 as text", "sequence type must be smallint, integer, or bigint"),
+            (
+                "create sequence sq6 as smallint maxvalue 40000",
+                "MAXVALUE (40000) is out of range for sequence data type smallint",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as exc:
+                cur.execute(sql)
+            assert exc.value.diag.sqlstate == "22023", sql
+            assert exc.value.diag.message_primary == message, sql
+        # ALTER: restart, bounds, increment; a missing sequence.
+        cur.execute("alter sequence sq1 restart with 7")
+        assert cur.statusmessage == "ALTER SEQUENCE"
+        cur.execute("select nextval('sq1')")
+        assert cur.fetchone() == (7,)
+        cur.execute("alter sequence sq1 increment by 3 maxvalue 50")
+        cur.execute("select nextval('sq1'), nextval('sq1')")
+        assert cur.fetchone() == (10, 13)
+        cur.execute("alter sequence sq1 restart")
+        cur.execute("select nextval('sq1')")
+        assert cur.fetchone() == (1,)
+        cur.execute("select seqincrement, seqmax from pg_sequence where seqrelid = 'sq1'::regclass")
+        assert cur.fetchone() == (3, 50)
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter sequence sq1 restart with 51")
+        assert exc.value.diag.message_primary == (
+            "RESTART value (51) cannot be greater than MAXVALUE (50)"
+        )
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter sequence nopeseq restart")
+        assert exc.value.diag.sqlstate == "42P01"
+        assert exc.value.diag.message_primary == 'relation "nopeseq" does not exist'
+        cur.execute("alter sequence if exists nopeseq restart")
+        assert cur.statusmessage == "ALTER SEQUENCE"
+        assert notices[-1][2] == 'relation "nopeseq" does not exist, skipping'
+        # setval honours the bounds; a temp sequence is a sequence.
+        cur.execute("select setval('sq2', 3, false)")
+        cur.execute("select nextval('sq2')")
+        assert cur.fetchone() == (3,)
+        cur.execute("create temp sequence sqt")
+        cur.execute("select nextval('sqt')")
+        assert cur.fetchone() == (1,)
+        # DROP: missing (with and without IF EXISTS), several at once.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("drop sequence nope")
+        assert exc.value.diag.sqlstate == "42P01"
+        assert exc.value.diag.message_primary == 'sequence "nope" does not exist'
+        cur.execute("drop sequence if exists nope, nope2")
+        assert cur.statusmessage == "DROP SEQUENCE"
+        assert notices[-2][2] == 'sequence "nope" does not exist, skipping'
+        cur.execute("drop sequence sq1, sq2, sq3, sq3b, sq4, sqt")
+        assert cur.statusmessage == "DROP SEQUENCE"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select nextval('sq1')")
+        assert exc.value.diag.sqlstate == "42P01"
+        cur.execute(
+            "select count(*) from pg_class where relname in ('sq1', 'sq2', 'sq3', 'sq3b', 'sq4',"
+            " 'sqt')"
+        )
+        assert cur.fetchone() == (0,)
+
+
+def test_drop_view_and_index_of_nothing(home: Path) -> None:
+    """There are no views or indexes to drop, but the statements answer as
+    PostgreSQL 16.15 does for a missing one (measured 2026-09-23): 42P01 for
+    a view, 42704 for an index, and IF EXISTS skips with a notice."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        notices = _notices(conn)
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("drop view nope")
+        assert exc.value.diag.sqlstate == "42P01"
+        assert exc.value.diag.message_primary == 'view "nope" does not exist'
+        cur.execute("drop view if exists nope")
+        assert cur.statusmessage == "DROP VIEW"
+        assert notices[-1][2] == 'view "nope" does not exist, skipping'
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("drop index nope")
+        assert exc.value.diag.sqlstate == "42704"
+        assert exc.value.diag.message_primary == 'index "nope" does not exist'
+        cur.execute("drop index if exists nope")
+        assert cur.statusmessage == "DROP INDEX"
+        assert notices[-1][2] == 'index "nope" does not exist, skipping'
+
+
+def test_drop_table_restrict_and_cascade_over_foreign_keys_and_sequences(home: Path) -> None:
+    """A table another table's FOREIGN KEY references cannot be dropped
+    (2BP01) unless CASCADE drops the constraint, with PostgreSQL 16.15's
+    notice (measured 2026-09-23); the same for a sequence a column default
+    draws from. Before the fix the RESTRICT drop went through and left the
+    dependant's key pointing at nothing, so its next INSERT was 42P01."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        notices = _notices(conn)
+        cur.execute("create table pa (id int primary key, n int)")
+        cur.execute("create table pb (id int primary key, a int references pa(id))")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("drop table pa")
+        assert exc.value.diag.sqlstate == "2BP01"
+        assert exc.value.diag.message_primary == (
+            "cannot drop table pa because other objects depend on it"
+        )
+        assert exc.value.diag.message_detail == (
+            "constraint pb_a_fkey on table pb depends on table pa"
+        )
+        assert exc.value.diag.message_hint == (
+            "Use DROP ... CASCADE to drop the dependent objects too."
+        )
+        # Still there, still enforced.
+        cur.execute("insert into pa values (1, 1)")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into pb values (1, 2)")
+        assert exc.value.diag.sqlstate == "23503"
+        # Dropping both at once needs no CASCADE; dropping the parent alone
+        # takes the constraint with it.
+        cur.execute("drop table pa, pb")
+        cur.execute("create table pa (id int primary key, n int)")
+        cur.execute("create table pb (id int primary key, a int references pa(id))")
+        cur.execute("drop table pa cascade")
+        assert cur.statusmessage == "DROP TABLE"
+        assert notices[-1][2] == "drop cascades to constraint pb_a_fkey on table pb"
+        cur.execute("insert into pb values (1, 2)")
+        cur.execute("select * from pb")
+        assert cur.fetchall() == [(1, 2)]
+        cur.execute("drop table pb cascade")
+        # A serial's sequence: RESTRICT refuses, CASCADE drops the default.
+        cur.execute("create table sr (id serial primary key, n int)")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("drop sequence sr_id_seq")
+        assert exc.value.diag.sqlstate == "2BP01"
+        assert exc.value.diag.message_primary == (
+            "cannot drop sequence sr_id_seq because other objects depend on it"
+        )
+        assert exc.value.diag.message_detail == (
+            "default value for column id of table sr depends on sequence sr_id_seq"
+        )
+        cur.execute("drop sequence sr_id_seq cascade")
+        assert cur.statusmessage == "DROP SEQUENCE"
+        assert notices[-1][2] == "drop cascades to default value for column id of table sr"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into sr (n) values (1)")
+        assert exc.value.diag.sqlstate == "23502"
+        cur.execute("select count(*) from pg_class where relname = 'sr_id_seq'")
+        assert cur.fetchone() == (0,)
+        cur.execute("drop table sr")
+        # A sequence OWNED BY a column goes with the column's table.
+        cur.execute("create table ow (id int primary key)")
+        cur.execute("create sequence ows owned by ow.id")
+        cur.execute("drop table ow")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("select nextval('ows')")
+        assert exc.value.diag.sqlstate == "42P01"
+
+
+def test_nextval_is_drawn_once_per_row(home: Path) -> None:
+    """`nextval` in a select list, an aggregate argument, a WHERE conjunct
+    and an UPDATE SET value is evaluated once per ROW, as PostgreSQL 16.15
+    evaluates a volatile call (measured 2026-09-23); with LIMIT only the
+    emitted rows draw, and an ORDER BY over the call's alias sorts the
+    values the rows were given. Before this any `nextval` beside a table
+    was 0A000, and an UPDATE gave every row the same value."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create sequence sq9")
+        cur.execute("create table t9 (id serial primary key, n int)")
+        cur.execute("insert into t9 (n) values (10), (20), (30)")
+        cur.execute("select nextval('sq9'), nextval('sq9') from t9")
+        assert cur.fetchall() == [(1, 2), (3, 4), (5, 6)]
+        cur.execute("select n, nextval('sq9') from t9 order by n limit 2")
+        assert cur.fetchall() == [(10, 7), (20, 8)]
+        cur.execute("select nextval('sq9') as a, n from t9 order by a desc")
+        assert cur.fetchall() == [(11, 30), (10, 20), (9, 10)]
+        cur.execute("select sum(nextval('sq9')), count(*) from t9")
+        assert cur.fetchone() == (39, 3)
+        cur.execute("select n from t9 where nextval('sq9') > 100")
+        assert cur.fetchall() == []
+        # The cheaper conjunct runs first, so only the rows past `n > 15`
+        # draw a value.
+        cur.execute("select n from t9 where nextval('sq9') > 5 and n > 15")
+        assert cur.fetchall() == [(20,), (30,)]
+        cur.execute("select currval('sq9')")
+        assert cur.fetchone() == (19,)
+        cur.execute("update t9 set n = nextval('sq9') * 100")
+        cur.execute("select n from t9 order by id")
+        assert cur.fetchall() == [(2000,), (2100,), (2200,)]
+        cur.execute("update t9 set id = default")
+        cur.execute("select id from t9 order by id")
+        assert cur.fetchall() == [(4,), (5,), (6,)]
+
+
+def test_alter_table_rename_type_and_constraints(home: Path) -> None:
+    """`ALTER TABLE` table-level actions with PostgreSQL 16.15's outcomes
+    and error codes (measured 2026-09-23): RENAME TO carries the FOREIGN
+    KEYs that reference it; ALTER COLUMN TYPE rewrites the rows, with and
+    without USING, and refuses an impossible cast with 42804 and
+    PostgreSQL's hint; ADD CONSTRAINT checks the existing rows (23514 /
+    23505) and a duplicate name is 42710; DROP CONSTRAINT of a missing one
+    is 42704 unless IF EXISTS; RENAME CONSTRAINT; OWNER TO; DROP COLUMN
+    takes the constraints over that column with it; ADD COLUMN with a
+    column-level UNIQUE / CHECK / REFERENCES; a CHECK whose operator does
+    not exist fails at ALTER time with 42883; and an unknown INSERT / UPDATE
+    target names the relation. Before this every one of these was 0A000."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute("create table d (id int primary key, n int, s text)")
+        cur.execute("create table d2 (id int primary key, r int references d(id))")
+        cur.execute("insert into d values (1, 10, '5'), (2, 20, '6')")
+        cur.execute("insert into d2 values (1, 1)")
+        cur.execute("alter table d rename to d3")
+        assert cur.statusmessage == "ALTER TABLE"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into d2 values (2, 9)")
+        assert exc.value.diag.sqlstate == "23503"
+        assert exc.value.diag.message_primary == (
+            'insert or update on table "d2" violates foreign key constraint "d2_r_fkey"'
+        )
+        cur.execute(
+            "select conname, pg_get_constraintdef(oid) from pg_constraint where conrelid ="
+            " 'd2'::regclass"
+        )
+        assert cur.fetchall() == [
+            ("d2_pkey", "PRIMARY KEY (id)"),
+            ("d2_r_fkey", "FOREIGN KEY (r) REFERENCES d3(id)"),
+        ]
+        # ALTER COLUMN TYPE: text -> int needs USING; int -> text does not.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter table d3 alter column s type int")
+        assert exc.value.diag.sqlstate == "42804"
+        assert exc.value.diag.message_primary == (
+            'column "s" cannot be cast automatically to type integer'
+        )
+        assert exc.value.diag.message_hint == ('You might need to specify "USING s::integer".')
+        cur.execute("alter table d3 alter column s type int using s::int")
+        cur.execute("alter table d3 alter column n type text")
+        cur.execute("select n, s, pg_typeof(n)::text, pg_typeof(s)::text from d3 order by id")
+        assert cur.fetchall() == [("10", 5, "text", "integer"), ("20", 6, "text", "integer")]
+        # ADD CONSTRAINT checks the rows already there.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter table d3 add constraint s_small check (s < 6)")
+        assert exc.value.diag.sqlstate == "23514"
+        assert exc.value.diag.message_primary == (
+            'check constraint "s_small" of relation "d3" is violated by some row'
+        )
+        cur.execute("alter table d3 add constraint s_small check (s < 100)")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter table d3 add constraint s_small check (s < 100)")
+        assert exc.value.diag.sqlstate == "42710"
+        assert exc.value.diag.message_primary == (
+            'constraint "s_small" for relation "d3" already exists'
+        )
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into d3 values (3, '30', 100)")
+        assert exc.value.diag.sqlstate == "23514"
+        cur.execute("alter table d3 add constraint n_uniq unique (n)")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into d3 values (3, '10', 7)")
+        assert exc.value.diag.sqlstate == "23505"
+        cur.execute("update d3 set n = '10' where id = 1")
+        cur.execute("insert into d3 values (3, '30', 5)")
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter table d3 add constraint s_uniq unique (s)")
+        assert exc.value.diag.sqlstate == "23505"
+        assert exc.value.diag.message_primary == ('could not create unique index "s_uniq"')
+        assert exc.value.diag.message_detail == "Key (s)=(5) is duplicated."
+        cur.execute("delete from d3 where id = 3")
+        # DROP / RENAME CONSTRAINT.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter table d3 drop constraint nope")
+        assert exc.value.diag.sqlstate == "42704"
+        assert exc.value.diag.message_primary == (
+            'constraint "nope" of relation "d3" does not exist'
+        )
+        cur.execute("alter table d3 drop constraint if exists nope")
+        cur.execute("alter table d3 rename constraint s_small to s_smaller")
+        cur.execute("alter table d3 drop constraint s_smaller")
+        cur.execute("insert into d3 values (3, '30', 100)")
+        cur.execute("alter table d3 owner to current_user")
+        cur.execute(
+            "select conname from pg_constraint where conrelid = 'd3'::regclass and contype <> 'p'"
+            " order by 1"
+        )
+        assert cur.fetchall() == [("n_uniq",)]
+        # DROP COLUMN takes the UNIQUE over it along.
+        cur.execute("alter table d3 drop column n")
+        cur.execute(
+            "select conname from pg_constraint where conrelid = 'd3'::regclass and contype <> 'p'"
+            " order by 1"
+        )
+        assert cur.fetchall() == []
+        # ADD COLUMN with column-level constraints.
+        cur.execute(
+            "alter table d3 add column u int unique, add column c int check (c > 0), add column r"
+            " int references d2(id) on delete cascade"
+        )
+        cur.execute(
+            "select conname, pg_get_constraintdef(oid) from pg_constraint"
+            " where conrelid = 'd3'::regclass and contype <> 'p' order by 1"
+        )
+        assert cur.fetchall() == [
+            ("d3_c_check", "CHECK ((c > 0))"),
+            ("d3_r_fkey", "FOREIGN KEY (r) REFERENCES d2(id) ON DELETE CASCADE"),
+            ("d3_u_key", "UNIQUE (u)"),
+        ]
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("update d3 set c = 0 where id = 1")
+        assert exc.value.diag.sqlstate == "23514"
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("update d3 set r = 5 where id = 1")
+        assert exc.value.diag.sqlstate == "23503"
+        # A CHECK over an operator that does not exist fails at ALTER time.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("alter table d3 add column w text check (w > 1)")
+        assert exc.value.diag.sqlstate == "42883"
+        assert exc.value.diag.message_primary == "operator does not exist: text > integer"
+        # An unknown column in a write names the relation.
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("insert into d3 (id, zz) values (9, 9)")
+        assert exc.value.diag.sqlstate == "42703"
+        assert exc.value.diag.message_primary == 'column "zz" of relation "d3" does not exist'
+        with pytest.raises(psycopg.Error) as exc:
+            cur.execute("update d3 set zz = 1")
+        assert exc.value.diag.sqlstate == "42703"
+        assert exc.value.diag.message_primary == 'column "zz" of relation "d3" does not exist'
+
+
+def test_constraint_and_index_catalogs(home: Path) -> None:
+    """`pg_constraint`, `pg_index`, `pg_indexes` and the index rows of
+    `pg_class`, with `pg_get_constraintdef` / `pg_get_indexdef`, as
+    PostgreSQL 16.15 fills them for a table's CHECK / PRIMARY KEY / UNIQUE
+    / FOREIGN KEY constraints (measured 2026-09-23; oids and the operator
+    columns aside). Before this `pg_constraint` was 42P01, so nothing that
+    reflects a schema -- psql's `\\d`, an ORM's inspector -- could see a
+    constraint."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "create table pa (id int primary key, a int, b int, unique (a, b) deferrable initially"
+            " deferred,"
+            " check (a > 0), r int references pa(id) on delete cascade on update set null"
+            " deferrable,"
+            ' "Q q" int unique)'
+        )
+        cur.execute(
+            "select conname, contype, condeferrable, condeferred, convalidated,"
+            " conrelid = 'pa'::regclass, contypid, conindid <> 0, conparentid,"
+            " confrelid = 'pa'::regclass, confupdtype, confdeltype, confmatchtype,"
+            " conislocal, coninhcount, connoinherit, conkey, confkey, conbin is null"
+            " from pg_constraint where conrelid = 'pa'::regclass order by oid"
+        )
+        assert cur.fetchall() == [
+            (
+                "pa_a_check",
+                "c",
+                False,
+                False,
+                True,
+                True,
+                0,
+                False,
+                0,
+                False,
+                " ",
+                " ",
+                " ",
+                True,
+                0,
+                False,
+                [2],
+                None,
+                False,
+            ),
+            (
+                "pa_pkey",
+                "p",
+                False,
+                False,
+                True,
+                True,
+                0,
+                True,
+                0,
+                False,
+                " ",
+                " ",
+                " ",
+                True,
+                0,
+                True,
+                [1],
+                None,
+                True,
+            ),
+            (
+                "pa_a_b_key",
+                "u",
+                True,
+                True,
+                True,
+                True,
+                0,
+                True,
+                0,
+                False,
+                " ",
+                " ",
+                " ",
+                True,
+                0,
+                True,
+                [2, 3],
+                None,
+                True,
+            ),
+            (
+                "pa_Q q_key",
+                "u",
+                False,
+                False,
+                True,
+                True,
+                0,
+                True,
+                0,
+                False,
+                " ",
+                " ",
+                " ",
+                True,
+                0,
+                True,
+                [5],
+                None,
+                True,
+            ),
+            (
+                "pa_r_fkey",
+                "f",
+                True,
+                False,
+                True,
+                True,
+                0,
+                True,
+                0,
+                True,
+                "n",
+                "c",
+                "s",
+                True,
+                0,
+                True,
+                [4],
+                [1],
+                True,
+            ),
+        ]
+        cur.execute(
+            "select conname, pg_get_constraintdef(oid) from pg_constraint where conrelid ="
+            " 'pa'::regclass order by oid"
+        )
+        assert cur.fetchall() == [
+            ("pa_a_check", "CHECK ((a > 0))"),
+            ("pa_pkey", "PRIMARY KEY (id)"),
+            ("pa_a_b_key", "UNIQUE (a, b) DEFERRABLE INITIALLY DEFERRED"),
+            ("pa_Q q_key", 'UNIQUE ("Q q")'),
+            (
+                "pa_r_fkey",
+                "FOREIGN KEY (r) REFERENCES pa(id) ON UPDATE SET NULL ON DELETE CASCADE DEFERRABLE",
+            ),
+        ]
+        # The FOREIGN KEY's conindid is the referenced key's index.
+        cur.execute(
+            "select con.conname from pg_index i join pg_constraint con on con.conindid ="
+            " i.indexrelid"
+            " where i.indrelid = 'pa'::regclass and i.indisprimary order by 1"
+        )
+        assert cur.fetchall() == [("pa_pkey",), ("pa_r_fkey",)]
+        cur.execute(
+            "select c.relname, indnatts, indnkeyatts, indisunique, indnullsnotdistinct,"
+            " indisprimary,"
+            " indisexclusion, indimmediate, indisclustered, indisvalid, indcheckxmin, indisready,"
+            " indislive, indisreplident, indkey, indoption, indexprs, indpred"
+            " from pg_index i join pg_class c on c.oid = i.indexrelid"
+            " where indrelid = 'pa'::regclass order by c.relname"
+        )
+        assert cur.fetchall() == [
+            (
+                "pa_Q q_key",
+                1,
+                1,
+                True,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                False,
+                "5",
+                "0",
+                None,
+                None,
+            ),
+            (
+                "pa_a_b_key",
+                2,
+                2,
+                True,
+                False,
+                False,
+                False,
+                False,
+                False,
+                True,
+                False,
+                True,
+                True,
+                False,
+                "2 3",
+                "0 0",
+                None,
+                None,
+            ),
+            (
+                "pa_pkey",
+                1,
+                1,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
+                False,
+                True,
+                True,
+                False,
+                "1",
+                "0",
+                None,
+                None,
+            ),
+        ]
+        cur.execute(
+            "select schemaname, tablename, indexname, tablespace, indexdef from pg_indexes where"
+            " tablename = 'pa' order by indexname"
+        )
+        assert cur.fetchall() == [
+            (
+                "public",
+                "pa",
+                "pa_Q q_key",
+                None,
+                'CREATE UNIQUE INDEX "pa_Q q_key" ON public.pa USING btree ("Q q")',
+            ),
+            (
+                "public",
+                "pa",
+                "pa_a_b_key",
+                None,
+                "CREATE UNIQUE INDEX pa_a_b_key ON public.pa USING btree (a, b)",
+            ),
+            (
+                "public",
+                "pa",
+                "pa_pkey",
+                None,
+                "CREATE UNIQUE INDEX pa_pkey ON public.pa USING btree (id)",
+            ),
+        ]
+        cur.execute(
+            "select pg_get_indexdef(indexrelid) from pg_index where indrelid = 'pa'::regclass"
+            " order by 1"
+        )
+        assert cur.fetchall() == [
+            ('CREATE UNIQUE INDEX "pa_Q q_key" ON public.pa USING btree ("Q q")',),
+            ("CREATE UNIQUE INDEX pa_a_b_key ON public.pa USING btree (a, b)",),
+            ("CREATE UNIQUE INDEX pa_pkey ON public.pa USING btree (id)",),
+        ]
+        cur.execute(
+            "select relname, relkind, relam, relhasindex, reltype, relpages, reltuples,"
+            " relreplident, relnatts"
+            " from pg_class where relname = 'pa' or relname like 'pa\\_%' order by relname"
+        )
+        rows = cur.fetchall()
+        assert rows[0][:4] == ("pa", "r", 2, True) and rows[0][5:] == (0, -1.0, "d", 5)
+        assert rows[1:] == [
+            ("pa_Q q_key", "i", 403, False, 0, 1, 0.0, "n", 1),
+            ("pa_a_b_key", "i", 403, False, 0, 1, 0.0, "n", 2),
+            ("pa_pkey", "i", 403, False, 0, 1, 0.0, "n", 1),
+        ]
+        cur.execute(
+            "select pg_get_constraintdef(1), pg_get_indexdef(1), pg_get_constraintdef(null)"
+        )
+        assert cur.fetchone() == (None, None, None)
+        # Dropping a constraint drops its index; a temp table's index is in
+        # the temp schema.
+        cur.execute("alter table pa drop constraint pa_a_b_key")
+        cur.execute("select indexname from pg_indexes where tablename = 'pa' order by 1")
+        assert cur.fetchall() == [("pa_Q q_key",), ("pa_pkey",)]
+        cur.execute("create temp table tt (id int primary key, u text unique)")
+        cur.execute(
+            "select schemaname like 'pg_temp%', indexname, indexdef from pg_indexes where"
+            " tablename = 'tt' order by 2"
+        )
+        assert cur.fetchall() == [
+            (True, "tt_pkey", "CREATE UNIQUE INDEX tt_pkey ON pg_temp.tt USING btree (id)"),
+            (True, "tt_u_key", "CREATE UNIQUE INDEX tt_u_key ON pg_temp.tt USING btree (u)"),
+        ]
+
+
+def test_numeric_typmod_is_applied(home: Path) -> None:
+    """A `numeric(p, s)` column or cast rounds its value half away from zero
+    to `s` places and refuses (22003 `numeric field overflow`) a value with
+    more than `p - s` digits before the point, as PostgreSQL 16.15 does
+    (measured 2026-09-23). The modifier used to be reported and ignored, so
+    `1.234` went into a `numeric(5,2)` column as `1.234` -- a value the
+    declared type cannot hold, which is silent corruption rather than a
+    missing feature."""
+    with _Server(home) as server, server.connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "create table nm (id int primary key, n numeric(5,2), m numeric(4), d decimal(6,3), g"
+            " numeric(6,-2))"
+        )
+        cur.execute(
+            "insert into nm values (1, 1.234, 12.7, 1.0005, 12345.6), (2, 1.235, 12.5, -1.0005,"
+            " 99999949)"
+        )
+        cur.execute("select n::text, m::text, d::text, g::text from nm order by id")
+        assert cur.fetchall() == [
+            ("1.23", "13", "1.001", "12300"),
+            ("1.24", "13", "-1.001", "99999900"),
+        ]
+        cur.execute("insert into nm (id, n) values (3, 'NaN'), (4, 0.005), (5, '1.234e2')")
+        cur.execute("select n::text from nm where id >= 3 order by id")
+        assert cur.fetchall() == [("NaN",), ("0.01",), ("123.40",)]
+        detail = "A field with precision 5, scale 2 must round to an absolute value less than 10^3."
+        for sql in (
+            "insert into nm (id, n) values (9, 1000)",
+            "insert into nm (id, n) values (9, 999.995)",
+            "update nm set n = 12345 where id = 1",
+            "select 12345::numeric(5,2)",
+        ):
+            with pytest.raises(psycopg.errors.NumericValueOutOfRange) as exc:
+                cur.execute(sql)
+            assert str(exc.value).startswith("numeric field overflow"), sql
+            assert exc.value.diag.message_detail == detail, sql
+        with pytest.raises(psycopg.errors.NumericValueOutOfRange) as exc:
+            cur.execute("insert into nm (id, m) values (9, 9999.5)")
+        assert exc.value.diag.message_detail == (
+            "A field with precision 4, scale 0 must round to an absolute value less than 10^4."
+        )
+        with pytest.raises(psycopg.errors.NumericValueOutOfRange) as exc:
+            cur.execute("select 'Infinity'::numeric(5,2)")
+        assert exc.value.diag.message_detail == (
+            "A field with precision 5, scale 2 cannot hold an infinite value."
+        )
+        cur.execute("update nm set n = 3.14159 where id = 1")
+        cur.execute("select n::text, (n + 0.001)::text from nm where id = 1")
+        assert cur.fetchall() == [("3.14", "3.141")]
+        cur.execute(
+            "select 1.2345::numeric(5,2)::text, 1.2345::numeric(3)::text,"
+            " '1.999'::numeric(5,2)::text,"
+            " (-1.005)::numeric(5,2)::text, 2.5::numeric(1)::text, 123.456::numeric(5,-1)::text,"
+            " 0.001::numeric(5,2)::text, 1e5::numeric(5,-2)::text, 'NaN'::numeric(5,2)::text,"
+            " pg_typeof(1.2345::numeric(5,2))::text"
+        )
+        assert cur.fetchall() == [
+            ("1.23", "1", "2.00", "-1.01", "3", "120", "0.00", "100000", "NaN", "numeric")
+        ]
+        cur.execute("select n from nm where n = 1.24")
+        assert cur.fetchall() == [(Decimal("1.24"),)]
+        cur.execute("select n from nm where n = 1.235")
+        assert cur.fetchall() == []
+        cur.execute("alter table nm add column c numeric(3,1)")
+        cur.execute("insert into nm (id, c) values (6, 12.34)")
+        cur.execute("alter table nm alter column c type numeric(4,2)")
+        cur.execute("select c::text from nm where id = 6")
+        assert cur.fetchall() == [("12.30",)]
+        for sql, message in (
+            ("select 1::numeric(1001)", "NUMERIC precision 1001 must be between 1 and 1000"),
+            ("select 1::numeric(0)", "NUMERIC precision 0 must be between 1 and 1000"),
+            ("select 1::numeric(5,-1001)", "NUMERIC scale -1001 must be between -1000 and 1000"),
+            ("create table nm2 (n numeric(0))", "NUMERIC precision 0 must be between 1 and 1000"),
+        ):
+            with pytest.raises(psycopg.errors.InvalidParameterValue) as exc:
+                cur.execute(sql)
+            assert str(exc.value).startswith(message), sql
+
+
+def test_prepare_execute_statements(home: Path) -> None:
+    """SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`, as PostgreSQL 16.15
+    answers them (measured 2026-09-23): an undeclared parameter takes its
+    type from the column, literal or cast it meets (`where id = $1` is
+    integer, `$1 + 1` integer, `limit $1` bigint, a bare `where $1`
+    boolean), an untyped `EXECUTE` argument is coerced to the parameter's
+    type by the assignment rule (`3.5` rounds into an integer) while a typed
+    one that cannot be is `42804` with PostgreSQL's hint, the wrong argument
+    count is `42601`, a duplicate name `42P05`, an unknown one `26000`, and
+    the statement is listed in `pg_prepared_statements` with `from_sql`.
+    SQL and wire prepared statements share one namespace: a wire `Execute`
+    runs a SQL-prepared name, a SQL `EXECUTE` runs a wire-prepared one, a
+    wire `Parse` of a name in use is `42P05`, and a SQL `DEALLOCATE` frees
+    the name for both."""
+    from psycopg import pq
+
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("create table pp (id int primary key, s text, n numeric(5,2))")
+        cur.execute("prepare ins (int, text) as insert into pp (id, s) values ($1, $2)")
+        cur.execute("prepare by_id as select id, s from pp where id = $1")
+        cur.execute("prepare plus as select $1 + 1")
+        cur.execute("prepare page as select id from pp order by id limit $1")
+        cur.execute("prepare gate as select 1 where $1")
+        cur.execute("prepare pair (int, unknown) as select $1, $2")
+        cur.execute("execute ins(1, 'a')")
+        cur.execute("execute ins('2', 'b')")
+        cur.execute("execute ins(3.5, 'c')")
+        cur.execute("execute by_id(4)")
+        assert cur.fetchall() == [(4, "c")]
+        cur.execute("execute by_id('1')")
+        assert cur.fetchall() == [(1, "a")]
+        cur.execute("execute plus(41)")
+        assert cur.fetchall() == [(42,)]
+        cur.execute("execute page(2)")
+        assert cur.fetchall() == [(1,), (2,)]
+        cur.execute("execute gate(true)")
+        assert cur.fetchall() == [(1,)]
+        cur.execute("execute gate('no')")
+        assert cur.fetchall() == []
+        cur.execute("execute pair(7, 'x')")
+        assert cur.fetchall() == [(7, "x")]
+        cur.execute(
+            "select name, statement, parameter_types::text, result_types::text, from_sql"
+            " from pg_prepared_statements order by name"
+        )
+        assert cur.fetchall() == [
+            (
+                "by_id",
+                "prepare by_id as select id, s from pp where id = $1",
+                "{integer}",
+                "{integer,text}",
+                True,
+            ),
+            ("gate", "prepare gate as select 1 where $1", "{boolean}", "{integer}", True),
+            (
+                "ins",
+                "prepare ins (int, text) as insert into pp (id, s) values ($1, $2)",
+                "{integer,text}",
+                None,
+                True,
+            ),
+            (
+                "page",
+                "prepare page as select id from pp order by id limit $1",
+                "{bigint}",
+                "{integer}",
+                True,
+            ),
+            (
+                "pair",
+                "prepare pair (int, unknown) as select $1, $2",
+                "{integer,text}",
+                "{integer,text}",
+                True,
+            ),
+            ("plus", "prepare plus as select $1 + 1", "{integer}", "{integer}", True),
+        ]
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as exc:
+            cur.execute("execute ins(true, 'd')")
+        assert str(exc.value).startswith(
+            "parameter $1 of type boolean cannot be coerced to the expected type integer"
+        )
+        assert exc.value.diag.message_hint == "You will need to rewrite or cast the expression."
+        with pytest.raises(psycopg.errors.DatatypeMismatch) as exc:
+            cur.execute("execute ins(now(), 'd')")
+        assert str(exc.value).startswith(
+            "parameter $1 of type timestamp with time zone cannot be coerced to the expected type"
+            " integer"
+        )
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation):
+            cur.execute("execute ins('x', 'd')")
+        with pytest.raises(psycopg.errors.SyntaxError) as exc:
+            cur.execute("execute ins(1)")
+        assert str(exc.value).startswith('wrong number of parameters for prepared statement "ins"')
+        with pytest.raises(psycopg.errors.DuplicatePreparedStatement) as exc:
+            cur.execute("prepare ins as select 1")
+        assert str(exc.value).startswith('prepared statement "ins" already exists')
+        with pytest.raises(psycopg.errors.IndeterminateDatatype) as exc:
+            cur.execute("prepare bad as select 1 where $1 is null")
+        assert str(exc.value).startswith("could not determine data type of parameter $1")
+        cur.execute("deallocate plus")
+        with pytest.raises(psycopg.errors.InvalidSqlStatementName) as exc:
+            cur.execute("execute plus(1)")
+        assert str(exc.value).startswith('prepared statement "plus" does not exist')
+        with pytest.raises(psycopg.errors.InvalidSqlStatementName):
+            cur.execute("deallocate plus")
+
+        pgconn = conn.pgconn
+
+        def wire(name: str, *args: object) -> tuple[str, bytes | None]:
+            getattr(pgconn, name)(*args)
+            results = []
+            while (res := pgconn.get_result()) is not None:
+                results.append(res)
+            res = results[0]
+            if res.error_message:
+                return pq.ExecStatus(res.status).name, res.error_message
+            return pq.ExecStatus(res.status).name, (res.get_value(0, 0) if res.ntuples else None)
+
+        # A wire Execute of the SQL-prepared name, and a wire Parse of it.
+        assert wire("send_query_prepared", b"by_id", [b"2"]) == ("TUPLES_OK", b"2")
+        assert wire("send_prepare", b"by_id", b"select 1") == (
+            "FATAL_ERROR",
+            b'ERROR:  prepared statement "by_id" already exists\n',
+        )
+        # A SQL EXECUTE of a wire-prepared name, and a SQL PREPARE of it.
+        assert wire("send_prepare", b"w1", b"select 43 + $1") == ("COMMAND_OK", None)
+        cur.execute("execute w1(2)")
+        assert cur.fetchall() == [(45,)]
+        with pytest.raises(psycopg.errors.DuplicatePreparedStatement):
+            cur.execute("prepare w1 as select 1")
+        cur.execute("select name, from_sql from pg_prepared_statements where name = 'w1'")
+        assert cur.fetchall() == [("w1", False)]
+        # A SQL DEALLOCATE frees the name on the wire too.
+        cur.execute("deallocate w1")
+        assert wire("send_query_prepared", b"w1", []) == (
+            "FATAL_ERROR",
+            b'ERROR:  prepared statement "w1" does not exist\n',
+        )
+        assert wire("send_prepare", b"w1", b"select 44") == ("COMMAND_OK", None)
+        assert wire("send_query_prepared", b"w1", []) == ("TUPLES_OK", b"44")
+        cur.execute("deallocate all")
+        assert wire("send_query_prepared", b"w1", []) == (
+            "FATAL_ERROR",
+            b'ERROR:  prepared statement "w1" does not exist\n',
+        )
+        cur.execute("select count(*) from pg_prepared_statements")
+        assert cur.fetchall() == [(0,)]
+
+
+def _failure(
+    conn: psycopg.Connection, sql: str
+) -> tuple[str | None, str | None, str | None, str | None]:
+    """`(sqlstate, message, position, hint)` of the error `sql` raises."""
+    try:
+        conn.execute(sql).fetchall()
+    except psycopg.Error as exc:  # noqa: BLE001 - the diagnostics are the assertion
+        d = exc.diag
+        return d.sqlstate, d.message_primary, d.statement_position, d.message_hint
+    raise AssertionError(f"{sql} did not fail")
+
+
+_NO_OPERATOR_HINT = (
+    "No operator matches the given name and argument types."
+    " You might need to add explicit type casts."
+)
+
+
+def test_operator_errors_are_positioned_wherever_the_operator_sits(home: Path) -> None:
+    """`42883 operator does not exist: <left> <op> <right>` is raised at
+    plan time with `P` on the operator and PostgreSQL's hint, in every
+    clause an operator can appear in (measured against PostgreSQL 16.15,
+    2026-09-24): the select list, WHERE and its `NOT` / `OR` / parenthesised
+    conjuncts, `CASE`, `ORDER BY`, `HAVING` (where `count(*)` is bigint),
+    `JOIN ... ON`, `BETWEEN` (spelled as its `>=` half), `ANY` / `ALL`
+    over an array, an `IN` list, an `IN (subquery)`, `EXISTS`, and the
+    WHERE of UPDATE / DELETE / INSERT ... SELECT. The LIKE family names
+    its operator (`~~`, `~~*`, `!~`), temporal arithmetic refuses text
+    (`date - text`, `timestamp with time zone - text`), and a bare
+    `interval + integer` is refused too. Rows are never touched."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute(
+            "create table oe (id int primary key, v text, n numeric, k int, d date, b bool)"
+        )
+        conn.execute("insert into oe values (1, 'a', 1.5, 2, '2024-01-01', true)")
+        cases = [
+            ("select id = 'x'::text from oe", "integer = text", "11"),
+            ("select 1 = true", "integer = boolean", "10"),
+            ("select 'a'::text < 1", "text < integer", "18"),
+            ("select id from oe where id = 'x'::text", "integer = text", "28"),
+            ("select id from oe where v = 1", "text = integer", "27"),
+            ("select id from oe where id = 1 and v = 1", "text = integer", "38"),
+            ("select id from oe where id = 1 or v = 2", "text = integer", "37"),
+            ("select id from oe where (id = 1) and (v = 2)", "text = integer", "41"),
+            ("select id from oe where not v = 2", "text = integer", "31"),
+            ("select case when v = 2 then 1 end from oe", "text = integer", "20"),
+            ("select id from oe order by id = 'x'::text", "integer = text", "31"),
+            ("select count(*) from oe having count(*) = 'x'::text", "bigint = text", "41"),
+            ("select id from oe group by id having id = 'x'::text", "integer = text", "41"),
+            ("select k from oe group by k having k = v", "integer = text", "38"),
+            ("select a.id from oe a join oe b on a.v = b.id", "text = integer", "40"),
+            ("select id from oe where id between 'a'::text and 3", "integer >= text", "28"),
+            ("select id from oe where v = any(array[1,2])", "text = integer", "27"),
+            ("select id from oe where v <> all(array[1])", "text <> integer", "27"),
+            ("select k from oe where k = any(array['a'::text])", "integer = text", "26"),
+            ("select k from oe where v in (1, 2)", "text = integer", "26"),
+            ("select k from oe where v not in (1, 2)", "text <> integer", "26"),
+            ("select k from oe where k in (1, 'a'::text)", "integer = text", "26"),
+            ("select id from oe where id in (select 'x')", "integer = text", "28"),
+            ("select id from oe where exists (select 1 where v = 1)", "text = integer", "50"),
+            ("select id from oe where (select 1) = 'x'::text", "integer = text", "36"),
+            ("update oe set v = 1 where v = 2", "text = integer", "29"),
+            ("delete from oe where v = 2", "text = integer", "24"),
+            ("insert into oe select 2, 'b', 1 where 'x'::text = 1", "text = integer", "49"),
+            ("select now() = 1", "timestamp with time zone = integer", "14"),
+            ("select 1 + 'x'::text", "integer + text", "10"),
+            ("select id from oe where v like 1", "text ~~ integer", "27"),
+            ("select id from oe where k ilike 'a'", "integer ~~* unknown", "27"),
+            ("select id from oe where v ~ 1", "text ~ integer", "27"),
+            ("select id from oe where k !~ 'a'", "integer !~ unknown", "27"),
+            ("select d - v from oe", "date - text", "10"),
+            ("select now() - 'x'::text", "timestamp with time zone - text", "14"),
+            ("select interval '1 day' + 1", "interval + integer", "25"),
+            ("select b = 1 from oe", "boolean = integer", "10"),
+            ("select v + 1 from oe", "text + integer", "10"),
+        ]
+        for sql, types, position in cases:
+            assert _failure(conn, sql) == (
+                "42883",
+                f"operator does not exist: {types}",
+                position,
+                _NO_OPERATOR_HINT,
+            ), sql
+        assert _failure(conn, "select ~ 'x'::text") == (
+            "42883",
+            "operator does not exist: ~ text",
+            "8",
+            "No operator matches the given name and argument type. You might need to add an"
+            " explicit type cast.",
+        )
+        assert conn.execute("select id, v, n, k, d, b from oe").fetchall() == [
+            (1, "a", Decimal("1.5"), 2, dt.date(2024, 1, 1), True)
+        ]
+
+
+def test_subquery_expressions(home: Path) -> None:
+    """Scalar subqueries, `EXISTS`, `IN` / `NOT IN`, `ANY` / `ALL` and
+    `ARRAY(...)` over a subquery, correlated or not, in the select list,
+    WHERE, `CASE`, `SET` and the WHERE of UPDATE / DELETE (values measured
+    against PostgreSQL 16.15, 2026-09-24). `NOT IN` over a set with a NULL
+    matches nothing, `<> ALL` over the non-null set is the fix; a scalar
+    subquery returning two rows is `21000`, two columns is
+    `42601 subquery must return only one column` positioned at the
+    subquery, and a mistyped `IN (subquery)` is the usual `42883`."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("create table sa (id int primary key, v int default 7, name text)")
+        conn.execute(
+            "create table sb (id int primary key, a_id int references sa(id), amt numeric(6,2))"
+        )
+        conn.execute("insert into sa (id, name) values (1, 'one'), (2, 'two'), (3, 'three')")
+        conn.execute(
+            "insert into sb values (10, 1, 1.5), (11, 1, 2.25), (12, 2, 10), (13, null, 3)"
+        )
+
+        def q(conn: psycopg.Connection, sql: str) -> list[tuple]:
+            return conn.execute(sql).fetchall()
+
+        assert q(conn, "select id from sa where id not in (select a_id from sb) order by id") == []
+        assert q(
+            conn,
+            "select id from sa where id not in (select a_id from sb where a_id is not null) order"
+            " by id",
+        ) == [(3,)]
+        assert q(
+            conn,
+            "select id from sa where id <> all (select a_id from sb where a_id is not null) order"
+            " by id",
+        ) == [(3,)]
+        assert q(conn, "select id from sa where id < all (select id from sb) order by id") == [
+            (1,),
+            (2,),
+            (3,),
+        ]
+        assert q(conn, "select id from sa where id > any (select a_id from sb) order by id") == [
+            (2,),
+            (3,),
+        ]
+        assert q(conn, "select array(select id from sb order by id)") == [([10, 11, 12, 13],)]
+        assert q(
+            conn, "select array(select a_id from sb where a_id is not null order by 1 desc)"
+        ) == [([2, 1, 1],)]
+        assert q(
+            conn,
+            "select id, array(select sb.id from sb where sb.a_id = sa.id order by sb.id) from sa"
+            " order by id",
+        ) == [(1, [10, 11]), (2, [12]), (3, [])]
+        assert q(
+            conn,
+            "select id, (select sum(amt) from sb where sb.a_id = sa.id) total from sa order by id",
+        ) == [
+            (1, Decimal("3.75")),
+            (2, Decimal("10.00")),
+            (3, None),
+        ]
+        assert q(
+            conn,
+            "select id, coalesce((select sum(amt) from sb where sb.a_id = sa.id), 0) total from sa"
+            " order by id",
+        ) == [(1, Decimal("3.75")), (2, Decimal("10.00")), (3, Decimal("0"))]
+        assert q(
+            conn,
+            "select name from sa where exists (select 1 from sb where sb.a_id = sa.id and amt > 2)"
+            " order by name",
+        ) == [("one",), ("two",)]
+        assert q(
+            conn,
+            "select sa.id, sb.id from sa join sb on sb.a_id = sa.id"
+            " where sb.amt = (select max(amt) from sb x where x.a_id = sa.id) order by 1, 2",
+        ) == [(1, 11), (2, 12)]
+        assert q(conn, "select count(*) from sa where id in (select a_id from sb)") == [(2,)]
+        assert q(conn, "select (select name from sa where id = 2) || '!'") == [("two!",)]
+        assert q(
+            conn,
+            "select id from sa where name = (select name from sa x where x.id = sa.id) order by id",
+        ) == [
+            (1,),
+            (2,),
+            (3,),
+        ]
+        assert q(
+            conn,
+            "select id from sa where exists (select 1 from sb b where b.a_id = sa.id"
+            " and exists (select 1 from sb c where c.id = b.id + 1)) order by id",
+        ) == [(1,), (2,)]
+        assert q(
+            conn,
+            "select id, (select count(*) from sb where sb.a_id = sa.id) > 1 as busy from sa order"
+            " by id",
+        ) == [
+            (1, True),
+            (2, False),
+            (3, False),
+        ]
+        assert q(
+            conn, "select case when exists (select 1 from sb where a_id = 3) then 'y' else 'n' end"
+        ) == [("n",)]
+        assert q(
+            conn,
+            "select exists (select 1 from sa where id = 1), exists (select 1 from sa where id = 9)",
+        ) == [(True, False)]
+        assert q(
+            conn,
+            "select 1 in (select id from sa), 9 in (select id from sa),"
+            " null in (select id from sa)",
+        ) == [(True, False, None)]
+        assert q(
+            conn, "select (select id from sa where id = 1) + (select id from sa where id = 2)"
+        ) == [(3,)]
+        assert q(conn, "select x from (select (select max(id) from sb) as x) s") == [(13,)]
+        assert q(
+            conn,
+            "select id from sa where (select count(*) from sb where sb.a_id = sa.id) = 0 order by"
+            " id",
+        ) == [(3,)]
+        conn.execute("update sa set v = (select count(*) from sb where sb.a_id = sa.id)")
+        assert q(conn, "select id, v from sa order by id") == [(1, 2), (2, 1), (3, 0)]
+        conn.execute("update sa set v = 99 where id in (select a_id from sb where amt > 5)")
+        assert q(conn, "select id, v from sa order by id") == [(1, 2), (2, 99), (3, 0)]
+        conn.execute("delete from sb where a_id in (select id from sa where v = 99)")
+        assert q(conn, "select id from sb order by id") == [(10,), (11,), (13,)]
+        conn.execute("delete from sb where not exists (select 1 from sa where sa.id = sb.a_id)")
+        assert q(conn, "select id from sb order by id") == [(10,), (11,)]
+        assert _failure(conn, "select id from sa where (select v from sa) = 7") == (
+            "21000",
+            "more than one row returned by a subquery used as an expression",
+            None,
+            None,
+        )
+        assert _failure(conn, "select (select 1, 2)") == (
+            "42601",
+            "subquery must return only one column",
+            "8",
+            None,
+        )
+        assert _failure(conn, "select id from sa where id = (select id, v from sa)") == (
+            "42601",
+            "subquery must return only one column",
+            "30",
+            None,
+        )
+        assert _failure(conn, "select id from sa where id in (select 'x')") == (
+            "42883",
+            "operator does not exist: integer = text",
+            "28",
+            _NO_OPERATOR_HINT,
+        )
+
+
+def test_alternate_date_input_shapes_under_mdy(home: Path) -> None:
+    """Under the default `DateStyle = ISO, MDY` PostgreSQL 16.15 reads
+    `M/D/Y`, `Mon D[,] Y`, `D Mon Y`, `Y Mon D`, dashed `D-Mon-Y` forms,
+    `YYYY.DDD` day-of-year, a two-digit year, and a leading weekday, for
+    `date`, `timestamp` and `timestamptz` alike (measured 2026-09-24). A
+    month or day outside its range is `22008` at the literal with the
+    `datestyle` hint; a day that merely does not exist in its month is
+    `22008` with no hint; and a bare offset on a date is rejected with the
+    hint, quoting the literal offset and all."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        jan8 = dt.date(1999, 1, 8)
+        for text in [
+            "Jan 8, 1999",
+            "Jan 8 1999",
+            "January 8, 1999",
+            "08-Jan-1999",
+            "1999-Jan-08",
+            "Jan-08-1999",
+            "8 Jan 1999",
+            "1999 Jan 8",
+            "1999.008",
+            "jan 8 1999",
+            "JAN 8 1999",
+            "Sat Jan 8 1999",
+            "Jan 8 99",
+            "8 Jan 99",
+        ]:
+            assert conn.execute(f"select '{text}'::date").fetchone() == (jan8,), text
+        assert conn.execute(
+            "select '1/13/2024'::date, '01/02/03'::date, '1/2/2003'::date"
+        ).fetchone() == (
+            dt.date(2024, 1, 13),
+            dt.date(2003, 1, 2),
+            dt.date(2003, 1, 2),
+        )
+        assert conn.execute(
+            "select '1/13/2024 10:20'::timestamp, 'Jan 8, 1999 10:20:30.5'::timestamp,"
+            " '08-Jan-1999 10:20'::timestamp, '1/13/2024 10:20:30+02'::timestamptz::text"
+        ).fetchone() == (
+            dt.datetime(2024, 1, 13, 10, 20),
+            dt.datetime(1999, 1, 8, 10, 20, 30, 500000),
+            dt.datetime(1999, 1, 8, 10, 20),
+            "2024-01-13 08:20:30+00",
+        )
+        hint = 'Perhaps you need a different "datestyle" setting.'
+        for text, with_hint in [
+            ("Jan 32 2024", True),
+            ("13/01/2024", True),
+            ("2020-13-01+02", True),
+            ("Feb 30 2024", False),
+        ]:
+            assert _failure(conn, f"select '{text}'::date") == (
+                "22008",
+                f'date/time field value out of range: "{text}"',
+                "8",
+                hint if with_hint else None,
+            ), text
+
+
+def test_assignment_type_errors_carry_positions(home: Path) -> None:
+    """A column-typed or explicitly typed value that cannot be assigned to
+    the target column is `42804 column "k" is of type integer but
+    expression is of type text` with the rewrite-or-cast hint, `P` at the
+    value, on UPDATE ... SET, INSERT ... VALUES and INSERT ... SELECT
+    (measured against PostgreSQL 16.15, 2026-09-24). `'x'::text` reports
+    at the literal, a bare column at the column, whatever the WHERE says.
+    Assignable pairs (`integer` into `numeric`, `integer` into `text`? no
+    -- only the numeric one) go through; nothing is written on failure."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute(
+            "create table asg (id int primary key, v text, n numeric, k int, d date, b bool, j"
+            " jsonb)"
+        )
+        conn.execute("insert into asg values (1, 'a', 1.5, 2, '2024-01-02', true, '{}')")
+        hint = "You will need to rewrite or cast the expression."
+        for sql, message, position in [
+            (
+                "update asg set k = v",
+                'column "k" is of type integer but expression is of type text',
+                "20",
+            ),
+            (
+                "update asg set k = d",
+                'column "k" is of type integer but expression is of type date',
+                "20",
+            ),
+            (
+                "update asg set d = v",
+                'column "d" is of type date but expression is of type text',
+                "20",
+            ),
+            (
+                "update asg set k = 'x'::text",
+                'column "k" is of type integer but expression is of type text',
+                "20",
+            ),
+            (
+                "update asg set b = k",
+                'column "b" is of type boolean but expression is of type integer',
+                "20",
+            ),
+            (
+                "update asg set k = b",
+                'column "k" is of type integer but expression is of type boolean',
+                "20",
+            ),
+            (
+                "update asg set j = v",
+                'column "j" is of type jsonb but expression is of type text',
+                "20",
+            ),
+            (
+                "update asg set k = asg.v",
+                'column "k" is of type integer but expression is of type text',
+                "20",
+            ),
+            (
+                "update asg set k = v where id = 1 and k = 2",
+                'column "k" is of type integer but expression is of type text',
+                "20",
+            ),
+            (
+                "insert into asg (id, k) values (2, 'x'::text)",
+                'column "k" is of type integer but expression is of type text',
+                "36",
+            ),
+            (
+                "insert into asg (id, k) values (2, true)",
+                'column "k" is of type integer but expression is of type boolean',
+                "36",
+            ),
+            (
+                "insert into asg (id, k) select 3, v from asg",
+                'column "k" is of type integer but expression is of type text',
+                "35",
+            ),
+        ]:
+            assert _failure(conn, sql) == ("42804", message, position, hint), sql
+        conn.execute("update asg set n = k")
+        conn.execute("update asg set v = k")
+        assert conn.execute("select id, v, n, k from asg").fetchall() == [(1, "2", Decimal("2"), 2)]
+        assert conn.execute("select count(*) from asg").fetchone() == (1,)
+
+
+def test_returning_with_parameters_and_n_way_joins(home: Path) -> None:
+    """UPDATE / DELETE ... RETURNING with bound parameters, a three-table
+    join with mixed ON / WHERE predicates, and an aggregate over a
+    subselect on one side of a join (measured against PostgreSQL 16.15,
+    2026-09-24)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("create table nj1 (id int primary key, name text)")
+        conn.execute(
+            "create table nj2 (id int primary key, a int references nj1(id), amt numeric(6,2))"
+        )
+        conn.execute("create table nj3 (id int primary key, b int references nj2(id), tag text)")
+        conn.execute("insert into nj1 values (1, 'one'), (2, 'two'), (3, 'three')")
+        conn.execute("insert into nj2 values (10, 1, 1.5), (11, 1, 2.25), (12, 2, 10)")
+        conn.execute(
+            "insert into nj3 values (100, 10, 'x'), (101, 11, 'y'), (102, 12, 'x'), (103, null,"
+            " 'z')"
+        )
+        assert conn.execute(
+            "select nj1.name, nj2.amt, nj3.tag from nj1 join nj2 on nj2.a = nj1.id"
+            " join nj3 on nj3.b = nj2.id where nj3.tag = %s order by nj2.id",
+            ("x",),
+        ).fetchall() == [("one", Decimal("1.50"), "x"), ("two", Decimal("10.00"), "x")]
+        assert conn.execute(
+            "select a.name, count(*), sum(c.amt) from nj1 a"
+            " join nj2 c on c.a = a.id left join nj3 d on d.b = c.id"
+            " group by a.name order by a.name"
+        ).fetchall() == [("one", 2, Decimal("3.75")), ("two", 1, Decimal("10.00"))]
+        assert conn.execute(
+            "select nj1.name, s.total from nj1"
+            " join (select a, sum(amt) total from nj2 group by a) s on s.a = nj1.id order by nj1.id"
+        ).fetchall() == [("one", Decimal("3.75")), ("two", Decimal("10.00"))]
+        assert conn.execute(
+            "select count(*), max(s.total) from nj1"
+            " join (select a, sum(amt) total from nj2 group by a) s on s.a = nj1.id"
+        ).fetchall() == [(2, Decimal("10.00"))]
+        assert conn.execute(
+            "update nj2 set amt = amt + %s where a = %s returning id, amt", (Decimal("0.5"), 1)
+        ).fetchall() == [(10, Decimal("2.00")), (11, Decimal("2.75"))]
+        assert conn.execute(
+            "delete from nj3 where tag = %s or b is null returning id, tag", ("y",)
+        ).fetchall() == [(101, "y"), (103, "z")]
+        assert conn.execute("select id from nj3 order by id").fetchall() == [(100,), (102,)]
+
+
+def test_psql_describe_helpers(home: Path) -> None:
+    """The catalog functions psql's `\\d` / `\\dt` lean on: `pg_am` rows,
+    `pg_get_userbyid` (an unknown OID is spelled out), `pg_table_is_visible`,
+    `OPERATOR(pg_catalog.~)`, a `COLLATE "C"` on a text comparison, the
+    3-argument `pg_get_indexdef` and 2-argument `pg_get_constraintdef`,
+    and `pg_attrdef` + `pg_get_expr` for a column default (measured
+    against PostgreSQL 16.15, 2026-09-24)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("create table cx (id int primary key, n int default 5, t text unique)")
+        assert conn.execute(
+            "select oid, amname, amhandler::text, amtype from pg_am order by oid"
+        ).fetchall() == [
+            (2, "heap", "heap_tableam_handler", "t"),
+            (403, "btree", "bthandler", "i"),
+            (405, "hash", "hashhandler", "i"),
+            (783, "gist", "gisthandler", "i"),
+            (2742, "gin", "ginhandler", "i"),
+            (3580, "brin", "brinhandler", "i"),
+            (4000, "spgist", "spghandler", "i"),
+        ]
+        assert conn.execute("select pg_get_userbyid(0), pg_get_userbyid(6171)").fetchone() == (
+            "unknown (OID=0)",
+            "pg_database_owner",
+        )
+        assert conn.execute(
+            "select c.relname, am.amname from pg_class c left join pg_am am on am.oid = c.relam"
+            " where c.relname = 'cx'"
+        ).fetchone() == ("cx", "heap")
+        assert conn.execute(
+            "select c.relname, pg_table_is_visible(c.oid) from pg_class c"
+            " where c.relname operator(pg_catalog.~) '^(cx)$' collate pg_catalog.default"
+            " and pg_catalog.pg_table_is_visible(c.oid)"
+        ).fetchall() == [("cx", True)]
+        assert conn.execute(
+            "select 'b' > 'a' collate \"C\", 'b' < 'a' collate \"C\""
+        ).fetchone() == (True, False)
+        assert conn.execute(
+            'select n.nspname as "Schema", c.relname as "Name",'
+            " case c.relkind when 'r' then 'table' when 'v' then 'view' when 'i' then 'index' end"
+            ' as "Type",'
+            ' pg_catalog.pg_get_userbyid(c.relowner) as "Owner"'
+            " from pg_catalog.pg_class c left join pg_catalog.pg_namespace n on n.oid ="
+            " c.relnamespace"
+            " where c.relkind in ('r', 'p', '') and n.nspname <> 'pg_catalog' and n.nspname !~"
+            " '^pg_toast'"
+            " and n.nspname <> 'information_schema' and pg_catalog.pg_table_is_visible(c.oid)"
+            " and c.relname = 'cx' order by 1, 2"
+        ).fetchall() == [("public", "cx", "table", conn.info.user)]
+        assert conn.execute(
+            "select c.relname, pg_get_indexdef(i.indexrelid, 0, true),"
+            " pg_get_indexdef(i.indexrelid, 1, true)"
+            " from pg_index i join pg_class c on c.oid = i.indexrelid where i.indrelid ="
+            " 'cx'::regclass"
+            " order by c.relname"
+        ).fetchall() == [
+            ("cx_pkey", "CREATE UNIQUE INDEX cx_pkey ON cx USING btree (id)", "id"),
+            ("cx_t_key", "CREATE UNIQUE INDEX cx_t_key ON cx USING btree (t)", "t"),
+        ]
+        assert conn.execute(
+            "select conname, pg_get_constraintdef(oid, true) from pg_constraint"
+            " where conrelid = 'cx'::regclass order by conname"
+        ).fetchall() == [("cx_pkey", "PRIMARY KEY (id)"), ("cx_t_key", "UNIQUE (t)")]
+        assert conn.execute(
+            "select a.attname, pg_get_expr(d.adbin, d.adrelid, true) from pg_attrdef d"
+            " join pg_attribute a on a.attrelid = d.adrelid and a.attnum = d.adnum"
+            " where d.adrelid = 'cx'::regclass"
+        ).fetchall() == [("n", "5")]
+
+
+def test_stray_qualifiers_are_refused(home: Path) -> None:
+    """A qualified column reference whose qualifier names no FROM item is
+    42P01 `missing FROM-clause entry for table "x"`, positioned at the
+    reference; a relation FROM knows only under an alias is 42P01 `invalid
+    reference to FROM-clause entry for table "t"` with a hint naming the
+    alias. Both used to be silently resolved against the bare column
+    (measured against PostgreSQL 16.15, 2026-09-24)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("create table wq (id int primary key, c int)")
+        conn.execute("insert into wq values (1, 2)")
+        alias_hint = 'Perhaps you meant to reference the table alias "w".'
+        invalid = 'invalid reference to FROM-clause entry for table "wq"'
+        for sql, message, position, hint in [
+            (
+                "select id from wq where x.id = 1",
+                'missing FROM-clause entry for table "x"',
+                "25",
+                None,
+            ),
+            ("select x.id from wq", 'missing FROM-clause entry for table "x"', "8", None),
+            (
+                "select id from wq where length(w.c::text) = 1",
+                'missing FROM-clause entry for table "w"',
+                "32",
+                None,
+            ),
+            (
+                "select starts_with(x.relname, 'a') from pg_class c limit 1",
+                'missing FROM-clause entry for table "x"',
+                "20",
+                None,
+            ),
+            ("select id from wq w where wq.id = 1", invalid, "27", alias_hint),
+            ("select wq.id from wq w", invalid, "8", alias_hint),
+            ("update wq w set c = 1 where wq.id = 1", invalid, "29", alias_hint),
+            ("delete from wq w where wq.id = 1", invalid, "24", alias_hint),
+        ]:
+            assert _failure(conn, sql) == ("42P01", message, position, hint), sql
+        # The qualifiers that ARE in scope: the relation, its alias, a CTE,
+        # a derived table, a FROM function by alias or by name, and a
+        # schema-qualified relation.
+        assert conn.execute("select w.id from wq w where w.c = 2").fetchall() == [(1,)]
+        assert conn.execute("select wq.id from wq where wq.c = 2").fetchall() == [(1,)]
+        assert conn.execute("select public.wq.id from public.wq").fetchall() == [(1,)]
+        assert conn.execute("with c as (select id from wq) select c.id from c").fetchall() == [(1,)]
+        assert conn.execute("select s.n from (select 1 n) s").fetchall() == [(1,)]
+        assert conn.execute("select g.g from generate_series(1, 2) g").fetchall() == [(1,), (2,)]
+        assert conn.execute(
+            "select generate_series.generate_series from generate_series(1, 2)"
+        ).fetchall() == [(1,), (2,)]
+        assert conn.execute(
+            "select length(c.relname) from pg_class c where c.relname = 'wq'"
+        ).fetchall() == [(2,)]
+        assert conn.execute("select id from wq w where length(w.c::text) = 1").fetchall() == [(1,)]
+        assert conn.execute("select id, c from wq t where t.c = 2").fetchall() == [(1, 2)]
+        # `pg_get_userbyid` answers a `name` wherever it is called.
+        cur = conn.execute("select pg_get_userbyid(10)")
+        assert cur.description[0].type_code == 19
+        # `coalesce` over a subquery takes the subquery's type, not the
+        # literal's.
+        cur = conn.execute(
+            "select coalesce((select 1.5::numeric), 0), greatest((select 2.5::numeric), 1)"
+        )
+        assert [d.type_code for d in cur.description] == [1700, 1700]
+        assert cur.fetchall() == [(Decimal("1.5"), Decimal("2.5"))]
+
+
+def test_common_table_expressions(home: Path) -> None:
+    """A non-recursive `WITH` is planned as the derived tables it is
+    shorthand for: chained CTEs, a CTE's column list, a reference alias, a
+    CTE shadowing a table of the same name (whose body still reads the
+    table), a `WITH` inside a subquery, and a CTE feeding an INSERT / UPDATE
+    / DELETE, a prepared statement, a cursor and CREATE TABLE AS. The two
+    shapes with no derived-table form -- `WITH RECURSIVE` and a
+    data-modifying CTE -- are refused with 0A000 rather than mis-run
+    (measured against PostgreSQL 16.15, 2026-09-24)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.autocommit = True
+        conn.execute("create table wq (id int primary key, c int)")
+        conn.execute("insert into wq values (1, 2), (2, 3)")
+        cur = conn.execute("with c as (select id from wq) select c.id from c order by c.id")
+        assert cur.description[0].type_code == 23
+        assert cur.fetchall() == [(1,), (2,)]
+        assert conn.execute("with c as (select 1 as a) select * from c c2(z)").fetchall() == [(1,)]
+        assert conn.execute(
+            "with a as (select id from wq), b as (select id * 10 as x from a) select x from b"
+            " order by x"
+        ).fetchall() == [(10,), (20,)]
+        assert conn.execute(
+            "with c(k) as (select id from wq) select k, c.k from c order by k desc"
+        ).fetchall() == [
+            (2, 2),
+            (1, 1),
+        ]
+        assert conn.execute(
+            "with wq as (select id from wq where id = 2) select id from wq"
+        ).fetchall() == [(2,)]
+        assert conn.execute(
+            "with c as (select id, c from wq) select c.id, w.c from c join wq w using (id) order"
+            " by 1"
+        ).fetchall() == [(1, 2), (2, 3)]
+        assert conn.execute(
+            "with a as (select 1 as n), b as (select n + 1 as n from a) select a.n, b.n from a, b"
+        ).fetchall() == [(1, 2)]
+        assert conn.execute(
+            "with c as (select id from wq) select (select max(id) from c)"
+        ).fetchall() == [(2,)]
+        assert conn.execute(
+            "with c as (select id from wq) select * from c union all select * from c order by 1"
+        ).fetchall() == [
+            (1,),
+            (1,),
+            (2,),
+            (2,),
+        ]
+        assert conn.execute(
+            "select * from wq where id in (with x as (select 1 as id) select id from x)"
+        ).fetchall() == [(1, 2)]
+        assert conn.execute(
+            "with c as (select id from wq) select id from c where id = %s", (2,), prepare=True
+        ).fetchall() == [(2,)]
+        conn.execute(
+            "with x as (select 1 as id) update wq set c = 9 where id in (select id from x)"
+        )
+        conn.execute("with x as (select 2 as id) delete from wq where id = (select id from x)")
+        assert conn.execute(
+            "with x as (select 5 as id) insert into wq select id, id from x returning *"
+        ).fetchall() == [(5, 5)]
+        assert conn.execute("select * from wq order by id").fetchall() == [(1, 9), (5, 5)]
+        conn.execute("create table t2 as with c as (select id from wq) select id from c")
+        assert conn.execute("select * from t2 order by id").fetchall() == [(1,), (5,)]
+        with conn.transaction():
+            conn.execute(
+                "declare cur cursor for with c as (select id from wq) select id from c order by id"
+            )
+            assert conn.execute("fetch all from cur").fetchall() == [(1,), (5,)]
+        assert _failure(conn, "with c as (select id from wq) select id from c where zz = 1")[
+            :2
+        ] == (
+            "42703",
+            'column "zz" does not exist',
+        )
+        assert _failure(
+            conn, "with c as (select id, c from wq) select sum(c) from c join wq using (id)"
+        )[:2] == (
+            "42702",
+            'column reference "c" is ambiguous',
+        )
+        assert _failure(conn, "with c as (select id from wq) select id from d")[:2] == (
+            "42P01",
+            'relation "d" does not exist',
+        )
+        # PostgreSQL runs these; the refusal is the one divergence here.
+        assert _failure(
+            conn,
+            "with recursive t(n) as (select 1 union all select n + 1 from t where n < 3) select n"
+            " from t",
+        )[:2] == ("0A000", "recursive WITH queries are not supported")
+        assert _failure(conn, "with m as (delete from wq returning id) select id from m")[:2] == (
+            "0A000",
+            "data-modifying statements in WITH are not supported",
+        )
+
+
+def test_unknown_function_is_42883_with_postgresql_signature(home: Path) -> None:
+    """A call to a function that does not exist is `42883 function
+    name(argtypes) does not exist`, with PostgreSQL's hint and the call's
+    position, wherever the call sits -- select list, WHERE, HAVING, ORDER
+    BY, FILTER, a subquery, an UPDATE or DELETE -- and the argument types
+    are the ones PostgreSQL resolves (untyped literals stay `unknown`,
+    arithmetic promotes, CASE / COALESCE of untyped literals is text). It
+    had been `0A000 function name() is not supported yet` with no position
+    on every path, and a call over a table column planned successfully and
+    failed per row (PostgreSQL 16.15, 2026-09-27)."""
+    hint = (
+        "No function matches the given name and argument types. "
+        "You might need to add explicit type casts."
+    )
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.commit()
+        for sql, signature, position in [
+            ("select nosuch(1)", "nosuch(integer)", "8"),
+            ("select nosuch()", "nosuch()", "8"),
+            ("select 1 where nosuch(2)", "nosuch(integer)", "16"),
+            ("select x from (select nosuch(1) as x) s", "nosuch(integer)", "23"),
+            ("select 1 + nosuch(2)", "nosuch(integer)", "12"),
+            ("select nosuch(i) from asg", "nosuch(integer)", "8"),
+            ("select i from asg order by nosuch(t)", "nosuch(text)", "28"),
+            ("select i from asg group by i having nosuch(i) > 1", "nosuch(integer)", "37"),
+            ("select count(*) filter (where nosuch(i)) from asg", "nosuch(integer)", "31"),
+            ("delete from asg where nosuch(i)", "nosuch(integer)", "23"),
+            ("update asg set i = nosuch(i)", "nosuch(integer)", "20"),
+            ('select "NoSuch"(1)', "NoSuch(integer)", "8"),
+            ("select public.nosuch(1)", "public.nosuch(integer)", "8"),
+            ("select nosuch('a', 1.5)", "nosuch(unknown, numeric)", "8"),
+            ("select nosuch(null)", "nosuch(unknown)", "8"),
+            ("select nosuch(i * 2.5) from asg", "nosuch(numeric)", "8"),
+            ("select nosuch(t || 'a', i is null) from asg", "nosuch(text, boolean)", "8"),
+            ("select nosuch(row(1, 2))", "nosuch(record)", "8"),
+            ("select nosuch(array[1, 2])", "nosuch(integer[])", "8"),
+            ("select nosuch(case when i = 1 then 'a' end) from asg", "nosuch(text)", "8"),
+            ("select nosuch(coalesce(null, 'b'))", "nosuch(text)", "8"),
+            ("select nosuch(nullif('a', 'b'))", "nosuch(text)", "8"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == f"function {signature} does not exist", sql
+            assert ei.value.diag.message_hint == hint, sql
+            assert ei.value.diag.statement_position == position, sql
+        assert conn.execute("select i from asg").fetchall() == [(1,)]
+        # A session-created function is a real name that this server cannot
+        # run, which stays the honest 0A000 rather than "does not exist".
+        conn.execute("create type mytyp")
+        conn.execute("create function myin(cstring) returns mytyp as 'int4in' language internal")
+        with pytest.raises(psycopg.errors.FeatureNotSupported) as ei:
+            conn.execute("select myin('1')")
+        assert ei.value.diag.message_primary == "function myin() is not supported yet"
+
+
+def test_unbound_parameter_is_42p02_at_the_reference(home: Path) -> None:
+    """A `$n` the statement was given no value for is `42P02 there is no
+    parameter $n` positioned at the reference, resolved while the statement
+    is analysed: it precedes the function lookup around it, a grouping fault
+    and any evaluation, and follows only an unknown relation or a column
+    fault earlier in the text. A reference inside a scalar subquery had
+    been `0A000 SubLink`, one in a grouped select answered a row, and none
+    carried a position (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.commit()
+        for sql, n, position in [
+            ("select $1", 1, "8"),
+            ("select $0", 0, "8"),
+            ("select $2, $1", 2, "8"),
+            ("select i from asg where i = $1", 1, "29"),
+            ("select i from asg where $1", 1, "25"),
+            ("update asg set i = $1", 1, "20"),
+            ("update asg set i = (select $1)", 1, "28"),
+            ("select (select $1)", 1, "16"),
+            ("select (select $2 from asg)", 2, "16"),
+            ("select i from asg where i = (select $1)", 1, "37"),
+            ("insert into asg (i) select (select $1)", 1, "36"),
+            ("select $1 from asg group by t", 1, "8"),
+            ("select nosuch($1)", 1, "15"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedParameter) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == f"there is no parameter ${n}", sql
+            assert ei.value.diag.statement_position == position, sql
+        with pytest.raises(psycopg.errors.UndefinedColumn) as ei:
+            conn.execute("select nosuchcol from asg where i = $1")
+        assert ei.value.diag.statement_position == "8"
+        with pytest.raises(psycopg.errors.UndefinedTable) as ei:
+            conn.execute("select i from nosuchtbl where i = $1")
+        assert ei.value.diag.statement_position == "15"
+        # A bound parameter is untouched, wherever it sits.
+        for sql, args, rows in [
+            ("select %s::int from asg group by t", (3,), [(3,)]),
+            ("select (select %s::int)", (3,), [(3,)]),
+            ("select i from asg where i = (select %s::int)", (1,), [(1,)]),
+        ]:
+            assert conn.execute(sql, args, prepare=True).fetchall() == rows, sql
+        conn.execute("prepare pp(int) as select $1")
+        assert conn.execute("execute pp(7)").fetchall() == [(7,)]
+
+
+def test_insert_select_typechecks_literal_and_subquery_items(home: Path) -> None:
+    """`INSERT ... SELECT` checks a select item that is a literal, a cast or
+    a scalar subquery against its target column the way a VALUES item is:
+    an untyped literal the column cannot read is `22P02` at the literal, a
+    typed item with no assignment cast is `42804 column "i" is of type
+    integer but expression is of type text` at the item. The literal had
+    failed unpositioned at run time and the subquery was read as the value
+    it yields (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.commit()
+        mismatch = 'column "i" is of type integer but expression is of type text'
+        for sql, position in [
+            ("insert into asg (i) select (select 'x')", "28"),
+            ("insert into asg (i) select (select t from asg limit 1)", "28"),
+            ("insert into asg (i) select 'z'::text", "28"),
+            ("insert into asg (i) select t from asg", "28"),
+        ]:
+            with pytest.raises(psycopg.errors.DatatypeMismatch) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == mismatch, sql
+            assert ei.value.diag.statement_position == position, sql
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as ei:
+            conn.execute("insert into asg (i) select 'x'")
+        assert ei.value.diag.message_primary == 'invalid input syntax for type integer: "x"'
+        assert ei.value.diag.statement_position == "28"
+        for sql in [
+            "insert into asg (i) select (select 2)",
+            "insert into asg (i) select 1 + (select 2)",
+            "insert into asg (t) select (select 1)",
+            "insert into asg (i) select '4'",
+            "insert into asg (i, t) select i, t from asg",
+        ]:
+            conn.execute(sql)
+        assert conn.execute("select count(*) from asg").fetchone() == (10,)
+
+
+def test_cast_predicates_and_from_less_series_references(home: Path) -> None:
+    """A cast in a boolean context is typed before it is evaluated: a
+    constant `::text` / `::int` / `CAST(... AS int)` in WHERE is `42804
+    argument of WHERE must be type boolean` at the operand (`AND` when it
+    is a conjunct), a `::bool` one filters, and an unparsable `'x'::bool`
+    is 22P02 -- over a table, over `FROM generate_series`, and over a
+    FROM-less series, where no column is in scope at all, so the output
+    alias (`bar`, or the default `generate_series`) in WHERE or HAVING is
+    `42703` at that reference. `HAVING` over a FROM-less series is a second
+    constant predicate, worded as HAVING when it is not boolean, and a
+    `GROUP BY` naming the alias resolves while the HAVING that follows it
+    does not, so the error sits on the HAVING's mention. An assignment
+    `CAST` points at the CAST, not the literal inside it. The FROM-less
+    WHERE was refused `0A000`, the cast predicates were `0A000` or
+    evaluated the constant, and none carried a position (PostgreSQL
+    16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.commit()
+        where_not = "argument of WHERE must be type boolean, not type "
+        for sql, rows in [
+            ("select generate_series(1,3) where false", []),
+            ("select generate_series(1,3) where true", [(1,), (2,), (3,)]),
+            ("select generate_series(1,3) having true", [(1,), (2,), (3,)]),
+            ("select generate_series(1,3) having false", []),
+            ("select generate_series(1,3) as bar group by bar having true", [(1,), (2,), (3,)]),
+            ("select generate_series(1,3) as bar order by bar desc", [(3,), (2,), (1,)]),
+            ("select i from asg where 'true'::bool", [(1,)]),
+            ("select i from asg where i::bool", [(1,)]),
+            ("select 1 from generate_series(1,3) g where g::bool", [(1,), (1,), (1,)]),
+            ("select 1 from generate_series(1,3) where null::bool", []),
+            ("select count(*) from generate_series(1,3) g where g::bool", [(3,)]),
+            ("select 1 from generate_series(1,3) g where g > 1 and g::bool", [(1,), (1,)]),
+            ("select i from asg where cast('1' as int) = i", [(1,)]),
+        ]:
+            assert conn.execute(sql).fetchall() == rows, sql
+        for sql, code, message, position in [
+            ("select generate_series(1,3) where 1", "42804", where_not + "integer", "35"),
+            ("select generate_series(1,3) where 'abc'::text", "42804", where_not + "text", "35"),
+            (
+                "select generate_series(1,3) where 'x'",
+                "22P02",
+                'invalid input syntax for type boolean: "x"',
+                "35",
+            ),
+            (
+                "select 1 from generate_series(1,3) where 1::int",
+                "42804",
+                where_not + "integer",
+                "42",
+            ),
+            (
+                "select 1 from generate_series(1,3) where 'x'::bool",
+                "22P02",
+                'invalid input syntax for type boolean: "x"',
+                "42",
+            ),
+            (
+                "select 1 from generate_series(1,3) where cast('x' as text)",
+                "42804",
+                where_not + "text",
+                "47",
+            ),
+            (
+                "select 1 from generate_series(1,3) where cast(null as int)",
+                "42804",
+                where_not + "integer",
+                "47",
+            ),
+            ("select i from asg where 'abc'::text", "42804", where_not + "text", "25"),
+            ("select i from asg where 1::int", "42804", where_not + "integer", "25"),
+            ("select i from asg where cast(i + 1 as text)", "42804", where_not + "text", "25"),
+            ("select i from asg where (i + 1)::text", "42804", where_not + "text", "26"),
+            (
+                "select i from asg where cast(cast('x' as text) as int)",
+                "42804",
+                where_not + "integer",
+                "25",
+            ),
+            (
+                "select 1 from generate_series(1,3) g where g::text",
+                "42804",
+                where_not + "text",
+                "44",
+            ),
+            (
+                "select 1 from generate_series(1,3) g where cast(g as text)",
+                "42804",
+                where_not + "text",
+                "44",
+            ),
+            (
+                "select 1 from generate_series(1,3) where 1 = 1 and 'x'::text",
+                "42804",
+                "argument of AND must be type boolean, not type text",
+                "52",
+            ),
+            (
+                "select generate_series(1,3) as bar where bar > 1",
+                "42703",
+                'column "bar" does not exist',
+                "42",
+            ),
+            (
+                "select generate_series(1,3) as bar where bar::bool",
+                "42703",
+                'column "bar" does not exist',
+                "42",
+            ),
+            (
+                "select generate_series(1,3) as bar where bar",
+                "42703",
+                'column "bar" does not exist',
+                "42",
+            ),
+            (
+                "select generate_series(1,3) g where g::bool",
+                "42703",
+                'column "g" does not exist',
+                "37",
+            ),
+            (
+                "select generate_series(1,3) where generate_series > 1",
+                "42703",
+                'column "generate_series" does not exist',
+                "35",
+            ),
+            (
+                "select generate_series(1,3) as bar where nosuch > 1",
+                "42703",
+                'column "nosuch" does not exist',
+                "42",
+            ),
+            (
+                "select generate_series(1,3) as bar where bar > 1 and false",
+                "42703",
+                'column "bar" does not exist',
+                "42",
+            ),
+            (
+                "select generate_series(1,3) as bar where false and bar > 1",
+                "42703",
+                'column "bar" does not exist',
+                "52",
+            ),
+            ("select generate_series(1,3) as bar where 1", "42804", where_not + "integer", "42"),
+            (
+                "select generate_series(1,3) as bar having bar > 1",
+                "42703",
+                'column "bar" does not exist',
+                "43",
+            ),
+            (
+                "select generate_series(1,3) as bar group by bar having bar > 1",
+                "42703",
+                'column "bar" does not exist',
+                "56",
+            ),
+            (
+                "select generate_series(1,3) having 1",
+                "42804",
+                "argument of HAVING must be type boolean, not type integer",
+                "36",
+            ),
+            (
+                "insert into asg (i) values (cast('x' as text))",
+                "42804",
+                'column "i" is of type integer but expression is of type text',
+                "34",
+            ),
+            (
+                "update asg set i = cast('x' as text)",
+                "42804",
+                'column "i" is of type integer but expression is of type text',
+                "25",
+            ),
+        ]:
+            assert _failure(conn, sql)[:3] == (code, message, position), sql
+            conn.rollback()
+
+
+def test_missing_sequence_is_42p01_at_the_literal(home: Path) -> None:
+    """`nextval` / `currval` / `setval` over a sequence the catalog lacks is
+    `42P01 relation "<name>" does not exist` positioned at the string
+    literal that named it, wherever the call sits -- the select list, WHERE
+    (bare, `::int`, `CAST`), an INSERT value, an UPDATE assignment -- and
+    the name is spelled as written, schema and all. It is resolved while
+    the call is analysed, so it beats the boolean-context `42804` around it
+    however the two are ordered, and loses only to a syntax error, an
+    unknown FROM relation, or a column / literal fault earlier in the text.
+    The server had raised it unpositioned after planning, so a WHERE
+    reference was `42804` and a bare one carried no `P` (PostgreSQL 16.15,
+    2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x')")
+        conn.commit()
+        missing = 'relation "nosuchseq" does not exist'
+        for sql, position in [
+            ("select nextval('nosuchseq')", "16"),
+            ("select nextval('nosuchseq') from asg", "16"),
+            ("select nextval('nosuchseq') where 1", "16"),
+            ("select nextval('nosuchseq') + 'x'", "16"),
+            ("select nextval('nosuchseq'), nosuchcol from asg", "16"),
+            ("select nextval('nosuchseq'::regclass)", "16"),
+            ("select currval('nosuchseq')", "16"),
+            ("select setval('nosuchseq', 5)", "15"),
+            ("select i from asg where nextval('nosuchseq') > 0", "33"),
+            ("select i from asg where nextval('nosuchseq')", "33"),
+            ("select i from asg where nextval('nosuchseq')::int", "33"),
+            ("select i from asg where cast(nextval('nosuchseq') as int)", "38"),
+            ("select i from asg where nextval('nosuchseq') > 0 and nosuchcol = 1", "33"),
+            ("insert into asg (i) values (nextval('nosuchseq'))", "37"),
+            ("update asg set i = nextval('nosuchseq')", "28"),
+        ]:
+            assert _failure(conn, sql)[:3] == ("42P01", missing, position), sql
+            conn.rollback()
+        assert _failure(conn, "select nextval('public.nosuchseq')")[:3] == (
+            "42P01",
+            'relation "public.nosuchseq" does not exist',
+            "16",
+        )
+        conn.rollback()
+        for sql, code, message, position in [
+            (
+                "select nextval('nosuchseq') from nosuchtbl",
+                "42P01",
+                'relation "nosuchtbl" does not exist',
+                "34",
+            ),
+            (
+                "select nosuchcol from asg where nextval('nosuchseq') > 0",
+                "42703",
+                'column "nosuchcol" does not exist',
+                "8",
+            ),
+            (
+                "select i from asg where nosuchcol = 1 and nextval('nosuchseq') > 0",
+                "42703",
+                'column "nosuchcol" does not exist',
+                "25",
+            ),
+            (
+                "select 1 + 'x', nextval('nosuchseq')",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "12",
+            ),
+            ("selct nextval('nosuchseq')", "42601", 'syntax error at or near "selct"', "1"),
+        ]:
+            assert _failure(conn, sql)[:3] == (code, message, position), sql
+            conn.rollback()
+
+
+def test_syntax_errors_carry_postgresqls_position(home: Path) -> None:
+    """`42601` names the offending token and its 1-based character position
+    -- `at or near "<token>"` at the token, `at end of input` one past the
+    text, `unterminated quoted string` at the opening quote -- counted over
+    the whole query string (a second statement, leading whitespace and a
+    multi-byte character all shift it), in the simple and the extended
+    protocol alike. The server had dropped the position libpg_query
+    reports (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.commit()
+        for sql, message, position in [
+            ("selct 1", 'syntax error at or near "selct"', "1"),
+            ("select 1 +", "syntax error at end of input", "11"),
+            ("select * from asg where", "syntax error at end of input", "24"),
+            ("select i from asg wher i = 1", 'syntax error at or near "i"', "24"),
+            ("select i from asg order by", "syntax error at end of input", "27"),
+            ("insert into asg values", "syntax error at end of input", "23"),
+            ("select (1", "syntax error at end of input", "10"),
+            ("select 'abc", 'unterminated quoted string at or near "\'abc"', "8"),
+            ("select 1; selct 2", 'syntax error at or near "selct"', "11"),
+            ("  selct 1", 'syntax error at or near "selct"', "3"),
+            ("select 'é', 1 +", "syntax error at end of input", "16"),
+            ("select 'é' frm asg", 'syntax error at or near "asg"', "16"),
+        ]:
+            assert _failure(conn, sql)[:3] == ("42601", message, position), sql
+            conn.rollback()
+        assert conn.execute("select 1;").fetchall() == [(1,)]
+        with pytest.raises(psycopg.errors.SyntaxError) as ei:
+            conn.execute("select i from asg wher i = %s", (1,), prepare=True)
+        assert ei.value.diag.statement_position == "24"
+        conn.rollback()
+        with pytest.raises(psycopg.errors.SyntaxError) as ei:
+            conn.execute("select 1 +", prepare=True)
+        assert ei.value.diag.statement_position == "11"
+
+
+def test_case_family_resolves_one_common_type(home: Path) -> None:
+    """A CASE's arms, COALESCE / GREATEST / LEAST's arguments and NULLIF's
+    operands resolve to ONE type by PostgreSQL's `select_common_type`: the
+    first typed input is the candidate, an untyped literal is read as that
+    type at parse time (so `case when i = 1 then 1 else 'a' end` is the
+    integer's 22P02 at the literal even when the arm is never taken), a
+    different type category is `42804 CASE types X and Y cannot be matched`
+    at the offending arm, and within a category the candidate widens along
+    an implicit cast (`int` beside `numeric` is numeric, `date` beside
+    `timestamptz` is timestamptz). The server had typed each arm on its
+    own, so `'2'` beside `1` came back as text and `'a'` never failed
+    (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x'), (2, 'y')")
+        conn.commit()
+        for sql, rows, oid in [
+            ("select case when i = 1 then 1 else '2' end from asg order by i", [(1,), (2,)], 23),
+            ("select case when i = 1 then '2' else 1 end from asg order by i", [(2,), (1,)], 23),
+            ("select case when i = 1 then i else '7' end from asg order by i", [(1,), (7,)], 23),
+            (
+                "select case when i = 1 then true else 'yes' end from asg order by i",
+                [(True,), (True,)],
+                16,
+            ),
+            (
+                "select case when i = 1 then 1.5 else '2' end from asg order by i",
+                [(Decimal("1.5"),), (Decimal("2"),)],
+                1700,
+            ),
+            (
+                "select case when i = 1 then 1 else 2.5 end from asg order by i",
+                [(Decimal("1"),), (Decimal("2.5"),)],
+                1700,
+            ),
+            (
+                "select case when i = 1 then 1 else 1.5::float8 end from asg order by i",
+                [(1.0,), (1.5,)],
+                701,
+            ),
+            (
+                "select case when i = 1 then '2020-01-01'::date else '2020-02-03' end"
+                " from asg order by i",
+                [(dt.date(2020, 1, 1),), (dt.date(2020, 2, 3),)],
+                1082,
+            ),
+            ("select coalesce(null::int, '7')", [(7,)], 23),
+            ("select coalesce(i, '7') from asg order by i", [(1,), (2,)], 23),
+            ("select nullif(i, '1') from asg order by i", [(None,), (2,)], 23),
+            ("select nullif(1, 1.0)", [(None,)], 1700),
+            ("select nullif(1.5, 1)", [(Decimal("1.5"),)], 1700),
+            ("select greatest(i, '7') from asg order by i", [(7,), (7,)], 23),
+            ("select least(i, '0') from asg order by i", [(0,), (0,)], 23),
+            ("select greatest('a', 'b')", [("b",)], 25),
+            (
+                "select case when i = 1 then 1 when i = 2 then 2.5 else '3' end"
+                " from asg order by i",
+                [(Decimal("1"),), (Decimal("2.5"),)],
+                1700,
+            ),
+            (
+                "select case when i = 1 then null else 'a' end from asg order by i",
+                [(None,), ("a",)],
+                25,
+            ),
+            (
+                "select case when i = 1 then 'a'::varchar else 'b'::text end from asg order by i",
+                [("a",), ("b",)],
+                25,
+            ),
+            (
+                "select case when i = 1 then i else i::bigint end from asg order by i",
+                [(1,), (2,)],
+                20,
+            ),
+        ]:
+            cur = conn.execute(sql)
+            assert cur.fetchall() == rows, sql
+            assert cur.description[0].type_code == oid, sql
+        for sql, typ in [
+            ("case when true then 'a'::varchar else 'b'::char(2) end", "character"),
+            ("case when true then 'a'::char(2) else 'b'::varchar end", "character varying"),
+            ("case when true then 'a'::name else 'b'::text end", "text"),
+            ("case when true then 'a'::text else 'b'::name end", "name"),
+            ("case when true then 'a'::varchar else 'b'::name end", "name"),
+            (
+                "case when true then '2020-01-01'::date else '2020-01-01'::timestamp end",
+                "timestamp without time zone",
+            ),
+            (
+                "case when true then '2020-01-01'::timestamptz else '2020-01-01'::date end",
+                "timestamp with time zone",
+            ),
+            ("case when true then 1::float4 else 1 end", "real"),
+            ("case when true then 1::float4 else 1::float8 end", "double precision"),
+            ("case when true then 1::int2 else 1 end", "integer"),
+            ("case when true then 1::numeric else 1::float8 end", "double precision"),
+            ("case when true then 1::int8 else 1::float4 end", "real"),
+            ("case when true then '{1}'::int[] else '{2}'::int8[] end", "bigint[]"),
+            ("case when true then 1 else '1'::oid end", "oid"),
+            ("case when true then null else null end", "text"),
+            ("coalesce(null, null)", "text"),
+            ("case when true then '1.2.3.4'::inet else '1.2.3.0/24'::cidr end", "inet"),
+        ]:
+            assert conn.execute(f"select pg_typeof({sql})").fetchone() == (typ,), sql
+        for sql, code, message, position in [
+            (
+                "select case when i = 1 then 1 else 'a' end from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "36",
+            ),
+            (
+                "select case when i = 1 then 'a' else 1 end from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "29",
+            ),
+            (
+                "select case when i = 1 then 1 when i = 2 then 'a' end from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "47",
+            ),
+            (
+                "select case when i = 1 then 1.5 else 'a' end from asg",
+                "22P02",
+                'invalid input syntax for type numeric: "a"',
+                "38",
+            ),
+            (
+                "select case when i = 1 then true else 'a' end from asg",
+                "22P02",
+                'invalid input syntax for type boolean: "a"',
+                "39",
+            ),
+            (
+                "select case when i = 1 then t else 1 end from asg",
+                "42804",
+                "CASE types integer and text cannot be matched",
+                "29",
+            ),
+            (
+                "select case when i = 1 then 1 else 'a'::text end from asg",
+                "42804",
+                "CASE types text and integer cannot be matched",
+                "29",
+            ),
+            (
+                "select case i when 1 then 1 else 'a' end from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "34",
+            ),
+            (
+                "select case when i = 1 then '2020-01-01'::date else 'x' end from asg",
+                "22007",
+                'invalid input syntax for type date: "x"',
+                "53",
+            ),
+            (
+                "select case when i = 1 then '2020-01-01'::date else '2020-02-30' end from asg",
+                "22008",
+                'date/time field value out of range: "2020-02-30"',
+                "53",
+            ),
+            (
+                "select coalesce(i, 'a') from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "20",
+            ),
+            (
+                "select coalesce('a', 1)",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "17",
+            ),
+            (
+                "select nullif(i, 'a') from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "18",
+            ),
+            ("select nullif('x', 1)", "22P02", 'invalid input syntax for type integer: "x"', "15"),
+            ("select nullif(1, true)", "42883", "operator does not exist: integer = boolean", "8"),
+            (
+                "select greatest(i, 'a') from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "20",
+            ),
+            (
+                "select i from asg where case when i = 1 then 1 else 'a' end = 1",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "53",
+            ),
+            (
+                "select i from asg order by case when i = 1 then 1 else 'a' end",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "56",
+            ),
+            (
+                "select i from asg where i = case when true then 'a' else 1 end",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "49",
+            ),
+            (
+                "select nosuch(case when i = 1 then 1 else 'a' end) from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "43",
+            ),
+            (
+                "select pg_typeof(case when true then '1'::money else 1 end)",
+                "42846",
+                "CASE/WHEN could not convert type money to integer",
+                "38",
+            ),
+            (
+                "select pg_typeof(case when true then true else 'x'::text end)",
+                "42804",
+                "CASE types text and boolean cannot be matched",
+                "38",
+            ),
+            (
+                "select pg_typeof(case when true then '{1}'::int[] else '{a}'::text[] end)",
+                "42846",
+                "CASE/WHEN could not convert type integer[] to text[]",
+                "38",
+            ),
+            (
+                "select pg_typeof(case when true then '1'::json else '1'::jsonb end)",
+                "42846",
+                "CASE/WHEN could not convert type json to jsonb",
+                "38",
+            ),
+            (
+                "select pg_typeof(greatest('1'::money, 1))",
+                "42846",
+                "GREATEST could not convert type integer to money",
+                "39",
+            ),
+            (
+                "select pg_typeof(case when true then '10:00'::time else '1 day'::interval end)",
+                "42804",
+                "CASE types interval and time without time zone cannot be matched",
+                "38",
+            ),
+            (
+                "select pg_typeof(case when true then 'a'::text else '1'::uuid end)",
+                "22P02",
+                'invalid input syntax for type uuid: "1"',
+                "53",
+            ),
+            (
+                "select pg_typeof(case when true then 'a'::bytea else 'b'::text end)",
+                "42804",
+                "CASE types text and bytea cannot be matched",
+                "38",
+            ),
+        ]:
+            assert _failure(conn, sql)[:3] == (code, message, position), sql
+            conn.rollback()
+
+
+def test_set_operations_and_values_resolve_one_common_type(home: Path) -> None:
+    """UNION / INTERSECT / EXCEPT columns and VALUES columns resolve under the
+    same rule: an untyped literal on either side is read as the other side's
+    type (`select 1 union select '2'` is two integers; `'a'` is the integer's
+    22P02 at the literal), a typed mismatch is `42804 UNION types X and Y
+    cannot be matched` at the offending side, a typed input with no implicit
+    cast is `42846 UNION could not convert type X to Y`, and the column
+    widens along an implicit cast so `1 union 1::numeric` is ONE numeric row.
+    `varchar UNION name` is `name`: `pg_cast` has name-to-varchar as an
+    assignment cast only (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x'), (2, 'y')")
+        conn.commit()
+        for sql, rows, oid in [
+            ("select 1 union select '2' order by 1", [(1,), (2,)], 23),
+            ("select '2' union select 1 order by 1", [(1,), (2,)], 23),
+            ("select i from asg union select '5' order by 1", [(1,), (2,), (5,)], 23),
+            ("select '5' union select i from asg order by 1", [(1,), (2,), (5,)], 23),
+            ("select 1 union select 1.5 order by 1", [(Decimal("1"),), (Decimal("1.5"),)], 1700),
+            ("select 1 union select 1::numeric", [(Decimal("1"),)], 1700),
+            ("select 1::float4 union select 1", [(1.0,)], 700),
+            ("select 1::int2 union select 1", [(1,)], 23),
+            ("select 1::oid union select 1", [(1,)], 26),
+            (
+                "select i from asg union select 1.5 order by 1",
+                [(Decimal("1"),), (Decimal("1.5"),), (Decimal("2"),)],
+                1700,
+            ),
+            ("select 1::int8 union select 1.5::float4 order by 1", [(1.0,), (1.5,)], 700),
+            ("select null union select 1 order by 1", [(1,), (None,)], 23),
+            ("select null union select 'a' order by 1", [("a",), (None,)], 25),
+            ("select 'x'::varchar union select 'y'::name order by 1", [("x",), ("y",)], 19),
+            ("select 'x'::name union select 'y'::varchar order by 1", [("x",), ("y",)], 19),
+            ("select 'x'::text union select 'y'::name order by 1", [("x",), ("y",)], 25),
+            ("select 'x'::name union select 'y'::text order by 1", [("x",), ("y",)], 19),
+            ("select 'y' union select 'abc'::char(2) order by 1", [("ab",), ("y",)], 1042),
+            (
+                "select 'x'::varchar(3) union select 'abcdef' order by 1",
+                [("abcdef",), ("x",)],
+                1043,
+            ),
+            ("select '{1}'::int[] union select '{2}'::int8[] order by 1", [([1],), ([2],)], 1016),
+            ("select array[1] union select '{2}' order by 1", [([1],), ([2],)], 1007),
+            ("select 1 intersect select '1'", [(1,)], 23),
+            ("select 1 except select '2'", [(1,)], 23),
+            ("select 1 union all select '1'", [(1,), (1,)], 23),
+            ("values (1), (1.5)", [(Decimal("1"),), (Decimal("1.5"),)], 1700),
+            ("values (1), ('2')", [(1,), (2,)], 23),
+            ("values ('2'), (1)", [(2,), (1,)], 23),
+            ("select * from (values (1), ('2')) v", [(1,), (2,)], 23),
+            ("select 1 union select 2 union select '3' order by 1", [(1,), (2,), (3,)], 23),
+        ]:
+            cur = conn.execute(sql)
+            assert cur.fetchall() == rows, sql
+            assert cur.description[0].type_code == oid, sql
+        cur = conn.execute("select '2020-01-01'::date union select now() order by 1")
+        first, second = cur.fetchall()
+        assert cur.description[0].type_code == 1184
+        assert first[0].tzinfo is not None and second[0] > first[0]
+        for sql, code, message, position in [
+            (
+                "select 1 union select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "23",
+            ),
+            (
+                "select 'a' union select 1",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "8",
+            ),
+            (
+                "select 1 union select null union select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "41",
+            ),
+            (
+                "select i from asg union select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "32",
+            ),
+            (
+                "values (1) union select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "25",
+            ),
+            (
+                "select 'a' union values (1)",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "8",
+            ),
+            (
+                "select 1 intersect select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "27",
+            ),
+            (
+                "select 1 except select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "24",
+            ),
+            (
+                "select 1 union all select 'a'",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "27",
+            ),
+            (
+                "(select 1) union (select 'a')",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "26",
+            ),
+            (
+                "select 1 union select 'a' order by 1",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "23",
+            ),
+            (
+                "select 1, 'a' union select 'b', 2",
+                "22P02",
+                'invalid input syntax for type integer: "b"',
+                "28",
+            ),
+            (
+                "select 1 union select 1.5 union select 'x'",
+                "22P02",
+                'invalid input syntax for type numeric: "x"',
+                "40",
+            ),
+            (
+                "select 1 union select '1.5'",
+                "22P02",
+                'invalid input syntax for type integer: "1.5"',
+                "23",
+            ),
+            (
+                "select 1 union select true",
+                "42804",
+                "UNION types integer and boolean cannot be matched",
+                "23",
+            ),
+            (
+                "select 1 union select '1'::text",
+                "42804",
+                "UNION types integer and text cannot be matched",
+                "23",
+            ),
+            (
+                "select t from asg union select 1",
+                "42804",
+                "UNION types text and integer cannot be matched",
+                "32",
+            ),
+            (
+                "select 1 union select t from asg",
+                "42804",
+                "UNION types integer and text cannot be matched",
+                "23",
+            ),
+            (
+                "select i from asg union select i::text from asg",
+                "42804",
+                "UNION types integer and text cannot be matched",
+                "32",
+            ),
+            (
+                "values (1), (true)",
+                "42804",
+                "VALUES types integer and boolean cannot be matched",
+                "14",
+            ),
+            (
+                "values ('1'::text), (1)",
+                "42804",
+                "VALUES types text and integer cannot be matched",
+                "22",
+            ),
+            ("values (1), ('a')", "22P02", 'invalid input syntax for type integer: "a"', "14"),
+            ("values ('a'), (1)", "22P02", 'invalid input syntax for type integer: "a"', "9"),
+            (
+                "values (1, 'a'), ('b', 2)",
+                "22P02",
+                'invalid input syntax for type integer: "b"',
+                "19",
+            ),
+            (
+                "select (values (1), ('a'))",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "22",
+            ),
+            (
+                "select 1::money union select 1",
+                "42846",
+                "UNION could not convert type integer to money",
+                "30",
+            ),
+            (
+                "select 1 union select 1::money",
+                "42846",
+                "UNION could not convert type money to integer",
+                "23",
+            ),
+            (
+                "select '{1}'::int[] union select '{a}'::text[]",
+                "42846",
+                "UNION could not convert type text[] to integer[]",
+                "34",
+            ),
+        ]:
+            assert _failure(conn, sql)[:3] == (code, message, position), sql
+            conn.rollback()
+        assert _failure(conn, "values (1) union values ('2')")[:3] == (
+            "42804",
+            "UNION types integer and text cannot be matched",
+            None,
+        )
+
+
+def test_function_overloads_resolve_as_postgresql_selects_them(home: Path) -> None:
+    """A call resolves against the overloads PostgreSQL has of the name, by
+    PostgreSQL's own rules: the chosen one declares the RESULT type
+    (`abs(1::int2)` is a smallint, `mod(i, 3::int8)` over an int4 column a
+    bigint, `ceil(i)` a double precision) and READS each argument as its
+    parameter type (`abs('1')` parses the literal as the float8 `1`,
+    `power(2, 3)` widens both to double precision). Arguments matching no
+    overload are `42883 function name(argtypes) does not exist` and an
+    untyped argument no single candidate claims is `42725 ... is not
+    unique`, both at the call; a polymorphic parameter handed an untyped
+    literal is `42804 could not determine polymorphic type`. Every one of
+    these was wrong before: a wrong-typed call planned and either answered
+    from the wrong overload or failed per row with a Rust-shaped message
+    (PostgreSQL 16.15, 2026-09-27)."""
+    no_match = (
+        "No function matches the given name and argument types. "
+        "You might need to add explicit type casts."
+    )
+    not_unique = (
+        "Could not choose a best candidate function. You might need to add explicit type casts."
+    )
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x'), (2, 'y')")
+        conn.commit()
+        # The selected overload declares the result type.
+        assert conn.execute(
+            "select pg_typeof(abs(1::int2))::text, pg_typeof(abs(1))::text,"
+            " pg_typeof(abs(1::int8))::text, pg_typeof(abs(1.5))::text,"
+            " pg_typeof(abs(1::float4))::text"
+        ).fetchone() == ("smallint", "integer", "bigint", "numeric", "real")
+        assert conn.execute(
+            "select pg_typeof(mod(1::int2, 2::int8))::text, pg_typeof(mod(1, 2))::text,"
+            " pg_typeof(mod(1.5, 2))::text"
+        ).fetchone() == ("bigint", "integer", "numeric")
+        # ... over a COLUMN too, where the column's declared type is the
+        # argument's: `mod(i, 3::int8)` is the int8 overload.
+        assert conn.execute(
+            "select abs(i), pg_typeof(abs(i))::text from asg where i = 1"
+        ).fetchone() == (1, "integer")
+        assert conn.execute(
+            "select abs(i::int2), pg_typeof(abs(i::int2))::text from asg where i = 1"
+        ).fetchone() == (1, "smallint")
+        assert conn.execute(
+            "select mod(i, 3::int8), pg_typeof(mod(i, 3::int8))::text from asg where i = 1"
+        ).fetchone() == (1, "bigint")
+        assert conn.execute(
+            "select ceil(i), pg_typeof(ceil(i))::text from asg where i = 1"
+        ).fetchone() == (1.0, "double precision")
+        # ... and with no value to read, the declared type still stands.
+        assert conn.execute(
+            "select pg_typeof(length(null))::text, pg_typeof(abs(null))::text,"
+            " pg_typeof(ceil(null))::text"
+        ).fetchone() == ("integer", "double precision", "double precision")
+        # An untyped literal is READ as the parameter type the overload
+        # declares, not as the string it looks like.
+        assert conn.execute("select abs('1'), pg_typeof(abs('1'))::text").fetchone() == (
+            1.0,
+            "double precision",
+        )
+        assert conn.execute("select round('1.5'), pg_typeof(round('1.5'))::text").fetchone() == (
+            2.0,
+            "double precision",
+        )
+        assert conn.execute("select chr('65'), mod('7', 2), left('abc', '1')").fetchone() == (
+            "A",
+            1,
+            "a",
+        )
+        # A narrower number widens to a `double precision` parameter.
+        assert conn.execute("select power(2, 3), pg_typeof(power(2, 3))::text").fetchone() == (
+            8.0,
+            "double precision",
+        )
+        assert conn.execute("select pi(), pg_typeof(pi())::text").fetchone() == (
+            3.141592653589793,
+            "double precision",
+        )
+        # `char` and `name` coerce to text implicitly, so `md5` takes them.
+        assert conn.execute("select md5(1::char), md5(1::name)").fetchone() == (
+            "c4ca4238a0b923820dcc509a6f75849b",
+            "c4ca4238a0b923820dcc509a6f75849b",
+        )
+        for sql, signature, position in [
+            ("select md5(1)", "md5(integer)", "8"),
+            ("select md5(i) from asg", "md5(integer)", "8"),
+            ("select abs(t) from asg", "abs(text)", "8"),
+            ("select abs(i, 2) from asg", "abs(integer, integer)", "8"),
+            ("select length(1, 2)", "length(integer, integer)", "8"),
+            ("select array_length(1, 1)", "array_length(integer, integer)", "8"),
+            ("select upper(1::oid)", "upper(oid)", "8"),
+            ("select round(1.5::float8, 1)", "round(double precision, integer)", "8"),
+            ("select array_to_string(1, ',')", "array_to_string(integer, unknown)", "8"),
+            ("select trim(both from 1)", "pg_catalog.btrim(integer)", "8"),
+            # The refusal precedes the operator around the call.
+            ("select md5(1) + 1", "md5(integer)", "8"),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == f"function {signature} does not exist", sql
+            assert ei.value.diag.message_hint == no_match, sql
+            assert ei.value.diag.statement_position == position, sql
+        # An untyped argument no single candidate claims is ambiguous.
+        for sql in ["select trunc('a')", "select trunc(null)"]:
+            with pytest.raises(psycopg.errors.AmbiguousFunction) as amb:
+                conn.execute(sql)
+            assert amb.value.diag.message_primary == "function trunc(unknown) is not unique", sql
+            assert amb.value.diag.message_hint == not_unique, sql
+            assert amb.value.diag.statement_position == "8", sql
+        # A polymorphic parameter cannot take an untyped literal at all --
+        # 42804, and PostgreSQL gives it no position.
+        for sql in ["select to_json('a')", "select cardinality('{1,2}')"]:
+            with pytest.raises(psycopg.errors.DatatypeMismatch) as dm:
+                conn.execute(sql)
+            assert dm.value.diag.message_primary == (
+                "could not determine polymorphic type because input has type unknown"
+            ), sql
+            assert dm.value.diag.statement_position is None, sql
+        # An argument's own fault comes first: the arguments are transformed
+        # before the function is looked up.
+        for sql, state, message, position in [
+            (
+                "select abs('a')",
+                "22P02",
+                'invalid input syntax for type double precision: "a"',
+                "12",
+            ),
+            (
+                "select md5(abs('a'))",
+                "22P02",
+                'invalid input syntax for type double precision: "a"',
+                "16",
+            ),
+            (
+                "select nosuch(case when i = 1 then 1 else 'a' end) from asg",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "43",
+            ),
+            (
+                "select nosuch(i) from asg a join asg b on a.i = b.i",
+                "42702",
+                'column reference "i" is ambiguous',
+                "15",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as err:
+                conn.execute(sql)
+            assert err.value.sqlstate == state, sql
+            assert err.value.diag.message_primary == message, sql
+            assert err.value.diag.statement_position == position, sql
+        assert conn.execute("select count(*) from asg").fetchone() == (2,)
+
+
+def test_generated_series_takes_its_element_type_from_the_overload(home: Path) -> None:
+    """`generate_series` resolves like any other call, so the overload the
+    bounds select fixes the element type: an `int8` series counts past
+    2^31 (it used to TRUNCATE into a negative int4), a `numeric` one walks
+    by fractions with PostgreSQL's scales (refused `0A000` before), and an
+    instant one steps by an interval, calendar-aware (January 31st plus a
+    month is February 29th). Bounds that no overload takes are the
+    resolver's `42883` / `42725` -- three small-int parameters are ambiguous
+    on PostgreSQL and used to answer rows here (measured PostgreSQL 16.15
+    under UTC, 2026-09-27)."""
+    ts = dt.datetime
+    with _Server(home) as server, server.connect() as conn:
+        # int4, and the int8 overload past 2^31.
+        assert conn.execute("select generate_series(1, 3)").fetchall() == [(1,), (2,), (3,)]
+        assert conn.execute("select generate_series(3000000000, 3000000002)").fetchall() == [
+            (3000000000,),
+            (3000000001,),
+            (3000000002,),
+        ]
+        assert conn.execute(
+            "select pg_typeof(g)::text from generate_series(3000000000, 3000000002) as g limit 1"
+        ).fetchone() == ("bigint",)
+        # numeric: the scales are the repeated sum's, not the start's.
+        assert conn.execute("select generate_series(1, 3, 0.5)").fetchall() == [
+            (Decimal("1"),),
+            (Decimal("1.5"),),
+            (Decimal("2.0"),),
+            (Decimal("2.5"),),
+            (Decimal("3.0"),),
+        ]
+        assert conn.execute("select generate_series(3, 1, -0.5)").fetchall() == [
+            (Decimal("3"),),
+            (Decimal("2.5"),),
+            (Decimal("2.0"),),
+            (Decimal("1.5"),),
+            (Decimal("1.0"),),
+        ]
+        assert conn.execute("select generate_series(1.5, 3.5)").fetchall() == [
+            (Decimal("1.5"),),
+            (Decimal("2.5"),),
+            (Decimal("3.5"),),
+        ]
+        # A numeric bound makes the whole series numeric, even a whole one.
+        assert conn.execute("select generate_series(1, 3.5)").fetchall() == [
+            (Decimal("1"),),
+            (Decimal("2"),),
+            (Decimal("3"),),
+        ]
+        assert conn.execute("select sum(g) from generate_series(1, 3, 0.5) as g").fetchone() == (
+            Decimal("10.0"),
+        )
+        # An instant series steps by an interval, and its month part is
+        # calendar-aware rather than a fixed number of days.
+        assert conn.execute(
+            "select generate_series('2020-01-01'::timestamp, '2020-01-03'::timestamp, '1 day')"
+        ).fetchall() == [(ts(2020, 1, 1),), (ts(2020, 1, 2),), (ts(2020, 1, 3),)]
+        assert conn.execute(
+            "select generate_series('2020-01-31'::timestamp, '2020-03-31'::timestamp, '1 month')"
+        ).fetchall() == [(ts(2020, 1, 31),), (ts(2020, 2, 29),), (ts(2020, 3, 29),)]
+        assert conn.execute(
+            "select generate_series('2020-01-03'::timestamp, '2020-01-01'::timestamp, '-1 day')"
+        ).fetchall() == [(ts(2020, 1, 3),), (ts(2020, 1, 2),), (ts(2020, 1, 1),)]
+        utc = dt.timezone.utc
+        assert conn.execute(
+            "select generate_series('2020-01-01'::timestamptz, '2020-01-02'::timestamptz,"
+            " '12 hours')"
+        ).fetchall() == [
+            (ts(2020, 1, 1, tzinfo=utc),),
+            (ts(2020, 1, 1, 12, tzinfo=utc),),
+            (ts(2020, 1, 2, tzinfo=utc),),
+        ]
+        # A NULL bound generates nothing; a zero step is 22023.
+        assert conn.execute("select generate_series(1, null)").fetchall() == []
+        assert conn.execute("select generate_series(1.5, 3.5, null)").fetchall() == []
+        with pytest.raises(psycopg.errors.InvalidParameterValue) as zero:
+            conn.execute("select generate_series(1, 5, 0)")
+        assert zero.value.diag.message_primary == "step size cannot equal zero"
+        # Bounds no overload takes.
+        with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+            conn.execute("select * from generate_series(1, 3::float8)")
+        assert ei.value.diag.message_primary == (
+            "function generate_series(integer, double precision) does not exist"
+        )
+        assert ei.value.diag.statement_position == "15"
+        for sql, signature in [
+            ("select generate_series(1)", "generate_series(integer)"),
+            (
+                "select generate_series(1,2,3,4)",
+                "generate_series(integer, integer, integer, integer)",
+            ),
+        ]:
+            with pytest.raises(psycopg.errors.UndefinedFunction) as ei:
+                conn.execute(sql)
+            assert ei.value.diag.message_primary == f"function {signature} does not exist", sql
+        # psycopg sends a small Python int as an `int2`, and PostgreSQL cannot
+        # choose between the int4 / int8 / numeric overloads for one.
+        for sql, signature in [
+            ("select generate_series(%s, %s)", "generate_series(smallint, smallint)"),
+            (
+                "select generate_series(%s, %s, %s)",
+                "generate_series(smallint, smallint, smallint)",
+            ),
+        ]:
+            args = (1, 10, 3)[: sql.count("%s")]
+            with pytest.raises(psycopg.errors.AmbiguousFunction) as amb:
+                conn.execute(sql, args)
+            assert amb.value.diag.message_primary == f"function {signature} is not unique", sql
+        # An untyped literal bound is ambiguous for the same reason.
+        with pytest.raises(psycopg.errors.AmbiguousFunction) as amb:
+            conn.execute("select generate_series('1','3')")
+        assert amb.value.diag.message_primary == (
+            "function generate_series(unknown, unknown) is not unique"
+        )
+
+
+def test_order_by_and_group_by_item_faults_are_positioned_at_the_item(home: Path) -> None:
+    """A fault in an `ORDER BY` / `GROUP BY` / `DISTINCT ON` item is reported
+    AT the item: a constant that is not a position is `42601 non-integer
+    constant in <clause>` (the clause is named, so `GROUP BY 'a'` says GROUP
+    BY -- it used to be a `42803` grouping error over the select list), a
+    position outside the select list is `42P10`, and a `SELECT DISTINCT`
+    whose sort term it does not project is `42P10`. `DISTINCT ON` also
+    resolves a POSITION (`DISTINCT ON (1)`), implies the sort on its keys
+    when the query has no `ORDER BY` of its own, and must lead the `ORDER
+    BY` -- which this server did not check outside an aggregate, so it
+    answered rows where PostgreSQL refuses the statement. Every one of these
+    errors was unpositioned (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table ob (id int primary key, n int, s text)")
+        conn.execute("insert into ob values (1, 5, 'b'), (2, -7, 'a'), (3, 2, 'c'), (4, null, 'd')")
+        conn.commit()
+        for sql, state, message, position in [
+            ("select id from ob order by 'a'", "42601", "non-integer constant in ORDER BY", "28"),
+            ("select id from ob order by 1.5", "42601", "non-integer constant in ORDER BY", "28"),
+            ("select id from ob order by null", "42601", "non-integer constant in ORDER BY", "28"),
+            ("select id from ob order by true", "42601", "non-integer constant in ORDER BY", "28"),
+            (
+                "select id, n from ob order by 2, 'a'",
+                "42601",
+                "non-integer constant in ORDER BY",
+                "34",
+            ),
+            (
+                "select id from ob order by 3",
+                "42P10",
+                "ORDER BY position 3 is not in select list",
+                "28",
+            ),
+            (
+                "select id from ob order by 0",
+                "42P10",
+                "ORDER BY position 0 is not in select list",
+                "28",
+            ),
+            (
+                "select id from ob order by -1",
+                "42P10",
+                "ORDER BY position -1 is not in select list",
+                "28",
+            ),
+            (
+                "select distinct n from ob order by id",
+                "42P10",
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                "36",
+            ),
+            (
+                "select distinct n from ob order by n + 1",
+                "42P10",
+                "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                "36",
+            ),
+            (
+                "select distinct n from ob order by 2",
+                "42P10",
+                "ORDER BY position 2 is not in select list",
+                "36",
+            ),
+            # Over an aggregate, and over a set operation.
+            (
+                "select n, count(*) from ob group by n order by 'a'",
+                "42601",
+                "non-integer constant in ORDER BY",
+                "48",
+            ),
+            (
+                "select n, count(*) from ob group by n having count(*) > 0 order by 3",
+                "42P10",
+                "ORDER BY position 3 is not in select list",
+                "68",
+            ),
+            (
+                "select n from ob union select 1 order by 'a'",
+                "42601",
+                "non-integer constant in ORDER BY",
+                "42",
+            ),
+            (
+                "select n from ob union select 1 order by 2",
+                "42P10",
+                "ORDER BY position 2 is not in select list",
+                "42",
+            ),
+            # GROUP BY names its own clause.
+            (
+                "select n, count(*) from ob group by 'a'",
+                "42601",
+                "non-integer constant in GROUP BY",
+                "37",
+            ),
+            (
+                "select n, count(*) from ob group by null",
+                "42601",
+                "non-integer constant in GROUP BY",
+                "37",
+            ),
+            (
+                "select n, count(*) from ob group by 1.5",
+                "42601",
+                "non-integer constant in GROUP BY",
+                "37",
+            ),
+            (
+                "select n, count(*) from ob group by 3",
+                "42P10",
+                "GROUP BY position 3 is not in select list",
+                "37",
+            ),
+            # DISTINCT ON: its own clause name, its own positions, and the
+            # rule that it leads the ORDER BY.
+            (
+                "select distinct on ('a') n from ob",
+                "42601",
+                "non-integer constant in DISTINCT ON",
+                "21",
+            ),
+            (
+                "select distinct on (2) n from ob",
+                "42P10",
+                "DISTINCT ON position 2 is not in select list",
+                "21",
+            ),
+            (
+                "select distinct on (s) s from ob order by n",
+                "42P10",
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                "21",
+            ),
+            (
+                "select distinct on (n) s from ob order by s",
+                "42P10",
+                "SELECT DISTINCT ON expressions must match initial ORDER BY expressions",
+                "21",
+            ),
+        ]:
+            with pytest.raises(psycopg.Error) as err:
+                conn.execute(sql)
+            assert err.value.sqlstate == state, sql
+            assert err.value.diag.message_primary == message, sql
+            assert err.value.diag.statement_position == position, sql
+        # A DISTINCT ON with no ORDER BY of its own comes back in its keys'
+        # order, as PostgreSQL's sort-then-unique gives it -- the rows' own
+        # order would put 5 first.
+        assert conn.execute("select distinct on (n) n from ob").fetchall() == [
+            (-7,),
+            (2,),
+            (5,),
+            (None,),
+        ]
+        assert conn.execute("select distinct on (1) n from ob").fetchall() == [
+            (-7,),
+            (2,),
+            (5,),
+            (None,),
+        ]
+        assert conn.execute("select distinct on (n) n from ob order by n desc").fetchall() == [
+            (None,),
+            (5,),
+            (2,),
+            (-7,),
+        ]
+        assert conn.execute("select distinct on (s, n) s, n from ob order by s, n").fetchall() == [
+            ("a", -7),
+            ("b", 5),
+            ("c", 2),
+            ("d", None),
+        ]
+
+
+def test_plan_time_input_faults_carry_positions(home: Path) -> None:
+    """A plan-time fault is positioned where PostgreSQL positions it: a
+    literal the target type cannot read points at THAT literal wherever it
+    is written (a comparison, `BETWEEN`, `IN`, `= ANY`, a second select-list
+    item, an INSERT value, an UPDATE assignment), a missing type at the type
+    name as written (and at the literal when a `regtype` / `regnamespace`
+    names it), and an aggregate or datetime call with no matching signature
+    at the call. A value read from a ROW has no literal to point at and
+    stays unpositioned, exactly as it is on PostgreSQL. All of these were
+    unpositioned (PostgreSQL 16.15, 2026-09-27)."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table asg (i int, t text)")
+        conn.execute("insert into asg values (1, 'x'), (2, 'y')")
+        conn.execute("create table bb (id int, ok boolean, t text)")
+        conn.execute("insert into bb values (1, true, 'x'), (2, false, 'y')")
+        conn.commit()
+        for sql, state, message, position in [
+            # A literal the column's type cannot read.
+            (
+                "select i from asg where i = 'x'",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "29",
+            ),
+            (
+                "select i from asg where i between 'a' and 3",
+                "22P02",
+                'invalid input syntax for type integer: "a"',
+                "35",
+            ),
+            (
+                "select i from asg where t = 'a' and i = 'x'",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "41",
+            ),
+            (
+                "select i from asg where i in ('x')",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "31",
+            ),
+            (
+                "select 'x' = any(array[1,2])",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "8",
+            ),
+            # The FAILING literal, not the first one.
+            (
+                "select '1'::int, 'x'::int",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "18",
+            ),
+            (
+                "select 'x'::int, '1'::int",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "8",
+            ),
+            ("select ('x')::int", "22P02", 'invalid input syntax for type integer: "x"', "9"),
+            ("select -'x'::int", "22P02", 'invalid input syntax for type integer: "x"', "9"),
+            (
+                "insert into asg values ('x', 'y')",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "25",
+            ),
+            (
+                "update asg set i = 'x'",
+                "22P02",
+                'invalid input syntax for type integer: "x"',
+                "20",
+            ),
+            (
+                "select int4range(1,5) @> 'abc'",
+                "22P02",
+                'malformed range literal: "abc"',
+                "26",
+            ),
+            # A missing type, at the name as written.
+            ("select 1::no_such_type", "42704", 'type "no_such_type" does not exist', "11"),
+            ("select 1 + 'a'::nosuchtype", "42704", 'type "nosuchtype" does not exist', "17"),
+            ("select cast(1 as no_such_type)", "42704", 'type "no_such_type" does not exist', "18"),
+            ("select 'nosuch'::regtype", "42704", 'type "nosuch" does not exist', "8"),
+            ("select 'nope'::regnamespace", "3F000", 'schema "nope" does not exist', "8"),
+            # An unquoted reserved word is the type grammar's syntax error,
+            # reported at the literal that spelled it.
+            ("select 'order'::regtype", "42601", 'syntax error at or near "order"', "8"),
+            # An aggregate with no signature for the column's type.
+            ("select min(ok) from bb", "42883", "function min(boolean) does not exist", "8"),
+            ("select max(ok) from bb", "42883", "function max(boolean) does not exist", "8"),
+            (
+                "select max(id), min(ok) from bb",
+                "42883",
+                "function min(boolean) does not exist",
+                "17",
+            ),
+            (
+                "select max(ok) from bb group by t",
+                "42883",
+                "function max(boolean) does not exist",
+                "8",
+            ),
+            (
+                "select min(b), max(b) from (values (true), (false)) v(b)",
+                "42883",
+                "function min(boolean) does not exist",
+                "8",
+            ),
+            ("select sum(t) from bb", "42883", "function sum(text) does not exist", "8"),
+            ("select avg(t) from bb", "42883", "function avg(text) does not exist", "8"),
+            (
+                "select string_agg(id, ',') from bb",
+                "42883",
+                "function string_agg(integer, unknown) does not exist",
+                "8",
+            ),
+            (
+                "select id from bb group by id having max(ok)",
+                "42883",
+                "function max(boolean) does not exist",
+                "38",
+            ),
+            ("select bool_and(t) from bb", "42883", "function bool_and(text) does not exist", "8"),
+            # The datetime family, whose operand types PostgreSQL resolves
+            # through the same overload rules -- including the arity, which
+            # this server used to word as "with 1 arguments".
+            (
+                "select age(time '10:00')",
+                "42883",
+                "function age(time without time zone) does not exist",
+                "8",
+            ),
+            ("select age(1,2)", "42883", "function age(integer, integer) does not exist", "8"),
+            ("select age('2021-01-02')", "42725", "function age(unknown) is not unique", "8"),
+            (
+                "select 1 + age(time '10:00')",
+                "42883",
+                "function age(time without time zone) does not exist",
+                "12",
+            ),
+            (
+                "select date_trunc('day', '2021-01-01 10:00')",
+                "42725",
+                "function date_trunc(unknown, unknown) is not unique",
+                "8",
+            ),
+            (
+                "select extract(year from '2021-01-01')",
+                "42725",
+                "function pg_catalog.extract(unknown, unknown) is not unique",
+                "8",
+            ),
+            (
+                "select date_trunc('day', 1)",
+                "42883",
+                "function date_trunc(unknown, integer) does not exist",
+                "8",
+            ),
+            (
+                "select extract(year from 1)",
+                "42883",
+                "function pg_catalog.extract(unknown, integer) does not exist",
+                "8",
+            ),
+            (
+                "select date_part('year', 1)",
+                "42883",
+                "function date_part(unknown, integer) does not exist",
+                "8",
+            ),
+            (
+                "select date_trunc('day')",
+                "42883",
+                "function date_trunc(unknown) does not exist",
+                "8",
+            ),
+            (
+                "select date_part('year')",
+                "42883",
+                "function date_part(unknown) does not exist",
+                "8",
+            ),
+            ("select date_trunc(1)", "42883", "function date_trunc(integer) does not exist", "8"),
+        ]:
+            with pytest.raises(psycopg.Error) as err:
+                conn.execute(sql)
+            assert err.value.sqlstate == state, sql
+            assert err.value.diag.message_primary == message, sql
+            assert err.value.diag.statement_position == position, sql
+        # A value that came from a ROW has no literal to point at: PostgreSQL
+        # leaves it unpositioned, and so does this server.
+        with pytest.raises(psycopg.errors.InvalidTextRepresentation) as row:
+            conn.execute("select t::int from asg")
+        assert row.value.diag.message_primary == 'invalid input syntax for type integer: "x"'
+        assert row.value.diag.statement_position is None
+        assert conn.execute("select min(i), max(i) from asg").fetchone() == (1, 2)

@@ -65,6 +65,17 @@ pub struct Column {
     /// when an INSERT omits the column. `Some(Bson::Null)` is an explicit
     /// `DEFAULT NULL`; `None` is no default at all.
     pub default: Option<Bson>,
+    /// An EXPRESSION column DEFAULT (`now()`, `gen_random_uuid()`,
+    /// `nextval('s')`, `'a' || 'b'`) as SQL text, evaluated per omitted row
+    /// at INSERT -- the same shape the Python server stores it in. A column
+    /// has `default` or `default_expr`, never both.
+    pub default_expr: Option<String>,
+    /// The default as PostgreSQL's `pg_get_expr` prints the analysed
+    /// expression (`(1 + 2)`, `'x'::text`, `nextval('s'::regclass)`), which is
+    /// what `information_schema.columns.column_default` shows. Display only:
+    /// never evaluated. `None` on a store written before it was recorded, in
+    /// which case the server falls back to rendering the stored default.
+    pub default_text: Option<String>,
     /// Where this column's values are READ from, for the RowDescription's
     /// `ftable` / `ftablecol`: `(relation oid, 1-based attnum)` for a column
     /// that passes a base table's column straight through, `None` for a
@@ -93,6 +104,8 @@ impl Column {
             nullable: !pk,
             sequence: None,
             default: None,
+            default_expr: None,
+            default_text: None,
             source: None,
             typmod: -1,
         }
@@ -130,7 +143,7 @@ impl Column {
     /// column with missing keys rather than explicit nulls.
     pub fn to_document(&self) -> Document {
         let (stored_type, decl_oid) = self.stored_type();
-        doc! {
+        let mut d = doc! {
             "name": &self.name,
             "type": stored_type,
             "field": self.field(),
@@ -138,7 +151,7 @@ impl Column {
             "nullable": self.nullable,
             "has_default": self.default.is_some(),
             "default": self.default.clone().unwrap_or(Bson::Null),
-            "default_expr": Bson::Null,
+            "default_expr": self.default_expr.as_deref().map_or(Bson::Null, Bson::from),
             "comment": Bson::Null,
             "sequence": self.sequence.as_deref().map_or(Bson::Null, Bson::from),
             "identity": Bson::Null,
@@ -150,7 +163,14 @@ impl Column {
             "json_plain": false,
             "decl_oid": decl_oid,
             "typmod": self.typmod,
+        };
+        // Rust-only and display-only, so it is written only when there is one:
+        // a table without expression defaults keeps the exact document the
+        // Python server writes (`golden.rs` pins that).
+        if let Some(text) = self.default_text.as_deref() {
+            d.insert("default_text", text);
         }
+        d
     }
 
     pub fn from_document(d: &Document) -> Option<Self> {
@@ -165,6 +185,8 @@ impl Column {
                 .get_bool("has_default")
                 .unwrap_or(false)
                 .then(|| d.get("default").cloned().unwrap_or(Bson::Null)),
+            default_expr: d.get_str("default_expr").ok().map(str::to_string),
+            default_text: d.get_str("default_text").ok().map(str::to_string),
             source: None,
             typmod: d.get_i32("typmod").unwrap_or(-1),
         })
