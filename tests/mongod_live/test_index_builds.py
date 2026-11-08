@@ -487,6 +487,72 @@ def test_a_build_in_progress_as_listed(rust_fp: Any, mongod_fp: Any) -> None:
     same(_while_building(rust_fp), _while_building(mongod_fp))
 
 
+def _stats_of(db: Any) -> dict:
+    """The counts and names the stats commands give for `db.c` (the sizes
+    themselves are each engine's own)."""
+    coll = db.command("collStats", "c")
+    stage = next(db.c.aggregate([{"$collStats": {"storageStats": {}}}]))["storageStats"]
+    out: dict = {}
+    for label, s in (("collStats", coll), ("$collStats", stage)):
+        out[label] = {
+            "nindexes": s["nindexes"],
+            "indexSizes": list(s["indexSizes"]),
+            "indexBuilds": s["indexBuilds"],
+            "totalIndexSize is their sum": s["totalIndexSize"] == sum(s["indexSizes"].values()),
+        }
+    out["$indexStats"] = sorted(
+        (
+            {"fields": list(d), "name": d["name"], "spec": d["spec"], "building": d.get("building")}
+            for d in db.c.aggregate([{"$indexStats": {}}])
+        ),
+        key=lambda d: d["name"],
+    )
+    out["dbStats.indexes"] = db.command("dbStats")["indexes"]
+    return out
+
+
+def _stats_while_building(client: Any) -> dict:
+    _seed(client, "live_ibs")
+    db = client.live_ibs
+    db.c.create_index("z", name="z_1")
+    begun = time.time()
+    build = _Build(
+        client,
+        "live_ibs",
+        [{"key": {"a": 1}, "name": "a_1", "sparse": True}, {"key": {"b": 1}, "name": "b_1"}],
+        "hangIndexBuildBeforeCommit",
+    )
+    deadline = time.monotonic() + 30
+    while not client.config["system.indexBuilds"].find_one(
+        {"commitReadyMembers": {"$exists": True}}
+    ):
+        assert time.monotonic() < deadline, "the build never got ready to commit"
+        time.sleep(0.05)
+    out = {"building": _stats_of(db)}
+    since = {d["name"]: d["accesses"]["since"] for d in db.c.aggregate([{"$indexStats": {}}])}
+    out["result"] = build.finish()
+    out["built"] = _stats_of(db)
+    after = {d["name"]: d["accesses"]["since"] for d in db.c.aggregate([{"$indexStats": {}}])}
+    out["since"] = {
+        name: {
+            "from the build's start": since[name].timestamp() >= begun - 1,
+            "kept at commit": after[name] == since[name],
+        }
+        for name in ("a_1", "b_1")
+    }
+    client.drop_database("live_ibs")
+    return out
+
+
+def test_a_build_in_progress_in_stats(rust_fp: Any, mongod_fp: Any) -> None:
+    """While it runs, a build's indexes count in `collStats` and
+    `$collStats` (`nindexes`, `indexSizes` after the finished ones,
+    `indexBuilds` naming them) and in `dbStats`, and `$indexStats` lists
+    them with `building: true` as its last field; their use is counted from
+    when the build began, through its commit (RM-321)."""
+    same(_stats_while_building(rust_fp), _stats_while_building(mongod_fp))
+
+
 def _memory_parameter(client: Any) -> list:
     out = [
         _answer(

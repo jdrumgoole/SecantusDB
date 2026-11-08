@@ -78,11 +78,11 @@ def _stats_while_building(client: Any) -> tuple:
     return out
 
 
-@pytest.mark.backlog("RM-321")
+@pytest.mark.backlog_fixed("RM-321")
 def test_a_building_index_counts_in_stats(rust_fp: Any, mongod_fp: Any) -> None:  # noqa: F811
     """mongod 8.2.11 counts an index still being built in `collStats`
     (`nindexes`, `indexSizes`) and lists it in `$indexStats` with
-    `building: true`; this server leaves it out of both until it commits."""
+    `building: true`; this server left it out of both until it committed."""
     theirs = _stats_while_building(mongod_fp)
     assert theirs == (2, ["_id_", "a_1"], [("_id_", False), ("a_1", True)]), theirs
     assert _stats_while_building(rust_fp) == theirs

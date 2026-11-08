@@ -1143,7 +1143,13 @@ impl CmdStorage for StorageAdapter {
             .collect();
         self.inner
             .begin_index_build(db, coll, uuid, &specs, member)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        // mongod counts an index's use from when its build began, and the
+        // commit does not restart it (measured 8.2.11, RM-321).
+        for s in &specs {
+            self.index_created(db, coll, &s.name);
+        }
+        Ok(())
     }
 
     fn run_index_build(&self, uuid: &[u8; 16], memory_limit: usize) -> Result<(), StorageError> {
@@ -1163,10 +1169,17 @@ impl CmdStorage for StorageAdapter {
             .into_iter()
             .find(|b| &b.uuid == uuid);
         self.inner.commit_index_build(uuid).map_err(map_err)?;
+        // Counted since the build began; a build restarted at open has no
+        // count yet, and starts one now.
         if let Some(b) = info {
+            let mut uses = self.index_use_map();
             for spec in &b.indexes {
                 if let Ok(name) = spec.get_str("name") {
-                    self.index_created(&b.db, &b.coll, name);
+                    uses.entry((b.db.clone(), b.coll.clone(), name.to_string()))
+                        .or_insert(IndexUse {
+                            ops: 0,
+                            since: Some(bson::DateTime::now()),
+                        });
                 }
             }
         }

@@ -1402,13 +1402,6 @@ inject (a panic, a power loss, a failing checkpoint).
       a write conflict.
       Backlog-ID: RM-320
       Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_transaction_older_than_an_index_cannot_write_past_it
-- [ ] **An index being built is not in `collStats` or `$indexStats`.**
-      mongod 8.2.11 counts an index whose build is still running in
-      `collStats` (`nindexes`, `indexSizes`) and lists it in `$indexStats`
-      with `building: true`; this server leaves it out of both until the
-      build commits (`listIndexes` lists it, since RM-187).
-      Backlog-ID: RM-321
-      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_building_index_counts_in_stats
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 

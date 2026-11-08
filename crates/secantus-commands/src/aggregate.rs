@@ -4537,9 +4537,14 @@ fn apply_index_stats(
     {
         indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
     }
+    // An index still being built is listed too, `building: true` (mongod
+    // 8.2.11, RM-321).
+    let building = crate::admin::building_indexes(storage, db, coll);
     Ok(indexes
         .into_iter()
-        .map(|ix| {
+        .map(|ix| (ix, false))
+        .chain(building.into_iter().map(|ix| (ix, true)))
+        .map(|(ix, is_building)| {
             // The index as `listIndexes` shows it, less what only the
             // catalog keeps.
             let mut spec = doc! {
@@ -4558,7 +4563,7 @@ fn apply_index_stats(
             // Each plan that read the index, since it was made or this
             // process began, whichever was later.
             let (ops, since) = storage.index_use(db, coll, &name).unwrap_or((0, None));
-            doc! {
+            let mut out = doc! {
                 "name": name,
                 "key": ix.get_document("key").cloned().unwrap_or_default(),
                 "host": "secantus",
@@ -4567,7 +4572,11 @@ fn apply_index_stats(
                     "since": since.unwrap_or_else(crate::handshake::process_started),
                 },
                 "spec": spec,
+            };
+            if is_building {
+                out.insert("building", true);
             }
+            out
         })
         .collect())
 }

@@ -83,9 +83,10 @@ fn totals(ctx: &CommandContext, db: &str) -> Result<Totals, CommandError> {
         t.objects += kept.records;
         t.data_size += kept.data_size;
         let sizes = kept.index_sizes;
-        t.indexes += storage
-            .list_indexes(db, &c)
-            .map_or(sizes.len(), |l| l.len()) as i64;
+        // An index still being built counts (mongod 8.2.11, RM-321).
+        t.indexes += storage.list_indexes(db, &c).map_or(sizes.len(), |l| {
+            l.len() + crate::admin::building_indexes(storage, db, &c).len()
+        }) as i64;
         t.index_size += sizes.values().filter_map(as_i64).sum::<i64>();
     }
     // The views are documents in `system.views`, a collection with an `_id` index.
@@ -241,12 +242,24 @@ pub(crate) fn storage_stats(
     let count = kept.records;
     let size = kept.data_size;
     let measured = kept.index_sizes;
-    // Every index is listed, one that holds no entry yet included.
+    // Every index is listed, one that holds no entry yet included, and
+    // after them the indexes still being built, which `indexBuilds` names
+    // (mongod 8.2.11, RM-321).
     let mut sizes = Document::new();
-    for index in storage.list_indexes(db, coll).unwrap_or_default() {
+    let mut builds = Vec::new();
+    let building = crate::admin::building_indexes(storage, db, coll);
+    let ready = storage.list_indexes(db, coll).unwrap_or_default();
+    for (index, is_building) in ready
+        .iter()
+        .map(|ix| (ix, false))
+        .chain(building.iter().map(|ix| (ix, true)))
+    {
         if let Ok(name) = index.get_str("name") {
             let size = measured.get(name).and_then(as_i64).unwrap_or(0);
             sizes.insert(name, Bson::Int64(size));
+            if is_building {
+                builds.push(Bson::String(name.to_string()));
+            }
         }
     }
     let index_total: i64 = sizes.values().filter_map(as_i64).sum();
@@ -280,7 +293,7 @@ pub(crate) fn storage_stats(
         }
     }
     out.insert("nindexes", sizes.len() as i32);
-    out.insert("indexBuilds", Bson::Array(vec![]));
+    out.insert("indexBuilds", Bson::Array(builds));
     out.insert("totalIndexSize", int(index_total / scale));
     out.insert("indexSizes", scaled);
     out.insert("totalSize", int((size + index_total) / scale));
