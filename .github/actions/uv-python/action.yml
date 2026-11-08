@@ -1,0 +1,66 @@
+name: uv-python
+description: >
+  Install a uv-managed CPython, restored from the Actions cache when a run on
+  the same runner image has installed it before. Run it after setup-uv, which
+  sets UV_PYTHON_INSTALL_DIR. Not for Windows, which takes its interpreter
+  from the runner tool cache (see the ``rust`` job in test.yml).
+
+# Why (2026-11-08): every Linux job downloaded its interpreter on every run.
+# The ubuntu-26.04 image ships no 3.10 in its tool cache, so setup-python
+# fetched it from github.com/actions/python-versions in each pg-oracle shard,
+# and `uv python install 3.12` fetched python-build-standalone in every other
+# job. Three PR runs on 2026-11-08 went red before any test ran because that
+# download answered HTTP 504 three times in a row (run 42469436515: both
+# pg-oracle shards, "Unexpected HTTP response: 504" in "Set up Python 3.10").
+#
+# The cache holds uv's python-dir, whose path is fixed under RUNNER_TEMP, so
+# a restored interpreter sits at the same path a fresh install would: the
+# WiredTiger build-cache keys, which hash the interpreter path, do not move.
+# setup-uv's own `cache-python` is not used because its key includes the
+# uv.lock hash, so every dependency change would re-download the interpreter.
+#
+# A cold miss still downloads, so the install retries with a backoff rather
+# than failing the job on the first 504. A failure after the last attempt is
+# still a red step, with the reason in the log.
+
+inputs:
+  version:
+    description: "The CPython version to install, as `uv python install` takes it (3.12)"
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Locate uv's python-dir
+      id: dir
+      shell: bash
+      run: |
+        set -euo pipefail
+        d="${UV_PYTHON_INSTALL_DIR:-$(uv python dir)}"
+        echo "path=$d" >> "$GITHUB_OUTPUT"
+        echo "key=uv-python-${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS:-unknown}-${{ inputs.version }}-v1" >> "$GITHUB_OUTPUT"
+        echo "uv python-dir: $d"
+
+    - name: Restore the interpreter
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.dir.outputs.path }}
+        key: ${{ steps.dir.outputs.key }}
+
+    - name: Install Python ${{ inputs.version }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        # A restored install satisfies this at once; on a miss it downloads.
+        for attempt in 1 2 3 4; do
+          if uv python install "${{ inputs.version }}"; then
+            uv python find "${{ inputs.version }}"
+            exit 0
+          fi
+          if [ "$attempt" -lt 4 ]; then
+            echo "uv python install ${{ inputs.version }}: attempt $attempt failed; retrying in $((attempt * 30))s"
+            sleep $((attempt * 30))
+          fi
+        done
+        echo "::error::uv python install ${{ inputs.version }} failed after 4 attempts"
+        exit 1
