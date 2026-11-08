@@ -1231,7 +1231,8 @@ fn server_parameters() -> Document {
 }
 
 /// A blocking stage's memory and spill counters in an explain, as mongod
-/// 8.2.11 lists them: a `$sort`'s, and a `$group`'s.
+/// 8.2.11 lists them: a `$sort`'s, a `$group`'s, and a
+/// `$_internalSetWindowFields`'s (RM-328).
 fn spill_fields(stage: &mut Document, spilled: &secantus_core::memlimit::SpillReport) {
     match stage.keys().next().map(String::as_str) {
         Some("$sort") => {
@@ -1247,6 +1248,15 @@ fn spill_fields(stage: &mut Document, spilled: &secantus_core::memlimit::SpillRe
             );
         }
         Some("$group") => {
+            if let Some(group) = spilled.groups.last() {
+                let per: Document = group
+                    .max_accumulator_memory
+                    .iter()
+                    .map(|(k, v)| (k.clone(), Bson::Int64(*v)))
+                    .collect();
+                stage.insert("maxAccumulatorMemoryUsageBytes", per);
+                stage.insert("totalOutputDataSizeBytes", group.total_output_data_size);
+            }
             stage.insert("usedDisk", spilled.group_spills > 0);
             stage.insert("spills", spilled.group_spills);
             stage.insert(
@@ -1255,6 +1265,23 @@ fn spill_fields(stage: &mut Document, spilled: &secantus_core::memlimit::SpillRe
             );
             stage.insert("spilledBytes", spilled.group_spilled_bytes);
             stage.insert("spilledRecords", spilled.group_spilled_records);
+        }
+        Some("$_internalSetWindowFields") => {
+            let window = spilled.windows.last().cloned().unwrap_or_default();
+            // In the order of the functions' names (mongod's map).
+            let mut functions = window.max_function_memory.clone();
+            functions.sort();
+            let per: Document = functions
+                .into_iter()
+                .map(|(k, v)| (k, Bson::Int64(v)))
+                .collect();
+            stage.insert("maxFunctionMemoryUsageBytes", per);
+            stage.insert("maxTotalMemoryUsageBytes", window.max_total_memory);
+            stage.insert("usedDisk", window.spills > 0);
+            stage.insert("spills", window.spills);
+            stage.insert("spilledDataStorageSize", window.spilled_data_storage_size);
+            stage.insert("spilledBytes", window.spilled_bytes);
+            stage.insert("spilledRecords", window.spilled_records);
         }
         _ => {}
     }
@@ -1292,7 +1319,14 @@ fn count_inline(
     pipeline: &[Document],
     options: &Document,
 ) -> i64 {
-    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    // The window's `$sort` runs as the `$sort` it is.
+    let stages: Vec<Bson> = pipeline
+        .iter()
+        .map(|stage| match stage.get(shape::WINDOW_SORT) {
+            Some(sort) => Bson::Document(doc! { "$sort": sort.clone() }),
+            None => Bson::Document(stage.clone()),
+        })
+        .collect();
     let mut cmd = doc! {
         "aggregate": coll,
         "pipeline": stages,
@@ -1662,7 +1696,7 @@ fn through_view(
     shape.hint = s.hint.clone();
     shape.options = s.options.clone();
     let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
-    let pipeline: Vec<Document> = hoist::hoist_matches(&stages)
+    let pipeline: Vec<Document> = hoist::hoist_matches(&shape::desugared(&stages))
         .into_iter()
         .filter_map(|b| match b {
             Bson::Document(d) => Some(d),
@@ -2014,7 +2048,7 @@ fn aggregate(
         // The pipeline as mongod reorders it, which the per-stage counts
         // run a prefix of.
         let staged: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
-        let pipeline: Vec<Document> = hoist::hoist_matches(&staged)
+        let pipeline: Vec<Document> = hoist::hoist_matches(&shape::desugared(&staged))
             .into_iter()
             .filter_map(|b| match b {
                 Bson::Document(d) => Some(d),

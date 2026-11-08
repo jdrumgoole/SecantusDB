@@ -187,6 +187,10 @@ thread_local! {
     }) };
     static ALLOW_DISK_USE: Cell<bool> = const { Cell::new(true) };
     static REPORT: RefCell<SpillReport> = RefCell::new(SpillReport::default());
+    /// Whether a stage's own counters are kept: only while `explain` runs
+    /// a stage to read them ([`captured`]), so a `$group` in a `$lookup`
+    /// does not keep one record for every document it is run for.
+    static STAGE_STATS: Cell<bool> = const { Cell::new(false) };
     static CURSOR_READ: RefCell<Option<CursorRead>> = const { RefCell::new(None) };
     static SPILL_DIR: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
@@ -208,6 +212,35 @@ pub struct SpillReport {
     pub sort_spilled_data_storage_size: i64,
     /// What the sorts counted, spilled or not (`sortTotalDataSizeBytes`).
     pub sort_total_data_size: i64,
+    /// Each `$group` that finished, in the order they did (RM-328).
+    pub groups: Vec<GroupStats>,
+    /// Each `$setWindowFields` that finished, in the order they did.
+    pub windows: Vec<WindowStats>,
+}
+
+/// What one `$group` counted, as mongod 8.2's `explain` lists it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct GroupStats {
+    /// Each accumulator's most memory over all its groups at once
+    /// (`maxAccumulatorMemoryUsageBytes`), in the spec's order.
+    pub max_accumulator_memory: Vec<(String, i64)>,
+    /// The size of every document it returned (`totalOutputDataSizeBytes`).
+    pub total_output_data_size: i64,
+}
+
+/// What one `$setWindowFields` counted, as mongod 8.2's `explain` lists it
+/// for the `$_internalSetWindowFields` it runs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WindowStats {
+    /// Each output's function at its largest (`maxFunctionMemoryUsageBytes`).
+    pub max_function_memory: Vec<(String, i64)>,
+    /// The stage's cache, functions and partition state at their largest
+    /// together (`maxTotalMemoryUsageBytes`).
+    pub max_total_memory: i64,
+    pub spills: i64,
+    pub spilled_records: i64,
+    pub spilled_bytes: i64,
+    pub spilled_data_storage_size: i64,
 }
 
 impl SpillReport {
@@ -228,6 +261,8 @@ impl SpillReport {
             sort_spilled_data_storage_size: self.sort_spilled_data_storage_size
                 - before.sort_spilled_data_storage_size,
             sort_total_data_size: self.sort_total_data_size - before.sort_total_data_size,
+            groups: self.groups[before.groups.len().min(self.groups.len())..].to_vec(),
+            windows: self.windows[before.windows.len().min(self.windows.len())..].to_vec(),
         }
     }
 }
@@ -407,10 +442,31 @@ pub fn report() -> SpillReport {
 /// Run `f` with a report of its own, and hand that back: what an explain
 /// reports for one stage, kept out of the operation's own report.
 pub fn captured<T>(f: impl FnOnce() -> T) -> (T, SpillReport) {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            STAGE_STATS.with(|s| s.set(self.0));
+        }
+    }
     let outer = REPORT.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    let _restore = Restore(STAGE_STATS.with(|s| s.replace(true)));
     let out = f();
     let inner = REPORT.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer));
     (out, inner)
+}
+
+/// A `$group` finished (RM-328).
+pub(crate) fn record_group(stats: impl FnOnce() -> GroupStats) {
+    if STAGE_STATS.with(Cell::get) {
+        REPORT.with(|r| r.borrow_mut().groups.push(stats()));
+    }
+}
+
+/// A `$setWindowFields` finished (RM-328).
+pub(crate) fn record_window(stats: impl FnOnce() -> WindowStats) {
+    if STAGE_STATS.with(Cell::get) {
+        REPORT.with(|r| r.borrow_mut().windows.push(stats()));
+    }
 }
 
 pub(crate) fn record_group_spill(records: i64, bytes: i64, storage: i64) {
@@ -488,6 +544,37 @@ fn value_len(v: &Bson) -> usize {
 /// mongod's size of a document (`Document::getApproximateSize`).
 pub fn document_size(doc: &Document) -> usize {
     bson_len(doc) + DOCUMENT_OVERHEAD
+}
+
+/// mongod's size of a document the classic engine built field by field,
+/// reserving room for its fields first (`MutableDocument(n)`), as a
+/// `$group` builds each document it returns (`Document::getApproximateSize`;
+/// measured on mongod 8.2.1, 2026-11-08, from `explain`'s
+/// `totalOutputDataSizeBytes` over 1 to 14 fields of names 1 to 100 bytes
+/// long, RM-328). Its storage (104 bytes), an empty BSON object (5), the
+/// buffer it allocated and what each value holds beyond its own `Value`.
+/// The buffer reserves 32 bytes a field and 32 more, and a hash table of 4
+/// bytes a bucket, 8 buckets doubling while there are more fields than
+/// buckets. A field takes its `Value`, two 4-byte words and its name with a
+/// NUL, to the next 8 bytes; once they no longer fit the buffer grows to
+/// the next power of two, at least 128, with room for the hash table.
+pub fn built_document_size(doc: &Document) -> usize {
+    let fields = doc.len();
+    let mut buckets = 8;
+    while fields > buckets {
+        buckets *= 2;
+    }
+    let hash = 4 * buckets;
+    let mut allocated = 32 * (fields + 1) + hash;
+    let mut used = 0;
+    for (name, _) in doc {
+        used += (VALUE + 8 + name.len() + 1).div_ceil(8) * 8;
+        if used + hash > allocated {
+            allocated = (used + hash).next_power_of_two().max(128);
+        }
+    }
+    let held: usize = doc.values().map(|v| classic_size(v) - VALUE).sum();
+    DOCUMENT_OVERHEAD + 5 + allocated + held
 }
 
 /// mongod's size of `doc` cut down to the top-level `fields` a stage and
@@ -637,6 +724,61 @@ mod tests {
         for d in docs {
             assert_eq!(bson_len(&d), bson::to_vec(&d).unwrap().len(), "{d:?}");
         }
+    }
+
+    #[test]
+    fn a_built_document_is_sized_as_mongod_sizes_one() {
+        // mongod 8.2.1's `totalOutputDataSizeBytes` per `$group` document
+        // (2026-11-08): `_id` and `n` int fields named `name(i)`.
+        let built = |fields: usize, name: &dyn Fn(usize) -> String| {
+            let mut d = doc! { "_id": 1 };
+            for i in 0..fields {
+                d.insert(name(i), 1);
+            }
+            built_document_size(&d)
+        };
+        let short = |i: usize| ((b'a' + i as u8) as char).to_string();
+        let ones: Vec<usize> = (0..14).map(|n| built(n, &short)).collect();
+        assert_eq!(
+            ones,
+            [205, 237, 269, 301, 333, 365, 397, 429, 493, 525, 557, 589, 621, 653]
+        );
+        for (len, size) in [(1, 237), (20, 237), (36, 237), (40, 365), (100, 365)] {
+            assert_eq!(built(1, &|_| "a".repeat(len)), size, "a name of {len}");
+        }
+        let long = |len: usize| move |i: usize| short(i).repeat(len);
+        let twenties: Vec<usize> = (0..9).map(|n| built(n, &long(20))).collect();
+        assert_eq!(twenties, [205, 237, 269, 365, 365, 621, 621, 621, 621]);
+        let thirties: Vec<usize> = (0..9).map(|n| built(n, &long(30))).collect();
+        assert_eq!(thirties, [205, 237, 365, 365, 621, 621, 621, 621, 1133]);
+        // What a value holds beyond its `Value`: a 1000-byte string 1024.
+        assert_eq!(
+            built_document_size(&doc! { "_id": 1, "f": "x".repeat(1000) }),
+            237 + 1024
+        );
+    }
+
+    #[test]
+    fn a_group_reports_its_accumulators_and_output() {
+        // mongod 8.2.1 over 300 documents in 7 groups (2026-11-08): the
+        // documents it builds take 1659 bytes; each `$sum` is counted over
+        // every group at once (here at Linux's 176 bytes a `$sum`, RM-397).
+        let docs: Vec<Document> = (0..300).map(|i| doc! {"_id": i, "k": i % 7}).collect();
+        let spec = Bson::Document(doc! {"_id": "$k", "n": {"$sum": 1}});
+        let (out, report) =
+            captured(|| crate::group::group_stage(&spec, &docs, &Document::new()).unwrap());
+        assert_eq!(out.len(), 7);
+        // Kept only while explain reads them.
+        reset_report();
+        crate::group::group_stage(&spec, &docs, &Document::new()).unwrap();
+        assert!(super::report().groups.is_empty());
+        assert_eq!(
+            report.groups,
+            [GroupStats {
+                max_accumulator_memory: vec![("n".to_string(), 7 * 176)],
+                total_output_data_size: 1659,
+            }]
+        );
     }
 
     #[test]

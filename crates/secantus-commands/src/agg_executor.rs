@@ -298,7 +298,11 @@ pub(crate) fn cursor_loads(
                 | "$lookup" | "$graphLookup" | "$unionWith",
                 r,
             ) => r,
-            ("$setWindowFields", Reads::Some(_)) if whole_input_window(spec) => Reads::All,
+            ("$setWindowFields" | "$_internalSetWindowFields", Reads::Some(_))
+                if whole_input_window(spec) =>
+            {
+                Reads::All
+            }
             (_, Reads::Some(_)) if blocks_bson(stage) => Reads::All,
             (_, Reads::All) => Reads::All,
             _ => return None,

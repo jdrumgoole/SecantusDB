@@ -335,7 +335,7 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
                     filters.push(m.clone());
                 }
             }
-            ("$sort", Bson::Document(s)) if !paged && shape.projection.is_none() => {
+            ("$sort" | WINDOW_SORT, Bson::Document(s)) if !paged && shape.projection.is_none() => {
                 shape.sort = Some(s.clone());
             }
             ("$skip", n) if shape.projection.is_none() => {
@@ -429,6 +429,248 @@ fn constified(v: &Bson) -> Bson {
     }
 }
 
+/// The `$sort` mongod parses a `$setWindowFields` into, as this explain
+/// carries it through the planner: a `$sort` to every rule that moves or
+/// absorbs one, listed with `outputSortKeyMetadata`, which a `$sort` the
+/// pipeline wrote does not show (RM-328). Never sent by a client: the
+/// command's own checks refuse the name before explain plans anything.
+pub(crate) const WINDOW_SORT: &str = "$_secantusWindowSort";
+
+/// The field a `$setWindowFields` partitioned by a computed key adds.
+const PARTITION_KEY: &str = "__internal_setWindowFields_partition_key";
+
+/// Whether `v` reads a variable (`$$NOW`, `$$ROOT`, a `let`).
+fn reads_variable(v: &Bson) -> bool {
+    match v {
+        Bson::String(s) => s.starts_with("$$"),
+        Bson::Array(items) => items.iter().any(reads_variable),
+        Bson::Document(d) if d.contains_key("$literal") => false,
+        Bson::Document(d) => d.values().any(reads_variable),
+        _ => false,
+    }
+}
+
+/// The field path a `partitionBy` names: `$a.b` and `$$ROOT.a.b` / `$$CURRENT.a.b`
+/// are `a.b`.
+fn partition_path(by: &Bson) -> Option<String> {
+    let s = by.as_str()?;
+    let path = match s.strip_prefix("$$") {
+        Some(var) => {
+            let (base, rest) = var.split_once('.')?;
+            if base != "ROOT" && base != "CURRENT" {
+                return None;
+            }
+            rest
+        }
+        None => s.strip_prefix('$')?,
+    };
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+/// `$setWindowFields` as mongod 8.2 parses it
+/// (`DocumentSourceInternalSetWindowFields::createFromBson`'s caller, measured
+/// 8.2.1, 2026-11-08): a `$sort` on its partition and `sortBy`, then the
+/// `$_internalSetWindowFields` that runs the windows. A partition that is a
+/// field path is sorted on as it is; a constant one is no partition; any
+/// other is computed into a field by an `$addFields` first, and dropped by a
+/// `$project` after. With neither a partition nor a `sortBy` there is no
+/// `$sort`.
+pub(crate) fn desugared_window(spec: &Document) -> Vec<Document> {
+    let mut internal = Document::new();
+    let mut sort = Document::new();
+    let mut before = None;
+    let mut after = None;
+    match spec.get("partitionBy") {
+        None => {}
+        Some(by)
+            if !reads_variable(by) && secantus_core::aggregate::is_constant_expression(by, &[]) => {
+        }
+        Some(by) => match partition_path(by) {
+            Some(path) => {
+                sort.insert(path, 1);
+                internal.insert("partitionBy", by.clone());
+            }
+            None => {
+                before = Some(doc! { "$addFields": { PARTITION_KEY: by.clone() } });
+                sort.insert(PARTITION_KEY, 1);
+                internal.insert("partitionBy", format!("${PARTITION_KEY}"));
+                after = Some(doc! { "$project": { PARTITION_KEY: false, "_id": true } });
+            }
+        },
+    }
+    if let Some(Bson::Document(by)) = spec.get("sortBy") {
+        for (k, v) in by {
+            sort.insert(k.clone(), v.clone());
+        }
+    }
+    for (k, v) in spec {
+        if k != "partitionBy" {
+            internal.insert(k.clone(), v.clone());
+        }
+    }
+    let mut out: Vec<Document> = before.into_iter().collect();
+    if !sort.is_empty() {
+        out.push(doc! { WINDOW_SORT: sort });
+    }
+    out.push(doc! { "$_internalSetWindowFields": internal });
+    out.extend(after);
+    out
+}
+
+/// `pipeline` with each `$setWindowFields` as the stages mongod parses it
+/// into ([`desugared_window`]).
+pub(crate) fn desugared(pipeline: &[Bson]) -> Vec<Bson> {
+    pipeline
+        .iter()
+        .flat_map(|stage| match stage.as_document() {
+            Some(d) if d.len() == 1 => match d.get("$setWindowFields") {
+                Some(Bson::Document(spec)) => desugared_window(spec)
+                    .into_iter()
+                    .map(Bson::Document)
+                    .collect(),
+                _ => vec![stage.clone()],
+            },
+            _ => vec![stage.clone()],
+        })
+        .collect()
+}
+
+/// The window functions that take no window, which mongod lists without one.
+const WINDOWLESS: &[&str] = &[
+    "$rank",
+    "$denseRank",
+    "$documentNumber",
+    "$shift",
+    "$expMovingAvg",
+    "$locf",
+    "$linearFill",
+];
+
+/// One `$_internalSetWindowFields` output as mongod 8.2.1 prints it back
+/// (measured 2026-11-08): the function's argument with its literals as
+/// `$const` and its own fields in the order the function serialises them,
+/// `$count` as the `$sum` of 1 it is, and the window -- whole partition
+/// when none was written -- except on the functions that take none.
+fn listed_window_output(spec: &Document) -> Document {
+    let window = spec.get("window");
+    let Some((op, arg)) = spec.iter().find(|(k, _)| k.starts_with('$')) else {
+        return spec.clone();
+    };
+    let field = |d: &Document, k: &str| d.get(k).map(constified);
+    let listed = match (op.as_str(), arg) {
+        ("$count", _) => doc! { "$sum": { "$const": 1 } },
+        ("$rank" | "$denseRank" | "$documentNumber", _) => doc! { op.clone(): arg.clone() },
+        ("$shift", Bson::Document(d)) => {
+            let mut out = Document::new();
+            if let Some(by) = d.get("by") {
+                out.insert("by", by.clone());
+            }
+            if let Some(o) = field(d, "output") {
+                out.insert("output", o);
+            }
+            out.insert("default", d.get("default").cloned().unwrap_or(Bson::Null));
+            doc! { "$shift": out }
+        }
+        ("$expMovingAvg", Bson::Document(d)) => {
+            let mut out = Document::new();
+            if let Some(n) = d.get("N") {
+                // Held as a `long long`.
+                out.insert("N", as_i64(n).map_or_else(|| n.clone(), Bson::Int64));
+            }
+            if let Some(alpha) = d.get("alpha") {
+                // Held as a decimal (`Decimal128(double)`, 15 digits).
+                let as_decimal = secantus_core::expressions::evaluate(
+                    &Document::new(),
+                    &Bson::Document(doc! { "$toDecimal": alpha.clone() }),
+                    &Document::new(),
+                )
+                .unwrap_or_else(|_| alpha.clone());
+                out.insert("alpha", as_decimal);
+            }
+            if let Some(i) = field(d, "input") {
+                out.insert("input", i);
+            }
+            doc! { "$expMovingAvg": out }
+        }
+        ("$topN" | "$bottomN" | "$top" | "$bottom", Bson::Document(d)) => {
+            let mut out = Document::new();
+            if let Some(n) = field(d, "n") {
+                out.insert("n", n);
+            }
+            if let Some(o) = field(d, "output") {
+                out.insert("output", o);
+            }
+            if let Some(by) = d.get("sortBy") {
+                out.insert("sortBy", by.clone());
+            }
+            doc! { op.clone(): out }
+        }
+        ("$firstN" | "$lastN" | "$minN" | "$maxN", Bson::Document(d)) => {
+            let mut out = Document::new();
+            if let Some(n) = field(d, "n") {
+                out.insert("n", n);
+            }
+            if let Some(i) = field(d, "input") {
+                out.insert("input", i);
+            }
+            doc! { op.clone(): out }
+        }
+        ("$minMaxScaler", Bson::Document(d)) => {
+            let mut out = Document::new();
+            if let Some(i) = field(d, "input") {
+                out.insert("input", i);
+            }
+            out.insert("min", d.get("min").cloned().unwrap_or(Bson::Int32(0)));
+            out.insert("max", d.get("max").cloned().unwrap_or(Bson::Int32(1)));
+            doc! { "$minMaxScaler": out }
+        }
+        ("$percentile" | "$median" | "$derivative" | "$integral", Bson::Document(d)) => {
+            let mut out = d.clone();
+            if let Some(i) = field(d, "input") {
+                out.insert("input", i);
+            }
+            doc! { op.clone(): out }
+        }
+        (_, Bson::Array(items)) => {
+            doc! { op.clone(): items.iter().map(constified).collect::<Vec<_>>() }
+        }
+        _ => doc! { op.clone(): constified(arg) },
+    };
+    let mut out = listed;
+    match window {
+        Some(w) => {
+            out.insert("window", w.clone());
+        }
+        None if !WINDOWLESS.contains(&op.as_str()) => {
+            out.insert("window", doc! { "documents": ["unbounded", "unbounded"] });
+        }
+        None => {}
+    }
+    out
+}
+
+/// A `$_internalSetWindowFields` spec as mongod prints it back.
+fn listed_internal_window(spec: &Document) -> Document {
+    let mut out = Document::new();
+    for key in ["partitionBy", "sortBy"] {
+        if let Some(v) = spec.get(key) {
+            out.insert(key, v.clone());
+        }
+    }
+    let mut output = Document::new();
+    if let Ok(fields) = spec.get_document("output") {
+        for (k, v) in fields {
+            let listed = match v {
+                Bson::Document(f) => Bson::Document(listed_window_output(f)),
+                other => other.clone(),
+            };
+            output.insert(k.clone(), listed);
+        }
+    }
+    out.insert("output", output);
+    out
+}
+
 /// A stage the planner left in the pipeline, as `explain` lists it: the
 /// stages mongod parses it into, each printed as mongod prints it back
 /// (measured 8.2.11).
@@ -444,6 +686,17 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
     match (name.as_str(), arg) {
         ("$unwind", Bson::String(path)) => one(doc! { "$unwind": { "path": path.clone() } }),
         ("$sort", Bson::Document(spec)) => one(doc! { "$sort": { "sortKey": spec.clone() } }),
+        (WINDOW_SORT, Bson::Document(spec)) => one(doc! { "$sort": {
+            "sortKey": spec.clone(),
+            "outputSortKeyMetadata": true,
+        } }),
+        ("$setWindowFields", Bson::Document(spec)) => desugared_window(spec)
+            .iter()
+            .flat_map(|stage| listed_stage(stage, db))
+            .collect(),
+        ("$_internalSetWindowFields", Bson::Document(spec)) => {
+            one(doc! { "$_internalSetWindowFields": listed_internal_window(spec) })
+        }
         ("$out", Bson::String(coll)) => one(doc! { "$out": { "coll": coll.clone(), "db": db } }),
         ("$limit" | "$skip", n) => one(doc! { name.clone(): wide(n) }),
         ("$sample", Bson::Document(spec)) => {

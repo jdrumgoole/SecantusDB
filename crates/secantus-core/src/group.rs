@@ -2237,6 +2237,10 @@ fn run_group(
     let sbe = crate::sbe::active();
     let budgeted = !(sbe && crate::aggregate::is_constant_expression(id_expr, &[]));
     let mut mem: usize = 0;
+    // Each accumulator's memory over every group, and its largest
+    // (`maxAccumulatorMemoryUsageBytes`, RM-328).
+    let mut acc_mem: Vec<usize> = vec![0; compiled.len()];
+    let mut acc_max: Vec<usize> = vec![0; compiled.len()];
     let mut spills = crate::group_spill::Spills::default();
 
     for d in docs {
@@ -2251,19 +2255,22 @@ fn run_group(
                 mem += memlimit::engine_size(&key_val);
                 ids.push(key_val);
                 let mut accs = Vec::with_capacity(compiled.len());
-                for c in &compiled {
+                for (j, c) in compiled.iter().enumerate() {
                     let acc = new_acc(c.op)?;
                     mem += acc_memory(&acc);
+                    acc_mem[j] += acc_memory(&acc);
                     accs.push(acc);
                 }
                 states.push(accs);
                 i
             }
         };
-        for (c, acc) in compiled.iter().zip(states[idx].iter_mut()) {
+        for (j, (c, acc)) in compiled.iter().zip(states[idx].iter_mut()).enumerate() {
             let before = acc_memory(acc);
             apply_acc(acc, c.arg, d, vars)?;
             mem = mem - before + acc_memory(acc);
+            acc_mem[j] = acc_mem[j] - before + acc_memory(acc);
+            acc_max[j] = acc_max[j].max(acc_mem[j]);
         }
         // SBE holds its hash table to its own 100 MiB
         // (`internalQuerySBEAggApproxMemoryUseInBytesBeforeSpill`, not
@@ -2288,22 +2295,36 @@ fn run_group(
                 mem,
             )?;
             mem = 0;
+            acc_mem.iter_mut().for_each(|m| *m = 0);
         }
     }
 
-    if !spills.is_empty() {
+    let out = if !spills.is_empty() {
         // What is still in memory is spilled too, and every group comes out
         // of the merge, in key order.
         crate::group_spill::spill(ids, states, &mut spills, mem)?;
         let fields: Vec<&str> = compiled.iter().map(|c| c.field).collect();
-        return crate::group_spill::merge(spills, &fields);
-    }
-
-    let mut out = Vec::with_capacity(ids.len());
-    for (id, accs) in ids.into_iter().zip(states) {
-        let paired: Vec<(&str, Acc)> = compiled.iter().map(|c| c.field).zip(accs).collect();
-        out.push(finalize(id, paired)?);
-    }
+        crate::group_spill::merge(spills, &fields)?
+    } else {
+        let mut out = Vec::with_capacity(ids.len());
+        for (id, accs) in ids.into_iter().zip(states) {
+            let paired: Vec<(&str, Acc)> = compiled.iter().map(|c| c.field).zip(accs).collect();
+            out.push(finalize(id, paired)?);
+        }
+        out
+    };
+    let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    memlimit::record_group(|| memlimit::GroupStats {
+        max_accumulator_memory: compiled
+            .iter()
+            .zip(&acc_max)
+            .map(|(c, m)| (c.field.to_string(), wide(*m)))
+            .collect(),
+        total_output_data_size: out
+            .iter()
+            .map(|d| wide(memlimit::built_document_size(d)))
+            .sum(),
+    });
     Ok(out)
 }
 

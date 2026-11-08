@@ -2533,7 +2533,10 @@ pub(crate) fn expression_shape_problem_in(spec: &Bson, stage: &str) -> Option<(i
                 // expression, mongod does not recognise the name at all. A
                 // `$setWindowFields` output runs them as window functions.
                 if ACCUMULATOR_ONLY.contains(&key.as_str())
-                    && !matches!(stage, "$group" | "$setWindowFields")
+                    && !matches!(
+                        stage,
+                        "$group" | "$setWindowFields" | "$_internalSetWindowFields"
+                    )
                 {
                     return Some((168, format!("Unrecognized expression '{key}'")));
                 }
@@ -3036,13 +3039,17 @@ pub fn stage_spec_error(pipeline: &[Bson]) -> Option<(i32, String)> {
                     bson_type_name(spec)
                 ),
             )),
-            "$setWindowFields" if !matches!(spec, Bson::Document(_)) => Some((
-                9,
-                format!(
-                    "the $setWindowFields stage specification must be an object, found {}",
-                    bson_type_name(spec)
-                ),
-            )),
+            "$setWindowFields" | "$_internalSetWindowFields"
+                if !matches!(spec, Bson::Document(_)) =>
+            {
+                Some((
+                    9,
+                    format!(
+                        "the {name} stage specification must be an object, found {}",
+                        bson_type_name(spec)
+                    ),
+                ))
+            }
             // Capital "The" on these two, lowercase "the" on $setWindowFields
             // directly above. mongod's own inconsistency; fidelity means keeping it.
             "$densify" if !matches!(spec, Bson::Document(_)) => Some((
