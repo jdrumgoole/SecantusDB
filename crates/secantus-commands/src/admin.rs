@@ -2956,6 +2956,22 @@ enum Failure {
 
 /// A building index's spec as mongod's build operation shows it: `v`,
 /// `unique` and `hidden`, then the rest.
+/// The indexes being built over `db.coll`, `{v, key, name, <options>}`,
+/// in the order `listIndexes` lists them after the finished ones. mongod
+/// counts them in `collStats`, `dbStats` and `$indexStats` too (8.2.11,
+/// RM-321).
+pub(crate) fn building_indexes(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+) -> Vec<Document> {
+    storage
+        .index_builds(Some(db), Some(coll))
+        .into_iter()
+        .flat_map(|b| b.indexes)
+        .collect()
+}
+
 fn listed_build_spec(spec: &Document) -> Document {
     let mut out = Document::new();
     for first in ["v", "unique", "hidden"] {

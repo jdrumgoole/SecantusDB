@@ -283,9 +283,10 @@ def _parallel_sort(client: Any) -> tuple:
         return ("err", e.code, (e.details or {}).get("errmsg"))
 
 
-@pytest.mark.backlog("RM-332")
+@pytest.mark.backlog_fixed("RM-332")
 def test_a_sort_on_two_arrays_is_refused(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses a sort whose keys are two arrays of one
     document: 2 "cannot sort with keys that are parallel arrays". The Rust
-    server sorts."""
+    server sorted; it refuses as mongod's key generator does (every entry
+    point: tests/mongod_live/test_sort_key_refusals.py)."""
     assert _parallel_sort(rust_mongo) == _parallel_sort(mongod)

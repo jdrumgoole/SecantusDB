@@ -993,7 +993,10 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         return Ok(None);
     }
     if rows.len() < 2 {
-        return Ok(Some(rows));
+        // mongod builds a lone document's sort key too, and refuses one it
+        // cannot build (two parallel arrays, RM-332): sorting the one row is
+        // what asks the store for that key.
+        return Ok(Some(sorted_over(storage, rows, ask)?));
     }
     // The sort is the store's. Past it, the plan says only how the documents
     // that compare equal are left; `tied` marks those.

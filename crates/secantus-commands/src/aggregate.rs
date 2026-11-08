@@ -1787,7 +1787,17 @@ pub(crate) fn validate_parse(pipeline: &[Bson]) -> Result<(), CommandError> {
                 continue;
             }
             ("$setWindowFields" | "$_internalSetWindowFields", Bson::Document(s)) => {
-                (false, window_fields_parse(s))
+                // The spec's own refusals come before any document's -- the
+                // `$sort` the stage runs behind reads them first (RM-332).
+                let presorted = name == "$_internalSetWindowFields";
+                let outcome = window_fields_parse(s).and_then(|()| {
+                    let whole = Bson::Document(s.clone());
+                    match secantus_core::set_window_fields_spec_refusal(&whole, presorted) {
+                        Some(f) => Err(f),
+                        None => Ok(()),
+                    }
+                });
+                (false, outcome)
             }
             _ => continue,
         };
@@ -1925,7 +1935,7 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError
                 SEARCH_INDEX_ATLAS_MSG,
             ));
         }
-        if !recognized_stage(name) {
+        if !recognized_stage(name) && !crate::hybrid::is_prepared_stage(name) {
             return Err(CommandError::new(
                 40324,
                 "Location40324",
@@ -4527,9 +4537,14 @@ fn apply_index_stats(
     {
         indexes.retain(|ix| ix.get_str("name") != Ok("_id_"));
     }
+    // An index still being built is listed too, `building: true` (mongod
+    // 8.2.11, RM-321).
+    let building = crate::admin::building_indexes(storage, db, coll);
     Ok(indexes
         .into_iter()
-        .map(|ix| {
+        .map(|ix| (ix, false))
+        .chain(building.into_iter().map(|ix| (ix, true)))
+        .map(|(ix, is_building)| {
             // The index as `listIndexes` shows it, less what only the
             // catalog keeps.
             let mut spec = doc! {
@@ -4548,7 +4563,7 @@ fn apply_index_stats(
             // Each plan that read the index, since it was made or this
             // process began, whichever was later.
             let (ops, since) = storage.index_use(db, coll, &name).unwrap_or((0, None));
-            doc! {
+            let mut out = doc! {
                 "name": name,
                 "key": ix.get_document("key").cloned().unwrap_or_default(),
                 "host": "secantus",
@@ -4557,7 +4572,11 @@ fn apply_index_stats(
                     "since": since.unwrap_or_else(crate::handshake::process_started),
                 },
                 "spec": spec,
+            };
+            if is_building {
+                out.insert("building", true);
             }
+            out
         })
         .collect())
 }

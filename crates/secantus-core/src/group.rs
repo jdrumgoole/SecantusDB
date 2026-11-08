@@ -1001,6 +1001,35 @@ pub(crate) fn apply_acc(acc: &mut Acc, arg: &Bson, doc: &Document, vars: &Docume
                     .map(|v| as_int_like(v) == Some(-1))
                     .collect();
             }
+            // A `sortBy` key is built as a `$sort`'s only when two or more of
+            // its paths meet an array. Then SBE refuses what a `$sort` does,
+            // and the classic engine refuses parallel arrays even when the
+            // paths meet ONE array (`a.x`, `a.y` over `[{x: [1], y: 2}]`) and
+            // never the ambiguous index (16746). Below two, neither refuses:
+            // `x.0` over `[{a: 5}, {"0": 6}]` is 16746 to a `$sort` and sorts
+            // here. Measured 8.2.1, 2026-11-08 (RM-332).
+            let refusal_paths: Vec<&str> = sortby.keys().map(String::as_str).collect();
+            let refusal = if crate::paths::sort_paths_meeting_arrays(doc, &refusal_paths) < 2 {
+                None
+            } else if crate::sbe::active() {
+                crate::paths::sort_key_refusal(doc, &refusal_paths)
+            } else {
+                Some(crate::paths::SortKeyRefusal::ParallelArrays)
+            };
+            match refusal {
+                None => {}
+                Some(crate::paths::SortKeyRefusal::ParallelArrays) => {
+                    return Err(Fallback::mongo(2, crate::paths::PARALLEL_ARRAYS_MESSAGE)
+                        .with_folded(false));
+                }
+                Some(crate::paths::SortKeyRefusal::Ambiguous(part, items)) => {
+                    return Err(Fallback::mongo(
+                        16746,
+                        crate::paths::ambiguous_sort_message(part, items),
+                    )
+                    .with_folded(false));
+                }
+            }
             let sort_vals: Vec<Bson> = sortby
                 .keys()
                 .map(|f| {

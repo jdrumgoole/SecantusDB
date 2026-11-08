@@ -1248,17 +1248,24 @@ pub(crate) fn sort_key_values(d: &Document, fields: &[(String, bool)]) -> R<Vec<
             return Ok(vec![v]);
         }
     }
-    let mut keys = Vec::with_capacity(fields.len());
-    for (path, rev) in fields {
-        // mongod refuses a sort path whose component names both an array
-        // index and a key of that array's elements -- per document, at
-        // execution time, so it belongs under the executor wrapper.
-        if let Some((part, items)) = paths::ambiguous_sort_path(d, path) {
+    // mongod refuses a document whose sort paths meet two different arrays,
+    // or name an array index that an element also carries as a key -- per
+    // document, at execution time, so it belongs under the executor wrapper.
+    let refusal_paths: Vec<&str> = fields.iter().map(|(p, _)| p.as_str()).collect();
+    match paths::sort_key_refusal(d, &refusal_paths) {
+        None => {}
+        Some(paths::SortKeyRefusal::ParallelArrays) => {
+            return Err(Fallback::mongo(2, paths::PARALLEL_ARRAYS_MESSAGE).with_folded(false));
+        }
+        Some(paths::SortKeyRefusal::Ambiguous(part, items)) => {
             return Err(
                 Fallback::mongo(16746, paths::ambiguous_sort_message(part, items))
                     .with_folded(false),
             );
         }
+    }
+    let mut keys = Vec::with_capacity(fields.len());
+    for (path, rev) in fields {
         // `sort_path_values` walks THROUGH arrays the way mongod's sort-key
         // generation does; `get_path` reads a numeric component only as an
         // index and never descends, which ranked `x: [{y: 1}]` with the

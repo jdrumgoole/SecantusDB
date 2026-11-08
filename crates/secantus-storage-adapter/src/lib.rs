@@ -262,6 +262,17 @@ impl CmdStorage for StorageAdapter {
         self.inner.with_user_transaction(h, f).map_err(map_err)
     }
 
+    fn catalog_changed_since_snapshot(
+        &self,
+        handle: &(dyn std::any::Any + Send),
+        db: &str,
+        coll: &str,
+    ) -> bool {
+        handle
+            .downcast_ref::<UserTransactionHandle>()
+            .is_some_and(|h| h.catalog_changed_since_snapshot(db, coll))
+    }
+
     fn commit_user_transaction(
         &self,
         handle: &mut (dyn std::any::Any + Send),
@@ -402,9 +413,12 @@ impl CmdStorage for StorageAdapter {
         opts: &Document,
         given: &Document,
     ) -> Result<(), StorageError> {
+        let change = self.inner.catalog_change(&[(db, coll)]);
         self.inner
             .coll_mod_recording(db, coll, opts, given)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        change.committed();
+        Ok(())
     }
 
     fn resume_token_is_event(&self, token: &Document) -> bool {
@@ -1058,11 +1072,18 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn coll_mod(&self, db: &str, coll: &str, opts: &Document) -> Result<(), StorageError> {
-        self.inner.coll_mod(db, coll, opts).map_err(map_err)
+        let change = self.inner.catalog_change(&[(db, coll)]);
+        self.inner.coll_mod(db, coll, opts).map_err(map_err)?;
+        change.committed();
+        Ok(())
     }
 
     fn drop_collection(&self, db: &str, coll: &str) -> Result<bool, StorageError> {
+        let change = self.inner.catalog_change(&[(db, coll)]);
         let dropped = self.inner.drop_collection(db, coll).map_err(map_err)?;
+        if dropped {
+            change.committed();
+        }
         self.indexes_gone(|d, c, _| (d, c) == (db, coll));
         Ok(dropped)
     }
@@ -1099,24 +1120,34 @@ impl CmdStorage for StorageAdapter {
         key: &Document,
         options: &Document,
     ) -> Result<bool, StorageError> {
+        let change = self.inner.catalog_change(&[(db, coll)]);
         let created = self
             .inner
             .create_index(db, coll, name, key, options)
             .map_err(map_err)?;
         if created {
+            change.committed();
             self.index_created(db, coll, name);
         }
         Ok(created)
     }
 
     fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<bool, StorageError> {
+        let change = self.inner.catalog_change(&[(db, coll)]);
         let dropped = self.inner.drop_index(db, coll, name).map_err(map_err)?;
+        if dropped {
+            change.committed();
+        }
         self.indexes_gone(|d, c, n| (d, c, n) == (db, coll, name));
         Ok(dropped)
     }
 
     fn drop_all_indexes(&self, db: &str, coll: &str) -> Result<usize, StorageError> {
+        let change = self.inner.catalog_change(&[(db, coll)]);
         let dropped = self.inner.drop_all_indexes(db, coll).map_err(map_err)?;
+        if dropped > 0 {
+            change.committed();
+        }
         self.indexes_gone(|d, c, n| (d, c) == (db, coll) && n != "_id_");
         Ok(dropped)
     }
@@ -1141,9 +1172,20 @@ impl CmdStorage for StorageAdapter {
                 options: options.clone(),
             })
             .collect();
+        // The unfinished index enters the catalog now: mongod 8.2.11 fails
+        // an older transaction's write there from this point, not only once
+        // the build commits.
+        let change = self.inner.catalog_change(&[(db, coll)]);
         self.inner
             .begin_index_build(db, coll, uuid, &specs, member)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        change.committed();
+        // mongod counts an index's use from when its build began, and the
+        // commit does not restart it (measured 8.2.11, RM-321).
+        for s in &specs {
+            self.index_created(db, coll, &s.name);
+        }
+        Ok(())
     }
 
     fn run_index_build(&self, uuid: &[u8; 16], memory_limit: usize) -> Result<(), StorageError> {
@@ -1162,11 +1204,25 @@ impl CmdStorage for StorageAdapter {
             .index_builds(None, None)
             .into_iter()
             .find(|b| &b.uuid == uuid);
+        let change = info.as_ref().map(|b| {
+            self.inner
+                .catalog_change(&[(b.db.as_str(), b.coll.as_str())])
+        });
         self.inner.commit_index_build(uuid).map_err(map_err)?;
+        if let Some(change) = change {
+            change.committed();
+        }
+        // Counted since the build began; a build restarted at open has no
+        // count yet, and starts one now.
         if let Some(b) = info {
+            let mut uses = self.index_use_map();
             for spec in &b.indexes {
                 if let Ok(name) = spec.get_str("name") {
-                    self.index_created(&b.db, &b.coll, name);
+                    uses.entry((b.db.clone(), b.coll.clone(), name.to_string()))
+                        .or_insert(IndexUse {
+                            ops: 0,
+                            since: Some(bson::DateTime::now()),
+                        });
                 }
             }
         }
@@ -1178,9 +1234,23 @@ impl CmdStorage for StorageAdapter {
         uuid: &[u8; 16],
         cause: &secantus_commands::storage::IndexBuildAbort,
     ) -> Result<(), StorageError> {
+        // The unfinished index leaves the catalog.
+        let change = self
+            .inner
+            .index_builds(None, None)
+            .into_iter()
+            .find(|b| &b.uuid == uuid)
+            .map(|b| {
+                self.inner
+                    .catalog_change(&[(b.db.as_str(), b.coll.as_str())])
+            });
         self.inner
             .abort_index_build(uuid, &wt_abort(cause))
-            .map_err(map_err)
+            .map_err(map_err)?;
+        if let Some(change) = change {
+            change.committed();
+        }
+        Ok(())
     }
 
     fn request_index_build_abort(
@@ -1239,9 +1309,15 @@ impl CmdStorage for StorageAdapter {
         name: &str,
         opts: &Document,
     ) -> Result<bool, StorageError> {
-        self.inner
+        let change = self.inner.catalog_change(&[(db, coll)]);
+        let changed = self
+            .inner
             .set_index_options(db, coll, name, opts)
-            .map_err(map_err)
+            .map_err(map_err)?;
+        if changed {
+            change.committed();
+        }
+        Ok(changed)
     }
 
     fn find_index_duplicates(
@@ -1256,7 +1332,9 @@ impl CmdStorage for StorageAdapter {
     }
 
     fn drop_database(&self, db: &str) -> Result<(), StorageError> {
+        let change = self.inner.catalog_change(&[(db, "")]);
         self.inner.drop_database(db).map_err(map_err)?;
+        change.committed();
         self.indexes_gone(|d, _, _| d == db);
         Ok(())
     }
@@ -1416,10 +1494,25 @@ impl CmdStorage for StorageAdapter {
         dst_coll: &str,
         drop_target: bool,
     ) -> Result<(bool, Option<String>), StorageError> {
+        // The target's catalog entry changes only when the rename replaces
+        // a collection there; a new name is a collection made, which an
+        // older transaction meets as its create's conflict (mongod 8.2.11).
+        let replaces = self
+            .inner
+            .collection_exists(dst_db, dst_coll)
+            .map_err(map_err)?;
+        let mut colls = vec![(src_db, src_coll)];
+        if replaces {
+            colls.push((dst_db, dst_coll));
+        }
+        let change = self.inner.catalog_change(&colls);
         let renamed = self
             .inner
             .rename_collection(src_db, src_coll, dst_db, dst_coll, drop_target)
             .map_err(map_err)?;
+        if renamed.0 {
+            change.committed();
+        }
         // The collection keeps its indexes, and they their counts.
         let mut uses = self.index_use_map();
         uses.retain(|(d, c, _), _| (d.as_str(), c.as_str()) != (dst_db, dst_coll));

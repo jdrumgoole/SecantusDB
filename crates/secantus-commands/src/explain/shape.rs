@@ -303,13 +303,15 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
         .collect();
     // A `$skip` or `$limit` behind a `$project` / `$unset` moves ahead of it:
     // a projection does not change how many documents there are (mongod
-    // 8.2.11, 2026-10-20).
+    // 8.2.11, 2026-10-20). Nor does `$score`, whose stages mongod moves a
+    // `$limit` ahead of too (RM-200).
     let mut hoisted = hoisted;
     let mut i = 1;
     while i < hoisted.len() {
         let paging = hoisted[i].contains_key("$skip") || hoisted[i].contains_key("$limit");
-        let projects =
-            hoisted[i - 1].contains_key("$project") || hoisted[i - 1].contains_key("$unset");
+        let projects = hoisted[i - 1].contains_key("$project")
+            || hoisted[i - 1].contains_key("$unset")
+            || hoisted[i - 1].contains_key("$_secantusScore");
         if paging && projects {
             hoisted.swap(i - 1, i);
             i = i.saturating_sub(1).max(1);
@@ -391,8 +393,12 @@ pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
 }
 
 /// An expression as mongod prints it back: every literal wrapped in `$const`.
-fn constified(v: &Bson) -> Bson {
+pub(super) fn constified(v: &Bson) -> Bson {
     match v {
+        // A metadata read prints as written.
+        Bson::Document(d) if d.len() == 1 && matches!(d.get("$meta"), Some(Bson::String(_))) => {
+            v.clone()
+        }
         Bson::Document(d) if d.len() == 1 && d.contains_key("$literal") => {
             Bson::Document(doc! { "$const": d.get("$literal").cloned().unwrap_or(Bson::Null) })
         }
@@ -678,6 +684,14 @@ pub(crate) fn listed_stage(stage: &Document, db: &str) -> Vec<Document> {
     let Some((name, arg)) = stage.iter().next() else {
         return vec![stage.clone()];
     };
+    // The stages `$score`, `$rankFusion` and `$scoreFusion` run as, as mongod
+    // lists the stages it desugars them into.
+    if let Some(listed) = super::hybrid::listed(stage, db) {
+        return listed;
+    }
+    if let Some(plain) = super::hybrid::unhidden(stage) {
+        return listed_stage(&plain, db);
+    }
     let wide = |v: &Bson| as_i64(v).map_or_else(|| v.clone(), Bson::Int64);
     let one = |d: Document| vec![d];
     let count_of = |field: &str| {

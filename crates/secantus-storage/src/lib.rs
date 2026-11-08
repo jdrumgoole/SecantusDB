@@ -54,6 +54,7 @@ pub use secantus_core::bsondoc;
 
 pub mod admission;
 mod auto_compact;
+mod catalog_changes;
 pub mod changestreams;
 pub mod compact;
 pub mod pitr_archive;
@@ -65,6 +66,7 @@ mod index_build;
 mod scan_bounds;
 mod sizes;
 
+pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
 pub use sizes::CollectionSizes;
 use sizes::Delta;
@@ -377,6 +379,9 @@ pub struct UserTransactionHandle {
     /// the settled value, the catalog this snapshot sees is the committed one
     /// every session sees (see `planner_shared_gen`).
     planner_gen: Option<u64>,
+    /// The catalog-change counter just before the transaction's snapshot was
+    /// taken: see [`UserTransactionHandle::catalog_changed_since_snapshot`].
+    catalog_epoch: u64,
 }
 
 impl UserTransactionHandle {
@@ -471,6 +476,18 @@ impl UserTransactionHandle {
     /// Has the transaction begun in WiredTiger -- taken its snapshot?
     pub fn began(&self) -> bool {
         self.began
+    }
+
+    /// Has the catalog entry of `(db, coll)` changed since the transaction's
+    /// snapshot was taken (a [`CatalogChange`] finished since, or is under
+    /// way)? `false` before the transaction has begun: its snapshot, taken
+    /// at its next statement, sees the change.
+    pub fn catalog_changed_since_snapshot(&self, db: &str, coll: &str) -> bool {
+        if !self.began {
+            return false;
+        }
+        let store = self.held.lock().unwrap_or_else(|e| e.into_inner()).store;
+        catalog_changes::changed_since(store, self.catalog_epoch, db, coll)
     }
 
     pub fn has_written(&self) -> bool {
@@ -4735,13 +4752,14 @@ fn sort_key(
     spec: &[(String, i32)],
     coll: Option<&Collation>,
 ) -> Result<Vec<SortPart>> {
+    // mongod refuses a document whose sort paths meet two different arrays,
+    // or name an array index that an element also carries as a key -- per
+    // document, at execution time.
+    if let Some(err) = sort_key_refusal(doc, spec) {
+        return Err(err);
+    }
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
-        // mongod refuses a sort path whose component names both an array index
-        // and a key of that array's elements -- per document, at execution time.
-        if let Some(err) = ambiguous_sort_path(doc, f) {
-            return Err(err);
-        }
         // `sort_field_value` resolves the path AND picks the representative
         // element (mongod sorts an array-valued field by its minimum ascending,
         // its maximum descending). Applying `array_sort_value` again here
@@ -4774,15 +4792,22 @@ fn sort_key(
     Ok(parts)
 }
 
-/// The refusal mongod raises when a sort path component names BOTH an array
-/// index and a key of that array's elements -- see
-/// [`secantus_core::ambiguous_sort_path`] for the measured rule. Shared
+/// The refusal mongod raises for a document it cannot build a sort key for --
+/// see [`secantus_core::sort_key_refusal`] for the measured rule. Shared
 /// with the aggregation `$sort` stage so the two sort paths cannot drift.
-fn ambiguous_sort_path(doc: &Document, field: &str) -> Option<StorageError> {
-    let (part, items) = secantus_core::ambiguous_sort_path(doc, field)?;
+fn sort_key_refusal(doc: &Document, spec: &[(String, i32)]) -> Option<StorageError> {
+    let paths: Vec<&str> = spec.iter().map(|(f, _)| f.as_str()).collect();
+    let (code, errmsg) = match secantus_core::sort_key_refusal(doc, &paths)? {
+        secantus_core::SortKeyRefusal::ParallelArrays => {
+            (2, secantus_core::PARALLEL_ARRAYS_MESSAGE.to_string())
+        }
+        secantus_core::SortKeyRefusal::Ambiguous(part, items) => {
+            (16746, secantus_core::ambiguous_sort_message(part, items))
+        }
+    };
     Some(StorageError::QueryError {
-        code: 16746,
-        errmsg: secantus_core::ambiguous_sort_message(part, items),
+        code,
+        errmsg,
         exec: true,
     })
 }
@@ -7603,10 +7628,18 @@ impl Drop for Storage {
         if let Err(e) = self.close() {
             eprintln!("secantus-storage: close failed: {e:?}");
         }
+        catalog_changes::forget_store(self as *const Storage as usize);
     }
 }
 
 impl Storage {
+    /// About to change the catalog entries of `colls`, each `(db,
+    /// collection)` (`""` for every collection of `db`): a transaction whose
+    /// snapshot is older may no longer write there (see [`CatalogChange`]).
+    pub fn catalog_change(&self, colls: &[(&str, &str)]) -> CatalogChange {
+        CatalogChange::begin(self as *const Storage as usize, colls)
+    }
+
     /// Close the store: stop the background threads, persist the oplog meta
     /// row and take the final checkpoint. Answers the FIRST failure (each is
     /// also logged): a close-time write error is a durability signal, and a
@@ -11091,6 +11124,7 @@ impl Storage {
             unattributed: false,
             registry_gen: 0,
             planner_gen: None,
+            catalog_epoch: 0,
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -11185,9 +11219,11 @@ impl Storage {
         let epoch = COMMITS_DONE.load(Ordering::SeqCst);
         let registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
         let planner_gen = planner_settled();
+        let catalog_epoch = catalog_changes::catalog_epoch();
         match session.reset_snapshot() {
             Ok(()) => {
                 handle.epoch = Some(epoch);
+                handle.catalog_epoch = catalog_epoch;
                 handle.registry_gen = registry_gen;
                 handle.planner_gen = planner_gen;
                 Ok(true)
@@ -11220,6 +11256,7 @@ impl Storage {
             handle.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             handle.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
             handle.planner_gen = planner_settled();
+            handle.catalog_epoch = catalog_changes::catalog_epoch();
             session.begin_transaction(None)?;
             handle.began = true;
         }
@@ -11740,6 +11777,7 @@ impl Storage {
             fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
             fresh.planner_gen = planner_settled();
+            fresh.catalog_epoch = catalog_changes::catalog_epoch();
             session.begin_transaction(None)?;
             fresh.began = true;
             // Any read takes the snapshot; the collection registry always
@@ -11862,6 +11900,7 @@ impl Storage {
                     fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
                     fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
                     fresh.planner_gen = planner_settled();
+                    fresh.catalog_epoch = catalog_changes::catalog_epoch();
                     session.begin_transaction(None)?;
                     fresh.began = true;
                     // REPEATABLE READ may move only onto a snapshot that sees

@@ -72,6 +72,7 @@ mod regexutil;
 mod summation;
 mod tzdb;
 mod windowfields;
+pub use windowfields::set_window_fields_spec_refusal;
 
 // Re-export the read-only dotted-path helpers (only) so the Rust storage layer's
 // index-key builders can resolve `key_spec` fields against documents, mirroring
@@ -79,8 +80,8 @@ mod windowfields;
 // private — its `set_path` / `unset_path` use deliberate `Result<_, ()>` "defer"
 // signals that shouldn't become public API (clippy::result_unit_err).
 pub use paths::{
-    ambiguous_sort_message, ambiguous_sort_path, get_path, get_path_values, has_path,
-    sort_path_values,
+    ambiguous_sort_message, get_path, get_path_values, has_path, sort_key_refusal,
+    sort_path_values, sort_paths_meeting_arrays, SortKeyRefusal, PARALLEL_ARRAYS_MESSAGE,
 };
 // mongod's two double renderings, needed by the command layer's stage
 // echo as well as by this crate's value messages. The module stays

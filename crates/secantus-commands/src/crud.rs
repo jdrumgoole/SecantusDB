@@ -2225,36 +2225,45 @@ pub(crate) fn update_in(
             // Resolve WHICH document sorts first, then pin the update to it.
             // Nothing matched -> leave the filter alone, so an upsert still
             // upserts.
-            let sorted = Ok::<_, CommandError>(storage).and_then(|st| {
-                crate::explain::order::find(
-                    st,
-                    &crate::explain::order::Ask {
-                        db: db_name,
-                        coll: &coll,
-                        filter: &q,
-                        sort: Some(sort),
-                        hint: None,
-                        collation: collation.as_ref(),
-                        vars: &Document::new(),
+            let sorted = crate::explain::order::find(
+                storage,
+                &crate::explain::order::Ask {
+                    db: db_name,
+                    coll: &coll,
+                    filter: &q,
+                    sort: Some(sort),
+                    hint: None,
+                    collation: collation.as_ref(),
+                    vars: &Document::new(),
+                    limit: 1,
+                    // An update of one document under a sort: mongod's
+                    // query has a limit of one.
+                    asked: crate::near::Asked {
                         limit: 1,
-                        // An update of one document under a sort: mongod's
-                        // query has a limit of one.
-                        asked: crate::near::Asked {
-                            limit: 1,
-                            sort: Some(sort),
-                            cached: true,
-                            ..Default::default()
-                        },
+                        sort: Some(sort),
+                        cached: true,
+                        ..Default::default()
                     },
-                )
-                .map_err(|_| CommandError::new(2, "BadValue", "sort resolution failed"))
-            });
-            if let Ok(rows) = sorted {
-                if let Some(first) = rows.first() {
-                    if let Ok(d) = secantus_core::bsondoc::from_bytes(first.as_slice()) {
-                        if let Some(id) = d.get("_id") {
-                            q = doc! { "_id": id.clone() };
-                        }
+                },
+            );
+            // A document the sort cannot be built for (parallel arrays, an
+            // ambiguous index component) is the statement's writeError under
+            // the update executor's wrapper, as on mongod 8.2.1 (RM-332); this
+            // used to drop the error and update an unsorted match.
+            let rows = match sorted {
+                Ok(rows) => rows,
+                Err(e) => {
+                    write_errors.push(Bson::Document(crate::util::write_error(index, e, "update")));
+                    if ordered {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if let Some(first) = rows.first() {
+                if let Ok(d) = secantus_core::bsondoc::from_bytes(first.as_slice()) {
+                    if let Some(id) = d.get("_id") {
+                        q = doc! { "_id": id.clone() };
                     }
                 }
             }

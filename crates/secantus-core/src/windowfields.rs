@@ -106,6 +106,30 @@ pub(crate) fn set_window_fields_each(
     window_fields_each(spec, docs, vars, downstream, false, sink)
 }
 
+/// The refusal `$setWindowFields` (or, with `presorted`,
+/// `$_internalSetWindowFields`) makes from its spec alone, or `None`.
+///
+/// mongod makes these when it parses the stage, so they come before anything
+/// a document can raise -- before the `$sort` the stage runs behind refuses a
+/// document with parallel arrays (`$documentNumber` over a two-field
+/// `sortBy` is 5371602 whatever the documents; measured 8.2.1, 2026-11-08,
+/// RM-332). The stage is run over no documents, and only a refusal made
+/// without one (a `bare` one) is kept: a shape this server defers on is the
+/// stage's to report when it runs.
+pub fn set_window_fields_spec_refusal(spec: &Bson, presorted: bool) -> Option<Fallback> {
+    match window_fields_each(
+        spec,
+        Vec::new(),
+        &Document::new(),
+        None,
+        presorted,
+        &mut |_| Ok(()),
+    ) {
+        Err(f) if f.is_bare() => Some(f),
+        _ => None,
+    }
+}
+
 /// `$_internalSetWindowFields`, the stage mongod 8.2 parses
 /// `$setWindowFields` into behind a `$sort` on its partition and `sortBy`
 /// (and runs when a pipeline names it): the documents are taken in the

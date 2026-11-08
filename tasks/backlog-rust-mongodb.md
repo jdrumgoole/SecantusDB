@@ -1305,13 +1305,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       server does. Found 2026-11-08 while working RM-331.
       Backlog-ID: RM-422
       Verify: tests/backlog/test_rm_found_2026_11_08_rm331.py::test_a_hint_that_bounds_nothing_keeps_the_canonical_filter_order
-- [ ] **A sort on two arrays of one document is not refused.** mongod
-      8.2.11 refuses `{$sort: {a: 1, b: 1}}` over `{a: [1, 2], b: [3, 4]}`
-      with 2 "cannot sort with keys that are parallel arrays" (and a
-      `{$sort: {_id: 1, t: 1}}` over a `$group`'s array keys likewise);
-      this server sorts. Found 2026-10-27 while working RM-222/RM-329.
-      Backlog-ID: RM-332
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_sort_on_two_arrays_is_refused
+- [ ] **An aggregate `$sort` on a `$meta` key is refused.** mongod 8.2.1
+      sorts `{$sort: {s: {$meta: "randVal"}}}` (and a `searchScore` key,
+      which has no value without `$search` and so ties); this server
+      refuses any `$meta` key in the stage with 2 "aggregation pipeline
+      uses a stage or operator not supported by the Rust server". A `find`
+      sort by `{$meta: "randVal"}` answers on both. Found 2026-11-08 while
+      working RM-332.
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_sort_on_a_meta_key_runs
+      Backlog-ID: RM-423
 - [ ] **A retryable write retried after a crash under `--data-nonlogged` is
       applied again.** A restarted server reads a session's
       `config.transactions` row, its oplog entries and its
@@ -1385,28 +1387,6 @@ inject (a panic, a power loss, a failing checkpoint).
       gap. Found while fixing RM-319 (2026-11-08).
       Backlog-ID: RM-425
       Verify: tests/backlog/test_rm_cmd_line_opts.py::test_get_cmd_line_opts_reports_the_command_line
-- [ ] **A transaction older than an index writes past it, and the index
-      misses the document.** A transaction whose snapshot was taken before
-      an index committed (on any collection) and that then writes to the
-      index's collection commits here, and the write reads the index list
-      from its snapshot, so the new index gets no entry for it: a query
-      through the index misses the document. mongod 8.2.11 refuses the
-      write: 112 WriteConflict "Unable to write to collection '<ns>' due to
-      catalog changes; please retry the operation", labelled
-      TransientTransactionError. Found 2026-10-26 while building RM-187; it
-      is older than the hybrid build (any `createIndexes`, and a PG `CREATE
-      INDEX` beside a PG transaction, is exposed). The fix is mongod's: a
-      write whose snapshot predates its collection's last catalog change is
-      a write conflict.
-      Backlog-ID: RM-320
-      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_transaction_older_than_an_index_cannot_write_past_it
-- [ ] **An index being built is not in `collStats` or `$indexStats`.**
-      mongod 8.2.11 counts an index whose build is still running in
-      `collStats` (`nindexes`, `indexSizes`) and lists it in `$indexStats`
-      with `building: true`; this server leaves it out of both until the
-      build commits (`listIndexes` lists it, since RM-187).
-      Backlog-ID: RM-321
-      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_building_index_counts_in_stats
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 
@@ -1430,21 +1410,6 @@ may run a command.
   a standalone answered `$changeStream`, `replSetGetStatus` and the default
   read/write concern commands differently whoever ran them. Against it the
   Rust server differs on none of 12,053 checks (66 users).
-- [ ] **`explain` of `$score`, `$rankFusion` and `$scoreFusion` lists the
-      stage as written.** The stages run since 2026-10-20 (RM-198, fixed),
-      desugared as mongod desugars them, but `explain` shows the stage
-      itself where mongod 8.2.11 shows its desugaring: for `$rankFusion` of
-      two pipelines, `$cursor`, `$replaceRoot`, `$_internalSetWindowFields`
-      (`$rank`), `$addFields`, a `$unionWith` holding the same for the
-      second pipeline, `$group`, two `$addFields`, `$setMetadata`, `$sort`
-      (`sortKey: {score: -1, _id: 1}`) and `$replaceRoot`; `$score` is
-      `$setMetadata` and, normalised, `$_internalSetWindowFields` with
-      `$minMaxScaler`. Also not reproduced: either fusion stage as the first
-      stage of a `$facet` sub-pipeline, which mongod accepts and answers
-      with the documents in collection order (in a `$lookup` or
-      `$unionWith` sub-pipeline both run, as on mongod).
-      Backlog-ID: RM-200
-      Verify: tests/backlog/test_rm_added_in_82.py::test_explain_of_rank_fusion_is_its_desugaring
 - **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,
   formerly RM-027). Refused as a `--noscripting` mongod 8.2.11 refuses it
   (31264, since 2026-10-20; it answered 9 before), like every map/reduce
@@ -2039,6 +2004,34 @@ What is left, all on the RUST MongoDB server:
       decision, as for the sort with a limit.
       Backlog-ID: RM-312
       Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
+- [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
+      mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
+      `$cursor` of its own (its `queryPlanner`, and `executionStats` above
+      that verbosity) holding the stages it absorbs, then the rest as
+      listed. `[{$unionWith: {coll: "s", pipeline: [{$match: {x: 1}},
+      {$project: {x: 1}}]}}]` is `$cursor` (`{x: {$eq: 1}}`,
+      `PROJECTION_SIMPLE`) on mongod and `$match`, `$project` here. A
+      `$rankFusion` or `$scoreFusion` input pipeline's `$unionWith` lists
+      its stages desugared (RM-200) but without that `$cursor`. Found
+      2026-11-08 working RM-200.
+      Backlog-ID: RM-426
+      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_union_with_sub_pipeline_is_explained
+- [ ] **`explain` lists a `$sort` and the `$limit` after it as two stages
+      where the cursor does not absorb them.** mongod 8.2.11 lists one
+      `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
+      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
+      `limit`), and the stages before it then count every document, not
+      the `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
+      Backlog-ID: RM-427
+      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
+- [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
+      `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
+      holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`
+      `$rank`, a `$rankFusion` input) is `SORT_KEY_GENERATOR` over the
+      `COLLSCAN`; this server's is the `COLLSCAN`. Found 2026-11-08 working
+      RM-200.
+      Backlog-ID: RM-428
+      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_facet_that_reads_sort_keys_has_a_key_generator
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

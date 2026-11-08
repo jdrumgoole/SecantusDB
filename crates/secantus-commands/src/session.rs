@@ -885,6 +885,32 @@ fn statement(
             }
         }
     }
+    // A transaction may not write to a collection whose catalog entry (an
+    // index, its options, the collection itself) changed after its snapshot
+    // was taken: mongod 8.2.11 fails the write before it runs, whether or
+    // not it would match anything (RM-320). Written past the change, the
+    // document missed an index committed since.
+    let changed = {
+        let t = txn.lock().unwrap_or_else(|e| e.into_inner());
+        let handle = t.handle.as_ref().expect("handle created above").as_ref();
+        txn_write_targets(name, doc, &ctx.db_name)
+            .into_iter()
+            .find(|(db, coll)| storage.catalog_changed_since_snapshot(handle, db, coll))
+    };
+    if let Some((db, coll)) = changed {
+        let mut reply = CommandError::new(
+            112,
+            "WriteConflict",
+            format!(
+                "Caused by :: Unable to write to collection '{db}.{coll}' due to catalog \
+                 changes; please retry the operation :: Please retry your operation or \
+                 multi-document transaction."
+            ),
+        )
+        .into_reply();
+        crate::finish_txn_statement(registry, txn, &mut reply);
+        return reply;
+    }
     let mut result = {
         let mut t = txn.lock().unwrap_or_else(|e| e.into_inner());
         let handle = t.handle.as_mut().expect("handle created above").as_mut();
@@ -949,6 +975,54 @@ fn statement(
         }
     }
     result
+}
+
+/// The collections a write command in a transaction writes, `(db,
+/// collection)`, in the order its statements reach them: a `bulkWrite`'s
+/// by its ops (mongod 8.2.11 names the first op's namespace whose catalog
+/// changed, not the first in `nsInfo`). Empty for any other command.
+fn txn_write_targets(name: &str, doc: &Document, db_name: &str) -> Vec<(String, String)> {
+    match name {
+        "insert" | "update" | "delete" | "findAndModify" | "findandmodify" => doc
+            .get_str(name)
+            .map(|coll| vec![(db_name.to_string(), coll.to_string())])
+            .unwrap_or_default(),
+        "bulkWrite" => {
+            let ns: Vec<&str> = doc
+                .get_array("nsInfo")
+                .map(|a| {
+                    a.iter()
+                        .map(|e| match e {
+                            Bson::Document(d) => d.get_str("ns").unwrap_or(""),
+                            _ => "",
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut out: Vec<(String, String)> = Vec::new();
+            for op in doc.get_array("ops").map(Vec::as_slice).unwrap_or_default() {
+                let Bson::Document(op) = op else { continue };
+                let Some(idx) = ["insert", "update", "delete"]
+                    .iter()
+                    .find_map(|k| op.get(*k).and_then(crate::util::as_i64))
+                else {
+                    continue;
+                };
+                let Some((db, coll)) = usize::try_from(idx)
+                    .ok()
+                    .and_then(|i| ns.get(i))
+                    .and_then(|n| n.split_once('.'))
+                else {
+                    continue;
+                };
+                if !out.iter().any(|(d, c)| d == db && c == coll) {
+                    out.push((db.to_string(), coll.to_string()));
+                }
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
 }
 
 // ------------------------------------------------------------ retryable writes

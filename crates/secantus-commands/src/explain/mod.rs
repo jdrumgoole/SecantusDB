@@ -25,6 +25,7 @@ pub(crate) mod distinct;
 mod exec;
 pub(crate) mod geo;
 pub(crate) mod hoist;
+mod hybrid;
 mod json_schema;
 mod node;
 pub(crate) mod order;
@@ -1390,7 +1391,14 @@ fn count_inline(
     if let Some(c) = options.get("collation") {
         cmd.insert("collation", c.clone());
     }
-    let Ok(reply) = order::uncounted(|| crate::aggregate::aggregate_inline(&cmd, ctx)) else {
+    // A prefix of a pipeline `hybrid::prepare` made runs as it did.
+    let mut run = || order::uncounted(|| crate::aggregate::aggregate_inline(&cmd, ctx));
+    let reply = if crate::hybrid::has_prepared_stage(pipeline) {
+        crate::hybrid::as_prepared(run)
+    } else {
+        run()
+    };
+    let Ok(reply) = reply else {
         return 0;
     };
     let Ok(cursor) = reply.get_document("cursor") else {
@@ -2101,8 +2109,13 @@ fn aggregate(
         through_view(&s, pipeline, false, ctx)?
     } else {
         // The pipeline as mongod reorders it, which the per-stage counts
-        // run a prefix of.
-        let staged: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+        // run a prefix of: `$score`, `$rankFusion` and `$scoreFusion` as the
+        // stages that run them, which `explain` lists as the stages mongod
+        // desugars them into (RM-200).
+        let mut staged: Vec<Bson> = pipeline.into_iter().map(Bson::Document).collect();
+        if crate::hybrid::mentions_hybrid(&staged) {
+            staged = crate::hybrid::prepare_for_explain(staged, Some(&coll))?;
+        }
         let pipeline: Vec<Document> = hoist::hoist_matches(&shape::desugared(&staged))
             .into_iter()
             .filter_map(|b| match b {
