@@ -442,15 +442,20 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             };
             pos(toks[i].start)
         }
-        // `CALL f()` over a FUNCTION: at the name, as a missing procedure.
-        "42809" if m.ends_with(" is not a procedure") => {
+        // `CALL f()` over a FUNCTION, or over overloads none of which is
+        // best: at the name, as a missing procedure.
+        "42809" | "42725"
+            if m.ends_with(" is not a procedure")
+                || (m.starts_with("procedure ") && m.ends_with(" is not unique")) =>
+        {
             if !toks
                 .first()
                 .is_some_and(|t| t.text.eq_ignore_ascii_case("call"))
             {
                 return None;
             }
-            let name = m.split('(').next()?.rsplit('.').next()?;
+            let name = m.strip_prefix("procedure ").unwrap_or(m);
+            let name = name.split('(').next()?.rsplit('.').next()?;
             let i = toks.iter().enumerate().position(|(i, t)| {
                 unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
             })?;

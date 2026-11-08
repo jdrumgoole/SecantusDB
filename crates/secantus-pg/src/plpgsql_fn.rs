@@ -1225,7 +1225,9 @@ impl Interp<'_> {
                             }
                         }
                     }
-                } else if next != Some("(") {
+                } else if !matches!(next, Some("(" | "=>" | ":=")) {
+                    // A named argument's name (`p(r => r)`) is not a column
+                    // reference, so not a variable either.
                     if let Some((v, ty)) = self.scalar(&name) {
                         bound = Some((v, ty, i));
                     } else if let Some(rec) = self.record(&name) {
@@ -2502,8 +2504,9 @@ fn sql_type(ty: &str) -> String {
     ty.to_string()
 }
 
-/// A `CALL`'s arguments as written: the variable each names, when it is a
-/// bare name (the only kind an OUTPUT parameter can write back to).
+/// A `CALL`'s arguments as written: the variable each names (a named
+/// argument's value), when it is a bare name (the only kind an OUTPUT
+/// parameter can write back to).
 fn call_arguments(text: &str) -> Vec<Option<String>> {
     use pg_query::protobuf::node::Node as N;
     let Ok(parsed) = pg_query::parse(text) else {
@@ -2524,6 +2527,10 @@ fn call_arguments(text: &str) -> Vec<Option<String>> {
     f.args
         .iter()
         .map(|a| match a.node.as_ref() {
+            Some(N::NamedArgExpr(na)) => na.arg.as_deref(),
+            _ => Some(a),
+        })
+        .map(|a| match a.and_then(|a| a.node.as_ref()) {
             Some(N::ColumnRef(r)) if r.fields.len() == 1 => match r.fields[0].node.as_ref() {
                 Some(N::String(s)) => Some(s.sval.clone()),
                 _ => None,

@@ -141,15 +141,14 @@ pub(crate) fn operand_literals(stmt: &str) -> Vec<Literal> {
     out
 }
 
-/// A `CALL`'s procedure as written: its name, where the name is, how many
-/// arguments it passes, and each argument that is a string constant.
+/// A `CALL`'s procedure as written: its name, where the name is, each
+/// argument that is a string constant, and the name each named one gives.
 pub(crate) struct CallTarget {
     pub(crate) name: String,
     pub(crate) at: usize,
-    pub(crate) nargs: usize,
     pub(crate) literals: Vec<Option<Literal>>,
-    /// A `name => value` argument.
-    pub(crate) named: bool,
+    /// The name each `name => value` argument gives.
+    pub(crate) names: Vec<Option<String>>,
 }
 
 pub(crate) fn call_target(stmt: &str) -> Option<CallTarget> {
@@ -173,12 +172,22 @@ pub(crate) fn call_target(stmt: &str) -> Option<CallTarget> {
     Some(CallTarget {
         name,
         at: usize::try_from(f.location).ok()?,
-        nargs: f.args.len(),
-        literals: f.args.iter().map(string_const).collect(),
-        named: f
+        literals: f
             .args
             .iter()
-            .any(|a| matches!(a.node.as_ref(), Some(N::NamedArgExpr(_)))),
+            .map(|a| match a.node.as_ref() {
+                Some(N::NamedArgExpr(na)) => na.arg.as_deref().and_then(string_const),
+                _ => string_const(a),
+            })
+            .collect(),
+        names: f
+            .args
+            .iter()
+            .map(|a| match a.node.as_ref() {
+                Some(N::NamedArgExpr(na)) => Some(na.name.clone()),
+                _ => None,
+            })
+            .collect(),
     })
 }
 
@@ -493,27 +502,16 @@ impl PgHandler {
         }
     }
 
-    /// `transformCallStmt`'s resolution of a CALL in a body: the error a
-    /// procedure that cannot be found raises, at the name. A procedure of
-    /// the name whose parameters, defaults counted, can take the call's
-    /// arguments resolves; a call with a named argument is left to the
-    /// call. Then each string constant passed for an input parameter is
-    /// read as that parameter's type, as `coerce_type` does, its input
-    /// error at the constant.
+    /// `transformCallStmt`'s resolution of a CALL in a body: the error the
+    /// procedure's lookup raises ([`Self::resolve_call`]), at the name.
+    /// Then each string constant passed for an input parameter is read as
+    /// that parameter's type, as `coerce_type` does, its input error at the
+    /// constant.
     pub(crate) fn check_call_in_body(
         &self,
         call: &CallTarget,
         arg_types: &[String],
     ) -> Option<(PgWireError, usize)> {
-        if call.named {
-            return None;
-        }
-        let docs = self.user_function_docs().ok()?;
-        let functions = self.functions().ok()?;
-        let reached: Vec<&str> = Self::routines_named(&functions, &call.name)
-            .into_iter()
-            .map(|f| f.key.as_str())
-            .collect();
         let strings = |d: &Document, key: &str| -> Vec<String> {
             d.get_array(key)
                 .map(|a| {
@@ -523,64 +521,20 @@ impl PgHandler {
                 })
                 .unwrap_or_default()
         };
-        let mine = |d: &&Document| d.get_str("_id").is_ok_and(|id| reached.contains(&id));
-        let procedures: Vec<&Document> = docs
-            .iter()
-            .filter(mine)
-            .filter(|d| d.get_bool("is_procedure").unwrap_or(false))
-            .collect();
-        let admits = |d: &Document| {
-            let all = strings(d, "param_types").len();
-            let defaults = d
-                .get_array("param_defaults")
-                .map(|a| a.iter().filter(|v| !matches!(v, Bson::Null)).count())
-                .unwrap_or(0);
-            all.saturating_sub(defaults) <= call.nargs && call.nargs <= all
+        let (found, numbers) = match self.resolve_call(&call.name, arg_types, &call.names) {
+            Ok(found) => found,
+            Err(PgWireError::UserError(mut info)) => {
+                info.position = None;
+                return Some((PgWireError::UserError(info), call.at));
+            }
+            Err(e) => return Some((e, call.at)),
         };
-        let shown = || {
-            format!(
-                "{}({})",
-                call.name,
-                arg_types
-                    .iter()
-                    .map(|t| secantus_pgplan::display_type(t))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
-        let Some(found) = procedures.iter().find(|d| admits(d)) else {
-            let function = docs.iter().filter(mine).any(|d| {
-                !d.get_bool("is_procedure").unwrap_or(false)
-                    && strings(d, "param_types").len() == call.nargs
-            });
-            let mut info = if function {
-                let mut i = ErrorInfo::new(
-                    "ERROR".into(),
-                    "42809".into(),
-                    format!("{} is not a procedure", shown()),
-                );
-                i.hint = Some("To call a function, use SELECT.".into());
-                i
-            } else {
-                let mut i = ErrorInfo::new(
-                    "ERROR".into(),
-                    "42883".into(),
-                    format!("procedure {} does not exist", shown()),
-                );
-                i.hint = Some(
-                    "No procedure matches the given name and argument types. You might need \
-                     to add explicit type casts."
-                        .into(),
-                );
-                i
-            };
-            info.position = None;
-            return Some((PgWireError::UserError(Box::new(info)), call.at));
-        };
+        let found = &found;
         let types = strings(found, "param_types");
         let modes = strings(found, "param_modes");
         let tz = self.session_timezone();
-        for (i, lit) in call.literals.iter().enumerate() {
+        for (k, lit) in call.literals.iter().enumerate() {
+            let i = numbers.get(k).copied().unwrap_or(k);
             let (Some(lit), Some(ty)) = (lit, types.get(i)) else {
                 continue;
             };
@@ -663,11 +617,15 @@ mod tests {
         let c = call_target("call s.pp('a', 2)").unwrap();
         assert_eq!(c.name, "s.pp");
         assert_eq!(c.at, 5);
-        assert_eq!(c.nargs, 2);
         assert_eq!(c.literals[0].as_ref().map(|l| l.value.as_str()), Some("a"));
         assert!(c.literals[1].is_none());
-        assert!(!c.named);
-        assert!(call_target("call pp(x => 1)").unwrap().named);
+        assert_eq!(c.names, [None, None]);
+        let named = call_target("call pp(1, x => 'b')").unwrap();
+        assert_eq!(named.names, [None, Some("x".to_string())]);
+        assert_eq!(
+            named.literals[1].as_ref().map(|l| l.value.as_str()),
+            Some("b")
+        );
         assert!(call_target("select 1").is_none());
     }
 

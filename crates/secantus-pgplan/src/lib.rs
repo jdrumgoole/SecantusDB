@@ -140,6 +140,7 @@ mod xml_export;
 mod xml_schema;
 pub use funcsig::category_preferred_of_oid;
 pub use funcsig::is_builtin_function_name as is_known_function;
+pub use funcsig::{select_routine, RoutineChoice};
 mod optype;
 mod semijoin;
 mod semijoin_hash;
@@ -813,11 +814,13 @@ pub enum Statement {
         action: alter_routine::AlterFunctionAction,
     },
     /// `CALL name(args)`: the arguments evaluated (a placeholder for each
-    /// OUT parameter included), with the types they were written as.
+    /// OUT parameter included), in the order written, with the types they
+    /// were written as and the name a named one (`b => 3`) gives.
     Call {
         name: String,
         args: Vec<Bson>,
         arg_types: Vec<String>,
+        arg_names: Vec<Option<String>>,
         location: i32,
     },
     /// `CREATE SCHEMA [IF NOT EXISTS] <name>`.
@@ -6699,9 +6702,48 @@ fn plan_call(c: &pg_query::protobuf::CallStmt, params: &[Bson]) -> Result<Statem
             )
         })
         .ok_or_else(|| Error::Parse("CALL without a name".into()))?;
-    let mut args = Vec::with_capacity(f.args.len());
-    let mut arg_types = Vec::with_capacity(f.args.len());
+    // `transformCallStmt` analyses each argument (a named one's value) in
+    // a query level with an empty range table, so a column reference fails
+    // at its own token before the procedure is looked up.
+    let values: Vec<pg_query::protobuf::Node> = f
+        .args
+        .iter()
+        .map(|a| match a.node.as_ref() {
+            Some(N::NamedArgExpr(na)) => na.arg.as_deref().cloned().unwrap_or_default(),
+            _ => a.clone(),
+        })
+        .collect();
+    fromless::check_values_row(&values, params)?;
+    // `ParseFuncOrColumn`'s checks of the names: each once, and no
+    // positional argument after a named one.
+    let mut arg_names: Vec<Option<String>> = Vec::with_capacity(f.args.len());
     for a in &f.args {
+        match a.node.as_ref() {
+            Some(N::NamedArgExpr(na)) => {
+                if arg_names.iter().flatten().any(|n| *n == na.name) {
+                    set_error_location(na.location);
+                    return Err(Error::Sqlstate(
+                        "42601",
+                        format!("argument name \"{}\" used more than once", na.name),
+                    ));
+                }
+                arg_names.push(Some(na.name.clone()));
+            }
+            _ => {
+                if arg_names.iter().any(Option::is_some) {
+                    set_error_location(expr_location(a).unwrap_or(-1));
+                    return Err(Error::Sqlstate(
+                        "42601",
+                        "positional argument cannot follow named argument".into(),
+                    ));
+                }
+                arg_names.push(None);
+            }
+        }
+    }
+    let mut args = Vec::with_capacity(values.len());
+    let mut arg_types = Vec::with_capacity(values.len());
+    for a in &values {
         let v = const_value(a, params)?;
         let untyped = matches!(a.node.as_ref(), Some(N::AConst(k))
             if k.isnull || matches!(k.val, Some(pg_query::protobuf::a_const::Val::Sval(_))));
@@ -6716,6 +6758,7 @@ fn plan_call(c: &pg_query::protobuf::CallStmt, params: &[Bson]) -> Result<Statem
         name,
         args,
         arg_types,
+        arg_names,
         location: f.location,
     })
 }

@@ -1730,6 +1730,14 @@ pub(crate) fn call_args_kind(args: &[pg_query::protobuf::Node]) -> CallArgs {
     kind
 }
 
+/// A routine parameter's DEFAULT (its SQL as stored), evaluated now and
+/// cast to the parameter's type, as a call that leaves it out takes it.
+pub fn evaluate_default(sql: &str, ty: &str) -> Result<Bson> {
+    let node = crate::domains::parse_default_sql(sql)?;
+    let v = crate::const_value(&node, &[])?;
+    crate::cast_value(v, ty)
+}
+
 /// Call a user function. With no hook installed (a Describe), or while only
 /// a TYPE is wanted, nothing runs and the answer is NULL.
 pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {
@@ -1745,9 +1753,7 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
             let sql = u.defaults.get(i).cloned().flatten().ok_or_else(|| {
                 Error::UndefinedFunction(format!("function {}() does not exist", u.name))
             })?;
-            let node = crate::domains::parse_default_sql(&sql)?;
-            let v = crate::const_value(&node, &[])?;
-            out.push(crate::cast_value(v, &u.arg_types[i])?);
+            out.push(evaluate_default(&sql, &u.arg_types[i])?);
         }
         defaulted = out;
         &defaulted[..]

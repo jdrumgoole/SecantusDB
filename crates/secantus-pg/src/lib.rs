@@ -2258,6 +2258,7 @@ impl plpgsql_fn::Host for PlHost<'_> {
             name,
             args,
             arg_types,
+            arg_names,
             ..
         } = self.plan(sql, params, types)?
         else {
@@ -2268,17 +2269,24 @@ impl plpgsql_fn::Host for PlHost<'_> {
         // statement.
         let run = || {
             self.h
-                .run_procedure(&name, args, arg_types)
+                .run_procedure(&name, args, arg_types, arg_names)
                 .map_err(|e| pl_error(&e))
         };
-        let (outputs, names, _, row) = if self.h.plpgsql_procedure(&name) {
+        let (outputs, names, _, row, sources) = if self.h.plpgsql_procedure(&name) {
             run()?
         } else {
             self.joined(|| self.atomic(run))?
         };
+        // Each output by the argument written for it (`usize::MAX` for one
+        // the call left to its default, which nothing can be written back to).
         let outputs = outputs
             .into_iter()
-            .map(|i| (i, names.get(i).cloned().unwrap_or_default()))
+            .map(|i| {
+                (
+                    sources.get(i).copied().flatten().unwrap_or(usize::MAX),
+                    names.get(i).cloned().unwrap_or_default(),
+                )
+            })
             .collect();
         Ok((
             outputs,
@@ -40830,8 +40838,9 @@ impl PgHandler {
                 name,
                 args,
                 arg_types,
+                arg_names,
                 ..
-            } => self.call_procedure(&name, args, arg_types),
+            } => self.call_procedure(&name, args, arg_types, arg_names),
             Statement::AlterFunction {
                 kind,
                 name,
