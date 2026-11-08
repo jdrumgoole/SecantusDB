@@ -1,6 +1,6 @@
 //! SBE expressions (`exec/sbe/expressions/expression.h`): the slot
-//! programs mongod 8.2.11's stage builders emit for a pushed-down `$group`,
-//! printed as its `DebugPrinter` prints them and evaluated as its VM
+//! programs mongod 8.2.11's stage builders emit for a pushed-down `$group`
+//! and the filter in front of it, printed as its `DebugPrinter` prints them and evaluated as its VM
 //! evaluates them.
 //!
 //! A value is `Option<Bson>`: `None` is SBE's `Nothing` (a missing field),
@@ -20,8 +20,13 @@ pub(crate) type Slot = u32;
 pub(crate) enum BinOp {
     FillEmpty,
     Eq,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
     Div,
     LogicOr,
+    LogicAnd,
 }
 
 /// An SBE expression.
@@ -164,6 +169,57 @@ pub(crate) fn as_f64(v: &Bson) -> Option<f64> {
     }
 }
 
+/// How SBE's comparison operators compare two values (`genericCompare`):
+/// numbers with numbers, strings with strings, and otherwise only values of
+/// one type; any other pair is `Nothing`, as is a NaN against a number that
+/// is not one (IEEE comparison: every ordering is false).
+fn sbe_compare(op: BinOp, x: &Bson, y: &Bson) -> Value {
+    let comparable = (is_number(x) && is_number(y))
+        || matches!(
+            (x, y),
+            (
+                Bson::String(_) | Bson::Symbol(_),
+                Bson::String(_) | Bson::Symbol(_)
+            )
+        )
+        || x.element_type() == y.element_type();
+    if !comparable {
+        return None;
+    }
+    let nan = |v: &Bson| is_number(v) && as_f64(v).is_some_and(f64::is_nan);
+    let o = match (nan(x), nan(y)) {
+        (false, false) => match (x, y) {
+            (Bson::String(a) | Bson::Symbol(a), Bson::String(b) | Bson::Symbol(b)) => a.cmp(b),
+            _ => secantus_core::order::cmp(x, y),
+        },
+        (true, true) => Ordering::Equal,
+        _ => return Some(Bson::Boolean(false)),
+    };
+    Some(Bson::Boolean(match op {
+        BinOp::Eq => o == Ordering::Equal,
+        BinOp::Lt => o == Ordering::Less,
+        BinOp::Lte => o != Ordering::Greater,
+        BinOp::Gt => o == Ordering::Greater,
+        BinOp::Gte => o != Ordering::Less,
+        _ => return None,
+    }))
+}
+
+/// `traverseF(input, lambda, compareArray)`: whether the lambda holds of
+/// the input or, when the input is an array, of any of its elements (one
+/// level: an element that is itself an array is handed over whole); with
+/// `compareArray`, of the array itself as well.
+fn traverse_f(input: Value, whole_array: bool, apply: &mut dyn FnMut(Value) -> Value) -> Value {
+    let holds = |v: Value| truthy(&v) == Some(true);
+    Some(Bson::Boolean(match input {
+        Some(Bson::Array(items)) => {
+            items.iter().any(|item| holds(apply(Some(item.clone()))))
+                || (whole_array && holds(apply(Some(Bson::Array(items)))))
+        }
+        other => holds(apply(other)),
+    }))
+}
+
 /// BSON order between two values, `Nothing` lowest.
 pub(crate) fn compare(a: &Value, b: &Value) -> Ordering {
     match (a, b) {
@@ -232,20 +288,22 @@ impl Expr {
                         Some(false) => r.eval(env),
                         None => None,
                     },
+                    BinOp::LogicAnd => match truthy(&a) {
+                        Some(true) => r.eval(env),
+                        Some(false) => Some(Bson::Boolean(false)),
+                        None => None,
+                    },
                     _ => {
                         let b = r.eval(env);
                         let (Some(x), Some(y)) = (a, b) else {
                             return None;
                         };
                         match op {
-                            BinOp::Eq => Some(Bson::Boolean(
-                                secantus_core::order::cmp(&x, &y) == Ordering::Equal,
-                            )),
                             BinOp::Div => {
                                 let (p, q) = (as_f64(&x)?, as_f64(&y)?);
                                 (q != 0.0).then(|| Bson::Double(p / q))
                             }
-                            BinOp::FillEmpty | BinOp::LogicOr => unreachable!(),
+                            _ => sbe_compare(*op, &x, &y),
                         }
                     }
                 }
@@ -298,6 +356,20 @@ impl Expr {
                     out
                 };
                 traverse_p(input, depth, &mut apply)
+            }
+            "traverseF" => {
+                let input = args[0].eval(env);
+                let whole_array = truthy(&args[2].eval(env)) == Some(true);
+                let Expr::Lambda { frame, body } = &args[1] else {
+                    return None;
+                };
+                let mut apply = |v: Value| {
+                    env.locals.push((*frame, v));
+                    let out = body.eval(env);
+                    env.locals.pop();
+                    out
+                };
+                traverse_f(input, whole_array, &mut apply)
             }
             "newObj" | "newBsonObj" => {
                 let vals: Vec<Value> = args.iter().map(|a| a.eval(env)).collect();

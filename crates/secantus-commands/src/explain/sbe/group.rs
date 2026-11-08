@@ -2,9 +2,14 @@
 //! `SlotBasedStageBuilder::buildGroup` builds it (`gen_group.cpp`, with the
 //! accumulators of `gen_accumulator.cpp`).
 //!
-//! Slots come from one counter, in the order the builder takes them: the
-//! scan's record and record id, its field slots (top-level fields, sorted),
-//! the dotted path's traversal, the spill slots, the group keys, the
+//! The scan may carry a filter, and a skip and a limit, in front of the
+//! group (the query the pipeline's leading stages make; `filter.rs`).
+//!
+//! Slots come from one counter, in the order the builder takes them: a
+//! skip's constant when a limit sits directly over it, the scan's record
+//! and record id, its field slots (the group's top-level fields, sorted,
+//! then the filter's, sorted), the limit's or lone skip's constant, the
+//! dotted path's traversal, the spill slots, the group keys, the
 //! accumulators, the finalize projection and the result. An expression that
 //! is already a slot takes none, and a projection of nothing but slots is
 //! not built at all (`SbBuilder::makeProject`).
@@ -13,9 +18,12 @@
 //! object of those; accumulator arguments that are field paths or `$$ROOT`
 //! (and numeric constants for `$sum`); at most one distinct dotted path,
 //! since with two mongod orders their slots by a hash table salted per
-//! process. Anything else returns `None`.
+//! process. A skip or limit only where the group reads no field (with
+//! one, mongod puts a dependency projection among them that is not built
+//! here). Anything else returns `None`.
 
 use super::expr::{BinOp, Expr, Slot, NULLISH_MASK};
+use super::filter::Filter;
 use super::stage::{Agg, AggFn, Stage};
 use super::Plan;
 use bson::{doc, Bson, Document};
@@ -155,7 +163,16 @@ fn is_count(acc: &Acc) -> bool {
     acc.op == "$count" || matches!(acc.arg, Some(Arg::Const(Bson::Int32(1))))
 }
 
-pub(super) fn build(group: &Document, uuid: &str, last: bool) -> Option<Plan> {
+/// The query in front of the group: its filter (the `parsedQuery`, and
+/// the program built from it) and its paging (0: none).
+pub(crate) struct Front {
+    pub parsed: Document,
+    pub filter: Option<Filter>,
+    pub skip: i64,
+    pub limit: i64,
+}
+
+pub(super) fn build(group: &Document, uuid: &str, last: bool, front: &Front) -> Option<Plan> {
     let (id, accs) = parse(group)?;
     let mut args: Vec<&Arg> = match &id {
         Id::One(a) => vec![a],
@@ -185,18 +202,30 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool) -> Option<Plan> {
         })
         .collect();
     let whole_document = args.iter().any(|a| matches!(a, Arg::Root));
-    // Node 2 is the dependency projection pushdown puts under the group
-    // when it needs a finite set of fields; it builds no SBE stage.
-    let node: u32 = if !fields.is_empty() && !whole_document {
-        3
-    } else {
-        2
-    };
+    let projected = !fields.is_empty() && !whole_document;
+    let (skip, limit) = (front.skip.max(0), front.limit.max(0));
+    if projected && (skip > 0 || limit > 0) {
+        return None;
+    }
+    // The query's nodes: the scan, then a SKIP and a LIMIT. Node 2 is the
+    // dependency projection pushdown puts under the group when it needs a
+    // finite set of fields; it builds no SBE stage.
+    let front_nodes = 1 + u32::from(skip > 0) + u32::from(limit > 0);
+    let node: u32 = if projected { 3 } else { front_nodes + 1 };
 
     let mut slots = Slots(0);
+    let merged_skip = (skip > 0 && limit > 0).then(|| slots.next());
     let record = slots.next();
     let record_id = slots.next();
-    let scan_fields: Vec<(String, Slot)> = fields.into_iter().map(|f| (f, slots.next())).collect();
+    let mut names: Vec<String> = fields.into_iter().collect();
+    if let Some(f) = &front.filter {
+        for name in f.fields() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    let scan_fields: Vec<(String, Slot)> = names.into_iter().map(|f| (f, slots.next())).collect();
     let field_slot = |f: &str| scan_fields.iter().find(|(n, _)| n == f).map(|(_, s)| *s);
     let mut root = Stage::Scan {
         node: 1,
@@ -205,13 +234,58 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool) -> Option<Plan> {
         fields: scan_fields.clone(),
         uuid: uuid.to_string(),
     };
+    if let Some(f) = &front.filter {
+        root = Stage::Filter {
+            node: 1,
+            predicate: f.program(&field_slot)?,
+            input: Box::new(root),
+        };
+    }
+    let mut env: Vec<(Slot, i64)> = Vec::new();
+    let mut query_plan = doc! {
+        "stage": "COLLSCAN",
+        "planNodeId": 1,
+        "filter": front.parsed.clone(),
+        "direction": "forward",
+    };
+    if skip > 0 {
+        query_plan = doc! {
+            "stage": "SKIP",
+            "planNodeId": 2,
+            "skipAmount": super::number(skip),
+            "inputStage": query_plan,
+        };
+    }
+    if limit > 0 {
+        query_plan = doc! {
+            "stage": "LIMIT",
+            "planNodeId": front_nodes as i32,
+            "limitAmount": super::number(limit),
+            "inputStage": query_plan,
+        };
+    }
+    if skip > 0 || limit > 0 {
+        let skip_slot = (skip > 0).then(|| merged_skip.unwrap_or_else(|| slots.next()));
+        let limit_slot = (limit > 0).then(|| slots.next());
+        let skip_at = skip_slot.map(|s| (s, skip));
+        let limit_at = limit_slot.map(|s| (s, limit));
+        env.extend(skip_at);
+        env.extend(limit_at);
+        env.sort();
+        root = Stage::LimitSkip {
+            node: front_nodes,
+            limit: limit_at,
+            skip: skip_at,
+            input: Box::new(root),
+        };
+    }
 
     // The dotted path: `traverseP` over its top-level field, one lambda per
     // level, framed from 1 + (levels - 1) since generating it took those.
     let mut path_slot = None;
     if let Some(path) = paths.first() {
         let top = field_slot(&path[0])?;
-        let first_frame = path.len() as u32;
+        let first_frame = path.len() as u32 + front.filter.as_ref().map_or(0, Filter::frames);
         let traversal = traverse(Expr::Slot(top), &path[1..], first_frame);
         let s = slots.next();
         path_slot = Some(s);
@@ -494,15 +568,11 @@ pub(super) fn build(group: &Document, uuid: &str, last: bool) -> Option<Plan> {
     Some(Plan {
         root,
         result,
+        env,
         query_plan: doc! {
             "stage": "GROUP",
             "planNodeId": node as i32,
-            "inputStage": {
-                "stage": "COLLSCAN",
-                "planNodeId": 1,
-                "filter": {},
-                "direction": "forward",
-            },
+            "inputStage": query_plan,
         },
         eof: false,
     })

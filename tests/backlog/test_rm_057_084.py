@@ -356,12 +356,17 @@ def test_explain_reports_rejected_plans(rust_mongo: Any, mongod: Any) -> None:
     assert _rejected_plans(rust_mongo) == _rejected_plans(mongod)
 
 
+def _uuid_text(db: Any, name: str) -> str:
+    raw = next(c for c in db.list_collections() if c["name"] == name)["info"]["uuid"]
+    return str(raw.as_uuid() if hasattr(raw, "as_uuid") else raw)
+
+
 def _group_explain(client: Any) -> Any:
     db = client["rm071"]
     name = _name()
     db[name].insert_many([{"a": i % 3, "b": i} for i in range(10)])
     db.m.insert_one({"a": 1})
-    uuid_ = str(next(c for c in db.list_collections() if c["name"] == name)["info"]["uuid"])
+    uuid_ = _uuid_text(db, name)
     out = []
     for pipeline in [
         [{"$match": {"b": {"$gt": 3}}}, {"$group": {"_id": "$a"}}],
@@ -378,9 +383,39 @@ def _group_explain(client: Any) -> Any:
 def test_explain_of_a_group_pushed_into_the_query(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains a pushed-down `$group` behind a filter, and a
     pushed-down `$lookup`, as the slot-based plan it runs (`explainVersion`
-    "2", `queryPlan` and `slotBasedPlan`). A `$group` over a plain
-    collection scan already does (tests/mongod_live/test_sbe_group_explain.py)."""
+    "2", `queryPlan` and `slotBasedPlan`). A `$group` over a plain or
+    filtered collection scan already does (tests/mongod_live/
+    test_sbe_group_explain.py, test_sbe_filtered_front_explain.py); the
+    `$lookup` is what is left of this test."""
     assert _group_explain(rust_mongo) == _group_explain(mongod)
+
+
+def _sbe_filters(client: Any) -> Any:
+    db = client["rm071f"]
+    name = _name()
+    db[name].insert_many([{"a": i, "b": i % 3} for i in range(10)] + [{"a": None}])
+    uuid_ = _uuid_text(db, name)
+    out = []
+    for pipeline in [
+        [{"$match": {"a": None}}, {"$count": "n"}],
+        [{"$match": {"a": {"$in": [1, 2]}}}, {"$count": "n"}],
+        [{"$match": {"a": {"$ne": 2}}}, {"$count": "n"}],
+        [{"$match": {"a": {"$gt": 1}}}, {"$limit": 2}, {"$group": {"_id": "$b"}}],
+    ]:
+        ex = db.command("aggregate", name, pipeline=pipeline, explain=True)
+        planner = ex.get("queryPlanner") or ex["stages"][0]["$cursor"]["queryPlanner"]
+        out.append((ex.get("explainVersion"), str(planner["winningPlan"]).replace(uuid_, "<uuid>")))
+    return out
+
+
+@pytest.mark.backlog("RM-071")
+def test_explain_of_a_filter_sbe_runs_beyond_comparisons(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 runs a `$count` behind `{a: null}`, an `$in` or a `$ne`,
+    and a field-reading `$group` behind a `$limit`, in SBE: a `filter` of
+    `typeMatch`, `isMember` or `!` programs, and the dependency projection
+    among the paging. Comparisons and their `$and`s already are
+    (tests/mongod_live/test_sbe_filtered_front_explain.py)."""
+    assert _sbe_filters(rust_mongo) == _sbe_filters(mongod)
 
 
 def _view_count_explain(client: Any) -> Any:
@@ -388,14 +423,41 @@ def _view_count_explain(client: Any) -> Any:
     name = _name()
     db[name].insert_many([{"a": i} for i in range(5)])
     db.command("create", name + "_v", viewOn=name, pipeline=[{"$match": {"a": {"$gt": 1}}}])
+    uuid_ = _uuid_text(db, name)
     ex = db.command("explain", {"count": name + "_v"}, verbosity="queryPlanner")
-    return ex.get("explainVersion")
+    plan = ex["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"]
+    return ex.get("explainVersion"), str(plan).replace(uuid_, "<uuid>"), ex["stages"][1:]
+
+
+@pytest.mark.backlog_fixed("RM-072")
+def test_explain_of_count_on_a_view(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 explains `count` on a view as a slot-based plan: the
+    view's `$match` as a `filter` over the scan, the `$count` as a `group`,
+    and its `$project` listed after the cursor. Fixed 2026-11-08."""
+    assert _view_count_explain(rust_mongo) == _view_count_explain(mongod)
+
+
+def _view_count_over_an_index(client: Any) -> Any:
+    db = client["rm072i"]
+    name = _name()
+    db[name].insert_many([{"a": i, "b": i % 3} for i in range(20)])
+    db[name].create_index("a")
+    db[name].create_index([("b", -1)])
+    db.command("create", name + "_v", viewOn=name, pipeline=[{"$match": {"a": {"$gt": 1}}}])
+    out = []
+    for cmd in [{"count": name + "_v"}, {"count": name + "_v", "query": {"b": 2}}]:
+        ex = db.command("explain", cmd, verbosity="queryPlanner")
+        plan = ex["stages"][0]["$cursor"]["queryPlanner"]["winningPlan"]
+        out.append((ex.get("explainVersion"), plan.get("queryPlan", plan)))
+    return out
 
 
 @pytest.mark.backlog("RM-072")
-def test_explain_of_count_on_a_view(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 explains `count` on a view as a slot-based plan."""
-    assert _view_count_explain(rust_mongo) == _view_count_explain(mongod)
+def test_explain_of_count_on_a_view_over_an_index(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 explains `count` on a view whose filter an index serves
+    as a slot-based plan too: a `GROUP` over a `COUNT_SCAN` where the count
+    reads no field, over `FETCH` and `IXSCAN` where a filter is left."""
+    assert _view_count_over_an_index(rust_mongo) == _view_count_over_an_index(mongod)
 
 
 def _expr_false_stage(client: Any) -> Any:

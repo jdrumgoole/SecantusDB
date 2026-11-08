@@ -7,38 +7,45 @@
 //! prints it, and RUN over the collection's documents, so every count in
 //! `executionStats` comes from executing the slot program.
 //!
-//! What is built here: a `$group` over a whole-collection scan with no
-//! filter, sort, paging or collation, whose `_id` and accumulator arguments
+//! What is built here: a `$group` (or the `$group` a `$count` is) over a
+//! collection scan with no sort, hint or collation, whose filter is
+//! comparisons and their `$and`s (`filter.rs`), with a skip and a limit
+//! when the group reads no field; whose `_id` and accumulator arguments
 //! are field paths, `$$ROOT` or constants, and whose accumulators are
 //! `$sum`, `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`, `$push` and
 //! `$addToSet`. Everything else SBE runs is still explained in the classic
 //! shape (`tasks/backlog-rust-mongodb.md`, RM-071).
 
 mod expr;
+mod filter;
 mod group;
 mod print;
 mod stage;
 
 use bson::{doc, Bson, Document};
 use expr::Slot;
+pub(crate) use filter::Filter;
+pub(crate) use group::Front;
 use stage::{Counted, Stage};
 
 /// A built slot-based plan.
 pub(crate) struct Plan {
     root: Stage,
     result: Slot,
+    /// The constants the plan reads from slots: its skip and limit.
+    env: Vec<(Slot, i64)>,
     /// The `queryPlan`: the query solution the stages were built from.
     query_plan: Document,
     /// The collection does not exist: `limit 0` over `coscan`.
     eof: bool,
 }
 
-/// The plan for `group` (a `$group` spec) over a collection scan of the
-/// collection whose UUID is `uuid`; `last`: nothing classic follows, so the
-/// result is a BSON object (`newBsonObj`) rather than an SBE one (`newObj`).
-/// `None` when the group is outside what is built here.
-pub(crate) fn group_plan(group: &Document, uuid: &str, last: bool) -> Option<Plan> {
-    group::build(group, uuid, last)
+/// The plan for `group` (a `$group` spec) over `front`, a collection scan
+/// of the collection whose UUID is `uuid`; `last`: nothing classic follows,
+/// so the result is a BSON object (`newBsonObj`) rather than an SBE one
+/// (`newObj`). `None` when the group is outside what is built here.
+pub(crate) fn group_plan(group: &Document, uuid: &str, last: bool, front: &Front) -> Option<Plan> {
+    group::build(group, uuid, last, front)
 }
 
 /// The plan mongod builds over a collection that does not exist.
@@ -52,6 +59,7 @@ pub(crate) fn eof_plan() -> Plan {
             uuid: String::new(),
         },
         result: 1,
+        env: vec![],
         query_plan: doc! { "stage": "EOF", "planNodeId": 1, "type": "nonExistentNamespace" },
         eof: true,
     }
@@ -112,8 +120,13 @@ impl Plan {
                 "[1] limit 0ll \n[1] coscan ".to_string(),
             )
         } else {
+            let env: Vec<String> = self
+                .env
+                .iter()
+                .map(|(s, v)| format!("s{s} = {v}"))
+                .collect();
             (
-                format!("$$RESULT=s{} env: {{  }}", self.result),
+                format!("$$RESULT=s{} env: {{ {} }}", self.result, env.join(", ")),
                 print::stages(&self.root),
             )
         };
@@ -133,6 +146,14 @@ impl Plan {
         all_plans: bool,
     ) -> (Document, i64) {
         let (stages, produced, examined) = if self.eof {
+            // Under a `$cursor`, saved and restored around its one batch.
+            let (saved, restored) = match pull {
+                Pull::Whole => (0, 0),
+                Pull::Batches { .. } => {
+                    let (_, loads, _) = batches(0, None);
+                    (loads + 1, loads)
+                }
+            };
             let stages = doc! {
                 "stage": "limit",
                 "planNodeId": 1,
@@ -140,8 +161,8 @@ impl Plan {
                 "executionTimeMillisEstimate": 0_i32,
                 "opens": 1_i32,
                 "closes": 1_i32,
-                "saveState": 0_i32,
-                "restoreState": 0_i32,
+                "saveState": number(saved),
+                "restoreState": number(restored),
                 "isEOF": 1_i32,
                 "limit": 0_i32,
                 "inputStage": {
@@ -151,14 +172,14 @@ impl Plan {
                     "executionTimeMillisEstimate": 0_i32,
                     "opens": 1_i32,
                     "closes": 1_i32,
-                    "saveState": 0_i32,
-                    "restoreState": 0_i32,
+                    "saveState": number(saved),
+                    "restoreState": number(restored),
                     "isEOF": 0_i32,
                 },
             };
             (stages, 0, 0)
         } else {
-            let (rows, counted) = self.root.run(docs);
+            let (rows, counted) = self.root.run(docs, None);
             let n = rows.len() as i64;
             let (produced, saves, eof) = match pull {
                 Pull::Whole => (n, None, true),
@@ -170,7 +191,12 @@ impl Plan {
                     (got, Some((loads + 1, loads)), eof)
                 }
             };
-            let examined = docs.len() as i64;
+            // What the scan at the bottom read.
+            let mut scan = &counted;
+            while let Some(below) = scan.input.as_deref() {
+                scan = below;
+            }
+            let examined = scan.reads;
             let pulled = Pulled { produced, eof };
             let stages = stats_doc(&self.root, &counted, Some(&pulled), saves);
             (stages, produced, examined)
@@ -207,7 +233,7 @@ fn stats_doc(
     saves: Option<(i64, i64)>,
 ) -> Document {
     let returned = pulled.map_or(counted.returned, |p| counted.returned.min(p.produced));
-    let eof = pulled.is_none_or(|p| p.eof);
+    let eof = pulled.map_or(counted.eof, |p| p.eof);
     let (saved, restored) = saves.unwrap_or((0, 0));
     let mut out = doc! {
         "stage": stage.name(),
