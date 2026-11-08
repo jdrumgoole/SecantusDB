@@ -22635,9 +22635,11 @@ fn resolve_one_sublink(
                 // at run time and must still print as `2 3`.
                 Some(value) => {
                     let node = located(param_node(params, value), sl.location);
-                    let ty = sub_plan_def(&plan, lookup)
+                    let column = sub_plan_def(&plan, lookup)
                         .ok()
-                        .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+                        .and_then(|d| d.columns.first().map(|c| (c.pg_type.clone(), c.typmod)));
+                    let typmod = column.as_ref().map_or(-1, |(_, m)| *m);
+                    let ty = column.map(|(t, _)| t);
                     // So must a type the value reads back as another (an
                     // `oid` is carried as a bigint, a `name` as text) -- and
                     // every other built-in type, so the value is typed as the
@@ -22646,9 +22648,13 @@ fn resolve_one_sublink(
                     // 1))` 42P18 and a CASE over it text (RP-023).
                     // A domain, or a domain's array, is cast to as well: no
                     // parameter type names one (RP-569).
+                    // So is a `char(n)[]` / `varchar(n)[]` one, whose
+                    // elements the cast at its modifier pads (RP-666).
                     let cast = |t: &str| {
+                        let base = t.strip_suffix("[]").unwrap_or(t);
                         sublink_value_cast(t)
-                            || domains::user_domain(t.strip_suffix("[]").unwrap_or(t)).is_some()
+                            || domains::user_domain(base).is_some()
+                            || !length_typmods(base, typmod).is_empty()
                     };
                     if let Some(t) = ty
                         .as_deref()
@@ -22665,32 +22671,48 @@ fn resolve_one_sublink(
                         {
                             relabel_cast(node, ty)
                         }
-                        Some(ty) if cast(ty) => pg_query::protobuf::Node {
-                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-                                arg: Some(Box::new(node)),
-                                type_name: Some(type_name_node(ty)),
-                                location: -1,
-                            }))),
-                        },
+                        // The value is of the column's type at the column's
+                        // modifier (`exprTypmod` of an EXPR sublink is its
+                        // column's): a `char(n)` value is stored without its
+                        // blanks, and the cast to `character(n)` gives them
+                        // back, as the column itself has them, element by
+                        // element in a `char(n)[]` one's (RP-666).
+                        Some(ty) if cast(ty) => {
+                            let mut type_name = type_name_node(ty);
+                            type_name.typmods =
+                                length_typmods(ty.strip_suffix("[]").unwrap_or(ty), typmod);
+                            pg_query::protobuf::Node {
+                                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                    arg: Some(Box::new(node)),
+                                    type_name: Some(type_name),
+                                    location: -1,
+                                }))),
+                            }
+                        }
                         _ => node,
                     })
                 }
                 None => {
-                    let ty = sub_plan_def(&plan, lookup)?
+                    let (ty, typmod) = sub_plan_def(&plan, lookup)?
                         .columns
                         .first()
-                        .map(|c| c.pg_type.clone())
-                        .unwrap_or_else(|| "text".into());
+                        .map(|c| (c.pg_type.clone(), c.typmod))
+                        .unwrap_or_else(|| ("text".into(), -1));
                     let null = located(param_node(params, Bson::Null), sl.location);
                     // `record` is no type a cast can name: a row subquery
                     // that returned nothing is a bare NULL.
                     if ty == "record" {
                         return Ok(null);
                     }
+                    // A NULL of the column's type at its modifier, as an
+                    // EXPR sublink is typed whatever it returns (RP-666).
+                    let mut type_name = type_name_node(&ty);
+                    type_name.typmods =
+                        length_typmods(ty.strip_suffix("[]").unwrap_or(&ty), typmod);
                     Ok(pg_query::protobuf::Node {
                         node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                             arg: Some(Box::new(null)),
-                            type_name: Some(type_name_node(&ty)),
+                            type_name: Some(type_name),
                             location: -1,
                         }))),
                     })

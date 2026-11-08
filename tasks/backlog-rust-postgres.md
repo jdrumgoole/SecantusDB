@@ -2435,15 +2435,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp656.py`: `t656(c char(3), v varchar(4), n
 numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
 
-- [ ] **A scalar subquery over a `char(n)` column drops its blanks.**
-      `select (select c from t656)` is `xy ` on PostgreSQL 15.19 and
-      `octet_length((select c from t656))` 3; here they are `xy` and 2.
-      The subquery's value, stored without its padding, is cast to the
-      column's type without its modifier (`bpchar`), where the ARRAY
-      sublink is cast at it since RP-656. Its RowDescription modifier is
-      RP-497's.
-      Verify: tests/backlog/test_rp_found_rp656.py::test_scalar_subquery_keeps_char_padding
-      Backlog-ID: RP-666
 - [ ] **An `ARRAY(select n ...)` over a `numeric(p,s)` column describes no
       modifier.** `select array(select n from t656)` describes `numeric[]`
       327686 on PostgreSQL 15.19 (`exprTypmod` of an ARRAY sublink is its
@@ -2452,6 +2443,22 @@ numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
       one is declared as `numeric[]`, which carries none.
       Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
       Backlog-ID: RP-667
+
+## Found while working RP-666 (2026-11-08)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+`_SETUP` table of `tests/backlog/test_rp_found_rp656.py` made temporary.
+
+- [ ] **`min` / `max` over a `char(n)` column drop the value's blanks.**
+      `select octet_length(max(c)) from t656` is 3 on PostgreSQL 15.19 (an
+      Aggref is its argument's type, and `bpchar_larger` returns one of
+      the stored values, blanks and all); here it is 2, and so is
+      `octet_length((select max(c) from t656))`. The aggregate returns the
+      value as stored, without its padding; `select max(c)` prints `xy `
+      only because its RowDescription carries the column's width, which
+      RP-659 takes away.
+      Verify: tests/backlog/test_rp_found_rp656.py::test_min_max_over_char_n_keep_its_blanks
+      Backlog-ID: RP-671
 
 ## Found while working RP-570 (2026-11-08)
 
