@@ -1,5 +1,5 @@
 """RP-590's WHERE regression, and the gap test of what was found while
-working it: RP-606 (the `record_image` operators `*=` .. `*>=` are
+working it: RP-650 (the `record_image` operators `*=` .. `*>=` are
 refused).
 
 Two different composite types compare through `record = record`, which
@@ -130,7 +130,7 @@ RECORD_IMAGE = {
 }
 
 
-@pytest.mark.backlog("RP-606")
+@pytest.mark.backlog("RP-650")
 @pytest.mark.parametrize("query", list(RECORD_IMAGE))
 def test_record_image_operators(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_IMAGE[query]

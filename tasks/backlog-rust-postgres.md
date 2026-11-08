@@ -2284,7 +2284,7 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       does not exist: integer *= integer` at 15. Here each is 0A000
       `operator *= on these operands is not supported yet`.
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
-      Backlog-ID: RP-606
+      Backlog-ID: RP-650
 
 ## Found while working RP-559 (2026-11-08)
 

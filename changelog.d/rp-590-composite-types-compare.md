@@ -21,7 +21,7 @@ an `unknown` field, which was wrong before this change too.
 
 - `=`, `<>`, `<`, `<=`, `>` and `>=` between two different composite types
   now resolve to `record`'s operators. The `record_image` forms (`*=` ..
-  `*>=`) pass the same check but are still 0A000 when they run (RP-606).
+  `*>=`) pass the same check but are still 0A000 when they run (RP-650).
   Any other operator between them is still 42883 (`ct + ct2`). An enum
   beside a composite is still refused.
 - In a WHERE, a composite column compared with a record of other field types
@@ -39,5 +39,5 @@ The crate regression tests are `secantus-pgplan`'s
 
 #### Filed
 
-- RP-606: the `record_image` operators (`*=` .. `*>=`) are refused with
+- RP-650: the `record_image` operators (`*=` .. `*>=`) are refused with
   0A000. On PostgreSQL `(select row(1.0)) *= (select row(1.00))` is `f`.
