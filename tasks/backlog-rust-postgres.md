@@ -2003,24 +2003,38 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 
 ## Found while working RP-470 (2026-11-07)
 
-- [ ] **A whole-row reference is still refused in two shapes.** On
-      PostgreSQL 15.19, `select (select fs) from fs` and the same over `fs,
-      fe` answer `(1,y)`, and `select (fs).* from fs, fe order by 1`
-      answers `1, y`. Here the first is 42703 `column "fs" does not exist`
-      -- a subquery's correlation does not bind an outer FROM item's whole
-      row -- and the last is 0A000 `this field selection is not supported
-      yet`: `ORDER BY 1` copies the `(fs).*` target before the join expands
-      it. Since RP-470 a table's or a plain subquery's whole row over a
-      join works, built at its scan, and since RP-477 a LATERAL leaf's
-      (`select l from fs join lateral (select fs.a) l on true`) does too.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
-      Backlog-ID: RP-479
 - [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
       15.19 reports `column "a" specified in USING clause does not exist in
       left table` with no position; here it points into the statement (41,
       33 in the gap test's two statements).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
+
+## Found while working RP-479 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
+holding `(1, 'y')`.
+
+- [ ] **An UPDATE's or DELETE's target table is not a whole row.**
+      `update fs set c = fs::text returning c` and `update fs set c =
+      (select fs::text) returning c` answer `(1,y)` on PostgreSQL, and
+      `delete from fs where fs is null returning a` no row; here each is
+      42703 `column "fs" does not exist`. The write's target is not offered
+      as a whole row to its own SET, WHERE or RETURNING (nor, through
+      `outer_whole_row`, to their subqueries' per-row call); a SELECT's FROM
+      item and an UPDATE ... FROM's other table already are.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_dml_target_whole_row
+      Backlog-ID: RP-516
+- [ ] **`v.*` in a subquery's select list over an outer FROM item is
+      42P01.** On PostgreSQL 15.19 `select (select v.*) from (values (1))
+      v(a)` answers 1 (the star expands to the outer item's columns), and
+      over `v(a, c)` it is 42601 `subquery must return only one column` at
+      8; here each is 42P01 `missing FROM-clause entry for table "v"`. Since
+      RP-479 a bare outer name is the item's whole row in a subquery; a
+      star over it is not yet expanded there. Measured on 15.19 with
+      VALUES lists.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_outer_star_in_subquery
+      Backlog-ID: RP-517
 
 ## Found while working RP-500 (2026-11-07)
 
