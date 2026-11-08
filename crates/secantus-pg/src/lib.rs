@@ -23806,6 +23806,10 @@ impl PgHandler {
                         ) {
                             d.insert(field, Bson::Int32(target));
                         }
+                        // The `[]` it was declared with (RP-658).
+                        if let Some(field) = def.field_of("attndims") {
+                            d.insert(field, Bson::Int32(c.ndims()));
+                        }
                         let generated = c.extra.get_str("generated").is_ok();
                         d.insert(
                             def.field_of("atthasdef").expect("column"),
@@ -23938,6 +23942,11 @@ impl PgHandler {
                                 def.field_of("atttypmod").expect("column"),
                                 Bson::Int32(catalog_typmod(c)),
                             );
+                            // A key column's attribute is copied from the
+                            // table's (`ConstructTupleDescriptor`).
+                            if let Some(field) = def.field_of("attndims") {
+                                d.insert(field, Bson::Int32(c.ndims()));
+                            }
                             rows.push(d);
                         }
                     }

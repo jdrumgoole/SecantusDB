@@ -2359,6 +2359,8 @@ pub enum AlterTableAction {
         column: String,
         pg_type: String,
         typmod: i32,
+        /// The new type's declared array dimensions (`attndims`).
+        ndims: i32,
         /// `USING <expr>`: the new value computed from the row, as SQL
         /// (planned by the executor over the table), instead of a cast.
         using: Option<String>,
@@ -5248,8 +5250,17 @@ fn plan_node(
                 None => None,
             };
             let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
+            let like_columns = like_column_names(&c, lookup);
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
+                // A column PostgreSQL defines from a type OID -- one LIKE
+                // (a partition's too) or `OF type` brings -- has no array
+                // bounds written, so no `attndims` (`makeTypeNameFromOid`).
+                for col in def.columns.iter_mut() {
+                    if of_type.is_some() || like_columns.contains(&col.name) {
+                        col.set_ndims(0);
+                    }
+                }
                 def.extra.extend(extra);
                 if let Some(ty) = of_type {
                     def.extra.insert(typed_tables::OF_TYPE_KEY, ty);
@@ -7403,6 +7414,13 @@ pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)
 }
 
+/// The array dimensions a type name is written with -- `int[][]` 2, `int
+/// ARRAY[4]` 1, `_int4` 0 -- which `pg_attribute.attndims` records
+/// (`BuildDescForRelation`: `list_length(typeName->arrayBounds)`).
+fn declared_ndims(tn: &pg_query::protobuf::TypeName) -> i32 {
+    i32::try_from(tn.array_bounds.len()).unwrap_or(i32::MAX)
+}
+
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
     match expr_memo::type_name(tn, || {
         (type_name_of_uncached(tn), declared_typmod_uncached(tn))
@@ -8040,6 +8058,7 @@ fn plan_alter_action(
                 column: cmd.name.clone(),
                 pg_type: ty,
                 typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                ndims: cd.type_name.as_ref().map_or(0, declared_ndims),
                 using,
             })
         }
@@ -8564,6 +8583,7 @@ fn plan_added_column(
         column.sequence = Some(format!("{table}_{}_seq", cd.colname));
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+    column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -8965,11 +8985,13 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             column,
             pg_type,
             typmod,
+            ndims,
             ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
                 c.typmod = *typmod;
+                c.set_ndims(*ndims);
             }
         }
         AlterTableAction::AddCheck(check) => {
@@ -11093,6 +11115,22 @@ fn write_target_missing(table: &str, what: &str) -> Error {
     }
 }
 
+/// The columns the LIKE clauses of `c` bring, by name.
+fn like_column_names(
+    c: &pg_query::protobuf::CreateStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<String> {
+    c.table_elts
+        .iter()
+        .filter_map(|e| match e.node.as_ref() {
+            Some(N::TableLikeClause(like)) => like.relation.as_ref(),
+            _ => None,
+        })
+        .filter_map(|rel| lookup(&relation_name(rel)))
+        .flat_map(|def| def.columns.into_iter().map(|col| col.name))
+        .collect()
+}
+
 /// `CREATE TABLE t (LIKE src [INCLUDING ...], ...)`: the LIKE clause
 /// replaced by `src`'s column definitions, rendered as SQL and parsed back.
 /// Column names, types and NOT NULL always come across (as in PostgreSQL);
@@ -11299,6 +11337,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 // 4 rather than as an unsized `text` -- and so the Python
                 // server, which shares this catalog, reads the same type.
                 column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+                column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
                 // `s text COLLATE x`: recorded, and honoured wherever the
                 // column is ordered or compared (`enum_order`). It used to be
                 // dropped, so the column compared by bytes whatever it said.

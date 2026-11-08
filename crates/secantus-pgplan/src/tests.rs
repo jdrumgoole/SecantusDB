@@ -5547,3 +5547,16 @@ fn a_cast_of_a_domain_column_to_its_own_domain_is_a_relabel() {
     // ... and the coercion after it checks again.
     assert!(const_value(&cast(false), &[]).is_err());
 }
+
+/// `attndims` counts the bounds a column's type is WRITTEN with, never the
+/// array-ness of the type itself (RP-658).
+#[test]
+fn a_column_records_its_declared_array_dimensions() {
+    let Statement::CreateTable(def, _) =
+        plan_ok("CREATE TABLE t (a int[], b int[][], c int, d int[3], e int ARRAY, f _int4)")
+    else {
+        panic!("not a CREATE TABLE");
+    };
+    let got: Vec<i32> = def.columns.iter().map(|c| c.ndims()).collect();
+    assert_eq!(got, vec![1, 2, 0, 1, 1, 0]);
+}

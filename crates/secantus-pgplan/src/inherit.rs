@@ -251,6 +251,10 @@ pub(crate) fn merge_parents(
             col.extra = c.extra.clone();
             // Only the child's own declaration makes a column local.
             col.extra.remove(LOCAL_KEY);
+            // An inherited column's definition is built from the parent's
+            // type OID, with no array bounds written: `attndims` 0, and 0
+            // still when the child declares it too (`MergeAttributes`).
+            col.set_ndims(0);
             columns.push(col);
         }
         for k in &pdef.check_constraints {

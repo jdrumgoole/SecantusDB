@@ -2443,19 +2443,29 @@ as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
       Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
       Backlog-ID: RP-654
 
-## Found while working RP-653 (2026-11-08)
+## Found while working RP-658 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d653n as
-int`. The gap test is in `tests/backlog/test_rp_found_rp653.py`.
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp658.py`.
 
-- [ ] **A user column's `attndims` is always 0.** `attndims` is the number
-      of dimensions a column was declared with (`ColumnDef`'s
-      `arrayBounds`): after `create table t653n (a int[], b int[][], c int,
-      d int[3], e d653n[])` PostgreSQL 15.19's `pg_attribute` has 1, 2, 0,
-      1 and 1; here every column is 0 (`catalog_fill.rs` writes a constant
-      for a user table), so a client reading it sees no array column.
-      Verify: tests/backlog/test_rp_found_rp653.py::test_array_column_attndims
-      Backlog-ID: RP-658
+- [ ] **ALTER COLUMN TYPE between two array types is refused.** An array's
+      assignment cast is its element's (`find_coercion_pathway` over
+      `typelem`), so on PostgreSQL 15.19 `alter column a type int8[]` of an
+      `int[]` column, `smallint[]` to `int[]` and `int8[]` to `numeric[]`
+      each succeed with no USING and keep the values; only a pair with no
+      element cast (`text` to `int[]`) is 42804. Here the first three are
+      42804 `column "a" cannot be cast automatically to type bigint[]`
+      (`alter_type_is_automatic` knows no array pair).
+      Verify: tests/backlog/test_rp_found_rp658.py::test_alter_type_between_array_types
+      Backlog-ID: RP-662
+- [ ] **A composite type's attribute has `attndims` 0.** `create type c as
+      (p int[][], q int, r text[])` gives `p`, `q` and `r` 2, 0 and 1 in
+      PostgreSQL 15.19's `pg_attribute` (`DefineCompositeType` builds the
+      descriptor with `BuildDescForRelation`, which counts the written
+      bounds); here each is 0: the composite's stored fields keep only a
+      type name. A table column records them since RP-658.
+      Verify: tests/backlog/test_rp_found_rp658.py::test_composite_attribute_attndims
+      Backlog-ID: RP-663
 
 ## Found while working RP-575 (2026-11-08)
 
