@@ -1,4 +1,4 @@
-//! `RETURNING *` and `RETURNING t.*` on an UPDATE or DELETE, spelled out as
+//! `RETURNING *` and `RETURNING t.*` on an UPDATE, DELETE or INSERT, spelled out as
 //! the columns they stand for before the statement is planned.
 //!
 //! PostgreSQL expands a star in RETURNING over every relation the statement

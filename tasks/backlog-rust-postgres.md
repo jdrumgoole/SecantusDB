@@ -2123,23 +2123,31 @@ and `fs(a int, c text)`.
       Backlog-ID: RP-524
       Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
 
-## Found while working RP-523 (2026-11-08)
+## Found while working RP-527 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`.
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp527.py`.
 
-- [ ] **A column reference's schema is not read.** In `schema.rel.col`,
-      PostgreSQL 15.19's `refnameNamespaceItem` takes `schema.rel` to an
-      UNALIASED entry of that relation, and `errorMissingRTE` finds an
-      entry of that relation or with `rel` as its alias name. So `select
-      other.fs.c from fs` and `update fs set c = other.fs.c` are 42P01
-      `invalid reference to FROM-clause entry for table "fs"` (HINT `There
-      is an entry for table "fs", but it cannot be referenced from this
-      part of the query.`), and under an alias `x`, `pg_catalog.fs.c` is
-      `missing FROM-clause entry for table "fs"`. Here the qualifier is
-      matched by its relation name alone: the first two answer the row,
-      and the last is the alias's `invalid reference`.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_schema_qualified_reference
-      Backlog-ID: RP-527
+- [ ] **A FROM relation that does not exist is reported after the
+      statement's qualified column references.** PostgreSQL 15.19's
+      `transformFromClause` runs before the select list and WHERE are read,
+      so `select fs.c from nosuch` is 42P01 `relation "nosuch" does not
+      exist` at 18, `select nosuch.c from nosuch` the same at 22 and
+      `select a from nosuch where zz.a = 1` at 15. Here the qualifier check
+      runs first: the first and third are `missing FROM-clause entry for
+      table "fs"` / `"zz"` (at 8, 28), and the second has PostgreSQL's
+      message at the reference (8).
+      Backlog-ID: RP-545
+      Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
+- [ ] **A function over a table's row type does not depend on the
+      table.** PostgreSQL 15.19 records `function rq534f(rq534) depends on
+      type rq534` (`pg_depend`): a plain `drop table rq534` is 2BP01
+      `cannot drop table rq534 because other objects depend on it`, and
+      `drop table rq534 cascade` drops the function too (NOTICE `drop
+      cascades to function rq534f(rq534)`). Here the plain DROP succeeds and
+      the function stays in `pg_proc` over a type that no longer exists.
+      Backlog-ID: RP-546
+      Verify: tests/backlog/test_rp_found_rp527.py::test_row_type_function_depends_on_its_table
 
 ## Found while working RP-522 (2026-11-08)
 

@@ -1224,13 +1224,16 @@ def test_aliased_write_target_hides_its_name(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ALIASED_WRITE_TARGET_NAME[query]
 
 
-# Found while working RP-523 (RP-527). A qualifier of three names is
-# `schema.rel`: `refnameNamespaceItem` takes it to an UNALIASED entry of
+# Found while working RP-523 (RP-527; fixed). A qualifier of three names
+# is `schema.rel`: `refnameNamespaceItem` takes it to an UNALIASED entry of
 # that relation, and `searchRangeTableForRel` to an entry of that relation
-# or with `rel` as its alias name. Here the schema is not read, so a
-# schema that does not hold the table still finds it.
+# or with `rel` as its alias name. The schema was not read, so a schema
+# that does not hold the table still found it.
 _FS_ENTRY_HINT = (
     'There is an entry for table "fs", but it cannot be referenced from this part of the query.'
+)
+_FE_ENTRY_HINT = (
+    'There is an entry for table "fe", but it cannot be referenced from this part of the query.'
 )
 SCHEMA_QUALIFIED_REFERENCE = {
     "select other.fs.c from fs": (
@@ -1258,13 +1261,168 @@ SCHEMA_QUALIFIED_REFERENCE = {
         "21",
     ),
     "select public.fs.c from fs": [("y",)],
+    # Every query level is searched as `transformColumnRef` searches it:
+    # a join's ON sees its two sides, an aliased join hides them, a FROM
+    # subquery sees an earlier item only through LATERAL (a function always
+    # does), an INSERT's source does not see its target, and a CTE is not
+    # the relation of its name.
+    "select other.fs.c from fs, fe": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "8",
+    ),
+    "select public.fs.c, public.fe.b from fs join fe on public.fe.a = public.fs.a": [("y", "x")],
+    "select * from fs join (fe join fs y on public.fe.a = public.fs.a) on true": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "54",
+    ),
+    "select * from (fs join fe using (a)) j where public.fs.a = 1": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "46",
+    ),
+    "select (select other.fs.c from fe) from fs": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "16",
+    ),
+    "select (select public.fs.c from fe x where x.a = public.fs.a) from fs": [("y",)],
+    "select * from fs, (select public.fs.c) x": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "27",
+    ),
+    "select x.* from fs, lateral (select public.fs.a) x": [(1,)],
+    "select * from fs, generate_series(other.fs.a, 2) g": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "35",
+    ),
+    "select public.fs.c from fs union all select public.fs.c from fe": (
+        "42P01",
+        'missing FROM-clause entry for table "fs"',
+        None,
+        "45",
+    ),
+    "with fs as (select 1 as c) select public.fs.c from fs": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "35",
+    ),
+    "select public.pg_class.relname from pg_class where relname = 'pg_type'": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "pg_class"',
+        'There is an entry for table "pg_class", but it cannot be referenced from this part'
+        " of the query.",
+        "8",
+    ),
+    "select pg_catalog.pg_class.relname from pg_class where relname = 'pg_type'": [("pg_type",)],
+    "explain (costs off) select other.fs.c from fs": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "28",
+    ),
+    "delete from fs where other.fs.a = 1": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "22",
+    ),
+    "delete from fs x using fe where public.fe.a = public.fs.a": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        'Perhaps you meant to reference the table alias "x".',
+        "47",
+    ),
+    "update fs set c = 'q' from fe where other.fe.a = fs.a": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fe"',
+        _FE_ENTRY_HINT,
+        "37",
+    ),
+    "insert into fs select public.fs.a, 'z' from fe": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "23",
+    ),
+    "insert into fs values (3,'q') returning other.fs.a": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "41",
+    ),
+    # A reference that resolves reads as its entry: `fs.*` is fs's columns,
+    # in an INSERT's RETURNING too.
+    "select public.fs.* from fs": [(1, "y")],
+    "insert into fs values (3,'q') returning public.fs.*": [(3, "q")],
+    "insert into fs as x values (3,'q') returning x.*": [(3, "q")],
 }
 
 
-@pytest.mark.backlog("RP-527")
+@pytest.mark.backlog_fixed("RP-527")
 @pytest.mark.parametrize("query", list(SCHEMA_QUALIFIED_REFERENCE))
 def test_schema_qualified_reference(query: str, dsn: str) -> None:
     assert answer(dsn, query) == SCHEMA_QUALIFIED_REFERENCE[query]
+
+
+# RP-527 with a second schema holding a table of the same name: the
+# reference names the relation, not the name.
+_RP527_SCHEMA = [
+    "drop schema if exists rp527 cascade",
+    "create schema rp527",
+    "create table rp527.fs (a int, c text)",
+    "insert into rp527.fs values (2, 's')",
+]
+SCHEMA_QUALIFIED_OTHER_SCHEMA = {
+    "select rp527.fs.c from fs": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "8",
+    ),
+    "select rp527.fs.c from rp527.fs": [("s",)],
+    "select public.fs.c from rp527.fs": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "8",
+    ),
+    "select rp527.fs.c from rp527.fs x": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        'Perhaps you meant to reference the table alias "x".',
+        "8",
+    ),
+    "update fs set c = 'q' where rp527.fs.a = 1": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        _FS_ENTRY_HINT,
+        "29",
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-527")
+@pytest.mark.parametrize("query", list(SCHEMA_QUALIFIED_OTHER_SCHEMA))
+def test_schema_qualified_reference_other_schema(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _RP527_SCHEMA:
+            c.execute(q)
+    try:
+        assert answer(dsn, query) == SCHEMA_QUALIFIED_OTHER_SCHEMA[query]
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute(_RP527_SCHEMA[0])
 
 
 # Found while working RP-516. A write's name error is reported at the
