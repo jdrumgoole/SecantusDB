@@ -4955,3 +4955,63 @@ fn an_array_of_one_domain_is_the_domains_array() {
     }
     domains::set_user_domains(Vec::new());
 }
+
+/// RP-570: a cast to a domain's array coerces each element to the domain.
+/// From text it is `array_in` reading each element with `domain_in` -- the
+/// base type's input at the domain's modifier, so a long `char(3)` element
+/// is 22001 -- and from an array an explicit element cast, which truncates.
+/// Every domain of the chain checks each element, a NULL one too. Answers
+/// measured on PostgreSQL 15.19.
+#[test]
+fn a_cast_to_a_domain_array_coerces_each_element() {
+    let domain = |name: &str, oid, base: &str, typmod, not_null| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null,
+        checks: Vec::new(),
+        default_sql: None,
+        not_valid: Vec::new(),
+    };
+    domains::set_user_domains(vec![
+        domain("da3", 90011, "bpchar", 7, false),
+        domain("da3n", 90012, "da3", -1, true),
+        domain("dan", 90013, "numeric", (5 << 16 | 2) + 4, false),
+        domain("dai", 90014, "int4", -1, false),
+    ]);
+    let s = |t: &str| Bson::String(t.to_string());
+    let arr = |items: &[&str]| Bson::Array(items.iter().map(|t| s(t)).collect());
+    let cast = |v: Bson, e: &str| domain_array_cast(&v, e);
+    // Input: padded, too long refused, blank excess cut, nested dimensions.
+    assert_eq!(cast(s("{ab}"), "da3").unwrap(), Some(arr(&["ab "])));
+    assert_eq!(cast(s("{\"ab   \"}"), "da3").unwrap(), Some(arr(&["ab "])));
+    let err = cast(s("{abcd}"), "da3").unwrap_err().to_string();
+    assert!(
+        err.contains("value too long for type character(3)"),
+        "{err}"
+    );
+    assert_eq!(
+        cast(s("{{ab,c}}"), "da3").unwrap(),
+        Some(Bson::Array(vec![arr(&["ab ", "c  "])]))
+    );
+    // An array value: an explicit cast, which truncates.
+    assert_eq!(
+        cast(arr(&["abcd", "x"]), "da3").unwrap(),
+        Some(arr(&["abc", "x  "]))
+    );
+    // Through a domain over a domain, whose NOT NULL sees a NULL element.
+    assert_eq!(cast(s("{ab}"), "da3n").unwrap(), Some(arr(&["ab "])));
+    let err = cast(s("{ab,NULL}"), "da3n").unwrap_err().to_string();
+    assert!(err.contains("does not allow null values"), "{err}");
+    // numeric(5,2) rounds on input and refuses what does not fit.
+    let Some(Bson::Array(items)) = cast(s("{1.234}"), "dan").unwrap() else {
+        panic!("an array");
+    };
+    assert_eq!(numeric::numeric_text(&items[0]).as_deref(), Some("1.23"));
+    assert!(cast(s("{123456}"), "dan").is_err());
+    // A domain with no modifier, and no domain at all, are not this path's.
+    assert_eq!(cast(s("{7}"), "dai").unwrap(), None);
+    assert_eq!(cast(s("{ab}"), "bpchar").unwrap(), None);
+    domains::set_user_domains(Vec::new());
+}

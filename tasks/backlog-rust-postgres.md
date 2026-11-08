@@ -2282,15 +2282,50 @@ char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
       `pg_typeof` sees its domain (`rewrite_domain_typeof`).
       Backlog-ID: RP-569
       Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
-- [ ] **A cast to a domain's array does not apply the base type's
-      modifier.** `select '{ab}'::d559c[]` and `array['ab']::d559c[]` are
-      `{"ab "}` on PostgreSQL 15.19, each element coerced through
-      `char(3)`, and `'{abcd}'::d559c[]` is 22001 `value too long for type
-      character(3)`; here they are `{ab}` and `{abcd}`, an element longer
-      than the domain allows. The domain's CHECK is already applied per
-      element. RP-551 applies the modifier to a scalar cast.
-      Backlog-ID: RP-570
-      Verify: tests/backlog/test_rp_found_rp559.py::test_cast_to_domain_array_applies_typmod
+
+## Found while working RP-570 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d570c as
+char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
+and `(2, 'abcd', '{abcd}')`. The gap tests are in
+`tests/backlog/test_rp_found_rp570.py`.
+
+- [ ] **A cast to an array with a type modifier ignores the modifier.**
+      `select '{ab}'::char(3)[]` is `{"ab "}` on PostgreSQL 15.19, and
+      `'{abcd}'::char(3)[]`, `array['abcd']::char(3)[]` and
+      `'{abcd}'::varchar(3)[]` are `{abc}`: `array_in` reads at typmod -1
+      and `coerce_type_typmod` then runs the explicit length coercion over
+      each element. `'{1.234}'::numeric(5,2)[]` is `{1.23}` and
+      `'{123456}'::numeric(5,2)[]` 22003. Here every element comes back as
+      written. Since RP-570 a cast to a DOMAIN's array applies the domain's
+      modifier (`domain_array_cast`); `const_value_node` applies a written
+      modifier only to a scalar `bpchar` / `varchar` / `numeric` target.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_cast_to_typmod_array
+      Backlog-ID: RP-579
+- [ ] **A cast of a bare column to a domain with a modifier ignores it.**
+      `select t::d570c from t570` is `ab ` and `abc` on PostgreSQL 15.19,
+      and `ta::d570c[]` is `{"ab "}` and `{abc}`. Here each value comes
+      back as stored. A cast of a constant, or of an expression over the
+      row (`array[t]::d570c[]`), applies the modifier (RP-551, RP-570); a
+      cast of a bare column takes `ColumnExpr::Casts`, which
+      `cast_chain_has_typmod` lets through because the cast writes no
+      modifier of its own.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_column_cast_to_domain_applies_typmod
+      Backlog-ID: RP-580
+- [ ] **A domain array literal's input error has no position.** `select
+      '{abcd}'::d570c[]` is 22001 at 8 on PostgreSQL 15.19 (`array_in` runs
+      `domain_in` while it reads the literal, as `'x'::int` is positioned
+      there); here the 22001 has no position. `positioned` places an error
+      by its SQLSTATE and message, and an assignment's 22001 has none.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
+      Backlog-ID: RP-581
+- [ ] **A numeric overflow's 22003 has no DETAIL.** `select
+      '123456'::numeric(5,2)` and `123456::numeric(5,2)` are 22003
+      `numeric field overflow` with DETAIL `A field with precision 5, scale
+      2 must round to an absolute value less than 10^3.` on PostgreSQL
+      15.19 (`apply_typmod`); here the DETAIL is empty.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_numeric_overflow_detail
+      Backlog-ID: RP-582
 
 ## Found while working RP-571 (2026-11-08)
 

@@ -16524,6 +16524,72 @@ pub(crate) fn explicit_typmod(v: Bson, pg_type: &str, typmod: i32) -> Result<Bso
     }
 }
 
+/// A cast to the array of a domain whose base type carries a modifier
+/// (`d[]`, `d` a domain over `char(3)`), or `None` when `element` is no such
+/// domain. Every domain of the chain then checks each coerced element, a
+/// NULL one included, innermost first (15.19, RP-570).
+///
+/// - From text it is `array_in`, which reads each element with `domain_in`:
+///   the base type's input function AT the domain's modifier
+///   (`domain_state_setup` takes `getBaseTypeAndTypmod`), so a short
+///   `char(3)` element pads and a long one is 22001, as an input is
+///   (`'{abcd}'::d[]`), and a `numeric(5,2)` one rounds or overflows.
+/// - From an array it is an `ArrayCoerceExpr` whose element step is
+///   `coerce_to_domain` of an explicit cast, which truncates and pads
+///   (`array['abcd']::d[]` is `{abc}`).
+pub(crate) fn domain_array_cast(value: &Bson, element: &str) -> Result<Option<Bson>> {
+    let Some((base, typmod, chain)) = domains::base_type_and_typmod(element) else {
+        return Ok(None);
+    };
+    if typmod < 0 {
+        return Ok(None);
+    }
+    let check = |v: Bson| -> Result<Bson> {
+        for d in chain.iter().rev() {
+            domains::check_domain(d, &v)?;
+        }
+        Ok(v)
+    };
+    match value {
+        Bson::String(text) => {
+            let input = |v: Bson| -> Result<Bson> {
+                if v == Bson::Null {
+                    return check(v);
+                }
+                let v = fit_length(cast_value(v, &base)?, &base, typmod)?;
+                check(explicit_typmod(v, &base, typmod)?)
+            };
+            parse_array_with(text, &base, Some(&input)).map(Some)
+        }
+        v @ Bson::Array(_) => {
+            fn each(v: &Bson, f: &dyn Fn(Bson) -> Result<Bson>) -> Result<Bson> {
+                match v {
+                    Bson::Array(items) => Ok(Bson::Array(
+                        items
+                            .iter()
+                            .map(|i| each(i, f))
+                            .collect::<Result<Vec<_>>>()?,
+                    )),
+                    other => f(other.clone()),
+                }
+            }
+            let coerce = |v: Bson| -> Result<Bson> {
+                if v == Bson::Null {
+                    return check(v);
+                }
+                check(explicit_typmod(cast_value(v, &base)?, &base, typmod)?)
+            };
+            each(v, &coerce).map(Some)
+        }
+        v if arrays::is_bounded(v) => {
+            let lower = arrays::lower_bounds(v);
+            Ok(domain_array_cast(&arrays::strip(v), element)?
+                .map(|out| arrays::bounded(out, &lower)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// [`fit_to_column`] over a bare type and modifier.
 pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     if bits::is_bit_type(pg_type) {
@@ -36030,6 +36096,18 @@ fn array_rectangular(items: &[Bson]) -> bool {
 const STRUCTURAL: &str = "unexpected";
 
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
+    parse_array_with(text, element_type, None)
+}
+
+/// [`parse_array`] reading each element, the NULL one included, with
+/// `input` instead of the element type's own cast: `array_in` calls the
+/// element's input function per element, in order, and `domain_in` is one
+/// that also runs on a NULL (RP-570).
+fn parse_array_with(
+    text: &str,
+    element_type: &str,
+    input: Option<&dyn Fn(Bson) -> Result<Bson>>,
+) -> Result<Bson> {
     // `array_in` checks the literal's structure before it reads an element
     // (`'{1,{2,x}}'::int[]` is `malformed array literal`, not `"x"`): the
     // same parse with text elements, which only the structure can fail.
@@ -36046,6 +36124,7 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
         pos: 0,
         element_type,
         delim: pgtypes::typdelim(element_type),
+        input,
     };
     p.skip_space();
     // An optional dimension decoration, `[lo:hi]...=` (`[hi]` alone means
@@ -36138,6 +36217,9 @@ struct ArrayParser<'a> {
     element_type: &'a str,
     /// The element type's `typdelim`: `,` except for `box`, which uses `;`.
     delim: char,
+    /// The element input in place of `element_type`'s cast, when the
+    /// element is a domain's (`parse_array_with`).
+    input: Option<&'a dyn Fn(Bson) -> Result<Bson>>,
 }
 
 impl ArrayParser<'_> {
@@ -36265,10 +36347,16 @@ impl ArrayParser<'_> {
             }
         }
         // An UNQUOTED `NULL` is the null element; a quoted one is the string.
-        if !was_quoted && raw.eq_ignore_ascii_case("null") {
-            return Ok(Bson::Null);
+        let value = if !was_quoted && raw.eq_ignore_ascii_case("null") {
+            Bson::Null
+        } else {
+            Bson::String(raw)
+        };
+        match self.input {
+            Some(input) => input(value),
+            None if value == Bson::Null => Ok(Bson::Null),
+            None => cast_value(value, self.element_type),
         }
-        cast_value(Bson::String(raw), self.element_type)
     }
 }
 
@@ -43067,6 +43155,13 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 for d in chain.iter().rev() {
                     domains::check_domain(d, &v)?;
                 }
+                return Ok(v);
+            }
+        }
+        // And a cast to such a domain's ARRAY coerces each element the same
+        // way, through the base type's input when it reads text (RP-570).
+        if let Some(element) = target.strip_suffix("[]") {
+            if let Some(v) = domain_array_cast(&value, element)? {
                 return Ok(v);
             }
         }
