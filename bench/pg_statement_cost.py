@@ -48,7 +48,7 @@ import tempfile
 import time
 from pathlib import Path
 
-REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
+REPO = Path(__file__).resolve().parents[1]
 RUST = Path(
     os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pgserver/target/release/secantusd-pg")
 )

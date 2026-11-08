@@ -212,6 +212,36 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Everything a `describe_fields` answer is a function of. A `RowDescription`
+/// depends on the statement text and the declared parameter types (through
+/// the plan), on the catalog (`version` moves on every DDL statement,
+/// transaction-control statement and savepoint rollback, on every connection
+/// -- the same discipline `CatalogCache` and `INSTALLED_USER_TYPES` rely on),
+/// on the session `TimeZone` (the planner types some constants through it),
+/// on the session user, and on the result format the `Bind` asked for.
+///
+/// The memo is per connection, so a block's uncommitted table and type
+/// overlays need no key of their own: every statement that mutates them
+/// bumps `version`.
+#[derive(Debug, PartialEq, Eq, Hash)]
+struct DescribeKey {
+    sql: String,
+    param_types: Vec<Option<String>>,
+    storage: usize,
+    db: String,
+    version: u64,
+    binary: bool,
+    timezone: Option<String>,
+    user: String,
+}
+
+/// How many `DescribeKey`s one connection keeps before starting over.
+const DESCRIBE_MEMO_ENTRIES: usize = 64;
+
+/// The Describe memo: the key's hash to the key it was computed from (the
+/// hash alone could collide) and the RowDescription it produced.
+type DescribeMemo = HashMap<u64, (DescribeKey, Option<Vec<FieldInfo>>)>;
+
 fn catalog_cache() -> &'static CatalogCache {
     static CACHE: OnceLock<CatalogCache> = OnceLock::new();
     CACHE.get_or_init(|| CatalogCache {
@@ -770,6 +800,12 @@ pub struct PgHandler {
     txn: Mutex<Option<UserTransactionHandle>>,
     /// Session settings (GUCs), per connection as PostgreSQL's are.
     settings: Arc<Mutex<HashMap<String, String>>>,
+    /// `describe_fields` answers this connection has already computed, by
+    /// [`DescribeKey`]. See [`Self::describe_fields`].
+    describe_memo: Mutex<DescribeMemo>,
+    /// `user_wire_type` answers by resolution name, valid for one catalog
+    /// version (the `u64`). See [`Self::user_wire_type`].
+    wire_type_memo: Mutex<(u64, HashMap<String, Option<Type>>)>,
     /// NoticeResponses raised by the statement in flight (a `DO` block's
     /// `RAISE NOTICE` / `WARNING` / `INFO`), sent to the client by the query
     /// handlers before the statement's own result or error.
@@ -1047,6 +1083,8 @@ impl PgHandler {
             databases,
             txn: Mutex::new(None),
             settings: Arc::new(Mutex::new(default_settings())),
+            describe_memo: Mutex::new(HashMap::new()),
+            wire_type_memo: Mutex::new((0, HashMap::new())),
             pending_notices: Mutex::new(Vec::new()),
             pending_params: Mutex::new(Vec::new()),
             copy_in: Mutex::new(None),
@@ -1363,10 +1401,61 @@ impl PgHandler {
         }
     }
 
-    /// The wire type for a column whose type is a USER enum: pgwire's `Type`
-    /// takes a custom oid, and psycopg matches it against what EnumInfo
-    /// registered.
+    /// The wire `Type` of a USER type (enum / range / multirange / base /
+    /// composite, or an array of one) by resolution name; `None` for a
+    /// builtin.
+    ///
+    /// Memoized per connection for one catalog version. Every result column
+    /// of every statement asks this, and the uncached answer reads four
+    /// type-catalog collections (the enums list is built and sorted for the
+    /// lookup) -- ~8 lock acquisitions and a handful of allocations per
+    /// column, which was the single largest software cost left in a
+    /// `select 1` (measured 2026-09-27). The memo is keyed by the process-wide
+    /// catalog version, which every catalog-changing statement on any
+    /// connection bumps, and is bypassed while this transaction holds
+    /// uncommitted types of its own (they live in the overlay, not the
+    /// catalog); a read taken on the transaction's own session is not
+    /// recorded, for the reason `may_fill_catalog_cache` gives.
     fn user_wire_type(&self, pg_type: &str) -> Option<Type> {
+        const WIRE_TYPE_MEMO_ENTRIES: usize = 256;
+        let overlay_empty = self
+            .uncommitted_types
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_empty();
+        if !overlay_empty {
+            return self.user_wire_type_uncached(pg_type);
+        }
+        let version = catalog_cache()
+            .version
+            .load(std::sync::atomic::Ordering::SeqCst);
+        {
+            let memo = self
+                .wire_type_memo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if memo.0 == version {
+                if let Some(ty) = memo.1.get(pg_type) {
+                    return ty.clone();
+                }
+            }
+        }
+        let ty = self.user_wire_type_uncached(pg_type);
+        if self.may_fill_catalog_cache(version) {
+            let mut memo = self
+                .wire_type_memo
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if memo.0 != version || memo.1.len() >= WIRE_TYPE_MEMO_ENTRIES {
+                memo.0 = version;
+                memo.1.clear();
+            }
+            memo.1.insert(pg_type.to_string(), ty.clone());
+        }
+        ty
+    }
+
+    fn user_wire_type_uncached(&self, pg_type: &str) -> Option<Type> {
         let enums = self.enums().ok()?;
         // An enum ARRAY: `inttestenum[]` reports the type's typarray oid
         // (derived, oid + 100_000), so a client that registered the array
@@ -6144,20 +6233,20 @@ impl PgHandler {
         // Everything else runs INSIDE the open transaction when there is one,
         // so a later ROLLBACK really discards it.
         //
-        // The statement runs synchronously, so it runs under
-        // `block_in_place`: a worker that blocks in a long statement
-        // (`pg_sleep`, a big scan) would otherwise take the runtime's I/O
-        // driver down with it — no other connection is served, and the
-        // `CancelRequest` meant to interrupt the statement never arrives.
+        // The statement runs synchronously, and blocks the thread for as long
+        // as it takes (`pg_sleep`, a big scan). That is safe because every
+        // connection has its own thread and runtime (`server::serve_connection`):
+        // nothing else is scheduled here, so there is no I/O driver to hold up
+        // and no `block_in_place` hand-off to pay for.
         let mut guard = self.txn.lock().unwrap_or_else(|e| e.into_inner());
-        let out = tokio::task::block_in_place(|| match guard.as_mut() {
+        let out = match guard.as_mut() {
             Some(handle) => self
                 .storage
                 .with_user_transaction(handle, || self.execute(stmt, max_rows))
                 .map_err(|e| Self::storage_err("transaction failed", e))
                 .and_then(|r| r),
             None => self.execute(stmt, max_rows),
-        });
+        };
         self.collect_planner_warnings();
         if out.is_err() {
             self.note_failure();
@@ -14358,12 +14447,79 @@ impl PgHandler {
     ///
     /// Planned against NULL placeholders: `Describe` arrives before `Bind`, so
     /// no values exist yet, and the result SHAPE does not depend on them.
+    ///
+    /// Memoized per connection. psycopg sends a `Describe` with every
+    /// `Bind`/`Execute` of a prepared statement, and answering it meant
+    /// planning the statement a second time per execution -- 2.5us of the
+    /// ~12us a `select 1` spent in the server (measured 2026-09-27). The plan
+    /// is a pure function of the [`DescribeKey`], so the answer is too; the
+    /// one exception is a `FETCH`, whose columns are the CURSOR's and change
+    /// with it, and that is never recorded. Errors are never recorded either:
+    /// the failed-block bookkeeping they carry has to run every time.
     fn describe_fields(
         &self,
         sql: &str,
         n_params: usize,
         param_types: &[Option<String>],
     ) -> PgWireResult<Option<Vec<FieldInfo>>> {
+        let key = DescribeKey {
+            sql: sql.to_string(),
+            param_types: param_types.to_vec(),
+            storage: Arc::as_ptr(&self.storage) as usize,
+            db: self.db().to_string(),
+            version: catalog_cache()
+                .version
+                .load(std::sync::atomic::Ordering::SeqCst),
+            binary: self
+                .binary_results
+                .load(std::sync::atomic::Ordering::Relaxed),
+            timezone: self
+                .settings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("TimeZone")
+                .cloned(),
+            user: self
+                .session_user
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        };
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            key.hash(&mut h);
+            h.finish()
+        };
+        if let Some((held, fields)) = self
+            .describe_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&hash)
+        {
+            if *held == key {
+                return Ok(fields.clone());
+            }
+        }
+        let (fields, memoizable) = self.describe_fields_uncached(sql, n_params, param_types)?;
+        if memoizable {
+            let mut memo = self.describe_memo.lock().unwrap_or_else(|e| e.into_inner());
+            if memo.len() >= DESCRIBE_MEMO_ENTRIES {
+                memo.clear();
+            }
+            memo.insert(hash, (key, fields.clone()));
+        }
+        Ok(fields)
+    }
+
+    /// [`Self::describe_fields`] without the memo, plus whether the answer
+    /// may be memoized.
+    fn describe_fields_uncached(
+        &self,
+        sql: &str,
+        n_params: usize,
+        param_types: &[Option<String>],
+    ) -> PgWireResult<(Option<Vec<FieldInfo>>, bool)> {
         let params = vec![Bson::Null; n_params];
         // Describe resolves table names too, and against the same uncommitted
         // catalog, through `self.lookup`. The DECLARED parameter types
@@ -14388,7 +14544,8 @@ impl PgHandler {
         // the failure went unrecorded and the aborted block kept accepting
         // commands.
         .inspect_err(|_| self.note_failure())?;
-        Ok(Some(match stmt {
+        let memoizable = !matches!(stmt, Statement::Fetch { .. });
+        let fields = match stmt {
             // A FETCH describes the CURSOR's columns. Without this arm a
             // prepared FETCH described zero of them, and psycopg prepares any
             // statement it runs six times -- so a cursor read in a loop worked
@@ -14505,8 +14662,9 @@ impl PgHandler {
                 })
                 .collect(),
             // CREATE / INSERT / UPDATE / DELETE return no rows.
-            _ => return Ok(None),
-        }))
+            _ => return Ok((None, memoizable)),
+        };
+        Ok((Some(fields), memoizable))
     }
 }
 
@@ -14562,7 +14720,7 @@ impl ExtendedQueryHandler for PgHandler {
         }
         pgwire::api::store::PortalStore::put_statement(client.portal_store(), Arc::new(stmt));
         client
-            .send(PgWireBackendMessage::ParseComplete(
+            .feed(PgWireBackendMessage::ParseComplete(
                 pgwire::messages::extendedquery::ParseComplete::new(),
             ))
             .await?;
@@ -14611,7 +14769,7 @@ impl ExtendedQueryHandler for PgHandler {
             _ => {}
         }
         client
-            .send(PgWireBackendMessage::CloseComplete(
+            .feed(PgWireBackendMessage::CloseComplete(
                 pgwire::messages::extendedquery::CloseComplete::new(),
             ))
             .await?;
@@ -15082,7 +15240,7 @@ impl PgWireServerHandlers for HandlerFactory {
                     .load(std::sync::atomic::Ordering::Relaxed)
                 {
                     let info: ErrorInfo = PgHandler::admin_shutdown().into();
-                    return pgwire::api::IdleEvent::Fatal(info);
+                    return pgwire::api::IdleEvent::Fatal(Box::new(info));
                 }
                 let messages = handler.drain_notifications();
                 if !messages.is_empty() {

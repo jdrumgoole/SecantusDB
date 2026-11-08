@@ -22,21 +22,29 @@
 //!
 //! [`RunningPgServer::stop`] therefore: tells the accept loop and every live
 //! connection to finish, drains them (each holds an `Arc<Storage>` clone), shuts
-//! the tokio runtime down so any straggler is dropped, and only then drops the
-//! last `Arc` — which is where the checkpoint happens. If a wedged task still
-//! holds a reference when the bounded drain gives up, the checkpoint cannot
-//! run, and `stop` says so loudly on stderr rather than returning as though the
-//! data were safe.
+//! the accept runtime down, and only then drops the last `Arc` — which is where
+//! the checkpoint happens. If a wedged connection still holds a reference when
+//! the bounded drain gives up, the checkpoint cannot run, and `stop` says so
+//! loudly on stderr rather than returning as though the data were safe.
 //!
 //! The connections have to be TOLD, not just waited for. A pooled PostgreSQL
 //! connection sits idle in `process_socket` indefinitely -- a real backend never
 //! hangs up on one -- so a `stop()` that only waited would block for the whole
 //! drain timeout every time a caller left a connection open, which in an
-//! embedded test is most of the time (measured: 10.8s). Each connection task
+//! embedded test is most of the time (measured: 10.8s). Each connection
 //! therefore selects its socket against a shutdown watch, and drops the
 //! connection when it fires. Cancelling there is safe: storage calls are
-//! synchronous, so a task is never cancelled part-way through a write, and an
-//! open transaction rolls back with its handle.
+//! synchronous, so a connection is never cancelled part-way through a write,
+//! and an open transaction rolls back with its handle.
+//!
+//! # One thread per connection
+//!
+//! The accept loop is a task on a small tokio runtime; each accepted socket is
+//! handed to its own OS thread with its own single-threaded runtime
+//! ([`serve_connection`]). A statement is a blocking WiredTiger call, and on
+//! its own thread it may simply block -- no `block_in_place`, no worker
+//! hand-off, no other connection affected. PostgreSQL is a process per
+//! connection; this is the same shape one level down.
 
 use std::io;
 use std::net::SocketAddr;
@@ -58,9 +66,8 @@ use crate::{DatabaseRegistry, HandlerFactory, PgHandler};
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Poll interval for that drain.
 const DRAIN_POLL: Duration = Duration::from_millis(10);
-/// How long the runtime shutdown waits for a worker still inside a synchronous
-/// storage call. Storage calls are sync, so a task is never cancelled mid-write;
-/// this only bounds how long we wait for one to come back.
+/// How long the accept runtime's shutdown waits for its tasks. Connections are
+/// not on it (each has its own thread), so this is only the accept loop.
 const RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Increments the live-connection count for a connection task's lifetime and
@@ -83,19 +90,19 @@ impl Drop for ConnGuard {
 }
 
 /// A running PostgreSQL-wire server: a bound address, the runtime its accept
-/// loop lives on, and the `Storage` it owns.
+/// loop lives on (connections run on their own threads), and the `Storage` it
+/// owns.
 ///
 /// Dropping it (or calling [`stop`](Self::stop)) shuts the server down and
 /// closes the store, checkpointing WiredTiger. See the module docs for why the
 /// handle owns the storage.
 pub struct RunningPgServer {
     address: SocketAddr,
-    /// `None` once stopped. Dropping the runtime is what cancels any connection
-    /// task the drain did not catch.
+    /// `None` once stopped. Only the accept loop lives here.
     runtime: Option<Runtime>,
     accept: Option<JoinHandle<()>>,
     stop_flag: Arc<AtomicBool>,
-    /// Broadcast to the accept loop and every live connection task. Sending
+    /// Broadcast to the accept loop and every live connection. Sending
     /// `true` is what makes an idle pooled connection let go promptly.
     shutdown: watch::Sender<bool>,
     active: Arc<AtomicUsize>,
@@ -142,10 +149,11 @@ impl RunningPgServer {
         while self.active.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
             std::thread::sleep(DRAIN_POLL);
         }
-        // Dropping the runtime cancels whatever the drain did not catch. A task
-        // inside a synchronous storage call is not cancelled mid-write —
-        // cancellation only happens at an await point — so this cannot tear a
-        // write; it only bounds how long we wait for one to return.
+        // A connection the drain did not catch is a thread inside a synchronous
+        // storage call; it is not cancelled mid-write -- the shutdown watch is
+        // only observed at an await point -- so it finishes the statement, sees
+        // the watch, and lets go of the store then. The accept runtime has no
+        // connections on it; this only ends the accept loop.
         if let Some(runtime) = self.runtime.take() {
             runtime.shutdown_timeout(RUNTIME_SHUTDOWN_TIMEOUT);
         }
@@ -194,7 +202,13 @@ pub fn bind(
     storage: Storage,
     databases: Arc<DatabaseRegistry>,
 ) -> io::Result<RunningPgServer> {
-    let runtime = Builder::new_multi_thread().enable_all().build()?;
+    // One worker is plenty: the only task here is the accept loop. Connections
+    // get their own threads (`serve_connection`).
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("secantus-pg-accept")
+        .enable_all()
+        .build()?;
     let listener = runtime.block_on(async { TcpListener::bind(addr).await })?;
     let address = listener.local_addr()?;
 
@@ -247,19 +261,66 @@ async fn accept_loop(
         };
         let handler = Arc::new(PgHandler::new(storage.clone(), databases.clone()));
         let active = active.clone();
-        let mut conn_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            let _guard = ConnGuard::new(active);
-            tokio::select! {
-                _ = pgwire::tokio::process_socket(
-                    sock,
-                    None,
-                    Arc::new(HandlerFactory(handler)),
-                ) => {}
-                // The server is stopping: drop this connection rather than wait
-                // for a client that may never hang up.
-                _ = conn_shutdown.changed() => {}
-            }
-        });
+        let conn_shutdown = shutdown.clone();
+        // The guard is taken HERE, not on the connection thread, so the count
+        // covers the window between accept and the thread starting: `stop`
+        // must not conclude that no connection holds the store while one is
+        // still being handed off.
+        let guard = ConnGuard::new(active);
+        // Off the accept runtime's I/O driver and onto the connection's own
+        // thread (see `serve_connection`). `into_std` deregisters the socket
+        // from this runtime; the connection re-registers it with its own.
+        let Ok(sock) = sock.into_std() else { continue };
+        let spawned = std::thread::Builder::new()
+            .name("secantus-pg-conn".into())
+            .spawn(move || serve_connection(sock, handler, conn_shutdown, guard));
+        if let Err(e) = spawned {
+            // The guard went into the closure and never ran; the socket is
+            // dropped with it, which the client sees as a hangup.
+            eprintln!("secantus-pgserver: could not start a connection thread: {e}");
+        }
     }
+}
+
+/// One connection, one OS thread, one single-threaded tokio runtime.
+///
+/// A statement runs SYNCHRONOUSLY inside the handler -- storage calls are
+/// blocking WiredTiger calls -- so whatever runs it must be allowed to block.
+/// On a shared multi-thread runtime that meant `block_in_place` around every
+/// statement, which hands the worker's core to another thread and takes it
+/// back afterwards: measured at ~4us of a 40us `select 1` round trip
+/// (2026-09-27), and a cross-thread migration on every statement besides.
+/// PostgreSQL is a process per connection; a thread per connection is the
+/// same shape, and it makes blocking free: a long `pg_sleep` or scan holds up
+/// its own connection and nothing else, and the accept loop -- which is what a
+/// `CancelRequest` needs to reach -- stays on its own runtime.
+fn serve_connection(
+    sock: std::net::TcpStream,
+    handler: Arc<PgHandler>,
+    mut shutdown: watch::Receiver<bool>,
+    guard: ConnGuard,
+) {
+    let _guard = guard;
+    let runtime = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("secantus-pgserver: could not build a connection runtime: {e}");
+            return;
+        }
+    };
+    runtime.block_on(async move {
+        let Ok(sock) = tokio::net::TcpStream::from_std(sock) else {
+            return;
+        };
+        tokio::select! {
+            _ = pgwire::tokio::process_socket(
+                sock,
+                None,
+                Arc::new(HandlerFactory(handler)),
+            ) => {}
+            // The server is stopping: drop this connection rather than wait
+            // for a client that may never hang up.
+            _ = shutdown.changed() => {}
+        }
+    });
 }

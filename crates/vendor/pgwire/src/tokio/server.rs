@@ -603,6 +603,16 @@ pub async fn negotiate_tls<S>(
     Ok(None)
 }
 
+/// Whether `buf` holds a complete post-startup frontend message: a type
+/// byte, then a big-endian `i32` length that counts itself and the payload.
+fn frame_buffered(buf: &bytes::BytesMut) -> bool {
+    if buf.len() < 5 {
+        return false;
+    }
+    let len = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]) as usize;
+    buf.len() > len
+}
+
 /// Process messages on an already-negotiated socket.
 ///
 /// This is the common message processing loop shared by both TCP and Unix sockets.
@@ -626,6 +636,15 @@ macro_rules! process_socket_messages {
                     _ = &mut $startup_timeout => None,
                     msg = socket.next() => msg,
                 }
+            } else if frame_buffered(socket.read_buffer()) {
+                // A whole frontend message is already decoded-ready in the read
+                // buffer (a pipelined Bind / Describe / Execute / Sync arrives in
+                // one segment): take it straight away. The session is not idle,
+                // so the idle machinery below -- its timeout, its out-of-band
+                // event future, and the three-way `select!` -- has nothing to
+                // decide and is skipped (SecantusDB local patch; it was ~0.3us
+                // per message, paid four times per extended-protocol statement).
+                socket.next().await
             } else {
                 // PostgreSQL's idle timeouts: when the session sits idle past
                 // the handler's deadline, send the FATAL error and close the
@@ -675,7 +694,7 @@ macro_rules! process_socket_messages {
                             }
                             IdleEvent::Fatal(error) => {
                                 let _ = socket
-                                    .send(PgWireBackendMessage::ErrorResponse(error.into()))
+                                    .send(PgWireBackendMessage::ErrorResponse((*error).into()))
                                     .await;
                                 break;
                             }

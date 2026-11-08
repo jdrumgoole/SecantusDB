@@ -39,8 +39,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO = Path("/Users/jdrumgoole/GIT/SecantusDB")
-RUST_BINARY = REPO / "crates/secantus-pgserver/target/release/secantusd-pg"
+REPO = Path(__file__).resolve().parents[1]
+# The checkout this file lives in, so a worktree measures its own build;
+# `SECANTUSD_PG` overrides it (the same knob `bench/pg_statement_cost.py` honours).
+RUST_BINARY = Path(
+    os.environ.get("SECANTUSD_PG", REPO / "crates/secantus-pgserver/target/release/secantusd-pg")
+)
 
 
 @dataclass

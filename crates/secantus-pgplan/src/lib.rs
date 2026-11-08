@@ -1510,7 +1510,13 @@ fn parse_tree(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResul
     Ok(tree)
 }
 
-fn parse_one(sql: &str) -> Result<N> {
+/// The one statement in `sql`, as the memoized parse tree it lives in. The
+/// caller borrows the node out of the tree: every lowering takes its node by
+/// reference, and cloning the protobuf out of the memo was half the cost of
+/// planning a `select 1` (measured 2026-09-27, `sample` on the release
+/// server: 30 of 58 samples under `plan_with_session_types` were the clone
+/// and the drop of the clone).
+fn parse_one(sql: &str) -> Result<std::sync::Arc<pg_query::protobuf::ParseResult>> {
     let parsed = parse_tree(sql)?;
     let stmts = &parsed.stmts;
     if stmts.len() > 1 {
@@ -1519,11 +1525,24 @@ fn parse_one(sql: &str) -> Result<N> {
     if stmts.is_empty() {
         return Err(Error::Parse("empty statement".into()));
     }
-    stmts[0]
+    if stmts[0]
         .stmt
         .as_ref()
-        .and_then(|s| s.node.clone())
-        .ok_or_else(|| Error::Parse("empty statement".into()))
+        .and_then(|s| s.node.as_ref())
+        .is_none()
+    {
+        return Err(Error::Parse("empty statement".into()));
+    }
+    Ok(parsed)
+}
+
+/// The statement node of a tree `parse_one` accepted.
+fn one_node(parsed: &pg_query::protobuf::ParseResult) -> &N {
+    parsed.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|s| s.node.as_ref())
+        .expect("parse_one checked the node is present")
 }
 
 /// Lower one statement. `lookup` resolves a table name to its catalog entry;
@@ -1543,12 +1562,13 @@ pub fn plan_with_params(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
-    match parse_one(sql)? {
-        N::CreateStmt(c) => plan_create(&c),
-        N::CreateTableAsStmt(c) => plan_create_table_as(&c, lookup, params),
-        N::InsertStmt(i) => plan_insert(&i, lookup, params),
-        N::SelectStmt(s) => plan_select(&s, lookup, params),
-        N::DropStmt(d) => plan_drop(&d),
+    let parsed = parse_one(sql)?;
+    match one_node(&parsed) {
+        N::CreateStmt(c) => plan_create(c),
+        N::CreateTableAsStmt(c) => plan_create_table_as(c, lookup, params),
+        N::InsertStmt(i) => plan_insert(i, lookup, params),
+        N::SelectStmt(s) => plan_select(s, lookup, params),
+        N::DropStmt(d) => plan_drop(d),
         N::CreateSchemaStmt(c) => Ok(Statement::CreateSchema {
             name: c.schemaname.clone(),
             if_not_exists: c.if_not_exists,
@@ -1639,10 +1659,10 @@ pub fn plan_with_params(
         // = ...)` (base type) are both a DefineStmt of kind OBJECT_TYPE; the
         // other kinds (aggregate, operator, collation, ...) stay unsupported.
         N::DefineStmt(d) if ObjectType::try_from(d.kind) == Ok(ObjectType::ObjectType) => {
-            plan_define_type(&d)
+            plan_define_type(d)
         }
-        N::CreateFunctionStmt(f) => plan_create_function(&f),
-        N::CopyStmt(c) => plan_copy(&c, lookup, params),
+        N::CreateFunctionStmt(f) => plan_create_function(f),
+        N::CopyStmt(c) => plan_copy(c, lookup, params),
         N::VariableShowStmt(v) => Ok(Statement::Show(v.name.clone())),
         N::AlterRoleStmt(a) => Ok(Statement::AlterRole {
             name: a
@@ -1764,7 +1784,7 @@ pub fn plan_with_params(
                 body: body.unwrap_or_default(),
             })
         }
-        N::VariableSetStmt(v) => plan_set(&v),
+        N::VariableSetStmt(v) => plan_set(v),
         N::TransactionStmt(t) => {
             // Named enum, not the wire integer -- twice bitten already.
             match TransactionStmtKind::try_from(t.kind) {
@@ -1808,10 +1828,10 @@ pub fn plan_with_params(
                 Err(_) => Err(Error::Unsupported("this transaction statement".into())),
             }
         }
-        N::UpdateStmt(u) => plan_update(&u, lookup, params),
-        N::DeleteStmt(d) => plan_delete(&d, lookup, params),
-        N::TruncateStmt(t) => plan_truncate(&t, lookup),
-        other => Err(Error::Unsupported(disc(&other))),
+        N::UpdateStmt(u) => plan_update(u, lookup, params),
+        N::DeleteStmt(d) => plan_delete(d, lookup, params),
+        N::TruncateStmt(t) => plan_truncate(t, lookup),
+        other => Err(Error::Unsupported(disc(other))),
     }
 }
 
@@ -2589,7 +2609,8 @@ pub fn resolve_fk_target(fk: &mut ForeignKey, target: &TableDef) -> Result<()> {
 /// expression. `apply_row_expr` then evaluates it per row: `false` is a
 /// violation; `true` and NULL pass (SQL's CHECK rule).
 pub fn plan_check_expression(expression: &str, def: &TableDef) -> Result<ColumnExpr> {
-    let N::SelectStmt(sel) = parse_one(&format!("SELECT {expression}"))? else {
+    let parsed = parse_one(&format!("SELECT {expression}"))?;
+    let N::SelectStmt(sel) = one_node(&parsed) else {
         return Err(Error::Parse("CHECK expression is not an expression".into()));
     };
     let val = sel
@@ -10661,6 +10682,13 @@ fn static_range_type(n: Option<&pg_query::protobuf::Node>) -> Option<String> {
 /// what PostgreSQL does for a parameter with no context: an error.
 pub fn infer_param_types(sql: &str, declared: &[Option<String>]) -> Vec<Option<String>> {
     let mut inferred = declared.to_vec();
+    // Every write below lands in a slot that is `None`, so a statement whose
+    // parameters are all declared (or that has none) cannot be changed by the
+    // walk. Skip it: `nodes()` flattens the whole tree per Execute, and this
+    // runs on every extended-protocol statement.
+    if inferred.iter().all(Option::is_some) {
+        return inferred;
+    }
     let Ok(parsed) = parse_tree(sql) else {
         return inferred;
     };

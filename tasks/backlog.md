@@ -578,10 +578,11 @@ remain open:
       CancelRequest itself SHIPPED that day: the backend registry matches the
       pid / secret key, sets a per-backend flag polled by `pg_sleep`, row scans
       and the COPY OUT stream, the statement answers `57014`, and the
-      synchronous execution runs under `tokio::task::block_in_place` so the
+      synchronous execution ran under `tokio::task::block_in_place` so the
       cancel connection is served DURING the statement (before that the
       runtime's I/O driver was never polled while a statement ran, so every
-      other connection stalled too). `test_copy_out_error_with_copy_not_finished`
+      other connection stalled too; since 2026-09-27 each connection is its
+      own thread, which gives the same property without the hand-off). `test_copy_out_error_with_copy_not_finished`
       passes. `test_cancel` still hangs, and it is not the server: psycopg's
       `waiting.wait_conn(gen, interval=0.0)` drives `PQcancelPoll` before the
       non-blocking loopback `connect()` has completed; on macOS libpq reads
@@ -1073,7 +1074,11 @@ These work end-to-end but cut corners.
 - [ ] **OPEN — RUST pgserver: reading ONE ROW BY PRIMARY KEY costs ~10.7us
       where PostgreSQL pays ~2.0us (measured 2026-09-20).** This is the
       general per-statement target; the protocol work above has taken the
-      extended path as far as it goes cheaply.
+      extended path as far as it goes cheaply. **UPDATE 2026-09-27: the row
+      read is now ~6us over `select 1` (43.5 vs 37.4) — 40% of
+      `find_matching` was decoding the collection options to ask whether the
+      collection was timeseries; see the 2026-09-27 block under "per-statement
+      COST" below. The 6.0us `find_matching` figure here is stale.**
 
       | us / statement | ours | PG 16 | excess |
       | --- | --- | --- | --- |
@@ -1184,8 +1189,12 @@ These work end-to-end but cut corners.
       extended path materially cheaper for ALL statements.
 
 - [ ] **OPEN — RUST pgserver: the autocommit per-statement gap is in the WIRE
-      layer, not the query engine (attributed 2026-09-20).** `select 1` costs
-      ~55.8us against PostgreSQL 16's ~30us. Instrumented with steady-state
+      layer, not the query engine (attributed 2026-09-20). UPDATE 2026-09-27:
+      `select 1` is 37.4us now — the per-message socket write, the EAGAIN
+      read, the parse-node clone and the Describe rebuild were most of the
+      extended-protocol excess; see the 2026-09-27 block under "per-statement
+      COST" below. The figures in this entry are the 2026-09-20 state.**
+      `select 1` costs ~55.8us against PostgreSQL 16's ~30us. Instrumented with steady-state
       windows (NOT cumulative means -- an earlier reading drifted 144 -> 89us
       on warmup alone while the truth sat still), release build, quiet box:
 
@@ -1364,7 +1373,9 @@ These work end-to-end but cut corners.
 
 - [ ] **OPEN — Rust PostgreSQL server: per-statement COST, and a read-path
       ceiling at N≈4 (measured 2026-09-18; supersedes the "lift the global
-      write lock" framing this entry used to carry).**
+      write lock" framing this entry used to carry). The CEILING is gone and
+      the cost is down by a third as of 2026-09-27 — see the end of this
+      entry; what stays open is the ~7-11us that remains over PostgreSQL.**
 
       **The premise of the old entry was wrong, and measuring cost minutes
       settled it.** It said a global `Mutex<()>` was "taken on the write paths
@@ -1557,12 +1568,10 @@ These work end-to-end but cut corners.
       and not worth chasing.
 
       **Where to go, in order:**
-      1. Do not re-probe the 7 catalog collections per statement. They are
-         created once and never dropped; a process-wide "already ensured"
-         verdict, or doing it only on a catalog WRITE, removes seven session
-         opens per statement. **Still open** — the only remaining item from
-         the original list, and the named suspect for the ~25us that
-         separates our autocommit `select 1` from PostgreSQL's.
+      1. ~~Do not re-probe the 7 catalog collections per statement~~ — done
+         in #1477 (a process-wide "already ensured" verdict). It was NOT the
+         ~25us it was named the suspect for; the 2026-09-27 block at the end
+         of this entry says where that went.
       2. ~~Make the catalog readable inside a transaction without a full
          scan~~ — done 2026-09-19, see above.
       3. Then re-measure the extended-protocol penalty.
@@ -1585,6 +1594,113 @@ These work end-to-end but cut corners.
       Caveats on the numbers above: single box (M-series, local loopback), 5s
       windows, autocommit single-statement clients, no pipelining, `--repeat 3`.
       Re-measure with `invoke pg-concurrency` rather than quoting these.
+
+      **RESOLVED IN THE MAIN 2026-09-27 — the ceiling was `block_in_place`,
+      and the per-statement cost was repeated work, not one hotspot.** Two
+      findings, measured rather than profiled, on a RELEASE build, quiet box,
+      `--seconds 5 --repeat 3` / `--iters 1200` x3:
+
+      *The read-path ceiling was the tokio hand-off, not a lock and not the
+      client confound.* Every statement is a blocking WiredTiger call, and
+      each connection was a tokio task that wrapped it in
+      `tokio::task::block_in_place` — which migrates the worker off and back
+      on EVERY statement. At N=8 the runtime spent more CPU shuffling workers
+      than serving statements, which is exactly the "CPU rises 240% -> 480%
+      while throughput stands still" shape the profile above recorded and
+      could not name. Each connection now runs on its own OS thread with its
+      own single-threaded runtime (`server.rs`, `serve_connection`); the
+      accept loop keeps a one-worker runtime. **This must stay removed** —
+      re-introducing `block_in_place` re-introduces the plateau.
+
+      | workload | N | PG 16 ops/s | ours ops/s | ours 2026-09-18 | PG scaling | our scaling |
+      | --- | --- | --- | --- | --- | --- | --- |
+      | select | 1 | 27,363 | 22,795 | 11,075 | 1.00x | 1.00x |
+      | | 4 | 66,003 | 54,260 | — | 2.41x | 2.38x |
+      | | 8 | 83,385 | 69,742 | 23,898 | 3.05x | 3.06x |
+      | insert, one table each | 1 | 17,203 | 18,107 | 9,937 | 1.00x | 1.00x |
+      | | 4 | 40,369 | 45,630 | 21,263 | 2.35x | 2.52x |
+      | | 8 | 45,222 | 55,120 | 22,678 | 2.63x | 3.04x |
+
+      Scaling now matches PostgreSQL's on SELECT (3.06x vs 3.05x at N=8) and
+      exceeds it on INSERT, where we are now FASTER than PostgreSQL in
+      absolute terms at every client count (0.82x of PG's time at N=8).
+      SELECT sits at a flat 1.20x slower at every N — the per-statement gap
+      and nothing else. (An earlier run of the same bench, taken while a
+      stray debug daemon from another worktree was still alive, read 19.2k /
+      46.7k / 54.3k — kill every `secantusd-pg` before timing, not just
+      `pytest`.) The N=4 client confound above still applies
+      to the absolute N>=4 rows; it no longer needs separating, because the
+      scaling ratios match PG's under the same confound.
+
+      *The per-statement cost was five separate pieces of work repeated per
+      statement whose answer never changed, none of them the "one hotspot" the
+      three failed profile-led hypotheses had been looking for:*
+
+      | removed | mechanism | where |
+      | --- | --- | --- |
+      | a socket write per backend message | pgwire `send` -> `feed`, one flush per Sync / ReadyForQuery | `crates/vendor/pgwire` |
+      | a second `read` that returned EAGAIN per message | `frame_buffered()` fast path when the frame is already in the buffer | `crates/vendor/pgwire` |
+      | a deep clone of the parsed statement per statement | the parse memo hands out `Arc<ParseResult>`, `one_node` borrows | `lib.rs` |
+      | a RowDescription rebuild per Describe (8 `type_catalog_docs` calls) | per-connection `describe_memo`, 64 entries, keyed on statement + param types + result formats + catalog version; FETCH excluded, errors never recorded | `lib.rs` |
+      | a catalog read per wire-type lookup | per-connection `wire_type_memo`, catalog-version keyed, bypassed while `uncommitted_types` is non-empty | `lib.rs` |
+      | a full `bson::Document` decode of the collection options per row read (the `uuid` Binary goes through serde's extended-JSON path) — **40% of `find_matching`** | `is_timeseries` reads the raw blob; the `_id` fast path is gated on `filter.contains_key("_id")` | `secantus-storage` |
+      | materialising the portal on `Execute` with `max_rows = 0` | streams straight from the iterator, `Portal::finish()` | `lib.rs` |
+      | typing parameters that were all declared | `infer_param_types` short-circuit | `lib.rs` |
+
+      | us / statement (extended protocol) | 2026-09-20 | now | PG 16.15 |
+      | --- | --- | --- | --- |
+      | `select 1` | 55.2 | **35.0–35.5** | 30.1–30.4 |
+      | row by primary key | 62.3 | **42.5–42.7** | 31.4–32.1 |
+
+      The memos are pinned by `tests/test_rust_pgserver_slice.py`
+      (`test_describe_follows_ddl_*`, `test_describe_memo_keys_on_the_result_format`,
+      `test_fetch_describe_is_not_memoized`, `test_user_type_oids_follow_ddl_*`,
+      `test_execute_with_max_rows_zero_drains_the_portal`), every one of which
+      also passes against PostgreSQL 16; the timeseries gate by
+      `crates/secantus-storage/tests/timeseries.rs`.
+
+      The psycopg gauge against this build: **5,544 passed / 0 failed / 149
+      skipped** (the 2026-09-18 clean baseline shape, plus `test_generic_connect`
+      now passing), in 385s wall clock against the 1041s recorded on
+      2026-09-18. The same test population reached the same code and the
+      binary postdates every source edit, so the 2.7x is the server getting
+      faster, not the gauge stopping short — a connection-churn-heavy suite
+      is where the tokio hand-off removal shows most.
+
+      **What remains, and why it was left:** ~5us on `select 1`, ~10us on
+      the row read. Attributed pieces: `plan_with_session_types` ~1.1us per
+      Execute (re-plans a statement whose plan cannot have changed — a
+      per-statement plan cache keyed like the Describe memo would take it);
+      one WiredTiger cursor open per row read ~0.5us (measured, and the
+      cursor-cache attempt above already showed the count is not the cost);
+      and tokio's read path still costs one syscall more than a blocking
+      read would — removing it means driving the socket through `AsyncFd`
+      or a plain blocking `TcpStream` on the connection thread, which is a
+      transport rewrite. None of the three is worth its risk for its size;
+      the next lever with real headroom is still the one the entries above
+      keep circling — not opening a transaction handle for a statement that
+      touches no storage.
+
+      Reproduce: `SECANTUSD_PG=$PWD/crates/secantus-pgserver/target/release/secantusd-pg
+      REPO=$PWD uv run --no-sync python bench/pg_concurrency.py --server both
+      --seconds 5 --repeat 3` and `... bench/pg_statement_cost.py --iters 1200`.
+
+- [ ] **OPEN — RUST pgserver: a portal suspended by `Execute(max_rows=N)`
+      does not survive `Sync` inside a transaction block (found 2026-09-27,
+      verified PRE-EXISTING against the 2026-09-18 binary).** In a block,
+      `Bind p2` / `Execute p2 1` / `Sync` answers `D`, `s`, `Z` as PostgreSQL
+      does; the NEXT `Execute p2 1` / `Sync` answers `SELECT 0` where
+      PostgreSQL delivers the second row and suspends again. PostgreSQL keeps
+      a non-holdable portal for the life of the transaction, and a Sync inside
+      a block does not end the transaction; ours drops the suspended iterator
+      at Sync. Outside a block both servers agree (Sync ends the implicit
+      transaction and the portal with it). psycopg never hits it — it drains
+      every portal with `max_rows = 0` — so the gauge is silent on it, and it
+      is deliberately NOT pinned by `test_execute_with_max_rows_zero_drains_the_portal`
+      (which suspends, then drains, inside one Sync cycle). Probe with the raw
+      protocol helpers in that test file (`_pg_exchange`): `begin`, Parse /
+      Bind, then alternate `Execute(1)` + Sync until a `C` arrives — PG needs
+      three Executes for three rows, ours answers `SELECT 0` on the second.
 
 - [x] **find/aggregate firstBatch is byte-capped — FIXED 2026-08-22 (both servers).**
   `getMore` had mongod's 16MB reply budget; a FIRST batch was capped on document

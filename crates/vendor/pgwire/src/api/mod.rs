@@ -134,7 +134,10 @@ impl SessionExtensions {
 /// transcoding (or cannot be represented), in which case the UTF-8 bytes are
 /// sent as they are.
 #[derive(Clone)]
-pub struct BackendMessageTranscoder(pub Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>);
+pub struct BackendMessageTranscoder(pub TranscodeFn);
+
+/// The closure a [`BackendMessageTranscoder`] wraps.
+pub type TranscodeFn = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync>;
 
 impl std::fmt::Debug for BackendMessageTranscoder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -613,8 +616,9 @@ pub trait PgWireServerHandlers: 'static {
 pub enum IdleEvent {
     /// Send these messages and keep waiting for the client.
     Send(Vec<crate::messages::PgWireBackendMessage>),
-    /// Send this (FATAL) error and close the connection.
-    Fatal(crate::error::ErrorInfo),
+    /// Send this (FATAL) error and close the connection. Boxed: `ErrorInfo`
+    /// is ~400 bytes and `Send` is a `Vec`.
+    Fatal(Box<crate::error::ErrorInfo>),
 }
 
 /// The boxed future an [`PgWireServerHandlers::idle_event`] returns.

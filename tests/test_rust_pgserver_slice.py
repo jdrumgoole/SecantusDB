@@ -10092,3 +10092,233 @@ def test_aggregates_inside_expressions(home: Path) -> None:
         cur = conn.execute("select count(*) + 1 from t")
         cur.fetchall()
         assert cur.description[0].type_code == 20  # int8, as PostgreSQL types it
+
+
+# ---------------------------------------------------------------------------
+# Per-connection memos on the extended-protocol path (2026-09-27).
+#
+# Describe answers and user-type wire oids are memoized per connection, keyed
+# by the process-wide catalog version. Each memo is a correctness hazard in
+# exactly one shape -- a stale answer after DDL -- so these pin the DDL that
+# must invalidate them: from another connection, and from an open block on the
+# same connection (then rolled back). PostgreSQL 16.15 is the oracle for every
+# assertion here (unnamed statements, so no "cached plan must not change
+# result type" -- that is a prepared-statement rule, not a Describe one).
+# ---------------------------------------------------------------------------
+
+
+def test_describe_follows_ddl_from_another_connection(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn, server.connect() as other:
+        conn.execute("create table t (id int primary key, a int)")
+        conn.execute("insert into t values (1, 10)")
+        for _ in range(3):  # warm the memo
+            cur = conn.execute("select * from t")
+            assert [d.name for d in cur.description] == ["id", "a"]
+            assert cur.fetchall() == [(1, 10)]
+        # (`ALTER TABLE` is not supported yet, so a reshaping is DROP + CREATE.)
+        other.execute("drop table t")
+        other.execute("create table t (id int primary key, a int, b text)")
+        other.execute("insert into t values (2, 20, 'x')")
+        cur = conn.execute("select * from t")
+        assert [d.name for d in cur.description] == ["id", "a", "b"]
+        assert [d.type_code for d in cur.description] == [23, 23, 25]
+        assert cur.fetchall() == [(2, 20, "x")]
+        other.execute("drop table t")
+        other.execute("create table t (id int primary key, b text)")
+        cur = conn.execute("select * from t")
+        assert [d.name for d in cur.description] == ["id", "b"]
+        assert cur.fetchall() == []
+        other.execute("drop table t")
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            conn.execute("select * from t")
+
+
+def test_describe_follows_ddl_inside_the_same_block(home: Path) -> None:
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        conn.execute("create table t (id int primary key, a int)")
+        conn.execute("insert into t values (1, 10)")
+        conn.commit()
+        for _ in range(3):
+            cur = conn.execute("select * from t")
+            assert [d.name for d in cur.description] == ["id", "a"]
+        conn.execute("create table u (id int primary key, a int, b int)")
+        conn.execute("insert into u values (1, 10, 7)")
+        cur = conn.execute("select * from u")
+        assert [d.name for d in cur.description] == ["id", "a", "b"]
+        assert cur.fetchall() == [(1, 10, 7)]
+        conn.rollback()
+        with pytest.raises(psycopg.errors.UndefinedTable):
+            conn.execute("select * from u")
+        conn.rollback()
+        # The same name, a different shape: nothing remembered from the block.
+        conn.execute("create table u (id int primary key, c text)")
+        conn.commit()
+        cur = conn.execute("select * from u")
+        assert [d.name for d in cur.description] == ["id", "c"]
+        assert cur.fetchall() == []
+
+
+def test_describe_memo_keys_on_the_result_format(home: Path) -> None:
+    """The same SQL described for text and for binary results must answer
+    with the format the client asked for -- a memo that ignored the format
+    would hand a binary client a text RowDescription."""
+    with _Server(home) as server, server.connect() as conn:
+        conn.execute("create table t (id int primary key, v numeric, w date)")
+        conn.execute("insert into t values (1, 1.50, '2024-02-29')")
+        want = [(1, Decimal("1.50"), dt.date(2024, 2, 29))]
+        for _ in range(2):
+            for binary in (False, True, False, True):
+                cur = conn.execute("select * from t", binary=binary)
+                assert cur.fetchall() == want, binary
+                assert [d.type_code for d in cur.description] == [23, 1700, 1082]
+
+
+def test_fetch_describe_is_not_memoized(home: Path) -> None:
+    """`FETCH` describes the CURSOR, not the SQL text: the same text against
+    a different cursor has a different shape."""
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        conn.execute("create table t (id int primary key, a int, b text)")
+        conn.execute("insert into t values (1, 10, 'x'), (2, 20, 'y')")
+        conn.commit()
+        conn.execute("declare c cursor for select id, a from t order by id")
+        cur = conn.execute("fetch 1 from c")
+        assert [d.name for d in cur.description] == ["id", "a"]
+        assert cur.fetchall() == [(1, 10)]
+        cur = conn.execute("fetch 1 from c")
+        assert cur.fetchall() == [(2, 20)]
+        conn.execute("close c")
+        conn.execute("declare c cursor for select b from t order by id")
+        cur = conn.execute("fetch 1 from c")
+        assert [d.name for d in cur.description] == ["b"]
+        assert cur.fetchall() == [("x",)]
+        conn.rollback()
+
+
+def _type_oid(conn: psycopg.Connection, name: str) -> int:
+    return conn.execute("select oid from pg_type where typname = %s", (name,)).fetchone()[0]
+
+
+def test_user_type_oids_follow_ddl_from_another_connection(home: Path) -> None:
+    with _Server(home) as server, server.connect() as conn, server.connect() as other:
+        for _ in range(3):  # warm the memo with a built-in
+            cur = conn.execute("select 'a'::text")
+            assert cur.description[0].type_code == 25
+        # Any error will do: the cast must not resolve. (0A000 today where
+        # PostgreSQL says 42704 -- a separate gap, not pinned here.)
+        with pytest.raises(psycopg.Error):
+            conn.execute("select 'a'::mood")
+        other.execute("create type mood as enum ('a', 'b')")
+        oid = _type_oid(other, "mood")
+        assert oid > 16000
+        cur = conn.execute("select 'a'::mood")
+        assert cur.description[0].type_code == oid
+        assert cur.fetchall() == [("a",)]
+        other.execute("drop type mood")
+        with pytest.raises(psycopg.Error):
+            conn.execute("select 'a'::mood")
+        # Re-created: a new type, a new oid, and no answer from before.
+        other.execute("create type mood as enum ('z')")
+        cur = conn.execute("select 'z'::mood")
+        assert cur.description[0].type_code == _type_oid(other, "mood")
+        assert cur.fetchall() == [("z",)]
+
+
+def test_user_type_oids_follow_ddl_inside_the_same_block(home: Path) -> None:
+    with _Server(home) as server, server.connect(autocommit=False) as conn:
+        cur = conn.execute("select 1")
+        cur.fetchall()
+        conn.commit()
+        conn.execute("create type shade as enum ('x', 'y')")
+        cur = conn.execute("select 'x'::shade")
+        oid = cur.description[0].type_code
+        assert oid == _type_oid(conn, "shade")
+        assert cur.fetchall() == [("x",)]
+        conn.rollback()
+        with pytest.raises(psycopg.Error):
+            conn.execute("select 'x'::shade")
+        conn.rollback()
+        conn.execute("create type shade as enum ('x')")
+        conn.commit()
+        cur = conn.execute("select 'x'::shade")
+        assert cur.description[0].type_code == _type_oid(conn, "shade")
+
+
+# ---------------------------------------------------------------------------
+# Execute with max_rows = 0 streams the whole portal (2026-09-27).
+#
+# The common Execute -- psycopg always sends max_rows = 0 -- no longer parks
+# the rows in the portal to be fetched back out; they stream as they are
+# produced and the portal is marked finished. What the client sees must not
+# change: measured against PostgreSQL 16.15 with the raw protocol, since no
+# driver exposes the portal directly.
+# ---------------------------------------------------------------------------
+
+
+def _pg_msg(kind: bytes, body: bytes = b"") -> bytes:
+    import struct
+
+    return kind + struct.pack("!i", len(body) + 4) + body
+
+
+def _pg_cstr(s: str) -> bytes:
+    return s.encode() + b"\x00"
+
+
+def _pg_exchange(sock, *parts: bytes) -> list[tuple[str, bytes | None]]:
+    """Send `parts`, collect replies up to ReadyForQuery. Only the messages
+    whose payload carries state (CommandComplete / Error / RowDescription)
+    keep it; the rest are reported by type alone."""
+    from secantus.sql import pgwire
+
+    sock.sendall(b"".join(parts))
+    out: list[tuple[str, bytes | None]] = []
+    while True:
+        m = pgwire.read_message(sock)
+        out.append((m.type, m.payload if m.type in ("C", "E", "T") else None))
+        if m.type == "Z":
+            return out
+
+
+def test_execute_with_max_rows_zero_drains_the_portal(home: Path) -> None:
+    import socket
+    import struct
+
+    from secantus.sql import pgwire
+
+    with _Server(home) as server, server.connect() as setup:
+        setup.execute("create table pp (k int primary key)")
+        setup.execute("insert into pp values (1), (2), (3)")
+        sock = socket.create_connection(("127.0.0.1", server.port), timeout=10)
+        try:
+            sock.sendall(pgwire.build_startup_message({"user": "test", "database": "postgres"}))
+            while pgwire.read_message(sock).type != "Z":
+                pass
+            sync = _pg_msg(b"S")
+            # Named portals survive a Sync only inside a block.
+            assert _pg_exchange(sock, _pg_msg(b"Q", _pg_cstr("begin")))[0] == ("C", b"BEGIN\x00")
+            sql = "select k from pp order by k"
+            parse = _pg_msg(b"P", _pg_cstr("st") + _pg_cstr(sql) + struct.pack("!h", 0))
+            bind = _pg_msg(b"B", _pg_cstr("po") + _pg_cstr("st") + struct.pack("!hhh", 0, 0, 0))
+            assert [t for t, _ in _pg_exchange(sock, parse, bind, sync)] == ["1", "2", "Z"]
+
+            def execute(portal: str, max_rows: int) -> list[str]:
+                replies = _pg_exchange(
+                    sock, _pg_msg(b"E", _pg_cstr(portal) + struct.pack("!i", max_rows)), sync
+                )
+                return [t if p is None else f"{t}:{p[:-1].decode()}" for t, p in replies]
+
+            # max_rows = 0: every row, then the tag.
+            assert execute("po", 0) == ["D", "D", "D", "C:SELECT 3", "Z"]
+            # The portal is finished: nothing more, with or without a limit.
+            assert execute("po", 0) == ["C:SELECT 0", "Z"]
+            assert execute("po", 1) == ["C:SELECT 0", "Z"]
+            # Describe of a finished portal still answers its RowDescription.
+            replies = _pg_exchange(sock, _pg_msg(b"D", b"P" + _pg_cstr("po")), sync)
+            assert [t for t, _ in replies] == ["T", "Z"]
+            # A limited Execute suspends instead (the pre-existing path).
+            bind2 = _pg_msg(b"B", _pg_cstr("p2") + _pg_cstr("st") + struct.pack("!hhh", 0, 0, 0))
+            assert [t for t, _ in _pg_exchange(sock, bind2, sync)] == ["2", "Z"]
+            assert execute("p2", 1) == ["D", "s", "Z"]
+            assert _pg_exchange(sock, _pg_msg(b"Q", _pg_cstr("commit")))[0] == ("C", b"COMMIT\x00")
+        finally:
+            sock.close()

@@ -6722,15 +6722,32 @@ impl Storage {
         Self::delete_prepared_row(&session, gid)
     }
 
-    /// Insert one BSON-encoded document. Assigns an `ObjectId` `_id` if absent.
-    /// Returns the document's `id_key`. A duplicate `_id` yields
-    /// `StorageError::DuplicateId`.
     /// Whether `(db, coll)` is a timeseries collection (its stored options carry
     /// a `timeseries` sub-document). Mirrors `storage._is_timeseries`.
+    ///
+    /// Answered from the raw options blob: this runs on every point read, and
+    /// decoding the whole document (its `uuid` Binary goes through serde's
+    /// extended-JSON path) cost more than the read it was gating -- 40% of a
+    /// one-row-by-key `find_matching` (measured 2026-09-27).
     fn is_timeseries(&self, session: &Session, db: &str, coll: &str) -> Result<bool> {
-        Ok(coll_options(session, db, coll)?
-            .map(|o| o.contains_key("timeseries"))
-            .unwrap_or(false))
+        let cur = session.open_cursor(COLL_TABLE, None)?;
+        cur.set_key_ss(db, coll);
+        match cur.search() {
+            Ok(()) => {
+                let blob = cur.get_value_u()?;
+                if blob.is_empty() {
+                    return Ok(false);
+                }
+                let raw = bson::RawDocument::from_bytes(&blob)
+                    .map_err(|e| StorageError::Bson(e.to_string()))?;
+                Ok(raw
+                    .get("timeseries")
+                    .map_err(|e| StorageError::Bson(e.to_string()))?
+                    .is_some())
+            }
+            Err(e) if e.is_not_found() => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// A doc-table key discriminator for a timeseries collection. Timeseries
@@ -12030,7 +12047,10 @@ impl Storage {
         // EXCEPT in a timeseries collection, where the doc-table key is suffixed
         // (duplicate `_id`s coexist), so a reconstructed bare key would miss
         // rows. There, fall through to a collection scan.
-        if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
+        if filter.len() == 1
+            && filter.contains_key("_id")
+            && !self.is_timeseries(session, db, coll)?
+        {
             if let Some(spec) = filter.get("_id") {
                 if let Some(id_keys) = id_point_lookup_keys(spec)? {
                     // Callers want RecordIds. For an `_id` lookup the `_id` index IS
@@ -12739,7 +12759,10 @@ impl Storage {
         }
         // Timeseries skips the `_id` point lookup (suffixed keys) — see
         // `try_index_id_keys`; mirror that here so `explain` reports COLLSCAN.
-        if filter.len() == 1 && !self.is_timeseries(session, db, coll)? {
+        if filter.len() == 1
+            && filter.contains_key("_id")
+            && !self.is_timeseries(session, db, coll)?
+        {
             if let Some(spec) = filter.get("_id") {
                 if id_point_lookup_keys(spec)?.is_some() {
                     let mut kp = Document::new();

@@ -241,7 +241,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
         let stmt = StoredStatement::parse(client, &message, parser).await?;
         client.portal_store().put_statement(Arc::new(stmt));
         client
-            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await?;
 
         Ok(())
@@ -264,7 +264,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
             let portal = Portal::try_new(&message, statement)?;
             client.portal_store().put_portal(Arc::new(portal));
             client
-                .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+                .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
                 .await?;
             Ok(())
         } else {
@@ -331,6 +331,29 @@ pub trait ExtendedQueryHandler: Send + Sync {
             }?;
 
             match resp {
+                Response::Query(mut results) if max_rows == 0 => {
+                    // The whole result is wanted at once: stream it straight
+                    // to the client instead of parking it in the portal for
+                    // `fetch` to re-collect, re-box and hand back. The portal
+                    // ends Finished, as it would after a full fetch, so a
+                    // later Execute on it answers an empty CommandComplete.
+                    portal.finish().await;
+                    let tag_counts_rows = results.tag_counts_rows;
+                    let mut row_count = 0;
+                    while let Some(row) = results.data_rows().next().await {
+                        client.feed(PgWireBackendMessage::DataRow(row?)).await?;
+                        row_count += 1;
+                    }
+                    let tag = QueryResponse::complete_tag(
+                        results.command_tag(),
+                        tag_counts_rows,
+                        row_count,
+                    );
+                    client
+                        .feed(PgWireBackendMessage::CommandComplete(tag.into()))
+                        .await?;
+                    false
+                }
                 Response::Query(results) => {
                     portal.start(results).await;
                     true
@@ -399,12 +422,12 @@ pub trait ExtendedQueryHandler: Send + Sync {
             }
             if fetch_result.suspended {
                 client
-                    .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
+                    .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended))
                     .await?;
             } else {
                 let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, row_count);
                 client
-                    .send(PgWireBackendMessage::CommandComplete(tag.into()))
+                    .feed(PgWireBackendMessage::CommandComplete(tag.into()))
                     .await?;
             }
         }
@@ -521,7 +544,7 @@ pub trait ExtendedQueryHandler: Send + Sync {
             _ => {}
         }
         client
-            .send(PgWireBackendMessage::CloseComplete(CloseComplete))
+            .feed(PgWireBackendMessage::CloseComplete(CloseComplete))
             .await?;
         Ok(())
     }
@@ -690,12 +713,12 @@ where
 
     if suspended {
         client
-            .send(PgWireBackendMessage::PortalSuspended(PortalSuspended))
+            .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended))
             .await?;
     } else {
         let tag = QueryResponse::complete_tag(&command_tag, tag_counts_rows, rows);
         client
-            .send(PgWireBackendMessage::CommandComplete(tag.into()))
+            .feed(PgWireBackendMessage::CommandComplete(tag.into()))
             .await?;
     }
 
@@ -750,17 +773,17 @@ where
     if let Some(parameter_types) = describe_response.parameters() {
         // parameter type inference
         client
-            .send(PgWireBackendMessage::ParameterDescription(
+            .feed(PgWireBackendMessage::ParameterDescription(
                 ParameterDescription::new(parameter_types.iter().map(|t| t.oid()).collect()),
             ))
             .await?;
     }
     if describe_response.is_no_data() {
-        client.send(PgWireBackendMessage::NoData(NoData)).await?;
+        client.feed(PgWireBackendMessage::NoData(NoData)).await?;
     } else {
         let row_desc = into_row_description(describe_response.fields());
         client
-            .send(PgWireBackendMessage::RowDescription(row_desc))
+            .feed(PgWireBackendMessage::RowDescription(row_desc))
             .await?;
     }
 

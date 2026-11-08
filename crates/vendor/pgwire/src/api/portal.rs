@@ -194,6 +194,14 @@ impl<S: Clone> Portal<S> {
         *state = PortalExecutionState::Suspended(response);
     }
 
+    /// Mark the portal `Finished` without going through `Suspended`: the
+    /// caller streamed the whole response itself. A later
+    /// [`fetch()`](Self::fetch) answers no rows, as after an exhausting fetch.
+    pub async fn finish(&self) {
+        let mut state = self.state.lock().await;
+        *state = PortalExecutionState::Finished;
+    }
+
     /// Fetch up to `max_rows` from a portal's suspended state.
     ///
     /// Returns a [`FetchResult`] containing the rows, the row schema, and
@@ -218,7 +226,7 @@ impl<S: Clone> Portal<S> {
                 let row_schema = response.row_schema();
                 let data_rows = response.data_rows();
 
-                let mut rows = Vec::with_capacity(if max_rows == 0 { 256 } else { max_rows });
+                let mut rows = Vec::with_capacity(max_rows.min(256));
                 let mut suspended = true;
                 while max_rows == 0 || rows.len() < max_rows {
                     if let Some(row) = data_rows.next().await {
