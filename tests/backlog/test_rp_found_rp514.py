@@ -50,16 +50,57 @@ def answer(dsn: str, *queries: str) -> Any:
             c.execute("rollback")
 
 
-@pytest.mark.backlog("RP-518")
+@pytest.mark.backlog_fixed("RP-518")
 def test_function_comment_seen_in_its_transaction(dsn: str) -> None:
-    """A COMMENT ON FUNCTION is read back by `obj_description` in the
-    transaction that made it, as a COMMENT ON TABLE already is."""
+    """A COMMENT ON FUNCTION was read back by `obj_description` in the
+    transaction that made it, as a COMMENT ON TABLE already was."""
     got = answer(
         dsn,
         "comment on function gc(int) is 'w'",
         "select obj_description('gc(int)'::regprocedure, 'pg_proc')",
     )
     assert got == ("ok", [("w",)])
+
+
+_GC_COMMENT = "select obj_description('gc(int)'::regprocedure, 'pg_proc')"
+
+
+@pytest.mark.backlog_fixed("RP-518")
+def test_function_comment_follows_its_transaction(dsn: str) -> None:
+    """A COMMENT ON FUNCTION is undone by ROLLBACK TO SAVEPOINT and by
+    ROLLBACK, seen by another session only once committed, and a removed
+    comment likewise. Each answer measured on PostgreSQL 15.19."""
+
+    def comment(c: psycopg.Connection) -> Any:
+        return c.execute(_GC_COMMENT).fetchone()[0]
+
+    with (
+        psycopg.connect(dsn, autocommit=True) as c,
+        psycopg.connect(dsn, autocommit=True) as other,
+    ):
+        for q in _SETUP:
+            c.execute(q)
+        c.execute("begin")
+        c.execute("comment on function gc(int) is 'w'")
+        assert (comment(c), comment(other)) == ("w", None)
+        c.execute("savepoint s")
+        c.execute("comment on function gc(int) is 'x'")
+        assert comment(c) == "x"
+        c.execute("rollback to savepoint s")
+        assert comment(c) == "w"
+        c.execute("rollback")
+        assert comment(c) is None
+        c.execute("begin")
+        c.execute("comment on function gc(int) is 'z'")
+        c.execute("commit")
+        assert (comment(c), comment(other)) == ("z", "z")
+        c.execute("begin")
+        c.execute("comment on function gc(int) is null")
+        assert (comment(c), comment(other)) == (None, "z")
+        c.execute("commit")
+        assert comment(other) is None
+        # The rewritten record is still the function.
+        assert c.execute("select gc(5)").fetchone() == (1,)
 
 
 _AMBIGUOUS = "Specify the argument list to select the {} unambiguously."

@@ -17900,8 +17900,10 @@ impl PgHandler {
                 let signature = names.first().map_or("", String::as_str);
                 let key = self.function_acl_key(signature, kind)?;
                 self.check_routine_kind(&key, kind)?;
+                // The stored record, not the session's normalised reading of
+                // it, as ALTER FUNCTION rewrites it.
                 let Some(mut doc) = self
-                    .type_catalog_docs(Self::FUNCTION_COLLECTION)?
+                    .type_catalog_docs_raw(Self::FUNCTION_COLLECTION)?
                     .iter()
                     .find(|d| d.get_str("_id") == Ok(key.as_str()))
                     .cloned()
@@ -17921,7 +17923,11 @@ impl PgHandler {
                         doc.remove("comment");
                     }
                 }
-                self.put_comment_doc(Self::FUNCTION_COLLECTION, &id, Some(doc))
+                // Through the transaction's catalog overlay, which the
+                // function catalog is read through: `pg_description` is
+                // read under the transaction's snapshot (RP-518).
+                self.delete_type_doc(Self::FUNCTION_COLLECTION, &id)?;
+                self.insert_type_doc(Self::FUNCTION_COLLECTION, &id, doc)
             }
             "domain" => self.comment_on_domain(&Self::comment_relation(names), comment),
             "text search configuration" => self.comment_on_ts_config(names, comment),

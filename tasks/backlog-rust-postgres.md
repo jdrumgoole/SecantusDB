@@ -2059,17 +2059,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp514.py`.
 
-- [ ] **A COMMENT ON FUNCTION is not seen by its own transaction.**
-      PostgreSQL 15.19's `obj_description` reads `pg_description` under the
-      transaction's snapshot, so `begin; comment on function gc(int) is 'w';
-      select obj_description('gc(int)'::regprocedure, 'pg_proc')` answers
-      `w`. Here it answers NULL until the transaction commits (a COMMENT ON
-      TABLE is already seen). The comment is kept on the function's record,
-      which `put_comment_doc` writes straight to storage, while the function
-      catalog is read through `type_catalog_docs`' cache and its pending
-      overlay (`self.pending.types()`), which the write does not reach.
-      Verify: tests/backlog/test_rp_found_rp514.py::test_function_comment_seen_in_its_transaction
-      Backlog-ID: RP-518
 - [ ] **A built-in routine is not looked up among its overloads or its
       kind.** PostgreSQL 15.19 looks a built-in up in `pg_proc` like any
       routine: `grant execute on function lower to public` and `comment on
