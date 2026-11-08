@@ -1168,15 +1168,28 @@ fn sort_provider(
 /// one per index a predicate bounds, and when none of those returns the
 /// sort, a walk of every index that does. Each with its standing in the
 /// fixed preference; a walk has none.
+///
+/// A hint leaves only the hinted index's plans: its scans and their
+/// intersection, never a walk for the sort or another index (measured
+/// 8.2.1: `{s: {$gte: "a", $lte: "b"}}` hinted to a multikey `s_1` is
+/// still two plans, `["", "b"]` winning over `["a", {})`).
 fn candidates(
     parts: &[Document],
     q: &Query,
     catalog: &[Arc<IndexInfo>],
     filter: Option<Document>,
 ) -> Vec<(Access, Option<Preference>)> {
-    if q.hint != Hint::None || q.min_max || q.keys_only || q.wanted.is_some() {
+    if q.min_max || q.keys_only || q.wanted.is_some() {
         return Vec::new();
     }
+    let hinted = match &q.hint {
+        Hint::None => None,
+        Hint::Index(name) => match catalog.iter().find(|ix| &ix.name == name) {
+            Some(index) => Some(index),
+            None => return Vec::new(),
+        },
+        Hint::Natural(_) => return Vec::new(),
+    };
     let leaves = leaves_of(parts);
     // An index whose leading field holds arrays takes the bounds of one
     // predicate on it, and mongod tries one plan per predicate (measured
@@ -1184,7 +1197,18 @@ fn candidates(
     // `[-inf, 9)` and `(3, inf]`, in the order of the parsed query).
     let mut uses: Vec<IndexUse> = Vec::new();
     let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
-    for u in candidate_uses(&leaves, parts, q, catalog) {
+    let found = match hinted {
+        Some(index) => {
+            let u = use_index(index, &leaves, parts, q);
+            if u.leads {
+                vec![u]
+            } else {
+                Vec::new()
+            }
+        }
+        None => candidate_uses(&leaves, parts, q, catalog),
+    };
+    for u in found {
         let index = u.index.clone();
         let lead = index.fields()[0].0.to_string();
         let ctx_multikey = !index.multikey_paths[0].is_empty();
@@ -1224,6 +1248,9 @@ fn candidates(
         })
         .collect();
     if out.is_empty() {
+        if hinted.is_some() {
+            return out;
+        }
         // No predicate has an index: the walks that return the sort are
         // the candidates, unless an `$or` is planned on its own.
         if parts.iter().any(|p| p.contains_key("$or")) {
@@ -1282,6 +1309,9 @@ fn candidates(
             },
             None,
         ));
+    }
+    if hinted.is_some() {
+        return out;
     }
     for x in 0..singles {
         for y in x + 1..singles {
