@@ -46,10 +46,16 @@ fn branch_rank(branch: &Bson) -> (i32, String) {
 /// One operator document, rewritten as mongod prints it. `sorted_in` is
 /// whether an `$in` lists its values sorted and once each, as `parsedQuery`
 /// does; mongod's query-tree text (`debug_string`) keeps them as written.
-fn operator(d: Document, sorted_in: bool) -> Document {
+fn operator(mut d: Document, sorted_in: bool) -> Document {
     // `{$exists: false}` is `{$not: {$exists: true}}`.
     if d.len() == 1 && d.get("$exists").is_some_and(|v| !crate::util::truthy(v)) {
         return doc! { "$not": { "$exists": true } };
+    }
+    // `$in` lists its values once each, in sort order: `[1, 1.0]` is one
+    // value, and so an equality (measured 8.2.11, 2026-11-08).
+    if let (true, Some(Bson::Array(items))) = (sorted_in, d.get_mut("$in")) {
+        items.sort_by(cmp);
+        items.dedup_by(|a, b| sort_key(a) == sort_key(b));
     }
     // `{$in: [x]}` is `{$eq: x}`, under a `$not` as at the top.
     if let (1, Some(Bson::Array(items))) = (d.len(), d.get("$in")) {
@@ -97,13 +103,7 @@ fn operator(d: Document, sorted_in: bool) -> Document {
                     })
                     .collect(),
             ),
-            ("$in", Bson::Array(items)) if !sorted_in => Bson::Array(items),
-            // `$in` lists its values once each, in sort order.
-            ("$in", Bson::Array(mut items)) => {
-                items.sort_by(cmp);
-                items.dedup_by(|a, b| sort_key(a) == sort_key(b));
-                Bson::Array(items)
-            }
+            ("$in", Bson::Array(items)) => Bson::Array(items),
             // `$mod`'s divisor and remainder are 64-bit.
             ("$mod", Bson::Array(items)) => Bson::Array(
                 items
@@ -485,6 +485,21 @@ mod tests {
         assert_eq!(
             parsed_query(&doc! {"t": {"$elemMatch": {"$gt": 3, "$lt": 9}}}),
             doc! {"t": {"$elemMatch": {"$lt": 9, "$gt": 3}}}
+        );
+    }
+
+    /// Values that compare equal are one: an `$in` of `1` and `1.0` is an
+    /// equality, and of `2, 1.0, 1` keeps the first of the tie in sort order
+    /// (measured 8.2.11, 2026-11-08).
+    #[test]
+    fn in_values_equal_as_mongod_compares_them_are_one() {
+        assert_eq!(
+            parsed_query(&doc! {"_id": {"$in": [1, 1.0]}}),
+            doc! {"_id": {"$eq": 1}}
+        );
+        assert_eq!(
+            parsed_query(&doc! {"x": {"$in": [2, 1.0, 1]}}),
+            doc! {"x": {"$in": [1.0, 2]}}
         );
     }
 }

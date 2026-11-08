@@ -708,12 +708,14 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     None => {
                         let hoisted = crate::explain::hoist::hoist_matches(&pipeline);
                         let (filter, rest) = lift_leading_match(&hoisted);
-                        let is_view = |from: &str| {
-                            storage
-                                .get_collection_options(&ctx.db_name, from)
-                                .is_ok_and(|o| o.get_str("viewOn").is_ok())
-                        };
-                        match secantus_core::sbe::pushdown(&hoisted, &is_view) {
+                        match crate::explain::sbe_pushdown(
+                            storage,
+                            &ctx.db_name,
+                            c,
+                            &hoisted,
+                            hint,
+                            collation.as_ref(),
+                        ) {
                             Some(n) => {
                                 // Built before any document is read; a
                                 // collection that does not exist builds
@@ -3327,12 +3329,7 @@ fn apply_union_with(
         // own pushdown into SBE (measured 8.2.11: `$mod` by zero in a
         // `$group` there is SBE's 4848403).
         let hoisted = crate::explain::hoist::hoist_matches(sub);
-        let is_view = |name: &str| {
-            storage
-                .get_collection_options(db, name)
-                .is_ok_and(|o| o.get_str("viewOn").is_ok())
-        };
-        let sub = match secantus_core::sbe::pushdown(&hoisted, &is_view) {
+        let sub = match crate::explain::sbe_pushdown(storage, db, from, &hoisted, None, collation) {
             Some(end) => {
                 if storage.collection_exists(db, from).unwrap_or(false) {
                     secantus_core::sbe::build_check(&hoisted[..end], &Document::new())

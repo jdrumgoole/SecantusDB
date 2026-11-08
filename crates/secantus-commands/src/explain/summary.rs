@@ -189,14 +189,18 @@ fn plan_info_with(
         "aggregate" => {
             let pipeline: Vec<Bson> = stages.iter().cloned().map(Bson::Document).collect();
             let hoisted = super::hoist::hoist_matches(&pipeline);
-            let is_view = |from: &str| crate::views::is_view(storage, db, from);
-            Some(
-                if secantus_core::sbe::pushdown(&hoisted, &is_view).is_some() {
-                    "sbe"
-                } else {
-                    "classic"
-                },
-            )
+            let collation = crate::util::effective_collation(storage, db, &s.coll, request)
+                .ok()
+                .flatten();
+            let pushed = super::sbe_pushdown(
+                storage,
+                db,
+                &s.coll,
+                &hoisted,
+                request.get("hint"),
+                collation.as_ref(),
+            );
+            Some(if pushed.is_some() { "sbe" } else { "classic" })
         }
         _ => None,
     };
