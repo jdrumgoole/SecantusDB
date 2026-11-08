@@ -111,6 +111,7 @@ mod portal_stream;
 mod procedures;
 mod progress;
 mod renames;
+mod row_type_depends;
 mod row_waits;
 mod rule_trees;
 mod rules;
@@ -14906,7 +14907,8 @@ impl PgHandler {
     /// PostgreSQL's 2BP01 for a RESTRICT drop that something depends on: one
     /// DETAIL line per dependant.
     /// A DROP of view or materialized view `name` (of `kind`) over what
-    /// `rule_dependents` found reading it: RESTRICT refuses, naming each;
+    /// `rule_dependents` found reading it, and what names its row type
+    /// (`row_type_dependents`): RESTRICT refuses, naming each;
     /// CASCADE names them in one notice and drops them, the last found
     /// first, so each goes after what reads it.
     fn drop_rule_dependents(
@@ -14917,7 +14919,10 @@ impl PgHandler {
         cascade: bool,
         max_rows: usize,
     ) -> PgWireResult<()> {
-        if dependants.is_empty() {
+        // The routines and casts over its row type, which is made with the
+        // view and so named first (RP-546).
+        let row_type = self.row_type_dependents(name)?;
+        if dependants.is_empty() && row_type.lines.is_empty() {
             return Ok(());
         }
         let raw = |k: &str| k.to_string();
@@ -14927,13 +14932,24 @@ impl PgHandler {
                 "2BP01".into(), // dependent_objects_still_exist
                 format!("cannot drop {kind} {name} because other objects depend on it"),
             );
-            let lines: Vec<String> = dependants.iter().map(|d| d.line(raw)).collect();
+            let lines: Vec<String> = row_type
+                .lines
+                .iter()
+                .map(|(o, on)| format!("{o} depends on {on}"))
+                .chain(dependants.iter().map(|d| d.line(raw)))
+                .collect();
             info.detail = Some(lines.join("\n"));
             info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
             return Err(PgWireError::UserError(Box::new(info)));
         }
-        let descs: Vec<String> = dependants.iter().map(|d| d.desc(raw)).collect();
+        let descs: Vec<String> = row_type
+            .lines
+            .iter()
+            .map(|(o, _)| o.clone())
+            .chain(dependants.iter().map(|d| d.desc(raw)))
+            .collect();
         self.cascade_notice(&descs);
+        self.drop_row_type_dependents(&row_type)?;
         for d in dependants.iter().rev() {
             self.drop_rule_dependent(d, max_rows)?;
         }
@@ -26557,14 +26573,18 @@ impl PgHandler {
         // readers this statement has just dropped must be gone from the
         // catalog it reads, not still in the cached copy.
         bump_catalog_version();
-        self.execute(
-            Statement::DropTable(secantus_pgplan::DropTable {
-                tables: vec![name.to_string()],
-                if_exists: true,
-                cascade: false,
-            }),
-            max_rows,
-        )?;
+        // What names its row type was settled with the DROP MATERIALIZED
+        // VIEW, under that name, before anything went.
+        row_type_depends::keeping_row_type(|| {
+            self.execute(
+                Statement::DropTable(secantus_pgplan::DropTable {
+                    tables: vec![name.to_string()],
+                    if_exists: true,
+                    cascade: false,
+                }),
+                max_rows,
+            )
+        })?;
         Ok(())
     }
 
@@ -40346,16 +40366,15 @@ impl PgHandler {
                         .into_iter()
                         .filter(|f| in_schema.contains(&f.key))
                         .collect();
+                    // `getObjectDescription`'s form, as DROP TABLE names a
+                    // routine over a member's row type, so one reached both
+                    // ways is named once.
+                    let docs = self.type_catalog_docs(Self::FUNCTION_COLLECTION)?;
                     descs.extend(routines.iter().map(|f| {
-                        let args: Vec<String> = f
-                            .param_types
-                            .iter()
-                            .map(|t| self.display_type_name(t))
-                            .collect();
-                        // `format_procedure`'s form: no blank after a comma.
-                        // PostgreSQL 15's `getObjectDescription` calls a
-                        // procedure a function too.
-                        format!("function {name}.{}({})", f.name, args.join(","))
+                        docs.iter()
+                            .find(|d| d.get_str("_id") == Ok(f.key.as_str()))
+                            .map(row_type_depends::routine_description)
+                            .unwrap_or_else(|| format!("function {name}.{}()", f.name))
                     }));
                     // The relations it holds, stored as `schema.name`.
                     let relations = self.schema_relations(name)?;
@@ -43412,9 +43431,17 @@ impl PgHandler {
                                 }
                             }
                         }
-                        let objects: Vec<(String, String)> = kids
+                        // The routines and casts over its row type come
+                        // first: that type is made with the table (RP-546).
+                        let row_type = self.row_type_dependents(table)?;
+                        let objects: Vec<(String, String)> = row_type
+                            .lines
                             .iter()
-                            .map(|(k, p)| (format!("table {k}"), format!("table {p}")))
+                            .cloned()
+                            .chain(
+                                kids.iter()
+                                    .map(|(k, p)| (format!("table {k}"), format!("table {p}"))),
+                            )
                             .chain(fks.iter().map(|(child, fk)| {
                                 (
                                     format!("constraint {} on table {}", fk.name, child.name),
@@ -43452,6 +43479,7 @@ impl PgHandler {
                             }
                             let descs: Vec<String> = objects.into_iter().map(|(o, _)| o).collect();
                             self.cascade_notice(&descs);
+                            self.drop_row_type_dependents(&row_type)?;
                             for (child, fk) in &fks {
                                 let mut def =
                                     self.lookup(&child.name).unwrap_or_else(|| child.clone());
