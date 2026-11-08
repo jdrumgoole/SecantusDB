@@ -2464,16 +2464,6 @@ as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp658.py`.
 
-- [ ] **ALTER COLUMN TYPE between two array types is refused.** An array's
-      assignment cast is its element's (`find_coercion_pathway` over
-      `typelem`), so on PostgreSQL 15.19 `alter column a type int8[]` of an
-      `int[]` column, `smallint[]` to `int[]` and `int8[]` to `numeric[]`
-      each succeed with no USING and keep the values; only a pair with no
-      element cast (`text` to `int[]`) is 42804. Here the first three are
-      42804 `column "a" cannot be cast automatically to type bigint[]`
-      (`alter_type_is_automatic` knows no array pair).
-      Verify: tests/backlog/test_rp_found_rp658.py::test_alter_type_between_array_types
-      Backlog-ID: RP-662
 - [ ] **A composite type's attribute has `attndims` 0.** `create type c as
       (p int[][], q int, r text[])` gives `p`, `q` and `r` 2, 0 and 1 in
       PostgreSQL 15.19's `pg_attribute` (`DefineCompositeType` builds the

@@ -7745,36 +7745,85 @@ fn plan_alter_table(
 /// Whether `ALTER COLUMN ... TYPE` converts from `from` to `to` without a
 /// `USING` clause.
 ///
-/// PostgreSQL allows it exactly where an ASSIGNMENT cast exists, which is not
-/// the same as "the values happen to convert". Measured on 14.24 across 31
-/// type pairs, the rule is:
-///
-/// * to a STRING type -- always (everything has an assignment cast to text,
-///   so `json`, `bytea`, `date` and `int` all convert);
-/// * within the NUMERIC family, both directions;
-/// * within the DATE/TIME family, both directions;
-/// * `json` and `jsonb`, both directions;
-/// * a type to itself.
-///
-/// Everything else needs `USING`, and PostgreSQL answers 42804 -- notably
-/// FROM a string to anything but a string (`text -> int`, `text -> date`,
-/// `varchar -> int`), `bool` to or from `int`, and a scalar to an array.
+/// `ATPrepAlterColumnType` coerces the column's own Var to the new type with
+/// `coerce_to_target_type(..., COERCION_ASSIGNMENT, ...)`, and refuses with
+/// 42804 when that finds no path. Over a plain column that is
+/// `find_coercion_pathway` in the ASSIGNMENT context (`assignment_pathway`),
+/// decided from the TYPES alone, never from whether the values would
+/// convert: `text -> int` is refused on a table whose values are all digits.
 fn alter_type_is_automatic(from: &str, to: &str) -> bool {
-    const STRINGS: &[&str] = &["text", "varchar", "bpchar", "name", "char"];
-    const NUMBERS: &[&str] = &["int2", "int4", "int8", "numeric", "float4", "float8"];
-    const DATETIMES: &[&str] = &[
-        "date",
-        "timestamp",
-        "timestamptz",
-        "time",
-        "timetz",
-        "interval",
-    ];
-    if from == to || STRINGS.contains(&to) {
+    from == to || assignment_pathway(from, to)
+}
+
+/// PostgreSQL 15's `find_coercion_pathway(target, source,
+/// COERCION_ASSIGNMENT)` (`parse_coerce.c`) is not `COERCION_PATH_NONE`:
+///
+/// 1. the same type is a relabelling;
+/// 2. a `pg_cast` row from `source` to `target` (built in, or a user's
+///    `CREATE CAST`) decides alone, by its context: an ASSIGNMENT or
+///    IMPLICIT one is a path, an EXPLICIT one is none;
+/// 3. with no row, two array types coerce element by element when their
+///    elements have a path (`array_coerce`); a target `oidvector` or
+///    `int2vector` is never reached this way;
+/// 4. otherwise an assignment to a STRING-category type goes through the
+///    types' I/O functions (`CoerceViaIO`).
+///
+/// A domain is not yet seen through to its base type (`getBaseType`), so a
+/// domain on either side finds no path (RP-556).
+fn assignment_pathway(source: &str, target: &str) -> bool {
+    const INT2VECTOROID: i64 = 22;
+    const OIDVECTOROID: i64 = 30;
+    let (Some(s), Some(t)) = (
+        user_casts::type_oid(&one_array_level(source)),
+        user_casts::type_oid(&one_array_level(target)),
+    ) else {
+        return false;
+    };
+    if s == t {
         return true;
     }
-    let both = |set: &[&str]| set.contains(&from) && set.contains(&to);
-    both(NUMBERS) || both(DATETIMES) || both(&["json", "jsonb"])
+    if let Some((.., context, _)) = pg_casts::BUILTIN_CASTS
+        .iter()
+        .find(|(_, cs, ct, ..)| *cs == s && *ct == t)
+    {
+        return matches!(context, b'a' | b'i');
+    }
+    if let Some(cast) = user_casts::find(source, target) {
+        return matches!(cast.context, 'a' | 'i');
+    }
+    if t != OIDVECTOROID && t != INT2VECTOROID {
+        if let (Some(te), Some(se)) = (array_element_type(target), array_element_type(source)) {
+            if assignment_pathway(se, te) {
+                return true;
+            }
+        }
+    }
+    funcsig::category_of_oid(t) == Some('S')
+}
+
+/// `int4[][]` names the same type as `int4[]`: PostgreSQL records no
+/// dimension count in a type.
+fn one_array_level(name: &str) -> String {
+    let element = name.trim_end_matches("[]");
+    if element.len() == name.len() {
+        name.to_string()
+    } else {
+        format!("{element}[]")
+    }
+}
+
+/// `get_element_type`: the element of a true array type (`typsubscript`
+/// `array_subscript_handler`), which `int2vector` and `oidvector` are too.
+fn array_element_type(name: &str) -> Option<&str> {
+    let element = name.trim_end_matches("[]");
+    if element.len() != name.len() {
+        return Some(element);
+    }
+    match name {
+        "int2vector" => Some("int2"),
+        "oidvector" => Some("oid"),
+        _ => None,
+    }
 }
 
 fn plan_alter_view(a: &pg_query::protobuf::AlterTableStmt, view: &str) -> Result<Statement> {
