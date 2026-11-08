@@ -2313,18 +2313,6 @@ char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
 and `(2, 'abcd', '{abcd}')`. The gap tests are in
 `tests/backlog/test_rp_found_rp570.py`.
 
-- [ ] **A cast to an array with a type modifier ignores the modifier.**
-      `select '{ab}'::char(3)[]` is `{"ab "}` on PostgreSQL 15.19, and
-      `'{abcd}'::char(3)[]`, `array['abcd']::char(3)[]` and
-      `'{abcd}'::varchar(3)[]` are `{abc}`: `array_in` reads at typmod -1
-      and `coerce_type_typmod` then runs the explicit length coercion over
-      each element. `'{1.234}'::numeric(5,2)[]` is `{1.23}` and
-      `'{123456}'::numeric(5,2)[]` 22003. Here every element comes back as
-      written. Since RP-570 a cast to a DOMAIN's array applies the domain's
-      modifier (`domain_array_cast`); `const_value_node` applies a written
-      modifier only to a scalar `bpchar` / `varchar` / `numeric` target.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_cast_to_typmod_array
-      Backlog-ID: RP-579
 - [ ] **A cast of a bare column to a domain with a modifier ignores it.**
       `select t::d570c from t570` is `ab ` and `abc` on PostgreSQL 15.19,
       and `ta::d570c[]` is `{"ab "}` and `{abc}`. Here each value comes

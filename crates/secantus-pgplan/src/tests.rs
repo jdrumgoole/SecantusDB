@@ -5079,3 +5079,59 @@ fn a_row_beside_a_scalar_has_no_operator() {
         }
     }
 }
+
+/// A cast to an array with a modifier on the element type itself is the
+/// explicit length coercion over each element of the array `array_in` read
+/// at typmod -1: char(n) truncates and pads, varchar(n) truncates, numeric
+/// rounds and overflows with apply_typmod's DETAIL, and a NULL element, the
+/// nesting and the bounds are kept (15.19, RP-579, RP-582).
+#[test]
+fn typmod_array_cast_coerces_each_element() {
+    let s = |t: &str| Bson::String(t.to_string());
+    let arr = |items: &[&str]| Bson::Array(items.iter().map(|t| s(t)).collect());
+    let cast = |v: Bson, e: &str, typmod: i32| typmod_array_cast(v, e, typmod);
+    assert_eq!(
+        cast(arr(&["ab", "abcd"]), "bpchar", 7).unwrap(),
+        arr(&["ab ", "abc"])
+    );
+    assert_eq!(
+        cast(arr(&["ab", "abcd"]), "varchar", 7).unwrap(),
+        arr(&["ab", "abc"])
+    );
+    assert_eq!(
+        cast(
+            Bson::Array(vec![arr(&["abcd"]), Bson::Array(vec![Bson::Null])]),
+            "bpchar",
+            6
+        )
+        .unwrap(),
+        Bson::Array(vec![arr(&["ab"]), Bson::Array(vec![Bson::Null])])
+    );
+    let bounded = arrays::bounded(arr(&["abcd", "x"]), &[0]);
+    assert_eq!(
+        cast(bounded, "bpchar", 6).unwrap(),
+        arrays::bounded(arr(&["ab", "x "]), &[0])
+    );
+    let n52 = (5 << 16 | 2) + 4;
+    let Bson::Array(items) = cast(
+        cast_value(s("{1.234}"), "numeric[]").unwrap(),
+        "numeric",
+        n52,
+    )
+    .unwrap() else {
+        panic!("an array");
+    };
+    assert_eq!(numeric::numeric_text(&items[0]).as_deref(), Some("1.23"));
+    let err = cast(
+        cast_value(s("{123456}"), "numeric[]").unwrap(),
+        "numeric",
+        n52,
+    )
+    .unwrap_err();
+    assert_eq!(err.sqlstate(), "22003");
+    assert_eq!(
+        err.to_string(),
+        "numeric field overflow\nDetail: A field with precision 5, scale 2 must round to an \
+         absolute value less than 10^3."
+    );
+}

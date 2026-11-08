@@ -16649,6 +16649,31 @@ pub(crate) fn domain_array_cast(value: &Bson, element: &str) -> Result<Option<Bs
     }
 }
 
+/// An EXPLICIT cast to an array whose element type carries a modifier of
+/// its own (`char(3)[]`, `numeric(5,2)[]`), over the value already read as
+/// that array at typmod -1 (`array_in`). `coerce_type_typmod` of an array is
+/// an `ArrayCoerceExpr` over the element's length coercion function
+/// (`bpchar(bpchar, int4, bool)`, `numeric(numeric, int4)`), explicit, so
+/// every element truncates, pads, rounds or overflows as the scalar cast
+/// does: `'{abcd}'::char(3)[]` is `{abc}` and `'{123456}'::numeric(5,2)[]`
+/// is 22003 (15.19, RP-579). A NULL element stays NULL.
+pub(crate) fn typmod_array_cast(value: Bson, element: &str, typmod: i32) -> Result<Bson> {
+    if arrays::is_bounded(&value) {
+        let lower = arrays::lower_bounds(&value);
+        let out = typmod_array_cast(arrays::strip(&value), element, typmod)?;
+        return Ok(arrays::bounded(out, &lower));
+    }
+    match value {
+        Bson::Array(items) => items
+            .into_iter()
+            .map(|v| typmod_array_cast(v, element, typmod))
+            .collect::<Result<Vec<_>>>()
+            .map(Bson::Array),
+        Bson::Null => Ok(Bson::Null),
+        v => explicit_typmod(v, element, typmod),
+    }
+}
+
 /// [`fit_to_column`] over a bare type and modifier.
 pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     if bits::is_bit_type(pg_type) {
@@ -43246,6 +43271,14 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         if let Some(element) = target.strip_suffix("[]") {
             if let Some(v) = domain_array_cast(&value, element)? {
                 return Ok(v);
+            }
+            // A modifier written on the element type itself (`char(3)[]`)
+            // is the explicit length coercion over each element (RP-579).
+            if let Some(tn) = tc.type_name.as_ref() {
+                let typmod = declared_typmod(tn);
+                if typmod >= 0 {
+                    return typmod_array_cast(cast_value(value, &target)?, element, typmod);
+                }
             }
         }
         let source_value = value.clone();
