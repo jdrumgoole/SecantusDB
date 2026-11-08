@@ -355,6 +355,23 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
+  parse was honoured 0.65 s late once, RP-002's pre-fix signature
+  (2026-11-08).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
+  (RP-002's regression test) failed in CI's `pg-oracle (backlog)` lane on
+  snapshot PR #2480 (`e8272d38`): `cancel honoured 0.65 s after it was
+  sent`, budget 0.25 s. RP-002's own record puts the unfixed bug at about
+  0.6 s on CI, where the lock pass swallowed the cut-short parse and later
+  passes parsed the statement again. So this looks like an intermittent
+  return of that path, not slowness. A rerun of the same commit passed,
+  and the test passed in each of the 30 previous runs of that lane (main,
+  pg-batch-ci, rm-batch-ci). The snapshot carried RM-320, which changed
+  the shared storage crate (a transaction older than an index refuses to
+  write past it). Found by the MongoDB batch; not worked from that side.
+  On a recurrence, capture which passes parsed the statement and when each
+  checked the cancel flag.
+  Backlog-ID: RP-571
+  Verify: none -- intermittent, not reproduced; RP-002's regression test is the check, and it passed on rerun
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
