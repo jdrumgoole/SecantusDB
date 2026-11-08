@@ -126,11 +126,11 @@ _LEFT_BEHIND = {
 }
 
 
-@pytest.mark.backlog("RM-308")
+@pytest.mark.backlog_fixed("RM-308")
 def test_explain_lists_the_projection_a_limit_moved_past(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains `[$project, $limit, $match]` as a read with the
-    limit, then the `$match` and the `$project`; this server lists the
-    `$match` alone."""
+    limit, then the `$match` and the `$project`; this server listed the
+    `$match` alone, having taken the projection into the query."""
     got, want = _explained(rust_mongo, _LEFT_BEHIND), _explained(mongod, _LEFT_BEHIND)
     assert [list(s) for s in want["project_limit_match"][1]] == [["$match"], ["$project"]]
     assert got == want
@@ -175,17 +175,19 @@ def _planned(client: Any, pipeline: list) -> Any:
     return strip(planner.get("winningPlan", {}))
 
 
-@pytest.mark.backlog("RM-369")
+@pytest.mark.backlog_fixed("RM-369")
 @pytest.mark.parametrize(
     "name", ["project_limit_match", "project_skip_match"], ids=["limit", "skip"]
 )
 def test_an_inclusion_projection_keeps_its_int_flags_in_the_plan(
     rust_mongo: Any, mongod: Any, name: str
 ) -> None:
-    """mongod 8.2.11 echoes a projection's own flags in `PROJECTION_SIMPLE`'s
-    `transformBy` -- `{_id: 1, x: 1}` for `{$project: {x: 1}}` -- where this
-    server normalises them to booleans, `{_id: true, x: true}` (measured
-    2026-11-06)."""
+    """mongod 8.2.11 plans `{$project: {x: 1}}` behind a `$limit` / `$skip`
+    and a `$match` with the `transformBy` `{_id: 1, x: 1}`, where this server
+    printed booleans, `{_id: true, x: true}` (measured 2026-11-06). The int
+    flags are not the user's: mongod keeps the `$project` in the pipeline and
+    projects the fields the `$match` and it read, which is what this server
+    now does too (RM-308)."""
     # Canonical extended JSON, because Python's `True == 1`: a plain dict
     # comparison calls an int flag and a boolean one equal, which is the whole
     # difference here.
@@ -194,24 +196,24 @@ def test_an_inclusion_projection_keeps_its_int_flags_in_the_plan(
     assert got == want
 
 
-@pytest.mark.backlog("RM-370")
+@pytest.mark.backlog_fixed("RM-370")
 def test_an_exclusion_projection_is_not_pushed_into_the_plan(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 does not push an EXCLUSION projection into the read: the
     plan of `[{$project: {y: 0}}, {$limit: 3}, {$match: ...}]` is
-    `LIMIT -> COLLSCAN` with no projection stage at all. This server emits a
+    `LIMIT -> COLLSCAN` with no projection stage at all. This server emitted a
     `PROJECTION_SIMPLE` with `{y: false, _id: true}` (measured 2026-11-06)."""
     pipeline = _SHAPING["exclusion_project_limit_match"]
     got, want = _planned(rust_mongo, pipeline), _planned(mongod, pipeline)
     assert got == want
 
 
-@pytest.mark.backlog("RM-371")
+@pytest.mark.backlog_fixed("RM-371")
 def test_a_limit_between_a_reshape_and_a_match_is_still_taken(rust_mongo: Any, mongod: Any) -> None:
     """A `$limit` between an `$addFields` and a `$match` does not stop
     mongod 8.2.11 taking it: `[{$addFields}, {$limit: 3}, {$match}]` reads
     `LIMIT -> COLLSCAN` and lists `[$match, $addFields]`, the `$match` moved
-    ahead of the stage it reads nothing of. This server takes nothing and
-    lists all three stages in their written order (measured 2026-11-06)."""
+    ahead of the stage it reads nothing of. This server took nothing and
+    listed all three stages in their written order (measured 2026-11-06)."""
     pipeline = _SHAPING["addfields_limit_match"]
     assert _planned(rust_mongo, pipeline) == _planned(mongod, pipeline)
     assert _explained(rust_mongo, {"p": pipeline}) == _explained(mongod, {"p": pipeline})

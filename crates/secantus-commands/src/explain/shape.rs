@@ -290,35 +290,92 @@ pub(crate) fn find_and_modify(coll: &str, inner: &Document) -> Result<Shape, Com
     Ok(s)
 }
 
+fn is_paging(stage: &Document) -> bool {
+    stage.contains_key("$skip") || stage.contains_key("$limit")
+}
+
+/// A stage that hands on one document for each it reads: a `$skip` or
+/// `$limit` behind it may go ahead of it (`$score` too, RM-200).
+fn keeps_count(stage: &Document) -> bool {
+    [
+        "$project",
+        "$unset",
+        "$addFields",
+        "$set",
+        "$_secantusScore",
+    ]
+    .iter()
+    .any(|k| stage.contains_key(*k))
+}
+
+/// Whether the query can take every stage in `ahead`, so a `$skip` or
+/// `$limit` pulled up behind them reaches it: its own paging, the
+/// `$match` / `$sort` it takes before any paging, and the stages that keep
+/// the count. A `$match` after a `$limit`, or an `$unwind`, ends it.
+fn query_ahead(ahead: &[Bson]) -> bool {
+    let mut paged = false;
+    ahead.iter().all(|s| {
+        let Some(d) = s.as_document() else {
+            return false;
+        };
+        if is_paging(d) {
+            paged = true;
+            true
+        } else if d.contains_key("$match") || d.contains_key("$sort") || d.contains_key(WINDOW_SORT)
+        {
+            !paged
+        } else {
+            keeps_count(d)
+        }
+    })
+}
+
+/// Moves each `$skip` / `$limit` ahead of the count-keeping stages before
+/// it while the query can take what is ahead of it; whether any moved.
+fn pull_paging(stages: &mut [Bson]) -> bool {
+    let doc = |s: &Bson| s.as_document().cloned().unwrap_or_default();
+    let mut moved = false;
+    let mut i = 1;
+    while i < stages.len() {
+        if is_paging(&doc(&stages[i]))
+            && keeps_count(&doc(&stages[i - 1]))
+            && query_ahead(&stages[..i])
+        {
+            stages.swap(i - 1, i);
+            moved = true;
+            i = (i - 1).max(1);
+        } else {
+            i += 1;
+        }
+    }
+    moved
+}
+
 /// The leading stages of a pipeline the query planner absorbs, folded into
 /// `shape`; the stages it leaves are kept in `shape.rest`.
 pub(crate) fn absorb(shape: &mut Shape, pipeline: &[Document]) {
-    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
-    let hoisted: Vec<Document> = super::hoist::hoist_matches(&stages)
+    // mongod optimises the pipeline to a fixed point (8.2.11): a `$match`
+    // goes ahead of the stages that leave the fields it reads, and a `$skip`
+    // or `$limit` ahead of the stages that keep the number of documents, as
+    // far as the query (`pull_paging`). Each move can open the other:
+    // `[$project, $limit, $match]` reads as `[$limit, $match, $project]`,
+    // so the query takes the `$limit` and the plan projects what the two
+    // stages left read (RM-308); `[$addFields, $limit, $match]` as
+    // `[$limit, $match, $addFields]` (RM-371).
+    let mut stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    loop {
+        stages = super::hoist::hoist_matches(&stages);
+        if !pull_paging(&mut stages) {
+            break;
+        }
+    }
+    let hoisted: Vec<Document> = stages
         .into_iter()
         .filter_map(|s| match s {
             Bson::Document(d) => Some(d),
             _ => None,
         })
         .collect();
-    // A `$skip` or `$limit` behind a `$project` / `$unset` moves ahead of it:
-    // a projection does not change how many documents there are (mongod
-    // 8.2.11, 2026-10-20). Nor does `$score`, whose stages mongod moves a
-    // `$limit` ahead of too (RM-200).
-    let mut hoisted = hoisted;
-    let mut i = 1;
-    while i < hoisted.len() {
-        let paging = hoisted[i].contains_key("$skip") || hoisted[i].contains_key("$limit");
-        let projects = hoisted[i - 1].contains_key("$project")
-            || hoisted[i - 1].contains_key("$unset")
-            || hoisted[i - 1].contains_key("$_secantusScore");
-        if paging && projects {
-            hoisted.swap(i - 1, i);
-            i = i.saturating_sub(1).max(1);
-        } else {
-            i += 1;
-        }
-    }
     let pipeline = hoisted.as_slice();
     let mut filters: Vec<Document> = Vec::new();
     if !shape.filter.is_empty() {
@@ -1097,4 +1154,88 @@ pub(crate) fn echo(inner: &Document, db: &str) -> Document {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{absorb, find, Shape};
+    use bson::{doc, Document};
+
+    fn absorbed(pipeline: Vec<Document>) -> Shape {
+        let mut shape = find("c", &doc! { "find": "c" }).expect("a find shape");
+        absorb(&mut shape, &pipeline);
+        shape
+    }
+
+    /// mongod 8.2.11 reads `[$project, $limit, $match]` as `[$limit,
+    /// $match, $project]`: the query takes the `$limit`, and projects what
+    /// the two stages it leaves read (RM-308).
+    #[test]
+    fn a_match_goes_ahead_of_a_projection_a_limit_moved_past() {
+        let s = absorbed(vec![
+            doc! { "$project": { "x": 1 } },
+            doc! { "$limit": 3 },
+            doc! { "$match": { "x": 1 } },
+        ]);
+        assert_eq!(s.limit, 3);
+        assert_eq!(s.projection, Some(doc! { "_id": 1, "x": 1 }));
+        assert_eq!(
+            s.rest,
+            vec![
+                doc! { "$match": { "x": 1 } },
+                doc! { "$project": { "x": 1 } }
+            ]
+        );
+    }
+
+    /// The same through an `$addFields`, which keeps the number of
+    /// documents too (RM-371).
+    #[test]
+    fn a_limit_goes_ahead_of_a_reshape() {
+        let s = absorbed(vec![
+            doc! { "$addFields": { "w": 1 } },
+            doc! { "$limit": 3 },
+            doc! { "$match": { "x": 1 } },
+        ]);
+        assert_eq!(s.limit, 3);
+        assert_eq!(
+            s.rest,
+            vec![
+                doc! { "$match": { "x": 1 } },
+                doc! { "$addFields": { "w": 1 } }
+            ]
+        );
+    }
+
+    /// A `$limit` moves ahead only as far as the query: not behind an
+    /// `$unwind`, nor behind a `$match` that a `$limit` already keeps out
+    /// of the query (8.2.11).
+    #[test]
+    fn a_limit_stays_where_the_query_cannot_reach_it() {
+        let unwound = absorbed(vec![
+            doc! { "$unwind": "$t" },
+            doc! { "$project": { "x": 1 } },
+            doc! { "$limit": 2 },
+        ]);
+        assert_eq!(unwound.limit, 0);
+        assert_eq!(
+            unwound.rest[1..],
+            [doc! { "$project": { "x": 1 } }, doc! { "$limit": 2 }]
+        );
+        let paged = absorbed(vec![
+            doc! { "$limit": 3 },
+            doc! { "$match": { "x": 1 } },
+            doc! { "$project": { "x": 1 } },
+            doc! { "$limit": 2 },
+        ]);
+        assert_eq!(paged.limit, 3);
+        assert_eq!(
+            paged.rest,
+            vec![
+                doc! { "$match": { "x": 1 } },
+                doc! { "$project": { "x": 1 } },
+                doc! { "$limit": 2 },
+            ]
+        );
+    }
 }
