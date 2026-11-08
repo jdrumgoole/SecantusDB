@@ -301,8 +301,19 @@ pub(crate) fn storage_stats(
     Ok(out)
 }
 
-/// `dataSize`: the bytes and documents of one namespace.
-pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// A `dataSize` request, parsed.
+pub(crate) struct DataSize<'a> {
+    db: String,
+    coll: String,
+    pattern: Option<&'a Document>,
+    bounds: Option<(&'a Document, &'a Document)>,
+    estimate: bool,
+}
+
+/// Parse a `dataSize` as mongod does before it reads anything -- and so
+/// before it takes a lock (RM-185, measured 8.2.11: a malformed namespace,
+/// a wrongly typed field or `min` without `max` takes none).
+pub(crate) fn parse_data_size(doc: &Document) -> Result<DataSize<'_>, CommandError> {
     let ns = match doc.values().next() {
         Some(Bson::String(ns)) => ns.clone(),
         None | Some(Bson::Null) => {
@@ -371,6 +382,25 @@ pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ))
         }
     };
+    Ok(DataSize {
+        db: db.to_string(),
+        coll: coll.to_string(),
+        pattern,
+        bounds,
+        estimate,
+    })
+}
+
+/// `dataSize`: the bytes and documents of one namespace.
+pub fn data_size(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let DataSize {
+        db,
+        coll,
+        pattern,
+        bounds,
+        estimate,
+    } = parse_data_size(doc)?;
+    let (db, coll) = (db.as_str(), coll.as_str());
     let storage = ctx.storage()?;
     // A time-series collection is a view over its buckets to mongod, and
     // `dataSize` refuses a view (measured 8.2.11).

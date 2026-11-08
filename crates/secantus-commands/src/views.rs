@@ -10,6 +10,24 @@
 use crate::{CommandContext, CommandError};
 use bson::{doc, Bson, Document};
 
+/// A database's collections as mongod's catalog holds them: its views are
+/// the documents of `system.views`, a collection like any other, and are no
+/// collections themselves. Unordered.
+pub(crate) fn catalog_collections(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+) -> Result<Vec<String>, CommandError> {
+    let mut colls = storage
+        .list_collections(db)
+        .map_err(crate::util::command_error)?;
+    let has_views = !crate::ts_buckets::view_definitions(storage, db)?.is_empty();
+    if has_views && !colls.iter().any(|c| c == "system.views") {
+        colls.push("system.views".to_string());
+    }
+    colls.retain(|c| c == "system.views" || !is_view(storage, db, c));
+    Ok(colls)
+}
+
 /// Whether `db.coll` is a view.
 pub(crate) fn is_view(storage: &dyn crate::storage::Storage, db: &str, coll: &str) -> bool {
     storage

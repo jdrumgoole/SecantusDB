@@ -550,6 +550,11 @@ pub trait Facts {
     fn index_keys(&self, coll: &str) -> Vec<bson::Document>;
     /// The names of the database's collections and views.
     fn collections(&self) -> Vec<String>;
+    /// The names of the server's databases.
+    fn databases(&self) -> Vec<String>;
+    /// The names of `db`'s collections as mongod's catalog holds them: its
+    /// views left out, and `system.views` in when it has one.
+    fn collections_of(&self, db: &str) -> Vec<String>;
 }
 
 /// [`Facts`] off a server's storage; with none (unit tests), every
@@ -582,6 +587,18 @@ impl Facts for StorageFacts<'_> {
     fn collections(&self) -> Vec<String> {
         self.storage
             .and_then(|s| s.list_collections(self.db).ok())
+            .unwrap_or_default()
+    }
+
+    fn databases(&self) -> Vec<String> {
+        self.storage
+            .and_then(|s| s.list_databases().ok())
+            .unwrap_or_default()
+    }
+
+    fn collections_of(&self, db: &str) -> Vec<String> {
+        self.storage
+            .and_then(|s| crate::views::catalog_collections(s.as_ref(), db).ok())
             .unwrap_or_default()
     }
 }
@@ -827,6 +844,43 @@ pub fn statement_rounds(
             rounds.extend((0..4).map(|_| write_round(Some(c))));
             rounds.push(vec![(Resource::Collection(format!("{db}.{c}")), Ix)]);
             rounds.push(write_round(None));
+            Some(rounds)
+        }
+        // A round on each database it reads, and inside it one on each of
+        // the database's collections -- or the one named, whether or not it
+        // exists -- as it validates it (measured 8.2.11: a view takes none
+        // and `system.views` one; a database that does not exist takes its
+        // own round alone). The request has parsed (`parse_before_locks`).
+        "validateDBMetadata" => {
+            let named = |key: &str| doc.get_str(key).ok().map(str::to_string);
+            let dbs = match named("db") {
+                Some(db) => vec![db],
+                None => facts.databases(),
+            };
+            let existing = facts.databases();
+            let read = |db: &str, coll: Option<&str>| {
+                let mut r = vec![
+                    (Resource::ReplicationStateTransition, Ix),
+                    (Resource::Global, Is),
+                    (Resource::Database(db.to_string()), Is),
+                ];
+                if let Some(c) = coll {
+                    r.push((Resource::Collection(format!("{db}.{c}")), Is));
+                }
+                r
+            };
+            let mut rounds = Vec::new();
+            for db in &dbs {
+                rounds.push(read(db, None));
+                if !existing.contains(db) {
+                    continue;
+                }
+                let colls = match named("collection") {
+                    Some(c) => vec![c],
+                    None => facts.collections_of(db),
+                };
+                rounds.extend(colls.iter().map(|c| read(db, Some(c))));
+            }
             Some(rounds)
         }
         "dbStats" => {
@@ -1647,5 +1701,79 @@ mod tests {
             )
             .is_ok());
         lm.release(other);
+    }
+
+    /// A catalog of two databases, `a` (collections `x`, `y`) and `b` (`z`).
+    struct Catalog;
+
+    impl super::Facts for Catalog {
+        fn exists(&self, _: &str) -> bool {
+            true
+        }
+        fn is_empty(&self, _: &str) -> bool {
+            true
+        }
+        fn index_keys(&self, _: &str) -> Vec<bson::Document> {
+            Vec::new()
+        }
+        fn collections(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn databases(&self) -> Vec<String> {
+            vec!["a".into(), "b".into()]
+        }
+        fn collections_of(&self, db: &str) -> Vec<String> {
+            match db {
+                "a" => vec!["x".into(), "y".into()],
+                "b" => vec!["z".into()],
+                _ => Vec::new(),
+            }
+        }
+    }
+
+    /// Each round's global IS and collection IS, totalled.
+    fn reads(rounds: &[Vec<(super::Resource, super::Mode)>]) -> (usize, Vec<String>) {
+        use super::{Mode, Resource};
+        let globals = rounds
+            .iter()
+            .flatten()
+            .filter(|lock| **lock == (Resource::Global, Mode::Is))
+            .count();
+        let colls = rounds
+            .iter()
+            .flatten()
+            .filter_map(|(r, _)| match r {
+                Resource::Collection(ns) => Some(ns.clone()),
+                _ => None,
+            })
+            .collect();
+        (globals, colls)
+    }
+
+    #[test]
+    fn validate_db_metadata_reads_each_database_and_collection() {
+        use super::statement_rounds;
+        let api = bson::doc! {"version": "1"};
+        let rounds = |doc: bson::Document| statement_rounds(&doc, "a", &Catalog).unwrap();
+        // Every database, and each of its collections.
+        let all = rounds(bson::doc! {"validateDBMetadata": 1, "apiParameters": api.clone()});
+        assert_eq!(
+            reads(&all),
+            (5, vec!["a.x".into(), "a.y".into(), "b.z".into()])
+        );
+        // One database.
+        let one =
+            rounds(bson::doc! {"validateDBMetadata": 1, "db": "a", "apiParameters": api.clone()});
+        assert_eq!(reads(&one), (3, vec!["a.x".into(), "a.y".into()]));
+        // One collection in every database, whether or not it is there.
+        let named = rounds(bson::doc! {
+            "validateDBMetadata": 1, "collection": "q", "apiParameters": api.clone()
+        });
+        assert_eq!(reads(&named), (4, vec!["a.q".into(), "b.q".into()]));
+        // A database that does not exist: its own round alone.
+        let missing = rounds(bson::doc! {
+            "validateDBMetadata": 1, "db": "nosuch", "collection": "q", "apiParameters": api
+        });
+        assert_eq!(reads(&missing), (1, vec![]));
     }
 }

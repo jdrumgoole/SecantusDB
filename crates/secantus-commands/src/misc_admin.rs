@@ -369,40 +369,42 @@ pub fn rotate_certificates(doc: &Document, ctx: &mut CommandContext) -> HandlerR
     Ok(doc! {"ok": 1.0})
 }
 
-/// `validateDBMetadata`: what in the catalog API Version 1 does not allow,
-/// with `apiParameters: {version: "1", strict: true}` (any other API
-/// parameters find nothing). Measured on mongod 8.2.11: a `sparse` or `text`
-/// index is listed as 323; a view whose pipeline, nested ones included, uses
-/// a stage outside the API fails the command with that stage's 323; other
-/// index types, options, validators and collection kinds pass. With no `db`
-/// every database is read, in name order, and a database or collection that
-/// does not exist has nothing to report.
-pub fn validate_db_metadata(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+/// A `validateDBMetadata` request, parsed.
+pub(crate) struct ValidateDbMetadata {
+    pub(crate) db: Option<String>,
+    pub(crate) collection: Option<String>,
+    api: Document,
+}
+
+/// Parse a `validateDBMetadata` as mongod's parser does, before the command
+/// runs and so before it takes a lock (RM-185): its fields in the order
+/// sent, a null one absent, and `apiParameters` a struct of its own whose
+/// `version` is required (measured 8.2.11).
+pub(crate) fn parse_validate_db_metadata(
+    doc: &Document,
+) -> Result<ValidateDbMetadata, CommandError> {
     let mut api = None;
-    let mut db_arg = None;
-    let mut coll_arg = None;
+    let mut db = None;
+    let mut collection = None;
     for (k, v) in doc.iter().skip(1) {
-        match k.as_str() {
-            "apiParameters" => match v {
-                Bson::Document(d) => api = Some(d),
-                other => {
-                    return Err(wrong_type(
-                        "validateDBMetadata.apiParameters",
-                        other,
-                        "object",
-                    ))
-                }
-            },
-            "db" => match v {
-                Bson::String(s) => db_arg = Some(s.clone()),
-                other => return Err(wrong_type("validateDBMetadata.db", other, "string")),
-            },
-            "collection" => match v {
-                Bson::String(s) => coll_arg = Some(s.clone()),
-                other => return Err(wrong_type("validateDBMetadata.collection", other, "string")),
-            },
-            k if crate::params::is_generic_arg(k) => {}
-            k => {
+        match (k.as_str(), v) {
+            ("apiParameters" | "db" | "collection", Bson::Null) => {}
+            ("apiParameters", Bson::Document(d)) => api = Some(api_parameters(d)?),
+            ("apiParameters", other) => {
+                return Err(wrong_type(
+                    "validateDBMetadata.apiParameters",
+                    other,
+                    "object",
+                ))
+            }
+            ("db", Bson::String(s)) => db = Some(s.clone()),
+            ("db", other) => return Err(wrong_type("validateDBMetadata.db", other, "string")),
+            ("collection", Bson::String(s)) => collection = Some(s.clone()),
+            ("collection", other) => {
+                return Err(wrong_type("validateDBMetadata.collection", other, "string"))
+            }
+            (k, _) if crate::params::is_generic_arg(k) => {}
+            (k, _) => {
                 return Err(CommandError::new(
                     40415,
                     "IDLUnknownField",
@@ -418,6 +420,75 @@ pub fn validate_db_metadata(doc: &Document, ctx: &mut CommandContext) -> Handler
             "BSON field 'validateDBMetadata.apiParameters' is missing but a required field",
         ));
     };
+    Ok(ValidateDbMetadata {
+        db,
+        collection,
+        api,
+    })
+}
+
+/// `validateDBMetadata.apiParameters`: `version` a string, and required;
+/// `strict` and `deprecationErrors` booleans, which a null is not; nothing
+/// else (measured 8.2.11).
+fn api_parameters(api: &Document) -> Result<Document, CommandError> {
+    let mut version = false;
+    for (k, v) in api {
+        match (k.as_str(), v) {
+            ("version", Bson::Null) => {}
+            ("version", Bson::String(_)) => version = true,
+            ("version", other) => {
+                return Err(wrong_type(
+                    "validateDBMetadata.apiParameters.version",
+                    other,
+                    "string",
+                ))
+            }
+            ("strict" | "deprecationErrors", Bson::Boolean(_)) => {}
+            ("strict" | "deprecationErrors", other) => {
+                return Err(CommandError::new(
+                    14,
+                    "TypeMismatch",
+                    format!(
+                        "Field '{k}' should be a boolean value, but found: {}",
+                        secantus_core::query::bson_type_name(other)
+                    ),
+                ))
+            }
+            (k, _) => {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!(
+                        "BSON field 'validateDBMetadata.apiParameters.{k}' is an unknown field."
+                    ),
+                ))
+            }
+        }
+    }
+    if !version {
+        return Err(CommandError::new(
+            40414,
+            "IDLFailedToParse",
+            "BSON field 'validateDBMetadata.apiParameters.version' is missing but a required field",
+        ));
+    }
+    Ok(api.clone())
+}
+
+/// `validateDBMetadata`: what in the catalog API Version 1 does not allow,
+/// with `apiParameters: {version: "1", strict: true}` (any other API
+/// parameters find nothing). Measured on mongod 8.2.11: a `sparse` or `text`
+/// index is listed as 323; a view whose pipeline, nested ones included, uses
+/// a stage outside the API fails the command with that stage's 323; other
+/// index types, options, validators and collection kinds pass. With no `db`
+/// every database is read, in name order, and a database or collection that
+/// does not exist has nothing to report.
+pub fn validate_db_metadata(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let ValidateDbMetadata {
+        db: db_arg,
+        collection: coll_arg,
+        api,
+    } = parse_validate_db_metadata(doc)?;
     let strict_v1 = api.get_str("version") == Ok("1") && api.get_bool("strict") == Ok(true);
     let mut errors: Vec<Bson> = Vec::new();
     if strict_v1 {
@@ -471,4 +542,58 @@ pub fn validate_db_metadata(doc: &Document, ctx: &mut CommandContext) -> Handler
         }
     }
     Ok(doc! {"apiVersionErrors": errors, "ok": 1.0})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_validate_db_metadata;
+    use bson::{doc, Bson, Document};
+
+    fn refusal(doc: Document) -> (i32, String) {
+        let e = parse_validate_db_metadata(&doc).err().expect("refused");
+        (e.code, e.errmsg)
+    }
+
+    /// mongod 8.2.11's answers, measured 2026-11-08.
+    #[test]
+    fn validate_db_metadata_parses_api_parameters_as_mongod() {
+        let missing = "is missing but a required field";
+        let (code, msg) = refusal(doc! {"validateDBMetadata": 1, "apiParameters": {}});
+        assert_eq!(code, 40414);
+        assert_eq!(
+            msg,
+            format!("BSON field 'validateDBMetadata.apiParameters.version' {missing}")
+        );
+        let (code, msg) = refusal(doc! {"validateDBMetadata": 1, "apiParameters": Bson::Null});
+        assert_eq!(code, 40414);
+        assert_eq!(
+            msg,
+            format!("BSON field 'validateDBMetadata.apiParameters' {missing}")
+        );
+        let (code, msg) = refusal(doc! {
+            "validateDBMetadata": 1, "apiParameters": {"version": "1", "strict": Bson::Null}
+        });
+        assert_eq!(code, 14);
+        assert_eq!(
+            msg,
+            "Field 'strict' should be a boolean value, but found: null"
+        );
+        let (code, msg) = refusal(doc! {"validateDBMetadata": 1, "apiParameters": {"bogus": 1}});
+        assert_eq!(code, 40415);
+        assert_eq!(
+            msg,
+            "BSON field 'validateDBMetadata.apiParameters.bogus' is an unknown field."
+        );
+        // In the order sent.
+        let (_, msg) = refusal(doc! {
+            "validateDBMetadata": 1, "collection": 1, "apiParameters": {"version": 1}
+        });
+        assert!(msg.contains("'validateDBMetadata.collection'"), "{msg}");
+        // A null `db` is no `db`.
+        let parsed = parse_validate_db_metadata(&doc! {
+            "validateDBMetadata": 1, "db": Bson::Null, "apiParameters": {"version": "1"}
+        })
+        .unwrap();
+        assert_eq!(parsed.db, None);
+    }
 }
