@@ -904,7 +904,13 @@ impl PgHandler {
                     .map(|(o, c)| (crate::transforms::PG_TRANSFORM, o, c)),
             )
             .collect();
-        self.object_comments()
+        // A failed read is the statement's error (`virtual_rows_checked`),
+        // never rows that silently lack its comments.
+        let comments = self.object_comments().unwrap_or_else(|e| {
+            crate::note_catalog_fill_error(e);
+            Vec::new()
+        });
+        comments
             .into_iter()
             .map(|(oid, subid, text)| {
                 // The catalog the object lives in, as `pg_description` keys it.
@@ -1491,6 +1497,9 @@ impl PgHandler {
                                     Bson::Boolean(parents == 0 || declared)
                                 }
                             }
+                            // A system column's statistics target is 0
+                            // (`heap.c`'s `SysAtt`), a user column's -1.
+                            "attstattarget" if int(get(row, "attnum")) < 0 => Bson::Int32(0),
                             "attstattarget" | "attcacheoff" => Bson::Int32(-1),
                             "attbyval" | "attalign" => {
                                 let col = if c == "attbyval" {

@@ -55,7 +55,7 @@ A snapshot of \`$branch\`, frozen on \`$ci\` so the lanes' later pushes don't ca
         pr=${url##*/}
     fi
     echo "$(date '+%T') PR #$pr at ${snap:0:8} ($ahead commits)"
-    out=$(scripts/wait_ci.sh "$pr" 120 2>&1); rc=$?
+    out=$(scripts/wait_ci.sh "$pr" 120 "$snap" 2>&1); rc=$?
     echo "$out" | tail -12
     head=$(gh pr view "$pr" --json headRefOid -q .headRefOid)
     [[ $head == "$snap" ]] || { echo "$ci moved under the wait?"; exit 2; }
@@ -63,7 +63,9 @@ A snapshot of \`$branch\`, frozen on \`$ci\` so the lanes' later pushes don't ca
     # PR's runs of the same sha (#2386 and #2387, 2026-11-06). Judge by this
     # PR's own checks once wait_ci says they all finished.
     if [[ $rc -eq 1 ]]; then
-        bad=$(gh pr checks "$pr" --json name,state -q '[.[]|select(.state!="SUCCESS" and .state!="SKIPPED")]|map(.name)|join(", ")')
+        # No checks reported is not "all passed": it is a run that has not
+        # started, and is judged red.
+        bad=$(gh pr checks "$pr" --json name,state -q 'if length == 0 then "(no checks reported)" else [.[]|select(.state!="SUCCESS" and .state!="SKIPPED")]|map(.name)|join(", ") end')
         if [[ -z $bad ]]; then echo "$(date '+%T') a red run on ${snap:0:8} belongs to another PR; this PR's checks all passed; stopping so it is read before merging"; exit 4; fi
     fi
     if [[ $rc -ne 0 ]]; then echo "$(date '+%T') RED on PR #$pr at ${snap:0:8}: not merging; bisect"; exit 1; fi

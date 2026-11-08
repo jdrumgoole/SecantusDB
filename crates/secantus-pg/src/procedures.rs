@@ -17,8 +17,15 @@ use crate::{
     PgHandler, PlHost,
 };
 
-/// `(output positions, parameter names, parameter types, output values)`.
-pub(crate) type ProcedureOutput = (Vec<usize>, Vec<String>, Vec<String>, Vec<Option<Bson>>);
+/// `(output positions, parameter names, parameter types, output values,
+/// the argument written for each parameter)`.
+pub(crate) type ProcedureOutput = (
+    Vec<usize>,
+    Vec<String>,
+    Vec<String>,
+    Vec<Option<Bson>>,
+    Vec<Option<usize>>,
+);
 
 fn strings(d: &Document, key: &str) -> Vec<String> {
     d.get_array(key)
@@ -30,6 +37,26 @@ fn strings(d: &Document, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every declared parameter's type, OUT ones included.
+fn all_types(d: &Document) -> Vec<String> {
+    let all = strings(d, "all_param_types");
+    if all.is_empty() {
+        strings(d, "param_types")
+    } else {
+        all
+    }
+}
+
+/// Every declared parameter's name, OUT ones included.
+fn all_names(d: &Document) -> Vec<String> {
+    let all = strings(d, "all_params");
+    if all.is_empty() {
+        strings(d, "params")
+    } else {
+        all
+    }
+}
+
 impl PgHandler {
     /// `CALL name(args)`.
     pub(crate) fn call_procedure(
@@ -37,8 +64,10 @@ impl PgHandler {
         name: &str,
         args: Vec<Bson>,
         arg_types: Vec<String>,
+        arg_names: Vec<Option<String>>,
     ) -> PgWireResult<Vec<Response>> {
-        let (outputs, names, types, row) = self.run_procedure(name, args, arg_types)?;
+        let (outputs, names, types, row, _) =
+            self.run_procedure(name, args, arg_types, arg_names)?;
         if outputs.is_empty() {
             return Ok(vec![Response::Execution(Tag::new("CALL"))]);
         }
@@ -75,33 +104,46 @@ impl PgHandler {
         Ok(vec![Response::Query(response)])
     }
 
-    /// Run a procedure: its OUTPUT parameters' positions, every parameter's
-    /// name and type, and the output values (in position order).
-    pub(crate) fn run_procedure(
+    /// The procedure a CALL reaches, as `FuncnameGetCandidates` finds a
+    /// CALL's (`include_out_arguments`): every routine of the name,
+    /// procedure or function, whose parameters -- OUT ones included -- the
+    /// arguments can fill, positionally first and then by name
+    /// (`MatchNamedCall`), with a DEFAULT for each one left out. Then
+    /// `func_get_detail` picks among them by the arguments' types (in the
+    /// order written, `unknown` for an untyped literal); a FUNCTION picked
+    /// is 42809. The procedure's document, and the parameter each argument
+    /// fills.
+    pub(crate) fn resolve_call(
         &self,
         name: &str,
-        args: Vec<Bson>,
-        arg_types: Vec<String>,
-    ) -> PgWireResult<ProcedureOutput> {
+        arg_types: &[String],
+        arg_names: &[Option<String>],
+    ) -> PgWireResult<(Document, Vec<usize>)> {
+        let nargs = arg_types.len();
         let docs = self.user_function_docs()?;
+        let positional = arg_names.iter().take_while(|n| n.is_none()).count();
+        // `func_signature_string`: a named argument shows its name.
         let shown = || {
             format!(
                 "{name}({})",
                 arg_types
                     .iter()
-                    .map(|t| secantus_pgplan::display_type(t))
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let ty = secantus_pgplan::display_type(t);
+                        match arg_names.get(i).cloned().flatten() {
+                            Some(n) if i >= positional => format!("{n} => {ty}"),
+                            _ => ty,
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             )
         };
-        // Every declared parameter, OUT ones included.
-        let all_types = |d: &Document| -> Vec<String> {
-            let all = strings(d, "all_param_types");
-            if all.is_empty() {
-                strings(d, "param_types")
-            } else {
-                all
-            }
+        let fail = |code: &str, message: String, hint: &str| {
+            let mut info = ErrorInfo::new("ERROR".into(), code.into(), message);
+            info.hint = Some(hint.into());
+            PgWireError::UserError(Box::new(info))
         };
         self.require_routine_schema(name)?;
         let functions = self.functions()?;
@@ -109,62 +151,137 @@ impl PgHandler {
             .into_iter()
             .map(|f| f.key.as_str())
             .collect();
-        let procedure = docs.iter().find(|d| {
-            d.get_str("_id").is_ok_and(|id| reached.contains(&id))
-                && d.get_bool("is_procedure").unwrap_or(false)
-                && all_types(d).len() == args.len()
-        });
-        let Some(doc) = procedure else {
-            // A FUNCTION by that name and arity: PostgreSQL's 42809.
-            if docs.iter().any(|d| {
-                d.get_str("_id").is_ok_and(|id| reached.contains(&id))
-                    && !d.get_bool("is_procedure").unwrap_or(false)
-                    && strings(d, "param_types").len() == args.len()
-            }) {
-                let mut info = ErrorInfo::new(
-                    "ERROR".into(),
-                    "42809".into(),
-                    format!("{} is not a procedure", shown()),
-                );
-                info.hint = Some("To call a function, use SELECT.".into());
-                return Err(PgWireError::UserError(Box::new(info)));
+        // Each candidate: its document, the parameter each argument fills,
+        // and those parameters' types in the arguments' order.
+        let mut candidates: Vec<(&Document, Vec<usize>, Vec<String>)> = Vec::new();
+        for d in docs
+            .iter()
+            .filter(|d| d.get_str("_id").is_ok_and(|id| reached.contains(&id)))
+        {
+            let types = all_types(d);
+            let pronargs = types.len();
+            let ndefaults = d
+                .get_array("param_defaults")
+                .map(|a| a.iter().filter(|v| !matches!(v, Bson::Null)).count())
+                .unwrap_or(0);
+            if nargs > pronargs {
+                continue;
             }
-            let mut info = ErrorInfo::new(
-                "ERROR".into(),
-                "42883".into(),
-                format!("procedure {} does not exist", shown()),
-            );
-            info.hint = Some(
-                "No procedure matches the given name and argument types. You might need to \
-                 add explicit type casts."
-                    .into(),
-            );
-            return Err(PgWireError::UserError(Box::new(info)));
+            let mut filled = vec![false; pronargs];
+            let mut numbers = Vec::with_capacity(nargs);
+            for (k, given) in arg_names.iter().enumerate() {
+                let at = match given {
+                    None => Some(k),
+                    Some(n) => all_names(d).iter().position(|p| p == n),
+                };
+                match at {
+                    Some(i) if i < pronargs && !filled[i] => {
+                        filled[i] = true;
+                        numbers.push(i);
+                    }
+                    _ => break,
+                }
+            }
+            // Every parameter left out must be one of the trailing ones
+            // with a DEFAULT.
+            let first_default = pronargs.saturating_sub(ndefaults);
+            if numbers.len() != nargs || filled[..first_default].iter().any(|f| !f) {
+                continue;
+            }
+            let list = numbers.iter().map(|&i| types[i].clone()).collect();
+            candidates.push((d, numbers, list));
+        }
+        // Two candidates the arguments see as the same parameter types (one
+        // of them through its defaults) are ambiguous, whichever is picked.
+        let lists: Vec<Vec<String>> = candidates.iter().map(|c| c.2.clone()).collect();
+        let doubled = |i: usize| lists.iter().filter(|l| **l == lists[i]).count() > 1;
+        use secantus_pgplan::RoutineChoice as C;
+        let chosen = match secantus_pgplan::select_routine(&lists, arg_types) {
+            C::One(i) if !doubled(i) => i,
+            C::One(_) | C::Ambiguous => {
+                return Err(fail(
+                    "42725",
+                    format!("procedure {} is not unique", shown()),
+                    "Could not choose a best candidate procedure. You might need to add \
+                     explicit type casts.",
+                ))
+            }
+            C::None => {
+                return Err(fail(
+                    "42883",
+                    format!("procedure {} does not exist", shown()),
+                    "No procedure matches the given name and argument types. You might need \
+                     to add explicit type casts.",
+                ))
+            }
+            C::Undecided => {
+                return Err(Self::err(&secantus_pgplan::Error::Unsupported(format!(
+                    "choosing among the overloads of {name} for a call over a type with no \
+                     type category here"
+                ))))
+            }
         };
+        let (doc, numbers, _) = &candidates[chosen];
+        if !doc.get_bool("is_procedure").unwrap_or(false) {
+            return Err(fail(
+                "42809",
+                format!("{} is not a procedure", shown()),
+                "To call a function, use SELECT.",
+            ));
+        }
+        Ok(((*doc).clone(), numbers.clone()))
+    }
+
+    /// Run a procedure: its OUTPUT parameters' positions, every parameter's
+    /// name and type, the output values (in position order), and for each
+    /// parameter the argument written for it. The procedure is the one
+    /// [`Self::resolve_call`] finds.
+    pub(crate) fn run_procedure(
+        &self,
+        name: &str,
+        args: Vec<Bson>,
+        arg_types: Vec<String>,
+        arg_names: Vec<Option<String>>,
+    ) -> PgWireResult<ProcedureOutput> {
+        let (doc, numbers) = self.resolve_call(name, &arg_types, &arg_names)?;
+        let doc = &doc;
         let modes = strings(doc, "param_modes");
-        let names = {
-            let all = strings(doc, "all_params");
-            if all.is_empty() {
-                strings(doc, "params")
-            } else {
-                all
-            }
-        };
+        let names = all_names(doc);
         let types = all_types(doc);
+        let defaults: Vec<Option<String>> = doc
+            .get_array("param_defaults")
+            .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        // The argument written for each parameter.
+        let mut sources: Vec<Option<usize>> = vec![None; types.len()];
+        for (k, &i) in numbers.iter().enumerate() {
+            sources[i] = Some(k);
+        }
         // Each argument as its declared type, so a literal `'1'` for an
-        // `int` parameter arrives as the integer.
+        // `int` parameter arrives as the integer; a parameter left out
+        // takes its DEFAULT, evaluated now.
         let tz = self.session_timezone();
-        let mut bound = Vec::with_capacity(args.len());
-        for (i, a) in args.into_iter().enumerate() {
+        let mut args: Vec<Option<Bson>> = args.into_iter().map(Some).collect();
+        let mut bound = Vec::with_capacity(types.len());
+        let mut input = 0;
+        for (i, t) in types.iter().enumerate() {
             let out_only = modes.get(i).is_some_and(|m| m == "o");
-            bound.push(match (&a, types.get(i)) {
-                (Bson::Null, _) => Bson::Null,
+            let a = sources[i].and_then(|k| args[k].take());
+            bound.push(match a {
                 _ if out_only => Bson::Null,
-                (_, Some(t)) => {
+                Some(Bson::Null) => Bson::Null,
+                Some(a) => {
                     secantus_pgplan::cast_value_with_tz(a, t, &tz).map_err(|e| Self::err(&e))?
                 }
-                (_, None) => a,
+                None => match defaults.get(input).cloned().flatten() {
+                    Some(sql) => secantus_pgplan::correlated::evaluate_default(&sql, t)
+                        .map_err(|e| Self::err(&e))?,
+                    None => Bson::Null,
+                },
             });
+            if !out_only {
+                input += 1;
+            }
         }
         let outputs: Vec<usize> = (0..types.len())
             .filter(|i| modes.get(*i).is_some_and(|m| m == "o" || m == "b"))
@@ -221,7 +338,7 @@ impl PgHandler {
             }
         };
         if outputs.is_empty() {
-            return Ok((outputs, names, types, Vec::new()));
+            return Ok((outputs, names, types, Vec::new(), sources));
         }
         let row: Vec<Option<Bson>> = if outputs.len() == 1 {
             vec![Some(value)]
@@ -233,7 +350,7 @@ impl PgHandler {
             .unwrap_or_else(|| vec![Bson::Null; outputs.len()]);
             fields.into_iter().map(Some).collect()
         };
-        Ok((outputs, names, types, row))
+        Ok((outputs, names, types, row, sources))
     }
 }
 
@@ -300,21 +417,22 @@ impl PgHandler {
                 };
                 d
             }
-            None => match by_name.as_slice() {
-                [] => {
-                    return Err(error(
-                        "42883",
-                        format!("could not find a {noun} named \"{name}\""),
-                    ))
+            None => {
+                // With no argument list only the statement's kind is looked
+                // among (`LookupFuncWithArgs`, RP-508).
+                let of_kind: Vec<&str> = Self::routines_of_kind(&functions, name, kind)
+                    .into_iter()
+                    .map(|f| f.key.as_str())
+                    .collect();
+                let found: Vec<&Document> = docs
+                    .iter()
+                    .filter(|d| d.get_str("_id").is_ok_and(|id| of_kind.contains(&id)))
+                    .collect();
+                match found.as_slice() {
+                    [one] => one,
+                    _ => return Err(Self::routine_lookup_error(kind, name, found.len())),
                 }
-                [one] => one,
-                _ => {
-                    return Err(error(
-                        "42725",
-                        format!("{noun} name \"{name}\" is not unique"),
-                    ))
-                }
-            },
+            }
         };
         let is_procedure = target.get_bool("is_procedure").unwrap_or(false);
         let signature = shown(&strings(target, "param_types"));

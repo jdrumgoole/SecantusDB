@@ -71,6 +71,11 @@ struct Scope<'p> {
     /// A USING join's alias (`join b using (x) as u`) with the merged
     /// columns it names.
     using_aliases: Vec<(String, Vec<Column>)>,
+    /// The row type a whole-row reference to an entry of `tables` has, by
+    /// the entry's index: a table's or a view's own composite type, or
+    /// `record` for a FROM subquery or a CTE (an `RTE_SUBQUERY`'s whole-row
+    /// Var is RECORD). An entry not listed is not typed.
+    rowtypes: Vec<(usize, String)>,
 }
 
 impl<'p> Scope<'p> {
@@ -89,6 +94,7 @@ impl<'p> Scope<'p> {
             ctes: ctes.to_vec(),
             merged: Vec::new(),
             using_aliases: Vec::new(),
+            rowtypes: Vec::new(),
         };
         for item in items {
             scope.add(item, ctes, lookup);
@@ -136,7 +142,9 @@ impl<'p> Scope<'p> {
                         let colnames: Vec<_> = (0..aliased.len().max(named.len()))
                             .filter_map(|i| aliased.get(i).or(named.get(i)).cloned())
                             .collect();
-                        self.add_derived(alias, &colnames, q, ctes, lookup, None)
+                        let at = self.tables.len();
+                        self.add_derived(alias, &colnames, q, ctes, lookup, None);
+                        self.row_typed(at, "record");
                     }
                     None => self.complete = false,
                 }
@@ -158,10 +166,14 @@ impl<'p> Scope<'p> {
                     // puts the left items in its namespace, lateral-only).
                     Some(N::SelectStmt(q)) if !alias.is_empty() && rs.lateral => {
                         let left = self.snapshot();
-                        self.add_derived(alias, &colnames, q, ctes, lookup, Some(&left))
+                        let at = self.tables.len();
+                        self.add_derived(alias, &colnames, q, ctes, lookup, Some(&left));
+                        self.row_typed(at, "record");
                     }
                     Some(N::SelectStmt(q)) if !alias.is_empty() => {
-                        self.add_derived(alias, &colnames, q, ctes, lookup, None)
+                        let at = self.tables.len();
+                        self.add_derived(alias, &colnames, q, ctes, lookup, None);
+                        self.row_typed(at, "record");
                     }
                     _ => self.complete = false,
                 }
@@ -180,6 +192,7 @@ impl<'p> Scope<'p> {
                             .map(|a| a.aliasname.clone())
                             .filter(|a| !a.is_empty())
                             .unwrap_or_else(|| r.relname.clone());
+                        self.rowtypes.push((self.tables.len(), name.clone()));
                         self.tables.push((alias, def));
                     }
                     // A view: an RTE_SUBQUERY over its stored query, whose
@@ -205,7 +218,9 @@ impl<'p> Scope<'p> {
                                 self.complete = false;
                             } else {
                                 VIEW_DEPTH.with(|d| d.set(depth + 1));
+                                let at = self.tables.len();
                                 self.add_derived(alias, &colnames, &q, &[], lookup, None);
+                                self.row_typed(at, &name);
                                 VIEW_DEPTH.with(|d| d.set(depth));
                             }
                         }
@@ -321,6 +336,7 @@ impl<'p> Scope<'p> {
                                 c.name = n;
                             }
                             self.tables.truncate(start);
+                            self.rowtypes.retain(|(i, _)| *i < start);
                             self.merged.retain(|(_, r)| r.start < start);
                             self.using_aliases.clear();
                             self.tables.push((
@@ -336,6 +352,51 @@ impl<'p> Scope<'p> {
         }
     }
 
+    /// The derived table `add_derived` just added at `at`, if it added one,
+    /// has whole rows of type `ty`.
+    fn row_typed(&mut self, at: usize, ty: &str) {
+        if self.tables.len() == at + 1 {
+            self.rowtypes.push((at, ty.to_string()));
+        }
+    }
+
+    /// The row type of a whole-row reference -- `t` naming a FROM item and
+    /// no column, or `t.*` -- as `transformWholeRowRef` types its Var, or
+    /// `None` when it is not one or this cannot tell. A column of that name
+    /// is the column (`colNameToVar` comes first).
+    fn whole_row_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
+        let (name, star) = match c.fields.as_slice() {
+            [f] => match f.node.as_ref() {
+                Some(N::String(s)) => (s.sval.as_str(), false),
+                _ => return None,
+            },
+            [f, g] if matches!(g.node.as_ref(), Some(N::AStar(_))) => match f.node.as_ref() {
+                Some(N::String(s)) => (s.sval.as_str(), true),
+                _ => return None,
+            },
+            _ => return None,
+        };
+        // A bare name is a column first, at every level out
+        // (`transformColumnRef` tries `colNameToVar` before a relation).
+        if !star && self.knows(name) != Some(false) {
+            return None;
+        }
+        let mut hits = self
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, (a, _))| a == name);
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => self
+                .rowtypes
+                .iter()
+                .find(|(at, _)| *at == i)
+                .map(|(_, t)| t.clone()),
+            (None, _) if self.complete => self.parent?.whole_row_type(c),
+            _ => None,
+        }
+    }
+
     /// This scope as it stands, for a LATERAL item to see the ones before it.
     fn snapshot(&self) -> Scope<'p> {
         Scope {
@@ -347,6 +408,7 @@ impl<'p> Scope<'p> {
             ctes: self.ctes.clone(),
             merged: self.merged.clone(),
             using_aliases: self.using_aliases.clone(),
+            rowtypes: self.rowtypes.clone(),
         }
     }
 
@@ -472,6 +534,15 @@ impl<'p> Scope<'p> {
             Some(p) => p.knows(name),
             None => Some(false),
         }
+    }
+
+    /// Is `name` the reference name of a FROM item here or in an enclosing
+    /// scope? A bare name no column has is then that item's whole row, as
+    /// `transformColumnRef` falls back to `refnameNamespaceItem` (RP-532).
+    fn names_item(&self, name: &str) -> bool {
+        self.tables.iter().any(|(a, _)| a == name)
+            || self.using_aliases.iter().any(|(a, _)| a == name)
+            || self.parent.is_some_and(|p| p.names_item(name))
     }
 
     fn column_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
@@ -1112,6 +1183,16 @@ fn mismatch(op: &str, l: &str, r: &str, location: i32) -> Error {
     ))
 }
 
+/// The operators `pg_operator` has over `(record, record)` in PostgreSQL
+/// 15: `record_eq` .. `record_ge` and their `record_image_*` forms. (`!=`
+/// is the parser's spelling of `<>`.)
+fn is_record_operator(op: &str) -> bool {
+    matches!(
+        op,
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "*=" | "*<>" | "*<" | "*<=" | "*>" | "*>="
+    )
+}
+
 /// Check one `AExpr`: both sides typed, and no operator between them.
 fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
     use pg_query::protobuf::AExprKind as K;
@@ -1150,7 +1231,10 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         // any other TYPED operand (`c = d::text`) there is none (42883).
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
         if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
-            let is_enum = |t: &str| crate::user_enum(t).is_some();
+            // A composite is installed among the user types with no labels
+            // (`set_user_types`), so `user_enum` answers for it too: it is
+            // not an enum, and two composites are `record`'s (RP-590).
+            let is_enum = |t: &str| crate::user_enum(t).is_some() && user_composite(t).is_none();
             if (is_enum(&l) || is_enum(&r))
                 && l != r
                 && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
@@ -1179,15 +1263,90 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
-    // A COMPOSITE has only the record operators, and those only against the
-    // same type: beside any other typed operand there is no operator at all
-    // (`integer + point_t`, `point_t = integer`), and a user cast never
-    // supplies one.
-    if kind == Some(K::AexprOp) {
+    // A ROW beside a typed operand that is not one: no operator (RP-530).
+    if matches!(
+        kind,
+        Some(K::AexprOp | K::AexprDistinct | K::AexprNotDistinct | K::AexprNullif)
+    ) {
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            // `ROW(...) op (SELECT ...)` is a row comparison SubLink, not an
+            // operator (`transformAExprOp`): its subquery's width is checked
+            // against the row (`(1, 2) = (select 1)` is 42601).
+            let row_compare = kind == Some(K::AexprOp)
+                && matches!(l.node.as_ref(), Some(N::RowExpr(_)))
+                && matches!(r.node.as_ref(), Some(N::SubLink(_)));
+            if !row_compare {
+                row_against_non_row(&op, l, r, e.location, scope)?;
+            }
+        }
+    }
+    if kind == Some(K::AexprIn) {
+        if let (Some(l), Some(N::List(items))) = (
+            e.lexpr.as_deref(),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            // `transformAExprIn` falls back to one `=` (`<>` for NOT IN)
+            // per item, in the list's order.
+            for item in &items.items {
+                row_against_non_row(&op, l, item, e.location, scope)?;
+            }
+        }
+    }
+    // `fs <> ALL (ARRAY[1])` and `fs = ANY (int_array)`: the row against
+    // the array's element type (`make_scalar_array_op`).
+    if matches!(kind, Some(K::AexprOpAny | K::AexprOpAll)) {
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            if let Some(row) = row_operand_type(l, scope) {
+                let element = match r.node.as_ref() {
+                    Some(N::AArrayExpr(a)) if !a.elements.is_empty() => {
+                        common_type(&a.elements.iter().collect::<Vec<_>>(), scope)
+                    }
+                    // A cast to an array type (`'{1}'::int[]`), which
+                    // `operand_type` leaves untyped, or a typed array.
+                    Some(N::TypeCast(tc)) => tc
+                        .type_name
+                        .as_ref()
+                        .map(type_name_of)
+                        .and_then(|t| t.strip_suffix("[]").map(str::to_string)),
+                    _ => operand_type_declared(r, scope)
+                        .and_then(|t| t.strip_suffix("[]").map(str::to_string)),
+                };
+                if let Some(t) = element.filter(|t| t != "record" && user_composite(t).is_none()) {
+                    let op = if op == "!=" { "<>" } else { op.as_str() };
+                    return Err(mismatch(op, &row, &t, e.location));
+                }
+            }
+        }
+    }
+    // `fs BETWEEN 1 AND 2` is `fs >= 1 AND fs <= 2` (NOT: `<` and `>`).
+    if matches!(kind, Some(K::AexprBetween | K::AexprNotBetween)) {
+        if let (Some(l), Some(N::List(bounds))) = (
+            e.lexpr.as_deref(),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            let ops = if kind == Some(K::AexprBetween) {
+                [">=", "<="]
+            } else {
+                ["<", ">"]
+            };
+            for (b, op) in bounds.items.iter().zip(ops) {
+                row_against_non_row(op, l, b, e.location, scope)?;
+            }
+        }
+    }
+    // A COMPOSITE has only the record operators. Those take `record` on
+    // both sides, which every composite coerces to, so two DIFFERENT
+    // composite types still compare (`ct = ct2` is `record_eq`, RP-590),
+    // and `record_eq` / `record_cmp` check the field types they reach when
+    // the statement runs (`record_compare`). Any other operator between two
+    // composite types has no candidate (`ct + ct2`), and a user cast never
+    // supplies one. A composite beside a value that is not a row is
+    // `row_against_non_row`'s.
+    if kind == Some(K::AexprOp) && !is_record_operator(&op) {
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
         if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
             let composite = |t: &str| user_composite(t).is_some();
-            if (composite(&l) || composite(&r))
+            if (composite(&l) && composite(&r))
                 && user_casts::type_oid(&l) != user_casts::type_oid(&r)
                 && l != "record"
                 && r != "record"
@@ -1815,6 +1974,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                     ctes: cx.ctes.clone(),
                     merged: Vec::new(),
                     using_aliases: Vec::new(),
+                    rowtypes: Vec::new(),
                 };
                 for side in j.larg.iter().chain(j.rarg.iter()) {
                     on.add(side, &cx.ctes, cx.lookup);
@@ -1915,9 +2075,126 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 check_select(sel, &cx.ctes, cx.lookup, rs.lateral.then_some(scope))?;
             }
         }
+        N::AIndirection(ind) => {
+            if let Some(arg) = ind.arg.as_deref() {
+                walk(arg, scope, cx)?;
+                column_notation_on_base_type(ind, arg, scope)?;
+            }
+        }
         _ => {}
     }
     Ok(())
+}
+
+/// `(expr).field` or `(expr).*` over a value of a base type is refused when
+/// the statement is analysed, whatever the rows: `transformIndirection` hands
+/// a field name to `ParseFuncOrColumn`, whose column notation over a type
+/// that is not composite is 42809 `column notation .t applied to type
+/// integer, which is not a composite type` at the operand
+/// (`exprLocation`), and `ExpandRowReference` refuses a star with `type
+/// integer is not composite`, with no position. A function with one OUT
+/// parameter returns that parameter's type, a scalar (`(gto()).t`, RP-483).
+///
+/// Only a type known to be a built-in base type (or an array, never
+/// composite) is judged; a record, a composite, a domain over one, a user
+/// type or a type this pass cannot settle is left to the planner. A `$n`
+/// is left too: the server's own rewrites bind values through parameters
+/// whose declared type is not always the value's.
+fn column_notation_on_base_type(
+    ind: &pg_query::protobuf::AIndirection,
+    arg: &pg_query::protobuf::Node,
+    scope: &Scope,
+) -> Result<()> {
+    let field = match ind.indirection.first().and_then(|i| i.node.as_ref()) {
+        Some(N::String(s)) => Some(s.sval.as_str()),
+        Some(N::AStar(_)) => None,
+        _ => return Ok(()),
+    };
+    let Some(ty) = notation_operand_type(arg, scope) else {
+        return Ok(());
+    };
+    let ty = crate::domains::domain_base(&ty).unwrap_or(ty);
+    if crate::pgtypes::PSEUDO_TYPES.iter().any(|(_, n)| *n == ty)
+        || crate::pgtypes::oid_of_name(&ty).is_none()
+    {
+        return Ok(());
+    }
+    let shown = crate::display_type(&ty);
+    match field {
+        Some(field) => {
+            if let Some(loc) = crate::expr_location(arg) {
+                set_error_location(loc);
+            }
+            Err(Error::Sqlstate(
+                "42809",
+                format!(
+                    "column notation .{field} applied to type {shown}, which is not a composite type"
+                ),
+            ))
+        }
+        None => Err(Error::Sqlstate(
+            "42809",
+            format!("type {shown} is not composite"),
+        )),
+    }
+}
+
+/// The type of a column notation's operand, where this pass knows it: a
+/// user function's call is of its declared result type (its one OUT
+/// parameter's, for a function with one), a cast of the type it names, an
+/// `ARRAY[...]` of its elements' type's array, anything else as
+/// [`operand_type`] types it.
+fn notation_operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    match n.node.as_ref()? {
+        N::ParamRef(_) => None,
+        N::FuncCall(f) => {
+            let name = func_name(f)?;
+            if !correlated::user_function_named(&name) {
+                if let Some(t) = operand_type(n, scope) {
+                    return Some(t);
+                }
+                // A set-returning built-in's element type (`unnest`,
+                // `generate_series`), which `operand_type` leaves alone.
+                if f.over.is_some() || f.agg_star || f.funcname.len() > 2 {
+                    return None;
+                }
+                let args = f
+                    .args
+                    .iter()
+                    .map(|a| match a.node.as_ref() {
+                        Some(N::AConst(c))
+                            if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))) =>
+                        {
+                            Some(String::new())
+                        }
+                        _ => notation_operand_type(a, scope),
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                return crate::funcsig::set_result_type(&name, &args);
+            }
+            if f.over.is_some() || f.agg_star || !f.agg_order.is_empty() {
+                return None;
+            }
+            let u = correlated::user_function_for(&name, &f.args)?;
+            (u.columns.len() <= 1).then(|| u.return_type.clone())
+        }
+        N::TypeCast(tc) => Some(type_name_of(tc.type_name.as_ref()?)),
+        // A multidimensional array is of the same array type as its
+        // elements (`ARRAY[ARRAY[1]]` is `integer[]`).
+        N::AArrayExpr(a) => {
+            let mut types = a.elements.iter().map(|e| notation_operand_type(e, scope));
+            let first = types.next()??;
+            if !types.all(|t| t.as_deref() == Some(first.as_str())) {
+                return None;
+            }
+            Some(if first.ends_with("[]") {
+                first
+            } else {
+                format!("{first}[]")
+            })
+        }
+        _ => operand_type(n, scope),
+    }
 }
 
 fn check_select(
@@ -2532,6 +2809,7 @@ fn having_names_resolve(h: &pg_query::protobuf::Node, scope: &Scope) -> Result<(
                 if let Some(N::String(name)) = f.node.as_ref() {
                     if !SYSTEM.contains(&name.sval.as_str())
                         && scope.knows(&name.sval) == Some(false)
+                        && !scope.names_item(&name.sval)
                     {
                         missing = Some((name.sval.clone(), c.location));
                     }
@@ -2557,6 +2835,13 @@ fn having_names_resolve(h: &pg_query::protobuf::Node, scope: &Scope) -> Result<(
 /// server answered with whichever value came first). Untyped literals and
 /// NULLs take the common type; a part of a type this cannot judge skips the
 /// check.
+///
+/// A whole row is of its relation's composite type (category C), a
+/// `ROW(...)` or a subquery's whole row of `record` (a pseudo-type,
+/// category P), so the two do not meet (`greatest(fs, (2, 'a'::text))`).
+/// Once every part is of one category, each is coerced to the common
+/// type (`coerce_to_common_type`), and a composite has no implicit cast to
+/// another: `coalesce(fs, ft)` is 42846 at `ft`, after the category pass.
 fn common_type_check(
     label: &str,
     parts: &[&pg_query::protobuf::Node],
@@ -2564,21 +2849,22 @@ fn common_type_check(
 ) -> Result<()> {
     use pg_query::protobuf::a_const::Val;
     let mut first: Option<(String, &'static str)> = None;
+    let mut typed: Vec<(&pg_query::protobuf::Node, String, &'static str)> = Vec::new();
     for p in parts {
         if matches!(p.node.as_ref(), Some(N::AConst(c)) if c.isnull || matches!(c.val, Some(Val::Sval(_))))
         {
             continue;
         }
-        let Some(t) = operand_type(p, scope) else {
+        let Some(t) = operand_type(p, scope).or_else(|| row_part_type(p, scope)) else {
             return Ok(());
         };
-        let Some(cat) = category(&t) else {
+        let Some(cat) = part_category(&t) else {
             return Ok(());
         };
         match &first {
-            None => first = Some((t, cat)),
+            None => first = Some((t.clone(), cat)),
             Some((pt, pc)) if *pc != cat => {
-                if let Some(loc) = expr_location(p) {
+                if let Some(loc) = part_location(p) {
                     set_error_location(loc);
                 }
                 return Err(Error::DatatypeMismatch(format!(
@@ -2589,8 +2875,127 @@ fn common_type_check(
             }
             Some(_) => {}
         }
+        typed.push((p, t, cat));
+    }
+    if let Some((pt, "composite")) = &first {
+        // One composite type by its oid, however its name was written.
+        let oid = |t: &str| crate::user_composite(t).map(|(oid, _)| oid);
+        let common = oid(pt);
+        if let Some((p, t, _)) = typed
+            .iter()
+            .find(|(_, t, _)| common.is_some() && oid(t) != common)
+        {
+            if let Some(loc) = part_location(p) {
+                set_error_location(loc);
+            }
+            return Err(Error::CannotCoerce(format!(
+                "{label} could not convert type {} to {}",
+                display_type(t),
+                display_type(pt)
+            )));
+        }
     }
     Ok(())
+}
+
+/// The type of a part `operand_type` leaves untyped that is a row: a
+/// whole-row reference, or a `ROW(...)` (`record`).
+fn row_part_type(p: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    match p.node.as_ref()? {
+        N::ColumnRef(c) => scope.whole_row_type(c),
+        N::RowExpr(_) => Some("record".into()),
+        _ => None,
+    }
+}
+
+/// The row type of an operand that is a row: a table's or a view's whole
+/// row (its composite type), a `ROW(...)` or a FROM subquery's whole row
+/// (`record`), or a value of a composite type (`row(1)::ct`, a column of
+/// one). `None` for anything else, or what this cannot type.
+fn row_operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    row_part_type(n, scope).or_else(|| {
+        operand_type_declared(n, scope).filter(|t| t == "record" || user_composite(t).is_some())
+    })
+}
+
+/// A row beside a typed operand that is not a row has no operator. The
+/// operators that take a row are `record`'s comparisons, each against
+/// another row, and the polymorphic ones; of those only `anynonarray ||
+/// text` (and `text || anynonarray`) can take a row beside a scalar, and
+/// `||` beside an array may be `anycompatible || anycompatiblearray`. So
+/// `fs = 1`, `(1,2) < 1::bigint`, `fs <@ int4range(1,2)`, `nullif(fs, 1)`
+/// and `fs in (fs, 1)` are 42883 naming the two types as written (a domain
+/// by its own name) at the operator, as `make_op` reports them when the
+/// statement is analysed -- over no row too. The lowering compared a
+/// document with the scalar at run time (0A000 `comparing document with
+/// int32`) or, over no row or a NULL, answered; `fs || 1` concatenated.
+/// An untyped literal is left alone: it is read as the row's type.
+fn row_against_non_row(
+    op: &str,
+    l: &pg_query::protobuf::Node,
+    r: &pg_query::protobuf::Node,
+    location: i32,
+    scope: &Scope,
+) -> Result<()> {
+    // A scalar subquery of more than one column is `transformSubLink`'s
+    // 42601 first, before any operator is looked up.
+    let wide = |n: &pg_query::protobuf::Node| {
+        matches!(n.node.as_ref(), Some(N::SubLink(sl))
+            if matches!(sl.subselect.as_deref().and_then(|s| s.node.as_ref()),
+                Some(N::SelectStmt(s)) if s.target_list.len() != 1))
+    };
+    if wide(l) || wide(r) {
+        return Ok(());
+    }
+    let (lr, rr) = (row_operand_type(l, scope), row_operand_type(r, scope));
+    let (Some(lt), Some(rt)) = (
+        lr.clone().or_else(|| operand_type_declared(l, scope)),
+        rr.clone().or_else(|| operand_type_declared(r, scope)),
+    ) else {
+        return Ok(());
+    };
+    if lr.is_some() == rr.is_some() {
+        return Ok(());
+    }
+    let other = if lr.is_some() { &rt } else { &lt };
+    if other == "unknown" {
+        return Ok(());
+    }
+    if op == "||" {
+        let base = crate::domains::domain_base(other).unwrap_or_else(|| other.clone());
+        if category(&base) == Some("string") || base.ends_with("[]") {
+            return Ok(());
+        }
+    }
+    let op = if op == "!=" { "<>" } else { op };
+    Err(mismatch(op, &lt, &rt, location))
+}
+
+/// A part's type category: a built-in one `category` knows, `record`'s
+/// pseudo-type category, or a composite type's (a table's or a view's row
+/// type, a `CREATE TYPE ... AS`).
+fn part_category(t: &str) -> Option<&'static str> {
+    if t == "record" {
+        return Some("pseudo");
+    }
+    category(t).or_else(|| crate::user_composite(t).map(|_| "composite"))
+}
+
+/// Where `select_common_type` reports a part: `exprLocation` of the part
+/// as analysed. A `ROW(...)` cast to a composite becomes a new RowExpr at
+/// the cast (`coerce_record_to_complex`), so `row(0, 'a')::fs` is
+/// reported at its `::`.
+fn part_location(p: &pg_query::protobuf::Node) -> Option<i32> {
+    if let Some(N::TypeCast(tc)) = p.node.as_ref() {
+        if matches!(
+            tc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::RowExpr(_))
+        ) && tc.location >= 0
+        {
+            return Some(tc.location);
+        }
+    }
+    expr_location(p)
 }
 
 /// `coerce_to_boolean`: a clause of a typed, non-boolean built-in type --

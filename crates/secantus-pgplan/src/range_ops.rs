@@ -649,12 +649,52 @@ fn one_range_key(r: &Range, element: &str) -> String {
     )
 }
 
+/// An `oidvector`'s order key: a string whose order is `btoidvectorcmp`'s,
+/// the opclass support function of `oidvector_ops` behind `oidvectorlt` ..
+/// `oidvectorge` -- the shorter vector first ("We arbitrarily choose to sort
+/// first by vector length"), then oid by oid, each unsigned. Eight hex
+/// digits of the length, then eight of each oid, so every key of one length
+/// is as long as every other. After a `|` (which no hex digit sorts past
+/// within a key of the same length) the vector's own text, which
+/// `greatest` / `least` read the value back from (RP-603).
+fn oidvector_key(v: &Bson) -> Result<Bson> {
+    let Bson::Array(items) = crate::cast_value(v.clone(), "oidvector")? else {
+        return Err(Error::Unsupported(
+            "an oidvector that is not an array".into(),
+        ));
+    };
+    let oids = items
+        .iter()
+        .map(|item| match item {
+            Bson::Int32(n) => Ok(*n as u32),
+            Bson::Int64(n) => u32::try_from(*n)
+                .or_else(|_| i32::try_from(*n).map(|n| n as u32))
+                .map_err(|_| Error::Unsupported(format!("an oid out of range: {n}"))),
+            other => Err(Error::Unsupported(format!(
+                "an oidvector element that is not an oid: {other}"
+            ))),
+        })
+        .collect::<Result<Vec<u32>>>()?;
+    let mut key = format!("{:08x}", oids.len());
+    for oid in &oids {
+        key.push_str(&format!("{oid:08x}"));
+    }
+    key.push('|');
+    let text: Vec<String> = oids.iter().map(u32::to_string).collect();
+    key.push_str(&text.join(" "));
+    Ok(Bson::String(key))
+}
+
 /// `__range_sortkey(value, type)`: a string whose order is `range_cmp` for a
 /// range, `multirange_cmp` for a multirange (range by range, a shorter one
-/// first) and `charlt` for a `"char"`, so ORDER BY can sort the value by it.
+/// first), `charlt` for a `"char"` and `btoidvectorcmp` for an `oidvector`,
+/// so ORDER BY can sort the value by it.
 pub fn sort_key(v: &Bson, ty: &str) -> Result<Bson> {
     if *v == Bson::Null {
         return Ok(Bson::Null);
+    }
+    if ty == "oidvector" {
+        return oidvector_key(v);
     }
     // A `"char"`: its one byte, which its text spells `\ooo` when the high
     // bit is set (and as nothing for the zero byte).

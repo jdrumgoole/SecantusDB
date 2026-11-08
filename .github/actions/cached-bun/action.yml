@@ -1,0 +1,130 @@
+name: cached-bun
+description: >
+  Provide the Bun binary anthropics/claude-code-action runs on, from the
+  Actions cache, so the action can be given `path_to_bun_executable` and skip
+  its own download. Linux runners only. Use it in a job that also runs
+  claude-code-action: the Bun version is read from that action's own
+  action.yml, so it follows the action when dependabot bumps it.
+
+# Why (2026-11-08): claude-code-action installs Bun with setup-bun on every
+# run, with setup-bun's cache disabled (its upstream issue #1252), so every
+# run downloads it from github.com/oven-sh/bun releases. That download
+# answered HTTP 504 for six minutes and failed `claude-review` on PRs #2483
+# and #2488 before any review ran.
+#
+# Which scope saves it: a cache saved by a pull_request run is readable by
+# that PR alone, and claude-review only runs on PRs. The nightly
+# security-review (schedule) and @claude (issue_comment) runs are on the
+# default branch, so the entry they save is the one every PR restores. A PR
+# that misses downloads once and saves for its own reruns.
+#
+# A downloaded zip is checked against the release's SHASUMS256.txt before it
+# is cached. A PR's save cannot reach main's scope, so a PR cannot plant a
+# binary that the default-branch workflows restore.
+
+outputs:
+  path:
+    description: "Absolute path of the bun executable"
+    value: ${{ steps.dir.outputs.bin }}
+
+runs:
+  using: composite
+  steps:
+    - name: Read the Bun version claude-code-action pins
+      id: dir
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Every action a job uses is downloaded at "Set up job", under
+        # <work>/_actions/<owner>/<repo>/<ref>/.
+        shopt -s nullglob
+        files=("${RUNNER_WORKSPACE%/*}"/_actions/anthropics/claude-code-action/*/action.yml)
+        if [ "${#files[@]}" -ne 1 ]; then
+          echo "::error::expected one claude-code-action checkout under ${RUNNER_WORKSPACE%/*}/_actions, found ${#files[@]}"
+          exit 1
+        fi
+        ver=$(sed -n 's/^ *bun-version: *\([0-9][0-9.]*\).*$/\1/p' "${files[0]}" | head -1)
+        if [ -z "$ver" ]; then
+          echo "::error::no bun-version in ${files[0]}"
+          exit 1
+        fi
+        case "$RUNNER_ARCH" in
+          X64)   asset=bun-linux-x64; grep -qw avx2 /proc/cpuinfo || asset=bun-linux-x64-baseline ;;
+          ARM64) asset=bun-linux-aarch64 ;;
+          *) echo "::error::no Bun build for $RUNNER_ARCH"; exit 1 ;;
+        esac
+        d="$HOME/.cache/secantus-bun/$ver-$asset"
+        {
+          echo "version=$ver"
+          echo "asset=$asset"
+          echo "dir=$d"
+          echo "bin=$d/bun"
+          echo "key=bun-$RUNNER_OS-$asset-$ver-v1"
+        } >> "$GITHUB_OUTPUT"
+        echo "Bun $ver ($asset), pinned by ${files[0]}"
+
+    - name: Restore Bun
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.dir.outputs.dir }}
+        key: ${{ steps.dir.outputs.key }}
+
+    - name: Download Bun
+      if: steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        VER: ${{ steps.dir.outputs.version }}
+        ASSET: ${{ steps.dir.outputs.asset }}
+        DIR: ${{ steps.dir.outputs.dir }}
+      run: |
+        set -euo pipefail
+        base="https://github.com/oven-sh/bun/releases/download/bun-v$VER"
+        tmp="$RUNNER_TEMP/bun-download"
+        rm -rf "$tmp" && mkdir -p "$tmp"
+        # The 504s lasted minutes, so back off for longer than curl's own
+        # retries would on their own.
+        fetch() {
+          for attempt in 1 2 3 4; do
+            if curl --fail --silent --show-error --location --max-time 120 \
+                 --retry 3 --retry-all-errors --retry-delay 10 -o "$2" "$1"; then
+              return 0
+            fi
+            if [ "$attempt" -lt 4 ]; then
+              echo "download of $1: attempt $attempt failed; retrying in $((attempt * 30))s"
+              sleep $((attempt * 30))
+            fi
+          done
+          echo "::error::download of $1 failed after 4 attempts"
+          return 1
+        }
+        fetch "$base/$ASSET.zip" "$tmp/$ASSET.zip"
+        fetch "$base/SHASUMS256.txt" "$tmp/SHASUMS256.txt"
+        (cd "$tmp" && grep " $ASSET.zip\$" SHASUMS256.txt | sha256sum --check --strict)
+        unzip -q "$tmp/$ASSET.zip" -d "$tmp"
+        mkdir -p "$DIR"
+        install -m 0755 "$tmp/$ASSET/bun" "$DIR/bun"
+        rm -rf "$tmp"
+
+    - name: Check Bun runs
+      shell: bash
+      env:
+        BIN: ${{ steps.dir.outputs.bin }}
+        VER: ${{ steps.dir.outputs.version }}
+      run: |
+        set -euo pipefail
+        got=$("$BIN" --version)
+        if [ "$got" != "$VER" ]; then
+          echo "::error::$BIN reports $got, expected $VER"
+          exit 1
+        fi
+        echo "bun $got at $BIN"
+
+    # Saved straight after the download rather than at job end, so a review
+    # that fails later still leaves the binary cached.
+    - name: Save Bun
+      if: steps.restore.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.dir.outputs.dir }}
+        key: ${{ steps.dir.outputs.key }}

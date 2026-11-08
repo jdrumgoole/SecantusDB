@@ -1879,6 +1879,24 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             for a in args.iter().filter(|a| *a != &Bson::Null) {
                 best = Some(match best {
                     None => a.clone(),
+                    // Records order by `record_cmp`, called as
+                    // `ExecEvalMinMax` calls it, (current, next), so its
+                    // field checks name the two in that order.
+                    Some(cur) if crate::record_fields(a).is_some() => {
+                        match crate::record_cmp(&cur, a) {
+                            Some(o) => {
+                                let o = o?;
+                                if (name == "greatest" && o == std::cmp::Ordering::Less)
+                                    || (name == "least" && o == std::cmp::Ordering::Greater)
+                                {
+                                    a.clone()
+                                } else {
+                                    cur
+                                }
+                            }
+                            None => cur,
+                        }
+                    }
                     Some(cur) => {
                         let take = match compare_constants(a, &cur) {
                             Some(o) => {
@@ -2037,7 +2055,7 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             } else {
                 0
             };
-            Ok(crate::object_comment(oid, subid).map_or(Bson::Null, Bson::String))
+            Ok(crate::object_comment(oid, subid)?.map_or(Bson::Null, Bson::String))
         }
         // `pg_get_expr(adbin, adrelid)` renders a stored expression. This
         // server keeps `adbin` as the rendered TEXT already (see the
@@ -2250,6 +2268,19 @@ pub(crate) fn format_type_text(name: &str, typmod: Option<i32>) -> String {
     // (`timestamp(2) without time zone[]`).
     if let Some(element) = name.strip_suffix("[]") {
         return format!("{}[]", format_type_text(element, typmod));
+    }
+    // `format_type_extended` with FORMAT_TYPE_TYPEMOD_GIVEN and no modifier:
+    // a bare `bit` / `character` is `bit(1)` / `character(1)` per the SQL
+    // spec, so it prints the type's own name instead, which the parser
+    // will not give a bogus modifier -- `"bit"` (quoted, a keyword) and
+    // `bpchar`. `format_type(1560, -1)` on PostgreSQL 15.19; `NULL` keeps
+    // `bit` (RP-494).
+    if typmod.is_some_and(|m| m < 0) {
+        match name {
+            "bit" => return "\"bit\"".to_string(),
+            "bpchar" => return "bpchar".to_string(),
+            _ => {}
+        }
     }
     let display = crate::display_type(name);
     let Some(typmod) = typmod.filter(|m| *m >= 0) else {

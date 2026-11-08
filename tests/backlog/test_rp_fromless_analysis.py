@@ -1,7 +1,12 @@
 """Parse-analysis errors of statements with no FROM, found while working
 RP-439: a missing column inside an expression was refused as a gap (RP-441,
 fixed), and a cast literal's input error is reported after the operator's
-(RP-442, open).
+(RP-442, open); found while working RP-465, a VALUES list's reference
+and an unread CTE were not analysed (RP-501, fixed); and found while
+working RP-501, what `transformWithClause` checks that is still unchecked
+(RP-504) and a correlation over a set-operation FROM item (RP-505, fixed);
+and found while working RP-505, one over a WITH item or a star whose
+columns are not told (RP-506).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. Each was measured on PostgreSQL 15.19; none needs
@@ -353,3 +358,430 @@ KEYWORD_OPERANDS = {
 def test_keyword_function_operand_is_name(query: str, rust_pg: Any) -> None:
     """The operand is named `text` in the message here."""
     assert answer(rust_pg, query) == KEYWORD_OPERANDS[query]
+
+
+# Found while working RP-465: a VALUES list's column reference, and a CTE no
+# statement reads, are analysed like the rest of the statement
+# (`transformValuesClause`, `transformWithClause`). Measured on PostgreSQL
+# 15.19.
+VALUES_AND_UNREAD_CTE = {
+    "values (nosuch)": _missing("9"),
+    "values (1), (nosuch)": _missing("14"),
+    "with w as (select nosuch) select 1": _missing("19"),
+    "with w as (select 1 from nosuch) select 1": (
+        "42P01",
+        'relation "nosuch" does not exist',
+        None,
+        "26",
+    ),
+    # Each row is analysed before its length is compared, and every row
+    # before anything is evaluated; what is analysed before the reference
+    # fails first, as in a FROM-less select.
+    "values (1, nosuch)": _missing("12"),
+    "values (1 + nosuch)": _missing("13"),
+    "values (x.y)": ("42P01", 'missing FROM-clause entry for table "x"', None, "9"),
+    "values (1/0, nosuch)": _missing("14"),
+    "values (1, 2), (nosuch)": _missing("17"),
+    "values (1), (nosuch), (1, 2)": _missing("14"),
+    "values (1, 2), (3), (nosuch)": (
+        "42601",
+        "VALUES lists must all be the same length",
+        None,
+        "17",
+    ),
+    "values ('x'::int, nosuch)": ("22P02", 'invalid input syntax for type integer: "x"', None, "9"),
+    "values (nosuchfn(1), nosuch)": _no_function("9"),
+    "select * from (values (1), (nosuch)) v": _missing("29"),
+    # Every item, in the order written, before the statement; an item is
+    # never evaluated, read or not.
+    "with w as (select 1/0) select 1": None,
+    "with w as (select generate_series(1, 3)) select 1": None,
+    "with w as (select nosuchfn()) select 1": (
+        "42883",
+        "function nosuchfn() does not exist",
+        "No function matches the given name and argument types. "
+        "You might need to add explicit type casts.",
+        "19",
+    ),
+    "with w as (select 1 + 'a'::text) select 1": _no_operator(
+        "operator does not exist: integer + text", "21"
+    ),
+    "with w as (values (nosuch)) select 1": _missing("20"),
+    "with w as (select 1 union select nosuch) select 1": _missing("34"),
+    "with w as (select 1), v as (select nosuch) select * from w": _missing("36"),
+    "with w as (select 1 as a), v as (select b from w) select 1": (
+        "42703",
+        'column "b" does not exist',
+        None,
+        "41",
+    ),
+    "with w as (select nosuch) select nosuch2": _missing("19"),
+    "with w as (select 1 from nosuch) select 1 from nosuch2": (
+        "42P01",
+        'relation "nosuch" does not exist',
+        None,
+        "26",
+    ),
+    "with v as (select nosuch2), w as (select 1 from nosuch) select * from v": (
+        "42703",
+        'column "nosuch2" does not exist',
+        None,
+        "19",
+    ),
+    "with w as (select 1 from nosuch), v as (select nosuch2) select * from v": (
+        "42P01",
+        'relation "nosuch" does not exist',
+        None,
+        "26",
+    ),
+    "with w as (select 1 a), u as (select 1 from nosuch) select (select a from w)": (
+        "42P01",
+        'relation "nosuch" does not exist',
+        None,
+        "45",
+    ),
+    "select * from (with w as (select nosuch) select 1) s": _missing("34"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-501")
+@pytest.mark.parametrize("query", list(VALUES_AND_UNREAD_CTE))
+def test_values_and_unread_cte_are_analysed(query: str, rust_pg: Any) -> None:
+    """A VALUES list's reference was 0A000 `ColumnRef is not supported
+    yet` here (or the error of an item evaluated before it), and an unread
+    CTE was dropped unanalysed, so a statement PostgreSQL refuses ran."""
+    assert answer(rust_pg, query) == VALUES_AND_UNREAD_CTE[query]
+
+
+# What a VALUES list's reference and a WITH item can read, measured on
+# PostgreSQL 15.19 while working RP-501: an outer query's row, through a
+# correlated or LATERAL VALUES, and the nearest WITH item of a name, which
+# an inner WITH's item hides from the outer one.
+VALUES_AND_WITH_ROWS: dict[str, object] = {
+    "select (values (a)) from (select 1 a) t": [(1,)],
+    "select (values (t.a)) from (select 1 a) t": [(1,)],
+    "select (values (a + 1), (a)) from (select 1 a) t": (
+        "21000",
+        "more than one row returned by a subquery used as an expression",
+    ),
+    "select exists (values (a)) from (select 1 a) t": [(True,)],
+    "select a in (values (a)) from (select 1 a) t": [(True,)],
+    "select * from (select 1 a) t, lateral (values (t.a)) v": [(1, 1)],
+    "select * from (select 1 a) t, lateral (values (a)) v": [(1, 1)],
+    "select (values (b)) from (select 1 a) t": ("42703", 'column "b" does not exist'),
+    "with w as (select 1 a), v as (select a from w) select * from w": [(1,)],
+    "with w as (select 1 a) select * from (with w as (select 2 a) select * from w) s": [(2,)],
+    "with w as (select 1 a) select * from "
+    "(with v as (select a + 10 a from w), w as (select 2 a) select * from v, w) s": [(11, 2)],
+    "with w as (select 1 a) select * from "
+    "(with w as (select 2 a) select a from w union all select a from w) s": [(2,), (2,)],
+    "with o as (select 1 a) select * from (with w as (select a from o) select * from w) s": [(1,)],
+    "with o as (select 1 a) select * from (with w as (select a from o) select 1) s": [(1,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-501")
+@pytest.mark.parametrize("query", list(VALUES_AND_WITH_ROWS))
+def test_values_and_with_items_read_their_scope(query: str, rust_pg: Any) -> None:
+    """A correlated or LATERAL VALUES was 0A000, and an inner WITH's item
+    neither hid an outer one of its name (`(with w as (select 2 a) select
+    * from w)` read the outer `w`'s 1) nor saw an outer one its body read
+    (`relation "o" does not exist`)."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        try:
+            got: object = c.execute(query).fetchall()
+        except psycopg.Error as e:
+            got = (e.sqlstate, e.diag.message_primary)
+    assert got == VALUES_AND_WITH_ROWS[query]
+
+
+# A write's unread WITH item is analysed before the write, which then does
+# not happen. Measured on a private PostgreSQL 15.19 cluster: the answer,
+# then the table's rows.
+DML_SETUP = [
+    "drop table if exists rp501_t",
+    "create table rp501_t (a int)",
+    "insert into rp501_t values (1), (2)",
+]
+DML_WITH: dict[str, object] = {
+    "with w as (select nosuch) insert into rp501_t values (3)": (
+        ("42703", 'column "nosuch" does not exist', "19"),
+        [1, 2],
+    ),
+    "with w as (select nosuch) update rp501_t set a = 3": (
+        ("42703", 'column "nosuch" does not exist', "19"),
+        [1, 2],
+    ),
+    "with w as (select nosuch) delete from rp501_t": (
+        ("42703", 'column "nosuch" does not exist', "19"),
+        [1, 2],
+    ),
+    "insert into rp501_t with w as (select nosuch) select 3": (
+        ("42703", 'column "nosuch" does not exist', "39"),
+        [1, 2],
+    ),
+    "with w as (select 1/0) delete from rp501_t where a = 1": ("DELETE 1", [2]),
+    "with w as (select 5 a) insert into rp501_t values (3)": ("INSERT 0 1", [1, 2, 3]),
+}
+
+
+@pytest.mark.backlog_fixed("RP-501")
+@pytest.mark.parametrize("query", list(DML_WITH))
+def test_unread_cte_of_a_write_is_analysed(query: str, rust_pg: Any) -> None:
+    """The write ran, its unread item dropped unanalysed."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        for statement in DML_SETUP:
+            c.execute(statement)
+        try:
+            cur = c.execute(query)
+            got: object = cur.statusmessage
+        except psycopg.Error as e:
+            got = (e.sqlstate, e.diag.message_primary, e.diag.statement_position)
+        rows = [r[0] for r in c.execute("select a from rp501_t order by 1").fetchall()]
+    assert (got, rows) == DML_WITH[query]
+
+
+# Found while working RP-501, measured on PostgreSQL 15.19: what
+# `transformWithClause` checks of a WITH that this server does not, read or
+# unread -- an unread item's literal input (`transformTypeCast` reads it),
+# a WITH inside a subquery expression, the forward reference's HINT, an
+# alias list longer than the item's columns, and a name given twice.
+_FORWARD = (
+    "42P01",
+    'relation "w" does not exist',
+    "Use WITH RECURSIVE, or re-order the WITH items to remove forward references.",
+    "26",
+)
+_TOO_MANY = ("42P10", 'WITH query "w" has 1 columns available but 2 columns specified', None, "6")
+_TWICE = ("42712", 'WITH query name "w" specified more than once', None, "25")
+WITH_CHECKS = {
+    "with w as (select 'x'::int) select 1": (
+        "22P02",
+        'invalid input syntax for type integer: "x"',
+        None,
+        "19",
+    ),
+    "select (with w as (select nosuch) select 1)": _missing("27"),
+    "with v as (select a from w), w as (select 1 as a) select 1": _FORWARD,
+    "with v as (select a from w), w as (select 1 as a) select * from v": _FORWARD,
+    "with w(x, y) as (select 1) select 1": _TOO_MANY,
+    "with w(x, y) as (select 1) select * from w": _TOO_MANY,
+    "with w as (select 1 a), w as (select 2 a) select 1": _TWICE,
+    "with w as (select 1 a), w as (select 2 a) select * from w": _TWICE,
+}
+
+
+@pytest.mark.backlog("RP-504")
+@pytest.mark.parametrize("query", list(WITH_CHECKS))
+def test_with_clause_checks(query: str, rust_pg: Any) -> None:
+    """Each runs here, or is 42601 `table "w" has 1 columns available but
+    2 columns specified` with no position, or misses the HINT."""
+    assert answer(rust_pg, query) == WITH_CHECKS[query]
+
+
+# Found while working RP-501, measured on PostgreSQL 15.19: a subquery's
+# bare name for a column of an outer FROM item that is a set operation.
+OVER_A_SET_OPERATION = {
+    "select (select a) from (select 1 a union select 2) t order by 1": [(1,), (2,)],
+    "select (values (a)) from (select 1 a union select 2) t order by 1": [(1,), (2,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-505")
+@pytest.mark.parametrize("query", list(OVER_A_SET_OPERATION))
+def test_correlation_over_a_set_operation(query: str, rust_pg: Any) -> None:
+    """Each was 42703 `column "a" does not exist` with the
+    cannot-be-referenced HINT here: the names a subquery may read from a
+    FROM-subquery were taken from its own target list, which a set
+    operation keeps in its leaves (RP-505)."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        try:
+            got: object = c.execute(query).fetchall()
+        except psycopg.Error as e:
+            got = (e.sqlstate, e.diag.message_primary)
+    assert got == OVER_A_SET_OPERATION[query]
+
+
+def _rows(server: Any, query: str) -> object:
+    with psycopg.connect(_dsn(server) + " dbname=postgres", autocommit=True) as c:
+        try:
+            return c.execute(query).fetchall()
+        except psycopg.Error as e:
+            return (e.sqlstate, e.diag.message_primary, e.diag.message_hint)
+
+
+# Found while working RP-505, measured on PostgreSQL 15.19: the other
+# shapes whose FROM-subquery's column names the same guess lost, and two
+# that must stay errors.
+FROM_SUBQUERY_NAMES = {
+    # A star over a FROM-subquery's own FROM item.
+    "select (select a) from (select * from (values (1)) v(a)) t": [(1,)],
+    # A target named by FigureColname, and a VALUES list's `column1`.
+    "select (select count) from (select count(*) from (values (1)) v) t": [(1,)],
+    "select (select upper) from (select upper('x') union select 'y') t order by 1": [
+        ("X",),
+        ("y",),
+    ],
+    "select (select column1) from (values (1)) t": [(1,)],
+    # An alias's column list renames only the leading columns.
+    "select (select b) from (select 1 a, 2 b) t(x)": [(2,)],
+    "select (select b) from (select 1 a, 5 b union select 2, 6) t(x) order by 1": [
+        (5,),
+        (6,),
+    ],
+    # Nested and parenthesised set operations, one with its own LIMIT.
+    "select (select a) from (select 1 a union (select 2 b except select 3)) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    "select (select a) from (select 1 a union select 2 order by 1 limit 1) t": [(1,)],
+    # In EXISTS, IN and WHERE.
+    "select exists(select a) from (select 1 a union select 2) t": [(True,), (True,)],
+    "select a from (select 1 a union select 2) t where a in (select a) order by 1": [
+        (1,),
+        (2,),
+    ],
+    # The subquery's own FROM still comes first.
+    "select (select a from (select 9 a) i) from (select 1 a union select 2) t": [
+        (9,),
+        (9,),
+    ],
+    # A right leaf's name is not a column, and a renamed one is gone.
+    "select (select b) from (select 1 a union select 2 b) t": (
+        "42703",
+        'column "b" does not exist',
+        None,
+    ),
+    "select (select a) from (select 1 a union select 2) t(x)": (
+        "42703",
+        'column "a" does not exist',
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-505")
+@pytest.mark.parametrize("query", list(FROM_SUBQUERY_NAMES))
+def test_correlation_reads_a_from_subquerys_output_names(query: str, rust_pg: Any) -> None:
+    """Each was 42703 here, but the last two, which PostgreSQL refuses too."""
+    assert _rows(rust_pg, query) == FROM_SUBQUERY_NAMES[query]
+
+
+# Found while working RP-505, measured on PostgreSQL 15.19: the FROM items
+# whose columns a subquery's bare name could not find.
+FROM_ITEM_NAMES_UNKNOWN = {
+    # A WITH item, read directly or through a FROM-subquery's star.
+    "with w as (select 1 a) select (select a) from w": [(1,)],
+    "with w as (select 1 a) select (select a) from (select * from w) t": [(1,)],
+    "with w as (select 1 a) select (select a) from (select * from w union select 2) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    # A star over a function in FROM, and over a USING join.
+    "select (select g) from (select * from generate_series(1, 2) g) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    "select (select a) from (select * from (values (1)) v(a) join (values (1)) w(a) using (a)) t": [
+        (1,)
+    ],
+    # Measured while working RP-506. A WITH item renamed by its alias or its
+    # own column list, one read by a later item, one read by a
+    # FROM-subquery's own WITH, and a recursive one.
+    "with w as (select 1 a, 2 b) select (select b) from w t(x)": [(2,)],
+    "with w(x) as (select 1 a, 2 b) select (select x), (select b) from w": [(1, 2)],
+    "with w as (select 1 a), w2 as (select a + 1 b from w) select (select b) from w2": [(2,)],
+    (
+        "with w as (select 1 a) select (select a) from (with w2 as (select * from w) "
+        "select * from w2) t"
+    ): [(1,)],
+    (
+        "with recursive w(a) as (select 1 union all select a + 1 from w where a < 3) "
+        "select a, (select a * 10) from w order by 1"
+    ): [
+        (1, 10),
+        (2, 20),
+        (3, 30),
+    ],
+    (
+        "with recursive w(a) as (select 1 union all select a + 1 from w where a < 2) "
+        "select (select a) from (select * from w) t order by 1"
+    ): [
+        (1,),
+        (2,),
+    ],
+    # A function named by itself, WITH ORDINALITY, and a record result's
+    # columns, renamed by an alias's list.
+    "select (select generate_series) from (select * from generate_series(1, 2)) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    (
+        "select (select ordinality) from (select * from generate_series(5, 6) with "
+        "ordinality) t order by 1"
+    ): [
+        (1,),
+        (2,),
+    ],
+    """select (select key), (select value) from (select * from json_each('{"k": 1}')) t""": [
+        ("k", 1)
+    ],
+    """select (select k) from (select * from json_each('{"k": 1}') as j(k, v)) t""": [("k",)],
+    # A NATURAL join's merged columns, and a join alias's list, which hides
+    # the sides' names.
+    (
+        "select (select c) from (select * from (values (1, 2)) v(a, b) natural join "
+        "(values (1, 3)) u(a, c)) t"
+    ): [(3,)],
+    (
+        "select (select x) from ((values (1, 2)) v(a, b) join (values (1, 3)) u(a, c) "
+        "using (a)) j(x)"
+    ): [(1,)],
+    (
+        "select (select a) from ((values (1, 2)) v(a, b) join (values (1, 3)) u(a, c) "
+        "using (a)) j(x)"
+    ): (
+        "42703",
+        'column "a" does not exist',
+        'There is a column named "a" in table "v", but it cannot be referenced '
+        "from this part of the query.",
+    ),
+    # A name no item has is still 42703.
+    "with w as (select 1 a) select (select nosuch) from w": (
+        "42703",
+        'column "nosuch" does not exist',
+        None,
+    ),
+    "with w as (select 1 a) select (select aa) from (select * from w) t": (
+        "42703",
+        'column "aa" does not exist',
+        'Perhaps you meant to reference the column "t.a".',
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-506")
+@pytest.mark.parametrize("query", list(FROM_ITEM_NAMES_UNKNOWN))
+def test_correlation_over_a_cte_or_a_star_of_unknown_columns(query: str, rust_pg: Any) -> None:
+    """Each PostgreSQL answers with rows was 42703 `column ... does not exist` here."""
+    assert _rows(rust_pg, query) == FROM_ITEM_NAMES_UNKNOWN[query]
+
+
+# Found while working RP-506, measured on PostgreSQL 15.19: a subquery's own
+# WITH item reads the statement's, which was 42P01 here.
+NESTED_WITH_READS_OUTER = {
+    "with w as (select 1 a) select (with w2 as (select * from w) select a from w2)": [(1,)],
+    # An own item hides the statement's of its name from what follows it,
+    # not from the items before it.
+    (
+        "with w as (select 1 a) select (with w2 as (select * from w), w as (select 2 a) "
+        "select w2.a * 10 + w.a from w2, w)"
+    ): [(12,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-506")
+@pytest.mark.parametrize("query", list(NESTED_WITH_READS_OUTER))
+def test_subquery_with_reads_the_statements_with(query: str, rust_pg: Any) -> None:
+    """Each was 42P01 `relation "w" does not exist` here."""
+    assert _rows(rust_pg, query) == NESTED_WITH_READS_OUTER[query]

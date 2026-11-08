@@ -51,10 +51,17 @@ enum Stop {
 
 type Walk<T> = std::result::Result<T, Stop>;
 
+/// A FROM function's column names, as its result type gives them and its
+/// alias renames them.
+pub(crate) type FunctionColumns<'a> = &'a dyn Fn(&pb::RangeFunction) -> Option<Vec<String>>;
+
 struct Finder<'a> {
     location: i32,
     /// A relation's columns by name.
     columns: &'a dyn Fn(&str) -> Option<Vec<String>>,
+    /// A FROM function's columns; `None` leaves them unknown, as for the
+    /// hint (RP-413).
+    functions: Option<FunctionColumns<'a>>,
     /// The CTEs in scope, innermost WITH last: `(name, columns)`.
     ctes: Vec<Vec<(String, Option<Vec<String>>)>>,
 }
@@ -77,6 +84,7 @@ pub fn missing_column_hint(
     let mut finder = Finder {
         location: i32::try_from(byte).ok()?,
         columns,
+        functions: None,
         ctes: Vec::new(),
     };
     let found = match finder.statement(&mut node) {
@@ -236,6 +244,39 @@ fn levenshtein(a: &str, b: &str) -> usize {
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
+}
+
+/// The columns a FROM item exposes to the query it is in, in order, as its
+/// range table entry's `eref->colnames` has them (a join's are the join
+/// entry's, its merged columns first): a table's or a WITH item's, renamed
+/// by an alias's column list; a FROM-subquery's output names (a set
+/// operation's leftmost leaf's, a star expanded, an unnamed target named by
+/// `FigureColname`, a VALUES list's `column1`...); a function's from
+/// `functions`. `ctes` are the WITH items in scope, outermost first, each
+/// seeing the ones before it. `None` when they cannot be told here.
+pub(crate) fn from_item_columns(
+    item: &pb::Node,
+    columns: &dyn Fn(&str) -> Option<Vec<String>>,
+    functions: FunctionColumns<'_>,
+    ctes: &[pb::Node],
+) -> Option<Vec<String>> {
+    let mut item = item.clone();
+    // No reference sits at this location, so the walk never stops early.
+    let mut finder = Finder {
+        location: i32::MIN,
+        columns,
+        functions: Some(functions),
+        ctes: Vec::new(),
+    };
+    let mut with = pb::WithClause {
+        ctes: ctes.to_vec(),
+        ..Default::default()
+    };
+    finder.with(&mut with, &Vec::new()).ok()?;
+    finder
+        .range_item(&mut item, &Vec::new(), &mut Vec::new())
+        .ok()
+        .flatten()
 }
 
 fn strings(nodes: &[pb::Node]) -> Vec<String> {
@@ -402,66 +443,84 @@ impl Finder<'_> {
 
     /// One FROM item, analysed with the entries before it in `rtable`, which
     /// it then adds its own entries to (a join adds its sides', not its own:
-    /// the search skips join entries).
+    /// the search skips join entries). Its columns, as the query it is in
+    /// sees them, when they can be told.
     fn range_item(
         &mut self,
         item: &mut pb::Node,
         levels: &Levels,
         rtable: &mut Vec<Rte>,
-    ) -> Walk<()> {
-        match item.node.as_mut() {
-            Some(N::RangeVar(r)) => rtable.push(self.relation(r)),
+    ) -> Walk<Option<Vec<String>>> {
+        let rte = match item.node.as_mut() {
+            Some(N::RangeVar(r)) => self.relation(r),
             Some(N::JoinExpr(j)) => {
-                if let Some(l) = j.larg.as_deref_mut() {
-                    self.range_item(l, levels, rtable)?;
-                }
-                if let Some(r) = j.rarg.as_deref_mut() {
-                    self.range_item(r, levels, rtable)?;
-                }
+                let left = match j.larg.as_deref_mut() {
+                    Some(l) => self.range_item(l, levels, rtable)?,
+                    None => None,
+                };
+                let right = match j.rarg.as_deref_mut() {
+                    Some(r) => self.range_item(r, levels, rtable)?,
+                    None => None,
+                };
                 if let Some(q) = j.quals.as_deref_mut() {
                     self.expr(q, &with_level(levels, rtable))?;
                 }
+                let cols = match (left, right) {
+                    (Some(l), Some(r)) => join_columns(j, l, r),
+                    _ => None,
+                };
+                return Ok(renamed(cols, j.alias.as_ref()));
             }
             Some(N::RangeSubselect(rs)) => {
                 let cols = match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
                     Some(N::SelectStmt(body)) => self.select(body, &with_level(levels, rtable))?,
                     _ => None,
                 };
-                rtable.push(Rte {
+                Rte {
                     alias: rs
                         .alias
                         .as_ref()
                         .map(|a| a.aliasname.clone())
                         .unwrap_or_default(),
                     cols: renamed(cols, rs.alias.as_ref()),
-                });
+                }
             }
             Some(N::RangeFunction(rf)) => {
                 let inner = with_level(levels, rtable);
                 for f in &mut rf.functions {
                     self.expr(f, &inner)?;
                 }
-                // Its columns depend on the function's result type.
-                rtable.push(Rte {
-                    alias: String::new(),
-                    cols: None,
-                });
+                // Its columns depend on the function's result type, which
+                // only the planner can tell.
+                let alias = rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .or_else(|| crate::joins::range_function_name(rf))
+                    .unwrap_or_default();
+                Rte {
+                    alias,
+                    cols: self.functions.and_then(|f| f(rf)),
+                }
             }
             Some(N::RangeTableSample(ts)) => {
                 match ts.relation.as_deref().and_then(|r| r.node.as_ref()) {
-                    Some(N::RangeVar(r)) => rtable.push(self.relation(r)),
-                    _ => rtable.push(Rte {
+                    Some(N::RangeVar(r)) => self.relation(r),
+                    _ => Rte {
                         alias: String::new(),
                         cols: None,
-                    }),
+                    },
                 }
             }
-            _ => rtable.push(Rte {
+            _ => Rte {
                 alias: String::new(),
                 cols: None,
-            }),
-        }
-        Ok(())
+            },
+        };
+        let cols = rte.cols.clone();
+        rtable.push(rte);
+        Ok(cols)
     }
 
     /// A SELECT at `levels` (the levels enclosing it); its output column
@@ -549,8 +608,9 @@ impl Finder<'_> {
             return Ok(Some((1..=width).map(|i| format!("column{i}")).collect()));
         }
         let mut rtable = Vec::new();
+        let mut items = Vec::new();
         for item in &mut s.from_clause {
-            self.range_item(item, levels, &mut rtable)?;
+            items.push(self.range_item(item, levels, &mut rtable)?);
         }
         let here = with_level(levels, &rtable);
         self.exprs(s.target_list.iter_mut(), &here)?;
@@ -562,7 +622,7 @@ impl Finder<'_> {
         self.exprs(s.distinct_clause.iter_mut(), &here)?;
         self.exprs(s.limit_offset.as_deref_mut(), &here)?;
         self.exprs(s.limit_count.as_deref_mut(), &here)?;
-        Ok(output_columns(s, &rtable))
+        Ok(output_columns(s, &rtable, &items))
     }
 
     fn insert(&mut self, i: &mut pb::InsertStmt) -> Walk<()> {
@@ -648,25 +708,35 @@ impl Finder<'_> {
     }
 }
 
-/// A plain SELECT's output column names (`FigureColname`, a star expanded
-/// over the entries it reads), when they can be told.
-fn output_columns(s: &pb::SelectStmt, rtable: &[Rte]) -> Option<Vec<String>> {
-    // A star over a USING or NATURAL join reads the join's merged columns
-    // first, which the entries alone do not give.
-    let merged = |n: &pb::Node| -> bool {
-        fn any(n: &pb::Node) -> bool {
-            match n.node.as_ref() {
-                Some(N::JoinExpr(j)) => {
-                    j.is_natural
-                        || !j.using_clause.is_empty()
-                        || j.larg.as_deref().is_some_and(any)
-                        || j.rarg.as_deref().is_some_and(any)
-                }
-                _ => false,
-            }
-        }
-        any(n)
+/// A join's columns (`transformFromClauseItem`): with USING or NATURAL, the
+/// merged columns first, in the USING list's order (NATURAL: the left
+/// side's names the right side has too, in the left side's order), then
+/// each side's others; otherwise the left side's and then the right's.
+fn join_columns(j: &pb::JoinExpr, left: Vec<String>, right: Vec<String>) -> Option<Vec<String>> {
+    let using = if j.is_natural {
+        left.iter().filter(|c| right.contains(c)).cloned().collect()
+    } else {
+        strings(&j.using_clause)
     };
+    if using.is_empty() {
+        let mut out = left;
+        out.extend(right);
+        return Some(out);
+    }
+    let mut out = using.clone();
+    out.extend(left.into_iter().filter(|c| !using.contains(c)));
+    out.extend(right.into_iter().filter(|c| !using.contains(c)));
+    Some(out)
+}
+
+/// A plain SELECT's output column names (`FigureColname`, a star expanded
+/// over the FROM items' columns, `items`, or one entry's), when they can be
+/// told.
+fn output_columns(
+    s: &pb::SelectStmt,
+    rtable: &[Rte],
+    items: &[Option<Vec<String>>],
+) -> Option<Vec<String>> {
     let mut out = Vec::new();
     for t in &s.target_list {
         let Some(N::ResTarget(rt)) = t.node.as_ref() else {
@@ -685,11 +755,8 @@ fn output_columns(s: &pb::SelectStmt, rtable: &[Rte]) -> Option<Vec<String>> {
                 let parts = strings(&c.fields);
                 match parts.last() {
                     None => {
-                        if s.from_clause.iter().any(merged) {
-                            return None;
-                        }
-                        for rte in rtable {
-                            out.extend(rte.cols.clone()?);
+                        for cols in items {
+                            out.extend(cols.clone()?);
                         }
                     }
                     Some(alias) => {
@@ -790,5 +857,141 @@ mod tests {
             },
         ]];
         assert_eq!(hint_for(&levels, None, "bb"), None);
+    }
+
+    /// The columns of the first FROM item of `sql`, with `tables` as the
+    /// relations, `generate_series` as a one-column function and the WITH
+    /// of `sql` in scope.
+    fn item_columns(sql: &str, tables: &[(&str, &[&str])]) -> Option<Vec<String>> {
+        let Ok(N::SelectStmt(s)) = parse_one_as_sent(sql) else {
+            panic!("not a select: {sql}");
+        };
+        let item = s.from_clause.first().expect("no FROM item");
+        let columns = |name: &str| {
+            tables
+                .iter()
+                .find(|(t, _)| *t == name)
+                .map(|(_, cols)| cols.iter().map(|c| c.to_string()).collect())
+        };
+        // A scalar function's one column takes the alias, or its own name.
+        let functions = |rf: &pb::RangeFunction| -> Option<Vec<String>> {
+            let name = crate::joins::range_function_name(rf)?;
+            (name == "generate_series").then(|| {
+                vec![rf
+                    .alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or(name)]
+            })
+        };
+        let ctes = s.with_clause.map(|w| w.ctes).unwrap_or_default();
+        from_item_columns(item, &columns, &functions, &ctes)
+    }
+
+    fn v(cols: &[&str]) -> Option<Vec<String>> {
+        Some(cols.iter().map(|c| c.to_string()).collect())
+    }
+
+    // The names a subquery's bare reference to the FROM-subquery `t` may
+    // use, each as PostgreSQL 15.19 resolves it (RP-505).
+    #[test]
+    fn a_from_subquerys_columns_are_its_output_names() {
+        let names = |sql: &str| item_columns(sql, &[("e", &["a", "b"])]);
+        // A set operation's names are its leftmost leaf's, however nested.
+        assert_eq!(
+            names("select * from (select 1 a union select 2) t"),
+            v(&["a"])
+        );
+        assert_eq!(
+            names("select * from ((select 1 a) union (select 2 b except select 3)) t"),
+            v(&["a"])
+        );
+        // A star is expanded, an unnamed target named by FigureColname.
+        assert_eq!(names("select * from (select * from e) t"), v(&["a", "b"]));
+        assert_eq!(
+            names("select * from (select count(*) from e) t"),
+            v(&["count"])
+        );
+        assert_eq!(
+            names("select * from (values (1, 2)) t"),
+            v(&["column1", "column2"])
+        );
+        // An alias's column list renames only the leading columns.
+        assert_eq!(
+            names("select * from (select 1 a, 2 b) t(x)"),
+            v(&["x", "b"])
+        );
+        // A function whose result the planner cannot tell leaves it unknown.
+        assert_eq!(
+            names("select * from (select * from unnest(array[1])) t"),
+            None
+        );
+    }
+
+    // The FROM items RP-506 found unread, each as PostgreSQL 15.19 names
+    // their columns.
+    #[test]
+    fn a_with_item_a_function_and_a_merged_join_expose_their_columns() {
+        let names = |sql: &str| item_columns(sql, &[("e", &["a", "b"]), ("s", &["a", "c"])]);
+        // A WITH item, directly, renamed by an alias, and through a star;
+        // it hides a table of its name.
+        assert_eq!(names("with w as (select 1 a) select * from w"), v(&["a"]));
+        assert_eq!(
+            names("with w as (select 1 a, 2 b) select * from w t(x)"),
+            v(&["x", "b"])
+        );
+        assert_eq!(
+            names("with w(x) as (select 1 a, 2 b) select * from w"),
+            v(&["x", "b"])
+        );
+        assert_eq!(
+            names("with e as (select 1 z) select * from (select * from e) t"),
+            v(&["z"])
+        );
+        // A later WITH item reads an earlier one.
+        assert_eq!(
+            names("with w as (select 1 a), w2 as (select * from w) select * from w2"),
+            v(&["a"])
+        );
+        // A recursive one is named by its non-recursive term.
+        assert_eq!(
+            names(
+                "with recursive w(n) as (select 1 union all select n + 1 from w) select * from w"
+            ),
+            v(&["n"])
+        );
+        // A function in FROM, through a star.
+        assert_eq!(
+            names("select * from (select * from generate_series(1, 2) g) t"),
+            v(&["g"])
+        );
+        assert_eq!(
+            names("select * from (select * from generate_series(1, 2)) t"),
+            v(&["generate_series"])
+        );
+        // A USING join's merged columns come first, once; a NATURAL join's
+        // are the names both sides have; neither is a plain join's.
+        assert_eq!(
+            names("select * from (select * from e join s using (a)) t"),
+            v(&["a", "b", "c"])
+        );
+        assert_eq!(
+            names("select * from (select * from s natural join e) t"),
+            v(&["a", "c", "b"])
+        );
+        assert_eq!(
+            names("select * from (select * from e join s on true) t"),
+            v(&["a", "b", "a", "c"])
+        );
+        assert_eq!(
+            names("select * from e join s using (a)"),
+            v(&["a", "b", "c"])
+        );
+        // A join's alias renames its leading columns.
+        assert_eq!(
+            names("select * from (e join s using (a)) j(x)"),
+            v(&["x", "b", "c"])
+        );
     }
 }

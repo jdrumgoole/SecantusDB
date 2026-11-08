@@ -53,9 +53,16 @@ jobs:
           # refs and pyproject, and doesn't need the full checkout.
           submodules: false
 
+      - name: Bun from the Actions cache
+        # claude-code-action's own Bun download failed with HTTP 504 (see
+        # .github/actions/cached-bun); given a path, it skips the download.
+        id: bun
+        uses: ./.github/actions/cached-bun
+
       - name: Run nightly security review
         uses: anthropics/claude-code-action@4036a180cf690f49529f5d8c79c998855287f590  # v1
         with:
+          path_to_bun_executable: ${{ steps.bun.outputs.path }}
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Hand the action this workflow's own GITHUB_TOKEN. Without it,
           # `setupGitHubToken` mints a GitHub App token by exchanging an OIDC

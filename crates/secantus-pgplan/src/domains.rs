@@ -22,6 +22,10 @@ pub struct Domain {
     pub not_null: bool,
     /// `(constraint name, expression SQL)` in declared order.
     pub checks: Vec<(String, String)>,
+    /// The names of the `checks` added `NOT VALID` and not validated since
+    /// (`pg_constraint.convalidated` false): the values already stored were
+    /// not checked against them, though every new one is.
+    pub not_valid: Vec<String>,
     /// The DEFAULT expression's SQL.
     pub default_sql: Option<String>,
 }
@@ -83,6 +87,7 @@ pub fn system_domains() -> &'static [Domain] {
                     .iter()
                     .map(|(n, e)| (n.to_string(), e.to_string()))
                     .collect(),
+                not_valid: Vec::new(),
                 default_sql: default.map(str::to_string),
             }
         };
@@ -140,6 +145,28 @@ pub fn domain_name_of_oid(oid: i64) -> Option<String> {
 /// A domain's base type, for the wire.
 pub fn domain_base(name: &str) -> Option<String> {
     user_domain(name).map(|d| d.base)
+}
+
+/// `getBaseTypeAndTypmod`: a domain's innermost base type, the type
+/// modifier a value is coerced to on its way into the domain, and the
+/// domains of the chain, outermost first. `None` when `name` is no domain.
+///
+/// The modifier is the INNERMOST domain's (`typtypmod`): a domain over a
+/// domain cannot declare one of its own, so `dc3n` over `dc3 char(3)` is
+/// `bpchar` of width 3 although its own `typtypmod` is -1 (15.19).
+pub fn base_type_and_typmod(name: &str) -> Option<(String, i32, Vec<Domain>)> {
+    let mut chain: Vec<Domain> = Vec::new();
+    let mut base = name.to_string();
+    // Bounded: a catalog cannot hold a cycle, but a bad one must not hang.
+    while let Some(d) = user_domain(&base) {
+        if chain.len() > 16 || d.base == base {
+            break;
+        }
+        base = d.base.clone();
+        chain.push(d);
+    }
+    let typmod = chain.last()?.typmod;
+    Some((base, typmod, chain))
 }
 
 /// Check `value` against domain `name`: 23502 for a NULL the domain refuses,
@@ -382,6 +409,7 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
         typmod: declared_typmod(tn),
         not_null: not_null.unwrap_or(false),
         checks,
+        not_valid: Vec::new(),
         default_sql,
     }))
 }
@@ -391,8 +419,19 @@ pub(crate) fn plan_create_domain(c: &pg_query::protobuf::CreateDomainStmt) -> Re
 pub enum DomainChange {
     SetDefault(Option<String>),
     NotNull(bool),
-    AddCheck(String, String),
-    DropConstraint { name: String, missing_ok: bool },
+    /// `ADD CONSTRAINT name CHECK (expr) [NOT VALID]`.
+    AddCheck {
+        name: String,
+        expr: String,
+        /// `NOT VALID`: the stored values are not checked.
+        not_valid: bool,
+    },
+    /// `VALIDATE CONSTRAINT name`.
+    Validate(String),
+    DropConstraint {
+        name: String,
+        missing_ok: bool,
+    },
 }
 
 /// `ALTER DOMAIN name ...`.
@@ -415,8 +454,17 @@ pub(crate) fn plan_alter_domain(a: &pg_query::protobuf::AlterDomainStmt) -> Resu
             let (cname, expr) = checks
                 .pop()
                 .ok_or_else(|| Error::Unsupported("this ALTER DOMAIN constraint".into()))?;
-            DomainChange::AddCheck(cname, expr)
+            // `initially_valid` is `!skip_validation` (`transformConstraintAttrs`).
+            let not_valid = nodes
+                .iter()
+                .any(|n| matches!(n.node.as_ref(), Some(N::Constraint(k)) if k.skip_validation));
+            DomainChange::AddCheck {
+                name: cname,
+                expr,
+                not_valid,
+            }
         }
+        "V" => DomainChange::Validate(a.name.clone()),
         "X" => DomainChange::DropConstraint {
             name: a.name.clone(),
             missing_ok: a.missing_ok,

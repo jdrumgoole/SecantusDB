@@ -127,8 +127,16 @@ impl PgHandler {
                 out.push(("view", v));
             }
         }
+        // A materialized view is a relation of its own kind, though a table
+        // holds its rows.
+        let matviews: Vec<String> = self.matviews()?.into_iter().map(|(m, _, _)| m).collect();
+        for m in &matviews {
+            if m.starts_with(&prefix) {
+                out.push(("materialized view", m.clone()));
+            }
+        }
         for t in self.all_table_defs()? {
-            if t.name.starts_with(&prefix) {
+            if t.name.starts_with(&prefix) && !matviews.contains(&t.name) {
                 out.push(("table", t.name));
             }
         }
@@ -152,6 +160,9 @@ impl PgHandler {
             let quoted = format!("\"{}\"", key.replace('"', "\"\""));
             let sql = match *kind {
                 "view" => format!("DROP VIEW IF EXISTS {quoted} CASCADE"),
+                "materialized view" => {
+                    format!("DROP MATERIALIZED VIEW IF EXISTS {quoted} CASCADE")
+                }
                 "table" => format!("DROP TABLE IF EXISTS {quoted} CASCADE"),
                 _ => format!("DROP SEQUENCE IF EXISTS {quoted}"),
             };

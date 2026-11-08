@@ -71,9 +71,13 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
             (Some('{'), Some('}')) | (Some('('), Some(')')) => &inner[1..inner.len() - 1],
             _ => return false,
         };
-        inner
-            .split([',', '{', '}', '(', ')'])
-            .any(|e| e.trim().trim_matches('"') == value)
+        // An `int2vector` / `oidvector` element's input error names one of
+        // its space-separated numbers (`'{"1 x"}'::int2vector[]` is 22P02
+        // for `"x"`, at the literal).
+        inner.split([',', '{', '}', '(', ')']).any(|e| {
+            let e = e.trim().trim_matches('"');
+            e == value || e.split_ascii_whitespace().any(|w| w == value)
+        })
     };
     let mut hits = toks.iter().enumerate().filter(|(_, t)| holds(t));
     let (i, _) = hits.next()?;
@@ -100,6 +104,69 @@ pub fn alter_finds_relation_by_name(sql: &str) -> bool {
     )
 }
 
+/// Is `message` CREATE FUNCTION / PROCEDURE's 42704 for a type its own
+/// signature names? `interpret_function_parameter_list` and
+/// `compute_return_type` look those up by name, outside any expression,
+/// and report no position (RP-566): `type t does not exist` for a
+/// parameter, `type "t" does not exist` for the result, the name as
+/// `TypeNameToString` writes it. A body's errors are placed where they
+/// were raised.
+fn names_a_signature_type(sql: &str, message: &str) -> bool {
+    let Some(missing) = message
+        .strip_prefix("type ")
+        .and_then(|m| m.strip_suffix(" does not exist"))
+    else {
+        return false;
+    };
+    let head: Vec<String> = sql
+        .split_whitespace()
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let routine = |w: Option<&String>| w.is_some_and(|w| w == "function" || w == "procedure");
+    if head.first().map(String::as_str) != Some("create")
+        || !(routine(head.get(1)) || routine(head.get(3)))
+    {
+        return false;
+    }
+    let Ok(tree) = pg_query::parse(sql) else {
+        return false;
+    };
+    let Some(N::CreateFunctionStmt(f)) = tree
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return false;
+    };
+    let written = |tn: &pg_query::protobuf::TypeName| {
+        let mut t = tn
+            .names
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        if !tn.array_bounds.is_empty() {
+            t.push_str("[]");
+        }
+        t
+    };
+    let parameters = f.parameters.iter().filter_map(|p| match p.node.as_ref()? {
+        N::FunctionParameter(fp) => fp.arg_type.as_ref(),
+        _ => None,
+    });
+    let mut parameters = parameters;
+    parameters.any(|tn| written(tn) == missing)
+        || f.return_type
+            .as_ref()
+            .is_some_and(|tn| format!("\"{}\"", written(tn)) == missing)
+}
+
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
@@ -119,6 +186,9 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         .join(" ")
         .to_ascii_lowercase();
     if head == "create cast" || head == "drop cast" {
+        return None;
+    }
+    if sqlstate == "42704" && names_a_signature_type(sql, message) {
         return None;
     }
     // `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN
@@ -329,14 +399,25 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                             && toks[i - 1].text == "."
                             && unquote_ident(toks[i - 2].text) == parts[parts.len() - 2]))
             });
-            match qualified {
-                Some(i) => pos(toks[if parts.len() > 1 { i - 2 } else { i }].start),
+            // `(t).x`, a field of t's whole row, is t's column x
+            // (`ParseComplexProjection`), referenced where `t` is (RP-532).
+            let projected = toks.windows(5).position(|w| {
+                parts.len() == 2
+                    && w[0].text == "("
+                    && unquote_ident(w[1].text) == parts[0]
+                    && w[2].text == ")"
+                    && w[3].text == "."
+                    && unquote_ident(w[4].text) == *last
+            });
+            match (qualified, projected) {
+                (Some(i), _) => pos(toks[if parts.len() > 1 { i - 2 } else { i }].start),
+                (None, Some(i)) => pos(toks[i + 1].start),
                 // An ungrouped column is NAMED qualified (`t.a`) however it
                 // was written: a bare mention is the one PostgreSQL means.
-                None if sqlstate == "42803" => {
+                (None, None) if sqlstate == "42803" => {
                     pos(toks.iter().find(|t| unquote_ident(t.text) == *last)?.start)
                 }
-                None => None,
+                (None, None) => None,
             }
         }
         "42P01" => {
@@ -442,15 +523,20 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
             };
             pos(toks[i].start)
         }
-        // `CALL f()` over a FUNCTION: at the name, as a missing procedure.
-        "42809" if m.ends_with(" is not a procedure") => {
+        // `CALL f()` over a FUNCTION, or over overloads none of which is
+        // best: at the name, as a missing procedure.
+        "42809" | "42725"
+            if m.ends_with(" is not a procedure")
+                || (m.starts_with("procedure ") && m.ends_with(" is not unique")) =>
+        {
             if !toks
                 .first()
                 .is_some_and(|t| t.text.eq_ignore_ascii_case("call"))
             {
                 return None;
             }
-            let name = m.split('(').next()?.rsplit('.').next()?;
+            let name = m.strip_prefix("procedure ").unwrap_or(m);
+            let name = name.split('(').next()?.rsplit('.').next()?;
             let i = toks.iter().enumerate().position(|(i, t)| {
                 unquote_ident(t.text) == name && toks.get(i + 1).is_some_and(|n| n.text == "(")
             })?;

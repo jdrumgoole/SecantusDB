@@ -44,7 +44,10 @@ use secantus_core::order::{with_bindata_order, BinDataOrder};
 use secantus_core::query::matches as query_matches;
 use secantus_core::sortkey::{self, COMPOUND_SEP, RANK_MINKEY};
 use secantus_core::{get_path, get_path_values};
-use secantus_wt::{Connection, Cursor, Session, WtError};
+/// The engine error [`StorageError::Wt`] carries, nameable by the crates
+/// that see it (a [`ReadFault`] in a test builds one).
+pub use secantus_wt::WtError;
+use secantus_wt::{Connection, Cursor, Session};
 
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
@@ -247,11 +250,25 @@ pub fn with_read_overlay<T>(overlays: ReadOverlays, f: impl FnOnce() -> T) -> T 
 }
 
 fn overlay_for(db: &str, coll: &str) -> Option<TableOverlay> {
-    READ_OVERLAY.with(|o| {
+    let installed = READ_OVERLAY.with(|o| {
         o.borrow()
             .as_ref()
             .and_then(|m| m.get(&(db.to_string(), coll.to_string())).cloned())
-    })
+    });
+    // The running statement's view of the rows its calls wrote (RP-473)
+    // goes over the block's own: it is what they were before the calls.
+    let Some(held) = active_held_rows() else {
+        return installed;
+    };
+    let h = held.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(view) = h.views.overlay(db, coll) else {
+        return installed;
+    };
+    let mut out = installed.unwrap_or_default();
+    for (k, row) in &view.rows {
+        out.rows.insert(k.clone(), row.clone());
+    }
+    Some(out)
 }
 
 /// Opaque handle for a multi-document transaction. Owns a **dedicated** WT
@@ -5573,6 +5590,118 @@ pub struct Held {
     /// [`UndoJournal`]). Not emptied by [`Held::clear`]: a move onto a new
     /// WiredTiger transaction keeps the savepoints, and the journal with them.
     pub undo: UndoJournal,
+    /// What each running statement reads its own transaction's rows as (see
+    /// [`StatementViews`]). Kept across a move onto a new WiredTiger
+    /// transaction, as the journal is.
+    pub views: StatementViews,
+}
+
+/// The rows a statement's reads see of the transaction's own writes made by
+/// user code the statement called (RP-473): PostgreSQL's statement snapshot
+/// and its command id, under which a row a volatile function wrote is
+/// invisible to the statement that called it, as its `cmin` is not below
+/// the snapshot's `curcid` (`HeapTupleSatisfiesMVCC`) -- and a row the
+/// function updated or deleted is still seen as it was.
+///
+/// One level per statement running (the client's, then each statement a
+/// function body runs inside it). A level gets a view the first time it
+/// calls a volatile user function; while one of its calls runs, the first
+/// write of each row records the row as it was ([`undo_note_row`], the same
+/// sites the [`UndoJournal`] records at), in every level calling. The
+/// level's own reads, once no call of its own is running, lay those rows
+/// over what they read ([`with_read_overlay`]'s overlay): the statement
+/// reads its tables as they were before its calls wrote them. A statement's
+/// own writes are not recorded; the executor reads before it writes.
+#[derive(Debug, Default)]
+pub struct StatementViews {
+    levels: Vec<ViewLevel>,
+}
+
+#[derive(Debug, Default)]
+struct ViewLevel {
+    /// How many of this level's user-function calls are running.
+    calling: usize,
+    /// Whether the level has called a volatile function at all.
+    viewing: bool,
+    /// Each row the calls wrote, as it was before their first write of it:
+    /// by `(db, collection)`, then `_id` key, `None` for a row inserted.
+    rows: HashMap<(String, String), TableOverlay>,
+}
+
+impl StatementViews {
+    /// A new client statement starts: no level has a view.
+    pub fn reset(&mut self) {
+        self.levels.clear();
+    }
+
+    /// A statement a function body runs starts; the token ends it.
+    pub fn enter_statement(&mut self) -> usize {
+        self.base();
+        self.levels.push(ViewLevel::default());
+        self.levels.len() - 1
+    }
+
+    /// The statement [`Self::enter_statement`] started has ended.
+    pub fn leave_statement(&mut self, token: usize) {
+        self.levels.truncate(token.max(1));
+    }
+
+    /// The running statement calls a volatile user function; the token
+    /// ends the call.
+    pub fn enter_call(&mut self) -> usize {
+        self.base();
+        let at = self.levels.len() - 1;
+        let level = &mut self.levels[at];
+        level.calling += 1;
+        level.viewing = true;
+        at
+    }
+
+    /// The call [`Self::enter_call`] started has returned.
+    pub fn leave_call(&mut self, token: usize) {
+        self.levels.truncate(token + 1);
+        if let Some(level) = self.levels.get_mut(token) {
+            level.calling = level.calling.saturating_sub(1);
+        }
+    }
+
+    fn base(&mut self) {
+        if self.levels.is_empty() {
+            self.levels.push(ViewLevel::default());
+        }
+    }
+
+    /// Record a row's first write by a running call, in every level
+    /// calling: `prior` is the row before it, with its RecordId.
+    fn note(&mut self, db: &str, coll: &str, idk: &[u8], prior: Option<(i64, &[u8])>) {
+        for level in self.levels.iter_mut().filter(|l| l.calling > 0) {
+            level
+                .rows
+                .entry((db.to_string(), coll.to_string()))
+                .or_default()
+                .rows
+                .entry(idk.to_vec())
+                .or_insert_with(|| prior.map(|(r, b)| (r, b.to_vec())));
+        }
+    }
+
+    fn recording(&self) -> bool {
+        self.levels.iter().any(|l| l.calling > 0)
+    }
+
+    /// What the running statement's reads of `(db, coll)` lay over the
+    /// table: its calls' rows as they were, unless one of its calls is
+    /// running (that call's reads are its own statements').
+    fn overlay(&self, db: &str, coll: &str) -> Option<&TableOverlay> {
+        let level = self.levels.last()?;
+        if !level.viewing || level.calling > 0 {
+            return None;
+        }
+        level
+            .rows
+            .get(&(db.to_string(), coll.to_string()))
+            .filter(|ov| !ov.rows.is_empty())
+    }
 }
 
 /// A savepoint's undo journal: the first write of each document row after
@@ -5655,6 +5784,19 @@ fn undo_id_key(id: &Bson) -> Vec<u8> {
     id_key(id).unwrap_or_else(|_| format!("{id:?}").into_bytes())
 }
 
+/// The `_id` key of the raw document `doc`, as an overlay knows its rows.
+fn raw_id_key(doc: &[u8]) -> Result<Vec<u8>> {
+    let id: Bson = bson::RawDocument::from_bytes(doc)
+        .map_err(|e| StorageError::Bson(e.to_string()))?
+        .get("_id")
+        .map_err(|e| StorageError::Bson(e.to_string()))?
+        .ok_or_else(|| StorageError::Internal("a row without _id".into()))?
+        .to_raw_bson()
+        .try_into()
+        .map_err(|e: bson::raw::Error| StorageError::Bson(e.to_string()))?;
+    id_key(&id)
+}
+
 impl UndoJournal {
     /// Open a frame for savepoint `id`.
     pub fn open(&mut self, id: u64) {
@@ -5731,7 +5873,7 @@ fn undo_note_row(
     db: &str,
     coll: &str,
     id_k: &[u8],
-    prior: Option<&[u8]>,
+    prior: Option<(i64, &[u8])>,
     id_src: &[u8],
 ) -> Result<()> {
     if ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
@@ -5742,6 +5884,12 @@ fn undo_note_row(
             return Ok(());
         };
         let mut h = held.lock().unwrap_or_else(|e| e.into_inner());
+        if h.undo.paused == 0 && h.views.recording() {
+            let src = prior.map_or(id_src, |(_, b)| b);
+            let idk = raw_id_key(src)?;
+            h.views.note(db, coll, &idk, prior);
+        }
+        let prior = prior.map(|(_, b)| b);
         if !h.undo.recording() {
             return Ok(());
         }
@@ -6299,11 +6447,95 @@ fn note_row(db: &str, coll: &str, recordid: i64) -> Result<()> {
         });
     }
     let blocked = store != 0 && share_locks::write_blocked(store, &row, me);
+    if me != 0 {
+        test_point(
+            if blocked {
+                TestPoint::GuardedConflict
+            } else {
+                TestPoint::AfterRowCheck
+            },
+            &row,
+        );
+    }
     LAST_ROW.with(|l| *l.borrow_mut() = Some(row));
     if blocked {
         return Err(StorageError::WriteConflict);
     }
     Ok(())
+}
+
+/// A point in the move of a transaction ([`Storage::rebase_user_transaction_to`])
+/// and in the writes racing it that a test may stop at ([`set_test_hook`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestPoint {
+    /// A write has noted its row and found no guard on it: its WiredTiger
+    /// write follows at once -- unless the hook holds it here.
+    AfterRowCheck,
+    /// A moving transaction has rolled back its old WiredTiger transaction
+    /// and not yet replayed its writes.
+    AfterRollback,
+    /// A write turned away from its row by another transaction's guard or
+    /// shared lock.
+    GuardedConflict,
+    /// A moving transaction is about to wait for a collection's write lock,
+    /// which a writer holds from its check of a row to its write of it.
+    MoveLockWait,
+}
+
+type TestHook = Arc<dyn Fn(TestPoint, &WrittenRow) + Send + Sync>;
+
+static TEST_HOOK_ON: AtomicBool = AtomicBool::new(false);
+static TEST_HOOK: Mutex<Option<TestHook>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the hook every [`TestPoint`] calls --
+/// process-wide, for a test that must force the interleaving of a writer and
+/// a transaction moving beneath it. Not for production use.
+#[doc(hidden)]
+pub fn set_test_hook(hook: Option<TestHook>) {
+    let mut slot = TEST_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+    TEST_HOOK_ON.store(hook.is_some(), Ordering::SeqCst);
+    *slot = hook;
+}
+
+/// A scan a test may fail ([`set_read_fault`]): given the database and the
+/// collection a [`Storage::find_matching_with`] scan reads, the error to fail
+/// it with, or `None` to let it run.
+pub type ReadFault = Arc<dyn Fn(&str, &str) -> Option<StorageError> + Send + Sync>;
+
+static READ_FAULT_ON: AtomicBool = AtomicBool::new(false);
+static READ_FAULT: Mutex<Option<ReadFault>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the fault every document scan asks
+/// first -- process-wide, for a test that must prove a failed read reaches
+/// the client as an error rather than as an empty answer. Not for
+/// production use.
+#[doc(hidden)]
+pub fn set_read_fault(fault: Option<ReadFault>) {
+    let mut slot = READ_FAULT.lock().unwrap_or_else(|e| e.into_inner());
+    READ_FAULT_ON.store(fault.is_some(), Ordering::SeqCst);
+    *slot = fault;
+}
+
+fn read_fault(db: &str, coll: &str) -> Result<()> {
+    if !READ_FAULT_ON.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let fault = READ_FAULT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    match fault.and_then(|f| f(db, coll)) {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+fn test_point(point: TestPoint, row: &WrittenRow) {
+    if !TEST_HOOK_ON.load(Ordering::Relaxed) {
+        return;
+    }
+    let hook = TEST_HOOK.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(hook) = hook {
+        hook(point, row);
+    }
 }
 
 /// The document row this thread last wrote or tried to write. Read right
@@ -11567,11 +11799,64 @@ impl Storage {
         fresh.defer_creates = handle.defer_creates;
         fresh.deferred_creates = handle.deferred_creates.clone();
         fresh.deferred_keys = handle.deferred_keys.clone();
+        // The guard and the rollback are made holding the write lock of every
+        // collection the transaction has written a row of (sorted, as the
+        // other multi-collection takers do). A writer holds its collection's
+        // lock from noting a row -- when it looks for a guard -- to writing
+        // it, so one that looked before the guard stood has finished its
+        // write (which collides with the old transaction, still holding the
+        // row) before the rollback lets go, and one that comes after sees the
+        // guard: no writer is ever past the check but not yet at the row, as
+        // in PostgreSQL's `heap_update`, which stamps the tuple under the
+        // buffer lock. The replay below takes the locks itself, one write at
+        // a time.
+        //
+        // Not taken by a move made inside a running statement (a PL/pgSQL
+        // EXCEPTION block): that statement may itself be inside a storage
+        // call holding one of these non-reentrant locks.
+        let mut lock_colls: Vec<(String, String)> = if ACTIVE_HANDLE.with(|c| c.get()).is_null() {
+            handle
+                .held
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .collections
+                .clone()
+        } else {
+            Vec::new()
+        };
+        lock_colls.sort_unstable();
+        lock_colls.dedup();
+        let coll_locks: Vec<Arc<Mutex<()>>> = lock_colls
+            .iter()
+            .map(|(db, coll)| self.coll_lock(db, coll))
+            .collect();
+        let coll_guards: Vec<_> = coll_locks
+            .iter()
+            .zip(&lock_colls)
+            .map(|(lock, (db, coll))| match lock.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    test_point(TestPoint::MoveLockWait, &(db.clone(), coll.clone(), 0));
+                    lock.lock().unwrap_or_else(|e| e.into_inner())
+                }
+            })
+            .collect();
         let _moving = MoveGuard::new(&handle.held);
         // The replay rewrites what the journal already recorded (or what
         // came before its savepoints): it records nothing.
         let _undo_paused = UndoPause::new(&handle.held);
         self.rollback_user_transaction_inner(handle, false)?;
+        drop(coll_guards);
+        if TEST_HOOK_ON.load(Ordering::Relaxed) {
+            let guarded: Vec<WrittenRow> = {
+                let h = handle.held.lock().unwrap_or_else(|e| e.into_inner());
+                h.moving.iter().cloned().collect()
+            };
+            for row in &guarded {
+                test_point(TestPoint::AfterRollback, row);
+            }
+        }
         // The locks taken by rewriting a row unchanged have no oplog entry:
         // they are taken again after the replay.
         let mut relock = std::mem::take(&mut handle.locked);
@@ -13028,7 +13313,7 @@ impl Storage {
 
                 let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                 note_row(db, coll, recordid)?;
-                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
+                undo_note_row(db, coll, &key, Some((recordid, &old_blob)), &old_blob)?;
                 cur.set_key_ssq(db, coll, recordid);
                 cur.set_value_u(&frame_doc_value(&key, &blob));
                 cur.update()?;
@@ -13116,7 +13401,7 @@ impl Storage {
                     Err(e) if e.is_not_found() => return Ok(false),
                     Err(e) => return Err(e.into()),
                 };
-                undo_note_row(db, coll, &key, Some(&old_blob), &old_blob)?;
+                undo_note_row(db, coll, &key, Some((recordid, &old_blob)), &old_blob)?;
                 cur.remove()?;
                 self.sizes.adjust(
                     &session,
@@ -18685,7 +18970,7 @@ impl Storage {
                 for (recordid, id_k, blob) in self.scan_docs(session, db, coll)? {
                     doc_cur.reset()?;
                     note_row(db, coll, recordid)?;
-                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+                    undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                     doc_cur.set_key_ssq(db, coll, recordid);
                     doc_cur.remove()?;
                     self.sizes
@@ -19607,6 +19892,7 @@ impl Storage {
         coll_opt: Option<&Collation>,
         vars: &Document,
     ) -> Result<Vec<Vec<u8>>> {
+        read_fault(db, coll)?;
         if self.is_oplog_rs(db, coll) {
             // A `$natural` hint is the oplog's order, as a `$natural` sort
             // is: the command layer sends `sort({$natural: -1})` as the hint.
@@ -21332,7 +21618,7 @@ impl Storage {
             self.insert_index_entries(session, db, coll, &additions)?;
             cur.reset()?;
             note_row(db, coll, recordid)?;
-            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+            undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
             cur.update()?;
@@ -21511,7 +21797,7 @@ impl Storage {
                         // the framed value carries the id_key in-band.
                         let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                         note_row(db, coll, recordid)?;
-                        undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+                        undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                         cur.set_key_ssq(db, coll, recordid);
                         cur.set_value_u(&frame_doc_value(&id_k, &new_blob));
                         cur.update()?;
@@ -22117,7 +22403,7 @@ impl Storage {
             // reader ordering rationale.
             cur.reset()?;
             note_row(db, coll, recordid)?;
-            undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+            undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
             cur.set_key_ssq(db, coll, recordid);
             cur.remove()?;
             self.sizes
@@ -22207,7 +22493,7 @@ impl Storage {
                     // reader ordering rationale.
                     let cur = session.open_cursor(&doc_table_for(db, coll), None)?;
                     note_row(db, coll, recordid)?;
-                    undo_note_row(db, coll, &id_k, Some(&blob), &blob)?;
+                    undo_note_row(db, coll, &id_k, Some((recordid, &blob)), &blob)?;
                     cur.set_key_ssq(db, coll, recordid);
                     cur.remove()?;
                     self.sizes

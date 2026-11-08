@@ -1003,6 +1003,40 @@ one beside it.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
+## Found by a CI run (2026-11-07)
+
+- [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
+      once; not reproduced.** Commit `f96fc90d`, job 128491514608
+      (`pg-oracle (differential)`),
+      `tests/test_rust_pg_corpora.py::test_corpus_answers_as_postgresql_does[sqlalchemy_catalog]`.
+      The setup ran `COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'`, and
+      `SELECT obj_description('sa35_s.sa35_d_ix'::regclass, 'pg_class')`
+      then answered NULL where PostgreSQL answers `ix comment`. About 2,000
+      local runs, including runs under load and runs with forced
+      interleavings, never reproduced it. Two things that could each
+      produce exactly this symptom were found and fixed.
+      First, every storage read on the comment path answered a failure
+      with "no comment", and the publication was then recorded as current
+      for that catalog version. Those reads were the index comments, the
+      catalog, each table's index list, and `COMMENT ON INDEX`'s own lookup.
+      Second, the corpus test ignored a failed setup statement.
+      Since 2026-11-07 those reads raise `XX000` naming the storage error.
+      The publication is not recorded, and a failed corpus setup statement
+      fails its test with its error (regression test:
+      `crates/secantus-pg/tests/embedded.rs::a_failed_comment_read_is_an_error_not_a_null`).
+      **If it recurs, the job log names the cause.** Read the failing
+      statement's error, or the setup statement the test now reports. A
+      NULL with no error would mean the comment was never written, or was
+      published to a planner thread that missed it, and the transient
+      storage read is ruled out.
+      Some reads under `object_comments` still answer a failure as "none":
+      the constraint, text-search, conversion, opclass, subscription and
+      transform comment helpers, and `shobj_description`'s
+      `shared_comments`. They were not on this corpus's path, and their
+      first failure should be made to surface the same way.
+      Backlog-ID: RP-499
+      Verify: none -- seen once in CI, not reproduced; a recurrence now names its cause in the job log
+
 ## Found by the 2026-10-20 audit
 
 A review of the PG crates, each finding reproduced against a `secantusd-pg`
@@ -1675,16 +1709,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A subquery in a CREATE TABLE AS or CREATE MATERIALIZED VIEW is
-      refused.** `create table ct as select (select 1) x from e` is 0A000
-      `SubLink is not supported yet`, uncorrelated or correlated (`(select
-      e.a + 1)`, `exists(select ... where f.a = e.a)`), and so is `create
-      materialized view mv as select (select a + 1) from e`; PostgreSQL
-      15.19 makes each table with its rows. `select ... into` of the same
-      list is made. Measured on a private 15.19 cluster with `e(a int, b
-      text)` (found while working RP-449).
-      Verify: tests/backlog/test_rp_ctas_subquery.py::test_subquery_in_create_table_as
-      Backlog-ID: RP-466
 - [ ] **A missing relation named by a string literal for a `regclass`
       parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
       untyped literal argument to its parameter's type during analysis
@@ -1884,20 +1908,6 @@ and `fs(a int, c text)`, one row each.
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_exists_target_subquery_is_analysed
       Backlog-ID: RP-459
 
-## Found while working RP-453 (2026-11-07)
-
-- [ ] **An UPDATE ... FROM's or a DELETE ... USING's RETURNING subquery
-      cannot read the FROM.** `update fe set b = 'w' from fs returning
-      (select fs.a from fe limit 1)` answers 1 on PostgreSQL 15.19, `delete
-      from fe using fs returning (select fs.c from fe limit 1)` `y`, and the
-      same through an alias (`from fs x ... x.c`); the FROM and USING items
-      are relations of the statement's own level. Here each is 42P01
-      `missing FROM-clause entry for table "fs"` (or `"x"`). A subquery over
-      the write's target alone already reads it. Measured on PostgreSQL
-      15.19.
-      Backlog-ID: RP-457
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_returning_subquery_reads_the_from
-
 ## Found while working RP-455 (2026-11-07)
 
 - [ ] **A subquery inside a FROM-subquery is offered a sibling's alias as
@@ -1924,54 +1934,76 @@ and `fs(a int, c text)`, one row each.
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 `fs(a int, c text)`, one row each (`(1, 'x')`, `(1, 'y')`).
 
-- [ ] **A PL/pgSQL block label does not qualify its variables.** `<<blk>>
-      declare x int := 3; begin return blk.x + p; end` answers 10 for
-      `gl(7)` on PostgreSQL; here 42P01 `missing FROM-clause entry for table
-      "blk"`. The function's own name, the label of the block its
-      parameters are declared in, qualifies them since RP-451; a label the
-      body writes does not.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_block_label_qualifies_a_variable
-      Backlog-ID: RP-463
-- [ ] **CREATE FUNCTION ... LANGUAGE sql does not check its body.** With
-      `check_function_bodies` on, its default, PostgreSQL parses and
-      analyses each statement at CREATE: a body `select gx.q` is 42P01
-      `missing FROM-clause entry for table "gx"` at 65, `select nosuch`
-      42703 `column "nosuch" does not exist` at 65, `select 1 from nosuch`
-      42P01 `relation "nosuch" does not exist` at 72. Here each CREATE
-      succeeds and the error waits for the first call.
-      Verify: tests/backlog/test_rp_function_bodies.py::test_create_checks_the_body
-      Backlog-ID: RP-465
+## Found while working RP-465 (2026-11-07)
 
-## Found while working RP-461 (2026-11-07)
+Measured on a private PostgreSQL 15.19 cluster.
 
-- [ ] **A function with one OUT parameter names its FROM column after the
-      function.** `gto(out t int)` and `gtt() returns table (t int)` give
-      `select * from gto()` one column `t` on PostgreSQL 15.19, so `select
-      t from gto()`, `select g.t from gto() as g` and `select t from gtt()`
-      answer their row; here the column is `gto` (or the alias `g`), and
-      each is 42703. Two or more OUT columns are already named by their
-      parameters. A SQL function body naming such a column now meets the
-      same 42703, where it read a parameter of that name before RP-461.
-      Measured on PostgreSQL 15.19.
-      Backlog-ID: RP-477
-      Verify: tests/backlog/test_rp_function_bodies.py::test_one_out_parameter_names_the_column
+## Found while working RP-501 (2026-11-07)
+
+Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
+
+- [ ] **What `transformWithClause` checks of a WITH is not all checked.**
+      Since RP-501 an unread item is planned without being run, so its
+      names and types are checked, but not: an unread item's literal input
+      (`with w as (select 'x'::int) select 1` is 22P02 at 19 there, `1`
+      here); an item of a WITH inside a subquery expression (`select (with
+      w as (select nosuch) select 1)`, 42703 at 27 there, `1` here); the
+      forward reference's HINT `Use WITH RECURSIVE, or re-order the WITH
+      items to remove forward references.`; an alias list longer than the
+      item's columns (`with w(x, y) as (select 1)`, 42P10 `WITH query "w"
+      has 1 columns available but 2 columns specified` at 6 there; here
+      42601 `table "w" ...` with no position when read, and nothing when
+      not); and a name given twice (42712 `WITH query name "w" specified
+      more than once` at the second, 25; here the first wins).
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_clause_checks
+      Backlog-ID: RP-504
+
+## Found while working RP-486 (2026-11-07)
+
+- [ ] **A syntax error in a DO block the interpreter compiles carries no
+      position.** A body with a DECLARE section or a label is compiled by
+      the function interpreter, and its 42601 reaches the client with no
+      statement position: `do $$ declare x int; begin raise notice 'z' end
+      $$` is `syntax error at or near "end"` at 45 on PostgreSQL 15.19,
+      `do $$ <<blk>> begin raise notice 'z' end $$` the same at 38, and
+      `do $$ <<blk>> begin raise notice 'z'; end nope $$` `end label "nope"
+      differs from block's label "blk"` at 43. Here each message matches
+      and no position is sent. (The fast path for a plain `begin ... end`
+      body already points at the token.)
+      Verify: tests/backlog/test_rp_do_compile_errors.py::test_compile_error_has_a_position
+      Backlog-ID: RP-492
+
+## Found while working RP-463 (2026-11-07)
+
+- [ ] **An expression's error in a PL/pgSQL statement carries no QUERY and
+      no internal position.** `do $$ declare x int; begin raise notice '%',
+      nosuch.x; end $$` is 42P01 on both, but PostgreSQL 15.19 sends
+      `internal_query` `nosuch.x` and `internal_position` 1 (psql prints
+      `LINE 1: nosuch.x` and `QUERY:`); here neither field is sent. Called
+      as a function (`return nosuch.x` in `lbe()`), the error here instead
+      carries a statement position, 8, into `select lbe()`, where
+      PostgreSQL sends none. Measured on a private 15.19 cluster.
+      Verify: tests/backlog/test_rp_plpgsql_labels.py::test_expression_error_carries_its_query
+      Backlog-ID: RP-488
+
+## Found while working RP-483 (2026-11-07)
+
+- [ ] **A call in a schema that does not exist is reported as a missing
+      function.** On PostgreSQL 15.19 `select nosuch_schema.nosuch()` is
+      3F000 `schema "nosuch_schema" does not exist` at 8
+      (`LookupExplicitNamespace`, before any function is looked up), and
+      `select pg_temp.nosuch()` the same for `pg_temp` in a session that has
+      made no temporary object yet. Here each is 42883 `function nosuch()
+      does not exist` (the schema dropped from the name, at the parenthesis,
+      22) or `function pg_temp.nosuch() does not exist`, with the
+      no-matching-function HINT. Once the session has a temp table both
+      servers answer 42883 for `pg_temp`. Measured on a private 15.19
+      cluster.
+      Verify: tests/backlog/test_rp_function_bodies.py::test_call_in_a_missing_schema
+      Backlog-ID: RP-485
 
 ## Found while working RP-472 (2026-11-07)
 
-- [ ] **A scan sees the rows a function the same statement ran wrote.**
-      With `fq()` a SQL function whose body is `insert into t values (7);
-      select 1`, over `t` holding 1, 2, 3: `select * from t, fq()`, `select
-      * from fq(), t`, `select * from t x, lateral fq()` and `select * from
-      t where a < (select * from fq()) + 10` each answer t's three rows on
-      PostgreSQL 15.19, as the statement's snapshot predates the call; here
-      each answers four, 7 included. The function runs once (RP-472), but
-      a FROM function and an uncorrelated subquery are run while the
-      statement is PLANNED, before its scan, and the scan reads everything
-      committed by then. The faithful fix is PostgreSQL's: the statement
-      reads at its own snapshot and command id, which a volatile
-      function's writes come after.
-      Backlog-ID: RP-473
-      Verify: tests/backlog/test_rp_from_function_scan.py::test_scan_does_not_see_the_functions_write
 - [ ] **EXPLAIN of a user function in FROM prints no Function Scan.**
       PostgreSQL 15.19 prints `Function Scan on fq` for `explain (costs
       off) select * from fq()`, a scalar or a SETOF SQL function alike.
@@ -2007,47 +2039,540 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       `j` has no leaf to go to. The rows are right; the plan text is not.
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
-- [ ] **`pg_get_viewdef` of an aliased JOIN returns the view's text.**
-      PostgreSQL 15.19 prints `(fs JOIN fe USING (a)) j` with its alias, a
-      column list when the join's names repeat (`j(a, c, a_1, b)` over an
-      ON join), and a USING alias's column by the left side's name
-      (`SELECT fs.a FROM (fs JOIN fe USING (a) AS u)`). `ruleutils.rs`
-      gives up on an aliased JOIN (`collect_rtes`) and falls back to the
-      statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
-      Backlog-ID: RP-467
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
 
 ## Found while working RP-470 (2026-11-07)
 
-- [ ] **A whole-row reference is still refused in three shapes.** On
-      PostgreSQL 15.19, `select l from fs join lateral (select fs.a) l on
-      true` answers `(1)` (and NULL for a LATERAL side an outer join
-      NULL-extends), `select (select fs) from fs` and the same over `fs,
-      fe` answer `(1,y)`, and `select (fs).* from fs, fe order by 1`
-      answers `1, y`. Here the first two are 42703 `column "l" (or "fs")
-      does not exist` -- a LATERAL leaf (`lateral_leaf`) carries no row
-      column, and a subquery's correlation does not bind an outer FROM
-      item's whole row -- and the last is 0A000 `this field selection is
-      not supported yet`: `ORDER BY 1` copies the `(fs).*` target before
-      the join expands it. Since RP-470 a table's or a plain subquery's
-      whole row over a join works, built at its scan.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_remainder
-      Backlog-ID: RP-479
-- [ ] **A whole row is typed as a record, or as varchar.** `select x from
-      fs as x(p, q)`, alone or over a join, is of `fs`'s row type on
-      PostgreSQL 15.19 (psycopg reads `(1,y)`); here it is a `record`, as
-      `column_alias_rewrite` turns the table into a subquery first. A
-      view's whole row (`select v from v`, alone or over a join) has the
-      right value, but its RowDescription's type OID is 1043, varchar,
-      where PostgreSQL sends the view's row type (`'v'::regtype`).
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_under_column_aliases, tests/backlog/test_rp_subquery_scope.py::test_whole_row_of_a_view_is_its_row_type
-      Backlog-ID: RP-480
 - [ ] **A missing USING column's 42703 carries a position.** PostgreSQL
       15.19 reports `column "a" specified in USING clause does not exist in
       left table` with no position; here it points into the statement (41,
       33 in the gap test's two statements).
       Verify: tests/backlog/test_rp_subquery_scope.py::test_using_column_missing_has_no_position
       Backlog-ID: RP-481
+
+## Found while working RP-479 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
+holding `(1, 'y')`.
+
+- [ ] **`v.*` in a subquery's select list over an outer FROM item is
+      42P01.** On PostgreSQL 15.19 `select (select v.*) from (values (1))
+      v(a)` answers 1 (the star expands to the outer item's columns), and
+      over `v(a, c)` it is 42601 `subquery must return only one column` at
+      8; here each is 42P01 `missing FROM-clause entry for table "v"`. Since
+      RP-479 a bare outer name is the item's whole row in a subquery; a
+      star over it is not yet expanded there. Measured on 15.19 with
+      VALUES lists.
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_outer_star_in_subquery
+      Backlog-ID: RP-517
+
+## Found while working RP-508 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp508.py`.
+
+- [ ] **`pg_get_function_arguments` and `pg_get_function_identity_arguments`
+      of a procedure print no argument modes.** PostgreSQL 15.19's
+      `print_function_arguments` prints every mode of a procedure's
+      arguments, IN included: `create procedure gk(a int, inout b text)`
+      prints `IN a integer, INOUT b text` in both; here `a integer, b text`.
+      (A function's IN is left out on both servers.)
+      Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
+      Backlog-ID: RP-515
+
+## Found while working RP-467 (2026-11-08)
+
+- [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
+      exception.** PostgreSQL lets two unaliased FROM items share a name
+      when they are different relations (`select 1 from s1.t join s2.t on
+      true` runs, and only a `t.a` naming both is ambiguous), and refuses an
+      alias equal to another item's name (42712 `table name "t" specified
+      more than once`). Here the join of two unaliased `t` is that 42712,
+      since a joined row is keyed by the bare name, and `create view v as
+      select t.a from s1.t t join s2.t on s2.t.a = t.a` is accepted, its
+      definition then reading `t.a = t.a`. Measured on a private 15.19
+      cluster.
+      Backlog-ID: RP-526
+      Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
+
+## Found while working RP-528 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap test is in
+`tests/backlog/test_rp_found_rp528.py`.
+
+- [ ] **A DROP naming a schema that does not exist reports the relation
+      missing.** PostgreSQL 15.19's `DropErrorMsgNonExistent` asks for the
+      schema first: `drop table nosch.t` (and `view`, `materialized view`,
+      `index`, `sequence`) is 3F000 `schema "nosch" does not exist`, and
+      under IF EXISTS the NOTICE is `schema "nosch" does not exist,
+      skipping`. Here each is the relation's own 42P01 / 42704 (`table
+      "nosch.t" does not exist`) or its skipping NOTICE. The planner keys a
+      qualified name in an unknown schema as `nosch.t`, which `split_key`
+      cannot tell from a quoted `"nosch.t"` in `public` (PostgreSQL reports
+      that one as a missing table): the fix needs the written schema from
+      the parse tree.
+      Verify: tests/backlog/test_rp_found_rp528.py::test_drop_in_a_missing_schema
+      Backlog-ID: RP-533
+
+## Found while working RP-514 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp514.py`.
+
+- [ ] **A built-in routine is not looked up among its overloads or its
+      kind.** PostgreSQL 15.19 looks a built-in up in `pg_proc` like any
+      routine: `grant execute on function lower to public` and `comment on
+      function lower is 'x'` are 42725 `function name "lower" is not unique`
+      (`comment on routine abs` says `routine name`), and `grant execute on
+      procedure abs(int)` and `comment on procedure abs(int)` are 42809
+      `abs(integer) is not a procedure`. Here the bare-name GRANT succeeds,
+      the PROCEDURE forms are 42883 `procedure abs(integer) does not exist`,
+      and every COMMENT ON a built-in routine is refused as 0A000 (PostgreSQL
+      records `comment on function abs(int)`). `function_acl_key`
+      (object_acl.rs) knows a built-in only by `is_known_function(name)`:
+      the fix needs the built-in's overloads, and a place to keep a
+      built-in's comment.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
+      Backlog-ID: RP-519
+- [ ] **GRANT's 42883 for a signature no routine has carries a position.**
+      PostgreSQL 15.19's `LookupFuncWithArgs` raises `function gc(boolean)
+      does not exist` (and `procedure ...` for PROCEDURE) with no position;
+      here it carries one, at the routine's name (27, 28). COMMENT's same
+      error has none.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_grant_missing_signature_has_no_position
+      Backlog-ID: RP-520
+
+## Found while working RP-516 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
+and `fs(a int, c text)`.
+
+- [ ] **A write's name error is reported away from the reference.**
+      PostgreSQL 15.19 positions each at the name as written. Here `update
+      fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
+      target), not 21 / 31; `update fs set c = 'q' from fe e where e.a =
+      fs.a returning fe` is 42703 at 28 (the FROM item), not 60; and an
+      ambiguous bare column in an UPDATE ... FROM's or DELETE ... USING's
+      RETURNING (`returning a`) is 42702 with no position, not 59 / 53.
+      RP-414 has the reference's name and qualifier; this is where it is.
+      Backlog-ID: RP-524
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
+
+## Found while working RP-546 (2026-11-08)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
+tests are in `tests/backlog/test_rp_found_rp546.py`.
+
+- [ ] **DROP TABLE names a table's dependants by kind, not in creation
+      order.** PostgreSQL 15.19's `findDependentObjects` reads `pg_depend`
+      in creation order, so a view made before the table whose foreign key
+      references it is named first (`view o560v depends on table o560a`,
+      then the constraint), and a cast made between two functions over the
+      row type falls between them. Here the foreign keys always come before
+      the views (`drop table` and its CASCADE notice), and since RP-546 the
+      casts follow every routine: a cast's oid is derived from its types, not
+      drawn from the oid counter as `CastCreate` draws it, so its creation
+      order is not kept. `DROP SCHEMA ... CASCADE` names a routine over a
+      member's row type in the same order as here, not PostgreSQL's.
+      Backlog-ID: RP-560
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_table_dependants_in_creation_order
+- [ ] **An operator over a table's row type does not depend on it.**
+      `create operator ==== (leftarg = p561, rightarg = p561, ...)` records
+      a dependency on its argument types, so `drop table p561` names
+      `operator ====(p561,p561) depends on type p561` and CASCADE drops it.
+      Here the DETAIL names only the function, and the operator outlives the
+      table in `pg_operator`.
+      Backlog-ID: RP-561
+      Verify: tests/backlog/test_rp_found_rp546.py::test_operator_over_row_type_depends_on_its_table
+- [ ] **DROP TYPE of a table's row type with a routine over it names the
+      routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
+      `cannot drop type r562 because table r562 requires it` whatever else
+      names the type; here a routine over it makes the answer that routine's
+      `other objects depend on it`. With no routine it already matches.
+      Backlog-ID: RP-562
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
+- [ ] **DROP TYPE names a routine with a blank after each comma.**
+      `getObjectDescription` writes `format_procedure`'s
+      `function k563(integer,ty563)`; DROP TYPE's DETAIL and CASCADE notice
+      here say `k563(integer, ty563)` (`function_signature`, which DROP
+      FUNCTION's dependants share). DROP TABLE names them as PostgreSQL does
+      since RP-546 (`row_type_depends::routine_description`).
+      Backlog-ID: RP-563
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_names_a_routine_as_format_procedure
+- [ ] **A DROP TABLE of several tables is refused under the first one's
+      name.** PostgreSQL 15.19's `reportDependentObjects` says `cannot drop
+      desired object(s) because other objects depend on them` when the DROP
+      names more than one object; here `drop table m564a, m564b` is `cannot
+      drop table m564a because ...`, each table being dropped on its own.
+      Backlog-ID: RP-564
+      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_refusal_headline
+- [ ] **A routine over a temporary table's row type names no type.** On
+      PostgreSQL 15.19 `create function tf565(tt565)` over a temp table has
+      `proargtypes` `{tt565}`, and `drop table tt565` is 2BP01 naming it.
+      Here the argument is stored by its bare name, which resolves to no
+      type (`-`), the DROP succeeds, and the routine is left behind.
+      Backlog-ID: RP-565
+      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_a_temp_table_row_type
+- [ ] **A `regprocedure` prints its name unquoted and a schema's type
+      quoted whole.** `regprocedureout` is `format_procedure`: `"Q
+      f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
+      `Q f567("s567.t")` and `s567.h("s567.t")` (`regobj::text`), and
+      `pg_describe_object` of a routine shares that text.
+      Backlog-ID: RP-567
+      Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
+
+## Found while working RP-527 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp527.py`.
+
+- [ ] **A FROM relation that does not exist is reported after the
+      statement's qualified column references.** PostgreSQL 15.19's
+      `transformFromClause` runs before the select list and WHERE are read,
+      so `select fs.c from nosuch` is 42P01 `relation "nosuch" does not
+      exist` at 18, `select nosuch.c from nosuch` the same at 22 and
+      `select a from nosuch where zz.a = 1` at 15. Here the qualifier check
+      runs first: the first and third are `missing FROM-clause entry for
+      table "fs"` / `"zz"` (at 8, 28), and the second has PostgreSQL's
+      message at the reference (8).
+      Backlog-ID: RP-545
+      Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
+
+## Found while working RP-530 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
+holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
+int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
+
+- [ ] **An untyped literal beside a row is not read as `record`.** `select
+      fs = 'x' from fs`, `'x' = fs` and `(1,2) = 'x'` are 0A000 `input of
+      anonymous composite types is not implemented` at the literal (13, 8,
+      16) on PostgreSQL 15.19: the operator resolves to `record = record`
+      and `record_in` refuses the literal. Here each is 0A000 `comparing
+      document with string using = is not supported yet`, with no position.
+      Verify: tests/backlog/test_rp_found_rp530.py::test_untyped_literal_beside_a_row
+      Backlog-ID: RP-591
+- [ ] **A row beside an `ARRAY[...]` names the row `text`.** `select
+      array[1] = (1,2)`, `fs = array[1]` and `array[1] = fs` are 42883
+      `operator does not exist: integer[] = record` (`fs = integer[]`,
+      `integer[] = fs`) on PostgreSQL 15.19; here they name the array
+      `int4[]` and the row `text`. The SQLSTATE and position match.
+      Verify: tests/backlog/test_rp_found_rp530.py::test_row_beside_an_array_constructor
+      Backlog-ID: RP-592
+- [ ] **An error a PREPARE's query raises carries the query's own offset.**
+      PREPARE plans the deparsed inner query, so a recorded location is an
+      offset into `SELECT ...`, honoured whenever a token of the PREPARE
+      text happens to start there: `prepare p1(int) as select 12 = true`
+      is 42883 at 30 on PostgreSQL 15.19 and at 11 here (the `(` of
+      `p1(int)`). An offset that lands on no token falls back to the text
+      search, which is why most look right.
+      Verify: tests/backlog/test_rp_found_rp530.py::test_prepare_error_position
+      Backlog-ID: RP-593
+
+## Found while working RP-532 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
+holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
+holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
+gap tests are in `tests/backlog/test_rp_found_rp532.py`.
+
+- [ ] **An ungrouped whole row's 42803 names its first column, with no
+      position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
+      whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
+      the reference: `select fs, count(*) from fs group by a` is `column
+      "fs.*" must appear in the GROUP BY clause ...` at 8, and `select
+      count(*) from fs having fs is not null` the same at 32. Here they
+      name `fs.c` and `fs.a`, with no position.
+      Backlog-ID: RP-536
+      Verify: tests/backlog/test_rp_found_rp532.py::test_ungrouped_whole_row
+- [ ] **A relation name its alias hides is reported at the FROM item.**
+      Under `from fs x` the name `fs` names nothing, so PostgreSQL 15.19
+      reports `select count(*) from fs x group by fs` and `... order by fs`
+      as 42703 `column "fs" does not exist` at 36, the reference. Here the
+      first is positioned at 22 (the FROM item), and the second is 42803
+      `column "x.fs" must appear in the GROUP BY clause ...` at 22.
+      Backlog-ID: RP-537
+      Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
+
+## Found while working RP-551 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d551c as
+char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
+`fd551(a d551c)`. The gap tests are in `tests/backlog/test_rp_found_rp551.py`.
+
+- [ ] **A domain-typed result column goes out with no type modifier.**
+      PostgreSQL 15.19's `SendRowDescriptionMessage` sends a domain as its
+      base type and the base's modifier (`getBaseTypeAndTypmod`), so `select
+      'ab'::d551c` describes `bpchar` typmod 7, `1.5::d551n` 327686 and a
+      cast to `d551t` 0, as the same casts to `char(3)`, `numeric(5,2)` and
+      `timestamp(0)` do; here each is -1. The values themselves are right
+      (RP-551). A table's domain column already describes its width.
+      Backlog-ID: RP-557
+      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_result_column_typmod
+- [ ] **A domain column's `atttypmod` is the domain's width.** A column
+      declared with a domain carries no modifier of its own, so `fd551.a`'s
+      `atttypmod` is -1 on PostgreSQL 15.19 (the width is the domain's
+      `typtypmod`, which `information_schema` reads through
+      `_pg_truetypmod`); here it is 7. A domain over a domain already
+      answers -1 (RP-551 keeps the catalog at the column's own domain).
+      Backlog-ID: RP-558
+      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
+
+## Found while working RP-590 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp590.py`.
+
+- [ ] **The `record_image` operators are refused.** `*=`, `*<>`, `*<`,
+      `*<=`, `*>` and `*>=` over two record values are `record_image_eq`
+      .. `record_image_ge` on PostgreSQL 15.19, which compare the fields'
+      binary images: `(select row(1.0)) *= (select row(1.00))` is `f` where
+      `=` is `t`, and `row(1, 'a')::ca *= row(1, 'a')::cd` is `t`. Between
+      two `ROW(...)` constructors the operator is applied field by field
+      (`make_row_comparison_op`), so `row(1) *= row(1)` is 42883 `operator
+      does not exist: integer *= integer` at 15. Here each is 0A000
+      `operator *= on these operands is not supported yet`.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
+      Backlog-ID: RP-650
+
+## Found while working RP-559 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d559c as
+char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
+7)` and `('xy', null)`. The gap tests are in `tests/backlog/test_rp_found_rp559.py`.
+
+- [ ] **An array built from a domain column is typed by the column's base
+      type.** A column declared with a domain is of the domain (`exprType`
+      of its Var), so on PostgreSQL 15.19 `select array[a] from fd559`,
+      `array_agg(a)` and `array(select a from fd559)` are each `d559c[]`
+      (the domain's `typarray`, text `{"a b"}`), and `array[i]` is
+      `d559i[]`. Here they are `character[]` and `integer[]`, and the
+      ARRAY subquery is `text[]` with its padding lost (`xy`, not `xy `).
+      Since RP-559 an array of a domain CONSTANT is the domain's array; a
+      column is typed by its base everywhere in the planner, and only
+      `pg_typeof` sees its domain (`rewrite_domain_typeof`).
+      Backlog-ID: RP-569
+      Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
+
+## Found while working RP-570 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d570c as
+char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
+and `(2, 'abcd', '{abcd}')`. The gap tests are in
+`tests/backlog/test_rp_found_rp570.py`.
+
+- [ ] **A domain array literal's input error has no position.** `select
+      '{abcd}'::d570c[]` is 22001 at 8 on PostgreSQL 15.19 (`array_in` runs
+      `domain_in` while it reads the literal, as `'x'::int` is positioned
+      there); here the 22001 has no position. `positioned` places an error
+      by its SQLSTATE and message, and an assignment's 22001 has none.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
+      Backlog-ID: RP-581
+
+## Found while working RP-580 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d607a as
+char(3)` and `create domain d607b as d607a check (value <> 'abc')`. The gap
+test is in `tests/backlog/test_rp_found_rp580.py`.
+
+- [ ] **DROP DOMAIN drops a domain another domain is over.** `drop domain
+      d607a` and `drop domain d607a restrict` are 2BP01 `cannot drop type
+      d607a because other objects depend on it` (DETAIL `type d607b depends
+      on type d607a`, the CASCADE HINT) on PostgreSQL 15.19, and `drop
+      domain d607a cascade` drops both. Here each of the three drops
+      `d607a` alone and leaves `d607b` over a type that no longer exists.
+      `drop type d607a` is refused as PostgreSQL refuses it, but `drop type
+      d607a cascade` drops `d607b`, then fails 42704 `type "d607a" does
+      not exist` and leaves `d607a` in place.
+      Verify: tests/backlog/test_rp_found_rp580.py::test_drop_of_a_domain_another_domain_is_over
+      Backlog-ID: RP-607
+
+## Found while working RP-575 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp575.py`.
+
+- [ ] **The array built-ins refuse an `int2vector` or `oidvector`.** Both
+      are true array types to PostgreSQL 15.19's polymorphic resolution
+      (`typsubscript` is `array_subscript_handler`, `typelem` int2 / oid),
+      subscripted from 0: `cardinality('1 2'::int2vector)` is 2,
+      `array_dims('1 2'::int2vector)` `[0:1]`, `array_to_string('1
+      2'::oidvector, ',')` `1,2`, `array_dims(indkey)` / `array_upper(indkey,
+      1)` of a one-column index `[0:0]` / 0, and `cardinality(array_agg(v))`
+      over vectors 2. Here each is 42883 `function ... does not exist`:
+      `funcsig::accepts` takes only a `[]` type for `anyarray`. Accepting
+      the vectors there is not enough: a vector reaches the built-ins with
+      no lower bound of its own (`[1:2]`, and `array_position` off by one),
+      and over a column through an evaluator that does not see its type.
+      `'1 2'::int2vector || '3'::int2vector` is `[0:2]={1,2,3}` on
+      PostgreSQL and `{1,2,3}` here, for the same reason.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_array_builtins_over_a_vector
+      Backlog-ID: RP-601
+- [ ] **An `int2vector` of two dimensions prints as text.** `array_agg`
+      over vectors is `array_agg(anyarray)`, typed `int2vector` and holding
+      two dimensions, which `int2vectorout` refuses (`check_valid_int2vector`):
+      on PostgreSQL 15.19 `array_agg(v)::text` and `concat(array_agg(v))`
+      are 42804 `array is not a valid int2vector`. Here they are `{1,2}`.
+      The value sent as a column already is 42804 in text (RP-575); a cast
+      or `concat` prints it through `typeout`, which cannot fail.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
+      Backlog-ID: RP-602
+- [ ] **A parameter declared `int2vector[]` or `oidvector[]` has no type.**
+      A Bind of `{"1 2",3}` with type oid 1006 is `int2vector[]` to
+      `pg_typeof($1)` on PostgreSQL 15.19, `($1)[2]::text` is `3` and
+      `cardinality($1)` 2, in text or binary format. Here the first is 42P18
+      `could not determine data type of parameter $1` and the others 42804 /
+      42883: oids 1006 and 1013 are in neither the parameter-type nor the
+      array-element table (`element_of_array_oid`), so the value stays its
+      raw text.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
+      Backlog-ID: RP-604
+- [ ] **An `int2vector` input's out-of-range error quotes only its number.**
+      `int2vectorin` reports the rest of the input from the number on:
+      `'70000 1'::int2vector` and `'1 70000 1'::int2vector` are 22003
+      `value "70000 1" is out of range for type smallint` on PostgreSQL
+      15.19. Here the message quotes `"70000"`.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_int2vector_range_error_quotes_the_rest
+      Backlog-ID: RP-605
+
+## Found while working RP-603 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp603.py`.
+
+- [ ] **A network type's BETWEEN compares its text.** `'10.0.0.10'::inet
+      between '10.0.0.2' and '10.0.0.20'` is true on PostgreSQL 15.19
+      (`network_cmp` orders 10.0.0.10 after 10.0.0.2), and so is the `cidr`
+      form; here both are false, and a column's `WHERE a BETWEEN ...` keeps
+      no row. The rewrite in `enum_order` keys an `inet` / `cidr` operand of
+      `<`, `=`, `IN` and `greatest` with `__net_sortkey`, but its BETWEEN
+      arm is the enums' and the collations' only, so the bounds compare as
+      strings.
+      Verify: tests/backlog/test_rp_found_rp603.py::test_network_between_orders_by_network_cmp
+      Backlog-ID: RP-610
+- [ ] **An array of `oidvector`s orders its elements as int arrays.**
+      `array_cmp` compares elements with the element type's B-tree support
+      function, so on PostgreSQL 15.19 `array['1 2'::oidvector] <
+      array['3'::oidvector]` is false, as is `'1 2'::oidvector < any(vs)`
+      over an `oidvector[]` that is not an `ARRAY[...]` written in place;
+      here both are true. Since RP-603 an `oidvector` operand, and each
+      element of an `ARRAY[...]` under ANY / ALL, compares by its
+      `btoidvectorcmp` key; a whole `oidvector[]` reaches
+      `compare_constants`, which has no type to go by.
+      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_array_orders_by_btoidvectorcmp
+      Backlog-ID: RP-611
+- [ ] **`oidvector`'s comparison functions are refused.**
+      `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
+      `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
+      `function ... is not supported yet`. `cmpfn` has the B-tree support
+      functions of the byte-ordered types only.
+      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
+      Backlog-ID: RP-612
+
+## Found while working RP-529 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
+char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
+`tests/backlog/test_rp_found_rp529.py`.
+
+- [ ] **A domain's CHECK failing inside a record literal carries no
+      position.** `select '(0,x)'::ctp`, `ctp` a composite with a `pint`
+      field, is 23514 at 8 on PostgreSQL 15.19, at the literal as its other
+      input errors are (`'(abcd,1)'::fc` is 22001 at 8 here too); here the
+      23514 has no position.
+      Backlog-ID: RP-552
+      Verify: tests/backlog/test_rp_found_rp529.py::test_record_literal_domain_error_position
+- [ ] **A schema's domain reports its CHECK under the qualified name.**
+      `select 200::s.sd` is 23514 `value for domain s.sd violates check
+      constraint "sd_check"` on PostgreSQL 15.19; here the constraint is
+      `"s.sd_check"`, though `pg_constraint.conname` is `sd_check` in both.
+      Backlog-ID: RP-553
+      Verify: tests/backlog/test_rp_found_rp529.py::test_schema_domain_check_name
+- [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
+      refused.** `alter table falt alter column a type pint`, `a int` and
+      `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
+      (an implicit cast to the domain, no USING needed); here it is 42804
+      `column "a" cannot be cast automatically to type pint`.
+      Backlog-ID: RP-556
+      Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
+
+## Found while working RP-534 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
+`create domain dfs as fs` and `fd(k dfs)` holding `row(null, null)`,
+`row(1, null)`, `row(1, 'a')` and `null`.
+
+- [ ] **A domain over a table's row type is refused.** `create domain dfs
+      as fs` over a table `fs` is 42704 `type "fs" does not exist` here;
+      PostgreSQL 15.19 creates it (a domain may be over a composite since
+      PostgreSQL 11), and a column of it holds rows: `select count(*) from
+      fd where k is not null` is 1 and `... where k is null` 2, the null
+      test reading the fields because `type_is_rowtype` is true of the
+      domain. RP-534's per-row null test asks `type_is_rowtype` of the
+      column's declared type, so it needs to see through the domain then.
+      Backlog-ID: RP-538
+      Verify: tests/backlog/test_rp_found_rp534.py::test_domain_over_a_table_row_type
+
+## Found while working RP-500 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
+
+- [ ] **A string constant an operator over a column or a parameter, an
+      INSERT or UPDATE target, or COALESCE gives its type is not read at
+      CREATE.** PostgreSQL 15.19 coerces each while it analyses a SQL
+      function's body (`transformExpr`, `coerce_type`), so `create function
+      gx(p int) returns int language sql as $$ select p + 'a' $$` is 22P02
+      `invalid input syntax for type integer: "a"` at 69, and so are `select
+      a + 'q' from fe` (69), `insert into fe values ('q')` (82), `update fe
+      set a = 'q'` (77) and `select coalesce('q', 1)` (74). Here each CREATE
+      succeeds. Since RP-500 a cast's constant is read at CREATE, and an
+      operator's operand only where planning folds the comparison (`'a' =
+      1`, `a = 'q'` in a WHERE): the rest needs each constant's resolved
+      type from the analysis, which the planner does not keep. PREPARE has
+      the same shape (RP-511).
+      Backlog-ID: RP-507
+      Verify: tests/backlog/test_rp_found_rp500.py::test_operand_constant_read_at_create
+- [ ] **A malformed range literal's 22P02 has no DETAIL.** PostgreSQL
+      15.19's `range_parse` explains each one: `select '[1,2'::int4range`
+      has DETAIL `Unexpected end of input.`, `'[1,2]x'` `Junk after right
+      parenthesis or bracket.`, `'1,2'` `Missing left parenthesis or
+      bracket.`. Here the message and position match and the DETAIL is
+      empty.
+      Backlog-ID: RP-510
+      Verify: tests/backlog/test_rp_found_rp500.py::test_range_literal_detail
+- [ ] **PREPARE evaluates a constant expression, and does not read a cast
+      constant it does not evaluate.** PostgreSQL 15.19's PREPARE
+      parse-analyses its statement and plans nothing: `prepare s1 as select
+      1/0` is prepared, while `prepare s2 as select 'x'::int from fe`,
+      `prepare s3 as select case when false then 'x'::int end` and `prepare
+      s4(int) as select $1 + 'a'` are 22P02 at the constant (22, 43, 32).
+      Here the first is 22012 `division by zero` and the other three are
+      prepared. The planner folds a FROM-less constant expression while it
+      plans and reads a constant only where it folds. Since RP-500 CREATE
+      FUNCTION reads every cast's constant (`sql_fn_validator::literal_casts`),
+      which PREPARE could share, but it also needs planning that does not
+      evaluate.
+      Backlog-ID: RP-511
+      Verify: tests/backlog/test_rp_found_rp500.py::test_prepare_analyses_without_evaluating
+
+## Found while working RP-493 (2026-11-07)
+
+Measured on a private PostgreSQL 15.19 cluster.
+
+- [ ] **A scalar subquery's column, and a CASE folded by a computed
+      constant, lose their type modifier.** `select (select
+      2.5::numeric(5,2))` carries 327686 in every reader on PostgreSQL (the
+      subquery's first column, `exprTypmod` of its SubLink); here it is -1
+      everywhere. And `eval_const_expressions` simplifies a CASE whose WHEN
+      folds to a constant before the planned readers (a portal's Describe,
+      a populating CREATE TABLE AS, a SELECT from a view) see it, so `case
+      1 when 1 then 'a'::varchar(3) end` and `case when 1 = 1 then
+      'a'::varchar(3) end` describe 7 there (-1 in a prepared statement's
+      Describe, a view's columns and WITH NO DATA, as here). Since RP-493
+      only a literal `true` / `false` / `null` condition, or a literal
+      COALESCE argument, is folded (`expr_typmod.rs`); a computed one needs
+      the constant evaluator's own verdict on what folds.
+      Verify: tests/backlog/test_rp_ctas_subquery.py::test_typmod_from_scalar_subquery_and_computed_constants
+      Backlog-ID: RP-497
 
 ## Found while working RP-316 (2026-11-02)
 
@@ -2093,6 +2618,24 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
       `pgbench -i -s 1` in 22 s, as does the commit before it.
       Backlog-ID: RP-380
       Verify: none -- seen once in CI; a timing that does not fail on demand
+
+## Found fixing the READ COMMITTED move race (2026-11-07)
+
+- [ ] **A move made inside a running statement still has the write window.**
+      A READ COMMITTED block's move to a new snapshot now installs its guard
+      and rolls back holding the write lock of every collection it has
+      written, so no writer is between its guard check and its write
+      (`rebase_user_transaction_to`, crates/secantus-storage/src/lib.rs). A
+      move made mid-statement -- `rebase_active_transaction_to`, from a
+      PL/pgSQL EXCEPTION block -- skips those locks, because the statement
+      may already hold one of them (they are not re-entrant). There a writer
+      past its check can still write a guarded row after the rollback, and
+      the mover's replay then fails with 40001 after its hundred attempts,
+      an answer PostgreSQL never gives at READ COMMITTED. Measured only for
+      the statement-start move, where a forced interleaving reproduced the
+      CI failure in all six writer shapes.
+      Verify: none -- a timing window reachable only by forcing the interleaving through the storage test hook (`secantus_storage::set_test_hook`, as embedded.rs::a_write_cannot_slip_in_under_a_moving_transactions_guard does); no client-side gap test can hit it
+      Backlog-ID: RP-495
 
 ## Found by batch 34 (2026-10-23)
 
@@ -2194,3 +2737,58 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       to be checked against the whole file.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
+
+## Found while working RP-573 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster, each statement in a new
+session. The gap tests are in `tests/backlog/test_rp_found_rp573.py`. Since
+RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
+block runs (`check_plpgsql_declarations`), from the type text libpg_query
+keeps; what follows is what that lookup does not yet check.
+
+- [ ] **A PL/pgSQL DECLARE whose type text is not one type name is
+      created.** `read_datatype` passes the text to `parse_datatype` unless
+      it is a `%TYPE` of a variable or column it finds, and a text that is
+      not one type name is 42601 at the token, with the CONTEXT `invalid
+      type name "..."`: on PostgreSQL 15.19 `declare x nosuch573%type` is
+      `syntax error at or near "%"` at 78, `y nosuch573.x%type` the same at
+      87, `x int(3)` `syntax error at or near "("` at 72 and `x
+      varchar(nosuch)` `syntax error at or near "nosuch"` at 77. Here each
+      is created. libpg_query stubs the `%TYPE` lookups out
+      (`plpgsql_parse_wordtype` returns NULL), so finding the variable or
+      column is this server's to do, in the block scopes PL/pgSQL keeps.
+      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_text_that_is_not_one_type_name
+      Backlog-ID: RP-617
+- [ ] **A PL/pgSQL variable of a pseudo-type is created.**
+      `plpgsql_build_variable` refuses one: `declare x anyelement` is 0A000
+      `variable "x" has pseudo-type anyelement`, no position, CONTEXT
+      `compilation of PL/pgSQL function "e573" near line 1`, on PostgreSQL
+      15.19 (`void` the same, near the variable's line). Here the function
+      is created.
+      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_a_pseudo_type
+      Backlog-ID: RP-618
+- [ ] **A DECLARE's missing type is reported after a later syntax error.**
+      PL/pgSQL compiles the body in one pass, so `declare x nosuch573; begin
+      return 1 +; end` is 42704 `type "nosuch573" does not exist` at 69 on
+      PostgreSQL 15.19. Here the whole body is parsed first, and the answer
+      is 42601 `syntax error at end of input` at 104.
+      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_type_found_before_a_later_syntax_error
+      Backlog-ID: RP-619
+- [ ] **A `pg_temp` type in a session with no temporary schema is a
+      missing type, not a missing schema.** `LookupExplicitNamespace`
+      finds `pg_temp` only once the session has made its temp schema, so on
+      PostgreSQL 15.19 `create function e573(a pg_temp.nosuch) ...` is 3F000
+      `schema "pg_temp" does not exist` with no position, and `declare x
+      pg_temp.nosuch` the same at 69. Here they are 42704 `type
+      pg_temp.nosuch does not exist` and `type "pg_temp.nosuch" does not
+      exist` (`routine_type_missing` lets `pg_temp` through as a schema).
+      Verify: tests/backlog/test_rp_found_rp573.py::test_pg_temp_type_in_a_session_with_no_temp_schema
+      Backlog-ID: RP-620
+- [ ] **A PL/pgSQL compile error in a CREATE FUNCTION's body has no
+      position.** `declare x int; begin y := 1; return 1; end` is 42601
+      `"y" is not a known variable` at 80 on PostgreSQL 15.19, and `declare
+      x alias for $2` in a one-argument function is 42704 `variable "$2"
+      does not exist` at 82. Here the first has no position, and the second
+      is 42601 with none. (A DO block's syntax errors are RP-492.)
+      Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
+      Backlog-ID: RP-621

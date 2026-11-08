@@ -25,7 +25,8 @@ use pg_query::protobuf::{ColumnRef, Node, SelectStmt};
 /// analyses last. A bare name heading an ORDER BY, GROUP BY or DISTINCT ON
 /// item may name an output column instead (`findTargetlistEntrySQL92`):
 /// such an item is left to the planner. A subquery's body is its own
-/// query and is not walked. A `VALUES` list is not checked here.
+/// query and is not walked. A `VALUES` list is checked row by row
+/// (`check_values_row`).
 ///
 /// What is analysed before the reference fails first, as PostgreSQL
 /// analyses a node's arguments before the node: an untyped string literal
@@ -78,36 +79,7 @@ fn walk_clauses(s: &SelectStmt, ordered: Option<&[Bson]>) -> Result<()> {
     };
     let mut windows: Vec<Node> = s.window_clause.clone();
     {
-        let mut visit = |n: &mut Node| -> Result<()> {
-            match n.node.as_mut() {
-                // A window is analysed after the clauses: set aside.
-                Some(N::FuncCall(f)) => {
-                    if let Some(over) = f.over.take() {
-                        windows.push(Node {
-                            node: Some(N::WindowDef(over)),
-                        });
-                    }
-                    match ordered {
-                        Some(params) => missing_function(f, params),
-                        None => Ok(()),
-                    }
-                }
-                Some(N::ColumnRef(c)) => missing(c),
-                Some(N::TypeCast(tc)) => match (ordered, tc.arg.as_deref()) {
-                    (Some(params), Some(arg)) if is_string_literal(arg) => {
-                        let cast = Node {
-                            node: Some(N::TypeCast(tc.clone())),
-                        };
-                        match correlated::without_side_effects(|| const_value(&cast, params)) {
-                            Err(e) if !matches!(e, Error::Unsupported(_)) => Err(e),
-                            _ => Ok(()),
-                        }
-                    }
-                    _ => Ok(()),
-                },
-                _ => Ok(()),
-            }
-        };
+        let mut visit = |n: &mut Node| visit_node(n, ordered, &mut windows);
         let walk = |n: &Node, visit: &mut dyn FnMut(&mut Node) -> Result<()>| {
             walk_expr(&mut n.clone(), visit)
         };
@@ -146,6 +118,65 @@ fn walk_clauses(s: &SelectStmt, ordered: Option<&[Bson]>) -> Result<()> {
     Ok(())
 }
 
+/// One node of the ordered walk: a column reference fails; with
+/// `ordered`, a literal cast is read and a call with no reference in its
+/// arguments is looked up first. A window is set aside in `windows`, as
+/// it is analysed after the clauses.
+fn visit_node(n: &mut Node, ordered: Option<&[Bson]>, windows: &mut Vec<Node>) -> Result<()> {
+    match n.node.as_mut() {
+        Some(N::FuncCall(f)) => {
+            if let Some(over) = f.over.take() {
+                windows.push(Node {
+                    node: Some(N::WindowDef(over)),
+                });
+            }
+            match ordered {
+                Some(params) => missing_function(f, params),
+                None => Ok(()),
+            }
+        }
+        Some(N::ColumnRef(c)) => missing(c),
+        Some(N::TypeCast(tc)) => match (ordered, tc.arg.as_deref()) {
+            (Some(params), Some(arg)) if is_string_literal(arg) => {
+                let cast = Node {
+                    node: Some(N::TypeCast(tc.clone())),
+                };
+                match correlated::without_side_effects(|| const_value(&cast, params)) {
+                    Err(e) if !matches!(e, Error::Unsupported(_)) => Err(e),
+                    _ => Ok(()),
+                }
+            }
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+/// The first column reference of one row of a VALUES list with nothing
+/// around it to bind it (RP-501). `transformValuesClause` transforms each
+/// row's expressions in turn, before the row's length is compared and
+/// before anything is evaluated, in a query level whose range table is
+/// empty: so `values (1/0, nosuch)` is 42703 at `nosuch`, and what is
+/// analysed before the reference fails first, as in a FROM-less select.
+pub(crate) fn check_values_row(items: &[Node], params: &[Bson]) -> Result<()> {
+    let walk = |ordered: Option<&[Bson]>| -> Result<()> {
+        let mut windows = Vec::new();
+        for item in items {
+            walk_expr(&mut item.clone(), &mut |n| {
+                visit_node(n, ordered, &mut windows)
+            })?;
+        }
+        Ok(())
+    };
+    match walk(None) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            take_error_location();
+            walk(Some(params))
+        }
+    }
+}
+
 /// A call PostgreSQL has no function for, when nothing in its arguments
 /// is a column reference that would fail first: the refusal the planner
 /// gives such a call, which the server answers as 42883 (or 42809 for a
@@ -171,7 +202,7 @@ fn missing_function(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result
 
 /// Whether a planner refusal `function name(types)` names a function that
 /// neither PostgreSQL's catalog nor this database has.
-fn names_missing_function(m: &str) -> bool {
+pub(crate) fn names_missing_function(m: &str) -> bool {
     m.strip_prefix("function ")
         .and_then(|r| r.split_once('('))
         .is_some_and(|(name, _)| {

@@ -126,7 +126,10 @@ fn srf_kind(n: &Node) -> Option<Kind> {
         return Some(Kind::Scalar);
     }
     let u = correlated::user_function_for(&name, &f.args).filter(|u| u.returns_set)?;
-    if !u.columns.is_empty() {
+    // Several OUT columns make a record; ONE is the function's result type
+    // itself (`returns table (t int)` is `setof integer`), so `gtt() + 1`
+    // is arithmetic and `(gtt()).t` is 42809 (RP-483).
+    if u.columns.len() > 1 {
         return Some(Kind::Record {
             fields: u.columns.iter().map(|(n, _)| n.clone()).collect(),
             rowtype: None,

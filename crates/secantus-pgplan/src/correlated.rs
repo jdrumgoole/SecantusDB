@@ -196,6 +196,10 @@ pub(crate) fn walk_select(
     {
         expr(n, visit)?;
     }
+    // A VALUES list's rows are expressions of this query level too.
+    for row in &mut s.values_lists {
+        expr(row, visit)?;
+    }
     for item in &mut s.from_clause {
         walk_from(item, visit)?;
     }
@@ -489,7 +493,8 @@ pub(crate) fn fromless_outer_ref(inner: &pg_query::protobuf::SelectStmt, outer: 
     let _ = walk_select(&mut probe, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = parts_of(c) {
-                found |= parts.len() == 1 && outer.contains(&parts[0]);
+                found |= parts.len() == 1
+                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
             }
         }
         Ok(())
@@ -531,8 +536,9 @@ pub(crate) fn correlate(
             if let Some(parts) = parts_of(c) {
                 // With no FROM of its own, a bare name can only be the
                 // outer row's (`SET v = (SELECT v + 1)`).
-                let bare_outer =
-                    parts.len() == 1 && inner.from_clause.is_empty() && outer.contains(&parts[0]);
+                let bare_outer = parts.len() == 1
+                    && inner.from_clause.is_empty()
+                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
                 if (bare_outer || parts.len() >= 2 && !names.contains(&parts[parts.len() - 2]))
                     && !outer_refs.contains(&parts)
                 {
@@ -556,7 +562,8 @@ pub(crate) fn correlate(
         match probing(|| without_calls(|| plan_select(&body, lookup, &probe_params))) {
             Ok(p) => break (p, body),
             Err(Error::UndefinedColumn(name))
-                if outer.contains(&name) && !outer_refs.contains(&vec![name.clone()]) =>
+                if (outer.contains(&name) || crate::outer_whole_row(&name))
+                    && !outer_refs.contains(&vec![name.clone()]) =>
             {
                 outer_refs.push(vec![name]);
             }
@@ -661,7 +668,7 @@ pub(crate) fn correlate(
             .copied()
             .filter(|l| *l >= 0)
             .unwrap_or(sl.location);
-        args.push(pg_query::protobuf::Node {
+        let column = pg_query::protobuf::Node {
             node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                 fields: parts
                     .iter()
@@ -671,6 +678,26 @@ pub(crate) fn correlate(
                     .collect(),
                 location,
             })),
+        };
+        // A whole row is passed cast to its row type, which `eval` declares
+        // as its parameter's: PostgreSQL's outer Var carries the row type,
+        // so `exists (select 1 where fs is not null)` is typed with nothing
+        // in the body to type it (RP-521).
+        args.push(match outer_ref_whole_row(parts, lookup, params) {
+            // Its name parts as they are, so a quoted `"Fs"` stays itself.
+            Some(ty) => pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(column)),
+                    type_name: Some(pg_query::protobuf::TypeName {
+                        names: ty.split('.').map(string_node).collect(),
+                        typemod: -1,
+                        location: -1,
+                        ..Default::default()
+                    }),
+                    location: -1,
+                }))),
+            },
+            None => column,
         });
     }
     Ok(pg_query::protobuf::Node {
@@ -737,7 +764,11 @@ pub(crate) fn from_item_def(
             else {
                 return None;
             };
-            let planned = without_side_effects(|| plan_select(b, lookup, params)).ok()?;
+            // Planned as the statement plans it, with the WITH items around
+            // it in scope: `(select * from w) t` reads a CTE's columns
+            // (RP-506).
+            let b = crate::under_visible_ctes(b).ok()?;
+            let planned = without_side_effects(|| plan_select(&b, lookup, params)).ok()?;
             let mut def = sub_plan_def(&planned, lookup).ok()?;
             for (c, n) in def.columns.iter_mut().zip(&alias.colnames) {
                 if let Some(N::String(s)) = n.node.as_ref() {
@@ -793,7 +824,74 @@ fn outer_ref_type(
             }
         }
     }
-    None
+    // No level has the bare name as a column, so it is a FROM item's whole
+    // row (RP-479): a table's is of the table's row type, a subquery's a
+    // record.
+    if qualifier.is_some() {
+        return None;
+    }
+    outer_whole_row_type(col, lookup)
+}
+
+/// The row type of the FROM item an enclosing query names `name`, when a
+/// bare outer reference is that item's whole row rather than a column.
+fn outer_whole_row_type(name: &str, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Option<String> {
+    fn whole_row_type(
+        item: &pg_query::protobuf::Node,
+        name: &str,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ) -> Option<String> {
+        match item.node.as_ref()? {
+            N::RangeVar(r) => {
+                let visible = r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname);
+                (visible == name && lookup(&relation_name(r)).is_some())
+                    .then(|| table_rowtype(relation_name(r)))
+            }
+            // A subquery's is an anonymous record.
+            N::RangeSubselect(rs) => rs
+                .alias
+                .as_ref()
+                .is_some_and(|a| a.aliasname == name)
+                .then(|| "record".to_string()),
+            N::JoinExpr(j) if j.alias.is_none() => [j.larg.as_deref(), j.rarg.as_deref()]
+                .into_iter()
+                .flatten()
+                .find_map(|side| whole_row_type(side, name, lookup)),
+            _ => None,
+        }
+    }
+    OUTER_FROM
+        .with(|o| o.borrow().clone())
+        .iter()
+        .rev()
+        .flat_map(|level| level.iter())
+        .find_map(|item| whole_row_type(item, name, lookup))
+}
+
+/// The row type an outer reference carries when it is a FROM item's whole
+/// row (`fs` in `exists (select 1 where fs is not null)`), or `None` for a
+/// column.
+fn outer_ref_whole_row(
+    parts: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<String> {
+    let [name] = parts else {
+        return None;
+    };
+    let levels = OUTER_FROM.with(|o| o.borrow().clone());
+    let is_column = levels
+        .iter()
+        .flatten()
+        .any(|item| match item.node.as_ref() {
+            Some(N::JoinExpr(_)) => crate::optype::join_column_type(item, parts, lookup).is_some(),
+            _ => from_item_def(item, lookup, params)
+                .is_some_and(|(_, def)| def.columns.iter().any(|c| &c.name == name)),
+        });
+    if is_column {
+        return None;
+    }
+    outer_whole_row_type(name, lookup)
 }
 
 /// `inner` planned with each outer reference a `$N` cast to its type.
@@ -1002,6 +1100,8 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
             Some(N::ParamRef(p)) => usize::try_from(p.number - 1)
                 .ok()
                 .and_then(|i| declared.get(i).cloned().flatten()),
+            // An outer whole row, passed cast to its row type (RP-521).
+            Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_to_string),
             _ => None,
         })
         .collect();
@@ -1726,6 +1826,14 @@ pub(crate) fn call_args_kind(args: &[pg_query::protobuf::Node]) -> CallArgs {
     kind
 }
 
+/// A routine parameter's DEFAULT (its SQL as stored), evaluated now and
+/// cast to the parameter's type, as a call that leaves it out takes it.
+pub fn evaluate_default(sql: &str, ty: &str) -> Result<Bson> {
+    let node = crate::domains::parse_default_sql(sql)?;
+    let v = crate::const_value(&node, &[])?;
+    crate::cast_value(v, ty)
+}
+
 /// Call a user function. With no hook installed (a Describe), or while only
 /// a TYPE is wanted, nothing runs and the answer is NULL.
 pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> {
@@ -1741,9 +1849,7 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
             let sql = u.defaults.get(i).cloned().flatten().ok_or_else(|| {
                 Error::UndefinedFunction(format!("function {}() does not exist", u.name))
             })?;
-            let node = crate::domains::parse_default_sql(&sql)?;
-            let v = crate::const_value(&node, &[])?;
-            out.push(crate::cast_value(v, &u.arg_types[i])?);
+            out.push(evaluate_default(&sql, &u.arg_types[i])?);
         }
         defaulted = out;
         &defaulted[..]

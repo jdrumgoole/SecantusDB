@@ -1801,6 +1801,36 @@ fn a_lone_command_is_what_the_parser_would_split_off() {
     }
 }
 
+/// A statement whose WITH writes is told apart from one whose WITH only
+/// reads (RP-503): the first needs a transaction of its own, because its
+/// item writes while it is planned.
+#[test]
+fn a_data_modifying_with_is_found_at_the_top_of_each_command() {
+    for sql in [
+        "with x as (delete from t returning id) select * from x",
+        "WITH x AS (INSERT INTO t VALUES (1) RETURNING id) SELECT 1",
+        "with x as (update t set n = 1 returning id) select nosuch from x",
+        "with r as (select 1), x as (delete from t returning id) select 1",
+        "with x as (delete from t returning id) insert into u select id from x",
+        "insert into u with x as (delete from t returning id) select id from x",
+        "with x as (delete from t returning id) update u set b = 1",
+        "with x as (delete from t returning id) delete from u",
+    ] {
+        assert!(has_data_modifying_with(sql), "for {sql:?}");
+    }
+    for sql in [
+        "select 1",
+        "delete from t",
+        "select 'with x as (delete from t returning id)'",
+        "with x as (select 1) select * from x",
+        "with recursive r(n) as (select 1 union all select n + 1 from r where n < 3) select * from r",
+        "select * from t where name = 'without'",
+        "selct with",
+    ] {
+        assert!(!has_data_modifying_with(sql), "for {sql:?}");
+    }
+}
+
 /// The extended protocol takes ONE command: it has a single parameter list and
 /// a single row description, which two commands cannot share. PostgreSQL says
 /// so with 42601, not with "not supported".
@@ -3684,6 +3714,47 @@ fn float8_against_numeric_lowers_as_float8() {
     }
 }
 
+/// `x IS [NOT] NULL` over a composite column tests its FIELDS
+/// (`ExecEvalRowNull`: `row(1, null)` is neither), which no `{x: null}`
+/// filter expresses, so it is evaluated per row (RP-534); over a scalar
+/// column it stays a filter.
+#[test]
+fn composite_null_test_is_evaluated_per_row() {
+    set_user_composites(vec![(
+        "fs".into(),
+        67_010,
+        vec![("a".into(), "int4".into()), ("c".into(), "text".into())],
+    )]);
+    let def = || {
+        TableDef::new(
+            "fk",
+            vec![
+                Column::new("k", "fs", false),
+                Column::new("r", "record", false),
+                Column::new("n", "int4", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "fk").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select n from fk where k is null",
+        "select n from fk where k is not null",
+        "select n from fk where not (k is null)",
+        "select n from fk where r is not null",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    let (filter, residual) = lowered("select n from fk where n is null");
+    assert!(!residual, "a scalar null test is a filter: {filter:?}");
+    assert_eq!(filter, doc! { "n": Bson::Null });
+    set_user_composites(Vec::new());
+}
+
 /// A strict WHERE on a LEFT join's nullable side drops every
 /// NULL-extended row, so the narrow path plans an inner join
 /// (`reduce_outer_joins`, RP-365); `NOT col` is not strict and keeps the
@@ -4181,6 +4252,41 @@ fn a_column_reference_with_no_from_names_nothing() {
 }
 
 #[test]
+fn a_values_reference_and_an_unread_with_item_are_analysed() {
+    // `transformValuesClause` and `transformWithClause` (RP-501): a VALUES
+    // row's reference was 0A000 `ColumnRef is not supported yet`, or the
+    // error of an item evaluated before it, and an item no part of the
+    // statement reads was dropped unanalysed.
+    for (sql, state, at) in [
+        ("values (nosuch)", "42703", Some(8)),
+        ("values (1/0, nosuch)", "42703", Some(13)),
+        ("values (1, 2), (nosuch)", "42703", Some(16)),
+        ("values (x.y)", "42P01", Some(8)),
+        ("with w as (select nosuch) select 1", "42703", Some(18)),
+        // A missing relation is placed by the server, from its name.
+        ("with w as (select 1 from nosuch) select 1", "42P01", None),
+        (
+            "with v as (select nosuch2), w as (select 1 from nosuch) select * from v",
+            "42703",
+            Some(18),
+        ),
+        ("with w as (select nosuch) delete from t", "42703", Some(18)),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), state, "for {sql} (got {err})");
+        assert_eq!(take_error_location(), at, "for {sql}");
+    }
+    // A row's length is compared after the row is analysed.
+    let err = analysed("values (1, 2), (3), (nosuch)").expect_err("should refuse");
+    assert_eq!(err.sqlstate(), "42601", "{err}");
+    // Nothing in an unread item is evaluated.
+    analysed("with w as (select 1/0) select 1").expect("an unread item is not run");
+    analysed("with w as (select 1 a), v as (select a from w) select * from w")
+        .expect("an item reading an earlier one");
+}
+
+#[test]
 fn a_subquery_target_is_named_as_written() {
     // FigureColname names a target from the expression as written (RP-449):
     // a correlated subquery's per-row call named it `\x1fcorrelated`, and a
@@ -4204,6 +4310,50 @@ fn a_subquery_target_is_named_as_written() {
             other => panic!("{q}: {other:?}"),
         }
     }
+}
+
+#[test]
+fn column_notation_over_a_base_type_is_refused_at_analysis() {
+    // `ParseFuncOrColumn` refuses `.field` over a type that is not
+    // composite, at the operand, whatever the rows; `ExpandRowReference`
+    // refuses `.*` with no position (RP-483). Each was 0A000 `field
+    // selection on a non-record value`, or a NULL. Answers measured on
+    // PostgreSQL 15.19.
+    let notation = |ty: &str| {
+        format!("column notation .x applied to type {ty}, which is not a composite type")
+    };
+    for (q, want, at) in [
+        ("select (1).x", notation("integer"), Some(8)),
+        ("select (null::int).x", notation("integer"), Some(8)),
+        ("select (id).x from t", notation("integer"), Some(8)),
+        (
+            "select 1 from t where (name).x = 'a'",
+            notation("text"),
+            Some(23),
+        ),
+        ("select (array[array[1]]).x", notation("integer[]"), Some(8)),
+        ("select (unnest(array[1])).x", notation("integer"), Some(8)),
+        (
+            "select (generate_series(1, 2)).x",
+            notation("integer"),
+            Some(8),
+        ),
+        (
+            "select (1).*",
+            "type integer is not composite".to_string(),
+            None,
+        ),
+    ] {
+        let _ = take_error_location();
+        let err = analysed(q).expect_err(q);
+        assert!(
+            matches!(&err, Error::Sqlstate("42809", m) if *m == want),
+            "{q}: {err:?}"
+        );
+        assert_eq!(take_error_location(), at, "{q}");
+    }
+    // A record's field still reads.
+    analysed("select (row(1, 2)).f1").expect("a record's field");
 }
 
 #[test]
@@ -4281,4 +4431,907 @@ fn missing_rte_hint_follows_search_range_table_for_rel() {
     assert_eq!(hint(&[RangeLevel::default(), hidden], "fs"), entry("fs"));
     // A name no level's range table has.
     assert_eq!(hint(&levels, "q"), None);
+}
+
+/// `select x from t as x(a, b)`'s whole row after the column-alias and
+/// whole-row rewrites: its cast's type, the ROW's arguments and its field
+/// names.
+fn aliased_whole_row(sql: &str) -> (String, Vec<String>, Vec<String>) {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not a SELECT: {sql}");
+    };
+    let aliased = column_alias_rewrite(s, &lookup).unwrap().expect("aliased");
+    let out = whole_row_rewrite(&aliased, &lookup, &[])
+        .unwrap()
+        .expect("a whole row");
+    let Some(N::ResTarget(rt)) = out.target_list[0].node.as_ref() else {
+        panic!("no target");
+    };
+    let Some(N::TypeCast(cast)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+        panic!("the row is not cast to a row type: {:?}", rt.val);
+    };
+    let Some(N::RowExpr(row)) = cast.arg.as_deref().and_then(|v| v.node.as_ref()) else {
+        panic!("no ROW under the cast");
+    };
+    let names = |ns: &[pg_query::protobuf::Node]| -> Vec<String> {
+        ns.iter()
+            .map(|n| match n.node.as_ref() {
+                Some(N::String(sv)) => sv.sval.clone(),
+                Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                    Some(N::String(sv)) => sv.sval.clone(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            })
+            .collect()
+    };
+    let ty = cast
+        .type_name
+        .as_ref()
+        .map(|t| names(&t.names).join("."))
+        .unwrap_or_default();
+    (ty, names(&row.args), names(&row.colnames))
+}
+
+#[test]
+fn a_tables_whole_row_under_a_column_alias_list_is_its_row_type() {
+    // PostgreSQL 15.19: the whole row of `t x(a, b)` is of t's row type,
+    // its fields named as t names them (`row_to_json` prints `id`, not
+    // `a`), read from the renamed columns (RP-480).
+    assert_eq!(
+        aliased_whole_row("select x from t as x(a, b)"),
+        (
+            "t".to_string(),
+            vec!["a".into(), "b".into(), "n".into()],
+            vec!["id".into(), "name".into(), "n".into()],
+        )
+    );
+}
+
+/// `sql` after the whole-row rewrite.
+fn whole_rows_rewritten(sql: &str) -> pg_query::protobuf::SelectStmt {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not a SELECT: {sql}");
+    };
+    whole_row_rewrite(s, &lookup, &[])
+        .unwrap()
+        .expect("a whole row")
+}
+
+/// Is `n` the row of t, `ROW(id, name, n)::t`?
+fn is_row_of_t(n: Option<&pg_query::protobuf::Node>) -> bool {
+    let Some(N::TypeCast(cast)) = n.and_then(|n| n.node.as_ref()) else {
+        return false;
+    };
+    matches!(cast.arg.as_deref().and_then(|a| a.node.as_ref()), Some(N::RowExpr(r)) if r.args.len() == 3)
+}
+
+#[test]
+fn a_whole_row_is_grouped_by_and_tested_in_having() {
+    // PostgreSQL 15.19: `group by fs` groups by the row whether or not the
+    // select list names it, and HAVING reads it as WHERE does (RP-532).
+    let s = whole_rows_rewritten("select count(*) from t group by t having t is not null");
+    assert!(is_row_of_t(s.group_clause.first()), "{:?}", s.group_clause);
+    let Some(N::NullTest(test)) = s.having_clause.as_deref().and_then(|h| h.node.as_ref()) else {
+        panic!("no null test: {:?}", s.having_clause);
+    };
+    assert!(is_row_of_t(test.arg.as_deref()), "{:?}", test.arg);
+    let s = whole_rows_rewritten("select count(*) from t group by t.*");
+    assert!(is_row_of_t(s.group_clause.first()), "{:?}", s.group_clause);
+}
+
+#[test]
+fn a_field_of_a_whole_row_is_its_column() {
+    // PostgreSQL 15.19's `ParseComplexProjection`: `(t).n` is t's column
+    // n, so under `group by t` it is ungrouped (42803 at `t`), RP-532.
+    let s = whole_rows_rewritten("select (t).n, count(*) from t group by t");
+    let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+        panic!("no target");
+    };
+    match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+        Some(N::ColumnRef(c)) => {
+            assert_eq!(column_ref_name(c).as_deref(), Some("n"));
+            // The reference is where `t` was written.
+            assert_eq!(c.location, 8);
+        }
+        other => panic!("not the column: {other:?}"),
+    }
+}
+
+/// Whether `sql`'s UPDATE names its target as a whole row, and what its
+/// first SET value's whole-row reference became: the cast's type and the
+/// ROW's arguments, or `None` where nothing was rewritten.
+fn write_target_row(sql: &str, table: &TableDef) -> (bool, Option<(String, Vec<String>)>) {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::UpdateStmt(u)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not an UPDATE: {sql}");
+    };
+    let mut u = (**u).clone();
+    let Some(N::ResTarget(rt)) = u.target_list[0].node.as_mut() else {
+        panic!("no SET target");
+    };
+    let value = rt.val.as_deref_mut().expect("a SET value");
+    let named = names_write_target(u.relation.as_ref(), table, &[&*value]);
+    rewrite_write_target_rows(u.relation.as_ref(), table, vec![&mut *value]).unwrap();
+    let mut row = None;
+    walk_expr(value, &mut |n| {
+        if let Some(N::TypeCast(cast)) = n.node.as_ref() {
+            if let Some(N::RowExpr(r)) = cast.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+                    Some(N::String(sv)) => sv.sval.clone(),
+                    Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                        Some(N::String(sv)) => sv.sval.clone(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                let ty = cast
+                    .type_name
+                    .as_ref()
+                    .map(|t| t.names.iter().map(name).collect::<Vec<_>>().join("."));
+                row = Some((ty.unwrap_or_default(), r.args.iter().map(name).collect()));
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    (named, row)
+}
+
+#[test]
+fn a_writes_target_is_its_own_whole_row() {
+    // PostgreSQL 15.19: `update fs set c = fs::text` reads the target's
+    // row, of the table's row type; under an alias only the alias names
+    // it; a column of the table's name wins (RP-516).
+    let row = Some((
+        "t".to_string(),
+        vec!["id".into(), "name".into(), "n".into()],
+    ));
+    assert_eq!(
+        write_target_row("update t set name = t::text", &t()),
+        (true, row.clone())
+    );
+    assert_eq!(
+        write_target_row("update t x set name = (x.*)::text", &t()),
+        (true, row)
+    );
+    assert_eq!(
+        write_target_row("update t x set name = t::text", &t()),
+        (false, None)
+    );
+    let own = TableDef::new(
+        "t",
+        vec![
+            Column::new("id", "int4", true),
+            Column::new("t", "text", false),
+        ],
+    );
+    assert_eq!(write_target_row("update t set t = t", &own), (false, None));
+}
+
+/// What `check_write_qualifiers` says of `sql`'s one write: `None` when
+/// every qualifier is in its namespace, else the 42P01 message.
+fn write_qualifier_error(sql: &str) -> Option<String> {
+    let parsed = pg_query::parse(sql).unwrap();
+    let node = parsed.protobuf.stmts[0].stmt.as_deref().unwrap();
+    match check_write_qualifiers(node) {
+        Ok(()) => None,
+        Err(Error::Sqlstate("42P01", m)) => Some(m),
+        Err(e) => panic!("{sql}: {e:?}"),
+    }
+}
+
+#[test]
+fn a_writes_qualifiers_are_looked_up_in_its_namespace() {
+    // PostgreSQL 15.19: an aliased target answers to its alias alone, and
+    // a qualifier nothing in the statement has is missing (RP-523).
+    let hidden = "invalid reference to FROM-clause entry for table \"fs\"\nHint: Perhaps you meant to reference the table alias \"x\".";
+    for sql in [
+        "update fs x set c = fs.c",
+        "update fs x set c = 'q' where fs.a = 1",
+        "update fs x set c = 'q' returning fs.c",
+        "update fs x set c = 'q' returning fs.*",
+        "update fs x set (a, c) = (fs.a, 'q')",
+        "update fs x set c = 'q' from fe where fe.a = x.a returning fs.c",
+        "update public.fs x set c = public.fs.c",
+        "delete from fs x where fs.a = 1",
+        "delete from fs x using fe where fe.a = x.a returning fs.a",
+        "insert into fs as x values (2, 'z') returning fs.a",
+    ] {
+        assert_eq!(write_qualifier_error(sql).as_deref(), Some(hidden), "{sql}");
+    }
+    for (sql, q) in [
+        ("update fs set c = zz.c", "zz"),
+        ("update fs set c = fe.b", "fe"),
+        ("delete from fs where fe.a = 1", "fe"),
+        ("insert into fs values (2, 'z') returning zz.a", "zz"),
+    ] {
+        assert_eq!(
+            write_qualifier_error(sql),
+            Some(format!("missing FROM-clause entry for table \"{q}\"")),
+            "{sql}"
+        );
+    }
+    // EXCLUDED is in the range table, but in the namespace only for the
+    // ON CONFLICT clause.
+    assert_eq!(
+        write_qualifier_error("insert into fs values (2, 'z') on conflict (a) do update set c = excluded.c returning excluded.a")
+            .as_deref(),
+        Some("invalid reference to FROM-clause entry for table \"excluded\"\nHint: There is an entry for table \"excluded\", but it cannot be referenced from this part of the query.")
+    );
+    for sql in [
+        "update fs x set c = x.c where x.a = 1 returning x.*",
+        "update fs set c = fs.c returning public.fs.c",
+        "update fs set c = 'q' from fe e where e.a = fs.a returning e.b",
+        "update fs x set c = 'q' where x.a in (select fs.a from fs)",
+        "delete from fs x where exists (select 1 from fe where fe.a = fs.a)",
+        "insert into fs values (1, 'z') on conflict (a) do update set c = excluded.c where fs.a = 1",
+        "insert into fs as x values (1, 'z') returning x.a",
+    ] {
+        assert_eq!(write_qualifier_error(sql), None, "{sql}");
+    }
+}
+
+/// RP-522: a composite comparison is `record_eq` / `record_cmp`, which
+/// check each field pair they reach -- its types before its NULLs or values
+/// -- and a different width once every shared pair is equal (15.19).
+#[test]
+fn composite_record_compare_checks_the_fields_it_reaches() {
+    let s = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let (row, lit) = (s(&["int4", "text"]), s(&["int4", "unknown"]));
+    let fs = [Bson::Int32(1), Bson::String("y".into())];
+    let msg = |r: Result<Bson>| r.unwrap_err().to_string();
+    // A field of another type is 42804, an `unknown` one has no operator.
+    let e = msg(record_compare("=", &fs, &fs, true, Some((&row, &lit))));
+    assert!(
+        e.contains("cannot compare dissimilar column types text and unknown at record column 2"),
+        "{e}"
+    );
+    let e = msg(record_compare("<", &fs, &fs, true, Some((&lit, &row))));
+    assert!(
+        e.contains("types unknown and text at record column 2"),
+        "{e}"
+    );
+    let e = msg(record_compare("=", &fs, &fs, true, Some((&lit, &lit))));
+    assert!(
+        e.contains("could not identify an equality operator for type unknown"),
+        "{e}"
+    );
+    // A pair decided first is never checked.
+    let other = [Bson::Int32(2), Bson::String("y".into())];
+    let got = record_compare("=", &fs, &other, true, Some((&row, &lit))).unwrap();
+    assert_eq!(got, Bson::Boolean(false));
+    // A NULL is checked too: its type comes first.
+    let null_first = [Bson::Null, Bson::String("y".into())];
+    let e = msg(record_compare(
+        "=",
+        &fs,
+        &null_first,
+        true,
+        Some((&row, &s(&["unknown", "text"]))),
+    ));
+    assert!(
+        e.contains("types integer and unknown at record column 1"),
+        "{e}"
+    );
+    // A type modifier is not part of the type.
+    let got = record_compare(
+        "=",
+        &fs,
+        &fs,
+        true,
+        Some((&s(&["int4", "varchar(3)"]), &s(&["int4", "varchar"]))),
+    )
+    .unwrap();
+    assert_eq!(got, Bson::Boolean(true));
+    // Equal shared pairs, different widths: 42804 for `=` and `<` alike.
+    let wide = [Bson::Int32(1), Bson::String("y".into()), Bson::Int32(3)];
+    let wide_t = s(&["int4", "text", "int4"]);
+    for op in ["=", "<"] {
+        let e = msg(record_compare(op, &fs, &wide, true, Some((&row, &wide_t))));
+        assert!(e.contains("different numbers of columns"), "{op}: {e}");
+    }
+    // Two row constructors are compared field by field, unchecked.
+    let got = record_compare("=", &fs, &fs, false, Some((&row, &lit))).unwrap();
+    assert_eq!(got, Bson::Boolean(true));
+}
+
+/// RP-531: GREATEST and LEAST order records by `record_cmp`, called
+/// (current, next) as `ExecEvalMinMax` calls it, NULL fields last, and
+/// pass its field checks through (PostgreSQL 15.19).
+#[test]
+fn greatest_and_least_order_records_by_record_cmp() {
+    let rec = |a: Bson, c: Bson| {
+        typed_record_value(vec![a, c], vec!["int4".to_string(), "text".to_string()])
+    };
+    let fs = rec(Bson::Int32(1), Bson::String("y".into()));
+    let low = rec(Bson::Int32(0), Bson::String("a".into()));
+    let null_c = rec(Bson::Int32(1), Bson::Null);
+    let call = |name: &str, args: &[Bson]| scalar::call(name, args).unwrap();
+    assert_eq!(call("least", &[fs.clone(), low.clone()]).unwrap(), low);
+    assert_eq!(call("greatest", &[fs.clone(), low.clone()]).unwrap(), fs);
+    // A NULL field sorts after any value: `(1,)` is past `(1,y)`.
+    assert_eq!(
+        call("greatest", &[fs.clone(), null_c.clone()]).unwrap(),
+        null_c
+    );
+    assert_eq!(call("least", &[fs.clone(), null_c.clone()]).unwrap(), fs);
+    // A NULL argument is skipped.
+    assert_eq!(call("least", &[Bson::Null, fs.clone()]).unwrap(), fs);
+    // A field of another type is `record_cmp`'s 42804.
+    let int_c = typed_record_value(
+        vec![Bson::Int32(1), Bson::Int32(2)],
+        vec!["int4".to_string(), "int4".to_string()],
+    );
+    let e = call("greatest", &[fs.clone(), int_c])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("cannot compare dissimilar column types text and integer at record column 2"),
+        "{e}"
+    );
+    assert_eq!(
+        record_cmp(&fs, &low).map(|r| r.unwrap()),
+        Some(std::cmp::Ordering::Greater)
+    );
+    assert!(record_cmp(&fs, &Bson::Int32(1)).is_none());
+}
+
+/// RP-529: a domain field is its own type to `record_eq`, not its base: a
+/// table's domain column against a field of the base type is 42804
+/// (`fd = row(1)` on 15.19), against the domain itself it compares.
+#[test]
+fn composite_record_compare_tells_a_domain_from_its_base() {
+    let s = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let one = [Bson::Int32(1)];
+    let e = record_compare("=", &one, &one, true, Some((&s(&["dint"]), &s(&["int4"]))))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("cannot compare dissimilar column types dint and integer at record column 1"),
+        "{e}"
+    );
+    let got = record_compare("=", &one, &one, true, Some((&s(&["dint"]), &s(&["dint"])))).unwrap();
+    assert_eq!(got, Bson::Boolean(true));
+}
+
+/// RP-535: the sorts order two records by `record_cmp` (`btrecordcmp`),
+/// NULL fields last, so a DESC sort reverses it; before, two records had
+/// no order and `ORDER BY` a row kept its input order (PostgreSQL 15.19).
+#[test]
+fn sorts_order_records_by_record_cmp() {
+    use std::cmp::Ordering;
+    let rec = |a: Bson, c: Bson| {
+        typed_record_value(vec![a, c], vec!["int4".to_string(), "text".to_string()])
+    };
+    let y = rec(Bson::Int32(1), Bson::String("y".into()));
+    let z = rec(Bson::Int32(2), Bson::String("z".into()));
+    let nulls = rec(Bson::Null, Bson::Null);
+    assert_eq!(compare_values(&y, &z), Some(Ordering::Less));
+    assert_eq!(compare_values(&z, &nulls), Some(Ordering::Less));
+    assert_eq!(compare_values(&nulls, &y), Some(Ordering::Greater));
+    assert_eq!(compare_values(&y, &y.clone()), Some(Ordering::Equal));
+    // An anonymous ROW(...) orders the same way.
+    let anon = |a: i32| Bson::Document(bson::doc! { RECORD_KEY: [a, Bson::Null] });
+    assert_eq!(compare_values(&anon(1), &anon(2)), Some(Ordering::Less));
+    // A scalar pair is unchanged.
+    assert_eq!(
+        compare_values(&Bson::Int32(2), &Bson::Int32(1)),
+        Some(Ordering::Greater)
+    );
+}
+
+/// RP-551: a domain's values are coerced to its base type at the base's
+/// modifier, `getBaseTypeAndTypmod`'s, through a domain over a domain too
+/// (`dc3n` over `dc3 char(3)` is a width-3 `bpchar`, though its own
+/// `typtypmod` is -1), and an explicit cast truncates and pads. Answers
+/// measured on PostgreSQL 15.19.
+#[test]
+fn a_domain_over_char_n_coerces_to_its_base_width() {
+    let domain = |name: &str, oid, base: &str, typmod| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc3", 90001, "bpchar", 7),
+        domain("dc3n", 90002, "dc3", -1),
+    ]);
+    let (base, typmod, chain) = domains::base_type_and_typmod("dc3n").expect("a domain");
+    assert_eq!((base.as_str(), typmod), ("bpchar", 7));
+    assert_eq!(
+        chain.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        ["dc3n", "dc3"]
+    );
+    assert!(domains::base_type_and_typmod("bpchar").is_none());
+    assert!(is_bpchar_type("dc3n") && is_bpchar_type("bpchar") && !is_bpchar_type("text"));
+    let s = |t: &str| Bson::String(t.to_string());
+    assert_eq!(explicit_typmod(s("ab"), "bpchar", 7).unwrap(), s("ab "));
+    assert_eq!(explicit_typmod(s("abcd"), "bpchar", 7).unwrap(), s("abc"));
+    assert_eq!(explicit_typmod(s("abcd"), "varchar", 7).unwrap(), s("abc"));
+    // A column of the outer domain stores the innermost base and its width.
+    match plan_ok("CREATE TABLE fcn (a dc3n)") {
+        Statement::CreateTable(def, _) => {
+            let c = &def.columns[0];
+            assert_eq!((c.pg_type.as_str(), c.typmod), ("bpchar", 7));
+            assert_eq!(c.extra.get_str("domain_type").ok(), Some("dc3n"));
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    domains::set_user_domains(Vec::new());
+}
+
+/// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
+/// (`skip_validation`), which a plain ADD does not, and `VALIDATE
+/// CONSTRAINT` names the constraint (RP-555).
+#[test]
+fn alter_domain_not_valid_and_validate() {
+    use domains::DomainChange as C;
+    let change = |sql: &str| match plan_ok(sql) {
+        Statement::AlterDomain { name, change } => {
+            assert_eq!(name, "dnv");
+            change
+        }
+        other => panic!("wrong statement: {other:?}"),
+    };
+    assert_eq!(
+        change("ALTER DOMAIN dnv ADD CONSTRAINT big CHECK (value > 5) NOT VALID"),
+        C::AddCheck {
+            name: "big".into(),
+            expr: "value > 5".into(),
+            not_valid: true,
+        }
+    );
+    assert!(matches!(
+        change("ALTER DOMAIN dnv ADD CONSTRAINT big CHECK (value > 5)"),
+        C::AddCheck {
+            not_valid: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        change("ALTER DOMAIN dnv VALIDATE CONSTRAINT big"),
+        C::Validate("big".into())
+    );
+}
+
+/// `select_common_type` over an ARRAY constructor (RP-559): elements all of
+/// one domain make that domain's array, and any other mix -- another type, or
+/// an `unknown` NULL or string -- smashes each domain to its base first.
+#[test]
+fn an_array_of_one_domain_is_the_domains_array() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "di".to_string(),
+        oid: 90011,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: None,
+    }]);
+    let array_type = |sql: &str| {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("a target");
+        };
+        static_type(rt.val.as_deref().expect("an expression"), &Bson::Null)
+    };
+    for (sql, expected) in [
+        ("select array[1::di, 2::di]", "di[]"),
+        ("select array[null::di]", "di[]"),
+        ("select array[array[1::di]]", "di[]"),
+        ("select array[1::di, 2]", "int4[]"),
+        ("select array[null, 1::di]", "int4[]"),
+        ("select array['1', 1::di]", "int4[]"),
+    ] {
+        assert_eq!(array_type(sql), expected, "{sql}");
+    }
+    domains::set_user_domains(Vec::new());
+}
+
+/// RP-570: a cast to a domain's array coerces each element to the domain.
+/// From text it is `array_in` reading each element with `domain_in` -- the
+/// base type's input at the domain's modifier, so a long `char(3)` element
+/// is 22001 -- and from an array an explicit element cast, which truncates.
+/// Every domain of the chain checks each element, a NULL one too. Answers
+/// measured on PostgreSQL 15.19.
+#[test]
+fn a_cast_to_a_domain_array_coerces_each_element() {
+    let domain = |name: &str, oid, base: &str, typmod, not_null| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null,
+        checks: Vec::new(),
+        default_sql: None,
+        not_valid: Vec::new(),
+    };
+    domains::set_user_domains(vec![
+        domain("da3", 90011, "bpchar", 7, false),
+        domain("da3n", 90012, "da3", -1, true),
+        domain("dan", 90013, "numeric", (5 << 16 | 2) + 4, false),
+        domain("dai", 90014, "int4", -1, false),
+    ]);
+    let s = |t: &str| Bson::String(t.to_string());
+    let arr = |items: &[&str]| Bson::Array(items.iter().map(|t| s(t)).collect());
+    let cast = |v: Bson, e: &str| domain_array_cast(&v, e);
+    // Input: padded, too long refused, blank excess cut, nested dimensions.
+    assert_eq!(cast(s("{ab}"), "da3").unwrap(), Some(arr(&["ab "])));
+    assert_eq!(cast(s("{\"ab   \"}"), "da3").unwrap(), Some(arr(&["ab "])));
+    let err = cast(s("{abcd}"), "da3").unwrap_err().to_string();
+    assert!(
+        err.contains("value too long for type character(3)"),
+        "{err}"
+    );
+    assert_eq!(
+        cast(s("{{ab,c}}"), "da3").unwrap(),
+        Some(Bson::Array(vec![arr(&["ab ", "c  "])]))
+    );
+    // An array value: an explicit cast, which truncates.
+    assert_eq!(
+        cast(arr(&["abcd", "x"]), "da3").unwrap(),
+        Some(arr(&["abc", "x  "]))
+    );
+    // Through a domain over a domain, whose NOT NULL sees a NULL element.
+    assert_eq!(cast(s("{ab}"), "da3n").unwrap(), Some(arr(&["ab "])));
+    let err = cast(s("{ab,NULL}"), "da3n").unwrap_err().to_string();
+    assert!(err.contains("does not allow null values"), "{err}");
+    // numeric(5,2) rounds on input and refuses what does not fit.
+    let Some(Bson::Array(items)) = cast(s("{1.234}"), "dan").unwrap() else {
+        panic!("an array");
+    };
+    assert_eq!(numeric::numeric_text(&items[0]).as_deref(), Some("1.23"));
+    assert!(cast(s("{123456}"), "dan").is_err());
+    // A domain with no modifier, and no domain at all, are not this path's.
+    assert_eq!(cast(s("{7}"), "dai").unwrap(), None);
+    assert_eq!(cast(s("{ab}"), "bpchar").unwrap(), None);
+    domains::set_user_domains(Vec::new());
+}
+
+/// RP-530: a row beside a typed operand that is not a row has no operator,
+/// so parse analysis refuses it with 42883 at the operator, over no row
+/// too. Each was 0A000 `comparing document with int32` at run time, or
+/// answered (`t || 1`, `t in (t, 1)`, a NULL). Measured on PostgreSQL
+/// 15.19 (`position` there is this 0-based location plus one).
+#[test]
+fn a_row_beside_a_scalar_has_no_operator() {
+    for (sql, want, at) in [
+        ("select t = 1 from t", "t = integer", 9),
+        ("select 1 = t from t", "integer = t", 9),
+        ("select name = (1, 'y') from t", "text = record", 12),
+        ("select (1, 2) < 1::bigint", "record < bigint", 14),
+        ("select t <> 'a'::text from t", "t <> text", 9),
+        ("select t = null::int from t where false", "t = integer", 9),
+        ("select t || 1 from t", "t || integer", 9),
+        ("select t is distinct from 1 from t", "t = integer", 9),
+        ("select nullif(t, 1) from t", "t = integer", 7),
+        ("select t in (t, 1) from t", "t = integer", 9),
+        ("select 1 in (2, t) from t", "integer = t", 9),
+        ("select t not in (1) from t", "t <> integer", 9),
+        ("select t <> all(array[1]) from t", "t <> integer", 9),
+        ("select t = any('{1}'::int[]) from t", "t = integer", 9),
+        ("select t between 1 and 2 from t", "t >= integer", 9),
+        ("select count(*) from t x where x = 1.5", "t = numeric", 33),
+        ("select t = (select 1) from t", "t = integer", 9),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42883", "for {sql} (got {err})");
+        assert!(
+            err.to_string()
+                .contains(&format!("operator does not exist: {want}")),
+            "for {sql}: {err}"
+        );
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // `anynonarray || text`, a row beside a row, an untyped literal and a
+    // field of the row are left to resolve.
+    for sql in [
+        "select t || 'x'::text from t",
+        "select 'x'::varchar || t from t",
+        "select t = t from t",
+        "select t = row(1, 'a', 2) from t",
+        "select t = null from t",
+        "select t.n = 1, (t).n = 1 from t",
+        "select t is null from t",
+    ] {
+        assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+    // `ROW(...) = (SELECT ...)` is a row comparison SubLink, and a scalar
+    // subquery of two columns is `transformSubLink`'s 42601: neither is
+    // an operator's 42883.
+    for sql in [
+        "select (1, 2) = (select 1)",
+        "select t = (select 1, 2) from t",
+        "select (select 1, 2) = t from t",
+    ] {
+        take_error_location();
+        if let Err(e) = analysed(sql) {
+            assert_ne!(e.sqlstate(), "42883", "for {sql}: {e}");
+        }
+    }
+}
+
+/// A cast to an array with a modifier on the element type itself is the
+/// explicit length coercion over each element of the array `array_in` read
+/// at typmod -1: char(n) truncates and pads, varchar(n) truncates, numeric
+/// rounds and overflows with apply_typmod's DETAIL, and a NULL element, the
+/// nesting and the bounds are kept (15.19, RP-579, RP-582).
+#[test]
+fn typmod_array_cast_coerces_each_element() {
+    let s = |t: &str| Bson::String(t.to_string());
+    let arr = |items: &[&str]| Bson::Array(items.iter().map(|t| s(t)).collect());
+    let cast = |v: Bson, e: &str, typmod: i32| typmod_array_cast(v, e, typmod);
+    assert_eq!(
+        cast(arr(&["ab", "abcd"]), "bpchar", 7).unwrap(),
+        arr(&["ab ", "abc"])
+    );
+    assert_eq!(
+        cast(arr(&["ab", "abcd"]), "varchar", 7).unwrap(),
+        arr(&["ab", "abc"])
+    );
+    assert_eq!(
+        cast(
+            Bson::Array(vec![arr(&["abcd"]), Bson::Array(vec![Bson::Null])]),
+            "bpchar",
+            6
+        )
+        .unwrap(),
+        Bson::Array(vec![arr(&["ab"]), Bson::Array(vec![Bson::Null])])
+    );
+    let bounded = arrays::bounded(arr(&["abcd", "x"]), &[0]);
+    assert_eq!(
+        cast(bounded, "bpchar", 6).unwrap(),
+        arrays::bounded(arr(&["ab", "x "]), &[0])
+    );
+    let n52 = (5 << 16 | 2) + 4;
+    let Bson::Array(items) = cast(
+        cast_value(s("{1.234}"), "numeric[]").unwrap(),
+        "numeric",
+        n52,
+    )
+    .unwrap() else {
+        panic!("an array");
+    };
+    assert_eq!(numeric::numeric_text(&items[0]).as_deref(), Some("1.23"));
+    let err = cast(
+        cast_value(s("{123456}"), "numeric[]").unwrap(),
+        "numeric",
+        n52,
+    )
+    .unwrap_err();
+    assert_eq!(err.sqlstate(), "22003");
+    assert_eq!(
+        err.to_string(),
+        "numeric field overflow\nDetail: A field with precision 5, scale 2 must round to an \
+         absolute value less than 10^3."
+    );
+}
+
+/// The composite types RP-590's tests install, as the server installs
+/// them: each among the user types with no labels, and with its fields.
+fn install_rp590_composites() {
+    let comps: Vec<(String, i64, CompositeFields)> = vec![
+        (
+            "ca".into(),
+            67_590,
+            vec![("x".into(), "int4".into()), ("y".into(), "text".into())],
+        ),
+        (
+            "cb".into(),
+            67_591,
+            vec![("x".into(), "int4".into()), ("y".into(), "int4".into())],
+        ),
+        (
+            "cd".into(),
+            67_592,
+            vec![("p".into(), "int4".into()), ("q".into(), "text".into())],
+        ),
+        (
+            "cc".into(),
+            67_593,
+            vec![
+                ("x".into(), "int4".into()),
+                ("y".into(), "text".into()),
+                ("z".into(), "int4".into()),
+            ],
+        ),
+    ];
+    set_user_types(
+        comps
+            .iter()
+            .map(|(n, oid, _)| (n.clone(), *oid, Vec::new()))
+            .collect(),
+    );
+    set_user_composites(comps);
+}
+
+/// RP-590: two different composite types compare through `record =
+/// record`, which both coerce to, so parse analysis finds the operator
+/// (`row(1)::ca = row(1)::cd` is `t` on PostgreSQL 15.19). They were 42883
+/// `operator does not exist: ca = cd`: the enum rule took a composite,
+/// installed among the user types with no labels, for an enum. An operator
+/// `record` does not have is still refused.
+#[test]
+fn two_composite_types_compare_as_records() {
+    install_rp590_composites();
+    for sql in [
+        "select row(1, 'a')::ca = row(1, 'a')::cd",
+        "select row(1, 'a')::ca < row(2, 'a')::cd",
+        "select row(1, 'a')::ca <> row(1, 2)::cb",
+        "select row(1, 'a')::ca >= row(1, 'a', 1)::cc",
+        "select row(1, 'a')::ca is distinct from row(1, 'a')::cd",
+        "select row(1, 'a')::ca *= row(1, 'a')::cd",
+    ] {
+        take_error_location();
+        if let Err(e) = analysed(sql) {
+            assert_ne!(e.sqlstate(), "42883", "for {sql}: {e}");
+        }
+    }
+    take_error_location();
+    let err = analysed("select row(1, 'a')::ca + row(1, 'a')::cd").expect_err("no `ca + cd`");
+    assert_eq!(err.sqlstate(), "42883", "{err}");
+    assert!(
+        err.to_string().contains("operator does not exist: ca + cd"),
+        "{err}"
+    );
+    set_user_types(Vec::new());
+    set_user_composites(Vec::new());
+}
+
+/// RP-590: a composite column compared with a record of other field types
+/// or names is evaluated per row, where `record_compare` makes `record_eq`
+/// / `record_cmp`'s field checks (42804 on PostgreSQL 15.19 for `v = row(1,
+/// 2)::cb` over `(1, 'a')`) and compares the fields by position (`v =
+/// row(1, 'a')::cd` is true). As a filter the stored record was compared
+/// whole, its field types and names included, and matched no row. A record
+/// of the column's own type stays a filter.
+#[test]
+fn composite_column_against_another_record_type_is_per_row() {
+    install_rp590_composites();
+    let def = || {
+        TableDef::new(
+            "tk",
+            vec![
+                Column::new("v", "ca", false),
+                Column::new("n", "int4", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "tk").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select n from tk where v = row(1, 2)::cb",
+        "select n from tk where v = row(1, 'a')::cd",
+        "select n from tk where v < row(1, 'a')::cd",
+        "select n from tk where v = row(1, 'a', 0)::cc",
+        "select n from tk where v = (1, 'a')",
+        "select n from tk where v is distinct from row(1, 2)::cb",
+        "select n from tk where v in (row(1, 'a')::ca, row(1, 2)::cb)",
+        "select n from tk where v not in (row(1, 'a', 0)::cc)",
+        "select n from tk where v = any(array[row(1, 2)::cb])",
+        "select n from tk where v between row(1, 2)::cb and row(1, 3)::cb",
+        "select n from tk where not (v = row(1, 2)::cb)",
+        "select n from tk where v not between row(1, 2)::cb and row(1, 3)::cb",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    for sql in [
+        "select n from tk where v = row(1, 'a')::ca",
+        "select n from tk where v in (row(1, 'a')::ca, row(2, 'b')::ca)",
+        "select n from tk where n = 1",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(!residual, "{sql} stays a filter: {filter:?}");
+    }
+    set_user_types(Vec::new());
+    set_user_composites(Vec::new());
+}
+
+/// RP-580: a cast to a domain whose base type carries a modifier counts as a
+/// cast with a modifier, so a bare column's cast to it takes the general
+/// path, which coerces to the base type at the domain's modifier, as
+/// PostgreSQL 15.19's `coerce_to_domain` does (`t::d` over `char(3)` pads
+/// `ab` to `ab `). A domain with no modifier, at any depth, does not.
+#[test]
+fn a_cast_to_a_domain_with_a_modifier_has_a_typmod() {
+    let domain = |name: &str, oid, base: &str, typmod| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        default_sql: None,
+        not_valid: Vec::new(),
+    };
+    domains::set_user_domains(vec![
+        domain("dm3", 90021, "bpchar", 7),
+        domain("dm3c", 90022, "dm3", -1),
+        domain("dmi", 90023, "int4", -1),
+    ]);
+    let has_typmod = |sql: &str| -> bool {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("no target");
+        };
+        let Some(N::TypeCast(tc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            panic!("not a cast: {sql}");
+        };
+        cast_chain_has_typmod(tc)
+    };
+    let cases = [
+        ("select t::dm3 from x", true),
+        ("select t::dm3c from x", true),
+        ("select t::dm3[] from x", true),
+        ("select t::dm3::text from x", true),
+        ("select t::varchar(3) from x", true),
+        ("select t::dmi from x", false),
+        ("select t::text from x", false),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(has_typmod(sql), want, "{sql}");
+    }
+    domains::set_user_domains(Vec::new());
+}
+
+/// RP-603: an `oidvector`'s order key orders as `btoidvectorcmp` -- the
+/// shorter vector first, then oid by oid, each unsigned -- and carries the
+/// vector's text after its `|`, which `greatest` / `least` read back.
+#[test]
+fn oidvector_key_orders_as_btoidvectorcmp() {
+    let key = |text: &str| match crate::range_ops::sort_key(&Bson::String(text.into()), "oidvector")
+    {
+        Ok(Bson::String(k)) => k,
+        other => panic!("for {text:?}: {other:?}"),
+    };
+    let ordered = ["", "3", "5", "4294967295", "1 2", "2 1", "1 1 1"];
+    for pair in ordered.windows(2) {
+        assert!(key(pair[0]) < key(pair[1]), "{:?} < {:?}", pair[0], pair[1]);
+    }
+    assert_eq!(key("1 2"), key("1  2"));
+    assert_eq!(key("1 2").rsplit_once('|').map(|(_, t)| t), Some("1 2"));
+    assert_eq!(
+        crate::range_ops::sort_key(&Bson::Null, "oidvector").ok(),
+        Some(Bson::Null)
+    );
 }

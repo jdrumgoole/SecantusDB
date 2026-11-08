@@ -605,7 +605,7 @@ fn not_on_path(name: &str, location: i32) -> Error {
     Error::UndefinedTable(name.to_string())
 }
 
-fn relation_exists(key: &str) -> bool {
+pub(crate) fn relation_exists(key: &str) -> bool {
     RELATION_KEYS.with(|k| k.borrow().contains(key))
         || PLAN_USER_RELATIONS.with(|t| t.borrow().iter().any(|(n, _, _)| n == key))
 }
@@ -692,12 +692,7 @@ fn qualify_reference(r: &mut RangeVar, ctes: &[String], trivial: bool) -> Option
         }
         let key = resolve_unqualified(&r.relname);
         if key != r.relname {
-            if r.alias.is_none() {
-                r.alias = Some(Alias {
-                    aliasname: r.relname.clone(),
-                    colnames: Vec::new(),
-                });
-            }
+            add_alias(r);
             r.relname = key;
         }
         return None;
@@ -705,12 +700,7 @@ fn qualify_reference(r: &mut RangeVar, ctes: &[String], trivial: bool) -> Option
     if let Some(t) = names_temp_schema(&r.schemaname) {
         r.schemaname.clear();
         r.catalogname.clear();
-        if r.alias.is_none() {
-            r.alias = Some(Alias {
-                aliasname: r.relname.clone(),
-                colnames: Vec::new(),
-            });
-        }
+        add_alias(r);
         r.relname = relation_key(&t, &r.relname);
         return None;
     }
@@ -719,14 +709,56 @@ fn qualify_reference(r: &mut RangeVar, ctes: &[String], trivial: bool) -> Option
     }
     let schema = std::mem::take(&mut r.schemaname);
     r.catalogname.clear();
+    add_alias(r);
+    r.relname = relation_key(&schema, &r.relname);
+    Some(schema)
+}
+
+/// The `relpersistence` a reference whose alias [`add_alias`] supplied
+/// carries. A FROM item's `relpersistence` is never read (only a CREATE
+/// target's is, and a target's own `t` / `u` is left alone) and the
+/// deparser prints it for no FROM item, so the mark stays on the tree in
+/// memory and is gone from any text made of it.
+const ALIAS_ADDED: &str = "a";
+
+/// A reference folded to its stored `schema.name` key keeps answering to
+/// its bare name: unless the statement wrote one, it is given that name as
+/// its alias, which is the name PostgreSQL's `eref` carries. The alias is
+/// marked as added, for what has to tell it from a written one
+/// (`rte->alias`, which ruleutils prints and this is not): see
+/// [`alias_written`].
+fn add_alias(r: &mut RangeVar) {
     if r.alias.is_none() {
         r.alias = Some(Alias {
             aliasname: r.relname.clone(),
             colnames: Vec::new(),
         });
+        if matches!(r.relpersistence.as_str(), "" | "p") {
+            r.relpersistence = ALIAS_ADDED.into();
+        }
     }
-    r.relname = relation_key(&schema, &r.relname);
-    Some(schema)
+}
+
+/// Whether a FROM reference's alias was written by the statement
+/// (`rte->alias != NULL`), and not the bare name [`add_alias`] gave a
+/// schema-qualified, search-path-resolved or temporary reference.
+pub fn alias_written(r: &RangeVar) -> bool {
+    r.alias.is_some() && r.relpersistence != ALIAS_ADDED
+}
+
+/// For each `RangeVar` of `node`, in the order `nodes()` walks them,
+/// whether the statement wrote its alias ([`alias_written`]). A tree
+/// deparsed to text loses the mark, so whatever keeps the text (a view's
+/// definition) keeps this beside it, for ruleutils to read back by the same
+/// walk of the reparsed text.
+pub fn written_aliases(node: &N) -> Vec<bool> {
+    node.nodes()
+        .into_iter()
+        .filter_map(|(n, _, _, _)| match n {
+            pg_query::NodeRef::RangeVar(r) => Some(alias_written(r)),
+            _ => None,
+        })
+        .collect()
 }
 
 fn strings(l: &pg_query::protobuf::List) -> Option<Vec<String>> {
@@ -1265,6 +1297,31 @@ mod tests {
             );
             assert_eq!(deparsed("select * from t"), "SELECT * FROM t");
             assert_eq!(deparsed("select * from public.t"), "SELECT * FROM public.t");
+        });
+    }
+
+    fn written(sql: &str) -> (Vec<bool>, String) {
+        let mut tree = pg_query::parse(sql).unwrap().protobuf;
+        let n = tree.stmts[0].stmt.as_mut().unwrap().node.as_mut().unwrap();
+        qualify(n).unwrap();
+        (written_aliases(n), tree.deparse().unwrap())
+    }
+
+    // The alias a key's bare name is given is not a written one; the text
+    // made of the tree cannot tell them apart, `written_aliases` can.
+    #[test]
+    fn a_supplied_alias_is_not_a_written_one() {
+        with_env("s, public", &["s", "u"], &["s.t", "u.t"], || {
+            let supplied = (vec![false], "SELECT t.a FROM \"u.t\" t".to_string());
+            assert_eq!(written("select t.a from u.t"), supplied);
+            let as_written = (vec![true], "SELECT t.a FROM \"u.t\" t".to_string());
+            assert_eq!(written("select t.a from u.t t"), as_written);
+            assert_eq!(written("select * from t").0, vec![false]);
+            assert_eq!(written("select * from t x").0, vec![true]);
+            assert_eq!(
+                written("select * from pg_catalog.pg_class c, pg_class").0,
+                vec![true, false]
+            );
         });
     }
 

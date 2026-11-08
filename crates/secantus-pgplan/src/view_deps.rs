@@ -486,6 +486,23 @@ fn expand_in_select(
     if !has_star {
         return Ok(changed);
     }
+    // A FROM item's columns under its alias's column list, which renames
+    // the first columns and leaves the rest their own names.
+    fn renamed(
+        cols: Option<Vec<String>>,
+        alias: Option<&pg_query::protobuf::Alias>,
+    ) -> Option<Vec<String>> {
+        let mut cols = cols?;
+        for (slot, n) in cols
+            .iter_mut()
+            .zip(alias.map(|a| a.colnames.as_slice()).unwrap_or(&[]))
+        {
+            if let Some(N::String(s)) = n.node.as_ref() {
+                *slot = s.sval.clone();
+            }
+        }
+        Some(cols)
+    }
     // The FROM items, in order, with their columns; `None` for the whole
     // list when a `*` over them could not be expanded exactly.
     fn collect(
@@ -502,7 +519,9 @@ fn expand_in_select(
                     .map(|a| a.aliasname.clone())
                     .filter(|a| !a.is_empty())
                     .unwrap_or_else(|| v.relname.clone());
-                out.push((q, columns_of(&v.relname)));
+                // `fs f(x, y)` names the table's columns `x, y`, as far as
+                // the list goes (`parse_relation.c`'s `buildRelationAliases`).
+                out.push((q, renamed(columns_of(&v.relname), v.alias.as_ref())));
             }
             Some(N::RangeSubselect(rs)) => {
                 let q = rs
@@ -531,20 +550,7 @@ fn expand_in_select(
                     }
                     _ => None,
                 };
-                let cols = match rs.alias.as_ref().filter(|a| !a.colnames.is_empty()) {
-                    Some(a) => cols.map(|mut c| {
-                        for (i, n) in a.colnames.iter().enumerate() {
-                            if let (Some(slot), Some(N::String(s))) =
-                                (c.get_mut(i), n.node.as_ref())
-                            {
-                                *slot = s.sval.clone();
-                            }
-                        }
-                        c
-                    }),
-                    None => cols,
-                };
-                out.push((q, cols));
+                out.push((q, renamed(cols, rs.alias.as_ref())));
             }
             Some(N::JoinExpr(j)) => {
                 if j.is_natural || !j.using_clause.is_empty() {
@@ -602,4 +608,31 @@ fn expand_in_select(
     }
     s.target_list = out;
     Ok(changed | expanded)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_stars;
+
+    fn fs_columns(rel: &str) -> Option<Vec<String>> {
+        (rel == "fs").then(|| vec!["a".to_string(), "c".to_string()])
+    }
+
+    /// A table's alias column list names the columns its `*` covers, as far
+    /// as the list goes (RP-512).
+    #[test]
+    fn a_star_over_an_aliased_table_takes_the_alias_names() {
+        for (sql, want) in [
+            (
+                "select * from fs f(x, y)",
+                "SELECT f.x, f.y FROM fs f(x, y)",
+            ),
+            ("select * from fs f(x)", "SELECT f.x, f.c FROM fs f(x)"),
+            ("select f.* from fs f(x)", "SELECT f.x, f.c FROM fs f(x)"),
+            ("select * from fs f", "SELECT f.a, f.c FROM fs f"),
+            ("select * from fs", "SELECT fs.a, fs.c FROM fs"),
+        ] {
+            assert_eq!(expand_stars(sql, &fs_columns).unwrap(), want, "{sql}");
+        }
+    }
 }

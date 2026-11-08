@@ -1,7 +1,13 @@
 #!/usr/bin/env bash
 # Wait for every check on a PR's head commit to finish, then report them.
 #
-#   scripts/wait_ci.sh <PR> [max-minutes]     # default 120
+#   scripts/wait_ci.sh <PR> [max-minutes] [sha]   # default 120
+#
+# sha: the commit just pushed to the PR's branch. GitHub moves the PR's head
+# a few seconds after a push, and until it does the PR still names the
+# previous commit, whose finished checks would be reported as this push's
+# (land_batch.sh read PR #2441's red run on d373904b as ed796664's,
+# 2026-11-07). Waits up to 10 min for the head to become sha (exit 2 if not).
 #
 # Exit 0: every check completed and passed (success / skipped / neutral).
 # Exit 1: a check completed with any other conclusion (it is named).
@@ -20,7 +26,20 @@ set -uo pipefail
 pr=${1:?usage: $0 <PR> [max-minutes]}
 max=${2:-120}
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
+want=${3:-}
 sha=$(gh pr view "$pr" --json headRefOid -q .headRefOid) || exit 2
+if [[ -n $want ]]; then
+    tries=0
+    until [[ $sha == "$want"* ]]; do
+        tries=$((tries + 1))
+        if [[ $tries -gt 60 ]]; then
+            echo "PR #$pr still at ${sha:0:8}, not ${want:0:8}, after 10 min"
+            exit 2
+        fi
+        sleep 10
+        sha=$(gh pr view "$pr" --json headRefOid -q .headRefOid) || exit 2
+    done
+fi
 api="repos/$repo/commits/$sha/check-runs?per_page=100"
 echo "PR #$pr at ${sha:0:8}: waiting up to $max min"
 

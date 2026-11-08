@@ -83,7 +83,18 @@ pub(crate) fn as_subselect(rf: &pg_query::protobuf::RangeFunction) -> Result<N> 
         calls.push(deparse_expr(call)?);
     }
     let rows = if let [only] = calls.as_slice() {
-        format!("SELECT * FROM {only}")
+        // A bare alias names a scalar function's column as it would
+        // without the ordinality (`gsc() WITH ORDINALITY g` is `g`,
+        // `ordinality`), so the function is planned under it.
+        match rf.alias.as_ref() {
+            Some(a) if !a.aliasname.is_empty() && a.colnames.is_empty() => {
+                format!(
+                    "SELECT * FROM {only} AS {}",
+                    crate::scalar::quote_identifier(&a.aliasname)
+                )
+            }
+            _ => format!("SELECT * FROM {only}"),
+        }
     } else {
         format!("SELECT * FROM ROWS FROM ({}) AS __rows", calls.join(", "))
     };
