@@ -2005,15 +2005,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       `j` has no leaf to go to. The rows are right; the plan text is not.
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
-- [ ] **`pg_get_viewdef` of an aliased JOIN returns the view's text.**
-      PostgreSQL 15.19 prints `(fs JOIN fe USING (a)) j` with its alias, a
-      column list when the join's names repeat (`j(a, c, a_1, b)` over an
-      ON join), and a USING alias's column by the left side's name
-      (`SELECT fs.a FROM (fs JOIN fe USING (a) AS u)`). `ruleutils.rs`
-      gives up on an aliased JOIN (`collect_rtes`) and falls back to the
-      statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
-      Backlog-ID: RP-467
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
 
 ## Found while working RP-470 (2026-11-07)
 
@@ -2029,16 +2020,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
-- [ ] **An UPDATE's or DELETE's target table is not a whole row.**
-      `update fs set c = fs::text returning c` and `update fs set c =
-      (select fs::text) returning c` answer `(1,y)` on PostgreSQL, and
-      `delete from fs where fs is null returning a` no row; here each is
-      42703 `column "fs" does not exist`. The write's target is not offered
-      as a whole row to its own SET, WHERE or RETURNING (nor, through
-      `outer_whole_row`, to their subqueries' per-row call); a SELECT's FROM
-      item and an UPDATE ... FROM's other table already are.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_dml_target_whole_row
-      Backlog-ID: RP-516
 - [ ] **`v.*` in a subquery's select list over an outer FROM item is
       42P01.** On PostgreSQL 15.19 `select (select v.*) from (values (1))
       v(a)` answers 1 (the star expands to the outer item's columns), and
@@ -2055,23 +2036,6 @@ holding `(1, 'y')`.
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 `tests/backlog/test_rp_found_rp508.py`.
 
-- [ ] **GRANT and COMMENT ON a routine named without arguments look among
-      every kind.** PostgreSQL 15.19 resolves both through
-      `LookupFuncWithArgs`, which with no argument list looks among the
-      statement's kind only (as DROP and ALTER do since RP-508). With a
-      procedure `gq(int)`, `grant execute on function gq to public` is
-      42883 `could not find a function named "gq"` there, 42809 `gq(integer)
-      is not a function` here, and `comment on function gq is 'x'` is the
-      same 42883 there and succeeds here (likewise PROCEDURE over a
-      function). Over a function `gm(int)` and a procedure `gm(text)`,
-      `grant execute on function gm` and `comment on function gm` succeed
-      there and are 42725 here; `grant ... on routine gm`'s 42725 says
-      `routine name "gm" is not unique` there, `function name` here.
-      `object_acl.rs` and the COMMENT path take every routine of the name;
-      `routines_of_kind` and `routine_lookup_error` (lib.rs) are the
-      lookup DROP and ALTER use.
-      Verify: tests/backlog/test_rp_found_rp508.py::test_grant_and_comment_look_up_by_kind
-      Backlog-ID: RP-514
 - [ ] **`pg_get_function_arguments` and `pg_get_function_identity_arguments`
       of a procedure print no argument modes.** PostgreSQL 15.19's
       `print_function_arguments` prints every mode of a procedure's
@@ -2080,6 +2044,104 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       (A function's IN is left out on both servers.)
       Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
       Backlog-ID: RP-515
+
+## Found while working RP-467 (2026-11-08)
+
+- [ ] **A materialized view is not a dependent of the relations it
+      reads.** With `create materialized view mv as select a from s.t`, a
+      plain `drop table s.t` succeeds where PostgreSQL 15.19 refuses it
+      (2BP01 `cannot drop table s.t because other objects depend on it`,
+      DETAIL `materialized view mv depends on table s.t`), and `drop table
+      s.t cascade` or `drop schema s cascade` leaves `mv` behind where
+      PostgreSQL drops it with them. A view is followed; a materialized
+      view is not. Found by RP-467's regression test, whose cleanup relied
+      on the cascade. Measured on a private 15.19 cluster.
+      Backlog-ID: RP-525
+      Verify: tests/backlog/test_rp_found_rp467.py::test_drop_reaches_a_dependent_materialized_view
+- [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
+      exception.** PostgreSQL lets two unaliased FROM items share a name
+      when they are different relations (`select 1 from s1.t join s2.t on
+      true` runs, and only a `t.a` naming both is ambiguous), and refuses an
+      alias equal to another item's name (42712 `table name "t" specified
+      more than once`). Here the join of two unaliased `t` is that 42712,
+      since a joined row is keyed by the bare name, and `create view v as
+      select t.a from s1.t t join s2.t on s2.t.a = t.a` is accepted, its
+      definition then reading `t.a = t.a`. Measured on a private 15.19
+      cluster.
+      Backlog-ID: RP-526
+      Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
+
+## Found while working RP-514 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp514.py`.
+
+- [ ] **A built-in routine is not looked up among its overloads or its
+      kind.** PostgreSQL 15.19 looks a built-in up in `pg_proc` like any
+      routine: `grant execute on function lower to public` and `comment on
+      function lower is 'x'` are 42725 `function name "lower" is not unique`
+      (`comment on routine abs` says `routine name`), and `grant execute on
+      procedure abs(int)` and `comment on procedure abs(int)` are 42809
+      `abs(integer) is not a procedure`. Here the bare-name GRANT succeeds,
+      the PROCEDURE forms are 42883 `procedure abs(integer) does not exist`,
+      and every COMMENT ON a built-in routine is refused as 0A000 (PostgreSQL
+      records `comment on function abs(int)`). `function_acl_key`
+      (object_acl.rs) knows a built-in only by `is_known_function(name)`:
+      the fix needs the built-in's overloads, and a place to keep a
+      built-in's comment.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_builtin_routine_resolved_by_its_overloads
+      Backlog-ID: RP-519
+- [ ] **GRANT's 42883 for a signature no routine has carries a position.**
+      PostgreSQL 15.19's `LookupFuncWithArgs` raises `function gc(boolean)
+      does not exist` (and `procedure ...` for PROCEDURE) with no position;
+      here it carries one, at the routine's name (27, 28). COMMENT's same
+      error has none.
+      Verify: tests/backlog/test_rp_found_rp514.py::test_grant_missing_signature_has_no_position
+      Backlog-ID: RP-520
+
+## Found while working RP-516 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
+and `fs(a int, c text)`.
+
+- [ ] **A subquery that reads an outer whole row where nothing types it is
+      42P18.** `select 1 from fs where exists (select 1 where fs is not
+      null)` and `select (select fs is null) from fs` answer on PostgreSQL
+      (`1`, `false`), and so do the same EXISTS in an UPDATE's or DELETE's
+      WHERE; here each is 42P18 `could not determine data type of parameter
+      $1`. The per-row call's body keeps a bare `$N` for the outer row,
+      which only a cast (`fs::text`) or a select-list `(select fs)` types;
+      PostgreSQL's outer Var carries the row type.
+      Backlog-ID: RP-521
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_untyped_outer_whole_row
+- [ ] **A whole row compared with a row of untyped literals is answered,
+      not 42804.** PostgreSQL 15.19's `record_eq` refuses `fs = (1,'y')`
+      with 42804 `cannot compare dissimilar column types text and unknown
+      at record column 2` (no position), in a SELECT's WHERE or target list
+      and in an UPDATE's WHERE; here it compares the values and answers.
+      `fs = row(1,'y')::fs` agrees on both.
+      Backlog-ID: RP-522
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_against_untyped_record
+- [ ] **An aliased write target still answers to its table's name.**
+      Under `update fs x` or `delete from fs x`, PostgreSQL 15.19 reads
+      `fs.c` as `errorMissingRTE`'s 42P01 `invalid reference to FROM-clause
+      entry for table "fs"`, HINT `Perhaps you meant to reference the table
+      alias "x".`, at the reference (`update fs x set c = fs.c`, `delete
+      from fs x where fs.a = 1`, `update fs x set c = 'q' returning fs.c`).
+      Here each reads the row and answers. A SELECT's alias already hides
+      its table's name.
+      Backlog-ID: RP-523
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_write_target_hides_its_name
+- [ ] **A write's name error is reported away from the reference.**
+      PostgreSQL 15.19 positions each at the name as written. Here `update
+      fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
+      target), not 21 / 31; `update fs set c = 'q' from fe e where e.a =
+      fs.a returning fe` is 42703 at 28 (the FROM item), not 60; and an
+      ambiguous bare column in an UPDATE ... FROM's or DELETE ... USING's
+      RETURNING (`returning a`) is 42702 with no position, not 59 / 53.
+      RP-414 has the reference's name and qualifier; this is where it is.
+      Backlog-ID: RP-524
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
 
 ## Found while working RP-500 (2026-11-07)
 

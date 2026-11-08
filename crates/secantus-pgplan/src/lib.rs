@@ -1226,6 +1226,9 @@ pub enum Statement {
         /// `CREATE MATERIALIZED VIEW`: the query's SQL, kept so `REFRESH`
         /// can run it again.
         matview_sql: Option<String>,
+        /// Its query's `schemas::written_aliases`, kept beside
+        /// `matview_sql` for ruleutils (as `CreateView::written_aliases`).
+        matview_aliases: Vec<bool>,
         /// `USING am`: one of the database's own table access methods
         /// (`heap` is `None`).
         access_method: Option<String>,
@@ -3633,6 +3636,11 @@ pub struct CreateView {
     pub replace: bool,
     /// `LOCAL` / `CASCADED` for `WITH CHECK OPTION`.
     pub check_option: Option<String>,
+    /// Whether each `RangeVar` of the definition, in `nodes()` order, had
+    /// its alias written (`schemas::written_aliases`): the text cannot say
+    /// which aliases qualification added, and ruleutils prints only the
+    /// written ones.
+    pub written_aliases: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -7266,16 +7274,20 @@ fn plan_create_table_as_with(
         Some(q) => plan_query(q)?,
         None => return Err(Error::Parse("CREATE TABLE AS without a query".into())),
     };
-    let matview_sql = if matview {
-        Some(
-            c.query
-                .as_deref()
-                .ok_or_else(|| Error::Parse("CREATE MATERIALIZED VIEW without a query".into()))?
-                .deparse()
-                .map_err(|e| Error::Parse(e.to_string()))?,
+    let (matview_sql, matview_aliases) = if matview {
+        let q = c
+            .query
+            .as_deref()
+            .ok_or_else(|| Error::Parse("CREATE MATERIALIZED VIEW without a query".into()))?;
+        (
+            Some(q.deparse().map_err(|e| Error::Parse(e.to_string()))?),
+            q.node
+                .as_ref()
+                .map(schemas::written_aliases)
+                .unwrap_or_default(),
         )
     } else {
-        None
+        (None, Vec::new())
     };
     Ok(Statement::CreateTableAs {
         table: rel.relname.clone(),
@@ -7286,6 +7298,7 @@ fn plan_create_table_as_with(
         query: Box::new(query),
         with_data: !into.skip_data,
         matview_sql,
+        matview_aliases,
         access_method: misc_alter::table_access_method(&into.access_method)?,
     })
 }
@@ -10506,6 +10519,11 @@ fn plan_create_view(v: &pg_query::protobuf::ViewStmt) -> Result<Statement> {
         columns,
         replace: v.replace,
         check_option,
+        written_aliases: query
+            .node
+            .as_ref()
+            .map(schemas::written_aliases)
+            .unwrap_or_default(),
     }))
 }
 
@@ -12404,7 +12422,21 @@ fn plan_insert(
     let returning = if i.returning_list.is_empty() {
         None
     } else {
-        let (columns, casts) = plan_table_targets(&i.returning_list, &def, params)?;
+        // The target named as a whole row (RP-516).
+        let exprs: Vec<&pg_query::protobuf::Node> = i
+            .returning_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            })
+            .collect();
+        let mut list = std::borrow::Cow::Borrowed(&i.returning_list);
+        if names_write_target(i.relation.as_ref(), &def, &exprs) {
+            let exprs = returning_exprs(list.to_mut()).collect();
+            rewrite_write_target_rows(i.relation.as_ref(), &def, exprs)?;
+        }
+        let (columns, casts) = plan_table_targets(&list, &def, params)?;
         Some(Returning { columns, casts })
     };
     let on_conflict = match i.on_conflict_clause.as_deref() {
@@ -20621,6 +20653,14 @@ fn dml_scopes(
             }
         }
     }
+    // So does a FROM item's name no column answers to: a bare `fe` is that
+    // item's whole row (`transformWholeRowRef`), read through the FROM as
+    // its columns are (RP-516).
+    for n in &names {
+        if !target.contains(n) && !from_only.contains(n) {
+            from_only.push(n.clone());
+        }
+    }
     let mut target_names = Vec::new();
     if let Some(r) = relation {
         target_names.push(r.relname.clone());
@@ -23636,6 +23676,34 @@ fn role_spec_name(r: &pg_query::protobuf::RoleSpec) -> String {
     }
 }
 
+/// A routine a GRANT or COMMENT names, as its signature: `f(int4,text)`, or
+/// bare `f` when the statement left the argument list off (the executor's
+/// `function_acl_key` resolves it as `LookupFuncWithArgs` does).
+fn routine_signature(ow: &pg_query::protobuf::ObjectWithArgs) -> Option<String> {
+    let name = schemas::routine_name(
+        ow.objname
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(st) => Some(st.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter(),
+    )?;
+    if ow.args_unspecified {
+        return Some(name);
+    }
+    let args: Vec<String> = ow
+        .objargs
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::TypeName(tn) => Some(type_name_of(tn)),
+            _ => None,
+        })
+        .collect();
+    Some(format!("{name}({})", args.join(",")))
+}
+
 /// `GRANT` / `REVOKE` on objects.
 fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
     use pg_query::protobuf::{GrantTargetType as T, ObjectType as O};
@@ -23668,32 +23736,8 @@ fn plan_grant(g: &pg_query::protobuf::GrantStmt) -> Result<Statement> {
             }
             Some(N::RangeVar(rv)) => Some(relation_name(rv)),
             Some(N::String(st)) => Some(st.sval.clone()),
-            // A routine keeps its signature, `f(int4,text)` (bare `f` when
-            // the GRANT left it off): its privileges are per overload.
-            Some(N::ObjectWithArgs(ow)) => schemas::routine_name(
-                ow.objname
-                    .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        N::String(st) => Some(st.sval.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .into_iter(),
-            )
-            .map(|name| {
-                if ow.args_unspecified {
-                    return name;
-                }
-                let args: Vec<String> = ow
-                    .objargs
-                    .iter()
-                    .filter_map(|n| match n.node.as_ref()? {
-                        N::TypeName(tn) => Some(type_name_of(tn)),
-                        _ => None,
-                    })
-                    .collect();
-                format!("{name}({})", args.join(","))
-            }),
+            // A routine keeps its signature: its privileges are per overload.
+            Some(N::ObjectWithArgs(ow)) => routine_signature(ow),
             Some(N::TypeName(t)) => t.names.last().and_then(|n| match n.node.as_ref() {
                 Some(N::String(st)) => Some(st.sval.clone()),
                 _ => None,
@@ -23922,6 +23966,7 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         Ok(O::ObjectSchema) => "schema",
         Ok(O::ObjectFunction) => "function",
         Ok(O::ObjectProcedure) => "procedure",
+        Ok(O::ObjectRoutine) => "routine",
         Ok(O::ObjectType) => "type",
         Ok(O::ObjectDomain) => "domain",
         Ok(O::ObjectDatabase) => "database",
@@ -23947,8 +23992,17 @@ fn plan_comment(c: &pg_query::protobuf::CommentStmt) -> Result<Statement> {
         }
     }
     let mut names = Vec::new();
-    if let Some(o) = c.object.as_deref() {
-        strings(o, &mut names);
+    match c.object.as_deref().and_then(|o| o.node.as_ref()) {
+        // A routine is named by its signature, so an overload is found by
+        // its argument types and a schema-qualified name keeps its schema.
+        Some(N::ObjectWithArgs(ow)) if matches!(kind, "function" | "procedure" | "routine") => {
+            names.extend(routine_signature(ow));
+        }
+        _ => {
+            if let Some(o) = c.object.as_deref() {
+                strings(o, &mut names);
+            }
+        }
     }
     if names.is_empty() {
         return Err(Error::Unsupported("COMMENT ON this object".into()));
@@ -40594,6 +40648,100 @@ fn composite_field_targets(
     Ok(Some(out))
 }
 
+/// Whether a write's target is named as a whole row (`fs`, or `fs.*`
+/// inside an expression) anywhere in `exprs`: its name, or its alias, when
+/// no column of the table is called that.
+fn names_write_target(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    def: &TableDef,
+    exprs: &[&pg_query::protobuf::Node],
+) -> bool {
+    let Some(name) = relation.map(range_var_visible_name) else {
+        return false;
+    };
+    if def.column(&name).is_some() {
+        return false;
+    }
+    let names = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => whole_row_ref_of(c, &name),
+        _ => false,
+    };
+    exprs.iter().any(|e| expr_any(e, &names))
+}
+
+/// `c` is `name` alone or `name.*`.
+fn whole_row_ref_of(c: &pg_query::protobuf::ColumnRef, name: &str) -> bool {
+    let first = matches!(
+        c.fields.first().and_then(|f| f.node.as_ref()),
+        Some(N::String(sv)) if sv.sval == name
+    );
+    first
+        && (c.fields.len() == 1
+            || (c.fields.len() == 2 && matches!(c.fields[1].node.as_ref(), Some(N::AStar(_)))))
+}
+
+/// A write's target named as a whole row in its SET values, WHERE or
+/// RETURNING, as `ROW(<columns>)::<table>`: PostgreSQL's `setTargetTable`
+/// puts the target in the statement's namespace, so `transformColumnRef`
+/// reads a bare `fs` there as `transformWholeRowRef` over its RTE, of the
+/// table's row type. A column of that name wins, as it does there; under
+/// an alias only the alias names it. The statement's subqueries were
+/// resolved first, so a correlated one's per-row call reads the row
+/// through its argument here (RP-516). A RETURNING list's own `fs.*` was
+/// already expanded to the columns (`returning_star`).
+fn rewrite_write_target_rows(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    def: &TableDef,
+    exprs: Vec<&mut pg_query::protobuf::Node>,
+) -> Result<()> {
+    let Some(r) = relation else {
+        return Ok(());
+    };
+    let name = range_var_visible_name(r);
+    // A column of that name wins (and the ROW below would name itself).
+    if def.column(&name).is_some() {
+        return Ok(());
+    }
+    let rowtype = table_rowtype(relation_name(r));
+    let columns: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let row = |location: i32| pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                    args: columns.iter().map(|c| column_ref_node(c)).collect(),
+                    row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                    colnames: columns.iter().map(|c| string_node(c)).collect(),
+                    location,
+                    ..Default::default()
+                }))),
+            })),
+            type_name: Some(type_name_node(&rowtype)),
+            location: 0,
+        }))),
+    };
+    for e in exprs {
+        walk_expr(e, &mut |n| {
+            if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                if whole_row_ref_of(c, &name) {
+                    *n = row(c.location);
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// The expressions of a write's RETURNING list.
+fn returning_exprs(
+    list: &mut [pg_query::protobuf::Node],
+) -> impl Iterator<Item = &mut pg_query::protobuf::Node> {
+    list.iter_mut().filter_map(|t| match t.node.as_mut() {
+        Some(N::ResTarget(rt)) => rt.val.as_deref_mut(),
+        _ => None,
+    })
+}
+
 fn plan_update(
     u: &pg_query::protobuf::UpdateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -40605,6 +40753,34 @@ fn plan_update(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("UPDATE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "UPDATE of"))?;
+    // The target named as a whole row (RP-516).
+    let target_rows;
+    let u = {
+        let mut exprs: Vec<&pg_query::protobuf::Node> =
+            u.where_clause.as_deref().into_iter().collect();
+        for t in u.target_list.iter().chain(&u.returning_list) {
+            if let Some(N::ResTarget(rt)) = t.node.as_ref() {
+                exprs.extend(rt.val.as_deref());
+            }
+        }
+        if names_write_target(u.relation.as_ref(), &def, &exprs) {
+            let mut w = u.clone();
+            let relation = w.relation.clone();
+            let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+                w.where_clause.as_deref_mut().into_iter().collect();
+            for t in &mut w.target_list {
+                if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                    exprs.extend(rt.val.as_deref_mut());
+                }
+            }
+            exprs.extend(returning_exprs(&mut w.returning_list));
+            rewrite_write_target_rows(relation.as_ref(), &def, exprs)?;
+            target_rows = w;
+            &target_rows
+        } else {
+            u
+        }
+    };
     // `SET v.a = x, v.b = y` assigns fields of a composite column: one
     // `SET v = ROW(x, y, (v).c)::type`, the fields not named read back.
     let field_set;
@@ -41208,6 +41384,29 @@ fn plan_delete(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("DELETE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "DELETE from"))?;
+    // The target named as a whole row (RP-516).
+    let target_rows;
+    let d = {
+        let mut exprs: Vec<&pg_query::protobuf::Node> =
+            d.where_clause.as_deref().into_iter().collect();
+        for t in &d.returning_list {
+            if let Some(N::ResTarget(rt)) = t.node.as_ref() {
+                exprs.extend(rt.val.as_deref());
+            }
+        }
+        if names_write_target(d.relation.as_ref(), &def, &exprs) {
+            let mut w = d.clone();
+            let relation = w.relation.clone();
+            let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+                w.where_clause.as_deref_mut().into_iter().collect();
+            exprs.extend(returning_exprs(&mut w.returning_list));
+            rewrite_write_target_rows(relation.as_ref(), &def, exprs)?;
+            target_rows = w;
+            &target_rows
+        } else {
+            d
+        }
+    };
     let (filter, residual) = match d.where_clause.as_ref() {
         None => (Document::new(), None),
         Some(w) => match current_of(w)? {

@@ -12,15 +12,20 @@ FROM-subquery is offered a sibling's alias as its hint); and found while
 working RP-454, RP-469 (a FROM item named as a table an aliased JOIN hides
 is refused), RP-470 (a whole-row reference to a joined table was not found;
 fixed), RP-471 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an
-aliased JOIN) and RP-468 (a correlated subquery reading a join's column got
+aliased JOIN; fixed) and RP-468 (a correlated subquery reading a join's column got
 text; fixed); found while working RP-461, RP-478 (a LATERAL subquery's bare
 name for an earlier FROM item's column was not found; fixed); and found while
 working RP-470, RP-479 (a whole-row reference was still refused in three
 shapes, and an ORDER BY position past a star sorted by the wrong column;
 fixed), RP-480 (a whole row was typed as a record or as varchar; fixed)
 and RP-481 (a USING column's 42703 carries a position); and found while
-working RP-479, RP-516 (an UPDATE's or DELETE's target is not a whole row)
-and RP-517 (`v.*` in a subquery over an outer FROM item is 42P01).
+working RP-479, RP-516 (an UPDATE's or DELETE's target was not a whole
+row; fixed) and RP-517 (`v.*` in a subquery over an outer FROM item is
+42P01); and found while working RP-516, RP-521 (a subquery reading an outer
+whole row with no type is 42P18), RP-522 (a whole row compared with an
+untyped record is not 42804), RP-523 (an aliased write target answers to
+its table's name) and RP-524 (a write's name errors carry the wrong
+position).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -624,7 +629,8 @@ def test_aliased_join_plan(query: str, dsn: str) -> None:
 
 # ruleutils prints an aliased JOIN with its alias (and a column list when
 # the join's names repeat), and a USING alias's column by the left side's
-# name; here the view's own text comes back.
+# name. The view's own text came back, as the deparser gave up on an
+# aliased JOIN.
 ALIASED_JOIN_VIEWDEF = {
     "select j.c from (fs join fe using (a)) as j": (
         " SELECT j.c\n   FROM (fs\n     JOIN fe USING (a)) j;"
@@ -638,18 +644,190 @@ ALIASED_JOIN_VIEWDEF = {
 }
 
 
-@pytest.mark.backlog("RP-467")
+@pytest.mark.backlog_fixed("RP-467")
 @pytest.mark.parametrize("query", list(ALIASED_JOIN_VIEWDEF))
 def test_aliased_join_viewdef(query: str, dsn: str) -> None:
+    assert _viewdef(dsn, query, False) == ALIASED_JOIN_VIEWDEF[query]
+
+
+def _viewdef(dsn: str, query: str, pretty: bool, setup: tuple[str, ...] = ()) -> Any:
     with psycopg.connect(dsn, autocommit=True) as c:
-        for q in _SETUP:
+        for q in [*_SETUP, *setup]:
             c.execute(q)
         c.execute("create view rp_v as " + query)
         try:
-            row = c.execute("select pg_get_viewdef('rp_v')").fetchone()
+            row = c.execute("select pg_get_viewdef('rp_v', %s)", (pretty,)).fetchone()
         finally:
             c.execute("drop view rp_v")
-    assert row is not None and row[0] == ALIASED_JOIN_VIEWDEF[query]
+    return row[0] if row else None
+
+
+# Every join's columns are named as `set_deparse_for_query` names them
+# (RP-467): an unnamed join's column prints as the input column its join
+# alias variable is -- the left one's for an INNER or LEFT join, unless
+# only the right one needs no coercion, the right one's for a RIGHT join
+# -- and a merged column that is a COALESCE (FULL) or a coercion
+# (`varchar(3)` with `varchar(5)`) prints unqualified, every other column
+# of the statement renamed out of its way (`x(a_1, c, d)`). NATURAL prints
+# as its USING list, `*` takes a merged column once, and a USING name is
+# pushed down to the inputs (`fs fs(x, c)`). Each was the view's own text,
+# or a `*` expanded to both sides' merged columns.
+_JOIN_TABLES = (
+    "drop table if exists fx, fv, fv3 cascade",
+    "create table fx (a int, c text, d int)",
+    "create table fv (a int8, v varchar(3))",
+    "create table fv3 (v varchar(5), w int)",
+)
+JOIN_VIEWDEF = {
+    ("select a from fs join fe using (a)", False): (
+        " SELECT fs.a\n   FROM (fs\n     JOIN fe USING (a));"
+    ),
+    ("select * from fs join fe using (a)", False): (
+        " SELECT fs.a,\n    fs.c,\n    fe.b\n   FROM (fs\n     JOIN fe USING (a));"
+    ),
+    ("select * from fs natural left join fe", False): (
+        " SELECT fs.a,\n    fs.c,\n    fe.b\n   FROM (fs\n     LEFT JOIN fe USING (a));"
+    ),
+    ("select * from fs natural join fv", False): (
+        " SELECT fv.a,\n    fs.c,\n    fv.v\n   FROM (fs\n     JOIN fv USING (a));"
+    ),
+    ("select a from fs right join fe using (a)", False): (
+        " SELECT fe.a\n   FROM (fs\n     RIGHT JOIN fe USING (a));"
+    ),
+    ("select * from fs full join fe using (a)", False): (
+        " SELECT a,\n    fs.c,\n    fe.b\n   FROM (fs\n     FULL JOIN fe USING (a));"
+    ),
+    ("select v from fv join fv3 using (v)", False): (
+        " SELECT v\n   FROM (fv\n     JOIN fv3 USING (v));"
+    ),
+    ("select fs.c, x.a as xa from fs full join fe using (a), fx x", False): (
+        " SELECT fs.c,\n    x.a_1 AS xa\n   FROM (fs\n     FULL JOIN fe USING (a)),\n"
+        "    fx x(a_1, c, d);"
+    ),
+    ("select * from (fs join fe using (a)) as j(x, y, z)", False): (
+        " SELECT j.x,\n    j.y,\n    j.z\n   FROM (fs fs(x, c)\n"
+        "     JOIN fe fe(x, b) USING (x)) j(x, y, z);"
+    ),
+    ("select j.y from (fs join fe on true) as j(x, y)", False): (
+        " SELECT j.y\n   FROM (fs\n     JOIN fe ON (true)) j(x, y, a, b);"
+    ),
+    ("select j.c, j.b from (fs join fe on fs.a = fe.a) j", False): (
+        " SELECT j.c,\n    j.b\n   FROM (fs\n     JOIN fe ON ((fs.a = fe.a))) j(a, c, a_1, b);"
+    ),
+    ("select j.c from ((fs join fe using (a)) as j join fx on j.a = fx.a)", False): (
+        " SELECT j.c\n   FROM ((fs\n     JOIN fe USING (a)) j\n     JOIN fx ON ((j.a = fx.a)));"
+    ),
+    # The pretty form parenthesises an unnamed join on the right only.
+    ("select a from fs join (fe join fx using (a)) using (a)", True): (
+        " SELECT fs.a\n   FROM fs\n     JOIN (fe\n     JOIN fx USING (a)) USING (a);"
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-467")
+@pytest.mark.parametrize("case", list(JOIN_VIEWDEF))
+def test_join_viewdef_names_columns(case: tuple[str, bool], dsn: str) -> None:
+    query, pretty = case
+    try:
+        got = _viewdef(dsn, query, pretty, _JOIN_TABLES)
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute(_JOIN_TABLES[0])
+    assert got == JOIN_VIEWDEF[case]
+
+
+# ruleutils prints a relation's alias when the statement wrote one
+# (`rte->alias`), when its column aliases need it, or when its name had to
+# change -- not otherwise. A reference to another schema's table, to one the
+# search path finds outside `public`, or to a temporary table is stored
+# under its `schema.name` key and carries its bare name as an alias that
+# qualification supplied; RP-467 printed that alias as written (`FROM
+# rq467a.t t`, the b41_fixes corpus). Each answer is PostgreSQL 15.19's, on
+# a private cluster: `(search_path when the view is made, the view's query,
+# materialized?) -> (pg_get_viewdef there, and again under the default
+# path)`.
+_QUALIFIED_SETUP = (
+    "drop schema if exists rq467a, rq467b cascade",
+    "drop table if exists rq467p cascade",
+    "create schema rq467a",
+    "create schema rq467b",
+    "create table rq467a.t (a int, b text)",
+    "create table rq467b.t (a int)",
+    "create table rq467p (a int)",
+)
+QUALIFIED_RELATION_ALIAS = {
+    ("", "select a, b from rq467a.t where a > 1", False): (
+        " SELECT t.a,\n    t.b\n   FROM rq467a.t\n  WHERE (t.a > 1);",
+        None,
+    ),
+    ("", "select t.a from rq467a.t join rq467b.t u on u.a = t.a", False): (
+        " SELECT t.a\n   FROM (rq467a.t\n     JOIN rq467b.t u ON ((u.a = t.a)));",
+        None,
+    ),
+    # A written alias that is the bare name prints; so does any other.
+    ("", "select t.a from rq467a.t t", False): (" SELECT t.a\n   FROM rq467a.t t;", None),
+    ("", "select x.a from rq467a.t x", False): (" SELECT x.a\n   FROM rq467a.t x;", None),
+    ("", "select rq467p.a from public.rq467p", False): (
+        " SELECT rq467p.a\n   FROM rq467p;",
+        None,
+    ),
+    ("", "select rq467p.a from rq467p rq467p", False): (
+        " SELECT rq467p.a\n   FROM rq467p rq467p;",
+        None,
+    ),
+    ("rq467a, public", "select t.a from t", False): (
+        " SELECT t.a\n   FROM t;",
+        " SELECT t.a\n   FROM rq467a.t;",
+    ),
+    ("rq467a, public", "select t.a from t t", False): (
+        " SELECT t.a\n   FROM t t;",
+        " SELECT t.a\n   FROM rq467a.t t;",
+    ),
+    ("rq467a, public", "select a from t where a > 1", False): (
+        " SELECT t.a\n   FROM t\n  WHERE (t.a > 1);",
+        " SELECT t.a\n   FROM rq467a.t\n  WHERE (t.a > 1);",
+    ),
+    # The session's temporary schema is searched first: its tables print
+    # bare.
+    ("temp", "select tt.a from tt", False): (" SELECT tt.a\n   FROM tt;", None),
+    ("temp", "select tt.a from tt tt", False): (" SELECT tt.a\n   FROM tt tt;", None),
+    ("temp", "select tt.a from pg_temp.tt", False): (" SELECT tt.a\n   FROM tt;", None),
+    ("temp", "select x.a from pg_temp.tt x", False): (" SELECT x.a\n   FROM tt x;", None),
+    ("", "select t.a from rq467a.t", True): (" SELECT t.a\n   FROM rq467a.t;", None),
+    ("", "select t.a from rq467a.t t", True): (" SELECT t.a\n   FROM rq467a.t t;", None),
+}
+
+
+@pytest.mark.backlog_fixed("RP-467")
+@pytest.mark.parametrize("case", list(QUALIFIED_RELATION_ALIAS))
+def test_viewdef_qualified_relation_alias(case: tuple[str, str, bool], dsn: str) -> None:
+    path, query, materialized = case
+    kind = "materialized view" if materialized else "view"
+    got: Any
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _QUALIFIED_SETUP:
+            c.execute(q)
+        try:
+            if path == "temp":
+                c.execute("create temp table tt (a int)")
+            elif path:
+                c.execute(f"set search_path = {path}")
+            c.execute(f"create {kind} rq467v as {query}")
+            row = c.execute("select pg_get_viewdef('rq467v'::regclass)").fetchone()
+            c.execute("reset search_path")
+            again = None
+            if path and path != "temp":
+                again = c.execute("select pg_get_viewdef('rq467a.rq467v'::regclass)").fetchone()
+            got = (row[0] if row else None, again[0] if again else None)
+        except psycopg.Error as e:
+            got = (e.sqlstate, e.diag.message_primary)
+        finally:
+            c.execute("reset search_path")
+            schema = "rq467a." if path and path != "temp" else ""
+            c.execute(f"drop {kind} if exists {schema}rq467v")
+            c.execute(_QUALIFIED_SETUP[0])
+            c.execute(_QUALIFIED_SETUP[1])
+    assert got == QUALIFIED_RELATION_ALIAS[case]
 
 
 # A correlated subquery's value read from a join's column has that
@@ -803,16 +981,38 @@ def test_lateral_item_calls_once_per_row(query: str, dsn: str) -> None:
 
 # Found while working RP-479. An UPDATE's or DELETE's target table is a
 # whole row to its own SET, WHERE and RETURNING and to their subqueries, as
-# a SELECT's FROM item is. Here each is 42703 `column "fs" does not exist`;
-# an UPDATE ... FROM's other table already answers (`where fe is not null`).
+# a SELECT's FROM item is (`setTargetTable` puts it in the namespace), and
+# so is an INSERT's to its RETURNING; under an alias only the alias names
+# it. Each was 42703 `column "fs" does not exist`, and an UPDATE ... FROM's
+# or DELETE ... USING's other table named bare in RETURNING was too.
 DML_TARGET_WHOLE_ROW = {
     "update fs set c = fs::text returning c": [("(1,y)",)],
     "update fs set c = (select fs::text) returning c": [("(1,y)",)],
     "delete from fs where fs is null returning a": [],
+    "delete from fs where fs is not null returning a": [(1,)],
+    "update fs set c = 'q' returning fs": [("(1,q)",)],
+    "update fs set c = 'q' returning (fs).c": [("q",)],
+    "update fs set c = 'q' returning (fs.*)::text": [("(1,q)",)],
+    "update fs set c = fs.*::text returning c": [("(1,y)",)],
+    "update fs set c = 'q' where fs = row(1,'y')::fs returning a": [(1,)],
+    "update fs set c = (fs).c || 'z' returning c": [("yz",)],
+    "update fs set c = row_to_json(fs)::text returning c": [('{"a":1,"c":"y"}',)],
+    "update fs set c = 'q' returning (select fs)": [("(1,q)",)],
+    "update fs x set c = x::text returning c": [("(1,y)",)],
+    "update fs x set c = 'q' returning x": [("(1,q)",)],
+    "delete from fs x where x::text = '(1,y)' returning x": [("(1,y)",)],
+    "delete from fs returning (select fs::text)": [("(1,y)",)],
+    "insert into fs as x values (2, 'w') returning x, x::text": [("(2,w)", "(2,w)")],
+    "insert into fs values (2, 'w') returning (select fs::text)": [("(2,w)",)],
+    "update fs set c = fe::text from fe where fe.a = fs.a returning fs, fe": [
+        ('(1,"(1,x)")', "(1,x)")
+    ],
+    "delete from fs using fe where fe.a = fs.a returning fe": [("(1,x)",)],
+    "with u as (update fs set c = fs::text returning fs) select * from u": [('(1,"(1,y)")',)],
 }
 
 
-@pytest.mark.backlog("RP-516")
+@pytest.mark.backlog_fixed("RP-516")
 @pytest.mark.parametrize("query", list(DML_TARGET_WHOLE_ROW))
 def test_dml_target_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DML_TARGET_WHOLE_ROW[query]
@@ -839,3 +1039,118 @@ OUTER_STAR_IN_SUBQUERY = {
 @pytest.mark.parametrize("query", list(OUTER_STAR_IN_SUBQUERY))
 def test_outer_star_in_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OUTER_STAR_IN_SUBQUERY[query]
+
+
+# Found while working RP-516. A subquery that reads an outer whole row only
+# where nothing gives the row a type (`fs is not null`) is planned with an
+# untyped parameter, and the per-row call cannot run it: 42P18 `could not
+# determine data type of parameter $1`. A cast (`fs::text`) or a bare
+# `(select fs)` already answers.
+UNTYPED_OUTER_WHOLE_ROW = {
+    "select 1 from fs where exists (select 1 where fs is not null)": [(1,)],
+    "select (select fs is null) from fs": [(False,)],
+    "delete from fs where exists (select 1 where fs is not null) returning a": [(1,)],
+    "update fs set c = 'q' where exists (select 1 from fe where fs is not null) returning a": [
+        (1,)
+    ],
+}
+
+
+@pytest.mark.backlog("RP-521")
+@pytest.mark.parametrize("query", list(UNTYPED_OUTER_WHOLE_ROW))
+def test_untyped_outer_whole_row(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == UNTYPED_OUTER_WHOLE_ROW[query]
+
+
+# Found while working RP-516. A whole row compared with a row constructor
+# of untyped literals: PostgreSQL's `record_eq` refuses the `unknown`
+# column against the row type's `text` (42804, no position). Here the
+# comparison is answered.
+WHOLE_ROW_UNTYPED_RECORD = {
+    "select 1 from fs where fs = (1,'y')": (
+        "42804",
+        "cannot compare dissimilar column types text and unknown at record column 2",
+        None,
+        None,
+    ),
+    "select fs = (1,'y') from fs": (
+        "42804",
+        "cannot compare dissimilar column types text and unknown at record column 2",
+        None,
+        None,
+    ),
+    "update fs set c = 'q' where fs = (1,'y') returning a": (
+        "42804",
+        "cannot compare dissimilar column types text and unknown at record column 2",
+        None,
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog("RP-522")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_UNTYPED_RECORD))
+def test_whole_row_against_untyped_record(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_UNTYPED_RECORD[query]
+
+
+# Found while working RP-516. An aliased write target is hidden by its
+# alias: `fs.c` under `update fs x` is `errorMissingRTE`'s 42P01 with the
+# alias as its HINT. Here the table's name still reads the row.
+_ALIAS_HINT = 'Perhaps you meant to reference the table alias "x".'
+_HIDDEN = 'invalid reference to FROM-clause entry for table "fs"'
+ALIASED_WRITE_TARGET_NAME = {
+    "update fs x set c = fs.c returning c": ("42P01", _HIDDEN, _ALIAS_HINT, "21"),
+    "delete from fs x where fs.a = 1 returning a": ("42P01", _HIDDEN, _ALIAS_HINT, "24"),
+    "update fs x set c = 'q' returning fs.c": ("42P01", _HIDDEN, _ALIAS_HINT, "35"),
+}
+
+
+@pytest.mark.backlog("RP-523")
+@pytest.mark.parametrize("query", list(ALIASED_WRITE_TARGET_NAME))
+def test_aliased_write_target_hides_its_name(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == ALIASED_WRITE_TARGET_NAME[query]
+
+
+# Found while working RP-516. A write's name error is reported at the
+# reference: a missing name under an aliased target at the target's own
+# position (8) here, a bare name in an UPDATE ... FROM's RETURNING at the
+# FROM item's (28), and RETURNING's ambiguous column with none.
+WRITE_NAME_ERROR_POSITION = {
+    "update fs x set c = fs::text returning c": (
+        "42703",
+        'column "fs" does not exist',
+        None,
+        "21",
+    ),
+    "update fs x set c = 'q' where fs is null returning c": (
+        "42703",
+        'column "fs" does not exist',
+        None,
+        "31",
+    ),
+    "update fs set c = 'q' from fe e where e.a = fs.a returning fe": (
+        "42703",
+        'column "fe" does not exist',
+        None,
+        "60",
+    ),
+    "delete from fs using fe where fe.a = fs.a returning a": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "53",
+    ),
+    "update fs set c = 'q' from fe where fe.a = fs.a returning a": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "59",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-524")
+@pytest.mark.parametrize("query", list(WRITE_NAME_ERROR_POSITION))
+def test_write_name_error_position(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WRITE_NAME_ERROR_POSITION[query]
