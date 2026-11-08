@@ -2368,23 +2368,27 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
       Backlog-ID: RP-581
 
-## Found while working RP-580 (2026-11-08)
+## Found while working RP-607 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d607a as
-char(3)` and `create domain d607b as d607a check (value <> 'abc')`. The gap
-test is in `tests/backlog/test_rp_found_rp580.py`.
+Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
+as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **DROP DOMAIN drops a domain another domain is over.** `drop domain
-      d607a` and `drop domain d607a restrict` are 2BP01 `cannot drop type
-      d607a because other objects depend on it` (DETAIL `type d607b depends
-      on type d607a`, the CASCADE HINT) on PostgreSQL 15.19, and `drop
-      domain d607a cascade` drops both. Here each of the three drops
-      `d607a` alone and leaves `d607b` over a type that no longer exists.
-      `drop type d607a` is refused as PostgreSQL refuses it, but `drop type
-      d607a cascade` drops `d607b`, then fails 42704 `type "d607a" does
-      not exist` and leaves `d607a` in place.
-      Verify: tests/backlog/test_rp_found_rp580.py::test_drop_of_a_domain_another_domain_is_over
-      Backlog-ID: RP-607
+- [ ] **A column of a domain's array type is missing from `pg_attribute`.**
+      After `create table t607q (x d607q[], y int)`, PostgreSQL 15.19's
+      `pg_attribute` has `x` (attnum 1, `d607q[]`) and `y`; here it has
+      `y` alone, so `\d t607q` shows one column, though `select *` and
+      `information_schema.columns` see both. DROP DOMAIN finds the column
+      (RP-607), so the catalog row is what is missing.
+      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_array_column_in_pg_attribute
+      Backlog-ID: RP-653
+- [ ] **A domain over another domain's array type is refused.** `create
+      domain d607s as d607q[]` is made on PostgreSQL 15.19, with
+      `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
+      the CREATE is 42704 `type "d607q[]" does not exist`: `create_domain`
+      knows a base by a built-in's name or a user type's, never a user
+      type's array. The DROP side follows such a domain already (RP-607).
+      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
+      Backlog-ID: RP-654
 
 ## Found while working RP-575 (2026-11-08)
 
