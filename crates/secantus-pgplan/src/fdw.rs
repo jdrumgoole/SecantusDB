@@ -338,16 +338,8 @@ pub(crate) fn plan(
                     Statement::DropTable(t) => t.tables.clone(),
                     _ => Vec::new(),
                 };
-                for t in &tables {
-                    if let Some(def) = lookup(t) {
-                        if !is_foreign(&def) {
-                            return Err(Error::Sqlstate(
-                                "42809",
-                                format!("\"{t}\" is not a foreign table"),
-                            ));
-                        }
-                    }
-                }
+                // A relation of another kind is refused as it runs, by
+                // `DropErrorMsgWrongType` with its hint (RP-528).
                 FdwOp::DropForeignTables {
                     drop: Box::new(drop),
                     tables,
