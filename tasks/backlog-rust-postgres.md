@@ -2195,14 +2195,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
 int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
 
-- [ ] **Two different composite types are refused a comparison.** `select
-      row(1)::ct = row(1)::ct2` is `t` on PostgreSQL 15.19, and `row(1)::ct
-      < row(2)::ct2` too: both coerce to `record`, and `record_eq` /
-      `record_cmp` compare the fields. Here each is 42883 `operator does
-      not exist: ct = ct2` (`check_aexpr`'s composite rule takes a
-      different type oid for no operator).
-      Verify: tests/backlog/test_rp_found_rp530.py::test_two_composite_types_compare
-      Backlog-ID: RP-590
 - [ ] **An untyped literal beside a row is not read as `record`.** `select
       fs = 'x' from fs`, `'x' = fs` and `(1,2) = 'x'` are 0A000 `input of
       anonymous composite types is not implemented` at the literal (13, 8,
@@ -2276,6 +2268,23 @@ char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
       answers -1 (RP-551 keeps the catalog at the column's own domain).
       Backlog-ID: RP-558
       Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
+
+## Found while working RP-590 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp590.py`.
+
+- [ ] **The `record_image` operators are refused.** `*=`, `*<>`, `*<`,
+      `*<=`, `*>` and `*>=` over two record values are `record_image_eq`
+      .. `record_image_ge` on PostgreSQL 15.19, which compare the fields'
+      binary images: `(select row(1.0)) *= (select row(1.00))` is `f` where
+      `=` is `t`, and `row(1, 'a')::ca *= row(1, 'a')::cd` is `t`. Between
+      two `ROW(...)` constructors the operator is applied field by field
+      (`make_row_comparison_op`), so `row(1) *= row(1)` is 42883 `operator
+      does not exist: integer *= integer` at 15. Here each is 0A000
+      `operator *= on these operands is not supported yet`.
+      Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
+      Backlog-ID: RP-606
 
 ## Found while working RP-559 (2026-11-08)
 
