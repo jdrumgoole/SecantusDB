@@ -4767,3 +4767,29 @@ fn composite_record_compare_tells_a_domain_from_its_base() {
     let got = record_compare("=", &one, &one, true, Some((&s(&["dint"]), &s(&["dint"])))).unwrap();
     assert_eq!(got, Bson::Boolean(true));
 }
+
+/// RP-535: the sorts order two records by `record_cmp` (`btrecordcmp`),
+/// NULL fields last, so a DESC sort reverses it; before, two records had
+/// no order and `ORDER BY` a row kept its input order (PostgreSQL 15.19).
+#[test]
+fn sorts_order_records_by_record_cmp() {
+    use std::cmp::Ordering;
+    let rec = |a: Bson, c: Bson| {
+        typed_record_value(vec![a, c], vec!["int4".to_string(), "text".to_string()])
+    };
+    let y = rec(Bson::Int32(1), Bson::String("y".into()));
+    let z = rec(Bson::Int32(2), Bson::String("z".into()));
+    let nulls = rec(Bson::Null, Bson::Null);
+    assert_eq!(compare_values(&y, &z), Some(Ordering::Less));
+    assert_eq!(compare_values(&z, &nulls), Some(Ordering::Less));
+    assert_eq!(compare_values(&nulls, &y), Some(Ordering::Greater));
+    assert_eq!(compare_values(&y, &y.clone()), Some(Ordering::Equal));
+    // An anonymous ROW(...) orders the same way.
+    let anon = |a: i32| Bson::Document(bson::doc! { RECORD_KEY: [a, Bson::Null] });
+    assert_eq!(compare_values(&anon(1), &anon(2)), Some(Ordering::Less));
+    // A scalar pair is unchanged.
+    assert_eq!(
+        compare_values(&Bson::Int32(2), &Bson::Int32(1)),
+        Some(Ordering::Greater)
+    );
+}

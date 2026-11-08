@@ -39900,8 +39900,19 @@ fn bson_kind(v: &Bson) -> &'static str {
     }
 }
 
-/// The public door onto `compare_constants` for the wire layer's join sort.
+/// The public door onto `compare_constants` for the wire layer's sorts.
+///
+/// Two records order by `record_cmp`, a record type's btree opclass
+/// (`btrecordcmp`): field by field, a NULL field after every non-NULL one,
+/// so a DESC sort puts the all-NULL row first. Without this arm two
+/// records had no order at all, and `ORDER BY` a row kept the input order
+/// whatever its direction (RP-535). Two values of one sort key share their
+/// field types, so `record_cmp`'s type checks do not fail between them; a
+/// pair that does fail has no order, as any other pair with none.
 pub fn compare_values(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    if let Some(ord) = record_cmp(a, b) {
+        return ord.ok();
+    }
     compare_constants(a, b)
 }
 

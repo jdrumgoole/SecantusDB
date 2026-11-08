@@ -2170,14 +2170,6 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
       table's own whole row (`where fs is not null`).
       Backlog-ID: RP-534
       Verify: tests/backlog/test_rp_found_rp532.py::test_composite_null_test_in_a_clause
-- [ ] **ORDER BY a row DESC sorts it ascending.** `select fs from fs order
-      by fs desc` is `(,)`, `(2,z)`, `(1,y)`, `(1,y)` on PostgreSQL 15.19
-      (`btrecordcmp`, reversed), and `group by row(a, c) order by row(a,
-      c) desc` puts its counts in the same order; here both come back in
-      ascending order, the direction dropped. A scalar column's DESC
-      sorts as PostgreSQL does.
-      Backlog-ID: RP-535
-      Verify: tests/backlog/test_rp_found_rp532.py::test_row_order_desc
 - [ ] **An ungrouped whole row's 42803 names its first column, with no
       position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
       whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
