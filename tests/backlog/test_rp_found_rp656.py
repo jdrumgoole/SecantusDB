@@ -9,7 +9,9 @@ and the gap tests of what working it found:
   the column's modifier;
 - an `ARRAY(select n ...)` over a `numeric(p,s)` column describes no
   modifier;
-- `min` / `max` over a `char(n)` column drop the value's blanks (RP-671).
+- RP-671 (fixed): `min` / `max` over a `char(n)` column keep the value's
+  blanks where it enters an expression, a FROM-subquery or a scalar
+  subquery.
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after;
@@ -114,17 +116,28 @@ def test_array_sublink_of_numeric_describes_its_modifier(dsn: str) -> None:
 
 
 # An Aggref is its argument's type, and `min` / `max` return one of the
-# stored values, blanks and all: `octet_length(max(c))` is 3. Here the
-# value is the stored one without its padding, which a RowDescription at
-# the column's width (RP-659) puts back in print only.
+# stored values, blanks and all: `octet_length(max(c))` is 3. The value was
+# the stored one without its padding, which only the RowDescription at the
+# column's width (RP-659) put back, in print.
 MIN_MAX = {
     "select octet_length(max(c)) from t656": [(3,)],
     "select octet_length(min(c)) from t656": [(3,)],
     "select octet_length((select max(c) from t656))": [(3,)],
+    "select concat(max(c), '|') from t656": [("xy |",)],
+    "select format('%s|', min(c)) from t656": [("xy |",)],
+    "select max(c) like 'xy %' from t656": [(True,)],
+    "select to_json(max(c)) from t656": [("xy ",)],
+    "select max(c)::bytea from t656": [(b"xy ",)],
+    "select array[max(c)] from t656": [(["xy "],)],
+    "select octet_length(coalesce(max(c), 'z')) from t656": [(3,)],
+    "select octet_length(max(c) filter (where n > 0)) from t656": [(3,)],
+    "select octet_length(x) from (select max(c) as x from t656) s": [(3,)],
+    "select concat(x, '|') from (select min(c) as x from t656) s": [("xy |",)],
+    "select max(c) || '|' from t656": [("xy|",)],
 }
 
 
-@pytest.mark.backlog("RP-671")
+@pytest.mark.backlog_fixed("RP-671")
 @pytest.mark.parametrize("query", list(MIN_MAX))
 def test_min_max_over_char_n_keep_its_blanks(query: str, dsn: str) -> None:
     assert _answer(dsn, query)[2:] == (MIN_MAX[query],)

@@ -16761,6 +16761,35 @@ fn note_bpchar_width(c: &Column) {
     });
 }
 
+/// Record (or forget) the `char(n)` width of an aggregate's slot: `min` /
+/// `max` over a `char(n)` column return one of its stored values, which
+/// PostgreSQL keeps padded (`bpchar_larger`), so the value enters an
+/// expression over the slot padded, as the column's own would
+/// (`octet_length(max(c))` is the width; RP-671). The grouped value itself
+/// stays trimmed, as every stored `char(n)` value is here.
+fn note_aggregate_slot_width(slot: &str, item: &AggItem) {
+    ROW_WIDTHS.with(|w| {
+        let mut w = w.borrow_mut();
+        match bpchar_min_max_typmod(item) {
+            m if m > 4 => w.insert(slot.to_owned(), (m - 4) as usize),
+            _ => w.remove(slot),
+        };
+    });
+}
+
+/// The `char(n)` modifier of a `min` / `max` over a `char(n)` column, whose
+/// answer is one of the column's padded values; -1 for every other item.
+pub fn bpchar_min_max_typmod(item: &AggItem) -> i32 {
+    if matches!(item.func, AggFunc::Min | AggFunc::Max)
+        && item.source_type.as_deref() == Some("bpchar")
+        && item.source_typmod > 4
+    {
+        item.source_typmod
+    } else {
+        -1
+    }
+}
+
 /// Pad a `char(n)` value to its width.
 fn pad_bpchar(v: Bson, width: Option<usize>) -> Bson {
     match (v, width) {
@@ -18744,6 +18773,7 @@ fn extract_aggregates(
             // for the expression keys the value by exactly this.
             let slot = format!("__aggval{index}");
             let pg_type = aggregate_item_type(&items[index]);
+            note_aggregate_slot_width(&slot, &items[index]);
             if !slots.iter().any(|(name, _, _)| *name == slot) {
                 slots.push((slot.clone(), slot.clone(), pg_type));
             }
@@ -27559,8 +27589,14 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
             OutputCol::Grouping(_) => "int4".to_string(),
         };
         let mut c = Column::new(out, &ty, false);
-        if let OutputCol::Group(i) = col {
-            c.typmod = agg.group_by[*i].typmod;
+        match col {
+            OutputCol::Group(i) => c.typmod = agg.group_by[*i].typmod,
+            // `min` / `max` over a `char(n)` column answer one of its padded
+            // values, which this server keeps trimmed: the width is what
+            // pads it again where a FROM-subquery's or a scalar subquery's
+            // reader uses it (RP-671), as the column's own does.
+            OutputCol::Agg(i) => c.typmod = bpchar_min_max_typmod(&agg.items[*i]),
+            _ => {}
         }
         columns.push(c);
     }
