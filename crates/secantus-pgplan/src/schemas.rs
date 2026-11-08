@@ -605,7 +605,7 @@ fn not_on_path(name: &str, location: i32) -> Error {
     Error::UndefinedTable(name.to_string())
 }
 
-fn relation_exists(key: &str) -> bool {
+pub(crate) fn relation_exists(key: &str) -> bool {
     RELATION_KEYS.with(|k| k.borrow().contains(key))
         || PLAN_USER_RELATIONS.with(|t| t.borrow().iter().any(|(n, _, _)| n == key))
 }

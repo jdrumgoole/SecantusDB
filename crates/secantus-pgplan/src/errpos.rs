@@ -100,6 +100,69 @@ pub fn alter_finds_relation_by_name(sql: &str) -> bool {
     )
 }
 
+/// Is `message` CREATE FUNCTION / PROCEDURE's 42704 for a type its own
+/// signature names? `interpret_function_parameter_list` and
+/// `compute_return_type` look those up by name, outside any expression,
+/// and report no position (RP-566): `type t does not exist` for a
+/// parameter, `type "t" does not exist` for the result, the name as
+/// `TypeNameToString` writes it. A body's errors are placed where they
+/// were raised.
+fn names_a_signature_type(sql: &str, message: &str) -> bool {
+    let Some(missing) = message
+        .strip_prefix("type ")
+        .and_then(|m| m.strip_suffix(" does not exist"))
+    else {
+        return false;
+    };
+    let head: Vec<String> = sql
+        .split_whitespace()
+        .take(4)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    let routine = |w: Option<&String>| w.is_some_and(|w| w == "function" || w == "procedure");
+    if head.first().map(String::as_str) != Some("create")
+        || !(routine(head.get(1)) || routine(head.get(3)))
+    {
+        return false;
+    }
+    let Ok(tree) = pg_query::parse(sql) else {
+        return false;
+    };
+    let Some(N::CreateFunctionStmt(f)) = tree
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|s| s.stmt.as_ref())
+        .and_then(|s| s.node.as_ref())
+    else {
+        return false;
+    };
+    let written = |tn: &pg_query::protobuf::TypeName| {
+        let mut t = tn
+            .names
+            .iter()
+            .filter_map(|n| match n.node.as_ref()? {
+                N::String(s) => Some(s.sval.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(".");
+        if !tn.array_bounds.is_empty() {
+            t.push_str("[]");
+        }
+        t
+    };
+    let parameters = f.parameters.iter().filter_map(|p| match p.node.as_ref()? {
+        N::FunctionParameter(fp) => fp.arg_type.as_ref(),
+        _ => None,
+    });
+    let mut parameters = parameters;
+    parameters.any(|tn| written(tn) == missing)
+        || f.return_type
+            .as_ref()
+            .is_some_and(|tn| format!("\"{}\"", written(tn)) == missing)
+}
+
 /// The position in `sql` of an error with this SQLSTATE and primary
 /// message, when it can be found.
 pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize> {
@@ -119,6 +182,9 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
         .join(" ")
         .to_ascii_lowercase();
     if head == "create cast" || head == "drop cast" {
+        return None;
+    }
+    if sqlstate == "42704" && names_a_signature_type(sql, message) {
         return None;
     }
     // `ALTER TABLE | INDEX | VIEW | SEQUENCE | MATERIALIZED VIEW | FOREIGN

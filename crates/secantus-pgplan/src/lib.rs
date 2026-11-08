@@ -6776,6 +6776,103 @@ fn plan_call(c: &pg_query::protobuf::CallStmt, params: &[Bson]) -> Result<Statem
     })
 }
 
+/// A CREATE FUNCTION / PROCEDURE's language, lower-cased: its `LANGUAGE`
+/// option, or `sql` for a SQL-standard body.
+fn routine_language(f: &pg_query::protobuf::CreateFunctionStmt) -> Option<String> {
+    let named = f.options.iter().find_map(|opt| match opt.node.as_ref()? {
+        N::DefElem(e) if e.defname.eq_ignore_ascii_case("language") => {
+            e.arg.as_ref().and_then(|a| type_name_of_node(a))
+        }
+        _ => None,
+    });
+    named
+        .or_else(|| f.sql_body.is_some().then(|| "sql".to_string()))
+        .map(|l| l.to_ascii_lowercase())
+}
+
+/// `LookupTypeName` of a routine's parameter or result type, with
+/// `missing_ok` false: a type, a domain, a pseudo-type or a relation's row
+/// type (a catalog's too), or an array of one. A qualifier naming no
+/// schema is 3F000 (`LookupExplicitNamespace`); a type found nowhere is
+/// `None`, with the name as `TypeNameToString` writes it -- unquoted, and
+/// `[]` for an array. A `%TYPE` reference is looked up through its column,
+/// which reports its own errors.
+fn routine_type_missing(tn: &pg_query::protobuf::TypeName) -> Result<Option<String>> {
+    if tn.pct_type {
+        return Ok(None);
+    }
+    let parts: Vec<String> = tn
+        .names
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    if let [schema, _] = parts.as_slice() {
+        if !is_pg_temp_schema(schema) && !schemas::schema_exists(schema) {
+            return Err(Error::Sqlstate(
+                "3F000",
+                format!("schema \"{schema}\" does not exist"),
+            ));
+        }
+    }
+    let array = !tn.array_bounds.is_empty();
+    if column_type_exists(&type_name_of(tn))
+        || pgtypes::catalog_composite_oid(&parts, array).is_some()
+    {
+        return Ok(None);
+    }
+    let row_type = match parts.as_slice() {
+        [bare] => schemas::relation_exists(&schemas::resolve_unqualified(bare)),
+        [schema, bare] => {
+            let schema = if is_pg_temp_schema(schema) {
+                schemas::temp_schema().unwrap_or_else(|| schema.clone())
+            } else {
+                schema.clone()
+            };
+            schemas::relation_exists(&schemas::relation_key(&schema, bare))
+        }
+        _ => false,
+    };
+    if row_type {
+        return Ok(None);
+    }
+    let mut written = parts.join(".");
+    if array {
+        written.push_str("[]");
+    }
+    Ok(Some(written))
+}
+
+/// CREATE FUNCTION / PROCEDURE's type lookups for a SQL or PL/pgSQL
+/// routine, in `CreateFunction`'s order (RP-566): each parameter's
+/// (`interpret_function_parameter_list`, 42704 `type t does not exist`),
+/// then the declared result's (`compute_return_type`, which quotes the
+/// name, and creates a shell only for a C or internal function).
+fn check_routine_types(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<()> {
+    for p in &f.parameters {
+        if let Some(N::FunctionParameter(fp)) = p.node.as_ref() {
+            if let Some(tn) = fp.arg_type.as_ref() {
+                if let Some(t) = routine_type_missing(tn)? {
+                    return Err(Error::UndefinedObject(format!("type {t} does not exist")));
+                }
+            }
+        }
+    }
+    if f.is_procedure {
+        return Ok(());
+    }
+    if let Some(tn) = f.return_type.as_ref() {
+        if let Some(t) = routine_type_missing(tn)? {
+            return Err(Error::UndefinedObject(format!(
+                "type \"{t}\" does not exist"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
     let name_parts: Vec<String> = f
         .funcname
@@ -6810,6 +6907,12 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         })
         .next_back()
         .ok_or_else(|| Error::Parse("CREATE FUNCTION without a name".into()))?;
+    // Every type the signature names is looked up before the result is
+    // reconciled with the OUT parameters (RP-566). A `LANGUAGE internal`
+    // wrapper's are checked where it is created.
+    if matches!(routine_language(f).as_deref(), Some("sql" | "plpgsql")) {
+        check_routine_types(f)?;
+    }
     let mut arg_types = Vec::new();
     for p in &f.parameters {
         let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {

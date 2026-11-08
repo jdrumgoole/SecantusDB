@@ -2164,13 +2164,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       type (`-`), the DROP succeeds, and the routine is left behind.
       Backlog-ID: RP-565
       Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_a_temp_table_row_type
-- [ ] **A SQL routine over a type that does not exist is created.**
-      `create function ufn566(x nosuch566) returns int language sql ...`
-      and the same CREATE PROCEDURE are 42704 `type nosuch566 does not
-      exist` on PostgreSQL 15.19 (`interpret_function_parameter_list`); here
-      both are created, over a type nothing can name.
-      Backlog-ID: RP-566
-      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_an_undefined_type_is_refused
 - [ ] **A `regprocedure` prints its name unquoted and a schema's type
       quoted whole.** `regprocedureout` is `format_procedure`: `"Q
       f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
@@ -2586,3 +2579,19 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       to be checked against the whole file.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
+
+## Found while working RP-566 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp566.py`.
+
+- [ ] **A PL/pgSQL DECLARE of a type that does not exist is created.**
+      `plpgsql_validator` compiles the body at CREATE FUNCTION, and the
+      DECLARE's `parse_datatype` looks its type up: `create function b573()
+      returns int language plpgsql as $$ declare x nosuch573; begin return
+      1; end $$` is 42704 `type "nosuch573" does not exist` at 69 on
+      PostgreSQL 15.19. Here it is created, and the error waits for the
+      first call. (A parameter or result type that does not exist is
+      refused since RP-566.)
+      Verify: tests/backlog/test_rp_found_rp566.py::test_plpgsql_declare_of_an_undefined_type_is_refused
+      Backlog-ID: RP-573
