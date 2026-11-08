@@ -2067,14 +2067,26 @@ What is left, all on the RUST MongoDB server:
       **Decided 2026-10-16 (Joe):** as RM-071, transcribe and execute.
       Backlog-ID: RM-072
       Verify: tests/backlog/test_rm_057_084.py::test_explain_of_count_on_a_view_over_an_index
-- [ ] **`explain` of a sorted or filtered DISTINCT_SCAN `$group` lists no
-      `rejectedPlans`.** mongod 8.2.11 tries each index that could answer
-      it (with `$first` of `y` over `x_1`, `x_1_y_1` and `x_1_z_1`, after a
-      `$sort {x: 1}` or a `$match` on `x`) and lists the two it did not
-      pick; unsorted and unfiltered, it tries none. This server picks the
-      same index and lists none (found 2026-10-25).
-      Backlog-ID: RM-310
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_explain_lists_the_distinct_scans_a_group_tried
+- [ ] **A DISTINCT_SCAN plan's `executionStats` gives no work counters.**
+      mongod 8.2.11's `executionStages` for a DISTINCT_SCAN plan -- of
+      `distinct`, and of a `$group` it answers from one -- gives every
+      stage's `works`, `advanced`, `needTime`, `needYield`, `saveState`,
+      `restoreState` and `isEOF` (`distinct("x", {x: {$gt: 0}})` over
+      `x_1`: `works: 4`). This server's gives `nReturned` and the scan's
+      own fields, none of them. The trial's counters, in
+      `allPlansExecution`, are given. Found 2026-11-08 (RM-310).
+      Backlog-ID: RM-446
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_run_reports_its_work_counters
+- [ ] **A DISTINCT_SCAN bounded on a trailing field examines fewer keys
+      than mongod's.** mongod 8.2.11's DISTINCT_SCAN of `x_1_y_1` for
+      `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
+      (i 1 to 24) returns three keys and examines six, in eight works, in
+      its `executionStats` and in a `$group`'s trial. This server's
+      examines three, in four works. The plans ranked are the same. Perhaps
+      RM-377's seek past the bounds, once per value of `x`: not confirmed
+      in the source. Found 2026-11-08 (RM-310).
+      Backlog-ID: RM-447
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
 - [ ] **`explain` lists a `$match` after the cursor with its clauses
       sorted.** mongod 8.2.11 lists a `$match` stage it does not move into
       the query (behind a `$group` or a `$limit`) with its clauses in the
@@ -2981,6 +2993,21 @@ touched:
   they land within the second), not a retry.
   Backlog-ID: RM-372
   Verify: none -- a timing flake under load; the test passes when the connects land within a second
+- [ ] **The profiler's level-two test fails when its `find` touches the
+  disk or waits on a WiredTiger lock.** `profiler_wt.rs`'s
+  `level_two_writes_each_operation_in_mongods_shape` compares a `find`
+  entry's keys with a fixed list that has no `storage`. The entry carries
+  `storage` whenever the operation read or wrote bytes, or waited on the
+  cache, the schema lock or a handle lock (`opdebug::storage_section`), as
+  mongod's does, so the list holds only while WiredTiger stays out of the
+  way. In the local RM gate's `adapter-test` step (2026-11-09) the entry
+  had `storage` between `flowControl` and `responseLength`; the file then
+  passed 30 runs out of 30. Which counter was set was not captured: the
+  test should print the entry's `storage` when it differs, and then
+  either rule that counter out (a store with nothing to read from disk)
+  or accept `storage` where mongod would give it, never drop the check.
+  Backlog-ID: RM-448
+  Verify: none -- an intermittent failure, 1 in 31 runs, whose counter is unknown
 
 ## The macOS `test` lane wedges for its whole 30-minute cap, rarely (2026-09-18)
 

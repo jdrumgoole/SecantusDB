@@ -330,14 +330,83 @@ _MULTIPLANNED = {
 }
 
 
-@pytest.mark.backlog("RM-310")
+@pytest.mark.backlog_fixed("RM-310")
 def test_explain_lists_the_distinct_scans_a_group_tried(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 tries each index that could answer a sorted or
     filtered `$group` from a DISTINCT_SCAN and lists the losers in
-    `rejectedPlans`."""
+    `rejectedPlans`; this server listed none."""
     got = _distinct_group_planners(rust_mongo, _MULTIPLANNED)
     want = _distinct_group_planners(mongod, _MULTIPLANNED)
     assert len(want["filtered"][2]) == 2
+    assert got == want
+
+
+def _trial_brief(stage: dict) -> list:
+    out = []
+    while stage:
+        out.append((stage["stage"], stage.get("saveState"), stage.get("restoreState")))
+        stage = stage.get("inputStage")
+    return out
+
+
+def _distinct_group_trials(client: Any) -> dict:
+    """Each pipeline's `allPlansExecution`: every plan tried, its score and
+    its stages' trial counters."""
+    c = _coll(client)
+    c.insert_many([{"_id": i, "x": i % 4, "y": i, "z": -i} for i in range(1, 25)])
+    for key in (["x", "z"], ["x"], ["x", "w"], ["x", "y"]):
+        c.create_index([(k, 1) for k in key])
+    pipelines = {
+        **_MULTIPLANNED,
+        "last": [{"$sort": {"x": 1}}, {"$group": {"_id": "$x", "f": {"$last": "$y"}}}],
+        "descending": [{"$sort": {"x": -1}}, {"$group": {"_id": "$x", "f": {"$first": "$y"}}}],
+        "in": [
+            {"$match": {"x": {"$in": [1, 2]}}},
+            {"$group": {"_id": "$x", "f": {"$first": "$y"}}},
+        ],
+    }
+    out = {}
+    for name, pipeline in pipelines.items():
+        e = c.database.command(
+            "explain",
+            {"aggregate": c.name, "pipeline": pipeline, "cursor": {}},
+            verbosity="allPlansExecution",
+        )
+        tried = e["stages"][0]["$cursor"]["executionStats"]["allPlansExecution"]
+        out[name] = [
+            (
+                p["score"],
+                p["nReturned"],
+                p["totalKeysExamined"],
+                p["totalDocsExamined"],
+                [
+                    {k: s.get(k) for k in ("stage", "indexName", "works", "advanced", "isEOF")}
+                    for s in _stages(p["executionStages"])
+                ],
+                _trial_brief(p["executionStages"]),
+            )
+            for p in tried
+        ]
+    return out
+
+
+def _stages(stage: dict) -> list:
+    out = []
+    while stage:
+        out.append(stage)
+        stage = stage.get("inputStage")
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-310")
+def test_a_distinct_scan_groups_trial_scores_as_mongods(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 scores a `$group`'s DISTINCT_SCAN plans with its
+    `groupByDistinctBonus` (`min(1 - p, 4p)` on productivity `p`), counts a
+    fetching DISTINCT_SCAN as a fetch, lists the plans as its planner
+    enumerates them with the winner swapped to the front, and saves the
+    winner once as the trial ends, as it saves the plans it beat."""
+    got, want = _distinct_group_trials(rust_mongo), _distinct_group_trials(mongod)
+    assert [p[0] for p in want["sorted"]] == [3.0003, 3.0002, 3.0002, 3.0002]
     assert got == want
 
 
