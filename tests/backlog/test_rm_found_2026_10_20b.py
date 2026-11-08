@@ -1043,11 +1043,12 @@ def _not_found(client: Any) -> list:
     )
 
 
-@pytest.mark.backlog("RM-219")
+@pytest.mark.backlog_fixed("RM-219")
 def test_commands_mongod_runs_are_commands_here(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """None of these is 59 CommandNotFound on mongod 8.2.11 (one-member
-    replica set); each answers something of its own, success or a
-    command-specific error."""
+    """None of these was 59 CommandNotFound on mongod 8.2.11 (one-member
+    replica set), and each was here until `getDiagnosticData` and the query
+    settings commands landed (2026-11-08): each now answers something of
+    its own, success or a command-specific error."""
     assert _not_found(rust_mongo) == _not_found(mongod_rs)
 
 

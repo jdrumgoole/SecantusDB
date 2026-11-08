@@ -93,6 +93,42 @@ pub(crate) fn involved_view_collation(
     }
 }
 
+/// The fields mongod's `aggregate` takes beside the generic arguments.
+pub(crate) const AGGREGATE_FIELDS: &[&str] = &[
+    "aggregate",
+    "pipeline",
+    "explain",
+    "allowDiskUse",
+    "cursor",
+    "bypassDocumentValidation",
+    "collation",
+    "hint",
+    "let",
+    "needsMerge",
+    "fromMongos",
+    "fromRouter",
+    "isMapReduceCommand",
+    "collectionUUID",
+    "exchange",
+    "runtimeConstants",
+    "legacyRuntimeConstants",
+    "querySettings",
+    "passthroughToShard",
+    "encryptionInformation",
+    "sampleId",
+    "use44SortKeys",
+    "useNewUpsert",
+    "isClusterQueryWithoutShardKeyCmd",
+    "includeQueryStatsMetrics",
+    "requestReshardingResumeToken",
+    "requestResumeToken",
+    "resumeAfter",
+    "startAt",
+    "rawData",
+    "translatedForViewlessTimeseries",
+    "mirrored",
+];
+
 /// `aggregate` — run a pipeline and return a cursor over the results.
 pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // `cursor` means "missing or an object" literally: an explicit `cursor: null`
@@ -139,40 +175,7 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         }
     }
     argtypes::require_cursor_options(doc, "cursor")?;
-    const FIELDS: &[&str] = &[
-        "aggregate",
-        "pipeline",
-        "explain",
-        "allowDiskUse",
-        "cursor",
-        "bypassDocumentValidation",
-        "collation",
-        "hint",
-        "let",
-        "needsMerge",
-        "fromMongos",
-        "fromRouter",
-        "isMapReduceCommand",
-        "collectionUUID",
-        "exchange",
-        "runtimeConstants",
-        "legacyRuntimeConstants",
-        "querySettings",
-        "passthroughToShard",
-        "encryptionInformation",
-        "sampleId",
-        "use44SortKeys",
-        "useNewUpsert",
-        "isClusterQueryWithoutShardKeyCmd",
-        "includeQueryStatsMetrics",
-        "requestReshardingResumeToken",
-        "requestResumeToken",
-        "resumeAfter",
-        "startAt",
-        "rawData",
-        "translatedForViewlessTimeseries",
-        "mirrored",
-    ];
+    const FIELDS: &[&str] = AGGREGATE_FIELDS;
     if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
         return Err(CommandError::new(
             40415,
@@ -1175,6 +1178,21 @@ fn source_stage_problem(
             list_sampled_queries_problem(spec, db, coll, i)?;
             continue;
         }
+        if name == "$querySettings" {
+            if coll.is_some() {
+                return Err(namespace(
+                    "'$querySettings' can only be run with {aggregate: 1}".into(),
+                ));
+            }
+            if i > 0 {
+                return Err(CommandError::new(
+                    40602,
+                    "Location40602",
+                    "$querySettings is only valid as the first stage in a pipeline",
+                ));
+            }
+            continue;
+        }
         if name == "$queryStats" {
             // Its argument parsed with the stage (`validate_query_stats`);
             // mongod 8.2.11 then checks the namespace before the position.
@@ -1376,6 +1394,7 @@ fn is_source_stage(name: &str) -> bool {
             | "$listSessions"
             | "$listSampledQueries"
             | "$queryStats"
+            | "$querySettings"
     )
 }
 
@@ -1555,6 +1574,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$out"
             | "$planCacheStats"
             | "$project"
+            | "$querySettings"
             | "$queryStats"
             | "$redact"
             | "$replaceRoot"
@@ -1929,6 +1949,9 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError
             "$densify" => validate_densify(d.get(name))?,
             "$fill" => validate_fill(d.get(name))?,
             "$queryStats" => validate_query_stats(d.get(name))?,
+            "$querySettings" => {
+                crate::query_settings::validate_stage(d.get(name))?;
+            }
             _ => {}
         }
         nested_query_stats_specs(stage)?;
@@ -2415,7 +2438,13 @@ pub(crate) fn run_segmented(
                 let _ = core_run(docs, &buffer, vars, collation, Some(&ns))?;
                 buffer.clear();
             }
-            docs = if name == "$listSampledQueries" {
+            docs = if name == "$querySettings" {
+                // Every query setting (RM-219).
+                crate::query_settings::stage_rows(
+                    storage,
+                    stage.as_document().and_then(|d| d.get(name)),
+                )?
+            } else if name == "$listSampledQueries" {
                 // The queries `configureQueryAnalyzer` sampled. This server
                 // has no query analyzer (the command is 59 here), so it has
                 // sampled none: the list is empty, as mongod's is on a set

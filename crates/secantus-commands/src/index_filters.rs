@@ -357,6 +357,13 @@ pub(crate) fn apply(
     collation: Option<&secantus_core::collation::Collation>,
     catalog: Vec<Arc<IndexInfo>>,
 ) -> (Vec<Arc<IndexInfo>>, bool) {
+    // A read with query settings ignores index filters, and plans over the
+    // indexes its settings allow (RM-219).
+    if let Some(restricted) =
+        crate::query_settings::restricted_catalog(db, coll, query, sort, &catalog)
+    {
+        return (restricted.unwrap_or(catalog), false);
+    }
     let spec = collation.map(|c| c.spec().clone());
     match allowed(storage, db, coll, query, sort, projection, spec.as_ref()) {
         Some(indexes) => (restrict(catalog, &indexes), true),

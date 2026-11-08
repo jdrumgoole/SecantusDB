@@ -65,3 +65,18 @@ def test_only_on_skips_with_the_prefix_verify_reads() -> None:
         conf.only_on(elsewhere, why="a test")
     assert str(e.value).startswith(_backlog().PLATFORM_SKIP)
     conf.only_on(conf.PLATFORM, why="a test")  # here: does not skip
+
+
+def test_only_on_matches_an_operating_system() -> None:
+    import pytest
+
+    spec = importlib.util.spec_from_file_location(
+        "backlog_conftest_os", ROOT / "tests/backlog/conftest.py"
+    )
+    assert spec and spec.loader
+    conf = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(conf)
+    conf.only_on(conf.OS, why="here")  # this OS: does not skip
+    other = "linux" if conf.OS != "linux" else "darwin"
+    with pytest.raises(pytest.skip.Exception):
+        conf.only_on(other, why="elsewhere")

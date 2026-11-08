@@ -68,6 +68,7 @@ pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;
 pub mod findandmodify;
+pub mod ftdc;
 pub mod handshake;
 mod hostinfo;
 mod interrupt;
@@ -87,6 +88,7 @@ pub mod params;
 mod privileges;
 mod procstats;
 pub mod profiler;
+pub mod query_settings;
 mod query_shape;
 pub mod rbac;
 mod replset_admin;
@@ -246,6 +248,10 @@ pub struct CommandContext {
     /// Every database's profiling level and filter, shared server-wide. A
     /// context without one gets its own on the first `profile` command.
     pub profiler: Option<Arc<profiler::Profiler>>,
+    /// The server's latest FTDC sample, answered by `getDiagnosticData`.
+    pub ftdc: Option<Arc<ftdc::Ftdc>>,
+    /// The server's query settings, as last read or written.
+    pub query_settings: Option<Arc<query_settings::QuerySettingsStore>>,
     /// The operation `dispatch` is profiling, from its start to its end.
     pub(crate) profiling: Option<profiler::Pending>,
     /// The request came as a legacy `OP_QUERY`, and is answered `OP_REPLY`.
@@ -374,6 +380,8 @@ impl CommandContext {
             top_stats: None,
             slow_ops: None,
             profiler: None,
+            ftdc: None,
+            query_settings: None,
             profiling: None,
             op_query: false,
             slow_log: None,
@@ -465,6 +473,18 @@ impl CommandContext {
     /// Attach the server-wide profiler settings (builder-style).
     pub fn with_profiler(mut self, profiler: Arc<profiler::Profiler>) -> Self {
         self.profiler = Some(profiler);
+        self
+    }
+
+    /// Attach the server's query settings (builder-style).
+    pub fn with_query_settings(mut self, store: Arc<query_settings::QuerySettingsStore>) -> Self {
+        self.query_settings = Some(store);
+        self
+    }
+
+    /// Attach the server's FTDC sample (builder-style).
+    pub fn with_ftdc(mut self, ftdc: Arc<ftdc::Ftdc>) -> Self {
+        self.ftdc = Some(ftdc);
         self
     }
 
@@ -711,6 +731,9 @@ fn lookup(name: &str) -> Option<Handler> {
         // command_fully_qualified test sends it over the legacy OP_QUERY path).
         "dbStats" | "dbstats" => stats_admin::db_stats,
         "serverStatus" => admin::server_status,
+        "getDiagnosticData" => ftdc::get_diagnostic_data,
+        "setQuerySettings" => query_settings::set_query_settings,
+        "removeQuerySettings" => query_settings::remove_query_settings,
         "currentOp" => admin::current_op,
         "killOp" => serverinfo::kill_op,
         "validate" => admin::validate,
@@ -2224,6 +2247,13 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
     let _current = lock_manager::enter(ctx.locks.as_ref());
     // The command's write statements log themselves when slow, as mongod's do.
     let _slow = slowop::enter(ctx);
+    // The read's query settings, in place for its planning (RM-219).
+    let (_query_settings, planned) = match query_settings::enter(doc, ctx) {
+        Ok(Some((scope, planned))) => (Some(scope), planned),
+        Ok(None) => (None, None),
+        Err(e) => return e.into_reply(),
+    };
+    let doc = planned.as_ref().unwrap_or(doc);
     let (result, read_at) = snapshot::run(doc, command_name(doc), ctx, |ctx| handler(doc, ctx));
     match result {
         Ok(mut reply) => {

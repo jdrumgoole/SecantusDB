@@ -450,6 +450,15 @@ fn target(ctx: &CommandContext, coll: &str) -> Result<Target, CommandError> {
     })
 }
 
+/// The planner's view of a collection's indexes, read from the store.
+pub(crate) fn catalog_of_collection(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+) -> Result<Vec<Arc<IndexInfo>>, crate::storage::StorageError> {
+    catalog(storage, db, coll, None)
+}
+
 /// What the planner knows about each index of a collection. The multikey
 /// paths are read from `docs` when the caller holds the whole collection,
 /// and from the store's own record of them when it does not.
@@ -762,6 +771,9 @@ fn query_planner(
         out.insert("parsedQuery", canonical.clone());
         if let Some(c) = collation {
             out.insert("collation", c.spec().clone());
+        }
+        if let Some(settings) = crate::query_settings::active() {
+            out.insert("querySettings", (*settings).clone());
         }
         out.insert("indexFilterSet", false);
         // The plan cache key, wherever mongod built one: not for a

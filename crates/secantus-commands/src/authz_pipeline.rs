@@ -142,6 +142,7 @@ pub(crate) fn walk(
                 }
             }
             "$listSampledQueries" => need(needs, Resource::Cluster, &["listSampledQueries"]),
+            "$querySettings" => need(needs, Resource::Cluster, &["querySettings"]),
             // mongod 8.2.11 (measured 2026-11-08): reading the store with its
             // identifiers hashed needs `queryStatsReadTransformed`, and
             // reading it as recorded needs `queryStatsRead` as well.

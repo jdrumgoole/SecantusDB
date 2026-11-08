@@ -12,21 +12,24 @@ use crate::argtypes;
 use crate::util::{coll_arg, doc_field};
 use crate::{CommandContext, CommandError, HandlerResult};
 
+/// The fields mongod's `distinct` takes beside the generic arguments.
+pub(crate) const DISTINCT_FIELDS: &[&str] = &[
+    "distinct",
+    "key",
+    "query",
+    "collation",
+    "hint",
+    "mirrored",
+    "sampleId",
+    "rawData",
+    "includeQueryStatsMetrics",
+    "querySettings",
+];
+
 /// `distinct` — return the distinct values of `key` over docs matching `query`.
 pub fn distinct(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let coll = coll_arg(doc, "distinct")?;
-    const FIELDS: &[&str] = &[
-        "distinct",
-        "key",
-        "query",
-        "collation",
-        "hint",
-        "mirrored",
-        "sampleId",
-        "rawData",
-        "includeQueryStatsMetrics",
-        "querySettings",
-    ];
+    const FIELDS: &[&str] = DISTINCT_FIELDS;
     if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
         return Err(CommandError::new(
             40415,

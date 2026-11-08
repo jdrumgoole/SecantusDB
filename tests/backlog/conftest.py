@@ -31,6 +31,7 @@ import pathlib
 import platform
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -112,18 +113,22 @@ def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Itera
 #: This machine's platform, as mongod's builds differ: `arm64` (Apple silicon,
 #: Linux aarch64) or `x86_64`.
 PLATFORM = {"aarch64": "arm64"}.get(platform.machine(), platform.machine())
+#: Its operating system, where mongod's answer differs by OS rather than CPU
+#: (FTDC's `systemMetrics` is Linux-only): `linux` or `darwin`.
+OS = "linux" if sys.platform.startswith("linux") else sys.platform
 
 
 def only_on(*platforms: str, why: str) -> None:
-    """Skip the calling test unless this machine is one of `platforms`.
+    """Skip the calling test unless this machine is one of `platforms`: an
+    architecture (`arm64`, `x86_64`) or an operating system (`linux`, `darwin`).
 
     For a gap (or a case of a regression test) where mongod's own answer
     differs by platform and this server gives it on the others: each
     platform's mongod is the reference (Joe, 2026-11-07). `tools/backlog.py
     verify` reports the skip as ELSEWHERE, never as passing or REGRESSED.
     Call it in the test body, not a fixture, so verify reads the reason."""
-    if PLATFORM not in platforms:
-        pytest.skip(f"platform: {why} (here: {PLATFORM}; checked on {', '.join(platforms)})")
+    if PLATFORM not in platforms and OS not in platforms:
+        pytest.skip(f"platform: {why} (here: {OS} {PLATFORM}; checked on {', '.join(platforms)})")
 
 
 # --------------------------------------------------------------- answers --
