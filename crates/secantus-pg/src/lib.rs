@@ -13583,13 +13583,27 @@ impl PgHandler {
         let read_back = normalize_function_doc(&doc);
         // PostgreSQL checks the body at CREATE (`check_function_bodies`).
         match def.language.as_str() {
-            "plpgsql" => plpgsql_fn::validate(&plpgsql_create_sql(&read_back)).map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".into(),
-                    e.sqlstate,
-                    e.message,
-                )))
-            })?,
+            "plpgsql" => {
+                let create_sql = plpgsql_create_sql(&read_back);
+                plpgsql_fn::validate(&create_sql).map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".into(),
+                        e.sqlstate,
+                        e.message,
+                    )))
+                })?;
+                // `plpgsql_validator` compiles the body only under
+                // `check_function_bodies` (RP-573).
+                let checks = self
+                    .settings
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get("check_function_bodies")
+                    .is_none_or(|v| v != "off");
+                if checks {
+                    self.check_plpgsql_declarations(&def.name, &create_sql, &def.body)?;
+                }
+            }
             _ => {
                 pg_query::split_with_parser(&def.body).map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -13658,6 +13672,67 @@ impl PgHandler {
         } else {
             "CREATE FUNCTION"
         }))])
+    }
+
+    /// The type lookups PL/pgSQL's compiler makes of a body's declarations
+    /// (`read_datatype`), in the order it compiles them (RP-573): the first
+    /// type that does not exist is the error. A type name's error is raised
+    /// under `parse_datatype`'s callback and placed at the type's text,
+    /// transposed into the statement by `function_parse_error_transpose`;
+    /// a `%ROWTYPE`'s missing relation has no position and gets the
+    /// compiler's `near line N` frame, N the last line the grammar asked
+    /// the scanner for (`plpgsql_latest_lineno`): the variable's name's,
+    /// wherever the `%ROWTYPE` is. `create_sql` is what `parse_plpgsql` reads, `body` the
+    /// routine's source; `fname` names it in the frame
+    /// (`inline_code_block` for a DO).
+    pub(crate) fn check_plpgsql_declarations(
+        &self,
+        fname: &str,
+        create_sql: &str,
+        body: &str,
+    ) -> PgWireResult<()> {
+        let declared = plpgsql_fn::declared_types(create_sql);
+        if declared.is_empty() {
+            return Ok(());
+        }
+        self.install_user_types();
+        for d in &declared {
+            let Err(refused) = secantus_pgplan::plpgsql_declared_type(&d.typname) else {
+                continue;
+            };
+            let offset = plpgsql_fn::declared_type_offset(body, d);
+            let (e, at_type) = match refused {
+                secantus_pgplan::DeclaredTypeError::AtType(e) => (e, true),
+                secantus_pgplan::DeclaredTypeError::Compile(e) => (e, false),
+            };
+            let mut err = Self::err(&e);
+            if let PgWireError::UserError(info) = &mut err {
+                info.position = None;
+                match offset.filter(|_| at_type) {
+                    Some(byte) => {
+                        let at = body[..byte].chars().count() + 1;
+                        let (source, index) = self
+                            .statement_source
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .unwrap_or_default();
+                        info.position = sql_fn_params::match_prosrc_to_query(body, &source, at)
+                            .and_then(|p| p.checked_sub(statement_offset_in_source(&source, index)))
+                            .filter(|p| *p > 0)
+                            .map(|p| p.to_string());
+                    }
+                    None => {
+                        info.where_context = Some(format!(
+                            "compilation of PL/pgSQL function \"{fname}\" near line {}",
+                            d.lineno
+                        ));
+                    }
+                }
+            }
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// `fmgr_sql_validator` with `check_function_bodies` on: each statement

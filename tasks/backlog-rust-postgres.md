@@ -2690,18 +2690,57 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
 
-## Found while working RP-566 (2026-11-08)
+## Found while working RP-573 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp566.py`.
+Measured on a private PostgreSQL 15.19 cluster, each statement in a new
+session. The gap tests are in `tests/backlog/test_rp_found_rp573.py`. Since
+RP-573 a DECLARE's type is looked up at CREATE FUNCTION and before a DO
+block runs (`check_plpgsql_declarations`), from the type text libpg_query
+keeps; what follows is what that lookup does not yet check.
 
-- [ ] **A PL/pgSQL DECLARE of a type that does not exist is created.**
-      `plpgsql_validator` compiles the body at CREATE FUNCTION, and the
-      DECLARE's `parse_datatype` looks its type up: `create function b573()
-      returns int language plpgsql as $$ declare x nosuch573; begin return
-      1; end $$` is 42704 `type "nosuch573" does not exist` at 69 on
-      PostgreSQL 15.19. Here it is created, and the error waits for the
-      first call. (A parameter or result type that does not exist is
-      refused since RP-566.)
-      Verify: tests/backlog/test_rp_found_rp566.py::test_plpgsql_declare_of_an_undefined_type_is_refused
-      Backlog-ID: RP-573
+- [ ] **A PL/pgSQL DECLARE whose type text is not one type name is
+      created.** `read_datatype` passes the text to `parse_datatype` unless
+      it is a `%TYPE` of a variable or column it finds, and a text that is
+      not one type name is 42601 at the token, with the CONTEXT `invalid
+      type name "..."`: on PostgreSQL 15.19 `declare x nosuch573%type` is
+      `syntax error at or near "%"` at 78, `y nosuch573.x%type` the same at
+      87, `x int(3)` `syntax error at or near "("` at 72 and `x
+      varchar(nosuch)` `syntax error at or near "nosuch"` at 77. Here each
+      is created. libpg_query stubs the `%TYPE` lookups out
+      (`plpgsql_parse_wordtype` returns NULL), so finding the variable or
+      column is this server's to do, in the block scopes PL/pgSQL keeps.
+      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_text_that_is_not_one_type_name
+      Backlog-ID: RP-617
+- [ ] **A PL/pgSQL variable of a pseudo-type is created.**
+      `plpgsql_build_variable` refuses one: `declare x anyelement` is 0A000
+      `variable "x" has pseudo-type anyelement`, no position, CONTEXT
+      `compilation of PL/pgSQL function "e573" near line 1`, on PostgreSQL
+      15.19 (`void` the same, near the variable's line). Here the function
+      is created.
+      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_of_a_pseudo_type
+      Backlog-ID: RP-618
+- [ ] **A DECLARE's missing type is reported after a later syntax error.**
+      PL/pgSQL compiles the body in one pass, so `declare x nosuch573; begin
+      return 1 +; end` is 42704 `type "nosuch573" does not exist` at 69 on
+      PostgreSQL 15.19. Here the whole body is parsed first, and the answer
+      is 42601 `syntax error at end of input` at 104.
+      Verify: tests/backlog/test_rp_found_rp573.py::test_declare_type_found_before_a_later_syntax_error
+      Backlog-ID: RP-619
+- [ ] **A `pg_temp` type in a session with no temporary schema is a
+      missing type, not a missing schema.** `LookupExplicitNamespace`
+      finds `pg_temp` only once the session has made its temp schema, so on
+      PostgreSQL 15.19 `create function e573(a pg_temp.nosuch) ...` is 3F000
+      `schema "pg_temp" does not exist` with no position, and `declare x
+      pg_temp.nosuch` the same at 69. Here they are 42704 `type
+      pg_temp.nosuch does not exist` and `type "pg_temp.nosuch" does not
+      exist` (`routine_type_missing` lets `pg_temp` through as a schema).
+      Verify: tests/backlog/test_rp_found_rp573.py::test_pg_temp_type_in_a_session_with_no_temp_schema
+      Backlog-ID: RP-620
+- [ ] **A PL/pgSQL compile error in a CREATE FUNCTION's body has no
+      position.** `declare x int; begin y := 1; return 1; end` is 42601
+      `"y" is not a known variable` at 80 on PostgreSQL 15.19, and `declare
+      x alias for $2` in a one-argument function is 42704 `variable "$2"
+      does not exist` at 82. Here the first has no position, and the second
+      is 42601 with none. (A DO block's syntax errors are RP-492.)
+      Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
+      Backlog-ID: RP-621

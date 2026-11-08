@@ -73,6 +73,10 @@ impl PgHandler {
                     "CREATE FUNCTION inline_code_block() RETURNS void AS \
                      $secantus_do${body}\n$secantus_do$ LANGUAGE plpgsql"
                 );
+                // `plpgsql_compile_inline` compiles the whole block, its
+                // declarations' types looked up, before any of it runs
+                // (RP-573).
+                self.check_plpgsql_declarations("inline_code_block", &sql, body)?;
                 // Alone in its query string outside a block, the body may
                 // COMMIT; anywhere else it is atomic.
                 let prev = self.txn_control.swap(

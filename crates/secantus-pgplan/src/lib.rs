@@ -6931,6 +6931,119 @@ fn check_routine_types(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<()>
     Ok(())
 }
 
+/// Why a PL/pgSQL DECLARE's type was refused: by the type lookup
+/// `parse_datatype` runs under its own error callback, which places the
+/// error at the type's text in the body (`AtType`), or by a
+/// `%ROWTYPE`'s relation lookup, which has no position and is reported
+/// near its line (`Compile`).
+#[derive(Debug)]
+pub enum DeclaredTypeError {
+    AtType(Error),
+    Compile(Error),
+}
+
+/// The relation a `name%ROWTYPE` names, as `plpgsql_parse_wordrowtype`
+/// (`RelnameGetRelid`, the search path) and `plpgsql_parse_cwordrowtype`
+/// (`RangeVarGetRelid`, a missing schema 3F000) look it up: 42P01
+/// `relation "..." does not exist`, the name as written, unquoted. A name
+/// of three or more parts is not a `%ROWTYPE` to either, and is left to the
+/// type name's parse.
+fn rowtype_relation_missing(parts: &[String]) -> Result<()> {
+    if pgtypes::catalog_composite_oid(parts, false).is_some() {
+        return Ok(());
+    }
+    let found = match parts {
+        [bare] => schemas::relation_exists(&schemas::resolve_unqualified(bare)),
+        [schema, bare] => {
+            if !is_pg_temp_schema(schema) && !schemas::schema_exists(schema) {
+                return Err(Error::Sqlstate(
+                    "3F000",
+                    format!("schema \"{schema}\" does not exist"),
+                ));
+            }
+            let schema = if is_pg_temp_schema(schema) {
+                schemas::temp_schema().unwrap_or_else(|| schema.clone())
+            } else {
+                schema.clone()
+            };
+            schemas::relation_exists(&schemas::relation_key(&schema, bare))
+        }
+        _ => true,
+    };
+    if found {
+        Ok(())
+    } else {
+        Err(Error::UndefinedTable(parts.join(".")))
+    }
+}
+
+/// PL/pgSQL's lookup of the type a DECLARE names (`read_datatype`), from
+/// the type's text as written (RP-573): `name%ROWTYPE` and
+/// `schema.name%ROWTYPE` find their relation; any other text is parsed as
+/// a type name and looked up as `parse_datatype` does
+/// (`typenameTypeIdAndMod`): 42704 `type "t" does not exist`, the name as
+/// `TypeNameToString` writes it, or 3F000 for a missing schema.
+///
+/// What this does not check is let through: a `%TYPE` (a variable or a
+/// column, resolved where it is used), and a text that is not one type
+/// name, which PostgreSQL refuses as a syntax error.
+pub fn plpgsql_declared_type(text: &str) -> std::result::Result<(), DeclaredTypeError> {
+    let text = text.trim();
+    // The type text as SQL reads a cast's target type.
+    let type_name = |t: &str| -> Option<pg_query::protobuf::TypeName> {
+        let tree = pg_query::parse(&format!("select null::{t}")).ok()?;
+        let [stmt] = tree.protobuf.stmts.as_slice() else {
+            return None;
+        };
+        let Some(N::SelectStmt(sel)) = stmt.stmt.as_ref()?.node.as_ref() else {
+            return None;
+        };
+        let [target] = sel.target_list.as_slice() else {
+            return None;
+        };
+        let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+            return None;
+        };
+        match rt.val.as_deref()?.node.as_ref()? {
+            N::TypeCast(c) => c.type_name.clone(),
+            _ => None,
+        }
+    };
+    if let Some(at) = text.find('%') {
+        let after = text[at + 1..].trim_start().to_ascii_lowercase();
+        let keyword = after
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or_default();
+        if keyword == "rowtype" {
+            if let Some(tn) = type_name(text[..at].trim()) {
+                let parts: Vec<String> = tn
+                    .names
+                    .iter()
+                    .filter_map(|n| match n.node.as_ref()? {
+                        N::String(s) => Some(s.sval.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if tn.typmods.is_empty() && tn.array_bounds.is_empty() {
+                    return rowtype_relation_missing(&parts).map_err(DeclaredTypeError::Compile);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let Some(tn) = type_name(text) else {
+        return Ok(());
+    };
+    match routine_type_missing(&tn) {
+        Ok(None) => Ok(()),
+        Ok(Some(t)) => Err(DeclaredTypeError::AtType(Error::UndefinedObject(format!(
+            "type \"{t}\" does not exist"
+        )))),
+        Err(e) => Err(DeclaredTypeError::AtType(e)),
+    }
+}
+
 fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
     let name_parts: Vec<String> = f
         .funcname
@@ -47901,5 +48014,68 @@ mod rp350_const_classes {
         // numeric's `=` is in no integer class; a NULL is not modelled.
         assert_eq!(reduce("select * from e where a = 1 and a = 1.0").0, None);
         assert_eq!(reduce("select * from e where a = 1 and a = null").0, None);
+    }
+}
+
+#[cfg(test)]
+mod rp573_declared_types {
+    use super::*;
+
+    fn refused(text: &str) -> Option<(bool, String, String)> {
+        match plpgsql_declared_type(text) {
+            Ok(()) => None,
+            Err(DeclaredTypeError::AtType(e)) => Some((true, e.sqlstate().into(), e.to_string())),
+            Err(DeclaredTypeError::Compile(e)) => Some((false, e.sqlstate().into(), e.to_string())),
+        }
+    }
+
+    /// A DECLARE's type is looked up as `parse_datatype` and the
+    /// `%ROWTYPE` lookups do (RP-573): a missing type at the type, a
+    /// missing schema 3F000, a `%ROWTYPE`'s missing relation 42P01 with
+    /// no position; a `%TYPE` and a text that is not one type name are
+    /// not checked here.
+    #[test]
+    fn a_declared_type_is_looked_up() {
+        for ok in [
+            "int",
+            "int ",
+            "pg_catalog.int4",
+            "numeric(5,2)",
+            "double precision",
+            "timestamp with time zone",
+            "character varying(10)",
+            "int[]",
+            "text[3]",
+            "x%type",
+            "t.a%type",
+            "int(3)",
+        ] {
+            assert_eq!(refused(ok), None, "{ok}");
+        }
+        let at = |sqlstate: &str, message: &str| Some((true, sqlstate.into(), message.into()));
+        assert_eq!(
+            refused("nosuch573"),
+            at("42704", "type \"nosuch573\" does not exist")
+        );
+        assert_eq!(
+            refused("nosuch573[] "),
+            at("42704", "type \"nosuch573[]\" does not exist")
+        );
+        assert_eq!(
+            refused("\"NoSuch\""),
+            at("42704", "type \"NoSuch\" does not exist")
+        );
+        assert_eq!(
+            refused("nosch573.t"),
+            at("3F000", "schema \"nosch573\" does not exist")
+        );
+        assert_eq!(
+            refused("nosuch573 %ROWTYPE"),
+            Some((
+                false,
+                "42P01".into(),
+                "relation \"nosuch573\" does not exist".into()
+            ))
+        );
     }
 }
