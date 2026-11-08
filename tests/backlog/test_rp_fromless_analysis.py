@@ -4,7 +4,9 @@ fixed), and a cast literal's input error is reported after the operator's
 (RP-442, open); found while working RP-465, a VALUES list's reference
 and an unread CTE were not analysed (RP-501, fixed); and found while
 working RP-501, what `transformWithClause` checks that is still unchecked
-(RP-504) and a correlation over a set-operation FROM item (RP-505).
+(RP-504) and a correlation over a set-operation FROM item (RP-505, fixed);
+and found while working RP-505, one over a WITH item or a star whose
+columns are not told (RP-506).
 
 An answer is `(sqlstate, message, hint, position)`, or `None` for a
 statement that succeeds. Each was measured on PostgreSQL 15.19; none needs
@@ -585,14 +587,109 @@ OVER_A_SET_OPERATION = {
 }
 
 
-@pytest.mark.backlog("RP-505")
+@pytest.mark.backlog_fixed("RP-505")
 @pytest.mark.parametrize("query", list(OVER_A_SET_OPERATION))
 def test_correlation_over_a_set_operation(query: str, rust_pg: Any) -> None:
-    """42703 `column "a" does not exist` with the cannot-be-referenced
-    HINT here."""
+    """Each was 42703 `column "a" does not exist` with the
+    cannot-be-referenced HINT here: the names a subquery may read from a
+    FROM-subquery were taken from its own target list, which a set
+    operation keeps in its leaves (RP-505)."""
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
         try:
             got: object = c.execute(query).fetchall()
         except psycopg.Error as e:
             got = (e.sqlstate, e.diag.message_primary)
     assert got == OVER_A_SET_OPERATION[query]
+
+
+def _rows(server: Any, query: str) -> object:
+    with psycopg.connect(_dsn(server) + " dbname=postgres", autocommit=True) as c:
+        try:
+            return c.execute(query).fetchall()
+        except psycopg.Error as e:
+            return (e.sqlstate, e.diag.message_primary, e.diag.message_hint)
+
+
+# Found while working RP-505, measured on PostgreSQL 15.19: the other
+# shapes whose FROM-subquery's column names the same guess lost, and two
+# that must stay errors.
+FROM_SUBQUERY_NAMES = {
+    # A star over a FROM-subquery's own FROM item.
+    "select (select a) from (select * from (values (1)) v(a)) t": [(1,)],
+    # A target named by FigureColname, and a VALUES list's `column1`.
+    "select (select count) from (select count(*) from (values (1)) v) t": [(1,)],
+    "select (select upper) from (select upper('x') union select 'y') t order by 1": [
+        ("X",),
+        ("y",),
+    ],
+    "select (select column1) from (values (1)) t": [(1,)],
+    # An alias's column list renames only the leading columns.
+    "select (select b) from (select 1 a, 2 b) t(x)": [(2,)],
+    "select (select b) from (select 1 a, 5 b union select 2, 6) t(x) order by 1": [
+        (5,),
+        (6,),
+    ],
+    # Nested and parenthesised set operations, one with its own LIMIT.
+    "select (select a) from (select 1 a union (select 2 b except select 3)) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    "select (select a) from (select 1 a union select 2 order by 1 limit 1) t": [(1,)],
+    # In EXISTS, IN and WHERE.
+    "select exists(select a) from (select 1 a union select 2) t": [(True,), (True,)],
+    "select a from (select 1 a union select 2) t where a in (select a) order by 1": [
+        (1,),
+        (2,),
+    ],
+    # The subquery's own FROM still comes first.
+    "select (select a from (select 9 a) i) from (select 1 a union select 2) t": [
+        (9,),
+        (9,),
+    ],
+    # A right leaf's name is not a column, and a renamed one is gone.
+    "select (select b) from (select 1 a union select 2 b) t": (
+        "42703",
+        'column "b" does not exist',
+        None,
+    ),
+    "select (select a) from (select 1 a union select 2) t(x)": (
+        "42703",
+        'column "a" does not exist',
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-505")
+@pytest.mark.parametrize("query", list(FROM_SUBQUERY_NAMES))
+def test_correlation_reads_a_from_subquerys_output_names(query: str, rust_pg: Any) -> None:
+    """Each was 42703 here, but the last two, which PostgreSQL refuses too."""
+    assert _rows(rust_pg, query) == FROM_SUBQUERY_NAMES[query]
+
+
+# Found while working RP-505, measured on PostgreSQL 15.19: the FROM items
+# whose columns a subquery's bare name still cannot find.
+FROM_ITEM_NAMES_UNKNOWN = {
+    # A WITH item, read directly or through a FROM-subquery's star.
+    "with w as (select 1 a) select (select a) from w": [(1,)],
+    "with w as (select 1 a) select (select a) from (select * from w) t": [(1,)],
+    "with w as (select 1 a) select (select a) from (select * from w union select 2) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    # A star over a function in FROM, and over a USING join.
+    "select (select g) from (select * from generate_series(1, 2) g) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    "select (select a) from (select * from (values (1)) v(a) join (values (1)) w(a) using (a)) t": [
+        (1,)
+    ],
+}
+
+
+@pytest.mark.backlog("RP-506")
+@pytest.mark.parametrize("query", list(FROM_ITEM_NAMES_UNKNOWN))
+def test_correlation_over_a_cte_or_a_star_of_unknown_columns(query: str, rust_pg: Any) -> None:
+    """Each is 42703 `column ... does not exist` here."""
+    assert _rows(rust_pg, query) == FROM_ITEM_NAMES_UNKNOWN[query]
