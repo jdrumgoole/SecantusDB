@@ -1260,16 +1260,20 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       refuses `validateMode: "extraIndexKeysCheck"` (115).
       Backlog-ID: RM-219
       Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
-- [ ] **A `$group` after a `$match` on `_id` runs in the slot-based
-      engine.** mongod 8.2.11 runs it in its classic engine
-      (`explainVersion` 1) when the leading `$match` is on `_id` (an
-      equality or an `$in`), and in the slot-based engine after a `$match`
-      on another field; the two disagree on errors, so `{$mod: ["$n", 0]}`
-      in the `$group` is 16610 after `{$match: {_id: 1}}` on mongod and
-      4848403 here (`crates/secantus-core/src/sbe.rs` decides). Found
-      2026-10-27 while working RM-222.
-      Backlog-ID: RM-330
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_group_after_an_id_match_runs_in_the_classic_engine
+- [ ] **An aggregate `$match` on `_id` takes an `$in` of a `$`-prefixed
+      object.** mongod 8.2.11 refuses `{$match: {_id: {$in: [{$x: 1}]}}}`
+      with 2 "cannot nest $ under $in", as it does on any other path and as
+      this server does for `find` and for `$match` on another field; here
+      the aggregate answers. Found 2026-11-08 while working RM-330.
+      Backlog-ID: RM-420
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm330.py::test_an_id_match_refuses_a_dollar_object_in_in
+- [ ] **`$all` refuses a `$`-prefixed object that is not `$elemMatch`.**
+      mongod 8.2.11 takes `find({a: {$all: [{$x: 1}]}})` as an equality to
+      that object and answers (here, no documents); this server refuses
+      it with 2 "no $ expressions in $all". Found 2026-11-08 while working
+      RM-330.
+      Backlog-ID: RM-421
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm330.py::test_all_takes_a_dollar_object_as_a_value
 - [ ] **explain's bounds on a multikey index from two range predicates on
       one field.** Over a multikey index mongod does not intersect `$gte`
       and `$lte` on one field and bounds the scan by one of them: for

@@ -1587,7 +1587,7 @@ fn projection_name(projection: &Document, covered: bool) -> &'static str {
 }
 
 /// The single equality a point lookup needs: `{path: {$eq: scalar}}`.
-fn point_lookup(canonical: &Document) -> Option<(&str, &Bson)> {
+pub(super) fn point_lookup(canonical: &Document) -> Option<(&str, &Bson)> {
     if canonical.len() != 1 {
         return None;
     }

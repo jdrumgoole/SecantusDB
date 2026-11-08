@@ -181,7 +181,7 @@ def _mod_by_zero_after(client: Any, match: dict) -> tuple:
         return ("err", e.code)
 
 
-@pytest.mark.backlog("RM-330")
+@pytest.mark.backlog_fixed("RM-330")
 @pytest.mark.parametrize("match", [{"_id": 1}, {"_id": {"$in": [1]}}], ids=["eq", "in"])
 def test_a_group_after_an_id_match_runs_in_the_classic_engine(
     rust_mongo: Any, mongod: Any, match: dict
@@ -189,8 +189,64 @@ def test_a_group_after_an_id_match_runs_in_the_classic_engine(
     """mongod 8.2.11 runs a `$group` that follows a `$match` on `_id` in its
     classic engine (`explainVersion` 1): `$mod` by zero is 16610 there,
     where after a `$match` on another field it is the slot-based engine's
-    4848403. The Rust server answers 4848403 for both."""
+    4848403. The Rust server answered 4848403 for both until 2026-11-08."""
     assert _mod_by_zero_after(rust_mongo, match) == _mod_by_zero_after(mongod, match)
+
+
+def _mod_by_zero_with(client: Any, pipeline: list, **options: Any) -> tuple:
+    coll = client.rm330.c
+    coll.drop()
+    coll.insert_many([{"_id": 1, "i": 1, "n": 5}, {"_id": 2, "i": 2, "n": 6}])
+    group = {"$group": {"_id": None, "r": {"$first": {"$mod": ["$n", 0]}}}}
+    try:
+        return ("ok", list(coll.aggregate([*pipeline, group], **options)))
+    except pymongo.errors.OperationFailure as e:
+        return ("err", e.code)
+
+
+_ID_1 = {"$match": {"_id": 1}}
+
+
+@pytest.mark.backlog_fixed("RM-330")
+@pytest.mark.parametrize(
+    ("pipeline", "options"),
+    [
+        ([{"$match": {"_id": {"$in": [1, 1.0]}}}], {}),
+        ([{"$match": {"$or": [{"_id": 1}]}}], {}),
+        ([{"$match": {"_id": 1, "$expr": True}}], {}),
+        ([_ID_1, {"$sort": {"i": 1}}, {"$limit": 1}], {}),
+        ([_ID_1, {"$skip": 0}], {}),
+        ([_ID_1, {"$skip": 1}], {}),
+        ([_ID_1, {"$match": {"i": 1}}], {}),
+        ([{"$match": {"_id": {"$in": [1, 2]}}}], {}),
+        ([_ID_1], {"hint": {"_id": 1}}),
+        ([_ID_1], {"collation": {"locale": "en"}}),
+        ([_ID_1], {"collation": {"locale": "simple"}}),
+    ],
+    ids=[
+        "in-equal-values",
+        "or-one",
+        "expr-true",
+        "sort-limit",
+        "skip-0",
+        "skip-1",
+        "and-other-field",
+        "in-two",
+        "hint",
+        "other-collation",
+        "own-collation",
+    ],
+)
+def test_only_an_id_point_read_keeps_the_group_classic(
+    rust_mongo: Any, mongod: Any, pipeline: list, options: dict
+) -> None:
+    """mongod 8.2.11 keeps the pipeline classic only when its query is an
+    `_id` point read once optimised (one value, `$or` / `$expr: true`
+    dropped), with no hint, no `$skip` and the collection's own collation:
+    the classic 16610 for `$mod` by zero, else SBE's 4848403."""
+    assert _mod_by_zero_with(rust_mongo, pipeline, **options) == _mod_by_zero_with(
+        mongod, pipeline, **options
+    )
 
 
 def _multikey_bounds(client: Any, flt: dict) -> list:

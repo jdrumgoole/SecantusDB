@@ -179,14 +179,10 @@ fn build(
         return Ok(None);
     }
     let hoisted = crate::explain::hoist::hoist_matches(ask.pipeline);
-    let is_view = |from: &str| {
-        storage
-            .get_collection_options(ask.db, from)
-            .is_ok_and(|o| o.get_str("viewOn").is_ok())
-    };
     // The read and the stages SBE takes run in its engine, as when the
     // pipeline is read whole; a pipeline SBE takes part of is read whole.
-    let pushed = secantus_core::sbe::pushdown(&hoisted, &is_view);
+    let pushed =
+        crate::explain::sbe_pushdown(storage, ask.db, ask.coll, &hoisted, ask.hint, ask.collation);
     let sbe = pushed.is_some();
     if sbe && pushed != Some(hoisted.len()) {
         return Ok(None);

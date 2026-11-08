@@ -340,6 +340,50 @@ pub(crate) struct PipelineQuery {
     pub projection_stage: Option<Bson>,
 }
 
+/// How many leading stages of `hoisted` (a pipeline over `db.coll`, its
+/// `$match`es hoisted) mongod runs in its slot-based engine, read under `hint`
+/// and `collation` (the command's, else the collection's default): what
+/// [`secantus_core::sbe::pushdown`] decides, except that an `_id` point read
+/// keeps the whole pipeline classic ([`id_hack_read`]).
+pub(crate) fn sbe_pushdown(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    coll: &str,
+    hoisted: &[Bson],
+    hint: Option<&Bson>,
+    collation: Option<&Collation>,
+) -> Option<usize> {
+    let default = crate::util::default_collation(storage, db, coll);
+    let same_collation = match (collation, default.as_ref()) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same(b),
+        _ => false,
+    };
+    if id_hack_read(coll, hoisted, hint, same_collation) {
+        return None;
+    }
+    let is_view = |from: &str| crate::views::is_view(storage, db, from);
+    secantus_core::sbe::pushdown(hoisted, &is_view)
+}
+
+/// Whether mongod reads the front of `pipeline` as an `_id` point query
+/// (`isIdHackEligibleQuery`): its filter, as the planner optimises it
+/// (a one-value `$in`, a one-clause `$and` / `$or` and an always-true `$expr`
+/// fall away), is exactly an `_id` equality to a value with exact bounds (not
+/// null, an array or a regex), with no hint, no `$skip` and the collection's
+/// own collation. mongod runs such a query in its classic engine, so nothing
+/// after it is pushed down (measured 8.2.11, 2026-11-08: `$mod` by zero in
+/// a `$group` behind `{$match: {_id: 1}}` is the classic 16610, RM-330).
+fn id_hack_read(coll: &str, pipeline: &[Bson], hint: Option<&Bson>, same_collation: bool) -> bool {
+    let hinted = hint.is_some_and(|h| !matches!(h, Bson::Document(d) if d.is_empty()));
+    if hinted || !same_collation {
+        return false;
+    }
+    let q = pipeline_canonical(coll, pipeline);
+    let canonical = parsed_query(&q.filter);
+    q.skip == 0 && matches!(plan::point_lookup(&canonical), Some(("_id", _)))
+}
+
 pub(crate) fn pipeline_canonical(coll: &str, pipeline: &[Bson]) -> PipelineQuery {
     let stages: Vec<Document> = pipeline
         .iter()
@@ -663,8 +707,7 @@ fn cache_key_of(
     let sbe = !pipeline.is_empty() && {
         let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
         let hoisted = hoist::hoist_matches(&stages);
-        let is_view = |from: &str| crate::views::is_view(storage, db, from);
-        secantus_core::sbe::pushdown(&hoisted, &is_view).is_some()
+        sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
     };
     let parts = cache_key::Parts {
         sort: s.sort.as_ref().filter(|d| !d.is_empty()),
@@ -2063,4 +2106,111 @@ fn aggregate(
         }
     };
     reply_for(&request, verbosity, ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::id_hack_read;
+    use bson::{doc, Bson, Document};
+
+    fn reads(stages: Vec<Document>, hint: Option<&Bson>, same_collation: bool) -> bool {
+        let pipeline: Vec<Bson> = stages.into_iter().map(Bson::Document).collect();
+        let hoisted = super::hoist::hoist_matches(&pipeline);
+        id_hack_read("c", &hoisted, hint, same_collation)
+    }
+
+    fn group() -> Document {
+        doc! { "$group": { "_id": null, "r": { "$first": { "$mod": ["$n", 0] } } } }
+    }
+
+    /// The `$match`es mongod 8.2.11 answers with `explainVersion` 1 in front
+    /// of a `$group` (2026-11-08, RM-330).
+    #[test]
+    fn an_id_point_read_is_classic() {
+        for m in [
+            doc! { "_id": 1 },
+            doc! { "_id": { "$eq": 1 } },
+            doc! { "_id": { "$in": [1] } },
+            doc! { "_id": { "$in": [1, 1.0] } },
+            doc! { "_id": { "$in": [{ "a": 1 }, { "a": 1 }] } },
+            doc! { "_id": { "a": 1 } },
+            doc! { "_id": { "$eq": { "$x": 1 } } },
+            doc! { "_id": "x" },
+            doc! { "_id": Bson::MinKey },
+            doc! { "_id": Bson::MaxKey },
+            doc! { "$and": [{ "_id": 1 }] },
+            doc! { "$and": [{ "_id": 1 }, { "_id": 1 }] },
+            doc! { "$or": [{ "_id": 1 }] },
+            doc! { "_id": 1, "$expr": true },
+        ] {
+            assert!(
+                reads(vec![doc! { "$match": m.clone() }, group()], None, true),
+                "{m}"
+            );
+        }
+        let m = doc! { "$match": { "_id": 1 } };
+        for between in [
+            doc! { "$sort": { "i": 1 } },
+            doc! { "$project": { "n": 1 } },
+            doc! { "$limit": 1 },
+            doc! { "$skip": 0 },
+            doc! { "$match": { "_id": 1 } },
+        ] {
+            assert!(
+                reads(vec![m.clone(), between.clone(), group()], None, true),
+                "{between}"
+            );
+        }
+        assert!(reads(
+            vec![doc! { "$sort": { "i": 1 } }, m.clone(), group()],
+            None,
+            true
+        ));
+    }
+
+    /// The ones it answers with `explainVersion` 2: not an `_id` point read.
+    #[test]
+    fn anything_else_is_not() {
+        for m in [
+            doc! { "_id": { "$in": [1, 2] } },
+            doc! { "_id": { "$in": [] } },
+            doc! { "_id": { "$gt": 0 } },
+            doc! { "_id": 1, "i": 1 },
+            doc! { "i": 1 },
+            doc! { "_id": [1] },
+            doc! { "_id": null },
+            doc! { "_id": { "$in": [null] } },
+            doc! { "_id": { "$in": [[1]] } },
+            doc! { "_id": { "$in": [1, null] } },
+            doc! { "_id": { "$ne": 1 } },
+            doc! { "_id": { "$regex": "a" } },
+            doc! { "_id": { "$eq": Bson::RegularExpression(bson::Regex { pattern: "a".into(), options: String::new() }) } },
+            doc! { "_id": { "$eq": 1, "$gt": 0 } },
+            doc! { "_id": { "$exists": true } },
+        ] {
+            assert!(
+                !reads(vec![doc! { "$match": m.clone() }, group()], None, true),
+                "{m}"
+            );
+        }
+        let m = doc! { "$match": { "_id": 1 } };
+        assert!(!reads(
+            vec![m.clone(), doc! { "$match": { "i": 1 } }, group()],
+            None,
+            true
+        ));
+        assert!(!reads(
+            vec![m.clone(), doc! { "$skip": 1 }, group()],
+            None,
+            true
+        ));
+        let hint = Bson::Document(doc! { "_id": 1 });
+        assert!(!reads(vec![m.clone(), group()], Some(&hint), true));
+        assert!(!reads(
+            vec![m.clone(), group()],
+            Some(&Bson::String("_id_".into())),
+            true
+        ));
+        assert!(!reads(vec![m, group()], None, false));
+    }
 }
