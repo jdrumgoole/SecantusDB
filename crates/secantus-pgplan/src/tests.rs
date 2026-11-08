@@ -5380,9 +5380,9 @@ fn oidvector_array_key_orders_as_array_cmp() {
 
 /// A domain column is cast to its domain where an array shows its type
 /// (RP-569): an `ARRAY[...]` element, `array_agg`'s argument, `pg_typeof`'s,
-/// and an ARRAY subquery's one column. Not a column of another table, one a
-/// WITH hides, nor one whose domain has a `NOT VALID` CHECK, which the cast
-/// would check (RP-655).
+/// and an ARRAY subquery's one column. Not a column of another table, nor
+/// one a WITH hides. The cast is a relabel, which checks nothing, so a
+/// domain with a `NOT VALID` CHECK is cast to as well (RP-655).
 #[test]
 fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
     let domain = |name: &str, not_valid: Vec<String>| domains::Domain {
@@ -5440,6 +5440,7 @@ fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
             "SELECT pg_typeof(fd.a) FROM fd",
             "SELECT pg_typeof(fd.a::dc) FROM fd",
         ),
+        ("SELECT ARRAY[b] FROM fd", "SELECT ARRAY[b::dnv] FROM fd"),
     ] {
         assert_eq!(
             rewritten(sql).map(deparse).as_deref(),
@@ -5448,11 +5449,9 @@ fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
         );
     }
     for sql in [
-        "SELECT ARRAY[b] FROM fd",
         "SELECT ARRAY[y.a] FROM fd x",
         "SELECT a FROM fd",
         "WITH fd AS (SELECT 'x'::text AS a) SELECT ARRAY[a] FROM fd",
-        "SELECT ARRAY[a::dc] FROM fd",
     ] {
         assert_eq!(rewritten(sql), None, "{sql}");
     }
@@ -5462,4 +5461,89 @@ fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
     let mut two = select("SELECT a, i FROM fd");
     cast_array_subquery_column(&mut two, &lookup);
     assert_eq!(deparse(two), "SELECT a, i FROM fd");
+}
+
+/// A cast of a domain column to its own domain is no coercion (RP-655):
+/// `coerce_type` returns the column as it is, so the cast is marked a
+/// relabel, which checks none of the domain's constraints. A cast of the
+/// column to another type, of another column, or of a computed value to
+/// the domain stays a coercion.
+#[test]
+fn a_cast_of_a_domain_column_to_its_own_domain_is_a_relabel() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dnv".to_string(),
+        oid: 90022,
+        base: "int4".to_string(),
+        typmod: -1,
+        not_null: false,
+        checks: vec![("pos".to_string(), "VALUE > 0".to_string())],
+        not_valid: vec!["pos".to_string()],
+        default_sql: None,
+    }]);
+    let table = || {
+        let mut a = Column::new("a", "int4", false);
+        a.extra.insert("domain_type", "dnv");
+        TableDef::new("fd", vec![a, Column::new("i", "int4", false)])
+    };
+    let lookup = |name: &str| (name == "fd").then(table);
+    let relabels = |sql: &str| -> Vec<bool> {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        let out = rewrite_domain_typeof(s, &lookup)
+            .expect("rewrites")
+            .unwrap_or_else(|| (**s).clone());
+        N::SelectStmt(Box::new(out))
+            .nodes()
+            .into_iter()
+            .filter_map(|(n, _, _, _)| match n {
+                pg_query::NodeRef::TypeCast(tc) => Some(is_relabel(tc)),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(relabels("SELECT a::dnv FROM fd"), [true]);
+    assert_eq!(
+        relabels("SELECT fd.a::dnv FROM fd WHERE a::dnv < 0"),
+        [true, true]
+    );
+    assert_eq!(relabels("SELECT pg_typeof(a) FROM fd"), [true]);
+    assert_eq!(relabels("SELECT a::int4 FROM fd"), [false]);
+    assert_eq!(relabels("SELECT i::dnv FROM fd"), [false]);
+    assert_eq!(relabels("SELECT (a + 0)::dnv FROM fd"), [false]);
+    assert_eq!(relabels("SELECT a::int4::dnv FROM fd"), [false, false]);
+    assert_eq!(relabels("SELECT y.a::dnv FROM fd x"), [false]);
+
+    // A relabel reads the value and checks nothing; the same cast as a
+    // coercion checks the NOT VALID CHECK.
+    let cast = |relabel: bool| {
+        let mut type_name = type_name_node("dnv");
+        if relabel {
+            type_name.location = RELABEL_LOCATION;
+        }
+        pg_query::protobuf::Node {
+            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                arg: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::AConst(pg_query::protobuf::AConst {
+                        val: Some(pg_query::protobuf::a_const::Val::Ival(
+                            pg_query::protobuf::Integer { ival: -1 },
+                        )),
+                        isnull: false,
+                        location: -1,
+                    })),
+                })),
+                type_name: Some(type_name),
+                location: -1,
+            }))),
+        }
+    };
+    assert_eq!(const_value(&cast(true), &[]).ok(), Some(Bson::Int32(-1)));
+    assert!(const_value(&cast(false), &[]).is_err());
+    // ... and the coercion after it checks again.
+    assert!(const_value(&cast(false), &[]).is_err());
 }

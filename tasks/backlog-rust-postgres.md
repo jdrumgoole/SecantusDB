@@ -2367,17 +2367,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `t569c(c char(3))` holding `'xy'`; `d569c` over `char(3)` and `t569d(a
 d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
 
-- [ ] **A cast of a domain column to its own domain checks the domain.**
-      The column is already of the domain, so on PostgreSQL 15.19 `a::d569nv`
-      is no coercion (`coerce_type` returns the Var) and checks nothing:
-      `select a::d569nv from t569nv` reads back `-1` and `5`, and
-      `pg_typeof(a)` is `d569nv`. Here the cast checks the CHECK and fails
-      with 23514 on the `-1` stored before it, and so do `pg_typeof(a)` and
-      `array[a]`, which RP-569 reads through that cast; since RP-569 they
-      leave a domain with a `NOT VALID` CHECK out (`domain_columns_of_from`),
-      so `pg_typeof(a)` there is `integer` and `array[a]` `integer[]`.
-      Verify: tests/backlog/test_rp_found_rp569.py::test_cast_of_a_domain_column_to_its_domain_checks_nothing
-      Backlog-ID: RP-655
 - [ ] **An `ARRAY(select c ...)` over a `char(n)` column drops its
       blanks.** On PostgreSQL 15.19 `select array(select c from t569c)` is
       `{"xy "}`, as `array[c]` and `array_agg(c)` are; here it is `{xy}`,
@@ -2397,6 +2386,33 @@ d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
       array shows its type only over a single-table FROM.
       Verify: tests/backlog/test_rp_found_rp569.py::test_domain_column_array_through_join_with_or_set_operation
       Backlog-ID: RP-657
+
+## Found while working RP-655 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d655 as
+int`, `t655(a d655, b int)` holding `(-1, -1)` and `(5, 5)`, then `alter
+domain d655 add constraint d655_pos check (value > 0) not valid`. The gap
+tests are in `tests/backlog/test_rp_found_rp655.py`.
+
+- [ ] **A write re-checks a domain value it does not coerce into the
+      domain.** On PostgreSQL 15.19 `update t655 set b = b where b < 0`,
+      `update t655 set a = a where b < 0` and `insert into t655 select a, 9
+      from t655 where b < 0` each succeed: the column an UPDATE does not
+      assign is stored as it was, and a value already of the column's domain
+      is no coercion, so neither checks the domain. Here each is 23514 on the
+      `-1` stored before the CHECK: `check_row_constraints` checks every
+      domain column of the row being written. Only a value coerced into the
+      domain should be (`update t655 set a = -5` is 23514 on both).
+      Verify: tests/backlog/test_rp_found_rp655.py::test_write_checks_only_what_it_coerces_into_a_domain
+      Backlog-ID: RP-664
+- [ ] **A scalar subquery over a domain column is typed by the domain's
+      base.** `select pg_typeof((select a from t655 where b < 0))` is
+      `d655` on PostgreSQL 15.19 (`exprType` of the SubLink is its column's);
+      here it is `integer`. The subquery's column is typed by the stored
+      column's base type; since RP-569 only an ARRAY subquery's column is
+      cast to its domain (`cast_array_subquery_column`).
+      Verify: tests/backlog/test_rp_found_rp655.py::test_scalar_subquery_over_a_domain_column_is_of_the_domain
+      Backlog-ID: RP-665
 
 ## Found while working RP-570 (2026-11-08)
 

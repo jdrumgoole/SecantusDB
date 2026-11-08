@@ -178,8 +178,38 @@ pub fn domain_check(name: &str, value: &Bson) -> Result<()> {
     }
 }
 
+thread_local! {
+    /// Set while a cast that is no coercion is evaluated (`relabel`).
+    static RELABELLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f` as the evaluation of a cast whose operand is already of the
+/// target type: `coerce_type` returns such an expression as it is, so no
+/// domain constraint is checked. A value stored before a CHECK added `NOT
+/// VALID` reads back through it (15.19, RP-655). The value is still read
+/// as the domain's base type at its modifier, which only restores what
+/// the stored form drops (a `char(n)` domain's blanks).
+pub(crate) fn relabel<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RELABELLING.with(|r| r.set(self.0));
+        }
+    }
+    let _restore = Restore(RELABELLING.with(|r| r.replace(true)));
+    f()
+}
+
+/// Whether a `relabel` is being evaluated.
+pub(crate) fn relabelling() -> bool {
+    RELABELLING.with(std::cell::Cell::get)
+}
+
 /// `domain_check` for a domain already looked up.
 pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
+    if relabelling() {
+        return Ok(());
+    }
     if *value == Bson::Null && d.not_null {
         return Err(Error::Sqlstate(
             "23502",
