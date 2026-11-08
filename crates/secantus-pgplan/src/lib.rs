@@ -21796,6 +21796,16 @@ fn function_absent_in_reference(
 }
 
 /// A `TypeName` for an internal type name (`int4`, `text[]`).
+/// Whether `ty` names a composite type (a table's row type or a `CREATE
+/// TYPE ... AS`), or an array of one. A subquery's value of such a type is
+/// a document, or a list of them, that carries no type of its own, so it is
+/// cast to the subquery column's type to be described and read as it:
+/// `(select fs from fs)` is `fs`, `(select array_agg(fs) from fs)` `fs[]`,
+/// as on PostgreSQL (RP-554).
+fn composite_or_array_of_one(ty: &str) -> bool {
+    user_composite(ty.strip_suffix("[]").unwrap_or(ty)).is_some()
+}
+
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
         Some(b) => (b, true),
@@ -22087,7 +22097,7 @@ fn resolve_one_sublink(
                                 | "timetz"
                                 | "interval"
                                 | "uuid"
-                        )
+                        ) || composite_or_array_of_one(t)
                     };
                     // Any other built-in type is DECLARED for the parameter
                     // rather than cast to: a value carried in another form
@@ -22144,7 +22154,29 @@ fn resolve_one_sublink(
         }
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
-            Ok(param_node(params, Bson::Array(values)))
+            let node = param_node(params, Bson::Array(values));
+            // An array of a row type is that type's array (`fs[]`), which
+            // nothing reads back off a list of documents (RP-554).
+            let ty = sub_plan_def(&plan, lookup)
+                .ok()
+                .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+            Ok(match ty.filter(|t| composite_or_array_of_one(t)) {
+                Some(t) => {
+                    let array = if t.ends_with("[]") {
+                        t
+                    } else {
+                        format!("{t}[]")
+                    };
+                    pg_query::protobuf::Node {
+                        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                            arg: Some(Box::new(node)),
+                            type_name: Some(type_name_node(&array)),
+                            location: -1,
+                        }))),
+                    }
+                }
+                None => node,
+            })
         }
         Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink))
             if matches!(

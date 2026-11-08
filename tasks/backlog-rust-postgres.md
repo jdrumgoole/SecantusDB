@@ -2299,6 +2299,24 @@ char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
       Backlog-ID: RP-570
       Verify: tests/backlog/test_rp_found_rp559.py::test_cast_to_domain_array_applies_typmod
 
+## Found while working RP-554 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp554.py`.
+
+- [ ] **An ARRAY(subquery) of a built-in type is typed from its values.**
+      PostgreSQL 15.19 types `array(select ...)` as the array of the
+      subquery column's type, so `select array(select 1::int2)` is
+      `smallint[]` (1005), `array(select 'a'::varchar(3))` `varchar[]`
+      (1015), `array(select 1.5::float4)` `real[]` and `array(select
+      'x'::name)` `name[]`, an empty one too; here they are `int4[]`,
+      `text[]`, `float8[]` and `text[]`, and `pg_typeof` of an empty one is
+      42P18 `could not determine data type of parameter $1`. The ARRAY
+      sublink's value is a bare parameter whose type is read off its
+      elements; since RP-554 only a composite element type is cast to.
+      Backlog-ID: RP-571
+      Verify: tests/backlog/test_rp_found_rp554.py::test_array_sublink_element_type
+
 ## Found while working RP-529 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
@@ -2318,15 +2336,6 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       `"s.sd_check"`, though `pg_constraint.conname` is `sd_check` in both.
       Backlog-ID: RP-553
       Verify: tests/backlog/test_rp_found_rp529.py::test_schema_domain_check_name
-- [ ] **A scalar subquery's array of a row type is described as `text[]`.**
-      `select (select array_agg(fs) from fs)` and the same over a
-      FROM-subquery's whole-row column describe `fs[]` on PostgreSQL 15.19
-      and `pg_typeof` names it; here the column is `text[]` (1009), so
-      psycopg reads `[None]`, and `pg_typeof` of it is 42P18 `could not
-      determine data type of parameter $1`. The `::text` of it and the
-      aggregate outside a subquery answer as PostgreSQL.
-      Backlog-ID: RP-554
-      Verify: tests/backlog/test_rp_found_rp529.py::test_scalar_subquery_row_type_array
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
