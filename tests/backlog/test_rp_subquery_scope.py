@@ -22,8 +22,8 @@ and RP-481 (a USING column's 42703 carries a position); and found while
 working RP-479, RP-516 (an UPDATE's or DELETE's target was not a whole
 row; fixed) and RP-517 (`v.*` in a subquery over an outer FROM item is
 42P01); and found while working RP-516, RP-521 (a subquery reading an outer
-whole row with no type is 42P18), RP-522 (a whole row compared with an
-untyped record is not 42804), RP-523 (an aliased write target answers to
+whole row with no type was 42P18; fixed), RP-522 (a whole row compared with an
+untyped record was not 42804; fixed), RP-523 (an aliased write target answers to
 its table's name) and RP-524 (a write's name errors carry the wrong
 position).
 
@@ -1041,11 +1041,13 @@ def test_outer_star_in_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OUTER_STAR_IN_SUBQUERY[query]
 
 
-# Found while working RP-516. A subquery that reads an outer whole row only
-# where nothing gives the row a type (`fs is not null`) is planned with an
-# untyped parameter, and the per-row call cannot run it: 42P18 `could not
-# determine data type of parameter $1`. A cast (`fs::text`) or a bare
-# `(select fs)` already answers.
+# Found while working RP-516, fixed by RP-521. A subquery that reads an
+# outer whole row only where nothing gives the row a type (`fs is not null`)
+# was planned with an untyped parameter, and the per-row call could not run
+# it: 42P18 `could not determine data type of parameter $1`. The whole row
+# now reaches the per-row call as a parameter of its row type, as
+# PostgreSQL's outer Var carries it; a FROM-subquery's is a record (the last
+# two, measured on the shared 15.19 reference, which they create nothing on).
 UNTYPED_OUTER_WHOLE_ROW = {
     "select 1 from fs where exists (select 1 where fs is not null)": [(1,)],
     "select (select fs is null) from fs": [(False,)],
@@ -1053,10 +1055,15 @@ UNTYPED_OUTER_WHOLE_ROW = {
     "update fs set c = 'q' where exists (select 1 from fe where fs is not null) returning a": [
         (1,)
     ],
+    "select (select v is null) from (select 1 a) v": [(False,)],
+    "select (select v is not null) from (values (1, 'y'), (null, null)) v(a, c)": [
+        (True,),
+        (False,),
+    ],
 }
 
 
-@pytest.mark.backlog("RP-521")
+@pytest.mark.backlog_fixed("RP-521")
 @pytest.mark.parametrize("query", list(UNTYPED_OUTER_WHOLE_ROW))
 def test_untyped_outer_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == UNTYPED_OUTER_WHOLE_ROW[query]
@@ -1064,8 +1071,8 @@ def test_untyped_outer_whole_row(query: str, dsn: str) -> None:
 
 # Found while working RP-516. A whole row compared with a row constructor
 # of untyped literals: PostgreSQL's `record_eq` refuses the `unknown`
-# column against the row type's `text` (42804, no position). Here the
-# comparison is answered.
+# column against the row type's `text` (42804, no position). The
+# comparison was answered.
 WHOLE_ROW_UNTYPED_RECORD = {
     "select 1 from fs where fs = (1,'y')": (
         "42804",
@@ -1088,10 +1095,83 @@ WHOLE_ROW_UNTYPED_RECORD = {
 }
 
 
-@pytest.mark.backlog("RP-522")
+@pytest.mark.backlog_fixed("RP-522")
 @pytest.mark.parametrize("query", list(WHOLE_ROW_UNTYPED_RECORD))
 def test_whole_row_against_untyped_record(query: str, dsn: str) -> None:
     assert answer(dsn, query) == WHOLE_ROW_UNTYPED_RECORD[query]
+
+
+# RP-522's regression matrix: `record_eq` / `record_cmp` check each field
+# pair they REACH, its types before its NULLs or values, so a pair decided
+# first is never checked (`fs = (2,'y')` is false); a NULL field is still
+# `unknown`; two typed fields of different types are 42804 too; once every
+# shared pair is equal, a different width is 42804; `unknown` on both sides
+# has no equality operator (42883). IN, IS DISTINCT FROM and `= ANY` go
+# through the same function; two row constructors are compared field by
+# field instead, and are not checked. Measured on 15.19 with `_SETUP`.
+_DISSIMILAR = "cannot compare dissimilar column types {} and {} at record column {}"
+_WIDTHS = "cannot compare record types with different numbers of columns"
+WHOLE_ROW_RECORD_CHECKS = {
+    "select fs = (2,'y') from fs": [(False,)],
+    "select fs <> (1,'y') from fs": ("42804", _DISSIMILAR.format("text", "unknown", 2), None, None),
+    "select fs < (1,'y') from fs": ("42804", _DISSIMILAR.format("text", "unknown", 2), None, None),
+    "select fs < (2,'y') from fs": [(True,)],
+    "select (1,'y') = fs from fs": ("42804", _DISSIMILAR.format("unknown", "text", 2), None, None),
+    "select fs = (null,'y') from fs": (
+        "42804",
+        _DISSIMILAR.format("integer", "unknown", 1),
+        None,
+        None,
+    ),
+    "select fs = (1,'y'::varchar) from fs": (
+        "42804",
+        _DISSIMILAR.format("text", "character varying", 2),
+        None,
+        None,
+    ),
+    "select fs = (1,'y'::text, 3) from fs": ("42804", _WIDTHS, None, None),
+    "select fs > row(1) from fs": ("42804", _WIDTHS, None, None),
+    "select fs is distinct from (1,'y') from fs": (
+        "42804",
+        _DISSIMILAR.format("text", "unknown", 2),
+        None,
+        None,
+    ),
+    "select fs in ((1,'y')) from fs": (
+        "42804",
+        _DISSIMILAR.format("text", "unknown", 2),
+        None,
+        None,
+    ),
+    "select fs = any(array[(1,'y')]) from fs": (
+        "42804",
+        _DISSIMILAR.format("text", "unknown", 2),
+        None,
+        None,
+    ),
+    "select fs = (1,'y'::text) from fs": [(True,)],
+    "select fs = row(1,'y')::fs from fs": [(True,)],
+    "select (1,'y') = any(array[(1,'y')])": (
+        "42883",
+        "could not identify an equality operator for type unknown",
+        None,
+        None,
+    ),
+    "select row(1,null) = row(1,null)::record": (
+        "42883",
+        "could not identify an equality operator for type unknown",
+        None,
+        None,
+    ),
+    "select (1,'y') = (1,'y')": [(True,)],
+    "select fe = fs from fe, fs": [(False,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-522")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_RECORD_CHECKS))
+def test_whole_row_record_checks(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_RECORD_CHECKS[query]
 
 
 # Found while working RP-516. An aliased write target is hidden by its

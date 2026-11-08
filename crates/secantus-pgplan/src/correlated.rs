@@ -668,7 +668,7 @@ pub(crate) fn correlate(
             .copied()
             .filter(|l| *l >= 0)
             .unwrap_or(sl.location);
-        args.push(pg_query::protobuf::Node {
+        let column = pg_query::protobuf::Node {
             node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
                 fields: parts
                     .iter()
@@ -678,6 +678,26 @@ pub(crate) fn correlate(
                     .collect(),
                 location,
             })),
+        };
+        // A whole row is passed cast to its row type, which `eval` declares
+        // as its parameter's: PostgreSQL's outer Var carries the row type,
+        // so `exists (select 1 where fs is not null)` is typed with nothing
+        // in the body to type it (RP-521).
+        args.push(match outer_ref_whole_row(parts, lookup, params) {
+            // Its name parts as they are, so a quoted `"Fs"` stays itself.
+            Some(ty) => pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(column)),
+                    type_name: Some(pg_query::protobuf::TypeName {
+                        names: ty.split('.').map(string_node).collect(),
+                        typemod: -1,
+                        location: -1,
+                        ..Default::default()
+                    }),
+                    location: -1,
+                }))),
+            },
+            None => column,
         });
     }
     Ok(pg_query::protobuf::Node {
@@ -810,6 +830,12 @@ fn outer_ref_type(
     if qualifier.is_some() {
         return None;
     }
+    outer_whole_row_type(col, lookup)
+}
+
+/// The row type of the FROM item an enclosing query names `name`, when a
+/// bare outer reference is that item's whole row rather than a column.
+fn outer_whole_row_type(name: &str, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Option<String> {
     fn whole_row_type(
         item: &pg_query::protobuf::Node,
         name: &str,
@@ -834,11 +860,38 @@ fn outer_ref_type(
             _ => None,
         }
     }
-    levels
+    OUTER_FROM
+        .with(|o| o.borrow().clone())
         .iter()
         .rev()
         .flat_map(|level| level.iter())
-        .find_map(|item| whole_row_type(item, col, lookup))
+        .find_map(|item| whole_row_type(item, name, lookup))
+}
+
+/// The row type an outer reference carries when it is a FROM item's whole
+/// row (`fs` in `exists (select 1 where fs is not null)`), or `None` for a
+/// column.
+fn outer_ref_whole_row(
+    parts: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<String> {
+    let [name] = parts else {
+        return None;
+    };
+    let levels = OUTER_FROM.with(|o| o.borrow().clone());
+    let is_column = levels
+        .iter()
+        .flatten()
+        .any(|item| match item.node.as_ref() {
+            Some(N::JoinExpr(_)) => crate::optype::join_column_type(item, parts, lookup).is_some(),
+            _ => from_item_def(item, lookup, params)
+                .is_some_and(|(_, def)| def.columns.iter().any(|c| &c.name == name)),
+        });
+    if is_column {
+        return None;
+    }
+    outer_whole_row_type(name, lookup)
 }
 
 /// `inner` planned with each outer reference a `$N` cast to its type.
@@ -1047,6 +1100,8 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
             Some(N::ParamRef(p)) => usize::try_from(p.number - 1)
                 .ok()
                 .and_then(|i| declared.get(i).cloned().flatten()),
+            // An outer whole row, passed cast to its row type (RP-521).
+            Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_to_string),
             _ => None,
         })
         .collect();

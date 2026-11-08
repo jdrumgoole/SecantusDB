@@ -31616,18 +31616,79 @@ fn record_array_compare(op: &str, l: &Bson, r: &Bson) -> Option<Result<Bson>> {
 ///   for comparing composite-type values, as opposed to row constructors).
 ///
 /// A field that is itself a record compares by the SAME rules, recursively.
-fn record_compare(op: &str, a: &[Bson], b: &[Bson], composite: bool) -> Result<Bson> {
+///
+/// A composite comparison is PostgreSQL's `record_eq` / `record_cmp`
+/// (rowtypes.c), which check each field pair they REACH before its NULLs or
+/// its values: two different types are 42804 `cannot compare dissimilar
+/// column types`, a field still `unknown` (a bare literal or NULL in a
+/// `ROW(...)`) is 42883, as it has no equality operator or comparison
+/// function, and once every pair both have compared equal a different
+/// number of columns is 42804. `types` are the two records' static field
+/// types (`record_field_types`); a record built without them is not
+/// type-checked. A pair decided before such a field is never checked
+/// (`fs = (2, 'y')` is false, `fs = (1, 'y')` is 42804 on 15.19).
+fn record_compare(
+    op: &str,
+    a: &[Bson],
+    b: &[Bson],
+    composite: bool,
+    types: Option<(&[String], &[String])>,
+) -> Result<Bson> {
     use std::cmp::Ordering;
+    let equality = matches!(op, "=" | "<>" | "!=");
+    // `record_eq` / `record_cmp`'s check of the field pair at `i`, before
+    // its NULLs or values are looked at.
+    let check_field = |i: usize| -> Result<()> {
+        if !composite {
+            return Ok(());
+        }
+        let Some((ta, tb)) = types else {
+            return Ok(());
+        };
+        let (Some(t1), Some(t2)) = (ta.get(i), tb.get(i)) else {
+            return Ok(());
+        };
+        let (d1, d2) = (record_field_type_name(t1), record_field_type_name(t2));
+        if d1 != d2 {
+            return Err(Error::DatatypeMismatch(format!(
+                "cannot compare dissimilar column types {d1} and {d2} at record column {}",
+                i + 1
+            )));
+        }
+        if d1 == "unknown" {
+            let what = if equality {
+                "an equality operator"
+            } else {
+                "a comparison function"
+            };
+            return Err(Error::UndefinedFunction(format!(
+                "could not identify {what} for type unknown"
+            )));
+        }
+        Ok(())
+    };
+    // Every pair both records have compared equal: two composite values of
+    // different widths are an error, not an order (`record_eq`'s last check).
+    let width_check = || -> Result<()> {
+        if composite && a.len() != b.len() {
+            return Err(Error::DatatypeMismatch(
+                "cannot compare record types with different numbers of columns".into(),
+            ));
+        }
+        Ok(())
+    };
     // One field pair -> an Ordering, recursing into a nested record. Only
     // reached for a pair with no NULL on either side (the callers handle NULLs
     // first), so the nested record's own NULLs follow `composite`.
     fn cmp_pair(op: &str, x: &Bson, y: &Bson, composite: bool) -> Result<Ordering> {
         if let (Some(rx), Some(ry)) = (record_fields(x), record_fields(y)) {
+            let (tx, ty) = (record_field_types(x), record_field_types(y));
+            let types = tx.as_deref().zip(ty.as_deref());
             // A `<`-form comparison gives a total order over the nested record,
             // which is the tie-break the caller needs.
-            return match record_compare("<", rx, ry, composite)? {
+            return match record_compare("<", rx, ry, composite, types)? {
                 Bson::Boolean(true) => Ok(Ordering::Less),
-                _ => match record_compare("=", rx, ry, composite)? {
+                _ => match record_compare("=", rx, ry, composite, types)? {
                     Bson::Boolean(true) => Ok(Ordering::Equal),
                     _ => Ok(Ordering::Greater),
                 },
@@ -31641,9 +31702,10 @@ fn record_compare(op: &str, a: &[Bson], b: &[Bson], composite: bool) -> Result<B
             ))
         })
     }
-    if matches!(op, "=" | "<>" | "!=") {
+    if equality {
         let mut saw_null = false;
-        for (x, y) in a.iter().zip(b.iter()) {
+        for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+            check_field(i)?;
             match (*x == Bson::Null, *y == Bson::Null) {
                 (true, true) => {
                     // Composite: two NULLs are equal. Row constructor: the
@@ -31668,6 +31730,7 @@ fn record_compare(op: &str, a: &[Bson], b: &[Bson], composite: bool) -> Result<B
                 return Ok(Bson::Boolean(op != "="));
             }
         }
+        width_check()?;
         if a.len() != b.len() {
             return Ok(Bson::Boolean(op != "="));
         }
@@ -31676,7 +31739,8 @@ fn record_compare(op: &str, a: &[Bson], b: &[Bson], composite: bool) -> Result<B
         }
         return Ok(Bson::Boolean(op == "="));
     }
-    for (x, y) in a.iter().zip(b.iter()) {
+    for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        check_field(i)?;
         match (*x == Bson::Null, *y == Bson::Null) {
             (true, true) => {
                 // Composite: equal on this field, keep looking. Row
@@ -31705,7 +31769,36 @@ fn record_compare(op: &str, a: &[Bson], b: &[Bson], composite: bool) -> Result<B
             ord => return Ok(Bson::Boolean(decide_ord(op, ord))),
         }
     }
+    width_check()?;
     Ok(Bson::Boolean(decide_ord(op, a.len().cmp(&b.len()))))
+}
+
+/// A record field's static type as `format_type_be` names it in
+/// `record_eq`'s message, its type modifier dropped: the check compares
+/// type oids, so `varchar(3)` and `varchar` are one type.
+///
+/// A domain is read as its base type. PostgreSQL's check tells them apart
+/// (a domain column against its base type is 42804), but a table's row
+/// type here records a domain column under its base type, so comparing
+/// the names would refuse `fd = row(1::dint)`, which PostgreSQL answers
+/// (RP-529).
+fn record_field_type_name(t: &str) -> String {
+    let mut base = match t.find('(') {
+        Some(i) if !t.starts_with('"') => {
+            let tail = t[i..].find(')').map(|j| &t[i + j + 1..]).unwrap_or("");
+            format!("{}{}", t[..i].trim_end(), tail)
+        }
+        _ => t.to_string(),
+    };
+    // A domain over a domain resolves to the innermost base; bounded, as a
+    // catalog cannot hold a cycle but a bad one must not hang a comparison.
+    for _ in 0..16 {
+        match domains::domain_base(&base) {
+            Some(b) if b != base => base = b,
+            _ => break,
+        }
+    }
+    display_type(&base)
 }
 
 fn decide_ord(op: &str, ord: std::cmp::Ordering) -> bool {
@@ -39458,7 +39551,8 @@ pub(crate) fn eval_binary(op: &str, lhs: Bson, rhs: Bson) -> Result<Bson> {
         // three-valued rule is applied by const_value, which alone can tell a
         // bare `ROW(...)` from a composite value.
         if let (Some(a), Some(b)) = (compared_fields(&lhs), compared_fields(&rhs)) {
-            return record_compare(op, &a, &b, true);
+            let (ta, tb) = (record_field_types(&lhs), record_field_types(&rhs));
+            return record_compare(op, &a, &b, true, ta.as_deref().zip(tb.as_deref()));
         }
         // A scalar compared to an ARRAY with no ANY/ALL is an operator
         // PostgreSQL does not have (`text = text[]` is 42883). Array = array is
@@ -39807,7 +39901,7 @@ pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering
                         return None;
                     }
                     let is = |op: &str| {
-                        record_compare(op, rx, ry, true)
+                        record_compare(op, rx, ry, true, None)
                             .ok()
                             .map(|v| v == Bson::Boolean(true))
                     };
@@ -44246,7 +44340,8 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 };
                 let composite =
                     !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
-                return record_compare(&op, &a, &b, composite);
+                let (ta, tb) = (record_field_types(&lhs), record_field_types(&rhs));
+                return record_compare(&op, &a, &b, composite, ta.as_deref().zip(tb.as_deref()));
             }
         }
         // SQL/JSON path: `jsonb @? jsonpath` and `jsonb @@ jsonpath`, the
