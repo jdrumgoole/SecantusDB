@@ -177,10 +177,47 @@ fn derived_def(
             if let Some(t) = ranged {
                 c.pg_type = t;
             }
+            // An `oidvector` or `oidvector[]` column: a row casting to one,
+            // or building an `ARRAY[...]` of them, types it, so it orders by
+            // `btoidvectorcmp` (RP-611).
+            if let Some(t) = all
+                .iter()
+                .find_map(|r| oidvector_type(r.get(i)?, &|_| None))
+            {
+                c.pg_type = t.to_string();
+            }
             c
         })
         .collect();
     TableDef::new(name, columns)
+}
+
+/// `oidvector` or `oidvector[]` when `node` statically is one: a cast to
+/// one, a column `column` types as one, or an `ARRAY[...]` of them
+/// (RP-603, RP-611).
+fn oidvector_type(
+    node: &pg_query::protobuf::Node,
+    column: &dyn Fn(&pg_query::protobuf::ColumnRef) -> Option<String>,
+) -> Option<&'static str> {
+    let named = |t: &str| match t.trim() {
+        "oidvector" => Some("oidvector"),
+        "oidvector[]" => Some("oidvector[]"),
+        _ => None,
+    };
+    match node.node.as_ref()? {
+        N::ColumnRef(c) => column(c).as_deref().and_then(named),
+        N::TypeCast(tc) => named(&type_name_of(tc.type_name.as_ref()?)),
+        N::AArrayExpr(a) => a
+            .elements
+            .iter()
+            .any(|x| match oidvector_type(x, column) {
+                Some("oidvector") => true,
+                Some(_) => matches!(x.node.as_ref(), Some(N::AArrayExpr(_))),
+                None => false,
+            })
+            .then_some("oidvector[]"),
+        _ => None,
+    }
 }
 
 /// The labels of `ty` when it is an ENUM. The user-type table the planner
@@ -205,7 +242,7 @@ fn plain_type(t: &str) -> bool {
         return true;
     }
     !matches!(base, "inet" | "cidr")
-        && t.trim() != "oidvector"
+        && base != "oidvector"
         && !crate::collation::is_citext(base)
         && !crate::range::is_range_type(base)
         && !crate::range::is_multirange_type(base)
@@ -411,14 +448,41 @@ impl Rewriter<'_> {
     /// scope, or a cast to one -- whose ordering operators are
     /// `btoidvectorcmp`'s, not an array's (RP-603).
     fn oidvec_of(&self, node: &pg_query::protobuf::Node) -> bool {
-        match node.node.as_ref() {
-            Some(N::ColumnRef(c)) => self.column_of(c).is_some_and(|c| c.pg_type == "oidvector"),
-            Some(N::TypeCast(tc)) => tc
-                .type_name
-                .as_ref()
-                .is_some_and(|t| type_name_of(t) == "oidvector"),
-            _ => false,
+        self.oidvector_type(node) == Some("oidvector")
+    }
+
+    /// Whether `node` is statically an `oidvector[]` -- a column of one, a
+    /// cast to one, an `ARRAY[...]` of `oidvector`s -- which `array_cmp`
+    /// orders element by element with `btoidvectorcmp` (RP-611).
+    fn oidvec_arr_of(&self, node: &pg_query::protobuf::Node) -> bool {
+        self.oidvector_type(node) == Some("oidvector[]")
+    }
+
+    fn oidvector_type(&self, node: &pg_query::protobuf::Node) -> Option<&'static str> {
+        oidvector_type(node, &|c| self.column_of(c).map(|c| c.pg_type.clone()))
+    }
+
+    /// One side of an ordering comparison against an `oidvector[]`, as its
+    /// order key under `tag`: an `oidvector[]` as it is, anything else cast
+    /// to one first.
+    fn oidvec_arr_side(
+        &self,
+        node: &pg_query::protobuf::Node,
+        tag: &str,
+    ) -> pg_query::protobuf::Node {
+        if self.oidvec_arr_of(node) {
+            return Self::range_key(node.clone(), tag);
         }
+        Self::range_key(
+            pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(node.clone())),
+                    type_name: Some(type_name_node("oidvector[]")),
+                    location: -1,
+                }))),
+            },
+            tag,
+        )
     }
 
     /// One side of an ordering comparison against an `oidvector`, as its
@@ -1002,6 +1066,9 @@ impl Rewriter<'_> {
                 } else if self.oidvec_of(key) {
                     sb.node = Some(Box::new(Self::range_key(key.clone(), "oidvector")));
                     self.changed = true;
+                } else if self.oidvec_arr_of(key) {
+                    sb.node = Some(Box::new(Self::range_key(key.clone(), "oidvector[]")));
+                    self.changed = true;
                 } else if self.range_of(key).is_none() && self.char_of(key) {
                     sb.node = Some(Box::new(Self::range_key(key.clone(), crate::QUOTED_CHAR)));
                     self.changed = true;
@@ -1230,14 +1297,55 @@ impl Rewriter<'_> {
                     }
                 }
             }
+            // Two `oidvector[]`s: `array_cmp`, which compares element by
+            // element with the element type's B-tree support function,
+            // `btoidvectorcmp`. Each side compares as its order key (RP-611).
+            if kind == Ok(AExprKind::AexprOp) && ordered {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    if self.oidvec_arr_of(l) || self.oidvec_arr_of(r) {
+                        let nl = self.oidvec_arr_side(l, "oidvector[]");
+                        let nr = self.oidvec_arr_side(r, "oidvector[]");
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(nl));
+                            e.rexpr = Some(Box::new(nr));
+                        }
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
+            // `v < ANY (vs)` / `ALL` over an `oidvector[]` that is not an
+            // `ARRAY[...]` written in place: each element of it keyed as the
+            // left side is (RP-611).
+            if matches!(kind, Ok(AExprKind::AexprOpAny | AExprKind::AexprOpAll)) && ordered {
+                if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+                    if !matches!(r.node.as_ref(), Some(N::AArrayExpr(_)))
+                        && (self.oidvec_of(l) || self.oidvec_arr_of(r))
+                    {
+                        let nl = self.oidvec_side(l);
+                        let nr = self.oidvec_arr_side(r, crate::range_ops::OIDVECTOR_ELEMENTS);
+                        if let Some(N::AExpr(e)) = node.node.as_mut() {
+                            e.lexpr = Some(Box::new(nl));
+                            e.rexpr = Some(Box::new(nr));
+                        }
+                        self.changed = true;
+                        return Ok(());
+                    }
+                }
+            }
             // `v < ANY (ARRAY[...])` / `ALL` over an `oidvector`: each
             // element of the array keyed as the left side is.
             if matches!(kind, Ok(AExprKind::AexprOpAny | AExprKind::AexprOpAll)) && ordered {
-                if let (Some(l), Some(N::AArrayExpr(a))) = (
-                    e.lexpr.as_deref(),
-                    e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
-                ) {
-                    if self.oidvec_of(l) {
+                if let (
+                    Some(l),
+                    Some(
+                        r @ pg_query::protobuf::Node {
+                            node: Some(N::AArrayExpr(a)),
+                        },
+                    ),
+                ) = (e.lexpr.as_deref(), e.rexpr.as_deref())
+                {
+                    if self.oidvec_of(l) || self.oidvec_arr_of(r) {
                         let mut keyed = a.clone();
                         keyed.elements = a.elements.iter().map(|x| self.oidvec_side(x)).collect();
                         let nl = self.oidvec_side(l);
@@ -1487,6 +1595,17 @@ impl Rewriter<'_> {
                         self.changed = true;
                         return Ok(());
                     }
+                    // An `oidvector[]` BETWEEN, likewise (RP-611).
+                    if let ([lo, hi], true) = (bounds.items.as_slice(), self.oidvec_arr_of(l)) {
+                        let negated = kind == Ok(AExprKind::AexprNotBetween);
+                        let tag = "oidvector[]";
+                        let key = self.oidvec_arr_side(l, tag);
+                        let (lo, hi) =
+                            (self.oidvec_arr_side(lo, tag), self.oidvec_arr_side(hi, tag));
+                        *node = between_as_comparisons(key, lo, hi, negated);
+                        self.changed = true;
+                        return Ok(());
+                    }
                     if let Some((ty, labels)) = self.enum_of(l) {
                         // As the comparisons it abbreviates: the lowering has
                         // no BETWEEN over an expression.
@@ -1629,6 +1748,46 @@ impl Rewriter<'_> {
                 return self.expr(node);
             }
         }
+        // `array_larger(a, b)` / `array_smaller(a, b)` of `oidvector[]`s:
+        // `array_cmp` over `btoidvectorcmp`, strict, and the second argument
+        // on a tie, as PostgreSQL's (RP-611).
+        if let Some(N::FuncCall(f)) = node.node.as_ref() {
+            let name = func_name(f);
+            if let (Some(which @ ("array_larger" | "array_smaller")), [a, b], None) =
+                (name.as_deref(), f.args.as_slice(), f.over.as_ref())
+            {
+                if self.oidvec_arr_of(a) || self.oidvec_arr_of(b) {
+                    let (ka, kb) = (
+                        self.oidvec_arr_side(a, "oidvector[]"),
+                        self.oidvec_arr_side(b, "oidvector[]"),
+                    );
+                    let (first, second) = if which == "array_larger" {
+                        (">", "<=")
+                    } else {
+                        ("<", ">=")
+                    };
+                    let when =
+                        |op: &str, result: pg_query::protobuf::Node| pg_query::protobuf::Node {
+                            node: Some(N::CaseWhen(Box::new(pg_query::protobuf::CaseWhen {
+                                expr: Some(Box::new(op_expr(op, ka.clone(), kb.clone()))),
+                                result: Some(Box::new(result)),
+                                location: -1,
+                                ..Default::default()
+                            }))),
+                        };
+                    let case = pg_query::protobuf::Node {
+                        node: Some(N::CaseExpr(Box::new(pg_query::protobuf::CaseExpr {
+                            args: vec![when(first, ka.clone()), when(second, kb.clone())],
+                            location: -1,
+                            ..Default::default()
+                        }))),
+                    };
+                    *node = Self::net_value(case, "oidvector[]");
+                    self.changed = true;
+                    return Ok(());
+                }
+            }
+        }
         // `min(e)` / `max(e)`: the extreme POSITION, mapped back.
         if let Some(N::FuncCall(f)) = node.node.as_ref() {
             let name = func_name(f);
@@ -1641,6 +1800,19 @@ impl Rewriter<'_> {
                             node: Some(N::FuncCall(Box::new(agg))),
                         };
                         *node = Self::typed_value(Self::coll_value(call), &collation);
+                        self.changed = true;
+                        return Ok(());
+                    }
+                    // `max` / `min` of an `oidvector[]`: `array_larger` /
+                    // `array_smaller`, by `array_cmp` over `btoidvectorcmp`
+                    // (RP-611).
+                    if self.oidvec_arr_of(arg) {
+                        let mut agg = (**f).clone();
+                        agg.args = vec![Self::range_key(arg.clone(), "oidvector[]")];
+                        let call = pg_query::protobuf::Node {
+                            node: Some(N::FuncCall(Box::new(agg))),
+                        };
+                        *node = Self::net_value(call, "oidvector[]");
                         self.changed = true;
                         return Ok(());
                     }
@@ -1688,6 +1860,22 @@ impl Rewriter<'_> {
             // the value back from the key's tail. `max` / `min` are
             // `array_larger` / `array_smaller` over `anyarray`, an array's
             // order, so they are left alone (RP-603).
+            // Over `oidvector[]`s, by `array_cmp` over `btoidvectorcmp`
+            // (RP-611).
+            if m.args.iter().any(|a| self.oidvec_arr_of(a)) {
+                let mut mm = (**m).clone();
+                mm.args = m
+                    .args
+                    .iter()
+                    .map(|a| self.oidvec_arr_side(a, "oidvector[]"))
+                    .collect();
+                let inner = pg_query::protobuf::Node {
+                    node: Some(N::MinMaxExpr(Box::new(mm))),
+                };
+                *node = Self::net_value(inner, "oidvector[]");
+                self.changed = true;
+                return Ok(());
+            }
             if m.args.iter().any(|a| self.oidvec_of(a)) {
                 let mut mm = (**m).clone();
                 mm.args = m.args.iter().map(|a| self.oidvec_side(a)).collect();
@@ -1765,6 +1953,27 @@ impl Rewriter<'_> {
     }
 }
 
+/// `a op b`.
+fn op_expr(
+    op: &str,
+    a: pg_query::protobuf::Node,
+    b: pg_query::protobuf::Node,
+) -> pg_query::protobuf::Node {
+    pg_query::protobuf::Node {
+        node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+            kind: AExprKind::AexprOp as i32,
+            name: vec![pg_query::protobuf::Node {
+                node: Some(N::String(pg_query::protobuf::String {
+                    sval: op.to_string(),
+                })),
+            }],
+            lexpr: Some(Box::new(a)),
+            rexpr: Some(Box::new(b)),
+            location: -1,
+        }))),
+    }
+}
+
 /// `key >= lo AND key <= hi`, or `key < lo OR key > hi` for NOT BETWEEN.
 fn between_as_comparisons(
     key: pg_query::protobuf::Node,
@@ -1772,21 +1981,7 @@ fn between_as_comparisons(
     hi: pg_query::protobuf::Node,
     negated: bool,
 ) -> pg_query::protobuf::Node {
-    let cmp = |op: &str, a: pg_query::protobuf::Node, b: pg_query::protobuf::Node| {
-        pg_query::protobuf::Node {
-            node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
-                kind: AExprKind::AexprOp as i32,
-                name: vec![pg_query::protobuf::Node {
-                    node: Some(N::String(pg_query::protobuf::String {
-                        sval: op.to_string(),
-                    })),
-                }],
-                lexpr: Some(Box::new(a)),
-                rexpr: Some(Box::new(b)),
-                location: -1,
-            }))),
-        }
-    };
+    let cmp = op_expr;
     let (a, b) = if negated {
         (cmp("<", key.clone(), lo), cmp(">", key, hi))
     } else {
@@ -1964,6 +2159,7 @@ pub(crate) fn rewrite(
             if r.enum_of(&t).is_some()
                 || r.net_of(&t).is_some()
                 || r.oidvec_of(&t)
+                || r.oidvec_arr_of(&t)
                 || r.coll_of(&t).is_some()
                 || !matches!(t.node.as_ref(), Some(N::ColumnRef(_)))
             {

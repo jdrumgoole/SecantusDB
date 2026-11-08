@@ -5335,3 +5335,131 @@ fn oidvector_key_orders_as_btoidvectorcmp() {
         Some(Bson::Null)
     );
 }
+
+/// RP-611: an `oidvector[]`'s order key orders as `array_cmp` with
+/// `btoidvectorcmp` for its elements -- element by element, a NULL element
+/// after every other, the array whose elements run out first first, then
+/// the number of dimensions -- and carries the array's text after its `|`,
+/// which `greatest` / `least` / `max` / `min` read back.
+#[test]
+fn oidvector_array_key_orders_as_array_cmp() {
+    let key =
+        |text: &str| match crate::range_ops::sort_key(&Bson::String(text.into()), "oidvector[]") {
+            Ok(Bson::String(k)) => k,
+            other => panic!("for {text:?}: {other:?}"),
+        };
+    let ordered = [
+        "{}",
+        "{3}",
+        "{{3}}",
+        "{3,\"1 2\"}",
+        "{3,NULL}",
+        "{\"1 2\"}",
+        "{\"1 2\",3}",
+        "{NULL}",
+    ];
+    for pair in ordered.windows(2) {
+        assert!(key(pair[0]) < key(pair[1]), "{:?} < {:?}", pair[0], pair[1]);
+    }
+    assert_eq!(
+        key("{{\"1 2\"},{3}}").rsplit_once('|').map(|(_, t)| t),
+        Some("{{\"1 2\"},{\"3\"}}")
+    );
+    assert_eq!(
+        crate::range_ops::sort_key(
+            &Bson::Array(vec![Bson::String("1 2".into()), Bson::Null]),
+            crate::range_ops::OIDVECTOR_ELEMENTS
+        )
+        .ok(),
+        Some(Bson::Array(vec![
+            Bson::String("000000020000000100000002|1 2".into()),
+            Bson::Null
+        ]))
+    );
+}
+
+/// A domain column is cast to its domain where an array shows its type
+/// (RP-569): an `ARRAY[...]` element, `array_agg`'s argument, `pg_typeof`'s,
+/// and an ARRAY subquery's one column. Not a column of another table, one a
+/// WITH hides, nor one whose domain has a `NOT VALID` CHECK, which the cast
+/// would check (RP-655).
+#[test]
+fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
+    let domain = |name: &str, not_valid: Vec<String>| domains::Domain {
+        name: name.to_string(),
+        oid: 90021,
+        base: "bpchar".to_string(),
+        typmod: 7,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid,
+        default_sql: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc", Vec::new()),
+        domain("dnv", vec!["pos".to_string()]),
+    ]);
+    let table = || {
+        let mut a = Column::new("a", "bpchar", false);
+        a.extra.insert("domain_type", "dc");
+        let mut b = Column::new("b", "bpchar", false);
+        b.extra.insert("domain_type", "dnv");
+        TableDef::new("fd", vec![a, b, Column::new("i", "int4", false)])
+    };
+    let lookup = |name: &str| (name == "fd").then(table);
+    let select = |sql: &str| {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        (**s).clone()
+    };
+    let deparse = |s: pg_query::protobuf::SelectStmt| {
+        pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(s))),
+        }
+        .deparse()
+        .expect("deparses")
+    };
+    let rewritten = |sql: &str| rewrite_domain_typeof(&select(sql), &lookup).expect("rewrites");
+    for (sql, expected) in [
+        ("SELECT ARRAY[a] FROM fd", "SELECT ARRAY[a::dc] FROM fd"),
+        (
+            "SELECT ARRAY[x.a, i] FROM fd x",
+            "SELECT ARRAY[x.a::dc, i] FROM fd x",
+        ),
+        (
+            "SELECT array_agg(a) FROM fd",
+            "SELECT array_agg(a::dc) FROM fd",
+        ),
+        (
+            "SELECT pg_typeof(fd.a) FROM fd",
+            "SELECT pg_typeof(fd.a::dc) FROM fd",
+        ),
+    ] {
+        assert_eq!(
+            rewritten(sql).map(deparse).as_deref(),
+            Some(expected),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT ARRAY[b] FROM fd",
+        "SELECT ARRAY[y.a] FROM fd x",
+        "SELECT a FROM fd",
+        "WITH fd AS (SELECT 'x'::text AS a) SELECT ARRAY[a] FROM fd",
+        "SELECT ARRAY[a::dc] FROM fd",
+    ] {
+        assert_eq!(rewritten(sql), None, "{sql}");
+    }
+    let mut sub = select("SELECT a FROM fd");
+    cast_array_subquery_column(&mut sub, &lookup);
+    assert_eq!(deparse(sub), "SELECT a::dc FROM fd");
+    let mut two = select("SELECT a, i FROM fd");
+    cast_array_subquery_column(&mut two, &lookup);
+    assert_eq!(deparse(two), "SELECT a, i FROM fd");
+}

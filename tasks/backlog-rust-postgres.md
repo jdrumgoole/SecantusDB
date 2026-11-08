@@ -2334,24 +2334,44 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
       Backlog-ID: RP-650
 
-## Found while working RP-559 (2026-11-08)
+## Found while working RP-569 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d559c as
-char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
-7)` and `('xy', null)`. The gap tests are in `tests/backlog/test_rp_found_rp559.py`.
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp569.py`: `d569nv` over `int` with a CHECK
+`value > 0` added `NOT VALID` after `t569nv(a d569nv)` took `-1` and `5`;
+`t569c(c char(3))` holding `'xy'`; `d569c` over `char(3)` and `t569d(a
+d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
 
-- [ ] **An array built from a domain column is typed by the column's base
-      type.** A column declared with a domain is of the domain (`exprType`
-      of its Var), so on PostgreSQL 15.19 `select array[a] from fd559`,
-      `array_agg(a)` and `array(select a from fd559)` are each `d559c[]`
-      (the domain's `typarray`, text `{"a b"}`), and `array[i]` is
-      `d559i[]`. Here they are `character[]` and `integer[]`, and the
-      ARRAY subquery is `text[]` with its padding lost (`xy`, not `xy `).
-      Since RP-559 an array of a domain CONSTANT is the domain's array; a
-      column is typed by its base everywhere in the planner, and only
-      `pg_typeof` sees its domain (`rewrite_domain_typeof`).
-      Backlog-ID: RP-569
-      Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
+- [ ] **A cast of a domain column to its own domain checks the domain.**
+      The column is already of the domain, so on PostgreSQL 15.19 `a::d569nv`
+      is no coercion (`coerce_type` returns the Var) and checks nothing:
+      `select a::d569nv from t569nv` reads back `-1` and `5`, and
+      `pg_typeof(a)` is `d569nv`. Here the cast checks the CHECK and fails
+      with 23514 on the `-1` stored before it, and so do `pg_typeof(a)` and
+      `array[a]`, which RP-569 reads through that cast; since RP-569 they
+      leave a domain with a `NOT VALID` CHECK out (`domain_columns_of_from`),
+      so `pg_typeof(a)` there is `integer` and `array[a]` `integer[]`.
+      Verify: tests/backlog/test_rp_found_rp569.py::test_cast_of_a_domain_column_to_its_domain_checks_nothing
+      Backlog-ID: RP-655
+- [ ] **An `ARRAY(select c ...)` over a `char(n)` column drops its
+      blanks.** On PostgreSQL 15.19 `select array(select c from t569c)` is
+      `{"xy "}`, as `array[c]` and `array_agg(c)` are; here it is `{xy}`,
+      through a WITH and a UNION ALL too. The subquery's value is cast to
+      its column's array type without the column's modifier (`bpchar[]`),
+      and the value is stored without its padding.
+      Verify: tests/backlog/test_rp_found_rp569.py::test_array_subquery_keeps_char_padding
+      Backlog-ID: RP-656
+- [ ] **A domain column reached through a join, a WITH or a set operation
+      is typed by its base in an array.** On PostgreSQL 15.19 `select
+      array[a] from t569d x join t569c on true`, `array(select a from t569d
+      x join t569c on true)`, `array(select a from q)` over `with q as
+      (select a, i from t569d)` and `array(select a from t569d union all
+      select a from t569d)` are each `d569c[]` with the padding kept. Here
+      they are `character[]`, and the three subqueries drop the padding
+      (`xy`). Since RP-569 a domain column is cast to its domain where an
+      array shows its type only over a single-table FROM.
+      Verify: tests/backlog/test_rp_found_rp569.py::test_domain_column_array_through_join_with_or_set_operation
+      Backlog-ID: RP-657
 
 ## Found while working RP-570 (2026-11-08)
 
@@ -2373,14 +2393,6 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
 as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **A column of a domain's array type is missing from `pg_attribute`.**
-      After `create table t607q (x d607q[], y int)`, PostgreSQL 15.19's
-      `pg_attribute` has `x` (attnum 1, `d607q[]`) and `y`; here it has
-      `y` alone, so `\d t607q` shows one column, though `select *` and
-      `information_schema.columns` see both. DROP DOMAIN finds the column
-      (RP-607), so the catalog row is what is missing.
-      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_array_column_in_pg_attribute
-      Backlog-ID: RP-653
 - [ ] **A domain over another domain's array type is refused.** `create
       domain d607s as d607q[]` is made on PostgreSQL 15.19, with
       `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
@@ -2389,6 +2401,20 @@ as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
       type's array. The DROP side follows such a domain already (RP-607).
       Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
       Backlog-ID: RP-654
+
+## Found while working RP-653 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d653n as
+int`. The gap test is in `tests/backlog/test_rp_found_rp653.py`.
+
+- [ ] **A user column's `attndims` is always 0.** `attndims` is the number
+      of dimensions a column was declared with (`ColumnDef`'s
+      `arrayBounds`): after `create table t653n (a int[], b int[][], c int,
+      d int[3], e d653n[])` PostgreSQL 15.19's `pg_attribute` has 1, 2, 0,
+      1 and 1; here every column is 0 (`catalog_fill.rs` writes a constant
+      for a user table), so a client reading it sees no array column.
+      Verify: tests/backlog/test_rp_found_rp653.py::test_array_column_attndims
+      Backlog-ID: RP-658
 
 ## Found while working RP-575 (2026-11-08)
 
@@ -2443,17 +2469,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp603.py`.
 
-- [ ] **An array of `oidvector`s orders its elements as int arrays.**
-      `array_cmp` compares elements with the element type's B-tree support
-      function, so on PostgreSQL 15.19 `array['1 2'::oidvector] <
-      array['3'::oidvector]` is false, as is `'1 2'::oidvector < any(vs)`
-      over an `oidvector[]` that is not an `ARRAY[...]` written in place;
-      here both are true. Since RP-603 an `oidvector` operand, and each
-      element of an `ARRAY[...]` under ANY / ALL, compares by its
-      `btoidvectorcmp` key; a whole `oidvector[]` reaches
-      `compare_constants`, which has no type to go by.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_array_orders_by_btoidvectorcmp
-      Backlog-ID: RP-611
 - [ ] **`oidvector`'s comparison functions are refused.**
       `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
       `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
@@ -2461,6 +2476,25 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       functions of the byte-ordered types only.
       Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
       Backlog-ID: RP-612
+
+## Found while working RP-611 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp611.py`.
+
+- [ ] **An ORDER BY naming a window function over a keyed window is
+      refused.** `select v::text t, row_number() over (order by v) from
+      (values ('[1,2]'::int4range), ('[0,5]')) s(v) order by 2` (or `...
+      r ... order by r`) answers on PostgreSQL 15.19; here it is `function
+      row_number() is not supported yet`. The same query without the outer
+      ORDER BY answers, as does one whose window orders by a collation. It
+      fails when the window's ORDER BY is a range, a multirange or an
+      `oidvector`, which `sort_by` keys by `__range_sortkey`. A likely
+      cause, read from the code and not proven: `rewrite` resolves an
+      ORDER BY position or alias to its target and copies any target that
+      is not a column -- the window call too -- into the sort clause.
+      Verify: tests/backlog/test_rp_found_rp611.py::test_order_by_a_window_target_over_a_keyed_window
+      Backlog-ID: RP-652
 
 ## Found while working RP-529 (2026-11-08)
 

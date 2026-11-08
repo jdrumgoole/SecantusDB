@@ -13094,11 +13094,11 @@ impl PgHandler {
         // A user type's ARRAY (`custom[]`, `s.custom[]`): its typarray, the
         // element's oid + 100_000 (a column of one was missing from
         // `pg_attribute` altogether). A built-in's array is `oid_of_name`'s
-        // above, and a domain has none here.
+        // above. A domain's array is the `typarray` `DefineDomain` makes
+        // beside it, the same derived oid `pg_type` lists (RP-559), so a
+        // column declared `d[]` is in `pg_attribute` as `d[]` (RP-653).
         if let Some(element) = name.strip_suffix("[]") {
-            if secantus_pgplan::pgtypes::oid_of_name(element).is_none()
-                && secantus_pgplan::domains::user_domain(element).is_none()
-            {
+            if secantus_pgplan::pgtypes::oid_of_name(element).is_none() {
                 if let Some(oid) = self.type_oid_by_name(element) {
                     return Some(oid + Self::USER_TYPE_ARRAY_OID_OFFSET);
                 }
