@@ -5463,6 +5463,119 @@ fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
     assert_eq!(deparse(two), "SELECT a, i FROM fd");
 }
 
+/// A domain column keeps its domain however the FROM list reaches it
+/// (RP-657): through a join, a WITH item, a FROM subquery (under its
+/// column aliases), and in an ARRAY subquery over a set operation whose
+/// branches are all of the domain. A bare name another FROM item also
+/// has, or one a USING merges, or one beside an item whose columns are
+/// not known, is cast to nothing.
+#[test]
+fn a_domain_column_keeps_its_domain_through_joins_withs_and_set_operations() {
+    domains::set_user_domains(vec![domains::Domain {
+        name: "dc".to_string(),
+        oid: 90023,
+        base: "bpchar".to_string(),
+        typmod: 7,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: None,
+    }]);
+    let table = |name: &str| {
+        let mut a = Column::new("a", "bpchar", false);
+        a.extra.insert("domain_type", "dc");
+        TableDef::new(name, vec![a, Column::new("i", "int4", false)])
+    };
+    let lookup = |name: &str| match name {
+        "fd" | "fe" => Some(table(name)),
+        "pl" => Some(TableDef::new(
+            "pl",
+            vec![
+                Column::new("c", "bpchar", false),
+                Column::new("a", "text", false),
+            ],
+        )),
+        _ => None,
+    };
+    let select = |sql: &str| {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        (**s).clone()
+    };
+    let deparse = |s: pg_query::protobuf::SelectStmt| {
+        pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(s))),
+        }
+        .deparse()
+        .expect("deparses")
+    };
+    let rewritten = |sql: &str| {
+        rewrite_domain_typeof(&select(sql), &lookup)
+            .expect("rewrites")
+            .map(deparse)
+    };
+    for (sql, expected) in [
+        ("SELECT ARRAY[a] FROM fd x JOIN pl y ON true", None),
+        (
+            "SELECT ARRAY[x.a] FROM fd x JOIN pl y ON true",
+            Some("SELECT ARRAY[x.a::dc] FROM fd x JOIN pl y ON true"),
+        ),
+        ("SELECT ARRAY[i] FROM fd x JOIN pl y ON true", None),
+        (
+            "SELECT ARRAY[c, a] FROM fe, (SELECT c FROM pl) s",
+            Some("SELECT ARRAY[c, a::dc] FROM fe, (SELECT c FROM pl) s"),
+        ),
+        (
+            "SELECT ARRAY[b] FROM (SELECT a, i FROM fd) s(b)",
+            Some("SELECT ARRAY[b::dc] FROM (SELECT a, i FROM fd) s(b)"),
+        ),
+        (
+            "WITH q AS (SELECT * FROM fd) SELECT ARRAY[a] FROM q",
+            Some("WITH q AS (SELECT * FROM fd) SELECT ARRAY[a::dc] FROM q"),
+        ),
+        ("SELECT ARRAY[a] FROM fd JOIN fe USING (a)", None),
+        (
+            "SELECT ARRAY[fd.a] FROM fd JOIN fe USING (i)",
+            Some("SELECT ARRAY[fd.a::dc] FROM fd JOIN fe USING (i)"),
+        ),
+        ("SELECT ARRAY[a] FROM fd, generate_series(1, 2) g", None),
+    ] {
+        assert_eq!(rewritten(sql).as_deref(), expected, "{sql}");
+    }
+    for (sql, expected) in [
+        (
+            "SELECT a FROM fd x JOIN pl y ON true",
+            "SELECT a FROM fd x JOIN pl y ON true",
+        ),
+        (
+            "SELECT a FROM fd x JOIN fe y ON true",
+            "SELECT a FROM fd x JOIN fe y ON true",
+        ),
+        (
+            "SELECT y.a FROM fd x JOIN fe y ON true",
+            "SELECT y.a::dc FROM fd x JOIN fe y ON true",
+        ),
+        (
+            "SELECT a FROM fd UNION ALL SELECT a FROM fe",
+            "SELECT a::dc FROM fd UNION ALL SELECT a::dc FROM fe",
+        ),
+        (
+            "SELECT a FROM fd UNION SELECT a FROM pl",
+            "SELECT a FROM fd UNION SELECT a FROM pl",
+        ),
+    ] {
+        let mut sub = select(sql);
+        cast_array_subquery_column(&mut sub, &lookup);
+        assert_eq!(deparse(sub), expected, "{sql}");
+    }
+}
+
 /// A cast of a domain column to its own domain is no coercion (RP-655):
 /// `coerce_type` returns the column as it is, so the cast is marked a
 /// relabel, which checks none of the domain's constraints. A cast of the

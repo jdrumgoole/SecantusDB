@@ -2367,17 +2367,40 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `t569c(c char(3))` holding `'xy'`; `d569c` over `char(3)` and `t569d(a
 d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
 
-- [ ] **A domain column reached through a join, a WITH or a set operation
-      is typed by its base in an array.** On PostgreSQL 15.19 `select
-      array[a] from t569d x join t569c on true`, `array(select a from t569d
-      x join t569c on true)`, `array(select a from q)` over `with q as
-      (select a, i from t569d)` and `array(select a from t569d union all
-      select a from t569d)` are each `d569c[]` with the padding kept. Here
-      they are `character[]`, and the three subqueries drop the padding
-      (`xy`). Since RP-569 a domain column is cast to its domain where an
-      array shows its type only over a single-table FROM.
-      Verify: tests/backlog/test_rp_found_rp569.py::test_domain_column_array_through_join_with_or_set_operation
-      Backlog-ID: RP-657
+
+## Found while working RP-657 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d657c as
+char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
+`t657e(a d657c, i int)` holding `('e', 1)`. The gap tests are in
+`tests/backlog/test_rp_found_rp657.py`. Since RP-657 a domain column keeps
+its domain through a join, a WITH, a FROM subquery and a set operation all
+of whose branches are of the domain (`domain_scope.rs`).
+
+- [ ] **A set operation of a `char(n)` domain column and a `text` one drops
+      the domain's blanks.** `select array(select a from t657d union all
+      select a::text from t657e)` is `character[]` on PostgreSQL 15.19 with
+      `{"a b","xy ",e}`; here the type matches and `xy` loses its blank.
+      The branches disagree, so no branch is cast to the domain, and the
+      stored value is read without its padding.
+      Verify: tests/backlog/test_rp_found_rp657.py::test_set_operation_of_char_domain_and_text_keeps_blanks
+      Backlog-ID: RP-672
+- [ ] **`ARRAY(select * ...)` over a one-column domain subquery is typed by
+      the domain's base.** `select array(select * from (select a from
+      t657d) s order by 1)` is `d657c[]` on PostgreSQL 15.19, as the same
+      query with `select a` is; here it is `character[]`. A `*` target is
+      not a column reference the cast can wrap
+      (`domain_scope::cast_first_columns`).
+      Verify: tests/backlog/test_rp_found_rp657.py::test_array_of_star_over_a_domain_subquery_is_the_domains
+      Backlog-ID: RP-673
+- [ ] **A LATERAL subquery's column that is an outer domain column is typed
+      by the domain's base.** `select pg_typeof(b), array[b] from t657d x
+      cross join lateral (select x.a b) l` is `d657c` and `d657c[]`, with
+      the padding, on PostgreSQL 15.19; here `character` and `character[]`,
+      without it. The subquery's scope does not see the outer FROM item it
+      references, so its column's type is not known.
+      Verify: tests/backlog/test_rp_found_rp657.py::test_lateral_column_of_an_outer_domain_column_is_the_domains
+      Backlog-ID: RP-674
 
 ## Found while working RP-655 (2026-11-08)
 

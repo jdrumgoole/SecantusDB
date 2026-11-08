@@ -6,8 +6,8 @@ from a domain-typed column is the domain's array):
   (fixed, RP-655);
 - an `ARRAY(select c ...)` subquery over a `char(n)` column dropped the
   column's blanks (fixed, RP-656);
-- a domain column read through a join, a WITH or a set operation is
-  typed by its base type in an array.
+- a domain column read through a join, a WITH or a set operation was
+  typed by its base type in an array (fixed, RP-657).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after.
@@ -128,7 +128,8 @@ def test_array_subquery_keeps_char_padding(query: str, dsn: str) -> None:
 
 # The domain column keeps its domain however it is reached: through a join,
 # a WITH or a set operation's branch, an array of it is the domain's array
-# (whose text psycopg does not parse), with the domain's padding.
+# (whose text psycopg does not parse), with the domain's padding. These were
+# `character[]`, the subqueries' without the padding, until RP-657.
 REACHED_ARRAYS = {
     "select array[a] from t569d x join t569c on true order by i": ['{"a b"}', '{"xy "}'],
     "select array(select a from t569d x join t569c on true order by i)": ['{"a b","xy "}'],
@@ -141,7 +142,7 @@ REACHED_ARRAYS = {
 }
 
 
-@pytest.mark.backlog("RP-657")
+@pytest.mark.backlog_fixed("RP-657")
 @pytest.mark.parametrize("query", list(REACHED_ARRAYS))
 def test_domain_column_array_through_join_with_or_set_operation(query: str, dsn: str) -> None:
     with _connect(dsn) as c:
