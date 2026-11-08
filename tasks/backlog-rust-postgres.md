@@ -2270,13 +2270,34 @@ char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
       answers -1 (RP-551 keeps the catalog at the column's own domain).
       Backlog-ID: RP-558
       Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
-- [ ] **An array of a domain is described and printed as `varchar[]`.**
-      `select array['a b'::d551c]` is of the domain's array type
-      (`typarray`) on PostgreSQL 15.19 and prints `{"a b"}`, `array_out`
-      quoting the element that holds a blank; here the column is `varchar`
-      (1043) and the text `{a b}`. `pg_typeof` of it already names `d551c[]`.
-      Backlog-ID: RP-559
-      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_array
+
+## Found while working RP-559 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d559c as
+char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
+7)` and `('xy', null)`. The gap tests are in `tests/backlog/test_rp_found_rp559.py`.
+
+- [ ] **An array built from a domain column is typed by the column's base
+      type.** A column declared with a domain is of the domain (`exprType`
+      of its Var), so on PostgreSQL 15.19 `select array[a] from fd559`,
+      `array_agg(a)` and `array(select a from fd559)` are each `d559c[]`
+      (the domain's `typarray`, text `{"a b"}`), and `array[i]` is
+      `d559i[]`. Here they are `character[]` and `integer[]`, and the
+      ARRAY subquery is `text[]` with its padding lost (`xy`, not `xy `).
+      Since RP-559 an array of a domain CONSTANT is the domain's array; a
+      column is typed by its base everywhere in the planner, and only
+      `pg_typeof` sees its domain (`rewrite_domain_typeof`).
+      Backlog-ID: RP-569
+      Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
+- [ ] **A cast to a domain's array does not apply the base type's
+      modifier.** `select '{ab}'::d559c[]` and `array['ab']::d559c[]` are
+      `{"ab "}` on PostgreSQL 15.19, each element coerced through
+      `char(3)`, and `'{abcd}'::d559c[]` is 22001 `value too long for type
+      character(3)`; here they are `{ab}` and `{abcd}`, an element longer
+      than the domain allows. The domain's CHECK is already applied per
+      element. RP-551 applies the modifier to a scalar cast.
+      Backlog-ID: RP-570
+      Verify: tests/backlog/test_rp_found_rp559.py::test_cast_to_domain_array_applies_typmod
 
 ## Found while working RP-529 (2026-11-08)
 

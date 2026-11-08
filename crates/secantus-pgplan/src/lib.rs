@@ -28056,7 +28056,8 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 Bson::Array(items) => items.as_slice(),
                 _ => &[],
             };
-            let mut common: Option<String> = None;
+            let mut typed: Vec<String> = Vec::new();
+            let mut unknown = false;
             for (i, element) in a.elements.iter().enumerate() {
                 let value = items.get(i).unwrap_or(&Bson::Null);
                 // An UNTYPED parameter contributes nothing: PostgreSQL takes
@@ -28064,6 +28065,7 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 if matches!(element.node.as_ref(), Some(N::ParamRef(p))
                     if !param_is_declared(usize::try_from(p.number).unwrap_or(0)))
                 {
+                    unknown = true;
                     continue;
                 }
                 // A bare NULL literal contributes nothing either: `array[null,
@@ -28073,9 +28075,27 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                 if matches!(element.node.as_ref(), Some(N::AConst(c))
                     if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
                 {
+                    unknown = true;
                     continue;
                 }
-                let t = static_type(element, value);
+                typed.push(static_type(element, value));
+            }
+            // `select_common_type`: elements of one type keep it, a domain
+            // included -- only then is the result a domain's array
+            // (`array[1::d, 2::d]` is `d[]`). Otherwise every domain is
+            // smashed to its base type first (`getBaseType`), so `array[1::d,
+            // 2]` over a domain `d` of `int` is `int4[]`, and so is
+            // `array[null, 1::d]`: the NULL (an untyped string, an untyped
+            // parameter) is `unknown`, a type of its own (15.19, RP-559).
+            if unknown || typed.iter().any(|t| *t != typed[0]) {
+                for t in &mut typed {
+                    if let Some((base, _, _)) = domains::base_type_and_typmod(t) {
+                        *t = base;
+                    }
+                }
+            }
+            let mut common: Option<String> = None;
+            for t in typed {
                 match &common {
                     None => common = Some(t),
                     Some(existing) if *existing == t => {}

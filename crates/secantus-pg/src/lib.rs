@@ -6093,6 +6093,37 @@ impl PgHandler {
         ) {
             return None;
         }
+        // An ARRAY of a domain is the domain's own array type, which
+        // `DefineDomain` makes beside it (`typarray`, the derived oid +
+        // 100_000), with the domain as its element: PostgreSQL 15.19
+        // describes `array['a b'::d]` as `d[]`, unlike a domain itself,
+        // which `SendRowDescriptionMessage` sends as its base type. The
+        // element carries the innermost base (`Kind::Domain`), whose output
+        // function `array_out` prints each element with (RP-559).
+        if let Some(element) = pg_type.strip_suffix("[]") {
+            if let Some(d) = secantus_pgplan::domains::user_domain(element) {
+                let (base, _, _) = secantus_pgplan::domains::base_type_and_typmod(element)?;
+                let base_ty = self
+                    .user_wire_type(&base)
+                    .unwrap_or_else(|| wire_type(&base));
+                let (schema, bare) = match d.name.rsplit_once('.') {
+                    Some((s, n)) => (s.to_string(), n.to_string()),
+                    None => ("public".to_string(), d.name.clone()),
+                };
+                let elem = Type::new(
+                    bare.clone(),
+                    u32::try_from(d.oid).ok()?,
+                    postgres_types::Kind::Domain(base_ty),
+                    schema.clone(),
+                );
+                return Some(Type::new(
+                    format!("_{bare}"),
+                    u32::try_from(d.oid + Self::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+                    postgres_types::Kind::Array(elem),
+                    schema,
+                ));
+            }
+        }
         // A domain goes out as its base type, as PostgreSQL sends it -- a
         // user type's own oid when the base is one (an enum, a composite).
         if let Some(base) = secantus_pgplan::domains::domain_base(pg_type) {
@@ -47564,6 +47595,10 @@ fn copy_reassemble(d: &Document, field: &str, ty: &Type) -> Option<Bson> {
 /// every type, and the gap is recorded in `tasks/backlog-rust-postgres.md` rather than
 /// hidden.
 fn binary_encodable(ty: &Type) -> bool {
+    // An array of a domain is sent as its base type's array (RP-559).
+    if let Some(base_array) = domain_array_base(ty) {
+        return binary_encodable(&base_array);
+    }
     const OK: [Type; 72] = [
         Type::MACADDR,
         Type::MACADDR8,
@@ -48582,15 +48617,84 @@ fn encode_typed_row(
 /// A binary-format array of a text-family type: its elements carry text,
 /// between length words a whole-payload transcode would corrupt.
 fn binary_text_array(field: &FieldInfo) -> bool {
+    let ty = domain_array_base(field.datatype()).unwrap_or_else(|| field.datatype().clone());
     field.format() == FieldFormat::Binary
         && matches!(
-            *field.datatype(),
+            ty,
             Type::TEXT_ARRAY
                 | Type::VARCHAR_ARRAY
                 | Type::BPCHAR_ARRAY
                 | Type::NAME_ARRAY
                 | Type::CHAR_ARRAY
         )
+}
+
+/// The array type an array OF A DOMAIN is rendered as: its base type's array
+/// (`bpchar[]` for a domain over `char(3)`). A domain has no output or send
+/// function of its own -- `array_out` / `array_send` call the base type's --
+/// so the bytes are the base array's, under the domain array's oid (RP-559).
+fn domain_array_base(ty: &Type) -> Option<Type> {
+    let postgres_types::Kind::Array(inner) = ty.kind() else {
+        return None;
+    };
+    let postgres_types::Kind::Domain(base) = inner.kind() else {
+        return None;
+    };
+    let builtin = secantus_pgplan::pgtypes::BUILTIN_TYPES
+        .iter()
+        .find(|(_, oid, arr)| *oid == i64::from(base.oid()) && *arr != 0)
+        .and_then(|(_, _, arr)| u32::try_from(*arr).ok())
+        .and_then(Type::from_oid);
+    if builtin.is_some() {
+        return builtin;
+    }
+    // A user base type's array is its derived `typarray`, as
+    // `user_wire_type` builds it for an enum, a composite or a range.
+    Some(Type::new(
+        format!("_{}", base.name()),
+        u32::try_from(i64::from(base.oid()) + PgHandler::USER_TYPE_ARRAY_OID_OFFSET).ok()?,
+        postgres_types::Kind::Array(base.clone()),
+        base.schema().to_string(),
+    ))
+}
+
+/// An array of a domain, encoded as its base type's array and sent under the
+/// domain array's oid. In binary, `array_send` writes the array's element
+/// type into the header, which for an array of a domain is the domain
+/// (`ExecEvalArrayExpr` builds it with the domain as `elemtype`).
+fn encode_domain_array(
+    enc: &mut DataRowEncoder,
+    field: &FieldInfo,
+    base_array: Type,
+    v: Option<&Bson>,
+    tz: &secantus_pgplan::TimeZoneSetting,
+    ds: &secantus_pgplan::DateStyle,
+) -> PgWireResult<()> {
+    let as_base = FieldInfo::new(
+        field.name().to_string(),
+        None,
+        None,
+        base_array,
+        field.format(),
+    );
+    let mut tmp = DataRowEncoder::new(Arc::new(vec![as_base.clone()]));
+    encode_field_value_inner(&mut tmp, &as_base, v, tz, ds)?;
+    let Some(mut bytes) = split_single_field(&tmp.take_row()) else {
+        return enc.encode_field(&None::<&str>);
+    };
+    if field.format() == FieldFormat::Binary {
+        if let (Some(header), postgres_types::Kind::Array(domain)) =
+            (bytes.get_mut(8..12), field.datatype().kind())
+        {
+            header.copy_from_slice(&domain.oid().to_be_bytes());
+        }
+    }
+    enc.encode_field_with_type_and_format(
+        &RawEncoded(bytes),
+        field.datatype(),
+        field.format(),
+        &FormatOptions::default(),
+    )
 }
 
 /// `array_send`'s bytes with each element transcoded (and its length word
@@ -48785,6 +48889,9 @@ fn encode_field_value_inner(
     tz: &secantus_pgplan::TimeZoneSetting,
     ds: &secantus_pgplan::DateStyle,
 ) -> PgWireResult<()> {
+    if let Some(base_array) = domain_array_base(field.datatype()) {
+        return encode_domain_array(enc, field, base_array, v, tz, ds);
+    }
     let padded = blank_padded(field, v);
     let v = padded.as_deref();
     // `money`: `cash_out` in text, the int8 cent count in binary.
