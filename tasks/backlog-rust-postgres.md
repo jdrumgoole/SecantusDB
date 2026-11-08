@@ -2350,23 +2350,60 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp570.py::test_numeric_overflow_detail
       Backlog-ID: RP-582
 
-## Found while working RP-600 (2026-11-08)
+## Found while working RP-575 (2026-11-08)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp600.py`.
+`tests/backlog/test_rp_found_rp575.py`.
 
-- [ ] **An array of `int2vector` or `oidvector` is a two-dimensional int
-      array.** Each element is ONE value, so on PostgreSQL 15.19 `select
-      '{"1 2"}'::int2vector[]`, `array['1 2'::int2vector]` and `array(select
-      '1 2'::int2vector)` are `{"1 2"}` (`array_out` writes each element's
-      `int2vectorout` text), and `array(select indkey from pg_index ...)` is
-      `{1,"2 3"}`; here each is `{{1,2}}`, the vector carried as an int list
-      read as another dimension, and `array_agg(indkey)` over vectors of
-      different lengths answers where PostgreSQL is 2202E `cannot accumulate
-      arrays of different dimensionality`. The type (`int2vector[]`, 1006)
-      is already right. `oidvector[]` is the same.
-      Backlog-ID: RP-575
-      Verify: tests/backlog/test_rp_found_rp600.py::test_vector_array_elements
+- [ ] **The array built-ins refuse an `int2vector` or `oidvector`.** Both
+      are true array types to PostgreSQL 15.19's polymorphic resolution
+      (`typsubscript` is `array_subscript_handler`, `typelem` int2 / oid),
+      subscripted from 0: `cardinality('1 2'::int2vector)` is 2,
+      `array_dims('1 2'::int2vector)` `[0:1]`, `array_to_string('1
+      2'::oidvector, ',')` `1,2`, `array_dims(indkey)` / `array_upper(indkey,
+      1)` of a one-column index `[0:0]` / 0, and `cardinality(array_agg(v))`
+      over vectors 2. Here each is 42883 `function ... does not exist`:
+      `funcsig::accepts` takes only a `[]` type for `anyarray`. Accepting
+      the vectors there is not enough: a vector reaches the built-ins with
+      no lower bound of its own (`[1:2]`, and `array_position` off by one),
+      and over a column through an evaluator that does not see its type.
+      `'1 2'::int2vector || '3'::int2vector` is `[0:2]={1,2,3}` on
+      PostgreSQL and `{1,2,3}` here, for the same reason.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_array_builtins_over_a_vector
+      Backlog-ID: RP-601
+- [ ] **An `int2vector` of two dimensions prints as text.** `array_agg`
+      over vectors is `array_agg(anyarray)`, typed `int2vector` and holding
+      two dimensions, which `int2vectorout` refuses (`check_valid_int2vector`):
+      on PostgreSQL 15.19 `array_agg(v)::text` and `concat(array_agg(v))`
+      are 42804 `array is not a valid int2vector`. Here they are `{1,2}`.
+      The value sent as a column already is 42804 in text (RP-575); a cast
+      or `concat` prints it through `typeout`, which cannot fail.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_two_dimensional_vector_text
+      Backlog-ID: RP-602
+- [ ] **`oidvector`'s `<` and `>` compare element by element.**
+      `btoidvectorcmp` orders a shorter vector first, then by elements, so
+      on PostgreSQL 15.19 `'1 2'::oidvector < '3'::oidvector` is false and
+      `'3'::oidvector < '1 2'::oidvector` true; here they are the other way
+      round, the vectors compared as int arrays.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_oidvector_orders_by_length_first
+      Backlog-ID: RP-603
+- [ ] **A parameter declared `int2vector[]` or `oidvector[]` has no type.**
+      A Bind of `{"1 2",3}` with type oid 1006 is `int2vector[]` to
+      `pg_typeof($1)` on PostgreSQL 15.19, `($1)[2]::text` is `3` and
+      `cardinality($1)` 2, in text or binary format. Here the first is 42P18
+      `could not determine data type of parameter $1` and the others 42804 /
+      42883: oids 1006 and 1013 are in neither the parameter-type nor the
+      array-element table (`element_of_array_oid`), so the value stays its
+      raw text.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_vector_array_parameter
+      Backlog-ID: RP-604
+- [ ] **An `int2vector` input's out-of-range error quotes only its number.**
+      `int2vectorin` reports the rest of the input from the number on:
+      `'70000 1'::int2vector` and `'1 70000 1'::int2vector` are 22003
+      `value "70000 1" is out of range for type smallint` on PostgreSQL
+      15.19. Here the message quotes `"70000"`.
+      Verify: tests/backlog/test_rp_found_rp575.py::test_int2vector_range_error_quotes_the_rest
+      Backlog-ID: RP-605
 
 ## Found while working RP-529 (2026-11-08)
 

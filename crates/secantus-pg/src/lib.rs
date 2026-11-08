@@ -18934,7 +18934,13 @@ impl PgHandler {
     fn agg_wire_type(&self, item: &AggItem) -> Type {
         let user = match item.func {
             AggFunc::Min | AggFunc::Max => item.source_type.clone(),
-            AggFunc::ArrayAgg => item.source_type.as_ref().map(|t| format!("{t}[]")),
+            // `array_agg(int2vector)` is `array_agg(anyarray)`: the vector
+            // type itself (RP-575).
+            AggFunc::ArrayAgg => item
+                .source_type
+                .as_ref()
+                .filter(|t| !secantus_pgplan::vectors::is_vector(t))
+                .map(|t| format!("{t}[]")),
             _ => None,
         };
         user.and_then(|t| self.user_wire_type(&t))
@@ -47599,7 +47605,7 @@ fn binary_encodable(ty: &Type) -> bool {
     if let Some(base_array) = domain_array_base(ty) {
         return binary_encodable(&base_array);
     }
-    const OK: [Type; 72] = [
+    const OK: [Type; 74] = [
         Type::MACADDR,
         Type::MACADDR8,
         Type::PG_LSN,
@@ -47633,6 +47639,9 @@ fn binary_encodable(ty: &Type) -> bool {
         Type::XML,
         Type::INT2_VECTOR,
         Type::OID_VECTOR,
+        // `array_send` over `int2vectorsend` / `oidvectorsend` (RP-575).
+        Type::INT2_VECTOR_ARRAY,
+        Type::OID_VECTOR_ARRAY,
         Type::REGTYPE,
         Type::REGCLASS,
         Type::BOX,
@@ -48023,30 +48032,25 @@ fn encode_binary(enc: &mut DataRowEncoder, ty: &Type, v: Option<&Bson>) -> PgWir
     }
     // `int2vector` / `oidvector` send as a one-dimensional array whose lower
     // bound is 0 (they are subscripted from 0), not 1.
-    if matches!(*ty, Type::INT2_VECTOR | Type::OID_VECTOR) {
-        if let Bson::Array(items) = v {
-            let int2 = *ty == Type::INT2_VECTOR;
-            let mut out = Vec::new();
-            out.extend_from_slice(&1i32.to_be_bytes());
-            out.extend_from_slice(&0i32.to_be_bytes());
-            out.extend_from_slice(&(if int2 { 21u32 } else { 26u32 }).to_be_bytes());
-            out.extend_from_slice(&(items.len() as i32).to_be_bytes());
-            out.extend_from_slice(&0i32.to_be_bytes());
-            for item in items {
-                let n = match item {
-                    Bson::Int32(i) => i64::from(*i),
-                    Bson::Int64(i) => *i,
-                    _ => return Err(bad("this value")),
-                };
-                if int2 {
-                    out.extend_from_slice(&2i32.to_be_bytes());
-                    out.extend_from_slice(&(n as i16).to_be_bytes());
-                } else {
-                    out.extend_from_slice(&4i32.to_be_bytes());
-                    out.extend_from_slice(&(n as u32).to_be_bytes());
-                }
-            }
-            return enc.encode_field(&Some(out));
+    if matches!(*ty, Type::INT2_VECTOR | Type::OID_VECTOR)
+        && matches!(v, Bson::Array(_) | Bson::String(_))
+    {
+        let out = vector_binary(v, *ty == Type::INT2_VECTOR).ok_or_else(|| bad("this value"))?;
+        return enc.encode_field(&Some(out));
+    }
+    // An array of vectors: `array_send` over `int2vectorsend`, each element
+    // its own one-dimensional array (RP-575).
+    if matches!(*ty, Type::INT2_VECTOR_ARRAY | Type::OID_VECTOR_ARRAY) {
+        if let Bson::Array(items) = secantus_pgplan::arrays::strip(v) {
+            let elem = if *ty == Type::INT2_VECTOR_ARRAY {
+                Type::INT2_VECTOR
+            } else {
+                Type::OID_VECTOR
+            };
+            let binary =
+                array_binary_bounded(&items, &elem, &secantus_pgplan::arrays::lower_bounds(v))
+                    .ok_or_else(|| bad("this value"))?;
+            return enc.encode_field(&Some(binary));
         }
     }
     // A regtype / regclass (and the other reg types) is its 4-byte oid.
@@ -48935,6 +48939,26 @@ fn encode_field_value_inner(
     }
     // `int2vector` / `oidvector` (pg_index.indkey): space-separated, no braces.
     if matches!(field.datatype().oid(), 22 | 30) {
+        // `int2vectorout` / `oidvectorout` refuse anything but one dimension
+        // (`check_valid_int2vector`): `array_agg(indkey)` is typed
+        // `int2vector` and holds two, so its text is 42804 while its binary
+        // form (`array_send`) goes out (PostgreSQL 15.19, RP-575).
+        if let Some(Bson::Array(items)) = v {
+            if field.format() == FieldFormat::Text
+                && items.iter().any(|x| matches!(x, Bson::Array(_)))
+            {
+                let name = if field.datatype().oid() == 22 {
+                    "int2vector"
+                } else {
+                    "oidvector"
+                };
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".into(),
+                    "42804".into(), // datatype_mismatch
+                    format!("array is not a valid {name}"),
+                ))));
+            }
+        }
         // Raw bytes: a plain string under an array-kind type would be
         // escaped as though it were an array element (`"2 3"`).
         let text = match v {
@@ -49470,17 +49494,10 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
             .as_deref()
             .map(wire_type)
             .unwrap_or(Type::VARCHAR),
-        AggFunc::ArrayAgg => item
-            .source_type
-            .as_deref()
-            .map(|t| {
-                if t.ends_with("[]") {
-                    wire_type(t)
-                } else {
-                    wire_type(&format!("{t}[]"))
-                }
-            })
-            .unwrap_or(Type::TEXT_ARRAY),
+        // An array of arrays is the same array type, and so is an array of
+        // vectors (`aggregate_item_type`).
+        AggFunc::ArrayAgg if item.source_type.is_none() => Type::TEXT_ARRAY,
+        AggFunc::ArrayAgg => wire_type(&secantus_pgplan::aggregate_item_type(item)),
         // The extended families returned above.
         _ => Type::TEXT,
     }
@@ -49822,7 +49839,7 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             if item
                 .source_type
                 .as_deref()
-                .is_some_and(|t| t.ends_with("[]"))
+                .is_some_and(|t| t.ends_with("[]") || secantus_pgplan::vectors::is_vector(t))
                 && array_agg_refuses(
                     rows.iter()
                         .map(|d| d.get(field).cloned().unwrap_or(Bson::Null)),
@@ -51248,6 +51265,11 @@ impl ToSqlText for RawField {
 /// prefix). Mirrors the single-value arms of `encode_binary`; returns `None`
 /// for an element type whose binary layout this server does not emit.
 fn element_binary(v: &Bson, elem: &Type) -> Option<Vec<u8>> {
+    // A vector element (rust-postgres calls the type an array of int2 / oid):
+    // its own framing, from 0.
+    if matches!(*elem, Type::INT2_VECTOR | Type::OID_VECTOR) {
+        return vector_binary(v, *elem == Type::INT2_VECTOR);
+    }
     // An ARRAY element (a composite's array field): its own array framing.
     if let (postgres_types::Kind::Array(inner), Bson::Array(items)) = (elem.kind(), v) {
         return array_binary(items, inner);
@@ -51488,6 +51510,67 @@ fn record_field_type(v: &Bson) -> Type {
         // bytes, which is what its own record-binary tests expect.
         _ => Type::UNKNOWN,
     }
+}
+
+/// `int2vectorsend` / `oidvectorsend`: `array_send` of the vector's ints,
+/// one dimension with lower bound 0 even when empty. A vector inside an
+/// array is carried as its text, read back here. `array_agg` over vectors
+/// accumulates them into more dimensions, which `array_send` writes with
+/// the outer bounds at 1 and the vectors' own at 0 (PostgreSQL 15.19).
+fn vector_binary(v: &Bson, int2: bool) -> Option<Vec<u8>> {
+    let parsed;
+    let v = match v {
+        Bson::String(_) => {
+            let ty = if int2 { "int2vector" } else { "oidvector" };
+            parsed = secantus_pgplan::vectors::scalar(v.clone(), ty);
+            &parsed
+        }
+        other => other,
+    };
+    let Bson::Array(items) = v else {
+        return None;
+    };
+    let mut dims: Vec<usize> = vec![items.len()];
+    let mut level: &[Bson] = items;
+    while let Some(Bson::Array(inner)) = level.first() {
+        dims.push(inner.len());
+        level = inner;
+    }
+    fn leaves(items: &[Bson], out: &mut Vec<i64>) -> Option<()> {
+        for it in items {
+            match it {
+                Bson::Array(inner) => leaves(inner, out)?,
+                Bson::Int32(i) => out.push(i64::from(*i)),
+                Bson::Int64(i) => out.push(*i),
+                _ => return None,
+            }
+        }
+        Some(())
+    }
+    let mut flat = Vec::new();
+    leaves(items, &mut flat)?;
+    if flat.len() != dims.iter().product::<usize>() {
+        return None;
+    }
+    let mut out = Vec::new();
+    out.extend_from_slice(&(dims.len() as i32).to_be_bytes());
+    out.extend_from_slice(&0i32.to_be_bytes());
+    out.extend_from_slice(&(if int2 { 21u32 } else { 26u32 }).to_be_bytes());
+    for (i, d) in dims.iter().enumerate() {
+        out.extend_from_slice(&(*d as i32).to_be_bytes());
+        let lb = i32::from(i + 1 != dims.len());
+        out.extend_from_slice(&lb.to_be_bytes());
+    }
+    for n in flat {
+        if int2 {
+            out.extend_from_slice(&2i32.to_be_bytes());
+            out.extend_from_slice(&(n as i16).to_be_bytes());
+        } else {
+            out.extend_from_slice(&4i32.to_be_bytes());
+            out.extend_from_slice(&(n as u32).to_be_bytes());
+        }
+    }
+    Some(out)
 }
 
 /// Build the PostgreSQL binary wire form of a (possibly multidimensional)

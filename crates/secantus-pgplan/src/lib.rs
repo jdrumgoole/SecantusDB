@@ -57,6 +57,7 @@ pub mod typed_tables;
 pub mod typeout;
 mod typmod_cast;
 mod unread_ctes;
+pub mod vectors;
 pub use expr_where::with_expr_index_hook;
 pub mod arrays;
 pub mod bits;
@@ -3962,6 +3963,55 @@ pub fn is_pg_temp_schema(schema: &str) -> bool {
     schema == "pg_temp" || schema.starts_with("pg_temp_")
 }
 
+/// An array built-in's vector argument beside an array of vectors
+/// (`array_append(a, v)`, `array_position(a, v)`) in the element form the
+/// array carries it in, so it is one element and compares with the others
+/// (RP-575).
+fn vector_element_args(
+    f: &pg_query::protobuf::FuncCall,
+    name: &str,
+    args: Vec<Bson>,
+) -> Result<Vec<Bson>> {
+    if !arrays::is_array_function(name) {
+        return Ok(args);
+    }
+    let types: Vec<String> = f
+        .args
+        .iter()
+        .zip(&args)
+        .map(|(a, v)| static_type(a, v))
+        .collect();
+    let Some(elem) = types
+        .iter()
+        .find_map(|t| vectors::vector_array_element(t))
+        .map(str::to_owned)
+    else {
+        return Ok(args);
+    };
+    args.into_iter()
+        .zip(&types)
+        .map(|(v, t)| {
+            if t.trim() == elem {
+                vectors::element(v, &elem)
+            } else {
+                Ok(v)
+            }
+        })
+        .collect()
+}
+
+/// The elements an array of `element` unnests to: a vector's text form, as
+/// it is carried inside the array, is its int array again (RP-575).
+fn vector_scalars(values: Vec<Bson>, element: &str) -> Vec<Bson> {
+    if !vectors::is_vector(element) {
+        return values;
+    }
+    values
+        .into_iter()
+        .map(|v| vectors::scalar(v, element))
+        .collect()
+}
+
 /// `a[i]`, `a[lo:hi]` and their multidimensional forms.
 ///
 /// Two rules decide the shape of the answer, and both are PostgreSQL's rather
@@ -4084,7 +4134,15 @@ fn array_subscript(
     if !any_slice {
         let ndims = arrays::dim_lengths(&value).len();
         let plain: Vec<Option<i64>> = subs.iter().map(|(_, _, u)| *u).collect();
-        return Ok(arrays::element(&value, &plain, ndims));
+        let element = arrays::element(&value, &plain, ndims);
+        // A vector array's element is carried as its text; out of the array
+        // it is the vector's int array again (RP-575).
+        return Ok(
+            match vectors::vector_array_element(&static_type(arg, &value)) {
+                Some(elem) => vectors::scalar(element, elem),
+                None => element,
+            },
+        );
     }
     // Under a slice an omitted bound is the array's own edge, and a bare
     // index `i` stands for `i:i`.
@@ -15156,11 +15214,12 @@ fn srf_rows(
                         .strip_suffix("[]")
                         .map(str::to_owned)
                         .ok_or_else(|| Error::Unsupported("unnest() over a non-array".into()))?;
-                    lists.push(match value {
+                    let list = match value {
                         Bson::Null => Vec::new(),
                         v @ Bson::Array(_) => arrays::flatten(&v),
                         _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
-                    });
+                    };
+                    lists.push(vector_scalars(list, &element));
                     columns.push(name.to_string());
                     types.push(element);
                 }
@@ -15251,7 +15310,7 @@ fn srf_rows(
                 v @ Bson::Array(_) => arrays::flatten(&v),
                 _ => return Err(Error::Unsupported("unnest() over a non-array".into())),
             };
-            one(values, &element)
+            one(vector_scalars(values, &element), &element)
         }
         // `information_schema._pg_expandarray(arr)`: (x, n) per element.
         "_pg_expandarray" if call.args.len() == 1 => {
@@ -18547,9 +18606,12 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
             .clone()
             .unwrap_or_else(|| "text".to_string()),
         // An array of arrays is an array of one more dimension, and the
-        // same type: `array_agg(int4[])` is `int4[]`.
+        // same type: `array_agg(int4[])` is `int4[]`. So is a vector's:
+        // `int2vector` / `oidvector` are array types to the polymorphic
+        // resolution, so `array_agg(indkey)` is `array_agg(anyarray)`, and
+        // `int2vector` (RP-575).
         AggFunc::ArrayAgg => match item.source_type.as_deref() {
-            Some(t) if t.ends_with("[]") => t.to_string(),
+            Some(t) if t.ends_with("[]") || vectors::is_vector(t) => t.to_string(),
             t => format!("{}[]", t.unwrap_or("text")),
         },
         AggFunc::BoolAnd | AggFunc::BoolOr => "bool".to_string(),
@@ -22337,7 +22399,17 @@ fn resolve_one_sublink(
         }
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
-            let node = param_node(params, Bson::Array(values));
+            let ty = sub_plan_def(&plan, lookup)
+                .ok()
+                .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+            // An `int2vector` / `oidvector` row value is one element of the
+            // array, carried as its text there: as the int array it is
+            // carried as, it read as one more dimension of ints (RP-575).
+            let values = match ty.as_deref().filter(|t| vectors::is_vector(t)) {
+                Some(elem) => vectors::elements(Bson::Array(values), elem)?,
+                None => Bson::Array(values),
+            };
+            let node = param_node(params, values);
             // `transformSubLink` types an ARRAY sublink as the array of its
             // subquery column's type (`get_promoted_array_type`; an array
             // column is its own type, the result one more dimension of it):
@@ -22347,9 +22419,6 @@ fn resolve_one_sublink(
             // values survive a cast of themselves, declared otherwise -- or
             // it was typed off its elements, and an empty one not at all
             // (RP-600). A row type's array is cast to as well (RP-554).
-            let ty = sub_plan_def(&plan, lookup)
-                .ok()
-                .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
             let Some(element) = ty.filter(|t| !matches!(t.as_str(), "" | "unknown" | "record"))
             else {
                 return Ok(node);
@@ -22359,9 +22428,8 @@ fn resolve_one_sublink(
             } else {
                 format!("{element}[]")
             };
-            // An `int2vector` / `oidvector` is carried as an int array, which
-            // a cast to its array type reads as one more dimension of ints;
-            // it is declared instead (RP-575).
+            // An `int2vector` / `oidvector` array is already in its element
+            // form above, and declared rather than read again by a cast.
             let base = element.strip_suffix("[]").unwrap_or(&element);
             if !sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector") {
                 declare_sublink_param(params.len() - 1, &array);
@@ -30547,14 +30615,18 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                 {
                     let args = match named_call_args(f, &name, params) {
                         Some(a) => a?,
-                        None => bpchar_args(
+                        None => vector_element_args(
                             f,
                             &name,
-                            f.args
-                                .iter()
-                                .map(|a| const_value(a, params))
-                                .collect::<Result<Vec<_>>>()?,
-                        ),
+                            bpchar_args(
+                                f,
+                                &name,
+                                f.args
+                                    .iter()
+                                    .map(|a| const_value(a, params))
+                                    .collect::<Result<Vec<_>>>()?,
+                            ),
+                        )?,
                     };
                     if let Some(result) = scalar::call(&name, &args) {
                         let value = result?;
@@ -37047,6 +37119,17 @@ fn cast_value_inner(value: Bson, target: &str) -> Result<Bson> {
         // whether it gets a Decimal or a float.
         t if t.ends_with("[]") => {
             let element = t.trim_end_matches("[]");
+            // An array of `int2vector` / `oidvector`: each element is one
+            // vector, read by its input function and carried as its text, not
+            // as an int array the array machinery would read as one more
+            // dimension (RP-575).
+            if vectors::is_vector(element) {
+                let value = match value {
+                    Bson::String(text) => parse_array(&text, "text")?,
+                    other => other,
+                };
+                return vectors::elements(value, element);
+            }
             match &value {
                 Bson::Array(items) => Ok(Bson::Array(
                     items
@@ -44048,6 +44131,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     .map(|a| const_value(a, params))
                     .collect::<Result<Vec<_>>>()?;
                 let args = bpchar_args(f, &name, args);
+                let args = vector_element_args(f, &name, args)?;
                 if let Some(result) = scalar::call(&name, &args) {
                     return result;
                 }
@@ -44197,6 +44281,21 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             .iter()
             .map(|e| const_value(e, params))
             .collect::<Result<Vec<_>>>()?;
+        // An `int2vector` / `oidvector` element is one value, carried as its
+        // text inside the array; a nested ARRAY[...] is already in that form
+        // (RP-575).
+        let array_type = static_type(node, &Bson::Array(items.clone()));
+        let items = match vectors::vector_array_element(&array_type) {
+            Some(elem) => items
+                .into_iter()
+                .zip(&a.elements)
+                .map(|(v, n)| match n.node.as_ref() {
+                    Some(N::AArrayExpr(_)) => Ok(v),
+                    _ => vectors::element(v, elem),
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => items,
+        };
         if !array_rectangular(&items) {
             return Err(Error::ArraySubscript(
                 "multidimensional arrays must have array expressions with matching dimensions"
@@ -44224,7 +44323,6 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         // Every element takes the array's element type: an untyped literal
         // is parsed as it (`array[1, 'a']` is 22P02, not a NULL), and a
         // narrower number widens (`array[1, 2.5]` holds the numeric 1).
-        let array_type = static_type(node, &Bson::Array(items.clone()));
         let element = array_type.strip_suffix("[]").unwrap_or("").to_string();
         let items = items
             .into_iter()
@@ -44234,6 +44332,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     || matches!(v, Bson::Array(_))
                     || element.is_empty()
                     || element == "text"
+                    || vectors::is_vector(&element)
                 {
                     return Ok(v);
                 }
@@ -44411,12 +44510,20 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 Some(l) => const_value(l, params)?,
                 None => return Err(Error::Parse("ANY/ALL with no left operand".into())),
             };
-            let rhs = const_value(
-                e.rexpr
-                    .as_ref()
-                    .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?,
-                params,
-            )?;
+            let rexpr = e
+                .rexpr
+                .as_ref()
+                .ok_or_else(|| Error::Parse("ANY/ALL with no array operand".into()))?;
+            let rhs = const_value(rexpr, params)?;
+            // A vector array's elements are compared as the vectors they are,
+            // not as the text they are carried as inside it (RP-575).
+            let rhs = match vectors::vector_array_element(&static_type(rexpr, &rhs)) {
+                Some(elem) => {
+                    let lower = arrays::lower_bounds(&rhs);
+                    arrays::bounded(vectors::scalars(arrays::strip(&rhs), elem), &lower)
+                }
+                None => rhs,
+            };
             // A jsonb compares by value: both sides as their value keys.
             if matches!(op.as_str(), "=" | "<>" | "!=")
                 && static_json_type(e.lexpr.as_deref(), &lhs).as_deref() == Some("jsonb")
@@ -46395,6 +46502,13 @@ fn lower_scalar_array(
         return Err(Error::Unsupported("a jsonb comparison".into()));
     }
     let rhs = coerce_any_array(rhs, elem_type)?;
+    // A vector column meets each vector as the int array it is stored as,
+    // not as the text it is carried as inside the array (RP-575).
+    let rhs = if vectors::is_vector(elem_type) {
+        vectors::scalars(arrays::strip(&rhs), elem_type)
+    } else {
+        rhs
+    };
     let elems = match rhs {
         Bson::Array(v) => v,
         // A NULL array (a genuine NULL operand, or an unbound parameter at
