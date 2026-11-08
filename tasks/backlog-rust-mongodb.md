@@ -1732,6 +1732,32 @@ Still different, all 77:
       gives each entry the bytes it takes in mongod's memory: the C++
       sizes of the entry, its plan and its debug information. The field is
       left out here rather than given a value that is not mongod's.
+      **Decision needed (2026-11-08):** the number is mongod's C++ object
+      layout, and mongod gives two of them. It is
+      `PlanCacheEntryBase::_estimateObjectSizeInBytes` (r8.2.11
+      `plan_cache.h`): `sizeof` the entry, plus `SolutionCacheData` and
+      its `PlanCacheIndexTree` (each node's `IndexEntry`: key pattern and
+      `infoObj` `objsize()`, multikey path sets, identifier string
+      capacities), plus `DebugInfo` (the query's filter / sort /
+      projection / collation `objsize()`) and its `PlanRankingDecision`:
+      every candidate's `PlanStageStats` tree (each stage's filter BSON,
+      the index scan's key pattern, start / end keys, `indexName`
+      capacity), the `scores` and `candidateOrder` vector capacities.
+      SBE-keyed entries add `DebugInfoSBE` (`planSummary` capacity and
+      more). Probed on macOS arm64 mongod 8.2.11, the test's query over
+      `a_1` / `b_1`: 3040 for index names of 3 to 22 characters, 3048 at
+      23, 3076 at 24, 3140 at 40 -- the step is libc++'s short-string
+      limit (22). The Linux mongod CI runs is built against libstdc++
+      (short-string limit 15, `sizeof(std::string)` 32 rather than 24),
+      so its sizes differ throughout; no Linux 8.2.11 is on this box to
+      measure. Options: (1) port the estimate tree with a layout table
+      per mongod build (libc++ / arm64 for macOS, libstdc++ / x86_64 for
+      Linux), chosen by the target the server is built for, its `sizeof`
+      constants fitted by probing 8.2.11 on each -- several PRs, and a
+      Linux reference to fit against (CI or a container); (2) the Linux
+      layout only, which macOS then reports too -- part of the answer;
+      (3) keep the field omitted and make it a scope decision: the bytes
+      of mongod's own memory are not state this server has.
       Backlog-ID: RM-341
       Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size
 - [ ] **No plan is cached for a collection over 2,000 documents.** mongod
