@@ -504,6 +504,7 @@ fn fusion(name: &str, spec: &Bson, coll: &str) -> Result<Vec<Bson>, CommandError
     }
     let names: Vec<String> = pipelines.iter().map(|(n, _)| n.clone()).collect();
     let (weights, _) = weights(name, &names, combination.get("weights"))?;
+    let names_written = &names;
     let details = matches!(spec.get("scoreDetails"), Some(Bson::Boolean(true)));
 
     let mut out: Vec<Bson> = Vec::new();
@@ -517,7 +518,21 @@ fn fusion(name: &str, spec: &Bson, coll: &str) -> Result<Vec<Bson>, CommandError
                 p.push(s.clone());
             }
         }
-        let mut prep = doc! { "pipe": i as i32 };
+        // What explain lists for it: mongod's desugaring names the pipeline
+        // and prints its weight (RM-200).
+        let mut prep = doc! {
+            "pipe": i as i32,
+            "kind": if rank { "rank" } else { "score" },
+            "name": names_written[i].clone(),
+            "weight": weights[i],
+            "details": details,
+            "subDetails": stages.iter().any(|s| {
+                stage_name(s) == "$score"
+                    && s.as_document()
+                        .and_then(|d| d.get_document("$score").ok())
+                        .is_some_and(|d| matches!(d.get("scoreDetails"), Some(Bson::Boolean(true))))
+            }),
+        };
         // The rank is the input's `$rank` over its sort key.
         if let Some(by) = stages
             .iter()
@@ -572,9 +587,37 @@ pub(crate) fn mentions_hybrid(pipeline: &[Bson]) -> bool {
         .any(|s| names_stage(s) || mentions(s, "score") || mentions(s, "scoreDetails"))
 }
 
+/// What a pipeline is prepared for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// To run.
+    Run,
+    /// To be listed by `explain`, which shows a `$lookup` sub-pipeline as it
+    /// was written (mongod 8.2.11) and runs it through [`prepare`] again.
+    Explain,
+}
+
 /// Parse and desugar the hybrid stages of `pipeline`, an `aggregate` on
-/// `coll`, and rewrite the score metadata reads.
+/// `coll`, and rewrite the score metadata reads. Preparing a prepared
+/// pipeline again leaves it as it is.
 pub(crate) fn prepare(pipeline: Vec<Bson>, coll: Option<&str>) -> Result<Vec<Bson>, CommandError> {
+    prepared_as(pipeline, coll, Mode::Run)
+}
+
+/// [`prepare`] for `explain`: the stages mongod desugars, desugared, and a
+/// `$lookup` sub-pipeline as written.
+pub(crate) fn prepare_for_explain(
+    pipeline: Vec<Bson>,
+    coll: Option<&str>,
+) -> Result<Vec<Bson>, CommandError> {
+    prepared_as(pipeline, coll, Mode::Explain)
+}
+
+fn prepared_as(
+    pipeline: Vec<Bson>,
+    coll: Option<&str>,
+    mode: Mode,
+) -> Result<Vec<Bson>, CommandError> {
     let mut out: Vec<Bson> = Vec::with_capacity(pipeline.len());
     for (i, stage) in pipeline.into_iter().enumerate() {
         let name = stage_name(&stage).to_string();
@@ -596,18 +639,59 @@ pub(crate) fn prepare(pipeline: Vec<Bson>, coll: Option<&str>) -> Result<Vec<Bso
                 }
                 out.push(score_stage(&spec.unwrap_or(Bson::Null))?);
             }
-            _ => out.push(sub_pipelines(stage)?),
+            _ => out.push(sub_pipelines(stage, coll, mode)?),
         }
     }
     rewrite_metadata(&mut out)?;
     Ok(out)
 }
 
+thread_local! {
+    static PREPARED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Run `f`, an `aggregate` of a pipeline [`prepare`] made: its internal
+/// stages pass the stage-name check, as they do when the command prepares
+/// them itself. Only `explain`'s per-stage counts run one.
+pub(crate) fn as_prepared<T>(f: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PREPARED.with(|p| p.set(self.0));
+        }
+    }
+    let _restore = Restore(PREPARED.with(|p| p.replace(true)));
+    f()
+}
+
+/// Whether `name` is a stage [`prepare`] made, in a pipeline it made.
+pub(crate) fn is_prepared_stage(name: &str) -> bool {
+    name.starts_with("$_secantus") && PREPARED.with(std::cell::Cell::get)
+}
+
+/// Whether a stage of `pipeline`, or of a pipeline inside one, is a stage
+/// [`prepare`] made.
+pub(crate) fn has_prepared_stage(pipeline: &[Document]) -> bool {
+    fn internal(v: &Bson) -> bool {
+        match v {
+            Bson::Document(d) => d
+                .iter()
+                .any(|(k, v)| k.starts_with("$_secantus") || internal(v)),
+            Bson::Array(items) => items.iter().any(internal),
+            _ => false,
+        }
+    }
+    pipeline
+        .iter()
+        .any(|d| internal(&Bson::Document(d.clone())))
+}
+
 /// `stage` with the hybrid stages of its sub-pipelines desugared, each over
 /// the collection it reads: a `$unionWith`'s `coll` and a `$lookup`'s
-/// `from`. A `$facet` sub-pipeline reads no collection of its own. Each has
-/// its own score metadata, out of the outer pipeline's reach.
-fn sub_pipelines(mut stage: Bson) -> Result<Bson, CommandError> {
+/// `from`. A `$facet` sub-pipeline reads the stage's input, and a fusion
+/// there reads `outer`, the collection the aggregate does (mongod 8.2.11).
+/// Each has its own score metadata, out of the outer pipeline's reach.
+fn sub_pipelines(mut stage: Bson, outer: Option<&str>, mode: Mode) -> Result<Bson, CommandError> {
     let name = stage_name(&stage).to_string();
     let Some(Bson::Document(spec)) = stage.as_document_mut().and_then(|d| d.get_mut(&name)) else {
         return Ok(stage);
@@ -615,12 +699,13 @@ fn sub_pipelines(mut stage: Bson) -> Result<Bson, CommandError> {
     let prepared = |p: &Bson, coll: Option<&str>| -> Result<Option<Bson>, CommandError> {
         match p {
             Bson::Array(stages) if mentions_hybrid(stages) => {
-                Ok(Some(Bson::Array(prepare(stages.clone(), coll)?)))
+                Ok(Some(Bson::Array(prepared_as(stages.clone(), coll, mode)?)))
             }
             _ => Ok(None),
         }
     };
     match name.as_str() {
+        "$lookup" if mode == Mode::Explain => {}
         "$unionWith" | "$lookup" => {
             let coll = spec
                 .get_str(if name == "$lookup" { "from" } else { "coll" })
@@ -633,22 +718,24 @@ fn sub_pipelines(mut stage: Bson) -> Result<Bson, CommandError> {
             }
         }
         "$facet" => {
-            // mongod 8.2.11 has no score metadata inside a `$facet`: a
-            // `$score` there, or a read of the score, is 40218 (measured).
+            // mongod 8.2.11 sets no score inside a `$facet` but a
+            // `$rankFusion`'s, which may be its first stage: a `$score`
+            // there, a `$scoreFusion` (made of them) or a read of a score no
+            // `$rankFusion` set is 40218 (measured).
             let names: Vec<String> = spec.keys().cloned().collect();
             for facet in names {
                 if let Bson::Array(stages) = &spec[facet.as_str()] {
-                    if stages
-                        .iter()
-                        .any(|s| stage_name(s) == "$score" || mentions(s, "score"))
-                    {
-                        return Err(unavailable("score"));
-                    }
-                    if stages.iter().any(|s| mentions(s, "scoreDetails")) {
-                        return Err(unavailable("scoreDetails"));
+                    for (i, s) in stages.iter().enumerate() {
+                        let fusion = matches!(stage_name(s), "$rankFusion" | "$scoreFusion");
+                        if fusion && i != 0 {
+                            return Err(err(10170100, NOT_FIRST));
+                        }
+                        if matches!(stage_name(s), "$score" | "$scoreFusion") {
+                            return Err(unavailable("score"));
+                        }
                     }
                 }
-                if let Some(done) = prepared(&spec[facet.as_str()], None)? {
+                if let Some(done) = prepared(&spec[facet.as_str()], outer)? {
                     spec.insert(facet, done);
                 }
             }
@@ -724,7 +811,9 @@ fn rewrite_metadata(stages: &mut Vec<Bson>) -> Result<(), CommandError> {
     let hidden = || Bson::Array(vec![Bson::from(SCORE), Bson::from(SCORE_DETAILS)]);
     for mut stage in std::mem::take(stages) {
         let name = stage_name(&stage).to_string();
-        let ends = ENDS.contains(&name.as_str());
+        // A prepared pipeline's own `$unset` of the hidden fields ends them.
+        let ends = ENDS.contains(&name.as_str())
+            || stage.as_document().and_then(|d| d.get("$unset")) == Some(&hidden());
         if mentions(&stage, "score") && !live {
             return Err(unavailable("score"));
         }

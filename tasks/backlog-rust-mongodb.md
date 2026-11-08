@@ -1410,21 +1410,6 @@ may run a command.
   a standalone answered `$changeStream`, `replSetGetStatus` and the default
   read/write concern commands differently whoever ran them. Against it the
   Rust server differs on none of 12,053 checks (66 users).
-- [ ] **`explain` of `$score`, `$rankFusion` and `$scoreFusion` lists the
-      stage as written.** The stages run since 2026-10-20 (RM-198, fixed),
-      desugared as mongod desugars them, but `explain` shows the stage
-      itself where mongod 8.2.11 shows its desugaring: for `$rankFusion` of
-      two pipelines, `$cursor`, `$replaceRoot`, `$_internalSetWindowFields`
-      (`$rank`), `$addFields`, a `$unionWith` holding the same for the
-      second pipeline, `$group`, two `$addFields`, `$setMetadata`, `$sort`
-      (`sortKey: {score: -1, _id: 1}`) and `$replaceRoot`; `$score` is
-      `$setMetadata` and, normalised, `$_internalSetWindowFields` with
-      `$minMaxScaler`. Also not reproduced: either fusion stage as the first
-      stage of a `$facet` sub-pipeline, which mongod accepts and answers
-      with the documents in collection order (in a `$lookup` or
-      `$unionWith` sub-pipeline both run, as on mongod).
-      Backlog-ID: RM-200
-      Verify: tests/backlog/test_rm_added_in_82.py::test_explain_of_rank_fusion_is_its_desugaring
 - **Scope decision — `mapReduce` with a named `out`** (Joe, 2026-10-16,
   formerly RM-027). Refused as a `--noscripting` mongod 8.2.11 refuses it
   (31264, since 2026-10-20; it answered 9 before), like every map/reduce
@@ -2019,6 +2004,34 @@ What is left, all on the RUST MongoDB server:
       decision, as for the sort with a limit.
       Backlog-ID: RM-312
       Verify: tests/backlog/test_rm_found_2026_10_25.py::test_a_blocking_sort_leaves_ties_as_mongods_sort_does
+- [ ] **`explain` of a `$unionWith` lists its sub-pipeline as written.**
+      mongod 8.2.11 explains the sub-pipeline as it does the outer one: a
+      `$cursor` of its own (its `queryPlanner`, and `executionStats` above
+      that verbosity) holding the stages it absorbs, then the rest as
+      listed. `[{$unionWith: {coll: "s", pipeline: [{$match: {x: 1}},
+      {$project: {x: 1}}]}}]` is `$cursor` (`{x: {$eq: 1}}`,
+      `PROJECTION_SIMPLE`) on mongod and `$match`, `$project` here. A
+      `$rankFusion` or `$scoreFusion` input pipeline's `$unionWith` lists
+      its stages desugared (RM-200) but without that `$cursor`. Found
+      2026-11-08 working RM-200.
+      Backlog-ID: RM-426
+      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_union_with_sub_pipeline_is_explained
+- [ ] **`explain` lists a `$sort` and the `$limit` after it as two stages
+      where the cursor does not absorb them.** mongod 8.2.11 lists one
+      `$sort: {sortKey, limit}` after a `$replaceRoot`, in a `$facet`
+      sub-pipeline, and after a `$rankFusion` (its own `$sort` takes the
+      `limit`), and the stages before it then count every document, not
+      the `limit` the `$limit` pulled. Found 2026-11-08 working RM-200.
+      Backlog-ID: RM-427
+      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_sort_and_limit_after_the_cursor_are_one_stage
+- [ ] **A `$facet` whose sub-pipeline keeps a sort key plans no
+      `SORT_KEY_GENERATOR`.** mongod 8.2.11's `$cursor` under a `$facet`
+      holding a `$sort` with `outputSortKeyMetadata` (a `$setWindowFields`
+      `$rank`, a `$rankFusion` input) is `SORT_KEY_GENERATOR` over the
+      `COLLSCAN`; this server's is the `COLLSCAN`. Found 2026-11-08 working
+      RM-200.
+      Backlog-ID: RM-428
+      Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_facet_that_reads_sort_keys_has_a_key_generator
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 

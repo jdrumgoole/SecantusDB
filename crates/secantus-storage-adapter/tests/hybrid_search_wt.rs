@@ -189,3 +189,108 @@ fn hybrid_stages_run_in_lookup_and_union_sub_pipelines() {
         assert_eq!(code, 40218);
     });
 }
+
+/// The stage names `explain` lists after the cursor (RM-200).
+fn listed(c: &mut CommandContext, pipeline: Vec<Document>) -> Vec<String> {
+    let reply = dispatch_full(
+        &doc! {"explain": {"aggregate": "s", "pipeline": pipeline, "cursor": {}}, "verbosity": "executionStats"},
+        c,
+    );
+    reply
+        .get_array("stages")
+        .unwrap_or_else(|_| panic!("no stages in {reply}"))
+        .iter()
+        .skip(1)
+        .map(|s| s.as_document().unwrap().keys().next().unwrap().clone())
+        .collect()
+}
+
+#[test]
+fn explain_lists_the_stages_mongod_desugars_hybrid_stages_into() {
+    with_wt(|c| {
+        seed(c);
+        let rank = listed(
+            c,
+            vec![doc! {"$rankFusion": {"input": {"pipelines": {
+                "a": [{"$sort": {"x": 1}}],
+                "b": [{"$sort": {"y": -1}}],
+            }}}}],
+        );
+        assert_eq!(
+            rank,
+            [
+                "$replaceRoot",
+                "$_internalSetWindowFields",
+                "$addFields",
+                "$unionWith",
+                "$group",
+                "$addFields",
+                "$addFields",
+                "$setMetadata",
+                "$sort",
+                "$replaceRoot",
+            ]
+        );
+        let score = listed(
+            c,
+            vec![
+                doc! {"$score": {"score": "$x", "normalization": "minMaxScaler"}},
+                doc! {"$project": {"s": {"$meta": "score"}}},
+            ],
+        );
+        assert_eq!(
+            score,
+            [
+                "$setMetadata",
+                "$replaceRoot",
+                "$addFields",
+                "$_internalSetWindowFields",
+                "$setMetadata",
+                "$replaceRoot",
+                "$project",
+            ]
+        );
+    });
+}
+
+#[test]
+fn rank_fusion_runs_as_the_first_stage_of_a_facet() {
+    with_wt(|c| {
+        seed(c);
+        let reply = dispatch_full(
+            &doc! {"aggregate": "s", "pipeline": [{"$facet": {"f": [
+                {"$rankFusion": {"input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}}}},
+                {"$project": {"_id": 1}},
+            ]}}], "cursor": {}},
+            c,
+        );
+        let batch = reply
+            .get_document("cursor")
+            .and_then(|cur| cur.get_array("firstBatch"))
+            .unwrap_or_else(|_| panic!("no batch in {reply}"));
+        let ids: Vec<i32> = batch[0]
+            .as_document()
+            .unwrap()
+            .get_array("f")
+            .unwrap()
+            .iter()
+            .map(|d| d.as_document().unwrap().get_i32("_id").unwrap())
+            .collect();
+        assert_eq!(ids, [5, 4, 3, 2, 1, 0]);
+        let second = error(
+            c,
+            vec![doc! {"$facet": {"f": [
+                {"$match": {}},
+                {"$rankFusion": {"input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}}}},
+            ]}}],
+        );
+        assert_eq!(second.0, 10170100);
+        let score_fusion = error(
+            c,
+            vec![doc! {"$facet": {"f": [
+                {"$scoreFusion": {"input": {"pipelines": {"a": [{"$score": {"score": "$x"}}]}, "normalization": "none"}}},
+            ]}}],
+        );
+        assert_eq!(score_fusion.0, 40218);
+    });
+}

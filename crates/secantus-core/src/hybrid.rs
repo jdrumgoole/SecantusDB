@@ -32,12 +32,12 @@ pub const SCORE_DETAILS: &str = "__secantus_meta_scoreDetails";
 /// The field a fusion input pipeline wraps each document in.
 const FUSE: &str = "__secantus_fuse";
 
-const SCORE_DESCRIPTION: &str = "the score calculated from multiplying a weight in the range \
+pub const SCORE_DESCRIPTION: &str = "the score calculated from multiplying a weight in the range \
                                  [0,1] with either a normalized or nonnormalized value:";
-const RANK_DESCRIPTION: &str = "value output by reciprocal rank fusion algorithm, computed as \
+pub const RANK_DESCRIPTION: &str = "value output by reciprocal rank fusion algorithm, computed as \
                                 sum of (weight * (1 / (60 + rank))) across input pipelines from \
                                 which this document is output, from:";
-const FUSION_DESCRIPTION: &str = "the value calculated by combining the scores (either \
+pub const FUSION_DESCRIPTION: &str = "the value calculated by combining the scores (either \
                                   normalized or raw) across input pipelines from which this \
                                   document is output from:";
 

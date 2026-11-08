@@ -164,9 +164,10 @@ def test_hybrid_search_stages_82_added(rust_mongo: Any, mongod: Any) -> None:
     assert _stages(rust_mongo) == _stages(mongod)
 
 
-@pytest.mark.backlog("RM-200")
+@pytest.mark.backlog_fixed("RM-200")
 def test_explain_of_rank_fusion_is_its_desugaring(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 explains `$rankFusion` as the stages it desugars into."""
+    """mongod 8.2.11 explained `$rankFusion` as the stages it desugars into,
+    where this server listed the stage as written."""
     answers = []
     for client in (rust_mongo, mongod):
         db = client["rm200"]
@@ -185,3 +186,267 @@ def test_explain_of_rank_fusion_is_its_desugaring(rust_mongo: Any, mongod: Any) 
         answers.append([next(iter(stage)) for stage in reply.get("stages", [])])
     got, want = answers
     assert got == want
+
+
+# What each listing of RM-200 covers: every normalisation, weights, score
+# details and the custom combination, a stage the cursor absorbs past
+# `$score`, and the score read back after a fusion (mongod 8.2.11,
+# measured 2026-11-08).
+HYBRID_LISTINGS: dict[str, list] = {
+    "rank_two": [
+        {
+            "$rankFusion": {
+                "input": {"pipelines": {"a": [{"$sort": {"x": 1}}], "b": [{"$sort": {"y": -1}}]}}
+            }
+        }
+    ],
+    "rank_details": [
+        {
+            "$rankFusion": {
+                "input": {
+                    "pipelines": {
+                        "a": [{"$sort": {"x": 1}}],
+                        "b": [{"$match": {"y": {"$gt": 0}}}, {"$sort": {"y": -1}}, {"$limit": 3}],
+                    }
+                },
+                "combination": {"weights": {"a": 2}},
+                "scoreDetails": True,
+            }
+        }
+    ],
+    "rank_unabsorbed": [
+        {
+            "$rankFusion": {
+                "input": {
+                    "pipelines": {
+                        "a": [{"$sort": {"x": 1}}, {"$skip": 1}, {"$match": {"y": {"$gt": 0}}}]
+                    }
+                }
+            }
+        }
+    ],
+    "rank_then_meta": [
+        {"$rankFusion": {"input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}}}},
+        {"$addFields": {"z": 1}},
+        {"$sort": {"s": {"$meta": "score"}, "x": 1}},
+        {"$project": {"x": 1, "s": {"$meta": "score"}}},
+    ],
+    "score_none": [{"$score": {"score": "$x", "weight": 1}}],
+    "score_min_max": [
+        {
+            "$score": {
+                "score": "$x",
+                "normalization": "minMaxScaler",
+                "weight": 0.5,
+                "scoreDetails": True,
+            }
+        }
+    ],
+    "score_sigmoid": [
+        {
+            "$score": {
+                "score": {"$add": ["$x", 1]},
+                "normalization": "sigmoid",
+                "weight": 0.5,
+                "scoreDetails": True,
+            }
+        }
+    ],
+    "score_paged": [
+        {"$match": {"x": {"$gt": 0}}},
+        {"$score": {"score": "$x"}},
+        {"$limit": 2},
+        {"$replaceWith": {"a": "$x", "s": {"$meta": "score"}}},
+    ],
+    "score_fusion": [
+        {
+            "$scoreFusion": {
+                "input": {
+                    "pipelines": {
+                        "a": [{"$score": {"score": "$x", "normalization": "sigmoid"}}],
+                        "b": [{"$match": {"x": {"$gt": 2}}}, {"$score": {"score": "$y"}}],
+                    },
+                    "normalization": "none",
+                },
+                "combination": {"weights": {"b": 3}},
+                "scoreDetails": True,
+            }
+        }
+    ],
+    "score_fusion_min_max": [
+        {
+            "$scoreFusion": {
+                "input": {
+                    "pipelines": {"a": [{"$score": {"score": "$x", "scoreDetails": True}}]},
+                    "normalization": "minMaxScaler",
+                },
+                "scoreDetails": True,
+            }
+        }
+    ],
+    "score_fusion_expression": [
+        {
+            "$scoreFusion": {
+                "input": {
+                    "pipelines": {
+                        "a": [{"$score": {"score": "$x"}}],
+                        "b": [{"$score": {"score": "$y"}}],
+                    },
+                    "normalization": "sigmoid",
+                },
+                "combination": {"method": "expression", "expression": {"$add": ["$$a", "$$b"]}},
+                "scoreDetails": True,
+            }
+        }
+    ],
+}
+
+PAGING = {"$cursor", "$match", "$sort", "$limit", "$skip"}
+
+
+def _trimmed(stages: list) -> list:
+    """`stages` with each `$unionWith`'s from where its input pipeline's own
+    stages end, in a `$facet` too: what a `$unionWith`'s sub-pipeline shows
+    of its cursor is RM-426's, not this item's."""
+    out = []
+    for stage in stages:
+        if "$unionWith" in stage:
+            inner = stage["$unionWith"]["pipeline"]
+            while inner and next(iter(inner[0])) in PAGING:
+                inner = inner[1:]
+            stage = {"$unionWith": {**stage["$unionWith"], "pipeline": _trimmed(inner)}}
+        elif "$facet" in stage:
+            stage = {"$facet": {k: _trimmed(v) for k, v in stage["$facet"].items()}}
+        out.append(stage)
+    return out
+
+
+def _listed(stages: list) -> list:
+    """The stages after the cursor, trimmed."""
+    return _trimmed(stages[1:])
+
+
+def _hybrid_listings(client: Any) -> dict:
+    client.drop_database("rm200l")
+    db = client["rm200l"]
+    db.s.insert_many([{"_id": i, "x": i, "y": (i * 7) % 5} for i in range(6)])
+    out = {}
+    for name, pipeline in HYBRID_LISTINGS.items():
+        reply = db.command(
+            "explain",
+            {"aggregate": "s", "pipeline": pipeline, "cursor": {}},
+            verbosity="queryPlanner",
+        )
+        cursor = reply["stages"][0]["$cursor"]["queryPlanner"]
+        plan = cursor["winningPlan"]
+        out[name] = {
+            "cursor": [cursor["parsedQuery"], plan["stage"], plan.get("limitAmount")],
+            "stages": json.loads(json_util.dumps(_listed(reply["stages"]))),
+            "run": json.loads(json_util.dumps(list(db.s.aggregate(pipeline)))),
+        }
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-200")
+def test_explain_lists_hybrid_stages_as_mongod_desugars_them(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 listed `$score`, `$rankFusion` and `$scoreFusion` as
+    the stages it desugars them into, a `$limit` behind `$score` in the
+    cursor, and a score read as `{$meta: "score"}`; this server listed each
+    stage as written."""
+    got, want = _hybrid_listings(rust_mongo), _hybrid_listings(mongod)
+    for name in HYBRID_LISTINGS:
+        assert got[name] == want[name], name
+
+
+FACETS: list[list] = [
+    [{"$facet": {"f": [{"$rankFusion": {"input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}}}}]}}],
+    [
+        {
+            "$facet": {
+                "f": [
+                    {
+                        "$rankFusion": {
+                            "input": {
+                                "pipelines": {
+                                    "a": [{"$sort": {"x": -1}}],
+                                    "b": [{"$sort": {"y": 1}}],
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    ],
+    [
+        {
+            "$facet": {
+                "f": [
+                    {
+                        "$rankFusion": {
+                            "input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}},
+                            "scoreDetails": True,
+                        }
+                    },
+                    {"$project": {"s": {"$meta": "score"}, "d": {"$meta": "scoreDetails"}}},
+                ],
+                "g": [{"$count": "n"}],
+            }
+        }
+    ],
+    [
+        {
+            "$facet": {
+                "f": [
+                    {"$match": {}},
+                    {"$rankFusion": {"input": {"pipelines": {"a": [{"$sort": {"x": -1}}]}}}},
+                ]
+            }
+        }
+    ],
+    [
+        {
+            "$facet": {
+                "f": [
+                    {
+                        "$scoreFusion": {
+                            "input": {
+                                "pipelines": {"a": [{"$score": {"score": "$x"}}]},
+                                "normalization": "none",
+                            }
+                        }
+                    }
+                ]
+            }
+        }
+    ],
+    [{"$facet": {"f": [{"$project": {"s": {"$meta": "score"}}}]}}],
+]
+
+
+def _facets(client: Any) -> list:
+    client.drop_database("rm200f")
+    db = client["rm200f"]
+    db.s.insert_many([{"_id": i, "x": i, "y": (i * 7) % 5} for i in range(6)])
+    out = []
+    for pipeline in FACETS:
+        run = mongo_answer(lambda p=pipeline: list(db.s.aggregate(p)))
+        listed = mongo_answer(
+            lambda p=pipeline: db.command(
+                "explain", {"aggregate": "s", "pipeline": p, "cursor": {}}, verbosity="queryPlanner"
+            )["stages"]
+        )
+        if listed[0] == "ok":
+            # The cursor under a `$facet` is RM-428's.
+            listed = ("ok", _listed(listed[1]))
+        out.append(json.loads(json_util.dumps([run, listed])))
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-200")
+def test_rank_fusion_runs_first_in_a_facet(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 ran a `$rankFusion` as the first stage of a `$facet`
+    sub-pipeline, its second input over the collection, and listed it
+    desugared; a fusion later in one is 10170100 and a `$scoreFusion` there
+    is 40218. This server refused the first with 10170100."""
+    assert _facets(rust_mongo) == _facets(mongod)

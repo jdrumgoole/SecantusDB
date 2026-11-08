@@ -1935,7 +1935,7 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError
                 SEARCH_INDEX_ATLAS_MSG,
             ));
         }
-        if !recognized_stage(name) {
+        if !recognized_stage(name) && !crate::hybrid::is_prepared_stage(name) {
             return Err(CommandError::new(
                 40324,
                 "Location40324",
