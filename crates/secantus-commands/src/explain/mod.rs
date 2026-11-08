@@ -1858,8 +1858,19 @@ pub fn explain(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     Ok(out)
 }
 
-fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
+/// An `explain` request, parsed.
+pub(crate) struct Parsed {
+    inner: Document,
+    verbosity: Verbosity,
+    inline: bool,
+    name: String,
+}
+
+/// Parse an `explain` as mongod's parser does before the command runs --
+/// and so before it takes a lock (RM-185): its own fields, then the
+/// explained command's name and namespace. Every error here is one mongod
+/// answers having taken no lock.
+pub(crate) fn parse(doc: &Document, db: &str) -> Result<Parsed, CommandError> {
     let inner = match doc.get("explain") {
         None | Some(Bson::Null) => {
             return Err(err(
@@ -1899,7 +1910,6 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // An aggregate's own `explain: true` arrives here marked.
     let inline = doc.contains_key("$inline");
     let name = inner.keys().next().cloned().unwrap_or_default();
-    let db = ctx.db_name.clone();
     if let Ok(other) = inner.get_str("$db") {
         if other != db {
             return Err(err(
@@ -1931,6 +1941,53 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             }
         }
     }
+    let lowered = name.to_ascii_lowercase();
+    match name.as_str() {
+        "find" | "count" | "distinct" | "update" | "delete" => {
+            collection(&inner, &name, db)?;
+        }
+        "aggregate" => {}
+        _ if lowered == "findandmodify" || lowered == "mapreduce" => {
+            collection(&inner, &name, db)?;
+        }
+        other => return Err(unexplainable(other)),
+    }
+    Ok(Parsed {
+        inner,
+        verbosity,
+        inline,
+        name,
+    })
+}
+
+/// mongod's refusal of an explained command it does not explain.
+fn unexplainable(name: &str) -> CommandError {
+    if name == "explain" {
+        err(20, "IllegalOperation", "Explain cannot explain itself.")
+    } else if known_command(name) {
+        err(
+            20,
+            "IllegalOperation",
+            format!("Cannot explain cmd: {name}"),
+        )
+    } else {
+        err(
+            59,
+            "CommandNotFound",
+            format!("Explain failed due to unknown command: {name}"),
+        )
+    }
+}
+
+fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
+    let _budgets = secantus_core::memlimit::with_budgets(crate::aggregate::budgets_of(ctx));
+    let Parsed {
+        inner,
+        verbosity,
+        inline,
+        name,
+    } = parse(doc, &ctx.db_name)?;
+    let db = ctx.db_name.clone();
     let echo = shape::echo(&inner, &db);
     // The views the explained read resolves are on the explain's line
     // (RM-362, measured 8.2.1).
@@ -1979,13 +2036,6 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             refuse_view(&coll, ctx)?;
             s
         }
-        "explain" => {
-            return Err(err(
-                20,
-                "IllegalOperation",
-                "Explain cannot explain itself.",
-            ))
-        }
         // mongod explains a map/reduce by running its JavaScript; with no
         // engine it refuses as it refuses the command (`--noscripting`
         // 8.2.11, 2026-10-20).
@@ -2001,20 +2051,7 @@ fn explain_reply(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ),
             ));
         }
-        _ if known_command(&name) => {
-            return Err(err(
-                20,
-                "IllegalOperation",
-                format!("Cannot explain cmd: {name}"),
-            ))
-        }
-        _ => {
-            return Err(err(
-                59,
-                "CommandNotFound",
-                format!("Explain failed due to unknown command: {name}"),
-            ))
-        }
+        other => return Err(unexplainable(other)),
     };
     let storage = ctx.storage()?;
     let request = if crate::views::is_view(storage, &db, &shape.coll) {

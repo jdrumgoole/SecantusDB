@@ -14,6 +14,7 @@ from typing import Any
 
 import pymongo
 import pytest
+from bson import SON
 
 
 @pytest.fixture(scope="module")
@@ -639,30 +640,156 @@ def test_lock_counts_of_admin_commands(rust_mongo: Any, mongod: Any) -> None:
     assert _admin_commands(rust_mongo) == _reference(_admin_commands, mongod)
 
 
+#: The `apiParameters` every `validateDBMetadata` here sends.
+_STRICT_V1 = {"version": "1", "strict": True}
+
+
+def _validate_db_metadata(on: Any, **fields: Any) -> Callable[[], Any]:
+    return lambda: on.command(
+        SON([("validateDBMetadata", 1), *fields.items()]),
+    )
+
+
 def _before_parsing(client: Any) -> list:
-    db = client[_fresh("rm185p")]
+    name = _fresh("rm185p")
+    db = client[name]
     db.x.insert_one({})
+    db.y.insert_one({})
+    db.create_collection("v", viewOn="x", pipeline=[])
     return _deltas(
         client,
         [
             ("explain of nothing", lambda: db.command("explain", 1)),
-            ("dataSize of nothing", lambda: db.command("dataSize", 1)),
-            ("planCacheClear of nothing", lambda: db.command("planCacheClear", 1)),
+            ("explain of a null", lambda: db.command("explain", None)),
+            ("explain of no command", lambda: db.command("explain", {})),
+            ("explain of a bad namespace", lambda: db.command("explain", {"find": 1})),
+            ("explain of an empty one", lambda: db.command("explain", {"find": ""})),
+            ("explain of an explain", lambda: db.command("explain", {"explain": {"find": "x"}})),
+            ("explain of no such command", lambda: db.command("explain", {"nosuch": "x"})),
+            ("explain of a count", lambda: db.command("explain", {"count": 1})),
             (
-                "validateDBMetadata",
-                lambda: db.command(
-                    "validateDBMetadata", apiParameters={"version": "1", "strict": True}
-                ),
+                "explain verbosity typed wrong",
+                lambda: db.command("explain", {"find": "x"}, verbosity=1),
+            ),
+            (
+                "explain verbosity unknown",
+                lambda: db.command("explain", {"find": "x"}, verbosity="bogus"),
+            ),
+            (
+                "explain unknown field",
+                lambda: db.command("explain", {"find": "x"}, bogus=1),
+            ),
+            (
+                "explain of another $db",
+                lambda: db.command("explain", {"find": "x", "$db": "other"}),
+            ),
+            (
+                "explain with a writeConcern",
+                lambda: db.command("explain", {"find": "x"}, writeConcern={"w": 1}),
+            ),
+            ("dataSize of nothing", lambda: db.command("dataSize", 1)),
+            ("dataSize of no collection", lambda: db.command("dataSize", "nodot")),
+            ("dataSize min alone", lambda: db.command("dataSize", f"{name}.x", min={"a": 1})),
+            ("dataSize max alone", lambda: db.command("dataSize", f"{name}.x", max={"a": 1})),
+            ("dataSize keyPattern", lambda: db.command("dataSize", f"{name}.x", keyPattern=1)),
+            ("dataSize unknown field", lambda: db.command("dataSize", f"{name}.x", bogus=1)),
+            ("planCacheClear of nothing", lambda: db.command("planCacheClear", 1)),
+            ("planCacheClear of a null", lambda: db.command("planCacheClear", None)),
+            ("planCacheClear of an empty name", lambda: db.command("planCacheClear", "")),
+            ("planCacheClearFilters of nothing", lambda: db.command("planCacheClearFilters", 1)),
+            ("planCacheListFilters of nothing", lambda: db.command("planCacheListFilters", 1)),
+            ("planCacheSetFilter of an empty name", lambda: db.command("planCacheSetFilter", "")),
+            ("validateDBMetadata without apiParameters", _validate_db_metadata(db, db=name)),
+            (
+                "validateDBMetadata of a numeric version",
+                _validate_db_metadata(db, db=name, apiParameters={"version": 1}),
+            ),
+            (
+                "validateDBMetadata of a numeric strict",
+                _validate_db_metadata(db, db=name, apiParameters={"version": "1", "strict": 1}),
+            ),
+            (
+                "validateDBMetadata of a numeric db",
+                _validate_db_metadata(db, db=1, apiParameters=_STRICT_V1),
+            ),
+            # Then the rounds it takes, scoped to this database: with no `db`
+            # it reads every database, and so counts what the module's other
+            # tests left on each server.
+            (
+                "validateDBMetadata of a database",
+                _validate_db_metadata(db, db=name, apiParameters=_STRICT_V1),
+            ),
+            (
+                "validateDBMetadata of a database, not strict",
+                _validate_db_metadata(db, db=name, apiParameters={"version": "1"}),
+            ),
+            (
+                "validateDBMetadata of a collection",
+                _validate_db_metadata(db, db=name, collection="x", apiParameters=_STRICT_V1),
+            ),
+            (
+                "validateDBMetadata of a view",
+                _validate_db_metadata(db, db=name, collection="v", apiParameters=_STRICT_V1),
+            ),
+            (
+                "validateDBMetadata of no such collection",
+                _validate_db_metadata(db, db=name, collection="nosuch", apiParameters=_STRICT_V1),
+            ),
+            (
+                "validateDBMetadata of no such database",
+                _validate_db_metadata(db, db=_fresh("nosuch"), apiParameters=_STRICT_V1),
+            ),
+        ],
+    )
+
+
+@pytest.mark.backlog_fixed("RM-185")
+def test_lock_counts_before_a_command_parses(rust_mongo: Any, mongod: Any) -> None:
+    """mongod takes a command's locks inside the command, after it parses, so
+    one refused as malformed takes none; this server took the command's
+    chain before running it. It now parses `explain`, `dataSize`, the plan
+    cache commands and `validateDBMetadata` first. `validateDBMetadata`
+    took the generic chain; it now reads each database in its scope, and
+    each of its collections -- views left out -- or the one named (measured
+    8.2.11, 2026-11-08)."""
+    _same_counts(_before_parsing(rust_mongo), _reference(_before_parsing, mongod))
+
+
+def _parsed_after_locking(client: Any) -> list:
+    db = client[_fresh("rm185q")]
+    db.x.insert_one({})
+    return _deltas(
+        client,
+        [
+            ("find, filter typed wrong", lambda: db.command("find", "x", filter=1)),
+            ("find, unknown field", lambda: db.command("find", "x", bogus=1)),
+            ("aggregate without a pipeline", lambda: db.command("aggregate", "x")),
+            (
+                "aggregate of no collection",
+                lambda: db.command("aggregate", 1, pipeline=[], cursor={}),
+            ),
+            ("getMore of a name", lambda: db.command("getMore", "x", collection="x")),
+            (
+                "listCollections, filter typed wrong",
+                lambda: db.command("listCollections", 1, filter=1),
+            ),
+            ("insert without documents", lambda: db.command("insert", "x")),
+            ("update without updates", lambda: db.command("update", "x")),
+            ("dropIndexes without an index", lambda: db.command("dropIndexes", "x")),
+            ("createIndexes without indexes", lambda: db.command("createIndexes", "x")),
+            ("dbStats, scale typed wrong", lambda: db.command("dbStats", 1, scale="a")),
+            (
+                "listDatabases, filter typed wrong",
+                lambda: client.admin.command("listDatabases", 1, filter=1),
             ),
         ],
     )
 
 
 @pytest.mark.backlog("RM-185")
-def test_lock_counts_before_a_command_parses(rust_mongo: Any, mongod: Any) -> None:
-    """mongod takes a command's locks inside the command, after it parses, so
-    one refused as malformed takes none; and `validateDBMetadata` reads each
-    collection (8 global IS for one database of two collections; measured
-    8.2.11, 2026-10-24). This server takes a command's chain before running
-    it, and gives `validateDBMetadata` the generic one."""
-    assert _before_parsing(rust_mongo) == _reference(_before_parsing, mongod)
+def test_lock_counts_of_other_malformed_commands(rust_mongo: Any, mongod: Any) -> None:
+    """The same, for commands whose handler finds the error after the
+    statement's locks: mongod refuses each having taken no lock, and this
+    server takes the command's chain or rounds first (measured 8.2.11,
+    2026-11-08)."""
+    _same_counts(_parsed_after_locking(rust_mongo), _reference(_parsed_after_locking, mongod))

@@ -1622,13 +1622,23 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             | "listIndexes"
             | "killCursors"
             | "compact"
+            | "planCacheClear"
+            | "planCacheClearFilters"
+            | "planCacheListFilters"
+            | "planCacheSetFilter"
     ) {
         return None;
     }
     let invalid = |message: String| Some(CommandError::new(73, "InvalidNamespace", message));
     match doc.get(name) {
         Some(Bson::String(coll)) if coll.is_empty() => invalid(match name {
-            "distinct" | "validate" | "compact" => {
+            "distinct"
+            | "validate"
+            | "compact"
+            | "planCacheClear"
+            | "planCacheClearFilters"
+            | "planCacheListFilters"
+            | "planCacheSetFilter" => {
                 format!("Invalid namespace specified '{db}'")
             }
             _ => format!("Invalid namespace specified: {db}"),
@@ -1639,6 +1649,19 @@ fn collection_name_problem(name: &str, doc: &Document, db: &str) -> Option<Comma
             secantus_core::query::bson_type_name(other)
         )),
         None => None,
+    }
+}
+
+/// The parse a command's handler starts with, run ahead of the statement's
+/// locks: mongod parses a request before it runs it, and takes its locks
+/// inside the run, so a request it refuses as malformed takes no lock
+/// (RM-185, measured 8.2.11). The handler parses again, with the same code.
+fn parse_before_locks(name: &str, doc: &Document, db: &str) -> Result<(), CommandError> {
+    match name {
+        "explain" => explain::parse(doc, db).map(drop),
+        "dataSize" | "datasize" => stats_admin::parse_data_size(doc).map(drop),
+        "validateDBMetadata" => misc_admin::parse_validate_db_metadata(doc).map(drop),
+        _ => Ok(()),
     }
 }
 
@@ -1745,6 +1768,11 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             // check, so it sits inside the `Some(handler)` arm; this check WINS
             // over authorization (13), so it sits above `authorize`.
             if let Err(e) = argtypes::require_max_time_ms(doc, name) {
+                return e.into_reply();
+            }
+            // mongod parses a command before it takes a lock, so one it
+            // refuses as malformed takes none (RM-185).
+            if let Err(e) = parse_before_locks(name, doc, &ctx.db_name) {
                 return e.into_reply();
             }
             // Auth gating + RBAC run after CommandNotFound but before the

@@ -220,24 +220,13 @@ pub fn db_check(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                     doc! {"dbCheck": "admin.$cmd", "type": "start"},
                 )
                 .map_err(crate::util::command_error)?;
-            let mut colls = storage
-                .list_collections(&db)
-                .map_err(crate::util::command_error)?;
             // A database's views are the documents of `system.views`, which
             // mongod checks as it does any collection.
-            let has_views = !crate::ts_buckets::view_definitions(storage.as_ref(), &db)?.is_empty();
-            if has_views && !colls.iter().any(|c| c == "system.views") {
-                colls.push("system.views".to_string());
-            }
+            let mut colls = crate::views::catalog_collections(storage.as_ref(), &db)?;
             // mongod walks its catalog in its own internal order; this is
             // name order.
             colls.sort();
             for coll in colls {
-                // `system.views` answers the catalog's question for its views,
-                // so it is asked by name.
-                if coll != "system.views" && crate::views::is_view(storage.as_ref(), &db, &coll) {
-                    continue;
-                }
                 let ns = format!("{db}.{coll}");
                 let mut md5 = Md5::new();
                 for (_, raw) in sorted_rows(storage.as_ref(), &db, &coll)? {

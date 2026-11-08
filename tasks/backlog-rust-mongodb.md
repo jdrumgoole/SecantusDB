@@ -373,6 +373,14 @@ These are explicit non-goals. Don't add them without a reason.
     `TestCausalConsistency_Supported` (29/29 passed). Re-include them.
   - Rust's `diagnostics::ok_transaction` ("no-op commit/abort") is dead code
     that nothing dispatches to.
+- [ ] **An `aggregate` without `pipeline` is not refused as mongod refuses
+      it.** `pipeline` is a required field: mongod 8.2.11 answers 40414
+      "BSON field 'aggregate.pipeline' is missing but a required field" to
+      `{aggregate: "x"}` and `{aggregate: 1}`, with or without `cursor`.
+      This server asks for the cursor (9), and given one runs an empty
+      pipeline and answers `ok`. Found 2026-11-08 working RM-185.
+      Backlog-ID: RM-431
+      Verify: tests/backlog/test_rm_431_432.py::test_an_aggregate_without_a_pipeline_is_refused
 
 ### 2026-09-01: two PLANNER differences, measured and dispositioned
 
@@ -1494,13 +1502,20 @@ Still different:
       and 4 with every operation logged as slow: macOS 8.2.11 gave exactly
       that in 20 of 20 runs; the Linux build sometimes polls once less), and
       the tests accept any count mongod gave in its five runs for that one
-      lock (Joe, 2026-10-27). Still different:
-      mongod takes a command's locks inside it, after it parses, so a
-      malformed one (`{explain: 1}`, `{dataSize: 1}`) takes none, where this
-      server takes the command's chain before running it;
-      `validateDBMetadata` reads each collection (8 global IS for a
-      database of two), which this server gives the generic chain; the
-      transaction commands, which need a replica set, were measured on a
+      lock (Joe, 2026-10-27). mongod takes a command's locks inside it,
+      after it parses, so a malformed one takes none: since 2026-11-08
+      `explain`, `dataSize`, the plan cache commands and
+      `validateDBMetadata` parse before their locks here too
+      (`parse_before_locks`), and `validateDBMetadata` takes a round on each
+      database it reads and on each of its collections. Still different:
+      the other commands find a malformed field in their handler, after
+      their locks -- `find` with a wrongly typed `filter` or an unknown
+      field, `aggregate` without `pipeline` or on `1` with no stage to read
+      from, `getMore` of a name, `listCollections` and `listDatabases` with
+      a wrongly typed `filter`, `insert`, `update`, `createIndexes` and
+      `dropIndexes` without their required field, and `dbStats` with a
+      wrongly typed `scale` take their chain or rounds where mongod takes
+      none; the transaction commands, which need a replica set, were measured on a
       one-member mongod 8.2.11 set (2026-10-17) cannot be pinned the same
       way: its replication threads take the global IS about twice in any
       window, and its writes take rounds for the oplog and the session table
@@ -1524,7 +1539,7 @@ Still different:
       mongod's slow-operation log (RM-274, closed 2026-10-24): the tests set
       `slowms` out of reach on both servers.
       Backlog-ID: RM-185
-      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_before_a_command_parses
+      Verify: tests/backlog/test_rm_185_locks.py::test_lock_counts_of_other_malformed_commands
 - **Scope decision — `replSetReconfig` takes one member, this server**
   (2026-10-20, under "Explicitly out of scope: real replica sets"). mongod
   8.2.11 accepts a configuration that adds a member it cannot reach and
@@ -2059,6 +2074,17 @@ What is left, all on the RUST MongoDB server:
       RM-200.
       Backlog-ID: RM-428
       Verify: tests/backlog/test_rm_found_2026_11_08_explain_listing.py::test_facet_that_reads_sort_keys_has_a_key_generator
+- [ ] **`explain` of a write misses a required field mongod's parser
+      finds first.** mongod parses the explained command in full before it
+      explains it, required fields before the namespace's type:
+      `{explain: {insert: "x"}}` is 40414 "BSON field 'insert.documents' is
+      missing but a required field", where this server answers 20 "Cannot
+      explain cmd: insert"; `{explain: {update: 1}}` and `{explain: {delete:
+      1}}` name the missing `updates` / `deletes` (40414) where this server
+      refuses the namespace (73). Measured 8.2.11; found 2026-11-08 working
+      RM-185.
+      Backlog-ID: RM-432
+      Verify: tests/backlog/test_rm_431_432.py::test_explain_parses_the_write_it_explains
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
