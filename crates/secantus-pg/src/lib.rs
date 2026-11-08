@@ -21680,7 +21680,7 @@ impl PgHandler {
                             &mut d,
                             &def,
                             &c.pg_type,
-                            c.typmod,
+                            catalog_typmod(c),
                             i + 1,
                             udt_schema,
                             &db,
@@ -23814,7 +23814,7 @@ impl PgHandler {
                         );
                         d.insert(
                             def.field_of("atttypmod").expect("column"),
-                            Bson::Int32(c.typmod),
+                            Bson::Int32(catalog_typmod(c)),
                         );
                         // `ALTER COLUMN ... SET STORAGE / STATISTICS`.
                         if let (Ok(storage), Some(field)) =
@@ -23958,7 +23958,7 @@ impl PgHandler {
                             let mut d = plain(ix.oid, &c.name, atttypid, i + 1);
                             d.insert(
                                 def.field_of("atttypmod").expect("column"),
-                                Bson::Int32(c.typmod),
+                                Bson::Int32(catalog_typmod(c)),
                             );
                             rows.push(d);
                         }
@@ -56342,4 +56342,17 @@ fn first_occurrences(start: Vec<String>, more: impl IntoIterator<Item = String>)
         }
     }
     fields
+}
+
+/// The type modifier the catalog reports for a column. A domain column's is
+/// its domain's own `typtypmod` (what `_pg_truetypmod` reads): `Column::typmod`
+/// holds the width a value is coerced to, which through a domain over a
+/// domain is the innermost domain's (`getBaseTypeAndTypmod`), while 15.19's
+/// catalog answers the outer domain's -1 (RP-551).
+fn catalog_typmod(c: &secantus_pgcatalog::Column) -> i32 {
+    c.extra
+        .get_str("domain_type")
+        .ok()
+        .and_then(secantus_pgplan::domains::user_domain)
+        .map_or(c.typmod, |d| d.typmod)
 }

@@ -1,6 +1,6 @@
 """Gap tests of the divergences found while working RP-529 (a domain
 column's whole row is typed by the domain): RP-551 (a cast to a domain
-over `char(n)` is not blank-padded), RP-552 (a domain's CHECK error inside a
+over `char(n)` was not blank-padded; fixed), RP-552 (a domain's CHECK error inside a
 record literal carries no position), RP-553 (a schema's domain names its
 CHECK after the qualified name), RP-554 (a scalar subquery's array of a row
 type is described as `text[]`), RP-555 (`ALTER DOMAIN ... NOT VALID`
@@ -16,6 +16,7 @@ were measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -26,12 +27,15 @@ from tests.backlog.test_rp_batch26 import _dsn
 _SETUP = [
     "drop type if exists ctp",
     "drop table if exists fc, fcn, fnv, falt, fs cascade",
-    "drop domain if exists dc3n, dc3, dnv, pint cascade",
+    "drop domain if exists dc3n, dc3, dnv, pint, dv3, dn52n, dn52 cascade",
     "drop schema if exists s cascade",
     "create domain dc3 as char(3)",
     "create domain dc3n as dc3",
     "create domain dnv as int",
     "create domain pint as int check (value > 0)",
+    "create domain dv3 as varchar(3) check (value <> 'abcd')",
+    "create domain dn52 as numeric(5,2)",
+    "create domain dn52n as dn52",
     "create schema s",
     "create domain s.sd as int check (value < 100)",
     "create table fc (a dc3, b int)",
@@ -82,13 +86,41 @@ CHAR_DOMAIN = {
     "select octet_length(a) from fcn": [(3,)],
     "select fcn from fcn": [('("ab ")',)],
     "select fc = row('ab '::dc3, 1) from fc": [(True,)],
+    # An explicit cast truncates to the width; a write is refused (22001).
+    "select 'abcd'::dc3n": [("abc",)],
+    "insert into fcn values ('abcd')": (
+        "22001",
+        "value too long for type character(3)",
+        None,
+        None,
+    ),
+    # The padded value is a char(3) to an operator: its blanks do not count.
+    "select 'ab'::dc3 = 'ab'": [(True,)],
+    "select ('ab'::dc3)::text || '|'": [("ab|",)],
 }
 
 
-@pytest.mark.backlog("RP-551")
+@pytest.mark.backlog_fixed("RP-551")
 @pytest.mark.parametrize("query", list(CHAR_DOMAIN))
 def test_char_domain_cast_pads(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CHAR_DOMAIN[query]
+
+
+# Every modifier is the base's, as `coerce_to_domain` applies it before the
+# domain's CHECK runs: `'abcd'::dv3` is `abc`, which passes `value <>
+# 'abcd'`, and a numeric(5,2) rounds, through a domain over it too.
+BASE_TYPMOD = {
+    "select 'abcd'::dv3": [("abc",)],
+    "select 1.234::dn52": [(Decimal("1.23"),)],
+    "select 1.234::dn52n": [(Decimal("1.23"),)],
+    "select 12345.6::dn52n": ("22003", "numeric field overflow", None, None),
+}
+
+
+@pytest.mark.backlog_fixed("RP-551")
+@pytest.mark.parametrize("query", list(BASE_TYPMOD))
+def test_domain_cast_applies_base_typmod(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == BASE_TYPMOD[query]
 
 
 # A field's domain CHECK failing in a record literal is reported at the

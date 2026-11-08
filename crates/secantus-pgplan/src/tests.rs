@@ -4793,3 +4793,47 @@ fn sorts_order_records_by_record_cmp() {
         Some(Ordering::Greater)
     );
 }
+
+/// RP-551: a domain's values are coerced to its base type at the base's
+/// modifier, `getBaseTypeAndTypmod`'s, through a domain over a domain too
+/// (`dc3n` over `dc3 char(3)` is a width-3 `bpchar`, though its own
+/// `typtypmod` is -1), and an explicit cast truncates and pads. Answers
+/// measured on PostgreSQL 15.19.
+#[test]
+fn a_domain_over_char_n_coerces_to_its_base_width() {
+    let domain = |name: &str, oid, base: &str, typmod| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        default_sql: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc3", 90001, "bpchar", 7),
+        domain("dc3n", 90002, "dc3", -1),
+    ]);
+    let (base, typmod, chain) = domains::base_type_and_typmod("dc3n").expect("a domain");
+    assert_eq!((base.as_str(), typmod), ("bpchar", 7));
+    assert_eq!(
+        chain.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        ["dc3n", "dc3"]
+    );
+    assert!(domains::base_type_and_typmod("bpchar").is_none());
+    assert!(is_bpchar_type("dc3n") && is_bpchar_type("bpchar") && !is_bpchar_type("text"));
+    let s = |t: &str| Bson::String(t.to_string());
+    assert_eq!(explicit_typmod(s("ab"), "bpchar", 7).unwrap(), s("ab "));
+    assert_eq!(explicit_typmod(s("abcd"), "bpchar", 7).unwrap(), s("abc"));
+    assert_eq!(explicit_typmod(s("abcd"), "varchar", 7).unwrap(), s("abc"));
+    // A column of the outer domain stores the innermost base and its width.
+    match plan_ok("CREATE TABLE fcn (a dc3n)") {
+        Statement::CreateTable(def, _) => {
+            let c = &def.columns[0];
+            assert_eq!((c.pg_type.as_str(), c.typmod), ("bpchar", 7));
+            assert_eq!(c.extra.get_str("domain_type").ok(), Some("dc3n"));
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    domains::set_user_domains(Vec::new());
+}

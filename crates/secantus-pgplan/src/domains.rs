@@ -142,6 +142,28 @@ pub fn domain_base(name: &str) -> Option<String> {
     user_domain(name).map(|d| d.base)
 }
 
+/// `getBaseTypeAndTypmod`: a domain's innermost base type, the type
+/// modifier a value is coerced to on its way into the domain, and the
+/// domains of the chain, outermost first. `None` when `name` is no domain.
+///
+/// The modifier is the INNERMOST domain's (`typtypmod`): a domain over a
+/// domain cannot declare one of its own, so `dc3n` over `dc3 char(3)` is
+/// `bpchar` of width 3 although its own `typtypmod` is -1 (15.19).
+pub fn base_type_and_typmod(name: &str) -> Option<(String, i32, Vec<Domain>)> {
+    let mut chain: Vec<Domain> = Vec::new();
+    let mut base = name.to_string();
+    // Bounded: a catalog cannot hold a cycle, but a bad one must not hang.
+    while let Some(d) = user_domain(&base) {
+        if chain.len() > 16 || d.base == base {
+            break;
+        }
+        base = d.base.clone();
+        chain.push(d);
+    }
+    let typmod = chain.last()?.typmod;
+    Some((base, typmod, chain))
+}
+
 /// Check `value` against domain `name`: 23502 for a NULL the domain refuses,
 /// 23514 naming the first CHECK that is false.
 pub fn domain_check(name: &str, value: &Bson) -> Result<()> {
