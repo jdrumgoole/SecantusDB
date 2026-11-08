@@ -1929,13 +1929,28 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       more than once` at the second, 25; here the first wins).
       Verify: tests/backlog/test_rp_fromless_analysis.py::test_with_clause_checks
       Backlog-ID: RP-504
-- [ ] **A subquery's bare name for a column of an outer set-operation FROM
-      item is not found.** `select (select a) from (select 1 a union select
-      2) t` answers 1 and 2 on PostgreSQL; here it is 42703 `column "a" does
-      not exist` with the cannot-be-referenced HINT, the same through a
-      `(values (a))`. Qualified, `(select t.a)`, it works.
-      Verify: tests/backlog/test_rp_fromless_analysis.py::test_correlation_over_a_set_operation
-      Backlog-ID: RP-505
+
+## Found while working RP-505 (2026-11-08)
+
+Measured on PostgreSQL 15.19.
+
+- [ ] **A subquery's bare name for a column of a WITH item in FROM, or of
+      a FROM-subquery's star over a function or a USING join, is not
+      found.** `with w as (select 1 a) select (select a) from w` answers 1
+      on PostgreSQL, and so do `... from (select * from w) t`, `select
+      (select g) from (select * from generate_series(1, 2) g) t` (1 and 2)
+      and `select (select a) from (select * from (values (1)) v(a) join
+      (values (1)) w(a) using (a)) t`; here each is 42703 `column ... does
+      not exist`. The names an outer FROM item offers a subquery
+      (`collect_from_columns`) are read from the statement as written:
+      since RP-505 a FROM-subquery's are its output names as
+      `colhint::select_output_columns` tells them, but that consults no
+      WITH item in scope (`VISIBLE_CTES`, or the statement's own WITH,
+      which is pushed after the names are collected), no function's result
+      columns, and no USING join's merged ones; a plain WITH item in FROM
+      is looked up as a table.
+      Verify: tests/backlog/test_rp_fromless_analysis.py::test_correlation_over_a_cte_or_a_star_of_unknown_columns
+      Backlog-ID: RP-506
 
 ## Found while working RP-486 (2026-11-07)
 

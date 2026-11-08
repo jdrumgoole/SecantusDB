@@ -20907,6 +20907,20 @@ fn collect_from_columns(
             }
         }
         Some(N::RangeSubselect(rs)) => {
+            // The body's output names, as PostgreSQL's range table entry
+            // has them (RP-505): a set operation's leftmost leaf's, a star
+            // expanded, an unnamed target's FigureColname, and only the
+            // leading ones renamed by an alias's column list.
+            if let Some(N::SelectStmt(inner)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref()) {
+                let columns = |name: &str| {
+                    lookup(name).map(|d| d.columns.into_iter().map(|c| c.name).collect())
+                };
+                if let Some(cols) = colhint::select_output_columns(inner, &columns) {
+                    out.extend(colhint::renamed_by_alias(cols, rs.alias.as_ref()));
+                    return;
+                }
+            }
+            // Otherwise, as best the written list tells.
             // `(values (...)) v(a)`: the alias names the columns.
             let aliased: Vec<String> = rs
                 .alias

@@ -238,6 +238,32 @@ fn levenshtein(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
+/// The output column names of a FROM-subquery's body, as its range table
+/// entry's `eref->colnames` starts them (`transformRangeSubselect`), before
+/// an alias's column list renames the leading ones (`renamed_by_alias`): a
+/// set operation's are its leftmost leaf's, a star is expanded over the
+/// entries it reads, an unnamed target is named by `FigureColname`, and a
+/// VALUES list's are `column1`... `None` when they cannot be told here (a
+/// function in FROM, a star over a USING join), as for the hint.
+pub(crate) fn select_output_columns(
+    s: &pb::SelectStmt,
+    columns: &dyn Fn(&str) -> Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    let mut s = s.clone();
+    // No reference sits at this location, so the walk never stops early.
+    let mut finder = Finder {
+        location: i32::MIN,
+        columns,
+        ctes: Vec::new(),
+    };
+    finder.select(&mut s, &Vec::new()).ok().flatten()
+}
+
+/// `cols` renamed by `alias`'s column list (`t(x)` names only the first).
+pub(crate) fn renamed_by_alias(cols: Vec<String>, alias: Option<&pb::Alias>) -> Vec<String> {
+    renamed(Some(cols), alias).unwrap_or_default()
+}
+
 fn strings(nodes: &[pb::Node]) -> Vec<String> {
     nodes
         .iter()
@@ -790,5 +816,63 @@ mod tests {
             },
         ]];
         assert_eq!(hint_for(&levels, None, "bb"), None);
+    }
+
+    /// The body of the FROM-subquery in `sql`, a `select * from (...) t`.
+    fn subquery_columns(sql: &str, tables: &[(&str, &[&str])]) -> Option<Vec<String>> {
+        let Ok(N::SelectStmt(s)) = parse_one_as_sent(sql) else {
+            panic!("not a select: {sql}");
+        };
+        let Some(N::RangeSubselect(rs)) = s.from_clause.first().and_then(|f| f.node.as_ref())
+        else {
+            panic!("no FROM-subquery: {sql}");
+        };
+        let Some(N::SelectStmt(body)) = rs.subquery.as_ref().and_then(|q| q.node.as_ref()) else {
+            panic!("no body: {sql}");
+        };
+        let columns = |name: &str| {
+            tables
+                .iter()
+                .find(|(t, _)| *t == name)
+                .map(|(_, cols)| cols.iter().map(|c| c.to_string()).collect())
+        };
+        select_output_columns(body, &columns).map(|cols| renamed_by_alias(cols, rs.alias.as_ref()))
+    }
+
+    // The names a subquery's bare reference to the FROM-subquery `t` may
+    // use, each as PostgreSQL 15.19 resolves it (RP-505).
+    #[test]
+    fn a_from_subquerys_columns_are_its_output_names() {
+        let names = |sql: &str| subquery_columns(sql, &[("e", &["a", "b"])]);
+        let v = |cols: &[&str]| Some(cols.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+        // A set operation's names are its leftmost leaf's, however nested.
+        assert_eq!(
+            names("select * from (select 1 a union select 2) t"),
+            v(&["a"])
+        );
+        assert_eq!(
+            names("select * from ((select 1 a) union (select 2 b except select 3)) t"),
+            v(&["a"])
+        );
+        // A star is expanded, an unnamed target named by FigureColname.
+        assert_eq!(names("select * from (select * from e) t"), v(&["a", "b"]));
+        assert_eq!(
+            names("select * from (select count(*) from e) t"),
+            v(&["count"])
+        );
+        assert_eq!(
+            names("select * from (values (1, 2)) t"),
+            v(&["column1", "column2"])
+        );
+        // An alias's column list renames only the leading columns.
+        assert_eq!(
+            names("select * from (select 1 a, 2 b) t(x)"),
+            v(&["x", "b"])
+        );
+        // A star over a function in FROM cannot be told here.
+        assert_eq!(
+            names("select * from (select * from generate_series(1, 2) g) t"),
+            None
+        );
     }
 }
