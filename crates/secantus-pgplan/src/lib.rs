@@ -31773,6 +31773,29 @@ fn record_compare(
     Ok(Bson::Boolean(decide_ord(op, a.len().cmp(&b.len()))))
 }
 
+/// `record_cmp` (rowtypes.c) of two record VALUES, the comparison a
+/// record type's btree opclass gives `GREATEST` / `LEAST` and `NULLIF`'s
+/// `=` its `record_eq`: field by field, NULLs equal and last, each field
+/// pair it reaches type-checked first (`record_compare`). `None` unless
+/// both are records.
+pub(crate) fn record_cmp(a: &Bson, b: &Bson) -> Option<Result<std::cmp::Ordering>> {
+    use std::cmp::Ordering;
+    let (x, y) = (compared_fields(a)?, compared_fields(b)?);
+    let (ta, tb) = (record_field_types(a), record_field_types(b));
+    let types = ta.as_deref().zip(tb.as_deref());
+    let is = |op: &str| record_compare(op, &x, &y, true, types).map(|v| v == Bson::Boolean(true));
+    Some((|| {
+        if is("<")? {
+            return Ok(Ordering::Less);
+        }
+        Ok(if is("=")? {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
+        })
+    })())
+}
+
 /// A record field's static type as `format_type_be` names it in
 /// `record_eq`'s message, its type modifier dropped: the check compares
 /// type oids, so `varchar(3)` and `varchar` are one type.
@@ -43930,6 +43953,15 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             } else {
                 (lhs, rhs)
             };
+            // Two records are compared by `record_eq`, which checks the field
+            // pairs it reaches before their values (`nullif(fs, (1, 'y'))`
+            // is 42804 over the unknown 'y').
+            if compared_fields(&lhs).is_some() && compared_fields(&rhs).is_some() {
+                if eval_binary("=", lhs.clone(), rhs)? == Bson::Boolean(true) {
+                    return Ok(Bson::Null);
+                }
+                return Ok(lhs);
+            }
             if lhs != Bson::Null
                 && rhs != Bson::Null
                 && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)

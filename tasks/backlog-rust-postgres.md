@@ -2153,14 +2153,6 @@ The gap tests are in `tests/backlog/test_rp_found_rp522.py`.
       compared.
       Backlog-ID: RP-530
       Verify: tests/backlog/test_rp_found_rp522.py::test_record_against_scalar
-- [ ] **NULLIF, GREATEST and LEAST over a whole row answer wrongly.**
-      `nullif(fs, (1,'y'::text))` is NULL on PostgreSQL 15.19 (`record_eq`
-      finds them equal), `least(fs, row(0,'a')::fs)` is `(0,a)`, and
-      `greatest(fs, (2,'a'::text))` is 42804 `GREATEST types fs and record
-      cannot be matched` at 21 (`select_common_type`); here each of the
-      three answers `(1,y)`.
-      Backlog-ID: RP-531
-      Verify: tests/backlog/test_rp_found_rp522.py::test_record_conditionals
 - [ ] **GROUP BY a whole row not in the select list is 42703.** `select
       count(*) from fs group by fs` answers 1 on PostgreSQL 15.19; here it
       is 42703 `column "fs" does not exist` at 22. With `fs` in the select
