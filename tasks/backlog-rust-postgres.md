@@ -2334,24 +2334,44 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
       Backlog-ID: RP-650
 
-## Found while working RP-559 (2026-11-08)
+## Found while working RP-569 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d559c as
-char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
-7)` and `('xy', null)`. The gap tests are in `tests/backlog/test_rp_found_rp559.py`.
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp569.py`: `d569nv` over `int` with a CHECK
+`value > 0` added `NOT VALID` after `t569nv(a d569nv)` took `-1` and `5`;
+`t569c(c char(3))` holding `'xy'`; `d569c` over `char(3)` and `t569d(a
+d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
 
-- [ ] **An array built from a domain column is typed by the column's base
-      type.** A column declared with a domain is of the domain (`exprType`
-      of its Var), so on PostgreSQL 15.19 `select array[a] from fd559`,
-      `array_agg(a)` and `array(select a from fd559)` are each `d559c[]`
-      (the domain's `typarray`, text `{"a b"}`), and `array[i]` is
-      `d559i[]`. Here they are `character[]` and `integer[]`, and the
-      ARRAY subquery is `text[]` with its padding lost (`xy`, not `xy `).
-      Since RP-559 an array of a domain CONSTANT is the domain's array; a
-      column is typed by its base everywhere in the planner, and only
-      `pg_typeof` sees its domain (`rewrite_domain_typeof`).
-      Backlog-ID: RP-569
-      Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
+- [ ] **A cast of a domain column to its own domain checks the domain.**
+      The column is already of the domain, so on PostgreSQL 15.19 `a::d569nv`
+      is no coercion (`coerce_type` returns the Var) and checks nothing:
+      `select a::d569nv from t569nv` reads back `-1` and `5`, and
+      `pg_typeof(a)` is `d569nv`. Here the cast checks the CHECK and fails
+      with 23514 on the `-1` stored before it, and so do `pg_typeof(a)` and
+      `array[a]`, which RP-569 reads through that cast; since RP-569 they
+      leave a domain with a `NOT VALID` CHECK out (`domain_columns_of_from`),
+      so `pg_typeof(a)` there is `integer` and `array[a]` `integer[]`.
+      Verify: tests/backlog/test_rp_found_rp569.py::test_cast_of_a_domain_column_to_its_domain_checks_nothing
+      Backlog-ID: RP-655
+- [ ] **An `ARRAY(select c ...)` over a `char(n)` column drops its
+      blanks.** On PostgreSQL 15.19 `select array(select c from t569c)` is
+      `{"xy "}`, as `array[c]` and `array_agg(c)` are; here it is `{xy}`,
+      through a WITH and a UNION ALL too. The subquery's value is cast to
+      its column's array type without the column's modifier (`bpchar[]`),
+      and the value is stored without its padding.
+      Verify: tests/backlog/test_rp_found_rp569.py::test_array_subquery_keeps_char_padding
+      Backlog-ID: RP-656
+- [ ] **A domain column reached through a join, a WITH or a set operation
+      is typed by its base in an array.** On PostgreSQL 15.19 `select
+      array[a] from t569d x join t569c on true`, `array(select a from t569d
+      x join t569c on true)`, `array(select a from q)` over `with q as
+      (select a, i from t569d)` and `array(select a from t569d union all
+      select a from t569d)` are each `d569c[]` with the padding kept. Here
+      they are `character[]`, and the three subqueries drop the padding
+      (`xy`). Since RP-569 a domain column is cast to its domain where an
+      array shows its type only over a single-table FROM.
+      Verify: tests/backlog/test_rp_found_rp569.py::test_domain_column_array_through_join_with_or_set_operation
+      Backlog-ID: RP-657
 
 ## Found while working RP-570 (2026-11-08)
 

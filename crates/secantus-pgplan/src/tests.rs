@@ -5377,3 +5377,89 @@ fn oidvector_array_key_orders_as_array_cmp() {
         ]))
     );
 }
+
+/// A domain column is cast to its domain where an array shows its type
+/// (RP-569): an `ARRAY[...]` element, `array_agg`'s argument, `pg_typeof`'s,
+/// and an ARRAY subquery's one column. Not a column of another table, one a
+/// WITH hides, nor one whose domain has a `NOT VALID` CHECK, which the cast
+/// would check (RP-655).
+#[test]
+fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
+    let domain = |name: &str, not_valid: Vec<String>| domains::Domain {
+        name: name.to_string(),
+        oid: 90021,
+        base: "bpchar".to_string(),
+        typmod: 7,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid,
+        default_sql: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc", Vec::new()),
+        domain("dnv", vec!["pos".to_string()]),
+    ]);
+    let table = || {
+        let mut a = Column::new("a", "bpchar", false);
+        a.extra.insert("domain_type", "dc");
+        let mut b = Column::new("b", "bpchar", false);
+        b.extra.insert("domain_type", "dnv");
+        TableDef::new("fd", vec![a, b, Column::new("i", "int4", false)])
+    };
+    let lookup = |name: &str| (name == "fd").then(table);
+    let select = |sql: &str| {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|s| s.node.as_ref())
+        else {
+            panic!("a select");
+        };
+        (**s).clone()
+    };
+    let deparse = |s: pg_query::protobuf::SelectStmt| {
+        pg_query::protobuf::Node {
+            node: Some(N::SelectStmt(Box::new(s))),
+        }
+        .deparse()
+        .expect("deparses")
+    };
+    let rewritten = |sql: &str| rewrite_domain_typeof(&select(sql), &lookup).expect("rewrites");
+    for (sql, expected) in [
+        ("SELECT ARRAY[a] FROM fd", "SELECT ARRAY[a::dc] FROM fd"),
+        (
+            "SELECT ARRAY[x.a, i] FROM fd x",
+            "SELECT ARRAY[x.a::dc, i] FROM fd x",
+        ),
+        (
+            "SELECT array_agg(a) FROM fd",
+            "SELECT array_agg(a::dc) FROM fd",
+        ),
+        (
+            "SELECT pg_typeof(fd.a) FROM fd",
+            "SELECT pg_typeof(fd.a::dc) FROM fd",
+        ),
+    ] {
+        assert_eq!(
+            rewritten(sql).map(deparse).as_deref(),
+            Some(expected),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "SELECT ARRAY[b] FROM fd",
+        "SELECT ARRAY[y.a] FROM fd x",
+        "SELECT a FROM fd",
+        "WITH fd AS (SELECT 'x'::text AS a) SELECT ARRAY[a] FROM fd",
+        "SELECT ARRAY[a::dc] FROM fd",
+    ] {
+        assert_eq!(rewritten(sql), None, "{sql}");
+    }
+    let mut sub = select("SELECT a FROM fd");
+    cast_array_subquery_column(&mut sub, &lookup);
+    assert_eq!(deparse(sub), "SELECT a::dc FROM fd");
+    let mut two = select("SELECT a, i FROM fd");
+    cast_array_subquery_column(&mut two, &lookup);
+    assert_eq!(deparse(two), "SELECT a, i FROM fd");
+}
