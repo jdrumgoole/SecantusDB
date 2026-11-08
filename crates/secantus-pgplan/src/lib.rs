@@ -12404,7 +12404,21 @@ fn plan_insert(
     let returning = if i.returning_list.is_empty() {
         None
     } else {
-        let (columns, casts) = plan_table_targets(&i.returning_list, &def, params)?;
+        // The target named as a whole row (RP-516).
+        let exprs: Vec<&pg_query::protobuf::Node> = i
+            .returning_list
+            .iter()
+            .filter_map(|t| match t.node.as_ref() {
+                Some(N::ResTarget(rt)) => rt.val.as_deref(),
+                _ => None,
+            })
+            .collect();
+        let mut list = std::borrow::Cow::Borrowed(&i.returning_list);
+        if names_write_target(i.relation.as_ref(), &def, &exprs) {
+            let exprs = returning_exprs(list.to_mut()).collect();
+            rewrite_write_target_rows(i.relation.as_ref(), &def, exprs)?;
+        }
+        let (columns, casts) = plan_table_targets(&list, &def, params)?;
         Some(Returning { columns, casts })
     };
     let on_conflict = match i.on_conflict_clause.as_deref() {
@@ -20619,6 +20633,14 @@ fn dml_scopes(
             if !target.contains(&c) && !from_only.contains(&c) {
                 from_only.push(c);
             }
+        }
+    }
+    // So does a FROM item's name no column answers to: a bare `fe` is that
+    // item's whole row (`transformWholeRowRef`), read through the FROM as
+    // its columns are (RP-516).
+    for n in &names {
+        if !target.contains(n) && !from_only.contains(n) {
+            from_only.push(n.clone());
         }
     }
     let mut target_names = Vec::new();
@@ -40608,6 +40630,100 @@ fn composite_field_targets(
     Ok(Some(out))
 }
 
+/// Whether a write's target is named as a whole row (`fs`, or `fs.*`
+/// inside an expression) anywhere in `exprs`: its name, or its alias, when
+/// no column of the table is called that.
+fn names_write_target(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    def: &TableDef,
+    exprs: &[&pg_query::protobuf::Node],
+) -> bool {
+    let Some(name) = relation.map(range_var_visible_name) else {
+        return false;
+    };
+    if def.column(&name).is_some() {
+        return false;
+    }
+    let names = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+        Some(N::ColumnRef(c)) => whole_row_ref_of(c, &name),
+        _ => false,
+    };
+    exprs.iter().any(|e| expr_any(e, &names))
+}
+
+/// `c` is `name` alone or `name.*`.
+fn whole_row_ref_of(c: &pg_query::protobuf::ColumnRef, name: &str) -> bool {
+    let first = matches!(
+        c.fields.first().and_then(|f| f.node.as_ref()),
+        Some(N::String(sv)) if sv.sval == name
+    );
+    first
+        && (c.fields.len() == 1
+            || (c.fields.len() == 2 && matches!(c.fields[1].node.as_ref(), Some(N::AStar(_)))))
+}
+
+/// A write's target named as a whole row in its SET values, WHERE or
+/// RETURNING, as `ROW(<columns>)::<table>`: PostgreSQL's `setTargetTable`
+/// puts the target in the statement's namespace, so `transformColumnRef`
+/// reads a bare `fs` there as `transformWholeRowRef` over its RTE, of the
+/// table's row type. A column of that name wins, as it does there; under
+/// an alias only the alias names it. The statement's subqueries were
+/// resolved first, so a correlated one's per-row call reads the row
+/// through its argument here (RP-516). A RETURNING list's own `fs.*` was
+/// already expanded to the columns (`returning_star`).
+fn rewrite_write_target_rows(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    def: &TableDef,
+    exprs: Vec<&mut pg_query::protobuf::Node>,
+) -> Result<()> {
+    let Some(r) = relation else {
+        return Ok(());
+    };
+    let name = range_var_visible_name(r);
+    // A column of that name wins (and the ROW below would name itself).
+    if def.column(&name).is_some() {
+        return Ok(());
+    }
+    let rowtype = table_rowtype(relation_name(r));
+    let columns: Vec<String> = def.columns.iter().map(|c| c.name.clone()).collect();
+    let row = |location: i32| pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                    args: columns.iter().map(|c| column_ref_node(c)).collect(),
+                    row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                    colnames: columns.iter().map(|c| string_node(c)).collect(),
+                    location,
+                    ..Default::default()
+                }))),
+            })),
+            type_name: Some(type_name_node(&rowtype)),
+            location: 0,
+        }))),
+    };
+    for e in exprs {
+        walk_expr(e, &mut |n| {
+            if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                if whole_row_ref_of(c, &name) {
+                    *n = row(c.location);
+                }
+            }
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// The expressions of a write's RETURNING list.
+fn returning_exprs(
+    list: &mut [pg_query::protobuf::Node],
+) -> impl Iterator<Item = &mut pg_query::protobuf::Node> {
+    list.iter_mut().filter_map(|t| match t.node.as_mut() {
+        Some(N::ResTarget(rt)) => rt.val.as_deref_mut(),
+        _ => None,
+    })
+}
+
 fn plan_update(
     u: &pg_query::protobuf::UpdateStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -40619,6 +40735,34 @@ fn plan_update(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("UPDATE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "UPDATE of"))?;
+    // The target named as a whole row (RP-516).
+    let target_rows;
+    let u = {
+        let mut exprs: Vec<&pg_query::protobuf::Node> =
+            u.where_clause.as_deref().into_iter().collect();
+        for t in u.target_list.iter().chain(&u.returning_list) {
+            if let Some(N::ResTarget(rt)) = t.node.as_ref() {
+                exprs.extend(rt.val.as_deref());
+            }
+        }
+        if names_write_target(u.relation.as_ref(), &def, &exprs) {
+            let mut w = u.clone();
+            let relation = w.relation.clone();
+            let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+                w.where_clause.as_deref_mut().into_iter().collect();
+            for t in &mut w.target_list {
+                if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                    exprs.extend(rt.val.as_deref_mut());
+                }
+            }
+            exprs.extend(returning_exprs(&mut w.returning_list));
+            rewrite_write_target_rows(relation.as_ref(), &def, exprs)?;
+            target_rows = w;
+            &target_rows
+        } else {
+            u
+        }
+    };
     // `SET v.a = x, v.b = y` assigns fields of a composite column: one
     // `SET v = ROW(x, y, (v).c)::type`, the fields not named read back.
     let field_set;
@@ -41222,6 +41366,29 @@ fn plan_delete(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("DELETE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "DELETE from"))?;
+    // The target named as a whole row (RP-516).
+    let target_rows;
+    let d = {
+        let mut exprs: Vec<&pg_query::protobuf::Node> =
+            d.where_clause.as_deref().into_iter().collect();
+        for t in &d.returning_list {
+            if let Some(N::ResTarget(rt)) = t.node.as_ref() {
+                exprs.extend(rt.val.as_deref());
+            }
+        }
+        if names_write_target(d.relation.as_ref(), &def, &exprs) {
+            let mut w = d.clone();
+            let relation = w.relation.clone();
+            let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+                w.where_clause.as_deref_mut().into_iter().collect();
+            exprs.extend(returning_exprs(&mut w.returning_list));
+            rewrite_write_target_rows(relation.as_ref(), &def, exprs)?;
+            target_rows = w;
+            &target_rows
+        } else {
+            d
+        }
+    };
     let (filter, residual) = match d.where_clause.as_ref() {
         None => (Document::new(), None),
         Some(w) => match current_of(w)? {

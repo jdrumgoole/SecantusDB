@@ -4451,3 +4451,78 @@ fn a_tables_whole_row_under_a_column_alias_list_is_its_row_type() {
         )
     );
 }
+
+/// Whether `sql`'s UPDATE names its target as a whole row, and what its
+/// first SET value's whole-row reference became: the cast's type and the
+/// ROW's arguments, or `None` where nothing was rewritten.
+fn write_target_row(sql: &str, table: &TableDef) -> (bool, Option<(String, Vec<String>)>) {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::UpdateStmt(u)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not an UPDATE: {sql}");
+    };
+    let mut u = (**u).clone();
+    let Some(N::ResTarget(rt)) = u.target_list[0].node.as_mut() else {
+        panic!("no SET target");
+    };
+    let value = rt.val.as_deref_mut().expect("a SET value");
+    let named = names_write_target(u.relation.as_ref(), table, &[&*value]);
+    rewrite_write_target_rows(u.relation.as_ref(), table, vec![&mut *value]).unwrap();
+    let mut row = None;
+    walk_expr(value, &mut |n| {
+        if let Some(N::TypeCast(cast)) = n.node.as_ref() {
+            if let Some(N::RowExpr(r)) = cast.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                let name = |n: &pg_query::protobuf::Node| match n.node.as_ref() {
+                    Some(N::String(sv)) => sv.sval.clone(),
+                    Some(N::ColumnRef(c)) => match c.fields.last().and_then(|f| f.node.as_ref()) {
+                        Some(N::String(sv)) => sv.sval.clone(),
+                        _ => String::new(),
+                    },
+                    _ => String::new(),
+                };
+                let ty = cast
+                    .type_name
+                    .as_ref()
+                    .map(|t| t.names.iter().map(name).collect::<Vec<_>>().join("."));
+                row = Some((ty.unwrap_or_default(), r.args.iter().map(name).collect()));
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    (named, row)
+}
+
+#[test]
+fn a_writes_target_is_its_own_whole_row() {
+    // PostgreSQL 15.19: `update fs set c = fs::text` reads the target's
+    // row, of the table's row type; under an alias only the alias names
+    // it; a column of the table's name wins (RP-516).
+    let row = Some((
+        "t".to_string(),
+        vec!["id".into(), "name".into(), "n".into()],
+    ));
+    assert_eq!(
+        write_target_row("update t set name = t::text", &t()),
+        (true, row.clone())
+    );
+    assert_eq!(
+        write_target_row("update t x set name = (x.*)::text", &t()),
+        (true, row)
+    );
+    assert_eq!(
+        write_target_row("update t x set name = t::text", &t()),
+        (false, None)
+    );
+    let own = TableDef::new(
+        "t",
+        vec![
+            Column::new("id", "int4", true),
+            Column::new("t", "text", false),
+        ],
+    );
+    assert_eq!(write_target_row("update t set t = t", &own), (false, None));
+}

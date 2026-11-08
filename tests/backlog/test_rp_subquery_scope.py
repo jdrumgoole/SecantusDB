@@ -19,8 +19,13 @@ working RP-470, RP-479 (a whole-row reference was still refused in three
 shapes, and an ORDER BY position past a star sorted by the wrong column;
 fixed), RP-480 (a whole row was typed as a record or as varchar; fixed)
 and RP-481 (a USING column's 42703 carries a position); and found while
-working RP-479, RP-516 (an UPDATE's or DELETE's target is not a whole row)
-and RP-517 (`v.*` in a subquery over an outer FROM item is 42P01).
+working RP-479, RP-516 (an UPDATE's or DELETE's target was not a whole
+row; fixed) and RP-517 (`v.*` in a subquery over an outer FROM item is
+42P01); and found while working RP-516, RP-521 (a subquery reading an outer
+whole row with no type is 42P18), RP-522 (a whole row compared with an
+untyped record is not 42804), RP-523 (an aliased write target answers to
+its table's name) and RP-524 (a write's name errors carry the wrong
+position).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -882,16 +887,38 @@ def test_lateral_item_calls_once_per_row(query: str, dsn: str) -> None:
 
 # Found while working RP-479. An UPDATE's or DELETE's target table is a
 # whole row to its own SET, WHERE and RETURNING and to their subqueries, as
-# a SELECT's FROM item is. Here each is 42703 `column "fs" does not exist`;
-# an UPDATE ... FROM's other table already answers (`where fe is not null`).
+# a SELECT's FROM item is (`setTargetTable` puts it in the namespace), and
+# so is an INSERT's to its RETURNING; under an alias only the alias names
+# it. Each was 42703 `column "fs" does not exist`, and an UPDATE ... FROM's
+# or DELETE ... USING's other table named bare in RETURNING was too.
 DML_TARGET_WHOLE_ROW = {
     "update fs set c = fs::text returning c": [("(1,y)",)],
     "update fs set c = (select fs::text) returning c": [("(1,y)",)],
     "delete from fs where fs is null returning a": [],
+    "delete from fs where fs is not null returning a": [(1,)],
+    "update fs set c = 'q' returning fs": [("(1,q)",)],
+    "update fs set c = 'q' returning (fs).c": [("q",)],
+    "update fs set c = 'q' returning (fs.*)::text": [("(1,q)",)],
+    "update fs set c = fs.*::text returning c": [("(1,y)",)],
+    "update fs set c = 'q' where fs = row(1,'y')::fs returning a": [(1,)],
+    "update fs set c = (fs).c || 'z' returning c": [("yz",)],
+    "update fs set c = row_to_json(fs)::text returning c": [('{"a":1,"c":"y"}',)],
+    "update fs set c = 'q' returning (select fs)": [("(1,q)",)],
+    "update fs x set c = x::text returning c": [("(1,y)",)],
+    "update fs x set c = 'q' returning x": [("(1,q)",)],
+    "delete from fs x where x::text = '(1,y)' returning x": [("(1,y)",)],
+    "delete from fs returning (select fs::text)": [("(1,y)",)],
+    "insert into fs as x values (2, 'w') returning x, x::text": [("(2,w)", "(2,w)")],
+    "insert into fs values (2, 'w') returning (select fs::text)": [("(2,w)",)],
+    "update fs set c = fe::text from fe where fe.a = fs.a returning fs, fe": [
+        ('(1,"(1,x)")', "(1,x)")
+    ],
+    "delete from fs using fe where fe.a = fs.a returning fe": [("(1,x)",)],
+    "with u as (update fs set c = fs::text returning fs) select * from u": [('(1,"(1,y)")',)],
 }
 
 
-@pytest.mark.backlog("RP-516")
+@pytest.mark.backlog_fixed("RP-516")
 @pytest.mark.parametrize("query", list(DML_TARGET_WHOLE_ROW))
 def test_dml_target_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DML_TARGET_WHOLE_ROW[query]
@@ -918,3 +945,118 @@ OUTER_STAR_IN_SUBQUERY = {
 @pytest.mark.parametrize("query", list(OUTER_STAR_IN_SUBQUERY))
 def test_outer_star_in_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OUTER_STAR_IN_SUBQUERY[query]
+
+
+# Found while working RP-516. A subquery that reads an outer whole row only
+# where nothing gives the row a type (`fs is not null`) is planned with an
+# untyped parameter, and the per-row call cannot run it: 42P18 `could not
+# determine data type of parameter $1`. A cast (`fs::text`) or a bare
+# `(select fs)` already answers.
+UNTYPED_OUTER_WHOLE_ROW = {
+    "select 1 from fs where exists (select 1 where fs is not null)": [(1,)],
+    "select (select fs is null) from fs": [(False,)],
+    "delete from fs where exists (select 1 where fs is not null) returning a": [(1,)],
+    "update fs set c = 'q' where exists (select 1 from fe where fs is not null) returning a": [
+        (1,)
+    ],
+}
+
+
+@pytest.mark.backlog("RP-521")
+@pytest.mark.parametrize("query", list(UNTYPED_OUTER_WHOLE_ROW))
+def test_untyped_outer_whole_row(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == UNTYPED_OUTER_WHOLE_ROW[query]
+
+
+# Found while working RP-516. A whole row compared with a row constructor
+# of untyped literals: PostgreSQL's `record_eq` refuses the `unknown`
+# column against the row type's `text` (42804, no position). Here the
+# comparison is answered.
+WHOLE_ROW_UNTYPED_RECORD = {
+    "select 1 from fs where fs = (1,'y')": (
+        "42804",
+        "cannot compare dissimilar column types text and unknown at record column 2",
+        None,
+        None,
+    ),
+    "select fs = (1,'y') from fs": (
+        "42804",
+        "cannot compare dissimilar column types text and unknown at record column 2",
+        None,
+        None,
+    ),
+    "update fs set c = 'q' where fs = (1,'y') returning a": (
+        "42804",
+        "cannot compare dissimilar column types text and unknown at record column 2",
+        None,
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog("RP-522")
+@pytest.mark.parametrize("query", list(WHOLE_ROW_UNTYPED_RECORD))
+def test_whole_row_against_untyped_record(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WHOLE_ROW_UNTYPED_RECORD[query]
+
+
+# Found while working RP-516. An aliased write target is hidden by its
+# alias: `fs.c` under `update fs x` is `errorMissingRTE`'s 42P01 with the
+# alias as its HINT. Here the table's name still reads the row.
+_ALIAS_HINT = 'Perhaps you meant to reference the table alias "x".'
+_HIDDEN = 'invalid reference to FROM-clause entry for table "fs"'
+ALIASED_WRITE_TARGET_NAME = {
+    "update fs x set c = fs.c returning c": ("42P01", _HIDDEN, _ALIAS_HINT, "21"),
+    "delete from fs x where fs.a = 1 returning a": ("42P01", _HIDDEN, _ALIAS_HINT, "24"),
+    "update fs x set c = 'q' returning fs.c": ("42P01", _HIDDEN, _ALIAS_HINT, "35"),
+}
+
+
+@pytest.mark.backlog("RP-523")
+@pytest.mark.parametrize("query", list(ALIASED_WRITE_TARGET_NAME))
+def test_aliased_write_target_hides_its_name(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == ALIASED_WRITE_TARGET_NAME[query]
+
+
+# Found while working RP-516. A write's name error is reported at the
+# reference: a missing name under an aliased target at the target's own
+# position (8) here, a bare name in an UPDATE ... FROM's RETURNING at the
+# FROM item's (28), and RETURNING's ambiguous column with none.
+WRITE_NAME_ERROR_POSITION = {
+    "update fs x set c = fs::text returning c": (
+        "42703",
+        'column "fs" does not exist',
+        None,
+        "21",
+    ),
+    "update fs x set c = 'q' where fs is null returning c": (
+        "42703",
+        'column "fs" does not exist',
+        None,
+        "31",
+    ),
+    "update fs set c = 'q' from fe e where e.a = fs.a returning fe": (
+        "42703",
+        'column "fe" does not exist',
+        None,
+        "60",
+    ),
+    "delete from fs using fe where fe.a = fs.a returning a": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "53",
+    ),
+    "update fs set c = 'q' from fe where fe.a = fs.a returning a": (
+        "42702",
+        'column reference "a" is ambiguous',
+        None,
+        "59",
+    ),
+}
+
+
+@pytest.mark.backlog("RP-524")
+@pytest.mark.parametrize("query", list(WRITE_NAME_ERROR_POSITION))
+def test_write_name_error_position(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == WRITE_NAME_ERROR_POSITION[query]

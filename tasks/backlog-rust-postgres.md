@@ -2006,16 +2006,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
-- [ ] **An UPDATE's or DELETE's target table is not a whole row.**
-      `update fs set c = fs::text returning c` and `update fs set c =
-      (select fs::text) returning c` answer `(1,y)` on PostgreSQL, and
-      `delete from fs where fs is null returning a` no row; here each is
-      42703 `column "fs" does not exist`. The write's target is not offered
-      as a whole row to its own SET, WHERE or RETURNING (nor, through
-      `outer_whole_row`, to their subqueries' per-row call); a SELECT's FROM
-      item and an UPDATE ... FROM's other table already are.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_dml_target_whole_row
-      Backlog-ID: RP-516
 - [ ] **`v.*` in a subquery's select list over an outer FROM item is
       42P01.** On PostgreSQL 15.19 `select (select v.*) from (values (1))
       v(a)` answers 1 (the star expands to the outer item's columns), and
@@ -2081,6 +2071,50 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       error has none.
       Verify: tests/backlog/test_rp_found_rp514.py::test_grant_missing_signature_has_no_position
       Backlog-ID: RP-520
+
+## Found while working RP-516 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
+and `fs(a int, c text)`.
+
+- [ ] **A subquery that reads an outer whole row where nothing types it is
+      42P18.** `select 1 from fs where exists (select 1 where fs is not
+      null)` and `select (select fs is null) from fs` answer on PostgreSQL
+      (`1`, `false`), and so do the same EXISTS in an UPDATE's or DELETE's
+      WHERE; here each is 42P18 `could not determine data type of parameter
+      $1`. The per-row call's body keeps a bare `$N` for the outer row,
+      which only a cast (`fs::text`) or a select-list `(select fs)` types;
+      PostgreSQL's outer Var carries the row type.
+      Backlog-ID: RP-521
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_untyped_outer_whole_row
+- [ ] **A whole row compared with a row of untyped literals is answered,
+      not 42804.** PostgreSQL 15.19's `record_eq` refuses `fs = (1,'y')`
+      with 42804 `cannot compare dissimilar column types text and unknown
+      at record column 2` (no position), in a SELECT's WHERE or target list
+      and in an UPDATE's WHERE; here it compares the values and answers.
+      `fs = row(1,'y')::fs` agrees on both.
+      Backlog-ID: RP-522
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_against_untyped_record
+- [ ] **An aliased write target still answers to its table's name.**
+      Under `update fs x` or `delete from fs x`, PostgreSQL 15.19 reads
+      `fs.c` as `errorMissingRTE`'s 42P01 `invalid reference to FROM-clause
+      entry for table "fs"`, HINT `Perhaps you meant to reference the table
+      alias "x".`, at the reference (`update fs x set c = fs.c`, `delete
+      from fs x where fs.a = 1`, `update fs x set c = 'q' returning fs.c`).
+      Here each reads the row and answers. A SELECT's alias already hides
+      its table's name.
+      Backlog-ID: RP-523
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_write_target_hides_its_name
+- [ ] **A write's name error is reported away from the reference.**
+      PostgreSQL 15.19 positions each at the name as written. Here `update
+      fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
+      target), not 21 / 31; `update fs set c = 'q' from fe e where e.a =
+      fs.a returning fe` is 42703 at 28 (the FROM item), not 60; and an
+      ambiguous bare column in an UPDATE ... FROM's or DELETE ... USING's
+      RETURNING (`returning a`) is 42702 with no position, not 59 / 53.
+      RP-414 has the reference's name and qualifier; this is where it is.
+      Backlog-ID: RP-524
+      Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
 
 ## Found while working RP-500 (2026-11-07)
 
