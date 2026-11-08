@@ -2299,15 +2299,6 @@ Measured on a private PostgreSQL 15.19 cluster with `create domain d551c as
 char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
 `fd551(a d551c)`. The gap tests are in `tests/backlog/test_rp_found_rp551.py`.
 
-- [ ] **A domain-typed result column goes out with no type modifier.**
-      PostgreSQL 15.19's `SendRowDescriptionMessage` sends a domain as its
-      base type and the base's modifier (`getBaseTypeAndTypmod`), so `select
-      'ab'::d551c` describes `bpchar` typmod 7, `1.5::d551n` 327686 and a
-      cast to `d551t` 0, as the same casts to `char(3)`, `numeric(5,2)` and
-      `timestamp(0)` do; here each is -1. The values themselves are right
-      (RP-551). A table's domain column already describes its width.
-      Backlog-ID: RP-557
-      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_result_column_typmod
 - [ ] **A domain column's `atttypmod` is the domain's width.** A column
       declared with a domain carries no modifier of its own, so `fd551.a`'s
       `atttypmod` is -1 on PostgreSQL 15.19 (the width is the domain's
@@ -2316,6 +2307,40 @@ char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
       answers -1 (RP-551 keeps the catalog at the column's own domain).
       Backlog-ID: RP-558
       Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
+      Since RP-557 the wire sends a domain column with its base type's
+      modifier wherever it is computed, so fixing this keeps the column's
+      RowDescription at 7.
+
+## Found while working RP-557 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d557 as
+char(3)` and `t557(c char(3), a d557)`. Each was wrong before RP-557's
+change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
+
+- [ ] **`min` / `max` over a `char(n)` column describe its width.** An
+      Aggref carries no modifier (`exprTypmod` has no case for it), so
+      `select min(c) from t557` and `select max(a) from t557` describe
+      `bpchar` -1 on PostgreSQL 15.19; here both are 7
+      (`aggregate_result_typmod` copies the column's).
+      Verify: tests/backlog/test_rp_found_rp557.py::test_min_max_over_char_n_has_no_modifier
+      Backlog-ID: RP-659
+- [ ] **A set operation of a domain column and its base type keeps the
+      width.** `select a from t557 union select c from t557` (either order)
+      describes -1 on PostgreSQL 15.19: `select_common_type` smashes the
+      domain to `bpchar` and `select_common_typmod` finds the sides'
+      modifiers differ, the domain column's own being -1. Here it is 7.
+      Two sides of one type keep 7 in both.
+      Verify: tests/backlog/test_rp_found_rp557.py::test_set_op_of_a_domain_and_its_base_type
+      Backlog-ID: RP-660
+- [ ] **`CREATE TABLE AS` turns a domain column into its base type.**
+      `create table c557 as select a, c from t557` makes `a` of type `d557`
+      with `atttypmod` -1 on PostgreSQL 15.19 (`intorel_startup` copies the
+      query's tuple descriptor); here `a` is `character` with 7: the
+      columns are read back from the wire description (`copy_query_fields`
+      then `internal_type_name`), which has already seen through the domain
+      and, since RP-557, carries the domain's width.
+      Verify: tests/backlog/test_rp_found_rp557.py::test_create_table_as_keeps_a_domain_column
+      Backlog-ID: RP-661
 
 ## Found while working RP-590 (2026-11-08)
 
