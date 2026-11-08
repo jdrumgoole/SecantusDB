@@ -65,6 +65,9 @@ pub(crate) struct Entry {
     pub creation: Vec<Document>,
     pub scores: Vec<f64>,
     pub index_filter_set: bool,
+    /// `estimatedSizeBytes` (`super::entry_size`); `None` where this server
+    /// does not reproduce mongod's figure, and the field is left out.
+    pub estimated_size: Option<i64>,
     pub solution_hash: i64,
 }
 
@@ -191,7 +194,7 @@ pub(crate) fn solution_hash(solution: &str) -> i64 {
 /// for the classic cache), before the stage adds `host`.
 pub(crate) fn to_doc(e: &Entry) -> Document {
     let shape = super::cache_key::hex(e.shape_hash);
-    doc! {
+    let mut d = doc! {
         "version": "1",
         "queryHash": shape.clone(),
         "planCacheShapeHash": shape,
@@ -205,8 +208,12 @@ pub(crate) fn to_doc(e: &Entry) -> Document {
         "creationExecStats": e.creation.iter().cloned().map(Bson::Document).collect::<Vec<_>>(),
         "candidatePlanScores": e.scores.clone(),
         "indexFilterSet": e.index_filter_set,
-        "solutionHash": e.solution_hash,
+    };
+    if let Some(size) = e.estimated_size {
+        d.insert("estimatedSizeBytes", size);
     }
+    d.insert("solutionHash", e.solution_hash);
+    d
 }
 
 /// The cache of collection `db.coll` of `storage`, as its reads key it.
@@ -436,6 +443,7 @@ mod tests {
             creation: vec![],
             scores: vec![],
             index_filter_set: false,
+            estimated_size: None,
             solution_hash: 0,
         }
     }

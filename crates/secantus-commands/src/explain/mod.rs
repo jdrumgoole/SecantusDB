@@ -22,6 +22,7 @@ mod cache_key;
 pub(crate) mod debug_string;
 mod deps;
 pub(crate) mod distinct;
+mod entry_size;
 mod exec;
 pub(crate) mod geo;
 pub(crate) mod hoist;
