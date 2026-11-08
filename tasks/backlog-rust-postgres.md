@@ -1991,15 +1991,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
       `j` has no leaf to go to. The rows are right; the plan text is not.
       Backlog-ID: RP-471
       Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_plan
-- [ ] **`pg_get_viewdef` of an aliased JOIN returns the view's text.**
-      PostgreSQL 15.19 prints `(fs JOIN fe USING (a)) j` with its alias, a
-      column list when the join's names repeat (`j(a, c, a_1, b)` over an
-      ON join), and a USING alias's column by the left side's name
-      (`SELECT fs.a FROM (fs JOIN fe USING (a) AS u)`). `ruleutils.rs`
-      gives up on an aliased JOIN (`collect_rtes`) and falls back to the
-      statement as written: ` SELECT j.c FROM (fs JOIN fe USING (a) ) j;`.
-      Backlog-ID: RP-467
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_aliased_join_viewdef
 
 ## Found while working RP-470 (2026-11-07)
 
@@ -2066,6 +2057,19 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       (A function's IN is left out on both servers.)
       Verify: tests/backlog/test_rp_found_rp508.py::test_procedure_arguments_print_their_modes
       Backlog-ID: RP-515
+
+## Found while working RP-467 (2026-11-08)
+
+- [ ] **A view whose `*` covers a table's alias column list cannot be
+      read.** `create view v as select * from fs f(x, y)` is accepted, and
+      every `select * from v` is then 42703 `column f.a does not exist`:
+      CREATE VIEW expands the `*` (`view_deps::expand_stars`) to the
+      table's own column names, `f.a, f.c`, not the names the alias list
+      gives them. PostgreSQL 15.19 reads the view as columns `x, y` (`x,
+      c` under `f(x)`, and likewise for `f.*`). Measured on a private
+      15.19 cluster.
+      Backlog-ID: RP-512
+      Verify: tests/backlog/test_rp_found_rp467.py::test_view_star_over_an_aliased_column_list
 
 ## Found while working RP-500 (2026-11-07)
 

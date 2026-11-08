@@ -12,7 +12,7 @@ FROM-subquery is offered a sibling's alias as its hint); and found while
 working RP-454, RP-469 (a FROM item named as a table an aliased JOIN hides
 is refused), RP-470 (a whole-row reference to a joined table was not found;
 fixed), RP-471 (EXPLAIN of an aliased JOIN), RP-467 (`pg_get_viewdef` of an
-aliased JOIN) and RP-468 (a correlated subquery reading a join's column got
+aliased JOIN; fixed) and RP-468 (a correlated subquery reading a join's column got
 text; fixed); found while working RP-461, RP-478 (a LATERAL subquery's bare
 name for an earlier FROM item's column was not found; fixed); and found while
 working RP-470, RP-479 (a whole-row reference was still refused in three
@@ -624,7 +624,8 @@ def test_aliased_join_plan(query: str, dsn: str) -> None:
 
 # ruleutils prints an aliased JOIN with its alias (and a column list when
 # the join's names repeat), and a USING alias's column by the left side's
-# name; here the view's own text comes back.
+# name. The view's own text came back, as the deparser gave up on an
+# aliased JOIN.
 ALIASED_JOIN_VIEWDEF = {
     "select j.c from (fs join fe using (a)) as j": (
         " SELECT j.c\n   FROM (fs\n     JOIN fe USING (a)) j;"
@@ -638,18 +639,96 @@ ALIASED_JOIN_VIEWDEF = {
 }
 
 
-@pytest.mark.backlog("RP-467")
+@pytest.mark.backlog_fixed("RP-467")
 @pytest.mark.parametrize("query", list(ALIASED_JOIN_VIEWDEF))
 def test_aliased_join_viewdef(query: str, dsn: str) -> None:
+    assert _viewdef(dsn, query, False) == ALIASED_JOIN_VIEWDEF[query]
+
+
+def _viewdef(dsn: str, query: str, pretty: bool, setup: tuple[str, ...] = ()) -> Any:
     with psycopg.connect(dsn, autocommit=True) as c:
-        for q in _SETUP:
+        for q in [*_SETUP, *setup]:
             c.execute(q)
         c.execute("create view rp_v as " + query)
         try:
-            row = c.execute("select pg_get_viewdef('rp_v')").fetchone()
+            row = c.execute("select pg_get_viewdef('rp_v', %s)", (pretty,)).fetchone()
         finally:
             c.execute("drop view rp_v")
-    assert row is not None and row[0] == ALIASED_JOIN_VIEWDEF[query]
+    return row[0] if row else None
+
+
+# Every join's columns are named as `set_deparse_for_query` names them
+# (RP-467): an unnamed join's column prints as the input column its join
+# alias variable is -- the left one's for an INNER or LEFT join, unless
+# only the right one needs no coercion, the right one's for a RIGHT join
+# -- and a merged column that is a COALESCE (FULL) or a coercion
+# (`varchar(3)` with `varchar(5)`) prints unqualified, every other column
+# of the statement renamed out of its way (`x(a_1, c, d)`). NATURAL prints
+# as its USING list, `*` takes a merged column once, and a USING name is
+# pushed down to the inputs (`fs fs(x, c)`). Each was the view's own text,
+# or a `*` expanded to both sides' merged columns.
+_JOIN_TABLES = (
+    "drop table if exists fx, fv, fv3 cascade",
+    "create table fx (a int, c text, d int)",
+    "create table fv (a int8, v varchar(3))",
+    "create table fv3 (v varchar(5), w int)",
+)
+JOIN_VIEWDEF = {
+    ("select a from fs join fe using (a)", False): (
+        " SELECT fs.a\n   FROM (fs\n     JOIN fe USING (a));"
+    ),
+    ("select * from fs join fe using (a)", False): (
+        " SELECT fs.a,\n    fs.c,\n    fe.b\n   FROM (fs\n     JOIN fe USING (a));"
+    ),
+    ("select * from fs natural left join fe", False): (
+        " SELECT fs.a,\n    fs.c,\n    fe.b\n   FROM (fs\n     LEFT JOIN fe USING (a));"
+    ),
+    ("select * from fs natural join fv", False): (
+        " SELECT fv.a,\n    fs.c,\n    fv.v\n   FROM (fs\n     JOIN fv USING (a));"
+    ),
+    ("select a from fs right join fe using (a)", False): (
+        " SELECT fe.a\n   FROM (fs\n     RIGHT JOIN fe USING (a));"
+    ),
+    ("select * from fs full join fe using (a)", False): (
+        " SELECT a,\n    fs.c,\n    fe.b\n   FROM (fs\n     FULL JOIN fe USING (a));"
+    ),
+    ("select v from fv join fv3 using (v)", False): (
+        " SELECT v\n   FROM (fv\n     JOIN fv3 USING (v));"
+    ),
+    ("select fs.c, x.a as xa from fs full join fe using (a), fx x", False): (
+        " SELECT fs.c,\n    x.a_1 AS xa\n   FROM (fs\n     FULL JOIN fe USING (a)),\n"
+        "    fx x(a_1, c, d);"
+    ),
+    ("select * from (fs join fe using (a)) as j(x, y, z)", False): (
+        " SELECT j.x,\n    j.y,\n    j.z\n   FROM (fs fs(x, c)\n"
+        "     JOIN fe fe(x, b) USING (x)) j(x, y, z);"
+    ),
+    ("select j.y from (fs join fe on true) as j(x, y)", False): (
+        " SELECT j.y\n   FROM (fs\n     JOIN fe ON (true)) j(x, y, a, b);"
+    ),
+    ("select j.c, j.b from (fs join fe on fs.a = fe.a) j", False): (
+        " SELECT j.c,\n    j.b\n   FROM (fs\n     JOIN fe ON ((fs.a = fe.a))) j(a, c, a_1, b);"
+    ),
+    ("select j.c from ((fs join fe using (a)) as j join fx on j.a = fx.a)", False): (
+        " SELECT j.c\n   FROM ((fs\n     JOIN fe USING (a)) j\n     JOIN fx ON ((j.a = fx.a)));"
+    ),
+    # The pretty form parenthesises an unnamed join on the right only.
+    ("select a from fs join (fe join fx using (a)) using (a)", True): (
+        " SELECT fs.a\n   FROM fs\n     JOIN (fe\n     JOIN fx USING (a)) USING (a);"
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-467")
+@pytest.mark.parametrize("case", list(JOIN_VIEWDEF))
+def test_join_viewdef_names_columns(case: tuple[str, bool], dsn: str) -> None:
+    query, pretty = case
+    try:
+        got = _viewdef(dsn, query, pretty, _JOIN_TABLES)
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute(_JOIN_TABLES[0])
+    assert got == JOIN_VIEWDEF[case]
 
 
 # A correlated subquery's value read from a join's column has that
