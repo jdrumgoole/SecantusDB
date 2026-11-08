@@ -198,8 +198,18 @@ fn through_projection(
 /// `{z: 1}` behind the stage).
 pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
     let mut out = pipeline.to_vec();
+    // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
+    // still moves one behind it ahead of the stages after it (8.2.11:
+    // `[{$limit: 3}, {$project: {x: 1}}, {$match: {x: 1}}]` lists `$match`
+    // then `$project`; RM-308).
+    let paging = |s: &Bson| {
+        s.as_document()
+            .filter(|d| d.len() == 1)
+            .is_some_and(|d| d.contains_key("$skip") || d.contains_key("$limit"))
+    };
     let leading = |s: &Bson| {
-        as_match(s).is_some()
+        paging(s)
+            || as_match(s).is_some()
             || reshapes(s).is_some()
             || projects(s).is_some()
             || as_sort(s).is_some()
