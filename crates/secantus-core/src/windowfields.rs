@@ -165,8 +165,18 @@ pub(crate) fn set_window_fields_each(
             if !arg_empty || window.is_some() {
                 return Err(Fallback::Defer);
             }
-            if (op == "$rank" || op == "$denseRank") && sort_by.is_none() {
-                return Err(Fallback::Defer);
+            // Measured 8.2.1 and 8.2.12, 2026-11-08: all three read the sort
+            // key, and mongod refuses one without a single-field `sortBy`
+            // before it reads a document.
+            if sort_by.is_none_or(|sb| sb.len() != 1) {
+                return Err(Fallback::mongo(
+                    5371602,
+                    format!(
+                        "{op} must be specified with a top level sortBy expression with \
+                         exactly one element"
+                    ),
+                )
+                .bare());
             }
         } else if op == "$shift" {
             // Position-based (like the rank funcs): requires a sortBy, no window,
@@ -332,6 +342,14 @@ pub(crate) fn set_window_fields_each(
 
     // What of each document the partition cache holds.
     let cached = cache_fields(spec, &compiled, downstream);
+    let sizer = match sort_by {
+        Some(sort_by) if needs_rank => CacheSize::SortKey {
+            partition_by,
+            sort_by,
+            vars,
+        },
+        _ => CacheSize::Fields(cached.as_ref()),
+    };
     let mut spill = CacheSpill::default();
 
     // mongod emits PARTITION BY PARTITION, in partition-key order (above),
@@ -342,7 +360,22 @@ pub(crate) fn set_window_fields_each(
         .iter()
         .map(|part| sorted_slots(part, &docs, sort_by))
         .collect::<R<Vec<_>>>()?;
-    for slots in &ordered {
+    for (pi, slots) in ordered.iter().enumerate() {
+        let token = match partition_by {
+            Some(by) => {
+                let key = |slots: &[usize]| {
+                    crate::memlimit::classic_size(&partition_key(&docs[slots[0]], by, vars))
+                };
+                PartitionToken {
+                    key: slots.first().map_or(0, |_| key(slots)),
+                    next: ordered
+                        .get(pi + 1)
+                        .filter(|next| !next.is_empty())
+                        .map(|next| (sizer.of(&docs[next[0]]), key(next))),
+                }
+            }
+            None => PartitionToken::default(),
+        };
         let slots = slots.clone();
         let n = slots.len();
         let ranks = if needs_rank {
@@ -403,7 +436,9 @@ pub(crate) fn set_window_fields_each(
             &compiled,
             &slots,
             &docs,
-            cached.as_ref(),
+            &sizer,
+            ranks.as_ref(),
+            token,
             range_vals.as_deref(),
             range_dates.as_deref(),
             vars,
@@ -557,32 +592,34 @@ fn cache_fields(
 }
 
 /// The documents mongod's partition iterator needs for `c` to answer `pos`
-/// (of `n`): the first it must still hold and the last it must have read.
+/// (of `n`): the first it must still hold, and the last index it asks for --
+/// past `n - 1` when the window runs off the partition's end, which makes
+/// the iterator read the next partition's first document to find that end.
 /// Measured on mongod 8.2.11 (2026-10-26, `maxTotalMemoryUsageBytes` and
 /// the budget bisected over a hundred documents): a window that drops
 /// documents needs the one answered and those its upper end reaches
 /// (`[-5, 5]`: six); `$first` / `$last` and a `range` window hold their
 /// whole window and the document leaving it, and a `range` window reads
-/// one past its end; a window with no upper end reads the partition;
-/// `$rank` reads one ahead, `$shift` back reads two.
+/// one past its end; a window with no upper end reads the partition and
+/// past it; `$shift` back holds the document leaving its endpoint, as
+/// `$first` does. A rank function's window is
+/// `["unbounded", "current"]`: it reads only the document it answers
+/// (`ExpressionFromRankAccumulator`; 8.2.1 and 8.2.12, RM-327).
 fn reach(
     c: &OutField,
     pos: usize,
     n: usize,
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
-) -> R<(usize, usize)> {
+) -> R<(usize, i64)> {
     let last = (n - 1) as i64;
     let p = pos as i64;
     let clamp = |i: i64| i.clamp(0, last) as usize;
-    if RANK_FUNCS.contains(&c.op) {
-        return Ok((pos, clamp(p + 2)));
-    }
-    if matches!(c.op, "$expMovingAvg" | "$locf") {
-        return Ok((pos, pos));
+    if RANK_FUNCS.contains(&c.op) || matches!(c.op, "$expMovingAvg" | "$locf") {
+        return Ok((pos, p));
     }
     if c.op == "$linearFill" {
-        return Ok((pos, clamp(last)));
+        return Ok((pos, last));
     }
     if c.op == "$shift" {
         let by = c
@@ -595,14 +632,17 @@ fn reach(
                 _ => None,
             })
             .unwrap_or(0);
+        // `$shift` reads its endpoint (`[by, by]`); back, it holds the
+        // document leaving it too, as `$first` does (`kEndpoints` expires
+        // what lies left of the endpoint it found the time before).
         return Ok(if by > 0 {
-            (pos, clamp(p + by))
+            (pos, p + by)
         } else {
-            (clamp(p + by), clamp(p + 2))
+            (clamp(p + by - 1), p)
         });
     }
     let Some(w) = c.window else {
-        return Ok((pos, clamp(last)));
+        return Ok((pos, last + 1));
     };
     let range = w.contains_key("range");
     let (lo, hi) = if range {
@@ -610,32 +650,44 @@ fn reach(
     } else {
         window_bounds(pos, n, Some(w))?
     };
-    let unbounded_hi = w
+    let upper = w
         .get("documents")
         .or_else(|| w.get("range"))
         .and_then(Bson::as_array)
-        .is_some_and(|b| matches!(b.get(1), Some(Bson::String(s)) if s == "unbounded"));
-    let hi = if unbounded_hi {
-        last
-    } else if range {
-        hi + 1
-    } else {
-        hi
+        .and_then(|b| b.get(1));
+    let hi = match upper {
+        Some(Bson::String(s)) if s == "unbounded" => last + 1,
+        _ if range => hi + 1,
+        // A document window asks for its upper bound, which `window_bounds`
+        // clamps to the partition.
+        Some(Bson::Int32(k)) => p + i64::from(*k),
+        Some(Bson::Int64(k)) => p + k,
+        _ => hi,
     };
     if range || (matches!(c.op, "$first" | "$last") && window_removes(Some(w))) {
-        return Ok((clamp((lo - 1).min(p)), clamp(hi.max(p))));
+        return Ok((clamp((lo - 1).min(p)), hi.max(p)));
     }
-    Ok((pos, clamp(hi.max(p))))
+    Ok((pos, hi.max(p)))
 }
 
 /// What one window function holds while `pos` is answered, as mongod's
 /// tracker counts it (measured 8.2.11, `maxFunctionMemoryUsageBytes`): a
 /// window that drops documents runs a removable function of a fixed size;
 /// one that only grows runs the `$group` accumulator over what it has read,
-/// counted as `$group` counts it; `$first` / `$last` and the position
-/// functions hold nothing of their own.
+/// counted as `$group` counts it; a rank function holds its accumulator;
+/// `$first` / `$last` and the other position functions hold nothing of
+/// their own.
 enum FunctionMemory {
     Nothing,
+    /// `AccumulatorRank` / `AccumulatorDenseRank` /
+    /// `AccumulatorDocumentNumber`: `sizeof(*this)`, and for `$rank` and
+    /// `$denseRank` the last distinct sort key, beyond the `Value` held
+    /// inline (Linux 8.2.12, x86-64 and arm64: 376, 368, 368; macOS arm64
+    /// 8.2.1 counts 32 less, RM-403).
+    Rank {
+        base: usize,
+        keeps_key: bool,
+    },
     /// A removable function: its own size, and each value in its window --
     /// once for a value a `Value` holds inline, twice for one on the heap,
     /// and `$push` every value twice (Linux x86-64 8.2.11, five ints in a
@@ -653,8 +705,28 @@ enum FunctionMemory {
 
 impl FunctionMemory {
     fn of(c: &OutField) -> R<FunctionMemory> {
+        match c.op {
+            "$rank" => {
+                return Ok(FunctionMemory::Rank {
+                    base: 376,
+                    keeps_key: true,
+                })
+            }
+            "$denseRank" => {
+                return Ok(FunctionMemory::Rank {
+                    base: 368,
+                    keeps_key: true,
+                })
+            }
+            "$documentNumber" => {
+                return Ok(FunctionMemory::Rank {
+                    base: 368,
+                    keeps_key: false,
+                })
+            }
+            _ => {}
+        }
         if matches!(c.op, "$first" | "$last")
-            || RANK_FUNCS.contains(&c.op)
             || PREFIX_OPS.contains(&c.op)
             || COVARIANCE_OPS.contains(&c.op)
             || matches!(c.op, "$shift" | "$derivative" | "$integral")
@@ -678,17 +750,33 @@ impl FunctionMemory {
         })
     }
 
-    /// The bytes held once the window covers indices `from..=upto` of `slots`.
+    /// The bytes held once the window covers indices `from..=upto` of
+    /// `slots`, answering `pos`.
+    #[allow(clippy::too_many_arguments)]
     fn held(
         &mut self,
         c: &OutField,
+        pos: usize,
         (from, upto): (usize, usize),
         slots: &[usize],
         docs: &[Document],
         vars: &Document,
+        sizer: &CacheSize,
+        ranks: Option<&Ranks>,
     ) -> R<usize> {
         Ok(match self {
             FunctionMemory::Nothing => 0,
+            FunctionMemory::Rank { base, keeps_key } => {
+                // The key the accumulator kept: the first of the documents
+                // tied with this one.
+                let first_tied = ranks.map_or(pos, |r| r.rank[pos] as usize - 1);
+                match sizer.sort_key(&docs[slots[first_tied]]) {
+                    Some(key) if *keeps_key => {
+                        *base + crate::memlimit::classic_size(&key) - crate::memlimit::VALUE
+                    }
+                    _ => *base,
+                }
+            }
             FunctionMemory::Removable { base, sizes } => {
                 if sizes.is_empty() {
                     sizes.resize(slots.len(), None);
@@ -808,6 +896,95 @@ impl Drop for CacheSpill {
     }
 }
 
+/// How mongod's partition cache counts a document
+/// (`Document::getApproximateSize`).
+enum CacheSize<'a> {
+    /// Cut down to the top-level fields this stage and the ones after it
+    /// read (`None`: whole documents).
+    Fields(Option<&'a std::collections::BTreeSet<String>>),
+    /// A rank function reads the sort key `$sort` attaches as metadata
+    /// (`ExpressionInternalRawSortKey`): mongod caches whole documents, each
+    /// carrying that key -- the partition key first when there is one, then
+    /// the `sortBy` value, an array when there are two (measured 8.2.1 and
+    /// 8.2.12, RM-327).
+    SortKey {
+        partition_by: Option<&'a Bson>,
+        sort_by: &'a Document,
+        vars: &'a Document,
+    },
+}
+
+impl CacheSize<'_> {
+    fn of(&self, doc: &Document) -> usize {
+        match self {
+            CacheSize::Fields(Some(f)) => crate::memlimit::fields_size(doc, f),
+            CacheSize::Fields(None) => crate::memlimit::document_size(doc),
+            CacheSize::SortKey { .. } => {
+                let key = self.sort_key(doc).unwrap_or(Bson::Null);
+                crate::memlimit::document_size(doc)
+                    + crate::memlimit::SORT_KEY_METADATA
+                    + crate::memlimit::classic_size(&key)
+            }
+        }
+    }
+
+    /// The sort key `$sort` attaches to `doc`, when the cache keeps it.
+    fn sort_key(&self, doc: &Document) -> Option<Bson> {
+        let CacheSize::SortKey {
+            partition_by,
+            sort_by,
+            vars,
+        } = self
+        else {
+            return None;
+        };
+        let mut parts = Vec::with_capacity(sort_by.len() + 1);
+        if let Some(by) = partition_by {
+            parts.push(partition_key(doc, by, vars));
+        }
+        for (field, dir) in sort_by.iter() {
+            let desc = matches!(dir, Bson::Int32(-1) | Bson::Int64(-1));
+            parts.push(order::sort_repr(field_value(doc, field), desc));
+        }
+        Some(if parts.len() == 1 {
+            parts.pop().expect("one part")
+        } else {
+            Bson::Array(parts)
+        })
+    }
+}
+
+/// `doc`'s partition key as `PartitionKeyComparator` holds it: missing is
+/// null.
+fn partition_key(doc: &Document, by: &Bson, vars: &Document) -> Bson {
+    match expressions::evaluate(doc, by, vars) {
+        Ok(Bson::Undefined) | Err(_) => Bson::Null,
+        Ok(v) => v,
+    }
+}
+
+/// What mongod's `PartitionIterator` counts besides its cache
+/// (`getNextPartitionStateSize`), for one partition: the partition key its
+/// comparator holds, and -- once a window asks past the partition's end --
+/// the next partition's first document, which it read to find that end,
+/// with the comparator now holding that partition's key. Nothing when
+/// there is no `partitionBy` (measured 8.2.1 and 8.2.12, RM-327).
+#[derive(Clone, Copy, Default)]
+struct PartitionToken {
+    key: usize,
+    /// The next partition's first document and key, if there is one.
+    next: Option<(usize, usize)>,
+}
+
+impl PartitionToken {
+    fn bytes(&self, read_next: bool) -> usize {
+        match self.next {
+            Some((doc, key)) if read_next => doc + key,
+            _ => self.key,
+        }
+    }
+}
+
 /// mongod's partition cache (`SpillableDeque`) over `slots`, as
 /// `DocumentSourceInternalSetWindowFields::doGetNext` drives it: for each
 /// document it reads what the windows need, answers, counts its cache and
@@ -816,13 +993,17 @@ impl Drop for CacheSpill {
 /// document and dropping those no window needs any more. Each document read
 /// is counted at its size with only the fields kept; past the budget the
 /// cache spills all it holds, or with `allowDiskUse: false` refuses
-/// (5643011).
+/// (5643011). The cache's own check counts the cache alone; the stage's
+/// counts the iterator's `token` too, and its message what is left once the
+/// cache is let go: the functions and the token.
 #[allow(clippy::too_many_arguments)]
 fn run_cache(
     compiled: &[OutField],
     slots: &[usize],
     docs: &[Document],
-    fields: Option<&std::collections::BTreeSet<String>>,
+    sizer: &CacheSize,
+    ranks: Option<&Ranks>,
+    token: PartitionToken,
     range_vals: Option<&[f64]>,
     range_dates: Option<&[f64]>,
     vars: &Document,
@@ -832,11 +1013,10 @@ fn run_cache(
     if n == 0 {
         return Ok(());
     }
+    let last = n as i64 - 1;
     let budget = crate::memlimit::budgets().window_fields;
-    let size = |i: usize| match fields {
-        Some(f) => crate::memlimit::fields_size(&docs[slots[i]], f),
-        None => crate::memlimit::document_size(&docs[slots[i]]),
-    };
+    let size = |i: usize| sizer.of(&docs[slots[i]]);
+    let mut read_next = false;
     let mut functions = compiled
         .iter()
         .map(FunctionMemory::of)
@@ -883,7 +1063,7 @@ fn run_cache(
         Ok(())
     };
     for pos in 0..n {
-        let mut ahead = pos;
+        let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
         for c in compiled {
             ahead = ahead.max(reach(c, pos, n, range_vals, range_dates)?.1);
@@ -897,22 +1077,24 @@ fn run_cache(
             };
             reads.push((from.max(0) as usize, upto.max(0) as usize));
         }
-        read_to(&mut cache, ahead, spill)?;
+        read_to(&mut cache, ahead.min(last) as usize, spill)?;
+        read_next |= ahead > last;
         let mut functions_held = 0usize;
         for ((f, c), window) in functions.iter_mut().zip(compiled).zip(&reads) {
-            functions_held += f.held(c, *window, slots, docs, vars)?;
+            functions_held += f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
         }
-        if cache.used + functions_held > budget {
+        let outside = functions_held + token.bytes(read_next);
+        if cache.used + outside > budget {
             if crate::memlimit::disk_allowed() {
                 spill_all(&mut cache, spill)?;
             }
-            // mongod names what its functions hold, the cache being its own
-            // tracker's (measured 8.2.11).
-            if cache.used + functions_held > budget {
+            // mongod names what is left once it lets the cache go: the
+            // functions and the iterator's token (measured 8.2.1, 8.2.12).
+            if cache.used + outside > budget {
                 return Err(Fallback::mongo(
                     5414201,
                     format!(
-                        "Exceeded memory limit in DocumentSourceSetWindowFields, used {functions_held} \
+                        "Exceeded memory limit in DocumentSourceSetWindowFields, used {outside} \
                          bytes but max allowed is {budget}"
                     ),
                 ));
@@ -2227,4 +2409,95 @@ fn range_window_bounds(
         high -= 1;
     }
     Ok((low, high))
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::memlimit::{self, Budgets};
+    use bson::{bson, doc};
+
+    fn docs() -> Vec<Document> {
+        (0..100i32)
+            .map(|i| doc! {"_id": i, "k": i % 7, "n": i * 2, "s": "x".repeat(300 + i as usize)})
+            .collect()
+    }
+
+    /// `$setWindowFields` over `docs()` under `budget`, with `allowDiskUse:
+    /// false` and a `{_id: 1, t: 1}` projection after it.
+    fn run(spec: &Bson, budget: usize) -> R<()> {
+        let _b = memlimit::with_budgets(Budgets {
+            window_fields: budget,
+            ..Default::default()
+        });
+        let _d = memlimit::allow_disk_use(false);
+        let downstream = ["_id", "t"].map(String::from).into_iter().collect();
+        set_window_fields_each(
+            spec,
+            docs(),
+            &Document::new(),
+            Some(&downstream),
+            &mut |_| Ok(()),
+        )
+    }
+
+    /// The least budget `spec` runs under, and the refusal one byte below.
+    fn least(spec: Bson) -> (usize, String) {
+        let (mut lo, mut hi) = (1, 400_000);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if run(&spec, mid).is_ok() {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        let refusal = run(&spec, lo).expect_err("refused below the least budget");
+        (hi, format!("{refusal:?}"))
+    }
+
+    fn window(output: Bson, partitioned: bool) -> Bson {
+        let mut spec = doc! {"sortBy": {"n": 1}, "output": {"t": output}};
+        if partitioned {
+            spec.insert("partitionBy", "$k");
+        }
+        Bson::Document(spec)
+    }
+
+    /// Linux mongod 8.2.12 (x86-64 and arm64), 2026-11-08 (RM-327).
+    #[test]
+    fn a_rank_caches_whole_documents_with_their_sort_key() {
+        let (least, refusal) = least(window(bson!({"$rank": {}}), false));
+        assert_eq!(least, 1619);
+        assert!(refusal.contains("5643011") && refusal.contains("Current memory: 1619 bytes"));
+    }
+
+    #[test]
+    fn a_partitioned_window_counts_the_next_partitions_first_document() {
+        let (least, refusal) = least(window(bson!({"$sum": "$n"}), true));
+        assert_eq!(least, 2304);
+        // What is left once the cache goes: the function's 176 bytes, the
+        // partition key's 16 and the next partition's first document's 132.
+        assert!(refusal.contains("5414201") && refusal.contains("used 324 bytes"));
+    }
+
+    #[test]
+    fn removable_windows_keep_their_budgets() {
+        let sum = bson!({"$sum": "$n", "window": {"documents": [-5, 5]}});
+        assert_eq!(least(window(sum, false)).0, 1222);
+        let push = bson!({"$push": "$s", "window": {"documents": [-5, 5]}});
+        assert_eq!(least(window(push, false)).0, 12885);
+    }
+
+    /// 8.2.1 and 8.2.12, 2026-11-08 (RM-405).
+    #[test]
+    fn a_rank_function_needs_one_sort_field() {
+        for spec in [
+            bson!({"output": {"t": {"$documentNumber": {}}}}),
+            bson!({"sortBy": {"k": 1, "n": 1}, "output": {"t": {"$rank": {}}}}),
+        ] {
+            let err = format!("{:?}", run(&spec, memlimit::MAX_BYTES).unwrap_err());
+            assert!(err.contains("5371602"), "{err}");
+        }
+    }
 }

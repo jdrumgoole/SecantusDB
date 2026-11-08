@@ -1060,20 +1060,31 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       records where mongod's spill 592.
       Backlog-ID: RM-399
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_top_k_sort_spills
-- [ ] **`$setWindowFields` refuses at slightly the wrong budget for some
-      windows.** The partition cache and the functions are counted as mongod
-      8.2.11 counts them for whole-partition, `["unbounded", "current"]` and
-      `$shift` windows (exact, measured by bisecting the budget), but not
-      quite for others (measured against the macOS arm64 build): a removable
-      `[-5, 5]` `$sum` is refused 16 bytes above mongod's limit, `$rank` 5
-      bytes below it, a partitioned whole-partition window 458 bytes below,
-      and a removable `$push` of 400-byte strings 208 bytes above
-      (`5414201` / `5643011` in each case). The function's memory over a
-      window that drops documents is the part least measured. The sizes this
-      server uses are the Linux x86-64 build's, the exemplar; the macOS
-      build counts some accumulators differently (`$sum` 184, not 176).
-      Backlog-ID: RM-327
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_window_budget_residuals
+- [ ] **macOS mongod counts window functions at its own sizes.** This
+      server counts a window function's memory at Linux mongod 8.2.12's
+      sizes (x86-64 and arm64 agree), the exemplar CI measures. macOS
+      mongod 8.2.1 (arm64) sizes many differently: a growing `$sum` /
+      `$count` 184 bytes, not 176; a removable `$sum` 8 more and a removable
+      `$push`, `$min`, `$max` and `$addToSet` 16-32 less; `$rank`,
+      `$denseRank` and `$documentNumber` 32 less (344 / 336 / 336); `$top`
+      and `$topN` 72 less, `$firstN` 32 less, `$minN` 16 less. So on this
+      Mac a `[-5, 5]` `$sum`, a partitioned whole-partition `$sum` and a
+      `[-5, 5]` `$push` run under 1230, 2312 and 12853 bytes where this
+      server needs 1222, 2304 and 12885. The `$group` face of the same
+      sizes is RM-397. Checked on this Mac only (`only_on("arm64")`).
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_macos_window_function_sizes
+      Backlog-ID: RM-403
+- [ ] **Four window shapes still miss mongod's `$setWindowFields` budget.**
+      Over 40 small documents Linux mongod 8.2.12 runs a `range` window
+      with no lower end (`["unbounded", 4]`) under 676 bytes, where this
+      server holds the whole partition (5176); `$expMovingAvg` under 261
+      and `$locf` under 253 (here 250: their functions count nothing); a
+      removable `[-3, 3]` `$max` under 852 (here 908). Each also misses
+      partitioned. The rest of a 48-shape matrix (document and range
+      windows, `$first` / `$last`, `$shift`, the rank functions, each with
+      and without `partitionBy`) matches to the byte.
+      Verify: tests/backlog/test_rm_found_2026_11_08.py::test_window_budget_more_shapes
+      Backlog-ID: RM-404
 - [ ] **`explain` lacks the stages' own memory counters.** The spill
       counters are there (a `SORT`'s, a `$sort`'s, a `$group`'s; RM-315), but
       mongod 8.2.11 also lists a `$group`'s `maxAccumulatorMemoryUsageBytes`

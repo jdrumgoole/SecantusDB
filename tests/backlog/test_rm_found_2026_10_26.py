@@ -258,16 +258,24 @@ WINDOWS = {
     "$rank": ({"$rank": {}}, False),
     "whole partitions": ({"$sum": "$n"}, True),
     "[-5, 5] $push of strings": ({"$push": "$s", "window": {"documents": [-5, 5]}}, False),
+    "whole partitions $avg": ({"$avg": "$n"}, True),
+    "partitioned $rank": ({"$rank": {}}, True),
+    "partitioned $shift back": ({"$shift": {"output": "$n", "by": -1}}, True),
 }
 
+#: The cases whose least budget macOS mongod counts with its own function
+#: sizes (RM-403): this server counts Linux's, the exemplar CI measures.
+MACOS_SIZES = ("[-5, 5] $sum", "whole partitions", "[-5, 5] $push of strings")
 
-def _least_budgets(client: Any) -> dict:
+
+def _least_budgets(client: Any, names: Any = WINDOWS) -> dict:
     client.drop_database("rm318")
     coll = client.rm318.c
     coll.insert_many([{"_id": i, "k": i % 7, "n": i * 2, "s": "x" * (300 + i)} for i in range(100)])
     coll.create_index("n")
     out = {}
-    for name, (output, partitioned) in WINDOWS.items():
+    for name in names:
+        output, partitioned = WINDOWS[name]
         spec: dict = {"sortBy": {"n": 1}, "output": {"t": output}}
         if partitioned:
             spec["partitionBy"] = "$k"
@@ -289,11 +297,30 @@ def _least_budgets(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-327")
+@pytest.mark.backlog_fixed("RM-327")
 def test_window_budget_residuals(rust_mongo: Any, mongod: Any) -> None:
-    """The least `$setWindowFields` budget each window runs under, mongod
-    8.2.11's."""
-    assert _least_budgets(rust_mongo) == _least_budgets(mongod)
+    """The least `$setWindowFields` budget each window runs under was a few
+    bytes off mongod's; it is now Linux mongod 8.2.12's to the byte. A rank
+    function's cache holds whole documents carrying `$sort`'s sort key (two
+    at its peak: 1619 bytes) and the function its accumulator; a
+    partitioned window counts the partition key and the next partition's
+    first document its iterator read to find the end (2304). On arm64 --
+    this Mac -- the cases macOS mongod sizes differently are RM-403's
+    gap, so only the others are compared."""
+    names = list(WINDOWS)
+    if PLATFORM == "arm64":
+        names = [n for n in names if n not in MACOS_SIZES]
+    assert _least_budgets(rust_mongo, names) == _least_budgets(mongod, names)
+
+
+@pytest.mark.backlog("RM-403")
+def test_macos_window_function_sizes(rust_mongo: Any, mongod: Any) -> None:
+    """macOS mongod 8.2.1 counts some window functions at its own sizes --
+    a growing `$sum` 184 bytes, not Linux's 176, a removable `$push` 32
+    less -- so these windows' least budgets are 1230, 2312 and 12853 on
+    this Mac (1222, 2304 and 12885 on Linux)."""
+    only_on("arm64", why="Linux mongod's sizes are this server's (RM-327's regression test)")
+    assert _least_budgets(rust_mongo, MACOS_SIZES) == _least_budgets(mongod, MACOS_SIZES)
 
 
 # ------------------------------------------- RM-328 explain's counters --
