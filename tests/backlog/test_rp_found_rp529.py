@@ -1,10 +1,10 @@
 """Gap tests of the divergences found while working RP-529 (a domain
 column's whole row is typed by the domain): RP-551 (a cast to a domain
-over `char(n)` is not blank-padded), RP-552 (a domain's CHECK error inside a
+over `char(n)` was not blank-padded; fixed), RP-552 (a domain's CHECK error inside a
 record literal carries no position), RP-553 (a schema's domain names its
 CHECK after the qualified name), RP-554 (a scalar subquery's array of a row
 type is described as `text[]`), RP-555 (`ALTER DOMAIN ... NOT VALID`
-validates the rows) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
+validated the rows; fixed) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
 column's type is refused).
 
 An answer is the rows, the command tag for a statement that returns none,
@@ -16,6 +16,7 @@ were measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with
 from __future__ import annotations
 
 from collections.abc import Iterator
+from decimal import Decimal
 from typing import Any
 
 import psycopg
@@ -26,12 +27,15 @@ from tests.backlog.test_rp_batch26 import _dsn
 _SETUP = [
     "drop type if exists ctp",
     "drop table if exists fc, fcn, fnv, falt, fs cascade",
-    "drop domain if exists dc3n, dc3, dnv, pint cascade",
+    "drop domain if exists dc3n, dc3, dnv, pint, dv3, dn52n, dn52 cascade",
     "drop schema if exists s cascade",
     "create domain dc3 as char(3)",
     "create domain dc3n as dc3",
     "create domain dnv as int",
     "create domain pint as int check (value > 0)",
+    "create domain dv3 as varchar(3) check (value <> 'abcd')",
+    "create domain dn52 as numeric(5,2)",
+    "create domain dn52n as dn52",
     "create schema s",
     "create domain s.sd as int check (value < 100)",
     "create table fc (a dc3, b int)",
@@ -82,13 +86,41 @@ CHAR_DOMAIN = {
     "select octet_length(a) from fcn": [(3,)],
     "select fcn from fcn": [('("ab ")',)],
     "select fc = row('ab '::dc3, 1) from fc": [(True,)],
+    # An explicit cast truncates to the width; a write is refused (22001).
+    "select 'abcd'::dc3n": [("abc",)],
+    "insert into fcn values ('abcd')": (
+        "22001",
+        "value too long for type character(3)",
+        None,
+        None,
+    ),
+    # The padded value is a char(3) to an operator: its blanks do not count.
+    "select 'ab'::dc3 = 'ab'": [(True,)],
+    "select ('ab'::dc3)::text || '|'": [("ab|",)],
 }
 
 
-@pytest.mark.backlog("RP-551")
+@pytest.mark.backlog_fixed("RP-551")
 @pytest.mark.parametrize("query", list(CHAR_DOMAIN))
 def test_char_domain_cast_pads(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CHAR_DOMAIN[query]
+
+
+# Every modifier is the base's, as `coerce_to_domain` applies it before the
+# domain's CHECK runs: `'abcd'::dv3` is `abc`, which passes `value <>
+# 'abcd'`, and a numeric(5,2) rounds, through a domain over it too.
+BASE_TYPMOD = {
+    "select 'abcd'::dv3": [("abc",)],
+    "select 1.234::dn52": [(Decimal("1.23"),)],
+    "select 1.234::dn52n": [(Decimal("1.23"),)],
+    "select 12345.6::dn52n": ("22003", "numeric field overflow", None, None),
+}
+
+
+@pytest.mark.backlog_fixed("RP-551")
+@pytest.mark.parametrize("query", list(BASE_TYPMOD))
+def test_domain_cast_applies_base_typmod(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == BASE_TYPMOD[query]
 
 
 # A field's domain CHECK failing in a record literal is reported at the
@@ -156,14 +188,76 @@ def _then(dsn: str, statement: str, query: str) -> Any:
         return tag, c.execute(query).fetchall()
 
 
-# NOT VALID adds the constraint without checking the rows already there.
-@pytest.mark.backlog("RP-555")
+# NOT VALID added the constraint without checking the rows already there.
+@pytest.mark.backlog_fixed("RP-555")
 def test_domain_constraint_not_valid(dsn: str) -> None:
     assert _then(
         dsn,
         "alter domain dnv add constraint big check (value > 5) not valid",
         "select convalidated from pg_constraint where conname = 'big'",
     ) == ("ALTER DOMAIN", [(False,)])
+
+
+_BIG = (
+    "select convalidated, pg_get_constraintdef(oid),"
+    " pg_get_constraintdef(oid, true) from pg_constraint where conname = 'big'"
+)
+
+# A NOT VALID constraint still checks every new value; VALIDATE CONSTRAINT
+# checks the stored ones (`validateDomainConstraint`), then marks it
+# validated, and its definition loses the NOT VALID. `fnv` holds 1.
+NOT_VALID_THEN_VALIDATE = [
+    ("alter domain dnv add constraint big check (value > 5) not valid", "ALTER DOMAIN"),
+    (
+        _BIG,
+        [(False, "CHECK ((VALUE > 5)) NOT VALID", "CHECK (VALUE > 5) NOT VALID")],
+    ),
+    (
+        "insert into fnv values (2)",
+        ("23514", 'value for domain dnv violates check constraint "big"'),
+    ),
+    ("insert into fnv values (7)", "INSERT 0 1"),
+    (
+        "alter domain dnv validate constraint big",
+        (
+            "23514",
+            'column "a" of table "fnv" contains values that violate the new constraint',
+        ),
+    ),
+    (
+        "alter domain dnv validate constraint nosuch",
+        ("42704", 'constraint "nosuch" of domain "dnv" does not exist'),
+    ),
+    ("delete from fnv where a < 5", "DELETE 1"),
+    ("alter domain dnv validate constraint big", "ALTER DOMAIN"),
+    (_BIG, [(True, "CHECK ((VALUE > 5))", "CHECK (VALUE > 5)")]),
+    # Validating a validated constraint does nothing.
+    ("alter domain dnv validate constraint big", "ALTER DOMAIN"),
+    ("alter domain dnv drop constraint big", "ALTER DOMAIN"),
+    ("select count(*) from pg_constraint where conname = 'big'", [(0,)]),
+]
+
+
+def _in_order(dsn: str, steps: list[str]) -> list[Any]:
+    """Each statement's answer after `_SETUP`, in order on one connection."""
+    out: list[Any] = []
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        for q in steps:
+            try:
+                cur = c.execute(q)
+            except psycopg.Error as e:
+                out.append((e.sqlstate, e.diag.message_primary))
+                continue
+            out.append(cur.fetchall() if cur.description else cur.statusmessage)
+    return out
+
+
+@pytest.mark.backlog_fixed("RP-555")
+def test_domain_constraint_not_valid_then_validate(dsn: str) -> None:
+    steps = [q for q, _ in NOT_VALID_THEN_VALIDATE]
+    assert _in_order(dsn, steps) == [a for _, a in NOT_VALID_THEN_VALIDATE]
 
 
 # A column retyped to a domain over its own type needs no USING.

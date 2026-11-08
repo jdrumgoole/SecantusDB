@@ -11008,7 +11008,13 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                         pgtypes::user_type_catalog_name(&ty)
                     )));
                 }
-                let ty = domain.as_ref().map_or(ty, |d| d.base.clone());
+                // Through a domain over a domain to the innermost base and
+                // its modifier (`getBaseTypeAndTypmod`): a `dc3n` over `dc3
+                // char(3)` column stores a width-3 `bpchar` (RP-551).
+                let resolved = domain
+                    .as_ref()
+                    .and_then(|d| domains::base_type_and_typmod(&d.name));
+                let ty = resolved.as_ref().map_or(ty, |(base, _, _)| base.clone());
                 let underlying = normalize_serial(&ty);
                 let pk = cd.constraints.iter().any(|c| {
                     matches!(c.node.as_ref(), Some(N::Constraint(k))
@@ -11034,7 +11040,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     column.extra.insert("collation", name);
                 }
                 if let Some(d) = &domain {
-                    column.typmod = d.typmod;
+                    column.typmod = resolved.as_ref().map_or(d.typmod, |(_, typmod, _)| *typmod);
                     column.extra.insert("domain_type", d.name.clone());
                     // The domain's DEFAULT is the column's unless the column
                     // declares its own (below, which then overwrites it).
@@ -16391,6 +16397,30 @@ pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
     fit_length(v, &column.pg_type, column.typmod)
 }
 
+/// An EXPLICIT cast's `coerce_type_typmod` over a value already of type
+/// `pg_type`: `char(n)` / `varchar(n)` truncate silently and `char(n)` pads
+/// (the padded text is the value, as `'ab'::char(3)` answers), `bit(n)`
+/// pads or truncates, and the other modifiers round as an assignment does.
+pub(crate) fn explicit_typmod(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
+    match (&v, pg_type) {
+        (Bson::String(text), "bpchar" | "varchar") if typmod > 4 => {
+            let n = (typmod - 4) as usize;
+            let mut t: String = text.chars().take(n).collect();
+            if pg_type == "bpchar" {
+                let len = t.chars().count();
+                t.push_str(&" ".repeat(n - len));
+            }
+            Ok(Bson::String(t))
+        }
+        (Bson::String(text), t) if bits::is_bit_type(t) => Ok(Bson::String(bits::fit_explicit(
+            text,
+            t,
+            usize::try_from(typmod).ok(),
+        ))),
+        _ => fit_length(v, pg_type, typmod),
+    }
+}
+
 /// [`fit_to_column`] over a bare type and modifier.
 pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     if bits::is_bit_type(pg_type) {
@@ -16468,6 +16498,13 @@ fn restore_bpchar_blanks(source: &Bson, out: Bson) -> Bson {
         ),
         (_, out) => out,
     }
+}
+
+/// Whether a value of type `t` is a `char(n)` to an operator or a function:
+/// `bpchar`, or a domain over it, which resolves to its base type as an
+/// operand does (`'ab'::dc3 = 'ab'` is true on 15.19, RP-551).
+pub(crate) fn is_bpchar_type(t: &str) -> bool {
+    t == "bpchar" || domains::base_type_and_typmod(t).is_some_and(|(base, _, _)| base == "bpchar")
 }
 
 pub(crate) fn trim_bpchar(v: Bson) -> Bson {
@@ -38745,7 +38782,7 @@ fn bpchar_args(f: &pg_query::protobuf::FuncCall, name: &str, args: Vec<Bson>) ->
     args.into_iter()
         .zip(f.args.iter())
         .map(|(v, node)| {
-            if static_type(node, &v) == "bpchar" {
+            if is_bpchar_type(&static_type(node, &v)) {
                 trim_bpchar(v)
             } else {
                 v
@@ -41887,6 +41924,7 @@ fn lower_where_plain(
         }
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
+            composite_null_test_is_per_row(def, &field)?;
             // A SQL NULL is either an explicit null or an absent field here,
             // and MQL's `null` / `$ne: null` match exactly that pair.
             match NullTestType::try_from(t.nulltesttype) {
@@ -42780,7 +42818,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         // citext, whose cast from bpchar is `rtrim1` (citext 1.6).
         let value = if (matches!(target.as_str(), "text" | "varchar" | "name")
             || collation::is_citext_type(&target))
-            && arg_type == "bpchar"
+            && is_bpchar_type(&arg_type)
         {
             trim_bpchar(value)
         } else {
@@ -42831,6 +42869,22 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 if matches!(arg_type.as_str(), "float4" | "real") {
                     return cast_value(Bson::String(geo::float4_text(d as f32)), &target);
                 }
+            }
+        }
+        // A cast to a domain is `coerce_to_domain`: a cast to the base type
+        // AT the base's modifier (`getBaseTypeAndTypmod`, through a domain
+        // over a domain too), then every domain's constraints over the
+        // coerced value. So `'ab'::dc3`, dc3 a domain over char(3), is
+        // `ab `, `'abcd'::dc3` is `abc`, and a CHECK sees the padded,
+        // truncated or rounded value (15.19, RP-551).
+        if let Some((base, typmod, chain)) = domains::base_type_and_typmod(&target) {
+            if typmod >= 0 {
+                let v = explicit_typmod(cast_value(value, &base)?, &base, typmod)?;
+                // Innermost first, as a domain over a domain checks its base's.
+                for d in chain.iter().rev() {
+                    domains::check_domain(d, &v)?;
+                }
+                return Ok(v);
             }
         }
         let source_value = value.clone();
@@ -44410,7 +44464,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         // blanks on each); against `text` only the bpchar side is converted.
         {
             let bp = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
-                n.is_some_and(|n| static_type(n, v) == "bpchar")
+                n.is_some_and(|n| is_bpchar_type(&static_type(n, v)))
             };
             let (lb, rb) = (bp(e.lexpr.as_deref(), &lhs), bp(e.rexpr.as_deref(), &rhs));
             if lb || rb {
@@ -44962,6 +45016,7 @@ fn lower_negated(
         },
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
+            composite_null_test_is_per_row(def, &field)?;
             match NullTestType::try_from(t.nulltesttype) {
                 Ok(NullTestType::IsNull) => Ok(doc! { field: { "$ne": Bson::Null } }),
                 Ok(NullTestType::IsNotNull) => Ok(doc! { field: Bson::Null }),
@@ -45054,6 +45109,28 @@ fn column_field(node: Option<&pg_query::protobuf::Node>, def: &TableDef) -> Resu
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("missing operand".into())),
     }
+}
+
+/// `Unsupported` for `x IS [NOT] NULL` over a column of a composite type,
+/// which the filter cannot express: PostgreSQL's `ExecEvalRowNull` makes a
+/// row IS NULL when every field is null and IS NOT NULL when none is, so
+/// `row(1, null)` is neither, where `{x: null}` tests only whether the value
+/// itself is (RP-534). Evaluated per row it reads the fields, as the select
+/// list does -- and as PostgreSQL, whose index quals refuse an `argisrow`
+/// null test (`match_clause_to_indexcol`), always does.
+fn composite_null_test_is_per_row(def: &TableDef, field: &str) -> Result<()> {
+    match field_type(def, field) {
+        Some(t) if type_is_rowtype(t) => Err(Error::Unsupported(
+            "IS [NOT] NULL over a composite column".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Whether a declared type is a row type (`type_is_rowtype`): `record`, or a
+/// composite -- a table's, a view's or a `CREATE TYPE ... AS` one.
+fn type_is_rowtype(t: &str) -> bool {
+    t.eq_ignore_ascii_case("record") || user_composite(t).is_some()
 }
 
 /// A filter that matches nothing. `{}` matches every document, so NOR of it

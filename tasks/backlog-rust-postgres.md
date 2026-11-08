@@ -2172,18 +2172,6 @@ holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
 holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
 gap tests are in `tests/backlog/test_rp_found_rp532.py`.
 
-- [ ] **A composite value's IS NULL in a WHERE or HAVING tests the value,
-      not its fields.** PostgreSQL 15.19's `ExecEvalRowNull` makes a row
-      IS NULL when every field is null and IS NOT NULL when none is, so
-      `select count(*) from fk where k is not null` is 1 and `... where k
-      is null` 2, `select count(*) from (select fs x from fs) s where x is
-      not null` is 3, and `select count(*) from fs group by fs having fs
-      is null` is 1. Here they are 3, 1, 4 and no row: the clause tests
-      whether the stored value is null. The select-list `k is not null`
-      already answers as PostgreSQL does, and so does a WHERE over the
-      table's own whole row (`where fs is not null`).
-      Backlog-ID: RP-534
-      Verify: tests/backlog/test_rp_found_rp532.py::test_composite_null_test_in_a_clause
 - [ ] **An ungrouped whole row's 42803 names its first column, with no
       position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
       whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
@@ -2202,21 +2190,43 @@ gap tests are in `tests/backlog/test_rp_found_rp532.py`.
       Backlog-ID: RP-537
       Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
 
+## Found while working RP-551 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d551c as
+char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
+`fd551(a d551c)`. The gap tests are in `tests/backlog/test_rp_found_rp551.py`.
+
+- [ ] **A domain-typed result column goes out with no type modifier.**
+      PostgreSQL 15.19's `SendRowDescriptionMessage` sends a domain as its
+      base type and the base's modifier (`getBaseTypeAndTypmod`), so `select
+      'ab'::d551c` describes `bpchar` typmod 7, `1.5::d551n` 327686 and a
+      cast to `d551t` 0, as the same casts to `char(3)`, `numeric(5,2)` and
+      `timestamp(0)` do; here each is -1. The values themselves are right
+      (RP-551). A table's domain column already describes its width.
+      Backlog-ID: RP-557
+      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_result_column_typmod
+- [ ] **A domain column's `atttypmod` is the domain's width.** A column
+      declared with a domain carries no modifier of its own, so `fd551.a`'s
+      `atttypmod` is -1 on PostgreSQL 15.19 (the width is the domain's
+      `typtypmod`, which `information_schema` reads through
+      `_pg_truetypmod`); here it is 7. A domain over a domain already
+      answers -1 (RP-551 keeps the catalog at the column's own domain).
+      Backlog-ID: RP-558
+      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
+- [ ] **An array of a domain is described and printed as `varchar[]`.**
+      `select array['a b'::d551c]` is of the domain's array type
+      (`typarray`) on PostgreSQL 15.19 and prints `{"a b"}`, `array_out`
+      quoting the element that holds a blank; here the column is `varchar`
+      (1043) and the text `{a b}`. `pg_typeof` of it already names `d551c[]`.
+      Backlog-ID: RP-559
+      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_array
+
 ## Found while working RP-529 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
 char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
 `tests/backlog/test_rp_found_rp529.py`.
 
-- [ ] **A cast to a domain over `char(n)` is not blank-padded.** `select
-      'ab'::dc3` is `ab ` on PostgreSQL 15.19 (`octet_length` 3), and so
-      is a column of a domain over that domain (`dc3n`, where the width
-      is not inherited at all: the column stores `ab`); here both are `ab`.
-      A wrong answer follows: `fc = row('ab '::dc3, 1)` against a `dc3`
-      column's padded whole row is false here, true on PostgreSQL. A
-      `dc3` column and its row type's field do pad (RP-529).
-      Backlog-ID: RP-551
-      Verify: tests/backlog/test_rp_found_rp529.py::test_char_domain_cast_pads
 - [ ] **A domain's CHECK failing inside a record literal carries no
       position.** `select '(0,x)'::ctp`, `ctp` a composite with a `pint`
       field, is 23514 at 8 on PostgreSQL 15.19, at the literal as its other
@@ -2239,13 +2249,6 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       aggregate outside a subquery answer as PostgreSQL.
       Backlog-ID: RP-554
       Verify: tests/backlog/test_rp_found_rp529.py::test_scalar_subquery_row_type_array
-- [ ] **`ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` checks the rows.**
-      PostgreSQL 15.19 adds the constraint unchecked (`convalidated` false)
-      when a `dnv` column holds a value it refuses; here it is 23514
-      `column "a" of table "fnv" contains values that violate the new
-      constraint` and nothing is added.
-      Backlog-ID: RP-555
-      Verify: tests/backlog/test_rp_found_rp529.py::test_domain_constraint_not_valid
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
@@ -2253,6 +2256,23 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       `column "a" cannot be cast automatically to type pint`.
       Backlog-ID: RP-556
       Verify: tests/backlog/test_rp_found_rp529.py::test_alter_column_type_to_domain
+
+## Found while working RP-534 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`,
+`create domain dfs as fs` and `fd(k dfs)` holding `row(null, null)`,
+`row(1, null)`, `row(1, 'a')` and `null`.
+
+- [ ] **A domain over a table's row type is refused.** `create domain dfs
+      as fs` over a table `fs` is 42704 `type "fs" does not exist` here;
+      PostgreSQL 15.19 creates it (a domain may be over a composite since
+      PostgreSQL 11), and a column of it holds rows: `select count(*) from
+      fd where k is not null` is 1 and `... where k is null` 2, the null
+      test reading the fields because `type_is_rowtype` is true of the
+      domain. RP-534's per-row null test asks `type_is_rowtype` of the
+      column's declared type, so it needs to see through the domain then.
+      Backlog-ID: RP-538
+      Verify: tests/backlog/test_rp_found_rp534.py::test_domain_over_a_table_row_type
 
 ## Found while working RP-500 (2026-11-07)
 

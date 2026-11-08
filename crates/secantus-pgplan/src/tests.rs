@@ -3714,6 +3714,47 @@ fn float8_against_numeric_lowers_as_float8() {
     }
 }
 
+/// `x IS [NOT] NULL` over a composite column tests its FIELDS
+/// (`ExecEvalRowNull`: `row(1, null)` is neither), which no `{x: null}`
+/// filter expresses, so it is evaluated per row (RP-534); over a scalar
+/// column it stays a filter.
+#[test]
+fn composite_null_test_is_evaluated_per_row() {
+    set_user_composites(vec![(
+        "fs".into(),
+        67_010,
+        vec![("a".into(), "int4".into()), ("c".into(), "text".into())],
+    )]);
+    let def = || {
+        TableDef::new(
+            "fk",
+            vec![
+                Column::new("k", "fs", false),
+                Column::new("r", "record", false),
+                Column::new("n", "int4", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "fk").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select n from fk where k is null",
+        "select n from fk where k is not null",
+        "select n from fk where not (k is null)",
+        "select n from fk where r is not null",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    let (filter, residual) = lowered("select n from fk where n is null");
+    assert!(!residual, "a scalar null test is a filter: {filter:?}");
+    assert_eq!(filter, doc! { "n": Bson::Null });
+    set_user_composites(Vec::new());
+}
+
 /// A strict WHERE on a LEFT join's nullable side drops every
 /// NULL-extended row, so the narrow path plans an inner join
 /// (`reduce_outer_joins`, RP-365); `NOT col` is not strict and keeps the
@@ -4791,5 +4832,84 @@ fn sorts_order_records_by_record_cmp() {
     assert_eq!(
         compare_values(&Bson::Int32(2), &Bson::Int32(1)),
         Some(Ordering::Greater)
+    );
+}
+
+/// RP-551: a domain's values are coerced to its base type at the base's
+/// modifier, `getBaseTypeAndTypmod`'s, through a domain over a domain too
+/// (`dc3n` over `dc3 char(3)` is a width-3 `bpchar`, though its own
+/// `typtypmod` is -1), and an explicit cast truncates and pads. Answers
+/// measured on PostgreSQL 15.19.
+#[test]
+fn a_domain_over_char_n_coerces_to_its_base_width() {
+    let domain = |name: &str, oid, base: &str, typmod| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc3", 90001, "bpchar", 7),
+        domain("dc3n", 90002, "dc3", -1),
+    ]);
+    let (base, typmod, chain) = domains::base_type_and_typmod("dc3n").expect("a domain");
+    assert_eq!((base.as_str(), typmod), ("bpchar", 7));
+    assert_eq!(
+        chain.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        ["dc3n", "dc3"]
+    );
+    assert!(domains::base_type_and_typmod("bpchar").is_none());
+    assert!(is_bpchar_type("dc3n") && is_bpchar_type("bpchar") && !is_bpchar_type("text"));
+    let s = |t: &str| Bson::String(t.to_string());
+    assert_eq!(explicit_typmod(s("ab"), "bpchar", 7).unwrap(), s("ab "));
+    assert_eq!(explicit_typmod(s("abcd"), "bpchar", 7).unwrap(), s("abc"));
+    assert_eq!(explicit_typmod(s("abcd"), "varchar", 7).unwrap(), s("abc"));
+    // A column of the outer domain stores the innermost base and its width.
+    match plan_ok("CREATE TABLE fcn (a dc3n)") {
+        Statement::CreateTable(def, _) => {
+            let c = &def.columns[0];
+            assert_eq!((c.pg_type.as_str(), c.typmod), ("bpchar", 7));
+            assert_eq!(c.extra.get_str("domain_type").ok(), Some("dc3n"));
+        }
+        other => panic!("wrong statement: {other:?}"),
+    }
+    domains::set_user_domains(Vec::new());
+}
+
+/// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
+/// (`skip_validation`), which a plain ADD does not, and `VALIDATE
+/// CONSTRAINT` names the constraint (RP-555).
+#[test]
+fn alter_domain_not_valid_and_validate() {
+    use domains::DomainChange as C;
+    let change = |sql: &str| match plan_ok(sql) {
+        Statement::AlterDomain { name, change } => {
+            assert_eq!(name, "dnv");
+            change
+        }
+        other => panic!("wrong statement: {other:?}"),
+    };
+    assert_eq!(
+        change("ALTER DOMAIN dnv ADD CONSTRAINT big CHECK (value > 5) NOT VALID"),
+        C::AddCheck {
+            name: "big".into(),
+            expr: "value > 5".into(),
+            not_valid: true,
+        }
+    );
+    assert!(matches!(
+        change("ALTER DOMAIN dnv ADD CONSTRAINT big CHECK (value > 5)"),
+        C::AddCheck {
+            not_valid: false,
+            ..
+        }
+    ));
+    assert_eq!(
+        change("ALTER DOMAIN dnv VALIDATE CONSTRAINT big"),
+        C::Validate("big".into())
     );
 }
