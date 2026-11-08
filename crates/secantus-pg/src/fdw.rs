@@ -43,18 +43,10 @@ thread_local! {
     static DROPPING_FOREIGN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Refuse a plain `DROP TABLE` of a foreign table.
-pub(crate) fn check_drop_table(def: &TableDef) -> PgWireResult<()> {
-    if secantus_pgplan::fdw::is_foreign(def) && !DROPPING_FOREIGN.with(|d| d.get()) {
-        let mut info = ErrorInfo::new(
-            "ERROR".into(),
-            "42809".into(),
-            format!("\"{}\" is not a table", def.name),
-        );
-        info.hint = Some("Use DROP FOREIGN TABLE to remove a foreign table.".into());
-        return Err(PgWireError::UserError(Box::new(info)));
-    }
-    Ok(())
+/// A `DROP FOREIGN TABLE` is running: the table drop it runs expects a
+/// foreign table, not a table (`drop_kind`).
+pub(crate) fn dropping_foreign() -> bool {
+    DROPPING_FOREIGN.with(|d| d.get())
 }
 
 impl PgHandler {

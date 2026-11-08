@@ -2060,23 +2060,24 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Backlog-ID: RP-526
       Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
 
-## Found while working RP-525 (2026-11-08)
+## Found while working RP-528 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap test is in
-`tests/backlog/test_rp_found_rp525.py`.
+`tests/backlog/test_rp_found_rp528.py`.
 
-- [ ] **A DROP of the wrong kind of relation is not refused as one.**
-      PostgreSQL 15.19's `DropErrorMsgWrongType` answers `drop table m` of
-      a materialized view with 42809 `"m" is not a table`, HINT `Use DROP
-      MATERIALIZED VIEW to remove a materialized view.`, `drop view m` with
-      42809 `"m" is not a view` and the same HINT, and `drop materialized
-      view v` of a view with 42809 `"v" is not a materialized view`, HINT
-      `Use DROP VIEW to remove a view.`. Here `drop table m` succeeds and
-      leaves `m`'s definition in `pg_matviews` with no relation under it,
-      and the other two are 42P01 `... does not exist`. A table and a view
-      already refuse each other's DROP.
-      Backlog-ID: RP-528
-      Verify: tests/backlog/test_rp_found_rp525.py::test_drop_of_the_wrong_relation_kind
+- [ ] **A DROP naming a schema that does not exist reports the relation
+      missing.** PostgreSQL 15.19's `DropErrorMsgNonExistent` asks for the
+      schema first: `drop table nosch.t` (and `view`, `materialized view`,
+      `index`, `sequence`) is 3F000 `schema "nosch" does not exist`, and
+      under IF EXISTS the NOTICE is `schema "nosch" does not exist,
+      skipping`. Here each is the relation's own 42P01 / 42704 (`table
+      "nosch.t" does not exist`) or its skipping NOTICE. The planner keys a
+      qualified name in an unknown schema as `nosch.t`, which `split_key`
+      cannot tell from a quoted `"nosch.t"` in `public` (PostgreSQL reports
+      that one as a missing table): the fix needs the written schema from
+      the parse tree.
+      Verify: tests/backlog/test_rp_found_rp528.py::test_drop_in_a_missing_schema
+      Backlog-ID: RP-533
 
 ## Found while working RP-514 (2026-11-08)
 

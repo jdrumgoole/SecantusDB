@@ -63,6 +63,7 @@ mod default_acl;
 mod depend;
 mod distinct_set;
 mod do_block;
+mod drop_kind;
 mod embedded;
 mod encoding;
 mod event_triggers;
@@ -41994,6 +41995,8 @@ impl PgHandler {
 
             Statement::DropSequence { names, if_exists } => {
                 self.ensure_collection(SEQUENCE_COLLECTION)?;
+                let names =
+                    self.check_drop_kinds(&names, drop_kind::RelKind::Sequence, if_exists)?;
                 for name in &names {
                     if self.sequence_doc(name)?.is_none() {
                         if if_exists {
@@ -43173,6 +43176,7 @@ impl PgHandler {
             }
 
             Statement::DropIndex { names, if_exists } => {
+                let names = self.check_drop_kinds(&names, drop_kind::RelKind::Index, if_exists)?;
                 for qualified in &names {
                     let found = self.find_index_by_name(qualified)?;
                     let bare = match secantus_pgplan::schemas::split_key(qualified) {
@@ -43181,13 +43185,6 @@ impl PgHandler {
                     };
                     let name = &bare;
                     let Some((def, _)) = found else {
-                        if self.relation_exists(name)? {
-                            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".into(),
-                                "42809".into(), // wrong_object_type
-                                format!("\"{name}\" is not an index"),
-                            ))));
-                        }
                         if if_exists {
                             self.notice(
                                 "00000",
@@ -43247,20 +43244,10 @@ impl PgHandler {
                 cascade,
             } => {
                 self.ensure_collection(Self::VIEW_COLLECTION)?;
+                let names = self.check_drop_kinds(&names, drop_kind::RelKind::View, if_exists)?;
                 let views = self.views()?;
                 for name in &names {
                     if !views.iter().any(|(n, _)| n == name) {
-                        if self.relation_exists(name)? {
-                            let mut info = ErrorInfo::new(
-                                "ERROR".into(),
-                                "42809".into(), // wrong_object_type
-                                format!("\"{name}\" is not a view"),
-                            );
-                            if self.lookup(name).is_some() {
-                                info.hint = Some("Use DROP TABLE to remove a table.".into());
-                            }
-                            return Err(PgWireError::UserError(Box::new(info)));
-                        }
                         if if_exists {
                             self.notice(
                                 "00000",
@@ -43288,21 +43275,16 @@ impl PgHandler {
             }
 
             Statement::DropTable(drop) => {
-                for table in &drop.tables {
-                    if let Some(def) = self.lookup(table) {
-                        fdw::check_drop_table(&def)?;
-                    }
+                // DROP FOREIGN TABLE runs as this statement.
+                let right = if fdw::dropping_foreign() {
+                    drop_kind::RelKind::ForeignTable
+                } else {
+                    drop_kind::RelKind::Table
+                };
+                let present = self.check_drop_kinds(&drop.tables, right, drop.if_exists)?;
+                for table in &present {
                     // `heap_drop_with_catalog`: as a TRUNCATE does.
                     self.ssi_table_write(table)?;
-                    if self.views()?.iter().any(|(n, _)| n == table) {
-                        let mut info = ErrorInfo::new(
-                            "ERROR".into(),
-                            "42809".into(), // wrong_object_type
-                            format!("\"{table}\" is not a table"),
-                        );
-                        info.hint = Some("Use DROP VIEW to remove a view.".into());
-                        return Err(PgWireError::UserError(Box::new(info)));
-                    }
                     // A partitioned table's partitions go with it, and a
                     // partition takes its rows out of the tree.
                     let mut children: Vec<String> = Vec::new();
@@ -43418,20 +43400,6 @@ impl PgHandler {
                         }
                     }
                     let Some(def) = self.lookup(table) else {
-                        // A composite type is a relation of the wrong kind:
-                        // refused even under IF EXISTS (`DropErrorMsgWrongType`).
-                        if secantus_pgplan::is_standalone_composite(table) {
-                            let mut info = ErrorInfo::new(
-                                "ERROR".into(),
-                                "42809".into(),
-                                format!(
-                                    "\"{}\" is not a table",
-                                    secantus_pgplan::schemas::split_key(table).1
-                                ),
-                            );
-                            info.hint = Some("Use DROP TYPE to remove a type.".into());
-                            return Err(PgWireError::UserError(Box::new(info)));
-                        }
                         if drop.if_exists {
                             self.notice(
                                 "00000",
@@ -44006,6 +43974,8 @@ impl PgHandler {
                 if_exists,
                 cascade,
             } => {
+                let names =
+                    self.check_drop_kinds(&names, drop_kind::RelKind::MatView, if_exists)?;
                 let existing = self.matviews()?;
                 for name in &names {
                     if !existing.iter().any(|(n, _, _)| n == name) {
