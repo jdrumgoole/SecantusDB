@@ -417,21 +417,22 @@ impl PgHandler {
                 };
                 d
             }
-            None => match by_name.as_slice() {
-                [] => {
-                    return Err(error(
-                        "42883",
-                        format!("could not find a {noun} named \"{name}\""),
-                    ))
+            None => {
+                // With no argument list only the statement's kind is looked
+                // among (`LookupFuncWithArgs`, RP-508).
+                let of_kind: Vec<&str> = Self::routines_of_kind(&functions, name, kind)
+                    .into_iter()
+                    .map(|f| f.key.as_str())
+                    .collect();
+                let found: Vec<&Document> = docs
+                    .iter()
+                    .filter(|d| d.get_str("_id").is_ok_and(|id| of_kind.contains(&id)))
+                    .collect();
+                match found.as_slice() {
+                    [one] => one,
+                    _ => return Err(Self::routine_lookup_error(kind, name, found.len())),
                 }
-                [one] => one,
-                _ => {
-                    return Err(error(
-                        "42725",
-                        format!("{noun} name \"{name}\" is not unique"),
-                    ))
-                }
-            },
+            }
         };
         let is_procedure = target.get_bool("is_procedure").unwrap_or(false);
         let signature = shown(&strings(target, "param_types"));

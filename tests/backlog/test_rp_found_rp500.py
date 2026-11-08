@@ -29,12 +29,22 @@ _SETUP = [
     "drop routine if exists gx(int)",
     "drop procedure if exists pd(int, int)",
     "drop procedure if exists gvp(int)",
+    "drop routine if exists gm(int)",
+    "drop routine if exists gm(text)",
+    "drop routine if exists gz(int)",
+    "drop routine if exists gp(int)",
+    "drop routine if exists gp(text)",
     "drop table if exists fe cascade",
     "create table fe (a int, b text)",
     "create procedure gq(int) language sql as $$ select 1 $$",
     "create function gq2(int) returns int language sql as $$ select 1 $$",
     "create procedure pd(a int, b int default 2) language sql as $$ select 1 $$",
     "create procedure gvp(x int) language sql as $$ select 1 $$",
+    # A function and a procedure of one name, and two procedures of one.
+    "create function gm(int) returns int language sql as $$ select 1 $$",
+    "create procedure gm(text) language sql as $$ select 1 $$",
+    "create procedure gp(int) language sql as $$ select 1 $$",
+    "create procedure gp(text) language sql as $$ select 1 $$",
 ]
 
 _TEARDOWN = [
@@ -43,6 +53,11 @@ _TEARDOWN = [
     "drop routine if exists gx(int)",
     "drop procedure if exists pd(int, int)",
     "drop procedure if exists gvp(int)",
+    "drop routine if exists gm(int)",
+    "drop routine if exists gm(text)",
+    "drop routine if exists gz(int)",
+    "drop routine if exists gp(int)",
+    "drop routine if exists gp(text)",
     "drop table if exists fe cascade",
 ]
 
@@ -100,10 +115,10 @@ def test_operand_constant_read_at_create(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OPERAND_CONSTANT_READ_AT_CREATE[query]
 
 
-# RP-508: a routine named without arguments is looked up among routines of
-# the statement's kind only (`LookupFuncWithArgs` with `objtype`), so the
-# other kind is missing, not the wrong kind; and DROP ROUTINE's notice says
-# "routine".
+# RP-508 (fixed): a routine named without arguments was looked up among
+# every routine, so the other kind was the wrong kind (42809) where
+# PostgreSQL's `LookupFuncWithArgs` looks among the statement's kind only
+# and finds it missing; and DROP ROUTINE's notice said "function".
 DROP_WITHOUT_ARGUMENTS = {
     "drop function if exists gq": ("ok", None, ["function gq() does not exist, skipping"]),
     "drop function gq": ("42883", 'could not find a function named "gq"', None, None, None, []),
@@ -124,10 +139,64 @@ DROP_WITHOUT_ARGUMENTS = {
 }
 
 
-@pytest.mark.backlog("RP-508")
+@pytest.mark.backlog_fixed("RP-508")
 @pytest.mark.parametrize("query", list(DROP_WITHOUT_ARGUMENTS))
 def test_drop_without_arguments_over_the_other_kind(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DROP_WITHOUT_ARGUMENTS[query]
+
+
+def _not_unique(kind: str, name: str) -> tuple[Any, ...]:
+    return (
+        "42725",
+        f'{kind} name "{name}" is not unique',
+        None,
+        f"Specify the argument list to select the {kind} unambiguously.",
+        None,
+        [],
+    )
+
+
+# RP-508 (fixed), its neighbours: the same kind filter picks the one routine
+# of the statement's kind out of a function and a procedure of one name
+# (`drop function gm` drops `gm(int)` and keeps the procedure), for ALTER as
+# for DROP; and the 42725 for two of the kind names the statement's kind.
+LOOKUP_BY_KIND = {
+    "drop function gm": ("ok", None, []),
+    "drop procedure gm": ("ok", None, []),
+    "drop routine gm": _not_unique("routine", "gm"),
+    "drop procedure gp": _not_unique("procedure", "gp"),
+    "drop routine if exists nosuchr": ("ok", None, ["routine nosuchr() does not exist, skipping"]),
+    "drop function gp": ("42883", 'could not find a function named "gp"', None, None, None, []),
+    "alter function gq rename to gz": (
+        "42883",
+        'could not find a function named "gq"',
+        None,
+        None,
+        None,
+        [],
+    ),
+    "alter procedure gm rename to gz": ("ok", None, []),
+    "alter routine gm rename to gz": _not_unique("routine", "gm"),
+    "alter procedure gp rename to gz": _not_unique("procedure", "gp"),
+}
+
+
+@pytest.mark.backlog_fixed("RP-508")
+@pytest.mark.parametrize("query", list(LOOKUP_BY_KIND))
+def test_routine_lookup_by_kind(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == LOOKUP_BY_KIND[query]
+
+
+@pytest.mark.backlog_fixed("RP-508")
+def test_drop_function_keeps_the_procedure_of_its_name(dsn: str) -> None:
+    """`drop function gm` over a function `gm(int)` and a procedure
+    `gm(text)` drops the function only (PostgreSQL 15.19)."""
+    assert answer(dsn, "drop function gm") == ("ok", None, [])
+    with psycopg.connect(dsn, autocommit=True) as c:
+        rows = c.execute(
+            "select prokind, oid::regprocedure::text from pg_proc where proname = 'gm'"
+        ).fetchall()
+    assert rows == [("p", "gm(text)")]
 
 
 # RP-509 (fixed): a CALL's defaulted parameter, its named arguments, and a
