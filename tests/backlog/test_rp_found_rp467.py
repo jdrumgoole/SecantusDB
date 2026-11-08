@@ -46,9 +46,9 @@ def view_answer(dsn: str, query: str) -> Any:
 
 
 # PostgreSQL expands a view's `*` into the columns as the alias list names
-# them, so the view reads `x, y` (or `x, c` under a shorter list). Here
-# CREATE VIEW's star expansion (`view_deps::expand_stars`) writes the
-# table's own names, `f.a, f.c`, and every read of the view is 42703.
+# them, so the view reads `x, y` (or `x, c` under a shorter list). CREATE
+# VIEW's star expansion (`view_deps::expand_stars`) wrote the table's own
+# names, `f.a, f.c`, and every read of the view was 42703 (RP-512).
 ALIASED_TABLE_STAR = {
     "select * from fs f(x, y)": (["x", "y"], [(1, "y")]),
     "select * from fs f(x)": (["x", "c"], [(1, "y")]),
@@ -56,7 +56,7 @@ ALIASED_TABLE_STAR = {
 }
 
 
-@pytest.mark.backlog("RP-512")
+@pytest.mark.backlog_fixed("RP-512")
 @pytest.mark.parametrize("query", list(ALIASED_TABLE_STAR))
 def test_view_star_over_an_aliased_column_list(query: str, dsn: str) -> None:
     assert view_answer(dsn, query) == ALIASED_TABLE_STAR[query]
