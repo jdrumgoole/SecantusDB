@@ -6776,6 +6776,103 @@ fn plan_call(c: &pg_query::protobuf::CallStmt, params: &[Bson]) -> Result<Statem
     })
 }
 
+/// A CREATE FUNCTION / PROCEDURE's language, lower-cased: its `LANGUAGE`
+/// option, or `sql` for a SQL-standard body.
+fn routine_language(f: &pg_query::protobuf::CreateFunctionStmt) -> Option<String> {
+    let named = f.options.iter().find_map(|opt| match opt.node.as_ref()? {
+        N::DefElem(e) if e.defname.eq_ignore_ascii_case("language") => {
+            e.arg.as_ref().and_then(|a| type_name_of_node(a))
+        }
+        _ => None,
+    });
+    named
+        .or_else(|| f.sql_body.is_some().then(|| "sql".to_string()))
+        .map(|l| l.to_ascii_lowercase())
+}
+
+/// `LookupTypeName` of a routine's parameter or result type, with
+/// `missing_ok` false: a type, a domain, a pseudo-type or a relation's row
+/// type (a catalog's too), or an array of one. A qualifier naming no
+/// schema is 3F000 (`LookupExplicitNamespace`); a type found nowhere is
+/// `None`, with the name as `TypeNameToString` writes it -- unquoted, and
+/// `[]` for an array. A `%TYPE` reference is looked up through its column,
+/// which reports its own errors.
+fn routine_type_missing(tn: &pg_query::protobuf::TypeName) -> Result<Option<String>> {
+    if tn.pct_type {
+        return Ok(None);
+    }
+    let parts: Vec<String> = tn
+        .names
+        .iter()
+        .filter_map(|n| match n.node.as_ref()? {
+            N::String(s) => Some(s.sval.clone()),
+            _ => None,
+        })
+        .collect();
+    if let [schema, _] = parts.as_slice() {
+        if !is_pg_temp_schema(schema) && !schemas::schema_exists(schema) {
+            return Err(Error::Sqlstate(
+                "3F000",
+                format!("schema \"{schema}\" does not exist"),
+            ));
+        }
+    }
+    let array = !tn.array_bounds.is_empty();
+    if column_type_exists(&type_name_of(tn))
+        || pgtypes::catalog_composite_oid(&parts, array).is_some()
+    {
+        return Ok(None);
+    }
+    let row_type = match parts.as_slice() {
+        [bare] => schemas::relation_exists(&schemas::resolve_unqualified(bare)),
+        [schema, bare] => {
+            let schema = if is_pg_temp_schema(schema) {
+                schemas::temp_schema().unwrap_or_else(|| schema.clone())
+            } else {
+                schema.clone()
+            };
+            schemas::relation_exists(&schemas::relation_key(&schema, bare))
+        }
+        _ => false,
+    };
+    if row_type {
+        return Ok(None);
+    }
+    let mut written = parts.join(".");
+    if array {
+        written.push_str("[]");
+    }
+    Ok(Some(written))
+}
+
+/// CREATE FUNCTION / PROCEDURE's type lookups for a SQL or PL/pgSQL
+/// routine, in `CreateFunction`'s order (RP-566): each parameter's
+/// (`interpret_function_parameter_list`, 42704 `type t does not exist`),
+/// then the declared result's (`compute_return_type`, which quotes the
+/// name, and creates a shell only for a C or internal function).
+fn check_routine_types(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<()> {
+    for p in &f.parameters {
+        if let Some(N::FunctionParameter(fp)) = p.node.as_ref() {
+            if let Some(tn) = fp.arg_type.as_ref() {
+                if let Some(t) = routine_type_missing(tn)? {
+                    return Err(Error::UndefinedObject(format!("type {t} does not exist")));
+                }
+            }
+        }
+    }
+    if f.is_procedure {
+        return Ok(());
+    }
+    if let Some(tn) = f.return_type.as_ref() {
+        if let Some(t) = routine_type_missing(tn)? {
+            return Err(Error::UndefinedObject(format!(
+                "type \"{t}\" does not exist"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<Statement> {
     let name_parts: Vec<String> = f
         .funcname
@@ -6810,6 +6907,12 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
         })
         .next_back()
         .ok_or_else(|| Error::Parse("CREATE FUNCTION without a name".into()))?;
+    // Every type the signature names is looked up before the result is
+    // reconciled with the OUT parameters (RP-566). A `LANGUAGE internal`
+    // wrapper's are checked where it is created.
+    if matches!(routine_language(f).as_deref(), Some("sql" | "plpgsql")) {
+        check_routine_types(f)?;
+    }
     let mut arg_types = Vec::new();
     for p in &f.parameters {
         let Some(N::FunctionParameter(fp)) = p.node.as_ref() else {
@@ -16421,6 +16524,72 @@ pub(crate) fn explicit_typmod(v: Bson, pg_type: &str, typmod: i32) -> Result<Bso
     }
 }
 
+/// A cast to the array of a domain whose base type carries a modifier
+/// (`d[]`, `d` a domain over `char(3)`), or `None` when `element` is no such
+/// domain. Every domain of the chain then checks each coerced element, a
+/// NULL one included, innermost first (15.19, RP-570).
+///
+/// - From text it is `array_in`, which reads each element with `domain_in`:
+///   the base type's input function AT the domain's modifier
+///   (`domain_state_setup` takes `getBaseTypeAndTypmod`), so a short
+///   `char(3)` element pads and a long one is 22001, as an input is
+///   (`'{abcd}'::d[]`), and a `numeric(5,2)` one rounds or overflows.
+/// - From an array it is an `ArrayCoerceExpr` whose element step is
+///   `coerce_to_domain` of an explicit cast, which truncates and pads
+///   (`array['abcd']::d[]` is `{abc}`).
+pub(crate) fn domain_array_cast(value: &Bson, element: &str) -> Result<Option<Bson>> {
+    let Some((base, typmod, chain)) = domains::base_type_and_typmod(element) else {
+        return Ok(None);
+    };
+    if typmod < 0 {
+        return Ok(None);
+    }
+    let check = |v: Bson| -> Result<Bson> {
+        for d in chain.iter().rev() {
+            domains::check_domain(d, &v)?;
+        }
+        Ok(v)
+    };
+    match value {
+        Bson::String(text) => {
+            let input = |v: Bson| -> Result<Bson> {
+                if v == Bson::Null {
+                    return check(v);
+                }
+                let v = fit_length(cast_value(v, &base)?, &base, typmod)?;
+                check(explicit_typmod(v, &base, typmod)?)
+            };
+            parse_array_with(text, &base, Some(&input)).map(Some)
+        }
+        v @ Bson::Array(_) => {
+            fn each(v: &Bson, f: &dyn Fn(Bson) -> Result<Bson>) -> Result<Bson> {
+                match v {
+                    Bson::Array(items) => Ok(Bson::Array(
+                        items
+                            .iter()
+                            .map(|i| each(i, f))
+                            .collect::<Result<Vec<_>>>()?,
+                    )),
+                    other => f(other.clone()),
+                }
+            }
+            let coerce = |v: Bson| -> Result<Bson> {
+                if v == Bson::Null {
+                    return check(v);
+                }
+                check(explicit_typmod(cast_value(v, &base)?, &base, typmod)?)
+            };
+            each(v, &coerce).map(Some)
+        }
+        v if arrays::is_bounded(v) => {
+            let lower = arrays::lower_bounds(v);
+            Ok(domain_array_cast(&arrays::strip(v), element)?
+                .map(|out| arrays::bounded(out, &lower)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// [`fit_to_column`] over a bare type and modifier.
 pub(crate) fn fit_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
     if bits::is_bit_type(pg_type) {
@@ -21795,6 +21964,66 @@ fn function_absent_in_reference(
     )))
 }
 
+/// Whether `ty` names a composite type (a table's row type or a `CREATE
+/// TYPE ... AS`), or an array of one. A subquery's value of such a type is
+/// a document, or a list of them, that carries no type of its own, so it is
+/// cast to the subquery column's type to be described and read as it:
+/// `(select fs from fs)` is `fs`, `(select array_agg(fs) from fs)` `fs[]`,
+/// as on PostgreSQL (RP-554).
+fn composite_or_array_of_one(ty: &str) -> bool {
+    user_composite(ty.strip_suffix("[]").unwrap_or(ty)).is_some()
+}
+
+/// Whether a subquery's value of type `t` is CAST to it where the planner
+/// folds the subquery into a parameter: a value that reads back as another
+/// type (an `oid` carried as a bigint, a `name` as text, a timestamp as a
+/// datetime) and a row type's document. Any other built-in type is
+/// declared for the parameter instead (`declare_sublink_param`), since a
+/// value carried in another form (a `pg_lsn` as its position) would not
+/// survive a cast of itself.
+fn sublink_value_cast(t: &str) -> bool {
+    matches!(
+        t,
+        "int2vector"
+            | "oidvector"
+            | "oid"
+            | "int2"
+            | "float4"
+            | "name"
+            | "varchar"
+            | "bpchar"
+            | "\"char\""
+            | "xid"
+            | "cid"
+            | "timestamp"
+            | "timestamptz"
+            | "date"
+            | "time"
+            | "timetz"
+            | "interval"
+            | "uuid"
+    ) || composite_or_array_of_one(t)
+}
+
+/// Declares built-in type `t` for plan parameter `at` (0-based), the value
+/// of a subquery folded into it, so it is described and typed as `t`. A
+/// name no built-in has, a quoted one or a row type is left undeclared.
+fn declare_sublink_param(at: usize, t: &str) {
+    if t.contains('"')
+        || pgtypes::oid_of_name(t).is_none()
+        || user_composite(t.strip_suffix("[]").unwrap_or(t)).is_some()
+    {
+        return;
+    }
+    PLAN_PARAM_TYPES.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() <= at {
+            p.resize(at + 1, None);
+        }
+        p[at] = Some(t.to_string());
+    });
+}
+
 /// A `TypeName` for an internal type name (`int4`, `text[]`).
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
@@ -22066,48 +22295,12 @@ fn resolve_one_sublink(
                     // subquery's column wherever it lands: a bare parameter
                     // has no declared type, which made `pg_typeof((select
                     // 1))` 42P18 and a CASE over it text (RP-023).
-                    let cast = |t: &str| {
-                        matches!(
-                            t,
-                            "int2vector"
-                                | "oidvector"
-                                | "oid"
-                                | "int2"
-                                | "float4"
-                                | "name"
-                                | "varchar"
-                                | "bpchar"
-                                | "\"char\""
-                                | "xid"
-                                | "cid"
-                                | "timestamp"
-                                | "timestamptz"
-                                | "date"
-                                | "time"
-                                | "timetz"
-                                | "interval"
-                                | "uuid"
-                        )
-                    };
-                    // Any other built-in type is DECLARED for the parameter
-                    // rather than cast to: a value carried in another form
-                    // (a `pg_lsn` as its position) would not survive a cast
-                    // of itself.
-                    if let Some(t) = ty.as_deref().filter(|t| {
-                        !cast(t)
-                            && !matches!(*t, "" | "unknown" | "record" | "text")
-                            && !t.contains('"')
-                            && pgtypes::oid_of_name(t).is_some()
-                            && user_composite(t).is_none()
-                    }) {
-                        let at = params.len() - 1;
-                        PLAN_PARAM_TYPES.with(|p| {
-                            let mut p = p.borrow_mut();
-                            if p.len() <= at {
-                                p.resize(at + 1, None);
-                            }
-                            p[at] = Some(t.to_string());
-                        });
+                    let cast = |t: &str| sublink_value_cast(t);
+                    if let Some(t) = ty
+                        .as_deref()
+                        .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record" | "text"))
+                    {
+                        declare_sublink_param(params.len() - 1, t);
                     }
                     Ok(match ty.as_deref() {
                         Some(ty) if cast(ty) => pg_query::protobuf::Node {
@@ -22144,7 +22337,43 @@ fn resolve_one_sublink(
         }
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
-            Ok(param_node(params, Bson::Array(values)))
+            let node = param_node(params, Bson::Array(values));
+            // `transformSubLink` types an ARRAY sublink as the array of its
+            // subquery column's type (`get_promoted_array_type`; an array
+            // column is its own type, the result one more dimension of it):
+            // `array(select 1::int2)` is `smallint[]`, empty or not. A list
+            // of values carries no type of its own, so it is typed by the
+            // column as a scalar subquery's value is -- cast to where the
+            // values survive a cast of themselves, declared otherwise -- or
+            // it was typed off its elements, and an empty one not at all
+            // (RP-600). A row type's array is cast to as well (RP-554).
+            let ty = sub_plan_def(&plan, lookup)
+                .ok()
+                .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+            let Some(element) = ty.filter(|t| !matches!(t.as_str(), "" | "unknown" | "record"))
+            else {
+                return Ok(node);
+            };
+            let array = if element.ends_with("[]") {
+                element.clone()
+            } else {
+                format!("{element}[]")
+            };
+            // An `int2vector` / `oidvector` is carried as an int array, which
+            // a cast to its array type reads as one more dimension of ints;
+            // it is declared instead (RP-575).
+            let base = element.strip_suffix("[]").unwrap_or(&element);
+            if !sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector") {
+                declare_sublink_param(params.len() - 1, &array);
+                return Ok(node);
+            }
+            Ok(pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(node)),
+                    type_name: Some(type_name_node(&array)),
+                    location: -1,
+                }))),
+            })
         }
         Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink))
             if matches!(
@@ -35867,6 +36096,18 @@ fn array_rectangular(items: &[Bson]) -> bool {
 const STRUCTURAL: &str = "unexpected";
 
 fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
+    parse_array_with(text, element_type, None)
+}
+
+/// [`parse_array`] reading each element, the NULL one included, with
+/// `input` instead of the element type's own cast: `array_in` calls the
+/// element's input function per element, in order, and `domain_in` is one
+/// that also runs on a NULL (RP-570).
+fn parse_array_with(
+    text: &str,
+    element_type: &str,
+    input: Option<&dyn Fn(Bson) -> Result<Bson>>,
+) -> Result<Bson> {
     // `array_in` checks the literal's structure before it reads an element
     // (`'{1,{2,x}}'::int[]` is `malformed array literal`, not `"x"`): the
     // same parse with text elements, which only the structure can fail.
@@ -35883,6 +36124,7 @@ fn parse_array(text: &str, element_type: &str) -> Result<Bson> {
         pos: 0,
         element_type,
         delim: pgtypes::typdelim(element_type),
+        input,
     };
     p.skip_space();
     // An optional dimension decoration, `[lo:hi]...=` (`[hi]` alone means
@@ -35975,6 +36217,9 @@ struct ArrayParser<'a> {
     element_type: &'a str,
     /// The element type's `typdelim`: `,` except for `box`, which uses `;`.
     delim: char,
+    /// The element input in place of `element_type`'s cast, when the
+    /// element is a domain's (`parse_array_with`).
+    input: Option<&'a dyn Fn(Bson) -> Result<Bson>>,
 }
 
 impl ArrayParser<'_> {
@@ -36102,10 +36347,16 @@ impl ArrayParser<'_> {
             }
         }
         // An UNQUOTED `NULL` is the null element; a quoted one is the string.
-        if !was_quoted && raw.eq_ignore_ascii_case("null") {
-            return Ok(Bson::Null);
+        let value = if !was_quoted && raw.eq_ignore_ascii_case("null") {
+            Bson::Null
+        } else {
+            Bson::String(raw)
+        };
+        match self.input {
+            Some(input) => input(value),
+            None if value == Bson::Null => Ok(Bson::Null),
+            None => cast_value(value, self.element_type),
         }
-        cast_value(Bson::String(raw), self.element_type)
     }
 }
 
@@ -42904,6 +43155,13 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 for d in chain.iter().rev() {
                     domains::check_domain(d, &v)?;
                 }
+                return Ok(v);
+            }
+        }
+        // And a cast to such a domain's ARRAY coerces each element the same
+        // way, through the base type's input when it reads text (RP-570).
+        if let Some(element) = target.strip_suffix("[]") {
+            if let Some(v) = domain_array_cast(&value, element)? {
                 return Ok(v);
             }
         }

@@ -2195,13 +2195,6 @@ tests are in `tests/backlog/test_rp_found_rp546.py`.
       type (`-`), the DROP succeeds, and the routine is left behind.
       Backlog-ID: RP-565
       Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_a_temp_table_row_type
-- [ ] **A SQL routine over a type that does not exist is created.**
-      `create function ufn566(x nosuch566) returns int language sql ...`
-      and the same CREATE PROCEDURE are 42704 `type nosuch566 does not
-      exist` on PostgreSQL 15.19 (`interpret_function_parameter_list`); here
-      both are created, over a type nothing can name.
-      Backlog-ID: RP-566
-      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_an_undefined_type_is_refused
 - [ ] **A `regprocedure` prints its name unquoted and a schema's type
       quoted whole.** `regprocedureout` is `format_procedure`: `"Q
       f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
@@ -2320,15 +2313,68 @@ char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
       `pg_typeof` sees its domain (`rewrite_domain_typeof`).
       Backlog-ID: RP-569
       Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
-- [ ] **A cast to a domain's array does not apply the base type's
-      modifier.** `select '{ab}'::d559c[]` and `array['ab']::d559c[]` are
-      `{"ab "}` on PostgreSQL 15.19, each element coerced through
-      `char(3)`, and `'{abcd}'::d559c[]` is 22001 `value too long for type
-      character(3)`; here they are `{ab}` and `{abcd}`, an element longer
-      than the domain allows. The domain's CHECK is already applied per
-      element. RP-551 applies the modifier to a scalar cast.
-      Backlog-ID: RP-570
-      Verify: tests/backlog/test_rp_found_rp559.py::test_cast_to_domain_array_applies_typmod
+
+## Found while working RP-570 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d570c as
+char(3)` and `t570(k int, t text, ta text[])` holding `(1, 'ab', '{ab}')`
+and `(2, 'abcd', '{abcd}')`. The gap tests are in
+`tests/backlog/test_rp_found_rp570.py`.
+
+- [ ] **A cast to an array with a type modifier ignores the modifier.**
+      `select '{ab}'::char(3)[]` is `{"ab "}` on PostgreSQL 15.19, and
+      `'{abcd}'::char(3)[]`, `array['abcd']::char(3)[]` and
+      `'{abcd}'::varchar(3)[]` are `{abc}`: `array_in` reads at typmod -1
+      and `coerce_type_typmod` then runs the explicit length coercion over
+      each element. `'{1.234}'::numeric(5,2)[]` is `{1.23}` and
+      `'{123456}'::numeric(5,2)[]` 22003. Here every element comes back as
+      written. Since RP-570 a cast to a DOMAIN's array applies the domain's
+      modifier (`domain_array_cast`); `const_value_node` applies a written
+      modifier only to a scalar `bpchar` / `varchar` / `numeric` target.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_cast_to_typmod_array
+      Backlog-ID: RP-579
+- [ ] **A cast of a bare column to a domain with a modifier ignores it.**
+      `select t::d570c from t570` is `ab ` and `abc` on PostgreSQL 15.19,
+      and `ta::d570c[]` is `{"ab "}` and `{abc}`. Here each value comes
+      back as stored. A cast of a constant, or of an expression over the
+      row (`array[t]::d570c[]`), applies the modifier (RP-551, RP-570); a
+      cast of a bare column takes `ColumnExpr::Casts`, which
+      `cast_chain_has_typmod` lets through because the cast writes no
+      modifier of its own.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_column_cast_to_domain_applies_typmod
+      Backlog-ID: RP-580
+- [ ] **A domain array literal's input error has no position.** `select
+      '{abcd}'::d570c[]` is 22001 at 8 on PostgreSQL 15.19 (`array_in` runs
+      `domain_in` while it reads the literal, as `'x'::int` is positioned
+      there); here the 22001 has no position. `positioned` places an error
+      by its SQLSTATE and message, and an assignment's 22001 has none.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
+      Backlog-ID: RP-581
+- [ ] **A numeric overflow's 22003 has no DETAIL.** `select
+      '123456'::numeric(5,2)` and `123456::numeric(5,2)` are 22003
+      `numeric field overflow` with DETAIL `A field with precision 5, scale
+      2 must round to an absolute value less than 10^3.` on PostgreSQL
+      15.19 (`apply_typmod`); here the DETAIL is empty.
+      Verify: tests/backlog/test_rp_found_rp570.py::test_numeric_overflow_detail
+      Backlog-ID: RP-582
+
+## Found while working RP-600 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp600.py`.
+
+- [ ] **An array of `int2vector` or `oidvector` is a two-dimensional int
+      array.** Each element is ONE value, so on PostgreSQL 15.19 `select
+      '{"1 2"}'::int2vector[]`, `array['1 2'::int2vector]` and `array(select
+      '1 2'::int2vector)` are `{"1 2"}` (`array_out` writes each element's
+      `int2vectorout` text), and `array(select indkey from pg_index ...)` is
+      `{1,"2 3"}`; here each is `{{1,2}}`, the vector carried as an int list
+      read as another dimension, and `array_agg(indkey)` over vectors of
+      different lengths answers where PostgreSQL is 2202E `cannot accumulate
+      arrays of different dimensionality`. The type (`int2vector[]`, 1006)
+      is already right. `oidvector[]` is the same.
+      Backlog-ID: RP-575
+      Verify: tests/backlog/test_rp_found_rp600.py::test_vector_array_elements
 
 ## Found while working RP-529 (2026-11-08)
 
@@ -2349,15 +2395,6 @@ char(3)`, `create domain dc3n as dc3` and the rest of the `_SETUP` in
       `"s.sd_check"`, though `pg_constraint.conname` is `sd_check` in both.
       Backlog-ID: RP-553
       Verify: tests/backlog/test_rp_found_rp529.py::test_schema_domain_check_name
-- [ ] **A scalar subquery's array of a row type is described as `text[]`.**
-      `select (select array_agg(fs) from fs)` and the same over a
-      FROM-subquery's whole-row column describe `fs[]` on PostgreSQL 15.19
-      and `pg_typeof` names it; here the column is `text[]` (1009), so
-      psycopg reads `[None]`, and `pg_typeof` of it is 42P18 `could not
-      determine data type of parameter $1`. The `::text` of it and the
-      aggregate outside a subquery answer as PostgreSQL.
-      Backlog-ID: RP-554
-      Verify: tests/backlog/test_rp_found_rp529.py::test_scalar_subquery_row_type_array
 - [ ] **`ALTER COLUMN TYPE` to a domain over the column's type is
       refused.** `alter table falt alter column a type pint`, `a int` and
       `pint` a domain over `int`, retypes the column on PostgreSQL 15.19
@@ -2608,3 +2645,19 @@ tests are scenarios in `tests/backlog/test_rp_batch26.py`.
       to be checked against the whole file.
       Backlog-ID: RP-049
       Verify: none -- internal code structure; no answer differs from PostgreSQL
+
+## Found while working RP-566 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp566.py`.
+
+- [ ] **A PL/pgSQL DECLARE of a type that does not exist is created.**
+      `plpgsql_validator` compiles the body at CREATE FUNCTION, and the
+      DECLARE's `parse_datatype` looks its type up: `create function b573()
+      returns int language plpgsql as $$ declare x nosuch573; begin return
+      1; end $$` is 42704 `type "nosuch573" does not exist` at 69 on
+      PostgreSQL 15.19. Here it is created, and the error waits for the
+      first call. (A parameter or result type that does not exist is
+      refused since RP-566.)
+      Verify: tests/backlog/test_rp_found_rp566.py::test_plpgsql_declare_of_an_undefined_type_is_refused
+      Backlog-ID: RP-573

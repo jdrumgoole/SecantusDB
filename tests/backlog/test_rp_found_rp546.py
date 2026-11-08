@@ -194,8 +194,8 @@ def test_routine_over_a_temp_table_row_type(dsn: str) -> None:
 
 # An argument type that does not exist is 42704 at CREATE FUNCTION and
 # CREATE PROCEDURE in a SQL routine (`LookupTypeName` in
-# `interpret_function_parameter_list`). Here both are created.
-@pytest.mark.backlog("RP-566")
+# `interpret_function_parameter_list`). Both used to be created.
+@pytest.mark.backlog_fixed("RP-566")
 def test_routine_over_an_undefined_type_is_refused(dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
         try:
@@ -214,6 +214,85 @@ def test_routine_over_an_undefined_type_is_refused(dsn: str) -> None:
         ("42704", "type nosuch566 does not exist", None),
         ("42704", "type nosuch566 does not exist", None),
     ]
+
+
+def _located(c: psycopg.Connection, query: str) -> Any:
+    try:
+        c.execute(query)
+    except psycopg.Error as e:
+        return (e.sqlstate, e.diag.message_primary, e.diag.statement_position)
+    return "ok"
+
+
+# What else `CreateFunction` looks up by name, measured on PostgreSQL 15.19:
+# a parameter's type unquoted and with `[]` (`TypeNameToString`), a missing
+# schema 3F000, then the result's type QUOTED (`compute_return_type`, which
+# makes a shell only for a C or internal function), none with a position;
+# a body's own lookup keeps its position. A relation's row type, a
+# catalog's, a temp table's, a view's, a domain, an enum, a composite, a
+# pseudo-type and `%TYPE` are all types a routine may name.
+@pytest.mark.backlog_fixed("RP-566")
+def test_routine_signature_types_are_looked_up(dsn: str) -> None:
+    sql = "language sql as $$ select 1 $$"
+    refused = [
+        f"create function q566a(x nosuch566[]) returns int {sql}",
+        f"create function q566b(x public.nosuch566) returns int {sql}",
+        f"create function q566c(x nosch566.t) returns int {sql}",
+        f"create function q566d(x int = 1, y nosuch566) returns int {sql}",
+        f"create function q566e(x nosuch566, out y int) returns text {sql}",
+        f"create function q566f() returns table (x nosuch566) {sql}",
+        f"create function q566g(x text) returns nosuch566 {sql}",
+        "create function q566h() returns setof nosuch566 language plpgsql as $$ begin end $$",
+        f"create function q566i() returns public.nosuch566[] {sql}",
+        f"create function q566j(x nosuch566) returns nosuch2 {sql}",
+        "create function q566k() returns int language sql as $$ select 'x'::nosuch566 $$",
+    ]
+    accepted = [
+        f"create function a566a(x t566, y t566[], z v566) returns int {sql}",
+        "create function a566b(x pg_class, y pg_class[]) returns t566"
+        " language sql as $$ select null::t566 $$",
+        f"create function a566c(x tt566, y pg_temp.tt566) returns int {sql}",
+        f"create function a566d(x d566, y c566, z e566) returns int {sql}",
+        f"create function a566e(x anyelement, y t566.a%type) returns int {sql}",
+        "create function a566f(x information_schema.tables) returns record"
+        " language sql as $$ select 1, 2 $$",
+        f"create procedure a566g(inout x d566) {sql}",
+        "create function a566h() returns trigger language plpgsql as $$ begin return null; end $$",
+    ]
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists t566 cascade")
+        c.execute("drop domain if exists d566 cascade")
+        c.execute("drop type if exists c566, e566 cascade")
+        c.execute("create table t566 (a int)")
+        c.execute("create view v566 as select a from t566")
+        c.execute("create temp table tt566 (a int)")
+        c.execute("create domain d566 as int")
+        c.execute("create type c566 as (x int)")
+        c.execute("create type e566 as enum ('x')")
+        try:
+            got = [_located(c, q) for q in refused + accepted]
+        finally:
+            for f in ("a566a", "a566b", "a566c", "a566d", "a566e", "a566f", "a566h"):
+                c.execute(f"drop function if exists {f}")
+            c.execute("drop procedure if exists a566g")
+            c.execute("drop table if exists t566, tt566 cascade")
+            c.execute("drop domain if exists d566 cascade")
+            c.execute("drop type if exists c566, e566 cascade")
+    missing = ("42704", "type nosuch566 does not exist", None)
+    result = ("42704", 'type "nosuch566" does not exist', None)
+    assert got == [
+        ("42704", "type nosuch566[] does not exist", None),
+        ("42704", "type public.nosuch566 does not exist", None),
+        ("3F000", 'schema "nosch566" does not exist', None),
+        missing,
+        missing,
+        missing,
+        result,
+        result,
+        ("42704", 'type "public.nosuch566[]" does not exist', None),
+        missing,
+        ("42704", 'type "nosuch566" does not exist', "68"),
+    ] + ["ok"] * len(accepted)
 
 
 # `regprocedureout` is `format_procedure`: the name quoted as an identifier

@@ -3,7 +3,7 @@ column's whole row is typed by the domain): RP-551 (a cast to a domain
 over `char(n)` was not blank-padded; fixed), RP-552 (a domain's CHECK error inside a
 record literal carries no position), RP-553 (a schema's domain names its
 CHECK after the qualified name), RP-554 (a scalar subquery's array of a row
-type is described as `text[]`), RP-555 (`ALTER DOMAIN ... NOT VALID`
+type was described as `text[]`; fixed), RP-555 (`ALTER DOMAIN ... NOT VALID`
 validated the rows; fixed) and RP-556 (`ALTER COLUMN TYPE` to a domain over the
 column's type is refused).
 
@@ -156,12 +156,16 @@ def test_schema_domain_check_name(query: str, dsn: str) -> None:
 
 # A scalar subquery's `array_agg` of a whole row is an array of the row
 # type, as the same aggregate outside a subquery is described here already.
-@pytest.mark.backlog("RP-554")
+# It was `text[]`, which psycopg read as `[None]`; so was an ARRAY(...) of a
+# whole row, and a scalar subquery's whole row was `text` (RP-554).
+@pytest.mark.backlog_fixed("RP-554")
 @pytest.mark.parametrize(
     "query",
     [
         "select (select array_agg(x) from (select fs as x from fs) q)",
         "select (select array_agg(fs) from fs)",
+        "select (select array[fs] from fs)",
+        "select array(select fs from fs)",
     ],
 )
 def test_scalar_subquery_row_type_array(query: str, dsn: str) -> None:
@@ -173,6 +177,31 @@ def test_scalar_subquery_row_type_array(query: str, dsn: str) -> None:
         assert [d.type_code for d in cur.description] == [fs_array]
         assert cur.fetchall() == [('{"(1,y)"}',)]
     assert answer(dsn, f"select pg_typeof(({query[7:]}))") == [("fs[]",)]
+
+
+# A scalar subquery of a whole row is of the row type, and a subquery that
+# finds no row is a NULL of it, or an empty array of it (RP-554).
+@pytest.mark.backlog_fixed("RP-554")
+@pytest.mark.parametrize(
+    ("query", "type_name", "rows"),
+    [
+        ("select (select fs from fs)", "fs", [("(1,y)",)]),
+        ("select (select fs from fs where false)", "fs", [(None,)]),
+        ("select (select array_agg(fs) from fs where false)", "fs[]", [(None,)]),
+        ("select array(select fs from fs where false)", "fs[]", [("{}",)]),
+    ],
+)
+def test_scalar_subquery_row_type(
+    query: str, type_name: str, rows: list[tuple[Any, ...]], dsn: str
+) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        oid = c.execute(f"select '{type_name}'::regtype::oid").fetchone()[0]
+        cur = c.execute(query)
+        assert [d.type_code for d in cur.description] == [oid]
+        assert cur.fetchall() == rows
+    assert answer(dsn, f"select pg_typeof(({query[7:]}))") == [(type_name,)]
 
 
 def _then(dsn: str, statement: str, query: str) -> Any:
