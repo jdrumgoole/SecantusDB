@@ -4749,3 +4749,21 @@ fn greatest_and_least_order_records_by_record_cmp() {
     );
     assert!(record_cmp(&fs, &Bson::Int32(1)).is_none());
 }
+
+/// RP-529: a domain field is its own type to `record_eq`, not its base: a
+/// table's domain column against a field of the base type is 42804
+/// (`fd = row(1)` on 15.19), against the domain itself it compares.
+#[test]
+fn composite_record_compare_tells_a_domain_from_its_base() {
+    let s = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let one = [Bson::Int32(1)];
+    let e = record_compare("=", &one, &one, true, Some((&s(&["dint"]), &s(&["int4"]))))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("cannot compare dissimilar column types dint and integer at record column 1"),
+        "{e}"
+    );
+    let got = record_compare("=", &one, &one, true, Some((&s(&["dint"]), &s(&["dint"])))).unwrap();
+    assert_eq!(got, Bson::Boolean(true));
+}

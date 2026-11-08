@@ -31808,27 +31808,17 @@ pub(crate) fn record_cmp(a: &Bson, b: &Bson) -> Option<Result<std::cmp::Ordering
 /// `record_eq`'s message, its type modifier dropped: the check compares
 /// type oids, so `varchar(3)` and `varchar` are one type.
 ///
-/// A domain is read as its base type. PostgreSQL's check tells them apart
-/// (a domain column against its base type is 42804), but a table's row
-/// type here records a domain column under its base type, so comparing
-/// the names would refuse `fd = row(1::dint)`, which PostgreSQL answers
-/// (RP-529).
+/// A domain is its own type, not its base: a domain column against its
+/// base type is 42804 (`fd = row(1)` on 15.19, RP-529), as a table's row
+/// type records the column under the domain.
 fn record_field_type_name(t: &str) -> String {
-    let mut base = match t.find('(') {
+    let base = match t.find('(') {
         Some(i) if !t.starts_with('"') => {
             let tail = t[i..].find(')').map(|j| &t[i + j + 1..]).unwrap_or("");
             format!("{}{}", t[..i].trim_end(), tail)
         }
         _ => t.to_string(),
     };
-    // A domain over a domain resolves to the innermost base; bounded, as a
-    // catalog cannot hold a cycle but a bad one must not hang a comparison.
-    for _ in 0..16 {
-        match domains::domain_base(&base) {
-            Some(b) if b != base => base = b,
-            _ => break,
-        }
-    }
     display_type(&base)
 }
 
@@ -32015,8 +32005,20 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
     // A table's row type pads a `char(n)` field to the column's width, as
     // the column itself does (`'(ab,x)'::t` is `("ab ",x)` on 15.19).
     let widths = user_composite_widths(target).unwrap_or_default();
-    for (i, (v, (_, ty))) in raw.into_iter().zip(fields.iter()).enumerate() {
+    for (i, (v, (_, field_ty))) in raw.into_iter().zip(fields.iter()).enumerate() {
         let width = widths.get(i).copied().flatten();
+        // A domain field (a table's domain column) over `char(n)` pads as
+        // its base does, then answers to each domain's constraints.
+        let mut domains_of = Vec::new();
+        let mut base = field_ty.clone();
+        while let Some(d) = domains::user_domain(&base) {
+            if domains_of.len() > 16 || d.base == base {
+                break;
+            }
+            domains_of.push(d);
+            base = domains_of[domains_of.len() - 1].base.clone();
+        }
+        let ty = if base == "bpchar" { &base } else { field_ty };
         let v = if let (true, Some(n)) = (ty == "bpchar", width) {
             let v = cast_value_inner(v, ty)?;
             let v = if literal.is_some() {
@@ -32047,7 +32049,12 @@ fn composite_value(value: Bson, target: &str, fields: &[(String, String)]) -> Re
         // record prints its fields padded (`("ab ",1)` on 15.19), where
         // `cast_value` would store the value trimmed.
         out.push(if ty == "bpchar" {
-            cast_value_inner(v, ty)?
+            let v = cast_value_inner(v, ty)?;
+            // Innermost first, as a domain over a domain checks its base's.
+            for d in domains_of.iter().rev() {
+                domains::check_domain(d, &v)?;
+            }
+            v
         } else {
             cast_value(v, ty)?
         });

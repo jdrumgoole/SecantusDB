@@ -1,6 +1,7 @@
 """Gap tests of the divergences found while working RP-522 (a whole row
 compared with a record runs `record_eq`'s field checks): RP-529 (a domain
-column's whole row is typed by its base type), RP-530 (a record compared
+column's whole row was typed by its base type, fixed: a table's row type
+records the column under its domain), RP-530 (a record compared
 with a scalar is 0A000, not 42883), RP-531 (NULLIF, GREATEST and LEAST over
 a whole row, fixed: they compare by `record_eq` / `record_cmp`, and
 `select_common_type` types a whole row and a `ROW(...)`) and RP-532 (GROUP
@@ -23,15 +24,21 @@ from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
     "drop view if exists vfs",
-    "drop table if exists fs, fd, ft cascade",
-    "drop domain if exists dint cascade",
+    "drop table if exists fs, fd, ft, fp, fc cascade",
+    "drop domain if exists dint, pint, dc3 cascade",
     "create domain dint as int",
+    "create domain pint as int check (value > 0)",
+    "create domain dc3 as char(3)",
     "create table fs (a int, c text)",
     "create table fd (a dint)",
     "create table ft (a int, c text)",
+    "create table fp (a pint, c text)",
+    "create table fc (a dc3, b int)",
     "insert into fs values (1, 'y')",
     "insert into fd values (1)",
     "insert into ft values (1, 'y')",
+    "insert into fp values (1, 'x')",
+    "insert into fc values ('ab', 1)",
     "create view vfs as select * from fs",
 ]
 
@@ -62,7 +69,15 @@ def answer(dsn: str, query: str) -> Any:
 
 # A whole row's field of a domain type is the DOMAIN to `record_eq`: its
 # tuple descriptor carries the domain's oid, so a row of the base type is
-# 42804 whatever the values (the type is checked before the value).
+# 42804 whatever the values (the type is checked before the value). Each
+# answered here, as the row type recorded the base type; and a cast to the
+# row type skipped the domain's CHECK.
+_DINT_INT = (
+    "42804",
+    "cannot compare dissimilar column types dint and integer at record column 1",
+    None,
+    None,
+)
 DOMAIN_FIELD = {
     "select fd = row(1) from fd": (
         "42804",
@@ -77,10 +92,38 @@ DOMAIN_FIELD = {
         None,
     ),
     "select fd = row(1::dint) from fd": [(True,)],
+    "select fd < row(2) from fd": _DINT_INT,
+    "select fd is distinct from row(1) from fd": _DINT_INT,
+    "select fd = any(array[row(1)]) from fd": _DINT_INT,
+    "select nullif(fd, row(1)) from fd": _DINT_INT,
+    "select row(1)::fd = row(1)": _DINT_INT,
+    "select row(1)::fd = fd from fd": [(True,)],
+    "select fd = fd from fd": [(True,)],
+    "select fp = row(1,'x'::text) from fp": (
+        "42804",
+        "cannot compare dissimilar column types pint and integer at record column 1",
+        None,
+        None,
+    ),
+    "select pg_typeof((fd).a) from fd": [("dint",)],
+    "select pg_typeof((fp).a) from fp": [("pint",)],
+    "select row(0,'x')::fp": (
+        "23514",
+        'value for domain pint violates check constraint "pint_check"',
+        None,
+        None,
+    ),
+    "select row(1,'x')::fp": [("(1,x)",)],
+    # A domain over char(3) still pads its field to the width.
+    "select fc from fc": [('("ab ",1)',)],
+    "select row('ab', 1)::fc": [('("ab ",1)',)],
+    "select '(ab,1)'::fc": [('("ab ",1)',)],
+    "select row('abcd', 1)::fc": [("(abc,1)",)],
+    "select '(abcd,1)'::fc": ("22001", "value too long for type character(3)", None, "8"),
 }
 
 
-@pytest.mark.backlog("RP-529")
+@pytest.mark.backlog_fixed("RP-529")
 @pytest.mark.parametrize("query", list(DOMAIN_FIELD))
 def test_domain_field_of_a_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DOMAIN_FIELD[query]
