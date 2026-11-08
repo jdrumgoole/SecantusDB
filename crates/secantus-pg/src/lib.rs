@@ -26842,6 +26842,21 @@ fn type_size(ty: &Type) -> i16 {
     }
 }
 
+/// The type modifier a result column of `pg_type` carries in the
+/// RowDescription, `typmod` being the column's own (`exprTypmod`).
+///
+/// `SendRowDescriptionMessage` sends a domain as its base type AND the
+/// modifier `getBaseTypeAndTypmod` gives it -- the innermost domain's
+/// `typtypmod`, whatever the column's own was -- so `'ab'::d`, `d` a domain
+/// over `char(3)`, is described `bpchar` 7 as `'ab'::char(3)` is (RP-557).
+/// Only the wire sees through the domain: PostgreSQL's `CREATE TABLE AS`
+/// keeps the domain and its own modifier, -1. The one here reads its
+/// columns back from this description, and so makes the base type with the
+/// domain's width (RP-661).
+fn wire_typmod(pg_type: &str, typmod: i32) -> i32 {
+    secantus_pgplan::domains::base_type_and_typmod(pg_type).map_or(typmod, |(_, m, _)| m)
+}
+
 fn wire_type(pg_type: &str) -> Type {
     match pg_type {
         // Their own oids (1560 / 1562): a bit string is not a varchar, and a
@@ -37010,16 +37025,21 @@ impl PgHandler {
                 };
                 // The declared width travels with the type: a `char(4)` is
                 // described as 4, which is also what the output padding below
-                // reads. A computed column (a cast or a call) keeps -1.
+                // reads. A computed column (a cast or a call) keeps -1. A
+                // domain goes out with its base type's modifier
+                // (`wire_typmod`).
                 let typmod = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(expr) => secantus_pgplan::column_expr_typmod(expr, def),
+                    Some(expr) => wire_typmod(
+                        secantus_pgplan::column_expr_type(expr),
+                        secantus_pgplan::column_expr_typmod(expr, def),
+                    ),
                     None => def
                         .columns
                         .iter()
                         .find(|c| c.field() == *field)
                         .or_else(|| def.column(field))
                         .or_else(|| def.column(out))
-                        .map_or(-1, |c| c.typmod),
+                        .map_or(-1, |c| wire_typmod(&c.pg_type, c.typmod)),
                 };
                 self.field_sourced(out.clone(), ty, typmod, source)
             })
@@ -37890,7 +37910,7 @@ impl PgHandler {
                     .as_ref()
                     .and_then(|m| m.get(i).copied())
                     .unwrap_or(-1);
-                self.field_mod(name.clone(), wire, typmod)
+                self.field_mod(name.clone(), wire, wire_typmod(ty, typmod))
             })
             .collect()
     }
@@ -37912,7 +37932,7 @@ impl PgHandler {
                 .iter()
                 .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field_mod(name.clone(), wire, *typmod)
+                    self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                 })
                 .collect()),
             Statement::ValuesConstant(vc) => Ok(self.values_fields(vc)),
@@ -38021,7 +38041,7 @@ impl PgHandler {
                     .iter()
                     .map(|(name, _, ty, typmod)| {
                         let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                        self.field_mod(name.clone(), wire, *typmod)
+                        self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                     })
                     .collect::<Vec<_>>();
                 let rows = self
@@ -45414,7 +45434,7 @@ impl PgHandler {
                         .iter()
                         .map(|(name, _, ty, typmod)| {
                             let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                            self.field_mod(name.clone(), wire, *typmod)
+                            self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -45485,7 +45505,10 @@ impl PgHandler {
                             // padded type, and the encoder pads on the way out.
                             let typmod = match col {
                                 OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
-                                OutputCol::Group(i) => agg.group_by[*i].typmod,
+                                OutputCol::Group(i) => {
+                                    let g = &agg.group_by[*i];
+                                    wire_typmod(&g.pg_type, g.typmod)
+                                }
                                 OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                             };
                             self.field_mod(name.clone(), ty, typmod)
@@ -53161,7 +53184,7 @@ impl PgHandler {
                         let typmod = def
                             .as_ref()
                             .and_then(|d| d.columns.get(i))
-                            .map_or(-1, |c| c.typmod);
+                            .map_or(-1, |c| wire_typmod(&c.pg_type, c.typmod));
                         f.with_type_modifier(typmod)
                     })
                     .collect()
@@ -53231,7 +53254,10 @@ impl PgHandler {
                     };
                     let typmod = match col {
                         OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
-                        OutputCol::Group(i) => agg.group_by[*i].typmod,
+                        OutputCol::Group(i) => {
+                            let g = &agg.group_by[*i];
+                            wire_typmod(&g.pg_type, g.typmod)
+                        }
                         OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                     };
                     self.field_mod(name.clone(), ty, typmod)
@@ -53251,7 +53277,7 @@ impl PgHandler {
                 .iter()
                 .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field_mod(name.clone(), wire, *typmod)
+                    self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                 })
                 .collect(),
             Statement::ValuesConstant(vc) => self.values_fields(&vc),

@@ -1,6 +1,6 @@
 """Gap tests of the divergences found while working RP-551 (a cast to a
 domain over `char(n)` is blank-padded): RP-557 (a domain-typed result
-column goes out with no type modifier), RP-558 (a domain column's
+column went out with no type modifier; fixed), RP-558 (a domain column's
 `atttypmod` is the domain's) and RP-559 (an array of a domain was described
 and printed as `varchar[]`; fixed).
 
@@ -46,19 +46,26 @@ def _connect(dsn: str) -> psycopg.Connection:
 
 # `SendRowDescriptionMessage` sends a domain column as its base type AND the
 # base's modifier (`getBaseTypeAndTypmod`), so a cast to a domain over
-# char(3) describes typmod 7, as `'ab'::char(3)` does.
+# char(3) describes typmod 7, as `'ab'::char(3)` does. Each went out -1, in
+# the simple and the extended protocol alike; `information_schema`'s
+# `time_stamp` is a domain over `timestamptz(2)`.
 WIRE_TYPMOD = {
     "select 'ab'::d551c": 7,
     "select 1.5::d551n": 327686,
     "select now()::timestamp::d551t": 0,
+    "select a::d551c from fd551": 7,
+    "select 'ab'::d551c union select 'cd'::d551c": 7,
+    "values ('ab'::d551c), ('c'::d551c)": 7,
+    "select created from information_schema.triggers": 2,
 }
 
 
-@pytest.mark.backlog("RP-557")
+@pytest.mark.backlog_fixed("RP-557")
+@pytest.mark.parametrize("prepare", [False, True])
 @pytest.mark.parametrize("query", list(WIRE_TYPMOD))
-def test_domain_result_column_typmod(query: str, dsn: str) -> None:
+def test_domain_result_column_typmod(query: str, prepare: bool, dsn: str) -> None:
     with _connect(dsn) as c:
-        cur = c.execute(query)
+        cur = c.execute(query, prepare=prepare)
         assert cur.pgresult is not None
         assert cur.pgresult.fmod(0) == WIRE_TYPMOD[query]
 
