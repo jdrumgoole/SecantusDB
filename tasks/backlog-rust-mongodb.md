@@ -1812,6 +1812,15 @@ Still different, all 77:
       leaves these fields out of its comparison. Found 2026-11-08 (RM-342).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm342.py::test_explain_gives_each_stage_its_work_accounting
       Backlog-ID: RM-434
+- [ ] **A `$sort` after a `$group` mongod pushes into SBE counts its
+      documents smaller than mongod's.** `[{$group: {_id: "$a"}}, {$sort:
+      {_id: 1}}]` over ten documents: mongod 8.2.11's `$sort` reports
+      `totalDataSizeSortedBytesEstimate` 735 for the three groups the SBE
+      plan hands it, this server's 351, its estimate of the same three
+      documents as the classic engine builds them. Found 2026-11-08
+      (RM-071).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm071.py::test_a_sort_after_a_pushed_down_group_sizes_what_sbe_hands_it
+      Backlog-ID: RM-435
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 
@@ -1965,25 +1974,35 @@ plan over the collection's documents. Pinned by
 
 What is left, all on the RUST MongoDB server:
 
-- [ ] **`aggregate` stages mongod runs in its slot-based engine** (14
-      replies). mongod 8.2.11 pushes a `$group` not served by a
+- [ ] **`aggregate` stages mongod runs in its slot-based engine, beyond a
+      plain `$group`.** mongod 8.2.11 pushes a `$group` not served by a
       DISTINCT_SCAN, and `$count`, `$sortByCount`, `$bucket` and `$lookup`,
       into SBE and explains them with `explainVersion: "2"`, a
       `winningPlan` of `{queryPlan, slotBasedPlan}` and executionStats made
-      of SBE stages with slot expressions. This server reports the classic
-      `$cursor` / `stages` shape. The `queryPlan` tree could be derived
-      from the rules this server follows; `slotBasedPlan` and the SBE
-      statistics are the engine's own programs and are not reproduced.
-      Sending `queryPlan` alone is Joe's call. `explain_commands.py`
-      replies: `aggregate: stages after the cursor` 6, 7, 8, 11;
-      `aggregate: $group and $lookup` 1, 2, 3, 5, 6, 7; `executionStats:
-      aggregate` 5, 6; `a collection that does not exist` 9. The rest of
-      the aggregate explain is reproduced (the cursor's dependency
-      projection, `$groupByDistinctScan`, `$match` and `$sort` moved ahead
-      of `$unwind`, stages as mongod parses them, per-stage counts under
-      `$limit`). Also open in listings: mongod constant-folds (`{$abs: -1}`
-      is `{$const: 1}`) and orders the fields of object-form operators its
-      own way (`$dateToString`).
+      of SBE stages. Since 2026-11-08 (`explain/sbe/`) this server builds,
+      prints and RUNS that plan for a `$group` over a whole-collection scan
+      (no filter, sort, paging, hint or collation) whose `_id` is a field
+      path, `$$ROOT`, a scalar constant or an object of those, whose
+      arguments are field paths or `$$ROOT` (numeric constants for `$sum`),
+      with `$sum`, `$count`, `$avg`, `$first`, `$last`, `$min`, `$max`,
+      `$push` and `$addToSet`, and at most one distinct dotted path; and
+      the `limit 0` / `coscan` plan over a collection that does not exist.
+      Still the classic `$cursor` / `stages` shape: a filtered, sorted,
+      paged or projected front (the filter's `traverseF` program, index
+      scans), `$lookup`, `$count` / `$sortByCount` / `$bucket` (not
+      desugared before `secantus_core::sbe::pushdown`, which the executor
+      shares), any other accumulator or expression (the expression
+      compiler of `gen_expression.cpp`), a collation (its env slot), and
+      two or more distinct dotted paths (mongod orders their slots by an
+      `absl::flat_hash_map` salted per process, so its own order varies
+      from run to run). The SBE stages never spill here (`usedDisk` is
+      always false), and the `$cursor` batches are capped by count only,
+      not by `internalDocumentSourceCursorBatchSizeBytes`.
+      `explain_commands.py` replies (0-based steps, measured 2026-11-08):
+      `aggregate: stages after the cursor` 6, 7, 8, 11; `aggregate: $group
+      and $lookup` 2, 5, 6, 7; `executionStats: aggregate` 6. Also open in listings: mongod
+      constant-folds (`{$abs: -1}` is `{$const: 1}`) and orders the fields
+      of object-form operators its own way (`$dateToString`).
       **Decided 2026-10-16 (Joe):** reproduce SBE faithfully: transcribe
       mongod 8.2.11's SBE stage builders for these shapes and EXECUTE the
       slot programs, so `queryPlan`, `slotBasedPlan` and the SBE execution

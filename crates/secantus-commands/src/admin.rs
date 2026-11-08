@@ -1150,7 +1150,7 @@ pub(crate) fn dropped_reason(storage: &dyn crate::Storage, db: &str, coll: &str)
     )
 }
 
-fn collection_uuid_text(storage: &dyn crate::Storage, db: &str, coll: &str) -> String {
+pub(crate) fn collection_uuid_text(storage: &dyn crate::Storage, db: &str, coll: &str) -> String {
     // Asking for the id of a collection that is not there would register it.
     if !storage.collection_exists(db, coll).unwrap_or(false) {
         return String::new();
