@@ -4567,6 +4567,10 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         reply.insert("opLatencies", status.op_latencies(txn_latency));
     }
     reply.insert("opcounters", opcounters);
+    reply.insert(
+        "querySettings",
+        crate::query_settings::server_status_section(ctx),
+    );
     if let Some(status) = status {
         reply.insert("security", status.security());
     }

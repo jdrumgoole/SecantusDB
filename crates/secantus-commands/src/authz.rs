@@ -355,6 +355,8 @@ pub(crate) fn check(
         "lockInfo" => c.cluster("serverStatus"),
         "getClusterParameter" => c.cluster("getClusterParameter"),
         "setClusterParameter" => c.cluster("setClusterParameter"),
+        "setQuerySettings" | "removeQuerySettings" => c.cluster("querySettings"),
+        "getDiagnosticData" => c.cluster("serverStatus"),
         "setUserWriteBlockMode" => c.cluster("setUserWriteBlockMode"),
         "applyOps" => c.cluster("applyOps"),
         "rotateCertificates" => c.cluster("rotateCertificates"),

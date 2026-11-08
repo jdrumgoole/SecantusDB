@@ -1595,7 +1595,7 @@ pub(crate) fn open_cursor(
 }
 
 /// The fields mongod's `find` takes (8.2.11); any other is 40415.
-const FIND_FIELDS: &[&str] = &[
+pub(crate) const FIND_FIELDS: &[&str] = &[
     "find",
     "filter",
     "sort",

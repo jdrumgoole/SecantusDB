@@ -190,6 +190,10 @@ struct Shared {
     slow_ops: Arc<secantus_commands::slowop::SlowOpSettings>,
     /// Every database's profiling level and filter, set by `profile`.
     profiler: Arc<secantus_commands::profiler::Profiler>,
+    /// The latest FTDC sample, taken by `ftdc_loop`.
+    ftdc: Arc<secantus_commands::ftdc::Ftdc>,
+    /// The query settings, as last read or written.
+    query_settings: Arc<secantus_commands::query_settings::QuerySettingsStore>,
     address: SocketAddr,
     next_conn_id: AtomicI64,
     next_reply_id: AtomicI64,
@@ -495,6 +499,8 @@ pub fn bind(
         top_stats: Arc::new(secantus_commands::topstats::TopStats::new()),
         slow_ops: Arc::new(secantus_commands::slowop::SlowOpSettings::new()),
         profiler: Arc::new(secantus_commands::profiler::Profiler::new()),
+        ftdc: Arc::new(secantus_commands::ftdc::Ftdc::new()),
+        query_settings: Arc::new(secantus_commands::query_settings::QuerySettingsStore::new()),
         address,
         next_conn_id: AtomicI64::new(1),
         next_reply_id: AtomicI64::new(1),
@@ -508,6 +514,15 @@ pub fn bind(
         logs,
     });
 
+    // Counted before it starts, so a `stop` straight after this cannot
+    // miss it: the collector holds the storage until it exits.
+    let ftdc_guard = ConnGuard::new(shared.active.clone());
+    let ftdc_shared = shared.clone();
+    thread::spawn(move || {
+        ftdc_loop(ftdc_shared);
+        drop(ftdc_guard);
+    });
+
     let accept_shared = shared.clone();
     let accept = thread::spawn(move || accept_loop(listener, accept_shared));
 
@@ -515,6 +530,25 @@ pub fn bind(
         shared,
         accept: Some(accept),
     })
+}
+
+/// mongod's FTDC collector: a sample on every period boundary until the
+/// server stops, the latest kept for `getDiagnosticData`.
+fn ftdc_loop(shared: Arc<Shared>) {
+    use secantus_commands::ftdc::{next_boundary, PERIOD};
+    let now_ms = || bson::DateTime::now().timestamp_millis();
+    let auth = Arc::new(Mutex::new(ConnectionAuth::new()));
+    let mut next = next_boundary(now_ms(), PERIOD);
+    while !shared.stop.load(Ordering::SeqCst) {
+        let now = now_ms();
+        if now >= next {
+            let mut ctx = make_context(0, &shared, &auth, &None);
+            shared.ftdc.collect(&mut ctx);
+            next = next_boundary(now_ms(), PERIOD);
+        } else {
+            thread::sleep(Duration::from_millis((next - now) as u64).min(READ_POLL));
+        }
+    }
 }
 
 fn accept_loop(listener: TcpListener, shared: Arc<Shared>) {
@@ -1308,6 +1342,8 @@ fn make_context(
         .with_top_stats(shared.top_stats.clone())
         .with_slow_ops(shared.slow_ops.clone())
         .with_profiler(shared.profiler.clone())
+        .with_ftdc(shared.ftdc.clone())
+        .with_query_settings(shared.query_settings.clone())
         // `next_conn_id` starts at 1 and is bumped per accepted connection, so
         // it is the lifetime total plus one; `conns` holds the live sockets.
         .with_conn_stats(secantus_commands::ConnStats {

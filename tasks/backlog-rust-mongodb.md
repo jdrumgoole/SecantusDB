@@ -1227,39 +1227,51 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
         options are not applied.
       Backlog-ID: RM-216
       Verify: none -- the missing fields are mongod's internal accounting; the registry's own tests are backlog_fixed
-- [ ] **Three commands mongod runs are 59 CommandNotFound here.**
-      mongod 8.2.11 (one-member replica set) answers each with success or
-      an error of its own:
-      - diagnostics: `getDiagnosticData` (mongod's FTDC sample);
-      - settings: `setQuerySettings` / `removeQuerySettings` (each setting
-        is keyed by mongod's `queryShapeHash`; a `find`'s and a
-        `distinct`'s hash a buffer of their own, an `aggregate`'s its
-        shape's BSON, all of which `query_shape.rs` reproduces since
-        2026-11-07 for the shapes RM-358 covers).
-
-      `filemd5` with `partialOk` is refused by name (115): its `md5state` is
-      mongod's own MD5 implementation's state. `autoCompact` landed
-      2026-10-26 (RM-192's compaction, run in the background). Thirteen of
-      the original seventeen landed 2026-10-20 (`applyOps`, `rotateCertificates`,
-      `validateDBMetadata`, `dbCheck`,
-      `invalidateUserCache`, `replSetGetRBID`,
-      `replSetFreeze`, `replSetMaintenance`, `dropConnections`,
-      `releaseMemory`, `filemd5`, `setUserWriteBlockMode`,
-      `setClusterParameter`, whose
-      `defaultMaxTimeMS` limits reads; the other parameters govern sharding,
-      queryable encryption, search and serverless change streams, and are
-      kept and reported only). Each left is its own slice, and query
-      settings are a real feature rather than a reply. `applyOps` still
-      refuses a document over 16 MB (mongod applies one a little larger,
-      as oplog application allows) and `importCollection`,
-      `createDatabaseMetadata` and `modifyCollectionShardingIndexCatalog`
-      entries (115). `dbCheck` runs before it answers (mongod runs it in the
-      background), walks a whole database's collections in name order
-      (mongod's is its catalog's internal order), does not apply
-      `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`, and
-      refuses `validateMode: "extraIndexKeysCheck"` (115).
-      Backlog-ID: RM-219
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_commands_mongod_runs_are_commands_here
+- [ ] **`applyOps`, `dbCheck` and `filemd5` refuse what mongod runs.**
+      mongod 8.2.11 (one-member replica set) applies an `applyOps` insert of
+      a document a little over 16 MB, as oplog application allows (10334
+      here), and takes `importCollection`, `createDatabaseMetadata` and
+      `modifyCollectionShardingIndexCatalog` entries (115 here); it runs
+      `dbCheck` with `validateMode: "extraIndexKeysCheck"` and answers
+      `filemd5` with `partialOk` (both 115 here: its `md5state` is mongod's
+      own MD5 implementation's state). `dbCheck` also runs before it answers
+      (mongod runs it in the background), walks a database's collections in
+      name order (mongod's is its catalog's internal order) and does not
+      apply `maxBytesPerBatch` / `maxBatchTimeMillis` / `maxCountPerSecond`.
+      Carried over from RM-219 when its last commands landed, 2026-11-08.
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_admin_command_remainders
+      Backlog-ID: RM-416
+- [ ] **FTDC is a sample in memory only.** Since 2026-11-08
+      `getDiagnosticData` answers mongod's periodic sample (RM-219). Open:
+      the sample has no `transportLayerStats` collector; nothing is written
+      to `diagnostic.data` (mongod keeps `metrics.*` files there); and
+      `getParameter` / `setParameter` do not know
+      `diagnosticDataCollectionEnabled` (true),
+      `diagnosticDataCollectionPeriodMillis` (1000) or the other
+      `diagnosticData*` parameters (72 here), so the period cannot change.
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_ftdc_parameters_and_transport_collector
+      Backlog-ID: RM-417
+- [ ] **Query settings keep `queryFramework` without acting on it.** Since
+      2026-11-08 `setQuerySettings` / `removeQuerySettings` / `$querySettings`
+      keep mongod's settings and a read of their shape is refused (411) or
+      planned over its `indexHints` (RM-219). Open: under `queryFramework:
+      "sbe"` mongod runs a plain `find` in its slot-based engine
+      (`explainVersion` "2"), and `"classic"` keeps a `$group` pipeline out
+      of it, where this server's engine choice is unchanged;
+      `showDebugQueryShape` gives no `debugQueryShape`; a query whose shape
+      `query_shape.rs` does not compute is refused 115; and a write made to
+      `config.clusterParameters` directly is read only at the next start
+      (mongod's op observer reloads it).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_query_framework_chooses_the_engine_and_debug_shape_is_shown
+      Backlog-ID: RM-418
+- [ ] **`$collStats` refuses `local.oplog.rs`.** `{$collStats:
+      {storageStats: {}}}` on the oplog is 26 NamespaceNotFound here, and
+      `collStats` answers it with `size: 0` and no `capped`; mongod 8.2.11
+      answers both as for any capped collection. The FTDC sample's
+      `local.oplog.rs.stats` collector carries the same 26. Found 2026-11-08
+      while working RM-219.
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_oplog_storage_stats
+      Backlog-ID: RM-419
 - [ ] **An aggregate `$match` on `_id` takes an `$in` of a `$`-prefixed
       object.** mongod 8.2.11 refuses `{$match: {_id: {$in: [{$x: 1}]}}}`
       with 2 "cannot nest $ under $in", as it does on any other path and as
