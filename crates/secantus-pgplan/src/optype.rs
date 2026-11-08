@@ -1250,15 +1250,78 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // A ROW beside a typed operand that is not one: no operator (RP-530).
+    if matches!(
+        kind,
+        Some(K::AexprOp | K::AexprDistinct | K::AexprNotDistinct | K::AexprNullif)
+    ) {
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            row_against_non_row(&op, l, r, e.location, scope)?;
+        }
+    }
+    if kind == Some(K::AexprIn) {
+        if let (Some(l), Some(N::List(items))) = (
+            e.lexpr.as_deref(),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            // `transformAExprIn` falls back to one `=` (`<>` for NOT IN)
+            // per item, in the list's order.
+            for item in &items.items {
+                row_against_non_row(&op, l, item, e.location, scope)?;
+            }
+        }
+    }
+    // `fs <> ALL (ARRAY[1])` and `fs = ANY (int_array)`: the row against
+    // the array's element type (`make_scalar_array_op`).
+    if matches!(kind, Some(K::AexprOpAny | K::AexprOpAll)) {
+        if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
+            if let Some(row) = row_operand_type(l, scope) {
+                let element = match r.node.as_ref() {
+                    Some(N::AArrayExpr(a)) if !a.elements.is_empty() => {
+                        common_type(&a.elements.iter().collect::<Vec<_>>(), scope)
+                    }
+                    // A cast to an array type (`'{1}'::int[]`), which
+                    // `operand_type` leaves untyped, or a typed array.
+                    Some(N::TypeCast(tc)) => tc
+                        .type_name
+                        .as_ref()
+                        .map(type_name_of)
+                        .and_then(|t| t.strip_suffix("[]").map(str::to_string)),
+                    _ => operand_type_declared(r, scope)
+                        .and_then(|t| t.strip_suffix("[]").map(str::to_string)),
+                };
+                if let Some(t) = element.filter(|t| t != "record" && user_composite(t).is_none()) {
+                    let op = if op == "!=" { "<>" } else { op.as_str() };
+                    return Err(mismatch(op, &row, &t, e.location));
+                }
+            }
+        }
+    }
+    // `fs BETWEEN 1 AND 2` is `fs >= 1 AND fs <= 2` (NOT: `<` and `>`).
+    if matches!(kind, Some(K::AexprBetween | K::AexprNotBetween)) {
+        if let (Some(l), Some(N::List(bounds))) = (
+            e.lexpr.as_deref(),
+            e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
+        ) {
+            let ops = if kind == Some(K::AexprBetween) {
+                [">=", "<="]
+            } else {
+                ["<", ">"]
+            };
+            for (b, op) in bounds.items.iter().zip(ops) {
+                row_against_non_row(op, l, b, e.location, scope)?;
+            }
+        }
+    }
     // A COMPOSITE has only the record operators, and those only against the
-    // same type: beside any other typed operand there is no operator at all
-    // (`integer + point_t`, `point_t = integer`), and a user cast never
-    // supplies one.
+    // same type: beside another composite type there is no operator
+    // (`ct = ct2`), and a user cast never supplies one. A composite beside a
+    // value that is not a row is `row_against_non_row`'s.
     if kind == Some(K::AexprOp) {
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
         if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
             let composite = |t: &str| user_composite(t).is_some();
-            if (composite(&l) || composite(&r))
+            if (composite(&l) && composite(&r))
                 && user_casts::type_oid(&l) != user_casts::type_oid(&r)
                 && l != "record"
                 && r != "record"
@@ -2818,6 +2881,59 @@ fn row_part_type(p: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> 
         N::RowExpr(_) => Some("record".into()),
         _ => None,
     }
+}
+
+/// The row type of an operand that is a row: a table's or a view's whole
+/// row (its composite type), a `ROW(...)` or a FROM subquery's whole row
+/// (`record`), or a value of a composite type (`row(1)::ct`, a column of
+/// one). `None` for anything else, or what this cannot type.
+fn row_operand_type(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    row_part_type(n, scope).or_else(|| {
+        operand_type_declared(n, scope).filter(|t| t == "record" || user_composite(t).is_some())
+    })
+}
+
+/// A row beside a typed operand that is not a row has no operator. The
+/// operators that take a row are `record`'s comparisons, each against
+/// another row, and the polymorphic ones; of those only `anynonarray ||
+/// text` (and `text || anynonarray`) can take a row beside a scalar, and
+/// `||` beside an array may be `anycompatible || anycompatiblearray`. So
+/// `fs = 1`, `(1,2) < 1::bigint`, `fs <@ int4range(1,2)`, `nullif(fs, 1)`
+/// and `fs in (fs, 1)` are 42883 naming the two types as written (a domain
+/// by its own name) at the operator, as `make_op` reports them when the
+/// statement is analysed -- over no row too. The lowering compared a
+/// document with the scalar at run time (0A000 `comparing document with
+/// int32`) or, over no row or a NULL, answered; `fs || 1` concatenated.
+/// An untyped literal is left alone: it is read as the row's type.
+fn row_against_non_row(
+    op: &str,
+    l: &pg_query::protobuf::Node,
+    r: &pg_query::protobuf::Node,
+    location: i32,
+    scope: &Scope,
+) -> Result<()> {
+    let (lr, rr) = (row_operand_type(l, scope), row_operand_type(r, scope));
+    let (Some(lt), Some(rt)) = (
+        lr.clone().or_else(|| operand_type_declared(l, scope)),
+        rr.clone().or_else(|| operand_type_declared(r, scope)),
+    ) else {
+        return Ok(());
+    };
+    if lr.is_some() == rr.is_some() {
+        return Ok(());
+    }
+    let other = if lr.is_some() { &rt } else { &lt };
+    if other == "unknown" {
+        return Ok(());
+    }
+    if op == "||" {
+        let base = crate::domains::domain_base(other).unwrap_or_else(|| other.clone());
+        if category(&base) == Some("string") || base.ends_with("[]") {
+            return Ok(());
+        }
+    }
+    let op = if op == "!=" { "<>" } else { op };
+    Err(mismatch(op, &lt, &rt, location))
 }
 
 /// A part's type category: a built-in one `category` knows, `record`'s

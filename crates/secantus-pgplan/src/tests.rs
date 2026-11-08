@@ -5015,3 +5015,53 @@ fn a_cast_to_a_domain_array_coerces_each_element() {
     assert_eq!(cast(s("{ab}"), "bpchar").unwrap(), None);
     domains::set_user_domains(Vec::new());
 }
+
+/// RP-530: a row beside a typed operand that is not a row has no operator,
+/// so parse analysis refuses it with 42883 at the operator, over no row
+/// too. Each was 0A000 `comparing document with int32` at run time, or
+/// answered (`t || 1`, `t in (t, 1)`, a NULL). Measured on PostgreSQL
+/// 15.19 (`position` there is this 0-based location plus one).
+#[test]
+fn a_row_beside_a_scalar_has_no_operator() {
+    for (sql, want, at) in [
+        ("select t = 1 from t", "t = integer", 9),
+        ("select 1 = t from t", "integer = t", 9),
+        ("select name = (1, 'y') from t", "text = record", 12),
+        ("select (1, 2) < 1::bigint", "record < bigint", 14),
+        ("select t <> 'a'::text from t", "t <> text", 9),
+        ("select t = null::int from t where false", "t = integer", 9),
+        ("select t || 1 from t", "t || integer", 9),
+        ("select t is distinct from 1 from t", "t = integer", 9),
+        ("select nullif(t, 1) from t", "t = integer", 7),
+        ("select t in (t, 1) from t", "t = integer", 9),
+        ("select 1 in (2, t) from t", "integer = t", 9),
+        ("select t not in (1) from t", "t <> integer", 9),
+        ("select t <> all(array[1]) from t", "t <> integer", 9),
+        ("select t = any('{1}'::int[]) from t", "t = integer", 9),
+        ("select t between 1 and 2 from t", "t >= integer", 9),
+        ("select count(*) from t x where x = 1.5", "t = numeric", 33),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "42883", "for {sql} (got {err})");
+        assert!(
+            err.to_string()
+                .contains(&format!("operator does not exist: {want}")),
+            "for {sql}: {err}"
+        );
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // `anynonarray || text`, a row beside a row, an untyped literal and a
+    // field of the row are left to resolve.
+    for sql in [
+        "select t || 'x'::text from t",
+        "select 'x'::varchar || t from t",
+        "select t = t from t",
+        "select t = row(1, 'a', 2) from t",
+        "select t = null from t",
+        "select t.n = 1, (t).n = 1 from t",
+        "select t is null from t",
+    ] {
+        assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+}
