@@ -4587,6 +4587,7 @@ pub fn server_status(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         "querySettings",
         crate::query_settings::server_status_section(ctx),
     );
+    reply.insert("queues", queues_section(ctx));
     if let Some(status) = status {
         reply.insert("security", status.security());
     }
@@ -4684,6 +4685,22 @@ fn section_wanted(doc: &Document, section: &str) -> bool {
         doc.get(section),
         Some(Bson::Boolean(false) | Bson::Int32(0) | Bson::Int64(0))
     ) && !matches!(doc.get(section), Some(Bson::Double(d)) if *d == 0.0)
+}
+
+/// `queues`: the admission control pools' tickets and queues, as mongod's
+/// `AdmissionServerStatusSection` reports them -- `ingress` while ingress
+/// admission control is on (RM-355). Execution control's `execution` and
+/// the connection limiter's `ingressSessionEstablishment` are not reported.
+fn queues_section(ctx: &CommandContext) -> Document {
+    let mut out = Document::new();
+    if let Some(ingress) = ctx
+        .server_params
+        .as_ref()
+        .and_then(|p| p.ingress_admission().server_status())
+    {
+        out.insert("ingress", ingress);
+    }
+    out
 }
 
 /// `globalLock`: how long the server has run, the reads and writes running,

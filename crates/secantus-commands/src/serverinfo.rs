@@ -674,6 +674,20 @@ fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             false,
             Bson::Document(doc! {"version": format!("{}.{}", version[0], version[1])}),
         ),
+        // Ingress admission control (`admission::ingress`, RM-355), with
+        // mongod 8.2.11's defaults: on, and a pool and queue of
+        // `DEFAULT_MAX_CONN` that limit nothing until lowered.
+        ("ingressAdmissionControlEnabled", true, Bson::Boolean(true)),
+        (
+            "ingressAdmissionControllerMaxQueueDepth",
+            true,
+            Bson::Int32(crate::admission::ingress::DEFAULT_TICKETS),
+        ),
+        (
+            "ingressAdmissionControllerTicketPoolSize",
+            true,
+            Bson::Int32(crate::admission::ingress::DEFAULT_TICKETS),
+        ),
         // The connection-establishment rate limiter (`params::IngressBucket`),
         // with mongod 8.2.11's defaults: off, and no limit when on.
         (

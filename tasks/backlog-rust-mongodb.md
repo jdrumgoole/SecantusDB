@@ -536,13 +536,27 @@ These are explicit non-goals. Don't add them without a reason.
       `queues: {ingress: {admissions: 1}, execution: {admissions: 2}}`, and
       in `storage.timeWaitingMicros` the `storageExecutionMicros` it waited
       for admission -- never zero, so a `find` of documents in the cache
-      still has a `storage` section (measured 2026-10-27). This server has
-      no execution admission control (its `admission.rs` holds writes back
-      under a flag, off by default), so neither field: its `storage` section
-      is WiredTiger's per-session statistics alone (RM-023), absent when
-      they counted nothing. A stand-in number is not to be printed; the
-      field follows the mechanism, if one is built.
-      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** Measured when it was asked (2026-11-07): building the mechanism changes the
+      still has a `storage` section (measured 2026-10-27). Since 2026-11-08
+      this server has mongod's ingress admission control
+      (`secantus-commands` `admission/`, a port of `TicketHolder` and
+      `IngressAdmissionController`; `tests/mongod_live/test_ingress_admission.py`):
+      `serverStatus.queues.ingress`, the three `ingressAdmissionControl*`
+      parameters, queueing with mongod's interrupts and overflow, and the
+      line's `queues.ingress`. It has no execution control (its
+      `admission.rs` holds writes back under a flag, off by default), so
+      no `queues.execution`, no line `execution` admissions and no
+      `storageExecutionMicros`: its `storage` section is WiredTiger's
+      per-session statistics alone (RM-023), absent when they counted
+      nothing. A stand-in number is not to be printed; the field follows
+      the mechanism, if one is built. Also left, all measured 8.2.11
+      2026-11-08: a `currentOp` row has no `queues` (each pool's
+      `admissions`, `totalTimeQueuedMicros`, `isHoldingTicket`) or, while
+      it waits, `currentQueue`; `serverStatus.queues` has no
+      `ingressSessionEstablishment` (the connection limiter's counts); the
+      line of a command that never got its ticket names `<db>.$cmd` on
+      mongod, its collection here; and mongod's first retryable write
+      after startup takes a second, exempt, ingress admission (not traced).
+      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08; the ticket pools are next, built on `admission::TicketHolder`. Measured when it was asked (2026-11-07): building the mechanism changes the
       server's default concurrency. Measured on mongod 8.2.11 (single-node
       set, this Mac): `storageEngineConcurrencyAdjustmentAlgorithm:
       throughputProbing` (initial concurrency 0 = from the cores, min 4,

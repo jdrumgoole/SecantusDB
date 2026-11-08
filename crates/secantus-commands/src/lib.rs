@@ -35,6 +35,7 @@
 pub use secantus_core::bsondoc;
 
 pub mod admin;
+pub mod admission;
 mod agg_executor;
 mod agg_meta;
 mod agg_stream;
@@ -317,6 +318,12 @@ pub struct CommandContext {
     /// statement is counted once and its collection intent lock is not
     /// released at the statement's end.
     pub(crate) txn_locks: bool,
+    /// The running command's ingress admissions (RM-355), fresh for each
+    /// command and kept after it for its `Slow query` line.
+    pub ingress_admission: Arc<admission::AdmissionContext>,
+    /// When the command began its admission: where its `maxTimeMS` runs
+    /// from, as mongod's does.
+    pub exec_started: Option<std::time::Instant>,
 }
 
 /// A cursor reply's document batch as pre-encoded BSON blobs, plus which field
@@ -399,6 +406,8 @@ impl CommandContext {
             raw_insert_documents: None,
             locks: None,
             txn_locks: false,
+            ingress_admission: Arc::default(),
+            exec_started: None,
         }
     }
 
@@ -871,6 +880,11 @@ pub fn dispatch(doc: &Document, ctx: &mut CommandContext) -> Document {
 fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     handshake::process_started();
     let started = std::time::Instant::now();
+    // The command's admissions, and the ingress ticket it holds until it
+    // has finished, its write concern's wait included (RM-355).
+    ctx.ingress_admission = Arc::default();
+    ctx.exec_started = None;
+    let _ingress = admission::ingress::HeldScope::enter();
     let stats = ctx.top_stats.clone();
     if let Some(stats) = &stats {
         stats.count_op(doc);
@@ -1846,6 +1860,20 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
                     return reply;
                 }
             }
+            // A node inside its `replSetStepDown` window is a SECONDARY, and
+            // mongod refuses writes there with 10107 while still serving
+            // reads. Gated on the write-command set so a read is unaffected.
+            // mongod refuses before it admits the command.
+            if is_write_concern_command(name)
+                && ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down())
+            {
+                return stepdown::not_primary_error(ctx.step_down.as_deref()).into_reply();
+            }
+            // Ingress admission control, where mongod's `_initiateCommand`
+            // admits: parsed, authorized, under its `maxTimeMS` (RM-355).
+            if let Err(e) = admit_ingress(name, doc, ctx) {
+                return e.into_reply();
+            }
             if max_time_forced_to_expire(name, doc, ctx) {
                 return CommandError::new(50, "MaxTimeMSExpired", "operation exceeded time limit")
                     .into_reply();
@@ -1856,12 +1884,6 @@ fn dispatch_inner(doc: &Document, ctx: &mut CommandContext) -> Document {
             if is_write_concern_command(name) {
                 if let Some(e) = validate_write_concern(doc, name) {
                     return e.into_reply();
-                }
-                // A node inside its `replSetStepDown` window is a SECONDARY, and
-                // mongod refuses writes there with 10107 while still serving
-                // reads. Gated on the write-command set so a read is unaffected.
-                if ctx.step_down.as_ref().is_some_and(|s| s.is_stepped_down()) {
-                    return stepdown::not_primary_error(ctx.step_down.as_deref()).into_reply();
                 }
             }
             // Refuse a direct insert/update/delete on a synthetic read-only view
@@ -2231,6 +2253,43 @@ fn abort_transaction(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
     }
 }
 
+/// Admit the command through ingress admission control (RM-355), waiting
+/// in its queue if the pool has no ticket free: until a ticket is returned,
+/// the command is killed (11601) or its `maxTimeMS` is spent (50), each
+/// noticed when the wait wakes, as mongod notices them. The ticket is held
+/// in the command's [`admission::ingress::HeldScope`].
+fn admit_ingress(name: &str, doc: &Document, ctx: &mut CommandContext) -> Result<(), CommandError> {
+    let started = std::time::Instant::now();
+    ctx.exec_started = Some(started);
+    let Some(params) = ctx.server_params.clone() else {
+        return Ok(());
+    };
+    let budget = match max_time_ms_budget(doc) {
+        0 => cluster_params::default_read_budget(doc, ctx),
+        b => b,
+    };
+    let mut interrupted = || {
+        if ops::current_killed() {
+            return Err(CommandError::new(
+                11601,
+                "Interrupted",
+                "operation was interrupted",
+            ));
+        }
+        if budget > 0 && started.elapsed() >= std::time::Duration::from_millis(budget as u64) {
+            return Err(CommandError::max_time_expired());
+        }
+        Ok(())
+    };
+    let subject = admission::ingress::subject_to_admission_control(name, doc);
+    let ticket =
+        params
+            .ingress_admission()
+            .admit(&ctx.ingress_admission, subject, &mut interrupted)?;
+    admission::ingress::HeldScope::hold(ticket);
+    Ok(())
+}
+
 /// Run `handler`, mapping its `Err` into the standard error reply.
 ///
 /// `maxTimeMS` is armed HERE, around the whole handler, because that is the
@@ -2243,7 +2302,10 @@ fn run_handler(handler: Handler, doc: &Document, ctx: &mut CommandContext) -> Do
         0 => cluster_params::default_read_budget(doc, ctx),
         b => b,
     };
-    let _deadline = deadline::arm((budget > 0).then_some(budget));
+    let _deadline = deadline::arm_since(
+        ctx.exec_started.unwrap_or_else(std::time::Instant::now),
+        (budget > 0).then_some(budget),
+    );
     let _write_block_bypass = misc_admin::write_block_bypass(ctx);
     // Expressions are parsed under the feature compatibility version.
     let _fcv = secantus_core::expressions::gate_fcv(
