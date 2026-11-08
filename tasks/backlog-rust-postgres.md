@@ -2299,23 +2299,23 @@ char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
       Backlog-ID: RP-570
       Verify: tests/backlog/test_rp_found_rp559.py::test_cast_to_domain_array_applies_typmod
 
-## Found while working RP-554 (2026-11-08)
+## Found while working RP-571 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
-`tests/backlog/test_rp_found_rp554.py`.
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp571.py`.
 
-- [ ] **An ARRAY(subquery) of a built-in type is typed from its values.**
-      PostgreSQL 15.19 types `array(select ...)` as the array of the
-      subquery column's type, so `select array(select 1::int2)` is
-      `smallint[]` (1005), `array(select 'a'::varchar(3))` `varchar[]`
-      (1015), `array(select 1.5::float4)` `real[]` and `array(select
-      'x'::name)` `name[]`, an empty one too; here they are `int4[]`,
-      `text[]`, `float8[]` and `text[]`, and `pg_typeof` of an empty one is
-      42P18 `could not determine data type of parameter $1`. The ARRAY
-      sublink's value is a bare parameter whose type is read off its
-      elements; since RP-554 only a composite element type is cast to.
-      Backlog-ID: RP-571
-      Verify: tests/backlog/test_rp_found_rp554.py::test_array_sublink_element_type
+- [ ] **An array of `int2vector` or `oidvector` is a two-dimensional int
+      array.** Each element is ONE value, so on PostgreSQL 15.19 `select
+      '{"1 2"}'::int2vector[]`, `array['1 2'::int2vector]` and `array(select
+      '1 2'::int2vector)` are `{"1 2"}` (`array_out` writes each element's
+      `int2vectorout` text), and `array(select indkey from pg_index ...)` is
+      `{1,"2 3"}`; here each is `{{1,2}}`, the vector carried as an int list
+      read as another dimension, and `array_agg(indkey)` over vectors of
+      different lengths answers where PostgreSQL is 2202E `cannot accumulate
+      arrays of different dimensionality`. The type (`int2vector[]`, 1006)
+      is already right. `oidvector[]` is the same.
+      Backlog-ID: RP-575
+      Verify: tests/backlog/test_rp_found_rp571.py::test_vector_array_elements
 
 ## Found while working RP-529 (2026-11-08)
 

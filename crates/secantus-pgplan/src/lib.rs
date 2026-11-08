@@ -21795,7 +21795,6 @@ fn function_absent_in_reference(
     )))
 }
 
-/// A `TypeName` for an internal type name (`int4`, `text[]`).
 /// Whether `ty` names a composite type (a table's row type or a `CREATE
 /// TYPE ... AS`), or an array of one. A subquery's value of such a type is
 /// a document, or a list of them, that carries no type of its own, so it is
@@ -21806,6 +21805,57 @@ fn composite_or_array_of_one(ty: &str) -> bool {
     user_composite(ty.strip_suffix("[]").unwrap_or(ty)).is_some()
 }
 
+/// Whether a subquery's value of type `t` is CAST to it where the planner
+/// folds the subquery into a parameter: a value that reads back as another
+/// type (an `oid` carried as a bigint, a `name` as text, a timestamp as a
+/// datetime) and a row type's document. Any other built-in type is
+/// declared for the parameter instead (`declare_sublink_param`), since a
+/// value carried in another form (a `pg_lsn` as its position) would not
+/// survive a cast of itself.
+fn sublink_value_cast(t: &str) -> bool {
+    matches!(
+        t,
+        "int2vector"
+            | "oidvector"
+            | "oid"
+            | "int2"
+            | "float4"
+            | "name"
+            | "varchar"
+            | "bpchar"
+            | "\"char\""
+            | "xid"
+            | "cid"
+            | "timestamp"
+            | "timestamptz"
+            | "date"
+            | "time"
+            | "timetz"
+            | "interval"
+            | "uuid"
+    ) || composite_or_array_of_one(t)
+}
+
+/// Declares built-in type `t` for plan parameter `at` (0-based), the value
+/// of a subquery folded into it, so it is described and typed as `t`. A
+/// name no built-in has, a quoted one or a row type is left undeclared.
+fn declare_sublink_param(at: usize, t: &str) {
+    if t.contains('"')
+        || pgtypes::oid_of_name(t).is_none()
+        || user_composite(t.strip_suffix("[]").unwrap_or(t)).is_some()
+    {
+        return;
+    }
+    PLAN_PARAM_TYPES.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.len() <= at {
+            p.resize(at + 1, None);
+        }
+        p[at] = Some(t.to_string());
+    });
+}
+
+/// A `TypeName` for an internal type name (`int4`, `text[]`).
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
         Some(b) => (b, true),
@@ -22076,48 +22126,12 @@ fn resolve_one_sublink(
                     // subquery's column wherever it lands: a bare parameter
                     // has no declared type, which made `pg_typeof((select
                     // 1))` 42P18 and a CASE over it text (RP-023).
-                    let cast = |t: &str| {
-                        matches!(
-                            t,
-                            "int2vector"
-                                | "oidvector"
-                                | "oid"
-                                | "int2"
-                                | "float4"
-                                | "name"
-                                | "varchar"
-                                | "bpchar"
-                                | "\"char\""
-                                | "xid"
-                                | "cid"
-                                | "timestamp"
-                                | "timestamptz"
-                                | "date"
-                                | "time"
-                                | "timetz"
-                                | "interval"
-                                | "uuid"
-                        ) || composite_or_array_of_one(t)
-                    };
-                    // Any other built-in type is DECLARED for the parameter
-                    // rather than cast to: a value carried in another form
-                    // (a `pg_lsn` as its position) would not survive a cast
-                    // of itself.
-                    if let Some(t) = ty.as_deref().filter(|t| {
-                        !cast(t)
-                            && !matches!(*t, "" | "unknown" | "record" | "text")
-                            && !t.contains('"')
-                            && pgtypes::oid_of_name(t).is_some()
-                            && user_composite(t).is_none()
-                    }) {
-                        let at = params.len() - 1;
-                        PLAN_PARAM_TYPES.with(|p| {
-                            let mut p = p.borrow_mut();
-                            if p.len() <= at {
-                                p.resize(at + 1, None);
-                            }
-                            p[at] = Some(t.to_string());
-                        });
+                    let cast = |t: &str| sublink_value_cast(t);
+                    if let Some(t) = ty
+                        .as_deref()
+                        .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record" | "text"))
+                    {
+                        declare_sublink_param(params.len() - 1, t);
                     }
                     Ok(match ty.as_deref() {
                         Some(ty) if cast(ty) => pg_query::protobuf::Node {
@@ -22155,27 +22169,41 @@ fn resolve_one_sublink(
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
             let node = param_node(params, Bson::Array(values));
-            // An array of a row type is that type's array (`fs[]`), which
-            // nothing reads back off a list of documents (RP-554).
+            // `transformSubLink` types an ARRAY sublink as the array of its
+            // subquery column's type (`get_promoted_array_type`; an array
+            // column is its own type, the result one more dimension of it):
+            // `array(select 1::int2)` is `smallint[]`, empty or not. A list
+            // of values carries no type of its own, so it is typed by the
+            // column as a scalar subquery's value is -- cast to where the
+            // values survive a cast of themselves, declared otherwise -- or
+            // it was typed off its elements, and an empty one not at all
+            // (RP-571). A row type's array is cast to as well (RP-554).
             let ty = sub_plan_def(&plan, lookup)
                 .ok()
                 .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
-            Ok(match ty.filter(|t| composite_or_array_of_one(t)) {
-                Some(t) => {
-                    let array = if t.ends_with("[]") {
-                        t
-                    } else {
-                        format!("{t}[]")
-                    };
-                    pg_query::protobuf::Node {
-                        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-                            arg: Some(Box::new(node)),
-                            type_name: Some(type_name_node(&array)),
-                            location: -1,
-                        }))),
-                    }
-                }
-                None => node,
+            let Some(element) = ty.filter(|t| !matches!(t.as_str(), "" | "unknown" | "record"))
+            else {
+                return Ok(node);
+            };
+            let array = if element.ends_with("[]") {
+                element.clone()
+            } else {
+                format!("{element}[]")
+            };
+            // An `int2vector` / `oidvector` is carried as an int array, which
+            // a cast to its array type reads as one more dimension of ints;
+            // it is declared instead (RP-575).
+            let base = element.strip_suffix("[]").unwrap_or(&element);
+            if !sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector") {
+                declare_sublink_param(params.len() - 1, &array);
+                return Ok(node);
+            }
+            Ok(pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(node)),
+                    type_name: Some(type_name_node(&array)),
+                    location: -1,
+                }))),
             })
         }
         Ok(kind @ (SubLinkType::AnySublink | SubLinkType::AllSublink))
