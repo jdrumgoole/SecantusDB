@@ -130,8 +130,9 @@ def test_drop_without_arguments_over_the_other_kind(query: str, dsn: str) -> Non
     assert answer(dsn, query) == DROP_WITHOUT_ARGUMENTS[query]
 
 
-# RP-509: a CALL's defaulted parameter, its named arguments, and a column
-# reference among its arguments.
+# RP-509 (fixed): a CALL's defaulted parameter, its named arguments, and a
+# column reference among its arguments were refused; they are resolved as
+# `FuncnameGetCandidates` and `transformCallStmt` resolve them.
 CALL_ARGUMENTS = {
     "call pd(1)": ("ok", None, []),
     "call pd(b => 3, a => 1)": ("ok", None, []),
@@ -139,7 +140,7 @@ CALL_ARGUMENTS = {
 }
 
 
-@pytest.mark.backlog("RP-509")
+@pytest.mark.backlog_fixed("RP-509")
 @pytest.mark.parametrize("query", list(CALL_ARGUMENTS))
 def test_call_arguments(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CALL_ARGUMENTS[query]

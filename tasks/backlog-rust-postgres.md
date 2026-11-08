@@ -2078,18 +2078,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`.
       exist, skipping` there, `function ...` here.
       Backlog-ID: RP-508
       Verify: tests/backlog/test_rp_found_rp500.py::test_drop_without_arguments_over_the_other_kind
-- [ ] **A CALL that leaves a defaulted parameter out, names its arguments,
-      or passes a column fails.** With `create procedure pd(a int, b int
-      default 2)`, PostgreSQL 15.19 runs `call pd(1)` and `call pd(b => 3, a
-      => 1)`. Here the first is 42883 `procedure pd(integer) does not
-      exist`, because `run_procedure` matches a procedure by its full
-      parameter count, and the second is 0A000 `NamedArgExpr is not
-      supported yet`. And `call gvp(nosuch)` is 42703 `column "nosuch" does
-      not exist` at 10 there, 0A000 `ColumnRef is not supported yet` here.
-      Since RP-500 a CALL in a SQL function's body is resolved at CREATE,
-      counting defaults, and a named argument is left to the call.
-      Backlog-ID: RP-509
-      Verify: tests/backlog/test_rp_found_rp500.py::test_call_arguments
 - [ ] **A malformed range literal's 22P02 has no DETAIL.** PostgreSQL
       15.19's `range_parse` explains each one: `select '[1,2'::int4range`
       has DETAIL `Unexpected end of input.`, `'[1,2]x'` `Junk after right

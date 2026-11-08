@@ -21355,3 +21355,223 @@ def test_an_untyped_values_parameter_is_text(home: Path) -> None:
         cur.execute("insert into vt values (%s, %s, %s)", ("1", "1.5", "1"))
         cur.execute("select i, n, t, pg_typeof(i)::text from vt")
         assert cur.fetchone() == (1, Decimal("1.5"), "1", "integer")
+
+
+# A CALL's arguments as PostgreSQL resolves them (RP-509): a defaulted
+# parameter left out, named arguments in any order, a column reference
+# among them, the overload `func_get_detail` picks by type, and a PL/pgSQL
+# CALL writing an OUT / INOUT value back through a named argument, and the
+# same lookup run for a CALL in a SQL function's body at CREATE. Every
+# answer measured on a fresh PostgreSQL 15.19 cluster (2026-11-08).
+_NO_PROCEDURE_HINT = (
+    "No procedure matches the given name and argument types. You might need to add "
+    "explicit type casts."
+)
+_NOT_UNIQUE_HINT = (
+    "Could not choose a best candidate procedure. You might need to add explicit type casts."
+)
+
+
+def _called(*notices: str) -> tuple[object, ...]:
+    return ("ok", None, "CALL", list(notices))
+
+
+def _missing(signature: str, at: str = "6") -> tuple[object, ...]:
+    return ("42883", f"procedure {signature} does not exist", _NO_PROCEDURE_HINT, at)
+
+
+def _not_unique(signature: str, at: str = "6") -> tuple[object, ...]:
+    return ("42725", f"procedure {signature} is not unique", _NOT_UNIQUE_HINT, at)
+
+
+_CALL_SETUP = [
+    "create procedure pd(a int, b int default 2)"
+    " language plpgsql as $$ begin raise notice 'pd % %', a, b; end $$",
+    "create procedure pio(inout x int, y int default 10)"
+    " language plpgsql as $$ begin x := x + y; end $$",
+    "create procedure po(a int, out r int) language plpgsql as $$ begin r := a * 2; end $$",
+    "create procedure pdx(a int, b text default 'x' || 'y')"
+    " language plpgsql as $$ begin raise notice 'pdx % %', a, b; end $$",
+    "create procedure gvp(x int) language sql as $$ select 1 $$",
+    "create procedure pd2(a int) language plpgsql as $$ begin raise notice 'one'; end $$",
+    "create procedure pd2(a int, b int default 1)"
+    " language plpgsql as $$ begin raise notice 'two'; end $$",
+    "create table t (a int, b int)",
+    "create procedure psq(a int, b int default 7)"
+    " language sql as $$ insert into t values (a, b) $$",
+    "create procedure pnm(p int, q text default 'dq')"
+    " language plpgsql as $$ begin raise notice 'pnm % %', p, q; end $$",
+    "create procedure pnm(p text, z int default 3)"
+    " language plpgsql as $$ begin raise notice 'pnmt % %', p, z; end $$",
+]
+
+_CALL_CASES = [
+    ("call pd(1)", _called("pd 1 2")),
+    ("call pd(b => 3, a => 1)", _called("pd 1 3")),
+    ("call pd(1, b => 5)", _called("pd 1 5")),
+    ("call pd(a => 1)", _called("pd 1 2")),
+    ("call pd(a := 4)", _called("pd 4 2")),
+    ("call pd(b => 1)", _missing("pd(b => integer)")),
+    ("call pd(c => 1)", _missing("pd(c => integer)")),
+    ("call pd(1, a => 2)", _missing("pd(integer, a => integer)")),
+    ("call pd()", _missing("pd()")),
+    ("call pd(1,2,3)", _missing("pd(integer, integer, integer)")),
+    ("call pd('5')", _called("pd 5 2")),
+    ("call pd(b => '6', a => '7')", _called("pd 7 6")),
+    ("call pio(1)", ("ok", [(11,)], "CALL", [])),
+    ("call pio(y => 5, x => 2)", ("ok", [(7,)], "CALL", [])),
+    ("call pio(x => 2)", ("ok", [(12,)], "CALL", [])),
+    ("call po(1, null)", ("ok", [(2,)], "CALL", [])),
+    ("call po(r => null, a => 3)", ("ok", [(6,)], "CALL", [])),
+    ("call po(a => 3)", _missing("po(a => integer)")),
+    ("call po(3)", _missing("po(integer)")),
+    ("call pdx(1)", _called("pdx 1 xy")),
+    ("call pdx(b => 'q', a => 2)", _called("pdx 2 q")),
+    ("call gvp(nosuch)", ("42703", 'column "nosuch" does not exist', None, "10")),
+    ("call gvp(t.nosuch)", ("42P01", 'missing FROM-clause entry for table "t"', None, "10")),
+    ("call gvp(nosuch + 1)", ("42703", 'column "nosuch" does not exist', None, "10")),
+    ("call gvp(x => nosuch)", ("42703", 'column "nosuch" does not exist', None, "15")),
+    ("call pd2(1)", _not_unique("pd2(integer)")),
+    ("call pd2(1, 2)", _called("two")),
+    ("call pd2(a => 1)", _not_unique("pd2(a => integer)")),
+    ("call pd2(b => 1, a => 2)", _called("two")),
+    ("call psq(1)", _called()),
+    ("call psq(b => 2, a => 3)", _called()),
+    ("select * from t order by a, b", ("ok", [(1, 7), (3, 2)], "SELECT 2", [])),
+    ("call pnm(1)", _called("pnm 1 dq")),
+    ("call pnm(p => 1)", _called("pnm 1 dq")),
+    ("call pnm(p => 'x')", _called("pnmt x 3")),
+    ("call pnm(z => 1, p => 'x')", _called("pnmt x 1")),
+    ("call pnm(q => 'k', p => 1)", _called("pnm 1 k")),
+    ("call pnm('x')", _called("pnmt x 3")),
+    (
+        "do $$ begin call pd(b => 3, a => 1); call pd(9); end $$",
+        ("ok", None, "DO", ["pd 1 3", "pd 9 2"]),
+    ),
+    (
+        "create function fcall() returns void language sql as $$ call pd(b => 3, a => 1) $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    ("select fcall()", ("ok", [(None,)], "SELECT 1", ["pd 1 3"])),
+    (
+        "create function fcall2() returns void language sql as $$ call pd(9) $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    ("select fcall2()", ("ok", [(None,)], "SELECT 1", ["pd 9 2"])),
+    ("call pd(1 + 1, b => 2 * 3)", _called("pd 2 6")),
+    ("call pd(nosuch => 1)", _missing("pd(nosuch => integer)")),
+    ("call nosuchproc(a => 1)", _missing("nosuchproc(a => integer)")),
+    ("call pd(a => 1, a => 2)", ("42601", 'argument name "a" used more than once', None, "17")),
+    (
+        "call pd(a => 1, 2)",
+        ("42601", "positional argument cannot follow named argument", None, "17"),
+    ),
+    ("call pd(b => 1, nosuch)", ("42703", 'column "nosuch" does not exist', None, "17")),
+    (
+        "do $$ declare v int := 3; begin call pio(x => v, y => 4); raise notice 'v=%', v; end $$",
+        ("ok", None, "DO", ["v=7"]),
+    ),
+    (
+        "do $$ declare v int := 3; begin call pio(y => 4, x => v); raise notice 'v=%', v; end $$",
+        ("ok", None, "DO", ["v=7"]),
+    ),
+    (
+        "do $$ declare v int := 3; begin call pio(v); raise notice 'v=%', v; end $$",
+        ("ok", None, "DO", ["v=13"]),
+    ),
+    (
+        "do $$ declare r int; begin call po(r => r, a => 21); raise notice 'r=%', r; end $$",
+        ("ok", None, "DO", ["r=42"]),
+    ),
+    (
+        "create function fpd(a int) returns int language sql as $$ select a $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    (
+        "call fpd(1)",
+        ("42809", "fpd(integer) is not a procedure", "To call a function, use SELECT.", "6"),
+    ),
+    (
+        "call fpd(a => 1)",
+        ("42809", "fpd(a => integer) is not a procedure", "To call a function, use SELECT.", "6"),
+    ),
+    ("call pnm(1.5)", _missing("pnm(numeric)")),
+    ("call pd(1::bigint)", _missing("pd(bigint)")),
+    ("call pd(1.5)", _missing("pd(numeric)")),
+    ("call pd2(1::smallint)", _not_unique("pd2(smallint)")),
+    ("call pdx(1, null)", _called("pdx 1 <NULL>")),
+    ("call pdx(b => null, a => 1)", _called("pdx 1 <NULL>")),
+    (
+        "create function fb1() returns void language sql as $$ call pd(c => 1) $$",
+        _missing("pd(c => integer)", "60"),
+    ),
+    (
+        "create function fb2() returns void language sql as $$ call pd2(1) $$",
+        _not_unique("pd2(integer)", "60"),
+    ),
+    (
+        "create function fb3() returns void language sql as $$ call pd(b => 1) $$",
+        _missing("pd(b => integer)", "60"),
+    ),
+    (
+        "create function fb4() returns void language sql as $$ call fpd(a => 1) $$",
+        ("42809", "fpd(a => integer) is not a procedure", "To call a function, use SELECT.", "60"),
+    ),
+    (
+        "create function fb5(p int) returns void language sql as $$ call pnm(p) $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    ("select fb5(4)", ("ok", [(None,)], "SELECT 1", ["pnm 4 dq"])),
+    (
+        "create function fb6(p text) returns void language sql as $$ call pnm(p => p) $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    ("select fb6('w')", ("ok", [(None,)], "SELECT 1", ["pnmt w 3"])),
+    (
+        "create function fb7() returns void language sql as $$ call pd(b => 'zz', a => 1) $$",
+        ("22P02", 'invalid input syntax for type integer: "zz"', None, "68"),
+    ),
+    (
+        "create function fb8() returns void language sql as $$ call pd(b => 2, a => 1) $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    ("select fb8()", ("ok", [(None,)], "SELECT 1", ["pd 1 2"])),
+    (
+        "create function fb9(p int) returns void language sql as $$ call pd2(p, p) $$",
+        ("ok", None, "CREATE FUNCTION", []),
+    ),
+    (
+        "create function fb10(p int) returns void language sql as $$ call pd2(p) $$",
+        _not_unique("pd2(integer)", "66"),
+    ),
+]
+
+
+def test_call_resolves_defaults_named_arguments_and_overloads(home: Path) -> None:
+    """CALL fills defaults, takes named arguments and picks overloads as PG 15.
+
+    Before RP-509 a procedure was matched by its full parameter count, so
+    `call pd(1)` over `pd(a int, b int default 2)` was 42883; a named
+    argument was 0A000 `NamedArgExpr is not supported yet`; a column
+    reference was 0A000 rather than 42703; and two overloads the
+    arguments could not tell apart ran the first instead of 42725.
+    """
+    with _Server(home) as server, server.connect() as c:
+        for q in _CALL_SETUP:
+            c.execute(q)
+        notices: list[str | None] = []
+        c.add_notice_handler(lambda d: notices.append(d.message_primary))
+        got = []
+        for q, _ in _CALL_CASES:
+            notices.clear()
+            try:
+                cur = c.execute(q)
+                rows = cur.fetchall() if cur.description else None
+                got.append((q, ("ok", rows, cur.statusmessage, list(notices))))
+            except psycopg.Error as e:
+                d = e.diag
+                assert d.message_detail is None, (q, d.message_detail)
+                got.append(
+                    (q, (e.sqlstate, d.message_primary, d.message_hint, d.statement_position))
+                )
+        assert got == _CALL_CASES

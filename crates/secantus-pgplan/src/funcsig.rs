@@ -634,7 +634,7 @@ fn unknown_resolution(
         return None;
     }
     let overloads = sigs().get(name)?;
-    let mut cands: Vec<&Sig> = overloads
+    let cands: Vec<&Sig> = overloads
         .iter()
         .filter(|s| !s.variadic && s.args.len() == args.len() && sig_accepts(s, args))
         .collect();
@@ -650,9 +650,29 @@ fn unknown_resolution(
     if polymorphic && !args.iter().all(|a| a == "unknown") {
         return None;
     }
-    let keep_best = |cands: &mut Vec<&Sig>, score: &dyn Fn(&str, &str) -> bool| {
-        let count = |s: &&Sig| {
-            s.args
+    let lists: Vec<&[String]> = cands.iter().map(|s| s.args.as_slice()).collect();
+    let cands: Vec<&Sig> = narrow_candidates(&lists, args)?
+        .into_iter()
+        .map(|i| cands[i])
+        .collect();
+    match cands.as_slice() {
+        [_, _, ..] => Some(Err(())),
+        _ if polymorphic => None,
+        [s] => Some(Ok(*s)),
+        [] => None,
+    }
+}
+
+/// `func_select_candidate`'s narrowing of the candidates that all take
+/// `args` (each list as long as `args`, `unknown` for an untyped literal):
+/// the indices into `lists` that survive -- one is the winner, more is
+/// ambiguous. `None` where a parameter's type has no category here.
+fn narrow_candidates(lists: &[&[String]], args: &[String]) -> Option<Vec<usize>> {
+    let cats = categories();
+    let mut cands: Vec<usize> = (0..lists.len()).collect();
+    let keep_best = |cands: &mut Vec<usize>, score: &dyn Fn(&str, &str) -> bool| {
+        let count = |s: &usize| {
+            lists[*s]
                 .iter()
                 .zip(args)
                 .filter(|(p, a)| *a != "unknown" && score(p, a))
@@ -686,7 +706,7 @@ fn unknown_resolution(
             let mut slot: Option<(char, bool)> = None;
             let mut conflict = false;
             for s in &cands {
-                let (c, p) = *cats.get(s.args[i].as_str())?;
+                let (c, p) = *cats.get(lists[*s][i].as_str())?;
                 match slot {
                     None => slot = Some((c, p)),
                     Some((sc, sp)) if sc == c => slot = Some((sc, sp || p)),
@@ -702,12 +722,12 @@ fn unknown_resolution(
             slots.push((i, c, p));
         }
         if resolved {
-            let keep: Vec<&Sig> = cands
+            let keep: Vec<usize> = cands
                 .iter()
                 .copied()
                 .filter(|s| {
                     slots.iter().all(|&(i, c, p)| {
-                        cats.get(s.args[i].as_str())
+                        cats.get(lists[*s][i].as_str())
                             .is_some_and(|&(sc, sp)| sc == c && (!p || sp))
                     })
                 })
@@ -724,10 +744,10 @@ fn unknown_resolution(
         if let Some(first) = known.next() {
             if known.all(|k| k == first) {
                 let as_known: Vec<String> = args.iter().map(|_| first.clone()).collect();
-                let fits: Vec<&Sig> = cands
+                let fits: Vec<usize> = cands
                     .iter()
                     .copied()
-                    .filter(|s| sig_accepts(s, &as_known))
+                    .filter(|s| lists[*s].iter().zip(&as_known).all(|(p, a)| accepts(p, a)))
                     .collect();
                 if let [one] = fits.as_slice() {
                     cands = vec![*one];
@@ -735,11 +755,51 @@ fn unknown_resolution(
             }
         }
     }
-    match cands.as_slice() {
-        [_, _, ..] => Some(Err(())),
-        _ if polymorphic => None,
-        [s] => Some(Ok(*s)),
-        [] => None,
+    Some(cands)
+}
+
+/// What [`select_routine`] makes of a call's candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutineChoice {
+    /// The candidate at this index.
+    One(usize),
+    /// None takes the arguments: 42883.
+    None,
+    /// More than one is equally good: 42725.
+    Ambiguous,
+    /// A type with no category here (a user type) leaves the rules
+    /// undecided.
+    Undecided,
+}
+
+/// `func_get_detail`'s choice among a user routine's candidates, each the
+/// parameter types in the order of the call's arguments (`args`, `unknown`
+/// for an untyped literal): the one exact match; else the only one every
+/// argument can be implicitly coerced to (`func_match_argtypes`); else
+/// `func_select_candidate`'s narrowing.
+pub fn select_routine(cands: &[Vec<String>], args: &[String]) -> RoutineChoice {
+    let fits_with = |c: &[String], ok: &dyn Fn(&str, &str) -> bool| {
+        c.len() == args.len() && c.iter().zip(args).all(|(p, a)| ok(p, a))
+    };
+    if let Some(i) = cands
+        .iter()
+        .position(|c| fits_with(c, &|p, a| a != "unknown" && p == a))
+    {
+        return RoutineChoice::One(i);
+    }
+    let fits: Vec<usize> = (0..cands.len())
+        .filter(|&i| fits_with(&cands[i], &accepts))
+        .collect();
+    match fits.as_slice() {
+        [] => return RoutineChoice::None,
+        [one] => return RoutineChoice::One(*one),
+        _ => {}
+    }
+    let lists: Vec<&[String]> = fits.iter().map(|&i| cands[i].as_slice()).collect();
+    match narrow_candidates(&lists, args).as_deref() {
+        Some([one]) => RoutineChoice::One(fits[*one]),
+        Some(_) => RoutineChoice::Ambiguous,
+        None => RoutineChoice::Undecided,
     }
 }
 
@@ -987,4 +1047,51 @@ pub fn binary_operator_result(op: &str, l: &str, r: &str) -> Option<String> {
             .then(|| it.next().map(planner_type))
             .flatten()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn v(types: &[&str]) -> Vec<String> {
+        types.iter().map(|t| t.to_string()).collect()
+    }
+
+    /// `func_get_detail` over a user routine's candidates, as PostgreSQL
+    /// 15.19 resolves `CALL p(...)` (RP-509).
+    #[test]
+    fn select_routine_follows_func_get_detail() {
+        let int_text = [v(&["int4"]), v(&["text"])];
+        // An exact match wins outright.
+        assert_eq!(
+            select_routine(&int_text, &v(&["int4"])),
+            RoutineChoice::One(0)
+        );
+        // An untyped literal prefers the string category.
+        assert_eq!(
+            select_routine(&int_text, &v(&["unknown"])),
+            RoutineChoice::One(1)
+        );
+        // Only the integer one takes a smallint, by implicit cast.
+        assert_eq!(
+            select_routine(&int_text, &v(&["int2"])),
+            RoutineChoice::One(0)
+        );
+        // Nothing takes a numeric implicitly.
+        assert_eq!(
+            select_routine(&[v(&["int4"])], &v(&["numeric"])),
+            RoutineChoice::None
+        );
+        // int8 and float8 both take an int4, neither exactly; float8 is
+        // the numeric category's preferred type.
+        assert_eq!(
+            select_routine(&[v(&["int8"]), v(&["float8"])], &v(&["int4"])),
+            RoutineChoice::One(1)
+        );
+        // int4 and int8 both take an int2 and neither is preferred.
+        assert_eq!(
+            select_routine(&[v(&["int4"]), v(&["int8"])], &v(&["int2"])),
+            RoutineChoice::Ambiguous
+        );
+    }
 }
