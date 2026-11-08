@@ -162,11 +162,14 @@ fn derived_def(
             let ranged = all.iter().find_map(|r| match r.get(i)?.node.as_ref() {
                 Some(N::TypeCast(tc)) => {
                     let t = type_name_of(tc.type_name.as_ref()?);
+                    let scalar = tc.type_name.as_ref()?.array_bounds.is_empty();
                     (crate::range::is_range_type(&t)
                         || crate::range::is_multirange_type(&t)
                         || t == crate::QUOTED_CHAR
-                        || tc.type_name.as_ref()?.array_bounds.is_empty()
-                            && crate::collation::is_citext(&t))
+                        || scalar && crate::collation::is_citext(&t)
+                        // A network type: its comparisons go by
+                        // `__net_sortkey`, not by the text (RP-610).
+                        || scalar && matches!(t.as_str(), "inet" | "cidr"))
                     .then_some(t)
                 }
                 _ => None,
@@ -1414,6 +1417,58 @@ impl Rewriter<'_> {
                     return Ok(());
                 }
             }
+            // A BETWEEN over a network type: as the comparisons
+            // `transformAExprBetween` expands it into, `a >= b AND a <= c`
+            // (SYMMETRIC: OR'd with the bounds swapped), each then resolved
+            // and keyed by `__net_sortkey` on its own, as PostgreSQL
+            // resolves each comparison on its own (RP-610).
+            if matches!(
+                kind,
+                Ok(AExprKind::AexprBetween
+                    | AExprKind::AexprNotBetween
+                    | AExprKind::AexprBetweenSym
+                    | AExprKind::AexprNotBetweenSym)
+            ) {
+                if let (Some(l), Some(N::List(bounds))) = (
+                    e.lexpr.as_deref(),
+                    e.rexpr.as_deref().and_then(|r| r.node.as_ref()),
+                ) {
+                    if let [lo, hi] = bounds.items.as_slice() {
+                        if [l, lo, hi].iter().any(|n| self.net_of(n).is_some()) {
+                            let negated = matches!(
+                                kind,
+                                Ok(AExprKind::AexprNotBetween | AExprKind::AexprNotBetweenSym)
+                            );
+                            let symmetric = matches!(
+                                kind,
+                                Ok(AExprKind::AexprBetweenSym | AExprKind::AexprNotBetweenSym)
+                            );
+                            let forward =
+                                between_as_comparisons(l.clone(), lo.clone(), hi.clone(), negated);
+                            *node = if symmetric {
+                                let swapped = between_as_comparisons(
+                                    l.clone(),
+                                    hi.clone(),
+                                    lo.clone(),
+                                    negated,
+                                );
+                                bool_expr(
+                                    if negated {
+                                        BoolExprType::AndExpr
+                                    } else {
+                                        BoolExprType::OrExpr
+                                    },
+                                    vec![forward, swapped],
+                                )
+                            } else {
+                                forward
+                            };
+                            self.changed = true;
+                            return self.expr(node);
+                        }
+                    }
+                }
+            }
             if matches!(
                 kind,
                 Ok(AExprKind::AexprBetween | AExprKind::AexprNotBetween)
@@ -1737,15 +1792,23 @@ fn between_as_comparisons(
     } else {
         (cmp(">=", key.clone(), lo), cmp("<=", key, hi))
     };
+    bool_expr(
+        if negated {
+            BoolExprType::OrExpr
+        } else {
+            BoolExprType::AndExpr
+        },
+        vec![a, b],
+    )
+}
+
+/// `args` joined by `op`.
+fn bool_expr(op: BoolExprType, args: Vec<pg_query::protobuf::Node>) -> pg_query::protobuf::Node {
     pg_query::protobuf::Node {
         node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
             xpr: None,
-            boolop: if negated {
-                BoolExprType::OrExpr as i32
-            } else {
-                BoolExprType::AndExpr as i32
-            },
-            args: vec![a, b],
+            boolop: op as i32,
+            args,
             location: -1,
         }))),
     }
