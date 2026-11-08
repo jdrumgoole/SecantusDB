@@ -1008,9 +1008,12 @@ pub fn apply_numeric_typmod(canonical: &str, typmod: i32) -> Result<String> {
     }
     let precision = (typmod - 4) >> 16;
     let scale = ((typmod - 4) & 0x7FF) as u32;
-    // PostgreSQL's DETAIL ("A field with precision 5, scale 2 must round
-    // to ...") has no channel here; the SQLSTATE and message match.
-    let overflow = |_detail: String| Error::Sqlstate("22003", "numeric field overflow".into());
+    // `apply_typmod`'s DETAIL ("A field with precision 5, scale 2 must
+    // round to ...") travels after the message, as the server's error
+    // conversion splits it into its own field (RP-582).
+    let overflow = |detail: String| {
+        Error::Sqlstate("22003", format!("numeric field overflow\nDetail: {detail}"))
+    };
     match canonical {
         "NaN" => return Ok(canonical.to_string()),
         "Infinity" | "-Infinity" => {

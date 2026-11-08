@@ -2342,13 +2342,6 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       by its SQLSTATE and message, and an assignment's 22001 has none.
       Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
       Backlog-ID: RP-581
-- [ ] **A numeric overflow's 22003 has no DETAIL.** `select
-      '123456'::numeric(5,2)` and `123456::numeric(5,2)` are 22003
-      `numeric field overflow` with DETAIL `A field with precision 5, scale
-      2 must round to an absolute value less than 10^3.` on PostgreSQL
-      15.19 (`apply_typmod`); here the DETAIL is empty.
-      Verify: tests/backlog/test_rp_found_rp570.py::test_numeric_overflow_detail
-      Backlog-ID: RP-582
 
 ## Found while working RP-575 (2026-11-08)
 

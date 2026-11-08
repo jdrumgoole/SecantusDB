@@ -139,14 +139,15 @@ def test_domain_array_literal_error_position(query: str, dsn: str) -> None:
     assert answer(dsn, query) == LITERAL_ERRORS[query]
 
 
-# apply_typmod's 22003 explains the overflow in its DETAIL.
+# apply_typmod's 22003 explains the overflow in its DETAIL, which the
+# server's 22003 lacked until RP-582.
 OVERFLOWS = {
     "select '123456'::numeric(5,2)": _OVERFLOW,
     "select 123456::numeric(5,2)": _OVERFLOW,
 }
 
 
-@pytest.mark.backlog("RP-582")
+@pytest.mark.backlog_fixed("RP-582")
 @pytest.mark.parametrize("query", list(OVERFLOWS))
 def test_numeric_overflow_detail(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OVERFLOWS[query]
