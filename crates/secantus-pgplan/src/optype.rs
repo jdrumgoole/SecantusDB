@@ -1256,7 +1256,15 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         Some(K::AexprOp | K::AexprDistinct | K::AexprNotDistinct | K::AexprNullif)
     ) {
         if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
-            row_against_non_row(&op, l, r, e.location, scope)?;
+            // `ROW(...) op (SELECT ...)` is a row comparison SubLink, not an
+            // operator (`transformAExprOp`): its subquery's width is checked
+            // against the row (`(1, 2) = (select 1)` is 42601).
+            let row_compare = kind == Some(K::AexprOp)
+                && matches!(l.node.as_ref(), Some(N::RowExpr(_)))
+                && matches!(r.node.as_ref(), Some(N::SubLink(_)));
+            if !row_compare {
+                row_against_non_row(&op, l, r, e.location, scope)?;
+            }
         }
     }
     if kind == Some(K::AexprIn) {
@@ -2912,6 +2920,16 @@ fn row_against_non_row(
     location: i32,
     scope: &Scope,
 ) -> Result<()> {
+    // A scalar subquery of more than one column is `transformSubLink`'s
+    // 42601 first, before any operator is looked up.
+    let wide = |n: &pg_query::protobuf::Node| {
+        matches!(n.node.as_ref(), Some(N::SubLink(sl))
+            if matches!(sl.subselect.as_deref().and_then(|s| s.node.as_ref()),
+                Some(N::SelectStmt(s)) if s.target_list.len() != 1))
+    };
+    if wide(l) || wide(r) {
+        return Ok(());
+    }
     let (lr, rr) = (row_operand_type(l, scope), row_operand_type(r, scope));
     let (Some(lt), Some(rt)) = (
         lr.clone().or_else(|| operand_type_declared(l, scope)),

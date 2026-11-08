@@ -5040,6 +5040,7 @@ fn a_row_beside_a_scalar_has_no_operator() {
         ("select t = any('{1}'::int[]) from t", "t = integer", 9),
         ("select t between 1 and 2 from t", "t >= integer", 9),
         ("select count(*) from t x where x = 1.5", "t = numeric", 33),
+        ("select t = (select 1) from t", "t = integer", 9),
     ] {
         take_error_location();
         let err = analysed(sql).expect_err("should refuse");
@@ -5063,5 +5064,18 @@ fn a_row_beside_a_scalar_has_no_operator() {
         "select t is null from t",
     ] {
         assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+    // `ROW(...) = (SELECT ...)` is a row comparison SubLink, and a scalar
+    // subquery of two columns is `transformSubLink`'s 42601: neither is
+    // an operator's 42883.
+    for sql in [
+        "select (1, 2) = (select 1)",
+        "select t = (select 1, 2) from t",
+        "select (select 1, 2) = t from t",
+    ] {
+        take_error_location();
+        if let Err(e) = analysed(sql) {
+            assert_ne!(e.sqlstate(), "42883", "for {sql}: {e}");
+        }
     }
 }
