@@ -2439,16 +2439,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp603.py`.
 
-- [ ] **A network type's BETWEEN compares its text.** `'10.0.0.10'::inet
-      between '10.0.0.2' and '10.0.0.20'` is true on PostgreSQL 15.19
-      (`network_cmp` orders 10.0.0.10 after 10.0.0.2), and so is the `cidr`
-      form; here both are false, and a column's `WHERE a BETWEEN ...` keeps
-      no row. The rewrite in `enum_order` keys an `inet` / `cidr` operand of
-      `<`, `=`, `IN` and `greatest` with `__net_sortkey`, but its BETWEEN
-      arm is the enums' and the collations' only, so the bounds compare as
-      strings.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_network_between_orders_by_network_cmp
-      Backlog-ID: RP-610
 - [ ] **An array of `oidvector`s orders its elements as int arrays.**
       `array_cmp` compares elements with the element type's B-tree support
       function, so on PostgreSQL 15.19 `array['1 2'::oidvector] <

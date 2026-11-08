@@ -356,6 +356,20 @@ QUERIES = [
     "SELECT '2001:db8::/32'::cidr::text",
     "SELECT NULL::inet",
     "SELECT NULL::cidr",
+    # A network BETWEEN expands to comparisons in `network_cmp` order,
+    # where 10.0.0.10 follows 10.0.0.2 (RP-610); each one resolves its
+    # operand types on its own, so a typed bound types the untyped left.
+    "SELECT '10.0.0.10'::inet BETWEEN '10.0.0.2' AND '10.0.0.20'",
+    "SELECT '10.0.0.10'::inet NOT BETWEEN '10.0.0.2' AND '10.0.0.20'",
+    "SELECT '10.0.0.10'::inet BETWEEN SYMMETRIC '10.0.0.20' AND '10.0.0.2'",
+    "SELECT '10.0.0.10'::inet NOT BETWEEN SYMMETRIC '10.0.0.20' AND '10.0.0.2'",
+    "SELECT '10.0.0.10' BETWEEN '10.0.0.2'::inet AND '10.0.0.20'::inet",
+    "SELECT '10.0.0.10/32'::cidr BETWEEN '10.0.0.2/32' AND '10.0.0.20/32'",
+    "SELECT '10.0.0.10'::inet BETWEEN NULL AND '10.0.0.20'",
+    # A VALUES column cast to a network type compares as one.
+    "SELECT a::text FROM (VALUES ('10.0.0.10'::inet), ('9.0.0.1')) s(a) WHERE a < '10.0.0.2'",
+    "SELECT a::text FROM (VALUES ('10.0.0.10'::cidr), ('9.0.0.0/8')) s(a) "
+    "WHERE a BETWEEN '9.0.0.0/8' AND '10.0.0.10'",
     "SELECT NULL::uuid",
     # Anonymous records (ROW / parenthesised list): construction, text
     # render with PG field-quoting, and three-valued comparison.
@@ -1078,6 +1092,8 @@ ERROR_QUERIES = [
     "SELECT 'notanip'::inet",
     "SELECT '10.1.2.3/8'::cidr",
     "SELECT '1.2.3.4/33'::inet",
+    # A network BETWEEN's bound is read as the type (RP-610).
+    "SELECT '10.0.0.10'::inet BETWEEN 'bogus' AND '10.0.0.20'",
     "SELECT 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid",
     "SELECT 'a0-eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",
     "SELECT 'g0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid",

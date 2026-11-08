@@ -1,6 +1,6 @@
 """Gap tests of the divergences found while working RP-603 (`oidvector`'s
 ordering operators compared as int arrays): the network types' BETWEEN
-compares their text (RP-610), an array of `oidvector`s orders its elements
+compared their text (RP-610, fixed), an array of `oidvector`s orders its elements
 as int arrays (RP-611), and `oidvector`'s comparison functions are refused
 (RP-612).
 
@@ -30,10 +30,12 @@ NETWORK_BETWEEN: dict[str, list[tuple[object, ...]]] = {
     "select '10.0.0.10/32'::cidr between '10.0.0.2/32' and '10.0.0.20/32'": [(True,)],
     "select a::text from (values ('10.0.0.10'::inet), ('9.0.0.1')) s(a) "
     "where a between '10.0.0.2' and '10.0.0.20'": [("10.0.0.10/32",)],
+    "select '10.0.0.10'::inet between symmetric '10.0.0.20' and '10.0.0.2'": [(True,)],
+    "select '10.0.0.10'::inet not between symmetric '10.0.0.20' and '10.0.0.2'": [(False,)],
 }
 
 
-@pytest.mark.backlog("RP-610")
+@pytest.mark.backlog_fixed("RP-610")
 @pytest.mark.parametrize("query", list(NETWORK_BETWEEN))
 def test_network_between_orders_by_network_cmp(query: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
