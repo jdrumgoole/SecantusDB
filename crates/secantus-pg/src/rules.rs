@@ -275,7 +275,11 @@ impl PgHandler {
             Some(r) => self.statement_rule_trees('r', &bare, &rule.name, r)?,
             None => None,
         };
-        self.execute(self.plan_internal(&format!("DROP TABLE {quoted}"))?, 0)?;
+        // The view keeps the table's row type (`DefineQueryRewrite` turns
+        // the relation into a view in place), so what names that type stays.
+        crate::row_type_depends::keeping_row_type(|| {
+            self.execute(self.plan_internal(&format!("DROP TABLE {quoted}"))?, 0)
+        })?;
         // The internal CREATE VIEW is its own source while it runs.
         let create = format!("CREATE VIEW {quoted} AS {select}");
         let outer = self.enter_statement_source(&create);

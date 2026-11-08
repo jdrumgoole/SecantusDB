@@ -2109,6 +2109,86 @@ and `fs(a int, c text)`.
       Backlog-ID: RP-524
       Verify: tests/backlog/test_rp_subquery_scope.py::test_write_name_error_position
 
+## Found while working RP-546 (2026-11-08)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster. The gap
+tests are in `tests/backlog/test_rp_found_rp546.py`.
+
+- [ ] **DROP TABLE names a table's dependants by kind, not in creation
+      order.** PostgreSQL 15.19's `findDependentObjects` reads `pg_depend`
+      in creation order, so a view made before the table whose foreign key
+      references it is named first (`view o560v depends on table o560a`,
+      then the constraint), and a cast made between two functions over the
+      row type falls between them. Here the foreign keys always come before
+      the views (`drop table` and its CASCADE notice), and since RP-546 the
+      casts follow every routine: a cast's oid is derived from its types, not
+      drawn from the oid counter as `CastCreate` draws it, so its creation
+      order is not kept. `DROP SCHEMA ... CASCADE` names a routine over a
+      member's row type in the same order as here, not PostgreSQL's.
+      Backlog-ID: RP-560
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_table_dependants_in_creation_order
+- [ ] **An operator over a table's row type does not depend on it.**
+      `create operator ==== (leftarg = p561, rightarg = p561, ...)` records
+      a dependency on its argument types, so `drop table p561` names
+      `operator ====(p561,p561) depends on type p561` and CASCADE drops it.
+      Here the DETAIL names only the function, and the operator outlives the
+      table in `pg_operator`.
+      Backlog-ID: RP-561
+      Verify: tests/backlog/test_rp_found_rp546.py::test_operator_over_row_type_depends_on_its_table
+- [ ] **DROP TYPE of a table's row type with a routine over it names the
+      routines.** PostgreSQL 15.19 answers `drop type r562` with 2BP01
+      `cannot drop type r562 because table r562 requires it` whatever else
+      names the type; here a routine over it makes the answer that routine's
+      `other objects depend on it`. With no routine it already matches.
+      Backlog-ID: RP-562
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_of_a_row_type_with_a_routine
+- [ ] **DROP TYPE names a routine with a blank after each comma.**
+      `getObjectDescription` writes `format_procedure`'s
+      `function k563(integer,ty563)`; DROP TYPE's DETAIL and CASCADE notice
+      here say `k563(integer, ty563)` (`function_signature`, which DROP
+      FUNCTION's dependants share). DROP TABLE names them as PostgreSQL does
+      since RP-546 (`row_type_depends::routine_description`).
+      Backlog-ID: RP-563
+      Verify: tests/backlog/test_rp_found_rp546.py::test_drop_type_names_a_routine_as_format_procedure
+- [ ] **A DROP TABLE of several tables is refused under the first one's
+      name.** PostgreSQL 15.19's `reportDependentObjects` says `cannot drop
+      desired object(s) because other objects depend on them` when the DROP
+      names more than one object; here `drop table m564a, m564b` is `cannot
+      drop table m564a because ...`, each table being dropped on its own.
+      Backlog-ID: RP-564
+      Verify: tests/backlog/test_rp_found_rp546.py::test_multi_table_drop_refusal_headline
+- [ ] **A routine over a temporary table's row type names no type.** On
+      PostgreSQL 15.19 `create function tf565(tt565)` over a temp table has
+      `proargtypes` `{tt565}`, and `drop table tt565` is 2BP01 naming it.
+      Here the argument is stored by its bare name, which resolves to no
+      type (`-`), the DROP succeeds, and the routine is left behind.
+      Backlog-ID: RP-565
+      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_a_temp_table_row_type
+- [ ] **A SQL routine over a type that does not exist is created.**
+      `create function ufn566(x nosuch566) returns int language sql ...`
+      and the same CREATE PROCEDURE are 42704 `type nosuch566 does not
+      exist` on PostgreSQL 15.19 (`interpret_function_parameter_list`); here
+      both are created, over a type nothing can name.
+      Backlog-ID: RP-566
+      Verify: tests/backlog/test_rp_found_rp546.py::test_routine_over_an_undefined_type_is_refused
+- [ ] **A `regprocedure` prints its name unquoted and a schema's type
+      quoted whole.** `regprocedureout` is `format_procedure`: `"Q
+      f567"(s567.t)` and `s567.h(s567.t)` on PostgreSQL 15.19. Here they are
+      `Q f567("s567.t")` and `s567.h("s567.t")` (`regobj::text`), and
+      `pg_describe_object` of a routine shares that text.
+      Backlog-ID: RP-567
+      Verify: tests/backlog/test_rp_found_rp546.py::test_regprocedure_quotes_as_format_procedure
+- [ ] **A view dropped by CASCADE leaves the routines over its row type.**
+      On PostgreSQL 15.19 `drop table w568`, with a view `w568v` over it and
+      `w568f(w568v)`, names `view w568v depends on table w568` and then
+      `function w568f(w568v) depends on type w568v`, and CASCADE drops the
+      function too. Here the DETAIL names only the view, and the function
+      outlives it (`drop_rule_dependent` removes the view without asking
+      `row_type_dependents`). A direct DROP VIEW or DROP MATERIALIZED VIEW
+      answers as PostgreSQL does since RP-546.
+      Backlog-ID: RP-568
+      Verify: tests/backlog/test_rp_found_rp546.py::test_cascaded_view_takes_its_row_type_dependants
+
 ## Found while working RP-527 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
@@ -2125,15 +2205,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       message at the reference (8).
       Backlog-ID: RP-545
       Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
-- [ ] **A function over a table's row type does not depend on the
-      table.** PostgreSQL 15.19 records `function rq534f(rq534) depends on
-      type rq534` (`pg_depend`): a plain `drop table rq534` is 2BP01
-      `cannot drop table rq534 because other objects depend on it`, and
-      `drop table rq534 cascade` drops the function too (NOTICE `drop
-      cascades to function rq534f(rq534)`). Here the plain DROP succeeds and
-      the function stays in `pg_proc` over a type that no longer exists.
-      Backlog-ID: RP-546
-      Verify: tests/backlog/test_rp_found_rp527.py::test_row_type_function_depends_on_its_table
 
 ## Found while working RP-522 (2026-11-08)
 
