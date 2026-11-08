@@ -38,6 +38,16 @@ pub fn to_json_value(v: &Bson, ty: &str) -> Json {
         );
     }
     let ty = ty.trim();
+    // A vector taken from an array is carried as its text there; `datum_to_json`
+    // reads it as the int array it is (`to_json(array['1 2'::int2vector])` is
+    // `[[1,2]]`).
+    let scalar;
+    let v = if crate::vectors::is_vector(ty) && matches!(v, Bson::String(_)) {
+        scalar = crate::vectors::scalar(v.clone(), ty);
+        &scalar
+    } else {
+        v
+    };
     if let Bson::Array(items) = v {
         let elem = match ty {
             "int2vector" => "int2",

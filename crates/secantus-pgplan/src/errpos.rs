@@ -71,9 +71,13 @@ fn element_literal(toks: &[Tok], value: &str) -> Option<usize> {
             (Some('{'), Some('}')) | (Some('('), Some(')')) => &inner[1..inner.len() - 1],
             _ => return false,
         };
-        inner
-            .split([',', '{', '}', '(', ')'])
-            .any(|e| e.trim().trim_matches('"') == value)
+        // An `int2vector` / `oidvector` element's input error names one of
+        // its space-separated numbers (`'{"1 x"}'::int2vector[]` is 22P02
+        // for `"x"`, at the literal).
+        inner.split([',', '{', '}', '(', ')']).any(|e| {
+            let e = e.trim().trim_matches('"');
+            e == value || e.split_ascii_whitespace().any(|w| w == value)
+        })
     };
     let mut hits = toks.iter().enumerate().filter(|(_, t)| holds(t));
     let (i, _) = hits.next()?;
