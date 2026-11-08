@@ -1312,22 +1312,20 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       this server sorts. Found 2026-10-27 while working RM-222/RM-329.
       Backlog-ID: RM-332
       Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_sort_on_two_arrays_is_refused
-- [ ] **A retryable write retried after a restart is applied again.** The
-      server keeps a session's `config.transactions` row (RM-224, since
-      2026-10-27), but what each retryable write did lives only in memory
-      (`transactions::TransactionRegistry`), so a retry that reaches a
-      restarted server runs again: a retried insert fails on a duplicate
-      key, a retried `findAndModify` changes the document a second time.
-      mongod 8.2.11 answers the retry from the row and the session's
-      `prevOpTime` chain in the oplog (`retriedStmtIds`; a `findAndModify`
-      its image from `config.image_collection` with `retriedStmtId`) and
-      applies nothing twice. Under `--data-nonlogged` the row and the image
-      are also lost in a crash, since they are written without an oplog
-      entry and that mode recovers data tables by replaying the oplog;
-      mongod rebuilds them from the oplog in recovery. A driver retries
-      exactly when it lost the connection, which a restart is.
+- [ ] **A retryable write retried after a crash under `--data-nonlogged` is
+      applied again.** A restarted server reads a session's
+      `config.transactions` row, its oplog entries and its
+      `config.image_collection` image back (since 2026-11-08), but that mode
+      writes the row and the image without an oplog entry and recovers its
+      data tables by replaying the oplog, so a SIGKILL loses both: a retried
+      insert fails on a duplicate key, a retried `findAndModify` changes the
+      document a second time. mongod 8.2.11 rebuilds the row and the image
+      from the oplog in recovery (its `SessionUpdateTracker`; the image from
+      the document the replayed write changed) and answers both retries as
+      after a clean restart. The fix is in `recover_from_oplog`
+      (`secantus-storage`), which the PG server links too.
       Backlog-ID: RM-350
-      Verify: tests/backlog/test_rm_350_retry_after_restart.py::test_a_retry_after_a_restart_applies_nothing_twice
+      Verify: tests/backlog/test_rm_350_retry_after_restart.py::test_a_retry_after_a_crash_under_data_nonlogged_applies_nothing_twice
 
 ### 7.085 The shared Rust storage, audited -- 2026-10-20
 

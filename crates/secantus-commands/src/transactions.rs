@@ -345,6 +345,13 @@ impl Applied {
         self.records.is_empty() && self.inserted.is_empty()
     }
 
+    /// The statements a retryable write applied, as read back from storage.
+    pub fn from_records(records: Vec<(i32, StmtRecord)>) -> Self {
+        let mut applied = Applied::default();
+        applied.add(records);
+        applied
+    }
+
     fn add(&mut self, records: Vec<(i32, StmtRecord)>) {
         let inserts = records
             .iter()
@@ -845,6 +852,33 @@ impl TransactionRegistry {
         Ok(Applied::default())
     }
 
+    /// Whether the registry holds anything for the session.
+    pub fn knows(&self, lsid_bytes: &[u8]) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sessions
+            .contains_key(lsid_bytes)
+    }
+
+    /// Take up a session the registry holds nothing for at the retryable
+    /// write `txn_number`, whose statements in `applied` already ran: what
+    /// the server kept of it before it restarted (or forgot an idle
+    /// session), read back from storage. A session the registry has meanwhile
+    /// taken up is left as it is.
+    pub fn restore_retryable(&self, lsid_bytes: &[u8], txn_number: i64, applied: Applied) {
+        let (mut inner, now) = self.locked();
+        inner
+            .sessions
+            .entry(lsid_bytes.to_vec())
+            .or_insert_with(|| Session {
+                active: txn_number,
+                kind: Kind::Retryable(applied),
+                last_use: now,
+                owner: None,
+            });
+    }
+
     /// Remember what statements of the retryable write `(lsid, txnNumber)`
     /// did. Dropped if the session has moved on to another number.
     pub fn record_statements(
@@ -1170,6 +1204,27 @@ mod tests {
         r.abort_in_progress(&txn);
         assert_eq!(rollbacks.load(Ordering::SeqCst), 1);
         assert_eq!(code(&r.for_statement(LS, 1, false).unwrap_err()), 251);
+    }
+
+    /// RM-350: what a restarted server reads back of a session's last
+    /// retryable write answers its retry, and an older number is too old.
+    #[test]
+    fn a_restored_retryable_write_answers_its_retry() {
+        let (r, _, _) = reg();
+        assert!(!r.knows(LS));
+        let records = (0..20)
+            .map(|i| (i, StmtRecord::Insert { id: None }))
+            .chain([(20, StmtRecord::Delete)])
+            .collect();
+        r.restore_retryable(LS, 7, Applied::from_records(records));
+        assert!(r.knows(LS));
+        let applied = r.begin_retryable(LS, 7).unwrap();
+        assert!((0..21).all(|i| applied.contains(i)) && !applied.contains(21));
+        assert_eq!(code(&r.begin_retryable(LS, 6).unwrap_err()), 225);
+        // A session the registry already holds is not overwritten.
+        r.restore_retryable(LS, 9, Applied::default());
+        assert_eq!(code(&r.begin_retryable(LS, 6).unwrap_err()), 225);
+        assert!(r.begin_retryable(LS, 7).unwrap().contains(20));
     }
 
     #[test]
