@@ -14,6 +14,7 @@ import bson
 import pymongo
 import pytest
 
+from tests.backlog.conftest import OS, only_on
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
 # --------------------------------------------------- getDiagnosticData --
@@ -52,8 +53,32 @@ def test_get_diagnostic_data_samples_mongods_collectors(
 ) -> None:
     """A set member's sample is `start`, `replSetGetStatus`, the three
     `$collStats` collectors, `serverStatus` and `end`, each collector stamped
-    with its own `start` and `end`."""
-    assert _sample_shape(rust_mongo) == _sample_shape(mongod_rs)
+    with its own `start` and `end` -- on each OS, as its mongod samples: on
+    Linux mongod adds `systemMetrics`, which is RM-424's gap."""
+    ours, theirs = _sample_shape(rust_mongo), _sample_shape(mongod_rs)
+    if OS == "linux":
+        for shape in (ours, theirs):
+            shape["keys"] = [k for k in shape["keys"] if k != "systemMetrics"]
+            shape["stamped"].pop("systemMetrics", None)
+    assert ours == theirs
+
+
+@pytest.mark.backlog("RM-424")
+def test_linux_diagnostic_data_samples_system_metrics(
+    rust_mongo: Any,
+    mongod_rs: Any,  # noqa: F811
+) -> None:
+    """On Linux mongod 8.2's diagnostic sample carries a `systemMetrics`
+    collector (the machine's CPU, memory and disk counters from `/proc`),
+    stamped with its own `start` and `end`, just before `end` (CI,
+    2026-11-08). This server's has none. macOS mongod has no such collector."""
+    only_on("linux", why="macOS mongod samples no systemMetrics")
+
+    def system_metrics(client: Any) -> tuple:
+        shape = _sample_shape(client)
+        return ("systemMetrics" in shape["keys"], shape["stamped"].get("systemMetrics"))
+
+    assert system_metrics(rust_mongo) == system_metrics(mongod_rs)
 
 
 def _refreshes_by_period(client: Any) -> tuple:
