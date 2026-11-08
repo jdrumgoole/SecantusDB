@@ -536,6 +536,15 @@ impl<'p> Scope<'p> {
         }
     }
 
+    /// Is `name` the reference name of a FROM item here or in an enclosing
+    /// scope? A bare name no column has is then that item's whole row, as
+    /// `transformColumnRef` falls back to `refnameNamespaceItem` (RP-532).
+    fn names_item(&self, name: &str) -> bool {
+        self.tables.iter().any(|(a, _)| a == name)
+            || self.using_aliases.iter().any(|(a, _)| a == name)
+            || self.parent.is_some_and(|p| p.names_item(name))
+    }
+
     fn column_type(&self, c: &pg_query::protobuf::ColumnRef) -> Option<String> {
         self.column_type_raw(c).filter(|t| !t.is_empty())
     }
@@ -2712,6 +2721,7 @@ fn having_names_resolve(h: &pg_query::protobuf::Node, scope: &Scope) -> Result<(
                 if let Some(N::String(name)) = f.node.as_ref() {
                     if !SYSTEM.contains(&name.sval.as_str())
                         && scope.knows(&name.sval) == Some(false)
+                        && !scope.names_item(&name.sval)
                     {
                         missing = Some((name.sval.clone(), c.location));
                     }

@@ -4452,6 +4452,61 @@ fn a_tables_whole_row_under_a_column_alias_list_is_its_row_type() {
     );
 }
 
+/// `sql` after the whole-row rewrite.
+fn whole_rows_rewritten(sql: &str) -> pg_query::protobuf::SelectStmt {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not a SELECT: {sql}");
+    };
+    whole_row_rewrite(s, &lookup, &[])
+        .unwrap()
+        .expect("a whole row")
+}
+
+/// Is `n` the row of t, `ROW(id, name, n)::t`?
+fn is_row_of_t(n: Option<&pg_query::protobuf::Node>) -> bool {
+    let Some(N::TypeCast(cast)) = n.and_then(|n| n.node.as_ref()) else {
+        return false;
+    };
+    matches!(cast.arg.as_deref().and_then(|a| a.node.as_ref()), Some(N::RowExpr(r)) if r.args.len() == 3)
+}
+
+#[test]
+fn a_whole_row_is_grouped_by_and_tested_in_having() {
+    // PostgreSQL 15.19: `group by fs` groups by the row whether or not the
+    // select list names it, and HAVING reads it as WHERE does (RP-532).
+    let s = whole_rows_rewritten("select count(*) from t group by t having t is not null");
+    assert!(is_row_of_t(s.group_clause.first()), "{:?}", s.group_clause);
+    let Some(N::NullTest(test)) = s.having_clause.as_deref().and_then(|h| h.node.as_ref()) else {
+        panic!("no null test: {:?}", s.having_clause);
+    };
+    assert!(is_row_of_t(test.arg.as_deref()), "{:?}", test.arg);
+    let s = whole_rows_rewritten("select count(*) from t group by t.*");
+    assert!(is_row_of_t(s.group_clause.first()), "{:?}", s.group_clause);
+}
+
+#[test]
+fn a_field_of_a_whole_row_is_its_column() {
+    // PostgreSQL 15.19's `ParseComplexProjection`: `(t).n` is t's column
+    // n, so under `group by t` it is ungrouped (42803 at `t`), RP-532.
+    let s = whole_rows_rewritten("select (t).n, count(*) from t group by t");
+    let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+        panic!("no target");
+    };
+    match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+        Some(N::ColumnRef(c)) => {
+            assert_eq!(column_ref_name(c).as_deref(), Some("n"));
+            // The reference is where `t` was written.
+            assert_eq!(c.location, 8);
+        }
+        other => panic!("not the column: {other:?}"),
+    }
+}
+
 /// Whether `sql`'s UPDATE names its target as a whole row, and what its
 /// first SET value's whole-row reference became: the cast's type and the
 /// ROW's arguments, or `None` where nothing was rewritten.
