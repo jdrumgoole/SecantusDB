@@ -106,7 +106,9 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Set up Python 3.12
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
 
       # --- WiredTiger build cache -------------------------------------
       # Restored by exact key or not at all; see the ``rust`` job for
@@ -251,7 +253,9 @@ jobs:
           #
           # cache-python is deliberately NOT set: restoring uv's managed
           # python-dir fails on NTFS (os error 267, see #524), and Windows takes
-          # its interpreter from the runner tool cache instead.
+          # its interpreter from the runner tool cache instead. Elsewhere the
+          # interpreter is cached by .github/actions/uv-python, on a key that
+          # does not change with uv.lock.
           prune-cache: false
           cache-suffix: py3.12
           cache-dependency-glob: uv.lock
@@ -261,7 +265,9 @@ jobs:
       # repointed at that interpreter. Non-Windows keeps the uv-managed 3.12.
       - name: Set up Python 3.12
         if: runner.os != 'Windows'
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
@@ -506,7 +512,9 @@ jobs:
           #
           # cache-python is deliberately NOT set: restoring uv's managed
           # python-dir fails on NTFS (os error 267, see #524), and Windows takes
-          # its interpreter from the runner tool cache instead.
+          # its interpreter from the runner tool cache instead. Elsewhere the
+          # interpreter is cached by .github/actions/uv-python, on a key that
+          # does not change with uv.lock.
           prune-cache: false
           cache-suffix: py3.12
           cache-dependency-glob: uv.lock
@@ -516,7 +524,9 @@ jobs:
       # repointed at that interpreter. Non-Windows keeps the uv-managed 3.12.
       - name: Set up Python 3.12
         if: runner.os != 'Windows'
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
@@ -934,7 +944,9 @@ jobs:
           #
           # cache-python is deliberately NOT set: restoring uv's managed
           # python-dir fails on NTFS (os error 267, see #524), and Windows takes
-          # its interpreter from the runner tool cache instead.
+          # its interpreter from the runner tool cache instead. Elsewhere the
+          # interpreter is cached by .github/actions/uv-python, on a key that
+          # does not change with uv.lock.
           prune-cache: false
           cache-suffix: py3.12
           cache-dependency-glob: uv.lock
@@ -944,7 +956,9 @@ jobs:
       # repointed at that interpreter. Non-Windows keeps the uv-managed 3.12.
       - name: Set up Python 3.12
         if: runner.os != 'Windows'
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
       - name: Set up Python 3.12 (Windows tool cache)
         if: runner.os == 'Windows'
         id: setup-python
@@ -1418,9 +1432,12 @@ jobs:
           enable-cache: true
 
       - name: Set up Python 3.10
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        # uv-managed and cached: the ubuntu-26.04 image has no 3.10 in its
+        # tool cache, and setup-python's download of it failed with HTTP 504
+        # (2026-11-08, see .github/actions/uv-python).
+        uses: ./.github/actions/uv-python
         with:
-          python-version: "3.10"
+          version: "3.10"
 
       - name: Pin the build interpreter so the cache can actually be reused
         id: pybuild
@@ -1440,8 +1457,8 @@ jobs:
           echo "img=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
       - name: Restore the WiredTiger build
-        # Same key shape as the ``test`` job's Linux 3.10 cell, so this job
-        # normally restores that build rather than paying for its own.
+        # Keyed on this job's own interpreter (3.10, uv-managed under
+        # RUNNER_TEMP), so the shards restore each other's build.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
         with:
           path: build

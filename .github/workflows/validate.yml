@@ -134,7 +134,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Python 3.12
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
 
       - name: Sync dependencies (storage engine ON)
         # The editable build runs CMake with the storage-engine flag flipped
@@ -472,7 +474,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Python 3.12
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
 
       - name: Merge shards into the report
         # --no-project: the generator is stdlib-only (it reads the server's
@@ -556,7 +560,9 @@ jobs:
           enable-cache: true
 
       - name: Set up Python 3.12
-        run: uv python install 3.12
+        uses: ./.github/actions/uv-python
+        with:
+          version: "3.12"
 
       - name: Regenerate cross-driver summary
         # --no-project: the generator is stdlib-only and reads the package
