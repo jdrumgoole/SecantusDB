@@ -482,9 +482,10 @@ def _startup_log(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-319")
+@pytest.mark.backlog_fixed("RM-319")
 def test_local_startup_log_records_each_start(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11 keeps a capped `local.startup_log`, one document per
     start: `_id`, `hostname`, `startTime`, `startTimeLocal`, `cmdLine`,
-    `pid`, `buildinfo`."""
+    `pid`, `buildinfo`. This server had no such collection; it now records
+    each start as mongod does."""
     assert _startup_log(rust_mongo) == _startup_log(mongod_rs)

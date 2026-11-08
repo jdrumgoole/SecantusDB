@@ -77,13 +77,22 @@ pub fn fsync(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// `getCmdLineOpts` — parsed command line; drivers read
 /// `parsed.security.authorization` to detect `--auth`.
 pub fn get_cmd_line_opts(_doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    let mut parsed = doc! { "net": {}, "storage": {} };
     let mut argv = vec![Bson::String("secantus".to_string())];
     if ctx.require_auth {
-        parsed.insert("security", doc! { "authorization": "enabled" });
         argv.push(Bson::String("--auth".to_string()));
     }
-    Ok(doc! { "argv": argv, "parsed": parsed, "ok": 1.0 })
+    Ok(doc! { "argv": argv, "parsed": parsed_options(ctx.require_auth), "ok": 1.0 })
+}
+
+/// The options the server was started with, as `getCmdLineOpts` reports
+/// them under `parsed`; also the `cmdLine` of each `local.startup_log`
+/// record, which mongod takes from the same place.
+pub fn parsed_options(require_auth: bool) -> Document {
+    let mut parsed = doc! { "net": {}, "storage": {} };
+    if require_auth {
+        parsed.insert("security", doc! { "authorization": "enabled" });
+    }
+    parsed
 }
 
 /// `hostInfo`: the machine's own figures, in mongod's keys, types and order

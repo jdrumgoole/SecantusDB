@@ -56,6 +56,79 @@ fn a_persistent_store_survives_a_restart() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// mongod adds one `local.startup_log` record per start, to a capped
+/// collection of 10 MB, `_id` `<hostname>-<ms>`, with the `cmdLine`
+/// `getCmdLineOpts` reports and the `buildinfo` `buildInfo` does (RM-319).
+#[test]
+fn each_start_is_recorded_in_local_startup_log() {
+    let dir = std::env::temp_dir().join(format!("secantus-mdb-startup-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for starts in 1..=2_u64 {
+        let server = Server::builder().storage_path(&dir).start().expect("start");
+        let client = client(&server);
+        let local = client.database("local");
+        let log = local.collection::<Document>("startup_log");
+        assert_eq!(log.count_documents(doc! {}).run().unwrap(), starts);
+        let listed = local
+            .run_command(doc! {"listCollections": 1, "filter": {"name": "startup_log"}})
+            .run()
+            .unwrap();
+        let info = listed
+            .get_document("cursor")
+            .unwrap()
+            .get_array("firstBatch")
+            .unwrap()[0]
+            .as_document()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            info.get_document("options").unwrap(),
+            &doc! {"capped": true, "size": 10_485_760_i32}
+        );
+        let last = log
+            .find_one(doc! {})
+            .sort(doc! {"$natural": -1})
+            .run()
+            .unwrap()
+            .expect("a record");
+        let keys: Vec<&str> = last.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "_id",
+                "hostname",
+                "startTime",
+                "startTimeLocal",
+                "cmdLine",
+                "pid",
+                "buildinfo"
+            ]
+        );
+        let hostname = last.get_str("hostname").unwrap();
+        let ms = last
+            .get_str("_id")
+            .unwrap()
+            .strip_prefix(&format!("{hostname}-"))
+            .unwrap();
+        let ms: i64 = ms.parse().unwrap();
+        let start = last.get_datetime("startTime").unwrap().timestamp_millis();
+        assert_eq!(start, ms - ms % 1000);
+        assert_eq!(last.get_i64("pid").unwrap(), i64::from(std::process::id()));
+        let admin = client.database("admin");
+        let opts = admin.run_command(doc! {"getCmdLineOpts": 1}).run().unwrap();
+        assert_eq!(
+            last.get_document("cmdLine").unwrap(),
+            opts.get_document("parsed").unwrap()
+        );
+        let mut info = admin.run_command(doc! {"buildInfo": 1}).run().unwrap();
+        for gossip in ["ok", "$clusterTime", "operationTime"] {
+            info.remove(gossip);
+        }
+        assert_eq!(last.get_document("buildinfo").unwrap(), &info);
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn advertises_a_replica_set_unless_told_not_to() {
     let rs = Server::start().unwrap();
