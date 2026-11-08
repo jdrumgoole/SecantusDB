@@ -2033,17 +2033,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 
 ## Found while working RP-467 (2026-11-08)
 
-- [ ] **A materialized view is not a dependent of the relations it
-      reads.** With `create materialized view mv as select a from s.t`, a
-      plain `drop table s.t` succeeds where PostgreSQL 15.19 refuses it
-      (2BP01 `cannot drop table s.t because other objects depend on it`,
-      DETAIL `materialized view mv depends on table s.t`), and `drop table
-      s.t cascade` or `drop schema s cascade` leaves `mv` behind where
-      PostgreSQL drops it with them. A view is followed; a materialized
-      view is not. Found by RP-467's regression test, whose cleanup relied
-      on the cascade. Measured on a private 15.19 cluster.
-      Backlog-ID: RP-525
-      Verify: tests/backlog/test_rp_found_rp467.py::test_drop_reaches_a_dependent_materialized_view
 - [ ] **Two schemas' tables of one name are not `checkNameSpaceConflicts`'
       exception.** PostgreSQL lets two unaliased FROM items share a name
       when they are different relations (`select 1 from s1.t join s2.t on
@@ -2056,6 +2045,24 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       cluster.
       Backlog-ID: RP-526
       Verify: tests/backlog/test_rp_found_rp467.py::test_same_name_relations_in_from
+
+## Found while working RP-525 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap test is in
+`tests/backlog/test_rp_found_rp525.py`.
+
+- [ ] **A DROP of the wrong kind of relation is not refused as one.**
+      PostgreSQL 15.19's `DropErrorMsgWrongType` answers `drop table m` of
+      a materialized view with 42809 `"m" is not a table`, HINT `Use DROP
+      MATERIALIZED VIEW to remove a materialized view.`, `drop view m` with
+      42809 `"m" is not a view` and the same HINT, and `drop materialized
+      view v` of a view with 42809 `"v" is not a materialized view`, HINT
+      `Use DROP VIEW to remove a view.`. Here `drop table m` succeeds and
+      leaves `m`'s definition in `pg_matviews` with no relation under it,
+      and the other two are 42P01 `... does not exist`. A table and a view
+      already refuse each other's DROP.
+      Backlog-ID: RP-528
+      Verify: tests/backlog/test_rp_found_rp525.py::test_drop_of_the_wrong_relation_kind
 
 ## Found while working RP-514 (2026-11-08)
 

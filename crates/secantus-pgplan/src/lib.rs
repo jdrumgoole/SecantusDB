@@ -1240,10 +1240,11 @@ pub enum Statement {
         /// `CONCURRENTLY`.
         concurrent: bool,
     },
-    /// `DROP MATERIALIZED VIEW [IF EXISTS] names`.
+    /// `DROP MATERIALIZED VIEW [IF EXISTS] names [CASCADE]`.
     DropMatView {
         names: Vec<String>,
         if_exists: bool,
+        cascade: bool,
     },
 }
 
@@ -10812,25 +10813,6 @@ fn write_target_missing(table: &str, what: &str) -> Error {
     } else {
         Error::UndefinedTable(table.to_string())
     }
-}
-
-/// Every view whose definition reads `table`, for DROP's dependency check.
-pub fn views_reading(table: &str) -> Vec<String> {
-    PLAN_VIEWS.with(|v| {
-        v.borrow()
-            .iter()
-            .filter(|(_, d)| {
-                pg_query::parse(d)
-                    .map(|p| {
-                        p.tables()
-                            .iter()
-                            .any(|t| t == table || t == &format!("public.{table}"))
-                    })
-                    .unwrap_or(false)
-            })
-            .map(|(n, _)| n.clone())
-            .collect()
-    })
 }
 
 /// `CREATE TABLE t (LIKE src [INCLUDING ...], ...)`: the LIKE clause
@@ -40276,6 +40258,7 @@ fn plan_drop(d: &pg_query::protobuf::DropStmt) -> Result<Statement> {
         return Ok(Statement::DropMatView {
             names,
             if_exists: d.missing_ok,
+            cascade: DropBehavior::try_from(d.behavior) == Ok(DropBehavior::DropCascade),
         });
     }
     // `DROP TYPE` / `DROP DOMAIN`: the object is a TypeName, not a List of
