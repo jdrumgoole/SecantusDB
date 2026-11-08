@@ -2097,14 +2097,6 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)`
 and `fs(a int, c text)`.
 
-- [ ] **A whole row compared with a row of untyped literals is answered,
-      not 42804.** PostgreSQL 15.19's `record_eq` refuses `fs = (1,'y')`
-      with 42804 `cannot compare dissimilar column types text and unknown
-      at record column 2` (no position), in a SELECT's WHERE or target list
-      and in an UPDATE's WHERE; here it compares the values and answers.
-      `fs = row(1,'y')::fs` agrees on both.
-      Backlog-ID: RP-522
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_whole_row_against_untyped_record
 - [ ] **A write's name error is reported away from the reference.**
       PostgreSQL 15.19 positions each at the name as written. Here `update
       fs x set c = fs::text` and `... where fs is null` are 42703 at 8 (the
@@ -2133,6 +2125,47 @@ Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`.
       and the last is the alias's `invalid reference`.
       Verify: tests/backlog/test_rp_subquery_scope.py::test_schema_qualified_reference
       Backlog-ID: RP-527
+
+## Found while working RP-522 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain dint as
+int`, `fs(a int, c text)` holding `(1, 'y')` and `fd(a dint)` holding `1`.
+The gap tests are in `tests/backlog/test_rp_found_rp522.py`.
+
+- [ ] **A domain column's whole row is typed by its base type.** A table's
+      row type records a domain column under the domain's base type
+      (`row_type_fields`, `pg_type`; the domain is in `extra.domain_type`),
+      so `fd = row(1)` and `fd = row(2)` answer where PostgreSQL 15.19's
+      `record_eq` refuses each, 42804 `cannot compare dissimilar column
+      types dint and integer at record column 1`. Since RP-522 the field
+      check reads a domain as its base type, so `fd = row(1::dint)` still
+      answers true as on PostgreSQL; a row type that keeps the domain lets
+      the check drop that.
+      Backlog-ID: RP-529
+      Verify: tests/backlog/test_rp_found_rp522.py::test_domain_field_of_a_whole_row
+- [ ] **A record compared with a scalar is 0A000, not 42883.** `select fs
+      = (1) from fs`, `(1) = fs` and `fs::text = (1,'y')` are 42883
+      `operator does not exist: fs = integer` (`integer = fs`, `text =
+      record`) on PostgreSQL 15.19, with the no-operator HINT, at the
+      operator (11, 12, 17); here each is 0A000 `comparing document with
+      int32 using = is not supported yet`, found only while the row is
+      compared.
+      Backlog-ID: RP-530
+      Verify: tests/backlog/test_rp_found_rp522.py::test_record_against_scalar
+- [ ] **NULLIF, GREATEST and LEAST over a whole row answer wrongly.**
+      `nullif(fs, (1,'y'::text))` is NULL on PostgreSQL 15.19 (`record_eq`
+      finds them equal), `least(fs, row(0,'a')::fs)` is `(0,a)`, and
+      `greatest(fs, (2,'a'::text))` is 42804 `GREATEST types fs and record
+      cannot be matched` at 21 (`select_common_type`); here each of the
+      three answers `(1,y)`.
+      Backlog-ID: RP-531
+      Verify: tests/backlog/test_rp_found_rp522.py::test_record_conditionals
+- [ ] **GROUP BY a whole row not in the select list is 42703.** `select
+      count(*) from fs group by fs` answers 1 on PostgreSQL 15.19; here it
+      is 42703 `column "fs" does not exist` at 22. With `fs` in the select
+      list too it answers.
+      Backlog-ID: RP-532
+      Verify: tests/backlog/test_rp_found_rp522.py::test_group_by_whole_row
 
 ## Found while working RP-500 (2026-11-07)
 

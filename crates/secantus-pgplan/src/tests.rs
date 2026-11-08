@@ -4589,3 +4589,67 @@ fn a_writes_qualifiers_are_looked_up_in_its_namespace() {
         assert_eq!(write_qualifier_error(sql), None, "{sql}");
     }
 }
+
+/// RP-522: a composite comparison is `record_eq` / `record_cmp`, which
+/// check each field pair they reach -- its types before its NULLs or values
+/// -- and a different width once every shared pair is equal (15.19).
+#[test]
+fn composite_record_compare_checks_the_fields_it_reaches() {
+    let s = |v: &[&str]| v.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let (row, lit) = (s(&["int4", "text"]), s(&["int4", "unknown"]));
+    let fs = [Bson::Int32(1), Bson::String("y".into())];
+    let msg = |r: Result<Bson>| r.unwrap_err().to_string();
+    // A field of another type is 42804, an `unknown` one has no operator.
+    let e = msg(record_compare("=", &fs, &fs, true, Some((&row, &lit))));
+    assert!(
+        e.contains("cannot compare dissimilar column types text and unknown at record column 2"),
+        "{e}"
+    );
+    let e = msg(record_compare("<", &fs, &fs, true, Some((&lit, &row))));
+    assert!(
+        e.contains("types unknown and text at record column 2"),
+        "{e}"
+    );
+    let e = msg(record_compare("=", &fs, &fs, true, Some((&lit, &lit))));
+    assert!(
+        e.contains("could not identify an equality operator for type unknown"),
+        "{e}"
+    );
+    // A pair decided first is never checked.
+    let other = [Bson::Int32(2), Bson::String("y".into())];
+    let got = record_compare("=", &fs, &other, true, Some((&row, &lit))).unwrap();
+    assert_eq!(got, Bson::Boolean(false));
+    // A NULL is checked too: its type comes first.
+    let null_first = [Bson::Null, Bson::String("y".into())];
+    let e = msg(record_compare(
+        "=",
+        &fs,
+        &null_first,
+        true,
+        Some((&row, &s(&["unknown", "text"]))),
+    ));
+    assert!(
+        e.contains("types integer and unknown at record column 1"),
+        "{e}"
+    );
+    // A type modifier is not part of the type.
+    let got = record_compare(
+        "=",
+        &fs,
+        &fs,
+        true,
+        Some((&s(&["int4", "varchar(3)"]), &s(&["int4", "varchar"]))),
+    )
+    .unwrap();
+    assert_eq!(got, Bson::Boolean(true));
+    // Equal shared pairs, different widths: 42804 for `=` and `<` alike.
+    let wide = [Bson::Int32(1), Bson::String("y".into()), Bson::Int32(3)];
+    let wide_t = s(&["int4", "text", "int4"]);
+    for op in ["=", "<"] {
+        let e = msg(record_compare(op, &fs, &wide, true, Some((&row, &wide_t))));
+        assert!(e.contains("different numbers of columns"), "{op}: {e}");
+    }
+    // Two row constructors are compared field by field, unchecked.
+    let got = record_compare("=", &fs, &fs, false, Some((&row, &lit))).unwrap();
+    assert_eq!(got, Bson::Boolean(true));
+}
