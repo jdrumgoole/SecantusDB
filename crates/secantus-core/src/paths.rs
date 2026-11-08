@@ -126,57 +126,197 @@ pub fn sort_path_values<'a>(doc: &'a Document, path: &str) -> Vec<(&'a Bson, boo
 /// What an array element that lacks the next path component stands for.
 static MISSING_IN_ELEMENT: Bson = Bson::Null;
 
-/// The `(component, array)` mongod refuses to sort by, or `None`.
-///
-/// A component is ambiguous when it is a VALID INDEX of the array it is applied
-/// to *and* some element of that array is a document carrying that exact key.
-/// Both halves are load-bearing -- `x.1` over `[{"1": 5}]` is fine (index 1 is
-/// past the end, so only the field reading exists) and `x.0` over `[{"00": 5}]`
-/// is fine (`"00"` is not the key `"0"`). The element carrying the key need not
-/// be the one at that index: `[{a: 5}, {"0": 6}]` sorted by `x.0` is refused.
-/// Measured over 19 shapes on 8.2.11, 2026-09-09.
-///
-/// mongod refuses only for a SORT -- the same path in a `find` filter, a
-/// `$group` `_id` or a projection resolves to both readings happily.
-/// Mirrors `secantus.ordering._check_sort_path_ambiguity`.
-pub fn ambiguous_sort_path<'a>(
-    doc: &'a Document,
-    path: &'a str,
-) -> Option<(&'a str, &'a Vec<Bson>)> {
-    let parts: Vec<&str> = path.split('.').collect();
-    ambiguity_walk(doc.get(parts[0])?, &parts[1..])
+/// Why mongod refuses to build a sort key for one document.
+#[derive(Debug, PartialEq)]
+pub enum SortKeyRefusal<'a> {
+    /// Two sort paths reach two different arrays of the document: 2
+    /// "cannot sort with keys that are parallel arrays".
+    ParallelArrays,
+    /// A path component is a valid INDEX of the array it is applied to while
+    /// an element of that array is a document carrying that exact key: 16746
+    /// (see [`ambiguous_sort_message`]). The component and the array.
+    Ambiguous(&'a str, &'a Vec<Bson>),
 }
 
-fn ambiguity_walk<'a>(current: &'a Bson, rest: &[&'a str]) -> Option<(&'a str, &'a Vec<Bson>)> {
-    let (part, tail) = rest.split_first()?;
-    match current {
-        Bson::Document(d) => d.get(*part).and_then(|v| ambiguity_walk(v, tail)),
-        Bson::Array(items) => {
-            let index = index_component(part).filter(|i| *i < items.len());
-            // The FIELD reading walks every element, which is also how a
-            // non-numeric component descends through an array.
-            let named: Vec<&Bson> = items
-                .iter()
-                .filter_map(|e| match e {
-                    Bson::Document(d) => d.get(*part),
-                    _ => None,
-                })
-                .collect();
-            if index.is_some() && !named.is_empty() {
-                return Some((part, items));
-            }
-            if let Some(i) = index {
-                if let Some(hit) = ambiguity_walk(&items[i], tail) {
-                    return Some(hit);
-                }
-            }
-            named.into_iter().find_map(|v| ambiguity_walk(v, tail))
+/// mongod's message for [`SortKeyRefusal::ParallelArrays`].
+pub const PARALLEL_ARRAYS_MESSAGE: &str = "cannot sort with keys that are parallel arrays";
+
+/// What mongod refuses to sort `doc` by under the sort paths `paths`, or
+/// `None`.
+///
+/// mongod builds a sort key with its B-tree key generator
+/// (`BtreeKeyGenerator::_getKeysWithArray`), so it refuses what that refuses,
+/// and this is a port of its walk. At each level every path still in play is
+/// followed through documents until it ends or meets an array; all the paths
+/// that meet one must meet the SAME array (empty or not), or it is the
+/// parallel-arrays refusal. That array's elements are then walked in turn
+/// with what is left of those paths. A component after an array that is a
+/// valid index of it also resolves POSITIONALLY, for every element, so `a.0.c`
+/// and `a.c` over `[{c: [1]}, {c: [2]}]` meet two arrays at the second
+/// element; an element that is a document carrying that component as a key
+/// as well is the ambiguity refusal. An element that is itself an array is
+/// walked as nothing but the positional reading. The two refusals are raised
+/// in the walk's order -- level by level, path by path -- so `{a.0, a.x,
+/// a.y}` over `[{"0": 1, x: [1], y: [2]}]` is 16746 and `{a.x, a.y, a.0}` is
+/// 2. Measured over 40 shapes against 8.2.1, 2026-11-08 (RM-332); the
+/// ambiguity half over 19 against 8.2.11, 2026-09-09.
+///
+/// mongod refuses only for a SORT -- the same paths in a `find` filter, a
+/// `$group` `_id`, a projection or a `$sortArray` resolve happily.
+pub fn sort_key_refusal<'a>(doc: &'a Document, paths: &[&'a str]) -> Option<SortKeyRefusal<'a>> {
+    let fields: Vec<Option<KeyPath<'a>>> = paths
+        .iter()
+        .map(|p| {
+            Some(KeyPath {
+                path: p,
+                positional: None,
+            })
+        })
+        .collect();
+    refusal_walk(Container::Doc(doc), &fields)
+}
+
+/// How many of `paths` meet an array in `doc`: the first array along the
+/// path, or the value it ends at being one (empty or not).
+///
+/// The `$top` / `$bottom` accumulators decide by this count whether to build
+/// their key as a `$sort` does (see [`sort_key_refusal`]): with fewer than
+/// two, never; with two or more, SBE walks the key generator and the classic
+/// engine refuses outright, whether or not the arrays are one array.
+pub fn sort_paths_meeting_arrays(doc: &Document, paths: &[&str]) -> usize {
+    paths
+        .iter()
+        .filter(|p| matches!(along_path(Container::Doc(doc), p).0, Some(Bson::Array(_))))
+        .count()
+}
+
+/// What one sort path still has to resolve at a level of [`refusal_walk`].
+#[derive(Clone, Copy)]
+struct KeyPath<'a> {
+    path: &'a str,
+    positional: Option<Positional<'a>>,
+}
+
+/// The positional reading of a path's next component over the array the
+/// level walks (mongod's `PositionalPathInfo`): where it leads, and what is
+/// left after it.
+#[derive(Clone, Copy)]
+struct Positional<'a> {
+    array: &'a Vec<Bson>,
+    dotted: Option<&'a Bson>,
+    rest: &'a str,
+}
+
+/// What a level reads its components from. An array is read only through a
+/// positional reading (its keys are its canonical indexes).
+#[derive(Clone, Copy)]
+enum Container<'a> {
+    Doc(&'a Document),
+    Arr(&'a Vec<Bson>),
+    Nothing,
+}
+
+impl<'a> Container<'a> {
+    fn get(self, name: &str) -> Option<&'a Bson> {
+        match self {
+            Container::Doc(d) => d.get(name),
+            Container::Arr(a) => index_component(name).and_then(|i| a.get(i)),
+            Container::Nothing => None,
         }
-        _ => None,
     }
 }
 
-/// mongod's message for the refusal [`ambiguous_sort_path`] detects.
+fn split_component(path: &str) -> (&str, &str) {
+    path.split_once('.').unwrap_or((path, ""))
+}
+
+/// mongod's `extractElementAtPathOrArrayAlongPath`: follow `path` through
+/// documents, stopping at the first array; the value and what is left of the
+/// path.
+fn along_path<'a>(c: Container<'a>, path: &'a str) -> (Option<&'a Bson>, &'a str) {
+    let (head, rest) = split_component(path);
+    match c.get(head) {
+        None => (None, rest),
+        Some(v @ Bson::Array(_)) => (Some(v), rest),
+        Some(v) if rest.is_empty() => (Some(v), rest),
+        Some(Bson::Document(d)) => along_path(Container::Doc(d), rest),
+        Some(_) => (None, rest),
+    }
+}
+
+fn refusal_walk<'a>(
+    obj: Container<'a>,
+    fields: &[Option<KeyPath<'a>>],
+) -> Option<SortKeyRefusal<'a>> {
+    let mut array: Option<&'a Vec<Bson>> = None;
+    let mut through: Vec<(usize, &'a str)> = Vec::new();
+    for (i, field) in fields.iter().enumerate() {
+        let Some(field) = field else { continue };
+        let (head, _) = split_component(field.path);
+        let (found, rest) = if obj.get(head).is_some() {
+            if let Some(p) = field.positional {
+                return Some(SortKeyRefusal::Ambiguous(head, p.array));
+            }
+            along_path(obj, field.path)
+        } else if let Some(p) = field.positional {
+            (p.dotted, p.rest)
+        } else {
+            (None, "")
+        };
+        if let Some(Bson::Array(a)) = found {
+            match array {
+                None => array = Some(a),
+                Some(seen) if !std::ptr::eq(seen, a) => {
+                    return Some(SortKeyRefusal::ParallelArrays);
+                }
+                Some(_) => {}
+            }
+            through.push((i, rest));
+        }
+    }
+    let array = array?;
+    let mut next: Vec<Option<KeyPath<'a>>> = vec![None; fields.len()];
+    let mut live = false;
+    for (i, rest) in through {
+        if rest.is_empty() {
+            continue;
+        }
+        let (part, tail) = split_component(rest);
+        let positional = index_component(part).and_then(|n| array.get(n)).map(|elt| {
+            let (dotted, rest) = if tail.is_empty() {
+                (Some(elt), "")
+            } else {
+                match elt {
+                    Bson::Document(d) => along_path(Container::Doc(d), tail),
+                    Bson::Array(a) => along_path(Container::Arr(a), tail),
+                    _ => (None, ""),
+                }
+            };
+            Positional {
+                array,
+                dotted,
+                rest,
+            }
+        });
+        next[i] = Some(KeyPath {
+            path: rest,
+            positional,
+        });
+        live = true;
+    }
+    if !live {
+        return None;
+    }
+    array.iter().find_map(|elem| {
+        let obj = match elem {
+            Bson::Document(d) => Container::Doc(d),
+            _ => Container::Nothing,
+        };
+        refusal_walk(obj, &next)
+    })
+}
+
+/// mongod's message for [`SortKeyRefusal::Ambiguous`].
 pub fn ambiguous_sort_message(part: &str, items: &[Bson]) -> String {
     let rendered: Vec<String> = items
         .iter()
@@ -394,6 +534,112 @@ fn unset_in_bson(cur: &mut Bson, parts: &[&str]) {
 #[cfg(test)]
 mod tests {
     use bson::doc;
+
+    /// What mongod 8.2.1 answers for a sort over each document, measured
+    /// 2026-11-08 (RM-332): `P` is 2 "parallel arrays", `A` is 16746, `-`
+    /// is a sort.
+    #[test]
+    fn sort_key_refusal_matches_mongod() {
+        use super::SortKeyRefusal::{Ambiguous, ParallelArrays};
+        let cases: Vec<(bson::Document, Vec<&str>, char)> = vec![
+            (doc! {"a": [1, 2], "b": [3, 4]}, vec!["a", "b"], 'P'),
+            (doc! {"a": [1, 2], "b": 3}, vec!["a", "b"], '-'),
+            (doc! {"a": [], "b": [3, 4]}, vec!["a", "b"], 'P'),
+            (doc! {"a": [], "b": []}, vec!["a", "b"], 'P'),
+            (
+                doc! {"a": [{"x": 1, "y": 2}, {"x": 3, "y": 0}]},
+                vec!["a.x", "a.y"],
+                '-',
+            ),
+            (doc! {"a": {"b": [1], "c": [2]}}, vec!["a.b", "a.c"], 'P'),
+            (
+                doc! {"a": [{"b": [1, 2], "c": [3, 4]}]},
+                vec!["a.b", "a.c"],
+                'P',
+            ),
+            (doc! {"a": [{"b": [1, 2], "c": 3}]}, vec!["a.b", "a.c"], '-'),
+            (doc! {"a": [{"b": 1}], "c": [1]}, vec!["a.b", "c"], 'P'),
+            (doc! {"a": [[1, 2], [3]], "b": [1]}, vec!["a", "b"], 'P'),
+            (doc! {"a": [1, 2], "b": [3, 4]}, vec!["a.0", "b"], 'P'),
+            (
+                doc! {"a": [{"b": {"c": [1, 2], "d": [3]}}]},
+                vec!["a.b.c", "a.b.d"],
+                'P',
+            ),
+            (doc! {"a": [1], "b": 2, "c": [3]}, vec!["a", "b", "c"], 'P'),
+            (doc! {"a": [{"b": 1}]}, vec!["a", "a.b"], '-'),
+            (doc! {"a": {"b": [1]}}, vec!["a", "a.b"], '-'),
+            (
+                doc! {"a": [{"b": [1]}, {"c": [2]}]},
+                vec!["a.b", "a.c"],
+                '-',
+            ),
+            (doc! {"b": [1]}, vec!["a", "b"], '-'),
+            (doc! {"a": null, "b": [1]}, vec!["a", "b"], '-'),
+            (doc! {"a": [1, 2], "b": [3, 4]}, vec!["a"], '-'),
+            (doc! {"a": [{"x": [1], "y": 2}]}, vec!["a.x", "a.y"], '-'),
+            (
+                doc! {"a": [{"x": 1}, [{"x": 2}]], "b": 1},
+                vec!["a.x", "b"],
+                '-',
+            ),
+            (doc! {"a": [[1, 2], [3, 4]]}, vec!["a.0", "a.1"], 'P'),
+            (doc! {"a": [[1, 2]]}, vec!["a.0", "a.1"], '-'),
+            (
+                doc! {"a": [{"c": [1], "d": [2]}]},
+                vec!["a.0.c", "a.0.d"],
+                'P',
+            ),
+            (
+                doc! {"a": [{"c": [1], "d": [2]}]},
+                vec!["a.0.c", "a.c"],
+                '-',
+            ),
+            (
+                doc! {"a": [{"c": [1]}, {"c": [2]}]},
+                vec!["a.0.c", "a.c"],
+                'P',
+            ),
+            (
+                doc! {"a": [{"c": [1]}, {"c": [2]}]},
+                vec!["a.1.c", "a.c"],
+                'P',
+            ),
+            (doc! {"a": [{"0": 1}, 2], "b": [1]}, vec!["a.0", "b"], 'P'),
+            (
+                doc! {"a": [{"0": 1, "x": [1], "y": [2]}]},
+                vec!["a.0", "a.x", "a.y"],
+                'A',
+            ),
+            (
+                doc! {"a": [{"0": 1, "x": [1], "y": [2]}]},
+                vec!["a.x", "a.y", "a.0"],
+                'P',
+            ),
+            (doc! {"a": [5, 6], "b": 1}, vec!["a.0", "a.1"], '-'),
+            (doc! {"a": [[{"x": [1]}]], "b": [2]}, vec!["a.x"], '-'),
+            (doc! {"a": [[[1], [2]]]}, vec!["a.0.0", "a.0.1"], 'P'),
+            (doc! {"a": [[1, 2], [3]]}, vec!["a.0", "a"], '-'),
+            (
+                doc! {"a": [{"x": [1]}, {"x": [2]}]},
+                vec!["a.0.x", "a.1.x"],
+                'P',
+            ),
+            // The ambiguity half (8.2.11, 2026-09-09).
+            (doc! {"x": [{"a": 5}, {"0": 6}]}, vec!["x.0"], 'A'),
+            (doc! {"x": [{"1": 5}]}, vec!["x.1"], '-'),
+            (doc! {"x": [{"00": 5}]}, vec!["x.0"], '-'),
+            (doc! {"x": [[5]]}, vec!["x.0"], '-'),
+        ];
+        for (doc, paths, want) in cases {
+            let got = match super::sort_key_refusal(&doc, &paths) {
+                None => '-',
+                Some(ParallelArrays) => 'P',
+                Some(Ambiguous(..)) => 'A',
+            };
+            assert_eq!(got, want, "{doc} sorted by {paths:?}");
+        }
+    }
 
     /// mongod refuses to create a field under a non-document (`PathNotViable`,
     /// 28); `set_path` returned silently instead, so the update reported

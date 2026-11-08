@@ -1787,7 +1787,17 @@ pub(crate) fn validate_parse(pipeline: &[Bson]) -> Result<(), CommandError> {
                 continue;
             }
             ("$setWindowFields" | "$_internalSetWindowFields", Bson::Document(s)) => {
-                (false, window_fields_parse(s))
+                // The spec's own refusals come before any document's -- the
+                // `$sort` the stage runs behind reads them first (RM-332).
+                let presorted = name == "$_internalSetWindowFields";
+                let outcome = window_fields_parse(s).and_then(|()| {
+                    let whole = Bson::Document(s.clone());
+                    match secantus_core::set_window_fields_spec_refusal(&whole, presorted) {
+                        Some(f) => Err(f),
+                        None => Ok(()),
+                    }
+                });
+                (false, outcome)
             }
             _ => continue,
         };

@@ -1305,13 +1305,15 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       server does. Found 2026-11-08 while working RM-331.
       Backlog-ID: RM-422
       Verify: tests/backlog/test_rm_found_2026_11_08_rm331.py::test_a_hint_that_bounds_nothing_keeps_the_canonical_filter_order
-- [ ] **A sort on two arrays of one document is not refused.** mongod
-      8.2.11 refuses `{$sort: {a: 1, b: 1}}` over `{a: [1, 2], b: [3, 4]}`
-      with 2 "cannot sort with keys that are parallel arrays" (and a
-      `{$sort: {_id: 1, t: 1}}` over a `$group`'s array keys likewise);
-      this server sorts. Found 2026-10-27 while working RM-222/RM-329.
-      Backlog-ID: RM-332
-      Verify: tests/backlog/test_rm_222_invalid_utf8.py::test_a_sort_on_two_arrays_is_refused
+- [ ] **An aggregate `$sort` on a `$meta` key is refused.** mongod 8.2.1
+      sorts `{$sort: {s: {$meta: "randVal"}}}` (and a `searchScore` key,
+      which has no value without `$search` and so ties); this server
+      refuses any `$meta` key in the stage with 2 "aggregation pipeline
+      uses a stage or operator not supported by the Rust server". A `find`
+      sort by `{$meta: "randVal"}` answers on both. Found 2026-11-08 while
+      working RM-332.
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm332.py::test_a_sort_on_a_meta_key_runs
+      Backlog-ID: RM-423
 - [ ] **A retryable write retried after a crash under `--data-nonlogged` is
       applied again.** A restarted server reads a session's
       `config.transactions` row, its oplog entries and its

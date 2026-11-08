@@ -4718,13 +4718,14 @@ fn sort_key(
     spec: &[(String, i32)],
     coll: Option<&Collation>,
 ) -> Result<Vec<SortPart>> {
+    // mongod refuses a document whose sort paths meet two different arrays,
+    // or name an array index that an element also carries as a key -- per
+    // document, at execution time.
+    if let Some(err) = sort_key_refusal(doc, spec) {
+        return Err(err);
+    }
     let mut parts = Vec::with_capacity(spec.len());
     for (f, d) in spec {
-        // mongod refuses a sort path whose component names both an array index
-        // and a key of that array's elements -- per document, at execution time.
-        if let Some(err) = ambiguous_sort_path(doc, f) {
-            return Err(err);
-        }
         // `sort_field_value` resolves the path AND picks the representative
         // element (mongod sorts an array-valued field by its minimum ascending,
         // its maximum descending). Applying `array_sort_value` again here
@@ -4757,15 +4758,22 @@ fn sort_key(
     Ok(parts)
 }
 
-/// The refusal mongod raises when a sort path component names BOTH an array
-/// index and a key of that array's elements -- see
-/// [`secantus_core::ambiguous_sort_path`] for the measured rule. Shared
+/// The refusal mongod raises for a document it cannot build a sort key for --
+/// see [`secantus_core::sort_key_refusal`] for the measured rule. Shared
 /// with the aggregation `$sort` stage so the two sort paths cannot drift.
-fn ambiguous_sort_path(doc: &Document, field: &str) -> Option<StorageError> {
-    let (part, items) = secantus_core::ambiguous_sort_path(doc, field)?;
+fn sort_key_refusal(doc: &Document, spec: &[(String, i32)]) -> Option<StorageError> {
+    let paths: Vec<&str> = spec.iter().map(|(f, _)| f.as_str()).collect();
+    let (code, errmsg) = match secantus_core::sort_key_refusal(doc, &paths)? {
+        secantus_core::SortKeyRefusal::ParallelArrays => {
+            (2, secantus_core::PARALLEL_ARRAYS_MESSAGE.to_string())
+        }
+        secantus_core::SortKeyRefusal::Ambiguous(part, items) => {
+            (16746, secantus_core::ambiguous_sort_message(part, items))
+        }
+    };
     Some(StorageError::QueryError {
-        code: 16746,
-        errmsg: secantus_core::ambiguous_sort_message(part, items),
+        code,
+        errmsg,
         exec: true,
     })
 }
