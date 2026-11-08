@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.conftest import mongo_answer
+from tests.backlog.conftest import PLATFORM, mongo_answer, only_on
 
 DEFAULT = 104_857_600
 
@@ -53,31 +53,171 @@ def _profiled(db: Any, pipeline: list, knobs: dict, comment: str) -> dict:
 # ------------------------------------------- RM-325 spill storage size --
 
 
+def _bucket_auto_storage(client: Any, db: Any) -> dict:
+    def counters() -> dict:
+        return client.admin.command("serverStatus")["metrics"]["query"]["bucketAuto"]
+
+    before = counters()
+    _profiled(
+        db,
+        [{"$bucketAuto": {"groupBy": "$n", "buckets": 5, "output": {"s": {"$push": "$s"}}}}],
+        {"internalDocumentSourceBucketAutoMaxMemoryBytes": 50_000},
+        "rm325bucket",
+    )
+    after = counters()
+    return {k: after[k] - before[k] for k in after}
+
+
+def _sort_storage_sizes(client: Any) -> dict:
+    db = _spill_db(client)
+    sizes = {}
+    pipelines = {
+        # The query layer's sort, over documents that arrive in its order:
+        # a `Value` key (an array of two) and the document's BSON.
+        "in order": [{"$sort": {"n": 1, "s": 1}}],
+        # A pipeline `$sort`: the fields kept, as a `Document`.
+        "after $project": [{"$project": {"s": 1, "k": 1}}, {"$sort": {"k": -1, "s": 1}}],
+    }
+    for name, pipeline in pipelines.items():
+        entry = _profiled(
+            db, pipeline, {"internalQueryMaxBlockingSortMemoryUsageBytes": 50_000}, "rm325" + name
+        )
+        sizes[name] = (entry.get("sortSpills"), entry.get("sortSpilledDataStorageSize"))
+    sizes["$bucketAuto"] = _bucket_auto_storage(client, db)
+    return sizes
+
+
+@pytest.mark.backlog_fixed("RM-325")
+def test_spill_file_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """A sorter's spill file was this server's own; it is now mongod 8.2's:
+    64 KiB chunks of `serializeForSorter` records, each snappy-compressed by
+    mongod's compressor, so a sort's and `$bucketAuto`'s
+    `spilledDataStorageSize` are mongod's to the byte -- each platform's
+    mongod, whose sizes differ (the in-order sort: 130545 bytes on arm64,
+    131252 on x86_64). On x86_64 the `after $project` case is RM-402's gap."""
+    ours, theirs = _sort_storage_sizes(rust_mongo), _sort_storage_sizes(mongod)
+    if PLATFORM == "x86_64":
+        ours.pop("after $project")
+        theirs.pop("after $project")
+    assert ours == theirs
+
+
+@pytest.mark.backlog("RM-402")
+def test_x86_spill_after_project_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """On x86_64 mongod 8.2 stores 122253 bytes for the 29 spills of a sort
+    after `$project`; this server stores 122288 (CI, 2026-11-07). On arm64
+    the two agree, pinned by RM-325's regression test."""
+    only_on("x86_64", why="the arm64 sizes agree (RM-325's regression test)")
+    ours = _sort_storage_sizes(rust_mongo)["after $project"]
+    assert ours == _sort_storage_sizes(mongod)["after $project"]
+
+
 def _storage_sizes(client: Any) -> dict:
     db = _spill_db(client)
-    sort = _profiled(
-        db,
-        [{"$sort": {"s": 1, "n": -1}}, {"$project": {"_id": 1}}],
-        {"internalQueryMaxBlockingSortMemoryUsageBytes": 50_000},
-        "rm316sort",
-    )
     group = _profiled(
         db,
         [{"$unwind": "$s"}, {"$group": {"_id": "$n", "s": {"$push": "$s"}}}],
         {"internalDocumentSourceGroupMaxMemoryBytes": 5_000},
         "rm316group",
     )
+
+    def window_storage() -> int:
+        return client.admin.command("serverStatus")["metrics"]["query"]["setWindowFields"][
+            "spilledDataStorageSize"
+        ]
+
+    before = window_storage()
+    _profiled(
+        db,
+        [{"$setWindowFields": {"partitionBy": "$k", "output": {"t": {"$push": "$s"}}}}],
+        {"internalDocumentSourceSetWindowFieldsMaxMemoryBytes": 50_000},
+        "rm325window",
+    )
     return {
-        "sort": sort.get("sortSpilledDataStorageSize"),
         "group": group.get("groupSpilledDataStorageSize"),
+        "window": window_storage() - before,
     }
 
 
 @pytest.mark.backlog("RM-325")
 def test_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 compresses a sort's runs (130545 bytes for 2461200) and
-    spills a `$group` to a WiredTiger table."""
+    """mongod 8.2 spills a classic `$group` to a sorter file of its
+    accumulators' merge values (16321 bytes here) and a `$setWindowFields`
+    to a WiredTiger table (4096)."""
     assert _storage_sizes(rust_mongo) == _storage_sizes(mongod)
+
+
+def _leading_sort_storage(client: Any) -> Any:
+    db = _spill_db(client)
+    entry = _profiled(
+        db,
+        [{"$sort": {"s": 1, "n": -1}}, {"$project": {"_id": 1}}],
+        {"internalQueryMaxBlockingSortMemoryUsageBytes": 50_000},
+        "rm316sort",
+    )
+    return entry.get("sortSpilledDataStorageSize")
+
+
+@pytest.mark.backlog("RM-395")
+def test_leading_sort_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2's `SORT` takes documents as its collection scan reads them,
+    so a sort that reverses that order spills runs of the first documents
+    read, each sorted (130545 bytes)."""
+    assert _leading_sort_storage(rust_mongo) == _leading_sort_storage(mongod)
+
+
+def _added_fields_sort(client: Any) -> Any:
+    client.drop_database("rm396")
+    coll = client.rm396.c
+    coll.insert_many(
+        [
+            {
+                "_id": i,
+                "k": i % 7,
+                "s": f"name-{i * 37 % 1000:04d}" * 20,
+                "a": [i, i + 1],
+                "o": {"x": i, "y": "z" * (i % 30)},
+                "n": i,
+            }
+            for i in range(400)
+        ]
+    )
+    entry = _profiled(
+        client.rm396,
+        [{"$addFields": {"t": {"$multiply": ["$n", 2]}}}, {"$sort": {"t": -1}}],
+        {"internalQueryMaxBlockingSortMemoryUsageBytes": 60_000},
+        "rm396",
+    )
+    return (entry.get("sortSpills"), entry.get("sortSpilledDataStorageSize"))
+
+
+@pytest.mark.backlog("RM-396")
+def test_added_fields_sort_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2 spills a `$sort` after `$addFields` at its own record
+    boundaries: its first two runs of documents of varying size hold about
+    three records more than this server's, so the merged runs (and the
+    file, 39691 bytes) differ though the spills and bytes agree."""
+    assert _added_fields_sort(rust_mongo) == _added_fields_sort(mongod)
+
+
+def _group_sum_spilled_bytes(client: Any) -> Any:
+    db = _spill_db(client)
+    entry = _profiled(
+        db,
+        [{"$unwind": "$s"}, {"$group": {"_id": "$n", "t": {"$sum": "$n"}, "c": {"$count": {}}}}],
+        {"internalDocumentSourceGroupMaxMemoryBytes": 5_000},
+        "rm397",
+    )
+    return (entry.get("groupSpills"), entry.get("groupSpilledBytes"))
+
+
+@pytest.mark.backlog("RM-397")
+def test_group_sum_spilled_bytes(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2 on arm64 counts a `$group` of `$sum` and `$count` as
+    115200 bytes over its 22 spills; this server counts 110400. On x86_64
+    mongod and this server agree (CI, 2026-11-07)."""
+    only_on("arm64", why="x86_64 mongod and this server agree")
+    assert _group_sum_spilled_bytes(rust_mongo) == _group_sum_spilled_bytes(mongod)
 
 
 # --------------------------------------- RM-326 sort stats per batch --
@@ -103,10 +243,11 @@ def _per_batch(client: Any) -> dict:
     }
 
 
-@pytest.mark.backlog("RM-326")
+@pytest.mark.backlog_fixed("RM-326")
 def test_sort_profile_per_batch(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 profiles the sort in front of a `$setWindowFields` once
-    per cursor-stage batch: `sortSpills: 52` for a sort that spilled 13."""
+    """mongod 8.2.11 profiled the sort in front of a `$setWindowFields` once
+    per cursor-stage batch: `sortSpills: 52` for a sort that spilled 13, and
+    `spillToDisk` counted the 20 chunks its runs were written as."""
     assert _per_batch(rust_mongo) == _per_batch(mongod)
 
 

@@ -1482,6 +1482,12 @@ pub(crate) fn uncounted<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Inside [`uncounted`]: a run `explain` (or the server itself) makes for
+/// what it says of itself, not the operation the client sent.
+pub(crate) fn is_uncounted() -> bool {
+    UNCOUNTED.with(std::cell::Cell::get)
+}
+
 /// What a command does with the documents a plan reads, for counting the
 /// indexes it uses.
 #[derive(Clone, Copy)]

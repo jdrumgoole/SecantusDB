@@ -32,22 +32,20 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
-use std::fs::File;
-use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use bson::{doc, Bson, Document};
 
 use crate::fallback::Fallback;
-use crate::memlimit;
+use crate::{memlimit, spill_file};
 
 type R<T> = Result<T, Fallback>;
 
 /// `sizeof(FileIterator<Key, Value>)` on mongod 8.2.11 (arm64), measured.
 const FILE_ITERATOR: usize = 136;
 /// `kSortedFileBufferSize`.
-const SORTED_FILE_BUFFER: usize = 64 << 10;
+const SORTED_FILE_BUFFER: usize = spill_file::CHUNK;
 
 /// Which of mongod's sorts this is, for what a document counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,72 +162,18 @@ fn refused(budget: usize) -> Fallback {
 
 static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
 
-/// `Value::serializeForSorter`: the bytes one value takes in a spill.
-fn value_bytes(v: &Bson) -> usize {
-    1 + match v {
-        Bson::Null | Bson::Undefined | Bson::MinKey | Bson::MaxKey => 0,
-        Bson::ObjectId(_) => 12,
-        Bson::Int32(_) => 4,
-        Bson::Int64(_) | Bson::Double(_) | Bson::DateTime(_) | Bson::Timestamp(_) => 8,
-        Bson::Decimal128(_) => 16,
-        Bson::Boolean(_) => 1,
-        Bson::String(x) | Bson::Symbol(x) | Bson::JavaScriptCode(x) => 4 + x.len(),
-        Bson::Binary(b) => 1 + 4 + b.bytes.len(),
-        Bson::RegularExpression(r) => r.pattern.len() + 1 + r.options.len() + 1,
-        Bson::Document(d) => document_bytes(d),
-        Bson::Array(a) => 4 + a.iter().map(value_bytes).sum::<usize>(),
-        Bson::JavaScriptCodeWithScope(c) => 4 + c.code.len() + memlimit::bson_len(&c.scope),
-        Bson::DbPointer(_) => 12 + 33,
-    }
-}
+/// A key and its document as the sorter holds them, with the document's
+/// position in the input (`$bucketAuto` writes it into each record).
+type Held = (Vec<Bson>, Document, i64);
 
-/// `Document::serializeForSorter`: its fields, then its metadata (a byte
-/// when it has none).
-fn document_bytes(d: &Document) -> usize {
-    4 + d
-        .iter()
-        .map(|(k, v)| k.len() + 1 + value_bytes(v))
-        .sum::<usize>()
-        + 1
-}
-
-/// The bytes a key and its document take in a spill (the sort's
-/// `spilledBytes`): the key as a `Value` (an array of them for a compound
-/// sort) and the document as this sorter keeps it -- a classic `Document`,
-/// the query layer's working-set member (its BSON), or `$bucketAuto`'s
-/// wrapper around the document.
-fn spilled_bytes(keys: &[Bson], doc: &Document, sizing: &Sizing) -> usize {
-    let key = match keys {
-        [one] => value_bytes(one),
-        many => 1 + 4 + many.iter().map(value_bytes).sum::<usize>(),
-    };
-    let kept = || -> Document {
-        doc.iter()
-            .filter(|(k, _)| {
-                sizing.fields.is_none_or(|f| f.contains(k.as_str()))
-                    || sizing.added.is_some_and(|a| a.contains(k.as_str()))
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
-    let value = match sizing.source {
-        SortSource::QueryLayer => memlimit::bson_len(doc),
-        SortSource::Sbe => memlimit::bson_len(&kept()),
-        SortSource::BucketAuto => {
-            // `{output: <document>, generatedSortKey: <long>}`.
-            4 + 7 + 1 + document_bytes(&kept()) + 17 + 9 + 1
-        }
-        SortSource::Stored | SortSource::Modified | SortSource::Unwound => document_bytes(&kept()),
-    };
-    key + value
-}
-
-fn io_error(what: &str, path: &std::path::Path, e: impl std::fmt::Display) -> Fallback {
+fn io_error(path: &std::path::Path, e: spill_file::Error) -> Fallback {
     Fallback::mongo(
         1,
         format!(
-            "the sort could not {what} its spill file {}: {e}",
-            path.display()
+            "the sort could not {} its spill file {}: {}",
+            e.what,
+            path.display(),
+            e.detail
         ),
     )
 }
@@ -238,6 +182,9 @@ fn io_error(what: &str, path: &std::path::Path, e: impl std::fmt::Display) -> Fa
 struct Run {
     path: PathBuf,
     records: usize,
+    /// How many values each key holds: one is written as itself, more as
+    /// an array of them.
+    arity: usize,
 }
 
 impl Drop for Run {
@@ -253,111 +200,179 @@ impl Drop for Run {
     }
 }
 
+/// The document as the sort keeps it: only the fields mongod's dependency
+/// analysis leaves it, and those a stage before it added.
+fn kept(doc: &Document, sizing: &Sizing) -> Document {
+    if sizing.fields.is_none() {
+        return doc.clone();
+    }
+    doc.iter()
+        .filter(|(k, _)| {
+            sizing.fields.is_none_or(|f| f.contains(k.as_str()))
+                || sizing.added.is_some_and(|a| a.contains(k.as_str()))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// One record as this sorter's mongod counterpart serializes it: the key
+/// as a `Value` (an array of them for a compound sort), then the document
+/// as that sorter keeps it -- the query layer's (and SBE's) as BSON, a
+/// pipeline `$sort`'s as a `Document`, `$bucketAuto`'s inside the
+/// `{output, generatedSortKey}` document it sorts.
+fn write_record(
+    (keys, d, pos): &Held,
+    sizing: &Sizing,
+    out: &mut Vec<u8>,
+) -> Result<(), spill_file::Error> {
+    match keys.as_slice() {
+        [one] => spill_file::write_value(one, out)?,
+        many => spill_file::write_value(&Bson::Array(many.to_vec()), out)?,
+    }
+    match sizing.source {
+        SortSource::QueryLayer => spill_file::write_bson(d, out),
+        SortSource::Sbe => spill_file::write_bson(&kept(d, sizing), out),
+        SortSource::BucketAuto => spill_file::write_document(
+            &doc! { "output": kept(d, sizing), "generatedSortKey": *pos },
+            out,
+        ),
+        SortSource::Stored | SortSource::Modified | SortSource::Unwound => {
+            spill_file::write_document(&kept(d, sizing), out)
+        }
+    }
+}
+
+fn read_record(
+    at: &mut spill_file::Cursor,
+    arity: usize,
+    source: SortSource,
+) -> Result<Held, spill_file::Error> {
+    let key = spill_file::read_value(at)?;
+    let keys = match (arity, key) {
+        (1, k) => vec![k],
+        (_, Bson::Array(k)) if k.len() == arity => k,
+        _ => {
+            return Err(spill_file::Error {
+                what: "read",
+                detail: "a record whose key is not the sort's".into(),
+            })
+        }
+    };
+    let (d, pos) = match source {
+        SortSource::QueryLayer | SortSource::Sbe => (spill_file::read_bson(at)?, 0),
+        SortSource::BucketAuto => {
+            let mut w = spill_file::read_document(at)?;
+            match (w.remove("output"), w.remove("generatedSortKey")) {
+                (Some(Bson::Document(d)), Some(Bson::Int64(pos))) => (d, pos),
+                _ => {
+                    return Err(spill_file::Error {
+                        what: "read",
+                        detail: "a $bucketAuto record without its document".into(),
+                    })
+                }
+            }
+        }
+        SortSource::Stored | SortSource::Modified | SortSource::Unwound => {
+            (spill_file::read_document(at)?, 0)
+        }
+    };
+    Ok((keys, d, pos))
+}
+
 /// Write sorted `items` as a run, counted as one spill.
-fn write_run(items: impl Iterator<Item = (Vec<Bson>, Document)>, sizing: &Sizing) -> R<Run> {
+fn write_run(items: impl Iterator<Item = Held>, sizing: &Sizing) -> R<Run> {
     let bucket_auto = sizing.source == SortSource::BucketAuto;
     let dir = memlimit::spill_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| io_error("create the directory for", &dir, e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        io_error(
+            &dir,
+            spill_file::Error {
+                what: "create the directory for",
+                detail: e.to_string(),
+            },
+        )
+    })?;
     let path = dir.join(format!(
-        "secantus-sort-{}-{}.bson",
+        "secantus-sort-{}-{}.spill",
         std::process::id(),
         NEXT_FILE.fetch_add(1, AtomicOrdering::Relaxed)
     ));
-    let file = File::create(&path).map_err(|e| io_error("create", &path, e))?;
+    let mut out = spill_file::Writer::create(&path).map_err(|e| io_error(&path, e))?;
+    // Registered before anything is written, so a failure below removes it.
     let mut run = Run {
         path: path.clone(),
         records: 0,
+        arity: 1,
     };
-    let mut out = BufWriter::new(file);
-    let mut bytes = 0i64;
-    for (keys, d) in items {
-        bytes += spilled_bytes(&keys, &d, sizing) as i64;
-        let mut buf = Vec::new();
-        crate::bsondoc::write(&doc! { "k": keys, "d": d }, &mut buf)
-            .map_err(|e| io_error("encode a record for", &path, e))?;
-        out.write_all(&buf)
-            .map_err(|e| io_error("write", &path, e))?;
+    for item in items {
+        run.arity = item.0.len();
+        write_record(&item, sizing, out.buffer()).map_err(|e| io_error(&path, e))?;
+        out.added().map_err(|e| io_error(&path, e))?;
         run.records += 1;
     }
-    out.flush().map_err(|e| io_error("write", &path, e))?;
-    let file = out
-        .into_inner()
-        .map_err(|e| io_error("write", &path, e.error()))?;
-    file.sync_all().map_err(|e| io_error("write", &path, e))?;
-    let stored = file
-        .metadata()
-        .map_err(|e| io_error("measure", &path, e))?
-        .len() as i64;
+    let written = out.done().map_err(|e| io_error(&path, e))?;
     if bucket_auto {
-        memlimit::record_bucket_auto_spill(run.records as i64, bytes, stored);
+        memlimit::record_bucket_auto_spill(
+            run.records as i64,
+            written.bytes,
+            written.stored,
+            written.chunks,
+        );
     } else {
-        memlimit::record_sort_spill(run.records as i64, bytes, stored);
+        memlimit::record_sort_spill(
+            run.records as i64,
+            written.bytes,
+            written.stored,
+            written.chunks,
+        );
     }
     Ok(run)
 }
 
 /// A run being read back.
 struct Reader {
-    input: BufReader<File>,
+    input: spill_file::Reader,
     path: PathBuf,
     left: usize,
+    arity: usize,
+    source: SortSource,
 }
 
 impl Reader {
-    fn open(run: &Run) -> R<Reader> {
-        let file = File::open(&run.path).map_err(|e| io_error("open", &run.path, e))?;
+    fn open(run: &Run, source: SortSource) -> R<Reader> {
         Ok(Reader {
-            input: BufReader::new(file),
+            input: spill_file::Reader::open(&run.path).map_err(|e| io_error(&run.path, e))?,
             path: run.path.clone(),
             left: run.records,
+            arity: run.arity,
+            source,
         })
     }
 
-    fn next(&mut self) -> R<Option<(Vec<Bson>, Document)>> {
+    fn next(&mut self) -> R<Option<Held>> {
         if self.left == 0 {
             return Ok(None);
         }
         self.left -= 1;
-        let mut len = [0u8; 4];
+        let (arity, source) = (self.arity, self.source);
         self.input
-            .read_exact(&mut len)
-            .map_err(|e| io_error("read", &self.path, e))?;
-        let size = usize::try_from(i32::from_le_bytes(len))
-            .ok()
-            .filter(|n| *n >= 5)
-            .ok_or_else(|| io_error("read", &self.path, "a record with a bad length"))?;
-        let mut bytes = vec![0u8; size];
-        bytes[..4].copy_from_slice(&len);
-        self.input
-            .read_exact(&mut bytes[4..])
-            .map_err(|e| io_error("read", &self.path, e))?;
-        let mut record =
-            crate::bsondoc::from_bytes(&bytes).map_err(|e| io_error("read", &self.path, e))?;
-        let keys = match record.remove("k") {
-            Some(Bson::Array(k)) => k,
-            _ => return Err(io_error("read", &self.path, "a record without its key")),
-        };
-        let d = match record.remove("d") {
-            Some(Bson::Document(d)) => d,
-            _ => {
-                return Err(io_error(
-                    "read",
-                    &self.path,
-                    "a record without its document",
-                ))
-            }
-        };
-        Ok(Some((keys, d)))
+            .record(|at| read_record(at, arity, source))
+            .map(Some)
+            .map_err(|e| io_error(&self.path, e))
     }
 }
 
 /// Merge `runs` (in order) into one stream, equal keys in run order.
 fn merge_runs(
     runs: &[Run],
+    source: SortSource,
     cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering,
-    mut emit: impl FnMut((Vec<Bson>, Document)) -> R<()>,
+    mut emit: impl FnMut(Held) -> R<()>,
 ) -> R<()> {
-    let mut readers = runs.iter().map(Reader::open).collect::<R<Vec<_>>>()?;
+    let mut readers = runs
+        .iter()
+        .map(|r| Reader::open(r, source))
+        .collect::<R<Vec<_>>>()?;
     let mut heads = Vec::with_capacity(readers.len());
     for r in readers.iter_mut() {
         heads.push(r.next()?);
@@ -366,11 +381,11 @@ fn merge_runs(
         crate::deadline::check()?;
         let mut least: Option<usize> = None;
         for (i, h) in heads.iter().enumerate() {
-            let Some((k, _)) = h else { continue };
+            let Some((k, _, _)) = h else { continue };
             match least {
                 None => least = Some(i),
                 Some(l) => {
-                    let (lk, _) = heads[l].as_ref().expect("a head");
+                    let (lk, _, _) = heads[l].as_ref().expect("a head");
                     if cmp(k, lk) == Ordering::Less {
                         least = Some(i);
                     }
@@ -398,10 +413,10 @@ fn merge_spills(
     while runs.len() > target {
         let mut next = Vec::new();
         for chunk in runs.chunks(parallel) {
-            let mut merged: Vec<(Vec<Bson>, Document)> = Vec::new();
+            let mut merged: Vec<Held> = Vec::new();
             // Read the chunk through a writer of its own: mongod writes each
             // merged chunk as a run, a single run included.
-            merge_runs(chunk, cmp, |item| {
+            merge_runs(chunk, sizing.source, cmp, |item| {
                 merged.push(item);
                 Ok(())
             })?;
@@ -424,7 +439,12 @@ pub fn blocking_sort(
     let budget = sizing.budget;
     let reserve = reserved(budget, sizing.source.file_iterator());
     let effective = budget.saturating_sub(reserve);
-    let size = |(k, d): &(Vec<Bson>, Document)| sized_key(k, sizing.source) + doc_size(d, sizing);
+    let size = |(k, d, _): &Held| sized_key(k, sizing.source) + doc_size(d, sizing);
+    let items = items
+        .into_iter()
+        .enumerate()
+        .map(|(i, (k, d))| (k, d, i as i64));
+    let unheld = |held: Vec<Held>| held.into_iter().map(|(k, d, _)| (k, d)).collect();
     let n = items.len() as i64;
     let bucket_auto = sizing.source == SortSource::BucketAuto;
     let record = |bytes: usize| {
@@ -436,7 +456,7 @@ pub fn blocking_sort(
     if let Some(k) = limit {
         // mongod's top-k sorter keeps only the k first; a limit of one never
         // goes near its budget.
-        let mut items = items;
+        let mut items: Vec<Held> = items.collect();
         items.sort_by(|a, b| cmp(&a.0, &b.0));
         items.truncate(k);
         let held: usize = items.iter().map(size).sum();
@@ -444,16 +464,16 @@ pub fn blocking_sort(
         if k > 1 && held > effective && !memlimit::disk_allowed() {
             return Err(refused(budget));
         }
-        return Ok(items);
+        return Ok(unheld(items));
     }
 
     let iterators = (reserve / sizing.source.file_iterator()).max(1);
     let parallel = (budget / SORTED_FILE_BUFFER).max(2);
-    let mut held: Vec<(Vec<Bson>, Document)> = Vec::new();
+    let mut held: Vec<Held> = Vec::new();
     let mut runs: Vec<Run> = Vec::new();
     let mut used = 0usize;
     let mut total = 0usize;
-    let spill = |held: &mut Vec<(Vec<Bson>, Document)>, runs: &mut Vec<Run>| -> R<()> {
+    let spill = |held: &mut Vec<Held>, runs: &mut Vec<Run>| -> R<()> {
         if held.is_empty() {
             return Ok(());
         }
@@ -482,13 +502,13 @@ pub fn blocking_sort(
     record(total);
     if runs.is_empty() {
         held.sort_by(|a, b| cmp(&a.0, &b.0));
-        return Ok(held);
+        return Ok(unheld(held));
     }
     spill(&mut held, &mut runs)?;
     let runs = merge_spills(runs, parallel, parallel, cmp, sizing)?;
     let mut out = Vec::with_capacity(n as usize);
-    merge_runs(&runs, cmp, |item| {
-        out.push(item);
+    merge_runs(&runs, sizing.source, cmp, |(k, d, _)| {
+        out.push((k, d));
         Ok(())
     })?;
     Ok(out)
@@ -617,6 +637,43 @@ mod tests {
             (29, 1200, 649_200)
         );
         assert_eq!(report.sort_spilled_bytes, 2_461_200);
+        // Its file, every run in mongod's 64 KiB snappy chunks (RM-325).
+        assert_eq!(report.sort_spilled_data_storage_size, 130_545);
+    }
+
+    /// Run `items` through a query-layer sort under `budget`, already in
+    /// the order a collection scan reads them: `(spills, spilledBytes,
+    /// spilledDataStorageSize)`.
+    fn spilled(items: Vec<(Vec<Bson>, Document)>, budget: usize) -> (i64, i64, i64) {
+        let sizing = Sizing {
+            source: SortSource::QueryLayer,
+            fields: None,
+            added: None,
+            budget,
+        };
+        let (out, report) = memlimit::captured(|| blocking_sort(items, &cmp, &sizing, None));
+        out.unwrap();
+        (
+            report.sort_spills,
+            report.sort_spilled_bytes,
+            report.sort_spilled_data_storage_size,
+        )
+    }
+
+    #[test]
+    fn a_spill_file_takes_what_mongods_takes() {
+        // Measured against mongod 8.2.1 (arm64), `$sort: {n: 1}` under a
+        // 200000-byte budget: the profile's `sortSpills`,
+        // `sortSpilledBytes` and `sortSpilledDataStorageSize`.
+        let keyed = |d: Document| (vec![d.get("n").unwrap().clone()], d);
+        let xs = (0..300).map(|i| keyed(doc! { "_id": i, "s": "x".repeat(1000), "n": i }));
+        assert_eq!(spilled(xs.collect(), 200_000), (2, 310_200, 17_921));
+        let ints = (0..5000).map(|i| keyed(doc! { "_id": i, "a": i * 7, "b": i % 13, "n": i }));
+        assert_eq!(spilled(ints.collect(), 200_000), (2, 200_000, 94_667));
+        let only = (0..9000i32).map(|i| keyed(doc! { "_id": i, "n": i64::from(i) }));
+        assert_eq!(spilled(only.collect(), 200_000), (3, 306_000, 135_744));
+        let dbl = (0..9000).map(|i| keyed(doc! { "_id": i, "n": f64::from(i) }));
+        assert_eq!(spilled(dbl.collect(), 200_000), (3, 306_000, 109_279));
     }
 
     /// The smallest budget a pipeline runs under with `allowDiskUse: false`,

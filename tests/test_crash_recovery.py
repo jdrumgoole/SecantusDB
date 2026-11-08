@@ -295,6 +295,13 @@ def test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history(tmp
     ack_file = tmp_path / "acks.txt"
     port_file = tmp_path / "port.txt"
     env = {**os.environ, "SECANTUS_DATA_NONLOGGED": "1", "SECANTUS_CHECKPOINT_SECONDS": "1"}
+    # Evidence for a failure seen once (2026-11-07, a local gate under load):
+    # a read at the first ack's time was refused as older than the oldest
+    # timestamp, and that ack's cluster time was 16 minutes before the run.
+    # Either the ack file was not this run's (the writer appends) or the
+    # writer's server minted a stale timestamp. These two checks say which.
+    assert not ack_file.exists(), f"{ack_file} exists before the writer started"
+    started = int(time.time())
     proc = subprocess.Popen(
         [sys.executable, "-c", _TXN_WRITER, str(store), str(ack_file), str(port_file)],
         env=env,
@@ -317,6 +324,12 @@ def test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history(tmp
         lo, hi, secs, inc = (int(x) for x in line.split(":"))
         acks.append((lo, hi, Timestamp(secs, inc)))
     assert len(acks) >= 5, f"too few commits acked: {proc.stderr.read().decode()[-2000:]}"
+    ended = int(time.time())
+    outside = [t for _, _, t in acks if not started - 1 <= t.time <= ended + 1]
+    assert not outside, (
+        f"acks minted outside this run's wall-clock window [{started}, {ended}]: "
+        f"{outside[:3]}; {ack_file}: {ack_file.read_text()[:400]!r}"
+    )
     srv = _open_after_crash(_secantus_server, tmp_path)
     try:
         host, port = srv.address

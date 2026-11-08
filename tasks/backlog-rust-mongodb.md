@@ -997,27 +997,69 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   246 SnapshotUnavailable, by name, rather than answer as of now; without
   `atClusterTime` it reads the latest data, which is correct. `secantusd-rs`
   creates its stores the other way, mongod's (RM-210).
-- [ ] **A spill's on-disk size is this server's file, not mongod's.**
-      The memory budgets spill as mongod 8.2.11 does -- the same spills,
-      records and bytes for a sort, a `$group` and a `$setWindowFields`
-      (RM-211, RM-315) -- but `spilledDataStorageSize` (the profile's
-      `sortSpilledDataStorageSize` / `groupSpilledDataStorageSize`, explain,
-      `serverStatus`'s `metrics.query`) is the size of this server's
-      uncompressed spill file. mongod's sorter compresses each run (130545
-      bytes for the 2461200 a 300-document sort spills) and a `$group` or
-      `$setWindowFields` spills to a WiredTiger table (4096 bytes).
+- [ ] **A `$group`'s and a `$setWindowFields`'s spills take this
+      server's size on disk, not mongod's.** A sort's spill file is mongod
+      8.2's -- 64 KiB chunks of `serializeForSorter` records, each
+      snappy-compressed by mongod's own compressor -- so a sort's and a
+      `$bucketAuto`'s `spilledDataStorageSize` are mongod's to the byte
+      (`test_spill_file_storage_size`). Two spillers are not: a classic
+      `$group` writes its partial states as this server's own BSON
+      documents, where mongod writes each group's key and its accumulators'
+      `getValue(toBeMerged)` values to a sorter file (16321 bytes for a
+      `$push` of 300 1000-byte strings on 8.2.1, against 320100 here); and a
+      `$setWindowFields` spills its partition cache to a file, where mongod's
+      goes to a WiredTiger temporary table (`spilledDataStorageSize: 4096`,
+      against 310800). The first needs every accumulator's merge value in
+      mongod's form; the second a WiredTiger table, which the engine crate
+      cannot reach today.
       Backlog-ID: RM-325
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_spill_storage_size
-- [ ] **A sort under a cursor stage reports its spills once, not per
-      batch.** When a query-layer sort feeds later stages through
-      mongod's cursor stage, 8.2.11's profile adds the sort's counters
-      again for every batch that stage reads: a `$setWindowFields` over 300
-      documents, whose sort spills 13 times (as its `explain` says), is
-      profiled with `sortSpills: 52` -- four batches of 32, 64, 128 and 256.
-      `metrics.query.sort.spillToDisk` also counts differently from the
-      spills (`+26` for a sort of 29). This server reports each sort once.
+- [ ] **A sort under a cursor stage is counted once behind stages whose
+      reads depend on the documents.** mongod 8.2.11's cursor stage adds
+      its executor's sort counts to its own at every buffer it loads
+      (`DocumentSourceCursor::loadBatch`), so a query-layer sort that
+      spilled is profiled once per load: this server counts the loads where
+      the stages after the cursor stage read a number of documents known
+      from the batch (one-for-one stages, `$skip`, `$limit`, a stage that
+      reads everything, a window that reaches its end). Behind an
+      `$unwind`, a `$match` that does not read to the end, a `$rank` or a
+      bounded window, or a partitioned `$setWindowFields`, what they read
+      for the first batch depends on the documents, and the sort is counted
+      once: `sortSpills: 13` where mongod says 39 (an `$unwind` of strings,
+      a `$rank`), or 42 (a partitioned window). Following those needs what
+      each stage read of its input, which the eager pipeline does not keep.
       Backlog-ID: RM-326
-      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_sort_profile_per_batch
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sort_counts_per_load_through_stages_that_filter
+- [ ] **A `getMore` reports none of its cursor's sort counts, and the
+      sort counters count each sort once.** mongod 8.2.11 profiles every
+      `getMore` of a cursor whose plan sorted with the sort's counts so far
+      (`sortSpills: 52` on the `getMore` after an aggregate that reported
+      52; 29 on a `find`'s), and adds an operation's `keysSorted` and
+      `sortTotalDataSizeBytes` to `metrics.query.sort.totalKeysSorted` /
+      `totalBytesSorted` when it ends (`curop_metrics.cpp`), each `getMore`
+      included: 2400 keys for a sort of 300 read through four loads and one
+      `getMore`, 600 for a `find` of 300 and its `getMore`. This server's
+      `getMore` entries carry no sort counts, and it adds each sort's keys
+      and bytes once, as it sorts.
+      Backlog-ID: RM-400
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_get_more_sort_counts
+- [ ] **An SBE sort counts its bytes in `totalBytesSorted`.** mongod
+      8.2.11's slot-based sort in front of a `$group` (`[{$sort: {n: 1}},
+      {$group: {_id: "$k", f: {$first: "$n"}}}]` over 300 documents) adds
+      its 300 keys to `metrics.query.sort.totalKeysSorted` and nothing to
+      `totalBytesSorted`. This server adds 17700 bytes.
+      Backlog-ID: RM-398
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_sbe_sort_bytes
+- [ ] **A sort with a limit spills as mongod's top-k sorter does not.**
+      Over its budget mongod 8.2.11 spills a sort with a limit
+      (`TopKSorter`): `[$sort, {$limit: 200}, $addFields]` over 300 1-KB
+      documents spills 13 runs of 900 records under a 50000-byte budget,
+      where this server's limited sort spills nothing. A `$limit` mongod
+      moves into the sort past an `$addFields` (`extractLimitForPushdown`)
+      is not taken in here, so that sort spills as a whole sort would: 900
+      records where mongod's spill 592.
+      Backlog-ID: RM-399
+      Verify: tests/backlog/test_rm_326_sort_counts.py::test_top_k_sort_spills
 - [ ] **`$setWindowFields` refuses at slightly the wrong budget for some
       windows.** The partition cache and the functions are counted as mongod
       8.2.11 counts them for whole-partition, `["unbounded", "current"]` and
@@ -1041,6 +1083,52 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       front of it in the cursor's plan). This server lists neither.
       Backlog-ID: RM-328
       Verify: tests/backlog/test_rm_found_2026_10_26.py::test_explain_memory_counters
+- [ ] **A query-layer sort spills its documents in sorted order, not as its
+      scan read them.** mongod 8.2's `SORT` takes the documents as the stage
+      below hands them over (a forward `COLLSCAN` for a plain collection)
+      and spills each run sorted. Here the read hands the sorter documents it
+      has already sorted -- `find`, the aggregate pipeline's leading `$sort`,
+      `explain`'s executor -- so a sort that reorders its input spills
+      different runs: the same spills, records and bytes, but a different
+      file (130528 bytes against mongod 8.2.1's 130545 for 300 documents
+      sorted by `{s: 1, n: -1}`; measured by copying mongod's live spill file
+      out of `_tmp`). A sort whose input is already in order, a pipeline
+      `$sort` after another stage, and the stream's `SORT` under a write
+      (`sort_members`, given a budget) spill as mongod does. The fix is for
+      the read to run the budgeted sort over its input, as `sort_members`
+      does, instead of the command sorting the sorted output again.
+      Backlog-ID: RM-395
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_leading_sort_spill_storage_size
+- [ ] **A `$sort` after `$addFields` spills at slightly different record
+      boundaries.** Over documents of varying size, mongod 8.2.1's first two
+      runs of a `$sort` after `$addFields` hold about three records more
+      than this server's (its merged runs are 60909 and 55591 bytes before
+      compression, these 59997 and 56503), so the file differs (39691 bytes
+      against 39694) though the spills, records and bytes agree. The
+      memory a modified document counts (`SortSource::Modified`, measured by
+      bisection over documents of one size) is not quite mongod's for
+      these.
+      Backlog-ID: RM-396
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_added_fields_sort_spill_storage_size
+- [ ] **On x86_64 a sort after `$project` stores 35 bytes more spill than
+      mongod.** mongod 8.2's spill sizes differ by platform (the in-order
+      sort stores 130545 bytes on arm64 and 131252 on x86_64), and each
+      platform's mongod is the reference (Joe, 2026-11-07). On arm64 this
+      server agrees on every RM-325 case. On CI's x86_64 Linux the 29
+      spills of `[{$project: {s: 1, k: 1}}, {$sort: {k: -1, s: 1}}]` store
+      122288 bytes where mongod stores 122253. Checked on x86_64 only, by
+      CI. Found 2026-11-07, snapshot PR #2447.
+      Backlog-ID: RM-402
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_x86_spill_after_project_storage_size
+- [ ] **A `$group` of `$sum` and `$count` counts less memory than mongod.**
+      Spilling 300 groups of `{t: {$sum: "$n"}, c: {$count: {}}}` 22 times,
+      mongod 8.2.1 reports `groupSpilledBytes: 115200` and this server
+      110400: the spills and records agree, so each group's accumulators
+      are counted 16 bytes short. That is mongod on arm64: on CI's x86_64
+      Linux mongod and this server agree (2026-11-07), so the gap test runs
+      on arm64 only.
+      Backlog-ID: RM-397
+      Verify: tests/backlog/test_rm_found_2026_10_26.py::test_group_sum_spilled_bytes
 - **Scope decision — SBE's `$concatArrays` refusal names a count mongod
   never set.** Over its budget mongod 8.2.11 says "Concatentating array of
   2 elements and N bytes with array of 87684434848907256 elements and M
@@ -2258,6 +2346,25 @@ dropped (four), and `listIndexes` lists by name.
   Backlog-ID: RM-115
   Verify: none -- local gpg lock, environment
 
+- [ ] **NOT REPRODUCED -- left open as a watch item. A crash-recovery
+  test read at an acknowledged commit's time 16 minutes before its own
+  run (2026-11-07).** `test_crash_recovery.py::test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history`
+  failed once, in a local `gate_rm.py` run under load: after the hard kill
+  and replay, a snapshot read at the first ack's cluster time,
+  `Timestamp(1794087900, 63)` (21:45:00 UTC), was refused as older than the
+  oldest timestamp, while the reopened server's own cluster time was
+  22:01:13. Every ack should be seconds old: `mint_ts` mints from the wall
+  clock, and the reopened store keeps 300 s of history. So either the
+  test's `acks.txt` was not this run's (the writer appends to it) or the
+  writer's server minted a stale timestamp. mongod 8.2.11 keeps snapshot
+  history across `kill -9` and a 1 s checkpoint cadence (probed
+  2026-11-07), so the test's expectation is right. Not reproduced: 8
+  serial and 20 four-way-parallel runs passed, and so did a variant that
+  spans several checkpoints. The test now asserts the ack file is fresh
+  and every ack falls inside the run's wall-clock window, so the next
+  failure names which cause it was.
+  Backlog-ID: RM-401
+  Verify: none -- intermittent, not reproduced; the test's new checks capture the cause on the next occurrence
 - [ ] **NOT REPRODUCED -- left open as a watch item. `test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
   timed out ONCE (2026-09-30).** It passed in every full-suite run of the
   2026-10-07 batch (14,500+ tests under `-n auto`). Its nested collect-only pytest hit the 300s
