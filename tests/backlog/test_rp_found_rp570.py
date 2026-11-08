@@ -1,10 +1,10 @@
 """Gap tests of the divergences found while working RP-570 (a cast to a
 domain's array coerces each element through the domain's modifier, which
-`test_expression_cast_to_domain_array` pins over a row's expression): a cast
-of a COLUMN to such a domain ignores the domain's modifier, and a domain
-array literal's input error carries no position. A cast to an array with a
-type modifier of its own ignored it until RP-579, and a numeric overflow had
-no DETAIL until RP-582; their tests are the regression tests.
+`test_expression_cast_to_domain_array` pins over a row's expression): a
+domain array literal's input error carries no position. A cast of a COLUMN
+to such a domain ignored the domain's modifier until RP-580, a cast to an
+array with a type modifier of its own ignored it until RP-579, and a numeric
+overflow had no DETAIL until RP-582; their tests are the regression tests.
 
 An answer is the rows, or `(sqlstate, message, detail, position)` for an
 error. The expected answers were measured on a private, freshly initdb'd
@@ -23,8 +23,11 @@ from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
     "drop table if exists t570 cascade",
+    # The domain over d570c first: DROP DOMAIN ... CASCADE leaves it (RP-607).
+    "drop domain if exists d580cc",
     "drop domain if exists d570c cascade",
     "create domain d570c as char(3)",
+    "create domain d580cc as d570c check (value <> 'abc')",
     "create table t570 (k int, t text, ta text[])",
     "insert into t570 values (1, 'ab', '{ab}'), (2, 'abcd', '{abcd}')",
 ]
@@ -34,7 +37,7 @@ _SETUP = [
 def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
-        for q in _SETUP[:2]:
+        for q in _SETUP[:3]:
             c.execute(q)
 
 
@@ -112,17 +115,37 @@ def test_expression_cast_to_domain_array(query: str, dsn: str) -> None:
 
 
 # A cast of a bare column is the same `coerce_to_domain` as a constant's:
-# the base type at the domain's modifier.
+# the base type at the domain's modifier. Each came back as stored until
+# RP-580, in a plain select, a join and a FROM-subquery alike.
+_D580CC_CHECK = (
+    "23514",
+    'value for domain d580cc violates check constraint "d580cc_check"',
+    None,
+    None,
+)
 COLUMN_CASTS = {
     "select t::d570c, octet_length(t::d570c) from t570 order by k": [
         ("ab ", "3"),
         ("abc", "3"),
     ],
     "select ta::d570c[]::text from t570 order by k": [('{"ab "}',), ("{abc}",)],
+    "select a.t::d570c, b.k from t570 a join t570 b on a.k = b.k order by b.k": [
+        ("ab ", "1"),
+        ("abc", "2"),
+    ],
+    "select x, octet_length(x) from (select t::d570c as x from t570) s order by x": [
+        ("ab ", "3"),
+        ("abc", "3"),
+    ],
+    # A domain over the domain: its CHECK sees the value AFTER the modifier,
+    # so `abcd` truncated to `abc` fails it, as an element of an array does.
+    "select t::d580cc from t570 where k = 1": [("ab ",)],
+    "select t::d580cc from t570 order by k": _D580CC_CHECK,
+    "select ta::d580cc[]::text from t570 order by k": _D580CC_CHECK,
 }
 
 
-@pytest.mark.backlog("RP-580")
+@pytest.mark.backlog_fixed("RP-580")
 @pytest.mark.parametrize("query", list(COLUMN_CASTS))
 def test_column_cast_to_domain_applies_typmod(query: str, dsn: str) -> None:
     assert answer(dsn, query) == COLUMN_CASTS[query]

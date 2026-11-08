@@ -1183,6 +1183,16 @@ fn mismatch(op: &str, l: &str, r: &str, location: i32) -> Error {
     ))
 }
 
+/// The operators `pg_operator` has over `(record, record)` in PostgreSQL
+/// 15: `record_eq` .. `record_ge` and their `record_image_*` forms. (`!=`
+/// is the parser's spelling of `<>`.)
+fn is_record_operator(op: &str) -> bool {
+    matches!(
+        op,
+        "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "*=" | "*<>" | "*<" | "*<=" | "*>" | "*>="
+    )
+}
+
 /// Check one `AExpr`: both sides typed, and no operator between them.
 fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
     use pg_query::protobuf::AExprKind as K;
@@ -1221,7 +1231,10 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         // any other TYPED operand (`c = d::text`) there is none (42883).
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
         if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
-            let is_enum = |t: &str| crate::user_enum(t).is_some();
+            // A composite is installed among the user types with no labels
+            // (`set_user_types`), so `user_enum` answers for it too: it is
+            // not an enum, and two composites are `record`'s (RP-590).
+            let is_enum = |t: &str| crate::user_enum(t).is_some() && user_composite(t).is_none();
             if (is_enum(&l) || is_enum(&r))
                 && l != r
                 && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
@@ -1321,11 +1334,15 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
-    // A COMPOSITE has only the record operators, and those only against the
-    // same type: beside another composite type there is no operator
-    // (`ct = ct2`), and a user cast never supplies one. A composite beside a
-    // value that is not a row is `row_against_non_row`'s.
-    if kind == Some(K::AexprOp) {
+    // A COMPOSITE has only the record operators. Those take `record` on
+    // both sides, which every composite coerces to, so two DIFFERENT
+    // composite types still compare (`ct = ct2` is `record_eq`, RP-590),
+    // and `record_eq` / `record_cmp` check the field types they reach when
+    // the statement runs (`record_compare`). Any other operator between two
+    // composite types has no candidate (`ct + ct2`), and a user cast never
+    // supplies one. A composite beside a value that is not a row is
+    // `row_against_non_row`'s.
+    if kind == Some(K::AexprOp) && !is_record_operator(&op) {
         let side = |n: Option<&pg_query::protobuf::Node>| n.and_then(|n| operand_type(n, scope));
         if let (Some(l), Some(r)) = (side(e.lexpr.as_deref()), side(e.rexpr.as_deref())) {
             let composite = |t: &str| user_composite(t).is_some();

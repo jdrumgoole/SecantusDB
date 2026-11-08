@@ -1,6 +1,6 @@
 """Gap tests of the divergences found while working RP-530 (a row beside a
 typed operand that is not a row has no operator): RP-590 (two different
-composite types are refused a comparison), RP-591 (an untyped literal
+composite types were refused a comparison, fixed), RP-591 (an untyped literal
 beside a row is not read as `record`), RP-592 (a row beside an `ARRAY[...]`
 names the row `text`) and RP-593 (an error a PREPARE's query raises carries
 the query's own offset).
@@ -71,9 +71,11 @@ TWO_COMPOSITES = {
 }
 
 
-@pytest.mark.backlog("RP-590")
+@pytest.mark.backlog_fixed("RP-590")
 @pytest.mark.parametrize("query", list(TWO_COMPOSITES))
 def test_two_composite_types_compare(query: str, dsn: str) -> None:
+    """Two different composite types compare as records. Each was 42883
+    `operator does not exist: ct = ct2`; in a WHERE: test_rp_found_rp590.py."""
     assert answer(dsn, query) == TWO_COMPOSITES[query]
 
 

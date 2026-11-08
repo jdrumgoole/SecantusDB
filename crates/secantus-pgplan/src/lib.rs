@@ -29853,10 +29853,22 @@ pub fn display_type(internal: &str) -> String {
 /// casts (`generate_series(1, 2)::int4`, `...::int4::text`).
 ///
 /// Returns the underlying `FuncCall` plus the cast chain, innermost-first, so
-/// Does any cast in a chain of casts carry a type modifier?
+/// Does any cast in a chain of casts carry a type modifier, written in the
+/// cast (`::varchar(3)`) or the domain's own (`::d`, `::d[]`, `d` a domain
+/// over `char(3)`)? `coerce_to_domain` coerces to the base type at the
+/// domain's modifier (`getBaseTypeAndTypmod`), the same for a bare column
+/// as for a constant, so such a cast takes the general path that applies it
+/// (RP-580).
 fn cast_chain_has_typmod(tc: &pg_query::protobuf::TypeCast) -> bool {
-    if tc.type_name.as_ref().is_some_and(|t| !t.typmods.is_empty()) {
-        return true;
+    if let Some(t) = tc.type_name.as_ref() {
+        if !t.typmods.is_empty() {
+            return true;
+        }
+        let name = type_name_of(t);
+        let element = name.strip_suffix("[]").unwrap_or(&name);
+        if domains::base_type_and_typmod(element).is_some_and(|(_, typmod, _)| typmod >= 0) {
+            return true;
+        }
     }
     match tc.arg.as_deref().and_then(|a| a.node.as_ref()) {
         Some(N::TypeCast(inner)) => cast_chain_has_typmod(inner),
@@ -45545,6 +45557,75 @@ fn composite_null_test_is_per_row(def: &TableDef, field: &str) -> Result<()> {
     }
 }
 
+/// `Unsupported` for a comparison of a composite column with a record
+/// whose field types are not the column type's -- another composite type
+/// (`v = row(1, 2)::cb`), a wider or narrower one, or a `ROW(...)` with an
+/// `unknown` field (`v = (1, 'a')`) -- under `=`, `<`, IS DISTINCT FROM,
+/// IN, ANY / ALL or BETWEEN. PostgreSQL runs each through `record_eq` /
+/// `record_cmp`, which check every field pair they reach: 42804 for two
+/// different field types or, once the pairs compared equal, two widths,
+/// and 42883 for an `unknown` field. A filter compares the stored record
+/// whole, its field types included, so it matched no row where PostgreSQL
+/// raised one of those (RP-590). It also carries its fields' NAMES, so a
+/// composite of the same field types under other names (`v = row(1,
+/// 'a')::cd`, which `record_eq` finds equal) matched none either.
+/// Evaluated per row, `record_compare` compares positionally and makes the
+/// checks. A record of the column's own field names and types stays a
+/// filter: it compares as PostgreSQL does.
+///
+/// Only an operand that is a row, a cast, an array, a parameter or a
+/// literal is read here, so a call with a side effect is not run twice.
+fn composite_compare_is_per_row(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<()> {
+    fn records(v: &Bson, out: &mut Vec<Bson>) {
+        match arrays::strip(v) {
+            Bson::Array(items) => items.iter().for_each(|i| records(i, out)),
+            other if record_fields(&other).is_some() => out.push(other),
+            _ => {}
+        }
+    }
+    let Ok(field) = column_field(e.lexpr.as_deref(), def) else {
+        return Ok(());
+    };
+    let Some((_, fields)) = field_type(def, &field).and_then(user_composite) else {
+        return Ok(());
+    };
+    let want: Vec<String> = fields
+        .iter()
+        .map(|(_, t)| record_field_type_name(t))
+        .collect();
+    let names: Vec<String> = fields.iter().map(|(n, _)| n.clone()).collect();
+    let Some(rhs) = e.rexpr.as_deref() else {
+        return Ok(());
+    };
+    let operands: Vec<&pg_query::protobuf::Node> = match rhs.node.as_ref() {
+        Some(N::List(l)) => l.items.iter().collect(),
+        _ => vec![rhs],
+    };
+    for n in operands {
+        if !matches!(
+            n.node.as_ref(),
+            Some(N::RowExpr(_) | N::TypeCast(_) | N::AArrayExpr(_) | N::ParamRef(_) | N::AConst(_))
+        ) {
+            continue;
+        }
+        let Ok(v) = const_value(n, params) else {
+            continue;
+        };
+        let mut found = Vec::new();
+        records(&v, &mut found);
+        for r in &found {
+            let got: Option<Vec<String>> = record_field_types(r)
+                .map(|ts| ts.iter().map(|t| record_field_type_name(t)).collect());
+            if got.as_ref() != Some(&want) || record_names(r).as_ref() != Some(&names) {
+                return Err(Error::Unsupported(
+                    "a composite column compared with a record of other field types".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether a declared type is a row type (`type_is_rowtype`): `record`, or a
 /// composite -- a table's, a view's or a `CREATE TYPE ... AS` one.
 fn type_is_rowtype(t: &str) -> bool {
@@ -46120,6 +46201,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     if let Some(err) = array_operand_mismatch(e, Some(def)) {
         return Err(err);
     }
+    composite_compare_is_per_row(e, def, params)?;
     // Named enum, never the wire integer. Written against the integers first,
     // this had `Op = 0` (it is 1, so every plain `=` was refused) and
     // `Between = 10` (it is 11, so BETWEEN silently ran the NOT BETWEEN arm and
@@ -46654,6 +46736,7 @@ fn reg_oid_operand(v: Bson) -> Bson {
 }
 
 fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
+    composite_compare_is_per_row(e, def, params)?;
     let negated = in_is_negated(e);
     let field = column_field(e.lexpr.as_deref(), def)?;
     let items = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
@@ -46718,6 +46801,7 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
 
 /// `x BETWEEN a AND b` / `x NOT BETWEEN a AND b`.
 fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
+    composite_compare_is_per_row(e, def, params)?;
     let field = column_field(e.lexpr.as_deref(), def)?;
     let bounds = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
         Some(N::List(l)) if l.items.len() == 2 => &l.items,

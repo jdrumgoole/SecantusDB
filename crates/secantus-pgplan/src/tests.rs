@@ -5135,3 +5135,181 @@ fn typmod_array_cast_coerces_each_element() {
          absolute value less than 10^3."
     );
 }
+
+/// The composite types RP-590's tests install, as the server installs
+/// them: each among the user types with no labels, and with its fields.
+fn install_rp590_composites() {
+    let comps: Vec<(String, i64, CompositeFields)> = vec![
+        (
+            "ca".into(),
+            67_590,
+            vec![("x".into(), "int4".into()), ("y".into(), "text".into())],
+        ),
+        (
+            "cb".into(),
+            67_591,
+            vec![("x".into(), "int4".into()), ("y".into(), "int4".into())],
+        ),
+        (
+            "cd".into(),
+            67_592,
+            vec![("p".into(), "int4".into()), ("q".into(), "text".into())],
+        ),
+        (
+            "cc".into(),
+            67_593,
+            vec![
+                ("x".into(), "int4".into()),
+                ("y".into(), "text".into()),
+                ("z".into(), "int4".into()),
+            ],
+        ),
+    ];
+    set_user_types(
+        comps
+            .iter()
+            .map(|(n, oid, _)| (n.clone(), *oid, Vec::new()))
+            .collect(),
+    );
+    set_user_composites(comps);
+}
+
+/// RP-590: two different composite types compare through `record =
+/// record`, which both coerce to, so parse analysis finds the operator
+/// (`row(1)::ca = row(1)::cd` is `t` on PostgreSQL 15.19). They were 42883
+/// `operator does not exist: ca = cd`: the enum rule took a composite,
+/// installed among the user types with no labels, for an enum. An operator
+/// `record` does not have is still refused.
+#[test]
+fn two_composite_types_compare_as_records() {
+    install_rp590_composites();
+    for sql in [
+        "select row(1, 'a')::ca = row(1, 'a')::cd",
+        "select row(1, 'a')::ca < row(2, 'a')::cd",
+        "select row(1, 'a')::ca <> row(1, 2)::cb",
+        "select row(1, 'a')::ca >= row(1, 'a', 1)::cc",
+        "select row(1, 'a')::ca is distinct from row(1, 'a')::cd",
+        "select row(1, 'a')::ca *= row(1, 'a')::cd",
+    ] {
+        take_error_location();
+        if let Err(e) = analysed(sql) {
+            assert_ne!(e.sqlstate(), "42883", "for {sql}: {e}");
+        }
+    }
+    take_error_location();
+    let err = analysed("select row(1, 'a')::ca + row(1, 'a')::cd").expect_err("no `ca + cd`");
+    assert_eq!(err.sqlstate(), "42883", "{err}");
+    assert!(
+        err.to_string().contains("operator does not exist: ca + cd"),
+        "{err}"
+    );
+    set_user_types(Vec::new());
+    set_user_composites(Vec::new());
+}
+
+/// RP-590: a composite column compared with a record of other field types
+/// or names is evaluated per row, where `record_compare` makes `record_eq`
+/// / `record_cmp`'s field checks (42804 on PostgreSQL 15.19 for `v = row(1,
+/// 2)::cb` over `(1, 'a')`) and compares the fields by position (`v =
+/// row(1, 'a')::cd` is true). As a filter the stored record was compared
+/// whole, its field types and names included, and matched no row. A record
+/// of the column's own type stays a filter.
+#[test]
+fn composite_column_against_another_record_type_is_per_row() {
+    install_rp590_composites();
+    let def = || {
+        TableDef::new(
+            "tk",
+            vec![
+                Column::new("v", "ca", false),
+                Column::new("n", "int4", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "tk").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select n from tk where v = row(1, 2)::cb",
+        "select n from tk where v = row(1, 'a')::cd",
+        "select n from tk where v < row(1, 'a')::cd",
+        "select n from tk where v = row(1, 'a', 0)::cc",
+        "select n from tk where v = (1, 'a')",
+        "select n from tk where v is distinct from row(1, 2)::cb",
+        "select n from tk where v in (row(1, 'a')::ca, row(1, 2)::cb)",
+        "select n from tk where v not in (row(1, 'a', 0)::cc)",
+        "select n from tk where v = any(array[row(1, 2)::cb])",
+        "select n from tk where v between row(1, 2)::cb and row(1, 3)::cb",
+        "select n from tk where not (v = row(1, 2)::cb)",
+        "select n from tk where v not between row(1, 2)::cb and row(1, 3)::cb",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    for sql in [
+        "select n from tk where v = row(1, 'a')::ca",
+        "select n from tk where v in (row(1, 'a')::ca, row(2, 'b')::ca)",
+        "select n from tk where n = 1",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(!residual, "{sql} stays a filter: {filter:?}");
+    }
+    set_user_types(Vec::new());
+    set_user_composites(Vec::new());
+}
+
+/// RP-580: a cast to a domain whose base type carries a modifier counts as a
+/// cast with a modifier, so a bare column's cast to it takes the general
+/// path, which coerces to the base type at the domain's modifier, as
+/// PostgreSQL 15.19's `coerce_to_domain` does (`t::d` over `char(3)` pads
+/// `ab` to `ab `). A domain with no modifier, at any depth, does not.
+#[test]
+fn a_cast_to_a_domain_with_a_modifier_has_a_typmod() {
+    let domain = |name: &str, oid, base: &str, typmod| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        default_sql: None,
+        not_valid: Vec::new(),
+    };
+    domains::set_user_domains(vec![
+        domain("dm3", 90021, "bpchar", 7),
+        domain("dm3c", 90022, "dm3", -1),
+        domain("dmi", 90023, "int4", -1),
+    ]);
+    let has_typmod = |sql: &str| -> bool {
+        let parsed = pg_query::parse(sql).unwrap();
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("no target");
+        };
+        let Some(N::TypeCast(tc)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            panic!("not a cast: {sql}");
+        };
+        cast_chain_has_typmod(tc)
+    };
+    let cases = [
+        ("select t::dm3 from x", true),
+        ("select t::dm3c from x", true),
+        ("select t::dm3[] from x", true),
+        ("select t::dm3::text from x", true),
+        ("select t::varchar(3) from x", true),
+        ("select t::dmi from x", false),
+        ("select t::text from x", false),
+    ];
+    for (sql, want) in cases {
+        assert_eq!(has_typmod(sql), want, "{sql}");
+    }
+    domains::set_user_domains(Vec::new());
+}
