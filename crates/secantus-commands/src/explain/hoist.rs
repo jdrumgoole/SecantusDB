@@ -67,10 +67,9 @@ fn paths_overlap(a: &str, b: &str) -> bool {
 }
 
 fn as_sort(stage: &Bson) -> Option<&Document> {
-    stage
-        .as_document()
-        .filter(|d| d.len() == 1)?
-        .get_document("$sort")
+    let d = stage.as_document().filter(|d| d.len() == 1)?;
+    d.get_document("$sort")
+        .or_else(|_| d.get_document(super::shape::WINDOW_SORT))
         .ok()
 }
 

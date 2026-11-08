@@ -117,7 +117,17 @@ pub fn apply_pipeline(
                     });
                 }
             }
-            let (out, next) = window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll)?;
+            let (out, next) =
+                window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll, false)?;
+            docs = out;
+            i += 1 + next;
+            continue;
+        }
+        if name == "$_internalSetWindowFields" {
+            // What `$setWindowFields` runs behind its `$sort`: no sort of
+            // its own (RM-328).
+            let (out, next) =
+                window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll, true)?;
             docs = out;
             i += 1 + next;
             continue;
@@ -327,6 +337,14 @@ fn apply_stage(
         "$densify" => densify::densify_stage(spec, &docs),
         "$fill" => fill::fill_stage(spec, docs, vars),
         "$setWindowFields" => windowfields::set_window_fields_stage(spec, docs, vars),
+        "$_internalSetWindowFields" => {
+            let mut out = Vec::with_capacity(docs.len());
+            windowfields::internal_set_window_fields_each(spec, docs, vars, None, &mut |d| {
+                out.push(d);
+                Ok(())
+            })?;
+            Ok(out)
+        }
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
         _ => Err(Fallback::Defer),
     }
@@ -433,6 +451,7 @@ fn window_fields_streamed(
     rest: &[Bson],
     vars: &Document,
     coll: Option<&Collation>,
+    presorted: bool,
 ) -> R<(Vec<Document>, usize)> {
     let fused = rest
         .iter()
@@ -447,7 +466,12 @@ fn window_fields_streamed(
     DOWNSTREAM.with(|d| after.extend(d.borrow().iter().cloned()));
     let fields = group::downstream_fields(&after);
     let mut out = Vec::new();
-    windowfields::set_window_fields_each(spec, docs, vars, fields.as_ref(), &mut |d| {
+    let each = if presorted {
+        windowfields::internal_set_window_fields_each
+    } else {
+        windowfields::set_window_fields_each
+    };
+    each(spec, docs, vars, fields.as_ref(), &mut |d| {
         let mut one = vec![d];
         for stage in &rest[..fused] {
             let (name, spec) = stage

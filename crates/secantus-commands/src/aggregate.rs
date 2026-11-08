@@ -1533,6 +1533,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$sample"
             | "$set"
             | "$setWindowFields"
+            | "$_internalSetWindowFields"
             | "$skip"
             | "$sort"
             | "$sortByCount"
@@ -1736,7 +1737,9 @@ pub(crate) fn validate_parse(pipeline: &[Bson]) -> Result<(), CommandError> {
                 }
                 continue;
             }
-            ("$setWindowFields", Bson::Document(s)) => (false, window_fields_parse(s)),
+            ("$setWindowFields" | "$_internalSetWindowFields", Bson::Document(s)) => {
+                (false, window_fields_parse(s))
+            }
             _ => continue,
         };
         if let Err(f) = outcome {
@@ -1888,7 +1891,9 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError
         // before the engine runs, is the same place `$facet` already does it and
         // avoids widening the engine's error type. All probed against 8.2.11.
         match name {
-            "$setWindowFields" => validate_set_window_fields(d.get(name))?,
+            "$setWindowFields" | "$_internalSetWindowFields" => {
+                validate_set_window_fields(name, d.get(name))?
+            }
             "$sample" => validate_sample(d.get(name))?,
             "$unwind" => validate_unwind(d.get(name))?,
             "$bucket" => validate_bucket(d.get(name))?,
@@ -2044,7 +2049,7 @@ fn validate_fill(spec: Option<&Bson>) -> Result<(), CommandError> {
 /// Python server's `_SET_WINDOW_FIELDS_KNOWN`.
 const SET_WINDOW_FIELDS_KNOWN: &[&str] = &["partitionBy", "sortBy", "output"];
 
-fn validate_set_window_fields(spec: Option<&Bson>) -> Result<(), CommandError> {
+fn validate_set_window_fields(stage: &str, spec: Option<&Bson>) -> Result<(), CommandError> {
     let Some(spec) = spec.and_then(Bson::as_document) else {
         return Ok(()); // shape errors are the engine's to report
     };
@@ -2055,14 +2060,14 @@ fn validate_set_window_fields(spec: Option<&Bson>) -> Result<(), CommandError> {
         return Err(CommandError::new(
             40415,
             "IDLUnknownField",
-            format!("BSON field '$setWindowFields.{unknown}' is an unknown field."),
+            format!("BSON field '{stage}.{unknown}' is an unknown field."),
         ));
     }
     if !spec.contains_key("output") {
         return Err(CommandError::new(
             40414,
             "IDLFailedToParse",
-            "BSON field '$setWindowFields.output' is missing but a required field",
+            format!("BSON field '{stage}.output' is missing but a required field"),
         ));
     }
     // The same silent acceptance one level down: an unknown key inside `window`
@@ -5722,7 +5727,7 @@ fn stage_fold_error(stage: &bson::Document, vars: &Document) -> Option<(i32, Str
                 Some(Bson::Document(out)) => out.values().find_map(|a| accumulator_fault(a, vars)),
                 _ => None,
             }),
-        ("$setWindowFields", Bson::Document(d)) => d
+        ("$setWindowFields" | "$_internalSetWindowFields", Bson::Document(d)) => d
             .get("partitionBy")
             .and_then(|e| expression_fault(e, vars))
             .or_else(|| match d.get("output") {

@@ -346,9 +346,10 @@ def _explained(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-328")
+@pytest.mark.backlog_fixed("RM-328")
 def test_explain_memory_counters(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11's `explain` lists a `$group`'s accumulator memory and
+    """mongod 8.2.11's `explain` listed a `$group`'s accumulator memory and
     output size, and the `$_internalSetWindowFields` stage it runs with
-    its memory counters."""
+    its memory counters, which this server did not (fixed 2026-11-08; the
+    values: `tests/mongod_live/test_explain_memory_counters.py`)."""
     assert _explained(rust_mongo) == _explained(mongod)

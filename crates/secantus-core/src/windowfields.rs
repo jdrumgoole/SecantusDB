@@ -103,6 +103,33 @@ pub(crate) fn set_window_fields_each(
     downstream: Option<&std::collections::BTreeSet<String>>,
     sink: &mut dyn FnMut(Document) -> R<()>,
 ) -> R<()> {
+    window_fields_each(spec, docs, vars, downstream, false, sink)
+}
+
+/// `$_internalSetWindowFields`, the stage mongod 8.2 parses
+/// `$setWindowFields` into behind a `$sort` on its partition and `sortBy`
+/// (and runs when a pipeline names it): the documents are taken in the
+/// order they come, and a partition is a run of them with one key -- a key
+/// seen again after another starts a new partition (measured 8.2.1,
+/// 2026-11-08, RM-328).
+pub(crate) fn internal_set_window_fields_each(
+    spec: &Bson,
+    docs: Vec<Document>,
+    vars: &Document,
+    downstream: Option<&std::collections::BTreeSet<String>>,
+    sink: &mut dyn FnMut(Document) -> R<()>,
+) -> R<()> {
+    window_fields_each(spec, docs, vars, downstream, true, sink)
+}
+
+fn window_fields_each(
+    spec: &Bson,
+    docs: Vec<Document>,
+    vars: &Document,
+    downstream: Option<&std::collections::BTreeSet<String>>,
+    presorted: bool,
+    sink: &mut dyn FnMut(Document) -> R<()>,
+) -> R<()> {
     let spec = spec.as_document().ok_or(Fallback::Defer)?;
     let partition_by = spec.get("partitionBy");
     let sort_by = match spec.get("sortBy") {
@@ -114,7 +141,12 @@ pub(crate) fn set_window_fields_each(
             return Err(Fallback::mongo(
                 14,
                 format!(
-                    "BSON field '$setWindowFields.sortBy' is the wrong type '{}', expected type 'object'",
+                    "BSON field '{}.sortBy' is the wrong type '{}', expected type 'object'",
+                    if presorted {
+                        "$_internalSetWindowFields"
+                    } else {
+                        "$setWindowFields"
+                    },
                     crate::query::bson_type_name(other)
                 ),
             )
@@ -302,6 +334,7 @@ pub(crate) fn set_window_fields_each(
     let mut partitions: Vec<Vec<usize>> = Vec::new();
     let mut keys: Vec<Bson> = Vec::new();
     let mut key_index: HashMap<Vec<u8>, usize> = HashMap::new();
+    let mut last_key: Option<Vec<u8>> = None;
     for (i, doc) in docs.iter().enumerate() {
         let key_val = match partition_by {
             Some(by) => expressions::evaluate(doc, by, vars)?,
@@ -317,6 +350,16 @@ pub(crate) fn set_window_fields_each(
         let mut wrap = Document::new();
         wrap.insert("k", crate::collation::fold_active(key_val.clone()));
         let key = crate::bsondoc::to_vec(&wrap).map_err(|_| Fallback::Defer)?;
+        if presorted {
+            // A partition ends where the key changes.
+            if last_key.as_ref() != Some(&key) {
+                partitions.push(Vec::new());
+                keys.push(key_val);
+                last_key = Some(key);
+            }
+            partitions.last_mut().expect("pushed above").push(i);
+            continue;
+        }
         let idx = *key_index.entry(key).or_insert_with(|| {
             partitions.push(Vec::new());
             keys.push(key_val);
@@ -330,7 +373,7 @@ pub(crate) fn set_window_fields_each(
     // the order they were found when keys compare equal. Measured 8.2.11,
     // 2026-10-16, on five specs with and without a collation. (An earlier
     // note here recorded first-seen order; it was not re-measured then.)
-    if keys.iter().all(order::is_comparable) {
+    if !presorted && keys.iter().all(order::is_comparable) {
         let mut by_key: Vec<usize> = (0..partitions.len()).collect();
         by_key.sort_by(|&a, &b| order::cmp(&keys[a], &keys[b]));
         let mut taken: Vec<Option<Vec<usize>>> = partitions.into_iter().map(Some).collect();
@@ -358,8 +401,12 @@ pub(crate) fn set_window_fields_each(
     // not cosmetic. `sorted_slots` yields exactly that sequence.
     let ordered = partitions
         .iter()
-        .map(|part| sorted_slots(part, &docs, sort_by))
+        .map(|part| sorted_slots(part, &docs, sort_by.filter(|_| !presorted)))
         .collect::<R<Vec<_>>>()?;
+    let mut stats = WindowMemory {
+        functions: vec![0; compiled.len()],
+        total: 0,
+    };
     for (pi, slots) in ordered.iter().enumerate() {
         let token = match partition_by {
             Some(by) => {
@@ -443,6 +490,7 @@ pub(crate) fn set_window_fields_each(
             range_dates.as_deref(),
             vars,
             &mut spill,
+            &mut stats,
         )?;
         // $expMovingAvg / $locf / $linearFill each produce a per-slot vector —
         // precompute once per partition per output field (parallel to `compiled`).
@@ -562,7 +610,27 @@ pub(crate) fn set_window_fields_each(
             sink(out_doc)?;
         }
     }
+    let wide = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
+    crate::memlimit::record_window(|| crate::memlimit::WindowStats {
+        max_function_memory: compiled
+            .iter()
+            .zip(&stats.functions)
+            .map(|(c, m)| (c.field.to_string(), wide(*m)))
+            .collect(),
+        max_total_memory: wide(stats.total),
+        spills: spill.spills,
+        spilled_records: spill.records,
+        spilled_bytes: spill.bytes,
+        spilled_data_storage_size: spill.stored,
+    });
     spill.finish()
+}
+
+/// The most a stage's functions, and the stage as a whole, held at once
+/// (`maxFunctionMemoryUsageBytes`, `maxTotalMemoryUsageBytes`; RM-328).
+struct WindowMemory {
+    functions: Vec<usize>,
+    total: usize,
 }
 
 /// The top-level fields of each document the partition cache keeps (`None`:
@@ -823,6 +891,10 @@ struct CacheSpill {
     file: Option<(std::path::PathBuf, std::io::BufWriter<std::fs::File>)>,
     /// The spill table's size so far.
     stored: i64,
+    /// How many times the cache spilled, and what it wrote.
+    spills: i64,
+    records: i64,
+    bytes: i64,
 }
 
 impl CacheSpill {
@@ -865,6 +937,9 @@ impl CacheSpill {
             .len() as i64;
         crate::memlimit::record_window_spill(docs.len() as i64, bytes, stored - self.stored);
         self.stored = stored;
+        self.spills += 1;
+        self.records += docs.len() as i64;
+        self.bytes += bytes;
         Ok(())
     }
 
@@ -983,6 +1058,18 @@ impl PartitionToken {
             _ => self.key,
         }
     }
+
+    /// The most it holds at once: reading the next partition's first
+    /// document, the comparator holds that partition's key before it lets
+    /// this one's go (`maxTotalMemoryUsageBytes`, measured 8.2.1,
+    /// 2026-11-08: a partition of whole-partition `$first` peaks at its
+    /// documents, the next one's first and both keys).
+    fn peak(&self, read_next: bool) -> usize {
+        match self.next {
+            Some(_) if read_next => self.bytes(true) + self.key,
+            _ => self.key,
+        }
+    }
 }
 
 /// mongod's partition cache (`SpillableDeque`) over `slots`, as
@@ -1008,6 +1095,7 @@ fn run_cache(
     range_dates: Option<&[f64]>,
     vars: &Document,
     spill: &mut CacheSpill,
+    stats: &mut WindowMemory,
 ) -> R<()> {
     let n = slots.len();
     if n == 0 {
@@ -1040,12 +1128,22 @@ fn run_cache(
         cache.used = 0;
         Ok(())
     };
-    let read_to = |cache: &mut Cache, upto: usize, spill: &mut CacheSpill| -> R<()> {
+    // mongod's tracker keeps its largest total at every change, so it sees
+    // what the cache held for a moment: a document read before the one
+    // behind it is let go, and a cache over its budget before it spills
+    // (`maxTotalMemoryUsageBytes`, measured 8.2.1, 2026-11-08).
+    let read_to = |cache: &mut Cache,
+                   upto: usize,
+                   spill: &mut CacheSpill,
+                   outside: usize,
+                   total: &mut usize|
+     -> R<()> {
         while cache.next <= upto && cache.next < n {
             let s = size(cache.next);
             cache.held.push_back((cache.next, s));
             cache.used += s;
             cache.next += 1;
+            *total = (*total).max(cache.used + outside);
             if cache.used > budget {
                 if !crate::memlimit::disk_allowed() {
                     let used = cache.used;
@@ -1062,6 +1160,7 @@ fn run_cache(
         }
         Ok(())
     };
+    let mut outside_before = token.bytes(false);
     for pos in 0..n {
         let mut ahead = pos as i64;
         let mut reads = Vec::with_capacity(compiled.len());
@@ -1077,13 +1176,30 @@ fn run_cache(
             };
             reads.push((from.max(0) as usize, upto.max(0) as usize));
         }
-        read_to(&mut cache, ahead.min(last) as usize, spill)?;
+        read_to(
+            &mut cache,
+            ahead.min(last) as usize,
+            spill,
+            outside_before,
+            &mut stats.total,
+        )?;
         read_next |= ahead > last;
         let mut functions_held = 0usize;
-        for ((f, c), window) in functions.iter_mut().zip(compiled).zip(&reads) {
-            functions_held += f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
+        for (((f, c), window), max) in functions
+            .iter_mut()
+            .zip(compiled)
+            .zip(&reads)
+            .zip(stats.functions.iter_mut())
+        {
+            let held = f.held(c, pos, *window, slots, docs, vars, sizer, ranks)?;
+            *max = (*max).max(held);
+            functions_held += held;
         }
         let outside = functions_held + token.bytes(read_next);
+        stats.total = stats
+            .total
+            .max(cache.used + functions_held + token.peak(read_next));
+        outside_before = outside;
         if cache.used + outside > budget {
             if crate::memlimit::disk_allowed() {
                 spill_all(&mut cache, spill)?;
@@ -1103,7 +1219,7 @@ fn run_cache(
         // Advance: read the next document, then let go of what the next
         // answer does not need.
         if pos + 1 < n {
-            read_to(&mut cache, pos + 1, spill)?;
+            read_to(&mut cache, pos + 1, spill, outside, &mut stats.total)?;
             let mut keep = pos + 1;
             for c in compiled {
                 keep = keep.min(reach(c, pos + 1, n, range_vals, range_dates)?.0);
@@ -2462,6 +2578,59 @@ mod budget_tests {
             spec.insert("partitionBy", "$k");
         }
         Bson::Document(spec)
+    }
+
+    /// `$_internalSetWindowFields` takes its input as it comes: a partition
+    /// is a run of one key (mongod 8.2.1, 2026-11-08, RM-328).
+    #[test]
+    fn the_internal_stage_partitions_runs_of_a_key() {
+        let docs: Vec<Document> = [1, 2, 1, 2, 2, 1]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| doc! {"_id": i as i32, "k": *k, "n": i as i32})
+            .collect();
+        let spec = Bson::Document(doc! {
+            "partitionBy": "$k",
+            "sortBy": {"n": -1},
+            "output": {"t": {"$sum": "$n"}},
+        });
+        let mut out = Vec::new();
+        internal_set_window_fields_each(&spec, docs, &Document::new(), None, &mut |d| {
+            out.push(d);
+            Ok(())
+        })
+        .unwrap();
+        let totals: Vec<(i32, i32)> = out
+            .iter()
+            .map(|d| (d.get_i32("_id").unwrap(), d.get_i32("t").unwrap()))
+            .collect();
+        assert_eq!(totals, [(0, 0), (1, 1), (2, 2), (3, 7), (4, 7), (5, 5)]);
+    }
+
+    /// What `explain` lists for the stage: each function's most and the
+    /// stage's, with the moment the cache passes its budget before it
+    /// spills (mongod 8.2.1, 2026-11-08, RM-328).
+    #[test]
+    fn a_window_reports_its_memory_at_its_peak() {
+        let spec = window(bson!({"$first": "$n"}), false);
+        let (_, report) = memlimit::captured(|| {
+            set_window_fields_each(&spec, docs(), &Document::new(), None, &mut |_| Ok(()))
+        });
+        let total: usize = docs().iter().map(memlimit::document_size).sum();
+        let stats = &report.windows[0];
+        assert_eq!(stats.max_function_memory, [("t".to_string(), 0)]);
+        assert_eq!(stats.max_total_memory, total as i64);
+        assert_eq!(stats.spills, 0);
+        let (_, report) = memlimit::captured(|| {
+            let _b = memlimit::with_budgets(Budgets {
+                window_fields: 10_000,
+                ..Default::default()
+            });
+            set_window_fields_each(&spec, docs(), &Document::new(), None, &mut |_| Ok(()))
+        });
+        let stats = &report.windows[0];
+        assert!(stats.spills > 0);
+        assert!(stats.max_total_memory > 10_000, "{stats:?}");
     }
 
     /// Linux mongod 8.2.12 (x86-64 and arm64), 2026-11-08 (RM-327).

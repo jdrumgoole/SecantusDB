@@ -147,7 +147,7 @@ pub(crate) fn projection(rest: &[Document]) -> Option<Document> {
                 deps.read(vec![paths[0].clone()]);
                 deps.written.extend(paths.into_iter().skip(1));
             }
-            ("$sort", Bson::Document(spec)) => {
+            ("$sort" | super::shape::WINDOW_SORT, Bson::Document(spec)) => {
                 deps.read(spec.keys().cloned().collect());
             }
             ("$limit" | "$skip", _) => {}
