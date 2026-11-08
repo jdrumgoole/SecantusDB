@@ -312,6 +312,7 @@ pub(crate) fn plans_table_scan(
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: false,
         implies: &implies,
         trial: None,
     };
@@ -559,13 +560,15 @@ impl plan::Whole for Held<'_> {
     }
 }
 
-/// The plan for one command over one collection.
+/// The plan for one command over one collection; `sbe`: the query is a
+/// pipeline's front mongod runs in SBE ([`front_runs_in_sbe`]).
 fn plan_for(
     s: &Shape,
     canonical: &Document,
     collation: Option<&Collation>,
     t: &Target,
     ctx: &CommandContext,
+    sbe: bool,
 ) -> Result<(Node, Vec<plan::Ranked>), CommandError> {
     let ns = format!("{}.{}", ctx.db_name, s.coll);
     if !t.exists {
@@ -642,6 +645,7 @@ fn plan_for(
         keys_only: false,
         wanted: None,
         pipeline: s.pipeline,
+        sbe,
         implies: &implies,
         trial: Some(&trial),
     };
@@ -712,13 +716,7 @@ fn cache_key_of(
         Kind::Distinct(key) => (None, Some(key.as_str())),
         _ => (None, None),
     };
-    // A pipeline whose `$group` or `$lookup` mongod pushes into its query
-    // runs in SBE: planned by the classic planner, cached as such (`s`).
-    let sbe = !pipeline.is_empty() && {
-        let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
-        let hoisted = hoist::hoist_matches(&stages);
-        sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
-    };
+    let sbe = front_runs_in_sbe(storage, db, s, collation, pipeline);
     let parts = cache_key::Parts {
         sort: s.sort.as_ref().filter(|d| !d.is_empty()),
         projection,
@@ -732,6 +730,23 @@ fn cache_key_of(
         implies: &implies,
     };
     cache_key::key_for(canonical, &parts, &ix)
+}
+
+/// Whether the query `s` plans is the front of a pipeline whose `$group` or
+/// `$lookup` mongod pushes into its query: it runs in SBE, planned by the
+/// classic planner and cached as such (`s`).
+fn front_runs_in_sbe(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+) -> bool {
+    !pipeline.is_empty() && {
+        let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+        let hoisted = hoist::hoist_matches(&stages);
+        sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation).is_some()
+    }
 }
 
 /// The plan cache key mongod builds for the query `s` plans, as a `Slow
@@ -816,7 +831,7 @@ fn distinct_group(
     ctx: &CommandContext,
 ) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
     distinct_group_with(s, collation, &t.catalog, |asked| {
-        plan_for(asked, canonical, collation, t, ctx)
+        plan_for(asked, canonical, collation, t, ctx, false)
     })
 }
 
@@ -875,6 +890,7 @@ pub(crate) fn distinct_group_read(
             keys_only: false,
             wanted: None,
             pipeline: true,
+            sbe: false,
             implies: &implied,
             trial: None,
         };
@@ -1586,7 +1602,13 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             regrouped = shape;
             (&regrouped, (plan, ranked))
         }
-        None => (s, plan_for(s, &canonical, collation.as_ref(), &t, ctx)?),
+        None => {
+            let sbe = front_runs_in_sbe(storage, &db, s, collation.as_ref(), &r.pipeline);
+            (
+                s,
+                plan_for(s, &canonical, collation.as_ref(), &t, ctx, sbe)?,
+            )
+        }
     };
     if crate::notablescan::enabled(ctx) {
         let why = resolve_hint(s.hint.as_ref(), &t.catalog)

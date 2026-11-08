@@ -1718,15 +1718,16 @@ Still different, all 77:
       itself.
       Backlog-ID: RM-056
       Verify: none -- performance budget (timings against an earlier build)
-- [ ] **A query SBE runs is not cached.** mongod 8.2.11 runs a `$match`
-      with the `$group` or `$lookup` pushed behind it in SBE, planned by the
-      classic planner (no index intersection among the candidates), and
-      caches the winner under a key ending `s` with `worksType: "reads"`:
-      the keys and documents the winner's trial read. `count_documents` is
-      such a pipeline. Here the pushed-down front is not cached at all
-      (`explain` already prints its `s` key's hashes).
-      Backlog-ID: RM-340
-      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_a_query_sbe_runs_is_cached_with_its_reads
+- [ ] **A rooted `$or` in front of stages SBE runs caches no branch.**
+      mongod 8.2.11 caches each branch as a classic entry (`worksType:
+      "works"`) under a key that is neither the classic branch's nor the `s`
+      key of the same clause with the pipeline's projection (`CA4248A6`
+      for the test's clause, where those two are `0B947F35` and
+      `6F377EC6`): its encoding is still to be found. Until then such a
+      branch is not cached here, so that it cannot share a classic
+      query's entry.
+      Backlog-ID: RM-429
+      Verify: tests/backlog/test_plan_cache_or_branches.py::test_an_or_branch_before_sbe_stages_is_cached
 - [ ] **`$planCacheStats` lists no `estimatedSizeBytes`.** mongod 8.2.11
       gives each entry the bytes it takes in mongod's memory: the C++
       sizes of the entry, its plan and its debug information. The field is

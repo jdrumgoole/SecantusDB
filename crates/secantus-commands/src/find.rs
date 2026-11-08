@@ -810,6 +810,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                         .filter(|p| !p.is_empty()),
                     cached: true,
                     distinct: None,
+                    sbe: false,
                 },
             },
         )

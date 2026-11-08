@@ -844,10 +844,9 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                                 limit: front.limit,
                                 sort,
                                 projection: front.projection.as_ref(),
-                                // A front SBE runs is cached with its reads
-                                // (RM-340), which is not reproduced.
-                                cached: !sbe_read,
+                                cached: true,
                                 distinct: None,
+                                sbe: sbe_read,
                             },
                         },
                     )

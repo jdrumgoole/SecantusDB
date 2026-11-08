@@ -118,6 +118,11 @@ pub(crate) struct Query<'a> {
     /// The query is an aggregate's front: a projection that keeps the sort's
     /// fields runs below a blocking sort.
     pub pipeline: bool,
+    /// The query is an aggregate's front that mongod runs in SBE: planned
+    /// by the classic planner without index intersections, and cached by
+    /// what its winner read (measured 8.2.11, 2026-11-08: `{a: 3, b: 5}`
+    /// over `a_1` and `b_1` tries the two scans and no `AND_SORTED`).
+    pub sbe: bool,
     /// What the caller can say of the collection: mongod runs its candidate
     /// plans against the data and keeps the one that finishes first, and
     /// with this the planner can count what each would read.
@@ -166,7 +171,8 @@ pub(crate) enum CacheMode {
 pub(crate) struct Decision<'p> {
     /// The plans, best first, with their scores and what they counted.
     pub ranked: Vec<(&'p Node, f64, &'p Stats)>,
-    /// The winner's `works`.
+    /// The winner's `works`; for a query SBE runs, the keys and documents
+    /// it read.
     pub works: i64,
 }
 
@@ -866,10 +872,14 @@ fn or_access(
     q: &Query,
     catalog: &[Arc<IndexInfo>],
 ) -> Option<(Node, Option<Document>)> {
+    // The subplanner plans each branch in the classic engine, whatever
+    // runs the query (measured 8.2.11, 2026-11-08: a rooted `$or` behind a
+    // `$group` caches its branch with `worksType: "works"`).
     let plain = Query {
         sort: None,
         projection: None,
         hint: Hint::None,
+        sbe: false,
         ..q.clone()
     };
     // Per index, in catalog order: the single-predicate branches reading it,
@@ -1293,7 +1303,11 @@ fn candidates(
         }
         _ => false,
     };
-    for group in &groups {
+    // A front SBE runs is planned with no index intersection (measured
+    // 8.2.11, 2026-11-08: `{t: {$all: [1, 2]}, a: {$lt: 50}}` behind a
+    // `$group`, `t_1` multikey, tries the two `t_1` scans and `a_1`).
+    let intersect = !q.sbe;
+    for group in groups.iter().filter(|_| intersect) {
         if !group.clone().all(|at| points(&out[at].0)) {
             continue;
         }
@@ -1313,7 +1327,7 @@ fn candidates(
     if hinted.is_some() {
         return out;
     }
-    for x in 0..singles {
+    for x in (0..singles).filter(|_| intersect) {
         for y in x + 1..singles {
             if !in_order(&out[x].0) || !in_order(&out[y].0) {
                 continue;
@@ -1432,9 +1446,10 @@ fn tried(
     // mongod looks the query up in its plan cache before any trial: an
     // active entry's plan runs in place of the trial, as long as it does
     // no worse than ten times the works it was cached with
-    // (`internalQueryCacheEvictionRatio`); a branch of an `$or` takes it
-    // as it is. A plan that does worse sends the entry inactive and the
-    // query to a trial whose winner is cached whatever happens.
+    // (`internalQueryCacheEvictionRatio`) -- in SBE, ten times the keys and
+    // documents it read; a branch of an `$or` takes it as it is. A plan
+    // that does worse sends the entry inactive and the query to a trial
+    // whose winner is cached whatever happens.
     let looked = trial.cache.and_then(|c| c.lookup(q).map(|l| (c, l)));
     let mut mode = CacheMode::Always;
     if let Some((cache, l)) = &looked {
@@ -1446,8 +1461,12 @@ fn tried(
                 let fits = l.branch
                     || l.trusted
                     || trial.whole.env().is_none_or(|env| {
-                        super::trial::within(&plans[at], &env, trial_need(q), works * 10)
-                            != Some(false)
+                        let within = if q.sbe {
+                            super::trial::within_reads
+                        } else {
+                            super::trial::within
+                        };
+                        within(&plans[at], &env, trial_need(q), works * 10) != Some(false)
                     });
                 if fits {
                     trial.ranked.borrow_mut().clear();
@@ -1485,10 +1504,15 @@ fn tried(
             .iter()
             .map(|&i| (&plans[i], outcome.scores[i], &outcome.stats[i]))
             .collect();
-        let d = Decision {
-            ranked,
-            works: outcome.works,
+        // SBE keeps what the winner read in the trial: its keys and
+        // documents (`worksType: "reads"`).
+        let works = if q.sbe {
+            let (keys, docs) = outcome.stats[at].totals();
+            keys + docs
+        } else {
+            outcome.works
         };
+        let d = Decision { ranked, works };
         cache.store(l, q, &d, mode);
     }
     Some(found.swap_remove(at).0)

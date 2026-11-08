@@ -14,6 +14,12 @@
 //! entry's plan as it is (the subplanner), and its trial writes nothing when
 //! the best plans tie or the winner returned nothing.
 //!
+//! A pipeline's front that mongod runs in SBE is planned by the same
+//! classic planner, without index intersections, and cached under its `s`
+//! key with `worksType: "reads"`: `works` is then the keys and documents
+//! the winner read in its trial, and an active entry's plan is replanned
+//! once its reads reach ten times that.
+//!
 //! The cache is an LRU of `internalQueryCacheMaxEntriesPerCollection`
 //! (5000) entries, the latest used first, which is also the order
 //! `$planCacheStats` lists them in. It is cleared when the collection's

@@ -57,6 +57,7 @@ pub(crate) fn scan_values(
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: false,
         implies: &implied,
         trial: None,
     };
