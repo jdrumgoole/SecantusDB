@@ -78,6 +78,12 @@ if [[ -n $into ]]; then
     git fetch -q origin
     if ! git ls-remote --exit-code --heads origin "$into" >/dev/null; then
         git push -q origin "origin/main:refs/heads/$into" || exit 1
+    elif git merge-base --is-ancestor "origin/$into" origin/main; then
+        # Everything on it has landed: start the batch from main, or the lanes
+        # base on the last batch's tip and miss what main gained since (batch
+        # 13, 2026-11-08: the Backlog-ID reservation in tools/backlog.py).
+        # A fast-forward, so a branch with unlanded work is never touched.
+        git push -q origin "origin/main:refs/heads/$into" || exit 1
     fi
 fi
 
