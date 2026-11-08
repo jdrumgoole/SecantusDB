@@ -16,7 +16,7 @@ import struct
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import bson
@@ -25,6 +25,7 @@ import pytest
 from bson import Binary, Decimal128, Int64, Timestamp
 from pymongo.errors import PyMongoError
 
+from tests.backlog.conftest import mongo_answer
 from tests.backlog.test_rm_057_084 import mongod_rs  # noqa: F401 - fixture
 
 # ------------------------------------------------------------- helpers --
@@ -476,7 +477,7 @@ def test_window_functions(rust_mongo: Any, mongod: Any) -> None:
 # `$planCacheStats` runs since RM-154 (2026-10-27):
 # `tests/backlog/test_rm_154_plan_cache.py::test_plan_cache_stats_stage`.
 STAGE_CASES = {
-    "$queryStats": lambda c: list(c.admin.aggregate([{"$queryStats": {}}]))[:0],
+    "$queryStats": lambda c: list(c.admin.aggregate([{"$queryStats": {}}])),
     "$listSampledQueries": lambda c: list(c.admin.aggregate([{"$listSampledQueries": {}}]))[:0],
 }
 
@@ -486,12 +487,277 @@ def _stages(client: Any) -> dict:
     return {name: answer(lambda f=f: f(client)) for name, f in STAGE_CASES.items()}
 
 
-@pytest.mark.backlog("RM-215")
+@pytest.mark.backlog_fixed("RM-215")
 def test_diagnostic_stages(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
     """mongod 8.2.11 (one-member replica set) runs `$queryStats` and
-    `$listSampledQueries`; the Rust server answers 40324 (unknown stage)
-    for `$queryStats`."""
+    `$listSampledQueries`; the Rust server answered 40324 (unknown stage)
+    for `$queryStats`. At its defaults mongod records no query
+    (`internalQueryStatsRateLimit: 0`), so both list nothing."""
     assert _stages(rust_mongo) == _stages(mongod_rs)
+
+
+_HMAC_KEY = Binary(b"k" * 32, 8)
+
+
+def _query_stats_spec(spec: Any) -> list:
+    return [{"$queryStats": spec}]
+
+
+QUERY_STATS_CASES: dict[str, tuple[str, Any, list]] = {
+    # (database, aggregate target, pipeline)
+    "plain": ("admin", 1, _query_stats_spec({})),
+    "then_match": ("admin", 1, _query_stats_spec({}) + [{"$match": {"x": 1}}]),
+    "hmac": (
+        "admin",
+        1,
+        _query_stats_spec(
+            {"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": _HMAC_KEY}}
+        ),
+    ),
+    "hmac_64": (
+        "admin",
+        1,
+        _query_stats_spec(
+            {"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": Binary(b"k" * 64, 8)}}
+        ),
+    ),
+    "transform_null": ("admin", 1, _query_stats_spec({"transformIdentifiers": None})),
+    "not_object": ("admin", 1, _query_stats_spec(1)),
+    "null": ("admin", 1, _query_stats_spec(None)),
+    "unknown_field": ("admin", 1, _query_stats_spec({"x": 1})),
+    "unknown_first": ("admin", 1, _query_stats_spec({"x": 1, "transformIdentifiers": 1})),
+    "transform_type": ("admin", 1, _query_stats_spec({"transformIdentifiers": 1, "x": 1})),
+    "no_algorithm": ("admin", 1, _query_stats_spec({"transformIdentifiers": {}})),
+    "null_algorithm": (
+        "admin",
+        1,
+        _query_stats_spec({"transformIdentifiers": {"algorithm": None}}),
+    ),
+    "algorithm_type": ("admin", 1, _query_stats_spec({"transformIdentifiers": {"algorithm": 1}})),
+    "algorithm_enum": ("admin", 1, _query_stats_spec({"transformIdentifiers": {"algorithm": "x"}})),
+    "algorithm_none": (
+        "admin",
+        1,
+        _query_stats_spec({"transformIdentifiers": {"algorithm": "none"}}),
+    ),
+    "no_key": (
+        "admin",
+        1,
+        _query_stats_spec({"transformIdentifiers": {"algorithm": "hmac-sha-256"}}),
+    ),
+    "key_type": (
+        "admin",
+        1,
+        _query_stats_spec({"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": "k"}}),
+    ),
+    "key_subtype": (
+        "admin",
+        1,
+        _query_stats_spec(
+            {"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": Binary(b"k" * 32, 4)}}
+        ),
+    ),
+    "key_vector": (
+        "admin",
+        1,
+        _query_stats_spec(
+            {"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": Binary(b"k" * 32, 9)}}
+        ),
+    ),
+    "key_short": (
+        "admin",
+        1,
+        _query_stats_spec(
+            {"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": Binary(b"k" * 31, 8)}}
+        ),
+    ),
+    "short_key_first": (
+        "admin",
+        1,
+        _query_stats_spec({"transformIdentifiers": {"hmacKey": Binary(b"k", 8), "algorithm": 1}}),
+    ),
+    "extra_transform_field": (
+        "admin",
+        1,
+        _query_stats_spec(
+            {"transformIdentifiers": {"algorithm": "hmac-sha-256", "hmacKey": _HMAC_KEY, "z": 1}}
+        ),
+    ),
+    "other_db": ("rm215", 1, _query_stats_spec({})),
+    "other_db_bad_spec": ("rm215", 1, _query_stats_spec(1)),
+    "collection": ("rm215", "c", _query_stats_spec({})),
+    "admin_collection": ("admin", "system.version", _query_stats_spec({})),
+    "second": ("admin", 1, [{"$documents": []}, {"$queryStats": {}}]),
+    "second_bad_spec": ("admin", 1, [{"$documents": []}, {"$queryStats": {"x": 1}}]),
+    "second_other_db": ("rm215", 1, [{"$documents": []}, {"$queryStats": {}}]),
+    "bad_spec_then_unknown_stage": ("admin", 1, _query_stats_spec({"x": 1}) + [{"$bogus": 1}]),
+    "then_unknown_stage": ("admin", 1, _query_stats_spec({}) + [{"$bogus": 1}]),
+    "facet": ("rm215", "c", [{"$facet": {"f": [{"$queryStats": {}}]}}]),
+    "facet_bad_spec": ("rm215", "c", [{"$facet": {"f": [{"$queryStats": 1}]}}]),
+    "facet_then_unknown_stage": (
+        "rm215",
+        "c",
+        [{"$facet": {"f": [{"$queryStats": {}}]}}, {"$bogus": 1}],
+    ),
+    "facet_collectionless": (
+        "admin",
+        1,
+        [{"$documents": [{}]}, {"$facet": {"f": [{"$queryStats": {}}]}}],
+    ),
+    "lookup": (
+        "rm215",
+        "c",
+        [{"$lookup": {"from": "c", "pipeline": [{"$queryStats": {}}], "as": "x"}}],
+    ),
+    "lookup_collectionless": (
+        "admin",
+        1,
+        [
+            {"$documents": [{}]},
+            {"$lookup": {"pipeline": [{"$documents": [{}]}, {"$queryStats": {}}], "as": "x"}},
+        ],
+    ),
+    "union": ("rm215", "c", [{"$unionWith": {"coll": "c", "pipeline": [{"$queryStats": {}}]}}]),
+    "union_collectionless": (
+        "admin",
+        1,
+        [
+            {"$documents": [{}]},
+            {"$unionWith": {"pipeline": [{"$documents": [{}]}, {"$queryStats": {}}]}},
+        ],
+    ),
+    "union_without_documents": (
+        "admin",
+        1,
+        [{"$documents": [{}]}, {"$unionWith": {"pipeline": [{"$queryStats": {}}]}}],
+    ),
+    "nested_twice": (
+        "rm215",
+        "c",
+        [
+            {
+                "$lookup": {
+                    "from": "c",
+                    "as": "x",
+                    "pipeline": [{"$unionWith": {"coll": "c", "pipeline": [{"$queryStats": {}}]}}],
+                }
+            }
+        ],
+    ),
+    "change_stream": ("rm215", "c", [{"$changeStream": {}}, {"$queryStats": {}}]),
+}
+
+
+def _query_stats_answers(client: Any) -> dict:
+    db = _db(client, "rm215")
+    db.c.insert_one({"a": 1})
+    out: dict = {
+        name: mongo_answer(
+            lambda d=d, t=t, p=p: client[d].command("aggregate", t, pipeline=p, cursor={})[
+                "cursor"
+            ]["firstBatch"]
+        )
+        for name, (d, t, p) in QUERY_STATS_CASES.items()
+    }
+    out["api_strict"] = mongo_answer(
+        lambda: client.admin.command(
+            "aggregate",
+            1,
+            pipeline=_query_stats_spec({}),
+            cursor={},
+            apiVersion="1",
+            apiStrict=True,
+        )
+    )
+    for name, pipeline in [
+        ("view", _query_stats_spec({})),
+        ("view_bad_spec", _query_stats_spec(1)),
+        ("view_second", [{"$match": {}}, {"$queryStats": {}}]),
+        ("view_lookup", [{"$lookup": {"from": "c", "pipeline": [{"$queryStats": {}}], "as": "x"}}]),
+    ]:
+        out[name] = mongo_answer(
+            lambda name=name, pipeline=pipeline: db.command(
+                "create", name, viewOn="c", pipeline=pipeline
+            )
+        )
+    out["explain_stage"] = mongo_answer(
+        lambda: [
+            list(stage)[0]
+            for stage in client.admin.command(
+                "explain",
+                {"aggregate": 1, "pipeline": _query_stats_spec({}), "cursor": {}},
+                verbosity="queryPlanner",
+            )["stages"]
+        ]
+    )
+    out["explain_facet"] = mongo_answer(
+        lambda: db.command(
+            "explain",
+            {
+                "aggregate": "c",
+                "pipeline": [{"$facet": {"f": [{"$queryStats": {}}]}}],
+                "cursor": {},
+            },
+        )
+    )
+    out["rate_limit"] = mongo_answer(
+        lambda: client.admin.command("getParameter", 1, internalQueryStatsRateLimit=1)[
+            "internalQueryStatsRateLimit"
+        ]
+    )
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-215")
+def test_query_stats_argument_and_placement(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 parses `$queryStats`'s argument field by field (9,
+    14, 40414, 40415, 2), then refuses it anywhere but first in an
+    `{aggregate: 1}` on `admin` (73, 40602), nested in a sub-pipeline by
+    that sub-pipeline's namespace (73, or 40600 / 51047 / 31441 when it
+    reads none), and in a view (73 under the view's wrapper). Measured
+    2026-11-08; the Rust server answered 40324 to every one."""
+    assert _query_stats_answers(rust_mongo) == _query_stats_answers(mongod_rs)
+
+
+@pytest.fixture
+def recording_mongod() -> Iterator[Any]:
+    """A mongod of this test's own: the entries a query stats store records
+    outlive the parameter that let it record them, so the module's replica
+    set would list them to every later `$queryStats`."""
+    from tests.mongod_reference import MONGOD, _start_mongod, _stop_mongod
+
+    assert MONGOD, "no mongod on PATH: the reference server is required"
+    proc, uri, dbpath = _start_mongod()
+    client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=10_000)
+    try:
+        yield client
+    finally:
+        client.close()
+        _stop_mongod(proc, dbpath)
+
+
+def _recorded_find(client: Any) -> Any:
+    db = _db(client, "rm215s")
+    db.c.insert_many([{"a": i} for i in range(3)])
+    client.admin.command("setParameter", 1, internalQueryStatsRateLimit=-1)
+    list(db.c.find({"a": {"$gt": 1}}))
+    return [
+        entry["key"]["queryShape"]
+        for entry in client.admin.aggregate([{"$queryStats": {}}])
+        if entry["key"]["queryShape"].get("cmdNs", {}).get("db") == "rm215s"
+    ]
+
+
+@pytest.mark.backlog("RM-215")
+def test_query_stats_records_queries_when_asked(rust_mongo: Any, recording_mongod: Any) -> None:
+    """mongod 8.2.11 records a query in its query stats store once
+    `internalQueryStatsRateLimit` is not 0 (-1: every query), and
+    `$queryStats` lists it under its representative shape. This server has
+    no store, so it refuses to change the parameter (20) and leaves the
+    module's server recording nothing."""
+    assert mongo_answer(lambda: _recorded_find(rust_mongo)) == mongo_answer(
+        lambda: _recorded_find(recording_mongod)
+    )
 
 
 def _list_sampled_queries(client: Any) -> list:

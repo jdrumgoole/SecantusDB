@@ -1175,17 +1175,43 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
   every subtype-2 value. mongod 8.2.11 writes the bytes alone, which is not
   a valid subtype-2 value: pymongo refuses to decode the reply. Out of
   scope; nothing reads the old subtype as mongod emits it.
-- [ ] **`$queryStats` is an unknown stage** (40324). mongod 8.2.11 runs it
-      on a one-member replica set (an empty result on a fresh one, filling
-      as queries run, so an empty answer here would be a stand-in). It needs
-      mongod's query-shape statistics: the query stats store, keyed by the
-      representative query shape's SHA-256 (`queryShapeHash`, which this
-      server computes since 2026-11-07 for the shapes RM-358 covers), which
-      RM-170 (`includeQueryStatsMetrics`) also lacks. The plan cache's shape (`planCacheShapeHash`) is a different
-      shape and does not serve it. (`$listSampledQueries` landed 2026-10-20,
-      and `$planCacheStats` 2026-10-27 with the plan cache, RM-154.)
+- [ ] **`$queryStats` never records a query.** mongod 8.2.11 records
+      queries in its query stats store once `internalQueryStatsRateLimit`
+      is not 0 (-1: every query), and `$queryStats` lists each under its
+      representative shape (`key.queryShape`, `keyHash`, `queryShapeHash`)
+      with its `metrics`. Its default is 0, which records nothing: this
+      server reports that 0 and refuses to change it (20), so `$queryStats`
+      (argument, placement and privileges as mongod's since 2026-11-08) is
+      always empty. The store needs mongod's query-shape statistics, keyed by
+      the representative shape's SHA-256 (`queryShapeHash`, which this
+      server computes since 2026-11-07 for the shapes RM-358 covers);
+      `metrics` holds the counters RM-170 decided not to stand in for (the
+      delinquency counters, RM-355) beside ones a plan supplies. The plan
+      cache's shape (`planCacheShapeHash`) is a different shape and does not
+      serve it.
       Backlog-ID: RM-215
-      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_diagnostic_stages
+      Verify: tests/backlog/test_rm_found_2026_10_20b.py::test_query_stats_records_queries_when_asked
+- [ ] **A `$lookup` without `from` is refused.** mongod 8.2.11 runs a
+      `$lookup` whose pipeline starts with `$documents` and names no `from`
+      (in `{aggregate: 1}` or over a collection, with `let`), and refuses
+      one whose pipeline does not with 9 "$lookup stage without explicit
+      collection must have a pipeline with $documents as first stage". This
+      server answers 2 "$lookup requires 'from' (string)" to both. (A
+      `$unionWith` without `coll` runs since RM-179.) Found 2026-11-08
+      (RM-215).
+      Verify: tests/backlog/test_rm_found_2026_11_08b.py::test_a_lookup_without_from_runs_its_documents
+      Backlog-ID: RM-413
+- [ ] **A collectionless aggregate's explain is not mongod's.** For
+      `{aggregate: 1, pipeline: [{$documents: [...]}, {$match: ...}]}` at
+      `executionStats` mongod 8.2.11 gives each stage its `nReturned` and
+      `executionTimeMillisEstimate`, a `$queue: []`, and the `$match` moved
+      ahead of the `$replaceRoot` and rewritten over `_tempDocumentsField`.
+      This server gives the stages with no counts, `$queue: [{}]`, and the
+      `$match` last as written; `$listSampledQueries`, `$listLocalSessions`
+      (whose spec mongod also expands) and `$queryStats` lack the counts too.
+      Found 2026-11-08 (RM-215).
+      Verify: tests/backlog/test_rm_found_2026_11_08b.py::test_a_collectionless_explain_counts_each_stage
+      Backlog-ID: RM-414
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which

@@ -74,6 +74,7 @@ pub(crate) fn binary_subtype_name(subtype: bson::spec::BinarySubtype) -> &'stati
         B::Encrypted => "encrypt",
         B::Column => "column",
         B::Sensitive => "sensitive",
+        B::Vector => "vector",
         _ => "Custom",
     }
 }

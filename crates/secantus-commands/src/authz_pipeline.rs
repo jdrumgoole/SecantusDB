@@ -142,6 +142,19 @@ pub(crate) fn walk(
                 }
             }
             "$listSampledQueries" => need(needs, Resource::Cluster, &["listSampledQueries"]),
+            // mongod 8.2.11 (measured 2026-11-08): reading the store with its
+            // identifiers hashed needs `queryStatsReadTransformed`, and
+            // reading it as recorded needs `queryStatsRead` as well.
+            "$queryStats" => {
+                let transformed = spec
+                    .as_document()
+                    .and_then(|d| d.get("transformIdentifiers"))
+                    .is_some_and(|t| !matches!(t, Bson::Null));
+                need(needs, Resource::Cluster, &["queryStatsReadTransformed"]);
+                if !transformed {
+                    need(needs, Resource::Cluster, &["queryStatsRead"]);
+                }
+            }
             "$listLocalSessions" | "$listSessions" => {
                 let all = spec.as_document().and_then(|d| d.get("allUsers"));
                 if truthy(all) {
@@ -338,6 +351,37 @@ mod tests {
             "admin",
         );
         assert_eq!(stream, vec![(any_normal(), vec!["changeStream", "find"])]);
+    }
+
+    #[test]
+    fn query_stats_needs_transformed_reads_and_plain_ones_need_both() {
+        // mongod 8.2.11 (RM-215): a role with only `queryStatsRead` reads
+        // nothing; one with only `queryStatsReadTransformed` reads the
+        // transformed store.
+        let plain = aggregate(
+            &doc! {"aggregate": 1, "pipeline": [{"$queryStats": {}}], "cursor": {}},
+            "admin",
+        );
+        assert!(has(&plain, Resource::Cluster, &["queryStatsRead"]));
+        assert!(has(
+            &plain,
+            Resource::Cluster,
+            &["queryStatsReadTransformed"]
+        ));
+        let key = bson::Binary {
+            subtype: bson::spec::BinarySubtype::Sensitive,
+            bytes: vec![0; 32],
+        };
+        let transformed = aggregate(
+            &doc! {"aggregate": 1, "pipeline": [{"$queryStats": {"transformIdentifiers": {
+                "algorithm": "hmac-sha-256", "hmacKey": key,
+            }}}], "cursor": {}},
+            "admin",
+        );
+        assert_eq!(
+            transformed,
+            vec![(Resource::Cluster, vec!["queryStatsReadTransformed"])]
+        );
     }
 
     #[test]

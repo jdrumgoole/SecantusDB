@@ -45,6 +45,7 @@ const CHANGE_STREAM_PIPELINE_STAGES: &[&str] = &[
 const KNOWN_STAGES: &[&str] = &[
     "$currentOp",
     "$listSampledQueries",
+    "$queryStats",
     "$indexStats",
     "$listLocalSessions",
     "$listSessions",

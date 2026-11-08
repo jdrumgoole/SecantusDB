@@ -304,6 +304,10 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let code_name = crate::util::error_code_name(code);
         return Ok(CommandError::new(code, code_name, errmsg).into_reply());
     }
+    // Every stage has parsed; a `$queryStats` nested in one is refused now.
+    if let Some(e) = nested_query_stats_problem(&pipeline, &ctx.db_name, coll.is_some()) {
+        return Ok(e.into_reply());
+    }
     let mut pipeline = pipeline;
     argtypes::normalise_pipeline_sorts(&mut pipeline);
     // The command's `let`, which mongod substitutes before it folds.
@@ -1169,6 +1173,24 @@ fn source_stage_problem(
             list_sampled_queries_problem(spec, db, coll, i)?;
             continue;
         }
+        if name == "$queryStats" {
+            // Its argument parsed with the stage (`validate_query_stats`);
+            // mongod 8.2.11 then checks the namespace before the position.
+            if db != "admin" || coll.is_some() {
+                return Err(namespace(
+                    "$queryStats must be run against the 'admin' database with {aggregate: 1}"
+                        .into(),
+                ));
+            }
+            if i > 0 {
+                return Err(CommandError::new(
+                    40602,
+                    "Location40602",
+                    "$queryStats is only valid as the first stage in a pipeline",
+                ));
+            }
+            continue;
+        }
         let known: &[&str] = match name.as_str() {
             "$currentOp" => &[
                 "allUsers",
@@ -1347,7 +1369,11 @@ fn known_sessions(spec: Option<&Bson>) -> Vec<Document> {
 fn is_source_stage(name: &str) -> bool {
     matches!(
         name,
-        "$currentOp" | "$listLocalSessions" | "$listSessions" | "$listSampledQueries"
+        "$currentOp"
+            | "$listLocalSessions"
+            | "$listSessions"
+            | "$listSampledQueries"
+            | "$queryStats"
     )
 }
 
@@ -1527,6 +1553,7 @@ pub(crate) fn recognized_stage(name: &str) -> bool {
             | "$out"
             | "$planCacheStats"
             | "$project"
+            | "$queryStats"
             | "$redact"
             | "$replaceRoot"
             | "$replaceWith"
@@ -1899,7 +1926,237 @@ pub(crate) fn validate_stage_names(pipeline: &[Bson]) -> Result<(), CommandError
             "$bucket" => validate_bucket(d.get(name))?,
             "$densify" => validate_densify(d.get(name))?,
             "$fill" => validate_fill(d.get(name))?,
+            "$queryStats" => validate_query_stats(d.get(name))?,
             _ => {}
+        }
+        nested_query_stats_specs(stage)?;
+    }
+    Ok(())
+}
+
+/// The pipelines a stage runs inside it, with the stage's name and whether
+/// each reads a collection: `$facet`'s read the stage's own input (`None`,
+/// whatever the outer pipeline reads); `$lookup`'s and `$unionWith`'s read
+/// `from` / `coll`, or no collection when they name none.
+fn sub_pipelines(stage: &Bson) -> Vec<(&str, &[Bson], Option<bool>)> {
+    let Some((name, spec)) = stage.as_document().and_then(|d| d.iter().next()) else {
+        return Vec::new();
+    };
+    match (name.as_str(), spec) {
+        ("$facet", Bson::Document(facets)) => facets
+            .values()
+            .filter_map(Bson::as_array)
+            .map(|p| ("$facet", p.as_slice(), None))
+            .collect(),
+        ("$lookup" | "$unionWith", Bson::Document(spec)) => {
+            let source = if name == "$lookup" { "from" } else { "coll" };
+            let reads = !matches!(spec.get(source), None | Some(Bson::Null));
+            spec.get_array("pipeline")
+                .map(|p| vec![(name.as_str(), p.as_slice(), Some(reads))])
+                .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// A `$queryStats` inside another stage's pipeline is parsed with it, so its
+/// argument is checked where that stage stands (mongod 8.2.11).
+fn nested_query_stats_specs(stage: &Bson) -> Result<(), CommandError> {
+    for (_, stages, _) in sub_pipelines(stage) {
+        for inner in stages {
+            if let Some(spec) = inner.as_document().and_then(|d| d.get("$queryStats")) {
+                validate_query_stats(Some(spec))?;
+            }
+            nested_query_stats_specs(inner)?;
+        }
+    }
+    Ok(())
+}
+
+/// Where a `$queryStats` inside another stage's pipeline is refused, once
+/// the whole pipeline has parsed (mongod 8.2.11, measured 2026-11-08): a
+/// sub-pipeline that reads a collection, or any outside `admin`, is not
+/// `{aggregate: 1}` on `admin` (73); a collectionless one on `admin` meets
+/// the nesting stage's own refusal.
+fn nested_query_stats_problem(
+    pipeline: &[Bson],
+    db: &str,
+    reads_collection: bool,
+) -> Option<CommandError> {
+    pipeline.iter().find_map(|stage| {
+        sub_pipelines(stage)
+            .into_iter()
+            .find_map(|(kind, stages, reads)| {
+                query_stats_in(stages, kind, db, reads.unwrap_or(reads_collection))
+            })
+    })
+}
+
+/// The refusal of the first `$queryStats` in `stages`, the pipeline `kind`
+/// runs over a collection when `reads`, or under them.
+pub(crate) fn query_stats_in(
+    stages: &[Bson],
+    kind: &str,
+    db: &str,
+    reads: bool,
+) -> Option<CommandError> {
+    for stage in stages {
+        if stage_name(stage) == "$queryStats" {
+            if db != "admin" || reads {
+                return Some(CommandError::new(
+                    73,
+                    "InvalidNamespace",
+                    "$queryStats must be run against the 'admin' database with {aggregate: 1}",
+                ));
+            }
+            let (code, errmsg) = match kind {
+                "$facet" => (
+                    40600,
+                    "$queryStats is not allowed to be used within a $facet stage",
+                ),
+                "$lookup" => (
+                    51047,
+                    "$queryStats is not allowed within a $lookup's sub-pipeline",
+                ),
+                _ => (
+                    31441,
+                    "$queryStats is not allowed within a $unionWith's sub-pipeline",
+                ),
+            };
+            return Some(CommandError::new(code, format!("Location{code}"), errmsg));
+        }
+        if let Some(problem) = nested_query_stats_problem(std::slice::from_ref(stage), db, reads) {
+            return Some(problem);
+        }
+    }
+    None
+}
+
+/// `$queryStats`'s argument, parsed as mongod 8.2.11's IDL parses it
+/// (measured 2026-11-08): a document whose fields are read in order, each
+/// checked as it is read -- `transformIdentifiers` a document of `algorithm`
+/// (`"hmac-sha-256"` or `"none"`) and `hmacKey` (sensitive binData of 32
+/// bytes or more) -- then the required `algorithm`, then the pairing of the
+/// two. A null field is an absent one. Where the stage may stand is
+/// `source_stage_problem`'s, checked after every stage has parsed.
+fn validate_query_stats(spec: Option<&Bson>) -> Result<(), CommandError> {
+    let Some(spec) = spec else { return Ok(()) };
+    let Bson::Document(spec) = spec else {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            format!(
+                "$queryStats value must be an object. Found: {}",
+                secantus_core::query::bson_type_name(spec)
+            ),
+        ));
+    };
+    let wrong_type = |path: &str, value: &Bson, expected: &str| {
+        CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(value)
+            ),
+        )
+    };
+    let unknown = |path: &str| {
+        CommandError::new(
+            40415,
+            "IDLUnknownField",
+            format!("BSON field '{path}' is an unknown field."),
+        )
+    };
+    for (field, value) in spec {
+        if field != "transformIdentifiers" {
+            return Err(unknown(&format!("$queryStats.{field}")));
+        }
+        let transform = match value {
+            Bson::Null => continue,
+            Bson::Document(d) => d,
+            other => {
+                return Err(wrong_type(
+                    "$queryStats.transformIdentifiers",
+                    other,
+                    "object",
+                ))
+            }
+        };
+        let mut algorithm: Option<&str> = None;
+        let mut key = false;
+        for (field, value) in transform {
+            let path = format!("$queryStats.transformIdentifiers.{field}");
+            match (field.as_str(), value) {
+                (_, Bson::Null) if field == "algorithm" || field == "hmacKey" => {}
+                ("algorithm", Bson::String(name)) => {
+                    if name != "hmac-sha-256" && name != "none" {
+                        return Err(CommandError::new(
+                            2,
+                            "BadValue",
+                            format!(
+                                "Enumeration value '{name}' for field '{path}' is not a valid \
+                                 value."
+                            ),
+                        ));
+                    }
+                    algorithm = Some(name);
+                }
+                ("algorithm", other) => return Err(wrong_type(&path, other, "string")),
+                ("hmacKey", Bson::Binary(b)) => {
+                    if b.subtype != bson::spec::BinarySubtype::Sensitive {
+                        return Err(CommandError::new(
+                            14,
+                            "TypeMismatch",
+                            format!(
+                                "BSON field '{path}' is the wrong binData type '{}', expected \
+                                 type 'sensitive'",
+                                crate::session::binary_subtype_name(b.subtype)
+                            ),
+                        ));
+                    }
+                    if b.bytes.len() < 32 {
+                        return Err(CommandError::new(
+                            2,
+                            "BadValue",
+                            format!(
+                                "hmacKey must be greater than or equal to 32 bytes, found \
+                                 length: {}",
+                                b.bytes.len()
+                            ),
+                        ));
+                    }
+                    key = true;
+                }
+                ("hmacKey", other) => return Err(wrong_type(&path, other, "binData")),
+                _ => return Err(unknown(&path)),
+            }
+        }
+        match algorithm {
+            None => {
+                return Err(CommandError::new(
+                    40414,
+                    "IDLFailedToParse",
+                    "BSON field '$queryStats.transformIdentifiers.algorithm' is missing but a \
+                     required field",
+                ))
+            }
+            Some("none") => {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "Algorithm specified but found no valid algorithm",
+                ))
+            }
+            Some(_) if !key => {
+                return Err(CommandError::new(
+                    9,
+                    "FailedToParse",
+                    "The 'hmacKey' parameter of the $queryStats stage must be specified when \
+                     applying the hmac-sha-256 algorithm",
+                ))
+            }
+            Some(_) => {}
         }
     }
     Ok(())
@@ -2161,6 +2418,13 @@ pub(crate) fn run_segmented(
                 // has no query analyzer (the command is 59 here), so it has
                 // sampled none: the list is empty, as mongod's is on a set
                 // that never configured one (RM-215).
+                Vec::new()
+            } else if name == "$queryStats" {
+                // The query stats store's entries. mongod 8.2.11 records a
+                // query only while `internalQueryStatsRateLimit` is not 0,
+                // and 0 is its default, so a server left at its defaults
+                // has recorded none. This server reports that parameter as
+                // 0 and keeps it there: it has no store (RM-215).
                 Vec::new()
             } else if name == "$currentOp" {
                 // The registry's operations, and its idle cursors when asked
@@ -5802,4 +6066,147 @@ fn accumulator_fault(v: &Bson, vars: &Document) -> Option<secantus_core::fallbac
             }
             other => expression_fault(other, vars),
         })
+}
+
+#[cfg(test)]
+mod query_stats_tests {
+    use super::*;
+    use bson::doc;
+
+    fn key(subtype: bson::spec::BinarySubtype, len: usize) -> Bson {
+        Bson::Binary(bson::Binary {
+            subtype,
+            bytes: vec![0; len],
+        })
+    }
+
+    fn spec_error(spec: Bson) -> Option<(i32, String)> {
+        validate_stage_names(&[Bson::Document(doc! {"$queryStats": spec})])
+            .err()
+            .map(|e| (e.code, e.errmsg))
+    }
+
+    /// `$queryStats`'s argument, field by field in order, as mongod 8.2.11
+    /// parses it (RM-215).
+    #[test]
+    fn the_argument_parses_as_mongods_idl_does() {
+        use bson::spec::BinarySubtype as B;
+        let good = key(B::Sensitive, 32);
+        assert_eq!(spec_error(Bson::Document(doc! {})), None);
+        assert_eq!(
+            spec_error(Bson::Document(doc! {"transformIdentifiers": Bson::Null})),
+            None
+        );
+        assert_eq!(
+            spec_error(Bson::Document(doc! {"transformIdentifiers": {
+                "algorithm": "hmac-sha-256", "hmacKey": key(B::Sensitive, 64),
+            }})),
+            None
+        );
+        let cases: Vec<(Bson, i32, &str)> =
+            vec![
+            (Bson::Int32(1), 9, "$queryStats value must be an object. Found: int"),
+            (
+                Bson::Document(doc! {"x": 1, "transformIdentifiers": 1}),
+                40415,
+                "BSON field '$queryStats.x' is an unknown field.",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": 1, "x": 1}),
+                14,
+                "BSON field '$queryStats.transformIdentifiers' is the wrong type 'int', expected \
+                 type 'object'",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": {"hmacKey": good.clone()}}),
+                40414,
+                "BSON field '$queryStats.transformIdentifiers.algorithm' is missing but a \
+                 required field",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": {
+                    "hmacKey": key(B::Sensitive, 1), "algorithm": 1,
+                }}),
+                2,
+                "hmacKey must be greater than or equal to 32 bytes, found length: 1",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": {"algorithm": "x", "hmacKey": "k"}}),
+                2,
+                "Enumeration value 'x' for field '$queryStats.transformIdentifiers.algorithm' \
+                 is not a valid value.",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": {
+                    "algorithm": "hmac-sha-256", "hmacKey": key(B::Vector, 32),
+                }}),
+                14,
+                "BSON field '$queryStats.transformIdentifiers.hmacKey' is the wrong binData \
+                 type 'vector', expected type 'sensitive'",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": {
+                    "algorithm": "hmac-sha-256", "hmacKey": Bson::Null,
+                }}),
+                9,
+                "The 'hmacKey' parameter of the $queryStats stage must be specified when \
+                 applying the hmac-sha-256 algorithm",
+            ),
+            (
+                Bson::Document(doc! {"transformIdentifiers": {
+                    "algorithm": "none", "hmacKey": good,
+                }}),
+                9,
+                "Algorithm specified but found no valid algorithm",
+            ),
+        ];
+        for (spec, code, message) in cases {
+            assert_eq!(
+                spec_error(spec.clone()),
+                Some((code, message.to_string())),
+                "{spec:?}"
+            );
+        }
+    }
+
+    /// Only first, only on `admin` with `{aggregate: 1}`; nested, the
+    /// sub-pipeline's namespace decides (mongod 8.2.11, RM-215).
+    #[test]
+    fn it_stands_first_in_a_collectionless_admin_pipeline() {
+        let q = || Bson::Document(doc! {"$queryStats": {}});
+        let code = |r: Result<(), CommandError>| r.err().map(|e| e.code);
+        assert_eq!(code(source_stage_problem(&[q()], "admin", None)), None);
+        assert_eq!(code(source_stage_problem(&[q()], "t", None)), Some(73));
+        assert_eq!(
+            code(source_stage_problem(&[q()], "admin", Some("c"))),
+            Some(73)
+        );
+        let second = [Bson::Document(doc! {"$documents": []}), q()];
+        assert_eq!(
+            code(source_stage_problem(&second, "admin", None)),
+            Some(40602)
+        );
+        assert_eq!(code(source_stage_problem(&second, "t", None)), Some(73));
+
+        let nested = |stage: Document, db: &str, reads: bool| {
+            nested_query_stats_problem(&[Bson::Document(stage)], db, reads).map(|e| e.code)
+        };
+        let facet = doc! {"$facet": {"f": [q()]}};
+        assert_eq!(nested(facet.clone(), "admin", false), Some(40600));
+        assert_eq!(nested(facet, "t", true), Some(73));
+        let lookup = doc! {"$lookup": {"pipeline": [{"$documents": [{}]}, q()], "as": "x"}};
+        assert_eq!(nested(lookup, "admin", false), Some(51047));
+        let lookup_from = doc! {"$lookup": {"from": "c", "pipeline": [q()], "as": "x"}};
+        assert_eq!(nested(lookup_from, "admin", false), Some(73));
+        let union = doc! {"$unionWith": {"pipeline": [{"$documents": [{}]}, q()]}};
+        assert_eq!(nested(union, "admin", false), Some(31441));
+        let deep = doc! {"$lookup": {"from": "c", "as": "x", "pipeline": [
+            {"$unionWith": {"coll": "c", "pipeline": [q()]}},
+        ]}};
+        assert_eq!(nested(deep, "t", true), Some(73));
+        assert_eq!(
+            nested(doc! {"$facet": {"f": [{"$match": {}}]}}, "t", true),
+            None
+        );
+    }
 }
