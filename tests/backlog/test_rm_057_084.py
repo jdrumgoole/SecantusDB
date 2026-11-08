@@ -359,14 +359,27 @@ def test_explain_reports_rejected_plans(rust_mongo: Any, mongod: Any) -> None:
 def _group_explain(client: Any) -> Any:
     db = client["rm071"]
     name = _name()
-    db[name].insert_many([{"a": i % 3} for i in range(10)])
-    ex = db.command("aggregate", name, pipeline=[{"$group": {"_id": "$a"}}], explain=True)
-    return ex.get("explainVersion")
+    db[name].insert_many([{"a": i % 3, "b": i} for i in range(10)])
+    db.m.insert_one({"a": 1})
+    uuid_ = str(next(c for c in db.list_collections() if c["name"] == name)["info"]["uuid"])
+    out = []
+    for pipeline in [
+        [{"$match": {"b": {"$gt": 3}}}, {"$group": {"_id": "$a"}}],
+        [{"$lookup": {"from": "m", "localField": "a", "foreignField": "a", "as": "j"}}],
+    ]:
+        ex = db.command("aggregate", name, pipeline=pipeline, explain=True)
+        planner = ex.get("queryPlanner") or ex["stages"][0]["$cursor"]["queryPlanner"]
+        plan = str(planner["winningPlan"]).replace(uuid_, "<uuid>")
+        out.append((ex.get("explainVersion"), plan))
+    return out
 
 
 @pytest.mark.backlog("RM-071")
 def test_explain_of_a_group_pushed_into_the_query(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 pushes `$group` into a slot-based plan: `explainVersion: "2"`."""
+    """mongod 8.2.11 explains a pushed-down `$group` behind a filter, and a
+    pushed-down `$lookup`, as the slot-based plan it runs (`explainVersion`
+    "2", `queryPlan` and `slotBasedPlan`). A `$group` over a plain
+    collection scan already does (tests/mongod_live/test_sbe_group_explain.py)."""
     assert _group_explain(rust_mongo) == _group_explain(mongod)
 
 

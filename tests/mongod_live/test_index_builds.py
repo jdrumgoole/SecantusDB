@@ -352,6 +352,13 @@ def _ended_by(client: Any, how: str) -> dict:
     elif how == "dropDatabase":
         reply = _answer(lambda: db.command("dropDatabase"))
     elif how == "killOp build":
+        # `_Build` may return in the moment between the build's setup and
+        # the build itself, when mongod lists no build operation (its
+        # comment): wait for the operation this kills.
+        deadline = time.monotonic() + 30
+        while not build.ops():
+            assert time.monotonic() < deadline, "the build operation was never listed"
+            time.sleep(0.02)
         opid = build.ops()[0]["opid"]
         reply = _answer(lambda: client.admin.command("killOp", op=opid))
     elif how == "killOp command":

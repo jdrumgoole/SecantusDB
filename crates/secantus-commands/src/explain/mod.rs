@@ -32,6 +32,7 @@ pub(crate) mod order;
 mod parsed;
 mod plan;
 pub(crate) mod plan_cache;
+mod sbe;
 mod shape;
 pub(crate) mod stream;
 pub(crate) mod summary;
@@ -1595,6 +1596,10 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     );
     t.catalog = catalog;
     let grouped = distinct_group(s, &canonical, collation.as_ref(), &t, ctx)?;
+    let pushed_down = match grouped {
+        Some(_) => None,
+        None => sbe_front(storage, &db, s, collation.as_ref(), &r.pipeline, t.exists),
+    };
     let regrouped;
     let (s, (plan, ranked)) = match grouped {
         Some((shape, plan, ranked)) => {
@@ -1646,6 +1651,41 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             })
             .collect();
         planner.insert("rejectedPlans", rejected);
+    }
+    if let Some((pushed, group)) = pushed_down {
+        let built = if t.exists {
+            let whole_scan = match &plan {
+                Node::CollScan { filter, backward } => filter.is_none() && !backward,
+                Node::Projection { input, .. } => {
+                    matches!(
+                        &**input,
+                        Node::CollScan {
+                            filter: None,
+                            backward: false
+                        }
+                    )
+                }
+                _ => false,
+            };
+            let uuid = crate::admin::collection_uuid_text(storage, &db, &s.coll);
+            group
+                .filter(|_| whole_scan)
+                .and_then(|g| sbe::group_plan(&g, &uuid, s.rest.len() == pushed))
+        } else {
+            Some(sbe::eof_plan())
+        };
+        if let Some(built) = built {
+            let is_cached = cache.as_ref().is_some_and(|c| c.cached(&plan));
+            let sbe = Pushed {
+                plan: &built,
+                pushed,
+                is_cached,
+                docs: &t.docs,
+                stage_counts: &stage_counts,
+                stage_spills: &stage_spills,
+            };
+            return sbe_reply(r, planner, &sbe, verbosity, ctx);
+        }
     }
     let stats = wanted.then(|| {
         let (multi, upsert, returns) = match &s.kind {
@@ -1721,6 +1761,139 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
         reply.insert("serverParameters", server_parameters());
         reply.insert("command", r.echo.clone());
     }
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// How many of the stages after the query mongod runs in SBE with it, and
+/// the `$group` among them that is built here (RM-071): only where the
+/// query is a whole-collection scan and the `$group` is the one stage
+/// pushed. Over a collection that does not exist any pushed pipeline is
+/// the same EOF plan. `$lookup`, a filtered or sorted front and a
+/// collation are still explained in the classic shape.
+fn sbe_front(
+    storage: &dyn crate::storage::Storage,
+    db: &str,
+    s: &Shape,
+    collation: Option<&Collation>,
+    pipeline: &[Document],
+    exists: bool,
+) -> Option<(usize, Option<Document>)> {
+    let stages: Vec<Bson> = pipeline.iter().cloned().map(Bson::Document).collect();
+    let hoisted = hoist::hoist_matches(&stages);
+    let n = sbe_pushdown(storage, db, &s.coll, &hoisted, s.hint.as_ref(), collation)?;
+    let taken = pipeline.len().checked_sub(s.rest.len())?;
+    let pushed = n.checked_sub(taken)?;
+    if pushed == 0 {
+        return None;
+    }
+    let group = s.rest.first()?.get_document("$group").ok().cloned();
+    let plain = group.is_some()
+        && taken == 0
+        && pushed == 1
+        && s.filter.is_empty()
+        && s.sort.is_none()
+        && s.skip == 0
+        && s.limit == 0
+        && s.projection_stage.is_none()
+        && s.hint.is_none()
+        && collation.is_none();
+    (plain || !exists).then_some((pushed, group))
+}
+
+/// A slot-based plan ready to report, with the per-stage counts of the
+/// classic stages after it.
+struct Pushed<'a> {
+    plan: &'a sbe::Plan,
+    /// How many of the stages after the query the plan runs.
+    pushed: usize,
+    is_cached: bool,
+    docs: &'a [Document],
+    stage_counts: &'a [i64],
+    stage_spills: &'a [secantus_core::memlimit::SpillReport],
+}
+
+/// The reply for a pipeline mongod runs in SBE: `explainVersion` "2", the
+/// slot-based `winningPlan`, and the plan's own `executionStats`; under a
+/// `$cursor` when classic stages follow it.
+fn sbe_reply(
+    r: &Request,
+    planner: Document,
+    p: &Pushed<'_>,
+    verbosity: Verbosity,
+    ctx: &mut CommandContext,
+) -> HandlerResult {
+    let s = &r.shape;
+    let db = ctx.db_name.clone();
+    let whole = s.rest.len() == p.pushed;
+    let mut qp = Document::new();
+    for (k, v) in planner {
+        if k == "maxIndexedOrSolutionsReached" && whole {
+            qp.insert("optimizedPipeline", true);
+        }
+        if k == "winningPlan" {
+            qp.insert(k, p.plan.winning_plan(p.is_cached));
+        } else {
+            qp.insert(k, v);
+        }
+    }
+    let wanted = verbosity != Verbosity::QueryPlanner;
+    let all_plans = verbosity == Verbosity::AllPlans;
+    let mut reply = doc! { "explainVersion": "2" };
+    if whole {
+        reply.insert("queryPlanner", qp);
+        if wanted {
+            let (stats, _) = p.plan.execution_stats(p.docs, sbe::Pull::Whole, all_plans);
+            reply.insert("executionStats", stats);
+        }
+        reply.insert("command", r.echo.clone());
+        reply.insert("serverInfo", server_info(ctx));
+        reply.insert("serverParameters", server_parameters());
+        reply.insert("ok", 1.0);
+        return Ok(reply);
+    }
+    let mut cursor = doc! { "queryPlanner": qp };
+    let mut pulled = None;
+    if wanted {
+        // What the `$cursor` handed over: the count of the last stage it
+        // runs, as the stages after it pulled it.
+        let handed = p.stage_counts.get(p.pushed - 1).copied().unwrap_or(0);
+        let limit = s
+            .rest
+            .get(p.pushed)
+            .and_then(|st| st.get("$limit"))
+            .and_then(as_i64);
+        let (stats, produced) =
+            p.plan
+                .execution_stats(p.docs, sbe::Pull::Batches { limit, handed }, all_plans);
+        // A plan that ran to the end handed over everything it produced.
+        pulled = Some(handed.min(produced));
+        cursor.insert("executionStats", stats);
+    }
+    let counted = |stage: &mut Document, n: i64| {
+        stage.insert("nReturned", Bson::Int64(n));
+        stage.insert("executionTimeMillisEstimate", Bson::Int64(0));
+    };
+    let mut first = doc! { "$cursor": cursor };
+    if let Some(n) = pulled {
+        counted(&mut first, n);
+    }
+    let mut stages = vec![Bson::Document(first)];
+    for (i, stage) in s.rest.iter().enumerate().skip(p.pushed) {
+        for mut listed in shape::listed_stage(stage, &db) {
+            if let Some(spilled) = p.stage_spills.get(i) {
+                spill_fields(&mut listed, spilled);
+            }
+            if let Some(n) = p.stage_counts.get(i) {
+                counted(&mut listed, *n);
+            }
+            stages.push(Bson::Document(listed));
+        }
+    }
+    reply.insert("stages", stages);
+    reply.insert("serverInfo", server_info(ctx));
+    reply.insert("serverParameters", server_parameters());
+    reply.insert("command", r.echo.clone());
     reply.insert("ok", 1.0);
     Ok(reply)
 }
