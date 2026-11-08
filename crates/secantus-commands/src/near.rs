@@ -132,6 +132,9 @@ pub(crate) struct Asked<'a> {
     pub cached: bool,
     /// `distinct`'s key, part of the plan cache key.
     pub distinct: Option<&'a str>,
+    /// The read is an aggregate's front that mongod runs in SBE
+    /// (`explain::plan::Query::sbe`).
+    pub sbe: bool,
 }
 
 fn shown(d: Option<&Document>) -> String {

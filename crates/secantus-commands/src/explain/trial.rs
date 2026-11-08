@@ -341,6 +341,20 @@ impl<'a> Stage<'a> {
     }
 
     /// What the stage and those under it counted, shaped as the plan.
+    /// The keys and documents the stage and its inputs have read.
+    fn reads(&self) -> i64 {
+        let keys = match (self.node, &self.scan) {
+            (Node::DistinctScan(..), Some(_)) => self.prefixes.len() as i64,
+            (_, Some(scan)) => scan.keys(),
+            _ => 0,
+        };
+        let docs = match self.node {
+            Node::DistinctScan(_, _, true) => self.returned,
+            _ => self.docs,
+        };
+        keys + docs + self.inputs.iter().map(Stage::reads).sum::<i64>()
+    }
+
     fn stats(&self) -> Stats {
         let mut extra = self.extra.clone();
         if matches!(self.node, Node::Sort { .. }) && !extra.contains_key("totalDataSizeSorted") {
@@ -693,4 +707,26 @@ pub(crate) fn within(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<b
         }
     }
     Some(false)
+}
+
+/// The cached plan as SBE runs it (`classic_runtime_planner_for_sbe`'s
+/// `CachedPlanner`): worked until it hands over `need` documents or runs
+/// out, and given up when the keys and documents it has read reach
+/// `budget` first (measured 8.2.11, 2026-11-08: a plan cached at 200 reads
+/// that runs out after 1,960 is kept, one that runs out after 2,000 is
+/// replanned). Whether it finished; `None`: a stage this does not step.
+pub(crate) fn within_reads(plan: &Node, env: &Env, need: i64, budget: i64) -> Option<bool> {
+    let mut cache = Entries::new();
+    let mut stage = Stage::new(plan, env, &mut cache)?;
+    loop {
+        let work = stage.work(env);
+        if stage.reads() >= budget {
+            return Some(false);
+        }
+        match work {
+            Work::Advanced(_) if stage.returned >= need => return Some(true),
+            Work::Eof => return Some(true),
+            _ => {}
+        }
+    }
 }

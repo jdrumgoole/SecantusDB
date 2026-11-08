@@ -1,5 +1,5 @@
-"""What the plan cache does not yet reproduce (RM-340, RM-341, RM-342),
-against mongod 8.2.11 live."""
+"""The plan cache against mongod 8.2.11 live: what it did not reproduce
+(RM-341, RM-342) and what it now does (RM-340)."""
 
 from __future__ import annotations
 
@@ -54,14 +54,88 @@ def _sbe(client: Any) -> Any:
     return first, _summary(col)
 
 
-@pytest.mark.backlog("RM-340")
+@pytest.mark.backlog_fixed("RM-340")
 def test_a_query_sbe_runs_is_cached_with_its_reads(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 runs a `$match` and the `$group` pushed behind it in
     SBE, planned by the classic planner without index intersections, and
     caches the winner under a key ending `s` with `worksType: "reads"` --
     the keys and documents its trial read (`count_documents` is such a
-    pipeline)."""
+    pipeline). The front was not cached at all here."""
     assert _sbe(rust_mongo) == _sbe(mongod)
+
+
+def _group(col: Any, q: Any, limit: int = 0) -> Any:
+    stages: list = [{"$match": q}]
+    if limit:
+        stages.append({"$limit": limit})
+    stages.append({"$group": {"_id": "$b", "n": {"$sum": 1}}})
+    return list(col.aggregate(stages))
+
+
+def _sbe_steps(client: Any, db: str, steps: list) -> Any:
+    col = _fresh(client, db, 2000)
+    seen = []
+    for q, limit in steps:
+        _group(col, q, limit)
+        seen.append(
+            [
+                (s, e["planCacheKey"], e["cachedPlan"]["inputStage"]["inputStage"]["indexName"])
+                for s, e in zip(_summary(col), _listed(col), strict=True)
+            ]
+        )
+    return seen
+
+
+_RANGE = {"a": {"$lt": 5}, "b": {"$lt": 90}}
+
+
+@pytest.mark.backlog_fixed("RM-340")
+def test_a_cached_sbe_plan_is_replanned_at_ten_times_its_reads(
+    rust_mongo: Any, mongod: Any
+) -> None:
+    """mongod 8.2.11 keeps an active SBE entry's plan while it finishes
+    within ten times the reads it was cached with, and replans when its
+    reads reach that: cached at 200 reads on `a_1`, a query `a_1` answers
+    in 1,960 reads keeps it, one it answers in 2,000 replans to `b_1`; under
+    a `$limit` the entry's reads are the trial's to that limit."""
+    steps = [
+        (_RANGE, 0),
+        (_RANGE, 0),
+        ({"a": {"$lt": 49}, "b": {"$lt": 5}}, 0),
+        ({"a": {"$lt": 50}, "b": {"$lt": 5}}, 0),
+        ({"a": {"$lt": 5}, "b": {"$lt": 90}}, 7),
+        ({"a": {"$lt": 50}, "b": {"$lt": 90}}, 0),
+    ]
+    assert _sbe_steps(rust_mongo, "rm340r", steps) == _sbe_steps(mongod, "rm340r", steps)
+
+
+def _no_intersection(client: Any) -> Any:
+    col = _fresh(client, "rm340i", 2000)
+    col.update_many({}, [{"$set": {"t": [{"$mod": ["$_id", 3]}, {"$mod": ["$_id", 4]}]}}])
+    col.create_index("t")
+    seen = []
+    for q in ({"a": 3, "b": 5}, {"t": {"$all": [1, 2]}, "a": {"$lt": 50}}):
+        for _ in range(2):
+            _group(col, q)
+        pipeline = [{"$match": q}, {"$group": {"_id": "$b"}}]
+        explained = col.database.command(
+            "explain",
+            {"aggregate": "c", "pipeline": pipeline, "cursor": {}},
+            verbosity="queryPlanner",
+        )
+        planner = explained.get("queryPlanner") or explained["stages"][0]["$cursor"]["queryPlanner"]
+        seen.append((_summary(col)[0], len(planner["rejectedPlans"])))
+    return seen
+
+
+@pytest.mark.backlog_fixed("RM-340")
+def test_a_query_sbe_runs_tries_no_index_intersection(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 plans a front it runs in SBE without index
+    intersections: `{a: 3, b: 5}` over `a_1` and `b_1` tries the two scans
+    and no `AND_SORTED`, and `{t: {$all: [1, 2]}}` over a multikey `t_1`
+    tries its two scans and no intersection of them -- in the cache entry
+    and in `explain`'s rejected plans alike."""
+    assert _no_intersection(rust_mongo) == _no_intersection(mongod)
 
 
 def _sizes(client: Any) -> Any:

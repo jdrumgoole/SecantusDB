@@ -244,6 +244,7 @@ fn plan_info_with(
         keys_only: false,
         wanted: None,
         pipeline: s.pipeline,
+        sbe: false,
         implies: &implies,
         trial: None,
     };

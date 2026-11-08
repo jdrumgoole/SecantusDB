@@ -479,6 +479,7 @@ fn consult<'a>(
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial,
     };
@@ -575,12 +576,20 @@ impl plan::CacheHook for ReadCache<'_> {
         if !(top || branch) || !cacheable(q) {
             return None;
         }
+        // A branch of a rooted `$or` in front of stages SBE runs is cached
+        // by mongod under a key this does not yet build (RM-429): it is
+        // left uncached rather than share the entry of a classic query.
+        if branch && self.ask.asked.sbe {
+            return None;
+        }
         let parts = super::cache_key::Parts {
             sort: if top { q.sort } else { None },
-            projection: if top { self.ask.asked.projection } else { None },
+            // A branch is keyed with the query's projection (measured
+            // 8.2.11, 2026-11-08: `find(rooted $or, {b: 1, _id: 0})`).
+            projection: self.ask.asked.projection,
             collation: q.collation,
             distinct: if top { self.ask.asked.distinct } else { None },
-            sbe: false,
+            sbe: q.sbe,
         };
         let filter = if top { self.ask.filter } else { q.canonical };
         let implies = |partial: &Document| self.storage.query_implies_partial(filter, partial);
@@ -639,20 +648,22 @@ impl plan::CacheHook for ReadCache<'_> {
                 return;
             }
         }
+        let projection: Document = self
+            .ask
+            .asked
+            .projection
+            .map(|p| {
+                p.iter()
+                    .filter(|(k, _)| !k.starts_with('$'))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A branch is created from its own clause, with no sort, and with
+        // the query's projection.
         let mut created_from = if l.branch {
-            doc! { "query": q.canonical.clone(), "sort": {}, "projection": {} }
+            doc! { "query": q.canonical.clone(), "sort": {}, "projection": projection }
         } else {
-            let projection: Document = self
-                .ask
-                .asked
-                .projection
-                .map(|p| {
-                    p.iter()
-                        .filter(|(k, _)| !k.starts_with('$'))
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect()
-                })
-                .unwrap_or_default();
             doc! {
                 "query": self.ask.filter.clone(),
                 "sort": self.ask.sort.cloned().unwrap_or_default(),
@@ -685,11 +696,7 @@ impl plan::CacheHook for ReadCache<'_> {
                 super::cache_key::command_shape(
                     &e,
                     if l.branch { None } else { q.sort },
-                    if l.branch {
-                        None
-                    } else {
-                        self.ask.asked.projection
-                    },
+                    self.ask.asked.projection,
                     q.collation,
                 )
             })
@@ -705,7 +712,7 @@ impl plan::CacheHook for ReadCache<'_> {
                 command_shape,
                 active: false,
                 works: d.works,
-                reads: false,
+                reads: q.sbe,
                 created: bson::DateTime::now(),
                 created_from,
                 solution_hash: super::plan_cache::solution_hash(&solution),
@@ -751,6 +758,7 @@ pub(crate) fn through_cache(
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
     };
@@ -882,6 +890,7 @@ pub(crate) fn stream_plan(
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
     };
@@ -1037,6 +1046,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial,
     };
@@ -1361,6 +1371,7 @@ fn untried_plan(storage: &dyn Storage, ask: &Ask) -> Option<Node> {
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
     };
@@ -1570,6 +1581,7 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
     };
@@ -1940,6 +1952,7 @@ pub(crate) fn counted_plan(
         keys_only: false,
         wanted: None,
         pipeline: false,
+        sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
     };
