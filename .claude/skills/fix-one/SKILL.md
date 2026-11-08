@@ -201,6 +201,16 @@ git push origin HEAD:<branch>   # fast-forward only, never --force
   checks the commits together. A rejected push means the same: fetch,
   rebase, the same overlap test, push again. (A session gated three times
   for other lanes' unrelated commits, 150 min, on 2026-11-06.)
+- **Prose does not count as overlap.** Every item edits
+  `tasks/backlog-rust-*.md`, and most add a `changelog.d/` fragment, so
+  counting them would re-gate after every landing of the other lane (RM-332
+  rebased and re-gated three times for RM-330, RM-350 and RM-319 on
+  2026-11-08). When the only files both sides touch are those (a conflict
+  resolved in them included), run `tests/test_backlog_markers.py`, which
+  catches two lanes filing the same ID, and `python tools/backlog.py verify
+  --file backlog-rust-mongodb.md --id <your ID>` (the PG file for an RP
+  item), then push. An overlap in code or tests, or a conflict in one,
+  still re-gates.
 - Check the landing: `git log origin/<branch> --oneline -1` is your commit.
   Put this line in your final report exactly, plain text, sha unformatted
   (`scripts/fix_many.sh` reads it to decide whether the item landed, and
