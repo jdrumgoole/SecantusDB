@@ -22346,7 +22346,7 @@ fn resolve_one_sublink(
             // column as a scalar subquery's value is -- cast to where the
             // values survive a cast of themselves, declared otherwise -- or
             // it was typed off its elements, and an empty one not at all
-            // (RP-571). A row type's array is cast to as well (RP-554).
+            // (RP-600). A row type's array is cast to as well (RP-554).
             let ty = sub_plan_def(&plan, lookup)
                 .ok()
                 .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));

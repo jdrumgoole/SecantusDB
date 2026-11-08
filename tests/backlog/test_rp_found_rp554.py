@@ -1,5 +1,5 @@
 """Gap tests of the divergences found while working RP-554 (a scalar
-subquery's array of a row type was described as `text[]`): RP-571 (an
+subquery's array of a row type was described as `text[]`): RP-600 (an
 ARRAY(subquery) of a built-in type was typed from its values, not from the
 subquery's column, so `pg_typeof` of one was 42P18 and a timestamp, interval
 or regclass element read back NULL), fixed.
@@ -56,7 +56,7 @@ ARRAY_SUBLINK: dict[str, tuple[int, list[tuple[Any, ...]], str]] = {
 }
 
 
-@pytest.mark.backlog_fixed("RP-571")
+@pytest.mark.backlog_fixed("RP-600")
 @pytest.mark.parametrize("query", list(ARRAY_SUBLINK))
 def test_array_sublink_element_type(query: str, dsn: str) -> None:
     oid, rows, type_name = ARRAY_SUBLINK[query]

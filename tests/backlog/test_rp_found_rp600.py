@@ -1,4 +1,4 @@
-"""Gap tests of the divergences found while working RP-571 (an ARRAY
+"""Gap tests of the divergences found while working RP-600 (an ARRAY
 subquery was typed from its values): RP-575 (an array of `int2vector` or
 `oidvector` is a two-dimensional int array).
 

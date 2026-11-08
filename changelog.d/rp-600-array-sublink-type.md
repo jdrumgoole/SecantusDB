@@ -25,10 +25,10 @@ element types lost their values.
 - `pg_typeof` of an ARRAY subquery names its type; it was 42P18 `could not
   determine data type of parameter $1` for every built-in element type.
 
-Fixes RP-571 (tests/backlog/test_rp_found_rp554.py::test_array_sublink_element_type)
+Fixes RP-600 (tests/backlog/test_rp_found_rp554.py::test_array_sublink_element_type)
 
 #### Found
 
 - RP-575: an array of `int2vector` or `oidvector` is a two-dimensional int
   array (`'{"1 2"}'::int2vector[]` is `{{1,2}}` here, `{"1 2"}` on
-  PostgreSQL) (tests/backlog/test_rp_found_rp571.py::test_vector_array_elements).
+  PostgreSQL) (tests/backlog/test_rp_found_rp600.py::test_vector_array_elements).

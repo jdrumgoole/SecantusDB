@@ -2327,10 +2327,10 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp570.py::test_numeric_overflow_detail
       Backlog-ID: RP-582
 
-## Found while working RP-571 (2026-11-08)
+## Found while working RP-600 (2026-11-08)
 
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp571.py`.
+`tests/backlog/test_rp_found_rp600.py`.
 
 - [ ] **An array of `int2vector` or `oidvector` is a two-dimensional int
       array.** Each element is ONE value, so on PostgreSQL 15.19 `select
@@ -2343,7 +2343,7 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       arrays of different dimensionality`. The type (`int2vector[]`, 1006)
       is already right. `oidvector[]` is the same.
       Backlog-ID: RP-575
-      Verify: tests/backlog/test_rp_found_rp571.py::test_vector_array_elements
+      Verify: tests/backlog/test_rp_found_rp600.py::test_vector_array_elements
 
 ## Found while working RP-529 (2026-11-08)
 

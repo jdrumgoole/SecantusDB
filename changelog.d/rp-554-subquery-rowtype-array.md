@@ -22,6 +22,6 @@ Fixes RP-554 (tests/backlog/test_rp_found_rp529.py::test_scalar_subquery_row_typ
 
 #### Found
 
-- RP-571: an `ARRAY(subquery)` of a built-in type is typed from its values
+- RP-600: an `ARRAY(subquery)` of a built-in type is typed from its values
   (`array(select 1::int2)` is `int4[]` here, `smallint[]` on PostgreSQL)
   (tests/backlog/test_rp_found_rp554.py::test_array_sublink_element_type).
