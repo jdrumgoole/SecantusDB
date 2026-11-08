@@ -10,9 +10,9 @@ column after the function; fixed), found while working RP-477, RP-483
 and a field of its scalar result was not refused; fixed), and found while
 working RP-483, RP-485 (a call in a schema that does not exist is a missing
 function, not a missing schema); and found while working RP-465, RP-500
-(CREATE does not check a literal's input, the result type, a CALL, or a
-SQL-standard body with `check_function_bodies` off) and RP-502 (an array
-parameter cannot be subscripted).
+(CREATE did not check a literal's input, the result type, a CALL, or a
+SQL-standard body with `check_function_bodies` off; fixed) and RP-502 (an
+array parameter could not be subscripted; fixed).
 
 An answer is the rows, `("rowcount", n)` for a statement with none, or
 `(sqlstate, message, hint, position)` for an error. The expected answers
@@ -424,7 +424,11 @@ def test_create_runs_nothing_in_the_body(dsn: str) -> None:
 
 # Found while working RP-465: what PostgreSQL 15.19's validator also
 # refuses at CREATE, measured on the same cluster. A pair is `(setting,
-# CREATE)`; the setting runs first when there is one.
+# CREATE)`; the setting runs first when there is one. Each CREATE succeeded
+# here (RP-500): the body's string constants are now read by their cast's
+# or their operator's type, a CALL's procedure is resolved, the final
+# statement is held to the declared result (`check_sql_fn_retval`), and a
+# SQL-standard body is analysed with `check_function_bodies` off.
 CREATE_CHECKS_LITERALS_AND_RESULT = {
     (None, _CREATE_GX.format("select 'x'::int")): (
         "22P02",
@@ -464,7 +468,7 @@ CREATE_CHECKS_LITERALS_AND_RESULT = {
 }
 
 
-@pytest.mark.backlog("RP-500")
+@pytest.mark.backlog_fixed("RP-500")
 @pytest.mark.parametrize("case", list(CREATE_CHECKS_LITERALS_AND_RESULT))
 def test_create_checks_literals_and_result(case: tuple[str | None, str], dsn: str) -> None:
     setting, create = case
@@ -487,6 +491,235 @@ def test_create_checks_literals_and_result(case: tuple[str | None, str], dsn: st
             for f in ("gx(int)", "gc1()", "gc2()"):
                 c.execute(f"drop function if exists {f}")
     assert got == CREATE_CHECKS_LITERALS_AND_RESULT[case]
+
+
+# RP-500's regression: `fmgr_sql_validator`'s checks around the gap test's
+# cases, measured on a private, freshly initdb'd PostgreSQL 15.19 cluster
+# after `_SETUP` and `_VALIDATOR_SETUP`. An answer is "ok" (CREATE succeeds)
+# or `(sqlstate, message, detail, hint, context, position)`. Bodies
+# PostgreSQL accepts must still be created: a coercion the result check
+# allows, a constant no input function refuses, a cast's typmod (applied
+# when the expression runs, not at CREATE).
+_VALIDATOR_SETUP = [
+    "drop procedure if exists gvp(int)",
+    "drop type if exists gvk",
+    "create type gvk as (k int, l text)",
+    "create procedure gvp(x int) language sql as $$ select 1 $$",
+]
+
+
+def _mismatch(declared: str, detail: str) -> tuple[Any, ...]:
+    return (
+        "42P13",
+        f"return type mismatch in function declared to return {declared}",
+        detail,
+        None,
+        'SQL function "gx"',
+        None,
+    )
+
+
+def _input(message: str, position: str) -> tuple[Any, ...]:
+    return ("22P02", message, None, None, None, position)
+
+
+_GX = "create function gx(p int) returns {} language sql as $$ {} $$"
+_NOT_A_QUERY = "Function's final statement must be SELECT or INSERT/UPDATE/DELETE RETURNING."
+_NO_PROCEDURE_HINT = (
+    "No procedure matches the given name and argument types."
+    " You might need to add explicit type casts."
+)
+
+VALIDATOR_CHECKS = {
+    # The final statement's result against the declared type.
+    (None, _GX.format("int", "select '5'")): _mismatch("integer", "Actual return type is text."),
+    (None, _GX.format("int", "select true")): _mismatch(
+        "integer", "Actual return type is boolean."
+    ),
+    (None, _GX.format("boolean", "select 1")): _mismatch(
+        "boolean", "Actual return type is integer."
+    ),
+    (None, _GX.format("int", "select null")): _mismatch("integer", "Actual return type is text."),
+    (None, _GX.format("int", "select 1; select 'a'::text")): _mismatch(
+        "integer", "Actual return type is text."
+    ),
+    (None, _GX.format("int", "insert into fe values (1)")): _mismatch("integer", _NOT_A_QUERY),
+    (None, _GX.format("int", "create table gvz (a int)")): _mismatch("integer", _NOT_A_QUERY),
+    (None, _GX.format("int", "call gvp(1)")): _mismatch("integer", _NOT_A_QUERY),
+    (None, _GX.format("int", "insert into fe values (1) returning b")): _mismatch(
+        "integer", "Actual return type is text."
+    ),
+    (None, _GX.format("int", "select 1 as a, 2 as b order by 1")): _mismatch(
+        "integer", "Final statement must return exactly one column."
+    ),
+    (None, _GX.format("setof int", "select 'a'::text")): _mismatch(
+        "integer", "Actual return type is text."
+    ),
+    (None, _GX.format("table (x int)", "select 'a'::text")): _mismatch(
+        "integer", "Actual return type is text."
+    ),
+    (None, _GX.format("table (x int, y text)", "select 1")): _mismatch(
+        "record", "Final statement returns too few columns."
+    ),
+    (None, _GX.format("gvk", "select 1")): _mismatch(
+        "gvk", "Final statement returns too few columns."
+    ),
+    (None, _GX.format("gvk", "select 1, 'a', 2")): _mismatch(
+        "gvk", "Final statement returns too many columns."
+    ),
+    (None, _GX.format("fe", "select a from fe")): _mismatch(
+        "fe", "Final statement returns too few columns."
+    ),
+    (
+        None,
+        "create function gx(p int, out x int, out y int) language sql as $$ select 1, 'a'::text $$",
+    ): _mismatch("record", "Final statement returns text instead of integer at column 2."),
+    # What the result check lets through.
+    (None, _GX.format("text", "select 1")): "ok",
+    (None, _GX.format("bigint", "select 1")): "ok",
+    (None, _GX.format("int", "select 1.5")): "ok",
+    (None, _GX.format("int", "select 1::bigint")): "ok",
+    (None, _GX.format("void", "select 'a'::text")): "ok",
+    (None, _GX.format("int", "select 'a'::text; select 1")): "ok",
+    (None, _GX.format("int", "insert into fe values (p, 'a') returning a")): "ok",
+    (None, _GX.format("int", "update fe set a = p returning a")): "ok",
+    (None, _GX.format("int", "values (1)")): "ok",
+    (None, _GX.format("int", "select 1 union select 2")): "ok",
+    (None, _GX.format("table (x int, y text)", "select 1, 2")): "ok",
+    (None, _GX.format("gvk", "select 1, 'a'")): "ok",
+    (None, _GX.format("gvk", "select row(1, 'a')::gvk")): "ok",
+    (None, _GX.format("setof fe", "select * from fe")): "ok",
+    (None, _GX.format("fe", "select f from fe f")): "ok",
+    (None, _GX.format("record", "select 1, 'a'")): "ok",
+    (None, _GX.format("int[]", "select array[1, 2]")): "ok",
+    (None, _GX.format("text[]", "select array[1, 2]")): "ok",
+    (None, _GX.format("jsonb", """select '{"a": 1}'::json""")): "ok",
+    (
+        None,
+        "create function gx(p anyelement) returns anyelement language sql"
+        " as $$ select 'a'::text $$",
+    ): "ok",
+    # A constant's input, read while the body is analysed.
+    (None, _GX.format("int", "select 'x'::int from fe")): _input(
+        'invalid input syntax for type integer: "x"', "65"
+    ),
+    (None, _GX.format("int", "select case when false then 'x'::int end")): _input(
+        'invalid input syntax for type integer: "x"', "86"
+    ),
+    (None, _GX.format("int", "select '99999999999'::int")): (
+        "22003",
+        'value "99999999999" is out of range for type integer',
+        None,
+        None,
+        None,
+        "65",
+    ),
+    (None, _GX.format("int", "select a from fe where a = 'q'")): _input(
+        'invalid input syntax for type integer: "q"', "85"
+    ),
+    (None, _GX.format("boolean", "select 1 in ('z')")): _input(
+        'invalid input syntax for type integer: "z"', "75"
+    ),
+    (None, _GX.format("regclass", "select 'nosuchrel'::regclass")): (
+        "42P01",
+        'relation "nosuchrel" does not exist',
+        None,
+        None,
+        None,
+        "70",
+    ),
+    # What it does not refuse: an error only evaluation raises, and a
+    # typmod, which is applied when the expression runs.
+    (None, _GX.format("int", "select 1/0")): "ok",
+    (None, _GX.format("int", "select case when p > 0 then 'x'::text::int end")): "ok",
+    (None, _GX.format("numeric", "select '123.456'::numeric(4,2)")): "ok",
+    (None, _GX.format("varchar(2)", "select 'abcdef'::varchar(2)")): "ok",
+    (None, _GX.format("interval", "select interval '1' hour")): "ok",
+    (None, _GX.format("regclass", "select 'fe'::regclass")): "ok",
+    # A CALL's procedure, resolved at CREATE.
+    (None, _GX.format("void", "call nosuchproc(1, 'a')")): (
+        "42883",
+        "procedure nosuchproc(integer, unknown) does not exist",
+        None,
+        _NO_PROCEDURE_HINT,
+        None,
+        "64",
+    ),
+    (None, _GX.format("void", "call gvp(1, 2)")): (
+        "42883",
+        "procedure gvp(integer, integer) does not exist",
+        None,
+        _NO_PROCEDURE_HINT,
+        None,
+        "64",
+    ),
+    (None, _GX.format("void", "call gts()")): (
+        "42809",
+        "gts() is not a procedure",
+        None,
+        "To call a function, use SELECT.",
+        None,
+        "64",
+    ),
+    (None, _GX.format("void", "call gvp('a')")): _input(
+        'invalid input syntax for type integer: "a"', "68"
+    ),
+    (None, _GX.format("void", "call gvp(p)")): "ok",
+    (None, _GX.format("void", "call gvp(1/0)")): "ok",
+    # A SQL-standard body is analysed whatever `check_function_bodies`
+    # says; only its result check waits for the setting.
+    (
+        "set check_function_bodies = off",
+        "create function gx(p int) returns int begin atomic select 'abc'; end",
+    ): "ok",
+    (
+        "set check_function_bodies = off",
+        "create function gx(p int) returns int begin atomic select 'x'::int; end",
+    ): _input('invalid input syntax for type integer: "x"', "59"),
+    (
+        "set check_function_bodies = off",
+        "create function gx(p int) returns int language sql as $$ select 'abc' $$",
+    ): "ok",
+    (None, "create function gx(p int) returns int begin atomic select 1, 2; end"): _mismatch(
+        "integer", "Final statement must return exactly one column."
+    ),
+}
+
+
+def validator_answer(dsn: str, case: tuple[str | None, str]) -> Any:
+    setting, create = case
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in [*_SETUP, *_VALIDATOR_SETUP]:
+            c.execute(q)
+        c.execute("drop routine if exists gx(int)")
+        c.execute("drop routine if exists gx(anyelement)")
+        if setting:
+            c.execute(setting)
+        try:
+            c.execute(create)
+            return "ok"
+        except psycopg.Error as e:
+            d = e.diag
+            return (
+                e.sqlstate,
+                d.message_primary,
+                d.message_detail,
+                d.message_hint,
+                d.context,
+                d.statement_position,
+            )
+        finally:
+            c.execute("drop routine if exists gx(int)")
+            c.execute("drop routine if exists gx(anyelement)")
+            c.execute("drop table if exists gvz")
+            c.execute("drop procedure if exists gvp(int)")
+            c.execute("drop type if exists gvk")
+
+
+@pytest.mark.backlog_fixed("RP-500")
+@pytest.mark.parametrize("case", list(VALIDATOR_CHECKS))
+def test_validator_checks(case: tuple[str | None, str], dsn: str) -> None:
+    assert validator_answer(dsn, case) == VALIDATOR_CHECKS[case]
 
 
 # Found while working RP-465: an array parameter's subscript, measured on

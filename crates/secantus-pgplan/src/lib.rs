@@ -3501,6 +3501,9 @@ pub struct UserFunctionDef {
     pub security_definer: bool,
     /// The `SET name = value` clauses, as `proconfig` entries.
     pub config: Vec<String>,
+    /// A SQL-standard body (`BEGIN ATOMIC ... END`, `RETURN expr`), which
+    /// CREATE parse-analyses whatever `check_function_bodies` says.
+    pub sql_standard: bool,
 }
 
 /// One `ALTER VIEW` action.
@@ -6964,6 +6967,7 @@ fn plan_create_function(f: &pg_query::protobuf::CreateFunctionStmt) -> Result<St
             is_procedure: f.is_procedure,
             security_definer,
             config,
+            sql_standard: f.sql_body.is_some(),
         }));
     }
     if !language.eq_ignore_ascii_case("internal") {
