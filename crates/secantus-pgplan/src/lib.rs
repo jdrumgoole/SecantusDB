@@ -1292,6 +1292,9 @@ pub enum ConflictAction {
         /// `(stored field, column type, expression)`, planned over the
         /// target's columns PLUS the proposed row's under `EXCLUDED_PREFIX`.
         set_exprs: Vec<(String, String, i32, ColumnExpr)>,
+        /// As `Update::of_domain`: the stored fields whose value is already
+        /// of the column's domain (`excluded.a`, the target's own `a`).
+        of_domain: Vec<String>,
         /// `WHERE` on the DO UPDATE: the update is skipped when it is false.
         filter: Option<ColumnExpr>,
     },
@@ -1406,6 +1409,13 @@ pub struct Insert {
     /// executor needs them to check each column's assignment cast once it
     /// knows the source's column types. Empty for a `VALUES` insert.
     pub source_targets: Vec<SourceTarget>,
+    /// `INSERT ... SELECT`: per output column of the source, the domain its
+    /// value is already of -- a column of that domain, a cast to it --
+    /// which `coerce_to_target_type` returns as it is when the target
+    /// column is of the same domain, so the write checks none of the
+    /// domain's constraints (RP-664). Empty when the source's columns are
+    /// not known here (a `*` over a join, a VALUES insert).
+    pub source_domains: Vec<Option<String>>,
 }
 
 /// One select-list entry of an `INSERT ... SELECT` source (of its leftmost
@@ -3671,6 +3681,13 @@ pub struct Update {
     /// of the subscripts, none of which a plain expression over the row can
     /// express.
     pub set_subscripts: Vec<SubscriptAssign>,
+    /// The stored fields whose SET value is already of the column's
+    /// domain -- the column itself, a cast to the domain -- which
+    /// `coerce_to_target_type` returns as it is, so the write checks none
+    /// of the domain's constraints (RP-664). Every other domain column the
+    /// SET list assigns is coerced into its domain and checked; a column
+    /// the SET list does not assign is stored as it was, and not checked.
+    pub of_domain: Vec<String>,
     pub filter: Document,
     /// As `Delete::residual`.
     pub residual: Option<ColumnExpr>,
@@ -5096,6 +5113,10 @@ fn plan_query_node(
     if let Some(inner) = node.node.as_mut() {
         optype::using_to_direction(inner);
     }
+    // Which of a write's values are already of their column's domain is
+    // read from the statement as written, before its subqueries run and
+    // its FROM list is rewritten into them (RP-664).
+    let write_domains = domain_scope::of_write(&node, lookup);
     let mut params = params.to_vec();
     cancel::check()?;
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
@@ -5140,12 +5161,16 @@ fn plan_query_node(
     cancel::check()?;
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
-    plan_node(
+    let mut st = plan_node(
         node.node
             .ok_or_else(|| Error::Parse("empty statement".into()))?,
         lookup,
         &params,
-    )
+    )?;
+    if let Some(w) = write_domains {
+        w.apply(&mut st);
+    }
+    Ok(st)
 }
 
 /// The DECLARE of `inner`, the cursor's planned query.
@@ -12486,7 +12511,12 @@ fn plan_on_conflict(
                     Some(row_column_expr(&w, &fields, params, &sample)?)
                 }
             };
-            ConflictAction::Update { set_exprs, filter }
+            ConflictAction::Update {
+                set_exprs,
+                // Filled from the statement as written (`domain_scope`).
+                of_domain: Vec::new(),
+                filter,
+            }
         }
         _ => return Err(Error::Unsupported("this ON CONFLICT action".into())),
     };
@@ -12816,6 +12846,8 @@ fn plan_insert(
         } else {
             Vec::new()
         },
+        // Filled from the statement as written (`domain_scope`).
+        source_domains: Vec::new(),
     }))
 }
 
@@ -42140,6 +42172,8 @@ fn plan_update(
         unset,
         set_exprs,
         set_subscripts,
+        // Filled from the statement as written (`domain_scope`).
+        of_domain: Vec::new(),
         filter,
         residual,
         returning,

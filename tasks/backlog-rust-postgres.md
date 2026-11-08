@@ -2394,17 +2394,6 @@ int`, `t655(a d655, b int)` holding `(-1, -1)` and `(5, 5)`, then `alter
 domain d655 add constraint d655_pos check (value > 0) not valid`. The gap
 tests are in `tests/backlog/test_rp_found_rp655.py`.
 
-- [ ] **A write re-checks a domain value it does not coerce into the
-      domain.** On PostgreSQL 15.19 `update t655 set b = b where b < 0`,
-      `update t655 set a = a where b < 0` and `insert into t655 select a, 9
-      from t655 where b < 0` each succeed: the column an UPDATE does not
-      assign is stored as it was, and a value already of the column's domain
-      is no coercion, so neither checks the domain. Here each is 23514 on the
-      `-1` stored before the CHECK: `check_row_constraints` checks every
-      domain column of the row being written. Only a value coerced into the
-      domain should be (`update t655 set a = -5` is 23514 on both).
-      Verify: tests/backlog/test_rp_found_rp655.py::test_write_checks_only_what_it_coerces_into_a_domain
-      Backlog-ID: RP-664
 - [ ] **A scalar subquery over a domain column is typed by the domain's
       base.** `select pg_typeof((select a from t655 where b < 0))` is
       `d655` on PostgreSQL 15.19 (`exprType` of the SubLink is its column's);
@@ -2444,6 +2433,31 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
       RP-659 takes away.
       Verify: tests/backlog/test_rp_found_rp656.py::test_min_max_over_char_n_keep_its_blanks
       Backlog-ID: RP-671
+
+## Found while working RP-664 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp664.py`.
+
+- [ ] **An `UPDATE ... FROM` a subquery over the target whose WHERE names
+      the target is 42P01.** `update t664 set a = x.a from (select a from
+      t664 where b < 0) x where t664.b < 0` is `UPDATE 1` on PostgreSQL
+      15.19, with or without a domain column; here it is 42P01 `missing
+      FROM-clause entry for table "t664"`. Without the subquery's own
+      WHERE the statement runs, so the rewrite of an UPDATE ... FROM into
+      correlated subqueries (`rewrite_dml_from`) loses the target's name
+      when the FROM subquery has a WHERE of its own.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_update_from_subquery_over_the_target
+      Backlog-ID: RP-668
+- [ ] **A PL/pgSQL assignment to a record's field does not check the
+      field's domain.** In a BEFORE trigger on `t664t(a d664t, b int)`,
+      whose domain has a CHECK `value > 0`, `new.a := -5; new.a := 7;
+      return new;` is 23514 on PostgreSQL 15.19 for an INSERT or an UPDATE
+      (the assignment coerces `-5` into the column's domain); here the row
+      is written with `a` = 7. Only the value the trigger leaves in the row
+      is checked, after it returns (RP-664).
+      Verify: tests/backlog/test_rp_found_rp664.py::test_plpgsql_assignment_to_a_record_field_checks_its_domain
+      Backlog-ID: RP-670
 
 ## Found while working RP-570 (2026-11-08)
 

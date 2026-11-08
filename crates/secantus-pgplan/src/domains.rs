@@ -205,6 +205,14 @@ pub(crate) fn relabelling() -> bool {
     RELABELLING.with(std::cell::Cell::get)
 }
 
+/// Whether the type names `a` and `b` name one domain (by its oid).
+pub fn same_domain(a: &str, b: &str) -> bool {
+    match (user_domain(a), user_domain(b)) {
+        (Some(a), Some(b)) => a.oid == b.oid,
+        _ => false,
+    }
+}
+
 /// `domain_check` for a domain already looked up.
 pub fn check_domain(d: &Domain, value: &Bson) -> Result<()> {
     if relabelling() {

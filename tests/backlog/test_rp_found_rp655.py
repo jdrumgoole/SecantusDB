@@ -1,10 +1,11 @@
 """Gap tests of the divergences found while working RP-655 (a cast of a
 domain column to its own domain checks nothing):
 
-- a write re-checks a domain column's value that is not coerced into the
+- a write re-checked a domain column's value that was not coerced into the
   domain -- a column an UPDATE does not assign, or a value already of the
-  column's domain -- so a row stored before a `NOT VALID` CHECK cannot be
-  updated or copied;
+  column's domain -- so a row stored before a `NOT VALID` CHECK could not be
+  updated or copied (RP-664, fixed; more shapes in
+  `test_rp_found_rp664.py`);
 - a scalar subquery over a domain column is typed by the domain's base.
 
 The expected answers were measured on a private, freshly initdb'd
@@ -71,7 +72,7 @@ WRITES = {
 }
 
 
-@pytest.mark.backlog("RP-664")
+@pytest.mark.backlog_fixed("RP-664")
 @pytest.mark.parametrize("query", list(WRITES))
 def test_write_checks_only_what_it_coerces_into_a_domain(query: str, dsn: str) -> None:
     with _connect(dsn) as c:

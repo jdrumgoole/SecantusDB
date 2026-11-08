@@ -567,12 +567,26 @@ impl PgHandler {
         def: &TableDef,
         rows: Vec<Document>,
     ) -> PgWireResult<Vec<Document>> {
+        Ok(self
+            .before_insert_rows_from(def, rows)?
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect())
+    }
+
+    /// `before_insert_rows`, each row kept with the index of the row it
+    /// came from.
+    pub(crate) fn before_insert_rows_from(
+        &self,
+        def: &TableDef,
+        rows: Vec<Document>,
+    ) -> PgWireResult<Vec<(usize, Document)>> {
         let triggers = self.triggers_for(&def.name, "BEFORE", "INSERT", "ROW")?;
         if triggers.is_empty() {
-            return Ok(rows);
+            return Ok(rows.into_iter().enumerate().collect());
         }
         let mut out = Vec::with_capacity(rows.len());
-        'rows: for row in rows {
+        'rows: for (i, row) in rows.into_iter().enumerate() {
             let mut rec = self.row_record(def, &row)?;
             let mut changed = false;
             for trg in &triggers {
@@ -588,11 +602,14 @@ impl PgHandler {
                     None => continue 'rows,
                 }
             }
-            out.push(if changed {
-                Self::record_row(def, rec)?
-            } else {
-                row
-            });
+            out.push((
+                i,
+                if changed {
+                    Self::record_row(def, rec)?
+                } else {
+                    row
+                },
+            ));
         }
         Ok(out)
     }
