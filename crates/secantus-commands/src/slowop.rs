@@ -77,6 +77,8 @@ struct Sink {
     /// The server is a member of a replica set, whose lines print the
     /// operation's read concern.
     replicated: bool,
+    /// The command's ingress admissions, which its statements' lines print.
+    admission: std::sync::Arc<crate::admission::AdmissionContext>,
 }
 
 thread_local! {
@@ -95,6 +97,7 @@ pub fn enter(ctx: &CommandContext) -> SinkScope {
         locks: ctx.locks.clone(),
         remote: crate::opdebug::remote(ctx),
         replicated: ctx.replica_set_name.is_some(),
+        admission: ctx.ingress_admission.clone(),
     });
     SinkScope(SINK.with(|s| s.replace(sink)))
 }
@@ -155,6 +158,10 @@ pub(crate) fn statement_line(component: &'static str, mut attr: Document, worked
         if let Some(lm) = &sink.locks {
             crate::lock_manager::log_lock(lm);
         }
+        // A statement's line has its command's admissions; an index
+        // build's thread was admitted by no command.
+        let admitted = (component != "STORAGE").then(|| sink.admission.as_ref());
+        attr.insert("queues", crate::admission::ingress::line_queues(admitted));
         attr.insert("workingMillis", worked.as_millis() as i64);
         attr.insert("durationMillis", worked.as_millis() as i64);
         let attr = crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER);
@@ -413,6 +420,11 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
         out.insert("remote", remote);
     }
     out.insert("protocol", if ctx.op_query { "op_query" } else { "op_msg" });
+    // What admission control admitted it through (RM-355).
+    out.insert(
+        "queues",
+        crate::admission::ingress::line_queues(Some(&ctx.ingress_admission)),
+    );
     out
 }
 

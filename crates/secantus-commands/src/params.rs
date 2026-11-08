@@ -165,6 +165,17 @@ const SETTABLE: &[(&str, ParamKind)] = &[
         "ingressConnectionEstablishmentMaxQueueDepth",
         ParamKind::Int32AtLeast(0),
     ),
+    // mongod's ingress admission control (`admission::ingress`), applied
+    // to the controller as they change (RM-355).
+    ("ingressAdmissionControlEnabled", ParamKind::Bool),
+    (
+        "ingressAdmissionControllerTicketPoolSize",
+        ParamKind::Int32AtLeast(0),
+    ),
+    (
+        "ingressAdmissionControllerMaxQueueDepth",
+        ParamKind::Int32AtLeast(0),
+    ),
     // The aggregation memory budgets (`secantus_core::memlimit::Budgets`),
     // each read by every `aggregate` (RM-211). Types and bounds measured
     // on mongod 8.2.11, 2026-10-26: `internalQueryMaxPushBytes` is an int,
@@ -257,6 +268,9 @@ pub struct ServerParams {
     fcv: Mutex<Option<String>>,
     /// The connection-establishment token bucket (`admit_connection`).
     ingress: Mutex<IngressBucket>,
+    /// mongod's ingress admission control, which every command passes
+    /// through (RM-355).
+    ingress_admission: crate::admission::ingress::IngressAdmissionController,
 }
 
 /// mongod's connection-establishment rate limiter (8.2.11, measured
@@ -422,6 +436,11 @@ impl ServerParams {
         true
     }
 
+    /// mongod's ingress admission control (RM-355).
+    pub fn ingress_admission(&self) -> &crate::admission::ingress::IngressAdmissionController {
+        &self.ingress_admission
+    }
+
     /// The feature compatibility version, if it has been read or set.
     pub fn fcv(&self) -> Option<String> {
         self.fcv.lock().ok()?.clone()
@@ -491,6 +510,7 @@ impl ServerParams {
     /// Store `value`, returning nothing — the caller already holds the previous
     /// value for `was`.
     fn set(&self, name: &str, value: Bson) {
+        self.ingress_admission.apply(name, &value);
         if let Ok(mut guard) = self.values.lock() {
             guard.insert(name.to_string(), value);
         }

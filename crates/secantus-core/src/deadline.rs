@@ -209,6 +209,21 @@ pub fn arm(max_time_ms: Option<i64>) -> Guard {
     Guard { previous }
 }
 
+/// [`arm`], the budget counted from `since` rather than from now: an
+/// operation's `maxTimeMS` runs from where mongod starts it, before the
+/// operation waits for admission, so the time it queued is spent from it.
+pub fn arm_since(since: Instant, max_time_ms: Option<i64>) -> Guard {
+    let previous = CURRENT.with(|c| c.get());
+    if let Some(ms) = max_time_ms.filter(|ms| *ms > 0) {
+        let armed = Armed {
+            deadline: since + Duration::from_millis(ms as u64),
+            ticks: 0,
+        };
+        CURRENT.with(|c| c.set(Some(armed)));
+    }
+    Guard { previous }
+}
+
 /// Neither the budget nor the kill flag, until the guard drops: for work an
 /// operation must finish whatever happened to it -- the abort of an index
 /// build its own interruption caused (RM-187).
@@ -285,6 +300,17 @@ pub fn check_now() -> Result<(), MaxTimeMsExpired> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A budget armed from a moment already past has that much less left.
+    #[test]
+    fn a_budget_armed_since_a_past_moment_is_partly_spent() {
+        let since = Instant::now() - Duration::from_millis(50);
+        let _g = arm_since(since, Some(60));
+        let left = remaining_ms().unwrap();
+        assert!(left <= 10.0, "{left}");
+        let _g = arm_since(since, Some(40));
+        assert!(expired());
+    }
 
     /// Nothing armed must cost nothing and never fire — the fast path every
     /// command without `maxTimeMS` takes.
