@@ -668,7 +668,7 @@ def test_correlation_reads_a_from_subquerys_output_names(query: str, rust_pg: An
 
 
 # Found while working RP-505, measured on PostgreSQL 15.19: the FROM items
-# whose columns a subquery's bare name still cannot find.
+# whose columns a subquery's bare name could not find.
 FROM_ITEM_NAMES_UNKNOWN = {
     # A WITH item, read directly or through a FROM-subquery's star.
     "with w as (select 1 a) select (select a) from w": [(1,)],
@@ -685,11 +685,103 @@ FROM_ITEM_NAMES_UNKNOWN = {
     "select (select a) from (select * from (values (1)) v(a) join (values (1)) w(a) using (a)) t": [
         (1,)
     ],
+    # Measured while working RP-506. A WITH item renamed by its alias or its
+    # own column list, one read by a later item, one read by a
+    # FROM-subquery's own WITH, and a recursive one.
+    "with w as (select 1 a, 2 b) select (select b) from w t(x)": [(2,)],
+    "with w(x) as (select 1 a, 2 b) select (select x), (select b) from w": [(1, 2)],
+    "with w as (select 1 a), w2 as (select a + 1 b from w) select (select b) from w2": [(2,)],
+    (
+        "with w as (select 1 a) select (select a) from (with w2 as (select * from w) "
+        "select * from w2) t"
+    ): [(1,)],
+    (
+        "with recursive w(a) as (select 1 union all select a + 1 from w where a < 3) "
+        "select a, (select a * 10) from w order by 1"
+    ): [
+        (1, 10),
+        (2, 20),
+        (3, 30),
+    ],
+    (
+        "with recursive w(a) as (select 1 union all select a + 1 from w where a < 2) "
+        "select (select a) from (select * from w) t order by 1"
+    ): [
+        (1,),
+        (2,),
+    ],
+    # A function named by itself, WITH ORDINALITY, and a record result's
+    # columns, renamed by an alias's list.
+    "select (select generate_series) from (select * from generate_series(1, 2)) t order by 1": [
+        (1,),
+        (2,),
+    ],
+    (
+        "select (select ordinality) from (select * from generate_series(5, 6) with "
+        "ordinality) t order by 1"
+    ): [
+        (1,),
+        (2,),
+    ],
+    """select (select key), (select value) from (select * from json_each('{"k": 1}')) t""": [
+        ("k", 1)
+    ],
+    """select (select k) from (select * from json_each('{"k": 1}') as j(k, v)) t""": [("k",)],
+    # A NATURAL join's merged columns, and a join alias's list, which hides
+    # the sides' names.
+    (
+        "select (select c) from (select * from (values (1, 2)) v(a, b) natural join "
+        "(values (1, 3)) u(a, c)) t"
+    ): [(3,)],
+    (
+        "select (select x) from ((values (1, 2)) v(a, b) join (values (1, 3)) u(a, c) "
+        "using (a)) j(x)"
+    ): [(1,)],
+    (
+        "select (select a) from ((values (1, 2)) v(a, b) join (values (1, 3)) u(a, c) "
+        "using (a)) j(x)"
+    ): (
+        "42703",
+        'column "a" does not exist',
+        'There is a column named "a" in table "v", but it cannot be referenced '
+        "from this part of the query.",
+    ),
+    # A name no item has is still 42703.
+    "with w as (select 1 a) select (select nosuch) from w": (
+        "42703",
+        'column "nosuch" does not exist',
+        None,
+    ),
+    "with w as (select 1 a) select (select aa) from (select * from w) t": (
+        "42703",
+        'column "aa" does not exist',
+        'Perhaps you meant to reference the column "t.a".',
+    ),
 }
 
 
-@pytest.mark.backlog("RP-506")
+@pytest.mark.backlog_fixed("RP-506")
 @pytest.mark.parametrize("query", list(FROM_ITEM_NAMES_UNKNOWN))
 def test_correlation_over_a_cte_or_a_star_of_unknown_columns(query: str, rust_pg: Any) -> None:
-    """Each is 42703 `column ... does not exist` here."""
+    """Each PostgreSQL answers with rows was 42703 `column ... does not exist` here."""
     assert _rows(rust_pg, query) == FROM_ITEM_NAMES_UNKNOWN[query]
+
+
+# Found while working RP-506, measured on PostgreSQL 15.19: a subquery's own
+# WITH item reads the statement's, which was 42P01 here.
+NESTED_WITH_READS_OUTER = {
+    "with w as (select 1 a) select (with w2 as (select * from w) select a from w2)": [(1,)],
+    # An own item hides the statement's of its name from what follows it,
+    # not from the items before it.
+    (
+        "with w as (select 1 a) select (with w2 as (select * from w), w as (select 2 a) "
+        "select w2.a * 10 + w.a from w2, w)"
+    ): [(12,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-506")
+@pytest.mark.parametrize("query", list(NESTED_WITH_READS_OUTER))
+def test_subquery_with_reads_the_statements_with(query: str, rust_pg: Any) -> None:
+    """Each was 42P01 `relation "w" does not exist` here."""
+    assert _rows(rust_pg, query) == NESTED_WITH_READS_OUTER[query]
