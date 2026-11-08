@@ -2,7 +2,9 @@
 compared with a record runs `record_eq`'s field checks): RP-529 (a domain
 column's whole row is typed by its base type), RP-530 (a record compared
 with a scalar is 0A000, not 42883), RP-531 (NULLIF, GREATEST and LEAST over
-a whole row) and RP-532 (GROUP BY a whole row not in the select list).
+a whole row, fixed: they compare by `record_eq` / `record_cmp`, and
+`select_common_type` types a whole row and a `ROW(...)`) and RP-532 (GROUP
+BY a whole row not in the select list).
 
 An answer is the rows, or `(sqlstate, message, hint, position)` for an
 error. The expected answers were measured on a private, freshly initdb'd
@@ -20,13 +22,17 @@ import pytest
 from tests.backlog.test_rp_batch26 import _dsn
 
 _SETUP = [
-    "drop table if exists fs, fd cascade",
+    "drop view if exists vfs",
+    "drop table if exists fs, fd, ft cascade",
     "drop domain if exists dint cascade",
     "create domain dint as int",
     "create table fs (a int, c text)",
     "create table fd (a dint)",
+    "create table ft (a int, c text)",
     "insert into fs values (1, 'y')",
     "insert into fd values (1)",
+    "insert into ft values (1, 'y')",
+    "create view vfs as select * from fs",
 ]
 
 
@@ -34,8 +40,8 @@ _SETUP = [
 def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
-        c.execute(_SETUP[0])
-        c.execute(_SETUP[1])
+        for q in _SETUP[:3]:
+            c.execute(q)
 
 
 def answer(dsn: str, query: str) -> Any:
@@ -115,9 +121,9 @@ def test_record_against_scalar(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_AGAINST_SCALAR[query]
 
 
-# NULLIF compares its arguments with `record_eq`; GREATEST and LEAST
-# resolve one common type for their arguments (`select_common_type`) and
-# order them with `record_cmp`.
+# NULLIF compared its arguments with `record_eq`; GREATEST and LEAST
+# resolved one common type for their arguments (`select_common_type`) and
+# ordered them with `record_cmp`. Each of the four answered `(1,y)`.
 RECORD_CONDITIONALS = {
     "select nullif(fs, (1,'y'::text)) from fs": [(None,)],
     "select nullif(fs, row(2,'y')::fs) from fs": [("(1,y)",)],
@@ -131,10 +137,92 @@ RECORD_CONDITIONALS = {
 }
 
 
-@pytest.mark.backlog("RP-531")
+@pytest.mark.backlog_fixed("RP-531")
 @pytest.mark.parametrize("query", list(RECORD_CONDITIONALS))
 def test_record_conditionals(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_CONDITIONALS[query]
+
+
+def _mismatch(label: str, a: str, b: str, position: str) -> tuple:
+    return ("42804", f"{label} types {a} and {b} cannot be matched", None, position)
+
+
+def _no_convert(label: str, a: str, b: str, position: str) -> tuple:
+    return ("42846", f"{label} could not convert type {a} to {b}", None, position)
+
+
+def _dissimilar(a: str, b: str, column: int) -> tuple:
+    return (
+        "42804",
+        f"cannot compare dissimilar column types {a} and {b} at record column {column}",
+        None,
+        None,
+    )
+
+
+# The rest of the family, measured with RP-531 on the same cluster. A
+# table's or a view's whole row is of its own composite type (category C),
+# a `ROW(...)` or a subquery's or CTE's whole row of `record` (category P);
+# the category pass runs over every part before any is coerced, and a
+# composite has no cast to another. A `ROW(...)` cast to a composite is
+# reported at its `::`.
+RECORD_CONDITIONALS_MORE = {
+    "select nullif(fs, (1,'y')) from fs": _dissimilar("text", "unknown", 2),
+    "select nullif(fs, (1,2)) from fs": _dissimilar("text", "integer", 2),
+    "select nullif(row(1,'y'::text), fs) from fs": [(None,)],
+    "select nullif(fs, ft) from fs, ft": [(None,)],
+    "select greatest(fs, row(0,'a')::fs) from fs": [("(1,y)",)],
+    "select greatest(fs, row(2,null)::fs) from fs": [("(2,)",)],
+    "select least(fs, row(1,null)::fs) from fs": [("(1,y)",)],
+    "select greatest(fs, null) from fs": [("(1,y)",)],
+    "select greatest(row(1,'a'::text), row(2,'a'::text), row(2,'b'::text))": [(("2", "b"),)],
+    "select least(row(1,'a'::text), row(2,'a'::text))": [(("1", "a"),)],
+    "select greatest(row(1,'a'::text), row(1,2))": _dissimilar("text", "integer", 2),
+    "select greatest(row(1,'a'::text), row(1))": (
+        "42804",
+        "cannot compare record types with different numbers of columns",
+        None,
+        None,
+    ),
+    "select greatest(row(1), 1)": _mismatch("GREATEST", "record", "integer", "25"),
+    "select greatest(fs, 1) from fs": _mismatch("GREATEST", "fs", "integer", "21"),
+    "select greatest(1, fs) from fs": _mismatch("GREATEST", "integer", "fs", "20"),
+    "select greatest(t, row(0,'a')::fs) from fs t": [("(1,y)",)],
+    "select greatest(fs.*, (0,'a'::text)) from fs": _mismatch("GREATEST", "fs", "record", "23"),
+    "select greatest(fs, ft) from fs, ft": _no_convert("GREATEST", "ft", "fs", "21"),
+    "select greatest(fs, ft, 1) from fs, ft": _mismatch("GREATEST", "fs", "integer", "25"),
+    "select greatest(fs, row(0,'a')::fs, (1,'b'::text)) from fs": _mismatch(
+        "GREATEST", "fs", "record", "37"
+    ),
+    "select greatest(null, fs, (1,'b'::text)) from fs": _mismatch("GREATEST", "fs", "record", "27"),
+    "select greatest((1,'b'::text), fs) from fs": _mismatch("GREATEST", "record", "fs", "32"),
+    "select coalesce(fs, (2,'a'::text)) from fs": _mismatch("COALESCE", "fs", "record", "21"),
+    "select coalesce(fs, row(2,'a')::fs) from fs": [("(1,y)",)],
+    "select coalesce(fs, ft) from fs, ft": _no_convert("COALESCE", "ft", "fs", "21"),
+    "select case when true then fs else (2,'a'::text) end from fs": _mismatch(
+        "CASE", "record", "fs", "28"
+    ),
+    "select case when false then fs when true then (2,'a'::text) end from fs": (
+        _mismatch("CASE", "fs", "record", "47")
+    ),
+    "select greatest(vfs, row(0,'a')::fs) from vfs": _no_convert("GREATEST", "fs", "vfs", "32"),
+    "select greatest(vfs, (0,'a'::text)) from vfs": _mismatch("GREATEST", "vfs", "record", "22"),
+    "select greatest(s, row(0,'a')::fs) from (select 1 a, 'x'::text c) s": (
+        _mismatch("GREATEST", "record", "fs", "30")
+    ),
+    "with w as (select * from fs) select greatest(w, row(0,'a')::fs) from w": (
+        _mismatch("GREATEST", "record", "fs", "59")
+    ),
+    "select greatest(row(1,'a'::text)::fs, (2,'a'))": _mismatch("GREATEST", "fs", "record", "39"),
+    "select least(fs, (2,'a')::fs) from fs": [("(1,y)",)],
+    "select greatest(a, 2) from fs": [(2,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-531")
+@pytest.mark.parametrize("query", list(RECORD_CONDITIONALS_MORE))
+def test_record_conditionals_more(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == RECORD_CONDITIONALS_MORE[query]
 
 
 # A GROUP BY item need not be in the select list, a whole row included.

@@ -4653,3 +4653,44 @@ fn composite_record_compare_checks_the_fields_it_reaches() {
     let got = record_compare("=", &fs, &fs, false, Some((&row, &lit))).unwrap();
     assert_eq!(got, Bson::Boolean(true));
 }
+
+/// RP-531: GREATEST and LEAST order records by `record_cmp`, called
+/// (current, next) as `ExecEvalMinMax` calls it, NULL fields last, and
+/// pass its field checks through (PostgreSQL 15.19).
+#[test]
+fn greatest_and_least_order_records_by_record_cmp() {
+    let rec = |a: Bson, c: Bson| {
+        typed_record_value(vec![a, c], vec!["int4".to_string(), "text".to_string()])
+    };
+    let fs = rec(Bson::Int32(1), Bson::String("y".into()));
+    let low = rec(Bson::Int32(0), Bson::String("a".into()));
+    let null_c = rec(Bson::Int32(1), Bson::Null);
+    let call = |name: &str, args: &[Bson]| scalar::call(name, args).unwrap();
+    assert_eq!(call("least", &[fs.clone(), low.clone()]).unwrap(), low);
+    assert_eq!(call("greatest", &[fs.clone(), low.clone()]).unwrap(), fs);
+    // A NULL field sorts after any value: `(1,)` is past `(1,y)`.
+    assert_eq!(
+        call("greatest", &[fs.clone(), null_c.clone()]).unwrap(),
+        null_c
+    );
+    assert_eq!(call("least", &[fs.clone(), null_c.clone()]).unwrap(), fs);
+    // A NULL argument is skipped.
+    assert_eq!(call("least", &[Bson::Null, fs.clone()]).unwrap(), fs);
+    // A field of another type is `record_cmp`'s 42804.
+    let int_c = typed_record_value(
+        vec![Bson::Int32(1), Bson::Int32(2)],
+        vec!["int4".to_string(), "int4".to_string()],
+    );
+    let e = call("greatest", &[fs.clone(), int_c])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        e.contains("cannot compare dissimilar column types text and integer at record column 2"),
+        "{e}"
+    );
+    assert_eq!(
+        record_cmp(&fs, &low).map(|r| r.unwrap()),
+        Some(std::cmp::Ordering::Greater)
+    );
+    assert!(record_cmp(&fs, &Bson::Int32(1)).is_none());
+}

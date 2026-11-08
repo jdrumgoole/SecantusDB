@@ -1879,6 +1879,24 @@ fn eval(name: &str, args: &[Bson]) -> Result<Bson> {
             for a in args.iter().filter(|a| *a != &Bson::Null) {
                 best = Some(match best {
                     None => a.clone(),
+                    // Records order by `record_cmp`, called as
+                    // `ExecEvalMinMax` calls it, (current, next), so its
+                    // field checks name the two in that order.
+                    Some(cur) if crate::record_fields(a).is_some() => {
+                        match crate::record_cmp(&cur, a) {
+                            Some(o) => {
+                                let o = o?;
+                                if (name == "greatest" && o == std::cmp::Ordering::Less)
+                                    || (name == "least" && o == std::cmp::Ordering::Greater)
+                                {
+                                    a.clone()
+                                } else {
+                                    cur
+                                }
+                            }
+                            None => cur,
+                        }
+                    }
                     Some(cur) => {
                         let take = match compare_constants(a, &cur) {
                             Some(o) => {
