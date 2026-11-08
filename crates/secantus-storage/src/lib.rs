@@ -51,6 +51,7 @@ pub use secantus_core::bsondoc;
 
 pub mod admission;
 mod auto_compact;
+mod catalog_changes;
 pub mod changestreams;
 pub mod compact;
 pub mod pitr_archive;
@@ -62,6 +63,7 @@ mod index_build;
 mod scan_bounds;
 mod sizes;
 
+pub use catalog_changes::CatalogChange;
 pub use index_build::{IndexBuildAbort, IndexBuildInfo, IndexBuildSpec};
 pub use sizes::CollectionSizes;
 use sizes::Delta;
@@ -360,6 +362,9 @@ pub struct UserTransactionHandle {
     /// the settled value, the catalog this snapshot sees is the committed one
     /// every session sees (see `planner_shared_gen`).
     planner_gen: Option<u64>,
+    /// The catalog-change counter just before the transaction's snapshot was
+    /// taken: see [`UserTransactionHandle::catalog_changed_since_snapshot`].
+    catalog_epoch: u64,
 }
 
 impl UserTransactionHandle {
@@ -454,6 +459,18 @@ impl UserTransactionHandle {
     /// Has the transaction begun in WiredTiger -- taken its snapshot?
     pub fn began(&self) -> bool {
         self.began
+    }
+
+    /// Has the catalog entry of `(db, coll)` changed since the transaction's
+    /// snapshot was taken (a [`CatalogChange`] finished since, or is under
+    /// way)? `false` before the transaction has begun: its snapshot, taken
+    /// at its next statement, sees the change.
+    pub fn catalog_changed_since_snapshot(&self, db: &str, coll: &str) -> bool {
+        if !self.began {
+            return false;
+        }
+        let store = self.held.lock().unwrap_or_else(|e| e.into_inner()).store;
+        catalog_changes::changed_since(store, self.catalog_epoch, db, coll)
     }
 
     pub fn has_written(&self) -> bool {
@@ -7379,10 +7396,18 @@ impl Drop for Storage {
         if let Err(e) = self.close() {
             eprintln!("secantus-storage: close failed: {e:?}");
         }
+        catalog_changes::forget_store(self as *const Storage as usize);
     }
 }
 
 impl Storage {
+    /// About to change the catalog entries of `colls`, each `(db,
+    /// collection)` (`""` for every collection of `db`): a transaction whose
+    /// snapshot is older may no longer write there (see [`CatalogChange`]).
+    pub fn catalog_change(&self, colls: &[(&str, &str)]) -> CatalogChange {
+        CatalogChange::begin(self as *const Storage as usize, colls)
+    }
+
     /// Close the store: stop the background threads, persist the oplog meta
     /// row and take the final checkpoint. Answers the FIRST failure (each is
     /// also logged): a close-time write error is a durability signal, and a
@@ -10867,6 +10892,7 @@ impl Storage {
             unattributed: false,
             registry_gen: 0,
             planner_gen: None,
+            catalog_epoch: 0,
             opened_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_micros() as i64),
@@ -10961,9 +10987,11 @@ impl Storage {
         let epoch = COMMITS_DONE.load(Ordering::SeqCst);
         let registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
         let planner_gen = planner_settled();
+        let catalog_epoch = catalog_changes::catalog_epoch();
         match session.reset_snapshot() {
             Ok(()) => {
                 handle.epoch = Some(epoch);
+                handle.catalog_epoch = catalog_epoch;
                 handle.registry_gen = registry_gen;
                 handle.planner_gen = planner_gen;
                 Ok(true)
@@ -10996,6 +11024,7 @@ impl Storage {
             handle.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             handle.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
             handle.planner_gen = planner_settled();
+            handle.catalog_epoch = catalog_changes::catalog_epoch();
             session.begin_transaction(None)?;
             handle.began = true;
         }
@@ -11516,6 +11545,7 @@ impl Storage {
             fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
             fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
             fresh.planner_gen = planner_settled();
+            fresh.catalog_epoch = catalog_changes::catalog_epoch();
             session.begin_transaction(None)?;
             fresh.began = true;
             // Any read takes the snapshot; the collection registry always
@@ -11585,6 +11615,7 @@ impl Storage {
                     fresh.epoch = Some(COMMITS_DONE.load(Ordering::SeqCst));
                     fresh.registry_gen = COLL_TABLE_GEN.load(Ordering::SeqCst);
                     fresh.planner_gen = planner_settled();
+                    fresh.catalog_epoch = catalog_changes::catalog_epoch();
                     session.begin_transaction(None)?;
                     fresh.began = true;
                     // REPEATABLE READ may move only onto a snapshot that sees

@@ -1387,21 +1387,6 @@ inject (a panic, a power loss, a failing checkpoint).
       gap. Found while fixing RM-319 (2026-11-08).
       Backlog-ID: RM-425
       Verify: tests/backlog/test_rm_cmd_line_opts.py::test_get_cmd_line_opts_reports_the_command_line
-- [ ] **A transaction older than an index writes past it, and the index
-      misses the document.** A transaction whose snapshot was taken before
-      an index committed (on any collection) and that then writes to the
-      index's collection commits here, and the write reads the index list
-      from its snapshot, so the new index gets no entry for it: a query
-      through the index misses the document. mongod 8.2.11 refuses the
-      write: 112 WriteConflict "Unable to write to collection '<ns>' due to
-      catalog changes; please retry the operation", labelled
-      TransientTransactionError. Found 2026-10-26 while building RM-187; it
-      is older than the hybrid build (any `createIndexes`, and a PG `CREATE
-      INDEX` beside a PG transaction, is exposed). The fix is mongod's: a
-      write whose snapshot predates its collection's last catalog change is
-      a write conflict.
-      Backlog-ID: RM-320
-      Verify: tests/backlog/test_rm_index_build_gaps.py::test_a_transaction_older_than_an_index_cannot_write_past_it
 
 ### 7.084 What an authenticated user may run -- 2026-10-14
 

@@ -1591,6 +1591,18 @@ pub trait Storage: Send + Sync {
         Ok(f())
     }
 
+    /// Has the catalog entry of `db.coll` (its indexes, its options, its
+    /// existence) changed since `handle`'s snapshot was taken? mongod refuses
+    /// such a transaction's write there (112). Default: never.
+    fn catalog_changed_since_snapshot(
+        &self,
+        _handle: &(dyn std::any::Any + Send),
+        _db: &str,
+        _coll: &str,
+    ) -> bool {
+        false
+    }
+
     /// Commit the transaction's WT session. Default no-op.
     fn commit_user_transaction(
         &self,

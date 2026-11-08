@@ -34,7 +34,7 @@ def _write_after_catalog_change(client: Any) -> tuple:
     return outcome, found
 
 
-@pytest.mark.backlog("RM-320")
+@pytest.mark.backlog_fixed("RM-320")
 def test_a_transaction_older_than_an_index_cannot_write_past_it(
     rust_mongo: Any,  # noqa: F811
     mongod_rs: Any,  # noqa: F811
@@ -42,8 +42,10 @@ def test_a_transaction_older_than_an_index_cannot_write_past_it(
     """mongod 8.2.11: a transaction whose snapshot predates an index cannot
     write to its collection once the index commits -- 112 WriteConflict
     ("Unable to write to collection ... due to catalog changes"), labelled
-    TransientTransactionError. This server commits the write without the
-    new index's entry, so the index misses the document."""
+    TransientTransactionError. This server committed the write without the
+    new index's entry, so the index missed the document; it now refuses the
+    write as mongod does (tests/mongod_live/test_txn_catalog_changes.py has
+    the other catalog changes and write commands)."""
     theirs = _write_after_catalog_change(mongod_rs)
     assert theirs == (("err", 112, ["TransientTransactionError"]), list(range(10))), theirs
     assert _write_after_catalog_change(rust_mongo) == theirs
