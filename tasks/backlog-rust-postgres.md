@@ -2230,21 +2230,44 @@ Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
       Backlog-ID: RP-545
       Verify: tests/backlog/test_rp_found_rp527.py::test_missing_from_relation_reported_first
 
-## Found while working RP-522 (2026-11-08)
+## Found while working RP-530 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain dint as
-int`, `fs(a int, c text)` holding `(1, 'y')` and `fd(a dint)` holding `1`.
-The gap tests are in `tests/backlog/test_rp_found_rp522.py`.
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
+holding `(1, 'y')`, `create type ct as (x int)` and `create type ct2 as (x
+int)`. The gap tests are in `tests/backlog/test_rp_found_rp530.py`.
 
-- [ ] **A record compared with a scalar is 0A000, not 42883.** `select fs
-      = (1) from fs`, `(1) = fs` and `fs::text = (1,'y')` are 42883
-      `operator does not exist: fs = integer` (`integer = fs`, `text =
-      record`) on PostgreSQL 15.19, with the no-operator HINT, at the
-      operator (11, 12, 17); here each is 0A000 `comparing document with
-      int32 using = is not supported yet`, found only while the row is
-      compared.
-      Backlog-ID: RP-530
-      Verify: tests/backlog/test_rp_found_rp522.py::test_record_against_scalar
+- [ ] **Two different composite types are refused a comparison.** `select
+      row(1)::ct = row(1)::ct2` is `t` on PostgreSQL 15.19, and `row(1)::ct
+      < row(2)::ct2` too: both coerce to `record`, and `record_eq` /
+      `record_cmp` compare the fields. Here each is 42883 `operator does
+      not exist: ct = ct2` (`check_aexpr`'s composite rule takes a
+      different type oid for no operator).
+      Verify: tests/backlog/test_rp_found_rp530.py::test_two_composite_types_compare
+      Backlog-ID: RP-590
+- [ ] **An untyped literal beside a row is not read as `record`.** `select
+      fs = 'x' from fs`, `'x' = fs` and `(1,2) = 'x'` are 0A000 `input of
+      anonymous composite types is not implemented` at the literal (13, 8,
+      16) on PostgreSQL 15.19: the operator resolves to `record = record`
+      and `record_in` refuses the literal. Here each is 0A000 `comparing
+      document with string using = is not supported yet`, with no position.
+      Verify: tests/backlog/test_rp_found_rp530.py::test_untyped_literal_beside_a_row
+      Backlog-ID: RP-591
+- [ ] **A row beside an `ARRAY[...]` names the row `text`.** `select
+      array[1] = (1,2)`, `fs = array[1]` and `array[1] = fs` are 42883
+      `operator does not exist: integer[] = record` (`fs = integer[]`,
+      `integer[] = fs`) on PostgreSQL 15.19; here they name the array
+      `int4[]` and the row `text`. The SQLSTATE and position match.
+      Verify: tests/backlog/test_rp_found_rp530.py::test_row_beside_an_array_constructor
+      Backlog-ID: RP-592
+- [ ] **An error a PREPARE's query raises carries the query's own offset.**
+      PREPARE plans the deparsed inner query, so a recorded location is an
+      offset into `SELECT ...`, honoured whenever a token of the PREPARE
+      text happens to start there: `prepare p1(int) as select 12 = true`
+      is 42883 at 30 on PostgreSQL 15.19 and at 11 here (the `(` of
+      `p1(int)`). An offset that lands on no token falls back to the text
+      search, which is why most look right.
+      Verify: tests/backlog/test_rp_found_rp530.py::test_prepare_error_position
+      Backlog-ID: RP-593
 
 ## Found while working RP-532 (2026-11-08)
 

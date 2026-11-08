@@ -2,7 +2,8 @@
 compared with a record runs `record_eq`'s field checks): RP-529 (a domain
 column's whole row was typed by its base type, fixed: a table's row type
 records the column under its domain), RP-530 (a record compared
-with a scalar is 0A000, not 42883), RP-531 (NULLIF, GREATEST and LEAST over
+with a scalar was 0A000, not 42883, fixed: parse analysis finds no operator
+for a row beside a typed operand that is not one), RP-531 (NULLIF, GREATEST and LEAST over
 a whole row, fixed: they compare by `record_eq` / `record_cmp`, and
 `select_common_type` types a whole row and a `ROW(...)`) and RP-532 (GROUP
 BY a whole row not in the select list).
@@ -134,8 +135,14 @@ _NO_OPERATOR_HINT = (
     "You might need to add explicit type casts."
 )
 
-# A record against a scalar has no operator: 42883 naming both types, at
-# the operator.
+
+def _no_operator(types: str, position: str) -> tuple:
+    return ("42883", f"operator does not exist: {types}", _NO_OPERATOR_HINT, position)
+
+
+# A record against a scalar has no operator: 42883 naming both types (a
+# domain by its own name), at the operator, when the statement is analysed.
+# Only `anynonarray || text` takes a row beside a scalar.
 RECORD_AGAINST_SCALAR = {
     "select fs = (1) from fs": (
         "42883",
@@ -155,12 +162,30 @@ RECORD_AGAINST_SCALAR = {
         _NO_OPERATOR_HINT,
         "17",
     ),
+    # Each of these answered: a row concatenated with a number, an IN list
+    # matched on its row item, and a NULL or no row at all compared nothing.
+    "select fs || 1 from fs": _no_operator("fs || integer", "11"),
+    "select fs in (fs, 1) from fs": _no_operator("fs = integer", "11"),
+    "select 1 in (2, fs) from fs": _no_operator("integer = fs", "10"),
+    "select nullif(fs, 1) from fs": _no_operator("fs = integer", "8"),
+    "select fs = null::int from fs": _no_operator("fs = integer", "11"),
+    "select fs = 1 from fs where false": _no_operator("fs = integer", "11"),
+    "select fs = 1::dint from fs": _no_operator("fs = dint", "11"),
+    "select fs <> all(array[1]) from fs": _no_operator("fs <> integer", "11"),
+    "select fs between 1 and 2 from fs": _no_operator("fs >= integer", "11"),
+    "select fs is distinct from 1 from fs": _no_operator("fs = integer", "11"),
+    "select fs <@ int4range(1,2) from fs": _no_operator("fs <@ int4range", "11"),
+    "select fs || 'x'::text from fs": [("(1,y)x",)],
+    "select 'a'::text || fs from fs": [("a(1,y)",)],
 }
 
 
-@pytest.mark.backlog("RP-530")
+@pytest.mark.backlog_fixed("RP-530")
 @pytest.mark.parametrize("query", list(RECORD_AGAINST_SCALAR))
 def test_record_against_scalar(query: str, dsn: str) -> None:
+    """A record against a scalar was 0A000 `comparing document with int32
+    using = is not supported yet`, found only while a row was compared;
+    over no row, or beside a NULL, it answered."""
     assert answer(dsn, query) == RECORD_AGAINST_SCALAR[query]
 
 
