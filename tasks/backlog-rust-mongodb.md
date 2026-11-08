@@ -1759,38 +1759,22 @@ Still different, all 77:
       query's entry.
       Backlog-ID: RM-429
       Verify: tests/backlog/test_plan_cache_or_branches.py::test_an_or_branch_before_sbe_stages_is_cached
-- [ ] **`$planCacheStats` lists no `estimatedSizeBytes`.** mongod 8.2.11
-      gives each entry the bytes it takes in mongod's memory: the C++
-      sizes of the entry, its plan and its debug information. The field is
-      left out here rather than given a value that is not mongod's.
-      **Decided (Joe, 2026-11-08): port mongod's `_estimateObjectSizeInBytes` with a layout table per mongod build, the faithful option: libc++ / arm64 for macOS, libstdc++ / x86_64 for Linux, chosen by the target the server is built for, each fitted by probing that platform's mongod 8.2.11 (CI or a container for Linux; `only_on` for the per-platform gap tests).** Measured when it was asked (2026-11-08): the number is mongod's C++ object
-      layout, and mongod gives two of them. It is
-      `PlanCacheEntryBase::_estimateObjectSizeInBytes` (r8.2.11
-      `plan_cache.h`): `sizeof` the entry, plus `SolutionCacheData` and
-      its `PlanCacheIndexTree` (each node's `IndexEntry`: key pattern and
-      `infoObj` `objsize()`, multikey path sets, identifier string
-      capacities), plus `DebugInfo` (the query's filter / sort /
-      projection / collation `objsize()`) and its `PlanRankingDecision`:
-      every candidate's `PlanStageStats` tree (each stage's filter BSON,
-      the index scan's key pattern, start / end keys, `indexName`
-      capacity), the `scores` and `candidateOrder` vector capacities.
-      SBE-keyed entries add `DebugInfoSBE` (`planSummary` capacity and
-      more). Probed on macOS arm64 mongod 8.2.11, the test's query over
-      `a_1` / `b_1`: 3040 for index names of 3 to 22 characters, 3048 at
-      23, 3076 at 24, 3140 at 40 -- the step is libc++'s short-string
-      limit (22). The Linux mongod CI runs is built against libstdc++
-      (short-string limit 15, `sizeof(std::string)` 32 rather than 24),
-      so its sizes differ throughout; no Linux 8.2.11 is on this box to
-      measure. Options: (1) port the estimate tree with a layout table
-      per mongod build (libc++ / arm64 for macOS, libstdc++ / x86_64 for
-      Linux), chosen by the target the server is built for, its `sizeof`
-      constants fitted by probing 8.2.11 on each -- several PRs, and a
-      Linux reference to fit against (CI or a container); (2) the Linux
-      layout only, which macOS then reports too -- part of the answer;
-      (3) keep the field omitted and make it a scope decision: the bytes
-      of mongod's own memory are not state this server has.
-      Backlog-ID: RM-341
-      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size
+- [ ] **`$planCacheStats` lists no `estimatedSizeBytes` on Linux.** The
+      field is mongod's estimate of the entry's C++ objects, so its figure
+      depends on how mongod was built (RM-341): this server reproduces
+      macOS arm64's (libc++, `explain/entry_size.rs` `LIBCXX_ARM64`) and
+      leaves the field out elsewhere. Linux x86_64 mongod 8.2.11, which CI
+      runs, is built against libstdc++: `std::string` is 32 bytes with 15
+      characters inline (libc++: 24 and 22), `std::set` 48, so every
+      `sizeof` and every capacity term differs. Fit a `LIBSTDCXX_X86_64`
+      layout by probing a Linux 8.2.11 (CI or a container; none is on this
+      Mac), the way the arm64 one was: the shapes of
+      `test_entries_of_many_shapes_report_mongods_size`, and index names
+      either side of 15 characters. **Decided (Joe, 2026-11-08, on RM-341):
+      a layout table per mongod build, chosen by the target the server is
+      built for, each fitted by probing that platform's mongod 8.2.11.**
+      Backlog-ID: RM-442
+      Verify: tests/backlog/test_rm_340_342_plan_cache_gaps.py::test_an_entry_reports_its_estimated_size_on_linux
 - [ ] **A compound index scan whose second field has several intervals
       examines a key more than mongod's for each value of the first.**
       Over `a_1_c_1` (2,000 documents, `a: i % 100`, `c: i % 7`), mongod
@@ -1821,6 +1805,59 @@ Still different, all 77:
       (RM-071).
       Verify: tests/backlog/test_rm_found_2026_11_08_rm071.py::test_a_sort_after_a_pushed_down_group_sizes_what_sbe_hands_it
       Backlog-ID: RM-435
+- [ ] **`estimatedSizeBytes` is left out of entries whose index tree this
+      server does not build.** It sizes an entry's `PlanCacheIndexTree`
+      from the canonical query and the clauses the winning plan's one index
+      was assigned (`plan::index_tags`, `entry_size::tagged_tree`). mongod
+      8.2.11 sizes every entry; this server leaves the field out where the
+      tree's nodes or tags are not modelled: a predicate inside
+      `$elemMatch` (its `ELEM_MATCH_*` node and the tags under it), an
+      `$or` or `$nor` that is not the root (an `OR` may take an
+      `OrPushdownTag` of its own), a `$not` over several predicates,
+      `$jsonSchema`, a winner that reads two indexes (`AND_SORTED` or an
+      `OR`, where `tagForSort` picks the lowest-numbered index), and an
+      `OR` stage among the candidates (`OrStats`). Found 2026-11-08 (RM-341).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_entries_this_does_not_size_report_their_size
+      Backlog-ID: RM-436
+- [ ] **A SORT_MERGE candidate's trial counts are not mongod's.** For
+      `{a: {$in: [1, 2]}, b: {$lt: 90}}` sorted by `c` over `a_1_c_1` and
+      `b_1`, mongod 8.2.11's winning SORT_MERGE reports 82 `works` and its
+      `dupsTested` and `dupsDropped` in `creationExecStats`; this server's
+      reports 83 works and neither field. Found 2026-11-08 (RM-341).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_sort_merge_candidate_counts_as_mongods
+      Backlog-ID: RM-437
+- [ ] **A scan over several intervals of one field seeks and returns
+      differently in the trial.** mongod 8.2.11's losing candidate for
+      `{a: {$lt: 5}, b: {$nin: [3, 4]}}` reads `b_1` over three intervals,
+      examining 101 keys in 3 seeks and returning 99; this server's scan
+      model seeks twice and returns 100, in `creationExecStats` (and so in
+      its score). Perhaps RM-433's cause on one field. Found 2026-11-08
+      (RM-341).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_nin_candidate_reads_mongods_keys
+      Backlog-ID: RM-438
+- [ ] **A candidate's FETCH filter puts an inexact `$exists` after the
+      other predicates.** mongod 8.2.11's losing candidate for `{a: {$lt:
+      5}, b: {$exists: true}}` over `b_1` rechecks `{$and: [{b: {$exists:
+      true}}, {a: {$lt: 5}}]}`; this server's puts `a` first. Found
+      2026-11-08 (RM-341).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_an_exists_candidates_filter_is_in_mongods_order
+      Backlog-ID: RM-439
+- [ ] **A `$type` index filter returns too few keys in the trial.** mongod
+      8.2.11's losing candidate for `{a: {$lt: 5}, b: {$type: "int"}}` over
+      `b_1` rechecks `$type` against each key and hands all 101 it examines
+      (every `b` an int) to its FETCH; this server's, with the same bounds
+      and filter, hands over 6 -- the documents the FETCH keeps -- so its
+      FETCH's `docsExamined` is 6, not 101. Found 2026-11-08 (RM-341).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_type_candidate_reads_mongods_keys
+      Backlog-ID: RM-440
+- [ ] **A multikey index does not cover a field that holds no array.**
+      mongod 8.2.11 answers `find({a: {$lt: 5}}, {a: 1, _id: 0})` from
+      `a_1_c_1` with a PROJECTION_COVERED over the IXSCAN when only `c`
+      holds arrays (`multiKeyPaths: {a: [], c: ["c"]}`); this server
+      fetches every document (PROJECTION_SIMPLE over a FETCH), which also
+      changes the trial and the cached plan. Found 2026-11-08 (RM-341).
+      Verify: tests/backlog/test_rm_found_2026_11_08_rm341.py::test_a_multikey_index_covers_a_field_that_holds_no_array
+      Backlog-ID: RM-441
 
 ### 7.079 `$out` and `$merge` -- 2026-10-13
 

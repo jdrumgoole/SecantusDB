@@ -622,6 +622,8 @@ struct IndexUse {
     covered: BTreeSet<usize>,
     /// Clauses rechecked against the key.
     on_key: BTreeSet<usize>,
+    /// Clauses whose predicate set bounds: mongod's index tags.
+    tagged: BTreeSet<usize>,
     /// The leading field is bounded by a predicate.
     leads: bool,
     bounded_fields: usize,
@@ -632,6 +634,7 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
     let mut bounds = Vec::new();
     let mut covered = BTreeSet::new();
     let mut on_key = BTreeSet::new();
+    let mut tagged = BTreeSet::new();
     let mut leads = false;
     let mut bounded_fields = 0;
     for (pos, (field, _)) in index.fields().into_iter().enumerate() {
@@ -660,6 +663,7 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
             if leaf.derived {
                 continue;
             }
+            tagged.insert(leaf.clause);
             match tight {
                 Tight::Exact => {
                     covered.insert(leaf.clause);
@@ -685,6 +689,7 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
             bounds: vec![vec![Interval::all()]; index.key.len()],
             covered: BTreeSet::new(),
             on_key: BTreeSet::new(),
+            tagged: BTreeSet::new(),
             leads,
             bounded_fields: 0,
         };
@@ -705,8 +710,51 @@ fn use_index(index: &Arc<IndexInfo>, leaves: &[Leaf], parts: &[Document], q: &Qu
         bounds,
         covered,
         on_key,
+        tagged,
         leads,
         bounded_fields,
+    }
+}
+
+/// The index a plan reads and the clauses of `q.canonical` it assigned to
+/// that index -- mongod's index tags, from which it builds the cache
+/// entry's `PlanCacheIndexTree`. `None` unless the plan reads one index
+/// (a scan, or the scans of a merge over points of it) and every clause is
+/// one mongod tags as this planner does (no `$elemMatch`).
+pub(crate) fn index_tags(q: &Query, winner: &Node) -> Option<(Arc<IndexInfo>, BTreeSet<usize>)> {
+    let index = match access_of_plan(winner)? {
+        Node::IxScan(ix) => ix.index.clone(),
+        Node::SortMerge { inputs, .. } => {
+            let mut indexes = inputs.iter().map(|n| match n {
+                Node::IxScan(ix) => Some(ix.index.clone()),
+                _ => None,
+            });
+            let first = indexes.next()??;
+            if !indexes.all(|i| i.is_some_and(|i| i.name == first.name)) {
+                return None;
+            }
+            first
+        }
+        _ => return None,
+    };
+    let parts = clauses(q.canonical);
+    let leaves = leaves_of(&parts);
+    if leaves.iter().any(|l| l.derived) {
+        return None;
+    }
+    Some((index.clone(), use_index(&index, &leaves, &parts, q).tagged))
+}
+
+/// The access under what the rest of the query puts over it.
+fn access_of_plan(node: &Node) -> Option<&Node> {
+    match node {
+        Node::Fetch { input, .. }
+        | Node::Sort { input, .. }
+        | Node::Skip(_, input)
+        | Node::Limit(_, input)
+        | Node::Projection { input, .. } => access_of_plan(input),
+        Node::IxScan(_) | Node::SortMerge { .. } => Some(node),
+        _ => None,
     }
 }
 

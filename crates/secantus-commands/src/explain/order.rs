@@ -834,7 +834,7 @@ impl plan::CacheHook for ReadCache<'_> {
         if let (false, Some(key)) = (l.branch, self.ask.asked.distinct) {
             created_from.insert("distinct", doc! { "key": key });
         }
-        let creation = d
+        let creation: Vec<Document> = d
             .ranked
             .iter()
             .map(|(node, _, stats)| {
@@ -861,6 +861,7 @@ impl plan::CacheHook for ReadCache<'_> {
             .unwrap_or_default();
         let signature = plan::signature(winner);
         let solution = plan::solution(winner);
+        let estimated_size = estimated_size(q, winner, &created_from, &creation);
         super::plan_cache::set(
             &self.place,
             super::plan_cache::Entry {
@@ -880,9 +881,42 @@ impl plan::CacheHook for ReadCache<'_> {
                 creation,
                 scores: d.ranked.iter().map(|(_, s, _)| *s).collect(),
                 index_filter_set: self.index_filter_set,
+                estimated_size,
             },
         );
     }
+}
+
+/// The entry's `estimatedSizeBytes` as mongod's build for this platform
+/// estimates it (`super::entry_size`). `None` -- and no field -- where no
+/// build of the platform is measured, or for a plan whose
+/// `PlanCacheIndexTree` this does not build: one reading anything but one
+/// index, or a query with a clause outside `entry_size::tagged_tree`.
+fn estimated_size(
+    q: &Query,
+    winner: &Node,
+    created_from: &Document,
+    creation: &[Document],
+) -> Option<i64> {
+    let layout = super::entry_size::LAYOUT?;
+    let (index, tagged) = plan::index_tags(q, winner)?;
+    if !index.plain {
+        return None;
+    }
+    let copy = super::entry_size::IndexCopy {
+        name: index.name.clone(),
+        key: index.key.clone(),
+        // The `_id` index keeps no path-level multikey metadata.
+        multikey: if index.name == "_id_" {
+            vec![]
+        } else {
+            index.multikey_paths.iter().map(Vec::len).collect()
+        },
+    };
+    let clauses = plan::clauses(q.canonical);
+    let tree = super::entry_size::tagged_tree(q.canonical, &clauses, &tagged, &copy)?;
+    let size = super::entry_size::estimate(&layout, created_from, creation, &tree)?;
+    i64::try_from(size).ok()
 }
 
 /// A command that reads no rows in order (`count`, an `update` of many

@@ -1,5 +1,6 @@
-"""The plan cache against mongod 8.2.11 live: what it did not reproduce
-(RM-341) and what it now does (RM-340, RM-342)."""
+"""The plan cache against mongod 8.2.11 live: what it reproduces (RM-340,
+RM-341 on macOS arm64, RM-342) and what it does not yet (RM-341's figure on
+Linux x86_64, RM-442)."""
 
 from __future__ import annotations
 
@@ -7,6 +8,8 @@ from typing import Any
 
 import pytest
 from pymongo.errors import PyMongoError
+
+from tests.backlog.conftest import only_on
 
 
 def _listed(col: Any) -> Any:
@@ -148,11 +151,91 @@ def _sizes(client: Any) -> Any:
     return [e.get("estimatedSizeBytes") for e in got]
 
 
-@pytest.mark.backlog("RM-341")
+_MACOS_ARM64 = "the figure is mongod's C++ layout; this is macOS arm64's (libc++)"
+
+
+@pytest.mark.backlog_fixed("RM-341")
 def test_an_entry_reports_its_estimated_size(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 lists each entry's `estimatedSizeBytes`: the bytes its
-    plan cache entry takes in mongod's memory (3040 for this one)."""
+    plan cache entry takes in mongod's memory, 3040 for this one on macOS
+    arm64. It was left out here; the estimate is now mongod's, over the
+    libc++ arm64 layout of its types."""
+    only_on("darwin", why=_MACOS_ARM64)
+    only_on("arm64", why=_MACOS_ARM64)
+    assert _sizes(mongod) == [3040]
     assert _sizes(rust_mongo) == _sizes(mongod)
+
+
+@pytest.mark.backlog("RM-442")
+def test_an_entry_reports_its_estimated_size_on_linux(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 on Linux x86_64 is built against libstdc++, whose
+    `std::string` is 32 bytes with 15 characters inline: its
+    `estimatedSizeBytes` differ from macOS's throughout, and this server
+    leaves the field out on Linux until that layout is measured."""
+    only_on("linux", why="the libstdc++ x86_64 layout is Linux mongod's")
+    only_on("x86_64", why="the libstdc++ x86_64 layout is Linux mongod's")
+    assert _sizes(rust_mongo) == _sizes(mongod)
+
+
+def _shape_sizes(client: Any) -> Any:
+    """`estimatedSizeBytes` over query shapes whose entries this server
+    sizes: every predicate kind it tags, sorts, projections, paging, `_id_`,
+    multikey and compound indexes, long index names, AND_SORTED and
+    SORT_MERGE candidates, a rooted `$or`'s branches and an SBE front."""
+    client.drop_database("rm341s")
+    col = client.rm341s.c
+    docs = [
+        {"_id": i, "a": i % 100, "b": (i // 20) % 100, "c": i % 7, "s": f"x{i % 9}"}
+        for i in range(2000)
+    ]
+    col.insert_many(docs)
+    col.create_index("a")
+    col.create_index("b", name="b" * 31)
+    col.create_index([("a", 1), ("c", 1)])
+    col.create_index("s")
+    col.insert_one({"_id": -1, "m": [1, 2]})
+    col.create_index("m")
+    lt5 = {"a": {"$lt": 5}}
+    runs: list = [
+        lambda: col.find({**lt5, "b": {"$lt": 90}}),
+        lambda: col.find({**lt5, "b": {"$lt": 90}}).sort("c", 1).limit(7),
+        lambda: col.find({**lt5, "b": {"$lt": 90}}, {"a": 1, "c": 1}).skip(2),
+        lambda: col.find({**lt5, "m": {"$lt": 3}}),
+        lambda: col.find(lt5, {"a": 1, "_id": 0}),
+        lambda: col.find({"a": {"$gt": 1, "$lt": 5}, "b": {"$ne": 3}}),
+        lambda: col.find({**lt5, "b": {"$nin": [3, 4]}, "s": {"$regex": "^x"}}),
+        lambda: col.find({"_id": {"$lt": 50}, **lt5}),
+        lambda: col.find({"a": 3, "b": 5}),
+        lambda: col.find({"a": {"$in": [1, 2]}, "b": {"$lt": 90}}).sort("c", 1),
+        lambda: col.find({**lt5, "$expr": {"$lt": ["$b", 90]}, "b": {"$all": [3]}}),
+        lambda: col.find({"$or": [{"b": 0, "s": "x3"}, {"b": 5, "s": "x2"}]}),
+        lambda: col.aggregate(
+            [
+                {"$match": {**lt5, "b": {"$lt": 90}, "s": "x1"}},
+                {"$group": {"_id": "$b", "n": {"$sum": 1}}},
+            ]
+        ),
+    ]
+    out = []
+    for run in runs:
+        col.database.command("planCacheClear", "c")
+        for _ in range(2):
+            list(run())
+        out.append(sorted(e.get("estimatedSizeBytes", -1) for e in _listed(col)))
+    return out
+
+
+@pytest.mark.backlog_fixed("RM-341")
+def test_entries_of_many_shapes_report_mongods_size(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11's `estimatedSizeBytes` on macOS arm64, shape by shape:
+    the entry, its `PlanCacheIndexTree` (a node per match expression node,
+    each tagged one carrying a copy of its `IndexEntry`), and its debug
+    information -- the query it came from and every candidate's stats."""
+    only_on("darwin", why=_MACOS_ARM64)
+    only_on("arm64", why=_MACOS_ARM64)
+    expected = _shape_sizes(mongod)
+    assert all(expected), "every shape caches an entry on mongod"
+    assert _shape_sizes(rust_mongo) == expected
 
 
 def _large(client: Any) -> Any:
