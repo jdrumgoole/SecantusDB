@@ -1149,6 +1149,16 @@ fn retryable_write(
         Ok(ids) => ids,
         Err(e) => return e.into_reply(),
     };
+    let session = logical_session_id(lsid, &authenticated(ctx));
+    if !registry.knows(lsid) {
+        if let Some(s) = ctx.storage.as_ref() {
+            match retryable_history(s.as_ref(), &session) {
+                Ok(Some((active, applied))) => registry.restore_retryable(lsid, active, applied),
+                Ok(None) => {}
+                Err(e) => return e.into_reply(),
+            }
+        }
+    }
     let done = match registry.begin_retryable(lsid, txn_number) {
         Ok(done) => done,
         Err(reply) => return reply,
@@ -1161,7 +1171,6 @@ fn retryable_write(
     // entries, as mongod's do (RM-224); a `bulkWrite` names each op's
     // statement as it runs it (`bulkwrite::bulk_write`).
     let fam = matches!(name, "findAndModify" | "findandmodify");
-    let session = logical_session_id(lsid, &authenticated(ctx));
     if let (Some(s), Ok(bytes)) = (ctx.storage.as_ref(), crate::bsondoc::to_vec(&session)) {
         s.set_statement_position(None);
         s.set_retryable_session(Some((bytes, txn_number, ids.clone())));
@@ -1208,6 +1217,108 @@ fn retryable_write(
     drop(held);
     registry.record_statements(lsid, txn_number, records);
     reply
+}
+
+/// What a session's last retryable write did, read from what the server
+/// keeps of it in storage, for a session it holds nothing for in memory: a
+/// server that restarted, or one that forgot an idle session the logical
+/// session reaper has not yet removed. mongod's
+/// `TransactionParticipant::refreshFromStorageIfNeeded` does the same: the
+/// session's `config.transactions` row names its transaction number and last
+/// write, the oplog entries of that number name the statements that ran, and
+/// a `findAndModify`'s image is in `config.image_collection`. `None` when
+/// the row is missing or is a transaction's.
+fn retryable_history(
+    storage: &dyn crate::Storage,
+    session: &Document,
+) -> Result<Option<(i64, transactions::Applied)>, CommandError> {
+    let first = |db: &str, coll: &str| -> Result<Option<Document>, CommandError> {
+        let rows = storage
+            .find(db, coll, &doc! {"_id": session.clone()}, None, None)
+            .map_err(crate::util::command_error)?;
+        Ok(rows
+            .first()
+            .and_then(|b| secantus_core::bsondoc::from_bytes(b).ok()))
+    };
+    let Some(row) = first("config", "transactions")? else {
+        return Ok(None);
+    };
+    if row.contains_key("state") {
+        return Ok(None);
+    }
+    let Some(txn_number) = row.get("txnNum").and_then(crate::util::as_i64) else {
+        return Ok(None);
+    };
+    let entries = storage
+        .find(
+            "local",
+            "oplog.rs",
+            &doc! {"lsid": session.clone(), "txnNumber": txn_number},
+            None,
+            None,
+        )
+        .map_err(crate::util::command_error)?;
+    let image = first("config", "image_collection")?.filter(|image| {
+        image.get("txnNum").and_then(crate::util::as_i64) == Some(txn_number)
+            && !image.get("invalidated").is_some_and(crate::util::truthy)
+    });
+    let mut records = Vec::new();
+    for bytes in entries {
+        let Ok(entry) = secantus_core::bsondoc::from_bytes(&bytes) else {
+            continue;
+        };
+        // An insert group is one `applyOps` entry, each insert naming its
+        // own statement.
+        let ops = match entry
+            .get_document("o")
+            .ok()
+            .and_then(|o| o.get_array("applyOps").ok())
+        {
+            Some(ops) if entry.get_str("op") == Ok("c") => ops
+                .iter()
+                .filter_map(|op| op.as_document().cloned())
+                .collect(),
+            _ => vec![entry],
+        };
+        for op in ops {
+            let Some(stmt_id) = op.get("stmtId").and_then(crate::util::as_i64) else {
+                continue;
+            };
+            let record = match (op.get_str("op").unwrap_or(""), &image) {
+                (kind @ ("u" | "d"), Some(image)) if op.contains_key("needsRetryImage") => {
+                    let remove = kind == "d";
+                    let last_error = if remove {
+                        doc! {"n": 1}
+                    } else {
+                        doc! {"n": 1, "updatedExisting": true}
+                    };
+                    StmtRecord::FindAndModify {
+                        reply: doc! {
+                            "lastErrorObject": last_error,
+                            "value": image.get("image").cloned().unwrap_or(Bson::Null),
+                            "ok": 1.0,
+                        },
+                        remove,
+                        new: image.get_str("imageKind") == Ok("postImage"),
+                    }
+                }
+                ("i", _) => StmtRecord::Insert {
+                    id: op
+                        .get_document("o")
+                        .ok()
+                        .and_then(|o| o.get("_id").cloned()),
+                },
+                ("u", _) => StmtRecord::Update { upserted: None },
+                ("d", _) => StmtRecord::Delete,
+                _ => continue,
+            };
+            records.push((stmt_id as i32, record));
+        }
+    }
+    Ok(Some((
+        txn_number,
+        transactions::Applied::from_records(records),
+    )))
 }
 
 /// Pin a reply's `operationTime` to the cluster time now, before the
