@@ -2306,7 +2306,10 @@ change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
       Aggref carries no modifier (`exprTypmod` has no case for it), so
       `select min(c) from t557` and `select max(a) from t557` describe
       `bpchar` -1 on PostgreSQL 15.19; here both are 7
-      (`aggregate_result_typmod` copies the column's).
+      (`aggregate_result_typmod` copies the column's). Since RP-671
+      `aggregate_output_def` carries the width too, as a FROM-subquery's
+      column, because it is what pads the trimmed value again: a fix must
+      keep the padding width and describe -1.
       Verify: tests/backlog/test_rp_found_rp557.py::test_min_max_over_char_n_has_no_modifier
       Backlog-ID: RP-659
 - [ ] **A set operation of a domain column and its base type keeps the
@@ -2418,21 +2421,50 @@ numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
       Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
       Backlog-ID: RP-667
 
-## Found while working RP-666 (2026-11-08)
+## Found while working RP-671 (2026-11-08)
 
-Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
-`_SETUP` table of `tests/backlog/test_rp_found_rp656.py` made temporary.
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): the
+VALUES-only statements as written, the rest with the `_SETUP` tables of
+`tests/backlog/test_rp_found_rp671.py` made temporary. This server keeps a
+`char(n)` value trimmed and pads it where it enters an expression; a value
+that reaches a comparison carrying its blanks is compared with them.
 
-- [ ] **`min` / `max` over a `char(n)` column drop the value's blanks.**
-      `select octet_length(max(c)) from t656` is 3 on PostgreSQL 15.19 (an
-      Aggref is its argument's type, and `bpchar_larger` returns one of
-      the stored values, blanks and all); here it is 2, and so is
-      `octet_length((select max(c) from t656))`. The aggregate returns the
-      value as stored, without its padding; `select max(c)` prints `xy `
-      only because its RowDescription carries the column's width, which
-      RP-659 takes away.
-      Verify: tests/backlog/test_rp_found_rp656.py::test_min_max_over_char_n_keep_its_blanks
-      Backlog-ID: RP-671
+- [ ] **A `char(n)` value that carries its blanks compares and sorts with
+      them.** `bpchareq` / `bpcharcmp` drop the trailing blanks first
+      (`bcTruelen`), so on PostgreSQL 15.19 `select k from (select k,
+      f::char(5) x from t671) s where x = 'xy'` finds the `'xy'` row, and
+      `order by f::char(5)` puts `'a'` before `E'a\t'`. Here the cast's
+      value is `'xy   '`: the filter (`=`, `IN`) finds nothing and the sort
+      puts the tab first, and so for a scalar subquery over the column
+      (`(select f)`), which RP-666 pads. The comparisons and the sort keys
+      carry no type to say the value is a `bpchar`.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_padded_char_n_compares_without_its_blanks
+      Backlog-ID: RP-679
+- [ ] **A HAVING comparison of a `char(n)` `min` / `max` does not compare as
+      `bpchar`.** On PostgreSQL 15.19, over `t671` (`'a'`, `'xy'`, `'b'`),
+      `having max(f) is distinct from 'xy'` keeps the `'a'` and `'b'`
+      groups; here it keeps only `'xy'`, the opposite. `having max(f) =
+      any('{a,xy}')`, `= 'xy'::char(3)`, `= 'xy  '::char(5)` and `= 'xy  '`
+      each keep `'xy'` (and `'a'`) there and nothing here: the constant is
+      compared with its blanks, or the shape leaves `plan_having`'s
+      comparison for one that is not `bpchar`'s.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_having_over_char_n_min_max_compares_as_bpchar
+      Backlog-ID: RP-680
+- [ ] **`min` / `max` over a `varchar` column are typed `varchar`.**
+      PostgreSQL has no `max(varchar)`: `select max(v) from (values
+      ('ab'::varchar(4)), ('cd')) s(v)` resolves to `max(text)` and is
+      described `text` (25) on 15.19; here it is `varchar` (1043), as are
+      `min` and the column of a FROM-subquery over either.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_min_max_over_varchar_is_text
+      Backlog-ID: RP-681
+- [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
+      over ()` is 42809 `OVER specified, but octet_length is not a window
+      function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
+      here it is 0A000 `window function octet_length() is not supported
+      yet`, for `upper` and `length` alike: a function PostgreSQL itself
+      refuses is reported as a gap in this server.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_over_on_a_plain_function_is_42809
+      Backlog-ID: RP-682
 
 ## Found while working RP-664 (2026-11-08)
 
