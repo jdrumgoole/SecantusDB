@@ -243,6 +243,19 @@ pub(crate) fn definition_problem(
         if let Err(e) = crate::aggregate::validate_stage_names(pipeline) {
             return Some(e);
         }
+        // A view reads a collection, so a `$queryStats` anywhere in it is not
+        // `{aggregate: 1}` on `admin`; mongod keeps that refusal's code (73)
+        // under the view's wrapper (8.2.11, 2026-11-08).
+        if let Some(e) = crate::aggregate::query_stats_in(pipeline, "view", db, true) {
+            return Some(CommandError::new(
+                e.code,
+                e.code_name,
+                format!(
+                    "Invalid pipeline for view {ns} :: caused by :: {}",
+                    e.errmsg
+                ),
+            ));
+        }
     }
     // A view defined, directly or through other views, on itself. mongod
     // prints the view and then the path that returns to it.
