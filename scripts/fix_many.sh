@@ -125,6 +125,18 @@ lane() {
         # stop the batch rather than start an item on a disk below the floor.
         if [[ -n $wt ]]; then
             rm -rf "$wt"/crates/target/*/incremental "$wt"/crates/*/target/*/incremental
+            # cargo also keeps every superseded compiled dependency in
+            # target/*/deps, so a lane still grows item by item (lane 1 of
+            # the 2026-11-08 batch reached 43 GB after ~8 items). Past the
+            # cap, wipe the lane's cargo targets: one cold build (~10-15
+            # min) instead of a batch stopped at the disk floor. The lane's
+            # .venv and its WiredTiger build/ stay.
+            local lane_gb
+            lane_gb=$(du -sg "$wt" 2>/dev/null | awk '{print $1}')
+            if [[ ${lane_gb:-0} -gt ${SECANTUS_LANE_MAX_GB:-35} ]]; then
+                rm -rf "$wt"/crates/target "$wt"/crates/*/target
+                echo "$(date '+%F %T') lane $k: ${lane_gb} GB over SECANTUS_LANE_MAX_GB (${SECANTUS_LANE_MAX_GB:-35}): cargo targets wiped" >>"$out/summary.txt"
+            fi
         fi
         local free_gb
         free_gb=$(df -g "${wt:-.}" | awk 'NR == 2 { print $4 }')
