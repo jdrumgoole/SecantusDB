@@ -38446,6 +38446,45 @@ fn whole_row_rewrite(
             }
         }
         walk_expr(node, &mut |n| {
+            // `(t).c` is t's column c itself, not a field of its row:
+            // `ParseComplexProjection` reads a whole-row Var's field as the
+            // column's own Var, so it is grouped only where the column is
+            // (`select (fs).a ... group by fs` is 42803, RP-532).
+            if !scalar && field_names.is_none() {
+                if let Some(N::AIndirection(ind)) = n.node.as_mut() {
+                    let column = match ind.arg.as_deref().and_then(|a| a.node.as_ref()) {
+                        Some(N::ColumnRef(c)) if is_whole_row(c, true) => {
+                            match ind.indirection.first().and_then(|f| f.node.as_ref()) {
+                                Some(N::String(f)) => {
+                                    let hits: Vec<usize> = (0..columns.len())
+                                        .filter(|i| columns[*i] == f.sval)
+                                        .collect();
+                                    match hits.as_slice() {
+                                        [i] => Some((arg_names[*i].clone(), c.location)),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some((name, location)) = column {
+                        let mut col = column_ref_node(&name);
+                        if let Some(N::ColumnRef(c)) = col.node.as_mut() {
+                            c.location = location;
+                        }
+                        ind.indirection.remove(0);
+                        if ind.indirection.is_empty() {
+                            *n = col;
+                        } else {
+                            ind.arg = Some(Box::new(col));
+                        }
+                        changed = true;
+                        return Ok(());
+                    }
+                }
+            }
             // `ROW(t.*)` is a row of t's COLUMNS (PostgreSQL expands the star
             // inside a row constructor), not a row holding t's row.
             if let Some(N::RowExpr(r)) = n.node.as_mut() {
@@ -38532,16 +38571,20 @@ fn whole_row_rewrite(
             }
         }
     }
+    // A GROUP BY item, and HAVING, read the whole row as any other clause
+    // does: `group by fs` (or `fs.*`) groups by the row, whether or not
+    // the select list names it (RP-532). The walk also renames a shared
+    // output name, as `rename` alone did here before.
+    for g in &mut out.group_clause {
+        rewrite(g, false)?;
+    }
+    if let Some(h) = out.having_clause.as_deref_mut() {
+        rewrite(h, false)?;
+    }
     if !(changed || expanded) {
         return Ok(None);
     }
     if renamed {
-        for g in &mut out.group_clause {
-            walk_expr(g, &mut |n| rename(n))?;
-        }
-        if let Some(h) = out.having_clause.as_deref_mut() {
-            walk_expr(h, &mut |n| rename(n))?;
-        }
         if let Some(N::RangeSubselect(rs)) = out.from_clause[0].node.as_mut() {
             if let Some(a) = rs.alias.as_mut() {
                 a.colnames = arg_names

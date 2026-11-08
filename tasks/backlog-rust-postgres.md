@@ -2167,12 +2167,51 @@ The gap tests are in `tests/backlog/test_rp_found_rp522.py`.
       compared.
       Backlog-ID: RP-530
       Verify: tests/backlog/test_rp_found_rp522.py::test_record_against_scalar
-- [ ] **GROUP BY a whole row not in the select list is 42703.** `select
-      count(*) from fs group by fs` answers 1 on PostgreSQL 15.19; here it
-      is 42703 `column "fs" does not exist` at 22. With `fs` in the select
-      list too it answers.
-      Backlog-ID: RP-532
-      Verify: tests/backlog/test_rp_found_rp522.py::test_group_by_whole_row
+
+## Found while working RP-532 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
+holding `(1, 'y')` twice, `(2, 'z')` and `(null, null)`, and `fk(k fs)`
+holding `row(null, null)`, `row(1, null)`, `row(1, 'a')` and `null`. The
+gap tests are in `tests/backlog/test_rp_found_rp532.py`.
+
+- [ ] **A composite value's IS NULL in a WHERE or HAVING tests the value,
+      not its fields.** PostgreSQL 15.19's `ExecEvalRowNull` makes a row
+      IS NULL when every field is null and IS NOT NULL when none is, so
+      `select count(*) from fk where k is not null` is 1 and `... where k
+      is null` 2, `select count(*) from (select fs x from fs) s where x is
+      not null` is 3, and `select count(*) from fs group by fs having fs
+      is null` is 1. Here they are 3, 1, 4 and no row: the clause tests
+      whether the stored value is null. The select-list `k is not null`
+      already answers as PostgreSQL does, and so does a WHERE over the
+      table's own whole row (`where fs is not null`).
+      Backlog-ID: RP-534
+      Verify: tests/backlog/test_rp_found_rp532.py::test_composite_null_test_in_a_clause
+- [ ] **ORDER BY a row DESC sorts it ascending.** `select fs from fs order
+      by fs desc` is `(,)`, `(2,z)`, `(1,y)`, `(1,y)` on PostgreSQL 15.19
+      (`btrecordcmp`, reversed), and `group by row(a, c) order by row(a,
+      c) desc` puts its counts in the same order; here both come back in
+      ascending order, the direction dropped. A scalar column's DESC
+      sorts as PostgreSQL does.
+      Backlog-ID: RP-535
+      Verify: tests/backlog/test_rp_found_rp532.py::test_row_order_desc
+- [ ] **An ungrouped whole row's 42803 names its first column, with no
+      position.** PostgreSQL 15.19's `check_ungrouped_columns` names a
+      whole-row Var `fs.*` (`get_rte_attribute_name` of attribute 0), at
+      the reference: `select fs, count(*) from fs group by a` is `column
+      "fs.*" must appear in the GROUP BY clause ...` at 8, and `select
+      count(*) from fs having fs is not null` the same at 32. Here they
+      name `fs.c` and `fs.a`, with no position.
+      Backlog-ID: RP-536
+      Verify: tests/backlog/test_rp_found_rp532.py::test_ungrouped_whole_row
+- [ ] **A relation name its alias hides is reported at the FROM item.**
+      Under `from fs x` the name `fs` names nothing, so PostgreSQL 15.19
+      reports `select count(*) from fs x group by fs` and `... order by fs`
+      as 42703 `column "fs" does not exist` at 36, the reference. Here the
+      first is positioned at 22 (the FROM item), and the second is 42803
+      `column "x.fs" must appear in the GROUP BY clause ...` at 22.
+      Backlog-ID: RP-537
+      Verify: tests/backlog/test_rp_found_rp532.py::test_alias_hides_relation_name
 
 ## Found while working RP-500 (2026-11-07)
 

@@ -329,14 +329,25 @@ pub fn error_position(sql: &str, sqlstate: &str, message: &str) -> Option<usize>
                             && toks[i - 1].text == "."
                             && unquote_ident(toks[i - 2].text) == parts[parts.len() - 2]))
             });
-            match qualified {
-                Some(i) => pos(toks[if parts.len() > 1 { i - 2 } else { i }].start),
+            // `(t).x`, a field of t's whole row, is t's column x
+            // (`ParseComplexProjection`), referenced where `t` is (RP-532).
+            let projected = toks.windows(5).position(|w| {
+                parts.len() == 2
+                    && w[0].text == "("
+                    && unquote_ident(w[1].text) == parts[0]
+                    && w[2].text == ")"
+                    && w[3].text == "."
+                    && unquote_ident(w[4].text) == *last
+            });
+            match (qualified, projected) {
+                (Some(i), _) => pos(toks[if parts.len() > 1 { i - 2 } else { i }].start),
+                (None, Some(i)) => pos(toks[i + 1].start),
                 // An ungrouped column is NAMED qualified (`t.a`) however it
                 // was written: a bare mention is the one PostgreSQL means.
-                None if sqlstate == "42803" => {
+                (None, None) if sqlstate == "42803" => {
                     pos(toks.iter().find(|t| unquote_ident(t.text) == *last)?.start)
                 }
-                None => None,
+                (None, None) => None,
             }
         }
         "42P01" => {

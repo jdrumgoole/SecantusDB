@@ -225,14 +225,39 @@ def test_record_conditionals_more(query: str, dsn: str) -> None:
     assert answer(dsn, query) == RECORD_CONDITIONALS_MORE[query]
 
 
-# A GROUP BY item need not be in the select list, a whole row included.
+# A GROUP BY item need not be in the select list, a whole row included,
+# written `fs`, `fs.*` or by its alias, and HAVING reads it too. A field of
+# it, `(fs).a`, is the column (`ParseComplexProjection`), so it is not
+# grouped by the row, and is reported where `fs` is.
 GROUP_BY_WHOLE_ROW = {
     "select count(*) from fs group by fs": [(1,)],
     "select fs, count(*) from fs group by fs": [("(1,y)", 1)],
+    "select count(*) from fs x group by x": [(1,)],
+    "select count(*) from fs group by fs.*": [(1,)],
+    "select count(*) from fs group by (fs), a": [(1,)],
+    "select count(*) from fs group by fs having count(*) > 0": [(1,)],
+    "select count(*) from fs group by fs having fs is not null": [(1,)],
+    "select count(*) from (select * from fs) s group by s": [(1,)],
+    "select count(*) from fs group by fs order by fs": [(1,)],
+    "select a, count(*) from fs group by fs": (
+        "42803",
+        'column "fs.a" must appear in the GROUP BY clause or be used in an aggregate function',
+        None,
+        "8",
+    ),
+    "select (fs).a, count(*) from fs group by fs": (
+        "42803",
+        'column "fs.a" must appear in the GROUP BY clause or be used in an aggregate function',
+        None,
+        "9",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-532")
+@pytest.mark.backlog_fixed("RP-532")
 @pytest.mark.parametrize("query", list(GROUP_BY_WHOLE_ROW))
 def test_group_by_whole_row(query: str, dsn: str) -> None:
+    """GROUP BY a whole row not in the select list was 42703 `column "fs"
+    does not exist`; HAVING refused the row's name, and `(fs).a` was
+    answered as though grouped."""
     assert answer(dsn, query) == GROUP_BY_WHOLE_ROW[query]
