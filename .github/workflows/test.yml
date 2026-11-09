@@ -1330,6 +1330,33 @@ jobs:
           fi
           echo "disk watchdog: free space never fell under the threshold"
 
+  changes:
+    # Which slow lanes a pull request needs. pg-oracle (three shards, ~30 min,
+    # the PR run's critical path) is skipped when every changed file is
+    # MongoDB-only code or tests the PostgreSQL server does not link
+    # (tools/ci_pg_needed.py, an allow-list: anything it does not name runs
+    # the lanes). Pushes to main and the weekly run always run everything.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      pg: ${{ steps.pg.outputs.pg }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: pg
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            git diff --name-only "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}" > changed.txt
+            wc -l < changed.txt
+            pg=$(python3 tools/ci_pg_needed.py < changed.txt)
+          else
+            pg=true
+          fi
+          echo "pg-oracle needed: $pg"
+          echo "pg=$pg" >> "$GITHUB_OUTPUT"
+
   pg-oracle:
     # The SQL suites that diff against a REAL PostgreSQL. They exist because
     # this project's rule is "run it against the reference server, don't reason
@@ -1341,6 +1368,8 @@ jobs:
     # Linux-only, deliberately: GitHub service containers run on Linux runners
     # only. It is a separate job because it builds the Rust PostgreSQL server,
     # which the ``test`` job does not.
+    needs: changes
+    if: needs.changes.outputs.pg == 'true'
     runs-on: ubuntu-latest
     # 45 until 2026-10-21, when the differential suite, every corpus, every
     # secantus-pg cargo test and the backlog's PG tests joined a lane that

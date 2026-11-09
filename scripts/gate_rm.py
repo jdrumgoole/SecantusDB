@@ -3,6 +3,12 @@
 
     scripts/gate_rm.py              # from the worktree root
     scripts/gate_rm.py --no-build   # the binaries are already built from HEAD
+    scripts/gate_rm.py --only rust-test,lint   # rerun steps a fix only they check
+    scripts/gate_rm.py --full       # the storage crate's tests even if untouched
+
+The storage crate's own tests (both oplog modes, ~9 min) run only when this
+work changes the storage crates (`STORAGE_PATHS`, compared with the branch it
+sits on); CI's rust-storage job runs them on every snapshot regardless.
 
 What it runs is what CI runs for the Rust MongoDB server, instead of the full
 ~16,600-test pytest suite (mostly the deprecated Python servers, which CI
@@ -102,10 +108,61 @@ def storage_engine_files(workflow: Path) -> list[str]:
     return files
 
 
+#: Paths whose change makes the storage crate's own tests (both oplog modes)
+#: worth running. The adapter tests are not in this gate: they drive the
+#: command layer against WiredTiger (`command_*_wt.rs`), so most MongoDB
+#: items reach them.
+STORAGE_PATHS = (
+    "crates/secantus-storage/",
+    "crates/secantus-wt/",
+    "crates/secantus-wiredtiger-sys/",
+    "cmake/",
+    "vendor/wiredtiger",
+)
+
+
+def gate_base(candidates: tuple[str, ...] = ("origin/rm-batch", "origin/main")) -> str | None:
+    """The branch this work sits on: of the candidates that exist, the one
+    HEAD is fewest commits ahead of (a fix-one lane branches from rm-batch)."""
+    best: tuple[int, str] | None = None
+    for ref in candidates:
+        r = subprocess.run(
+            ["git", "rev-list", "--count", f"{ref}..HEAD"], capture_output=True, text=True
+        )
+        if r.returncode == 0 and (best is None or int(r.stdout) < best[0]):
+            best = (int(r.stdout), ref)
+    return best[1] if best else None
+
+
+def changed_files(base: str) -> list[str]:
+    """Every file this work changes: committed since `base`, and uncommitted."""
+    out: set[str] = set()
+    for cmd in (
+        ["git", "diff", "--name-only", f"{base}...HEAD"],
+        ["git", "diff", "--name-only", "HEAD"],
+    ):
+        r = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out.update(line for line in r.stdout.splitlines() if line)
+    return sorted(out)
+
+
+def touches_storage(files: list[str]) -> bool:
+    return any(f.startswith(STORAGE_PATHS) for f in files)
+
+
 class Gate:
-    def __init__(self, out: Path) -> None:
+    def __init__(self, out: Path, only: set[str] | None = None) -> None:
         self.out = out
+        self.only = only
         self.failed = False
+
+    def skip(self, name: str, why: str) -> None:
+        """Record a step this run left out on purpose, with why."""
+        if self.only is not None and name not in self.only:
+            return
+        (self.out / f"{name}.rc").write_text("skipped\n")
+        (self.out / f"{name}.log").write_text(f"skipped: {why}\n")
+        print(f"    {name}=skipped ({why})", flush=True)
 
     def step(
         self,
@@ -114,6 +171,8 @@ class Gate:
         env: dict[str, str] | None = None,
         cwd: Path | None = None,
     ) -> None:
+        if self.only is not None and name not in self.only:
+            return
         print(f"==> {name}: {' '.join(cmd)}", flush=True)
         # Each step waits its turn on a busy machine (another lane's gate,
         # another session's build): scripts/wait_for_load.sh has the numbers.
@@ -148,8 +207,19 @@ def panicked_logs(out: Path) -> list[str]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--no-build", action="store_true", help="skip the two server builds")
+    ap.add_argument("--no-build", action="store_true", help="skip the server builds")
+    ap.add_argument(
+        "--only",
+        help="rerun just these comma-separated steps after a fix only they check "
+        "(the other steps' results on record are kept, and count)",
+    )
+    ap.add_argument(
+        "--full",
+        action="store_true",
+        help="run the storage crate's tests even when this work does not touch it",
+    )
     args = ap.parse_args()
+    only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
 
     root = Path(
         subprocess.run(
@@ -162,8 +232,9 @@ def main() -> int:
         print(f"no worktree venv at {py}: run ./inv sync first", file=sys.stderr)
         return 2
     out = root / ".scratch/gate"
-    shutil.rmtree(out, ignore_errors=True)
-    out.mkdir(parents=True)
+    if only is None:
+        shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("CARGO_BUILD_JOBS", "3")
     if MONGOD_8211.is_dir():
         os.environ["PATH"] = f"{MONGOD_8211}{os.pathsep}{os.environ['PATH']}"
@@ -179,21 +250,31 @@ def main() -> int:
     for name, why in sorted(excluded.items()):
         print(f"    not run, as in CI: {name}: {why}", flush=True)
 
-    g = Gate(out)
+    g = Gate(out, only)
+    # The storage crate's own tests (~9 min in both oplog modes) only when this
+    # work touches it: most MongoDB items change the command layer alone.
+    # CI's rust-storage job still runs them on every snapshot.
+    base = gate_base()
+    storage = args.full or base is None or touches_storage(changed_files(base))
     # The cargo lanes: the clean workspace, then each WiredTiger-linked crate
     # the workspace commands do not compile.
     g.step("rust-test", ["./inv", "rust-test"])
     g.step("wt-test", ["./inv", "rust-wt-test"])
-    g.step("storage-test", ["./inv", "rust-storage-test"])
-    # CI's rust-storage job runs the storage crate's tests a second time on
-    # the asynchronous oplog (2026-11-07: RM-361's slot timing passed this
-    # gate and failed only there).
-    g.step(
-        "storage-async-oplog",
-        ["cargo", "test"],
-        cwd=root / "crates/secantus-storage",
-        env={**rust_env(root), **ASYNC_OPLOG_ENV},
-    )
+    if storage:
+        g.step("storage-test", ["./inv", "rust-storage-test"])
+        # CI's rust-storage job runs the storage crate's tests a second time
+        # on the asynchronous oplog (2026-11-07: RM-361's slot timing passed
+        # this gate and failed only there).
+        g.step(
+            "storage-async-oplog",
+            ["cargo", "test"],
+            cwd=root / "crates/secantus-storage",
+            env={**rust_env(root), **ASYNC_OPLOG_ENV},
+        )
+    else:
+        why = f"nothing under {', '.join(STORAGE_PATHS)} changed since {base}"
+        g.skip("storage-test", why)
+        g.skip("storage-async-oplog", why)
     g.step("adapter-test", ["./inv", "rust-adapter-test"])
     if not args.no_build:
         # What the suites below launch, from HEAD; tools/provenance.py aborts
@@ -248,6 +329,14 @@ def main() -> int:
         print(f"    WT_PANIC / Bad address in: {', '.join(panics)}")
         g.failed = True
 
+    if only is not None:
+        # A rerun of some steps: the gate is every step on record.
+        print("    every step on record:", flush=True)
+        for rc_file in sorted(out.glob("*.rc")):
+            rc = rc_file.read_text().strip()
+            print(f"      {rc_file.stem}={rc}", flush=True)
+            if rc not in ("0", "skipped"):
+                g.failed = True
     print(f"gate={int(g.failed)}", flush=True)
     return int(g.failed)
 
