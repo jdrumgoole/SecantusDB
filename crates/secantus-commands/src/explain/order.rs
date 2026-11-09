@@ -261,6 +261,7 @@ fn merge_ranks(
         upsert: false,
         returns: false,
         known: None,
+        query: None,
     };
     Ok(Some(
         reached(plan, &env, docs.len())
@@ -663,7 +664,6 @@ fn consult<'a>(
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial,
@@ -963,7 +963,6 @@ pub(crate) fn through_cache(
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
@@ -1147,7 +1146,6 @@ fn planned_stream(
         batch_size,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
@@ -1427,7 +1425,6 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial,
@@ -1572,6 +1569,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
             upsert: false,
             returns: false,
             known: None,
+            query: None,
         };
         // Where the plan puts each row among those it places. One it does not
         // reach goes after the rest, in insertion order: the plan never selects.
@@ -1736,7 +1734,6 @@ fn untried_plan(storage: &dyn Storage, ask: &Ask) -> Option<Node> {
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
@@ -1946,7 +1943,6 @@ pub(crate) fn count_index_use(storage: &dyn Storage, ask: &Ask, uses: Uses) {
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,
@@ -2317,7 +2313,6 @@ pub(crate) fn counted_plan(
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: ask.asked.sbe,
         implies: &implied,
         trial: None,

@@ -198,9 +198,6 @@ pub(crate) struct Query<'a> {
     pub wanted: Option<&'a str>,
     /// Whether the query implies an index's partial filter.
     pub implies: &'a dyn Fn(&Document) -> bool,
-    /// The query is an aggregate's front: a projection that keeps the sort's
-    /// fields runs below a blocking sort.
-    pub pipeline: bool,
     /// The query is an aggregate's front that mongod runs in SBE: planned
     /// by the classic planner without index intersections, and cached by
     /// what its winner read (measured 8.2.11, 2026-11-08: `{a: 3, b: 5}`
@@ -471,6 +468,7 @@ impl Docs<'_> {
             upsert: false,
             returns: false,
             known: self.known.as_deref(),
+            query: None,
         }
     }
 }
@@ -1852,10 +1850,14 @@ fn covers(index: &IndexInfo, projection: &Document) -> bool {
     id_out || index.position("_id").is_some()
 }
 
+/// mongod's name for a projection: `PROJECTION_DEFAULT` for one that
+/// computes a value (a literal, a string, an operator) or names a dotted or
+/// positional path, `PROJECTION_COVERED` for one that answers from the keys
+/// of one index scan, else `PROJECTION_SIMPLE`.
 fn projection_name(projection: &Document, covered: bool) -> &'static str {
     let general = projection
         .iter()
-        .any(|(f, v)| f.contains('.') || matches!(v, Bson::Document(_) | Bson::Array(_)));
+        .any(|(f, v)| f.contains('.') || !secantus_core::projection::is_flag_value(v));
     if general {
         "PROJECTION_DEFAULT"
     } else if covered {
@@ -2170,20 +2172,45 @@ fn find_plan(q: &Query, catalog: &[Arc<IndexInfo>]) -> Node {
     wrap(access(q, catalog), q)
 }
 
-/// Whether a projection hands on every top-level field `sort` orders by.
-fn keeps(projection: &Document, sort: &Document) -> bool {
-    let top = |k: &str| k.split('.').next().unwrap_or(k).to_string();
-    let excluding = projection
-        .iter()
-        .filter(|(k, _)| *k != "_id")
-        .all(|(_, v)| matches!(v, Bson::Boolean(false)));
+/// Whether mongod's planner runs `projection` below a blocking sort by
+/// `sort`, so the sort orders the projected documents (measured 8.2.11,
+/// 2026-11-09): a projection that computes nothing -- every leaf an include
+/// or exclude flag, a positional `$` and a dotted path included, where a
+/// literal, an expression, `$slice`, `$elemMatch` or `$meta` keeps it above
+/// -- and that hands on whole every path the sort orders by (`{a: 1}` hands
+/// on `a.b`, `{"a.b": 1}` does not hand on `a`, `{"a.c": 0}` hands on `a.b`).
+fn runs_below_sort(projection: &Document, sort: &Document) -> bool {
+    fn leaves(spec: &Document, prefix: &str, out: &mut Vec<(String, bool)>) -> bool {
+        spec.iter().all(|(k, v)| {
+            let path = format!("{prefix}{k}");
+            match v {
+                v if secantus_core::projection::is_flag_value(v) => {
+                    out.push((path, secantus_core::projection::flag_truthy(v)));
+                    true
+                }
+                Bson::Document(d) if d.keys().all(|k| !k.starts_with('$')) => {
+                    leaves(d, &format!("{path}."), out)
+                }
+                _ => false,
+            }
+        })
+    }
+    let mut flags = Vec::new();
+    if !leaves(projection, "", &mut flags) {
+        return false;
+    }
+    let within = |path: &str, of: &str| path == of || path.starts_with(&format!("{of}."));
+    // `{_id: 1}` alone includes; beside an exclusion it only keeps `_id`.
+    let inclusion = flags.iter().any(|(p, on)| *on && p != "_id")
+        || flags.iter().all(|(p, on)| *on && p == "_id");
     sort.keys().all(|k| {
-        let field = top(k);
-        match projection.get(&field) {
-            Some(Bson::Boolean(on)) => *on,
-            Some(_) => false,
-            // Not named: an exclusion hands it on; an inclusion only `_id`.
-            None => excluding || field == "_id",
+        if inclusion {
+            let id_unnamed = !flags.iter().any(|(p, _)| p == "_id");
+            (id_unnamed && within(k, "_id")) || flags.iter().any(|(p, on)| *on && within(k, p))
+        } else {
+            !flags
+                .iter()
+                .any(|(p, on)| !*on && (within(k, p) || within(p, k)))
         }
     })
 }
@@ -2231,11 +2258,47 @@ fn wrap(a: Access, q: &Query) -> Node {
         input: Box::new(input),
     };
 
+    // A projection that keeps every path of a blocking sort without a limit
+    // runs below it, and the sort orders what it projects (measured 8.2.11:
+    // `SORT <- PROJECTION_SIMPLE <- COLLSCAN`; covered, `SORT <-
+    // PROJECTION_COVERED <- IXSCAN`, the keys projected before they sort).
+    let below = blocking.is_some_and(|s| {
+        absorbed.is_none()
+            && !q.return_key
+            && !q.show_record_id
+            && q.projection
+                .is_some_and(|p| !p.is_empty() && runs_below_sort(p, s))
+    });
+    let keys_projected = covered && sort_on_keys && below;
+    // Only one index scan's keys answer a covered projection: over a
+    // SORT_MERGE of scans it is mongod's general one.
+    let merged = covered && matches!(a.scan, Node::SortMerge { .. });
+    let projection = |p: &Document, input: Node| {
+        if q.show_record_id {
+            let mut spec = p.clone();
+            spec.insert("$recordId", doc! { "$meta": "recordId" });
+            return Node::Projection {
+                name: "PROJECTION_DEFAULT",
+                spec,
+                input: Box::new(input),
+            };
+        }
+        Node::Projection {
+            name: if merged {
+                "PROJECTION_DEFAULT"
+            } else {
+                projection_name(p, covered)
+            },
+            spec: p.clone(),
+            input: Box::new(input),
+        }
+    };
+
     let mut node = a.scan;
     let mut skipped = q.skip == 0;
     let mut sorted = blocking.is_none();
     if a.indexed {
-        if sort_on_keys {
+        if sort_on_keys && !keys_projected {
             node = sort_node(node, true);
             sorted = true;
         }
@@ -2249,37 +2312,21 @@ fn wrap(a: Access, q: &Query) -> Node {
             node = Node::fetch(a.fetch_filter, node);
         }
     }
-    // An aggregate's projection that keeps every field of a blocking sort
-    // runs first (measured 8.2.11: `[{$sort: {x: 1}}, {$project: {x: 1}}]`
-    // is `SORT <- PROJECTION_SIMPLE`; under a `$limit` the sort stays below).
-    let under = q.pipeline
-        && !covered
-        && !sorted
-        && absorbed.is_none()
-        && blocking.is_some_and(|s| q.projection.is_some_and(|p| keeps(p, s)));
     let mut projected = false;
-    if under {
-        if let Some(p) = q.projection.filter(|p| !p.is_empty()) {
-            node = Node::Projection {
-                name: projection_name(p, covered),
-                spec: p.clone(),
-                input: Box::new(node),
-            };
+    if below && !sorted {
+        if let Some(p) = q.projection {
+            node = projection(p, node);
             projected = true;
         }
     }
     if !sorted {
-        node = sort_node(node, false);
+        node = sort_node(node, keys_projected);
     }
     if !skipped {
         node = Node::Skip(q.skip, Box::new(node));
     }
     if let Some(p) = q.projection.filter(|p| !projected && !p.is_empty()) {
-        node = Node::Projection {
-            name: projection_name(p, covered),
-            spec: p.clone(),
-            input: Box::new(node),
-        };
+        node = projection(p, node);
     } else if q.show_record_id && !projected {
         node = Node::Projection {
             name: "PROJECTION_DEFAULT",

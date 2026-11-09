@@ -243,7 +243,6 @@ fn plan_info_with(
         batch_size: s.batch_size,
         keys_only: false,
         wanted: None,
-        pipeline: s.pipeline,
         sbe: false,
         implies: &implies,
         trial: None,

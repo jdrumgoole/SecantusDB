@@ -218,7 +218,12 @@ impl<'a> Stage<'a> {
             // that ends it included, then one per document it hands over,
             // then one to report that it is done. Which order it hands them
             // over in does not change the counts.
-            Node::Sort { limit, pattern, .. } => {
+            Node::Sort {
+                limit,
+                pattern,
+                input,
+                ..
+            } => {
                 if self.buffer.is_none() {
                     match self.inputs[0].work(env) {
                         Work::Advanced(row) => self.pending.push(row),
@@ -227,7 +232,14 @@ impl<'a> Stage<'a> {
                             let mut all = std::mem::take(&mut self.pending);
                             // What the sort held, counted when it sorts: a
                             // sort the trial does not finish reports none.
-                            super::exec::sort_stats(&mut self.extra, pattern, *limit, &all, env);
+                            super::exec::sort_stats(
+                                &mut self.extra,
+                                pattern,
+                                *limit,
+                                input,
+                                &all,
+                                env,
+                            );
                             if let Some(n) = limit {
                                 all.truncate((*n).max(0) as usize);
                             }

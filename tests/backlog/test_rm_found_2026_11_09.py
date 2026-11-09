@@ -52,11 +52,12 @@ def _projection_stage(client: Any) -> str:
     return planner["winningPlan"]["stage"]
 
 
-@pytest.mark.backlog("RM-445")
+@pytest.mark.backlog_fixed("RM-445")
 def test_a_renaming_projection_is_projection_default(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 explains `[{$project: {w: "$x"}}]`'s projection as
     `PROJECTION_DEFAULT`: a field computed from a path is no inclusion, so
-    the projection is not a simple one."""
+    the projection is not a simple one. This server called it
+    `PROJECTION_SIMPLE` until 2026-11-09 (fixed with RM-373)."""
     want = _projection_stage(mongod)
     assert want == "PROJECTION_DEFAULT"
     assert _projection_stage(rust_mongo) == want
