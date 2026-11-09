@@ -52,7 +52,6 @@ use secantus_wt::{Connection, Cursor, Session};
 /// The literal BSON decoder, for the crates that depend on this one.
 pub use secantus_core::bsondoc;
 
-pub mod admission;
 mod auto_compact;
 mod catalog_changes;
 pub mod changestreams;
@@ -199,10 +198,6 @@ pub struct StorageOptions {
     /// Stable-checkpoint cadence in seconds for the data-nonlogged mode
     /// (`SECANTUS_CHECKPOINT_SECONDS`, default 60).
     pub checkpoint_seconds: Option<u64>,
-    /// Admission control: cap on writes concurrently inside the storage
-    /// engine. `None` / 0 disables it (the default), preserving today's
-    /// behaviour exactly. See [`crate::admission`] for why this exists.
-    pub write_tickets: Option<usize>,
     /// Log a user transaction's writes as mongod does: held to its commit,
     /// then minted together and committed at their first timestamp, so a
     /// read at a time before the commit never sees it (RM-210, RM-314).
@@ -5233,8 +5228,6 @@ pub struct Storage {
     /// own lock: an entry nobody else holds has nobody to stay identical
     /// for. Mirrors `storage._coll_locks`.
     coll_locks: Mutex<CollLocks>,
-    /// Bounds concurrent engine writes. Disabled unless `write_tickets` is set.
-    write_tickets: crate::admission::Tickets,
     /// The newest log record `log_position` found, where its next scan
     /// resumes.
     log_tail: Mutex<Option<(u32, u32)>>,
@@ -8065,7 +8058,6 @@ impl Storage {
                 map: HashMap::new(),
                 prune_at: COLL_LOCKS_PRUNE_FLOOR,
             }),
-            write_tickets: crate::admission::Tickets::new(opts.write_tickets.unwrap_or(0)),
             log_tail: Mutex::new(None),
             ddl_generation: AtomicU64::new(0),
             capped_tallies: Mutex::new(HashMap::new()),
@@ -11030,27 +11022,6 @@ impl Storage {
         }
     }
 
-    /// Take an admission ticket for the duration of one engine write.
-    ///
-    /// A no-op when admission control is disabled (the default) or when this
-    /// thread is already admitted, so nested writes inside a multi-document
-    /// transaction ride the outer ticket instead of deadlocking against it.
-    #[inline]
-    fn admit_write(&self) -> crate::admission::Ticket<'_> {
-        self.write_tickets.acquire()
-    }
-
-    /// Writes currently admitted, and the cap. Diagnostics / tests.
-    pub fn write_admission(&self) -> (usize, usize) {
-        (self.write_tickets.in_flight(), self.write_tickets.limit())
-    }
-
-    /// Writes waiting for an admission ticket right now (0 while admission
-    /// control is off: nothing waits).
-    pub fn writes_waiting(&self) -> usize {
-        self.write_tickets.waiting()
-    }
-
     /// The write-ahead log's position: `(log file number, offset)` of its
     /// newest record, read through WiredTiger's `log:` cursor -- so it only
     /// moves forward, and moves when a logged write commits. `None` when the
@@ -12639,7 +12610,6 @@ impl Storage {
     }
 
     pub fn insert_one(&self, db: &str, coll: &str, doc_bytes: &[u8]) -> Result<Vec<u8>> {
-        let _admit = self.admit_write();
         self.retry_write_conflicts("insert_one", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -12767,7 +12737,6 @@ impl Storage {
         decoded: Option<Vec<Document>>,
         ordered: bool,
     ) -> Result<(usize, Vec<Document>)> {
-        let _admit = self.admit_write();
         // One wire message never runs as ONE statement transaction: its dirty
         // content (doc rows + full-doc oplog entries + index entries, ~2-3x
         // the message bytes) is unevictable until commit, and a 48MB-class
@@ -13400,7 +13369,6 @@ impl Storage {
 
     /// Delete the document with `_id == id`. Returns `false` if absent.
     pub fn delete_by_id(&self, db: &str, coll: &str, id: &Bson) -> Result<bool> {
-        let _admit = self.admit_write();
         self.retry_write_conflicts("delete_by_id", || {
             let lock = self.coll_lock(db, coll);
             let _c = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -20935,7 +20903,6 @@ impl Storage {
         validator: Option<&Document>,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
-        let _admit = self.admit_write();
         self.update_matching_leveled(
             db,
             coll,
@@ -21055,7 +21022,6 @@ impl Storage {
         validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
-        let _admit = self.admit_write();
         // Operator-/replacement-form update. `is_replacement` (no `$`-prefixed
         // top-level key) drives the oplog shape: a replacement emits the whole
         // doc in `o`, an operator update a `{$v:2, diff}`. Positional operators
@@ -21198,7 +21164,6 @@ impl Storage {
         validator_moderate: bool,
         want_post_image: bool,
     ) -> Result<UpdateOutcome> {
-        let _admit = self.admit_write();
         let _supplied = SuppliedUpsert::enter(supplied.is_some());
         self.update_matching_core(
             db,
@@ -22172,7 +22137,6 @@ impl Storage {
         coll_opt: Option<&Collation>,
         hint: Option<&Hint>,
     ) -> Result<usize> {
-        let _admit = self.admit_write();
         // Unbounded deletes (limit == 0, deleteMany) outside a user
         // transaction run CHUNKED — the matched set's index-entry removals
         // plus pre-images are unbounded dirty content in one transaction

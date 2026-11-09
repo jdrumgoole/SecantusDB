@@ -1216,12 +1216,6 @@ pub trait Storage: Send + Sync {
         None
     }
 
-    /// Writes queued for an admission ticket right now. Default: 0, a backend
-    /// with no admission control, where no write ever waits for one.
-    fn writes_waiting(&self) -> usize {
-        0
-    }
-
     /// Run TTL pruning across every collection, returning the number of docs
     /// deleted. Backs `secantusAdmin.pruneTtl` — an immediate pass (the WT
     /// backend also sweeps on a background cadence). Default: unsupported; the

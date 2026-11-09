@@ -9,9 +9,10 @@
 //! `serverStatus.queues` prints; each operation keeps its own admissions and
 //! the time it queued, which its `Slow query` line prints.
 //!
-//! The pools built on it: [`ingress`], mongod's ingress admission control.
-//! Execution control's read and write pools are still to come (RM-355).
+//! The pools built on it: [`ingress`], mongod's ingress admission control,
+//! and [`execution`], its execution control's read and write pools.
 
+pub mod execution;
 pub mod ingress;
 
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, Ordering};
@@ -43,6 +44,12 @@ pub struct AdmissionContext {
     /// When it began waiting in a queue, while it is.
     queueing_since: Mutex<Option<Instant>>,
     holding_ticket: AtomicBool,
+    /// The tickets it held past the pool's delinquency interval (mongod's
+    /// `ExecutionAdmissionContext`): how many, for how long in all, and the
+    /// longest, in milliseconds.
+    delinquent_acquisitions: AtomicI32,
+    total_acquisition_delinquency_millis: AtomicI64,
+    max_acquisition_delinquency_millis: AtomicI64,
 }
 
 impl Default for AdmissionContext {
@@ -54,6 +61,9 @@ impl Default for AdmissionContext {
             total_time_queued_micros: AtomicI64::new(0),
             queueing_since: Mutex::new(None),
             holding_ticket: AtomicBool::new(false),
+            delinquent_acquisitions: AtomicI32::new(0),
+            total_acquisition_delinquency_millis: AtomicI64::new(0),
+            max_acquisition_delinquency_millis: AtomicI64::new(0),
         }
     }
 }
@@ -85,6 +95,32 @@ impl AdmissionContext {
 
     pub fn is_holding_ticket(&self) -> bool {
         self.holding_ticket.load(Ordering::Relaxed)
+    }
+
+    /// The tickets it held past their pool's delinquency interval.
+    pub fn delinquent_acquisitions(&self) -> i32 {
+        self.delinquent_acquisitions.load(Ordering::Relaxed)
+    }
+
+    /// The milliseconds it held them, in all.
+    pub fn total_acquisition_delinquency_millis(&self) -> i64 {
+        self.total_acquisition_delinquency_millis
+            .load(Ordering::Relaxed)
+    }
+
+    /// The longest it held one, in milliseconds.
+    pub fn max_acquisition_delinquency_millis(&self) -> i64 {
+        self.max_acquisition_delinquency_millis
+            .load(Ordering::Relaxed)
+    }
+
+    /// mongod's `recordDelinquentAcquisition`.
+    fn record_delinquent_acquisition(&self, millis: i64) {
+        self.delinquent_acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.total_acquisition_delinquency_millis
+            .fetch_add(millis, Ordering::Relaxed);
+        self.max_acquisition_delinquency_millis
+            .fetch_max(millis, Ordering::Relaxed);
     }
 
     pub fn priority(&self) -> Priority {
@@ -172,10 +208,22 @@ impl QueueStats {
     }
 }
 
-/// mongod's `TicketHolder` with its immediate resize policy: `outof`
-/// tickets, of which `available` are free. Resizing moves both at once, so
-/// `available` goes below zero when the pool shrinks under operations that
-/// hold tickets, and no one is admitted until enough have been returned.
+/// How a [`TicketHolder`] changes size (mongod's `ResizePolicy`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResizePolicy {
+    /// Ticket by ticket: a growing pool hands out its new tickets one at a
+    /// time, and a shrinking one takes its surplus back one at a time,
+    /// waiting for each to be returned. The execution pools' policy.
+    Gradual,
+    /// At once: `outof` and `available` move together, so `available`
+    /// goes below zero when the pool shrinks under operations that hold
+    /// tickets, and no one is admitted until enough have been returned.
+    /// The ingress pool's policy.
+    Immediate,
+}
+
+/// mongod's `TicketHolder`: `outof` tickets, of which `available` are free,
+/// resized by its [`ResizePolicy`].
 ///
 /// As in mongod, a ticket is taken and returned with an atomic on
 /// `available` alone; only an operation that has to wait takes the
@@ -195,6 +243,11 @@ pub struct TicketHolder {
     /// pool that does not track delinquency (mongod's ingress pool, which
     /// it constructs with no callback).
     delinquent_after: Option<Duration>,
+    resize_policy: ResizePolicy,
+    /// Whether the most tickets used at once is kept, for throughput
+    /// probing (`get_and_reset_peak_used`).
+    track_peak_used: bool,
+    peak_used: AtomicI32,
     exempt: QueueStats,
     normal: QueueStats,
 }
@@ -226,7 +279,28 @@ fn next_wake() -> Duration {
 }
 
 impl TicketHolder {
+    /// A pool resized at once, keeping no peak: the ingress pool.
     pub fn new(tickets: i32, max_queue_depth: i32, delinquent_after: Option<Duration>) -> Self {
+        Self::with_policy(
+            tickets,
+            max_queue_depth,
+            delinquent_after,
+            ResizePolicy::Immediate,
+            false,
+        )
+    }
+
+    /// mongod's constructor in full. A pool with a delinquency interval
+    /// counts each ticket held past it in its own statistics and in the
+    /// operation's (mongod's execution pools, built with the callback that
+    /// does both).
+    pub fn with_policy(
+        tickets: i32,
+        max_queue_depth: i32,
+        delinquent_after: Option<Duration>,
+        resize_policy: ResizePolicy,
+        track_peak_used: bool,
+    ) -> Self {
         TicketHolder {
             available: AtomicI32::new(tickets),
             sleep: Mutex::new(()),
@@ -236,6 +310,9 @@ impl TicketHolder {
             waiters: AtomicI32::new(0),
             resize_lock: Mutex::new(()),
             delinquent_after,
+            resize_policy,
+            track_peak_used,
+            peak_used: AtomicI32::new(0),
             exempt: QueueStats::default(),
             normal: QueueStats::default(),
         }
@@ -267,16 +344,92 @@ impl TicketHolder {
         self.max_queue_depth.store(depth, Ordering::Relaxed);
     }
 
-    /// mongod's immediate resize: the pool becomes `size` tickets at once,
-    /// waking the waiters when tickets have become free.
-    pub fn resize(&self, size: i32) {
-        let _resizing = self.resize_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let old = self.outof.swap(size, Ordering::Relaxed);
-        let delta = size - old;
-        let before = self.available.fetch_add(delta, Ordering::SeqCst);
-        if before <= 0 && before + delta > 0 {
-            self.wake(true);
+    /// The operations of normal priority that have returned their tickets
+    /// (mongod's `numFinishedProcessing`): what throughput probing counts.
+    pub fn num_finished_processing(&self) -> i64 {
+        self.normal.finished_processing.load(Ordering::SeqCst)
+    }
+
+    /// The most tickets in use at once since the last call, which starts
+    /// the count again from those in use now (mongod's
+    /// `getAndResetPeakUsed`).
+    pub fn get_and_reset_peak_used(&self) -> i32 {
+        debug_assert!(self.track_peak_used);
+        self.peak_used.swap(self.used(), Ordering::SeqCst)
+    }
+
+    fn update_peak_used(&self) {
+        if self.track_peak_used {
+            self.peak_used.fetch_max(self.used(), Ordering::SeqCst);
         }
+    }
+
+    /// mongod's `resize`: the pool becomes `size` tickets by its policy.
+    /// A gradual shrink waits for each surplus ticket to be returned, until
+    /// `deadline` (`None`: for as long as it takes), and answers false when
+    /// the deadline came first, the pool then part-way to its new size.
+    pub fn resize(&self, size: i32, deadline: Option<Instant>) -> bool {
+        let _resizing = self.resize_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let difference = size - self.outof();
+        match self.resize_policy {
+            ResizePolicy::Immediate => {
+                let old = self.outof.swap(size, Ordering::Relaxed);
+                let delta = size - old;
+                let before = self.available.fetch_add(delta, Ordering::SeqCst);
+                if before <= 0 && before + delta > 0 {
+                    self.wake(true);
+                }
+                true
+            }
+            ResizePolicy::Gradual if difference > 0 => {
+                // Hand the new tickets out one by one, bypassing the
+                // statistics, as returned tickets.
+                for _ in 0..difference {
+                    self.return_ticket();
+                    self.outof.fetch_add(1, Ordering::Relaxed);
+                }
+                true
+            }
+            ResizePolicy::Gradual => {
+                // Take the surplus one by one, without returning it.
+                for _ in 0..-difference {
+                    if !self.take_until(deadline) {
+                        return false;
+                    }
+                    self.outof.fetch_sub(1, Ordering::Relaxed);
+                }
+                true
+            }
+        }
+    }
+
+    /// Take a ticket for the pool itself, waiting until `deadline` for one
+    /// to be returned: a gradual shrink's wait, counted in no statistics.
+    fn take_until(&self, deadline: Option<Instant>) -> bool {
+        if self.take() {
+            return true;
+        }
+        self.waiters.fetch_add(1, Ordering::SeqCst);
+        let taken = loop {
+            let sleep = self.sleep.lock().unwrap_or_else(|e| e.into_inner());
+            if self.take() {
+                break true;
+            }
+            let mut wait = next_wake();
+            if let Some(deadline) = deadline {
+                let now = Instant::now();
+                if now >= deadline {
+                    break false;
+                }
+                wait = wait.min(deadline - now);
+            }
+            let _ = self
+                .freed
+                .wait_timeout(sleep, wait)
+                .unwrap_or_else(|e| e.into_inner());
+        };
+        self.waiters.fetch_sub(1, Ordering::SeqCst);
+        taken
     }
 
     /// Wake one waiter, or all of them. Taken under the waiters' lock, so a
@@ -320,6 +473,7 @@ impl TicketHolder {
         }
         let ticket = self.try_acquire_normal(ctx)?;
         self.count_acquisition(ctx, &self.normal, priority);
+        self.update_peak_used();
         Some(ticket)
     }
 
@@ -332,13 +486,26 @@ impl TicketHolder {
         ctx: &Arc<AdmissionContext>,
         interrupted: &mut dyn FnMut() -> Result<(), CommandError>,
     ) -> Result<Ticket, CommandError> {
+        self.wait_for_ticket_until(ctx, None, interrupted)
+            .map(|t| t.expect("a wait with no deadline ends with a ticket"))
+    }
+
+    /// [`wait_for_ticket`](Self::wait_for_ticket) until `until` (mongod's
+    /// `waitForTicketUntil`): `None` when the deadline came first, the wait
+    /// counted as canceled.
+    pub fn wait_for_ticket_until(
+        self: &Arc<Self>,
+        ctx: &Arc<AdmissionContext>,
+        until: Option<Instant>,
+        interrupted: &mut dyn FnMut() -> Result<(), CommandError>,
+    ) -> Result<Option<Ticket>, CommandError> {
         if let Some(ticket) = self.try_acquire(ctx) {
-            return Ok(ticket);
+            return Ok(Some(ticket));
         }
         let started = Instant::now();
         self.normal.added_to_queue.fetch_add(1, Ordering::Relaxed);
         *ctx.queueing_since.lock().unwrap_or_else(|e| e.into_inner()) = Some(started);
-        let waited = self.perform_wait(ctx, interrupted);
+        let waited = self.perform_wait(ctx, until, interrupted);
         let micros = started.elapsed().as_micros() as i64;
         *ctx.queueing_since.lock().unwrap_or_else(|e| e.into_inner()) = None;
         ctx.total_time_queued_micros
@@ -350,9 +517,14 @@ impl TicketHolder {
             .removed_from_queue
             .fetch_add(1, Ordering::Relaxed);
         match waited {
-            Ok(ticket) => {
+            Ok(Some(ticket)) => {
                 self.count_acquisition(ctx, &self.normal, ctx.priority());
-                Ok(ticket)
+                self.update_peak_used();
+                Ok(Some(ticket))
+            }
+            Ok(None) => {
+                self.normal.canceled.fetch_add(1, Ordering::Relaxed);
+                Ok(None)
             }
             Err(e) => {
                 self.normal.canceled.fetch_add(1, Ordering::Relaxed);
@@ -364,12 +536,13 @@ impl TicketHolder {
     fn perform_wait(
         self: &Arc<Self>,
         ctx: &Arc<AdmissionContext>,
+        until: Option<Instant>,
         interrupted: &mut dyn FnMut() -> Result<(), CommandError>,
-    ) -> Result<Ticket, CommandError> {
+    ) -> Result<Option<Ticket>, CommandError> {
         let mut waiting = false;
         let result = (|| loop {
             if self.take() {
-                return Ok(self.make_ticket(ctx, Priority::Normal, true));
+                return Ok(Some(self.make_ticket(ctx, Priority::Normal, true)));
             }
             if !waiting {
                 let before = self.waiters.fetch_add(1, Ordering::SeqCst);
@@ -383,20 +556,34 @@ impl TicketHolder {
                     .with_extra(doc! { "errorLabels": ["SystemOverloadedError"] }));
                 }
             }
+            // mongod's next deadline: its jittered interval, or `until`
+            // when that comes sooner.
+            let mut wait = next_wake();
+            let mut last = false;
+            if let Some(until) = until {
+                let left = until.saturating_duration_since(Instant::now());
+                if left <= wait {
+                    wait = left;
+                    last = true;
+                }
+            }
             {
                 // Counted as waiting before this last look, so a ticket
                 // returned after it finds this waiter to wake.
                 let sleep = self.sleep.lock().unwrap_or_else(|e| e.into_inner());
                 if self.take() {
-                    return Ok(self.make_ticket(ctx, Priority::Normal, true));
+                    return Ok(Some(self.make_ticket(ctx, Priority::Normal, true)));
                 }
                 let (sleep, _) = self
                     .freed
-                    .wait_timeout(sleep, next_wake())
+                    .wait_timeout(sleep, wait)
                     .unwrap_or_else(|e| e.into_inner());
                 drop(sleep);
             }
             interrupted()?;
+            if last {
+                return Ok(None);
+            }
         })();
         if waiting {
             self.waiters.fetch_sub(1, Ordering::SeqCst);
@@ -446,8 +633,12 @@ impl TicketHolder {
         }
         ticket.ctx.holding_ticket.store(false, Ordering::Relaxed);
         self.count_release(&self.normal, ticket);
-        // mongod's `_releaseNormalPriorityTicket`: the wake costs a lock, so
-        // it is paid only when someone waits.
+        self.return_ticket();
+    }
+
+    /// mongod's `_releaseNormalPriorityTicket`: the wake costs a lock, so
+    /// it is paid only when someone waits.
+    fn return_ticket(&self) {
         let before = self.available.fetch_add(1, Ordering::SeqCst);
         if before >= 0 && self.waiters.load(Ordering::SeqCst) > 0 {
             self.wake(false);
@@ -463,6 +654,7 @@ impl TicketHolder {
         if let Some(after) = self.delinquent_after {
             if held > after {
                 let ms = held.as_millis() as i64;
+                ticket.ctx.record_delinquent_acquisition(ms);
                 stats
                     .total_delinquent_acquisitions
                     .fetch_add(1, Ordering::Relaxed);
@@ -664,7 +856,7 @@ mod tests {
         while holder.queued() < 3 {
             std::thread::sleep(Duration::from_millis(1));
         }
-        holder.resize(3);
+        holder.resize(3, None);
         for w in waiters {
             w.join().unwrap();
         }
@@ -677,7 +869,7 @@ mod tests {
         let holder = Arc::new(TicketHolder::new(2, 10, None));
         let ctx = || Arc::new(AdmissionContext::default());
         let (a, b) = (holder.try_acquire(&ctx()), holder.try_acquire(&ctx()));
-        holder.resize(1);
+        holder.resize(1, None);
         assert_eq!(
             (holder.outof(), holder.available(), holder.used()),
             (1, -1, 2)

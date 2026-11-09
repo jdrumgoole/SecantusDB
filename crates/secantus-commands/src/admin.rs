@@ -4693,6 +4693,10 @@ fn section_wanted(doc: &Document, section: &str) -> bool {
 /// the connection limiter's `ingressSessionEstablishment` are not reported.
 fn queues_section(ctx: &CommandContext) -> Document {
     let mut out = Document::new();
+    // mongod's order: execution control's pools, then ingress's (RM-355).
+    if let Some(execution) = ctx.locks.as_ref().and_then(|l| l.execution()) {
+        out.insert("execution", execution.server_status());
+    }
     if let Some(ingress) = ctx
         .server_params
         .as_ref()
@@ -4704,23 +4708,27 @@ fn queues_section(ctx: &CommandContext) -> Document {
 }
 
 /// `globalLock`: how long the server has run, the reads and writes running,
-/// and the ones queued. This server has no global lock; what queues an
-/// operation here is the storage engine's write admission (off unless
-/// configured), which is where mongod queues one too -- its tickets are
-/// taken with the global lock. A read never queues here.
+/// and the ones queued: waiting for an execution ticket as they take the
+/// global lock, or holding one and waiting for a lock (RM-355).
 fn global_lock(
     status: &crate::status::StatusCounters,
     up_millis: i64,
     ctx: &CommandContext,
 ) -> Document {
     let (readers, writers) = status.active_clients();
-    let queued = ctx
-        .storage()
-        .map(|s| s.writes_waiting() as i32)
-        .unwrap_or(0);
+    let (queued_readers, queued_writers) = ctx
+        .locks
+        .as_ref()
+        .map(|l| l.current_queue())
+        .map(|(r, w)| (r as i32, w as i32))
+        .unwrap_or((0, 0));
     doc! {
         "totalTime": Bson::Int64(up_millis.saturating_mul(1000)),
-        "currentQueue": { "total": queued, "readers": 0i32, "writers": queued },
+        "currentQueue": {
+            "total": queued_readers + queued_writers,
+            "readers": queued_readers,
+            "writers": queued_writers,
+        },
         "activeClients": {
             "total": (readers + writers) as i32,
             "readers": readers as i32,

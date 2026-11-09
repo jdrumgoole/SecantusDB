@@ -816,6 +816,10 @@ fn statement(
     // a second command on this session waits for it under the registry,
     // and every session's command then waits too.
     let owner = txn.lock().unwrap_or_else(|e| e.into_inner()).lock_owner;
+    // The statement's execution ticket is returned at its end, the
+    // transaction keeping its locks (mongod's stash), and taken again by
+    // its next statement (RM-355).
+    let mut _stash = None;
     if let (Some(lm), Some(owner)) = (ctx.locks.clone(), owner) {
         let mut chain = crate::lock_manager::statement_chain(doc, &ctx.db_name);
         // A collection a transaction creates is invisible to everyone else
@@ -850,6 +854,12 @@ fn statement(
             .unwrap_or(5);
         let mut failed = None;
         for (res, mode) in &chain {
+            // The ticket the global lock takes first is waited for as
+            // mongod waits for it: not within the lock request's bound.
+            if lm.take_global_ticket(owner, res, *mode).is_err() {
+                failed = Some((res.clone(), *mode, false));
+                break;
+            }
             let budget_left = secantus_core::deadline::remaining_ms();
             let bounded = limit >= 0 && budget_left.is_none_or(|left| left > f64::from(limit));
             let _lock_budget =
@@ -860,10 +870,15 @@ fn statement(
             }
         }
         match failed {
-            None => ctx.txn_locks = true,
+            None => {
+                ctx.txn_locks = true;
+                _stash = Some(crate::lock_manager::TicketStash::new(lm, owner));
+            }
             Some((res, mode, bounded)) => {
                 lm.release(owner);
-                let mut reply = if bounded {
+                let mut reply = if let Some(e) = crate::lock_manager::take_ticket_error() {
+                    e.into_reply()
+                } else if bounded {
                     let conn = ctx.connection_id;
                     CommandError::new(
                         24,

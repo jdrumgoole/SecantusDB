@@ -1460,10 +1460,6 @@ impl CmdStorage for StorageAdapter {
         )
     }
 
-    fn writes_waiting(&self) -> usize {
-        self.inner.writes_waiting()
-    }
-
     fn set_ttl_monitor(&self, sleep_secs: Option<i64>, enabled: Option<bool>) {
         self.inner.set_ttl_monitor(sleep_secs, enabled);
     }

@@ -631,6 +631,19 @@ pub fn get_log(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
 /// a mongod parameter with nothing behind it is not reported, so a client
 /// cannot read a setting that changes nothing.
 fn parameters(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
+    let mut all = listed(test_commands);
+    // mongod's execution admission control (`admission::execution`,
+    // RM-355), each settable at startup, with mongod 8.2.11's defaults.
+    all.extend(
+        crate::admission::execution::defaults()
+            .into_iter()
+            .map(|(name, value)| (name, true, value)),
+    );
+    all.sort_by(|a, b| a.0.cmp(b.0));
+    all
+}
+
+fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
     let version = crate::SERVER_VERSION_ARRAY;
     vec![
         // How old a `config.transactions` row must be before the transaction

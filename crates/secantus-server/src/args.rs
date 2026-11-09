@@ -69,13 +69,30 @@ pub struct CliArgs {
     pub oplog_nonlogged: Option<bool>,
     pub data_nonlogged: Option<bool>,
     pub checkpoint_seconds: Option<u64>,
-    /// Admission control: cap on concurrent engine writes (0 / None = off).
-    pub write_tickets: Option<usize>,
     /// `--block-compressor` / `[storage] block_compressor`: the compressor for
     /// newly created data tables.
     pub block_compressor: Option<String>,
     /// `--setParameter name=value`, each checked as mongod checks it.
     pub startup_parameters: Vec<(String, bson::Bson)>,
+}
+
+/// The `--setParameter`s, each parsed as mongod parses it in the order
+/// given. `--write-tickets N` is `storageEngineConcurrentWriteTransactions=N`,
+/// mongod's own cap on concurrent writes, given first.
+fn startup_parameters(cfg: &ResolvedConfig) -> Result<Vec<(String, bson::Bson)>, String> {
+    let tickets = cfg
+        .write_tickets
+        .map(|n| format!("storageEngineConcurrentWriteTransactions={n}"));
+    let mut out = Vec::new();
+    for arg in tickets.iter().chain(cfg.set_parameters.iter()) {
+        let parsed = secantus_commands::params::parse_startup_parameter(
+            arg,
+            cfg.enable_test_commands,
+            &out,
+        )?;
+        out.push(parsed);
+    }
+    Ok(out)
 }
 
 /// TLS options in plain-data form (the lib's [`TlsOptions`] is not `PartialEq`,
@@ -126,13 +143,8 @@ impl CliArgs {
             oplog_nonlogged: cfg.oplog_nonlogged,
             data_nonlogged: cfg.data_nonlogged,
             checkpoint_seconds: cfg.checkpoint_seconds,
-            write_tickets: cfg.write_tickets,
             block_compressor: cfg.block_compressor.clone(),
-            startup_parameters: cfg
-                .set_parameters
-                .iter()
-                .map(|p| secantus_commands::params::parse_startup_parameter(p))
-                .collect::<Result<Vec<_>, String>>()?,
+            startup_parameters: startup_parameters(cfg)?,
         })
     }
 
@@ -456,12 +468,11 @@ OPTIONS:
                                  incompressible data, more CPU) or none. An
                                  existing store keeps the one it was created
                                  with.
-    --write-tickets N            Admission control: cap on writes concurrently
-                                 inside the storage engine; further writers
-                                 queue OUTSIDE it. 0 = unlimited (default).
-                                 Bounds the p99.9 tail under write saturation,
-                                 which unbounded concurrency does not — see
-                                 tasks/backlog-rust-mongodb.md. Start near the core count.
+    --write-tickets N            The write ticket pool's size, fixed:
+                                 --setParameter
+                                 storageEngineConcurrentWriteTransactions=N.
+                                 By default mongod's throughput probing sizes
+                                 the read and write pools.
     --sync-on-commit             Fsync the WT log on every transaction commit
                                  (closes the writeConcern j:true durability gap
                                  at a throughput cost; off by default)

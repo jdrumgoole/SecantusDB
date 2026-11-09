@@ -355,7 +355,6 @@ fn storage_options(cli: &CliArgs) -> StorageOptions {
         // past time reads by (RM-210); `--data-logged` opts out.
         data_nonlogged: Some(cli.data_nonlogged.unwrap_or(true)),
         checkpoint_seconds: cli.checkpoint_seconds,
-        write_tickets: cli.write_tickets,
         transactions_logged_at_commit: true,
         ..StorageOptions::default()
     }
