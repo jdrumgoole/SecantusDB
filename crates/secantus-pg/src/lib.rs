@@ -19105,7 +19105,11 @@ impl PgHandler {
     /// enum, `array_agg(mood)` its array.
     fn agg_wire_type(&self, item: &AggItem) -> Type {
         let user = match item.func {
-            AggFunc::Min | AggFunc::Max => item.source_type.clone(),
+            // The overload's input type: an enum's own, a domain's base.
+            AggFunc::Min | AggFunc::Max => item
+                .source_type
+                .as_deref()
+                .map(secantus_pgplan::min_max_result_type),
             // `array_agg(int2vector)` is `array_agg(anyarray)`: the vector
             // type itself (RP-575).
             AggFunc::ArrayAgg => item
@@ -49705,7 +49709,9 @@ fn aggregate_result_typmod(item: &AggItem) -> i32 {
 /// The wire type an aggregate's result carries.
 ///
 /// Probed against PostgreSQL 14: `count(*)` and `count(col)` are int8 (oid 20),
-/// `sum(int4)` is **int8**, not int4, and `min`/`max` return the INPUT type.
+/// `sum(int4)` is **int8**, not int4, and `min`/`max` return their
+/// overload's input type, which is the argument's unless an implicit cast
+/// chose it (`max(varchar)` is `text`, RP-681).
 fn aggregate_wire_type(item: &AggItem) -> Type {
     if aggregates::is_extended(item.func) {
         return wire_type(&secantus_pgplan::aggregate_item_type(item));
@@ -49724,10 +49730,11 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
         AggFunc::Sum => wire_type(secantus_pgplan::sum_result_type(
             item.source_type.as_deref(),
         )),
+        // `max(varchar)` is `max(text)` (`secantus_pgplan::min_max_result_type`).
         AggFunc::Min | AggFunc::Max => item
             .source_type
             .as_deref()
-            .map(wire_type)
+            .map(|t| wire_type(&secantus_pgplan::min_max_result_type(t)))
             .unwrap_or(Type::VARCHAR),
         // An array of arrays is the same array type, and so is an array of
         // vectors (`aggregate_item_type`).

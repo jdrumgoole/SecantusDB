@@ -2383,7 +2383,17 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       value over a `char(3)` column UNIONed with `text` inserted into it.
       Here the column holds `xy`, 2 bytes: a `bpchar` column is stored
       trimmed and padded on the way out to its width, and one with no
-      width pads nothing.
+      width pads nothing. The same holds for any unsized `bpchar` column
+      (`create table u (a bpchar)`: `'ab  '` reads back `ab`), and for a
+      `max`, a GROUP BY or a DISTINCT over one. Sized while working RP-681
+      (2026-11-09): comparisons, `IN`, ranges and joins already agree with
+      PostgreSQL, but keeping the blanks breaks the keys -- a UNIQUE
+      constraint and a primary key are storage indexes over the stored
+      value (the PK is `_id`), so `'k'` and `'k '` would stop colliding
+      (both are 23505 on 15.19 today, rightly) -- and GROUP BY, DISTINCT
+      and an indexed `=` would separate them too. The faithful fix keeps
+      the value as written and keys it by `bpchar`'s comparison (trailing
+      blanks ignored), which reaches the storage keys: more than one PR.
       Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
       Backlog-ID: RP-693
 - [ ] **INTERSECT keeps the left side's value, not the smaller input's.**
@@ -2447,13 +2457,6 @@ that reaches a comparison carrying its blanks is compared with them.
       correlated call does not.
       Verify: tests/backlog/test_rp_found_rp679.py::test_correlated_array_of_char_n_keeps_the_elements_blanks
       Backlog-ID: RP-683
-- [ ] **`min` / `max` over a `varchar` column are typed `varchar`.**
-      PostgreSQL has no `max(varchar)`: `select max(v) from (values
-      ('ab'::varchar(4)), ('cd')) s(v)` resolves to `max(text)` and is
-      described `text` (25) on 15.19; here it is `varchar` (1043), as are
-      `min` and the column of a FROM-subquery over either.
-      Verify: tests/backlog/test_rp_found_rp671.py::test_min_max_over_varchar_is_text
-      Backlog-ID: RP-681
 - [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
       over ()` is 42809 `OVER specified, but octet_length is not a window
       function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
@@ -3145,3 +3148,29 @@ the column written out, so none is the star's. The gap tests are in
       expression subquery is too.
       Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
       Backlog-ID: RP-705
+
+## Found while working RP-681 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp681.py`: `t681(k int, v varchar(4), ...)`.
+
+- [ ] **`min` / `max` over a `reg*` or `cidr` value keep its type and
+      compare it as itself.** PostgreSQL 15.19 resolves `max(regclass)` to
+      `max(oid)` and `max(cidr)` to `max(inet)` (`func_select_candidate`
+      over `pg_aggregate`'s 22 overloads), coercing each input first:
+      `max(x)` over `'pg_class'::regclass` and `'pg_type'::regclass` is
+      1259, an `oid`, the larger OID. Here it is `pg_class`, a `regclass`
+      chosen by NAME (`pg_type` is larger as text), and `max(cidr)` is
+      described `cidr` (650), not `inet` (869). Since RP-681
+      `min_max_result_type` takes the overload's type only where it is
+      `text`, whose value is the input's string unchanged; these need the
+      input coerced in each engine that computes min / max.
+      Verify: tests/backlog/test_rp_found_rp681.py::test_min_max_coerce_their_input_to_the_overloads_type
+      Backlog-ID: RP-706
+- [ ] **`pg_typeof` of a `text` scalar subquery is 42P18.** `select
+      pg_typeof((select max(v) from t681))` is `text` on PostgreSQL 15.19;
+      here it is 42P18 `could not determine data type of parameter $1`, as
+      for `(select upper(v) ...)` and `(select string_agg(v, ',') ...)`,
+      while one over an `int` column or a bare `varchar` column answers.
+      Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
+      Backlog-ID: RP-707

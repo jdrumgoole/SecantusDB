@@ -13,7 +13,8 @@ value's blanks) pinned and found:
   a `char(n)` value, an `= ANY` array or `IS DISTINCT FROM` did not compare
   as `bpchar`, and `IS DISTINCT FROM`, `= ANY` and `<> ALL` over any grouped
   value were read as a plain `=` / `<>`;
-- `min` / `max` over a `varchar` column are typed `varchar`, not `text`;
+- RP-681 (fixed): `min` / `max` over a `varchar` column were typed
+  `varchar`, not `text`;
 - OVER on a function that is not a window function or an aggregate is
   0A000, not 42809.
 
@@ -195,9 +196,12 @@ def test_having_reads_each_expression_kind(query: str, dsn: str) -> None:
 _TEXT = 25
 
 
-@pytest.mark.backlog("RP-681")
+@pytest.mark.backlog_fixed("RP-681")
 @pytest.mark.parametrize("func", ["max", "min"])
 def test_min_max_over_varchar_is_text(func: str, dsn: str) -> None:
+    """PostgreSQL has no `max(varchar)`: the call resolves to `max(text)`
+    and was described `text` on 15.19, and `varchar` here. The wider shapes
+    are in `test_rp_found_rp681.py`."""
     query = f"select {func}(v) from (values ('ab'::varchar(4)), ('cd')) s(v)"
     with psycopg.connect(dsn, autocommit=True) as c:
         cur = c.execute(query)
