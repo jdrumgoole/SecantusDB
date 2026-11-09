@@ -20,8 +20,8 @@ shapes, and an ORDER BY position past a star sorted by the wrong column;
 fixed), RP-480 (a whole row was typed as a record or as varchar; fixed)
 and RP-481 (a USING column's 42703 carries a position); and found while
 working RP-479, RP-516 (an UPDATE's or DELETE's target was not a whole
-row; fixed) and RP-517 (`v.*` in a subquery over an outer FROM item is
-42P01); and found while working RP-516, RP-521 (a subquery reading an outer
+row; fixed) and RP-517 (`v.*` in a subquery over an outer FROM item was
+42P01; fixed); and found while working RP-516, RP-521 (a subquery reading an outer
 whole row with no type was 42P18; fixed), RP-522 (a whole row compared with an
 untyped record was not 42804; fixed), RP-523 (an aliased write target answers to
 its table's name) and RP-524 (a write's name errors carry the wrong
@@ -1018,27 +1018,85 @@ def test_dml_target_whole_row(query: str, dsn: str) -> None:
     assert answer(dsn, query) == DML_TARGET_WHOLE_ROW[query]
 
 
-# Found while working RP-479. `v.*` in a subquery's select list, where `v`
-# is an outer FROM item, is that item's columns (PostgreSQL expands the
-# star with the outer level's RTE): one column answers, two are the
-# sublink's width error. Here each is 42P01 `missing FROM-clause entry for
-# table "v"` at 16. Measured on PostgreSQL 15.19.
+# Found while working RP-479, fixed by RP-517. `v.*` in a subquery's select
+# list, where `v` is an outer FROM item, is that item's columns (PostgreSQL
+# expands the star with the outer level's RTE, `ExpandColumnRefStar`): one
+# column answers, two are the sublink's width error. Each was 42P01
+# `missing FROM-clause entry for table "v"` at 16. Measured on PostgreSQL
+# 15.19 (the tables' rows on a private cluster with `_SETUP`).
+_WIDTH_ERROR = ("42601", "subquery must return only one column", None, "8")
 OUTER_STAR_IN_SUBQUERY = {
     "select (select v.*) from (values (1)) v(a)": [(1,)],
-    "select (select v.*) from (values (1,'y')) v(a,c)": (
-        "42601",
-        "subquery must return only one column",
-        None,
-        "8",
-    ),
+    "select (select v.*) from (values (1,'y')) v(a,c)": _WIDTH_ERROR,
     "select (select v.* limit 1) + 1 from (values (2)) v(a)": [(3,)],
+    "select (select fs.*) from fs": _WIDTH_ERROR,
+    "select (select fs.* from fe) from fs": _WIDTH_ERROR,
+    "select (select fe.*) from fe join fs using (a)": _WIDTH_ERROR,
+    "select (select v.*, 1) from (values (5)) v(a)": _WIDTH_ERROR,
+    "select (select v.* from fe) from (values (5)) v(a)": [(5,)],
+    "select (select v.* where v.a > 0) from (values (5), (-1)) v(a)": [(5,), (None,)],
+    "select (select v.*) from (select 7 as k) v": [(7,)],
+    "select (select (select v.*)) from (values (5)) v(a)": [(5,)],
+    "select (select distinct v.* order by 1) from (values (5)) v(a)": [(5,)],
+    "with w as (select 4 k) select (select w.*) from w": [(4,)],
+    "select a from fs where a in (select fs.*)": (
+        "42601",
+        "subquery has too many columns",
+        None,
+        "26",
+    ),
+    "select array(select v.*) from (values (5)) v(a)": [([5],)],
+    "select b from fe, (values (8)) v(a) where (select v.* from fs) = 8": [("x",)],
+    # A star the subquery's own FROM binds is its own.
+    "select (select v.* from (values (9)) v(a)) from (values (5)) v(a)": [(9,)],
+    # An outer star over an aliased table by its own name is still the
+    # invalid reference, and a name no level has still missing.
+    "select (select fs.*) from fs x": (
+        "42P01",
+        'invalid reference to FROM-clause entry for table "fs"',
+        'Perhaps you meant to reference the table alias "x".',
+        "16",
+    ),
+    "select (select w.*) from (values (5)) v(a)": (
+        "42P01",
+        'missing FROM-clause entry for table "w"',
+        None,
+        "16",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-517")
+@pytest.mark.backlog_fixed("RP-517")
 @pytest.mark.parametrize("query", list(OUTER_STAR_IN_SUBQUERY))
 def test_outer_star_in_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == OUTER_STAR_IN_SUBQUERY[query]
+
+
+# Fixed by RP-517. `FigureColname` names an expression subquery after its
+# ANALYSED first target, so one whose first target is a star is named by
+# the star's first column. Each was named by the qualifier the written
+# `v.*` ends in (`v`), and a bare `*` was `?column?`. Measured on
+# PostgreSQL 15.19.
+STAR_SUBQUERY_NAME = {
+    "select (select v.*) from (values (1)) v(a)": ["a"],
+    "select (select v.*) from (select 7 as k) v": ["k"],
+    "select (select (select v.*)) from (values (5)) v(a)": ["a"],
+    "select (select v.*)::text from (values (5)) v(a)": ["a"],
+    "with w as (select 4 k) select (select w.*) from w": ["k"],
+    "select (select v.* from (values (9)) v(z)) from (values (5)) v(a)": ["z"],
+    "select (select * from (values (3)) w(z))": ["z"],
+    "select (select * from (select c from fs) s)": ["c"],
+}
+
+
+@pytest.mark.backlog_fixed("RP-517")
+@pytest.mark.parametrize("query", list(STAR_SUBQUERY_NAME))
+def test_star_subquery_is_named_by_its_first_column(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        cur = c.execute(query)
+        assert [d.name for d in cur.description or []] == STAR_SUBQUERY_NAME[query]
 
 
 # Found while working RP-516, fixed by RP-521. A subquery that reads an

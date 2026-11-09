@@ -5825,3 +5825,53 @@ fn a_char_n_column_strips_a_constant_only_for_a_bpchar_comparison() {
         );
     }
 }
+
+/// The first SELECT of `sql`, as parsed.
+fn parsed_select(sql: &str) -> pg_query::protobuf::SelectStmt {
+    let tree = pg_query::parse(sql).expect("parses").protobuf;
+    match tree.stmts[0].stmt.as_ref().and_then(|s| s.node.as_ref()) {
+        Some(N::SelectStmt(s)) => (**s).clone(),
+        _ => panic!("not a SELECT"),
+    }
+}
+
+/// The written form of each select-list target: `q.c` or `q.*`.
+fn target_refs(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    s.target_list
+        .iter()
+        .map(|t| match t.node.as_ref() {
+            Some(N::ResTarget(rt)) => match rt.val.as_deref().and_then(|v| v.node.as_ref()) {
+                Some(N::ColumnRef(c)) => c
+                    .fields
+                    .iter()
+                    .map(|f| match f.node.as_ref() {
+                        Some(N::String(s)) => s.sval.clone(),
+                        Some(N::AStar(_)) => "*".to_string(),
+                        _ => "?".to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("."),
+                _ => "?".to_string(),
+            },
+            _ => "?".to_string(),
+        })
+        .collect()
+}
+
+#[test]
+fn a_star_over_an_outer_from_item_is_its_columns() {
+    // RP-517: `ExpandColumnRefStar` expands `q.*` with whichever level's
+    // RTE answers to `q`; a star the subquery's own FROM binds is its own.
+    let outer = parsed_select("select 1 from t, (values (1, 2)) v(a, c)");
+    let depth = correlated::push_outer_from(&outer.from_clause);
+    let mut inner = parsed_select("select v.*, t.*, x.*, w.* from (select 1) x");
+    correlated::expand_outer_stars(&mut inner, &lookup);
+    let mut own = parsed_select("select v.* from (values (9)) v(z)");
+    correlated::expand_outer_stars(&mut own, &lookup);
+    correlated::pop_outer_from(depth);
+    assert_eq!(
+        target_refs(&inner),
+        ["v.a", "v.c", "t.id", "t.name", "t.n", "x.*", "w.*"]
+    );
+    assert_eq!(target_refs(&own), ["v.*"]);
+}
