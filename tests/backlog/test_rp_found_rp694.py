@@ -7,8 +7,9 @@ scalar variable stored the column's value uncoerced):
   I/O and refuses `t` as an integer (RP-712);
 - a `FOR` over a query, or an `EXECUTE ... INTO`, whose target is a scalar
   variable or a list of them is refused 0A000 (RP-713);
-- a variable of a NOT NULL domain with no default is created NULL, where
-  PostgreSQL refuses the NULL at the block's entry (RP-714).
+- a variable of a NOT NULL domain with no default was created NULL, where
+  PostgreSQL refuses the NULL at the block's entry (RP-714, fixed: the
+  block's entry now assigns the NULL through the domain coercion).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -23,9 +24,13 @@ import pytest
 
 from tests.backlog.test_rp_batch26 import _dsn
 
+_DOMAINS = ["dnn714o", "dck714", "dpos714", "dnn694"]
 _SETUP = [
-    "drop domain if exists dnn694 cascade",
+    "drop domain if exists " + ", ".join(_DOMAINS) + " cascade",
     "create domain dnn694 as int not null",
+    "create domain dnn714o as dnn694",
+    "create domain dck714 as int check (value is not null)",
+    "create domain dpos714 as int check (value > 0)",
 ]
 
 
@@ -101,15 +106,45 @@ def test_for_and_execute_into_scalar_variables(query: str, dsn: str) -> None:
 _NOT_NULL = ("error", "23502", "domain dnn694 does not allow null values")
 
 # `exec_stmt_block` initialises a variable with no DEFAULT by assigning it
-# NULL through `exec_assign_value`, which checks the domain's NOT NULL.
+# NULL through `exec_assign_value`, which checks the domain's NOT NULL and
+# evaluates its CHECKs on the NULL; a domain over a NOT NULL domain is named
+# itself, and an array of the domain is no domain.
 NOT_NULL_DOMAIN = {
     "do $$ declare x dnn694; begin end $$": _NOT_NULL,
     "do $$ declare x dnn694; begin select 5 into x; end $$": _NOT_NULL,
     "do $$ declare x dnn694 := 5; begin raise notice '%', x; end $$": ("ok", ["5"]),
+    "do $$ declare x dnn694 := null; begin end $$": _NOT_NULL,
+    "do $$ declare x dnn714o; begin end $$": (
+        "error",
+        "23502",
+        "domain dnn714o does not allow null values",
+    ),
+    "do $$ declare x dck714; begin end $$": (
+        "error",
+        "23514",
+        'value for domain dck714 violates check constraint "dck714_check"',
+    ),
+    "do $$ declare x dpos714; begin raise notice '%', x is null; end $$": ("ok", ["t"]),
+    "do $$ declare x dnn694[]; begin raise notice '%', x is null; end $$": ("ok", ["t"]),
+    "do $$ begin for i in 1..2 loop declare x dnn694; begin end; end loop;"
+    " exception when not_null_violation then raise notice 'caught'; end $$": ("ok", ["caught"]),
 }
 
 
-@pytest.mark.backlog("RP-714")
+@pytest.mark.backlog_fixed("RP-714")
 @pytest.mark.parametrize("query", list(NOT_NULL_DOMAIN))
 def test_a_not_null_domain_variable_without_a_default_is_refused(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == NOT_NULL_DOMAIN[query]
+
+
+@pytest.mark.backlog_fixed("RP-714")
+def test_a_not_null_domain_variables_refusal_names_the_block_initialization(dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        with pytest.raises(psycopg.errors.NotNullViolation) as e:
+            c.execute("do $$ declare x dnn694; begin end $$")
+    assert e.value.diag.context == (
+        "PL/pgSQL function inline_code_block line 1 during statement block local variable"
+        " initialization"
+    )
