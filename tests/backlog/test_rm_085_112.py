@@ -496,6 +496,103 @@ def test_a_field_changing_type_rolls_the_bucket_over(rust_mongo: Any, mongod: An
     assert got == ref
 
 
+def _column_series() -> dict[str, list]:
+    """Value series for one data field, chosen to reach every branch of
+    mongod's BSONColumnBuilder: delta and delta-of-delta runs, RLE, skips,
+    every Simple-8b selector width, the double scales and their rescaling,
+    the 128-bit types and interleaved objects. `_SKIP` is a measurement
+    without the field."""
+    import math
+    import random
+
+    rng = random.Random(88)
+    oid = "6500000000aabbccdd"
+    big = [rng.randrange(-(2**62), 2**62) for _ in range(40)]
+    return {
+        "ints": [0, 1, 2, 3],
+        "ints_wide": [1, 1000, -5, 7, 7, 7, 2**31 - 1, -(2**31), 0],
+        "ints_random": [rng.randrange(-(10**k), 10**k) for k in range(1, 10) for _ in range(7)],
+        "repeat_rle": [5] * 500,
+        "repeat_then_change": [5] * 130 + [6] + [5] * 250,
+        "count_limit": [i % 7 for i in range(1100)],
+        "int64": [bson.Int64(v) for v in big],
+        "int64_extremes": [bson.Int64(2**63 - 1), bson.Int64(-(2**63)), bson.Int64(0)],
+        "doubles": [1.5, 2.5, 3.25, 1.0],
+        "doubles_tenths": [0.1, 0.2, 0.3, 0.4, 0.7, 1.1],
+        "doubles_rescale": [1.0, 2.0, 3.0, 1.5, 2.25, 3.125, 1.0001, 7.0],
+        "doubles_long_rescale": [*map(float, range(70)), 0.5, *map(float, range(70))],
+        "doubles_random": [rng.uniform(-1e6, 1e6) for _ in range(80)],
+        "doubles_odd": [0.0, -0.0, math.inf, -math.inf, math.nan, 1e300, 5e-324, 3.0],
+        "doubles_money": [round(rng.uniform(0, 500), 2) for _ in range(90)],
+        "strings": ["a", "b", "ab", "abc", "", "x" * 16, "y" * 17, "abcd", "abce"],
+        "strings_long": ["x" * 20, "y" * 20, "z" * 30],
+        "strings_nul": ["\x00a", "b", "\x00b"],
+        "code": [bson.Code("f()"), bson.Code("g()"), bson.Code("g()")],
+        "bools": [True, False, True, True, False],
+        "nulls": [None, None, None],
+        "dates": [
+            bson.datetime.datetime(2026, 1, 1)
+            + bson.datetime.timedelta(milliseconds=rng.randrange(0, 10**7))
+            for _ in range(30)
+        ],
+        "oids": [bson.ObjectId(oid + format(i * 3, "06x")) for i in range(40)],
+        "oids_other_process": [
+            bson.ObjectId("6500000000aabbccdd000001"),
+            bson.ObjectId("6500000100aabbccee000002"),
+        ],
+        "decimals": [bson.Decimal128(str(rng.randrange(0, 10**6) / 100)) for _ in range(25)],
+        "binary": [bson.Binary(bytes([i, i + 1, i * 3 % 256]), 0) for i in range(20)]
+        + [bson.Binary(b"\x01\x02", 0), bson.Binary(b"\x01\x02", 5), bson.Binary(b"x" * 20, 0)],
+        "timestamps": [bson.Timestamp(1700000000 + i // 3, i % 3) for i in range(30)],
+        "regex": [bson.Regex("a+"), bson.Regex("a+"), bson.Regex("b")],
+        "minmax": [bson.MinKey(), bson.MinKey()],
+        "sparse": [1, _SKIP, 3, _SKIP, _SKIP, 4] + [_SKIP] * 70 + [9],
+        "skips_first": [_SKIP] * 65 + [2.5, 3.5],
+        "doubles_skips": [1.5, _SKIP, 2.25, _SKIP, 3.125] + [_SKIP] * 61 + [0.5],
+        "objects": [{"a": i, "b": "s" * (i % 3)} for i in range(30)],
+        "objects_growing": [{"a": 1}, {"a": 2, "b": 1}, {"b": 2}, {"a": 3, "c": {"d": 1}}] * 6,
+        "objects_reordered": [{"a": 1, "b": 2}, {"b": 3, "a": 4}, {"a": 5, "b": 6}],
+        "objects_nested": [{"x": {"y": i, "z": [i, i + 1]}, "w": i * 0.5} for i in range(25)],
+        "objects_empty": [{}, {"a": {}}, {"a": 1}, {}],
+        "objects_skips": [{"a": 1}, _SKIP, {"a": 2}, {"a": 3, "b": 1}, _SKIP],
+        "objects_to_scalar": [{"a": 1}, {"a": 2}, {"a": {"b": 1}}, {"a": 3}],
+        "arrays": [[i, i + 1, i + 2] for i in range(20)] + [[1], [], [1, 2, 3, 4]],
+    }
+
+
+_SKIP = object()
+
+
+def _bucket_columns(client: Any, values: list) -> list[dict]:
+    """The `data` columns of each bucket holding `values` (one measurement
+    each, `_id` and time counting up), ordered by first `_id`."""
+    db = client[_name("rm088c")]
+    db.create_collection("ts", timeseries={"timeField": "t"})
+    start = bson.datetime.datetime(2026, 1, 1)
+    docs = []
+    for i, v in enumerate(values):
+        d: dict = {"_id": i, "t": start + bson.datetime.timedelta(seconds=i)}
+        if v is not _SKIP:
+            d["v"] = v
+        docs.append(d)
+    db.ts.insert_many(docs)
+    buckets = sorted(db["system.buckets.ts"].find(), key=lambda b: b["control"]["min"]["_id"])
+    client.drop_database(db.name)
+    return [{k: bytes(col).hex() for k, col in sorted(b["data"].items())} for b in buckets]
+
+
+@pytest.mark.backlog_fixed("RM-088")
+def test_bucket_columns_hold_mongods_bytes(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 compresses each bucket field with its BSONColumnBuilder
+    (delta runs, Simple-8b, scaled doubles, interleaved objects); the Rust
+    server wrote every value as a literal until 2026-11-09. Each series'
+    buckets hold the same bytes on both servers."""
+    for label, values in _column_series().items():
+        got, ref = _both(rust_mongo, mongod, lambda c, v=values: _bucket_columns(c, v))
+        assert ref, label
+        assert got == ref, label
+
+
 @pytest.mark.backlog_fixed("RM-089")
 def test_an_unknown_hint_on_a_time_series_collection(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 refuses a hint naming no index on a time-series
