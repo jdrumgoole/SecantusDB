@@ -1320,6 +1320,9 @@ jobs:
         if: always() && runner.os != 'Windows'
         run: |
           f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f.lowest" ]; then
+            echo "disk watchdog: lowest free space $(( $(cat "$f.lowest") / 1048576 )) GB"
+          fi
           if [ -s "$f" ]; then
             cat "$f"
             echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
@@ -1714,6 +1717,9 @@ jobs:
         if: always() && runner.os != 'Windows'
         run: |
           f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f.lowest" ]; then
+            echo "disk watchdog: lowest free space $(( $(cat "$f.lowest") / 1048576 )) GB"
+          fi
           if [ -s "$f" ]; then
             cat "$f"
             echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
