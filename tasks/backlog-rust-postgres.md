@@ -1003,6 +1003,31 @@ one beside it.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
+## Found by a CI run (2026-11-09)
+
+- [ ] **OPEN — any DDL statement makes the next catalog query re-decode
+      every catalog collection.** `bump_catalog_version` (`lib.rs`, the
+      `CatalogCache` comment) moves one version after every statement that
+      may change the catalog, and the next read of any catalog then decodes
+      all of them again. PostgreSQL invalidates only the cache entries for
+      the rows that changed (`inval.c`, `CatCacheInvalidate`, a relation's
+      relcache entry), so its first query after DDL costs about what the
+      next one does. Measured 2026-11-09 with psql's `\d` collation
+      subquery (`tests/backlog/test_rp_catalog_latency.py`) after a
+      `CREATE TABLE`:
+      - PostgreSQL 15.19 (private cluster): 0.9 ms first, 0.2 ms after.
+      - Debug `secantusd-pg`: 0.58 s first, 0.016 s after; and the first
+        query grows with the schema: 0.68 s with 50 more tables, 0.97 s
+        with 150, 1.79 s with 400 (0.044 s after).
+      A slow CI runner took the first query to 2.2 s and failed RP-077's
+      latency test on PR #2552 (job 129166397146), which until then timed
+      that cold read instead of the subquery it was written for.
+      The faithful fix keys the decoded rows per catalog row, or per
+      relation, and invalidates what a statement changed, as `inval.c` does;
+      `catcache.rs` already models which lookups miss.
+      Backlog-ID: RP-715
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_what_the_next_does
+
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
