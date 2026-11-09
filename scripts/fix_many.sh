@@ -196,10 +196,15 @@ lane() {
     done
 }
 
+# Wait for the LANES by pid: a bare `wait` also waits for the caffeinate
+# above, which outlives everything but this script, so the batch hung at
+# its end with every lane finished (batch 9, 2026-11-09).
+lanes=()
 for k in $(seq 1 "$jobs"); do
     lane "$k" &
+    lanes+=($!)
 done
-wait
+wait "${lanes[@]}"
 
 # Integration mode opens no PR here: scripts/land_batch.sh <branch> <pid>
 # lands the branch in snapshots while the batch runs (a PR straight from
