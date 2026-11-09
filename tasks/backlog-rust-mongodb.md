@@ -652,16 +652,6 @@ These are explicit non-goals. Don't add them without a reason.
       '<db>.explain.dry.run' does not exist`). Found 2026-11-09 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_plan_cache_stats_names_its_stage
       Backlog-ID: RM-466
-- [ ] **A projection is not where mongod's plan puts it.** mongod 8.2.11
-      projects below a blocking SORT (`SORT` over `PROJECTION_SIMPLE` or
-      `PROJECTION_COVERED`, so the SORT sorts the projected documents:
-      `totalDataSizeSorted` 318 where whole documents are 402), and the
-      projection over a SORT_MERGE whose keys hold the projected fields is
-      `PROJECTION_DEFAULT`. This server's plan projects above the SORT and
-      calls that projection `PROJECTION_COVERED`, in `explain` and in a
-      profile entry's `execStats` alike. Found 2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_projection_is_where_mongods_plan_puts_it
-      Backlog-ID: RM-373
 - [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
       8.2.11 adds every document its sort read to
       `metrics.query.sort.totalKeysSorted` for a leading `$sort` and
@@ -712,6 +702,40 @@ These are explicit non-goals. Don't add them without a reason.
       Found 2026-11-09 (RM-375).
       Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_beside_a_multikey_field_sorts_index_keys
       Backlog-ID: RM-477
+- [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
+      puts RETURN_KEY above a blocking sort and drops the projection:
+      `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-
+      IXSCAN` where the index does not hold the sort. This server ignores
+      `returnKey` over a COLLSCAN (`PROJECTION_SIMPLE <- SORT <- COLLSCAN`)
+      and puts RETURN_KEY below the sort with no FETCH (`SORT <- RETURN_KEY
+      <- IXSCAN`). Found 2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_return_key_is_the_top_of_a_sorted_plan
+      Backlog-ID: RM-470
+- [ ] **An `$or` of index scans does not answer a covered projection.**
+      mongod 8.2.11 answers `{_id: 0, x: 1}` over an `$or` of two scans of
+      `{y: 1, x: 1}` from their keys (`SUBPLAN <- PROJECTION_DEFAULT <- OR
+      <- IXSCAN`, no FETCH). This server fetches each document
+      (`PROJECTION_SIMPLE <- FETCH <- OR`). Found 2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_an_or_of_scans_answers_a_covered_projection
+      Backlog-ID: RM-471
+- [ ] **A sort beside `showRecordId` is a `simple` sort.** mongod 8.2.11's
+      SORT under a `showRecordId` read's projection is `type: "default"`
+      (it keeps each document's RecordId); without `showRecordId` the same
+      read sorts `simple`. This server's is `simple` both ways. Found
+      2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_beside_show_record_id_is_a_default_sort
+      Backlog-ID: RM-472
+- [ ] **A SORT over a covered projection does not count what it sorted.**
+      mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` (`type:
+      "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
+      `find({y: {$gte: 0}}, {_id: 0, x: 1}).sort({x: 1})`, in `explain`
+      and in a profile entry's `execStats`: its working-set members, not
+      the projected documents. This server counts 528 in `explain` (the
+      projected documents) and 780 in the profile entry (members of their
+      index keys, as its sort of keys below a FETCH counts them since
+      RM-375). Found 2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_over_a_covered_projection_counts_what_it_sorted
+      Backlog-ID: RM-473
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
@@ -2171,16 +2195,6 @@ What is left, all on the RUST MongoDB server:
       Found 2026-11-09 working RM-311.
       Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
       Backlog-ID: RM-444
-- [ ] **`explain` calls a renaming projection `PROJECTION_SIMPLE`.**
-      mongod 8.2.11 explains `[{$project: {w: "$x"}}]`'s projection as
-      `PROJECTION_DEFAULT`, with or without a `$match` moved ahead of it: a
-      field computed from a path is no inclusion. This server's
-      `projection_name` (`explain/plan.rs`) calls a projection general only
-      when a field is dotted or its value a document or array, so a string
-      value is `PROJECTION_SIMPLE`. The documents are the same. Found
-      2026-11-09 working RM-311.
-      Verify: tests/backlog/test_rm_found_2026_11_09.py::test_a_renaming_projection_is_projection_default
-      Backlog-ID: RM-445
 - [ ] **A blocking sort keeps equal documents in the order it read them;
       mongod's sort does not.** Over 200 documents in runs of equal keys,
       mongod 8.2.11's `find().sort({s: 1})` and `$sort` (with a collation

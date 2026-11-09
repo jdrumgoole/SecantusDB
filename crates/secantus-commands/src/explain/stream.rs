@@ -995,6 +995,9 @@ enum Stage {
         sorted: Option<VecDeque<Member>>,
         collation: Option<Collation>,
         budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+        /// The projection below the sort, and the command's filter its
+        /// positional `$` reads: the sorter holds the projected documents.
+        project: Option<Box<(Document, Option<Document>)>>,
         t: Tally,
         /// What its sorter counted (`totalDataSizeSorted`, the spills).
         report: Option<Box<secantus_core::memlimit::SpillReport>>,
@@ -1062,6 +1065,7 @@ fn sort_members(
     limit: Option<i64>,
     collation: Option<&Collation>,
     budget: Option<(secantus_core::memlimit::Budgets, bool)>,
+    project: Option<&(Document, Option<Document>)>,
 ) -> Result<
     (
         VecDeque<Member>,
@@ -1078,7 +1082,16 @@ fn sort_members(
         let decoded: Vec<Document> = all
             .iter()
             .filter_map(|m| m.doc.as_deref())
-            .map(|b| secantus_core::bsondoc::from_bytes(b).map_err(undecodable))
+            .map(|b| {
+                let doc = secantus_core::bsondoc::from_bytes(b).map_err(undecodable)?;
+                match project {
+                    Some((spec, query)) => {
+                        secantus_core::projection::apply_projection(&doc, spec, query.as_ref())
+                            .map_err(fault)
+                    }
+                    None => Ok(doc),
+                }
+            })
             .collect::<Result<_, _>>()?;
         let sizing = secantus_core::sorter::Sizing {
             source: secantus_core::sorter::SortSource::QueryLayer,
@@ -1495,6 +1508,7 @@ impl Stage {
                 sorted,
                 collation,
                 budget,
+                project,
                 t,
                 report,
             } => {
@@ -1510,8 +1524,15 @@ impl Stage {
                         }
                         all.push(m);
                     }
-                    let (out, counted) =
-                        sort_members(cx, all, pattern, *limit, collation.as_ref(), *budget)?;
+                    let (out, counted) = sort_members(
+                        cx,
+                        all,
+                        pattern,
+                        *limit,
+                        collation.as_ref(),
+                        *budget,
+                        project.as_deref(),
+                    )?;
                     *sorted = Some(out);
                     *report = counted.map(Box::new);
                 }
@@ -1896,6 +1917,11 @@ fn stage_of(
                     _ => false,
                 }
             }
+            // A covered projection below the sort: the keys it projects sort.
+            let mut input = input.as_ref();
+            while let Node::Projection { input: below, .. } = input {
+                input = below;
+            }
             if !holds(input, &pattern) {
                 return Ok(None);
             }
@@ -2066,11 +2092,16 @@ impl Stream {
         // A sort over what is no index scan sorts whole documents, whatever
         // type mongod prints for it (a `findAndModify`'s SORT over a
         // COLLSCAN is `default`).
-        let of_keys = |n: &Node| match n {
-            Node::IxScan(_) => true,
-            Node::Or(inputs) => inputs.iter().all(|i| matches!(i, Node::IxScan(_))),
-            _ => false,
-        };
+        // A covered projection between them projects the keys (mongod
+        // 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN`).
+        fn of_keys(n: &Node) -> bool {
+            match n {
+                Node::IxScan(_) => true,
+                Node::Or(inputs) => inputs.iter().all(|i| matches!(i, Node::IxScan(_))),
+                Node::Projection { input, .. } => of_keys(input),
+                _ => false,
+            }
+        }
         if let Node::Sort {
             pattern,
             limit: sort_limit,
@@ -2096,6 +2127,12 @@ impl Stream {
                     sorted: None,
                     collation: opts.collation.cloned(),
                     budget: opts.sort_budget,
+                    project: match input.as_ref() {
+                        Node::Projection { spec, .. } => {
+                            Some(Box::new((spec.clone(), command.clone())))
+                        }
+                        _ => None,
+                    },
                     t: Tally::default(),
                     report: None,
                 };

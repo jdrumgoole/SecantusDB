@@ -512,7 +512,7 @@ pub fn is_flag_value(v: &Bson) -> bool {
 /// Truthiness of a flag value. A `Decimal128` needs its own zero test -- it is
 /// an object, so a plain "is it falsy" check calls every decimal truthy.
 /// NaN is NOT zero, so it includes. Mirrors `projection.py::_flag_truthy`.
-pub(crate) fn flag_truthy(v: &Bson) -> bool {
+pub fn flag_truthy(v: &Bson) -> bool {
     spec_truthy(v).unwrap_or(true)
 }
 
