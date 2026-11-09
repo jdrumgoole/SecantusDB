@@ -91,6 +91,248 @@ enum Reshape {
         kept: Vec<String>,
         renamed: Vec<(String, String)>,
     },
+    /// A `$group`: it keeps no field, its key's plain field paths are
+    /// renames, and `id_fields` are the key's own paths (`_id`, or `_id.k`
+    /// for each field of a document key).
+    Groups {
+        renamed: Vec<(String, String)>,
+        id_fields: Vec<String>,
+    },
+}
+
+/// The renames a `$group` key makes (mongod 8.2
+/// `ExpressionFieldPath::getComputedPaths`): a field path of one component
+/// (`$x`, `$$ROOT.x`, `$$CURRENT.x`) names the field it reads, inside a
+/// document key too; a dotted `$a.b` can reshape arrays and is no rename.
+fn key_renames(path: &str, key: &Bson, out: &mut Vec<(String, String)>) {
+    match key {
+        Bson::String(s) => {
+            let field = s
+                .strip_prefix("$$CURRENT.")
+                .or_else(|| s.strip_prefix("$$ROOT."))
+                .or_else(|| s.strip_prefix('$').filter(|f| !f.starts_with('$')));
+            if let Some(f) = field.filter(|f| !f.is_empty() && !f.contains('.')) {
+                out.push((path.to_string(), f.to_string()));
+            }
+        }
+        Bson::Document(d) if !is_operator(d) => {
+            for (k, v) in d {
+                key_renames(&format!("{path}.{k}"), v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether a document is an operator expression rather than a document of
+/// fields: its first field names an operator.
+fn is_operator(d: &Document) -> bool {
+    d.keys().next().is_some_and(|k| k.starts_with('$'))
+}
+
+/// A `$group`'s effect on the fields (mongod 8.2
+/// `DocumentSourceGroupBase::getModifiedPaths`).
+fn groups(stage: &Bson) -> Option<Reshape> {
+    let id = stage
+        .as_document()
+        .filter(|d| d.len() == 1)?
+        .get_document("$group")
+        .ok()?
+        .get("_id")?;
+    let mut renamed = Vec::new();
+    key_renames("_id", id, &mut renamed);
+    let id_fields = match id {
+        Bson::Document(d) if !d.is_empty() && !is_operator(d) => {
+            d.keys().map(|k| format!("_id.{k}")).collect()
+        }
+        _ => vec!["_id".to_string()],
+    };
+    Some(Reshape::Groups { renamed, id_fields })
+}
+
+/// Whether a filter holds one of `ops` on a path at or under `under`'s
+/// (mongod 8.2 `expression::hasPredicateOnPaths`: an `$elemMatch` carries
+/// its path down to the predicates inside it).
+fn has_predicate(
+    filter: &Document,
+    prefix: Option<&str>,
+    ops: &[&str],
+    under: &dyn Fn(&str) -> bool,
+) -> bool {
+    filter.iter().any(|(k, v)| match k.as_str() {
+        "$and" | "$or" | "$nor" => v.as_array().is_some_and(|cs| {
+            cs.iter()
+                .filter_map(Bson::as_document)
+                .any(|c| has_predicate(c, prefix, ops, under))
+        }),
+        k if k.starts_with('$') => false,
+        k => {
+            let path = prefix.map_or_else(|| k.to_string(), |p| format!("{p}.{k}"));
+            value_has_predicate(&path, v, ops, under)
+        }
+    })
+}
+
+fn value_has_predicate(path: &str, v: &Bson, ops: &[&str], under: &dyn Fn(&str) -> bool) -> bool {
+    let Some(d) = v.as_document().filter(|d| is_operator(d)) else {
+        return false;
+    };
+    d.iter().any(|(op, arg)| match op.as_str() {
+        "$not" => value_has_predicate(path, arg, ops, under),
+        "$elemMatch" => match arg.as_document() {
+            Some(inner) if is_operator(inner) => value_has_predicate(path, arg, ops, under),
+            Some(inner) => has_predicate(inner, Some(path), ops, under),
+            None => false,
+        },
+        op => ops.contains(&op) && under(path),
+    })
+}
+
+/// Whether mongod refuses to move any of a `$match` ahead of a `$group`
+/// (8.2 `groupMatchSwapVerified`): a `$type` on the key can tell apart
+/// values the group takes as one, and an `$exists` on a key of one field
+/// cannot see the null a missing field groups as.
+fn group_refuses(filter: &Document, id_fields: &[String]) -> bool {
+    let under = |p: &str| {
+        id_fields
+            .iter()
+            .any(|f| p == f || p.starts_with(&format!("{f}.")))
+    };
+    let ops: &[&str] = if id_fields.len() == 1 {
+        &["$type", "$exists"]
+    } else {
+        &["$type"]
+    };
+    has_predicate(filter, None, ops, &under)
+}
+
+/// Clauses as one filter: one document where their keys differ, else an
+/// `$and` of them.
+fn conjoin(parts: Vec<Document>) -> Document {
+    let mut one = Document::new();
+    for (k, v) in parts.iter().flatten() {
+        if one.insert(k.clone(), v.clone()).is_some() {
+            return doc! { "$and": parts.into_iter().map(Bson::Document).collect::<Vec<_>>() };
+        }
+    }
+    one
+}
+
+/// A whole filter as `movable` moves it, or `None` when any clause stays.
+fn move_whole(
+    filter: &Document,
+    movable: &dyn Fn(&str, &Bson) -> Option<Document>,
+) -> Option<Document> {
+    let parts = filter
+        .iter()
+        .map(|(k, v)| movable(k, v))
+        .collect::<Option<Vec<_>>>()?;
+    Some(conjoin(parts))
+}
+
+/// A `$match` clause split into what moves ahead of a stage and what stays
+/// (mongod 8.2 `splitMatchExpressionByFunction`): an `$and`'s children
+/// split one by one, a `$nor`'s wholly movable children move as a `$nor`
+/// of their own, and anything else moves whole or not at all.
+fn split_clause(
+    key: &str,
+    value: &Bson,
+    movable: &dyn Fn(&str, &Bson) -> Option<Document>,
+    moved: &mut Vec<Document>,
+    kept: &mut Vec<Document>,
+) {
+    let children = value
+        .as_array()
+        .and_then(|cs| cs.iter().map(Bson::as_document).collect::<Option<Vec<_>>>());
+    match (key, children) {
+        ("$and", Some(cs)) => {
+            for c in cs {
+                for (k, v) in c {
+                    split_clause(k, v, movable, moved, kept);
+                }
+            }
+        }
+        ("$nor", Some(cs)) => {
+            let (mut go, mut stay) = (Vec::new(), Vec::new());
+            for c in cs {
+                match move_whole(c, movable) {
+                    Some(m) => go.push(Bson::Document(m)),
+                    None => stay.push(Bson::Document(c.clone())),
+                }
+            }
+            if !go.is_empty() {
+                moved.push(doc! { "$nor": go });
+            }
+            if !stay.is_empty() {
+                kept.push(doc! { "$nor": stay });
+            }
+        }
+        _ => match movable(key, value) {
+            Some(clause) => moved.push(clause),
+            None => kept.push(doc! { key: value.clone() }),
+        },
+    }
+}
+
+/// An aggregation expression as it reads ahead of a stage that keeps `kept`
+/// and renames `renamed`, or `None` when it reads something the stage does
+/// not keep (mongod 8.2 `ExpressionFieldPath::copyWithSubstitution`).
+fn expr_through_projection(
+    v: &Bson,
+    kept: &[String],
+    renamed: &[(String, String)],
+) -> Option<Bson> {
+    let within = |r: &str, p: &str| r == p || r.starts_with(&format!("{p}."));
+    let path_to = |p: &str| -> Option<String> {
+        if kept.iter().any(|k| within(p, k)) {
+            return Some(p.to_string());
+        }
+        let (new, old) = renamed.iter().find(|(new, _)| within(p, new))?;
+        Some(format!("{old}{}", &p[new.len()..]))
+    };
+    match v {
+        Bson::String(s) if s.starts_with("$$") => {
+            let rest = &s[2..];
+            let (var, path) = match rest.split_once('.') {
+                Some((var, path)) => (var, Some(path)),
+                None => (rest, None),
+            };
+            if var != "ROOT" && var != "CURRENT" {
+                return Some(v.clone());
+            }
+            let path = path?;
+            let to = path_to(path)?;
+            Some(if to == path {
+                v.clone()
+            } else {
+                Bson::String(format!("${to}"))
+            })
+        }
+        Bson::String(s) if s.starts_with('$') => {
+            Some(Bson::String(format!("${}", path_to(&s[1..])?)))
+        }
+        Bson::Array(items) => items
+            .iter()
+            .map(|i| expr_through_projection(i, kept, renamed))
+            .collect::<Option<Vec<_>>>()
+            .map(Bson::Array),
+        Bson::Document(d) if d.contains_key("$literal") => Some(v.clone()),
+        Bson::Document(d) if d.contains_key("$_internalFindAllValuesAtPath") => {
+            let mut read = Vec::new();
+            expr_paths(v, &mut read)?;
+            read.iter()
+                .all(|r| kept.iter().any(|k| within(r, k)))
+                .then(|| v.clone())
+        }
+        Bson::Document(d) => {
+            let mut out = Document::new();
+            for (k, i) in d {
+                out.insert(k.clone(), expr_through_projection(i, kept, renamed)?);
+            }
+            Some(Bson::Document(out))
+        }
+        _ => Some(v.clone()),
+    }
 }
 
 fn reshapes(stage: &Bson) -> Option<Reshape> {
@@ -183,6 +425,27 @@ fn through_projection(
         let (new, old) = renamed.iter().find(|(new, _)| within(key, new))?;
         return Some(doc! { format!("{old}{}", &key[new.len()..]): value.clone() });
     }
+    // A logical clause moves whole, its children renamed (mongod 8.2
+    // `applyRenamesToExpression`); so does an `$expr`.
+    match key {
+        "$and" | "$or" | "$nor" => {
+            let children = value
+                .as_array()?
+                .iter()
+                .map(|c| {
+                    move_whole(c.as_document()?, &|k, v| {
+                        through_projection(k, v, kept, renamed)
+                    })
+                    .map(Bson::Document)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            return Some(doc! { key: children });
+        }
+        "$expr" => {
+            return expr_through_projection(value, kept, renamed).map(|e| doc! { "$expr": e });
+        }
+        _ => {}
+    }
     let mut read = Vec::new();
     clause_paths(key, value, &mut read)?;
     read.iter()
@@ -195,7 +458,8 @@ fn through_projection(
 /// the stage writes, and the `$match`es that lead are joined into one, which
 /// the read of the collection then takes (measured 8.2.11 by `explain`:
 /// `[{$addFields: {z: 1}}, {$match: {b: 2, z: 1}}]` reads `{b: 2}` and leaves
-/// `{z: 1}` behind the stage).
+/// `{z: 1}` behind the stage), and one behind a `$group` moves ahead of it
+/// onto the fields its key renames (RM-311).
 pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
     let mut out = pipeline.to_vec();
     // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
@@ -212,6 +476,7 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
             || as_match(s).is_some()
             || reshapes(s).is_some()
             || projects(s).is_some()
+            || groups(s).is_some()
             || as_sort(s).is_some()
     };
     'again: loop {
@@ -246,52 +511,50 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
                 out.swap(at - 1, at);
                 continue 'again;
             }
-            let Some(reshape) = reshapes(&out[at - 1]).or_else(|| projects(&out[at - 1])) else {
+            let Some(reshape) = reshapes(&out[at - 1])
+                .or_else(|| projects(&out[at - 1]))
+                .or_else(|| groups(&out[at - 1]))
+            else {
                 continue;
+            };
+            if let Reshape::Groups { id_fields, .. } = &reshape {
+                if group_refuses(m, id_fields) {
+                    continue;
+                }
+            }
+            let movable = |k: &str, v: &Bson| match &reshape {
+                Reshape::Writes(written) => {
+                    let mut read = Vec::new();
+                    (clause_paths(k, v, &mut read).is_some()
+                        && !read
+                            .iter()
+                            .any(|r| written.iter().any(|w| paths_overlap(r, w))))
+                    .then(|| doc! { k: v.clone() })
+                }
+                Reshape::Keeps {
+                    kept: names,
+                    renamed,
+                } => through_projection(k, v, names, renamed),
+                Reshape::Groups { renamed, .. } => through_projection(k, v, &[], renamed),
             };
             let mut moved = Vec::new();
             let mut kept = Vec::new();
             for (k, v) in m {
-                let ahead = match &reshape {
-                    Reshape::Writes(written) => {
-                        let mut read = Vec::new();
-                        (clause_paths(k, v, &mut read).is_some()
-                            && !read
-                                .iter()
-                                .any(|r| written.iter().any(|w| paths_overlap(r, w))))
-                        .then(|| doc! { k.clone(): v.clone() })
-                    }
-                    Reshape::Keeps {
-                        kept: names,
-                        renamed,
-                    } => through_projection(k, v, names, renamed),
-                };
-                match ahead {
-                    Some(clause) => moved.push(clause),
-                    None => kept.push(doc! { k.clone(): v.clone() }),
-                }
+                split_clause(k, v, &movable, &mut moved, &mut kept);
             }
             if moved.is_empty() {
                 continue;
             }
-            // Every clause moved: one filter, as the `$match` wrote it (a
-            // rename that names a field twice stays a conjunction).
-            let flat = |parts: Vec<Document>| {
-                let mut one = Document::new();
-                for (k, v) in parts.iter().flatten() {
-                    if one.insert(k.clone(), v.clone()).is_some() {
-                        return doc! { "$and": parts.iter().cloned().map(Bson::Document).collect::<Vec<_>>() };
-                    }
-                }
-                one
-            };
             let joined = |mut parts: Vec<Document>| match parts.len() {
                 1 => parts.remove(0),
                 _ => doc! { "$and": parts.into_iter().map(Bson::Document).collect::<Vec<_>>() },
             };
             let mut replaced = vec![
                 Bson::Document(
-                    doc! { "$match": if kept.is_empty() { flat(moved) } else { joined(moved) } },
+                    // Every clause moved: one filter, as the `$match` wrote
+                    // it (a rename that names a field twice stays a
+                    // conjunction).
+                    doc! { "$match": if kept.is_empty() { conjoin(moved) } else { joined(moved) } },
                 ),
                 out[at - 1].clone(),
             ];
