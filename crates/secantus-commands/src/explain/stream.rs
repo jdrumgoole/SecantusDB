@@ -85,6 +85,8 @@ struct Tally {
     advanced: i64,
     /// A work of the stage returned EOF (one ends a stage's run).
     eof_work: bool,
+    /// Works past that one that found the stage at its end again.
+    eof_again: i64,
     keys: i64,
     docs: i64,
     seeks: i64,
@@ -1914,6 +1916,14 @@ pub(crate) struct Stream {
     /// A write's read ([`Stream::pull_for_write`]): the error that ended it
     /// part-way, kept apart so the results matched before it are returned.
     failed: Option<Option<StorageError>>,
+    /// The keys and documents a trial examined before the first batch
+    /// ([`Stream::buffer_trial`]), which that batch counts.
+    carried: (i64, i64),
+    /// The trial's winner ran out, and has not been worked since: `find`'s
+    /// first batch, past what the trial buffered, works it once more and
+    /// finds it at its end (measured 8.2.11: the FETCH over an IXSCAN works
+    /// once more than the scan).
+    ran_out: bool,
 }
 
 /// The yields a run went through: a cursor's between its batches, a
@@ -2073,6 +2083,8 @@ impl Stream {
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
+            carried: (0, 0),
+            ran_out: false,
         }))
     }
 
@@ -2118,6 +2130,8 @@ impl Stream {
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
+            carried: (0, 0),
+            ran_out: false,
         }
     }
 
@@ -2162,6 +2176,8 @@ impl Stream {
             yields: Yields::default(),
             shown: Yields::default(),
             failed: None,
+            carried: (0, 0),
+            ran_out: false,
         }))
     }
 
@@ -2347,6 +2363,53 @@ impl Stream {
         self.batch(storage, want, max_bytes, true)
     }
 
+    /// mongod's trial of the plan against the others that could answer the
+    /// query, as the winner ran it (RM-349): its first `results` results
+    /// past its skip read now, as the command reads them, and held for the
+    /// batches that follow, which return them before they read on from
+    /// where the trial stopped. A winner that `ended` in its trial read
+    /// everything it returns. What the trial examined is counted by the
+    /// first batch.
+    pub(crate) fn buffer_trial(
+        &mut self,
+        storage: &dyn Storage,
+        results: usize,
+        ended: bool,
+    ) -> Result<(), StorageError> {
+        self.keys = 0;
+        self.docs = 0;
+        // A winner that ran out read to its end, or to its LIMIT, which a
+        // trial finds at its end too: `None` reads on to the end.
+        let skip = self.skip.max(0) as usize;
+        let want = match (ended, self.limit) {
+            (true, None) => None,
+            (true, Some(limit)) => Some(limit.max(0) as usize + skip),
+            (false, _) => Some(results + skip),
+        };
+        if want != Some(0) {
+            let found = self.read(storage, want.unwrap_or(0), None)?;
+            // A LIMIT the trial filled is at its end from then on.
+            let past = found.len().saturating_sub(skip) as i64;
+            self.limit_reached |= self.limit.is_some_and(|limit| past >= limit);
+            self.stashed.extend(found);
+        }
+        self.done |= ended;
+        self.ran_out = ended && self.done;
+        self.carried = (self.keys, self.docs);
+        Ok(())
+    }
+
+    /// The command ends with no batch read (`batchSize: 0`): the plan
+    /// yields, and what the trial examined is the command's to count.
+    pub(crate) fn save_trial(&mut self) -> (i64, i64) {
+        self.ran_out = false;
+        let (mut keys, docs) = std::mem::take(&mut self.carried);
+        if let Some(at) = self.root.yield_now() {
+            keys = at;
+        }
+        (keys, docs)
+    }
+
     fn batch(
         &mut self,
         storage: &dyn Storage,
@@ -2354,8 +2417,7 @@ impl Stream {
         max_bytes: usize,
         reaching: bool,
     ) -> Result<Batch, StorageError> {
-        self.keys = 0;
-        self.docs = 0;
+        (self.keys, self.docs) = std::mem::take(&mut self.carried);
         let result = self.fill(storage, want, max_bytes, reaching);
         // The batch is over: every stage yields, keeping only its position;
         // what was read ahead is read again by the next batch, and counted
@@ -2415,6 +2477,13 @@ impl Stream {
             let mut fresh: VecDeque<Found> = std::mem::take(&mut self.stashed);
             if fresh.is_empty() {
                 if self.done {
+                    // The work that finds the trial's winner at its end
+                    // again: the topmost stage's own, which asks no input.
+                    if self.first && std::mem::take(&mut self.ran_out) {
+                        let t = self.root.tally_mut();
+                        t.own += 1;
+                        t.eof_again += 1;
+                    }
                     break;
                 }
                 // With no count to fill, a chunk at a time until the bytes
@@ -2604,7 +2673,7 @@ fn work_counts(
     WorkCounts {
         works,
         advanced,
-        need_time: works - advanced - i64::from(eof_work),
+        need_time: works - advanced - i64::from(eof_work) - t.eof_again,
         eof,
         seeks: t.seeks,
         dups_tested: t.dups_tested,

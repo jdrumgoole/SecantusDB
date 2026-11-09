@@ -333,6 +333,33 @@ enum Whole {
     Unread,
 }
 
+impl<'a> Lazy<'a> {
+    /// The collection of `ask`, whose query matches `rows`, for a trial of
+    /// the plans over `catalog`.
+    fn new(
+        storage: &'a dyn Storage,
+        ask: &'a Ask<'a>,
+        rows: &'a Rows,
+        catalog: &[Arc<super::IndexInfo>],
+        canonical: &Document,
+    ) -> Lazy<'a> {
+        Lazy {
+            storage,
+            ask,
+            rows,
+            partial: catalog.iter().any(|ix| ix.partial.is_some())
+                || (canonical.len() == 1 && canonical.contains_key("$or"))
+                || ask.sort.is_some_and(|s| !s.is_empty()),
+            fields: catalog
+                .iter()
+                .flat_map(|ix| ix.key.keys())
+                .map(|field| field.split('.').next().unwrap_or(field).to_string())
+                .collect(),
+            whole: OnceCell::new(),
+        }
+    }
+}
+
 impl Lazy<'_> {
     /// `all` (RecordId, document) decoded as the trial reads them.
     fn decode(&self, all: &[(i64, Vec<u8>)]) -> Option<Loaded> {
@@ -649,20 +676,7 @@ fn consult<'a>(
     let Some(hook) = ReadCache::new(storage, ask, canonical.clone(), full)? else {
         return Ok(None);
     };
-    let whole = Lazy {
-        storage,
-        ask,
-        rows,
-        partial: catalog.iter().any(|ix| ix.partial.is_some())
-            || (canonical.len() == 1 && canonical.contains_key("$or"))
-            || ask.sort.is_some_and(|s| !s.is_empty()),
-        fields: catalog
-            .iter()
-            .flat_map(|ix| ix.key.keys())
-            .map(|field| field.split('.').next().unwrap_or(field).to_string())
-            .collect(),
-        whole: OnceCell::new(),
-    };
+    let whole = Lazy::new(storage, ask, rows, &catalog, &canonical);
     let trial = plan::Trial {
         total: None,
         matched: Some(rows.len()),
@@ -1038,8 +1052,9 @@ pub(crate) struct StreamFlags {
 /// The plan mongod runs for a `find` that a streaming cursor can read
 /// (`stream::Stream`), or `None` to read it as before: a collection that
 /// streams, no geo predicate or `$near`, a plan nothing contests (choosing
-/// among several needs mongod's trial over the collection) and no
-/// in-memory sort. Under a collation the plan is the collated one.
+/// among several needs mongod's trial over the collection, which
+/// [`stream_tried`] runs) and no in-memory sort. Under a collation the plan
+/// is the collated one.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn stream_plan(
     storage: &dyn Storage,
@@ -1050,6 +1065,57 @@ pub(crate) fn stream_plan(
     batch_size: bool,
     flags: StreamFlags,
 ) -> Result<Option<Node>, StorageError> {
+    let planned = planned_stream(
+        storage, ask, skip, limit, projection, batch_size, flags, false,
+    )?;
+    Ok(planned.map(|(plan, _)| plan))
+}
+
+/// What mongod's trial of a contested plan left buffered for the read
+/// after it (`MultiPlanStage`, `CachedPlanStage`): the winner's results,
+/// returned first, and whether the winner had run to its end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct TrialBuffer {
+    /// The results the winner handed over in its trial, past its skip.
+    pub results: usize,
+    /// The winner ran out in its trial: it reads nothing more.
+    pub ended: bool,
+}
+
+/// [`stream_plan`] for a `find`, a contested plan included (RM-349): mongod
+/// tries the candidates over the collection when the command runs (or runs
+/// the plan its plan cache holds), keeps the winner's trial results and
+/// returns them first, and then reads on from where the winner stopped.
+/// The trial is run here as the read through the store runs it, through
+/// the plan cache, and its buffer handed back with the plan. A rooted
+/// `$or`'s branches are tried one by one and their results dropped, so its
+/// plan buffers nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stream_tried(
+    storage: &dyn Storage,
+    ask: &Ask,
+    skip: i64,
+    limit: i64,
+    projection: Option<&Document>,
+    batch_size: bool,
+    flags: StreamFlags,
+) -> Result<Option<(Node, Option<TrialBuffer>)>, StorageError> {
+    planned_stream(
+        storage, ask, skip, limit, projection, batch_size, flags, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn planned_stream(
+    storage: &dyn Storage,
+    ask: &Ask,
+    skip: i64,
+    limit: i64,
+    projection: Option<&Document>,
+    batch_size: bool,
+    flags: StreamFlags,
+    tries: bool,
+) -> Result<Option<(Node, Option<TrialBuffer>)>, StorageError> {
     if !storage.can_stream(ask.db, ask.coll)? {
         return Ok(None);
     }
@@ -1086,10 +1152,20 @@ pub(crate) fn stream_plan(
         implies: &implied,
         trial: None,
     };
-    if !flags.min_max && plan::contested(&query, &catalog) {
-        return Ok(None);
-    }
-    let plan = plan::plan(&query, &catalog);
+    let (plan, buffer) = if !flags.min_max && plan::contested(&query, &catalog) {
+        // Everything below that declines a plan is settled before the
+        // trial, which writes the plan cache: a read that then declined
+        // would consult it a second time as it reads as before.
+        if !tries || !flags.sorts_documents || mentions_geo(ask.filter) {
+            return Ok(None);
+        }
+        match tried(storage, ask, &query, &catalog, &canonical)? {
+            Some(tried) => tried,
+            None => return Ok(None),
+        }
+    } else {
+        (plan::plan(&query, &catalog), None)
+    };
     // A sort of whole documents the plan does in memory reads them all for
     // the first batch, on mongod too (`stream::Stage::SortDocs`), when the
     // caller reads it so. A sort of index keys below the FETCH streams
@@ -1110,7 +1186,83 @@ pub(crate) fn stream_plan(
     if geo::scan(storage, ask.db, ask.coll, ask.filter, None, elsewhere)?.is_some() {
         return Ok(None);
     }
-    Ok(Some(plan))
+    Ok(Some((plan, buffer)))
+}
+
+/// The plan mongod's trial keeps for the contested `query`, run over the
+/// documents the query matches now and through the plan cache, with what
+/// the trial left buffered. `None`: the store does not offer the matched
+/// set, or the trial cannot run over it.
+fn tried(
+    storage: &dyn Storage,
+    ask: &Ask,
+    query: &Query,
+    catalog: &[Arc<super::IndexInfo>],
+    canonical: &Document,
+) -> Result<Option<(Node, Option<TrialBuffer>)>, StorageError> {
+    let Some(matched) = storage.matching_rows(
+        ask.db,
+        ask.coll,
+        ask.filter,
+        ask.hint,
+        ask.collation,
+        ask.vars,
+    )?
+    else {
+        return Ok(None);
+    };
+    let rows = matched.rows;
+    let hook = if ask.hint.is_none() {
+        ReadCache::new(storage, ask, canonical.clone(), catalog_of(storage, ask)?)?
+    } else {
+        None
+    };
+    let whole = Lazy::new(storage, ask, &rows, catalog, canonical);
+    let trial = plan::Trial {
+        total: None,
+        matched: Some(rows.len()),
+        whole: &whole,
+        ranked: Default::default(),
+        cache: hook.as_ref().map(|h| h as &dyn plan::CacheHook),
+    };
+    let plan = plan::plan(
+        &Query {
+            trial: Some(&trial),
+            ..query.clone()
+        },
+        catalog,
+    );
+    if subplanned(&plan) {
+        return Ok(Some((plan, None)));
+    }
+    // The winner's trial, or none: the plan cache's plan ran in its place
+    // (`CachedPlanStage`), or the winner was decided by counting, and
+    // either ran until it had what a trial asks for or ran out.
+    let buffer = match trial.ranked.borrow().first() {
+        Some(winner) => TrialBuffer {
+            results: winner.stats.n_returned.max(0) as usize,
+            ended: winner.stats.work.is_some_and(|w| w.eof),
+        },
+        None => TrialBuffer {
+            results: plan::trial_need(query) as usize,
+            ended: false,
+        },
+    };
+    Ok(Some((plan, Some(buffer))))
+}
+
+/// A plan the subplanner made of a rooted `$or`, under the stages that
+/// pass its documents along.
+fn subplanned(node: &Node) -> bool {
+    match node {
+        Node::Subplan(_) => true,
+        Node::Projection { input, .. }
+        | Node::Limit(_, input)
+        | Node::Skip(_, input)
+        | Node::ReturnKey(input)
+        | Node::Sort { input, .. } => subplanned(input),
+        _ => false,
+    }
 }
 
 /// A `find` with a `$near` read as mongod's ring search runs, as `getMore`
@@ -1314,20 +1466,7 @@ pub(crate) fn ordered_rows(storage: &dyn Storage, ask: &Ask) -> Result<Option<Ro
         } else {
             None
         };
-        let whole = Lazy {
-            storage,
-            ask,
-            rows: &rows,
-            partial: catalog.iter().any(|ix| ix.partial.is_some())
-                || (canonical.len() == 1 && canonical.contains_key("$or"))
-                || ask.sort.is_some_and(|s| !s.is_empty()),
-            fields: catalog
-                .iter()
-                .flat_map(|ix| ix.key.keys())
-                .map(|field| field.split('.').next().unwrap_or(field).to_string())
-                .collect(),
-            whole: OnceCell::new(),
-        };
+        let whole = Lazy::new(storage, ask, &rows, &catalog, &canonical);
         // The plans the read chose through the plan cache.
         let trial = plan::Trial {
             total,

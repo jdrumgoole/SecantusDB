@@ -1,0 +1,12 @@
+### A find that mongod plans by trial reads on from where its trial stopped
+
+When two indexes could answer a `find`, mongod runs both against the collection until one has handed over 101 documents (or the query's limit) or runs out, keeps the winner's results from that trial, returns them first and then reads on from where the winner stopped. The Rust MongoDB server used to read such a query whole when the command ran, so a cursor over it ignored every write made while it was open: over 3,000 documents read two at a time and all deleted after the first batch, mongod returns 101 and this server returned 1,557.
+
+It now runs the same trial when the command runs, through the plan cache as before, buffers what the winner returned in it, and streams the winner from there as it streams every other plan. Deletes, inserts and updates made between batches now show up exactly as they do on mongod 8.2.11, including under a cached plan, a limit, a skip, a sort, `batchSize: 0` and a rooted `$or` (whose branches' trial results mongod drops). The `Slow query` line and the profile entries of the `find` and each `getMore` now count what the winner examined, its trial included, with its stages in `execStats`.
+
+#### Fixed
+
+- `secantus-commands` (`explain/order.rs`, `explain/stream.rs`, `find.rs`): a `find` whose plan is contested streams the trial's winner (`order::stream_tried`), and `Stream::buffer_trial` reads the winner's trial results when the command runs. The first batch counts them, and works the winner once more past them when it ran out, as mongod's executor does. A LIMIT the trial filled reports its end from then on. Aggregates, counts and writes still decline a contested plan. Fixes RM-349 (tests/backlog/test_rm_found_2026_10_27b.py::test_a_plan_mongod_tried_buffers_only_its_trial).
+- The contested-`find` half of RM-363 (tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined). RM-363 stays open for other contested readers and time-series reads.
+- Regression tests: `tests/backlog/test_rm_355_364.py::test_a_contested_read_reports_its_winner_as_it_ran` (seven shapes, each entry's counts and `execStats` compared with mongod's) and `::test_a_rooted_or_of_tried_branches_counts_its_reads`.
+- Filed RM-458 (no CACHED_PLAN stage over a plan-cache read's stages in a profile entry) and RM-459 (a FETCH over the OR of a rooted `$or` whose branches are tried, in `explain` too), each with a gap test.

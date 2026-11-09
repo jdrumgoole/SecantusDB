@@ -658,6 +658,125 @@ def test_a_profile_entry_reports_each_stage_as_it_ran(
     assert answers["rust"] == answers["mongod"]
 
 
+def _contested(d: Any) -> None:
+    seed(d)
+    d.c.create_index("y")
+
+
+def _contested_many(d: Any) -> None:
+    d.c.insert_many([{"_id": n, "a": n % 7, "b": n % 11} for n in range(600)])
+    d.c.create_index("a")
+    d.c.create_index("b")
+
+
+#: Reads two indexes could serve, which mongod plans by trial: the winner's
+#: trial results are buffered when the command runs and returned first.
+_CONTESTED: dict[str, tuple[Any, Any]] = {
+    "ended_in_trial": (_contested, lambda d: list(d.c.find({"x": {"$gte": 2}, "y": 1}))),
+    "ended_in_trial_batches": (
+        _contested,
+        lambda d: list(d.c.find({"x": {"$gte": 2}, "y": 1}).batch_size(1)),
+    ),
+    "buffered_101": (
+        _contested_many,
+        lambda d: list(d.c.find({"a": {"$gte": 2}, "b": {"$gte": 3}}).batch_size(40)),
+    ),
+    "buffered_limit": (
+        _contested_many,
+        lambda d: list(d.c.find({"a": {"$gte": 2}, "b": {"$gte": 3}}).limit(7).batch_size(3)),
+    ),
+    "buffered_skip": (
+        _contested_many,
+        lambda d: list(d.c.find({"a": {"$gte": 2}, "b": {"$gte": 3}}).skip(5).batch_size(60)),
+    ),
+    "buffered_sorted": (
+        _contested_many,
+        lambda d: list(
+            d.c.find({"a": {"$gte": 2}, "b": {"$gte": 3}}).sort("_id", -1).batch_size(60)
+        ),
+    ),
+    "buffered_no_first_batch": (
+        _contested_many,
+        lambda d: list(d.c.find({"a": {"$gte": 2}, "b": {"$gte": 3}}).batch_size(0)),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-349")
+@pytest.mark.parametrize("name", list(_CONTESTED))
+def test_a_contested_read_reports_its_winner_as_it_ran(
+    rust_mongo: Any, steady_mongod: Any, name: str
+) -> None:
+    """mongod 8.2.11's profile entries for a `find` it planned by trial
+    carry the winner's stages (no MULTI_PLAN), counted from the trial on:
+    the `find`'s entry counts what the winner read in its trial and its
+    first batch, each `getMore`'s what it read past the buffer (measured
+    2026-11-09). This server read such a plan whole, through its store's
+    router, and its entries carried none."""
+    setup, op = _CONTESTED[name]
+    got = _both(rust_mongo, steady_mongod, op, setup)
+    answers = {
+        s: [
+            (e.get("keysExamined"), e.get("docsExamined"), _timeless(e.get("execStats")))
+            for e in entries
+        ]
+        for s, (_, entries) in got.items()
+    }
+    assert answers["mongod"] and all(a[2] for a in answers["mongod"]), answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog_fixed("RM-349")
+def test_a_rooted_or_of_tried_branches_counts_its_reads(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 tries each branch of a rooted `$or` on its own and drops
+    the branches' trial results: the `find` and each `getMore` count what
+    the composite plan read in that batch (measured 2026-11-09). Its stages
+    are RM-459's."""
+    query = {"$or": [{"a": {"$gte": 2}, "b": {"$gte": 3}}, {"a": 0, "b": 0}]}
+    got = _both(
+        rust_mongo,
+        mongod_rs,
+        lambda d: list(d.c.find(query).batch_size(60)),
+        _contested_many,
+    )
+    answers = {
+        s: [(e.get("keysExamined"), e.get("docsExamined"), e.get("nreturned")) for e in entries]
+        for s, (_, entries) in got.items()
+    }
+    assert len(answers["mongod"]) == 6, answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-458")
+def test_a_read_of_the_cached_plan_reports_its_cached_plan_stage(
+    rust_mongo: Any, steady_mongod: Any
+) -> None:
+    """mongod 8.2.11's profile entries for a `find` that runs the active
+    plan of its plan cache carry a CACHED_PLAN stage over the plan's, which
+    counts what it handed out (`works` and `advanced` 2 on a first batch of
+    two, 4 after the next, measured 2026-11-09). This server's start at the
+    plan's FETCH."""
+    query = {"a": {"$gte": 2}, "b": {"$gte": 3}}
+
+    def setup(d: Any) -> None:
+        _contested_many(d)
+        for _ in range(2):
+            list(d.c.find(query))
+
+    got = _both(
+        rust_mongo,
+        steady_mongod,
+        lambda d: list(d.c.find(query).batch_size(40)),
+        setup,
+    )
+    answers = {
+        s: [_timeless(e.get("execStats")) for e in entries if e.get("op") in ("query", "getmore")]
+        for s, (_, entries) in got.items()
+    }
+    assert [e["stage"] for e in answers["mongod"]] == ["CACHED_PLAN"] * 8, answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
 @pytest.mark.backlog_fixed("RM-359")
 def test_a_sort_of_index_keys_reports_its_works(rust_mongo: Any, steady_mongod: Any) -> None:
     """mongod 8.2.11's FETCH over a SORT of index keys (`type: "default"`)
@@ -979,11 +1098,12 @@ def test_every_view_a_read_resolves_is_named(rust_mongo: Any, mongod_rs: Any) ->
 # ------------------------------------------------------------- RM-363 --
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for a `find` two indexes could serve counts what
-    the plan it chose by trial examined. This server reads such a plan
-    through its store's router, and counts nothing."""
+    the plan it chose by trial examined. This server read such a plan
+    through its store's router, and counted nothing, until RM-349 streamed
+    the winner after its trial."""
 
     def setup(db: Any) -> None:
         seed(db)
