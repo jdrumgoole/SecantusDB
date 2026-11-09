@@ -4,7 +4,7 @@
     scripts/gate_rm.py              # from the worktree root
     scripts/gate_rm.py --no-build   # the binaries are already built from HEAD
     scripts/gate_rm.py --only rust-test,lint   # rerun steps a fix only they check
-    scripts/gate_rm.py --full       # the storage crate's tests even if untouched
+    scripts/gate_rm.py --full       # the storage and PG-server tests even if untouched
 
 The storage crate's own tests (both oplog modes, ~9 min) run only when this
 work changes the storage crates (`STORAGE_PATHS`, compared with the branch it
@@ -150,6 +150,24 @@ def touches_storage(files: list[str]) -> bool:
     return any(f.startswith(STORAGE_PATHS) for f in files)
 
 
+def pg_needed(files: list[str]) -> bool:
+    """CI's rule (tools/ci_pg_needed.py) for whether the PostgreSQL server's
+    answers can have changed: anything but the MongoDB-only paths."""
+    path = Path(__file__).resolve().parent.parent / "tools/ci_pg_needed.py"
+    spec = importlib.util.spec_from_file_location("ci_pg_needed", path)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return bool(mod.pg_needed(files))
+
+
+def is_pg_server_test(path: str) -> bool:
+    """A test of the Rust PostgreSQL server, which runs whenever the lane holds
+    a `secantusd-pg` and skips when it does not."""
+    name = Path(path).name
+    return name.startswith("test_rust_pg") or name == "test_pgserver_embedded.py"
+
+
 class Gate:
     def __init__(self, out: Path, only: set[str] | None = None) -> None:
         self.out = out
@@ -220,7 +238,8 @@ def main() -> int:
     ap.add_argument(
         "--full",
         action="store_true",
-        help="run the storage crate's tests even when this work does not touch it",
+        help="run the storage crate's tests and the PostgreSQL server's even when "
+        "this work does not touch them",
     )
     args = ap.parse_args()
     only = {s.strip() for s in args.only.split(",") if s.strip()} if args.only else None
@@ -259,7 +278,21 @@ def main() -> int:
     # work touches it: most MongoDB items change the command layer alone.
     # CI's rust-storage job still runs them on every snapshot.
     base = gate_base()
-    storage = args.full or base is None or touches_storage(changed_files(base))
+    changed = changed_files(base) if base else []
+    storage = args.full or base is None or touches_storage(changed)
+    # The PostgreSQL server's tests run in ci-selected whenever the lane holds
+    # a built `secantusd-pg` (which pg-build below keeps fresh once it exists)
+    # and skip otherwise: ci-selected took ~100 s or 400-850 s by that alone
+    # (2026-11-08/09). A MongoDB-only change cannot move their answers, and
+    # CI's pg-oracle runs them whenever it can.
+    if not (args.full or base is None or pg_needed(changed)):
+        pg_tests = [f for f in selected if is_pg_server_test(f)]
+        selected = [f for f in selected if not is_pg_server_test(f)]
+        print(
+            f"    not run: {len(pg_tests)} PostgreSQL server test files: "
+            f"only MongoDB-only paths changed since {base}",
+            flush=True,
+        )
     # The cargo lanes: the clean workspace, then each WiredTiger-linked crate
     # the workspace commands do not compile.
     g.step("rust-test", ["./inv", "rust-test"])

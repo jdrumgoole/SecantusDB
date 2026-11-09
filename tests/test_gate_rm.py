@@ -128,3 +128,13 @@ def test_a_step_line_gives_its_time_and_the_load_beside_it(
 def test_ci_selected_logs_its_slowest_tests() -> None:
     text = (ROOT / "scripts/gate_rm.py").read_text()
     assert '"--durations=25"' in text
+
+
+def test_postgres_server_tests_run_only_when_its_answers_can_change() -> None:
+    g = _gate_rm()
+    assert g.is_pg_server_test("tests/test_rust_pg_corpora.py")
+    assert g.is_pg_server_test("tests/test_rust_pgserver_differential.py")
+    assert g.is_pg_server_test("tests/test_pgserver_embedded.py")
+    assert not g.is_pg_server_test("tests/test_crash_recovery.py")
+    assert not g.pg_needed(["crates/secantus-commands/src/crud.rs", "changelog.d/x.md"])
+    assert g.pg_needed(["crates/secantus-core/src/lib.rs"])
