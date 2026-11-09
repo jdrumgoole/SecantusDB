@@ -1709,21 +1709,6 @@ a regression test.
       private 15.19 cluster (found while working RP-432).
       Verify: tests/backlog/test_rp_dml_from.py::test_missing_column_reported_before_ambiguous_one
       Backlog-ID: RP-436
-- [ ] **A missing relation named by a string literal for a `regclass`
-      parameter is looked up only if the call runs.** PostgreSQL 15.19 coerces an
-      untyped literal argument to its parameter's type during analysis
-      (`coerce_type` runs `regclassin`), so a relation it names that does
-      not exist is 42P01 `relation "nosuchseq" does not exist` at the
-      literal wherever the call sits: `select 1 where false and
-      nextval('nosuchseq') > 0` (zero rows here), `select (select
-      nextval('nosuchseq') where false)` (a NULL here), `select (select
-      nextval('nosuchseq'), 2)` (here the subquery's 42601 width error,
-      since RP-452) and `select nextval('nosuchseq') + (1 + true)` (here
-      the operator's 42883). An explicit `'nosuchseq'::regclass` is already
-      42P01 as it is planned. A statement PostgreSQL refuses runs.
-      Measured on PostgreSQL 15.19 (found while working RP-452).
-      Verify: tests/backlog/test_rp_regclass_literal.py::test_regclass_literal_is_resolved_at_analysis
-      Backlog-ID: RP-458
 - [ ] **`SELECT *` with no FROM is refused as a gap.** `select *` answers
       `0A000 this target is not supported yet`; PostgreSQL 15.19's
       `transformTargetList` answers 42601 `SELECT * with no tables
@@ -2299,15 +2284,6 @@ Measured on a private PostgreSQL 15.19 cluster with `create domain d551c as
 char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
 `fd551(a d551c)`. The gap tests are in `tests/backlog/test_rp_found_rp551.py`.
 
-- [ ] **A domain-typed result column goes out with no type modifier.**
-      PostgreSQL 15.19's `SendRowDescriptionMessage` sends a domain as its
-      base type and the base's modifier (`getBaseTypeAndTypmod`), so `select
-      'ab'::d551c` describes `bpchar` typmod 7, `1.5::d551n` 327686 and a
-      cast to `d551t` 0, as the same casts to `char(3)`, `numeric(5,2)` and
-      `timestamp(0)` do; here each is -1. The values themselves are right
-      (RP-551). A table's domain column already describes its width.
-      Backlog-ID: RP-557
-      Verify: tests/backlog/test_rp_found_rp551.py::test_domain_result_column_typmod
 - [ ] **A domain column's `atttypmod` is the domain's width.** A column
       declared with a domain carries no modifier of its own, so `fd551.a`'s
       `atttypmod` is -1 on PostgreSQL 15.19 (the width is the domain's
@@ -2316,6 +2292,43 @@ char(3)`, `d551n` over `numeric(5,2)`, `d551t` over `timestamp(0)` and
       answers -1 (RP-551 keeps the catalog at the column's own domain).
       Backlog-ID: RP-558
       Verify: tests/backlog/test_rp_found_rp551.py::test_domain_column_atttypmod
+      Since RP-557 the wire sends a domain column with its base type's
+      modifier wherever it is computed, so fixing this keeps the column's
+      RowDescription at 7.
+
+## Found while working RP-557 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d557 as
+char(3)` and `t557(c char(3), a d557)`. Each was wrong before RP-557's
+change too. The gap tests are in `tests/backlog/test_rp_found_rp557.py`.
+
+- [ ] **`min` / `max` over a `char(n)` column describe its width.** An
+      Aggref carries no modifier (`exprTypmod` has no case for it), so
+      `select min(c) from t557` and `select max(a) from t557` describe
+      `bpchar` -1 on PostgreSQL 15.19; here both are 7
+      (`aggregate_result_typmod` copies the column's). Since RP-671
+      `aggregate_output_def` carries the width too, as a FROM-subquery's
+      column, because it is what pads the trimmed value again: a fix must
+      keep the padding width and describe -1.
+      Verify: tests/backlog/test_rp_found_rp557.py::test_min_max_over_char_n_has_no_modifier
+      Backlog-ID: RP-659
+- [ ] **A set operation of a domain column and its base type keeps the
+      width.** `select a from t557 union select c from t557` (either order)
+      describes -1 on PostgreSQL 15.19: `select_common_type` smashes the
+      domain to `bpchar` and `select_common_typmod` finds the sides'
+      modifiers differ, the domain column's own being -1. Here it is 7.
+      Two sides of one type keep 7 in both.
+      Verify: tests/backlog/test_rp_found_rp557.py::test_set_op_of_a_domain_and_its_base_type
+      Backlog-ID: RP-660
+- [ ] **`CREATE TABLE AS` turns a domain column into its base type.**
+      `create table c557 as select a, c from t557` makes `a` of type `d557`
+      with `atttypmod` -1 on PostgreSQL 15.19 (`intorel_startup` copies the
+      query's tuple descriptor); here `a` is `character` with 7: the
+      columns are read back from the wire description (`copy_query_fields`
+      then `internal_type_name`), which has already seen through the domain
+      and, since RP-557, carries the domain's width.
+      Verify: tests/backlog/test_rp_found_rp557.py::test_create_table_as_keeps_a_domain_column
+      Backlog-ID: RP-661
 
 ## Found while working RP-590 (2026-11-08)
 
@@ -2334,24 +2347,149 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp590.py::test_record_image_operators
       Backlog-ID: RP-650
 
-## Found while working RP-559 (2026-11-08)
+## Found while working RP-569 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d559c as
-char(3)`, `d559i` over `int` and `fd559(a d559c, i d559i)` holding `('a b',
-7)` and `('xy', null)`. The gap tests are in `tests/backlog/test_rp_found_rp559.py`.
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp569.py`: `d569nv` over `int` with a CHECK
+`value > 0` added `NOT VALID` after `t569nv(a d569nv)` took `-1` and `5`;
+`t569c(c char(3))` holding `'xy'`; `d569c` over `char(3)` and `t569d(a
+d569c, i int)` holding `('a b', 1)` and `('xy', 2)`.
 
-- [ ] **An array built from a domain column is typed by the column's base
-      type.** A column declared with a domain is of the domain (`exprType`
-      of its Var), so on PostgreSQL 15.19 `select array[a] from fd559`,
-      `array_agg(a)` and `array(select a from fd559)` are each `d559c[]`
-      (the domain's `typarray`, text `{"a b"}`), and `array[i]` is
-      `d559i[]`. Here they are `character[]` and `integer[]`, and the
-      ARRAY subquery is `text[]` with its padding lost (`xy`, not `xy `).
-      Since RP-559 an array of a domain CONSTANT is the domain's array; a
-      column is typed by its base everywhere in the planner, and only
-      `pg_typeof` sees its domain (`rewrite_domain_typeof`).
-      Backlog-ID: RP-569
-      Verify: tests/backlog/test_rp_found_rp559.py::test_array_of_domain_column
+
+## Found while working RP-657 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d657c as
+char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
+`t657e(a d657c, i int)` holding `('e', 1)`. The gap tests are in
+`tests/backlog/test_rp_found_rp657.py`. Since RP-657 a domain column keeps
+its domain through a join, a WITH, a FROM subquery and a set operation all
+of whose branches are of the domain (`domain_scope.rs`).
+
+- [ ] **A set operation of a `char(n)` domain column and a `text` one drops
+      the domain's blanks.** `select array(select a from t657d union all
+      select a::text from t657e)` is `character[]` on PostgreSQL 15.19 with
+      `{"a b","xy ",e}`; here the type matches and `xy` loses its blank.
+      The branches disagree, so no branch is cast to the domain, and the
+      stored value is read without its padding.
+      Verify: tests/backlog/test_rp_found_rp657.py::test_set_operation_of_char_domain_and_text_keeps_blanks
+      Backlog-ID: RP-672
+- [ ] **`ARRAY(select * ...)` over a one-column domain subquery is typed by
+      the domain's base.** `select array(select * from (select a from
+      t657d) s order by 1)` is `d657c[]` on PostgreSQL 15.19, as the same
+      query with `select a` is; here it is `character[]`. A `*` target is
+      not a column reference the cast can wrap
+      (`domain_scope::cast_first_columns`).
+      Verify: tests/backlog/test_rp_found_rp657.py::test_array_of_star_over_a_domain_subquery_is_the_domains
+      Backlog-ID: RP-673
+- [ ] **A LATERAL subquery's column that is an outer domain column is typed
+      by the domain's base.** `select pg_typeof(b), array[b] from t657d x
+      cross join lateral (select x.a b) l` is `d657c` and `d657c[]`, with
+      the padding, on PostgreSQL 15.19; here `character` and `character[]`,
+      without it. The subquery's scope does not see the outer FROM item it
+      references, so its column's type is not known.
+      Verify: tests/backlog/test_rp_found_rp657.py::test_lateral_column_of_an_outer_domain_column_is_the_domains
+      Backlog-ID: RP-674
+
+## Found while working RP-655 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with `create domain d655 as
+int`, `t655(a d655, b int)` holding `(-1, -1)` and `(5, 5)`, then `alter
+domain d655 add constraint d655_pos check (value > 0) not valid`. The gap
+tests are in `tests/backlog/test_rp_found_rp655.py`.
+
+- [ ] **A scalar subquery over a domain column is typed by the domain's
+      base.** `select pg_typeof((select a from t655 where b < 0))` is
+      `d655` on PostgreSQL 15.19 (`exprType` of the SubLink is its column's);
+      here it is `integer`. The subquery's column is typed by the stored
+      column's base type; since RP-569 only an ARRAY subquery's column is
+      cast to its domain (`cast_array_subquery_column`).
+      Verify: tests/backlog/test_rp_found_rp655.py::test_scalar_subquery_over_a_domain_column_is_of_the_domain
+      Backlog-ID: RP-665
+
+## Found while working RP-656 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp656.py`: `t656(c char(3), v varchar(4), n
+numeric(5,2), ca char(3)[])` holding `('xy', 'ab', 2.5, '{a,bc}')`.
+
+- [ ] **An `ARRAY(select n ...)` over a `numeric(p,s)` column describes no
+      modifier.** `select array(select n from t656)` describes `numeric[]`
+      327686 on PostgreSQL 15.19 (`exprTypmod` of an ARRAY sublink is its
+      column's); here it is -1. Since RP-656 a `char(n)` or `varchar(n)`
+      column's array is cast at its modifier and describes it; a numeric
+      one is declared as `numeric[]`, which carries none.
+      Verify: tests/backlog/test_rp_found_rp656.py::test_array_sublink_of_numeric_describes_its_modifier
+      Backlog-ID: RP-667
+
+## Found while working RP-671 (2026-11-08)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): the
+VALUES-only statements as written, the rest with the `_SETUP` tables of
+`tests/backlog/test_rp_found_rp671.py` made temporary. This server keeps a
+`char(n)` value trimmed and pads it where it enters an expression; a value
+that reaches a comparison carrying its blanks is compared with them.
+
+- [ ] **A `char(n)` value that carries its blanks compares and sorts with
+      them.** `bpchareq` / `bpcharcmp` drop the trailing blanks first
+      (`bcTruelen`), so on PostgreSQL 15.19 `select k from (select k,
+      f::char(5) x from t671) s where x = 'xy'` finds the `'xy'` row, and
+      `order by f::char(5)` puts `'a'` before `E'a\t'`. Here the cast's
+      value is `'xy   '`: the filter (`=`, `IN`) finds nothing and the sort
+      puts the tab first, and so for a scalar subquery over the column
+      (`(select f)`), which RP-666 pads. The comparisons and the sort keys
+      carry no type to say the value is a `bpchar`.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_padded_char_n_compares_without_its_blanks
+      Backlog-ID: RP-679
+- [ ] **A HAVING comparison of a `char(n)` `min` / `max` does not compare as
+      `bpchar`.** On PostgreSQL 15.19, over `t671` (`'a'`, `'xy'`, `'b'`),
+      `having max(f) is distinct from 'xy'` keeps the `'a'` and `'b'`
+      groups; here it keeps only `'xy'`, the opposite. `having max(f) =
+      any('{a,xy}')`, `= 'xy'::char(3)`, `= 'xy  '::char(5)` and `= 'xy  '`
+      each keep `'xy'` (and `'a'`) there and nothing here: the constant is
+      compared with its blanks, or the shape leaves `plan_having`'s
+      comparison for one that is not `bpchar`'s.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_having_over_char_n_min_max_compares_as_bpchar
+      Backlog-ID: RP-680
+- [ ] **`min` / `max` over a `varchar` column are typed `varchar`.**
+      PostgreSQL has no `max(varchar)`: `select max(v) from (values
+      ('ab'::varchar(4)), ('cd')) s(v)` resolves to `max(text)` and is
+      described `text` (25) on 15.19; here it is `varchar` (1043), as are
+      `min` and the column of a FROM-subquery over either.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_min_max_over_varchar_is_text
+      Backlog-ID: RP-681
+- [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
+      over ()` is 42809 `OVER specified, but octet_length is not a window
+      function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
+      here it is 0A000 `window function octet_length() is not supported
+      yet`, for `upper` and `length` alike: a function PostgreSQL itself
+      refuses is reported as a gap in this server.
+      Verify: tests/backlog/test_rp_found_rp671.py::test_over_on_a_plain_function_is_42809
+      Backlog-ID: RP-682
+
+## Found while working RP-664 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp664.py`.
+
+- [ ] **An `UPDATE ... FROM` a subquery over the target whose WHERE names
+      the target is 42P01.** `update t664 set a = x.a from (select a from
+      t664 where b < 0) x where t664.b < 0` is `UPDATE 1` on PostgreSQL
+      15.19, with or without a domain column; here it is 42P01 `missing
+      FROM-clause entry for table "t664"`. Without the subquery's own
+      WHERE the statement runs, so the rewrite of an UPDATE ... FROM into
+      correlated subqueries (`rewrite_dml_from`) loses the target's name
+      when the FROM subquery has a WHERE of its own.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_update_from_subquery_over_the_target
+      Backlog-ID: RP-668
+- [ ] **A PL/pgSQL assignment to a record's field does not check the
+      field's domain.** In a BEFORE trigger on `t664t(a d664t, b int)`,
+      whose domain has a CHECK `value > 0`, `new.a := -5; new.a := 7;
+      return new;` is 23514 on PostgreSQL 15.19 for an INSERT or an UPDATE
+      (the assignment coerces `-5` into the column's domain); here the row
+      is written with `a` = 7. Only the value the trigger leaves in the row
+      is checked, after it returns (RP-664).
+      Verify: tests/backlog/test_rp_found_rp664.py::test_plpgsql_assignment_to_a_record_field_checks_its_domain
+      Backlog-ID: RP-670
 
 ## Found while working RP-570 (2026-11-08)
 
@@ -2368,23 +2506,33 @@ and `(2, 'abcd', '{abcd}')`. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp570.py::test_domain_array_literal_error_position
       Backlog-ID: RP-581
 
-## Found while working RP-580 (2026-11-08)
+## Found while working RP-607 (2026-11-08)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d607a as
-char(3)` and `create domain d607b as d607a check (value <> 'abc')`. The gap
-test is in `tests/backlog/test_rp_found_rp580.py`.
+Measured on a private PostgreSQL 15.19 cluster with `create domain d607q
+as int`. The gap tests are in `tests/backlog/test_rp_found_rp607.py`.
 
-- [ ] **DROP DOMAIN drops a domain another domain is over.** `drop domain
-      d607a` and `drop domain d607a restrict` are 2BP01 `cannot drop type
-      d607a because other objects depend on it` (DETAIL `type d607b depends
-      on type d607a`, the CASCADE HINT) on PostgreSQL 15.19, and `drop
-      domain d607a cascade` drops both. Here each of the three drops
-      `d607a` alone and leaves `d607b` over a type that no longer exists.
-      `drop type d607a` is refused as PostgreSQL refuses it, but `drop type
-      d607a cascade` drops `d607b`, then fails 42704 `type "d607a" does
-      not exist` and leaves `d607a` in place.
-      Verify: tests/backlog/test_rp_found_rp580.py::test_drop_of_a_domain_another_domain_is_over
-      Backlog-ID: RP-607
+- [ ] **A domain over another domain's array type is refused.** `create
+      domain d607s as d607q[]` is made on PostgreSQL 15.19, with
+      `typbasetype` `d607q[]`, and `'{1,2}'::d607s::text` is `{1,2}`; here
+      the CREATE is 42704 `type "d607q[]" does not exist`: `create_domain`
+      knows a base by a built-in's name or a user type's, never a user
+      type's array. The DROP side follows such a domain already (RP-607).
+      Verify: tests/backlog/test_rp_found_rp607.py::test_domain_over_a_domain_array
+      Backlog-ID: RP-654
+
+## Found while working RP-658 (2026-11-08)
+
+Measured on a private PostgreSQL 15.19 cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp658.py`.
+
+- [ ] **A composite type's attribute has `attndims` 0.** `create type c as
+      (p int[][], q int, r text[])` gives `p`, `q` and `r` 2, 0 and 1 in
+      PostgreSQL 15.19's `pg_attribute` (`DefineCompositeType` builds the
+      descriptor with `BuildDescForRelation`, which counts the written
+      bounds); here each is 0: the composite's stored fields keep only a
+      type name. A table column records them since RP-658.
+      Verify: tests/backlog/test_rp_found_rp658.py::test_composite_attribute_attndims
+      Backlog-ID: RP-663
 
 ## Found while working RP-575 (2026-11-08)
 
@@ -2439,27 +2587,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
 `tests/backlog/test_rp_found_rp603.py`.
 
-- [ ] **A network type's BETWEEN compares its text.** `'10.0.0.10'::inet
-      between '10.0.0.2' and '10.0.0.20'` is true on PostgreSQL 15.19
-      (`network_cmp` orders 10.0.0.10 after 10.0.0.2), and so is the `cidr`
-      form; here both are false, and a column's `WHERE a BETWEEN ...` keeps
-      no row. The rewrite in `enum_order` keys an `inet` / `cidr` operand of
-      `<`, `=`, `IN` and `greatest` with `__net_sortkey`, but its BETWEEN
-      arm is the enums' and the collations' only, so the bounds compare as
-      strings.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_network_between_orders_by_network_cmp
-      Backlog-ID: RP-610
-- [ ] **An array of `oidvector`s orders its elements as int arrays.**
-      `array_cmp` compares elements with the element type's B-tree support
-      function, so on PostgreSQL 15.19 `array['1 2'::oidvector] <
-      array['3'::oidvector]` is false, as is `'1 2'::oidvector < any(vs)`
-      over an `oidvector[]` that is not an `ARRAY[...]` written in place;
-      here both are true. Since RP-603 an `oidvector` operand, and each
-      element of an `ARRAY[...]` under ANY / ALL, compares by its
-      `btoidvectorcmp` key; a whole `oidvector[]` reaches
-      `compare_constants`, which has no type to go by.
-      Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_array_orders_by_btoidvectorcmp
-      Backlog-ID: RP-611
 - [ ] **`oidvector`'s comparison functions are refused.**
       `btoidvectorcmp('1 2', '3')` is 1 on PostgreSQL 15.19, and
       `oidvectorlt` .. `oidvectorne` answer as their operators; here each is
@@ -2467,6 +2594,25 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       functions of the byte-ordered types only.
       Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
       Backlog-ID: RP-612
+
+## Found while working RP-611 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp611.py`.
+
+- [ ] **An ORDER BY naming a window function over a keyed window is
+      refused.** `select v::text t, row_number() over (order by v) from
+      (values ('[1,2]'::int4range), ('[0,5]')) s(v) order by 2` (or `...
+      r ... order by r`) answers on PostgreSQL 15.19; here it is `function
+      row_number() is not supported yet`. The same query without the outer
+      ORDER BY answers, as does one whose window orders by a collation. It
+      fails when the window's ORDER BY is a range, a multirange or an
+      `oidvector`, which `sort_by` keys by `__range_sortkey`. A likely
+      cause, read from the code and not proven: `rewrite` resolves an
+      ORDER BY position or alias to its target and copies any target that
+      is not a column -- the window call too -- into the sort clause.
+      Verify: tests/backlog/test_rp_found_rp611.py::test_order_by_a_window_target_over_a_keyed_window
+      Backlog-ID: RP-652
 
 ## Found while working RP-529 (2026-11-08)
 
@@ -2792,3 +2938,39 @@ keeps; what follows is what that lookup does not yet check.
       is 42601 with none. (A DO block's syntax errors are RP-492.)
       Verify: tests/backlog/test_rp_found_rp573.py::test_plpgsql_compile_error_in_create_has_a_position
       Backlog-ID: RP-621
+
+## Found while working RP-458 (2026-11-08)
+
+Measured on PostgreSQL 15.19; none needs an object.
+
+- [ ] **`regclassin` reports a missing schema as a missing relation, and a
+      quoted name's 42P01 has no position.** `select 'nosuch.s'::regclass`
+      and `pg_relation_size('nosuch.s')` are 3F000 `schema "nosuch" does not
+      exist` at the literal (8, 25) on PostgreSQL (`RangeVarGetRelid` looks
+      the schema up first); here they are 42P01 `relation "nosuch.s" does
+      not exist`. And `select '"Nosuch"'::regclass` and `select
+      nextval($$nosuchseq$$)` are 42P01 at the literal (8, 16) there and
+      have no position here: the server places a 42P01 by searching the
+      statement for the name (`err_in`, `identifier_position`), which a
+      quoted or dollar-quoted name does not match.
+      Verify: tests/backlog/test_rp_found_rp458.py::test_regclassin_errors
+      Backlog-ID: RP-675
+- [ ] **The sequence functions over a relation that is not a sequence
+      answer 42P01.** `nextval('pg_class')`, `currval('pg_class')`,
+      `setval('pg_class', 1)` and `nextval('pg_class'::regclass)` are 42809
+      `"pg_class" is not a sequence` with no position on PostgreSQL 15.19
+      (`init_sequence` opens the relation, then checks its relkind), and
+      `nextval(1234)` is XX000 `could not open relation with OID 1234`.
+      Here each is 42P01 `relation "pg_class"` / `"1234" does not exist`,
+      at the argument.
+      Verify: tests/backlog/test_rp_found_rp458.py::test_sequence_function_over_a_relation_not_a_sequence
+      Backlog-ID: RP-676
+- [ ] **A named argument to a built-in whose parameters have no names is
+      refused as a gap.** `select nextval(regclass := 'nosuchseq')` and
+      `nextval(x => 'nosuchseq')` are 42883 `function nextval(regclass =>
+      unknown) does not exist` (`x => unknown`) at 8 with the
+      no-function-matches HINT on PostgreSQL 15.19 (`proargnames` is NULL
+      for `nextval`, so no candidate takes a named argument); here they are
+      0A000 `NamedArgExpr is not supported yet` with no position.
+      Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
+      Backlog-ID: RP-677

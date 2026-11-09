@@ -16,6 +16,7 @@ use bson::{doc, Bson, Document};
 pub mod acl;
 mod agg_hoist;
 mod agg_support;
+mod domain_scope;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
@@ -1291,6 +1292,9 @@ pub enum ConflictAction {
         /// `(stored field, column type, expression)`, planned over the
         /// target's columns PLUS the proposed row's under `EXCLUDED_PREFIX`.
         set_exprs: Vec<(String, String, i32, ColumnExpr)>,
+        /// As `Update::of_domain`: the stored fields whose value is already
+        /// of the column's domain (`excluded.a`, the target's own `a`).
+        of_domain: Vec<String>,
         /// `WHERE` on the DO UPDATE: the update is skipped when it is false.
         filter: Option<ColumnExpr>,
     },
@@ -1405,6 +1409,13 @@ pub struct Insert {
     /// executor needs them to check each column's assignment cast once it
     /// knows the source's column types. Empty for a `VALUES` insert.
     pub source_targets: Vec<SourceTarget>,
+    /// `INSERT ... SELECT`: per output column of the source, the domain its
+    /// value is already of -- a column of that domain, a cast to it --
+    /// which `coerce_to_target_type` returns as it is when the target
+    /// column is of the same domain, so the write checks none of the
+    /// domain's constraints (RP-664). Empty when the source's columns are
+    /// not known here (a `*` over a join, a VALUES insert).
+    pub source_domains: Vec<Option<String>>,
 }
 
 /// One select-list entry of an `INSERT ... SELECT` source (of its leftmost
@@ -2359,6 +2370,8 @@ pub enum AlterTableAction {
         column: String,
         pg_type: String,
         typmod: i32,
+        /// The new type's declared array dimensions (`attndims`).
+        ndims: i32,
         /// `USING <expr>`: the new value computed from the row, as SQL
         /// (planned by the executor over the table), instead of a cast.
         using: Option<String>,
@@ -3668,6 +3681,13 @@ pub struct Update {
     /// of the subscripts, none of which a plain expression over the row can
     /// express.
     pub set_subscripts: Vec<SubscriptAssign>,
+    /// The stored fields whose SET value is already of the column's
+    /// domain -- the column itself, a cast to the domain -- which
+    /// `coerce_to_target_type` returns as it is, so the write checks none
+    /// of the domain's constraints (RP-664). Every other domain column the
+    /// SET list assigns is coerced into its domain and checked; a column
+    /// the SET list does not assign is stored as it was, and not checked.
+    pub of_domain: Vec<String>,
     pub filter: Document,
     /// As `Delete::residual`.
     pub residual: Option<ColumnExpr>,
@@ -5093,6 +5113,10 @@ fn plan_query_node(
     if let Some(inner) = node.node.as_mut() {
         optype::using_to_direction(inner);
     }
+    // Which of a write's values are already of their column's domain is
+    // read from the statement as written, before its subqueries run and
+    // its FROM list is rewritten into them (RP-664).
+    let write_domains = domain_scope::of_write(&node, lookup);
     let mut params = params.to_vec();
     cancel::check()?;
     materialize_dml_ctes(&mut node, lookup, &mut params, run)?;
@@ -5137,12 +5161,16 @@ fn plan_query_node(
     cancel::check()?;
     resolve_sublinks(&mut node, lookup, &mut params, run)?;
     cancel::check()?;
-    plan_node(
+    let mut st = plan_node(
         node.node
             .ok_or_else(|| Error::Parse("empty statement".into()))?,
         lookup,
         &params,
-    )
+    )?;
+    if let Some(w) = write_domains {
+        w.apply(&mut st);
+    }
+    Ok(st)
 }
 
 /// The DECLARE of `inner`, the cursor's planned query.
@@ -5248,8 +5276,17 @@ fn plan_node(
                 None => None,
             };
             let (c, extra, column_options) = partitions::lower_create(&c, lookup)?;
+            let like_columns = like_column_names(&c, lookup);
             let mut st = plan_create(&expand_table_like(&c, lookup)?)?;
             if let Statement::CreateTable(def, _) = &mut st {
+                // A column PostgreSQL defines from a type OID -- one LIKE
+                // (a partition's too) or `OF type` brings -- has no array
+                // bounds written, so no `attndims` (`makeTypeNameFromOid`).
+                for col in def.columns.iter_mut() {
+                    if of_type.is_some() || like_columns.contains(&col.name) {
+                        col.set_ndims(0);
+                    }
+                }
                 def.extra.extend(extra);
                 if let Some(ty) = of_type {
                     def.extra.insert(typed_tables::OF_TYPE_KEY, ty);
@@ -7403,6 +7440,13 @@ pub(crate) fn declared_typmod_public(tn: &pg_query::protobuf::TypeName) -> i32 {
     declared_typmod(tn)
 }
 
+/// The array dimensions a type name is written with -- `int[][]` 2, `int
+/// ARRAY[4]` 1, `_int4` 0 -- which `pg_attribute.attndims` records
+/// (`BuildDescForRelation`: `list_length(typeName->arrayBounds)`).
+fn declared_ndims(tn: &pg_query::protobuf::TypeName) -> i32 {
+    i32::try_from(tn.array_bounds.len()).unwrap_or(i32::MAX)
+}
+
 fn declared_typmod(tn: &pg_query::protobuf::TypeName) -> i32 {
     match expr_memo::type_name(tn, || {
         (type_name_of_uncached(tn), declared_typmod_uncached(tn))
@@ -7727,36 +7771,85 @@ fn plan_alter_table(
 /// Whether `ALTER COLUMN ... TYPE` converts from `from` to `to` without a
 /// `USING` clause.
 ///
-/// PostgreSQL allows it exactly where an ASSIGNMENT cast exists, which is not
-/// the same as "the values happen to convert". Measured on 14.24 across 31
-/// type pairs, the rule is:
-///
-/// * to a STRING type -- always (everything has an assignment cast to text,
-///   so `json`, `bytea`, `date` and `int` all convert);
-/// * within the NUMERIC family, both directions;
-/// * within the DATE/TIME family, both directions;
-/// * `json` and `jsonb`, both directions;
-/// * a type to itself.
-///
-/// Everything else needs `USING`, and PostgreSQL answers 42804 -- notably
-/// FROM a string to anything but a string (`text -> int`, `text -> date`,
-/// `varchar -> int`), `bool` to or from `int`, and a scalar to an array.
+/// `ATPrepAlterColumnType` coerces the column's own Var to the new type with
+/// `coerce_to_target_type(..., COERCION_ASSIGNMENT, ...)`, and refuses with
+/// 42804 when that finds no path. Over a plain column that is
+/// `find_coercion_pathway` in the ASSIGNMENT context (`assignment_pathway`),
+/// decided from the TYPES alone, never from whether the values would
+/// convert: `text -> int` is refused on a table whose values are all digits.
 fn alter_type_is_automatic(from: &str, to: &str) -> bool {
-    const STRINGS: &[&str] = &["text", "varchar", "bpchar", "name", "char"];
-    const NUMBERS: &[&str] = &["int2", "int4", "int8", "numeric", "float4", "float8"];
-    const DATETIMES: &[&str] = &[
-        "date",
-        "timestamp",
-        "timestamptz",
-        "time",
-        "timetz",
-        "interval",
-    ];
-    if from == to || STRINGS.contains(&to) {
+    from == to || assignment_pathway(from, to)
+}
+
+/// PostgreSQL 15's `find_coercion_pathway(target, source,
+/// COERCION_ASSIGNMENT)` (`parse_coerce.c`) is not `COERCION_PATH_NONE`:
+///
+/// 1. the same type is a relabelling;
+/// 2. a `pg_cast` row from `source` to `target` (built in, or a user's
+///    `CREATE CAST`) decides alone, by its context: an ASSIGNMENT or
+///    IMPLICIT one is a path, an EXPLICIT one is none;
+/// 3. with no row, two array types coerce element by element when their
+///    elements have a path (`array_coerce`); a target `oidvector` or
+///    `int2vector` is never reached this way;
+/// 4. otherwise an assignment to a STRING-category type goes through the
+///    types' I/O functions (`CoerceViaIO`).
+///
+/// A domain is not yet seen through to its base type (`getBaseType`), so a
+/// domain on either side finds no path (RP-556).
+fn assignment_pathway(source: &str, target: &str) -> bool {
+    const INT2VECTOROID: i64 = 22;
+    const OIDVECTOROID: i64 = 30;
+    let (Some(s), Some(t)) = (
+        user_casts::type_oid(&one_array_level(source)),
+        user_casts::type_oid(&one_array_level(target)),
+    ) else {
+        return false;
+    };
+    if s == t {
         return true;
     }
-    let both = |set: &[&str]| set.contains(&from) && set.contains(&to);
-    both(NUMBERS) || both(DATETIMES) || both(&["json", "jsonb"])
+    if let Some((.., context, _)) = pg_casts::BUILTIN_CASTS
+        .iter()
+        .find(|(_, cs, ct, ..)| *cs == s && *ct == t)
+    {
+        return matches!(context, b'a' | b'i');
+    }
+    if let Some(cast) = user_casts::find(source, target) {
+        return matches!(cast.context, 'a' | 'i');
+    }
+    if t != OIDVECTOROID && t != INT2VECTOROID {
+        if let (Some(te), Some(se)) = (array_element_type(target), array_element_type(source)) {
+            if assignment_pathway(se, te) {
+                return true;
+            }
+        }
+    }
+    funcsig::category_of_oid(t) == Some('S')
+}
+
+/// `int4[][]` names the same type as `int4[]`: PostgreSQL records no
+/// dimension count in a type.
+fn one_array_level(name: &str) -> String {
+    let element = name.trim_end_matches("[]");
+    if element.len() == name.len() {
+        name.to_string()
+    } else {
+        format!("{element}[]")
+    }
+}
+
+/// `get_element_type`: the element of a true array type (`typsubscript`
+/// `array_subscript_handler`), which `int2vector` and `oidvector` are too.
+fn array_element_type(name: &str) -> Option<&str> {
+    let element = name.trim_end_matches("[]");
+    if element.len() != name.len() {
+        return Some(element);
+    }
+    match name {
+        "int2vector" => Some("int2"),
+        "oidvector" => Some("oid"),
+        _ => None,
+    }
 }
 
 fn plan_alter_view(a: &pg_query::protobuf::AlterTableStmt, view: &str) -> Result<Statement> {
@@ -8040,6 +8133,7 @@ fn plan_alter_action(
                 column: cmd.name.clone(),
                 pg_type: ty,
                 typmod: cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1),
+                ndims: cd.type_name.as_ref().map_or(0, declared_ndims),
                 using,
             })
         }
@@ -8564,6 +8658,7 @@ fn plan_added_column(
         column.sequence = Some(format!("{table}_{}_seq", cd.colname));
     }
     column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+    column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
     for con in &cd.constraints {
         let Some(N::Constraint(k)) = con.node.as_ref() else {
             continue;
@@ -8965,11 +9060,13 @@ pub fn apply_alter_to_def(def: &mut TableDef, action: &AlterTableAction) {
             column,
             pg_type,
             typmod,
+            ndims,
             ..
         } => {
             if let Some(c) = def.columns.iter_mut().find(|c| c.name == *column) {
                 c.pg_type = pg_type.clone();
                 c.typmod = *typmod;
+                c.set_ndims(*ndims);
             }
         }
         AlterTableAction::AddCheck(check) => {
@@ -11093,6 +11190,22 @@ fn write_target_missing(table: &str, what: &str) -> Error {
     }
 }
 
+/// The columns the LIKE clauses of `c` bring, by name.
+fn like_column_names(
+    c: &pg_query::protobuf::CreateStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<String> {
+    c.table_elts
+        .iter()
+        .filter_map(|e| match e.node.as_ref() {
+            Some(N::TableLikeClause(like)) => like.relation.as_ref(),
+            _ => None,
+        })
+        .filter_map(|rel| lookup(&relation_name(rel)))
+        .flat_map(|def| def.columns.into_iter().map(|col| col.name))
+        .collect()
+}
+
 /// `CREATE TABLE t (LIKE src [INCLUDING ...], ...)`: the LIKE clause
 /// replaced by `src`'s column definitions, rendered as SQL and parsed back.
 /// Column names, types and NOT NULL always come across (as in PostgreSQL);
@@ -11299,6 +11412,7 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                 // 4 rather than as an unsized `text` -- and so the Python
                 // server, which shares this catalog, reads the same type.
                 column.typmod = cd.type_name.as_ref().map(declared_typmod).unwrap_or(-1);
+                column.set_ndims(cd.type_name.as_ref().map_or(0, declared_ndims));
                 // `s text COLLATE x`: recorded, and honoured wherever the
                 // column is ordered or compared (`enum_order`). It used to be
                 // dropped, so the column compared by bytes whatever it said.
@@ -12397,7 +12511,12 @@ fn plan_on_conflict(
                     Some(row_column_expr(&w, &fields, params, &sample)?)
                 }
             };
-            ConflictAction::Update { set_exprs, filter }
+            ConflictAction::Update {
+                set_exprs,
+                // Filled from the statement as written (`domain_scope`).
+                of_domain: Vec::new(),
+                filter,
+            }
         }
         _ => return Err(Error::Unsupported("this ON CONFLICT action".into())),
     };
@@ -12727,6 +12846,8 @@ fn plan_insert(
         } else {
             Vec::new()
         },
+        // Filled from the statement as written (`domain_scope`).
+        source_domains: Vec::new(),
     }))
 }
 
@@ -16640,6 +16761,35 @@ fn note_bpchar_width(c: &Column) {
     });
 }
 
+/// Record (or forget) the `char(n)` width of an aggregate's slot: `min` /
+/// `max` over a `char(n)` column return one of its stored values, which
+/// PostgreSQL keeps padded (`bpchar_larger`), so the value enters an
+/// expression over the slot padded, as the column's own would
+/// (`octet_length(max(c))` is the width; RP-671). The grouped value itself
+/// stays trimmed, as every stored `char(n)` value is here.
+fn note_aggregate_slot_width(slot: &str, item: &AggItem) {
+    ROW_WIDTHS.with(|w| {
+        let mut w = w.borrow_mut();
+        match bpchar_min_max_typmod(item) {
+            m if m > 4 => w.insert(slot.to_owned(), (m - 4) as usize),
+            _ => w.remove(slot),
+        };
+    });
+}
+
+/// The `char(n)` modifier of a `min` / `max` over a `char(n)` column, whose
+/// answer is one of the column's padded values; -1 for every other item.
+pub fn bpchar_min_max_typmod(item: &AggItem) -> i32 {
+    if matches!(item.func, AggFunc::Min | AggFunc::Max)
+        && item.source_type.as_deref() == Some("bpchar")
+        && item.source_typmod > 4
+    {
+        item.source_typmod
+    } else {
+        -1
+    }
+}
+
 /// Pad a `char(n)` value to its width.
 fn pad_bpchar(v: Bson, width: Option<usize>) -> Bson {
     match (v, width) {
@@ -17518,8 +17668,11 @@ fn plan_table_targets(
             // it the way every expression sees it.
             // A cast carrying a modifier (`::numeric(5,1)`, `::varchar(3)`)
             // takes the general path too, which rounds and truncates to it.
+            // A cast that is no coercion takes the general path too, which
+            // knows not to check the column's own domain (RP-655).
             Some(N::TypeCast(tc))
                 if !cast_chain_has_typmod(tc)
+                    && !cast_chain_has_relabel(tc)
                     && cast_chain_over_column(tc).is_ok_and(|(col, chain)| {
                         def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
                             && !user_casts::in_chain(
@@ -18620,6 +18773,7 @@ fn extract_aggregates(
             // for the expression keys the value by exactly this.
             let slot = format!("__aggval{index}");
             let pg_type = aggregate_item_type(&items[index]);
+            note_aggregate_slot_width(&slot, &items[index]);
             if !slots.iter().any(|(name, _, _)| *name == slot) {
                 slots.push((slot.clone(), slot.clone(), pg_type));
             }
@@ -22224,6 +22378,24 @@ fn declare_sublink_param(at: usize, t: &str) {
     });
 }
 
+/// The `typmods` a `TypeName` of length type `base` (`bpchar`, `varchar`)
+/// spells `typmod` with, as the parser leaves them for `character(3)`: the
+/// declared length, the varlena header taken off. Empty for any other type
+/// or no modifier.
+fn length_typmods(base: &str, typmod: i32) -> Vec<pg_query::protobuf::Node> {
+    if !matches!(base, "bpchar" | "varchar") || typmod < 4 {
+        return Vec::new();
+    }
+    vec![pg_query::protobuf::Node {
+        node: Some(N::AConst(pg_query::protobuf::AConst {
+            val: Some(pg_query::protobuf::a_const::Val::Ival(
+                pg_query::protobuf::Integer { ival: typmod - 4 },
+            )),
+            ..Default::default()
+        })),
+    }]
+}
+
 /// A `TypeName` for an internal type name (`int4`, `text[]`).
 fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
     let (base, array) = match ty.strip_suffix("[]") {
@@ -22243,6 +22415,42 @@ fn type_name_node(ty: &str) -> pg_query::protobuf::TypeName {
         location: -1,
         ..Default::default()
     }
+}
+
+/// The `TypeName.location` that marks a cast as no coercion: the parser
+/// never writes a location below -1.
+const RELABEL_LOCATION: i32 = i32::MIN;
+
+/// A cast to `ty` of an expression that is ALREADY of `ty` -- a domain
+/// column to its own domain, a subquery's value to its column's domain.
+/// `coerce_type` returns such an expression as it is (its `exprType` is the
+/// target), so it checks no constraint; here the cast still says the type
+/// and reads the value as the base type at its modifier, and checks
+/// nothing (`domains::relabel`, RP-655).
+fn relabel_cast(arg: pg_query::protobuf::Node, ty: &str) -> pg_query::protobuf::Node {
+    let mut type_name = type_name_node(ty);
+    type_name.location = RELABEL_LOCATION;
+    pg_query::protobuf::Node {
+        node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+            arg: Some(Box::new(arg)),
+            type_name: Some(type_name),
+            location: -1,
+        }))),
+    }
+}
+
+/// Whether `tc` is a `relabel_cast`.
+fn is_relabel(tc: &pg_query::protobuf::TypeCast) -> bool {
+    tc.type_name
+        .as_ref()
+        .is_some_and(|t| t.location == RELABEL_LOCATION)
+}
+
+/// Whether a chain of casts has a `relabel_cast` in it.
+fn cast_chain_has_relabel(tc: &pg_query::protobuf::TypeCast) -> bool {
+    is_relabel(tc)
+        || matches!(tc.arg.as_deref().and_then(|a| a.node.as_ref()),
+            Some(N::TypeCast(inner)) if cast_chain_has_relabel(inner))
 }
 
 /// The functions whose call is a side effect or differs per call.
@@ -22398,7 +22606,10 @@ fn resolve_one_sublink(
     // The enclosing statements' CTEs are in scope, as an outer scope its own
     // WITH items see and hide (`under_visible_ctes`). Added AFTER the
     // subquery's own resolution: they are already resolved.
-    let inner = under_visible_ctes(&inner)?;
+    let mut inner = under_visible_ctes(&inner)?;
+    if sl.sub_link_type == SubLinkType::ArraySublink as i32 {
+        cast_array_subquery_column(&mut inner, lookup);
+    }
 
     // A QUALIFIED reference to something outside the subquery has to be
     // caught BEFORE planning, because planning cannot see it: the lowering
@@ -22486,16 +22697,27 @@ fn resolve_one_sublink(
                 // at run time and must still print as `2 3`.
                 Some(value) => {
                     let node = located(param_node(params, value), sl.location);
-                    let ty = sub_plan_def(&plan, lookup)
+                    let column = sub_plan_def(&plan, lookup)
                         .ok()
-                        .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+                        .and_then(|d| d.columns.first().map(|c| (c.pg_type.clone(), c.typmod)));
+                    let typmod = column.as_ref().map_or(-1, |(_, m)| *m);
+                    let ty = column.map(|(t, _)| t);
                     // So must a type the value reads back as another (an
                     // `oid` is carried as a bigint, a `name` as text) -- and
                     // every other built-in type, so the value is typed as the
                     // subquery's column wherever it lands: a bare parameter
                     // has no declared type, which made `pg_typeof((select
                     // 1))` 42P18 and a CASE over it text (RP-023).
-                    let cast = |t: &str| sublink_value_cast(t);
+                    // A domain, or a domain's array, is cast to as well: no
+                    // parameter type names one (RP-569).
+                    // So is a `char(n)[]` / `varchar(n)[]` one, whose
+                    // elements the cast at its modifier pads (RP-666).
+                    let cast = |t: &str| {
+                        let base = t.strip_suffix("[]").unwrap_or(t);
+                        sublink_value_cast(t)
+                            || domains::user_domain(base).is_some()
+                            || !length_typmods(base, typmod).is_empty()
+                    };
                     if let Some(t) = ty
                         .as_deref()
                         .filter(|t| !cast(t) && !matches!(*t, "" | "unknown" | "record" | "text"))
@@ -22503,32 +22725,56 @@ fn resolve_one_sublink(
                         declare_sublink_param(params.len() - 1, t);
                     }
                     Ok(match ty.as_deref() {
-                        Some(ty) if cast(ty) => pg_query::protobuf::Node {
-                            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-                                arg: Some(Box::new(node)),
-                                type_name: Some(type_name_node(ty)),
-                                location: -1,
-                            }))),
-                        },
+                        // The value is already of the column's domain, so
+                        // the cast checks none of its constraints (RP-655).
+                        Some(ty)
+                            if domains::user_domain(ty.strip_suffix("[]").unwrap_or(ty))
+                                .is_some() =>
+                        {
+                            relabel_cast(node, ty)
+                        }
+                        // The value is of the column's type at the column's
+                        // modifier (`exprTypmod` of an EXPR sublink is its
+                        // column's): a `char(n)` value is stored without its
+                        // blanks, and the cast to `character(n)` gives them
+                        // back, as the column itself has them, element by
+                        // element in a `char(n)[]` one's (RP-666).
+                        Some(ty) if cast(ty) => {
+                            let mut type_name = type_name_node(ty);
+                            type_name.typmods =
+                                length_typmods(ty.strip_suffix("[]").unwrap_or(ty), typmod);
+                            pg_query::protobuf::Node {
+                                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                                    arg: Some(Box::new(node)),
+                                    type_name: Some(type_name),
+                                    location: -1,
+                                }))),
+                            }
+                        }
                         _ => node,
                     })
                 }
                 None => {
-                    let ty = sub_plan_def(&plan, lookup)?
+                    let (ty, typmod) = sub_plan_def(&plan, lookup)?
                         .columns
                         .first()
-                        .map(|c| c.pg_type.clone())
-                        .unwrap_or_else(|| "text".into());
+                        .map(|c| (c.pg_type.clone(), c.typmod))
+                        .unwrap_or_else(|| ("text".into(), -1));
                     let null = located(param_node(params, Bson::Null), sl.location);
                     // `record` is no type a cast can name: a row subquery
                     // that returned nothing is a bare NULL.
                     if ty == "record" {
                         return Ok(null);
                     }
+                    // A NULL of the column's type at its modifier, as an
+                    // EXPR sublink is typed whatever it returns (RP-666).
+                    let mut type_name = type_name_node(&ty);
+                    type_name.typmods =
+                        length_typmods(ty.strip_suffix("[]").unwrap_or(&ty), typmod);
                     Ok(pg_query::protobuf::Node {
                         node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                             arg: Some(Box::new(null)),
-                            type_name: Some(type_name_node(&ty)),
+                            type_name: Some(type_name),
                             location: -1,
                         }))),
                     })
@@ -22537,9 +22783,11 @@ fn resolve_one_sublink(
         }
         Ok(SubLinkType::ArraySublink) => {
             let values: Vec<Bson> = rows.into_iter().map(first_column).collect();
-            let ty = sub_plan_def(&plan, lookup)
+            let column = sub_plan_def(&plan, lookup)
                 .ok()
-                .and_then(|d| d.columns.first().map(|c| c.pg_type.clone()));
+                .and_then(|d| d.columns.first().map(|c| (c.pg_type.clone(), c.typmod)));
+            let typmod = column.as_ref().map_or(-1, |(_, m)| *m);
+            let ty = column.map(|(t, _)| t);
             // An `int2vector` / `oidvector` row value is one element of the
             // array, carried as its text there: as the int array it is
             // carried as, it read as one more dimension of ints (RP-575).
@@ -22569,14 +22817,31 @@ fn resolve_one_sublink(
             // An `int2vector` / `oidvector` array is already in its element
             // form above, and declared rather than read again by a cast.
             let base = element.strip_suffix("[]").unwrap_or(&element);
-            if !sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector") {
+            // A domain's array is cast to too, which reads each element
+            // through the base type at its modifier: a `char(n)` domain's
+            // value, stored without its blanks, gets them back (RP-569).
+            let domain = domains::user_domain(base).is_some();
+            if !domain && (!sublink_value_cast(base) || matches!(base, "int2vector" | "oidvector"))
+            {
                 declare_sublink_param(params.len() - 1, &array);
                 return Ok(node);
             }
+            // Each element is already of the column's domain, so the cast
+            // checks none of its constraints (RP-655).
+            if domain {
+                return Ok(relabel_cast(node, &array));
+            }
+            // The array is of the column's type at the column's modifier
+            // (`exprTypmod` of an ARRAY sublink is its column's): a
+            // `char(n)` value is stored without its blanks, and the cast
+            // to `character(n)[]` gives them back, as `array[c]` and
+            // `array_agg(c)` have them (RP-656).
+            let mut type_name = type_name_node(&array);
+            type_name.typmods = length_typmods(base, typmod);
             Ok(pg_query::protobuf::Node {
                 node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
                     arg: Some(Box::new(node)),
-                    type_name: Some(type_name_node(&array)),
+                    type_name: Some(type_name),
                     location: -1,
                 }))),
             })
@@ -24179,70 +24444,43 @@ fn timezone_functions_as_views(
     Some(out)
 }
 
-/// `pg_typeof(c)` over a column of a domain type names the DOMAIN, though
-/// the column is stored (and sent) as its base type: the argument is cast
-/// to the domain, which its value already satisfies. Over the one table of
-/// a single-table FROM; `None` when nothing changed.
+/// A column declared with a domain is OF the domain (`exprType` of its
+/// Var), though it is stored (and sent) as its base type. Where that type
+/// shows, the column is cast to its domain, which its stored value already
+/// satisfies: `pg_typeof(c)` names the domain, and an `ARRAY[c]` element,
+/// `array_agg(c)`'s argument and an `ARRAY(select c ...)` subquery's column
+/// make the domain's array (`d[]`, its `typarray`), with a `char(n)`
+/// domain's padding (15.19, RP-569). Over any column of the FROM list --
+/// a table's, a join's, a WITH item's or a FROM subquery's
+/// (`domain_scope`, RP-657); `None` when nothing changed. An ARRAY
+/// subquery's column is cast where the subquery is resolved
+/// (`cast_array_subquery_column`).
 fn rewrite_domain_typeof(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) -> Result<Option<pg_query::protobuf::SelectStmt>> {
-    let [from] = s.from_clause.as_slice() else {
-        return Ok(None);
-    };
-    let Some(N::RangeVar(rv)) = from.node.as_ref() else {
-        return Ok(None);
-    };
-    let Some(def) = lookup(&relation_name(rv)) else {
-        return Ok(None);
-    };
-    let domains: std::collections::HashMap<String, String> = def
-        .columns
-        .iter()
-        .filter_map(|c| {
-            let d = c.extra.get_str("domain_type").ok()?;
-            Some((c.name.clone(), d.to_string()))
-        })
-        .collect();
-    if domains.is_empty() {
+    let scope = domain_scope::scope_of(s, lookup);
+    if !scope.has_domains() {
         return Ok(None);
     }
-    let alias = rv
-        .alias
-        .as_ref()
-        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
     let mut out = s.clone();
     let mut changed = false;
     let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
-        let Some(N::FuncCall(f)) = n.node.as_mut() else {
-            return Ok(());
-        };
-        if func_name(f).as_deref() != Some("pg_typeof") || f.args.len() != 1 {
-            return Ok(());
+        match n.node.as_mut() {
+            Some(N::FuncCall(f))
+                if f.args.len() == 1
+                    && matches!(func_name(f).as_deref(), Some("pg_typeof" | "array_agg")) =>
+            {
+                changed |= cast_domain_column(&mut f.args[0], &scope);
+            }
+            Some(N::AArrayExpr(a)) => {
+                for e in &mut a.elements {
+                    changed |= cast_domain_column(e, &scope);
+                }
+            }
+            Some(N::TypeCast(tc)) => changed |= relabel_own_domain_cast(tc, &scope),
+            _ => {}
         }
-        let Some(N::ColumnRef(c)) = f.args[0].node.as_ref() else {
-            return Ok(());
-        };
-        let qualifier_ok = match c.fields.as_slice() {
-            [_] => true,
-            [q, _] => matches!(q.node.as_ref(), Some(N::String(q)) if q.sval == alias),
-            _ => false,
-        };
-        let Some(domain) = column_ref_name(c).and_then(|name| domains.get(&name)) else {
-            return Ok(());
-        };
-        if !qualifier_ok {
-            return Ok(());
-        }
-        let arg = f.args[0].clone();
-        f.args[0] = pg_query::protobuf::Node {
-            node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
-                arg: Some(Box::new(arg)),
-                type_name: Some(type_name_node(domain)),
-                location: -1,
-            }))),
-        };
-        changed = true;
         Ok(())
     };
     for t in &mut out.target_list {
@@ -24255,6 +24493,101 @@ fn rewrite_domain_typeof(
         walk_expr(o, &mut visit)?;
     }
     Ok(changed.then_some(out))
+}
+
+/// `def`'s domain-typed columns: each one's name and its domain's.
+fn domain_columns_of(def: &TableDef) -> std::collections::HashMap<String, String> {
+    def.columns
+        .iter()
+        .filter_map(|c| {
+            let d = c.extra.get_str("domain_type").ok()?;
+            domains::base_type_and_typmod(d)?;
+            Some((c.name.clone(), d.to_string()))
+        })
+        .collect()
+}
+
+/// `ARRAY(select c ...)` over a domain column `c` is the domain's array,
+/// as `ARRAY[c]` is: the subquery's one column is cast to its domain before
+/// the subquery is planned (RP-569) -- reached through a join, a WITH or a
+/// FROM subquery, or in every branch of a set operation whose branches are
+/// all of the domain (RP-657). More than one column is the 42601 the
+/// subquery reports. The cast is a relabel, which checks nothing (RP-655).
+fn cast_array_subquery_column(
+    inner: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) {
+    domain_scope::cast_first_columns(inner, lookup);
+}
+
+/// Cast `node` to its column's domain when it is a bare reference to a
+/// domain column in `scope`; whether it was.
+fn cast_domain_column(node: &mut pg_query::protobuf::Node, scope: &domain_scope::Scope) -> bool {
+    let Some(domain) = scope.domain_of(node).map(str::to_string) else {
+        return false;
+    };
+    *node = relabel_cast(node.clone(), &domain);
+    true
+}
+
+/// `c::d` over a column of domain `d` is no coercion: the column is already
+/// of `d`, so the cast becomes a `relabel_cast` (RP-655). Whether it did.
+fn relabel_own_domain_cast(
+    tc: &mut pg_query::protobuf::TypeCast,
+    scope: &domain_scope::Scope,
+) -> bool {
+    if is_relabel(tc) {
+        return false;
+    }
+    let plain = tc.type_name.as_ref().is_some_and(|t| {
+        t.typmods.is_empty() && t.array_bounds.is_empty() && !t.setof && !t.pct_type
+    });
+    let own = plain
+        && tc
+            .arg
+            .as_deref()
+            .and_then(|a| scope.domain_of(a))
+            .is_some_and(|d| tc.type_name.as_ref().map(type_name_of).as_deref() == Some(d));
+    match tc.type_name.as_mut() {
+        Some(t) if own => {
+            t.location = RELABEL_LOCATION;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The casts of an UPDATE's or a DELETE's expressions (`exprs`) that are
+/// no coercion, over the target table's domain columns, made
+/// `relabel_cast`s (RP-655). Not with a FROM or USING list, whose tables
+/// share the scope.
+fn relabel_write_target_casts(
+    relation: Option<&pg_query::protobuf::RangeVar>,
+    def: &TableDef,
+    others: bool,
+    exprs: Vec<&mut pg_query::protobuf::Node>,
+) -> Result<()> {
+    let Some(rv) = relation else {
+        return Ok(());
+    };
+    let alias = rv
+        .alias
+        .as_ref()
+        .map_or_else(|| rv.relname.clone(), |a| a.aliasname.clone());
+    let scope = domain_scope::Scope::single(alias, def);
+    if others || !scope.has_domains() {
+        return Ok(());
+    }
+    let mut visit = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if let Some(N::TypeCast(tc)) = n.node.as_mut() {
+            relabel_own_domain_cast(tc, &scope);
+        }
+        Ok(())
+    };
+    for e in exprs {
+        walk_expr(e, &mut visit)?;
+    }
+    Ok(())
 }
 
 /// A role specification's name: `PUBLIC`, a role, or the session role
@@ -27256,8 +27589,14 @@ pub fn aggregate_output_def(agg: &Aggregate) -> Result<TableDef> {
             OutputCol::Grouping(_) => "int4".to_string(),
         };
         let mut c = Column::new(out, &ty, false);
-        if let OutputCol::Group(i) = col {
-            c.typmod = agg.group_by[*i].typmod;
+        match col {
+            OutputCol::Group(i) => c.typmod = agg.group_by[*i].typmod,
+            // `min` / `max` over a `char(n)` column answer one of its padded
+            // values, which this server keeps trimmed: the width is what
+            // pads it again where a FROM-subquery's or a scalar subquery's
+            // reader uses it (RP-671), as the column's own does.
+            OutputCol::Agg(i) => c.typmod = bpchar_min_max_typmod(&agg.items[*i]),
+            _ => {}
         }
         columns.push(c);
     }
@@ -41602,6 +41941,26 @@ fn plan_update(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("UPDATE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "UPDATE of"))?;
+    // A cast of a domain column to its own domain checks nothing (RP-655).
+    let relabelled;
+    let u = if domain_columns_of(&def).is_empty() {
+        u
+    } else {
+        let mut w = u.clone();
+        let relation = w.relation.clone();
+        let others = !w.from_clause.is_empty();
+        let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+            w.where_clause.as_deref_mut().into_iter().collect();
+        for t in &mut w.target_list {
+            if let Some(N::ResTarget(rt)) = t.node.as_mut() {
+                exprs.extend(rt.val.as_deref_mut());
+            }
+        }
+        exprs.extend(returning_exprs(&mut w.returning_list));
+        relabel_write_target_casts(relation.as_ref(), &def, others, exprs)?;
+        relabelled = w;
+        &relabelled
+    };
     // The target named as a whole row (RP-516).
     let target_rows;
     let u = {
@@ -41849,6 +42208,8 @@ fn plan_update(
         unset,
         set_exprs,
         set_subscripts,
+        // Filled from the statement as written (`domain_scope`).
+        of_domain: Vec::new(),
         filter,
         residual,
         returning,
@@ -42233,6 +42594,21 @@ fn plan_delete(
         .map(|r| r.relname.clone())
         .ok_or_else(|| Error::Parse("DELETE without a relation".into()))?;
     let def = lookup(&table).ok_or_else(|| write_target_missing(&table, "DELETE from"))?;
+    // A cast of a domain column to its own domain checks nothing (RP-655).
+    let relabelled;
+    let d = if domain_columns_of(&def).is_empty() {
+        d
+    } else {
+        let mut w = d.clone();
+        let relation = w.relation.clone();
+        let others = !w.using_clause.is_empty();
+        let mut exprs: Vec<&mut pg_query::protobuf::Node> =
+            w.where_clause.as_deref_mut().into_iter().collect();
+        exprs.extend(returning_exprs(&mut w.returning_list));
+        relabel_write_target_casts(relation.as_ref(), &def, others, exprs)?;
+        relabelled = w;
+        &relabelled
+    };
     // The target named as a whole row (RP-516).
     let target_rows;
     let d = {
@@ -43028,6 +43404,10 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
     // `'1'::int`, `$1::text`, `null::int`. The cast is applied to whatever the
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
+        // A cast that is no coercion checks no domain constraint (RP-655).
+        if is_relabel(tc) && !domains::relabelling() {
+            return domains::relabel(|| const_value_node(node, params));
+        }
         let arg = tc
             .arg
             .as_ref()

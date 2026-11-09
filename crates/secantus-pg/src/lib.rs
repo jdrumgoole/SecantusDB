@@ -139,6 +139,7 @@ mod ts_dicts;
 mod tuplesort;
 mod txn_gucs;
 mod txn_state;
+mod type_depend;
 mod window_order;
 mod wire_portals;
 mod x509;
@@ -13093,11 +13094,11 @@ impl PgHandler {
         // A user type's ARRAY (`custom[]`, `s.custom[]`): its typarray, the
         // element's oid + 100_000 (a column of one was missing from
         // `pg_attribute` altogether). A built-in's array is `oid_of_name`'s
-        // above, and a domain has none here.
+        // above. A domain's array is the `typarray` `DefineDomain` makes
+        // beside it, the same derived oid `pg_type` lists (RP-559), so a
+        // column declared `d[]` is in `pg_attribute` as `d[]` (RP-653).
         if let Some(element) = name.strip_suffix("[]") {
-            if secantus_pgplan::pgtypes::oid_of_name(element).is_none()
-                && secantus_pgplan::domains::user_domain(element).is_none()
-            {
+            if secantus_pgplan::pgtypes::oid_of_name(element).is_none() {
                 if let Some(oid) = self.type_oid_by_name(element) {
                     return Some(oid + Self::USER_TYPE_ARRAY_OID_OFFSET);
                 }
@@ -19362,219 +19363,6 @@ impl PgHandler {
         self.insert_type_doc(Self::DOMAIN_COLLECTION, name, doc)
     }
 
-    /// What depends on an enum, composite or range type's VALUES, as
-    /// PostgreSQL 15.19's `reportDependentObjects` lists it: columns of its
-    /// array type, then its own columns, then each domain over it followed
-    /// by that domain's columns, then fields of composite types. RESTRICT is
-    /// 2BP01 naming them all; CASCADE drops them, with one notice.
-    fn drop_type_value_dependents(&self, name: &str, cascade: bool) -> PgWireResult<()> {
-        let array = format!("{name}[]");
-        let tables = self.all_table_defs()?;
-        let direct = |c: &secantus_pgcatalog::Column| c.extra.get_str("domain_type").is_err();
-        let mut details: Vec<String> = Vec::new();
-        let mut drops: Vec<String> = Vec::new();
-        let mut columns: Vec<(String, String)> = Vec::new();
-        // A typed table (`CREATE TABLE ... OF type`) depends on its type;
-        // CASCADE drops the table.
-        let typed: Vec<String> = tables
-            .iter()
-            .filter(|t| t.extra.get_str(secantus_pgplan::typed_tables::OF_TYPE_KEY) == Ok(name))
-            .map(|t| t.name.clone())
-            .collect();
-        for t in &typed {
-            details.push(format!("table {t} depends on type {name}"));
-            drops.push(format!("table {t}"));
-        }
-        for (ty, shown) in [(array.as_str(), array.as_str()), (name, name)] {
-            for def in &tables {
-                for c in def.columns.iter().filter(|c| c.pg_type == ty && direct(c)) {
-                    details.push(format!(
-                        "column {} of table {} depends on type {shown}",
-                        c.name, def.name
-                    ));
-                    drops.push(format!("column {} of table {}", c.name, def.name));
-                    columns.push((def.name.clone(), c.name.clone()));
-                }
-            }
-        }
-        let domains: Vec<String> = self
-            .domains()?
-            .into_iter()
-            .filter(|d| d.base == name)
-            .map(|d| d.name)
-            .collect();
-        for d in &domains {
-            details.push(format!("type {d} depends on type {name}"));
-            drops.push(format!("type {d}"));
-            for (t, c) in self.domain_columns(d)? {
-                details.push(format!(
-                    "column {c} of table {} depends on type {d}",
-                    t.name
-                ));
-                drops.push(format!("column {c} of table {}", t.name));
-                columns.push((t.name.clone(), c));
-            }
-        }
-        let mut fields: Vec<(String, String)> = Vec::new();
-        for (composite, _, comp_fields) in self.composites()? {
-            if composite == name || self.row_type_of_table(&composite)? {
-                continue;
-            }
-            for (f, t) in comp_fields.iter().filter(|(_, t)| t == name || *t == array) {
-                details.push(format!(
-                    "column {f} of composite type {composite} depends on type {}",
-                    if *t == array { &array } else { name }
-                ));
-                drops.push(format!("column {f} of composite type {composite}"));
-                fields.push((composite.clone(), f.clone()));
-            }
-        }
-        if details.is_empty() {
-            return Ok(());
-        }
-        if !cascade {
-            let mut info = ErrorInfo::new(
-                "ERROR".into(),
-                "2BP01".into(), // dependent_objects_still_exist
-                format!("cannot drop type {name} because other objects depend on it"),
-            );
-            info.detail = Some(details.join("\n"));
-            info.hint = Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
-            return Err(PgWireError::UserError(Box::new(info)));
-        }
-        self.cascade_notice(&drops);
-        for t in &typed {
-            self.internal_sql(&format!(
-                "DROP TABLE {} CASCADE",
-                secantus_pgplan::scalar::quote_identifier(t)
-            ))?;
-        }
-        // One ALTER per table, dropping all of its columns at once.
-        let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
-        for (table, column) in columns {
-            match by_table.iter_mut().find(|(t, _)| *t == table) {
-                Some((_, cols)) => cols.push(column),
-                None => by_table.push((table, vec![column])),
-            }
-        }
-        for (table, cols) in by_table {
-            self.execute_inner(
-                Statement::AlterTable {
-                    table,
-                    missing_ok: false,
-                    actions: cols
-                        .into_iter()
-                        .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
-                            name,
-                            if_exists: true,
-                        })
-                        .collect(),
-                },
-                0,
-            )?;
-        }
-        for d in &domains {
-            self.delete_type_doc(Self::DOMAIN_COLLECTION, d)?;
-        }
-        for (composite, field) in fields {
-            let Some(doc) = self
-                .type_catalog_docs(Self::COMPOSITE_COLLECTION)?
-                .iter()
-                .find(|d| d.get_str("composite") == Ok(composite.as_str()))
-                .cloned()
-            else {
-                continue;
-            };
-            let id = doc.get_str("_id").unwrap_or(&composite).to_string();
-            // As ALTER TYPE ... DROP ATTRIBUTE: its stored values lose the
-            // field, and its attnum is left as a dropped slot (RP-158).
-            self.alter_type_attributes(
-                &id,
-                vec![secantus_pgplan::typed_tables::AttributeAction::Drop {
-                    name: field,
-                    if_exists: true,
-                    cascade: true,
-                }],
-            )?;
-        }
-        Ok(())
-    }
-
-    fn drop_domains(&self, names: &[String], if_exists: bool, cascade: bool) -> PgWireResult<()> {
-        let existing = self.domains()?;
-        for name in names {
-            if !existing.iter().any(|d| d.name == *name) {
-                if if_exists {
-                    self.notice(
-                        "00000",
-                        format!(
-                            "type \"{}\" does not exist, skipping",
-                            secantus_pgplan::pgtypes::user_type_catalog_name(name)
-                        ),
-                        None,
-                    );
-                    continue;
-                }
-                return Err(Self::undefined_domain(name));
-            }
-            self.drop_type_signature_dependents(name, cascade)?;
-            let dependents = self.domain_columns(name)?;
-            if !dependents.is_empty() {
-                if !cascade {
-                    let mut info = ErrorInfo::new(
-                        "ERROR".into(),
-                        "2BP01".into(),
-                        format!("cannot drop type {name} because other objects depend on it"),
-                    );
-                    info.detail = Some(
-                        dependents
-                            .iter()
-                            .map(|(t, c)| {
-                                format!("column {c} of table {} depends on type {name}", t.name)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    );
-                    info.hint =
-                        Some("Use DROP ... CASCADE to drop the dependent objects too.".into());
-                    return Err(PgWireError::UserError(Box::new(info)));
-                }
-                let drops: Vec<String> = dependents
-                    .iter()
-                    .map(|(t, c)| format!("column {c} of table {}", t.name))
-                    .collect();
-                self.cascade_notice(&drops);
-                // One ALTER per table: two single-column ALTERs of one table
-                // left the second column behind (read back as NULL).
-                let mut by_table: Vec<(String, Vec<String>)> = Vec::new();
-                for (t, c) in dependents {
-                    match by_table.iter_mut().find(|(n, _)| *n == t.name) {
-                        Some((_, cols)) => cols.push(c),
-                        None => by_table.push((t.name.clone(), vec![c])),
-                    }
-                }
-                for (table, cols) in by_table {
-                    self.execute_inner(
-                        Statement::AlterTable {
-                            table,
-                            missing_ok: false,
-                            actions: cols
-                                .into_iter()
-                                .map(|name| secantus_pgplan::AlterTableAction::DropColumn {
-                                    name,
-                                    if_exists: true,
-                                })
-                                .collect(),
-                        },
-                        0,
-                    )?;
-                }
-            }
-            self.delete_type_doc(Self::DOMAIN_COLLECTION, name)?;
-        }
-        Ok(())
-    }
-
     /// This database's materialized views: `(name, definition, populated)`.
     /// A view's or materialized view's `written_aliases`, where its
     /// document keeps them (one made before they were kept has none).
@@ -24018,6 +23806,10 @@ impl PgHandler {
                         ) {
                             d.insert(field, Bson::Int32(target));
                         }
+                        // The `[]` it was declared with (RP-658).
+                        if let Some(field) = def.field_of("attndims") {
+                            d.insert(field, Bson::Int32(c.ndims()));
+                        }
                         let generated = c.extra.get_str("generated").is_ok();
                         d.insert(
                             def.field_of("atthasdef").expect("column"),
@@ -24150,6 +23942,11 @@ impl PgHandler {
                                 def.field_of("atttypmod").expect("column"),
                                 Bson::Int32(catalog_typmod(c)),
                             );
+                            // A key column's attribute is copied from the
+                            // table's (`ConstructTupleDescriptor`).
+                            if let Some(field) = def.field_of("attndims") {
+                                d.insert(field, Bson::Int32(c.ndims()));
+                            }
                             rows.push(d);
                         }
                     }
@@ -25440,7 +25237,12 @@ impl PgHandler {
                     decode_doc(bytes).map_err(|e| Self::storage_err("could not decode a row", e))?
                 }
             };
-            let secantus_pgplan::ConflictAction::Update { set_exprs, filter } = &oc.action else {
+            let secantus_pgplan::ConflictAction::Update {
+                set_exprs,
+                of_domain,
+                filter,
+            } = &oc.action
+            else {
                 continue; // DO NOTHING: skipped, and not counted.
             };
             // A row this command inserted or updated: PostgreSQL refuses
@@ -25480,7 +25282,14 @@ impl PgHandler {
             for k in &unset {
                 after.remove(k);
             }
-            self.check_row_constraints(def, &after)?;
+            // Only the columns DO UPDATE assigns are coerced; the others are
+            // the existing row's as stored.
+            let assigned: Vec<String> = set_exprs
+                .iter()
+                .map(|(f, ..)| f.clone())
+                .filter(|f| !of_domain.contains(f))
+                .collect();
+            self.check_row_constraints_with(def, &after, DomainChecks::Only(&assigned))?;
             self.check_computed_uniques(def, std::slice::from_ref(&after), &[row_id(&existing)])?;
             self.check_foreign_keys(def, std::slice::from_ref(&after))?;
             let id = row_id(&existing);
@@ -27052,6 +26861,21 @@ fn type_size(ty: &Type) -> i16 {
         Type::NAME => 64,
         _ => -1,
     }
+}
+
+/// The type modifier a result column of `pg_type` carries in the
+/// RowDescription, `typmod` being the column's own (`exprTypmod`).
+///
+/// `SendRowDescriptionMessage` sends a domain as its base type AND the
+/// modifier `getBaseTypeAndTypmod` gives it -- the innermost domain's
+/// `typtypmod`, whatever the column's own was -- so `'ab'::d`, `d` a domain
+/// over `char(3)`, is described `bpchar` 7 as `'ab'::char(3)` is (RP-557).
+/// Only the wire sees through the domain: PostgreSQL's `CREATE TABLE AS`
+/// keeps the domain and its own modifier, -1. The one here reads its
+/// columns back from this description, and so makes the base type with the
+/// domain's width (RP-661).
+fn wire_typmod(pg_type: &str, typmod: i32) -> i32 {
+    secantus_pgplan::domains::base_type_and_typmod(pg_type).map_or(typmod, |(_, m, _)| m)
 }
 
 fn wire_type(pg_type: &str) -> Type {
@@ -37222,16 +37046,21 @@ impl PgHandler {
                 };
                 // The declared width travels with the type: a `char(4)` is
                 // described as 4, which is also what the output padding below
-                // reads. A computed column (a cast or a call) keeps -1.
+                // reads. A computed column (a cast or a call) keeps -1. A
+                // domain goes out with its base type's modifier
+                // (`wire_typmod`).
                 let typmod = match casts.get(i).and_then(|c| c.as_ref()) {
-                    Some(expr) => secantus_pgplan::column_expr_typmod(expr, def),
+                    Some(expr) => wire_typmod(
+                        secantus_pgplan::column_expr_type(expr),
+                        secantus_pgplan::column_expr_typmod(expr, def),
+                    ),
                     None => def
                         .columns
                         .iter()
                         .find(|c| c.field() == *field)
                         .or_else(|| def.column(field))
                         .or_else(|| def.column(out))
-                        .map_or(-1, |c| c.typmod),
+                        .map_or(-1, |c| wire_typmod(&c.pg_type, c.typmod)),
                 };
                 self.field_sourced(out.clone(), ty, typmod, source)
             })
@@ -38102,7 +37931,7 @@ impl PgHandler {
                     .as_ref()
                     .and_then(|m| m.get(i).copied())
                     .unwrap_or(-1);
-                self.field_mod(name.clone(), wire, typmod)
+                self.field_mod(name.clone(), wire, wire_typmod(ty, typmod))
             })
             .collect()
     }
@@ -38124,7 +37953,7 @@ impl PgHandler {
                 .iter()
                 .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field_mod(name.clone(), wire, *typmod)
+                    self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                 })
                 .collect()),
             Statement::ValuesConstant(vc) => Ok(self.values_fields(vc)),
@@ -38233,7 +38062,7 @@ impl PgHandler {
                     .iter()
                     .map(|(name, _, ty, typmod)| {
                         let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                        self.field_mod(name.clone(), wire, *typmod)
+                        self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                     })
                     .collect::<Vec<_>>();
                 let rows = self
@@ -40015,6 +39844,7 @@ impl PgHandler {
                             overriding_system: false,
                             overriding_user: false,
                             source_targets: Vec::new(),
+                            source_domains: Vec::new(),
                         }),
                         max_rows,
                     );
@@ -40040,9 +39870,24 @@ impl PgHandler {
                 let def = self
                     .lookup_ref(&ins.table)
                     .ok_or_else(|| Self::err(&PlanError::UndefinedTable(ins.table.clone())))?;
+                // The domain columns whose source value is already of their
+                // domain: no coercion, so not checked (RP-664).
+                let mut of_domain: Vec<String> = Vec::new();
                 // `INSERT ... SELECT`: read the query's rows first, then write
                 // them exactly as a VALUES list would be written.
                 if let Some(source) = ins.source.take() {
+                    for (target, src) in ins.targets.iter().zip(&ins.source_domains) {
+                        let (Some(col), Some(src)) = (def.column(target), src) else {
+                            continue;
+                        };
+                        if col
+                            .extra
+                            .get_str("domain_type")
+                            .is_ok_and(|d| secantus_pgplan::domains::same_domain(src, d))
+                        {
+                            of_domain.push(col.field());
+                        }
+                    }
                     let mut source_types = self.check_insert_select_types(&def, &ins, &source)?;
                     // With user casts installed, the source's column types
                     // decide whether an assignment cast converts a value.
@@ -40102,14 +39947,33 @@ impl PgHandler {
                 // BEFORE triggers see each row with its defaults, and may
                 // rewrite or drop it before any constraint is checked.
                 let triggered = self.has_triggers(&ins.table)?;
+                // With BEFORE triggers, the domain fields each row is checked
+                // in afterwards: the ones its triggers changed.
+                let mut trigger_changed: Option<Vec<Vec<String>>> = None;
                 if triggered {
                     self.fire_statement_triggers(&ins.table, "BEFORE", "INSERT")?;
-                    ins.rows = self.before_insert_rows(&def, std::mem::take(&mut ins.rows))?;
+                    // A value is coerced into its domain, and checked, where
+                    // the row is formed: before a trigger sees it (RP-664).
+                    for row in &ins.rows {
+                        self.check_domains(&def, row, DomainChecks::Except(&of_domain))?;
+                    }
+                    let formed = std::mem::take(&mut ins.rows);
+                    let fired = self.before_insert_rows_from(&def, formed.clone())?;
+                    let mut changed = Vec::with_capacity(fired.len());
+                    for (i, row) in fired {
+                        changed.push(Self::changed_domain_fields(&def, &formed[i], &row));
+                        ins.rows.push(row);
+                    }
+                    trigger_changed = Some(changed);
                 }
                 // Every constraint is checked BEFORE the first write, so a
                 // violation on any row leaves none of them inserted.
-                for row in &ins.rows {
-                    self.check_row_constraints(&def, row)?;
+                for (n, row) in ins.rows.iter().enumerate() {
+                    let domains = match &trigger_changed {
+                        Some(changed) => DomainChecks::Only(&changed[n]),
+                        None => DomainChecks::Except(&of_domain),
+                    };
+                    self.check_row_constraints_with(&def, row, domains)?;
                     self.check_view_conditions(&def, row, &ins.view_checks)?;
                     self.check_partition_route(&def, row)?;
                 }
@@ -41694,6 +41558,25 @@ impl PgHandler {
                 self.ensure_collection(Self::ENUM_COLLECTION)?;
                 self.ensure_collection(Self::COMPOSITE_COLLECTION)?;
                 self.ensure_collection(Self::RANGE_COLLECTION)?;
+                // The user types the statement names that exist: a DROP of
+                // several goes through one dependency walk
+                // (`performMultipleDeletions`), so what depends on one of
+                // them is refused, or cascaded to, once, and one of them
+                // over another is not a dependent of it (RP-607).
+                let domains = self.domains()?;
+                let mut targets: Vec<String> = Vec::new();
+                for name in &names {
+                    let exists = domains.iter().any(|d| d.name == *name)
+                        || self.enums()?.iter().any(|(n, _, _)| n == name)
+                        || self.composites()?.iter().any(|(n, _, _)| n == name)
+                        || self.ranges()?.iter().any(|(n, _, _)| n == name);
+                    if exists && !targets.contains(name) {
+                        targets.push(name.clone());
+                    }
+                }
+                if targets.len() > 1 {
+                    self.drop_type_value_dependents(&targets, &targets, cascade)?;
+                }
                 for name in &names {
                     // A bare built-in name is pg_catalog's type, even beside a
                     // `public` one of that name (measured on 15.19).
@@ -41788,7 +41671,14 @@ impl PgHandler {
                         return Err(PgWireError::UserError(Box::new(info)));
                     }
                     // Columns, domains and composite fields of the type.
-                    self.drop_type_value_dependents(name, cascade)?;
+                    self.drop_type_value_dependents(std::slice::from_ref(name), &targets, cascade)?;
+                    // DROP TYPE drops a domain as DROP DOMAIN does.
+                    let from_domain = if domains.iter().any(|d| d.name == *name) {
+                        self.delete_type_doc(Self::DOMAIN_COLLECTION, name)?;
+                        1
+                    } else {
+                        0
+                    };
                     // A `public` type named after a built-in is keyed by its
                     // qualified name or its bare one, by kind.
                     let bare = name.strip_prefix("public.").unwrap_or(name);
@@ -41841,7 +41731,7 @@ impl PgHandler {
                     if from_range > 0 {
                         self.note_uncommitted_type(Self::RANGE_COLLECTION, name, None);
                     }
-                    let removed = from_enum + from_comp + from_range;
+                    let removed = from_enum + from_comp + from_range + from_domain;
                     if removed == 0 {
                         if if_exists {
                             self.notice(
@@ -45600,7 +45490,7 @@ impl PgHandler {
                         .iter()
                         .map(|(name, _, ty, typmod)| {
                             let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                            self.field_mod(name.clone(), wire, *typmod)
+                            self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                         })
                         .collect::<Vec<_>>(),
                 );
@@ -45671,7 +45561,10 @@ impl PgHandler {
                             // padded type, and the encoder pads on the way out.
                             let typmod = match col {
                                 OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
-                                OutputCol::Group(i) => agg.group_by[*i].typmod,
+                                OutputCol::Group(i) => {
+                                    let g = &agg.group_by[*i];
+                                    wire_typmod(&g.pg_type, g.typmod)
+                                }
                                 OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                             };
                             self.field_mod(name.clone(), ty, typmod)
@@ -45780,6 +45673,17 @@ impl PgHandler {
                     }
                     _ => Vec::new(),
                 };
+                // The domain columns the SET list coerces into their domain:
+                // those it assigns a value not already of the domain. The
+                // others are stored as they were, and not checked (RP-664).
+                let coerced: Vec<String> = upd
+                    .set
+                    .keys()
+                    .cloned()
+                    .chain(upd.set_exprs.iter().map(|(f, ..)| f.clone()))
+                    .chain(upd.set_subscripts.iter().map(|a| a.field.clone()))
+                    .filter(|f| !upd.of_domain.contains(f))
+                    .collect();
                 if triggered {
                     self.fire_statement_triggers(&upd.table, "BEFORE", "UPDATE")?;
                 }
@@ -45831,6 +45735,11 @@ impl PgHandler {
                                 .map_err(|e| Self::err(&e))?
                         };
                         let mut rekeyed: Option<Document> = None;
+                        // The domain fields checked against the row as
+                        // written: the SET list's coerced ones, or -- with a
+                        // BEFORE trigger, which sees them checked already --
+                        // the ones the trigger changed.
+                        let mut checked = std::borrow::Cow::Borrowed(coerced.as_slice());
                         if def.is_some() || upd.returning.is_some() {
                             let mut after = row.clone();
                             for (k, v) in &set {
@@ -45843,12 +45752,26 @@ impl PgHandler {
                                 // A BEFORE trigger may skip the row or
                                 // rewrite it; the write is then the whole
                                 // row it returned.
+                                // A value is coerced into its domain, and
+                                // checked, where the SET list is evaluated:
+                                // before the trigger sees the row (RP-664).
+                                self.check_domains(def, &after, DomainChecks::Only(&coerced))?;
+                                let planned = after.clone();
+                                checked = std::borrow::Cow::Owned(Vec::new());
                                 let Some(fired) =
                                     self.before_update_row(def, &targets, &row, after)?
                                 else {
                                     continue;
                                 };
                                 after = fired;
+                                for c in &def.columns {
+                                    let f = c.field();
+                                    if c.extra.get_str("domain_type").is_ok()
+                                        && after.get(&f) != planned.get(&f)
+                                    {
+                                        checked.to_mut().push(f);
+                                    }
+                                }
                                 set = Document::new();
                                 for (k, v) in &after {
                                     if k != "_id" && !k.starts_with("_id.") {
@@ -45902,7 +45825,11 @@ impl PgHandler {
                                         }
                                     }
                                 }
-                                self.check_row_constraints(def, &after)?;
+                                self.check_row_constraints_with(
+                                    def,
+                                    &after,
+                                    DomainChecks::Only(&checked),
+                                )?;
                                 self.check_view_conditions(def, &after, &view_checks)?;
                                 self.check_partition_route(def, &after)?;
                             }
@@ -46536,6 +46463,33 @@ impl PgHandler {
 /// Whether an UPDATE of `def` must look at each row it writes: a NOT NULL
 /// column, a domain column, a CHECK, or a FOREIGN KEY can all be violated by
 /// the new value.
+/// Which domain columns of a row being written are checked against their
+/// domain. PostgreSQL checks a domain where a value is COERCED into it
+/// (`coerce_to_domain`, run by the expression the write evaluates): a
+/// column an UPDATE does not assign is stored as it was, and a value
+/// already of the column's domain is no coercion, so neither checks
+/// anything. A row stored before a CHECK added `NOT VALID` can therefore
+/// still be updated and copied (RP-664).
+#[derive(Clone, Copy)]
+pub(crate) enum DomainChecks<'a> {
+    /// Every domain column: each value was coerced (VALUES, COPY, defaults).
+    All,
+    /// Every domain column but these stored fields.
+    Except(&'a [String]),
+    /// Only these stored fields.
+    Only(&'a [String]),
+}
+
+impl DomainChecks<'_> {
+    fn checks(&self, field: &str) -> bool {
+        match self {
+            Self::All => true,
+            Self::Except(f) => !f.iter().any(|x| x == field),
+            Self::Only(f) => f.iter().any(|x| x == field),
+        }
+    }
+}
+
 fn table_has_row_constraints(def: &TableDef) -> bool {
     // A partitioned table routes each written row.
     partition::is_partitioned(def)
@@ -46896,14 +46850,51 @@ impl PgHandler {
     /// order: every NOT NULL column first, then the CHECK constraints by
     /// name. A CHECK that evaluates to NULL passes (SQL's rule).
     fn check_row_constraints(&self, def: &TableDef, row: &Document) -> PgWireResult<()> {
-        // A domain column's value is coerced into the domain -- and checked
-        // against it -- before any table constraint runs.
+        self.check_row_constraints_with(def, row, DomainChecks::All)
+    }
+
+    /// The domain columns of `row` that `domains` names, each against its
+    /// domain's NOT NULL and CHECKs.
+    fn check_domains(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        domains: DomainChecks<'_>,
+    ) -> PgWireResult<()> {
         for c in &def.columns {
             if let Ok(domain) = c.extra.get_str("domain_type") {
+                if !domains.checks(&c.field()) {
+                    continue;
+                }
                 let v = row.get(c.field()).cloned().unwrap_or(Bson::Null);
                 secantus_pgplan::domains::domain_check(domain, &v).map_err(|e| Self::err(&e))?;
             }
         }
+        Ok(())
+    }
+
+    /// The stored fields of `def`'s domain columns whose value differs
+    /// between `before` and `after`.
+    fn changed_domain_fields(def: &TableDef, before: &Document, after: &Document) -> Vec<String> {
+        def.columns
+            .iter()
+            .filter(|c| c.extra.get_str("domain_type").is_ok())
+            .map(|c| c.field())
+            .filter(|f| before.get(f) != after.get(f))
+            .collect()
+    }
+
+    /// `check_row_constraints`, checking only the domain columns `domains`
+    /// says the write coerced into their domain.
+    pub(crate) fn check_row_constraints_with(
+        &self,
+        def: &TableDef,
+        row: &Document,
+        domains: DomainChecks<'_>,
+    ) -> PgWireResult<()> {
+        // A domain column's value is coerced into the domain -- and checked
+        // against it -- before any table constraint runs.
+        self.check_domains(def, row, domains)?;
         for c in &def.columns {
             // A PRIMARY KEY column is NOT NULL, the single-column key (the
             // document's `_id`) included: a row written without one would
@@ -47308,7 +47299,8 @@ impl PgHandler {
                 for (k, v) in &set {
                     r.insert(k.clone(), v.clone());
                 }
-                self.check_row_constraints(child, &r)?;
+                // Only the key columns the action assigns are coerced.
+                self.check_row_constraints_with(child, &r, DomainChecks::Only(fields))?;
                 after.push(r);
             }
             if fk.ref_table == child.name || matches!(action, Some("SET DEFAULT")) {
@@ -53347,7 +53339,7 @@ impl PgHandler {
                         let typmod = def
                             .as_ref()
                             .and_then(|d| d.columns.get(i))
-                            .map_or(-1, |c| c.typmod);
+                            .map_or(-1, |c| wire_typmod(&c.pg_type, c.typmod));
                         f.with_type_modifier(typmod)
                     })
                     .collect()
@@ -53417,7 +53409,10 @@ impl PgHandler {
                     };
                     let typmod = match col {
                         OutputCol::Agg(i) => aggregate_result_typmod(&agg.items[*i]),
-                        OutputCol::Group(i) => agg.group_by[*i].typmod,
+                        OutputCol::Group(i) => {
+                            let g = &agg.group_by[*i];
+                            wire_typmod(&g.pg_type, g.typmod)
+                        }
                         OutputCol::Expr(_) | OutputCol::Grouping(_) => -1,
                     };
                     self.field_mod(name.clone(), ty, typmod)
@@ -53437,7 +53432,7 @@ impl PgHandler {
                 .iter()
                 .map(|(name, _, ty, typmod)| {
                     let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                    self.field_mod(name.clone(), wire, *typmod)
+                    self.field_mod(name.clone(), wire, wire_typmod(ty, *typmod))
                 })
                 .collect(),
             Statement::ValuesConstant(vc) => self.values_fields(&vc),

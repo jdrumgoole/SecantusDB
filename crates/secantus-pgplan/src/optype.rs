@@ -15,6 +15,7 @@
 
 use super::*;
 
+mod regclass;
 mod sortable;
 
 pub(crate) use sortable::using_to_direction;
@@ -1744,11 +1745,24 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
     }
     match node {
         N::AExpr(e) => {
-            check_aexpr(e, scope)?;
+            if let Err(refused) = check_aexpr(e, scope) {
+                // `transformAExprOp` transforms the operands before it
+                // looks the operator up, so a literal among them that is
+                // no relation is the error first (RP-458).
+                let location = take_error_location();
+                for s in e.lexpr.iter().chain(e.rexpr.iter()) {
+                    regclass::scan(s, scope)?;
+                }
+                if let Some(l) = location {
+                    set_error_location(l);
+                }
+                return Err(refused);
+            }
             for s in e.lexpr.iter().chain(e.rexpr.iter()) {
                 walk(s, scope, cx)?;
             }
         }
+        N::ColumnRef(c) => regclass::note_reference(c, scope),
         N::BoolExpr(b) => {
             for a in &b.args {
                 bool_argument(b, a, scope)?;
@@ -1771,6 +1785,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
         // PostgreSQL when no cast applies, so it is a missing function
         // instead (`func_cast` marks the casts it builds with location -1).
         N::TypeCast(tc) => {
+            regclass::cast(tc, scope)?;
             if let (Some(arg), Some(tn)) = (tc.arg.as_deref(), tc.type_name.as_ref()) {
                 let target = type_name_of(tn);
                 if let Some(e) = operand_type(arg, scope).and_then(|source| {
@@ -2068,6 +2083,7 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
             for a in &f.args {
                 walk(a, scope, cx)?;
             }
+            regclass::arguments(f, scope)?;
         }
         // A FROM subquery sees the outer query only when it is LATERAL.
         N::RangeSubselect(rs) => {
@@ -2081,7 +2097,9 @@ fn walk(n: &pg_query::protobuf::Node, scope: &Scope, cx: &Cx) -> Result<()> {
                 column_notation_on_base_type(ind, arg, scope)?;
             }
         }
-        _ => {}
+        // An expression this walk does not descend into (an `ARRAY[...]`,
+        // a `ROW(...)`, an `IS TRUE`) is still transformed by PostgreSQL.
+        _ => regclass::scan(n, scope)?,
     }
     Ok(())
 }
@@ -2641,7 +2659,7 @@ fn walk_other_clauses(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Re
 
 /// 42883 for a comparison with no operator between its operands' types.
 pub(crate) fn check(node: &N, lookup: &dyn Fn(&str) -> Option<TableDef>) -> Result<()> {
-    check_in(node, &[], lookup)
+    regclass::analysing(|| check_in(node, &[], lookup))
 }
 
 /// [`check`] with the CTEs of an enclosing WITH in view: a data-modifying

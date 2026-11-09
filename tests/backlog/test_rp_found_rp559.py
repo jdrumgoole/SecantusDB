@@ -1,6 +1,7 @@
 """Gap tests of the divergences found while working RP-559 (an array of a
-domain is of the domain's array type): an array built from a domain-typed
-COLUMN is typed by the column's base type, and RP-570 (a cast to a
+domain is of the domain's array type): RP-569 (an array built from a
+domain-typed COLUMN was typed by the column's base type, fixed: the column
+is cast to its domain where an array shows its type), and RP-570 (a cast to a
 domain's array did not apply the base type's modifier to its elements,
 fixed: from text each element is read through the domain's input at its
 modifier, from an array each is cast explicitly).
@@ -73,7 +74,7 @@ COLUMN_ARRAYS = {
 }
 
 
-@pytest.mark.backlog("RP-569")
+@pytest.mark.backlog_fixed("RP-569")
 @pytest.mark.parametrize("query", list(COLUMN_ARRAYS))
 def test_array_of_domain_column(query: str, dsn: str) -> None:
     domain, values = COLUMN_ARRAYS[query]

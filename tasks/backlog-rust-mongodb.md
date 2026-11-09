@@ -2546,21 +2546,6 @@ dropped (four), and `listIndexes` lists by name.
   Backlog-ID: RM-115
   Verify: none -- local gpg lock, environment
 
-- [ ] **NOT REPRODUCED -- left open as a watch item. The batch lander's
-  `sleep 300` slept 63 minutes once (2026-11-08).** `scripts/land_batch.sh`
-  polls `rm-batch` every 300 s while the batch runs. On 2026-11-08 its
-  `sleep 300` (started 21:20:18 by the detached lander, pid 46959) was
-  still sleeping at 22:23, so RM-072's commit (on `rm-batch` at 22:02) got
-  no snapshot PR until the sleep was killed by hand. The fix-one sessions
-  running beside it on the same machine kept working, so the machine was
-  not asleep. A suspect is macOS throttling the timers of a detached
-  background process (App Nap, timer coalescing), but that was not shown.
-  On a recurrence, capture `ps -o stat,lstart,etime` of the sleep, the
-  lander's `taskinfo` / QoS, and `pmset -g log` around the stall. A
-  wall-clock deadline checked every few seconds would bound the delay
-  whatever the cause.
-  Backlog-ID: RM-443
-  Verify: none -- intermittent, not reproduced; tooling (the batch lander), no server behaviour
 - [ ] **NOT REPRODUCED -- left open as a watch item. `test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
   timed out ONCE (2026-09-30).** It passed in every full-suite run of the
   2026-10-07 batch (14,500+ tests under `-n auto`). Its nested collect-only pytest hit the 300s

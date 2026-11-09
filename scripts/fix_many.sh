@@ -67,6 +67,18 @@ backlog=${1:?usage: $0 [-j N] [-i BRANCH] [-l IDS] <postgres|mongodb> <count>}
 count=${2:?usage: $0 [-j N] [-i BRANCH] [-l IDS] <postgres|mongodb> <count>}
 
 cd "$(dirname "$0")/.."
+# Keep the Mac awake while this runs. An idle Mac on AC power drops into
+# "Maintenance Sleep" for 10-20 minutes at a time, and every process stops
+# with it: on 2026-11-08 a lander's `sleep 300` came back after 63 minutes
+# and the fix-one sessions beside it stalled the same way (RM-443, from
+# `pmset -g log`). `-i` alone was not enough: once the Mac had slept, it
+# kept going "back to sleep" from each short dark wake (`Sleep Service Back
+# to Sleep`), which only `-s` (no system sleep, honoured on AC power) stops.
+# `caffeinate -i -s -w $$` holds both until this script exits, and does
+# nothing where caffeinate is not installed.
+if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i -s -w $$ &
+fi
 out=.scratch/fix_many
 mkdir -p "$out"
 rm -f "$out/STOP"
@@ -77,6 +89,12 @@ if [[ -n $into ]]; then
     [[ $into == main ]] && { echo "-i main: use the default mode" >&2; exit 2; }
     git fetch -q origin
     if ! git ls-remote --exit-code --heads origin "$into" >/dev/null; then
+        git push -q origin "origin/main:refs/heads/$into" || exit 1
+    elif git merge-base --is-ancestor "origin/$into" origin/main; then
+        # Everything on it has landed: start the batch from main, or the lanes
+        # base on the last batch's tip and miss what main gained since (batch
+        # 13, 2026-11-08: the Backlog-ID reservation in tools/backlog.py).
+        # A fast-forward, so a branch with unlanded work is never touched.
         git push -q origin "origin/main:refs/heads/$into" || exit 1
     fi
 fi

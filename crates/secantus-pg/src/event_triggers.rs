@@ -368,6 +368,7 @@ impl PgHandler {
                     pg_type,
                     typmod,
                     using,
+                    ..
                 } => {
                     let Some(col) = def.column(column) else {
                         continue;
