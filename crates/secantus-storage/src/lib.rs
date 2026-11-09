@@ -17925,19 +17925,31 @@ impl Storage {
     ///
     /// The Python server takes no claims, and removes both markers when it
     /// opens a store, so the walk runs again after it has had the store.
+    ///
+    /// The marker's value is the `collation::KEY_FORMAT` the claims were
+    /// keyed by (0, written before 2026-11-09, is format 1: ICU4X's keys).
+    /// Under any other format the claims are not where a write looks for
+    /// them, so they are dropped and the walk taken again.
     fn backfill_collated_id_claims(&self) -> Result<()> {
         const DONE: &str = "$collated_id_claims";
         const CHUNK: usize = 500;
+        let format = i64::from(secantus_core::collation::KEY_FORMAT);
         let session = self.conn.open_session()?;
-        {
+        let stale = {
             let marker = session.open_cursor(UNIQ_TABLE, None)?;
             marker.set_key_sssu("", "", DONE, b"");
             match marker.search() {
-                Ok(()) => return Ok(()),
-                Err(e) if e.is_not_found() => {}
+                Ok(()) => {
+                    let found = marker.get_value_q()?;
+                    if (if found == 0 { 1 } else { found }) == format {
+                        return Ok(());
+                    }
+                    true
+                }
+                Err(e) if e.is_not_found() => false,
                 Err(e) => return Err(e.into()),
             }
-        }
+        };
         let mut collections: Vec<(String, String, Collation)> = Vec::new();
         {
             let cur = session.open_cursor(COLL_TABLE, None)?;
@@ -17951,6 +17963,18 @@ impl Storage {
                     }
                 }
                 more = cur.next()?;
+            }
+        }
+        if stale {
+            for (db, coll, _) in &collections {
+                session.begin_transaction(None)?;
+                match self.purge_unique_claims(&session, db, coll, Some(ID_INDEX_NAME)) {
+                    Ok(()) => commit_stamped(&session, &self.oplog, self.timestamped)?,
+                    Err(e) => {
+                        let _ = session.rollback_transaction(None);
+                        return Err(e);
+                    }
+                }
             }
         }
         let key_spec = bson::doc! {"_id": 1};
@@ -18001,7 +18025,7 @@ impl Storage {
         let written = (|| -> Result<()> {
             let marker = session.open_cursor(UNIQ_TABLE, None)?;
             marker.set_key_sssu("", "", DONE, b"");
-            marker.set_value_q(0);
+            marker.set_value_q(format);
             marker.insert()?;
             Ok(())
         })();
@@ -27267,6 +27291,85 @@ mod tests {
             )
             .unwrap();
         assert_eq!(errors.len(), 1, "{errors:?}");
+    }
+
+    /// Collated `_id` claims keyed by an older `collation::KEY_FORMAT` (ICU4X's
+    /// bytes, before 2026-11-09, under a marker of 0) are not where a write
+    /// looks: the open drops them and claims again under this format's keys,
+    /// so a second spelling is still refused and no stale claim is left.
+    #[test]
+    fn open_rekeys_collated_id_claims_of_an_older_key_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        {
+            let st = Storage::open(home).unwrap();
+            st.create_collection_with_options(
+                "app",
+                "k",
+                &doc! {"collation": {"locale": "en", "strength": 2i32}},
+            )
+            .unwrap();
+            st.insert(
+                "app",
+                "k",
+                vec![encode_doc(&doc! {"_id": "a"}).unwrap()],
+                true,
+            )
+            .unwrap();
+        }
+        // ICU4X keyed "a" at strength 2 as 2b0105; ICU 57.1 as 290105.
+        let old_key = escape_kb(&[0x2b, 0x01, 0x05]);
+        {
+            let conn = Connection::open(home, DEFAULT_CONFIG).unwrap();
+            let sess = conn.open_session().unwrap();
+            let _raw = untimestamped(&sess);
+            let scan = sess.open_cursor(UNIQ_TABLE, None).unwrap();
+            let edit = sess.open_cursor(UNIQ_TABLE, None).unwrap();
+            let mut rows = Vec::new();
+            let mut more = scan.next().unwrap();
+            while more {
+                let (d, c, n, k) = scan.get_key_sssu().unwrap();
+                rows.push((d, c, n, k, scan.get_value_q().unwrap()));
+                more = scan.next().unwrap();
+            }
+            for (d, c, n, k, rid) in rows {
+                if c == "k" {
+                    edit.set_key_sssu(&d, &c, &n, &k);
+                    edit.remove().unwrap();
+                    edit.set_key_sssu(&d, &c, &n, &old_key);
+                    edit.set_value_q(rid);
+                    edit.insert().unwrap();
+                } else if n == "$collated_id_claims" {
+                    edit.set_key_sssu(&d, &c, &n, &k);
+                    edit.set_value_q(0);
+                    edit.insert().unwrap();
+                }
+            }
+        }
+        let st = Storage::open(home).unwrap();
+        let (_, errors) = st
+            .insert(
+                "app",
+                "k",
+                vec![encode_doc(&doc! {"_id": "A"}).unwrap()],
+                true,
+            )
+            .unwrap();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        let sess = st.conn.open_session().unwrap();
+        let cur = sess.open_cursor(UNIQ_TABLE, None).unwrap();
+        cur.set_key_sssu("app", "k", ID_INDEX_NAME, &old_key);
+        assert!(
+            cur.search().unwrap_err().is_not_found(),
+            "the stale claim is left"
+        );
+        cur.reset().unwrap();
+        cur.set_key_sssu("", "", "$collated_id_claims", b"");
+        cur.search().unwrap();
+        assert_eq!(
+            cur.get_value_q().unwrap(),
+            i64::from(secantus_core::collation::KEY_FORMAT)
+        );
     }
 
     /// A clustered collection's own `expireAfterSeconds` expires a document

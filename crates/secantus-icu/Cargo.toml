@@ -1,0 +1,23 @@
+[package]
+name = "secantus-icu"
+version = "0.5.3-beta.196"
+edition = "2021"
+description = "The ICU 57.1 collator mongod 8.2 links, built from mongo's own copy of the sources and data. Internal to SecantusDB: no semver promise."
+license = "GPL-2.0-only AND ICU"
+repository = "https://github.com/jdrumgoole/SecantusDB"
+links = "secantus_icu"
+build = "build.rs"
+# In a checkout the sources are the repository's vendor/icu4c-57.1; a packaged
+# crate carries its own copy (scripts/crates_package_check.py writes it).
+include = ["build.rs", "src/**", "shim/**", "icu4c-57.1/**", "README.md"]
+
+rust-version = "1.98"
+readme = "README.md"
+keywords = ["icu", "collation", "mongodb", "ffi"]
+categories = ["external-ffi-bindings", "internationalization"]
+
+[lib]
+name = "secantus_icu"
+
+[build-dependencies]
+cc = "1"

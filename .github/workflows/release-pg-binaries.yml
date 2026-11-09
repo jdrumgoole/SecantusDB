@@ -247,6 +247,9 @@ jobs:
           mkdir -p "$stem"
           cp "$BIN" "$stem/secantusd-pg"
           cp LICENSE README.md "$stem/"
+          # ICU 57.1 is linked in (crates/secantus-icu); its licence asks
+          # for its notice to travel with the binary.
+          cp vendor/icu4c-57.1/LICENSE "$stem/LICENSE-ICU"
           if command -v shasum >/dev/null 2>&1; then
             sha() { shasum -a 256 "$1"; }
           else

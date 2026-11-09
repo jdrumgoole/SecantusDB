@@ -274,6 +274,8 @@ Why batches: nine
   - `tests/test_no_tracked_build_output.py` fails on a tracked cargo target
     directory or any tracked file over 8 MB. Run it when in doubt; do not
     raise its limit to get something in.
-  - The one binary that IS committed on purpose is the PGO profile,
-    `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling). Adding
-    another needs Joe's say-so.
+  - The binaries that ARE committed on purpose: the PGO profile,
+    `crates/pgo/_secantus_server.profdata.tar.gz` (see Tooling), and mongo's
+    trimmed ICU data, `vendor/icu4c-57.1/source/mongo_sources/icudt57l.dat`
+    and `icudt57b.dat` (Joe, 2026-11-09: mongod's own data, built into
+    `crates/secantus-icu`). Adding another needs Joe's say-so.

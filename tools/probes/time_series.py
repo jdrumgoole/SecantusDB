@@ -799,14 +799,12 @@ def typed(v):
 #: between patch releases of mongod, so the list is compared as a set.
 TYPE_LIST = re.compile(r"expected types '\[([^\]]*)\]'")
 UUID = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
-#: A collation sort key, as a duplicate-key error quotes it. mongod's ICU and
-#: ICU4X order strings alike and number the weights differently, so the bytes
-#: are not compared -- only that a key is reported.
-SORT_KEY = re.compile(r"CollationKey\(0x[0-9a-f]+\)")
+#: A collation sort key, as a duplicate-key error quotes it, is compared byte
+#: for byte: both servers make it with ICU 57.1 and mongo's data (RM-095).
 
 
 def scrub(text):
-    return SORT_KEY.sub("CollationKey(...)", UUID.sub("<uuid>", text))
+    return UUID.sub("<uuid>", text)
 
 
 def sorted_types(match):

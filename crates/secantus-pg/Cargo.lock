@@ -2291,16 +2291,19 @@ dependencies = [
  "chrono",
  "fancy-regex",
  "geo",
- "icu_collator",
- "icu_collator_data",
- "icu_locale_core",
- "icu_normalizer",
- "icu_provider",
  "libc",
  "rand 0.9.5",
  "regex",
  "regex-automata",
+ "secantus-icu",
  "snap",
+]
+
+[[package]]
+name = "secantus-icu"
+version = "0.5.3-beta.196"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

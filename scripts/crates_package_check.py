@@ -44,6 +44,7 @@ CRATES = REPO / "crates"
 MDB_ORDER = (
     "secantus-wiredtiger-sys",
     "secantus-wt",
+    "secantus-icu",
     "secantus-core",
     "secantus-auth",
     "secantus-wire",
@@ -66,6 +67,7 @@ PG_ORDER = (
 PG_NEEDS = (
     "secantus-wiredtiger-sys",
     "secantus-wt",
+    "secantus-icu",
     "secantus-core",
     "secantus-auth",
     "secantus-storage",
@@ -89,6 +91,10 @@ def _stage(dest: Path, order: tuple[str, ...]) -> None:
             dest / name,
             ignore=lambda d, names: [n for n in names if n in SKIP_DIRS or n == "Cargo.lock"],
         )
+        if name == "secantus-icu":
+            # In a checkout build.rs reads the repository's vendor/ copy; a
+            # packaged crate has to carry its own (`include` names it).
+            shutil.copytree(REPO / "vendor" / "icu4c-57.1", dest / name / "icu4c-57.1")
         manifest = dest / name / "Cargo.toml"
         # Each WiredTiger-linked crate declares its own empty [workspace] so it
         # stays out of crates/Cargo.toml; inside the staging workspace that

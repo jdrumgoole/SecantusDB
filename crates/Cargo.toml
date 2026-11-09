@@ -31,6 +31,7 @@
 resolver = "2"
 members = [
     "secantus-core",
+    "secantus-icu",
     "secantus-core-py",
     "secantus-wire",
     "secantus-commands",

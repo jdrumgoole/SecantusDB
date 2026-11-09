@@ -1,17 +1,11 @@
 //! Collation: string comparison by language rules, as `mongod` does it.
 //!
-//! `mongod` hands every collated comparison to ICU. This module hands it to
-//! ICU4X (`icu_collator`), which implements the same algorithm (UCA with CLDR
-//! tailorings) in Rust. Measured against `mongod` 8.2.11 on 2026-10-10 over
-//! 157 strings and 40 collations (every option, 24 locales), the two put the
-//! strings in the same order and the same equivalence classes, with one
-//! exception recorded in `tasks/backlog-rust-mongodb.md`: ICU4X always treats canonically
-//! equivalent strings as equal, where `mongod` with `normalization: false`
-//! (the default) tells `"ö\u{323}"` from `"o\u{323}\u{308}"`.
-//!
-//! `mongod` 8.2 links ICU 57.1 and ICU4X carries newer CLDR data, so a
-//! character added to Unicode since, or a tailoring CLDR has revised, can
-//! order differently. Nothing here claims otherwise.
+//! `mongod` hands every collated comparison to ICU 57.1, and so does this
+//! module: `secantus-icu` builds mongo's own copy of ICU and its trimmed data
+//! (`vendor/icu4c-57.1`, from mongo r8.2.11). Which locales exist, what each
+//! option defaults to, how strings order and the bytes of a sort key are
+//! therefore ICU's answers, reached through the calls mongod makes
+//! (`collator_factory_icu.cpp`, `collator_interface_icu.cpp`).
 //!
 //! Three things live here:
 //!
@@ -26,192 +20,26 @@
 //!   `{$eq: ["a", "A"]}` sees the collation without every expression operator
 //!   taking a parameter.
 
-mod iso3;
-
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use bson::{Bson, Document};
-use icu_collator::options::{AlternateHandling, CaseLevel, CollatorOptions, MaxVariable, Strength};
-use icu_collator::preferences::{CollationCaseFirst, CollationNumericOrdering};
-use icu_collator::provider::{
-    Baked, CollationDiacriticsV1, CollationJamoV1, CollationMetadata, CollationMetadataV1,
-    CollationReorderingV1, CollationRootV1, CollationSpecialPrimariesV1, CollationTailoringV1,
-};
-use icu_collator::{Collator, CollatorPreferences};
-use icu_normalizer::provider::{NormalizerNfdDataV1, NormalizerNfdTablesV1};
-use icu_provider::prelude::*;
+use secantus_icu::{reorder, value, Attribute, Collator, Opened};
 
 /// The collator version `mongod` 8.2 reports and requires (its ICU).
-pub const MONGOD_COLLATOR_VERSION: &str = "57.1";
+pub const MONGOD_COLLATOR_VERSION: &str = secantus_icu::ICU_VERSION;
 
 /// What an on-disk index entry's collation keys were made with. Bump it when
-/// `icu_collator` or its data changes the bytes of a sort key, and rebuild the
-/// indexes that carry the older number.
-pub const KEY_FORMAT: i32 = 1;
+/// the collator changes the bytes of a sort key, and rebuild the indexes that
+/// carry the older number. 1 was ICU4X's keys; 2 (2026-11-09) is ICU 57.1's,
+/// mongod's own bytes.
+pub const KEY_FORMAT: i32 = 2;
 
-/// Every locale `mongod` 8.2.11 accepts, found by asking it for each one
-/// (all two- and three-letter languages, then each with every script and
-/// region). `simple` is separate: it means no collation at all.
-const LOCALES: &[&str] = &[
-    "af",
-    "am",
-    "ar",
-    "as",
-    "az",
-    "be",
-    "bg",
-    "bn",
-    "bo",
-    "bs",
-    "bs_Cyrl",
-    "ca",
-    "chr",
-    "cs",
-    "cy",
-    "da",
-    "de",
-    "de_AT",
-    "dsb",
-    "dz",
-    "ee",
-    "el",
-    "en",
-    "en_US",
-    "en_US_POSIX",
-    "eo",
-    "es",
-    "et",
-    "fa",
-    "fa_AF",
-    "fi",
-    "fil",
-    "fo",
-    "fr",
-    "fr_CA",
-    "ga",
-    "gl",
-    "gu",
-    "ha",
-    "haw",
-    "he",
-    "hi",
-    "hr",
-    "hsb",
-    "hu",
-    "hy",
-    "id",
-    "ig",
-    "is",
-    "it",
-    "ja",
-    "ka",
-    "kk",
-    "kl",
-    "km",
-    "kn",
-    "ko",
-    "kok",
-    "ky",
-    "lb",
-    "lkt",
-    "ln",
-    "lo",
-    "lt",
-    "lv",
-    "mk",
-    "ml",
-    "mn",
-    "mr",
-    "ms",
-    "mt",
-    "my",
-    "nb",
-    "ne",
-    "nl",
-    "nn",
-    "om",
-    "or",
-    "pa",
-    "pl",
-    "ps",
-    "pt",
-    "ro",
-    "ru",
-    "se",
-    "si",
-    "sk",
-    "sl",
-    "smn",
-    "sq",
-    "sr",
-    "sr_Latn",
-    "sv",
-    "sw",
-    "ta",
-    "te",
-    "th",
-    "to",
-    "tr",
-    "ug",
-    "uk",
-    "ur",
-    "vi",
-    "wae",
-    "yi",
-    "yo",
-    "zh",
-    "zh_Hant",
-    "zu",
-];
-
-/// `@collation=<type>` values every locale takes, and the ones only some do
-/// (measured the same way).
-const COMMON_TYPES: &[&str] = &["search", "eor", "emoji"];
-const LOCALE_TYPES: &[(&str, &[&str])] = &[
-    ("ar", &["compat"]),
-    ("bn", &["traditional"]),
-    ("de", &["phonebook"]),
-    ("de_AT", &["phonebook"]),
-    ("es", &["traditional"]),
-    ("fi", &["traditional"]),
-    ("ja", &["unihan"]),
-    ("kn", &["traditional"]),
-    ("ko", &["unihan", "searchjl"]),
-    ("ln", &["phonetic"]),
-    ("si", &["dictionary"]),
-    ("sv", &["standard"]),
-    ("vi", &["traditional"]),
-    (
-        "zh",
-        &[
-            "standard",
-            "stroke",
-            "zhuyin",
-            "big5han",
-            "gb2312han",
-            "unihan",
-        ],
-    ),
-    (
-        "zh_Hant",
-        &[
-            "standard",
-            "pinyin",
-            "zhuyin",
-            "big5han",
-            "gb2312han",
-            "unihan",
-        ],
-    ),
-];
-
-/// Collation types `mongod` accepts that the bundled ICU4X data does not
-/// carry. ICU4X would silently fall back to the locale's standard order, which
-/// is a different answer, so these are refused by name.
-const UNSUPPORTED_TYPES: &[&str] = &["search", "searchjl", "big5han", "gb2312han", "phonetic"];
+/// The locale ICU falls back to when it has no data for the one asked for;
+/// mongod suggests no alternative then (`kFallbackLocaleName`).
+const FALLBACK_LOCALE: &str = "root";
 
 /// A parsed, usable collation. Never `simple`: that is `None` everywhere.
 #[derive(Clone)]
@@ -430,28 +258,13 @@ fn read_fields(d: &Document, ctx: Context<'_>) -> Result<Fields, SpecError> {
 }
 
 /// The spec as an error message prints it: as given, or (for `create`) with
-/// the defaults filled in and `backwards` / `version` only when given.
+/// the IDL's defaults filled in and `backwards` / `version` only when given.
 fn printed(d: &Document, f: &Fields, ctx: Context<'_>) -> String {
     if !ctx.print_defaults {
         return crate::query::bson_value_repr(&Bson::Document(d.clone()));
     }
-    let mut out = defaulted(f);
-    out.remove("backwards");
-    out.remove("version");
-    if let Some(b) = f.backwards {
-        out.insert("backwards", b);
-    }
-    if let Some(v) = &f.version {
-        out.insert("version", v.clone());
-    }
-    crate::query::bson_value_repr(&Bson::Document(out))
-}
-
-/// Every option spelled out, in `mongod`'s order.
-fn defaulted(f: &Fields) -> Document {
-    let locale = f.locale.clone().unwrap_or_default();
     let mut out = Document::new();
-    out.insert("locale", locale.clone());
+    out.insert("locale", f.locale.clone().unwrap_or_default());
     out.insert("caseLevel", f.case_level.unwrap_or(false));
     out.insert(
         "caseFirst",
@@ -472,247 +285,252 @@ fn defaulted(f: &Fields) -> Document {
             .unwrap_or_else(|| "punct".to_string()),
     );
     out.insert("normalization", f.normalization.unwrap_or(false));
-    out.insert(
-        "backwards",
-        f.backwards.unwrap_or(locale_is_backwards(&locale)),
-    );
-    out.insert("version", MONGOD_COLLATOR_VERSION);
-    out
+    if let Some(b) = f.backwards {
+        out.insert("backwards", b);
+    }
+    if let Some(v) = &f.version {
+        out.insert("version", v.clone());
+    }
+    crate::query::bson_value_repr(&Bson::Document(out))
 }
 
-/// Canadian French is the one locale whose accents compare from the end of
-/// the string unless told otherwise.
-fn locale_is_backwards(locale: &str) -> bool {
-    locale.split('@').next() == Some("fr_CA")
-}
-
-fn types_for(base: &str) -> impl Iterator<Item = &'static str> {
-    let own = LOCALE_TYPES
-        .iter()
-        .find(|(l, _)| *l == base)
-        .map(|(_, t)| *t)
-        .unwrap_or(&[]);
-    COMMON_TYPES.iter().chain(own.iter()).copied()
-}
-
-/// Whether `mongod` accepts this locale string exactly as written.
-fn locale_is_valid(locale: &str) -> bool {
-    match locale.split_once('@') {
-        None => LOCALES.contains(&locale),
-        Some((base, keyword)) => {
-            LOCALES.contains(&base)
-                && keyword
-                    .strip_prefix("collation=")
-                    .is_some_and(|t| types_for(base).any(|x| x == t))
-        }
+fn on_off(b: bool) -> i32 {
+    if b {
+        value::ON
+    } else {
+        value::OFF
     }
 }
 
-/// The valid locale nearest an invalid one, for `Did you mean`: the string as
-/// ICU parses it, then with the keyword, variant, region and script dropped in
-/// turn. ICU's parse cases each part and reads a three-letter language or
-/// region as its two-letter code (`eng_USA` is `en_US`), and after such a
-/// region it loses the variant (`en_USA_POSIX` is `en_US`, measured on
-/// `mongod` 8.2.11: `ulocimp_getCountry` steps past the two letters it wrote,
-/// not the three it read).
-fn nearest_locale(locale: &str) -> Option<String> {
-    let (base, keyword) = match locale.split_once('@') {
-        Some((b, k)) => (b, Some(k)),
-        None => (locale, None),
-    };
-    let mut parts: Vec<String> = Vec::new();
-    // Where the region may stand: after the language, or after a script.
-    let mut region_at = 1;
-    for (i, p) in base.split(['_', '-']).enumerate() {
-        if p.is_empty() {
-            break;
-        }
-        let alpha = p.chars().all(|c| c.is_ascii_alphabetic());
-        if i == 0 {
-            let lower = p.to_ascii_lowercase();
-            let two = (lower.len() == 3)
-                .then(|| iso3::two_letter(iso3::LANGUAGES_3, &lower))
-                .flatten();
-            parts.push(two.map_or(lower, str::to_string));
-        } else if i == 1 && p.len() == 4 && alpha {
-            let mut s = p.to_ascii_lowercase();
-            s[..1].make_ascii_uppercase();
-            parts.push(s);
-            region_at = 2;
-        } else {
-            let upper = p.to_ascii_uppercase();
-            if i == region_at && upper.len() == 3 {
-                if let Some(two) = iso3::two_letter(iso3::COUNTRIES_3, &upper) {
-                    parts.push(two.to_string());
-                    break;
-                }
-            }
-            parts.push(upper);
-        }
+fn icu_failed(what: &str, e: secantus_icu::Error, shown: &str) -> SpecError {
+    SpecError {
+        code: 96,
+        message: format!("Failed to {what}: {e}. Collation spec: {shown}"),
     }
-    if let Some(k) = keyword {
-        let whole = format!("{}@{k}", parts.join("_"));
-        if locale_is_valid(&whole) {
-            return Some(whole);
-        }
-    }
-    while !parts.is_empty() {
-        let candidate = parts.join("_");
-        if LOCALES.contains(&candidate.as_str()) {
-            return Some(candidate);
-        }
-        parts.pop();
-    }
-    None
 }
 
-/// `mongod`'s locale name as the BCP 47 tag ICU4X takes.
-fn bcp47(locale: &str) -> Result<String, SpecError> {
-    let (base, keyword) = match locale.split_once('@') {
-        Some((b, k)) => (b, k.strip_prefix("collation=")),
-        None => (locale, None),
-    };
-    let mut tag = base.replace('_', "-").replace("-POSIX", "-posix");
-    let co = match (base, keyword) {
-        (_, Some(t)) if UNSUPPORTED_TYPES.contains(&t) => {
-            return err(
-                2,
-                format!(
-                    "collation type '{t}' in locale \"{locale}\" is not supported by this server"
-                ),
+/// `updateCollationSpecFromICUCollator`: each option the document gives is
+/// set on the collator, each it leaves out is read from it (the locale's own
+/// default), and the result is the full spec in `mongod`'s order.
+fn resolve(
+    collator: &mut Collator,
+    name: &str,
+    f: &Fields,
+    shown: &str,
+) -> Result<Document, SpecError> {
+    let fail = |field: &str, e| icu_failed(&format!("set '{field}' attribute"), e, shown);
+    let read = |c: &Collator, attr, field: &str| {
+        c.attribute(attr).map_err(|e| {
+            icu_failed(
+                &format!("get '{field}' attribute from icu::Collator"),
+                e,
+                shown,
             )
-        }
-        // ICU 57's Swedish default is the reformed order and its `standard`
-        // the older one (v and w alike); CLDR has since renamed them.
-        ("sv", Some("standard")) => Some("trad"),
-        (_, Some("standard")) | (_, None) => None,
-        (_, Some("phonebook")) => Some("phonebk"),
-        (_, Some("traditional")) => Some("trad"),
-        (_, Some("dictionary")) => Some("dict"),
-        (_, Some(t)) => Some(t),
-    };
-    if let Some(co) = co {
-        tag.push_str("-u-co-");
-        tag.push_str(co);
-    }
-    Ok(tag)
-}
-
-/// ICU4X decides the French accent order from locale data alone. This
-/// provider hands the collator its normal data with that one bit set as the
-/// collation document asks.
-struct WithBackwards(bool);
-
-macro_rules! delegate {
-    ($provider:path => $($marker:ty),*) => {$(
-        impl DataProvider<$marker> for WithBackwards {
-            fn load(&self, req: DataRequest) -> Result<DataResponse<$marker>, DataError> {
-                DataProvider::<$marker>::load(&$provider, req)
-            }
-        }
-    )*};
-}
-delegate!(Baked => CollationSpecialPrimariesV1, CollationRootV1, CollationTailoringV1,
-    CollationDiacriticsV1, CollationJamoV1, CollationReorderingV1);
-delegate!(icu_normalizer::provider::Baked => NormalizerNfdDataV1, NormalizerNfdTablesV1);
-
-impl DataProvider<CollationMetadataV1> for WithBackwards {
-    fn load(&self, req: DataRequest) -> Result<DataResponse<CollationMetadataV1>, DataError> {
-        /// `CollationMetadata`'s backward-second-level bit.
-        const BACKWARD_SECOND_LEVEL: u32 = 1 << 7;
-        let found = DataProvider::<CollationMetadataV1>::load(&Baked, req)?;
-        let mut metadata: CollationMetadata = *found.payload.get();
-        if self.0 {
-            metadata.bits |= BACKWARD_SECOND_LEVEL;
-        } else {
-            metadata.bits &= !BACKWARD_SECOND_LEVEL;
-        }
-        Ok(DataResponse {
-            metadata: found.metadata,
-            payload: DataPayload::from_owned(metadata),
         })
-    }
-}
-
-fn build(full: &Document) -> Result<Collator, SpecError> {
-    let text = |k: &str| full.get_str(k).unwrap_or_default();
-    let flag = |k: &str| full.get_bool(k).unwrap_or(false);
-    let locale = text("locale");
-    let tag = bcp47(locale)?;
-    let parsed: icu_locale_core::Locale = tag.parse().map_err(|_| SpecError {
-        code: 2,
-        message: format!("Field 'locale' is invalid in: {{ locale: \"{locale}\" }}"),
-    })?;
-    let mut prefs = CollatorPreferences::from(&parsed);
-    prefs.numeric_ordering = Some(if flag("numericOrdering") {
-        CollationNumericOrdering::True
-    } else {
-        CollationNumericOrdering::False
-    });
-    prefs.case_first = Some(match text("caseFirst") {
-        "upper" => CollationCaseFirst::Upper,
-        "lower" => CollationCaseFirst::Lower,
-        _ => CollationCaseFirst::False,
-    });
-    let mut options = CollatorOptions::default();
-    options.strength = Some(match full.get_i32("strength").unwrap_or(3) {
-        1 => Strength::Primary,
-        2 => Strength::Secondary,
-        3 => Strength::Tertiary,
-        4 => Strength::Quaternary,
-        _ => Strength::Identical,
-    });
-    options.case_level = Some(if flag("caseLevel") {
-        CaseLevel::On
-    } else {
-        CaseLevel::Off
-    });
-    options.alternate_handling = Some(if text("alternate") == "shifted" {
-        AlternateHandling::Shifted
-    } else {
-        AlternateHandling::NonIgnorable
-    });
-    options.max_variable = Some(if text("maxVariable") == "space" {
-        MaxVariable::Space
-    } else {
-        MaxVariable::Punctuation
-    });
-    Collator::try_new_unstable(&WithBackwards(flag("backwards")), prefs, options).map_err(|e| {
-        SpecError {
-            code: 2,
-            message: format!("collation for locale \"{locale}\" could not be loaded: {e}"),
+    };
+    let mut out = Document::new();
+    out.insert("locale", name);
+    let case_level = match f.case_level {
+        Some(b) => {
+            collator
+                .set_attribute(Attribute::CaseLevel, on_off(b))
+                .map_err(|e| fail("caseLevel", e))?;
+            b
         }
-    })
+        None => read(collator, Attribute::CaseLevel, "caseLevel")? == value::ON,
+    };
+    out.insert("caseLevel", case_level);
+    let case_first = match &f.case_first {
+        Some(cf) => {
+            let v = match cf.as_str() {
+                "upper" => value::UPPER_FIRST,
+                "lower" => value::LOWER_FIRST,
+                _ => value::OFF,
+            };
+            collator
+                .set_attribute(Attribute::CaseFirst, v)
+                .map_err(|e| fail("caseFirst", e))?;
+            cf.clone()
+        }
+        None => match read(collator, Attribute::CaseFirst, "caseFirst")? {
+            value::UPPER_FIRST => "upper",
+            value::LOWER_FIRST => "lower",
+            _ => "off",
+        }
+        .to_string(),
+    };
+    out.insert("caseFirst", case_first);
+    let strength = match f.strength {
+        Some(n) => {
+            let v = match n {
+                1 => value::PRIMARY,
+                2 => value::SECONDARY,
+                3 => value::TERTIARY,
+                4 => value::QUATERNARY,
+                _ => value::IDENTICAL,
+            };
+            collator
+                .set_attribute(Attribute::Strength, v)
+                .map_err(|e| fail("strength", e))?;
+            n
+        }
+        None => match read(collator, Attribute::Strength, "strength")? {
+            value::PRIMARY => 1,
+            value::SECONDARY => 2,
+            value::TERTIARY => 3,
+            value::QUATERNARY => 4,
+            _ => 5,
+        },
+    };
+    out.insert("strength", strength);
+    let numeric = match f.numeric_ordering {
+        Some(b) => {
+            collator
+                .set_attribute(Attribute::NumericCollation, on_off(b))
+                .map_err(|e| fail("numericOrdering", e))?;
+            b
+        }
+        None => read(collator, Attribute::NumericCollation, "numericOrdering")? == value::ON,
+    };
+    out.insert("numericOrdering", numeric);
+    let alternate = match &f.alternate {
+        Some(a) => {
+            let v = if a == "shifted" {
+                value::SHIFTED
+            } else {
+                value::NON_IGNORABLE
+            };
+            collator
+                .set_attribute(Attribute::AlternateHandling, v)
+                .map_err(|e| fail("alternate", e))?;
+            a.clone()
+        }
+        None => if read(collator, Attribute::AlternateHandling, "alternate")? == value::SHIFTED {
+            "shifted"
+        } else {
+            "non-ignorable"
+        }
+        .to_string(),
+    };
+    out.insert("alternate", alternate);
+    let max_variable = match &f.max_variable {
+        Some(m) => {
+            let v = if m == "space" {
+                reorder::SPACE
+            } else {
+                reorder::PUNCTUATION
+            };
+            collator
+                .set_max_variable(v)
+                .map_err(|e| fail("maxVariable", e))?;
+            m.clone()
+        }
+        None => if collator.max_variable() == reorder::SPACE {
+            "space"
+        } else {
+            "punct"
+        }
+        .to_string(),
+    };
+    out.insert("maxVariable", max_variable);
+    let normalization = match f.normalization {
+        Some(b) => {
+            collator
+                .set_attribute(Attribute::NormalizationMode, on_off(b))
+                .map_err(|e| fail("normalization", e))?;
+            b
+        }
+        None => read(collator, Attribute::NormalizationMode, "normalization")? == value::ON,
+    };
+    out.insert("normalization", normalization);
+    let backwards = match f.backwards {
+        Some(b) => {
+            collator
+                .set_attribute(Attribute::FrenchCollation, on_off(b))
+                .map_err(|e| fail("backwards", e))?;
+            b
+        }
+        None => read(collator, Attribute::FrenchCollation, "backwards")? == value::ON,
+    };
+    out.insert("backwards", backwards);
+    if let Some(v) = &f.version {
+        if v != MONGOD_COLLATOR_VERSION {
+            return err(
+                161,
+                format!(
+                    "Requested collation version {v} but the only available collator version \
+                     was {MONGOD_COLLATOR_VERSION}. Requested collation spec: {shown}"
+                ),
+            );
+        }
+    }
+    out.insert("version", MONGOD_COLLATOR_VERSION);
+    Ok(out)
 }
 
-/// One collator per distinct spec: building one reads locale data, and a
-/// workload repeats the same few collations on every command.
-fn collator_for(full: &Document) -> Result<Arc<Collator>, SpecError> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<Collator>>>> = OnceLock::new();
-    let key = full.to_string();
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some(found) = cache.lock().ok().and_then(|c| c.get(&key).cloned()) {
-        return Ok(found);
+/// `validateCollationSpec`, over the resolved options: a locale's own default
+/// counts (`fr_CA` compares accents backwards unless told otherwise).
+fn validate(spec: &Document, shown: &str) -> Result<(), SpecError> {
+    let strength = spec.get_i32("strength").unwrap_or(3);
+    if spec.get_bool("backwards") == Ok(true) && strength == 1 {
+        return err(
+            2,
+            format!("'backwards' is invalid with 'strength' of 1 in: {shown}"),
+        );
     }
-    let built = Arc::new(build(full)?);
-    if let Ok(mut c) = cache.lock() {
-        c.insert(key, built.clone());
+    let case_first_on = spec.get_str("caseFirst").is_ok_and(|c| c != "off");
+    if case_first_on && strength < 3 && spec.get_bool("caseLevel") != Ok(true) {
+        return err(
+            2,
+            format!(
+                "'caseFirst' is invalid unless 'caseLevel' is on or 'strength' is greater than 2 \
+                 in: {shown}"
+            ),
+        );
     }
-    Ok(built)
+    Ok(())
 }
 
-/// Parse a collation document with `mongod`'s checks. `Ok(None)` is the
-/// `simple` locale: binary comparison, no collation.
+/// One collator per distinct document: opening one reads locale data, and a
+/// workload repeats the same few collations on every command. Only a
+/// collation that parsed is kept; a refusal is worked out again.
+fn cached(key: &str) -> Option<Collation> {
+    cache().lock().ok().and_then(|c| c.get(key).cloned())
+}
+
+fn cache() -> &'static Mutex<HashMap<String, Collation>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Collation>>> = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Parse a collation document with `mongod`'s checks, in its order
+/// (`CollatorFactoryICU::makeFromBSON`). `Ok(None)` is the `simple` locale:
+/// binary comparison, no collation.
 ///
 /// An EMPTY document is the caller's to decide (`find` takes it as absent,
 /// `create` refuses it); here it is a missing `locale`.
 pub fn parse_strict(d: &Document, ctx: Context<'_>) -> Result<Option<Collation>, SpecError> {
-    let f = read_fields(d, ctx)?;
-    let locale = f.locale.clone().unwrap_or_default();
-    if locale == "simple" {
-        return Ok(None);
+    let mut f = read_fields(d, ctx)?;
+    if ctx.print_defaults {
+        // `create` hands ICU the IDL-parsed collation, every option but
+        // `backwards` and `version` filled with its IDL default, so a locale's
+        // own default counts only for those two there (mongod 8.2.11:
+        // `{locale: "da"}` is `caseFirst: "off"` on a collection, "upper"
+        // on an index).
+        f.case_level.get_or_insert(false);
+        f.case_first.get_or_insert_with(|| "off".to_string());
+        f.strength.get_or_insert(3);
+        f.numeric_ordering.get_or_insert(false);
+        f.alternate
+            .get_or_insert_with(|| "non-ignorable".to_string());
+        f.max_variable.get_or_insert_with(|| "punct".to_string());
+        f.normalization.get_or_insert(false);
     }
+    let f = f;
+    // `printed` fills the same IDL defaults for `create` and shows the
+    // document as given otherwise, so the filling above does not show.
     let shown = || printed(d, &f, ctx);
+    let locale = f.locale.clone().unwrap_or_default();
     if locale.contains('\0') {
         return err(
             2,
@@ -722,58 +540,60 @@ pub fn parse_strict(d: &Document, ctx: Context<'_>) -> Result<Option<Collation>,
             ),
         );
     }
+    if locale == "simple" {
+        return Ok(None);
+    }
+    let key = format!(
+        "{locale}\0{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+        f.strength,
+        f.case_level,
+        f.case_first,
+        f.numeric_ordering,
+        f.alternate,
+        f.max_variable,
+        f.normalization,
+        f.backwards,
+        f.version
+    );
+    if let Some(found) = cached(&key) {
+        return Ok(Some(found));
+    }
+    let shown = shown();
+    let opened = Collator::open(&locale).map_err(|e| icu_failed("create collator", e, &shown))?;
+    let (mut collator, name, valid) = match opened {
+        Opened::Bogus => {
+            return err(2, format!("Field 'locale' is not valid in: {shown}"));
+        }
+        Opened::Collator {
+            collator,
+            name,
+            valid,
+        } => (collator, name, valid),
+    };
     if locale.is_empty() {
         return err(
             2,
-            format!("Field 'locale' cannot be the empty string in: {}", shown()),
+            format!("Field 'locale' cannot be the empty string in: {shown}"),
         );
     }
-    if !locale_is_valid(&locale) {
-        let hint = match nearest_locale(&locale) {
-            Some(n) if n != locale => format!(". Did you mean '{n}'?"),
-            _ => String::new(),
+    if locale != valid {
+        let hint = if valid != FALLBACK_LOCALE && !valid.is_empty() {
+            format!(". Did you mean '{valid}'?")
+        } else {
+            String::new()
         };
-        return err(
-            2,
-            format!("Field 'locale' is invalid in: {}{hint}", shown()),
-        );
+        return err(2, format!("Field 'locale' is invalid in: {shown}{hint}"));
     }
-    if let Some(v) = &f.version {
-        if v != MONGOD_COLLATOR_VERSION {
-            return err(
-                161,
-                format!(
-                    "Requested collation version {v} but the only available collator version \
-                     was {MONGOD_COLLATOR_VERSION}. Requested collation spec: {}",
-                    shown()
-                ),
-            );
-        }
+    let spec = resolve(&mut collator, &name, &f, &shown)?;
+    validate(&spec, &shown)?;
+    let made = Collation {
+        collator: Arc::new(collator),
+        spec,
+    };
+    if let Ok(mut c) = cache().lock() {
+        c.insert(key, made.clone());
     }
-    let strength = f.strength.unwrap_or(3);
-    let case_first_on = f.case_first.as_deref().is_some_and(|c| c != "off");
-    if case_first_on && strength < 3 && !f.case_level.unwrap_or(false) {
-        return err(
-            2,
-            format!(
-                "'caseFirst' is invalid unless 'caseLevel' is on or 'strength' is greater than 2 \
-                 in: {}",
-                shown()
-            ),
-        );
-    }
-    if f.backwards == Some(true) && strength == 1 {
-        return err(
-            2,
-            format!(
-                "'backwards' is invalid with 'strength' of 1 in: {}",
-                shown()
-            ),
-        );
-    }
-    let spec = defaulted(&f);
-    let collator = collator_for(&spec)?;
-    Ok(Some(Collation { collator, spec }))
+    Ok(Some(made))
 }
 
 /// Parse a collation document that has already been validated, or that comes
@@ -795,20 +615,18 @@ pub fn parse(d: &Document) -> Option<Collation> {
 /// Collation-aware string equality. `Some` always; the `Option` is the old
 /// "defer" signal the callers still unwrap.
 pub fn equal(a: &str, b: &str, c: &Collation) -> Option<bool> {
-    Some(c.collator.as_borrowed().compare(a, b) == Ordering::Equal)
+    Some(c.collator.compare(a, b) == Ordering::Equal)
 }
 
 /// Collation-aware string ordering.
 pub fn compare(a: &str, b: &str, c: &Collation) -> Option<Ordering> {
-    Some(c.collator.as_borrowed().compare(a, b))
+    Some(c.collator.compare(a, b))
 }
 
 /// The string's sort key: bytes that order as the collation orders, and are
 /// equal exactly when the collation calls two strings equal.
 pub fn sort_key(s: &str, c: &Collation) -> Vec<u8> {
-    let mut key = Vec::with_capacity(s.len() * 2 + 4);
-    let Ok(()) = c.collator.as_borrowed().write_sort_key_to(s, &mut key);
-    key
+    c.collator.sort_key(s)
 }
 
 /// The bytes an index entry holds for a string under the collation.
@@ -852,20 +670,17 @@ pub fn active() -> Option<Collation> {
 /// [`active_compare`] over a string's bytes, which may not be UTF-8
 /// (RM-222): byte order without a collation, as mongod compares strings;
 /// under one, the collation over the text with each invalid sequence
-/// replaced by U+FFFD.
+/// replaced by U+FFFD (ICU's `compareUTF8` over the bytes, as mongod).
 pub fn active_compare_bytes(a: &[u8], b: &[u8]) -> Ordering {
     ACTIVE.with(|c| match &*c.borrow() {
-        Some(c) => c
-            .collator
-            .as_borrowed()
-            .compare(&String::from_utf8_lossy(a), &String::from_utf8_lossy(b)),
+        Some(c) => c.collator.compare_bytes(a, b),
         None => a.cmp(b),
     })
 }
 
 pub fn active_compare(a: &str, b: &str) -> Ordering {
     ACTIVE.with(|c| match &*c.borrow() {
-        Some(c) => c.collator.as_borrowed().compare(a, b),
+        Some(c) => c.collator.compare(a, b),
         None => a.cmp(b),
     })
 }
@@ -1031,7 +846,12 @@ mod tests {
             ("und", None),
         ];
         for (locale, want) in cases {
-            assert_eq!(nearest_locale(locale).as_deref(), want, "{locale}");
+            let (code, message) = refusal(doc! {"locale": locale});
+            assert_eq!(code, 2, "{locale}");
+            let got = message
+                .split_once(". Did you mean '")
+                .map(|(_, rest)| rest.trim_end_matches("'?"));
+            assert_eq!(got, want, "{locale}: {message}");
         }
     }
 
@@ -1123,14 +943,44 @@ mod tests {
         );
     }
 
+    /// mongod 8.2.11 accepts each (RM-095): ICU 57's data has them, where
+    /// ICU4X's did not. The spec echoes the locale as given.
     #[test]
-    fn a_type_the_data_lacks_is_refused_not_approximated() {
-        let (code, message) = refusal(doc! {"locale": "en@collation=search"});
-        assert_eq!(code, 2);
-        assert!(
-            message.contains("not supported by this server"),
-            "{message}"
-        );
+    fn every_collation_type_mongods_data_has_is_accepted() {
+        for locale in [
+            "ko@collation=search",
+            "ko@collation=searchjl",
+            "zh@collation=big5han",
+            "zh@collation=gb2312han",
+            "ln@collation=phonetic",
+            "en@collation=search",
+        ] {
+            assert_eq!(
+                c(doc! {"locale": locale}).spec().get_str("locale"),
+                Ok(locale)
+            );
+        }
+    }
+
+    /// RM-091: with `normalization: false` (the default) the two orderings
+    /// of a dot below and a diaeresis on `o` are not equal, as on mongod.
+    #[test]
+    fn normalization_off_keeps_canonical_equivalents_apart() {
+        let (a, b) = ("\u{1ECD}\u{308}", "\u{F6}\u{323}");
+        let en = c(doc! {"locale": "en"});
+        assert_eq!(equal(a, b, &en), Some(false));
+        let on = c(doc! {"locale": "en", "normalization": true});
+        assert_eq!(equal(a, b, &on), Some(true));
+    }
+
+    /// The sort key is mongod's: ICU's collation key less its trailing NUL
+    /// (`"W\x01\x05"` for `"x"` under `en`, strength 2, in mongod 8.2.11's
+    /// duplicate-key error).
+    #[test]
+    fn sort_keys_are_mongods_bytes() {
+        let s2 = c(doc! {"locale": "en", "strength": 2});
+        assert_eq!(sort_key("x", &s2), b"W\x01\x05");
+        assert_eq!(sort_key("a", &s2), [0x29, 0x01, 0x05]);
     }
 
     #[test]
