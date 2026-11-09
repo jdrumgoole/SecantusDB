@@ -37,6 +37,8 @@ MONGO_ONLY = (
     "scripts/fix_many.sh",
     "scripts/fix_one.sh",
     "scripts/land_batch.sh",
+    "scripts/wait_ci.sh",
+    "tests/test_wait_ci.py",
     "tests/test_gate_rm.py",
     "tests/test_batch_scripts_exit.py",
 )

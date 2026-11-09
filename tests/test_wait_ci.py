@@ -33,14 +33,21 @@ if args[0] == "api":
     path = args[1]
     jq = args[args.index("--jq") + 1]
     key = "runs" if "/actions/runs" in path else "checks" if "/check-runs" in path else "pull"
-    doc = json.dumps(data[key])
+    doc = data[key]
+    early = Path(__file__).with_name("early")
+    if key == "checks" and data.get("early") and not early.exists():
+        early.write_text("")  # the first poll sees only the checks registered so far
+        doc = {"total_count": data["early"], "check_runs": doc["check_runs"][: data["early"]]}
+    doc = json.dumps(doc)
     out = subprocess.run(["jq", "-r", jq], input=doc, capture_output=True, text=True)
     sys.stdout.write(out.stdout); sys.exit(out.returncode)
 sys.exit(f"unexpected gh call: {args}")
 """
 
 
-def _run(tmp_path: Path, checks: list[dict], runs: list[dict]) -> subprocess.CompletedProcess[str]:
+def _run(
+    tmp_path: Path, checks: list[dict], runs: list[dict], early: int = 0
+) -> subprocess.CompletedProcess[str]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     gh = bin_dir / "gh"
@@ -53,6 +60,7 @@ def _run(tmp_path: Path, checks: list[dict], runs: list[dict]) -> subprocess.Com
                 "checks": {"total_count": len(checks), "check_runs": checks},
                 "runs": {"workflow_runs": runs},
                 "pull": {"mergeable_state": "clean"},
+                "early": early,
             }
         )
     )
@@ -87,7 +95,7 @@ def test_a_failed_workflow_run_whose_jobs_never_started_is_red(tmp_path: Path) -
 def test_passing_checks_and_runs_are_green(tmp_path: Path) -> None:
     proc = _run(tmp_path, CHECKS, [_run_of("Tests", "success"), _run_of("Docs", "success")])
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert "GREEN" in proc.stdout
+    assert f"GREEN: all {len(CHECKS)} checks passed" in proc.stdout
 
 
 def test_another_branchs_run_of_the_same_commit_is_not_this_prs(tmp_path: Path) -> None:
@@ -101,3 +109,9 @@ def test_a_failed_check_is_red(tmp_path: Path) -> None:
     proc = _run(tmp_path, checks, [_run_of("Tests", "failure")])
     assert proc.returncode == 1
     assert "check(s) did not pass" in proc.stdout
+
+
+def test_green_counts_the_checks_registered_after_the_first_poll(tmp_path: Path) -> None:
+    proc = _run(tmp_path, CHECKS, [_run_of("Tests", "success")], early=2)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"GREEN: all {len(CHECKS)} checks passed" in proc.stdout, proc.stdout

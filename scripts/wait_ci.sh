@@ -90,6 +90,9 @@ while :; do
     sleep 60
 done
 
+# Counted again: the first loop can end while later workflows' checks have
+# yet to register (PR #2565 reported "all 2 checks" of 10).
+total=$(gh api "$api" --jq .total_count) || exit 2
 gh api "$api" --jq '.check_runs[] | "  \(.conclusion)\t\(.name)"' | sort
 bad=$(gh api "$api" --jq '[.check_runs[] | select(.conclusion | IN("success","skipped","neutral") | not)] | length')
 if [[ "$bad" -ne 0 ]]; then
