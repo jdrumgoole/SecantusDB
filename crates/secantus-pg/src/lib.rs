@@ -49846,40 +49846,19 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// `accumArrayResultArr`'s checks on `array_agg`'s array inputs, in input
-/// order: a NULL array is 22004, an empty first array 2202E, and every later
-/// array must have the first one's dimensions and lower bounds (2202E).
-/// True, with the error recorded, when the inputs cannot be accumulated;
-/// before this a NULL failed later as a binary-encoding error and arrays of
-/// different lengths came back as a ragged array.
+/// `accumArrayResultArr`'s checks on `array_agg`'s array inputs
+/// (`secantus_pgplan::arrays::check_accumulable`, which the ARRAY sublink
+/// shares). True, with the error recorded, when the inputs cannot be
+/// accumulated; before this a NULL failed later as a binary-encoding error
+/// and arrays of different lengths came back as a ragged array.
 fn array_agg_refuses(values: impl Iterator<Item = Bson>) -> bool {
-    use secantus_pgplan::arrays;
-    let refuse = |code: &'static str, message: &str| {
-        ARRAY_AGG_ERROR.with(|e| *e.borrow_mut() = Some(PlanError::Sqlstate(code, message.into())));
-        true
-    };
-    let mut first: Option<(Vec<usize>, Vec<i64>)> = None;
-    for v in values {
-        if v == Bson::Null {
-            return refuse("22004", "cannot accumulate null arrays");
-        }
-        let shape = (
-            arrays::dim_lengths(&arrays::strip(&v)),
-            arrays::lower_bounds(&v),
-        );
-        match &first {
-            None if shape.0.is_empty() => return refuse("2202E", "cannot accumulate empty arrays"),
-            None => first = Some(shape),
-            Some(f) if *f != shape => {
-                return refuse(
-                    "2202E",
-                    "cannot accumulate arrays of different dimensionality",
-                );
-            }
-            Some(_) => {}
+    match secantus_pgplan::arrays::check_accumulable(values) {
+        Ok(()) => false,
+        Err(e) => {
+            ARRAY_AGG_ERROR.with(|slot| *slot.borrow_mut() = Some(e));
+            true
         }
     }
-    false
 }
 
 /// The float8 sum of `values` in order, as `sum` / `avg` of a

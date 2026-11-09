@@ -396,6 +396,65 @@ pub fn is_one_dimensional_empty(v: &Bson) -> bool {
         && lower_bounds(v).len() == 1
 }
 
+/// The most dimensions an array may have (`MAXDIM`, PostgreSQL's `c.h`).
+pub const MAXDIM: usize = 6;
+
+/// `accumArrayResultArr`'s checks (PostgreSQL 15 `arrayfuncs.c`) on the
+/// arrays an ARRAY sublink or `array_agg(anyarray)` accumulates into one more
+/// dimension, in input order: a NULL array is 22004; the first array may not
+/// be empty (2202E) nor so deep that one more dimension passes `MAXDIM`
+/// (54000); and every later one has the first one's dimensions AND lower
+/// bounds (2202E). Without them `array(select f ...)` over `{1,2}` and `{3}`
+/// answered the ragged `{{1,2},{3}}` (RP-730).
+pub fn check_accumulable<B: std::borrow::Borrow<Bson>>(
+    values: impl IntoIterator<Item = B>,
+) -> Result<()> {
+    let mut first: Option<(Vec<usize>, Vec<i64>)> = None;
+    for v in values {
+        let v = v.borrow();
+        if *v == Bson::Null {
+            return Err(Error::Sqlstate(
+                "22004",
+                "cannot accumulate null arrays".into(),
+            ));
+        }
+        // An array of one dimension and no elements (`acldefault`'s) has a
+        // dimension of length 0, which a literal `'{}'` does not.
+        let lengths = if is_one_dimensional_empty(v) {
+            vec![0]
+        } else {
+            dim_lengths(&strip(v))
+        };
+        let shape = (lengths, lower_bounds(v));
+        match &first {
+            None if shape.0.is_empty() => {
+                return Err(Error::Sqlstate(
+                    "2202E",
+                    "cannot accumulate empty arrays".into(),
+                ));
+            }
+            None if shape.0.len() + 1 > MAXDIM => {
+                return Err(Error::Sqlstate(
+                    "54000",
+                    format!(
+                        "number of array dimensions ({}) exceeds the maximum allowed ({MAXDIM})",
+                        shape.0.len() + 1
+                    ),
+                ));
+            }
+            None => first = Some(shape),
+            Some(f) if *f != shape => {
+                return Err(Error::Sqlstate(
+                    "2202E",
+                    "cannot accumulate arrays of different dimensionality".into(),
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// `v` as a plain array, its bounds dropped (anything else unchanged).
 pub fn strip(v: &Bson) -> Bson {
     match v {
@@ -875,6 +934,42 @@ mod tests {
 
     fn two_by_two() -> Bson {
         arr(vec![arr(vec![i(1), i(2)]), arr(vec![i(3), i(4)])])
+    }
+
+    /// `accumArrayResultArr` on PostgreSQL 15.19 (RP-730): the SQLSTATE of
+    /// each refused input list, `None` where it accumulates.
+    #[test]
+    fn accumulating_arrays_needs_one_shape_and_no_null() {
+        let code = |values: Vec<Bson>| match check_accumulable(values) {
+            Ok(()) => None,
+            Err(Error::Sqlstate(c, _)) => Some(c),
+            Err(e) => panic!("{e:?}"),
+        };
+        let one = |n| arr(vec![i(n)]);
+        assert_eq!(code(vec![]), None);
+        assert_eq!(code(vec![two_by_two(), two_by_two()]), None);
+        assert_eq!(code(vec![arr(vec![i(1), i(2)]), one(3)]), Some("2202E"));
+        assert_eq!(code(vec![one(1), arr(vec![one(3)])]), Some("2202E"));
+        // `'{}'` after an array has another shape; first, it is empty.
+        assert_eq!(code(vec![one(1), arr(vec![])]), Some("2202E"));
+        assert_eq!(code(vec![arr(vec![]), one(1)]), Some("2202E"));
+        // NULL is refused wherever it comes, before any shape is looked at.
+        assert_eq!(code(vec![one(1), Bson::Null]), Some("22004"));
+        assert_eq!(code(vec![Bson::Null, arr(vec![one(1)])]), Some("22004"));
+        // The lower bounds are part of the shape.
+        let from_two = |a, b| bounded(arr(vec![i(a), i(b)]), &[2]);
+        assert_eq!(code(vec![from_two(3, 4), from_two(5, 6)]), None);
+        assert_eq!(
+            code(vec![arr(vec![i(1), i(2)]), from_two(3, 4)]),
+            Some("2202E")
+        );
+        // Six dimensions accumulate into seven, past MAXDIM.
+        let mut deep = one(1);
+        for _ in 0..5 {
+            deep = arr(vec![deep]);
+        }
+        assert_eq!(dim_lengths(&deep).len(), 6);
+        assert_eq!(code(vec![deep]), Some("54000"));
     }
 
     #[test]

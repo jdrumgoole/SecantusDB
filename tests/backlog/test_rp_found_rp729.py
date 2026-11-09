@@ -1,8 +1,8 @@
 """What working RP-729 (a correlated `ARRAY(...)` over an array column is
 its own type) found:
 
-- an ARRAY sublink accumulates arrays of different shapes, or a NULL one,
-  where PostgreSQL refuses each (RP-730).
+- an ARRAY sublink accumulated arrays of different shapes, or a NULL one,
+  where PostgreSQL refuses each (RP-730, fixed since).
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
@@ -35,10 +35,11 @@ def _answer(dsn: str, query: str) -> object:
             return (e.sqlstate, str(e).splitlines()[0])
 
 
-@pytest.mark.backlog("RP-730")
+@pytest.mark.backlog_fixed("RP-730")
 def test_array_sublink_refuses_ragged_or_null_element_arrays(dsn: str) -> None:
     """`accumArrayResultArr` (PostgreSQL 15.19): every element array has the
-    first one's dimensions and lengths, and none is NULL."""
+    first one's dimensions and lengths, and none is NULL. The sublink
+    answered ragged arrays until RP-730."""
     for rows, want in (
         ("(array[1,2]), (array[3])", DIMS),
         ("(array[1]), (array[[3]])", DIMS),

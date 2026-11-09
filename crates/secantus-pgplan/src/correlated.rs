@@ -851,6 +851,9 @@ pub(crate) fn correlate(
         outer,
     )?;
     let mut typmod = -1;
+    // An ARRAY sublink's own column type: its result type is the same
+    // `int4[]` over an `int4` column and an `int4[]` one.
+    let mut array_column = None;
     let result_type = match kind {
         SubLinkType::ExistsSublink
         | SubLinkType::AnySublink
@@ -876,6 +879,7 @@ pub(crate) fn correlate(
             // FROM-subquery, as a `character(3)` (RP-679).
             typmod = def.columns.first().map_or(-1, |c| c.typmod);
             if kind == SubLinkType::ArraySublink {
+                array_column = Some(first.clone());
                 array_sublink_type(first)
             } else {
                 first
@@ -913,6 +917,11 @@ pub(crate) fn correlate(
                 c.pg_type, c.typmod
             ));
         }
+    }
+    // An ARRAY sublink's column type travels the same way: over an array
+    // column the rows are accumulated, which refuses some (RP-730).
+    if let Some(column) = &array_column {
+        op_arg.push_str(&format!("{ROW_TYPE_SEP}{column}{ROW_TYPE_SEP}{typmod}"));
     }
     let mut args = vec![
         int_const(kind as i32),
@@ -1862,7 +1871,16 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
             }
             Ok(rows.first().map_or(Bson::Null, first))
         }
-        SubLinkType::ArraySublink => Ok(Bson::Array(rows.iter().map(first).collect())),
+        SubLinkType::ArraySublink => {
+            let values: Vec<Bson> = rows.iter().map(first).collect();
+            // Over an array column the rows are accumulated into one more
+            // dimension (`accumArrayResultArr`), as the uncorrelated
+            // sublink's are (RP-730).
+            if column_types.first().is_some_and(|(t, _)| t.ends_with("[]")) {
+                crate::arrays::check_accumulable(&values)?;
+            }
+            Ok(Bson::Array(values))
+        }
         // `(a, b) op ANY (subquery)`: the row against each of the
         // subquery's rows, pairwise, as `make_row_comparison_op` builds it
         // (RP-697) -- not the row against the first column.
