@@ -33,10 +33,10 @@ column a SELECT returns, which the row description does not carry.
 
 #### Filed
 
-- RP-705: an assignment between types with only an explicit cast (`int`
+- RP-712: an assignment between types with only an explicit cast (`int`
   from `bool`) uses it, where PostgreSQL converts through text and raises
   22P02.
-- RP-706: a `FOR` over a query, or an `EXECUTE ... INTO`, refuses scalar
+- RP-713: a `FOR` over a query, or an `EXECUTE ... INTO`, refuses scalar
   variable targets with 0A000.
-- RP-707: a variable of a NOT NULL domain with no default starts NULL,
+- RP-714: a variable of a NOT NULL domain with no default starts NULL,
   where PostgreSQL raises 23502 at the block's entry.

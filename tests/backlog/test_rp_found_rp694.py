@@ -4,11 +4,11 @@ scalar variable stored the column's value uncoerced):
 - an assignment whose types have only an EXPLICIT cast between them (`int`
   from `bool`, `bool` from `int`) uses that cast, where PostgreSQL's
   PL/pgSQL coercion (`COERCION_PLPGSQL`) converts through the types' text
-  I/O and refuses `t` as an integer (RP-705);
+  I/O and refuses `t` as an integer (RP-712);
 - a `FOR` over a query, or an `EXECUTE ... INTO`, whose target is a scalar
-  variable or a list of them is refused 0A000 (RP-706);
+  variable or a list of them is refused 0A000 (RP-713);
 - a variable of a NOT NULL domain with no default is created NULL, where
-  PostgreSQL refuses the NULL at the block's entry (RP-707).
+  PostgreSQL refuses the NULL at the block's entry (RP-714).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -66,7 +66,7 @@ EXPLICIT_ONLY = {
 }
 
 
-@pytest.mark.backlog("RP-705")
+@pytest.mark.backlog("RP-712")
 @pytest.mark.parametrize("query", list(EXPLICIT_ONLY))
 def test_assignment_with_only_an_explicit_cast_converts_through_text(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == EXPLICIT_ONLY[query]
@@ -92,7 +92,7 @@ SCALAR_TARGETS = {
 }
 
 
-@pytest.mark.backlog("RP-706")
+@pytest.mark.backlog("RP-713")
 @pytest.mark.parametrize("query", list(SCALAR_TARGETS))
 def test_for_and_execute_into_scalar_variables(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == SCALAR_TARGETS[query]
@@ -109,7 +109,7 @@ NOT_NULL_DOMAIN = {
 }
 
 
-@pytest.mark.backlog("RP-707")
+@pytest.mark.backlog("RP-714")
 @pytest.mark.parametrize("query", list(NOT_NULL_DOMAIN))
 def test_a_not_null_domain_variable_without_a_default_is_refused(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == NOT_NULL_DOMAIN[query]

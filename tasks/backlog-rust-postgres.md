@@ -2539,7 +2539,7 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       and `x` is 1 (`t` for the `bool`). `eval_typed` and `coerce_moved`
       both cast with `::`.
       Verify: tests/backlog/test_rp_found_rp694.py::test_assignment_with_only_an_explicit_cast_converts_through_text
-      Backlog-ID: RP-705
+      Backlog-ID: RP-712
 - [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
       variable targets.** `for x in select '7'::text loop` over an `int`
       `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
@@ -2549,14 +2549,14 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       the target's `dno`, which a scalar list has none of (a plain `INTO`
       goes through `target_datum`).
       Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
-      Backlog-ID: RP-706
+      Backlog-ID: RP-713
 - [ ] **A NOT NULL domain variable with no default starts NULL.** `declare
       x dnn694; begin end` is 23502 `domain dnn694 does not allow null
       values` on PostgreSQL 15.19 (`exec_stmt_block` assigns the NULL
       through `exec_assign_value`); here the block runs, and a later
       `select 5 into x` succeeds.
       Verify: tests/backlog/test_rp_found_rp694.py::test_a_not_null_domain_variable_without_a_default_is_refused
-      Backlog-ID: RP-707
+      Backlog-ID: RP-714
 
 ## Found while working RP-668 (2026-11-09)
 
