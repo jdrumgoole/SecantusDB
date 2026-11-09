@@ -17,7 +17,8 @@
 #
 # Exit 0 done; 1 a check on the snapshot failed (bisect its commits; nothing
 # merged); 2 a git / gh step failed; 4 this PR's checks passed but another
-# run of the same commit failed (an intermittent: read it before merging).
+# run of the same commit failed, or a workflow run failed with jobs that
+# never started (scripts/wait_ci.sh): read it before merging.
 # A failed claude-review alone does not block: it is advisory.
 set -uo pipefail
 branch=${1:?usage: $0 <integration-branch> [batch-pid]}
@@ -79,7 +80,7 @@ A snapshot of \`$branch\`, frozen on \`$ci\` so the lanes' later pushes don't ca
         # No checks reported is not "all passed": it is a run that has not
         # started, and is judged red.
         bad=$(gh pr checks "$pr" --json name,state -q 'if length == 0 then "(no checks reported)" else [.[]|select(.state!="SUCCESS" and .state!="SKIPPED")]|map(.name)|join(", ") end')
-        if [[ -z $bad ]]; then echo "$(date '+%T') a red run on ${snap:0:8} belongs to another PR; this PR's checks all passed; stopping so it is read before merging"; exit 4; fi
+        if [[ -z $bad ]]; then echo "$(date '+%T') this PR's checks all passed but wait_ci found a red run on ${snap:0:8} (another PR's, or a workflow run whose jobs never started); stopping so it is read before merging"; exit 4; fi
         # claude-review is advice, not a test: it reviews the diff and its
         # own setup has failed on upstream outages (a Bun download 504,
         # 2026-11-08), which held a green snapshot for hours. Every
