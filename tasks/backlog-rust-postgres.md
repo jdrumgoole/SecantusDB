@@ -1031,7 +1031,7 @@ one beside it.
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
-      once; not reproduced.** Commit `f96fc90d`, job 128491514608
+      twice; not reproduced.** Commit `f96fc90d`, job 128491514608
       (`pg-oracle (differential)`),
       `tests/test_rust_pg_corpora.py::test_corpus_answers_as_postgresql_does[sqlalchemy_catalog]`.
       The setup ran `COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'`, and
@@ -1059,8 +1059,25 @@ one beside it.
       transform comment helpers, and `shobj_description`'s
       `shared_comments`. They were not on this corpus's path, and their
       first failure should be made to surface the same way.
+      **It recurred on 2026-11-09, as the NULL with no error.** RM snapshot
+      #2584, run 42717349016, job 129502313793, 23:17 UTC: the same check
+      answered NULL, 1 of 52 differ, 1 failed and 1,183 passed. Every setup
+      statement succeeded, because the test now fails a setup error first,
+      and no statement raised. The rerun of the same job on the same commit
+      passed (job 129513427390). The snapshot changed no code on this path.
+      That rules out the transient storage read. What remains: the comment
+      was written under a key the later read does not find, or the planner
+      thread that ran the check held a publication of `OBJECT_COMMENTS`
+      from before the write. Locally, 600 more runs did not reproduce it
+      (macOS arm64, a binary of tree `72006e6c`): 200 serial, and 400 as
+      four concurrent loops at load 13-25. Both occurrences are Linux CI.
+      A lead not yet checked: the autovacuum launcher builds a full
+      `PgHandler` (`autovacuum::setting`, `worker`) every second for the
+      server's whole life, a second session reading the catalog beside
+      every connection, so a fix should prove the catalog caches cannot
+      take that session's view as the connection's.
       Backlog-ID: RP-499
-      Verify: none -- seen once in CI, not reproduced; a recurrence now names its cause in the job log
+      Verify: none -- seen twice in Linux CI (2026-11-07, 2026-11-09), 600 + ~2,000 local runs never reproduced it
 
 ## Found by the 2026-10-20 audit
 
