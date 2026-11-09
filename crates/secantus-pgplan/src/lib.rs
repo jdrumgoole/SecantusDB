@@ -22141,12 +22141,24 @@ fn resolve_sublinks_in_expr(
                     let mut shape = sl.clone();
                     shape.sub_link_type = SubLinkType::RowcompareSublink as i32;
                     shape.testexpr = e.lexpr.clone();
+                    shape.oper_name = e.name.clone();
                     shape.location = e.location;
                     if let Some(l) = e.lexpr.as_deref_mut() {
                         resolve_sublinks_in_expr(l, lookup, params, run, outer)?;
                     }
+                    shape.testexpr = e.lexpr.clone();
                     let replacement = resolve_one_sublink(&sl, &shape, lookup, params, run, outer)?;
-                    e.rexpr = Some(Box::new(replacement));
+                    // A correlated one is the whole comparison, evaluated
+                    // per outer row (RP-697); an uncorrelated one the row
+                    // its subquery returned, compared where it stands.
+                    if matches!(
+                        replacement.node.as_ref(),
+                        Some(N::FuncCall(f)) if correlated::is_correlated(f)
+                    ) {
+                        *node = replacement;
+                    } else {
+                        e.rexpr = Some(Box::new(replacement));
+                    }
                     return Ok(());
                 }
             }
@@ -22985,12 +22997,19 @@ fn resolve_one_sublink(
     // see a qualified one: the lowering resolves a column by its LAST name
     // part and ignores the qualifier, so `e.dept_id = d.id` would bind the
     // outer `d.id` to the inner table's own `id` and plan clean.
+    // A ROWCOMPARE one (`(a, b) = (select ...)`) is correlated as the
+    // comparison its shape is, not as a scalar subquery (RP-697).
+    let correlated_sl = if shape.sub_link_type == SubLinkType::RowcompareSublink as i32 {
+        shape
+    } else {
+        sl
+    };
     if foreign_qualifier(&inner).is_some()
         || correlated::fromless_outer_ref(&inner, outer)
         || correlated::function_arg_outer_ref(&inner, outer, lookup)
     {
-        let test = sl.testexpr.as_deref().cloned();
-        let mut sl = sl.clone();
+        let test = correlated_sl.testexpr.as_deref().cloned();
+        let mut sl = correlated_sl.clone();
         if let Some(mut t) = test {
             resolve_sublinks_in_expr(&mut t, lookup, params, run, Outer::Names(outer))?;
             sl.testexpr = Some(Box::new(t));
@@ -23003,8 +23022,8 @@ fn resolve_one_sublink(
         // AROUND it does, is a correlation too. A name the outer query does
         // not have either is an ordinary typo and keeps its 42703.
         Err(Error::UndefinedColumn(name)) if outer.contains(&name) || outer_whole_row(&name) => {
-            let test = sl.testexpr.as_deref().cloned();
-            let mut sl = sl.clone();
+            let test = correlated_sl.testexpr.as_deref().cloned();
+            let mut sl = correlated_sl.clone();
             if let Some(mut t) = test {
                 resolve_sublinks_in_expr(&mut t, lookup, params, run, Outer::Names(outer))?;
                 sl.testexpr = Some(Box::new(t));
@@ -23036,6 +23055,46 @@ fn resolve_one_sublink(
         run(&plan)?
     };
     let first_column = |r: Vec<Bson>| r.into_iter().next().unwrap_or(Bson::Null);
+
+    // `(a, b) op (select x, y ...)`: the subquery's one row as a row
+    // constructor, so the comparison around it is `make_row_comparison_op`'s
+    // field by field; no row is a row of NULLs, which every row operator
+    // answers NULL, as `ExecSetParamPlan` does for an empty ROWCOMPARE
+    // sublink (RP-697).
+    if shape.sub_link_type == SubLinkType::RowcompareSublink as i32 {
+        if rows.len() > 1 && PLANNING_TO_EXECUTE.with(|p| p.get()) {
+            return Err(Error::CardinalityViolation(
+                "more than one row returned by a subquery used as an expression".into(),
+            ));
+        }
+        let def = sub_plan_def(&plan, lookup).ok();
+        let width = def.as_ref().map_or(0, |d| d.columns.len());
+        let values = rows
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| vec![Bson::Null; width]);
+        let args = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let node = param_node(params, v);
+                if let Some(c) = def.as_ref().and_then(|d| d.columns.get(i)) {
+                    if !matches!(c.pg_type.as_str(), "" | "unknown" | "record" | "text") {
+                        declare_sublink_param(params.len() - 1, &c.pg_type);
+                    }
+                }
+                node
+            })
+            .collect();
+        return Ok(pg_query::protobuf::Node {
+            node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                args,
+                row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                location: sl.location,
+                ..Default::default()
+            }))),
+        });
+    }
 
     match SubLinkType::try_from(sl.sub_link_type) {
         Ok(SubLinkType::ExistsSublink) => Ok(bool_const_node(!rows.is_empty())),

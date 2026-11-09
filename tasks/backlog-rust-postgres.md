@@ -3087,15 +3087,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 the column written out, so none is the star's. The gap tests are in
 `tests/backlog/test_rp_found_rp517.py`.
 
-- [ ] **A row compared with a correlated subquery is refused.** `select a
-      from fs where (a, c) in (select fs.a, fs.c)` and `(a, c) = (select
-      fs.a, fs.c)` answer `1` on PostgreSQL 15.19, and `not in` no row
-      (`make_row_comparison_op` compares the row with the subquery's
-      columns pairwise); here each is 0A000 `comparing document with int32
-      using = is not supported yet`, with no position. An uncorrelated one
-      is answered.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_row_against_a_correlated_subquery
-      Backlog-ID: RP-697
 - [ ] **A correlated set operation is 42P01.** `select (select v.a
       intersect select 5) from (values (5), (6)) v(a)` answers `5` and NULL
       on PostgreSQL 15.19, `(select v.a union all select 9 limit 1)` `5`,
@@ -3214,6 +3205,42 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       are kept trimmed.
       Verify: tests/backlog/test_rp_found_rp719.py::test_grouping_a_char_n_value_ignores_its_blanks
       Backlog-ID: RP-725
+
+## Found while working RP-697 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
+`ch697(k int, c char(3), v varchar(4))`.
+
+- [ ] **A `varchar` compared with a `char(n)` counts the trailing blanks.**
+      `select v = c` over `'ab '::varchar(4)` and `'ab'::char(3)` is true on
+      PostgreSQL 15.19 both ways round: `varchar = bpchar` resolves to
+      `bpchareq`, the `varchar` side cast to `bpchar`, which ignores
+      trailing blanks. Here it is false, and a row comparison whose pair is
+      a `varchar` and a `char(n)` (`(v, k) = (select x.c, x.k ...)`)
+      inherits it.
+      Verify: tests/backlog/test_rp_found_rp697.py::test_varchar_against_bpchar_ignores_trailing_blanks
+      Backlog-ID: RP-726
+- [ ] **An uncorrelated `row op ANY / ALL (subquery)` with an ordering
+      operator is refused.** `select k, (k, a) < any (select 2, 3) from
+      rn697` answers per row on PostgreSQL 15.19 (each subquery row a
+      `RowCompareExpr` with the row); here it is 0A000 `a row comparison
+      with < and a subquery is not supported yet`, as is `>= all`.
+      `row_subquery_comparison` builds only `=` and `<>`; the correlated
+      form is answered since RP-697.
+      Verify: tests/backlog/test_rp_found_rp697.py::test_uncorrelated_ordered_row_any
+      Backlog-ID: RP-727
+- [ ] **A row compared with a subquery whose column has no operator with
+      the row's field is not 42883.** `(a, c) = (select 1, 2)`, `c` text,
+      is 42883 `operator does not exist: text = integer` at 18 on
+      PostgreSQL 15.19 (`make_row_comparison_op` resolves each pair's
+      operator as the statement is analysed), and so is a correlated `in`
+      -- even over no rows (`... where false`). Here each is 0A000
+      `comparing string with int32 using = is not supported yet` with no
+      position, raised only when a row is compared, and nothing at all
+      over no rows.
+      Verify: tests/backlog/test_rp_found_rp697.py::test_row_pair_with_no_operator_is_42883
+      Backlog-ID: RP-728
 
 ## Found while working RP-681 (2026-11-09)
 
