@@ -28,8 +28,9 @@ if kill -0 "$writer" 2>/dev/null; then
 fi
 grep -q "big.wt" "$dir/report.txt" 2>/dev/null || { echo "disk watchdog self-test: the report does not name the file"; status=1; }
 grep -q "== holder of" "$dir/report.txt" 2>/dev/null || { echo "disk watchdog self-test: no holder found"; status=1; }
+grep -qE '^[0-9]+$' "$dir/report.txt.lowest" 2>/dev/null || { echo "disk watchdog self-test: no lowest free space recorded"; status=1; }
 cat "$dir/report.txt" 2>/dev/null | head -30
-rm -f "$dir/big.wt" "$dir/report.txt"
+rm -f "$dir/big.wt" "$dir/report.txt" "$dir/report.txt.lowest"
 rmdir "$dir"
 [ $status -eq 0 ] && echo "disk watchdog self-test: ok"
 exit $status

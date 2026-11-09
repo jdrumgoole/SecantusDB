@@ -17,6 +17,10 @@
 # DISK_WATCH_DIRS    where to look for big files (default /tmp, the runner
 #                    temp and work dirs)
 # DISK_WATCH_EVERY   seconds between samples (default 2)
+#
+# It also keeps the lowest free space it has seen in <report-file>.lowest
+# (KB), which the report step prints, so each job's real peak disk use is
+# measured rather than guessed from a few `df` lines.
 set -u
 
 report=${1:?usage: $0 <report-file> [watched-path]}
@@ -51,8 +55,13 @@ lineage() {
 }
 
 fired=0
+lowest=
 while :; do
     kb=$(free_kb)
+    if [[ -n $kb && ( -z $lowest || $kb -lt $lowest ) ]]; then
+        lowest=$kb
+        echo "$lowest" >"$report.lowest"
+    fi
     if [[ -n $kb && $kb -lt $min_kb && $fired -eq 0 ]]; then
         fired=1
         {

@@ -1,26 +1,36 @@
 name: Free disk the job does not use
 description: >
-  Remove the hosted Linux image's toolchains no SecantusDB job uses, and
-  report the disk before and after. No-op on macOS and Windows.
-
-# Why (RP-312): `ubuntu-latest` is not one disk size. Most jobs get a 145 GB
-# `/dev/root` with ~86 GB free, but some get a 72 GB `/dev/mapper/cow-root`,
-# where the same image leaves ~13 GB free (rust-storage, 2026-11-03, run
-# 41630467524: 157 MB free, rustc and ld died of ENOSPC). The heavy jobs
-# use 21-33 GB, so on the small disk they cannot fit without this. The
-# device and size printed first say which runner a job got.
+  Remove the hosted Linux image's toolchains no SecantusDB job uses. When the
+  runner already has `wait-below-gb` free, the removal runs in the background
+  and the job goes on at once; on a smaller runner the job waits for it.
+  No-op on macOS and Windows.
+inputs:
+  wait-below-gb:
+    description: >
+      Wait for the removal only when fewer GB than this are free at the start.
+    default: "70"
 runs:
   using: composite
   steps:
     - name: Free disk
       if: runner.os == 'Linux'
       shell: bash
+      env:
+        WAIT_BELOW_GB: ${{ inputs.wait-below-gb }}
       run: |
+        # Waiting for this removal cost 1.6-2.8 min on every job (2026-11-09,
+        # runs 42603341392 and 42595321543), on the PR run's critical path.
+        # Those runners start with 88 GB free of 145 GB; the most a job was
+        # seen using is about 49 GB (pg-oracle backlog, 123 GB free after
+        # freeing, 74 GB at its last sample). A runner with that much free
+        # space does not need the room before its tests start, minutes
+        # later, so the removal runs beside the job. The RP-312 watchdog
+        # still guards the floor, and its report gives the lowest free space
+        # each job reached.
+        free_gb() { df -Pk / | awk 'NR == 2 { print int($4 / 1048576) }'; }
         echo "--- before"
         df -h / | tail -1
-        # Every directory below is a toolchain no job in this repo runs on
-        # Linux. /opt/hostedtoolcache/Python stays: setup-python uses it.
-        sudo rm -rf \
+        remove='rm -rf \
           /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
           /usr/share/swift /usr/local/julia* /usr/local/share/boost \
           /usr/local/share/powershell /usr/local/share/chromium \
@@ -28,10 +38,17 @@ runs:
           /opt/hostedtoolcache/CodeQL /opt/hostedtoolcache/go \
           /opt/hostedtoolcache/PyPy /opt/hostedtoolcache/Ruby \
           /opt/hostedtoolcache/node
-        sudo docker image prune --all --force >/dev/null 2>&1 || true
-        echo "--- after"
-        df -h / | tail -1
-        free_gb=$(df -Pk / | awk 'NR == 2 { print int($4 / 1048576) }')
-        if [ "$free_gb" -lt 40 ]; then
-          echo "::warning::only ${free_gb} GB free on / after freeing ($(df -h / | awk 'NR == 2 { print $1, $2 }')): a small runner; RP-312"
+          docker image prune --all --force >/dev/null 2>&1 || true
+          echo "--- after"; df -h / | tail -1'
+        start=$(free_gb)
+        if [ "$start" -ge "$WAIT_BELOW_GB" ]; then
+          echo "${start} GB free (at least ${WAIT_BELOW_GB}): removing in the background"
+          nohup sudo bash -c "$remove" >"$RUNNER_TEMP/free-disk.log" 2>&1 &
+          exit 0
+        fi
+        echo "${start} GB free (under ${WAIT_BELOW_GB}): waiting for the removal"
+        sudo bash -c "$remove"
+        free=$(free_gb)
+        if [ "$free" -lt 40 ]; then
+          echo "::warning::only ${free} GB free on / after freeing ($(df -h / | awk 'NR == 2 { print $1, $2 }')): a small runner; RP-312"
         fi

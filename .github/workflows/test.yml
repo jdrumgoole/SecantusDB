@@ -1320,6 +1320,9 @@ jobs:
         if: always() && runner.os != 'Windows'
         run: |
           f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f.lowest" ]; then
+            echo "disk watchdog: lowest free space $(( $(cat "$f.lowest") / 1048576 )) GB"
+          fi
           if [ -s "$f" ]; then
             cat "$f"
             echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
@@ -1686,8 +1689,12 @@ jobs:
         run: |
           # `-m backlog_fixed` replaces addopts' `-m`, which deselects them.
           df -h / | tail -1
+          # --durations: every test over a second, so the shard can be split
+          # by measured time rather than by guess (2026-11-09: this step is
+          # the PR run's critical path at 21-31 min).
           uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
-            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs
+            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs \
+            --durations=0 --durations-min=1.0
           df -h / | tail -1
           # And the OPEN items' gap tests, through the backlog's own runner: it
           # exits non-zero when a gap test no longer measures its gap (BROKEN)
@@ -1714,6 +1721,9 @@ jobs:
         if: always() && runner.os != 'Windows'
         run: |
           f="$RUNNER_TEMP/disk-watch.txt"
+          if [ -s "$f.lowest" ]; then
+            echo "disk watchdog: lowest free space $(( $(cat "$f.lowest") / 1048576 )) GB"
+          fi
           if [ -s "$f" ]; then
             cat "$f"
             echo "::error::RP-312 disk watchdog fired: a runaway write; the report above names the writer"
