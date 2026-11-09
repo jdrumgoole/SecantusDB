@@ -27,6 +27,7 @@ def test_a_mongodb_only_change_skips_pg_oracle() -> None:
         "tests/mongod_live/test_slow_query_lines.py",
         "tasks/backlog-rust-mongodb.md",
         "changelog.d/rm-999-x.md",
+        "tests/test_gate_rm.py",
     ]
     assert _tool().pg_needed(files) is False
 
