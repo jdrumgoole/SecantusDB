@@ -2537,13 +2537,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp687.py`: `dcc687` a `varchar(3)` with
 `check (value <> 'no')`, `dvv687` a domain over it.
 
-- [ ] **An assignment to a `varchar(n)[]` variable truncates an overlong
-      element.** `declare x varchar(3)[]; begin x := array['abcdef'];` is
-      22001 on PostgreSQL 15.19 (the array's `ArrayCoerceExpr` applies the
-      element's length coercion by the assignment rule), as is the same
-      DEFAULT; here `x` is `{abc}`, the explicit cast's answer.
-      Verify: tests/backlog/test_rp_found_rp687.py::test_array_variable_assignment_refuses_an_overlong_element
-      Backlog-ID: RP-695
 - [ ] **A cast to a domain over a domain names the inner domain.** `select
       'no'::dvv687` is 23514 `value for domain dvv687 violates check
       constraint "dcc687_check"` on PostgreSQL 15.19 (one `CoerceToDomain`
@@ -2585,6 +2578,34 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       `select 5 into x` succeeds.
       Verify: tests/backlog/test_rp_found_rp694.py::test_a_not_null_domain_variable_without_a_default_is_refused
       Backlog-ID: RP-714
+
+## Found while working RP-695 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp695.py`: `t695(k int, a varchar(3)[], c
+char(3)[], b bit(3)[])`.
+
+- [ ] **An INSERT or UPDATE of a `varchar(n)[]` column keeps an overlong
+      element.** `insert into t695 (a) values (array['abcdef'])` is 22001
+      on PostgreSQL 15.19 (`transformAssignedExpr`'s `ArrayCoerceExpr`
+      applies the element's length coercion by the assignment rule), as
+      are a `'{abcdef}'` literal, an UPDATE, a `char(3)[]` column's
+      `'abcd'` and a `bit(3)[]` column's `B'1'` (22026); here each row is
+      stored as given, and `array['abc   ']` keeps its six characters
+      where PostgreSQL stores `{abc}`. `fit_to_column` fits only a scalar;
+      since RP-695 `fit_assigned_length` fits an array's elements for
+      PL/pgSQL.
+      Verify: tests/backlog/test_rp_found_rp695.py::test_array_column_assignment_fits_each_element
+      Backlog-ID: RP-710
+- [ ] **A PL/pgSQL assignment to an array element is refused.** `declare x
+      int[]; begin x[1] := 5;` makes `{5}` on PostgreSQL 15.19, and
+      `x[2] := 'ab'` over a `text[]` `{a}` makes `{a,ab}`
+      (`exec_assign_value` over a `PLpgSQL_arrayelem`, which coerces the
+      new element to the element type and `array_set_element`s it); here
+      the element's value is cast to the whole array's type: 22P02
+      `cannot cast int4 to int4[]` / `malformed array literal: "ab"`.
+      Verify: tests/backlog/test_rp_found_rp695.py::test_assignment_to_an_array_element
+      Backlog-ID: RP-711
 
 ## Found while working RP-668 (2026-11-09)
 

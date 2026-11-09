@@ -16877,9 +16877,64 @@ pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
 
 /// `fit_to_column` for a value of type `pg_type` at modifier `typmod`: an
 /// assignment's length coercion, as PL/pgSQL's into a domain field over
-/// `varchar(n)` (RP-670).
+/// `varchar(n)` (RP-670). An array type (`varchar[]`, its elements' modifier
+/// `typmod`) fits each element by the same rule, as the `ArrayCoerceExpr`
+/// over the element's length coercion function does: an overlong
+/// `varchar(3)[]` element is 22001, not truncated (15.19, RP-695). A NULL
+/// element stays NULL, and an array's lower bounds are kept.
 pub fn fit_assigned_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
-    fit_length(v, pg_type, typmod)
+    match pg_type.strip_suffix("[]") {
+        Some(element) => fit_array_elements(v, element, typmod),
+        None => fit_length(v, pg_type, typmod),
+    }
+}
+
+/// [`fit_length`] of every element of an array of `element`, through its
+/// nesting and its bounds.
+fn fit_array_elements(value: Bson, element: &str, typmod: i32) -> Result<Bson> {
+    if arrays::is_bounded(&value) {
+        let lower = arrays::lower_bounds(&value);
+        let out = fit_array_elements(arrays::strip(&value), element, typmod)?;
+        return Ok(arrays::bounded(out, &lower));
+    }
+    match value {
+        Bson::Array(items) => items
+            .into_iter()
+            .map(|v| fit_array_elements(v, element, typmod))
+            .collect::<Result<Vec<_>>>()
+            .map(Bson::Array),
+        Bson::Null => Ok(Bson::Null),
+        v => fit_length(v, element, typmod),
+    }
+}
+
+#[cfg(test)]
+mod fit_assigned_length_tests {
+    use super::fit_assigned_length as fit;
+    use bson::Bson;
+
+    fn arr(items: &[&str]) -> Bson {
+        Bson::Array(items.iter().map(|s| Bson::String((*s).into())).collect())
+    }
+
+    #[test]
+    fn fits_each_element_of_an_array_by_the_assignment_rule() {
+        // varchar(3)[]: an overlong element is 22001; trailing blanks drop.
+        assert!(fit(arr(&["ab", "abcdef"]), "varchar[]", 7).is_err());
+        assert_eq!(
+            fit(arr(&["abc   "]), "varchar[]", 7).unwrap(),
+            arr(&["abc"])
+        );
+        // A NULL element and a nested array.
+        let nested = Bson::Array(vec![Bson::Array(vec![
+            Bson::String("ab".into()),
+            Bson::Null,
+        ])]);
+        assert_eq!(fit(nested.clone(), "bpchar[]", 7).unwrap(), nested);
+        // bit(3)[]: an element of another length is 22026.
+        assert!(fit(arr(&["1"]), "bit[]", 3).is_err());
+        assert_eq!(fit(arr(&["101"]), "bit[]", 3).unwrap(), arr(&["101"]));
+    }
 }
 
 /// The type a declared type text names and the modifier it is written
@@ -16923,6 +16978,10 @@ mod declared_type_and_typmod_tests {
         assert_eq!(d("varchar"), Some(("varchar".into(), -1)));
         assert_eq!(d("bit(3)"), Some(("bit".into(), 3)));
         assert_eq!(d("int4"), Some(("int4".into(), -1)));
+        // An array keeps its element's modifier, however it is written.
+        assert_eq!(d("varchar(3)[]"), Some(("varchar[]".into(), 7)));
+        assert_eq!(d("character varying(3)[2]"), Some(("varchar[]".into(), 7)));
+        assert_eq!(d("varchar(3) array"), Some(("varchar[]".into(), 7)));
         assert_eq!(d("not a ( type"), None);
     }
 }

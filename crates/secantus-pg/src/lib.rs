@@ -2125,6 +2125,26 @@ impl plpgsql_fn::Host for PlHost<'_> {
     }
 
     fn assignment_length(&self, ty: &str, sql: &str, types: &[String]) -> Option<(String, i32)> {
+        // An array of (a domain over) `varchar(n)` and the like: the
+        // `ArrayCoerceExpr` applies the element's length coercion by the
+        // same rule, so the answer is the element's base as an array at
+        // the element's modifier (RP-695).
+        let declared = secantus_pgplan::declared_type_and_typmod(ty);
+        if let Some((element, typmod)) = declared
+            .as_ref()
+            .and_then(|(name, typmod)| Some((name.strip_suffix("[]")?, *typmod)))
+        {
+            let (base, typmod) = match secantus_pgplan::domains::base_type_and_typmod(element) {
+                Some((base, typmod, _)) => (base, typmod),
+                None => (element.to_string(), typmod),
+            };
+            let length = match base.as_str() {
+                "bpchar" | "varchar" => typmod > 4,
+                "bit" | "varbit" => typmod >= 0,
+                _ => false,
+            };
+            return length.then(|| (format!("{base}[]"), typmod));
+        }
         let (base, typmod) = match secantus_pgplan::domains::base_type_and_typmod(ty) {
             Some((base, typmod, _)) => {
                 // A value already of the domain is no coercion

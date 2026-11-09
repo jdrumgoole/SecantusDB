@@ -6,8 +6,8 @@ value):
   so an overlong one was kept truncated and a domain's CHECK was not
   checked, where PostgreSQL assigns it by the assignment rule (RP-694,
   fixed);
-- an assignment to a variable of `varchar(n)[]` truncates each overlong
-  element where PostgreSQL raises 22001 (RP-695);
+- an assignment to a variable of `varchar(n)[]` truncated each overlong
+  element where PostgreSQL raises 22001 (RP-695, fixed);
 - a cast to a domain over a domain names the INNER domain in its 23514,
   where PostgreSQL names the one cast to (RP-696).
 
@@ -164,17 +164,67 @@ def test_a_moved_row_assigns_each_variable_by_the_assignment_rule(query: str, ds
 
 
 # An array's assignment coercion is an `ArrayCoerceExpr` whose element step
-# is the element type's length coercion, by the same rule.
+# is the element type's length coercion, by the same rule: every way a value
+# reaches the variable, through every element, nesting and bounds included.
+# A value already of the declared type and modifier (an explicit
+# `::varchar(3)[]`) is no coercion, so it keeps the cast's truncation.
+_CHAR3 = ("error", "22001", "value too long for type character(3)")
 ARRAY_VARIABLE = {
     "do $$ declare x varchar(3)[]; begin x := array['abcdef']; end $$": _VARCHAR3,
     "do $$ declare x varchar(3)[] := array['abcdef']; begin end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[]; begin x := '{abcdef}'; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[]; begin x := '[2:2]={abcdef}'; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[]; begin x := array[array['ab','abcdef']]; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[]; begin x := array['abcdef']::varchar[]; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[]; y text[] := '{abcdef}'; begin x := y; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[]; begin select array['abcdef'] into x; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3) array; begin x := array['abcdef']; end $$": _VARCHAR3,
+    "do $$ declare x character varying(3)[2]; begin x := array['abcdef']; end $$": _VARCHAR3,
+    "do $$ declare x dcc687[]; begin x := array['abcdef']; end $$": _VARCHAR3,
+    "do $$ declare x dcc687[]; begin x := array['no']; end $$": (
+        "error",
+        "23514",
+        'value for domain dcc687 violates check constraint "dcc687_check"',
+    ),
+    "do $$ declare x char(3)[]; begin x := array['abcd']; end $$": _CHAR3,
+    "do $$ declare x char(3)[]; begin x := array['ab  x']; end $$": _CHAR3,
+    "do $$ declare x bit(3)[]; begin x := array[B'1']; end $$": (
+        "error",
+        "22026",
+        "bit string length 1 does not match type bit(3)",
+    ),
+    "do $$ declare x varbit(3)[]; begin x := array[B'10101']; end $$": (
+        "error",
+        "22001",
+        "bit string too long for type bit varying(3)",
+    ),
+    "do $$ declare x varchar(3)[]; begin x := array['abc   ']; raise notice '%', x; end $$": (
+        "ok",
+        ["{abc}"],
+    ),
+    "do $$ declare x char(3)[]; begin x := array['ab  ']; raise notice '[%]', x[1]; end $$": (
+        "ok",
+        ["[ab ]"],
+    ),
+    "do $$ declare x varchar(3)[]; begin x := array['ab',null]; raise notice '%', x; end $$": (
+        "ok",
+        ["{ab,NULL}"],
+    ),
+    "do $$ declare x varchar(3)[]; begin x := array['abcdef']::varchar(3)[];"
+    " raise notice '%', x; end $$": ("ok", ["{abc}"]),
+    "do $$ declare x numeric(3,1)[]; begin x := array[12.345]; raise notice '%', x; end $$": (
+        "ok",
+        ["{12.3}"],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-695")
+@pytest.mark.backlog_fixed("RP-695")
 @pytest.mark.parametrize("query", list(ARRAY_VARIABLE))
 def test_array_variable_assignment_refuses_an_overlong_element(query: str, dsn: str) -> None:
-    assert _answer(dsn, query) == ARRAY_VARIABLE[query]
+    """Was: each overlong element was truncated, as an explicit cast does,
+    and a `bit(3)[]` element of another length padded (RP-695)."""
+    assert _moved(dsn, query) == ARRAY_VARIABLE[query]
 
 
 # One `CoerceToDomain` checks the whole chain and names the domain it
