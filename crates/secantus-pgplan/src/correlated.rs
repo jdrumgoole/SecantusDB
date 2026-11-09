@@ -1805,7 +1805,15 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     let rows = run(&sql, &inner_params);
     PLAN_PARAM_TYPES.with(|t| *t.borrow_mut() = previous);
     let rows = rows?;
-    let first = |r: &Vec<Bson>| r.first().cloned().unwrap_or(Bson::Null);
+    // The result is of its column's type at its column's modifier
+    // (`exprTypmod` of an EXPR or ARRAY sublink): a `char(n)` value is
+    // stored without its blanks, and PostgreSQL's carries them, so each is
+    // padded to the width, as the uncorrelated sublink's cast to
+    // `character(n)` / `character(n)[]` pads it (RP-666). Answered as the
+    // inner rows stored them, `array(select t.f ...)` was `{a}` where
+    // 15.19 answers `{"a  "}` (RP-683).
+    let width = bpchar_width(&text(2)?, int(6)?);
+    let first = |r: &Vec<Bson>| pad_bpchar_deep(r.first().cloned().unwrap_or(Bson::Null), width);
     match kind {
         SubLinkType::ExistsSublink => Ok(Bson::Boolean(!rows.is_empty())),
         SubLinkType::ExprSublink => {
@@ -1825,6 +1833,27 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
             eval_scalar_array_const(&op, test, values, kind == SubLinkType::AnySublink)
         }
         _ => Err(Error::Unsupported("this correlated subquery form".into())),
+    }
+}
+
+/// The `char(n)` width of a correlated call's result: its type is `bpchar`
+/// (or an array of it, any depth) at a modifier `n + 4`.
+fn bpchar_width(result_type: &str, typmod: i64) -> Option<usize> {
+    let base = result_type.trim_end_matches("[]");
+    (base == "bpchar" && typmod > 4).then(|| usize::try_from(typmod - 4).ok())?
+}
+
+/// Pad a `char(n)` value, or each element of an array of them at any depth,
+/// to its width.
+fn pad_bpchar_deep(v: Bson, width: Option<usize>) -> Bson {
+    match v {
+        Bson::Array(items) if width.is_some() => Bson::Array(
+            items
+                .into_iter()
+                .map(|i| pad_bpchar_deep(i, width))
+                .collect(),
+        ),
+        v => crate::pad_bpchar(v, width),
     }
 }
 
@@ -2584,5 +2613,46 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
         } else {
             FnResult::Value(Bson::Null)
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `array(select t.f ...)` over a `char(3)` column, correlated, is
+    // `{"a  ","xy ",NULL}` on 15.19: each element at the column's width
+    // (RP-683). A `char(3)[]` column's arrays are padded inside, and a
+    // value with no modifier, or not a `bpchar`, is left as it is.
+    #[test]
+    fn a_correlated_char_n_result_is_padded_to_its_width() {
+        assert_eq!(bpchar_width("bpchar[]", 7), Some(3));
+        assert_eq!(bpchar_width("bpchar", 7), Some(3));
+        assert_eq!(bpchar_width("bpchar[][]", 7), Some(3));
+        assert_eq!(bpchar_width("bpchar", -1), None);
+        assert_eq!(bpchar_width("varchar[]", 7), None);
+        assert_eq!(bpchar_width("text", 7), None);
+        let width = bpchar_width("bpchar[]", 7);
+        assert_eq!(
+            pad_bpchar_deep(
+                Bson::Array(vec![
+                    Bson::String("a".into()),
+                    Bson::String("xy".into()),
+                    Bson::Null,
+                    Bson::Array(vec![Bson::String("é".into())]),
+                ]),
+                width,
+            ),
+            Bson::Array(vec![
+                Bson::String("a  ".into()),
+                Bson::String("xy ".into()),
+                Bson::Null,
+                Bson::Array(vec![Bson::String("é  ".into())]),
+            ])
+        );
+        assert_eq!(
+            pad_bpchar_deep(Bson::String("a".into()), None),
+            Bson::String("a".into())
+        );
     }
 }

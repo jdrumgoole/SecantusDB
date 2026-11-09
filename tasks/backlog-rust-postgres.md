@@ -2471,17 +2471,6 @@ VALUES-only statements as written, the rest with the `_SETUP` tables of
 `char(n)` value trimmed and pads it where it enters an expression; a value
 that reaches a comparison carrying its blanks is compared with them.
 
-- [ ] **A correlated `ARRAY(...)` over a `char(n)` column drops its
-      elements' blanks.** On PostgreSQL 15.19 `select k, array(select t.f
-      from (values (1, 'a'::char(3)), ...) t(k, f) where t.f = s.f) from
-      (values ...) s(k, f)` answers `{"a  "}`, described `character(3)[]`
-      (modifier 7); here the elements are `{a}`. Since RP-679 the call is
-      described with the modifier, but the elements are the inner rows'
-      stored (trimmed) values: the uncorrelated sublink casts its array to
-      the column's `char(n)[]`, which pads each element (RP-666), and the
-      correlated call does not.
-      Verify: tests/backlog/test_rp_found_rp679.py::test_correlated_array_of_char_n_keeps_the_elements_blanks
-      Backlog-ID: RP-683
 - [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
       over ()` is 42809 `OVER specified, but octet_length is not a window
       function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
@@ -3218,3 +3207,21 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       while one over an `int` column or a bare `varchar` column answers.
       Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
       Backlog-ID: RP-707
+
+## Found while working RP-683 (2026-11-09)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written.
+
+- [ ] **A correlated `ARRAY(...)` over an array column is typed one
+      dimension too many.** `select k, array(select t.f from (values (1,
+      array[1, null]), (2, array[2, 3])) t(k, f) where t.k >= s.k) from
+      ... s(k, f)` is described `integer[]` (1007) on 15.19, rows
+      `{{1,NULL},{2,3}}`, and `pg_typeof` of it is `integer[]`
+      (`get_promoted_array_type`: an array column's ARRAY sublink is its
+      own type, one more dimension of it). Here it is described 1043 and
+      reaches the client as the text `{{1,NULL},{2,3}}`, and `pg_typeof`
+      is `integer[][]`: `correlate` appends `[]` to a column type that is
+      already an array, which the uncorrelated sublink does not.
+      Verify: tests/backlog/test_rp_found_rp683.py::test_correlated_array_of_an_array_column_is_its_own_type
+      Backlog-ID: RP-729
