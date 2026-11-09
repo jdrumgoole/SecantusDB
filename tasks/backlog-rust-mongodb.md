@@ -2410,6 +2410,31 @@ What is left, there and beside it:
       **Decided 2026-10-16 (Joe):** link the C ICU 57.1 that mongod links,
       in place of ICU4X, so `normalization: false` and the `alternate:
       "shifted"` cases match.
+      **Decision needed (2026-11-09):** how ICU 57.1 gets into the build.
+      Sized from what mongod links, `mongodb/mongo` r8.2.11
+      `src/third_party/icu4c-57.1/source/`: `common/` 379 files, 7.6 MB;
+      `i18n/` 423 files, 8.1 MB; `stubdata/`; and mongo's trimmed data
+      `mongo_sources/icudt57l.dat`, a 3.3 MB prebuilt binary
+      (`icudt57b.dat` for big-endian). The gap test is still OPEN on
+      `18ce0753` (Rust server 1, mongod 8.2.11 0). The swap in Rust is
+      contained: `build` / `compare` / `sort_key` in
+      `secantus-core/src/collation.rs`, with `KEY_FORMAT` going to 2 so
+      collated indexes are re-keyed on open (that rebuild path exists). The
+      cost: a C++ build of ~800 files in everything that links
+      `secantus-core`, `secantusd-pg` and its Windows lane included, plus
+      the release binaries. The sort-key bytes change, which also settles
+      RM-095's `2b0105` vs `290105`. Options:
+      (a) **recommended**: commit mongo's copy, the sources and
+      `icudt57l.dat`, under `vendor/icu4c-57.1/`. That is exactly what
+      mongod links (mongo's patches, mongo's data trim), with no network
+      at build time. The 3.3 MB `.dat` needs an exception to "never commit
+      a generated binary", as the PGO profile has.
+      (b) a `unicode-org/icu` submodule at `release-57-1`: upstream without
+      mongo's patches. Not checked: whether that tag carries a prebuilt
+      `.dat`. If it does not, the build needs ICU's own data tools.
+      (c) fetch mongo's directory, pinned to r8.2.11, at build time: no
+      blob in git, but a network dependency in every clean build and every
+      CI job.
       Backlog-ID: RM-091
       Verify: tests/backlog/test_rm_085_112.py::test_canonically_equivalent_strings_differ_without_normalization
 - [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left.**
