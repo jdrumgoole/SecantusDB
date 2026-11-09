@@ -2039,16 +2039,6 @@ Measured on PostgreSQL 15.19 (the data-modifying WITH on a private cluster).
 Measured on a private PostgreSQL 15.19 cluster with `fs(a int, c text)`
 holding `(1, 'y')`.
 
-- [ ] **`v.*` in a subquery's select list over an outer FROM item is
-      42P01.** On PostgreSQL 15.19 `select (select v.*) from (values (1))
-      v(a)` answers 1 (the star expands to the outer item's columns), and
-      over `v(a, c)` it is 42601 `subquery must return only one column` at
-      8; here each is 42P01 `missing FROM-clause entry for table "v"`. Since
-      RP-479 a bare outer name is the item's whole row in a subquery; a
-      star over it is not yet expanded there. Measured on 15.19 with
-      VALUES lists.
-      Verify: tests/backlog/test_rp_subquery_scope.py::test_outer_star_in_subquery
-      Backlog-ID: RP-517
 
 ## Found while working RP-508 (2026-11-08)
 
@@ -3030,3 +3020,63 @@ Measured on PostgreSQL 15.19; none needs an object.
       0A000 `NamedArgExpr is not supported yet` with no position.
       Verify: tests/backlog/test_rp_found_rp458.py::test_named_argument_to_a_builtin_without_argument_names
       Backlog-ID: RP-677
+
+## Found while working RP-517 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
+`fs(a int, c text)` holding `(1, 'x')` and `(1, 'y')`. Each also fails with
+the column written out, so none is the star's. The gap tests are in
+`tests/backlog/test_rp_found_rp517.py`.
+
+- [ ] **A row compared with a correlated subquery is refused.** `select a
+      from fs where (a, c) in (select fs.a, fs.c)` and `(a, c) = (select
+      fs.a, fs.c)` answer `1` on PostgreSQL 15.19, and `not in` no row
+      (`make_row_comparison_op` compares the row with the subquery's
+      columns pairwise); here each is 0A000 `comparing document with int32
+      using = is not supported yet`, with no position. An uncorrelated one
+      is answered.
+      Verify: tests/backlog/test_rp_found_rp517.py::test_row_against_a_correlated_subquery
+      Backlog-ID: RP-697
+- [ ] **A correlated set operation is 42P01.** `select (select v.a
+      intersect select 5) from (values (5), (6)) v(a)` answers `5` and NULL
+      on PostgreSQL 15.19, `(select v.a union all select 9 limit 1)` `5`,
+      and `(select v.a union select 9)` is 21000 `more than one row
+      returned by a subquery used as an expression`; here each is 42P01
+      `missing FROM-clause entry for table "v"` at 16: the arms' outer
+      reference is not found.
+      Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_set_operation
+      Backlog-ID: RP-698
+- [ ] **A correlated subquery that passes an outer FROM function's column
+      or a whole row's field through answers it as text.** `select (select
+      f.x) from generate_series(1, 2) f(x)`, `(select f)` over
+      `generate_series(1, 2) f` and `select (select (v).a) from (values (1))
+      v(a)` answer integers on PostgreSQL 15.19 (the subquery's column is
+      the outer Var, of its type); here they are the strings `'1'`, `'2'`,
+      though `(select f.x + 1)` is an integer. And `(select (v).*)` is 0A000
+      `this field selection is not supported yet`, where PostgreSQL answers
+      `1`.
+      Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_pass_through_keeps_its_type
+      Backlog-ID: RP-699
+- [ ] **A GROUP BY naming a correlated subquery target is refused.**
+      `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
+      v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
+      15.19: the grouped item is the subquery, so its outer column is
+      grouped. Here the first is 42803 `subquery uses ungrouped column "v.a"
+      from outer query`, the star form 42P01 `missing FROM-clause entry for
+      table "v"`, the written-out one 42803 `column "v.a" must appear in the
+      GROUP BY clause or be used in an aggregate function`, each at 16.
+      Verify: tests/backlog/test_rp_found_rp517.py::test_group_by_a_correlated_subquery_target
+      Backlog-ID: RP-700
+- [ ] **A LATERAL subquery's outer column is named by its type, and a star
+      over an outer item there is 42P01.** `select l.* from (values (3))
+      v(a), lateral (select v.a) l` names its column `a` on PostgreSQL 15.19
+      (`FigureColname`), and `lateral (select fe.a, fe.b) l` names `a`, `b`;
+      here they are `int4` and `int4`, `text`. `lateral (select v.*) l` and
+      `lateral (select fe.* from fs) l` answer the outer item's columns
+      there (`ExpandColumnRefStar` finds it in the level's range table);
+      here each is 42P01 `invalid reference to FROM-clause entry for table
+      "v"` (`"fe"`) with the hint that the entry cannot be referenced from
+      this part of the query. RP-517 expanded such a star in an expression
+      subquery only.
+      Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
+      Backlog-ID: RP-701

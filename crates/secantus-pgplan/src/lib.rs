@@ -21877,7 +21877,13 @@ fn resolve_sublinks_in_target(
     };
     let star = matches!(v.node.as_ref(), Some(N::ColumnRef(c))
         if c.fields.iter().any(|f| matches!(f.node.as_ref(), Some(N::AStar(_)))));
-    let written = (rt.name.is_empty() && !star).then(|| expression_column_name(v));
+    let written = (rt.name.is_empty() && !star).then(|| {
+        // A subquery whose first target is a star is named by the star's
+        // first column, as the analysed subquery names it (RP-517).
+        let mut named = v.clone();
+        correlated::name_star_sublinks(&mut named, lookup);
+        expression_column_name(&named)
+    });
     resolve_sublinks_in_expr(v, lookup, params, run, outer)?;
     if let Some(name) = written {
         if expression_column_name(v) != name {
@@ -22717,6 +22723,8 @@ fn resolve_one_sublink(
     // A qualifier no level has is an error before anything else is done
     // with the subquery -- before an EXISTS drops the select list holding it.
     check_subquery_qualifiers(&inner)?;
+    // A star over an outer FROM item is that item's columns (RP-517).
+    correlated::expand_outer_stars(&mut inner, lookup);
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
         simplify_exists(&mut inner, lookup);
     }

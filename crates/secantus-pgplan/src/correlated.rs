@@ -1150,6 +1150,212 @@ fn outer_ref_whole_row(
     outer_whole_row_type(name, lookup)
 }
 
+/// `q.*` in a subquery's select list, where `q` is a FROM item of an
+/// enclosing query, is that item's columns (RP-517): `transformTargetList`
+/// expands the star with `ExpandColumnRefStar`, which finds `q` by
+/// `refnameNamespaceItem` at whichever level has it, so `select (select
+/// v.*) from (values (1)) v(a)` is `(select v.a)`, and over `v(a, c)` the
+/// sublink's width error. Rewritten here into the item's qualified
+/// columns, which the correlated rewrite then reads as any other outer
+/// reference. A set operation's arms are levels of their own; a nested
+/// subquery is expanded when it is resolved, with this level around it.
+/// A star whose qualifier this level binds is its own, and one no
+/// enclosing FROM item answers to is left for the errors it has.
+pub(crate) fn expand_outer_stars(
+    s: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) {
+    if s.larg.is_some() || s.rarg.is_some() {
+        for arm in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            expand_outer_stars(arm, lookup);
+        }
+        return;
+    }
+    let own = level_names(s);
+    let star_qualifier = |t: &pg_query::protobuf::Node| -> Option<(String, i32)> {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = rt.val.as_deref().and_then(|v| v.node.as_ref()) else {
+            return None;
+        };
+        match c.fields.as_slice() {
+            [q, star] if matches!(star.node.as_ref(), Some(N::AStar(_))) => match q.node.as_ref() {
+                Some(N::String(q)) => Some((q.sval.clone(), c.location)),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    if !s
+        .target_list
+        .iter()
+        .any(|t| star_qualifier(t).is_some_and(|(q, _)| !own.contains(&q)))
+    {
+        return;
+    }
+    let string = |v: &str| pg_query::protobuf::Node {
+        node: Some(N::String(pg_query::protobuf::String {
+            sval: v.to_string(),
+        })),
+    };
+    let mut expanded = Vec::with_capacity(s.target_list.len());
+    for t in std::mem::take(&mut s.target_list) {
+        let columns = star_qualifier(&t)
+            .filter(|(q, _)| !own.contains(q))
+            .and_then(|(q, at)| Some((outer_item_columns(&q, lookup)?, q, at)));
+        let Some((columns, q, at)) = columns else {
+            expanded.push(t);
+            continue;
+        };
+        for column in columns {
+            expanded.push(pg_query::protobuf::Node {
+                node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                    val: Some(Box::new(pg_query::protobuf::Node {
+                        node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                            fields: vec![string(&q), string(&column)],
+                            location: at,
+                        })),
+                    })),
+                    location: at,
+                    ..Default::default()
+                }))),
+            });
+        }
+    }
+    s.target_list = expanded;
+}
+
+/// The FROM item of one list that answers to `name`: a relation or a
+/// derived table by its alias (a relation without one by its name), an
+/// aliased JOIN by its alias alone, an unaliased one by its sides' names.
+fn named_item<'a>(
+    item: &'a pg_query::protobuf::Node,
+    name: &str,
+) -> Option<&'a pg_query::protobuf::Node> {
+    let is = |a: Option<&pg_query::protobuf::Alias>| a.is_some_and(|a| a.aliasname == name);
+    match item.node.as_ref()? {
+        N::RangeVar(r) => {
+            (r.alias.as_ref().map_or(&r.relname, |a| &a.aliasname) == name).then_some(item)
+        }
+        N::RangeSubselect(rs) => is(rs.alias.as_ref()).then_some(item),
+        N::RangeFunction(rf) => is(rf.alias.as_ref()).then_some(item),
+        N::JoinExpr(j) if j.alias.is_some() => is(j.alias.as_ref()).then_some(item),
+        N::JoinExpr(j) => [j.larg.as_deref(), j.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+            .find_map(|side| named_item(side, name)),
+        _ => None,
+    }
+}
+
+/// The columns of the FROM item an enclosing query names `name`, innermost
+/// level first, as `collect_from_columns` reads them.
+fn outer_item_columns(
+    name: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<Vec<String>> {
+    let levels = OUTER_FROM.with(|o| o.borrow().clone());
+    let item = levels
+        .iter()
+        .rev()
+        .find_map(|level| level.iter().find_map(|item| named_item(item, name)))?;
+    let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    let mut columns = Vec::new();
+    collect_from_columns(item, lookup, &ctes, &mut columns);
+    (!columns.is_empty()).then_some(columns)
+}
+
+/// The name of an expression subquery whose first target is a star
+/// (`(select v.*)`, `(select * from w)`): `FigureColnameInternal` reads the
+/// ANALYSED subquery's first target, so it is the star's first column, not
+/// the qualifier the written `v.*` ends in (RP-517). `None` where the
+/// first target is no star or its columns are not known here.
+pub(crate) fn star_sublink_name(
+    sel: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let Some(N::ResTarget(rt)) = sel.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    if !rt.name.is_empty() {
+        return None;
+    }
+    let Some(N::ColumnRef(c)) = rt.val.as_deref()?.node.as_ref() else {
+        return None;
+    };
+    let is_star = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AStar(_)));
+    let qualifier = match c.fields.as_slice() {
+        [star] if is_star(star) => None,
+        [q, star] if is_star(star) => match q.node.as_ref() {
+            Some(N::String(q)) => Some(q.sval.clone()),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    ctes.extend(sel.with_clause.iter().flat_map(|w| w.ctes.iter().cloned()));
+    let own = match &qualifier {
+        None => sel.from_clause.first(),
+        Some(q) => sel.from_clause.iter().find_map(|item| named_item(item, q)),
+    };
+    let columns = match (own, qualifier) {
+        (Some(item), _) => {
+            let mut columns = Vec::new();
+            collect_from_columns(item, lookup, &ctes, &mut columns);
+            columns
+        }
+        (None, Some(q)) if !level_names(sel).contains(&q) => outer_item_columns(&q, lookup)?,
+        _ => return None,
+    };
+    columns.into_iter().next()
+}
+
+/// Name each expression subquery in `node` whose first target is a star
+/// after the star's first column (`star_sublink_name`), as the analysed
+/// tree names it, so `expression_column_name` over the result gives the
+/// name `FigureColname` does. A subquery whose first target is another
+/// subquery is named by that one in turn, with its own FROM around it:
+/// `(select (select v.*))` is `a` (RP-517).
+pub(crate) fn name_star_sublinks(
+    node: &mut pg_query::protobuf::Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) {
+    let _ = walk_expr(node, &mut |n| {
+        let Some(N::SubLink(sl)) = n.node.as_mut() else {
+            return Ok(());
+        };
+        if sl.sub_link_type != SubLinkType::ExprSublink as i32 {
+            return Ok(());
+        }
+        let Some(N::SelectStmt(sel)) = sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
+        else {
+            return Ok(());
+        };
+        let name = star_sublink_name(sel, lookup);
+        let from = sel.from_clause.clone();
+        let Some(N::ResTarget(first)) = sel.target_list.first_mut().and_then(|t| t.node.as_mut())
+        else {
+            return Ok(());
+        };
+        match name {
+            Some(name) => first.name = name,
+            None if first.name.is_empty() => {
+                if let Some(v) = first.val.as_deref_mut() {
+                    let depth = push_outer_from(&from);
+                    name_star_sublinks(v, lookup);
+                    pop_outer_from(depth);
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    });
+}
+
 /// `inner` planned with each outer reference a `$N` cast to its type.
 fn typed_probe(
     inner: &pg_query::protobuf::SelectStmt,
