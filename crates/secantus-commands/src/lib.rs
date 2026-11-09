@@ -322,6 +322,9 @@ pub struct CommandContext {
     /// The running command's ingress admissions (RM-355), fresh for each
     /// command and kept after it for its `Slow query` line.
     pub ingress_admission: Arc<admission::AdmissionContext>,
+    /// The running command's execution admissions: the tickets its global
+    /// locks took (RM-355), fresh for each command.
+    pub execution_admission: Arc<admission::AdmissionContext>,
     /// When the command began its admission: where its `maxTimeMS` runs
     /// from, as mongod's does.
     pub exec_started: Option<std::time::Instant>,
@@ -408,6 +411,7 @@ impl CommandContext {
             locks: None,
             txn_locks: false,
             ingress_admission: Arc::default(),
+            execution_admission: Arc::default(),
             exec_started: None,
         }
     }
@@ -884,6 +888,8 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     // The command's admissions, and the ingress ticket it holds until it
     // has finished, its write concern's wait included (RM-355).
     ctx.ingress_admission = Arc::default();
+    ctx.execution_admission = Arc::default();
+    let _execution = lock_manager::admission_scope(ctx.execution_admission.clone());
     ctx.exec_started = None;
     let _ingress = admission::ingress::HeldScope::enter();
     let stats = ctx.top_stats.clone();

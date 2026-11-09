@@ -536,55 +536,52 @@ These are explicit non-goals. Don't add them without a reason.
       `queues: {ingress: {admissions: 1}, execution: {admissions: 2}}`, and
       in `storage.timeWaitingMicros` the `storageExecutionMicros` it waited
       for admission -- never zero, so a `find` of documents in the cache
-      still has a `storage` section (measured 2026-10-27). Since 2026-11-08
-      this server has mongod's ingress admission control
-      (`secantus-commands` `admission/`, a port of `TicketHolder` and
-      `IngressAdmissionController`; `tests/mongod_live/test_ingress_admission.py`):
-      `serverStatus.queues.ingress`, the three `ingressAdmissionControl*`
-      parameters, queueing with mongod's interrupts and overflow, and the
-      line's `queues.ingress`. It has no execution control (its
-      `admission.rs` holds writes back under a flag, off by default), so
-      no `queues.execution`, no line `execution` admissions and no
-      `storageExecutionMicros`: its `storage` section is WiredTiger's
-      per-session statistics alone (RM-023), absent when they counted
-      nothing. A stand-in number is not to be printed; the field follows
-      the mechanism, if one is built. Also left, all measured 8.2.11
-      2026-11-08: a `currentOp` row has no `queues` (each pool's
-      `admissions`, `totalTimeQueuedMicros`, `isHoldingTicket`) or, while
-      it waits, `currentQueue`; `serverStatus.queues` has no
-      `ingressSessionEstablishment` (the connection limiter's counts); the
-      line of a command that never got its ticket names `<db>.$cmd` on
-      mongod, its collection here; and mongod's first retryable write
-      after startup takes a second, exempt, ingress admission (not traced).
-      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08; the ticket pools are next, built on `admission::TicketHolder`. Measured when it was asked (2026-11-07): building the mechanism changes the
-      server's default concurrency. Measured on mongod 8.2.11 (single-node
-      set, this Mac): `storageEngineConcurrencyAdjustmentAlgorithm:
-      throughputProbing` (initial concurrency 0 = from the cores, min 4,
-      max 128, read/write ratio 0.5, adjusted every 100 ms) gave 8 read and
-      8 write tickets; `serverStatus.queues` has `execution.{read, write}`
-      (out, available, totalTickets, `exempt` and `normalPriority` queue
-      stats with the three delinquency counters) and `execution.monitor`,
-      plus `ingress` (a 1,000,000-ticket pool, `ingressAdmissionControlEnabled:
-      true`) and `ingressSessionEstablishment`. Every user command, `ping`
-      included, has `ingress: {admissions: 1}`; `execution.admissions` is 2
-      for `find`, `getMore`, `aggregate`, `count`, `listCollections` and
-      `dbStats`, 3 for an `insert`, 2 for an update statement and 4 for its
-      `update` command, and `ping`'s `execution` is `{}` with no `storage`;
-      `storageExecutionMicros` was 1-6 us whenever admissions > 0. The
-      count is mongod's acquisition structure, not its `locks`: a `find`
-      with `Global: {r: 1}` has 2 admissions, with or without the profiler,
-      so each command's acquisition points need their own probe. The
-      options: (a, recommended, the faithful one) build mongod's execution
-      control -- the ingress controller, read and write ticket holders with
-      throughput probing replacing `admission.rs`'s opt-in write tickets,
-      the queue sections, and per-command admission points -- sequenced as
-      ingress first (its 1,000,000 pool limits nothing), then the ticket
-      holders, then the per-command counts; it bounds concurrent engine
-      reads and writes by default, where today the server admits all
-      (`admission.rs` measured 16 to 4 writers costing 23% throughput on a
-      fixed limit; probing moves the limit to where throughput is best);
-      (b) ingress only, leaving this item open; (c) leave it open, as
-      RM-170's decision did for the delinquency counters.
+      still has a `storage` section (measured 2026-10-27). This server has
+      mongod's ingress admission control since 2026-11-08
+      (`secantus-commands` `admission/ingress.rs`;
+      `tests/mongod_live/test_ingress_admission.py`) and its execution
+      control's ticket pools since 2026-11-09 (`admission/execution.rs`, a
+      port of `TicketHolderManager` and `ThroughputProbing`;
+      `tests/mongod_live/test_execution_admission.py`): the read and write
+      pools of the gradual resize policy, sized by throughput probing (twice
+      the logical cores, split 0.5) or fixed by a concurrency given at
+      startup, the sixteen parameters, `serverStatus.queues.execution` with
+      its `monitor`, `globalLock.currentQueue` counting the operations
+      queued in them, and a ticket taken with each owner's global lock
+      (`lock_manager`, mongod's `Locker::_acquireTicket`), returned between
+      a transaction's statements and taken again with mongod's
+      `reacquireTicket` conflict check. `admission.rs`'s opt-in write
+      tickets are gone (`--write-tickets N` sets
+      `storageEngineConcurrentWriteTransactions`). Open:
+      - the line's `queues.execution` admissions and
+        `storage.timeWaitingMicros.storageExecutionMicros`, and
+        `delinquencyInfo` (the operation's context counts both since
+        2026-11-09; the line prints neither): the count is mongod's
+        acquisition structure, not its `locks` -- a `find` with `Global:
+        {r: 1}` has 2 admissions, with or without the profiler -- so each
+        command's acquisition points need their own probe before a count is
+        printed. Measured 2026-11-07: `execution.admissions` is 2 for `find`,
+        `getMore`, `aggregate`, `count`, `listCollections` and `dbStats`, 3
+        for an `insert`, 2 for an update statement and 4 for its `update`
+        command, and `ping`'s `execution` is `{}` with no `storage`;
+        `storageExecutionMicros` was 1-6 us whenever admissions > 0. When
+        the line prints `delinquencyInfo`, the backlog conftest's `rust_mongo`
+        needs the reference's `delinquentAcquisitionIntervalMillis`;
+      - where this server's ticket points differ from mongod's: a yield here
+        keeps its locks, so it keeps its ticket and takes no second
+        admission (mongod returns both and takes them again, RM-360); an
+        `awaitData` getMore returns its ticket for each 100 ms of its wait,
+        where mongod's yields once per wait; `commitTransaction` and
+        `abortTransaction` take no ticket (mongod's unstash takes one);
+      - a `currentOp` row has no `queues` (each pool's `admissions`,
+        `totalTimeQueuedMicros`, `isHoldingTicket`) or, while it waits,
+        `currentQueue`; `serverStatus.queues` has no
+        `ingressSessionEstablishment` (the connection limiter's counts); the
+        line of a command that never got its ingress ticket names
+        `<db>.$cmd` on mongod, its collection here; and mongod's first
+        retryable write after startup takes a second, exempt, ingress
+        admission (not traced), all measured 8.2.11 2026-11-08.
+      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08 and the ticket pools 2026-11-09; the per-command admission counts on the line are next.
       Backlog-ID: RM-355
       Verify: tests/backlog/test_rm_355_364.py::test_a_line_says_what_execution_control_admitted, tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
@@ -1956,7 +1953,9 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       since RM-023 (2026-10-27) `bytesRead` / `readingTimeMicros` from
       WiredTiger's per-session statistics; not `numInterruptChecks` (RM-360)
       or the three delinquency counters (mongod's execution admission
-      control, RM-355).
+      control, RM-355), which since 2026-11-09 each operation's execution
+      admission context counts (`AdmissionContext::delinquent_acquisitions`
+      and the two delinquency totals).
       **Decided 2026-10-16 (Joe):** leave it open; no stand-in values. Build
       it when those mechanisms exist.
       Backlog-ID: RM-170
@@ -2863,11 +2862,13 @@ Each a 45-60s local run against an 8.26ms baseline (zlib era):
 ### Admission control: prototyped, measured, and NOT the answer
 
 `--write-tickets N` (`secantus-storage/src/admission.rs`, default 0 = off)
-bounds how many writes are inside the storage engine at once. Measured: -22%
+bounded how many writes were inside the storage engine at once. Measured: -22%
 throughput to buy -12% p99.9. It relocates the queue rather than removing it.
-**Decision: the flag stays off by default**, kept as a diagnostic and a
-tail-predictability knob (with tickets the tail becomes perfectly repeatable);
-it should not be enabled hoping for a faster tail.
+Since 2026-11-09 it is gone: mongod's execution admission control replaced it
+(RM-355, Joe's decision of 2026-11-08), with read and write pools that
+throughput probing sizes by default, and `--write-tickets N` now fixes the
+write pool (`storageEngineConcurrentWriteTransactions=N`). The measurement
+above was of a fixed limit; the tail under probing is not yet measured.
 
 ### Where to go next
 

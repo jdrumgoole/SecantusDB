@@ -198,6 +198,9 @@ pub struct ResourceReport {
 struct Inner {
     heads: HashMap<Resource, Head>,
     stats: HashMap<&'static str, Stats>,
+    /// The owners waiting for a lock now, and the mode each waits for:
+    /// mongod's `Locker::hasLockPending`.
+    pending: HashMap<Owner, Mode>,
 }
 
 /// The server-wide lock manager, one per server: built into the server's
@@ -218,7 +221,16 @@ pub struct LockManager {
     /// `fsync: {lock: true}`'s hold: how many locks are outstanding, and the
     /// owner holding the global lock in S while any are.
     fsync: Mutex<(u32, Option<Owner>)>,
+    /// mongod's execution admission control, once the server wires it
+    /// (`admission::execution`): an owner takes a ticket from its read or
+    /// write pool as it takes the global lock (RM-355).
+    execution: std::sync::OnceLock<std::sync::Arc<ExecutionControl>>,
+    /// The execution ticket each owner holds, and whether from the read
+    /// pool: mongod's `Locker::_ticket`, one per owner.
+    tickets: Mutex<HashMap<Owner, (crate::admission::Ticket, bool)>>,
 }
+
+use crate::admission::execution::ExecutionControl;
 
 impl Default for LockManager {
     fn default() -> Self {
@@ -234,7 +246,19 @@ impl LockManager {
             next_owner: AtomicU64::new(1),
             next_ticket: AtomicU64::new(1),
             fsync: Mutex::new((0, None)),
+            execution: std::sync::OnceLock::new(),
+            tickets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Wire in the server's execution control (once).
+    pub fn set_execution(&self, control: std::sync::Arc<ExecutionControl>) -> bool {
+        self.execution.set(control).is_ok()
+    }
+
+    /// The server's execution control, when wired.
+    pub fn execution(&self) -> Option<&std::sync::Arc<ExecutionControl>> {
+        self.execution.get()
     }
 
     /// `fsync: {lock: true}`: the first lock takes the global lock in S under
@@ -285,7 +309,33 @@ impl LockManager {
     /// they clear or the request's deadline spends. Counts the acquisition,
     /// and the wait when there was one; a wait that ends on the deadline
     /// counts as a wait but leaves no hold.
+    ///
+    /// The global lock is taken with an execution ticket, before it, as
+    /// mongod's `Locker::lockGlobal` takes one (RM-355): an owner without
+    /// one takes one from the read pool for IS or S and from the write pool
+    /// for IX, waiting for it when the pool has none free, and holds it
+    /// until it lets the global lock go. X takes none. An error that ends
+    /// the ticket's wait other than the deadline is kept for
+    /// [`take_ticket_error`].
     pub fn acquire(
+        &self,
+        owner: Owner,
+        resource: &Resource,
+        mode: Mode,
+    ) -> Result<(), MaxTimeMsExpired> {
+        let ticketed = if matches!(resource, Resource::Global) {
+            self.take_ticket(owner, mode)?
+        } else {
+            false
+        };
+        let taken = self.acquire_lock(owner, resource, mode);
+        if taken.is_err() && ticketed {
+            self.drop_ticket(owner);
+        }
+        taken
+    }
+
+    fn acquire_lock(
         &self,
         owner: Owner,
         resource: &Resource,
@@ -338,6 +388,7 @@ impl LockManager {
                 head.queue.push_back((ticket, owner, mode));
             }
         }
+        inner.pending.insert(owner, mode);
         loop {
             let head = inner.heads.entry(resource.clone()).or_default();
             let ready = if converting {
@@ -348,6 +399,7 @@ impl LockManager {
             if ready {
                 head.queue.retain(|(t, _, _)| *t != ticket);
                 head.holders.push((owner, mode));
+                inner.pending.remove(&owner);
                 drop(inner);
                 if ticket_first {
                     note_flow_control_ticket();
@@ -363,6 +415,7 @@ impl LockManager {
             // transaction's lock with 11601 (RM-313).
             if secantus_core::deadline::expired() || secantus_core::deadline::interrupted() {
                 head.queue.retain(|(t, _, _)| *t != ticket);
+                inner.pending.remove(&owner);
                 drop(inner);
                 self.changed.notify_all();
                 self.count(resource, mode, Some(began.elapsed()));
@@ -384,11 +437,16 @@ impl LockManager {
                 head.holders.remove(at);
             }
         }
+        let global_gone = matches!(resource, Resource::Global) && !holds_global(&inner, owner);
         drop(inner);
+        if global_gone {
+            self.drop_ticket(owner);
+        }
         self.changed.notify_all();
     }
 
-    /// Release every hold `owner` has, waking waiters.
+    /// Release every hold `owner` has, waking waiters, and its execution
+    /// ticket with its global lock.
     pub fn release(&self, owner: Owner) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut any = false;
@@ -401,8 +459,203 @@ impl LockManager {
             .heads
             .retain(|_, h| !h.holders.is_empty() || !h.queue.is_empty());
         drop(inner);
+        self.drop_ticket(owner);
         if any {
             self.changed.notify_all();
+        }
+    }
+
+    /// Take `owner`'s execution ticket for the global lock in `mode` ahead
+    /// of the lock itself, when `resource` is the global lock and it needs
+    /// one: a caller that bounds the lock's wait does not bound the
+    /// ticket's.
+    pub fn take_global_ticket(
+        &self,
+        owner: Owner,
+        resource: &Resource,
+        mode: Mode,
+    ) -> Result<(), MaxTimeMsExpired> {
+        if matches!(resource, Resource::Global) {
+            self.take_ticket(owner, mode)?;
+        }
+        Ok(())
+    }
+
+    /// `globalLock.currentQueue`'s readers and writers: the operations
+    /// waiting for an execution ticket, and those holding one with a lock
+    /// request pending (mongod's `Locker::getClientState`), each a reader
+    /// or a writer by the pool its ticket is from, or by the mode it waits
+    /// for when it holds none.
+    pub fn current_queue(&self) -> (i64, i64) {
+        let (mut readers, mut writers) = match self.execution.get() {
+            Some(control) => (
+                control.holder(true).queued(),
+                control.holder(false).queued(),
+            ),
+            None => (0, 0),
+        };
+        let pending: Vec<(Owner, Mode)> = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.pending.iter().map(|(o, m)| (*o, *m)).collect()
+        };
+        let tickets = self.tickets.lock().unwrap_or_else(|e| e.into_inner());
+        for (owner, mode) in pending {
+            let reader = tickets
+                .get(&owner)
+                .map_or(matches!(mode, Mode::Is | Mode::S), |(_, r)| *r);
+            if reader {
+                readers += 1;
+            } else {
+                writers += 1;
+            }
+        }
+        (readers, writers)
+    }
+
+    /// Return `owner`'s execution ticket while it keeps its locks (mongod's
+    /// `Locker::releaseTicket`): what a transaction does between its
+    /// statements, taking one again with its next statement's global lock.
+    pub fn release_ticket(&self, owner: Owner) {
+        self.drop_ticket(owner);
+    }
+
+    fn drop_ticket(&self, owner: Owner) {
+        let ticket = self
+            .tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&owner);
+        // Returned outside the map's lock: a release may wake a waiter.
+        drop(ticket);
+    }
+
+    fn has_ticket(&self, owner: Owner) -> bool {
+        self.tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&owner)
+    }
+
+    /// Whether this thread's operation holds an execution ticket under
+    /// another owner, which a global lock it takes now rides on: mongod
+    /// keeps one locker per operation, and its global locks after the
+    /// first take no ticket of their own.
+    fn rides(&self) -> bool {
+        let me = self as *const LockManager as usize;
+        TICKETED.with(|t| {
+            let mut t = t.borrow_mut();
+            let tickets = self.tickets.lock().unwrap_or_else(|e| e.into_inner());
+            t.retain(|(lm, o)| *lm != me || tickets.contains_key(o));
+            t.iter().any(|(lm, _)| *lm == me)
+        })
+    }
+
+    /// Take `owner`'s execution ticket for a global lock in `mode`, when it
+    /// needs one (see [`acquire`](Self::acquire)): `true` when it took one.
+    fn take_ticket(&self, owner: Owner, mode: Mode) -> Result<bool, MaxTimeMsExpired> {
+        let Some(control) = self.execution.get() else {
+            return Ok(false);
+        };
+        if mode == Mode::X || self.has_ticket(owner) || self.rides() {
+            return Ok(false);
+        }
+        let reader = matches!(mode, Mode::Is | Mode::S);
+        let holder = control.holder(reader);
+        let ctx = EXEC_ADMISSION
+            .with(|c| c.borrow().clone())
+            .unwrap_or_default();
+        let mut interrupted = || {
+            // mongod's waiter checks its operation each time it wakes.
+            secantus_core::deadline::count_check();
+            if secantus_core::deadline::interrupted() {
+                return Err(crate::CommandError::new(
+                    11601,
+                    "Interrupted",
+                    "operation was interrupted",
+                ));
+            }
+            if secantus_core::deadline::expired() {
+                return Err(crate::CommandError::max_time_expired());
+            }
+            Ok(())
+        };
+        // An owner that already holds locks takes its ticket again (a
+        // transaction's next statement): mongod's `reacquireTicket`, which
+        // gives up rather than wait on a ticket that a request queued on
+        // one of its locks may hold.
+        let reacquiring = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.heads.values().any(|h| h.holds(owner))
+        };
+        let taken = if reacquiring {
+            self.reacquire(owner, mode, holder, &ctx, &mut interrupted)
+        } else {
+            holder.wait_for_ticket(&ctx, &mut interrupted)
+        };
+        match taken {
+            Ok(ticket) => {
+                self.tickets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(owner, (ticket, reader));
+                let me = self as *const LockManager as usize;
+                TICKETED.with(|t| t.borrow_mut().push((me, owner)));
+                Ok(true)
+            }
+            Err(e) => {
+                if e.code != MaxTimeMsExpired::CODE {
+                    TICKET_ERROR.with(|t| *t.borrow_mut() = Some(e));
+                }
+                Err(MaxTimeMsExpired)
+            }
+        }
+    }
+
+    /// mongod's `Locker::reacquireTicket`: a ticket at once if one is free;
+    /// else, while none of `owner`'s locks has a request queued on it,
+    /// waiting for one 100 ms at a time; and when one has, 24 LockTimeout.
+    fn reacquire(
+        &self,
+        owner: Owner,
+        mode: Mode,
+        holder: &std::sync::Arc<crate::admission::TicketHolder>,
+        ctx: &std::sync::Arc<crate::admission::AdmissionContext>,
+        interrupted: &mut dyn FnMut() -> Result<(), crate::CommandError>,
+    ) -> Result<crate::admission::Ticket, crate::CommandError> {
+        if let Some(ticket) = holder.try_acquire(ctx) {
+            return Ok(ticket);
+        }
+        loop {
+            let contended = {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner
+                    .heads
+                    .iter()
+                    .find(|(_, h)| h.holds(owner) && !h.queue.is_empty())
+                    .map(|(r, _)| r.described())
+            };
+            interrupted()?;
+            if let Some(resource) = contended {
+                // mongod prints the lock mode's number (`LockMode`).
+                let number = match mode {
+                    Mode::Is => 1,
+                    Mode::Ix => 2,
+                    Mode::S => 3,
+                    Mode::X => 4,
+                };
+                return Err(crate::CommandError::new(
+                    24,
+                    "LockTimeout",
+                    format!(
+                        "Unable to acquire ticket with mode '{number}' due to detected lock \
+                         conflict for resource {resource}"
+                    ),
+                ));
+            }
+            let until = Some(std::time::Instant::now() + Duration::from_millis(100));
+            if let Some(ticket) = holder.wait_for_ticket_until(ctx, until, interrupted)? {
+                return Ok(ticket);
+            }
         }
     }
 
@@ -979,6 +1232,100 @@ fn out_rounds(
     Some(rounds)
 }
 
+/// Whether `owner` holds the global lock in any mode.
+fn holds_global(inner: &Inner, owner: Owner) -> bool {
+    inner
+        .heads
+        .get(&Resource::Global)
+        .is_some_and(|h| h.holds(owner))
+}
+
+thread_local! {
+    /// The running operation's execution admissions (mongod's
+    /// `ExecutionAdmissionContext`), which its tickets are counted in.
+    static EXEC_ADMISSION: std::cell::RefCell<Option<std::sync::Arc<crate::admission::AdmissionContext>>> =
+        const { std::cell::RefCell::new(None) };
+    /// The owners whose execution tickets this thread's operation took,
+    /// by lock manager (see `LockManager::rides`).
+    static TICKETED: std::cell::RefCell<Vec<(usize, Owner)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Why the last ticket wait failed, when it was not the deadline.
+    static TICKET_ERROR: std::cell::RefCell<Option<crate::CommandError>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The error that ended this thread's last ticket wait, when it was not
+/// the deadline (a kill's 11601, a full queue's 433, a transaction's
+/// LockTimeout): what a failed [`LockManager::acquire`] answers instead of
+/// 50.
+pub fn take_ticket_error() -> Option<crate::CommandError> {
+    TICKET_ERROR.with(|t| t.borrow_mut().take())
+}
+
+/// Returns a transaction's execution ticket when its statement ends, the
+/// transaction keeping its locks.
+pub struct TicketStash {
+    lm: std::sync::Arc<LockManager>,
+    owner: Owner,
+}
+
+impl TicketStash {
+    pub fn new(lm: std::sync::Arc<LockManager>, owner: Owner) -> Self {
+        TicketStash { lm, owner }
+    }
+}
+
+impl Drop for TicketStash {
+    fn drop(&mut self) {
+        self.lm.release_ticket(self.owner);
+    }
+}
+
+/// Makes `ctx` the running operation's execution admissions until dropped.
+pub struct AdmissionScope(Option<std::sync::Arc<crate::admission::AdmissionContext>>);
+
+/// Count the tickets this thread's operation takes in `ctx`.
+pub fn admission_scope(ctx: std::sync::Arc<crate::admission::AdmissionContext>) -> AdmissionScope {
+    AdmissionScope(EXEC_ADMISSION.with(|c| c.replace(Some(ctx))))
+}
+
+impl Drop for AdmissionScope {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        EXEC_ADMISSION.with(|c| *c.borrow_mut() = previous);
+    }
+}
+
+/// Run `wait` with the running statement's execution ticket returned, and
+/// take one again after: what mongod's `getMore` does while it waits for
+/// data to arrive, its locks and ticket let go. A ticket that cannot be had again
+/// (a kill, a spent budget) leaves the statement without one, which its own
+/// interrupt checks then end.
+pub fn without_ticket<R>(wait: impl FnOnce() -> R) -> R {
+    let held = CURRENT
+        .with(|c| c.borrow().clone())
+        .zip(STATEMENT_OWNER.with(std::cell::Cell::get));
+    let Some((lm, owner)) = held else {
+        return wait();
+    };
+    let mode = match lm
+        .tickets
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&owner)
+    {
+        Some((_, true)) => Mode::Is,
+        Some((_, false)) => Mode::Ix,
+        None => return wait(),
+    };
+    lm.drop_ticket(owner);
+    let out = wait();
+    if lm.take_ticket(owner, mode).is_err() {
+        take_ticket_error();
+    }
+    out
+}
+
 thread_local! {
     /// Whether the operation this thread runs has been granted the global
     /// lock, in any mode: mongod's `Locker::wasGlobalLockTaken`.
@@ -1113,6 +1460,8 @@ pub fn begin_operation() {
     secantus_core::deadline::begin_operation();
     crate::explain::begin_operation();
     TOOK_GLOBAL.with(|t| t.set(false));
+    TICKETED.with(|t| t.borrow_mut().clear());
+    TICKET_ERROR.with(|t| *t.borrow_mut() = None);
     OP_LOCKS.with(|l| l.borrow_mut().clear());
     FLOW_CONTROL.with(|n| n.set(0));
 }
@@ -1294,7 +1643,12 @@ impl LockManager {
         inner
             .heads
             .retain(|_, h| !h.holders.is_empty() || !h.queue.is_empty());
+        let global_gone = chain.iter().any(|(r, _)| matches!(r, Resource::Global))
+            && !holds_global(&inner, owner);
         drop(inner);
+        if global_gone {
+            self.drop_ticket(owner);
+        }
         self.changed.notify_all();
     }
 }
@@ -1323,10 +1677,11 @@ impl Guard {
             statement_rounds(doc, db, facts).unwrap_or_else(|| vec![statement_chain(doc, db)]);
         let chain = rounds.pop().unwrap_or_default();
         // The rounds before the last are taken and let go, as mongod does.
+        let refused = || take_ticket_error().unwrap_or_else(crate::CommandError::max_time_expired);
         for round in &rounds {
             let owner = lm.statement_owner();
             if acquire_chain(lm, owner, round).is_err() {
-                return Some(Err(crate::CommandError::max_time_expired()));
+                return Some(Err(refused()));
             }
             lm.release(owner);
         }
@@ -1338,7 +1693,7 @@ impl Guard {
                 previous_owner: STATEMENT_OWNER.with(|o| o.replace(Some(owner))),
                 chain,
             })),
-            Err(_) => Some(Err(crate::CommandError::max_time_expired())),
+            Err(_) => Some(Err(refused())),
         }
     }
 }
@@ -1842,5 +2197,186 @@ mod tests {
             "validateDBMetadata": 1, "db": "nosuch", "collection": "q", "apiParameters": api
         });
         assert_eq!(reads(&missing), (1, vec![]));
+    }
+
+    // ------------------------------------------- execution tickets (RM-355)
+
+    /// A lock manager whose pools hold `reads` and `writes` tickets.
+    fn ticketed(reads: i32, writes: i32) -> std::sync::Arc<LockManager> {
+        use crate::admission::execution::{
+            ExecutionControl, READ_TRANSACTIONS, WRITE_TRANSACTIONS,
+        };
+        let lm = std::sync::Arc::new(LockManager::new());
+        let values = move |name: &str| match name {
+            READ_TRANSACTIONS => Some(bson::Bson::Int32(reads)),
+            WRITE_TRANSACTIONS => Some(bson::Bson::Int32(writes)),
+            _ => None,
+        };
+        lm.set_execution(ExecutionControl::build(&values, 8, None));
+        lm
+    }
+
+    fn used(lm: &LockManager, reader: bool) -> i32 {
+        lm.execution().unwrap().holder(reader).used()
+    }
+
+    #[test]
+    fn the_global_lock_takes_a_ticket_and_returns_it_with_the_lock() {
+        let lm = ticketed(5, 5);
+        super::begin_operation();
+        let reader = lm.statement_owner();
+        lm.acquire(reader, &Resource::Global, Mode::Is).unwrap();
+        assert_eq!((used(&lm, true), used(&lm, false)), (1, 0));
+        lm.release(reader);
+        assert_eq!(used(&lm, true), 0);
+        // IX takes a write ticket; X none, mongod's exclusive lock needing
+        // no admission.
+        let writer = lm.statement_owner();
+        lm.acquire(writer, &Resource::Global, Mode::Ix).unwrap();
+        assert_eq!(used(&lm, false), 1);
+        lm.release(writer);
+        let exclusive = lm.statement_owner();
+        lm.acquire(exclusive, &Resource::Global, Mode::X).unwrap();
+        assert_eq!((used(&lm, true), used(&lm, false)), (0, 0));
+        lm.release(exclusive);
+        // Only the global lock takes one.
+        let coll = lm.statement_owner();
+        lm.acquire(coll, &Resource::Collection("d.c".into()), Mode::Ix)
+            .unwrap();
+        assert_eq!(used(&lm, false), 0);
+        lm.release(coll);
+    }
+
+    #[test]
+    fn a_second_global_lock_of_one_operation_rides_on_its_ticket() {
+        let lm = ticketed(5, 5);
+        super::begin_operation();
+        let ctx = std::sync::Arc::new(crate::admission::AdmissionContext::default());
+        let _scope = super::admission_scope(ctx.clone());
+        let outer = lm.statement_owner();
+        lm.acquire(outer, &Resource::Global, Mode::Ix).unwrap();
+        let inner = lm.statement_owner();
+        lm.acquire(inner, &Resource::Global, Mode::Is).unwrap();
+        assert_eq!((used(&lm, true), used(&lm, false)), (0, 1));
+        lm.release(inner);
+        lm.release(outer);
+        // One admission, counted in the operation's context; the next
+        // global lock, after the first was let go, is a second.
+        assert_eq!(ctx.admissions(), 1);
+        let again = lm.statement_owner();
+        lm.acquire(again, &Resource::Global, Mode::Is).unwrap();
+        lm.release(again);
+        assert_eq!(ctx.admissions(), 2);
+    }
+
+    #[test]
+    fn writers_beyond_the_pool_wait_for_a_ticket() {
+        let lm = ticketed(5, 1);
+        let held = lm.statement_owner();
+        lm.acquire(held, &Resource::Global, Mode::Ix).unwrap();
+        let (lm2, done) = (
+            lm.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let flag = done.clone();
+        let waiter = std::thread::spawn(move || {
+            super::begin_operation();
+            let owner = lm2.statement_owner();
+            lm2.acquire(owner, &Resource::Global, Mode::Ix).unwrap();
+            flag.store(true, Ordering::SeqCst);
+            lm2.release(owner);
+        });
+        while lm.execution().unwrap().holder(false).queued() == 0 {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!done.load(Ordering::SeqCst));
+        // A reader is not held up by the writers' pool.
+        let reader = lm.statement_owner();
+        lm.acquire(reader, &Resource::Global, Mode::Is).unwrap();
+        lm.release(reader);
+        lm.release(held);
+        waiter.join().unwrap();
+        assert!(done.load(Ordering::SeqCst));
+        assert_eq!(used(&lm, false), 0);
+    }
+
+    #[test]
+    fn a_transaction_returns_its_ticket_between_statements() {
+        let lm = ticketed(5, 5);
+        super::begin_operation();
+        let txn = lm.transaction_owner();
+        let chain = [
+            (Resource::Global, Mode::Ix),
+            (Resource::Collection("d.c".into()), Mode::Ix),
+        ];
+        acquire_chain(&lm, txn, &chain).unwrap();
+        assert_eq!(used(&lm, false), 1);
+        // The statement ends: the locks stay, the ticket goes.
+        drop(TicketStash::new(lm.clone(), txn));
+        assert_eq!(used(&lm, false), 0);
+        // The next statement takes one again.
+        super::begin_operation();
+        acquire_chain(&lm, txn, &chain).unwrap();
+        assert_eq!(used(&lm, false), 1);
+        lm.release(txn);
+        assert_eq!(used(&lm, false), 0);
+    }
+
+    #[test]
+    fn a_transaction_gives_up_a_ticket_a_waiter_on_its_locks_may_hold() {
+        // mongod's `reacquireTicket`: with the pool empty and a request
+        // queued on one of the transaction's locks, 24 LockTimeout.
+        let lm = ticketed(5, 1);
+        let txn = lm.transaction_owner();
+        let coll = Resource::Collection("d.c".into());
+        super::begin_operation();
+        acquire_chain(
+            &lm,
+            txn,
+            &[(Resource::Global, Mode::Ix), (coll.clone(), Mode::Ix)],
+        )
+        .unwrap();
+        lm.release_ticket(txn);
+        // A drop takes the one write ticket and waits on the collection.
+        let lm2 = lm.clone();
+        let dropper = std::thread::spawn(move || {
+            super::begin_operation();
+            let owner = lm2.statement_owner();
+            let _budget = secantus_core::deadline::arm(Some(2_000));
+            let r = acquire_chain(
+                &lm2,
+                owner,
+                &[
+                    (Resource::Global, Mode::Ix),
+                    (Resource::Collection("d.c".into()), Mode::X),
+                ],
+            );
+            lm2.release(owner);
+            r.is_ok()
+        });
+        while !lm
+            .inner
+            .lock()
+            .unwrap()
+            .heads
+            .get(&coll)
+            .is_some_and(|h| !h.queue.is_empty())
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        super::begin_operation();
+        assert!(lm.acquire(txn, &Resource::Global, Mode::Ix).is_err());
+        let e = super::take_ticket_error().unwrap();
+        assert_eq!(
+            (e.code, e.errmsg.as_str()),
+            (
+                24,
+                "Unable to acquire ticket with mode '2' due to detected lock conflict for \
+                 resource {Collection : d.c}"
+            )
+        );
+        // The transaction aborts, and the drop goes through.
+        lm.release(txn);
+        assert!(dropper.join().unwrap());
     }
 }

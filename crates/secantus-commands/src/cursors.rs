@@ -1176,8 +1176,12 @@ pub fn get_more(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             // Block on the storage oplog condvar until it advances past
             // `position` or the deadline; then re-poll (the producer reads the
             // newly-appended entries). killCursors wakes this via notify.
+            // The wait holds no execution ticket, as mongod's lets its
+            // locks and ticket go while it waits for data (RM-355).
             let slice = (deadline - now).min(Duration::from_millis(100));
-            storage.wait_for_oplog(position, slice.as_millis() as u64);
+            crate::lock_manager::without_ticket(|| {
+                storage.wait_for_oplog(position, slice.as_millis() as u64)
+            });
             awaited += now.elapsed();
         }
         ctx.awaited.set(ctx.awaited.get() + awaited);

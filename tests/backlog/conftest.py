@@ -225,9 +225,9 @@ def mongod_rs() -> Iterator[Any]:
     `delinquentAcquisitionIntervalMillis` (30 ms, startup only) as
     `delinquencyInfo` on its `Slow query` line, which load decides: a
     three-document `find` printed it in the RM gate (2026-11-07), and any
-    `find` holding its ticket longer does on an idle machine. This server
-    has no execution control (RM-355), so the interval is out of reach and
-    the lines compared are the operation's own."""
+    `find` holding its ticket longer does on an idle machine. This server's
+    line prints no `delinquencyInfo` yet (RM-355), so the interval is out
+    of reach and the lines compared are the operation's own."""
     from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"

@@ -57,7 +57,9 @@ impl IngressAdmissionController {
     pub fn apply(&self, name: &str, value: &Bson) {
         match (name, value) {
             (ENABLED_PARAMETER, Bson::Boolean(on)) => self.enabled.store(*on, Ordering::Relaxed),
-            (POOL_SIZE_PARAMETER, Bson::Int32(n)) => self.holder.resize(*n),
+            (POOL_SIZE_PARAMETER, Bson::Int32(n)) => {
+                self.holder.resize(*n, None);
+            }
             (QUEUE_DEPTH_PARAMETER, Bson::Int32(n)) => self.holder.set_max_queue_depth(*n),
             _ => {}
         }

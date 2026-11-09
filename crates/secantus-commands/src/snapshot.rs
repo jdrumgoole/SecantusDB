@@ -73,19 +73,24 @@ fn read_point(
         Some(Bson::Timestamp(t)) => *t,
         _ => return Ok(Some(committed)),
     };
-    while storage.snapshot_clock().is_some_and(|(c, _)| c < at) {
-        if crate::ops::current_killed() {
-            return Err(CommandError::new(
-                11601,
-                "Interrupted",
-                "operation was interrupted",
-            ));
+    // mongod waits for its read concern before it takes a lock, so the
+    // wait holds no execution ticket (RM-355).
+    crate::lock_manager::without_ticket(|| {
+        while storage.snapshot_clock().is_some_and(|(c, _)| c < at) {
+            if crate::ops::current_killed() {
+                return Err(CommandError::new(
+                    11601,
+                    "Interrupted",
+                    "operation was interrupted",
+                ));
+            }
+            secantus_core::deadline::check_now().map_err(|_| {
+                CommandError::new(50, "MaxTimeMSExpired", "operation exceeded time limit")
+            })?;
+            std::thread::sleep(Duration::from_millis(1));
         }
-        secantus_core::deadline::check_now().map_err(|_| {
-            CommandError::new(50, "MaxTimeMSExpired", "operation exceeded time limit")
-        })?;
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        Ok(())
+    })?;
     Ok(Some(at))
 }
 

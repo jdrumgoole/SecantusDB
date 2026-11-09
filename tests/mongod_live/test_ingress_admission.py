@@ -9,9 +9,10 @@ and an operation's `Slow query` line its admissions and time queued. Each
 test runs the same thing on both servers and compares the answers; the
 servers are this module's own, so emptying the pool reaches no other test.
 
-What execution control adds to both (`queues.execution`, the line's
-`execution` admissions and `storage.timeWaitingMicros.storageExecutionMicros`)
-is RM-355's remainder, left out here.
+Execution control's `queues.execution` is `test_execution_admission.py`'s;
+what it adds to the line (its `execution` admissions and
+`storage.timeWaitingMicros.storageExecutionMicros`) is RM-355's remainder,
+left out here.
 """
 
 from __future__ import annotations

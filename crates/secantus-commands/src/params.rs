@@ -111,6 +111,9 @@ pub enum ParamKind {
     /// -1 are "must be a positive value", 1 and 49 "Must be above minimum
     /// of 50 MB", a fraction is kept).
     BuildMemoryMegabytes,
+    /// One of execution admission control's parameters, coerced and
+    /// validated as mongod does each (`admission::execution`, RM-355).
+    Execution,
 }
 
 /// `(name, kind)` for every runtime-settable parameter.
@@ -164,6 +167,34 @@ const SETTABLE: &[(&str, ParamKind)] = &[
     (
         "ingressConnectionEstablishmentMaxQueueDepth",
         ParamKind::Int32AtLeast(0),
+    ),
+    // mongod's execution admission control (`admission::execution`),
+    // applied to its pools and monitor as they change (RM-355).
+    (
+        "storageEngineConcurrentReadTransactions",
+        ParamKind::Execution,
+    ),
+    (
+        "storageEngineConcurrentWriteTransactions",
+        ParamKind::Execution,
+    ),
+    ("storageEngineReadMaxQueueDepth", ParamKind::Execution),
+    ("storageEngineWriteMaxQueueDepth", ParamKind::Execution),
+    (
+        "throughputProbingConcurrencyMovingAverageWeight",
+        ParamKind::Execution,
+    ),
+    ("throughputProbingMaxConcurrency", ParamKind::Execution),
+    ("throughputProbingReadWriteRatio", ParamKind::Execution),
+    (
+        "throughputProbingStallDetectionTimeoutMs",
+        ParamKind::Execution,
+    ),
+    ("throughputProbingStepMultiple", ParamKind::Execution),
+    ("wiredTigerConcurrentReadTransactions", ParamKind::Execution),
+    (
+        "wiredTigerConcurrentWriteTransactions",
+        ParamKind::Execution,
     ),
     // mongod's ingress admission control (`admission::ingress`), applied
     // to the controller as they change (RM-355).
@@ -274,6 +305,8 @@ pub struct ServerParams {
     /// mongod's ingress admission control, which every command passes
     /// through (RM-355).
     ingress_admission: crate::admission::ingress::IngressAdmissionController,
+    /// mongod's execution admission control, once the server starts it.
+    execution: std::sync::OnceLock<std::sync::Arc<crate::admission::execution::ExecutionControl>>,
 }
 
 /// mongod's connection-establishment rate limiter (8.2.11, measured
@@ -444,6 +477,30 @@ impl ServerParams {
         &self.ingress_admission
     }
 
+    /// Start mongod's execution admission control with the parameters the
+    /// server was started with (once; a second call answers the first's).
+    pub fn start_execution_control(
+        &self,
+        logs: Option<std::sync::Arc<crate::logbuf::LogBuffer>>,
+    ) -> std::sync::Arc<crate::admission::execution::ExecutionControl> {
+        use crate::admission::execution as ex;
+        self.execution
+            .get_or_init(|| {
+                // A concurrency given at startup fixes the pools, and mongod
+                // reports the algorithm as fixed then.
+                if self.number(ex::READ_TRANSACTIONS, 0) != 0
+                    || self.number(ex::WRITE_TRANSACTIONS, 0) != 0
+                {
+                    self.set(
+                        ex::ALGORITHM,
+                        Bson::String(ex::FIXED_CONCURRENT_TRANSACTIONS.to_string()),
+                    );
+                }
+                ex::ExecutionControl::start(&|n| self.get(n), logs)
+            })
+            .clone()
+    }
+
     /// The feature compatibility version, if it has been read or set.
     pub fn fcv(&self) -> Option<String> {
         self.fcv.lock().ok()?.clone()
@@ -515,7 +572,19 @@ impl ServerParams {
     fn set(&self, name: &str, value: Bson) {
         self.ingress_admission.apply(name, &value);
         if let Ok(mut guard) = self.values.lock() {
+            if let Some(alias) = crate::admission::execution::alias(name) {
+                guard.insert(alias.to_string(), value.clone());
+            }
             guard.insert(name.to_string(), value);
+        }
+    }
+
+    /// Apply a value `set` stored to execution control (mongod's
+    /// `on_update`, whose refusal comes after the value was stored).
+    fn apply_execution(&self, name: &str, value: &Bson) -> Result<(), CommandError> {
+        match self.execution.get() {
+            Some(control) => control.apply(name, value),
+            None => Ok(()),
         }
     }
 
@@ -545,9 +614,29 @@ const STARTUP: &[(&str, bool)] = &[
 /// whole string.`, a boolean other than `true`/`false`/`1`/`0` `Value is
 /// not a valid boolean`. A parameter mongod knows that this server does not
 /// take at startup is refused by name.
-pub fn parse_startup_parameter(arg: &str) -> Result<(String, Bson), String> {
+///
+/// Execution admission control's parameters are parsed and validated as
+/// mongod does them (RM-355): against the values `earlier` ones gave, with
+/// the concurrencies' floor of 5 lifted when `test_commands` is on.
+pub fn parse_startup_parameter(
+    arg: &str,
+    test_commands: bool,
+    earlier: &[(String, Bson)],
+) -> Result<(String, Bson), String> {
     let (name, value) = arg.split_once('=').unwrap_or((arg, ""));
     let bad = |why: &str| format!("Bad value for parameter \"{name}\": {why}");
+    if crate::admission::execution::is_parameter(name) {
+        let current = |n: &str| {
+            earlier
+                .iter()
+                .rev()
+                .find(|(e, _)| e == n)
+                .map(|(_, v)| v.clone())
+        };
+        return crate::admission::execution::parse_startup(name, value, test_commands, &current)
+            .map(|v| (name.to_string(), v))
+            .map_err(|why: String| bad(why.as_str()));
+    }
     let Some((_, boolean)) = STARTUP.iter().find(|(n, _)| *n == name) else {
         if crate::serverinfo::known_params(false).contains_key(name) {
             return Err(format!(
@@ -637,6 +726,8 @@ fn coerce(kind: ParamKind, value: &Bson) -> Option<Bson> {
             Some(n) if n > 0 => Some(Bson::Int32(n.min(i64::from(i32::MAX)) as i32)),
             _ => None,
         },
+        // Coerced by name (`coerce_named`).
+        ParamKind::Execution => None,
         // Accepts every BSON type; only these four are falsey.
         ParamKind::Bool => Some(Bson::Boolean(
             !matches!(
@@ -671,7 +762,7 @@ fn whole(value: &Bson) -> Option<i64> {
 /// A value as mongod coerces it to a whole number for a parameter: a bool
 /// is 0 or 1, a number is truncated toward zero, and each failure has its
 /// own words (measured 8.2.11, 2026-10-15).
-fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
+pub(crate) fn integral(value: &Bson, int32: bool) -> Result<i64, &'static str> {
     let n = match value {
         Bson::Boolean(b) => return Ok(i64::from(*b)),
         Bson::Int32(i) => return Ok(i64::from(*i)),
@@ -797,6 +888,26 @@ fn render_value(value: &Bson) -> String {
     }
 }
 
+/// The value `setParameter` stores for `name` of `kind`, or mongod's words
+/// for refusing `value`.
+fn coerce_named(
+    name: &str,
+    kind: ParamKind,
+    value: &Bson,
+    ctx: &CommandContext,
+) -> Result<Bson, String> {
+    if kind == ParamKind::Execution {
+        let store = ctx.server_params.clone();
+        return crate::admission::execution::coerce_runtime(
+            name,
+            value,
+            ctx.failpoints.is_some(),
+            &|n| store.as_ref().and_then(|s| s.get(n)),
+        );
+    }
+    coerce(kind, value).ok_or_else(|| refusal(kind, name, value))
+}
+
 /// `setParameter` — change a runtime-settable server parameter.
 pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if ctx.db_name != "admin" {
@@ -843,8 +954,8 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                 format!("attempted to set unrecognized parameter [{name}]{HELP_SUFFIX}"),
             ));
         };
-        if coerce(kind, value).is_none() {
-            return Err(CommandError::new(2, "BadValue", refusal(kind, name, value)));
+        if let Err(why) = coerce_named(name, kind, value, ctx) {
+            return Err(CommandError::new(2, "BadValue", why));
         }
     }
 
@@ -865,7 +976,8 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
         // `getParameter` reports the coerced value (`logLevel: 99` reads back
         // as 5, `quiet: "yes"` as true). The setting takes effect whether or
         // not there is a store to remember it in.
-        if let Some(coerced) = coerce(kind_of(name).expect("validated above"), value) {
+        if let Ok(coerced) = coerce_named(name, kind_of(name).expect("validated above"), value, ctx)
+        {
             if let Ok(storage) = ctx.storage() {
                 match (name.as_str(), &coerced) {
                     ("ttlMonitorSleepSecs", Bson::Int32(n)) => {
@@ -900,7 +1012,8 @@ pub fn set_parameter(doc: &Document, ctx: &mut CommandContext) -> HandlerResult 
                 _ => {}
             }
             if let Some(s) = store.as_ref() {
-                s.set(name, coerced);
+                s.set(name, coerced.clone());
+                s.apply_execution(name, &coerced)?;
             }
         }
         if Some(name.as_str()) == first {
@@ -1335,25 +1448,176 @@ mod tests {
 
     /// `--setParameter` refuses as mongod 8.2.11 refuses at startup
     /// (measured 2026-10-27).
+    /// Execution control's parameters at startup (mongod 8.2.11, measured
+    /// 2026-11-09): each refusal in mongod's words, the probing
+    /// concurrencies checked against the values given before them, and the
+    /// concurrencies' floor of 5 lifted with test commands.
+    #[test]
+    fn execution_parameters_parse_and_refuse_at_startup_as_mongod_does() {
+        let parse = |arg: &str| parse_startup_parameter(arg, false, &[]);
+        let bad = |name: &str, why: &str| Err(format!("Bad value for parameter \"{name}\": {why}"));
+        assert_eq!(
+            parse("storageEngineConcurrencyAdjustmentAlgorithm=bogus"),
+            bad(
+                "storageEngineConcurrencyAdjustmentAlgorithm",
+                "Enumeration value 'bogus' for field 'storageEngineConcurrencyAdjustmentAlgorithm' \
+                 is not a valid value."
+            )
+        );
+        assert_eq!(
+            parse("storageEngineConcurrencyAdjustmentIntervalMillis=5"),
+            bad(
+                "storageEngineConcurrencyAdjustmentIntervalMillis",
+                "Invalid value for parameter storageEngineConcurrencyAdjustmentIntervalMillis: 5 \
+                 is not greater than or equal to 10"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingMinConcurrency=0"),
+            bad(
+                "throughputProbingMinConcurrency",
+                "Throughput probing minimum concurrency cannot be less than 1"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingInitialConcurrency=2"),
+            bad(
+                "throughputProbingInitialConcurrency",
+                "Throughput probing initial concurrency cannot be less than minimum concurrency"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingInitialConcurrency=500"),
+            bad(
+                "throughputProbingInitialConcurrency",
+                "Throughput probing initial concurrency cannot be greater than maximum concurrency"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingMinConcurrency=200"),
+            bad(
+                "throughputProbingMinConcurrency",
+                "Throughput probing minimum concurrency cannot be greater than maximum concurrency"
+            )
+        );
+        assert_eq!(
+            parse("delinquentAcquisitionIntervalMillis=5"),
+            bad(
+                "delinquentAcquisitionIntervalMillis",
+                "Invalid value for parameter delinquentAcquisitionIntervalMillis: 5 is not \
+                 greater than or equal to 10"
+            )
+        );
+        assert_eq!(
+            parse("storageEngineConcurrentWriteTransactions=3"),
+            bad(
+                "storageEngineConcurrentWriteTransactions",
+                "Concurrent write transactions limit must be greater than or equal to 5."
+            )
+        );
+        assert_eq!(
+            parse("storageEngineConcurrentWriteTransactions=x"),
+            bad(
+                "storageEngineConcurrentWriteTransactions",
+                "Did not consume whole string."
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingStepMultiple=x"),
+            bad(
+                "throughputProbingStepMultiple",
+                "Did not consume any digits"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingStepMultiple=0.9"),
+            bad(
+                "throughputProbingStepMultiple",
+                "Invalid value for parameter throughputProbingStepMultiple: 0.9 is not less \
+                 than or equal to 0.5"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingReadWriteRatio=2"),
+            bad(
+                "throughputProbingReadWriteRatio",
+                "Invalid value for parameter throughputProbingReadWriteRatio: 2 is not less \
+                 than or equal to 1"
+            )
+        );
+        assert_eq!(
+            parse("throughputProbingMaxConcurrency=2"),
+            bad(
+                "throughputProbingMaxConcurrency",
+                "Throughput probing maximum concurrency cannot be less than minimum concurrency"
+            )
+        );
+        // Accepted, in mongod's types.
+        assert_eq!(
+            parse("throughputProbingStepMultiple=1e-1"),
+            Ok((
+                "throughputProbingStepMultiple".to_string(),
+                Bson::Double(0.1)
+            ))
+        );
+        assert_eq!(
+            parse("wiredTigerConcurrentWriteTransactions=10"),
+            Ok((
+                "wiredTigerConcurrentWriteTransactions".to_string(),
+                Bson::Int32(10)
+            ))
+        );
+        // Test commands lift the floor; an earlier minimum moves the bound.
+        assert!(
+            parse_startup_parameter("storageEngineConcurrentWriteTransactions=3", true, &[])
+                .is_ok()
+        );
+        let earlier = [(
+            "throughputProbingMinConcurrency".to_string(),
+            Bson::Int32(2),
+        )];
+        assert!(
+            parse_startup_parameter("throughputProbingMaxConcurrency=2", false, &earlier).is_ok()
+        );
+    }
+
+    /// A concurrency given at startup fixes the pools, and mongod then
+    /// reports the algorithm as fixed (measured 8.2.11, 2026-11-09).
+    #[test]
+    fn a_startup_concurrency_reports_the_algorithm_as_fixed() {
+        let params = ServerParams::new();
+        params.set_startup("storageEngineConcurrentWriteTransactions", Bson::Int32(10));
+        let control = params.start_execution_control(None);
+        assert!(control.supports_runtime_size_adjustment());
+        assert_eq!(
+            params.get("storageEngineConcurrencyAdjustmentAlgorithm"),
+            Some(Bson::String("fixedConcurrentTransactions".into()))
+        );
+        assert_eq!(
+            params.get("wiredTigerConcurrentWriteTransactions"),
+            Some(Bson::Int32(10))
+        );
+    }
+
     #[test]
     fn startup_parameters_parse_and_refuse_as_mongod_does() {
         assert_eq!(
-            parse_startup_parameter("logicalSessionRefreshMillis=0"),
+            parse_startup_parameter("logicalSessionRefreshMillis=0", false, &[]),
             Ok(("logicalSessionRefreshMillis".to_string(), Bson::Int32(0)))
         );
         assert_eq!(
-            parse_startup_parameter("disableLogicalSessionCacheRefresh=1"),
+            parse_startup_parameter("disableLogicalSessionCacheRefresh=1", false, &[]),
             Ok((
                 "disableLogicalSessionCacheRefresh".to_string(),
                 Bson::Boolean(true)
             ))
         );
         assert_eq!(
-            parse_startup_parameter("foo=1"),
+            parse_startup_parameter("foo=1", false, &[]),
             Err("Unknown --setParameter 'foo'".to_string())
         );
         assert_eq!(
-            parse_startup_parameter("logicalSessionRefreshMillis=abc"),
+            parse_startup_parameter("logicalSessionRefreshMillis=abc", false, &[]),
             Err(
                 "Bad value for parameter \"logicalSessionRefreshMillis\": Did not consume \
                  whole string."
@@ -1361,7 +1625,7 @@ mod tests {
             )
         );
         assert_eq!(
-            parse_startup_parameter("disableLogicalSessionCacheRefresh=yes"),
+            parse_startup_parameter("disableLogicalSessionCacheRefresh=yes", false, &[]),
             Err(
                 "Bad value for parameter \"disableLogicalSessionCacheRefresh\": Value is not \
                  a valid boolean"
@@ -1369,7 +1633,7 @@ mod tests {
             )
         );
         // A parameter mongod has that this server takes only at runtime.
-        assert!(parse_startup_parameter("notablescan=1")
+        assert!(parse_startup_parameter("notablescan=1", false, &[])
             .unwrap_err()
             .contains("does not take"));
     }

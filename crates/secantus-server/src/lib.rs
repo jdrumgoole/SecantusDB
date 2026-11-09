@@ -490,6 +490,9 @@ pub fn bind(
         .enable_test_commands
         .then(|| Arc::new(secantus_commands::failpoints::FailPointRegistry::new()));
     let locks = Arc::new(secantus_commands::lock_manager::LockManager::new());
+    // mongod's execution admission control: the read and write ticket
+    // pools each global lock takes from (RM-355).
+    locks.set_execution(server_params.start_execution_control(Some(logs.clone())));
     transactions.set_locks(locks.clone());
     let shared = Arc::new(Shared {
         config,
