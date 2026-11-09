@@ -1721,12 +1721,28 @@ fn trial_need(q: &Query) -> i64 {
 /// on `trial` for `explain`, which lists the plans as they were tried, the
 /// winner swapped with the first.
 fn pick(plans: Vec<Node>, q: &Query, trial: &Trial) -> Option<(usize, super::trial::Outcome)> {
+    tried_by(plans, trial_need(q), trial, false)
+}
+
+/// Which of `plans`, the candidates mongod tries for a `$group` it answers
+/// from a DISTINCT_SCAN, its trial keeps, recorded on `trial` as [`pick`]
+/// records them. `None`: the collection is not to hand.
+pub(crate) fn pick_for_group(plans: Vec<Node>, trial: &Trial) -> Option<usize> {
+    tried_by(plans, 101, trial, true).map(|(at, _)| at)
+}
+
+fn tried_by(
+    plans: Vec<Node>,
+    need: i64,
+    trial: &Trial,
+    group: bool,
+) -> Option<(usize, super::trial::Outcome)> {
     let all: Vec<&Node> = plans.iter().collect();
     // Counted where the plan hands documents over, past any skip (measured
     // 8.2.11: `skip: 1, limit: 2` ends the trial at two documents).
     let outcome = over_reach(trial.whole, &all, |docs| {
         let total = docs.total.unwrap_or(0);
-        let outcome = super::trial::run(&plans, &docs.env(), trial_need(q), total)?;
+        let outcome = super::trial::run(&plans, &docs.env(), need, total, group)?;
         let works = outcome.works;
         Some((outcome, works))
     })?;

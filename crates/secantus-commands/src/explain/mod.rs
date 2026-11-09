@@ -831,7 +831,18 @@ fn distinct_group(
     t: &Target,
     ctx: &CommandContext,
 ) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
-    distinct_group_with(s, collation, &t.catalog, |asked| {
+    let whole = Held {
+        docs: &t.docs,
+        collation,
+    };
+    let trial = plan::Trial {
+        total: Some(t.docs.len()),
+        matched: None,
+        whole: &whole,
+        ranked: Default::default(),
+        cache: None,
+    };
+    distinct_group_with(s, collation, &t.catalog, Some(&trial), |asked| {
         plan_for(asked, canonical, collation, t, ctx, false)
     })
 }
@@ -872,7 +883,7 @@ pub(crate) fn distinct_group_read(
     let catalog = catalog(storage, db, coll, None)?;
     let canonical = parsed::parsed_query(&s.filter);
     let implied = |partial: &Document| storage.query_implies_partial(&s.filter, partial);
-    let planned = distinct_group_with(&s, collation, &catalog, |asked| {
+    let planned = distinct_group_with(&s, collation, &catalog, None, |asked| {
         let Ok(hint) = resolve_hint(asked.hint.as_ref(), &catalog) else {
             return Ok((Node::Eof(""), Vec::new()));
         };
@@ -938,12 +949,15 @@ pub(crate) fn distinct_group_read(
 /// the one with the fewest fields. The scan goes the way the sort reads the
 /// index (forward, unsorted), and the other way for `$last`; it fetches the
 /// documents when its index does not hold a field the `$group` reads.
+/// Sorted or filtered, mongod instead tries the indexes that serve against
+/// each other, which `trial` (the collection, when it is to hand) runs.
 /// `plan`: the plan of a shape. `None`: not such a `$group`, or no index
 /// serves it.
 fn distinct_group_with(
     s: &Shape,
     collation: Option<&Collation>,
     catalog: &[Arc<IndexInfo>],
+    trial: Option<&plan::Trial>,
     plan: impl Fn(&Shape) -> Result<(Node, Vec<plan::Ranked>), CommandError>,
 ) -> Result<Option<(Shape, Node, Vec<plan::Ranked>)>, CommandError> {
     let path = |v: &Bson| match v {
@@ -1052,36 +1066,34 @@ fn distinct_group_with(
             _ => Some(ix),
         })
     }
+    let serving: Vec<String> = candidates.iter().map(|ix| ix.name.clone()).collect();
     let holding: Vec<&Arc<IndexInfo>> = candidates.iter().copied().filter(|ix| holds(ix)).collect();
     let Some(chosen) = fewest(holding).or_else(|| fewest(candidates)).cloned() else {
         return Ok(None);
     };
-    let (node, ranked) = if chosen.name == first.index.name {
-        planned
-    } else {
-        let mut hinted = asked.clone();
-        hinted.hint = Some(Bson::String(chosen.name.clone()));
-        plan(&hinted)?
-    };
-    let Node::DistinctScan(mut ix, width, scan_fetches) = scan_of(node) else {
-        return Ok(None);
-    };
-    // Its keys are an array's elements, where `$group` wants the arrays
-    // (measured 8.2.11, 2026-10-16: a multikey field is grouped without one).
-    if ix
-        .index
-        .multikey_paths
-        .get(width - 1)
-        .is_some_and(|p| !p.is_empty())
-    {
-        return Ok(None);
-    }
-    let fetching = scan_fetches || !holds(&ix.index);
-    ix.backward = sorted_by(&ix.index).unwrap_or(false) != last;
-    let scan = Node::DistinctScan(ix.clone(), width, fetching);
-    let plan = if fetching {
-        scan
-    } else {
+    // A scan as the `$group` reads it: through the projection of the
+    // fields it needs when its index holds them all, else fetching.
+    // `None`: its keys are an array's elements, where `$group` wants the
+    // arrays (measured 8.2.11, 2026-10-16: a multikey field is grouped
+    // without one).
+    let grouped = |node: Node| -> Option<(Node, bool)> {
+        let Node::DistinctScan(mut ix, width, scan_fetches) = scan_of(node) else {
+            return None;
+        };
+        if ix
+            .index
+            .multikey_paths
+            .get(width - 1)
+            .is_some_and(|p| !p.is_empty())
+        {
+            return None;
+        }
+        let fetching = scan_fetches || !holds(&ix.index);
+        ix.backward = sorted_by(&ix.index).unwrap_or(false) != last;
+        let scan = Node::DistinctScan(ix.clone(), width, fetching);
+        if fetching {
+            return Some((scan, true));
+        }
         let mut spec = Document::new();
         for (k, _) in ix.index.fields() {
             if reads.iter().any(|r| r == k) {
@@ -1091,34 +1103,110 @@ fn distinct_group_with(
         if !reads.iter().any(|r| r == "_id") {
             spec.insert("_id", 0_i32);
         }
-        Node::Projection {
-            name: if reads.iter().any(|r| r.contains('.')) {
-                "PROJECTION_DEFAULT"
-            } else {
-                "PROJECTION_COVERED"
+        Some((
+            Node::Projection {
+                name: if reads.iter().any(|r| r.contains('.')) {
+                    "PROJECTION_DEFAULT"
+                } else {
+                    "PROJECTION_COVERED"
+                },
+                spec,
+                input: Box::new(scan),
             },
-            spec,
-            input: Box::new(scan),
-        }
+            false,
+        ))
     };
-    // The other plans tried read through the projection of the fields the
-    // `$group` needs.
+    // A plan that is no DISTINCT_SCAN reads through the projection of the
+    // fields the `$group` needs.
+    let projected = |plan: Node| match (&plan, &s.projection) {
+        (Node::Projection { .. }, _) | (_, None) => plan,
+        (_, Some(p)) => Node::Projection {
+            name: "PROJECTION_SIMPLE",
+            spec: p.clone(),
+            input: Box::new(plan),
+        },
+    };
+    // Sorted or filtered, mongod plans the read as any query and tries each
+    // plan against the others (measured 8.2.11, 2026-11-08): every index
+    // that serves the `$group` as a DISTINCT_SCAN in the form the `$group`
+    // reads it, beside the plans the query's predicate gives that are none,
+    // in the order its planner enumerates them; unsorted and unfiltered,
+    // it takes the index above without a trial.
+    if let Some(trial) = trial.filter(|_| s.sort.is_some() || !s.filter.is_empty()) {
+        let mut plans: Option<Vec<Node>> = Some(Vec::new());
+        if planned.1.len() > 1 {
+            for r in &planned.1 {
+                let tried = match scan_of(r.plan.clone()) {
+                    Node::DistinctScan(ix, ..) if serving.contains(&ix.index.name) => {
+                        grouped(r.plan.clone()).map(|(n, _)| n)
+                    }
+                    // A DISTINCT_SCAN that does not give the sort, or a plan
+                    // that would have to sort: not modelled.
+                    Node::DistinctScan(..) => None,
+                    _ if s.sort.is_some() => None,
+                    _ => Some(projected(r.plan.clone())),
+                };
+                plans = plans.zip(tried).map(|(mut v, n)| {
+                    v.push(n);
+                    v
+                });
+            }
+        } else {
+            for name in &serving {
+                let mut hinted = asked.clone();
+                hinted.hint = Some(Bson::String(name.clone()));
+                let tried = grouped(plan(&hinted)?.0).map(|(n, _)| n);
+                plans = plans.zip(tried).map(|(mut v, n)| {
+                    v.push(n);
+                    v
+                });
+            }
+        }
+        // In the catalog's order, not the query's (measured 8.2.11,
+        // 2026-11-08: over `x_1_z_1`, `x_1`, `x_1_w_1`, `x_1_y_1`, `find`
+        // tries `x_1` first and the `$group` `x_1_z_1`).
+        if let Some(mut plans) = plans.filter(|p| p.len() > 1) {
+            plans.sort_by_key(|p| {
+                index_read(p)
+                    .and_then(|name| catalog.iter().position(|ix| ix.name == name))
+                    .unwrap_or(usize::MAX)
+            });
+            if let Some(at) = plan::pick_for_group(plans.clone(), trial) {
+                let mut ranked = std::mem::take(&mut *trial.ranked.borrow_mut());
+                // The winner is saved once as the trial ends, as the plans
+                // it beat are (measured 8.2.11: `saveState` 1 on each of its
+                // stages, where a query's winner has 0).
+                if let Some(winner) = ranked.first_mut() {
+                    set_aside(&mut winner.stats);
+                }
+                let mut shape = s.clone();
+                shape.sort = None;
+                shape.projection = None;
+                shape.rest[0] = doc! { "$groupByDistinctScan": { "newRoot": root } };
+                return Ok(Some((shape, plans[at].clone(), ranked)));
+            }
+        }
+    }
+    let (node, ranked) = if chosen.name == first.index.name {
+        planned
+    } else {
+        let mut hinted = asked.clone();
+        hinted.hint = Some(Bson::String(chosen.name.clone()));
+        plan(&hinted)?
+    };
+    let Some((plan, fetching)) = grouped(node) else {
+        return Ok(None);
+    };
     let mut ranked: Vec<plan::Ranked> = ranked
         .into_iter()
         .map(|mut r| {
-            if !matches!(r.plan, Node::Projection { .. }) {
-                if let Some(p) = &s.projection {
-                    r.plan = Node::Projection {
-                        name: "PROJECTION_SIMPLE",
-                        spec: p.clone(),
-                        input: Box::new(r.plan),
-                    };
-                    r.stats = Stats {
-                        n_returned: r.stats.n_returned,
-                        children: vec![r.stats],
-                        ..Stats::default()
-                    };
-                }
+            if !matches!(r.plan, Node::Projection { .. }) && s.projection.is_some() {
+                r.plan = projected(r.plan);
+                r.stats = Stats {
+                    n_returned: r.stats.n_returned,
+                    children: vec![r.stats],
+                    ..Stats::default()
+                };
             }
             r
         })
@@ -1136,6 +1224,15 @@ fn distinct_group_with(
     shape.projection = None;
     shape.rest[0] = doc! { "$groupByDistinctScan": { "newRoot": root } };
     Ok(Some((shape, plan, ranked)))
+}
+
+/// The index a plan of one index scan reads.
+fn index_read(node: &Node) -> Option<&str> {
+    match node {
+        Node::IxScan(ix) | Node::DistinctScan(ix, ..) => Some(&ix.index.name),
+        Node::Fetch { input, .. } | Node::Projection { input, .. } => index_read(input),
+        _ => None,
+    }
 }
 
 /// The fields a query's clauses name, under `$and` / `$or` / `$nor` too.

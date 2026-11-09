@@ -11,6 +11,10 @@
 //! no SORT, no index intersection; ε = min(1 / (10 · works), 1e-4)
 //! ```
 //!
+//! A DISTINCT_SCAN plan of a `$group` an aggregate answers from one
+//! (`$groupByDistinctScan`) also gains `min(1 - p, 4p)` for its
+//! productivity `p` (`groupByDistinctBonus`).
+//!
 //! and the best kept. Here each candidate is stepped with the stage rules
 //! of `PlanStage::work`, over the documents the caller holds, and what each
 //! stage counted during the trial is kept for `allPlansExecution`.
@@ -448,8 +452,16 @@ pub(crate) fn max_works(total: usize) -> i64 {
 /// `plan_ranker_util.h`), with what its stages counted during the trial.
 /// `need`: the documents a plan hands over to end the trial; `total`: the
 /// documents the collection holds, which set the trial's length. `None`: a
-/// plan holds a stage this does not step.
-pub(crate) fn run(plans: &[Node], env: &Env, need: i64, total: usize) -> Option<Outcome> {
+/// plan holds a stage this does not step. `group`: the plans read for a
+/// `$group` an aggregate answers from a DISTINCT_SCAN, whose DISTINCT_SCAN
+/// plans gain mongod's `groupByDistinctBonus`.
+pub(crate) fn run(
+    plans: &[Node],
+    env: &Env,
+    need: i64,
+    total: usize,
+    group: bool,
+) -> Option<Outcome> {
     // An index's entries, built once for every scan of it.
     let mut cache = Entries::new();
     let mut stages: Vec<Stage> = plans
@@ -482,13 +494,23 @@ pub(crate) fn run(plans: &[Node], env: &Env, need: i64, total: usize) -> Option<
             let advances = stage.returned.max(1) as f64;
             let epsilon = (1.0 / (10.0 * advances)).min(BONUS);
             let bonus = |absent: bool| if absent { epsilon } else { 0.0 };
-            let no_fetch = bonus(!holds(plan, &|n| matches!(n, Node::Fetch { .. })));
+            // A stage that fetches (`SpecificStats::doesFetch`): a FETCH, or a
+            // DISTINCT_SCAN that reads each key's document.
+            let no_fetch = bonus(!holds(plan, &|n| {
+                matches!(n, Node::Fetch { .. } | Node::DistinctScan(_, _, true))
+            }));
             let no_sort = bonus(!holds(plan, &|n| matches!(n, Node::Sort { .. })));
             let no_ixisect = bonus(!holds(plan, &|n| matches!(n, Node::AndSorted(_))));
             // Summed in mongod's order, which its doubles' last digit shows.
             let tie_breakers = no_fetch + no_sort + no_ixisect;
             let productivity = stage.returned as f64 / stage.works.max(1) as f64;
             let mut score = 1.0 + productivity + tie_breakers;
+            // A DISTINCT_SCAN read for a `$group` counts each advance as
+            // five an index scan's, up to the works it took
+            // (`groupByDistinctBonus`, `plan_ranker.h`, 8.2).
+            if group && holds(plan, &|n| matches!(n, Node::DistinctScan(..))) {
+                score += (1.0 - productivity).min(productivity * 4.0);
+            }
             if stage.is_eof() {
                 score += 1.0;
             }
