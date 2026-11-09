@@ -117,6 +117,10 @@ pub struct ConnectionAuth {
     /// connection` (6788700). `None` once that line is written; mongod
     /// writes it once a connection (`IngressHandshakeMetrics`).
     pub(crate) awaiting_first_command: Option<std::time::Instant>,
+    /// The connection's last op (mongod's `ReplClientInfo`, a decoration
+    /// of its `Client`): the oplog seq a write concern waits for
+    /// (`crate::lastop`, RM-360). 0 until the connection has one.
+    pub(crate) last_op_seq: i64,
 }
 
 impl ConnectionAuth {
@@ -135,6 +139,7 @@ impl ConnectionAuth {
             privileges: None,
             auth_started: None,
             awaiting_first_command: Some(std::time::Instant::now()),
+            last_op_seq: 0,
         }
     }
 

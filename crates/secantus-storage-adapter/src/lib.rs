@@ -469,6 +469,10 @@ impl CmdStorage for StorageAdapter {
         secantus_storage::take_last_commit_ts()
     }
 
+    fn take_last_logged_seq(&self) -> Option<i64> {
+        secantus_storage::take_last_logged_seq()
+    }
+
     fn unreplicated(&self) -> Option<Box<dyn std::any::Any>> {
         Some(Box::new(secantus_storage::unreplicated()))
     }

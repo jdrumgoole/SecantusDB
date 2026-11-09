@@ -843,8 +843,11 @@ def _two_indexes(db: Any) -> None:
 _UNCOUNTED = {
     "find": (_two_indexes, lambda d: list(d.c.find({"x": {"$gt": 1}, "y": 1}))),
     "aggregate": (seed, lambda d: list(d.c.aggregate([{"$match": {"x": {"$gte": 4}}}]))),
-    "insert": (seed, lambda d: d.c.insert_one({"_id": 100})),
-    "update": (seed, lambda d: d.c.update_one({"_id": 1}, {"$set": {"q": 1}})),
+    "insert": (
+        seed,
+        lambda d: d.c.insert_many([{"_id": 1}, {"_id": 100}], ordered=False),
+    ),
+    "findAndModify": (seed, lambda d: d.c.find_one_and_update({"_id": 1}, {"$set": {"q": 1}})),
     "createIndexes": (seed, lambda d: d.c.create_index("z")),
 }
 
@@ -852,12 +855,16 @@ _UNCOUNTED = {
 @pytest.mark.backlog("RM-360")
 def test_every_line_counts_its_interrupt_checks(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for every command carries `numInterruptChecks`
-    (measured 2026-11-08, time-based yields off: a `find` with two
-    candidate plans 8, an `aggregate` 5, an `insert` 13, an `update` 15, a
+    (measured 2026-11-09, time-based yields off: a `find` with two
+    candidate plans 8, an `aggregate` 5, an unordered `insert` of two
+    documents, one a duplicate key, 27, a retryable `findAndModify` 26, a
     `createIndexes` 73). This server counts its reads with one candidate
-    plan and prints none here: mongod's planner checks once per index scan
-    of every plan it enumerates, its pipeline stages every 128th document,
-    and its writes and DDL at points this server does not check yet."""
+    plan and its `insert`, `update` and `delete`, and prints none here:
+    mongod's planner checks once per index scan of every plan it
+    enumerates, its pipeline stages every 128th document, a failed batch
+    of inserts is inserted again a document at a time under locks of its
+    own, a `findAndModify` takes rounds this server does not (RM-357), and
+    DDL checks at points this server does not check yet."""
     for name, (setup, op) in _UNCOUNTED.items():
         answers = {}
         for server, client, is_mongod in (

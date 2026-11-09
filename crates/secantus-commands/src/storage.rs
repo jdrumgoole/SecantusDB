@@ -469,6 +469,13 @@ pub trait Storage: Send + Sync {
         None
     }
 
+    /// The seq of the latest oplog entry the writes on this thread logged
+    /// and committed since the last call, once; `None` when they logged
+    /// none (mongod's client last op, RM-360).
+    fn take_last_logged_seq(&self) -> Option<i64> {
+        None
+    }
+
     /// Write this thread's writes without oplog entries while the returned
     /// guard lives: what mongod keeps beside the oplog rather than in it (a
     /// `findAndModify`'s retry image, a session's `config.transactions`

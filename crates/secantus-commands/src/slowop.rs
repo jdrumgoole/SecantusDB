@@ -523,9 +523,11 @@ pub fn attributes(
 /// after taking that lock (`CurOp::completeAndLogOperation`) -- for the
 /// commands whose checks are all where mongod's are (RM-360): a read of a
 /// collection by `find`, `count` or `distinct`, a `getMore` of a `find`'s
-/// cursor, `listIndexes`, `listCollections`, `collStats`, `ping` and
-/// `buildInfo`, outside a transaction. Others print none until theirs are:
-/// a pipeline's stages, writes and DDL check where mongod's do not yet.
+/// cursor, `listIndexes`, `listCollections`, `collStats`, `ping`,
+/// `buildInfo`, and `insert`, `update` and `delete` on a member of a
+/// replica set, outside a transaction. Others print none until theirs are:
+/// a pipeline's stages, `findAndModify` and DDL check where mongod's do
+/// not yet.
 pub fn with_interrupt_checks(
     request: &Document,
     ctx: &CommandContext,
@@ -545,6 +547,9 @@ pub fn with_interrupt_checks(
                 .and_then(|o| o.get_str("find").ok())
                 .is_some_and(|coll| of_collection(Some(coll))),
             "listIndexes" | "listCollections" | "collStats" | "ping" | "buildInfo" => true,
+            // Writes, on a member of a replica set: their last op and
+            // write-concern waits are counted (`lastop`).
+            "insert" | "update" | "delete" => ctx.replica_set_name.is_some(),
             _ => false,
         };
     if counted && !secantus_core::deadline::is_unmatched() {

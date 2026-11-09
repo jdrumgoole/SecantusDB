@@ -42,8 +42,10 @@ pub(crate) fn begin_operation() {
 /// the outermost call into the planner (RM-360): one per index scan the
 /// access planner builds (`QueryPlannerAccess::makeLeafNode`) and one when
 /// it is done (`PrepareExecutionHelper::prepare`), or the express
-/// executor's one; none for a `RECORD_STORE_FAST_COUNT` or a `DISTINCT_SCAN`
-/// without a query (measured 8.2.11, 2026-11-08). A failed check trips the
+/// executor's one; none for a `RECORD_STORE_FAST_COUNT`, a `DISTINCT_SCAN`
+/// without a query, or an IDHACK, which mongod builds without its planner
+/// (an upsert's or a `count`'s `_id` lookup; measured 8.2.11, 2026-11-08
+/// and 2026-11-09). A write's are its write plan's ([`write`]). A failed check trips the
 /// command (`deadline::tripped`). A plan with more than one candidate
 /// ([`candidates`]) has the leaves of all of mongod's enumerated plans,
 /// which this planner does not build, so its count is not mongod's.
@@ -61,12 +63,27 @@ fn planning_checks(node: &Node, distinct_without_query: bool) {
             | Node::Limit(_, input)
             | Node::Projection { input, .. }
             | Node::ReturnKey(input)
-            | Node::Count(input) => leaves(input),
+            | Node::Count(input)
+            | Node::Update(input)
+            | Node::Delete { input, .. } => leaves(input),
             _ => None,
+        }
+    }
+    /// An `_id` lookup mongod answers with IDHACK, which it builds without
+    /// its planner (`isIdHackEligibleQuery`): an upsert's, a `count`'s.
+    fn id_hack(node: &Node) -> bool {
+        match node {
+            Node::IdHack(_) => true,
+            Node::Count(input)
+            | Node::Update(input)
+            | Node::Delete { input, .. }
+            | Node::Projection { input, .. } => id_hack(input),
+            _ => false,
         }
     }
     use secantus_core::deadline::{check_for_interrupt, unmatched};
     let checks = match node {
+        _ if id_hack(node) => Some(0),
         Node::FastCount => Some(0),
         Node::DistinctScan(..) if distinct_without_query => Some(0),
         Node::Projection { input, .. }
@@ -74,7 +91,7 @@ fn planning_checks(node: &Node, distinct_without_query: bool) {
         {
             Some(0)
         }
-        Node::Express { .. } => Some(1),
+        Node::Express { .. } | Node::ExpressWrite { .. } => Some(1),
         other => leaves(other).map(|n| n + 1),
     };
     match checks {
@@ -2032,6 +2049,19 @@ pub(crate) fn write(
     returns: bool,
 ) -> Node {
     let _timing = timing();
+    let node = write_plan(q, catalog, delete, multi, upsert, returns);
+    planning_checks(&node, false);
+    node
+}
+
+fn write_plan(
+    q: &Query,
+    catalog: &[Arc<IndexInfo>],
+    delete: bool,
+    multi: bool,
+    upsert: bool,
+    returns: bool,
+) -> Node {
     if let (Hint::None, Some(("_id", value))) = (&q.hint, point_lookup(q.canonical)) {
         let id_index = catalog.iter().find(|ix| ix.name == "_id_");
         match id_index {

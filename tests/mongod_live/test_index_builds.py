@@ -197,6 +197,31 @@ class _Build:
             if str(o.get("desc", "")).startswith("IndexBuildsCoordinator")
         ]
 
+    def held_op(self) -> Any:
+        """The opid of the build's operation once the build itself runs.
+
+        `_Build` may return while mongod still sets the build up: mongod
+        8.2.11 lists the operation then, lists none for a moment, and lists
+        it again, with the same opid and a progress `msg` ("Index Build:
+        scanning collection ..."), once the build runs (probed 2026-11-09).
+        A `killOp` before that interrupts the setup, and one in the gap
+        finds nothing; a test that looked twice once saw the operation and
+        then none (RM gate, 2026-11-09). This server lists its operation
+        throughout, without a `msg`: listed in every look for half a second
+        is the build's too, as mongod's setup never is."""
+        deadline = time.monotonic() + 30
+        listed_since = None
+        while True:
+            ops = self.ops()
+            now = time.monotonic()
+            if ops and "msg" in ops[0]:
+                return ops[0]["opid"]
+            listed_since = (listed_since or now) if ops else None
+            if listed_since is not None and now - listed_since >= 0.5:
+                return ops[0]["opid"]
+            assert now < deadline, "the build operation was never listed"
+            time.sleep(0.02)
+
     def finish(self) -> Any:
         self.client.admin.command("configureFailPoint", self.pause, mode="off")
         self.thread.join(timeout=120)
@@ -352,14 +377,7 @@ def _ended_by(client: Any, how: str) -> dict:
     elif how == "dropDatabase":
         reply = _answer(lambda: db.command("dropDatabase"))
     elif how == "killOp build":
-        # `_Build` may return in the moment between the build's setup and
-        # the build itself, when mongod lists no build operation (its
-        # comment): wait for the operation this kills.
-        deadline = time.monotonic() + 30
-        while not build.ops():
-            assert time.monotonic() < deadline, "the build operation was never listed"
-            time.sleep(0.02)
-        opid = build.ops()[0]["opid"]
+        opid = build.held_op()
         reply = _answer(lambda: client.admin.command("killOp", op=opid))
     elif how == "killOp command":
         ops = client.admin.command("currentOp", {"$all": True})["inprog"]

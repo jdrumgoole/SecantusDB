@@ -12,8 +12,18 @@ counts them; each scenario compares the count, and the yields, line for
 line. Both servers run with time-based yields off, so the counts are the
 operation's own and not the machine's.
 
+A write counts the checks of what follows it too: a retryable write's
+session check-out, the reads of the system's latest optime a write that
+logged nothing makes for its client's last op (its global IS lock and the
+transition lock beside it, twice when the client's last op was already the
+system's), and its write concern's waits -- the oplog's holes, the journal
+flush for `j`, the commit point for `majority`, each a check before it
+waits and one when it wakes.
+
 What this server does not count yet prints no field, and is RM-360's
-remainder: plans with several candidates, pipelines, writes and DDL.
+remainder: plans with several candidates, pipelines, `findAndModify`, DDL,
+and the write concerns whose waits are not modelled (`fsync`, a numbered
+`w` above 1, a tag, `majority` with `j: false`).
 """
 
 from __future__ import annotations
@@ -22,6 +32,7 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
+from pymongo import WriteConcern
 
 from tests.backlog.opdebug import logged, no_timed_yields, seed
 
@@ -92,6 +103,7 @@ SCENARIOS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
         lambda d: d.command("count", "c", query={"z": 0}),
         ("count",),
     ),
+    "count by _id": (seed, lambda d: d.command("count", "c", query={"_id": 3}), ("count",)),
     "count of a collection not there": (
         seed,
         lambda d: d.command("count", "nope", query={"z": 0}),
@@ -107,6 +119,113 @@ SCENARIOS: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str
     "listIndexes": (seed, lambda d: list(d.c.list_indexes()), ("listIndexes",)),
     "listCollections": (seed, lambda d: d.list_collection_names(), ("listCollections",)),
     "collStats": (seed, lambda d: d.command("collStats", "c"), ("collStats",)),
+}
+
+
+_W1 = WriteConcern(w=1)
+_JOURNAL = WriteConcern(w=1, j=True)
+_MAJORITY = WriteConcern(w="majority")
+
+
+def _w1(db: Any) -> Any:
+    return db.c.with_options(write_concern=_W1)
+
+
+#: Writes on a member of a replica set: the driver's own (retryable, the
+#: implicit `majority`), and the shapes each part of the count turns on.
+WRITES: dict[str, tuple[Callable[[Any], Any], Callable[[Any], Any], tuple[str, ...]]] = {
+    "insert": (seed, lambda d: d.c.insert_one({"_id": 100}), ("insert",)),
+    "insert of several": (
+        seed,
+        lambda d: d.c.insert_many([{"_id": 100 + n} for n in range(5)]),
+        ("insert",),
+    ),
+    "insert, w: 1": (seed, lambda d: _w1(d).insert_one({"_id": 100}), ("insert",)),
+    "insert, j": (
+        seed,
+        lambda d: d.c.with_options(write_concern=_JOURNAL).insert_one({"_id": 100}),
+        ("insert",),
+    ),
+    "insert of a duplicate key": (seed, lambda d: d.c.insert_one({"_id": 1}), ("insert",)),
+    "insert of a duplicate key, w: 1": (
+        seed,
+        lambda d: _w1(d).insert_one({"_id": 1}),
+        ("insert",),
+    ),
+    "insert not retryable": (
+        seed,
+        lambda d: d.command({"insert": "c", "documents": [{"_id": 100}]}),
+        ("insert",),
+    ),
+    "insert not retryable, w: 1": (
+        seed,
+        lambda d: d.command({"insert": "c", "documents": [{"_id": 100}], "writeConcern": {"w": 1}}),
+        ("insert",),
+    ),
+    "update": (seed, lambda d: d.c.update_one({"_id": 1}, {"$set": {"q": 1}}), ("update",)),
+    "update, w: 1": (
+        seed,
+        lambda d: _w1(d).update_one({"_id": 1}, {"$set": {"q": 1}}),
+        ("update",),
+    ),
+    "update, majority": (
+        seed,
+        lambda d: d.c.with_options(write_concern=_MAJORITY).update_one(
+            {"_id": 1}, {"$set": {"q": 1}}
+        ),
+        ("update",),
+    ),
+    "update through an index": (
+        seed,
+        lambda d: d.c.update_one({"x": 1}, {"$set": {"q": 1}}),
+        ("update",),
+    ),
+    "update matching nothing": (
+        seed,
+        lambda d: d.c.update_one({"_id": 99}, {"$set": {"q": 1}}),
+        ("update",),
+    ),
+    "update matching nothing, w: 1": (
+        seed,
+        lambda d: _w1(d).update_one({"_id": 99}, {"$set": {"q": 1}}),
+        ("update",),
+    ),
+    "update matching nothing, j": (
+        seed,
+        lambda d: d.c.with_options(write_concern=_JOURNAL).update_one(
+            {"_id": 99}, {"$set": {"q": 1}}
+        ),
+        ("update",),
+    ),
+    "update changing nothing": (
+        seed,
+        lambda d: d.c.update_one({"_id": 1}, {"$set": {"x": 1}}),
+        ("update",),
+    ),
+    "upsert": (
+        seed,
+        lambda d: d.c.update_one({"_id": 99}, {"$set": {"q": 1}}, upsert=True),
+        ("update",),
+    ),
+    "update of many": (seed, lambda d: d.c.update_many({"z": 1}, {"$set": {"q": 1}}), ("update",)),
+    "update of many, w: 1": (
+        seed,
+        lambda d: _w1(d).update_many({"z": 1}, {"$set": {"q": 1}}),
+        ("update",),
+    ),
+    "update not retryable, matching nothing": (
+        seed,
+        lambda d: d.command(
+            {"update": "c", "updates": [{"q": {"_id": 99}, "u": {"$set": {"q": 1}}}]}
+        ),
+        ("update",),
+    ),
+    "replace": (seed, lambda d: d.c.replace_one({"_id": 1}, {"a": 1}), ("update",)),
+    "delete": (seed, lambda d: d.c.delete_one({"_id": 1}), ("delete",)),
+    "delete, w: 1": (seed, lambda d: _w1(d).delete_one({"_id": 1}), ("delete",)),
+    "delete matching nothing": (seed, lambda d: d.c.delete_one({"_id": 99}), ("delete",)),
+    "delete of many": (seed, lambda d: d.c.delete_many({"z": 1}), ("delete",)),
+    "delete of many, w: 1": (seed, lambda d: _w1(d).delete_many({"z": 1}), ("delete",)),
 }
 
 
@@ -129,6 +248,18 @@ def test_a_line_counts_mongods_interrupt_checks(
     rust_mongo: Any, mongod_rs: Any, label: str
 ) -> None:
     scenario = SCENARIOS[label]
+    theirs = _counts(mongod_rs, True, scenario)
+    ours = _counts(rust_mongo, False, scenario)
+    assert theirs, f"{label}: mongod wrote no line"
+    assert all(n is not None for _, n, _ in theirs), theirs
+    assert ours == theirs, f"{label}: ours {ours}, mongod {theirs}"
+
+
+@pytest.mark.parametrize("label", list(WRITES))
+def test_a_write_line_counts_mongods_interrupt_checks(
+    rust_mongo: Any, mongod_rs: Any, label: str
+) -> None:
+    scenario = WRITES[label]
     theirs = _counts(mongod_rs, True, scenario)
     ours = _counts(rust_mongo, False, scenario)
     assert theirs, f"{label}: mongod wrote no line"
