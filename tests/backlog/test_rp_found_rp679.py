@@ -81,8 +81,11 @@ def test_char_n_cells_and_sort_keys_compare_without_their_blanks(query: str, dsn
     assert _answer(dsn, query) == FIXED[query]
 
 
-@pytest.mark.backlog("RP-683")
+@pytest.mark.backlog_fixed("RP-683")
 def test_correlated_array_of_char_n_keeps_the_elements_blanks(dsn: str) -> None:
+    """A correlated ARRAY sublink answered the inner rows' stored (trimmed)
+    values, `{a}`; it is padded at the column's modifier, as the uncorrelated
+    sublink's cast to `character(3)[]` pads it."""
     query = (
         f"select k, array(select t.f from {V} t(k, f) where t.f = s.f) from {V} s(k, f) order by k"
     )
@@ -90,3 +93,21 @@ def test_correlated_array_of_char_n_keeps_the_elements_blanks(dsn: str) -> None:
         [-1, 7],
         [(1, ["a  "]), (2, ["xy "]), (3, ["a\t "])],
     )
+
+
+@pytest.mark.backlog_fixed("RP-683")
+def test_correlated_char_n_values_enter_an_expression_padded(dsn: str) -> None:
+    """Found while working RP-683: a correlated scalar sublink over an INNER
+    `char(3)` column dropped its blanks the same way (`octet_length` 1 where
+    15.19 answers 3), and so did each element an expression read from the
+    correlated array. Comparisons and grouping still ignore the blanks."""
+    s = f"(select t.f from {V} t(k, f) where t.k = s.k)"
+    a = f"array(select t.f from {V} t(k, f) where t.k = s.k)"
+    assert _answer(
+        dsn,
+        f"select k, octet_length({s}), octet_length(({a})[1]) from {V} s(k, f) order by k",
+    ) == ([-1, -1, -1], [(1, 3, 3), (2, 3, 3), (3, 3, 3)])
+    assert _answer(dsn, f"select k from {V} s(k, f) where {s} = 'xy'") == ([-1], [(2,)])
+    assert _answer(
+        dsn, f"select x, count(*) from (select {s} x from {V} s(k, f)) q group by x order by x"
+    ) == ([7, -1], [("a  ", 1), ("a\t ", 1), ("xy ", 1)])
