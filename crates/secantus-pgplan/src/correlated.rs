@@ -25,6 +25,10 @@ use pg_query::protobuf::a_const::Val;
 /// keeps it out of any name a user can write.
 pub(crate) const CORRELATED: &str = "\u{1f}correlated";
 
+/// Separates a row comparison's operator, in a correlated call's operator
+/// argument, from the subquery's column types and modifiers after it.
+const ROW_TYPE_SEP: char = '\u{1f}';
+
 /// Plans and runs a correlated subquery's SQL with its bound values.
 pub type CorrelatedRunner<'a> = dyn Fn(&str, &[Bson]) -> Result<Vec<Vec<Bson>>> + 'a;
 type Runner = CorrelatedRunner<'static>;
@@ -759,6 +763,7 @@ pub(crate) fn correlate(
             | SubLinkType::ArraySublink
             | SubLinkType::AnySublink
             | SubLinkType::AllSublink
+            | SubLinkType::RowcompareSublink
     ) {
         return Err(Error::Unsupported("this correlated subquery form".into()));
     }
@@ -847,9 +852,10 @@ pub(crate) fn correlate(
     )?;
     let mut typmod = -1;
     let result_type = match kind {
-        SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink => {
-            "bool".to_string()
-        }
+        SubLinkType::ExistsSublink
+        | SubLinkType::AnySublink
+        | SubLinkType::AllSublink
+        | SubLinkType::RowcompareSublink => "bool".to_string(),
         _ => {
             // The parameters were planned as untyped NULLs, so an output
             // that IS an outer column (`(select s.x)`) came out `text`.
@@ -889,12 +895,31 @@ pub(crate) fn correlate(
             _ => None,
         })
         .unwrap_or_else(|| "=".to_string());
+    // A row on the left (`(a, b) in (...)`, `(a, b) = (select ...)`) is
+    // compared with each subquery row pair by pair, each pair by the
+    // operator its two types resolve to (`make_row_comparison_op`): the
+    // subquery's column types travel after the operator, so each value is
+    // compared as a value of its column's type (RP-697).
+    let test = sl.testexpr.as_deref().cloned().unwrap_or_else(null_const);
+    let mut op_arg = op.clone();
+    if matches!(test.node.as_ref(), Some(N::RowExpr(_))) && kind != SubLinkType::ExprSublink {
+        let typed = typed_probe(inner, &outer_refs, first, lookup, params);
+        let def = typed
+            .and_then(|p| sub_plan_def(&p, lookup).ok())
+            .or_else(|| sub_plan_def(&planned, lookup).ok());
+        for c in def.iter().flat_map(|d| d.columns.iter()) {
+            op_arg.push_str(&format!(
+                "{ROW_TYPE_SEP}{}{ROW_TYPE_SEP}{}",
+                c.pg_type, c.typmod
+            ));
+        }
+    }
     let mut args = vec![
         int_const(kind as i32),
         str_const(&sql),
         str_const(&result_type),
-        str_const(&op),
-        sl.testexpr.as_deref().cloned().unwrap_or_else(null_const),
+        str_const(&op_arg),
+        test,
         int_const(i32::try_from(params.len()).unwrap_or(i32::MAX)),
         int_const(typmod),
     ];
@@ -1640,7 +1665,7 @@ pub(crate) fn is_correlated_name(name: &str) -> bool {
     name == CORRELATED
 }
 
-fn is_correlated(f: &pg_query::protobuf::FuncCall) -> bool {
+pub(crate) fn is_correlated(f: &pg_query::protobuf::FuncCall) -> bool {
     matches!(
         f.funcname.as_slice(),
         [n] if matches!(n.node.as_ref(), Some(N::String(s)) if s.sval == CORRELATED)
@@ -1775,7 +1800,20 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     let kind = SubLinkType::try_from(i32::try_from(int(0)?).unwrap_or(0))
         .map_err(|_| Error::Internal("a malformed correlated subquery".into()))?;
     let sql = text(1)?;
-    let op = text(3)?;
+    let op_arg = text(3)?;
+    let mut op_parts = op_arg.split(ROW_TYPE_SEP);
+    let op = op_parts.next().unwrap_or("=").to_string();
+    let column_types: Vec<(String, i32)> = {
+        let rest: Vec<&str> = op_parts.collect();
+        rest.chunks(2)
+            .map(|c| {
+                (
+                    c[0].to_string(),
+                    c.get(1).and_then(|m| m.parse().ok()).unwrap_or(-1),
+                )
+            })
+            .collect()
+    };
     let n_params = usize::try_from(int(5)?).unwrap_or(0);
     let mut inner_params = Vec::new();
     // Argument 6 is the result's modifier, read only for its type.
@@ -1825,12 +1863,44 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
             Ok(rows.first().map_or(Bson::Null, first))
         }
         SubLinkType::ArraySublink => Ok(Bson::Array(rows.iter().map(first).collect())),
+        // `(a, b) op ANY (subquery)`: the row against each of the
+        // subquery's rows, pairwise, as `make_row_comparison_op` builds it
+        // (RP-697) -- not the row against the first column.
+        SubLinkType::AnySublink | SubLinkType::AllSublink if row_test(arg(4)?) => {
+            let any = kind == SubLinkType::AnySublink;
+            let mut saw_null = false;
+            for r in &rows {
+                match row_compare(arg(4)?, &op, &column_types, r, params)? {
+                    Bson::Boolean(b) if b == any => return Ok(Bson::Boolean(any)),
+                    Bson::Null => saw_null = true,
+                    _ => {}
+                }
+            }
+            Ok(if saw_null {
+                Bson::Null
+            } else {
+                Bson::Boolean(!any)
+            })
+        }
         SubLinkType::AnySublink | SubLinkType::AllSublink => {
             // `x op ANY (values)` over what this row's subquery returned: the
             // constant evaluator already has ANY / ALL's three-valued rules.
             let test = const_value(arg(4)?, params)?;
             let values = Bson::Array(rows.iter().map(first).collect());
             eval_scalar_array_const(&op, test, values, kind == SubLinkType::AnySublink)
+        }
+        // `(a, b) op (subquery)`: one row at most, compared as a row
+        // constructor; no row is NULL (`ExecScanSubPlan`'s ROWCOMPARE_SUBLINK).
+        SubLinkType::RowcompareSublink => {
+            if rows.len() > 1 {
+                return Err(Error::CardinalityViolation(
+                    "more than one row returned by a subquery used as an expression".into(),
+                ));
+            }
+            let Some(r) = rows.first() else {
+                return Ok(Bson::Null);
+            };
+            row_compare(arg(4)?, &op, &column_types, r, params)
         }
         _ => Err(Error::Unsupported("this correlated subquery form".into())),
     }
@@ -1867,6 +1937,110 @@ fn pad_bpchar_deep(v: Bson, width: Option<usize>) -> Bson {
                 .collect(),
         ),
         v => crate::pad_bpchar(v, width),
+    }
+}
+
+/// Is a correlated sublink's left side a row (`(a, b) in (...)`)?
+fn row_test(n: &pg_query::protobuf::Node) -> bool {
+    matches!(n.node.as_ref(), Some(N::RowExpr(_)))
+}
+
+/// `field op value`, the value of the subquery column's type at its
+/// modifier: typed so, the pair takes the operator its two types resolve
+/// to -- a `char(n)` pair ignores trailing blanks as `bpchareq` does -- as
+/// each of `make_row_comparison_op`'s pairs is resolved by `make_op`.
+fn pair_compare(
+    field: &pg_query::protobuf::Node,
+    op: &str,
+    column: Option<&(String, i32)>,
+    value: &Bson,
+    params: &[Bson],
+) -> Result<Bson> {
+    // The value is one more parameter, past every one the field reads.
+    let mut extended = params.to_vec();
+    extended.push(value.clone());
+    let param = pg_query::protobuf::Node {
+        node: Some(N::ParamRef(pg_query::protobuf::ParamRef {
+            number: i32::try_from(extended.len()).unwrap_or(i32::MAX),
+            location: -1,
+        })),
+    };
+    let rhs = match column.filter(|(t, _)| !matches!(t.as_str(), "" | "unknown")) {
+        Some((ty, typmod)) => {
+            let mut cast = relabel_cast(param, ty);
+            if let Some(N::TypeCast(tc)) = cast.node.as_mut() {
+                if let Some(t) = tc.type_name.as_mut() {
+                    t.typmods = length_typmods(ty.strip_suffix("[]").unwrap_or(ty), *typmod);
+                }
+            }
+            cast
+        }
+        None => param,
+    };
+    let pair = pg_query::protobuf::Node {
+        node: Some(N::AExpr(Box::new(AExpr {
+            kind: AExprKind::AexprOp as i32,
+            name: vec![string_node(op)],
+            lexpr: Some(Box::new(field.clone())),
+            rexpr: Some(Box::new(rhs)),
+            location: -1,
+        }))),
+    };
+    const_value(&pair, &extended)
+}
+
+/// A row compared with one subquery row, as `ExecEvalRowCompare` and the
+/// AND / OR `make_row_comparison_op` builds for `=` / `<>` evaluate it: `=`
+/// is every pair equal, `<>` any pair unequal, each with SQL's three-valued
+/// logic; an ordering operator decides at the first pair that is not
+/// equal, a NULL there or before it making the row comparison NULL, and
+/// rows equal throughout satisfy only `<=` and `>=`.
+fn row_compare(
+    test: &pg_query::protobuf::Node,
+    op: &str,
+    columns: &[(String, i32)],
+    row: &[Bson],
+    params: &[Bson],
+) -> Result<Bson> {
+    let Some(N::RowExpr(t)) = test.node.as_ref() else {
+        return Err(Error::Internal("a malformed correlated subquery".into()));
+    };
+    let pair = |i: usize, op: &str| {
+        let value = row.get(i).cloned().unwrap_or(Bson::Null);
+        pair_compare(&t.args[i], op, columns.get(i), &value, params)
+    };
+    match op {
+        "=" | "<>" | "!=" => {
+            // `=` is an AND of the pairs, `<>` an OR: a pair that decides
+            // (false / true) settles it, a NULL leaves it unknown.
+            let decides = op == "=";
+            let mut saw_null = false;
+            for i in 0..t.args.len() {
+                match pair(i, op)? {
+                    Bson::Boolean(b) if b != decides => return Ok(Bson::Boolean(b)),
+                    Bson::Null => saw_null = true,
+                    _ => {}
+                }
+            }
+            Ok(if saw_null {
+                Bson::Null
+            } else {
+                Bson::Boolean(decides)
+            })
+        }
+        "<" | "<=" | ">" | ">=" => {
+            for i in 0..t.args.len() {
+                match pair(i, "=")? {
+                    Bson::Boolean(true) => continue,
+                    Bson::Boolean(false) => return pair(i, &op[..1]),
+                    _ => return Ok(Bson::Null),
+                }
+            }
+            Ok(Bson::Boolean(matches!(op, "<=" | ">=")))
+        }
+        _ => Err(Error::Unsupported(format!(
+            "a row comparison with {op} and a subquery"
+        ))),
     }
 }
 
@@ -2676,5 +2850,146 @@ mod tests {
             pad_bpchar_deep(Bson::String("a".into()), None),
             Bson::String("a".into())
         );
+    }
+
+    /// The row constructor a `select (...)` target is.
+    fn row(sql: &str) -> pg_query::protobuf::Node {
+        let tree = pg_query::parse(&format!("select {sql}")).expect("parses");
+        let Some(N::SelectStmt(s)) = tree.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("a SELECT");
+        };
+        let Some(N::ResTarget(rt)) = s.target_list[0].node.as_ref() else {
+            panic!("a target");
+        };
+        let node = *rt.val.clone().expect("a value");
+        assert!(row_test(&node), "{sql} is a row");
+        node
+    }
+
+    /// A row, an operator, the subquery's column types, its row's values
+    /// and the answer.
+    type Case = (
+        &'static str,
+        &'static str,
+        Vec<(String, i32)>,
+        Vec<Bson>,
+        Bson,
+    );
+
+    /// `ExecEvalRowCompare`'s rules for a row against a subquery's row
+    /// (RP-697), each answer measured on PostgreSQL 15.19 as `select (...)
+    /// op (select ...)`.
+    #[test]
+    fn a_row_compares_with_a_subquery_row_pair_by_pair() {
+        let int = ("int4".to_string(), -1);
+        let text = ("text".to_string(), -1);
+        let null = Bson::Null;
+        let i = |v: i32| Bson::Int32(v);
+        let s = |v: &str| Bson::String(v.into());
+        let cases: Vec<Case> = vec![
+            (
+                "(1, 'y')",
+                "=",
+                vec![int.clone(), text.clone()],
+                vec![i(1), s("y")],
+                Bson::Boolean(true),
+            ),
+            (
+                "(1, 'y')",
+                "=",
+                vec![int.clone(), text.clone()],
+                vec![i(2), null.clone()],
+                Bson::Boolean(false),
+            ),
+            (
+                "(1, 'y')",
+                "=",
+                vec![int.clone(), text.clone()],
+                vec![i(1), null.clone()],
+                Bson::Null,
+            ),
+            (
+                "(1, 'y')",
+                "<>",
+                vec![int.clone(), text.clone()],
+                vec![i(2), null.clone()],
+                Bson::Boolean(true),
+            ),
+            (
+                "(1, 'y')",
+                "<>",
+                vec![int.clone(), text.clone()],
+                vec![i(1), null.clone()],
+                Bson::Null,
+            ),
+            (
+                "(1, 'y')",
+                "<>",
+                vec![int.clone(), text.clone()],
+                vec![i(1), s("y")],
+                Bson::Boolean(false),
+            ),
+            // An ordering operator decides at the first unequal pair...
+            (
+                "(1, 'y')",
+                "<",
+                vec![int.clone(), text.clone()],
+                vec![i(2), null.clone()],
+                Bson::Boolean(true),
+            ),
+            (
+                "(1, 'z')",
+                "<",
+                vec![int.clone(), text.clone()],
+                vec![i(1), s("y")],
+                Bson::Boolean(false),
+            ),
+            // ...a NULL before it is NULL...
+            (
+                "(1, 'y')",
+                "<",
+                vec![int.clone(), text.clone()],
+                vec![null.clone(), s("z")],
+                Bson::Null,
+            ),
+            (
+                "(1, 'y')",
+                ">=",
+                vec![int.clone(), text.clone()],
+                vec![i(1), null.clone()],
+                Bson::Null,
+            ),
+            // ...and equal rows satisfy only `<=` and `>=`.
+            (
+                "(1, 'y')",
+                "<=",
+                vec![int.clone(), text.clone()],
+                vec![i(1), s("y")],
+                Bson::Boolean(true),
+            ),
+            (
+                "(1, 'y')",
+                ">",
+                vec![int.clone(), text.clone()],
+                vec![i(1), s("y")],
+                Bson::Boolean(false),
+            ),
+            // A `char(n)` value is compared as `bpchar`: its blanks do not count.
+            (
+                "('ab'::char(3), 2)",
+                "=",
+                vec![("bpchar".to_string(), 7), int.clone()],
+                vec![s("ab "), i(2)],
+                Bson::Boolean(true),
+            ),
+        ];
+        for (left, op, columns, values, want) in cases {
+            let got = row_compare(&row(left), op, &columns, &values, &[]).expect(left);
+            assert_eq!(got, want, "{left} {op} {values:?}");
+        }
     }
 }

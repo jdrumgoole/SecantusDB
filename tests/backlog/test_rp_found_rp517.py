@@ -3,7 +3,7 @@ the shapes of a correlated subquery that fail with a column named
 explicitly as well as through a star, so they are not the star's:
 
 - a row compared with a correlated subquery (`(a, c) in (select fs.a,
-  fs.c)`) is refused (RP-697);
+  fs.c)`) was refused (RP-697, fixed);
 - a correlated set operation is 42P01 (RP-698);
 - a correlated subquery that passed an outer FROM function's column, or a
   field of an outer whole row, through unchanged answered it as text, and
@@ -55,8 +55,9 @@ def answer(dsn: str, query: str) -> Any:
 
 
 # `transformAExprIn` / `make_row_comparison_op` compare the row with the
-# correlated subquery's columns pairwise. Here each is 0A000 `comparing
-# document with int32 using = is not supported yet`, with no position.
+# correlated subquery's columns pairwise. Each was 0A000 `comparing
+# document with int32 using = is not supported yet`, with no position
+# (RP-697, fixed).
 ROW_AGAINST_CORRELATED = {
     "select a from fs where (a, c) in (select fs.a, fs.c)": ([(1,)], ["a"]),
     "select a from fs where (a, c) = (select fs.a, fs.c)": ([(1,)], ["a"]),
@@ -64,10 +65,192 @@ ROW_AGAINST_CORRELATED = {
 }
 
 
-@pytest.mark.backlog("RP-697")
+@pytest.mark.backlog_fixed("RP-697")
 @pytest.mark.parametrize("query", list(ROW_AGAINST_CORRELATED))
 def test_row_against_a_correlated_subquery(query: str, dsn: str) -> None:
     assert answer(dsn, query) == ROW_AGAINST_CORRELATED[query]
+
+
+# More rows for the row comparisons: NULLs in either row, every operator,
+# `char(n)` pairs, and the uncorrelated `row op (subquery)`, which compared
+# the row with the subquery's first column (0A000 `comparing document with
+# int32`) in a select list and a WHERE alike. Measured on the same private
+# PostgreSQL 15.19 cluster.
+_ROW_SETUP = [
+    "drop table if exists rn, ch cascade",
+    "create table rn (k int, a int, c text)",
+    "insert into rn values (1, 1, 'y'), (2, null, 'y'), (3, 2, 'z'), (4, 1, null)",
+    "create table ch (k int, c char(3), v varchar(4))",
+    "insert into ch values (1, 'y', 'y'), (2, 'ab', 'ab ')",
+]
+
+_T, _F = True, False
+_COL = ["k", "?column?"]
+ROW_COMPARISONS = {
+    # IN / NOT IN / ANY / ALL: each subquery row compared pair by pair.
+    "select k, (a, c) in (select fs.a, fs.c from fs where fs.a = rn.a) from rn order by k": (
+        [(1, _T), (2, _F), (3, _F), (4, None)],
+        _COL,
+    ),
+    "select k, (a, c) not in (select fs.a, fs.c from fs where fs.a = rn.a or rn.k = 4)"
+    " from rn order by k": ([(1, _F), (2, _T), (3, _T), (4, None)], _COL),
+    "select k, (a, c) = any (select fs.a, fs.c from fs where rn.k < 3) from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, _F)],
+        _COL,
+    ),
+    "select k, (a, c) <> all (select fs.a, fs.c from fs where rn.k < 3) from rn order by k": (
+        [(1, _F), (2, None), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (a, c) = all (select fs.a, fs.c from fs where rn.k < 3) from rn order by k": (
+        [(1, _T), (2, None), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (a, c) <> any (select fs.a, fs.c from fs where rn.k < 4) from rn order by k": (
+        [(1, _F), (2, None), (3, _T), (4, _F)],
+        _COL,
+    ),
+    "select k, (k, a) < any (select rn.k, 3) from rn order by k": (
+        [(1, _T), (2, None), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (k, a) > all (select rn.k - 1, 3) from rn order by k": (
+        [(1, _T), (2, _T), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (a, 'y') in (select fs.a, fs.c from fs where fs.a = rn.a) from rn order by k": (
+        [(1, _T), (2, _F), (3, _F), (4, _T)],
+        _COL,
+    ),
+    "select k, row(a, c) in (select rn.a, 'y') from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, None)],
+        _COL,
+    ),
+    # `row op (subquery)`: one row, no row NULL, compared as a RowCompareExpr.
+    "select k, (a, c) = (select fs.a, fs.c from fs where fs.a = rn.a) from rn order by k": (
+        [(1, _T), (2, None), (3, None), (4, None)],
+        _COL,
+    ),
+    "select k, (a, c) <> (select fs.a, fs.c from fs where fs.a = rn.a) from rn order by k": (
+        [(1, _F), (2, None), (3, None), (4, None)],
+        _COL,
+    ),
+    "select k, (a, c) = (select fs.a, fs.c from fs, fe where rn.k > 0) from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, None)],
+        _COL,
+    ),
+    "select k, (1, c) = (select rn.a, 'y') from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, None)],
+        _COL,
+    ),
+    "select k, (k, a) < (select rn.k, 5) from rn order by k": (
+        [(1, _T), (2, None), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (k, a) >= (select rn.k, 1) from rn order by k": (
+        [(1, _T), (2, None), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (k, a) <= (select rn.k, rn.a) from rn order by k": (
+        [(1, _T), (2, None), (3, _T), (4, _T)],
+        _COL,
+    ),
+    "select k, (k, a, c) < (select rn.k, rn.a, 'z') from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, None)],
+        _COL,
+    ),
+    "select k, (k, a, c) >= (select rn.k, rn.a + 1, 'a') from rn order by k": (
+        [(1, _F), (2, None), (3, _F), (4, _F)],
+        _COL,
+    ),
+    "select k, (k, c) >= (select rn.k, null::text) from rn order by k": (
+        [(1, None), (2, None), (3, None), (4, None)],
+        _COL,
+    ),
+    "select k, (a, k) > (select null::int, rn.k) from rn order by k": (
+        [(1, None), (2, None), (3, None), (4, None)],
+        _COL,
+    ),
+    "select k from rn where (a, c) = (select rn.a, 'y') order by k": ([(1,)], ["k"]),
+    "select k from rn where (k, a) <= (select 3, rn.a) order by k": (
+        [(1,), (2,), (3,)],
+        ["k"],
+    ),
+    # `char(n)` pairs compare as `bpchar`, trailing blanks ignored.
+    "select k, (c, k) in (select x.c, x.k from ch x where x.k = ch.k) from ch order by k": (
+        [(1, _T), (2, _T)],
+        _COL,
+    ),
+    "select k, (c, k) in (select x.c, x.k from ch x) from ch order by k": (
+        [(1, _T), (2, _T)],
+        _COL,
+    ),
+    "select k, (c, k) = (select 'ab'::char(3), ch.k) from ch order by k": (
+        [(1, _F), (2, _T)],
+        _COL,
+    ),
+    "select k, (c, k) < (select x.c, x.k + 1 from ch x where x.k = ch.k) from ch order by k": (
+        [(1, _T), (2, _T)],
+        _COL,
+    ),
+    "select k, (c, k) > all (select x.c, x.k - 1 from ch x where x.k <= ch.k) from ch order by k": (
+        [(1, _T), (2, _F)],
+        _COL,
+    ),
+    # Uncorrelated.
+    "select k, (a, c) = (select 1, 'y') from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, None)],
+        _COL,
+    ),
+    "select k, (k, a) < (select 2, 5) from rn order by k": (
+        [(1, _T), (2, None), (3, _F), (4, _F)],
+        _COL,
+    ),
+    "select k, (a, c) = (select 1, 'y' where false) from rn order by k": (
+        [(1, None), (2, None), (3, None), (4, None)],
+        _COL,
+    ),
+    "select k from rn where (a, c) = (select 1, 'y') order by k": ([(1,)], ["k"]),
+    "select k, (c, k) = (select x.c, x.k from ch x where x.k = 2) from ch order by k": (
+        [(1, _F), (2, _T)],
+        _COL,
+    ),
+    "select k, (a, c) = (select 1, 'y' union all select 2, 'z') from rn order by k": (
+        "21000",
+        "more than one row returned by a subquery used as an expression",
+        None,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-697")
+@pytest.mark.parametrize("query", list(ROW_COMPARISONS))
+def test_row_comparison_with_a_subquery(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _ROW_SETUP:
+            c.execute(q)
+    try:
+        assert answer(dsn, query) == ROW_COMPARISONS[query]
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as c:
+            c.execute(_ROW_SETUP[0])
+
+
+@pytest.mark.backlog_fixed("RP-697")
+def test_row_against_a_correlated_subquery_with_a_parameter(dsn: str) -> None:
+    """A prepared statement's parameter read inside the correlated
+    subquery: `[(3,)]` on the private PostgreSQL 15.19 cluster."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _ROW_SETUP:
+            c.execute(q)
+        try:
+            c.execute(
+                "prepare p697(int) as select k from rn where (a, c) in"
+                " (select rn.a, rn.c where rn.k > $1) order by k"
+            )
+            assert c.execute("execute p697(1)").fetchall() == [(3,)]
+        finally:
+            c.execute(_ROW_SETUP[0])
 
 
 # A set operation's arms read the outer row as any subquery does. Here each

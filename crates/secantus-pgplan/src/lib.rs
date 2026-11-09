@@ -2443,9 +2443,11 @@ pub struct WindowItem {
     /// `OrderKey` so one comparator serves partitioning and ordering both;
     /// the direction and null placement are unused here.
     pub partition_by: Vec<OrderKey>,
-    /// Per `partition_by` key, whether it is a `jsonb` column -- partitioned
-    /// by VALUE (`{"x":1}` and `{"x":1.0}` are one partition).
-    pub partition_jsonb: Vec<bool>,
+    /// Per `partition_by` key, the type of a bare column key (empty for an
+    /// expression): a `jsonb` one is partitioned by VALUE (`{"x":1}` and
+    /// `{"x":1.0}` are one partition), a `char(n)` one without its trailing
+    /// blanks (RP-725).
+    pub partition_types: Vec<String>,
     pub order_by: Vec<OrderKey>,
     pub frame: WindowFrame,
     /// Fixed at plan time, for the DESCRIBE pass that never sees a row.
@@ -13900,9 +13902,12 @@ fn plan_window_call(
         }
     };
     extra.push(Column::new(&field, &result_type, false));
-    let partition_jsonb = partition_by
+    let partition_types = partition_by
         .iter()
-        .map(|k| k.expr.is_none() && field_type(def, &k.field) == Some("jsonb"))
+        .map(|k| match k.expr {
+            None => field_type(def, &k.field).unwrap_or_default().to_string(),
+            Some(_) => String::new(),
+        })
         .collect();
     // `OVER (w)` with nothing added is `OVER w` (`transformWindowFuncCall`).
     let reference = if !over.name.is_empty() {
@@ -13933,7 +13938,7 @@ fn plan_window_call(
         arg_field,
         args,
         partition_by,
-        partition_jsonb,
+        partition_types,
         order_by,
         frame,
         result_type,
@@ -16886,7 +16891,7 @@ pub fn pad_bpchar_elements(v: Bson, n: usize) -> Bson {
 /// a `char(n)[]` one so, through its nesting and bounds: what `bpchareq` /
 /// `bpcharcmp` compare, element by element in `array_eq` / `array_cmp` /
 /// `array_contains` (RP-719).
-pub(crate) fn trim_bpchar_deep(v: Bson) -> Bson {
+pub fn trim_bpchar_deep(v: Bson) -> Bson {
     match v {
         Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
         Bson::Array(items) => Bson::Array(items.into_iter().map(trim_bpchar_deep).collect()),
@@ -16902,6 +16907,14 @@ pub(crate) fn trim_bpchar_deep(v: Bson) -> Bson {
 /// array of a domain over it.
 pub(crate) fn is_bpchar_array_type(t: &str) -> bool {
     t.strip_suffix("[]").is_some_and(is_bpchar_type)
+}
+
+/// Whether two values of type `t` are equal regardless of trailing blanks:
+/// a `char(n)` (`bpchareq`, and `hashbpchar` hashes the value without them),
+/// a `char(n)[]` (`array_eq` over `bpchareq`), or a domain over either. What
+/// GROUP BY, DISTINCT and PARTITION BY group on (RP-725).
+pub fn blank_insensitive_type(t: &str) -> bool {
+    is_bpchar_type(t) || is_bpchar_array_type(t)
 }
 
 /// `make_const`'s reading of a `Float` literal that is really an integer
@@ -22141,12 +22154,24 @@ fn resolve_sublinks_in_expr(
                     let mut shape = sl.clone();
                     shape.sub_link_type = SubLinkType::RowcompareSublink as i32;
                     shape.testexpr = e.lexpr.clone();
+                    shape.oper_name = e.name.clone();
                     shape.location = e.location;
                     if let Some(l) = e.lexpr.as_deref_mut() {
                         resolve_sublinks_in_expr(l, lookup, params, run, outer)?;
                     }
+                    shape.testexpr = e.lexpr.clone();
                     let replacement = resolve_one_sublink(&sl, &shape, lookup, params, run, outer)?;
-                    e.rexpr = Some(Box::new(replacement));
+                    // A correlated one is the whole comparison, evaluated
+                    // per outer row (RP-697); an uncorrelated one the row
+                    // its subquery returned, compared where it stands.
+                    if matches!(
+                        replacement.node.as_ref(),
+                        Some(N::FuncCall(f)) if correlated::is_correlated(f)
+                    ) {
+                        *node = replacement;
+                    } else {
+                        e.rexpr = Some(Box::new(replacement));
+                    }
                     return Ok(());
                 }
             }
@@ -22985,12 +23010,19 @@ fn resolve_one_sublink(
     // see a qualified one: the lowering resolves a column by its LAST name
     // part and ignores the qualifier, so `e.dept_id = d.id` would bind the
     // outer `d.id` to the inner table's own `id` and plan clean.
+    // A ROWCOMPARE one (`(a, b) = (select ...)`) is correlated as the
+    // comparison its shape is, not as a scalar subquery (RP-697).
+    let correlated_sl = if shape.sub_link_type == SubLinkType::RowcompareSublink as i32 {
+        shape
+    } else {
+        sl
+    };
     if foreign_qualifier(&inner).is_some()
         || correlated::fromless_outer_ref(&inner, outer)
         || correlated::function_arg_outer_ref(&inner, outer, lookup)
     {
-        let test = sl.testexpr.as_deref().cloned();
-        let mut sl = sl.clone();
+        let test = correlated_sl.testexpr.as_deref().cloned();
+        let mut sl = correlated_sl.clone();
         if let Some(mut t) = test {
             resolve_sublinks_in_expr(&mut t, lookup, params, run, Outer::Names(outer))?;
             sl.testexpr = Some(Box::new(t));
@@ -23003,8 +23035,8 @@ fn resolve_one_sublink(
         // AROUND it does, is a correlation too. A name the outer query does
         // not have either is an ordinary typo and keeps its 42703.
         Err(Error::UndefinedColumn(name)) if outer.contains(&name) || outer_whole_row(&name) => {
-            let test = sl.testexpr.as_deref().cloned();
-            let mut sl = sl.clone();
+            let test = correlated_sl.testexpr.as_deref().cloned();
+            let mut sl = correlated_sl.clone();
             if let Some(mut t) = test {
                 resolve_sublinks_in_expr(&mut t, lookup, params, run, Outer::Names(outer))?;
                 sl.testexpr = Some(Box::new(t));
@@ -23036,6 +23068,46 @@ fn resolve_one_sublink(
         run(&plan)?
     };
     let first_column = |r: Vec<Bson>| r.into_iter().next().unwrap_or(Bson::Null);
+
+    // `(a, b) op (select x, y ...)`: the subquery's one row as a row
+    // constructor, so the comparison around it is `make_row_comparison_op`'s
+    // field by field; no row is a row of NULLs, which every row operator
+    // answers NULL, as `ExecSetParamPlan` does for an empty ROWCOMPARE
+    // sublink (RP-697).
+    if shape.sub_link_type == SubLinkType::RowcompareSublink as i32 {
+        if rows.len() > 1 && PLANNING_TO_EXECUTE.with(|p| p.get()) {
+            return Err(Error::CardinalityViolation(
+                "more than one row returned by a subquery used as an expression".into(),
+            ));
+        }
+        let def = sub_plan_def(&plan, lookup).ok();
+        let width = def.as_ref().map_or(0, |d| d.columns.len());
+        let values = rows
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| vec![Bson::Null; width]);
+        let args = values
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let node = param_node(params, v);
+                if let Some(c) = def.as_ref().and_then(|d| d.columns.get(i)) {
+                    if !matches!(c.pg_type.as_str(), "" | "unknown" | "record" | "text") {
+                        declare_sublink_param(params.len() - 1, &c.pg_type);
+                    }
+                }
+                node
+            })
+            .collect();
+        return Ok(pg_query::protobuf::Node {
+            node: Some(N::RowExpr(Box::new(pg_query::protobuf::RowExpr {
+                args,
+                row_format: pg_query::protobuf::CoercionForm::CoerceImplicitCast as i32,
+                location: sl.location,
+                ..Default::default()
+            }))),
+        });
+    }
 
     match SubLinkType::try_from(sl.sub_link_type) {
         Ok(SubLinkType::ExistsSublink) => Ok(bool_const_node(!rows.is_empty())),
@@ -27426,7 +27498,12 @@ fn qualified_col(n: Option<&pg_query::protobuf::Node>) -> Option<(String, String
     }
 }
 
-fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Vec<JoinPred>> {
+/// Each predicate comes with its constant's node, which decides how the
+/// constant is read against the column (`comparison_operand`).
+fn join_where_preds(
+    node: &pg_query::protobuf::Node,
+    params: &[Bson],
+) -> Result<Vec<(JoinPred, Option<pg_query::protobuf::Node>)>> {
     use pg_query::protobuf::BoolExprType;
     match node.node.as_ref() {
         // AND of sub-predicates -> flatten each.
@@ -27445,12 +27522,15 @@ fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
             let (alias, col) = qualified_col(Some(inner))
                 .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
-            Ok(vec![JoinPred {
-                alias,
-                col,
-                op: JoinOp::NotTrue,
-                value: Bson::Null,
-            }])
+            Ok(vec![(
+                JoinPred {
+                    alias,
+                    col,
+                    op: JoinOp::NotTrue,
+                    value: Bson::Null,
+                },
+                None,
+            )])
         }
         // alias.col <op> const
         Some(N::AExpr(e)) => {
@@ -27464,18 +27544,20 @@ fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             };
             let (alias, col) = qualified_col(e.lexpr.as_deref())
                 .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
-            let value = const_value(
-                e.rexpr
-                    .as_ref()
-                    .ok_or_else(|| Error::Parse("no right operand".into()))?,
-                params,
-            )?;
-            Ok(vec![JoinPred {
-                alias,
-                col,
-                op,
-                value,
-            }])
+            let rexpr = e
+                .rexpr
+                .as_deref()
+                .ok_or_else(|| Error::Parse("no right operand".into()))?;
+            let value = const_value(rexpr, params)?;
+            Ok(vec![(
+                JoinPred {
+                    alias,
+                    col,
+                    op,
+                    value,
+                },
+                Some(rexpr.clone()),
+            )])
         }
         _ => Err(Error::Unsupported("this subquery WHERE".into())),
     }
@@ -27750,25 +27832,61 @@ fn plan_join_select(
         }
     }
 
+    let side_def = |sub: &Option<Box<Statement>>, table: &str| -> Option<TableDef> {
+        match sub {
+            Some(stmt) => sub_plan_def(stmt, lookup).ok(),
+            None => lookup(table),
+        }
+    };
+    let ldef = side_def(&left_sub, &left.0);
+    let rdef = side_def(&right_sub, &right.0);
     // WHERE: one predicate, or an AND of several, each `alias.col <op> const`
-    // or `NOT alias.col`. Evaluated now against the constants.
+    // or `NOT alias.col`. Evaluated now against the constants, each read as
+    // its column's type first, as a one-table filter reads it: an untyped
+    // `x.k = '1'` is `int4 = int4`, `x.a = '{ab}'` an array of the column's
+    // type and `s.c = 'ab '::char(3)` `bpchareq`. Compared raw, a string
+    // met an int or an array and matched nothing (RP-723, RP-724).
     let filter = match s.where_clause.as_deref() {
         None => Vec::new(),
-        Some(node) => join_where_preds(node, params)?,
+        Some(node) => join_where_preds(node, params)?
+            .into_iter()
+            .map(|(mut pred, rexpr)| {
+                let def = if pred.alias == left.1 {
+                    ldef.as_ref()
+                } else if pred.alias == right.1 {
+                    rdef.as_ref()
+                } else {
+                    None
+                };
+                if let (Some(def), JoinOp::Eq | JoinOp::Gt | JoinOp::Ge | JoinOp::Lt | JoinOp::Le) =
+                    (def, &pred.op)
+                {
+                    let field = def.field_of(&pred.col).unwrap_or_else(|| pred.col.clone());
+                    // A date against a timestamp is promoted to midnight, and
+                    // a scalar against an array is 42883: the general join
+                    // planner's one-table filter does both.
+                    if pred.value != Bson::Null
+                        && ((field_type(def, &field) == Some("date") && is_instant(&pred.value))
+                            || (matches!(pred.value, Bson::Array(_))
+                                && !field_type(def, &field).is_some_and(|t| t.ends_with("[]"))))
+                    {
+                        return Err(Error::Unsupported(
+                            "this JOIN WHERE comparison on this path".into(),
+                        ));
+                    }
+                    if pred.value != Bson::Null {
+                        pred.value = comparison_operand(def, &field, rexpr.as_ref(), pred.value)?;
+                    }
+                }
+                Ok(pred)
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
     // Column references this path would resolve LOOSELY -- a bare name both
     // sides have (it took the left one), a qualifier naming neither side,
     // a column the named side lacks -- go to the general planner, whose
     // answers are PostgreSQL's 42702 / 42P01 / 42703.
     {
-        let side_def = |sub: &Option<Box<Statement>>, table: &str| -> Option<TableDef> {
-            match sub {
-                Some(stmt) => sub_plan_def(stmt, lookup).ok(),
-                None => lookup(table),
-            }
-        };
-        let ldef = side_def(&left_sub, &left.0);
-        let rdef = side_def(&right_sub, &right.0);
         let has = |d: &Option<TableDef>, c: &str| d.as_ref().is_some_and(|d| d.column(c).is_some());
         for (i, (_, alias, col)) in columns.iter().enumerate() {
             if matches!(exprs.get(i), Some(Some(ColumnExpr::Const { .. }))) {
@@ -41198,57 +41316,90 @@ fn infinite_instant(v: &Bson) -> Option<i8> {
     }
 }
 
+/// PostgreSQL's `array_cmp` (arrayfuncs.c), the btree order of every array
+/// type: the elements first, in storage (row-major) order, whatever the
+/// shapes; when one array's elements run out, or all of them are equal,
+/// the one with fewer elements first, then the one with fewer dimensions,
+/// then dimension by dimension the shorter one, and last the lower bounds
+/// (`'[0:0]={ab}' < '{ab}' < '[2:2]={ab}'`). An array whose lower bound is
+/// not 1 is held as a tagged document; comparing one with a plain array
+/// had no arm, so it answered no order, and a sort over a column holding
+/// both came out scrambled (RP-722).
+fn array_cmp(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let (ex_all, ey_all) = (arrays::flatten(a), arrays::flatten(b));
+    for (ex, ey) in ex_all.iter().zip(ey_all.iter()) {
+        // Inside an array, PostgreSQL compares NULLs directly rather
+        // than through scalar `=`: two NULLs are equal, and a NULL
+        // sorts after any non-NULL. (Probed, not assumed - scalar
+        // `NULL = NULL` is NULL, so the array rule is the surprise.)
+        match (ex == &Bson::Null, ey == &Bson::Null) {
+            (true, true) => continue,
+            (true, false) => return Some(Ordering::Greater),
+            (false, true) => return Some(Ordering::Less),
+            (false, false) => {}
+        }
+        // Records inside an array compare as `record_cmp` does, field
+        // by field (`array[row(1)] = array[row(1)]` is true).
+        if let (Some(rx), Some(ry)) = (record_fields(ex), record_fields(ey)) {
+            // A field still `unknown` (a bare literal or NULL in the
+            // ROW) has no comparison there: PostgreSQL refuses at
+            // execution, so this does not answer either.
+            let untyped = |v: &Bson| {
+                record_field_types(v).is_some_and(|ts| ts.iter().any(|t| t == "unknown"))
+            };
+            if untyped(ex) || untyped(ey) {
+                return None;
+            }
+            let is = |op: &str| {
+                record_compare(op, rx, ry, true, None)
+                    .ok()
+                    .map(|v| v == Bson::Boolean(true))
+            };
+            if is("<")? {
+                return Some(Ordering::Less);
+            }
+            if !is("=")? {
+                return Some(Ordering::Greater);
+            }
+            continue;
+        }
+        match compare_constants(ex, ey)? {
+            Ordering::Equal => continue,
+            other => return Some(other),
+        }
+    }
+    // The bounds hold one entry per dimension (none for `'{}'`, one for a
+    // one-dimensional empty array, which has a dimension of length 0).
+    let (lx, ly) = (arrays::lower_bounds(a), arrays::lower_bounds(b));
+    let dims = |v: &Bson, n: usize| {
+        let mut d = arrays::dim_lengths(&arrays::strip(v));
+        d.resize(n, 0);
+        d
+    };
+    Some(
+        ex_all
+            .len()
+            .cmp(&ey_all.len())
+            .then(lx.len().cmp(&ly.len()))
+            .then_with(|| dims(a, lx.len()).cmp(&dims(b, ly.len())))
+            .then_with(|| lx.cmp(&ly)),
+    )
+}
+
 pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
         // `bytea` orders by UNSIGNED byte value, lexicographically -- exactly
         // what `Vec<u8>` gives -- so `'\\x01' < '\\x02'` and a prefix sorts first.
         (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes.cmp(&y.bytes)),
-        // PostgreSQL orders arrays element by element, and when one is a
-        // prefix of the other the shorter one sorts first.
-        (Bson::Array(x), Bson::Array(y)) => {
-            for (ex, ey) in x.iter().zip(y.iter()) {
-                // Inside an array, PostgreSQL compares NULLs directly rather
-                // than through scalar `=`: two NULLs are equal, and a NULL
-                // sorts after any non-NULL. (Probed, not assumed - scalar
-                // `NULL = NULL` is NULL, so the array rule is the surprise.)
-                match (ex == &Bson::Null, ey == &Bson::Null) {
-                    (true, true) => continue,
-                    (true, false) => return Some(std::cmp::Ordering::Greater),
-                    (false, true) => return Some(std::cmp::Ordering::Less),
-                    (false, false) => {}
-                }
-                // Records inside an array compare as `record_cmp` does, field
-                // by field (`array[row(1)] = array[row(1)]` is true).
-                if let (Some(rx), Some(ry)) = (record_fields(ex), record_fields(ey)) {
-                    // A field still `unknown` (a bare literal or NULL in the
-                    // ROW) has no comparison there: PostgreSQL refuses at
-                    // execution, so this does not answer either.
-                    let untyped = |v: &Bson| {
-                        record_field_types(v).is_some_and(|ts| ts.iter().any(|t| t == "unknown"))
-                    };
-                    if untyped(ex) || untyped(ey) {
-                        return None;
-                    }
-                    let is = |op: &str| {
-                        record_compare(op, rx, ry, true, None)
-                            .ok()
-                            .map(|v| v == Bson::Boolean(true))
-                    };
-                    if is("<")? {
-                        return Some(std::cmp::Ordering::Less);
-                    }
-                    if !is("=")? {
-                        return Some(std::cmp::Ordering::Greater);
-                    }
-                    continue;
-                }
-                match compare_constants(ex, ey)? {
-                    std::cmp::Ordering::Equal => continue,
-                    other => return Some(other),
-                }
-            }
-            Some(x.len().cmp(&y.len()))
+        // Two arrays, either of them one whose lower bound is not 1 (held
+        // as a tagged document): PostgreSQL's `array_cmp`.
+        (x, y)
+            if (matches!(x, Bson::Array(_)) || arrays::is_bounded(x))
+                && (matches!(y, Bson::Array(_)) || arrays::is_bounded(y)) =>
+        {
+            array_cmp(x, y)
         }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
         // A regtype compares as its OID: `where t.oid = to_regtype('text')`;
@@ -46068,7 +46219,10 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             return Err(err);
         }
         // An untyped literal beside an array IS that array type: `array[1,2]
-        // @> '{1}'` reads `'{1}'` as `int4[]`.
+        // @> '{1}'` reads `'{1}'` as `int4[]`. An array whose lower bound is
+        // not 1 is an array here too (a tagged document, `arrays::bounded`):
+        // `'[0:1]={x,y}'::text[] && '{y}'` is true on 15.19 (RP-720, RP-721).
+        let arrayish = |v: &Bson| matches!(v, Bson::Array(_)) || arrays::is_bounded(v);
         let (lhs, rhs) = if matches!(op.as_str(), "@>" | "<@" | "&&") {
             let as_array_of =
                 |other: &pg_query::protobuf::Node, ov: &Bson, v: Bson| -> Result<Bson> {
@@ -46082,7 +46236,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             match (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                 (Some(l), Some(_))
                     if matches!(lhs, Bson::String(_))
-                        && matches!(rhs, Bson::Array(_))
+                        && arrayish(&rhs)
                         && unknown_operand(e.lexpr.as_deref()) =>
                 {
                     let r_node = e.rexpr.as_deref().expect("checked");
@@ -46091,7 +46245,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 }
                 (Some(l), Some(_))
                     if matches!(rhs, Bson::String(_))
-                        && matches!(lhs, Bson::Array(_))
+                        && arrayish(&lhs)
                         && unknown_operand(e.rexpr.as_deref()) =>
                 {
                     (lhs.clone(), as_array_of(l, &lhs, rhs)?)
@@ -46101,9 +46255,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         } else {
             (lhs, rhs)
         };
-        if matches!(op.as_str(), "@>" | "<@" | "&&")
-            && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_)))
-        {
+        if matches!(op.as_str(), "@>" | "<@" | "&&") && (arrayish(&lhs) || arrayish(&rhs)) {
             if lhs == Bson::Null || rhs == Bson::Null {
                 return Ok(Bson::Null);
             }
@@ -47268,14 +47420,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // 14.24). The stored value is unpadded -- padding happens on output --
     // so the literal is stripped to match it, rather than padded to a width
     // the stored side does not carry.
-    let value = bpchar_operand(def, &field, e.rexpr.as_deref(), value, true);
-    // A regtype / regclass value filters by its OID -- the stored column is
-    // a number.
-    let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
-        Some(oid) => Bson::Int64(oid),
-        None => value,
-    };
-    let value = coerce_to_column(def, &field, value)?;
+    let value = comparison_operand(def, &field, e.rexpr.as_deref(), value)?;
 
     // `=` and the range operators are already NULL-correct: MQL brackets by
     // type, so a null column value matches none of them -- which is what
@@ -47833,6 +47978,26 @@ fn bpchar_operand(
     } else {
         Bson::String(text.trim_end_matches(' ').to_string())
     }
+}
+
+/// The constant `value` (the node `node`) compared with column `field` of
+/// `def`, read as PostgreSQL resolves the operator: blanks dropped against
+/// a `char(n)` column (`bpchar_operand`), a regtype / regclass by its OID --
+/// the stored column is a number -- and an untyped literal as the column's
+/// own type (`coerce_to_column`). The one-table filter and the narrow join
+/// path's WHERE both read their constants here.
+fn comparison_operand(
+    def: &TableDef,
+    field: &str,
+    node: Option<&pg_query::protobuf::Node>,
+    value: Bson,
+) -> Result<Bson> {
+    let value = bpchar_operand(def, field, node, value, true);
+    let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
+        Some(oid) => Bson::Int64(oid),
+        None => value,
+    };
+    coerce_to_column(def, field, value)
 }
 
 /// `x BETWEEN a AND b` / `x NOT BETWEEN a AND b`.

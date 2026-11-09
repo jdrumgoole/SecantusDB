@@ -2593,14 +2593,15 @@ fn value_unique(def: &TableDef) -> bool {
             .any(|u| u.exclusion_ops.is_empty() && u.columns.iter().any(|c| special(c)))
 }
 
-/// Whether `field` (a stored field or a column name) is a `jsonb` column.
-fn jsonb_field(def: &TableDef, field: &str) -> bool {
+/// The declared type of the column `field` (a stored field or a column
+/// name) names, for `typed_ident`; empty when no column has it.
+fn field_ident_type<'a>(def: &'a TableDef, field: &str) -> &'a str {
     def.columns
         .iter()
-        .any(|c| (c.field() == field || c.name == field) && c.pg_type == "jsonb")
+        .find(|c| c.field() == field || c.name == field)
+        .map_or("", |c| c.pg_type.as_str())
 }
 
-/// `group_key_ident`, or `jsonb_ident` when `is_jsonb`.
 /// Group slim rows (keys and inputs in flat fields) in memory, in
 /// first-seen order, as the materialised path groups.
 #[allow(clippy::type_complexity)]
@@ -2625,7 +2626,7 @@ fn group_slim_rows(
         let ident: Vec<Option<Bson>> = key
             .iter()
             .zip(&one.group_by)
-            .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+            .map(|(v, k)| typed_ident(v, &k.pg_type))
             .collect();
         let id = format!("{ident:?}");
         let at = match index.get(&id) {
@@ -2653,11 +2654,33 @@ fn group_slim_rows(
         .collect()
 }
 
-fn typed_ident(v: &Option<Bson>, is_jsonb: bool) -> Option<Bson> {
-    if is_jsonb {
+/// The identity GROUP BY, DISTINCT and PARTITION BY match a value of type
+/// `ty` on: `group_key_ident`, a `jsonb` one by its number-normalised value
+/// (`jsonb_ident`), and a `char(n)` or `char(n)[]` one without its trailing
+/// blanks, as `bpchareq` and `hashbpchar` see it -- `'ab '::char(3)` and
+/// `'ab'::bpchar` are one group on PostgreSQL 15.19 (RP-725). The value the
+/// group prints stays its first row's, blanks and all.
+fn typed_ident(v: &Option<Bson>, ty: &str) -> Option<Bson> {
+    if ty == "jsonb" {
         jsonb_ident(v)
+    } else if secantus_pgplan::blank_insensitive_type(ty) {
+        group_key_ident(&v.clone().map(secantus_pgplan::trim_bpchar_deep))
     } else {
         group_key_ident(v)
+    }
+}
+
+/// The type name `typed_ident` reads for a column of wire type `t`: the
+/// two kinds of value it matches by more than their stored form.
+fn wire_ident_type(t: &Type) -> &'static str {
+    if *t == Type::JSONB {
+        "jsonb"
+    } else if *t == Type::BPCHAR {
+        "bpchar"
+    } else if *t == Type::BPCHAR_ARRAY {
+        "bpchar[]"
+    } else {
+        ""
     }
 }
 
@@ -7633,7 +7656,7 @@ impl PgHandler {
                     let ident: Vec<Option<Bson>> = key
                         .iter()
                         .zip(&agg.group_by)
-                        .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                        .map(|(v, k)| typed_ident(v, &k.pg_type))
                         .collect();
                     match set_index.find_or_add(ident) {
                         Ok(i) => set_buckets[i].push(d.clone()),
@@ -7684,7 +7707,7 @@ impl PgHandler {
                 let ident: Vec<Option<Bson>> = key
                     .iter()
                     .zip(&agg.group_by)
-                    .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                    .map(|(v, k)| typed_ident(v, &k.pg_type))
                     .collect();
                 match group_index.find_or_add(ident) {
                     Ok(i) => {
@@ -9862,16 +9885,14 @@ impl PgHandler {
                                 Self::aggregate_expr_value(agg, *i, &key, &vals).ok()
                             }
                         };
-                        let jsonb = match col {
-                            OutputCol::Group(i) => {
-                                agg.group_by.get(*i).is_some_and(|k| k.pg_type == "jsonb")
+                        let ty = match col {
+                            OutputCol::Group(i) => agg.group_by.get(*i).map(|k| k.pg_type.clone()),
+                            OutputCol::Agg(i) => {
+                                agg.items.get(*i).map(secantus_pgplan::aggregate_item_type)
                             }
-                            OutputCol::Agg(i) => agg.items.get(*i).is_some_and(|it| {
-                                secantus_pgplan::aggregate_item_type(it) == "jsonb"
-                            }),
-                            _ => false,
+                            _ => None,
                         };
-                        typed_ident(&v, jsonb)
+                        typed_ident(&v, ty.as_deref().unwrap_or_default())
                     })
                     .collect();
                 if seen.insert(ident) {
@@ -37553,7 +37574,7 @@ impl PgHandler {
                         schema[i].datatype(),
                         &tz,
                     )?;
-                    ident.push(typed_ident(&v, *schema[i].datatype() == Type::JSONB));
+                    ident.push(typed_ident(&v, wire_ident_type(schema[i].datatype())));
                     values.push(v);
                 }
                 trailing_rows = !seen.insert(ident);
@@ -37648,7 +37669,7 @@ impl PgHandler {
                     .map(|k| {
                         typed_ident(
                             &Some(secantus_pgplan::field_value(&d, k)),
-                            jsonb_field(&def, k),
+                            field_ident_type(&def, k),
                         )
                     })
                     .collect();
@@ -49946,8 +49967,8 @@ fn compute_aggregate(item: &AggItem, rows: &[Document]) -> PgWireResult<Bson> {
         let field2 = item.field2.as_deref();
         let mut seen: distinct_set::DistinctSet<(Option<Bson>, Option<Bson>)> =
             distinct_set::DistinctSet::new();
-        let jb1 = item.source_type.as_deref() == Some("jsonb");
-        let jb2 = item.source_type2.as_deref() == Some("jsonb");
+        let jb1 = item.source_type.as_deref().unwrap_or_default();
+        let jb2 = item.source_type2.as_deref().unwrap_or_default();
         rows.retain(|d| {
             let k = (
                 typed_ident(&Some(secantus_pgplan::field_value(d, field)), jb1),
@@ -50091,7 +50112,7 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
     if item.distinct {
         let mut seen = distinct_set::DistinctSet::<Option<Bson>>::new();
         let mut kept = Vec::with_capacity(values.len());
-        let jb = item.source_type.as_deref() == Some("jsonb");
+        let jb = item.source_type.as_deref().unwrap_or_default();
         for v in values {
             let k = typed_ident(&Some(v.clone()), jb);
             if seen.insert(k) {
@@ -50147,7 +50168,7 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                 let v = d.get(field).cloned().unwrap_or(Bson::Null);
                 let k = typed_ident(
                     &Some(v.clone()),
-                    item.source_type.as_deref() == Some("jsonb"),
+                    item.source_type.as_deref().unwrap_or_default(),
                 );
                 if seen.insert(k) {
                     kept.push(v);
@@ -50439,7 +50460,7 @@ fn materialise_windows(
                     .collect::<Result<_, _>>()?,
                 None => vec![true; docs.len()],
             };
-            for mut partition in window_partitions(docs, &w.partition_by, &w.partition_jsonb) {
+            for mut partition in window_partitions(docs, &w.partition_by, &w.partition_types) {
                 // In the sorted order, so rows that tie on the window's ORDER
                 // BY are taken in the order PostgreSQL's sort left them.
                 partition.sort_by_key(|r| rank[*r]);
@@ -50464,7 +50485,7 @@ fn materialise_windows(
 /// second), a numeric by its value (`group_key_ident`). Each row's key is
 /// that canonical form ENCODED, so partitioning is one hash lookup per row
 /// rather than a scan of the partitions seen so far.
-fn window_partitions(docs: &[Document], keys: &[OrderKey], jsonb: &[bool]) -> Vec<Vec<usize>> {
+fn window_partitions(docs: &[Document], keys: &[OrderKey], types: &[String]) -> Vec<Vec<usize>> {
     if keys.is_empty() {
         return vec![(0..docs.len()).collect()];
     }
@@ -50485,7 +50506,7 @@ fn window_partitions(docs: &[Document], keys: &[OrderKey], jsonb: &[bool]) -> Ve
             .map(|(i, k)| {
                 canonical(typed_ident(
                     &d.get(&k.field).cloned(),
-                    jsonb.get(i).copied().unwrap_or(false),
+                    types.get(i).map_or("", String::as_str),
                 ))
             })
             .collect();
@@ -55837,7 +55858,7 @@ impl PgHandler {
                     let ident: Vec<Option<Bson>> = key
                         .iter()
                         .zip(&one.group_by)
-                        .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                        .map(|(v, k)| typed_ident(v, &k.pg_type))
                         .collect();
                     let id = format!("{ident:?}");
                     match state.index.get(&id) {
@@ -56346,7 +56367,7 @@ impl PgHandler {
             let ident: Vec<Option<Bson>> = key
                 .iter()
                 .zip(&agg.group_by)
-                .map(|(v, k)| typed_ident(v, k.pg_type == "jsonb"))
+                .map(|(v, k)| typed_ident(v, &k.pg_type))
                 .collect();
             if current.as_ref().is_some_and(|(_, id)| *id != ident) {
                 let (k, _) = current.take().expect("checked");

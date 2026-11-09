@@ -3087,15 +3087,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 the column written out, so none is the star's. The gap tests are in
 `tests/backlog/test_rp_found_rp517.py`.
 
-- [ ] **A row compared with a correlated subquery is refused.** `select a
-      from fs where (a, c) in (select fs.a, fs.c)` and `(a, c) = (select
-      fs.a, fs.c)` answer `1` on PostgreSQL 15.19, and `not in` no row
-      (`make_row_comparison_op` compares the row with the subquery's
-      columns pairwise); here each is 0A000 `comparing document with int32
-      using = is not supported yet`, with no position. An uncorrelated one
-      is answered.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_row_against_a_correlated_subquery
-      Backlog-ID: RP-697
 - [ ] **A correlated set operation is 42P01.** `select (select v.a
       intersect select 5) from (values (5), (6)) v(a)` answers `5` and NULL
       on PostgreSQL 15.19, `(select v.a union all select 9 limit 1)` `5`,
@@ -3165,55 +3156,41 @@ the column written out, so none is the star's. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
       Backlog-ID: RP-705
 
-## Found while working RP-719 (2026-11-09)
+## Found while working RP-697 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp719.py`.
+`tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
+`ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **`&&` with an untyped array literal is 42883.** `select k from x719
-      where a && '{ab,y}'`, `a` a `text[]` column, resolves the literal to
-      `text[]` on PostgreSQL 15.19 and finds 1, 2 and 5; here it is
-      `operator does not exist: text[] && text`. The same overlap with
-      `'{ab,y}'::text[]` is answered.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_an_overlap_with_an_untyped_array_literal
-      Backlog-ID: RP-720
-- [ ] **`&&` misses a stored array whose lower bound is not 1.** `select k
-      from x719 where a && '{y}'::text[]` finds row 5, `'[0:1]={x,y}'`, on
-      PostgreSQL 15.19 (`arrayoverlap` compares elements, not bounds); here
-      it finds nothing. `@>` over the same row is answered.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_an_overlap_finds_an_array_with_its_own_lower_bound
-      Backlog-ID: RP-721
-- [ ] **GROUP BY over an array column returns its groups out of the ORDER
-      BY's order.** `select count(*), a from x719 group by a order by 2` is
-      `{ab}`, `{cd,ab}`, `{x,y}` on PostgreSQL 15.19 (`array_cmp`, element
-      by element); here `{cd,ab}`, `{x,y}`, `{ab}`. A plain `select a from
-      x719 order by a` is in the right order.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_groups_of_an_array_column_follow_the_order_by
-      Backlog-ID: RP-722
-- [ ] **In a join's WHERE, an untyped array literal against an array
-      column matches nothing.** `select x.k from x719 x join u719 u on x.k
-      = u.k where x.a = '{ab}'` is row 1 on PostgreSQL 15.19; here it is
-      empty, for `text[]` and `char(n)[]` columns alike. The literal is not
-      read as the column's type, as `coerce_to_column` does in a one-table
-      filter.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_a_join_filter_reads_an_untyped_literal_as_the_array_column
-      Backlog-ID: RP-723
-- [ ] **In a join's WHERE, a `char(n)` column against a padded `char(n)`
-      constant matches nothing.** `... where s.c = 'ab '::char(3)` over a
-      join is row 1 on PostgreSQL 15.19 (`bpchareq` ignores trailing
-      blanks); here it is empty. `s.c = 'ab'` is answered, and so is the
-      same filter over one table.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_a_join_filter_compares_a_char_n_column_without_its_blanks
-      Backlog-ID: RP-724
-- [ ] **GROUP BY a `char(n)` value splits it from the same value
-      unpadded.** `select count(*) from (values ('ab'::char(3)),
-      ('ab'::bpchar)) v(a) group by a` is one group of 2 on PostgreSQL
-      15.19 (`bpchar`'s equality and hash ignore trailing blanks), here two
-      groups of 1; `count(distinct a)` is 2 for 1. The same holds for
-      `char(n)[]` values. A stored column groups correctly, as its values
-      are kept trimmed.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_grouping_a_char_n_value_ignores_its_blanks
-      Backlog-ID: RP-725
+- [ ] **A `varchar` compared with a `char(n)` counts the trailing blanks.**
+      `select v = c` over `'ab '::varchar(4)` and `'ab'::char(3)` is true on
+      PostgreSQL 15.19 both ways round: `varchar = bpchar` resolves to
+      `bpchareq`, the `varchar` side cast to `bpchar`, which ignores
+      trailing blanks. Here it is false, and a row comparison whose pair is
+      a `varchar` and a `char(n)` (`(v, k) = (select x.c, x.k ...)`)
+      inherits it.
+      Verify: tests/backlog/test_rp_found_rp697.py::test_varchar_against_bpchar_ignores_trailing_blanks
+      Backlog-ID: RP-726
+- [ ] **An uncorrelated `row op ANY / ALL (subquery)` with an ordering
+      operator is refused.** `select k, (k, a) < any (select 2, 3) from
+      rn697` answers per row on PostgreSQL 15.19 (each subquery row a
+      `RowCompareExpr` with the row); here it is 0A000 `a row comparison
+      with < and a subquery is not supported yet`, as is `>= all`.
+      `row_subquery_comparison` builds only `=` and `<>`; the correlated
+      form is answered since RP-697.
+      Verify: tests/backlog/test_rp_found_rp697.py::test_uncorrelated_ordered_row_any
+      Backlog-ID: RP-727
+- [ ] **A row compared with a subquery whose column has no operator with
+      the row's field is not 42883.** `(a, c) = (select 1, 2)`, `c` text,
+      is 42883 `operator does not exist: text = integer` at 18 on
+      PostgreSQL 15.19 (`make_row_comparison_op` resolves each pair's
+      operator as the statement is analysed), and so is a correlated `in`
+      -- even over no rows (`... where false`). Here each is 0A000
+      `comparing string with int32 using = is not supported yet` with no
+      position, raised only when a row is compared, and nothing at all
+      over no rows.
+      Verify: tests/backlog/test_rp_found_rp697.py::test_row_pair_with_no_operator_is_42883
+      Backlog-ID: RP-728
 
 ## Found while working RP-681 (2026-11-09)
 
@@ -3260,3 +3237,26 @@ statement is VALUES-only and runs there as written.
       the same.
       Verify: tests/backlog/test_rp_found_rp729.py::test_array_sublink_refuses_ragged_or_null_element_arrays
       Backlog-ID: RP-730
+
+## Found while working RP-722 (2026-11-09)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp722.py`: `x722(k int, a text[])`
+holding `'{ab}'`, `'{cd,ab}'` and `'[0:1]={x,y}'`.
+
+- [ ] **A WHERE range filter over an array column misses an array whose
+      lower bound is not 1.** `select a from x722 where a > '{b}'` is
+      `{cd,ab}` and `[0:1]={x,y}` on PostgreSQL 15.19 (`array_gt` is
+      `array_cmp`: the elements first, the bounds last); here only
+      `{cd,ab}`. `>=` and `BETWEEN` miss it the same way; `=` against
+      `'[0:1]={x,y}'` finds it. The sort over such a column is right since
+      RP-722.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_a_range_filter_finds_an_array_whose_lower_bound_is_not_1
+      Backlog-ID: RP-733
+- [ ] **An array column compared with an untyped literal in the select list
+      is 42883.** `select k, a > '{b}' from x722` answers per row on
+      PostgreSQL 15.19, the literal read as `text[]` as it is in a WHERE;
+      here it is 42883 `operator does not exist: text[] > text`, as is
+      `a = '{x,y}'`.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_an_untyped_literal_in_the_select_list
+      Backlog-ID: RP-734

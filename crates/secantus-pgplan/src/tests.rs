@@ -3791,6 +3791,50 @@ fn left_join_reduced_by_a_strict_where_on_its_nullable_side() {
     );
 }
 
+/// The narrow join path reads each WHERE constant as its column's type, as
+/// a one-table filter does: an untyped `'1'` against an `int4` column is
+/// the integer, `'{ab}'` against a `text[]` the array, and a `char(n)`
+/// constant loses the blanks its cast added. Compared as written, each
+/// matched nothing (RP-723, RP-724).
+#[test]
+fn a_narrow_join_reads_its_where_constants_as_the_columns_type() {
+    let two = |name: &str| -> Option<TableDef> {
+        matches!(name, "e" | "k").then(|| {
+            TableDef::new(
+                name,
+                vec![
+                    Column::new("a", "int4", false),
+                    Column::new("c", "bpchar", false),
+                    Column::new("t", "text[]", false),
+                ],
+            )
+        })
+    };
+    let value_of = |sql: &str| match plan(sql, &two) {
+        Ok(Statement::Select(s)) => s
+            .join
+            .and_then(|j| j.filter.first().map(|p| p.value.clone())),
+        other => panic!("{sql}: {other:?}"),
+    };
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where e.a = '1'"),
+        Some(Bson::Int32(1))
+    );
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where k.c = 'ab '::char(3)"),
+        Some(Bson::String("ab".into()))
+    );
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where e.t = '{ab}'"),
+        Some(Bson::Array(vec![Bson::String("ab".into())]))
+    );
+    // A text constant is compared as text, blanks and all.
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where k.c = 'ab '::text"),
+        Some(Bson::String("ab ".into()))
+    );
+}
+
 /// A join qual over two aliases of the same column name: each reference
 /// reads its own side's row (RP-390).
 #[test]
@@ -4832,6 +4876,66 @@ fn sorts_order_records_by_record_cmp() {
     assert_eq!(
         compare_values(&Bson::Int32(2), &Bson::Int32(1)),
         Some(Ordering::Greater)
+    );
+}
+
+/// RP-722: the sorts order two arrays by `array_cmp` -- the elements in
+/// row-major order, then their count, the dimensions, each dimension's
+/// length and last the lower bounds -- an array whose lower bound is not 1
+/// (a tagged document) included; before, one beside a plain array had no
+/// order. Each pair's order was measured on PostgreSQL 15.19.
+#[test]
+fn sorts_order_arrays_by_array_cmp() {
+    use std::cmp::Ordering;
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|i| Bson::Int32(*i)).collect());
+    let texts = |v: &[&str]| Bson::Array(v.iter().map(|s| Bson::String((*s).into())).collect());
+    let ab = texts(&["ab"]);
+    let ab_at_0 = arrays::bounded(ab.clone(), &[0]);
+    let ab_at_2 = arrays::bounded(ab.clone(), &[2]);
+    let xy_at_0 = arrays::bounded(texts(&["x", "y"]), &[0]);
+    let cd_ab = texts(&["cd", "ab"]);
+    // `'[0:0]={ab}' < '{ab}' < '[2:2]={ab}' < '{cd,ab}' < '[0:1]={x,y}'`.
+    let chain = [&ab_at_0, &ab, &ab_at_2, &cd_ab, &xy_at_0];
+    for pair in chain.windows(2) {
+        assert_eq!(
+            compare_values(pair[0], pair[1]),
+            Some(Ordering::Less),
+            "{pair:?}"
+        );
+        assert_eq!(
+            compare_values(pair[1], pair[0]),
+            Some(Ordering::Greater),
+            "{pair:?}"
+        );
+    }
+    assert_eq!(
+        compare_values(&ab_at_2, &ab_at_2.clone()),
+        Some(Ordering::Equal)
+    );
+    // Two dimensions: elements first (`{{1,2},{3,4}}` > `{{1,2,3}}`, one
+    // more element), then the dimension count (`{1,2,3}` < `{{1,2,3}}`),
+    // then the lengths (`[1:1][0:3]={{1,2,3,4}}` < `{{1,2},{3,4}}`).
+    let m22 = Bson::Array(vec![ints(&[1, 2]), ints(&[3, 4])]);
+    let m13 = Bson::Array(vec![ints(&[1, 2, 3])]);
+    let m14_at_0 = arrays::bounded(Bson::Array(vec![ints(&[1, 2, 3, 4])]), &[1, 0]);
+    let m22_at_0 = arrays::bounded(m22.clone(), &[0, 1]);
+    assert_eq!(compare_values(&m13, &m22), Some(Ordering::Less));
+    assert_eq!(
+        compare_values(&ints(&[1, 2, 3]), &m13),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        compare_values(&ints(&[1, 2, 3, 4]), &m14_at_0),
+        Some(Ordering::Less)
+    );
+    assert_eq!(compare_values(&m14_at_0, &m22_at_0), Some(Ordering::Less));
+    assert_eq!(compare_values(&m22_at_0, &m22), Some(Ordering::Less));
+    // A NULL element after every value, and `'{}'` first of all.
+    let one_null = Bson::Array(vec![Bson::Int32(1), Bson::Null]);
+    assert_eq!(compare_values(&m22, &one_null), Some(Ordering::Less));
+    assert_eq!(
+        compare_values(&Bson::Array(vec![]), &ints(&[1])),
+        Some(Ordering::Less)
     );
 }
 
