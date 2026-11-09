@@ -2347,53 +2347,6 @@ pub(crate) fn update_in(
                 continue;
             }
         }
-        if let Some(sort) = &sort_spec {
-            // Resolve WHICH document sorts first, then pin the update to it.
-            // Nothing matched -> leave the filter alone, so an upsert still
-            // upserts.
-            let sorted = crate::explain::order::find(
-                storage,
-                &crate::explain::order::Ask {
-                    db: db_name,
-                    coll: &coll,
-                    filter: &q,
-                    sort: Some(sort),
-                    hint: None,
-                    collation: collation.as_ref(),
-                    vars: &Document::new(),
-                    limit: 1,
-                    // An update of one document under a sort: mongod's
-                    // query has a limit of one.
-                    asked: crate::near::Asked {
-                        limit: 1,
-                        sort: Some(sort),
-                        cached: true,
-                        ..Default::default()
-                    },
-                },
-            );
-            // A document the sort cannot be built for (parallel arrays, an
-            // ambiguous index component) is the statement's writeError under
-            // the update executor's wrapper, as on mongod 8.2.1 (RM-332); this
-            // used to drop the error and update an unsorted match.
-            let rows = match sorted {
-                Ok(rows) => rows,
-                Err(e) => {
-                    write_errors.push(Bson::Document(crate::util::write_error(index, e, "update")));
-                    if ordered {
-                        break;
-                    }
-                    continue;
-                }
-            };
-            if let Some(first) = rows.first() {
-                if let Ok(d) = secantus_core::bsondoc::from_bytes(first.as_slice()) {
-                    if let Some(id) = d.get("_id") {
-                        q = doc! { "_id": id.clone() };
-                    }
-                }
-            }
-        }
         let multi = bool_field(spec, "multi", false);
         let upsert = bool_field(spec, "upsert", false);
         // A replacement document cannot apply to many documents. mongod refuses
@@ -2508,7 +2461,8 @@ pub(crate) fn update_in(
         // Pipeline-form `u` (`[...]`) vs operator/replacement-form (`{...}`).
         // The statement's read of its documents, run as mongod's plan for
         // it runs, counting what it examines (RM-023): every match for an
-        // update of many, up to the first for an update of one.
+        // update of many, up to the first for an update of one, under its
+        // sort when it has one.
         let selection = if absent {
             None
         } else {
@@ -2518,7 +2472,7 @@ pub(crate) fn update_in(
                     db: db_name,
                     coll: &coll,
                     filter: &q,
-                    sort: None,
+                    sort: sort_spec.as_ref(),
                     hint: argtypes::given_hint(spec),
                     collation: collation.as_ref(),
                     vars: &stmt_vars,
@@ -2535,6 +2489,58 @@ pub(crate) fn update_in(
             // A read that fails here fails the update's own read too.
             .unwrap_or(None)
         };
+        // An update under a sort (8.0) takes the document that sorts first,
+        // which the statement's read above found as mongod's plan for it
+        // (UPDATE over a SORT, or over a read in the sort's order) reads it
+        // (RM-376), and the write is pinned to it. Nothing matched -> the
+        // filter stays, so an upsert still upserts.
+        if let (Some(sort), false) = (&sort_spec, absent) {
+            let sorted = match &selection {
+                Some(sel) => Ok(sel.first.iter().cloned().collect::<Vec<_>>()),
+                None => crate::explain::order::find(
+                    storage,
+                    &crate::explain::order::Ask {
+                        db: db_name,
+                        coll: &coll,
+                        filter: &q,
+                        sort: Some(sort),
+                        hint: None,
+                        collation: collation.as_ref(),
+                        vars: &Document::new(),
+                        limit: 1,
+                        // An update of one document under a sort: mongod's
+                        // query has a limit of one.
+                        asked: crate::near::Asked {
+                            limit: 1,
+                            sort: Some(sort),
+                            cached: true,
+                            ..Default::default()
+                        },
+                    },
+                ),
+            };
+            // A document the sort cannot be built for (parallel arrays, an
+            // ambiguous index component) is the statement's writeError under
+            // the update executor's wrapper, as on mongod 8.2.1 (RM-332); this
+            // used to drop the error and update an unsorted match.
+            let rows = match sorted {
+                Ok(rows) => rows,
+                Err(e) => {
+                    write_errors.push(Bson::Document(crate::util::write_error(index, e, "update")));
+                    if ordered {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            if let Some(first) = rows.first() {
+                if let Ok(d) = secantus_core::bsondoc::from_bytes(first.as_slice()) {
+                    if let Some(id) = d.get("_id") {
+                        q = doc! { "_id": id.clone() };
+                    }
+                }
+            }
+        }
         if let Some(sel) = selection.as_ref().filter(|s| s.pending.is_none()) {
             crate::profiler::note_statement_exec(crate::profiler::StatementExec {
                 summary: Some(sel.summary.clone()),
@@ -2774,7 +2780,7 @@ pub(crate) fn update_in(
                     db: db_name,
                     coll: &coll,
                     filter: &doc_field(spec, "q"),
-                    sort: None,
+                    sort: sort_spec.as_ref(),
                     hint: argtypes::given_hint(spec),
                     collation: collation.as_ref(),
                     vars: &stmt_vars,

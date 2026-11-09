@@ -140,12 +140,12 @@ def test_a_sort_of_index_keys_counts_the_data_it_sorted(rust_mongo: Any, mongod:
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-376")
+@pytest.mark.backlog_fixed("RM-376")
 def test_an_update_is_planned_as_mongod_plans_it(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 plans an update with a `sort` over its read (a
     COLLSCAN here, 0 keys and 12 documents examined) and an `_id` update
     under a non-simple collation through the `_id` index (`IXSCAN { _id: 1
-    }`, one key and one document). This server's statements report an
+    }`, one key and one document). This server's statements reported an
     `_id` express write for both."""
     ops = {
         "sort": lambda d: d.command(

@@ -674,17 +674,15 @@ These are explicit non-goals. Don't add them without a reason.
       (RM-374).
       Verify: tests/backlog/test_rm_found_rm374.py::test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted
       Backlog-ID: RM-468
-- [ ] **Two updates are planned as an `_id` express write where mongod's
-      are not.** mongod 8.2.11 plans an update with a `sort` (8.0) as
-      UPDATE over a SORT over its read (`planSummary: COLLSCAN`, 0 keys
-      and 12 documents examined for `{q: {z: 0}, sort: {y: -1}}`), and an
-      update of `{_id: 3}` under a non-simple collation as UPDATE, FETCH,
-      IXSCAN (`IXSCAN { _id: 1 }`). This server's statement reports
-      `EXPRESS_IXSCAN { _id: 1 },EXPRESS_UPDATE` for both, one key and one
-      document examined, and an EXPRESS_UPDATE `execStats`. Found
-      2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_an_update_is_planned_as_mongod_plans_it
-      Backlog-ID: RM-376
+- [ ] **A write's LIMIT of one counts a second work.** mongod 8.2.11's
+      LIMIT of one over an index read in a write's sort order is EOF after
+      the work that returned its document: a profile entry's UPDATE and
+      LIMIT each report `works: 1` (`needTime: 0`) for
+      `{q: {x: {$gte: 2}}, sort: {x: 1}}` over an index on `x`, an update
+      with a `sort` and a findAndModify alike. This server's report
+      `works: 2` and the UPDATE `needTime: 1`. Found 2026-11-09 (RM-376).
+      Verify: tests/backlog/test_rm_found_rm376.py::test_a_writes_limit_of_one_is_done_after_one_work
+      Backlog-ID: RM-474
 - [ ] **A SORT of index keys reports no `totalDataSizeSorted`.** mongod
       8.2.11's SORT below a FETCH (`type: "default"`) counts the data it
       sorted in a profile entry's `execStats` (780 for the twelve `{y, x}`
