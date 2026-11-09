@@ -387,14 +387,6 @@ one beside it.
   write past it). Found by the MongoDB batch; not worked from that side.
   On a recurrence, capture which passes parsed the statement and when each
   checked the cancel flag.
-  Recurred locally on 2026-11-09 (lane pg-batch-2, debug build, the machine
-  shared with another session): RP-202's
-  `tests/backlog/test_rp202_cancel.py::test_a_cancel_while_a_huge_in_list_is_planned_over_a_table`,
-  a cancel while a 200,000-item `IN` list is parsed and planned, was
-  honoured 0.31 s late (budget 0.3 s) in the gate's backlog verify (four
-  workers), then 0.62 s and 0.72 s in two of three runs of the file alone
-  at a load average of about 16 on 12 cores. Ten later runs passed, at
-  loads of 11 and 23. Which passes parsed the statement was not captured.
   Backlog-ID: RP-571
   Verify: none -- intermittent, not reproduced; RP-002's regression test is the check, and it passed on rerun
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
@@ -3229,7 +3221,11 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       cancel per 30 at 0.256-0.276 s on both. So some planning pass still
       runs a stretch that does not look for a cancel, as the rewrite
       passes did before RP-202; find which one by sampling the server when
-      a cancel is late.
+      a cancel is late. The tail reaches further under load: on the RP-733
+      branch (lane pg-batch-2, debug build) the whole file's run had the
+      cancel 0.62 s and 0.72 s late in two of three runs at a load average
+      of about 16, then passed ten runs at loads of 11 and 23, four of them
+      on a build of `aae69552`, before RP-733.
       Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
       Backlog-ID: RP-735
 
