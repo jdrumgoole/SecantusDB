@@ -2472,14 +2472,6 @@ a plain WHERE over a `char(n)` column, in a FROM-subquery's column over a
       operator would.
       Verify: tests/backlog/test_rp_found_rp680.py::test_char_n_against_text_compares_as_text
       Backlog-ID: RP-685
-- [ ] **`= ANY` of a `char(n)` array finds nothing over a `char(n)`
-      column.** `select k from t680 where f = any('{a,xy}'::char(3)[])` finds
-      the `'a'` and `'xy'` rows on PostgreSQL 15.19 (`bpchareq` drops the
-      blanks); here it finds none: the array's elements are padded
-      (`'a  '`) and compared with their blanks against the trimmed stored
-      value, the shape of RP-679 for an array's elements.
-      Verify: tests/backlog/test_rp_found_rp680.py::test_any_of_a_char_n_array_compares_as_bpchar
-      Backlog-ID: RP-684
 
 ## Found while working RP-670 (2026-11-09)
 

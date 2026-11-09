@@ -17038,6 +17038,35 @@ pub(crate) fn trim_bpchar(v: Bson) -> Bson {
     }
 }
 
+/// Which sides of `x op ANY / ALL (array)` drop their trailing blanks:
+/// `(x, the array's elements)`, given `x`'s type and the array's.
+///
+/// The operator is resolved as a binary one over `x` and the element type
+/// (`make_scalar_array_op`), so a `char(n)` side is compared as `bpchar`
+/// (`bpchareq` and the `bpchar` ordering ignore trailing blanks), or as
+/// `text` through `rtrim` against a `text` / `name` side; either way its
+/// blanks go. A `varchar` or untyped side against a `char(n)` one is read
+/// as `bpchar` too (`'a '::varchar = any('{a}'::char(3)[])` is true on
+/// 15.19), a `text` one keeps its blanks (`'a '::text = any('{a}'::char(3)[])`
+/// is false, and `'a'::char(3) = any(array['a '])`, a `text[]`, is false).
+fn any_array_bpchar_trims(
+    lhs_type: &str,
+    lhs_unknown: bool,
+    array_type: &str,
+    array_unknown: bool,
+) -> (bool, bool) {
+    let elem = array_type.strip_suffix("[]").unwrap_or(array_type);
+    let (lb, rb) = (
+        is_bpchar_type(lhs_type),
+        !array_unknown && is_bpchar_type(elem),
+    );
+    let (lv, rv) = (lhs_type == "varchar", !array_unknown && elem == "varchar");
+    (
+        lb || ((lhs_unknown || lv) && rb),
+        rb || ((array_unknown || rv) && lb),
+    )
+}
+
 /// Build a `ColumnExpr::Row` for an expression over the row's `fields`,
 /// given the statement's own `params`.
 ///
@@ -45125,6 +45154,25 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 }
                 None => rhs,
             };
+            // A `char(n)` side drops its trailing blanks (RP-684).
+            let (trim_l, trim_r) = any_array_bpchar_trims(
+                &e.lexpr
+                    .as_deref()
+                    .map_or_else(String::new, |l| static_type(l, &lhs)),
+                unknown_operand(e.lexpr.as_deref()),
+                &static_type(rexpr, &rhs),
+                unknown_operand(Some(rexpr)),
+            );
+            let lhs = if trim_l { trim_bpchar(lhs) } else { lhs };
+            let rhs = if trim_r {
+                // An untyped literal is read as the `char(n)` side's array.
+                match arrays::strip(&coerce_any_array(rhs, "bpchar")?) {
+                    Bson::Array(items) => Bson::Array(items.into_iter().map(trim_bpchar).collect()),
+                    other => other,
+                }
+            } else {
+                rhs
+            };
             // A jsonb compares by value: both sides as their value keys.
             if matches!(op.as_str(), "=" | "<>" | "!=")
                 && static_json_type(e.lexpr.as_deref(), &lhs).as_deref() == Some("jsonb")
@@ -47172,7 +47220,30 @@ fn lower_scalar_array(
     if elem_type == "jsonb" || field_type(def, &field) == Some("jsonb") {
         return Err(Error::Unsupported("a jsonb comparison".into()));
     }
+    // A `char(n)` side drops its trailing blanks (RP-684). The stored value
+    // of a `char(n)` column already has none; a `varchar` one compared as
+    // `bpchar` would need its own trimmed, which a filter cannot do.
+    let rexpr = e.rexpr.as_deref();
+    let (trim_col, trim_elems) = any_array_bpchar_trims(
+        elem_type,
+        false,
+        &rexpr.map_or_else(String::new, |r| static_type(r, &rhs)),
+        unknown_operand(rexpr),
+    );
+    if trim_col && !is_bpchar_type(elem_type) {
+        return Err(Error::Unsupported(
+            "a varchar column against a char(n) array".into(),
+        ));
+    }
     let rhs = coerce_any_array(rhs, elem_type)?;
+    let rhs = if trim_elems {
+        match arrays::strip(&rhs) {
+            Bson::Array(items) => Bson::Array(items.into_iter().map(trim_bpchar).collect()),
+            other => other,
+        }
+    } else {
+        rhs
+    };
     // A vector column meets each vector as the int array it is stored as,
     // not as the text it is carried as inside the array (RP-575).
     let rhs = if vectors::is_vector(elem_type) {
