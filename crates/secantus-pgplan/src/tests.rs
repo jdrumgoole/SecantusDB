@@ -5776,3 +5776,52 @@ fn any_array_bpchar_trims_follow_operator_resolution() {
         );
     }
 }
+
+/// A constant compared with a `char(n)` column keeps its trailing blanks
+/// only when the comparison is `text`'s: against a `text` or `name` value
+/// PostgreSQL 15.19 casts the column to `text` (RP-685). An untyped, a
+/// `char(n)` or a `varchar` constant, an IN list's members (coerced to the
+/// column's type) and a BETWEEN's untyped bounds compare as `bpchar`, which
+/// drops them (RP-691).
+#[test]
+fn a_char_n_column_strips_a_constant_only_for_a_bpchar_comparison() {
+    let def = TableDef::new(
+        "t",
+        vec![Column::new("k", "int4", true), {
+            let mut f = Column::new("f", "bpchar", false);
+            f.typmod = 7;
+            f
+        }],
+    );
+    let lookup = |name: &str| (name == "t").then(|| def.clone());
+    let filter = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => format!("{:?}", s.filter),
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for sql in [
+        "SELECT k FROM t WHERE f = 'xy  '::text",
+        "SELECT k FROM t WHERE f = 'xy  '::name",
+        "SELECT k FROM t WHERE f < 'xy  '::text",
+        "SELECT k FROM t WHERE f BETWEEN 'xy  '::text AND 'xz'::text",
+    ] {
+        assert!(
+            filter(sql).contains("\"xy  \""),
+            "kept for {sql}: {}",
+            filter(sql)
+        );
+    }
+    for sql in [
+        "SELECT k FROM t WHERE f = 'xy  '",
+        "SELECT k FROM t WHERE f = 'xy  '::varchar",
+        "SELECT k FROM t WHERE f IN ('xy  ', 'q')",
+        "SELECT k FROM t WHERE f IN ('xy  '::text, 'q'::text)",
+        "SELECT k FROM t WHERE f NOT IN ('xy  ', 'q')",
+        "SELECT k FROM t WHERE f BETWEEN 'xy  ' AND 'xy  '",
+    ] {
+        let got = filter(sql);
+        assert!(
+            got.contains("\"xy\"") && !got.contains("\"xy  \""),
+            "stripped for {sql}: {got}"
+        );
+    }
+}
