@@ -4016,7 +4016,7 @@ struct InFlight {
 impl InFlight {
     /// How long the run has held its slots open, in whole microseconds.
     fn held_micros(&self) -> i64 {
-        i64::try_from(self.minted_at.elapsed().as_micros()).unwrap_or(i64::MAX)
+        micros_since(self.minted_at)
     }
 }
 
@@ -4031,6 +4031,18 @@ fn note_oplog_slot_held(micros: i64) {
             m.set(Some(n.saturating_add(micros)));
         }
     });
+}
+
+/// Whole microseconds since `t`.
+fn micros_since(t: Instant) -> i64 {
+    i64::try_from(t.elapsed().as_micros()).unwrap_or(i64::MAX)
+}
+
+/// The asynchronous oplog's buffered write did not commit: its entries and
+/// the slots they would have held are dropped, uncounted (RM-379).
+fn clear_pending_oplog() {
+    PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+    PENDING_SLOTS.with(|s| s.borrow_mut().clear());
 }
 
 /// Index keys inserted and deleted; `None`: no write of that kind.
@@ -5541,6 +5553,15 @@ thread_local! {
     /// immediately, so such entries are never stranded in `PENDING_OPLOG` and
     /// never sync-written behind the drainer's back.
     static IN_ASYNC_STMT: Cell<bool> = const { Cell::new(false) };
+
+    /// When each emit buffered in `PENDING_OPLOG` outside a user transaction
+    /// would have reserved its oplog slot on mongod: the asynchronous oplog
+    /// mints nothing until the write commits, but mongod's
+    /// `totalOplogSlotDurationMicros` times the span from the write
+    /// generating its entries to its commit, which the write still has
+    /// (RM-379). Cleared with `PENDING_OPLOG`; noted by
+    /// `drain_pending_oplog`, right after the commit.
+    static PENDING_SLOTS: RefCell<Vec<Instant>> = const { RefCell::new(Vec::new()) };
 
     /// Seq ranges minted by the current sync-mode write statement (or by the
     /// current statement of a user transaction), parked until the transaction
@@ -8404,7 +8425,7 @@ impl Storage {
         let async_mode = self.async_oplog.is_some();
         if async_mode {
             IN_ASYNC_STMT.with(|f| f.set(true));
-            PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+            clear_pending_oplog();
         }
         // Sync mode: emits inside this statement park their minted seq ranges
         // in `PENDING_MINTED`; this guard deregisters them from the in-flight
@@ -8499,7 +8520,7 @@ impl Storage {
                     let _ = session.rollback_transaction(None);
                     if async_mode {
                         IN_ASYNC_STMT.with(|f| f.set(false));
-                        PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+                        clear_pending_oplog();
                     }
                     const EINVAL: i32 = 22;
                     if e.is_rollback() || e.code == EINVAL {
@@ -8526,7 +8547,7 @@ impl Storage {
                 let _ = session.rollback_transaction(None);
                 if async_mode {
                     IN_ASYNC_STMT.with(|f| f.set(false));
-                    PENDING_OPLOG.with(|p| p.borrow_mut().clear());
+                    clear_pending_oplog();
                 }
                 Err(e)
             }
@@ -8974,6 +8995,11 @@ impl Storage {
                     p.push(pair);
                 }
             });
+            // Where mongod reserves this emit's slots. A user transaction's
+            // are reserved at its commit (`commit_user_transaction`).
+            if self.async_oplog.is_some() && ACTIVE_TXN_SESSION.with(|c| c.get()).is_null() {
+                PENDING_SLOTS.with(|s| s.borrow_mut().push(Instant::now()));
+            }
             if !IN_ASYNC_STMT.with(|f| f.get()) {
                 // Self-draining emit (noop heartbeat, DDL on a bare session):
                 // the mint happens right here, so the real seq is known and
@@ -9117,6 +9143,15 @@ impl Storage {
         if self.async_oplog.is_none() {
             return 0;
         }
+        // Their write has just committed: the time from each emit to here is
+        // how long mongod would have held its slots (RM-379).
+        let slots = PENDING_SLOTS.with(|s| std::mem::take(&mut *s.borrow_mut()));
+        note_oplog_slot_held(
+            slots
+                .into_iter()
+                .map(micros_since)
+                .fold(0, i64::saturating_add),
+        );
         let pending: Vec<(OplogEntry, Option<Vec<u8>>)> =
             PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut()));
         self.mint_and_enqueue(pending)
@@ -11176,6 +11211,7 @@ impl Storage {
             dirty: u64,
             in_sync: bool,
             oplog: Vec<(OplogEntry, Option<Vec<u8>>)>,
+            slots: Vec<Instant>,
             in_async: bool,
         }
         impl Drop for Restore {
@@ -11198,6 +11234,12 @@ impl Storage {
                     *p = std::mem::take(&mut self.oplog);
                     p.extend(inner);
                 });
+                PENDING_SLOTS.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let inner = std::mem::take(&mut *s);
+                    *s = std::mem::take(&mut self.slots);
+                    s.extend(inner);
+                });
             }
         }
         let _restore = Restore {
@@ -11206,6 +11248,7 @@ impl Storage {
             dirty: PENDING_DIRTY_BYTES.with(|c| c.replace(0)),
             in_sync: IN_SYNC_STMT.with(|f| f.replace(false)),
             oplog: PENDING_OPLOG.with(|p| std::mem::take(&mut *p.borrow_mut())),
+            slots: PENDING_SLOTS.with(|s| std::mem::take(&mut *s.borrow_mut())),
             in_async: IN_ASYNC_STMT.with(|f| f.replace(false)),
         };
         f()
@@ -11484,6 +11527,12 @@ impl Storage {
             let began = handle.began;
             handle.began = false;
             if began {
+                // mongod reserves a transaction's slots as it commits: the
+                // asynchronous oplog mints them only after, so the commit is
+                // timed from here (RM-379).
+                let slots_reserved = (self.async_oplog.is_some()
+                    && !handle.pending_async.is_empty())
+                .then(Instant::now);
                 if wrote && self.async_oplog.is_none() && !handle.pending_async.is_empty() {
                     // A timestamped store's transaction held its entries
                     // (`emit_oplog_entries`): they are minted now, together,
@@ -11585,6 +11634,9 @@ impl Storage {
                 // analogue of `with_statement_txn`'s post-commit drain. An
                 // acked commitTransaction therefore has its entries minted
                 // before the reply, which `oplog_open_seq` relies on.
+                if let Some(t) = slots_reserved {
+                    note_oplog_slot_held(micros_since(t));
+                }
                 let pending = std::mem::take(&mut handle.pending_async);
                 if !pending.is_empty() {
                     self.mint_and_enqueue(pending);

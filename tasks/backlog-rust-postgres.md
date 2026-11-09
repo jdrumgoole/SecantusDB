@@ -389,6 +389,47 @@ one beside it.
   checked the cancel flag.
   Backlog-ID: RP-571
   Verify: none -- intermittent, not reproduced; RP-002's regression test is the check, and it passed on rerun
+- [ ] **OPEN -- a cancel while a huge `IN` list is planned is honoured up
+  to 0.52 s late, against RP-202's 0.3 s budget (2026-11-09).**
+  `tests/backlog/test_rp202_cancel.py::test_a_cancel_while_a_huge_in_list_is_planned_over_a_table`
+  (RP-202's regression test) failed in the `backlog` step of a local
+  `gate_pg.sh --storage --fast` on the RM-379 lane (commit `5cc38549` on
+  `rm-batch` `57e33821`, debug build): `[0.7]` honoured 0.32 s late.
+  Rerun on its own at once (load average about 7), it failed 3 runs of 5:
+  0.30 s, 0.52 s and 0.34 s late. After the lane was rebuilt, on
+  `rm-batch` `49012e84` without RM-379 it passed 6 of 6, and with RM-379
+  on `01a19d63` it passed 8 of 8 (load average about 3.5). RM-379 changes
+  only the shared storage crate's asynchronous-oplog path, which the PG
+  server does not select. So the late cancels follow load or the older
+  build, and the cause has not been measured. PostgreSQL 15.19 answers at
+  about 0.015 s. Found by the MongoDB batch, and not worked from that side.
+  To work it: time each rewrite pass of the `IN` list at delay 0.7 and
+  record when each pass checks the cancel flag, under a load average near
+  7. A copy that cannot be interrupted and takes about 0.3 s under load is
+  RP-202's own signature.
+  Verify: none -- intermittent under load; RP-202's regression test is the check, and it passed 14 of 14 runs on two rebuilt commits
+  Backlog-ID: RP-748
+- [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
+  in 6 of 547 TLS scenarios, because that reference now links OpenSSL 4.**
+  Homebrew's `postgresql@15` (15.19_1, 2026-11-07) links
+  `openssl@4/lib/libssl.4.dylib`. Since then
+  `tests/test_rust_pg_login_differential.py` (`pg_login_tls_files.py`)
+  reports `541 of 547 the same` on every local run, and again on
+  2026-11-09 in the RM-379 lane. The six are the CRL distribution-point
+  scenarios: no distribution point (good, revoked), distribution point a
+  (good, revoked), distribution point b, and revoked-first-answer. In each
+  of them the reference answers `tlsv1 alert unknown ca`, even for a good
+  certificate. The Rust PG server accepts the good certificate, or answers
+  `certificate revoked`. Neither server's code changed. RP-013's record
+  says the OpenSSL version decides how a CRL on the root is checked. CI's
+  Ubuntu reference links OpenSSL 3, which is why CI still passes. Until
+  this is settled, the local login step cannot tell a regression from this
+  difference. The fix is either a local reference PostgreSQL linked against
+  OpenSSL 3, or CRLs that the probe issues so that OpenSSL 3 and 4 agree,
+  with the decision recorded in RP-013. Found by the MongoDB batch, and not
+  worked from that side.
+  Verify: none -- the local reference's OpenSSL decides it; `tests/test_rust_pg_login_differential.py` against a PostgreSQL 15 on OpenSSL 4 is the check
+  Backlog-ID: RP-747
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
