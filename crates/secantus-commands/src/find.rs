@@ -1454,6 +1454,8 @@ fn stream_find(
             limit,
             sort: asked.sort,
             projection: projection.as_ref(),
+            // A contested plan is tried through the plan cache (RM-349).
+            cached: true,
             ..Default::default()
         },
     };
@@ -1482,9 +1484,9 @@ fn stream_find(
     } else {
         None
     };
-    let plan = match near {
-        Some(_) => crate::explain::Node::Eof("GEO_NEAR"),
-        None => match crate::explain::order::stream_plan(
+    let (plan, trial) = match near {
+        Some(_) => (crate::explain::Node::Eof("GEO_NEAR"), None),
+        None => match crate::explain::order::stream_tried(
             storage.as_ref(),
             &ask,
             skip,
@@ -1495,7 +1497,7 @@ fn stream_find(
         )
         .map_err(read_error)?
         {
-            Some(plan) => plan,
+            Some(planned) => planned,
             None => return Ok(None),
         },
     };
@@ -1522,7 +1524,7 @@ fn stream_find(
             doc.get_bool("allowDiskUse").unwrap_or(true),
         )),
     };
-    let stream = match near {
+    let mut stream = match near {
         Some(_) if wants_index_key => return Ok(None),
         Some(stream) => stream,
         None => match crate::explain::stream::Stream::of_plan_with(
@@ -1539,6 +1541,14 @@ fn stream_find(
             None => return Ok(None),
         },
     };
+    // A plan mongod chose by trial: what the winner returned in it is
+    // buffered when the command runs, and the read goes on from there.
+    if let Some(trial) = trial {
+        let _active = secantus_core::collation::activate(asked.collation);
+        stream
+            .buffer_trial(storage.as_ref(), trial.results, trial.ended)
+            .map_err(read_error)?;
+    }
     let mut cursor = FindStream {
         stream,
         projection,
@@ -1556,11 +1566,12 @@ fn stream_find(
     };
     // `batchSize: 0` asks for the cursor and no documents.
     let batch = if asked.batch_size == 0 {
+        let (keys_examined, docs_examined) = cursor.stream.save_trial();
         crate::cursors::StreamedBatch {
             docs: Vec::new(),
             exhausted: false,
-            keys_examined: 0,
-            docs_examined: 0,
+            keys_examined,
+            docs_examined,
         }
     } else {
         cursor.next_batch(

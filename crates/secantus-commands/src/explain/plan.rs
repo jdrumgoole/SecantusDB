@@ -1708,7 +1708,7 @@ fn tried(
 /// The documents mongod's trial asks a plan for
 /// (`trial_period::getTrialPeriodNumToReturn`): the query's limit, at most
 /// 101.
-fn trial_need(q: &Query) -> i64 {
+pub(crate) fn trial_need(q: &Query) -> i64 {
     if q.limit > 0 {
         q.limit.min(101)
     } else {

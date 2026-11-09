@@ -781,13 +781,13 @@ These are explicit non-goals. Don't add them without a reason.
       mongod's plan counts its keys and documents examined, and since
       RM-359 its profile entry carries its stages (`execStats`); these do
       neither:
-      - a read two or more plans could serve, which mongod chooses by trial;
-        its documents come from the store's router. mongod's `find` line
-        counts what the winner examined in its trial, the trial's results
-        buffered for the batches after it (`keysExamined: 12, docsExamined:
-        12` on the first batch of two and 0 on each `getMore`, over twelve
-        documents); counting it is streaming the winner after that buffer,
-        which is RM-349;
+      - a read two or more plans could serve, which mongod chooses by
+        trial, other than a `find`'s: an `aggregate`'s, a `count`'s, a
+        write's. Its documents come from the store's router. mongod counts
+        what the winner examined in its trial, and since RM-349 a `find`
+        streams the winner after its trial's buffer and counts as mongod's
+        does; the other readers still decline a contested plan
+        (`order::stream_plan`);
       - a time-series collection's read and a geo, `$near` or `$text` read.
         mongod counts the buckets its cursor stage buffered (all 15 of 300
         measurements in the first batch of 101, 0 after); counting them
@@ -795,7 +795,18 @@ These are explicit non-goals. Don't add them without a reason.
         since RM-348, which is RM-455.
       Measured 2026-10-27 and 2026-11-07.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
+      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
+- [ ] **A read of the plan cache's plan has no CACHED_PLAN stage.** mongod
+      8.2.11 runs the active plan of its plan cache under a CACHED_PLAN
+      stage, and its profile entries for the `find` and each `getMore`
+      carry it over the plan's stages, counting what it handed out (`works`
+      and `advanced` 2 on a first batch of two, 4 after the next); this
+      server's start at the plan's FETCH, whose counts are mongod's. A
+      `find` mongod plans by a fresh trial carries no MULTI_PLAN stage, and
+      neither does this server's. Measured 2026-11-09; found while working
+      RM-349.
+      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_the_cached_plan_reports_its_cached_plan_stage
+      Backlog-ID: RM-458
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -2180,6 +2191,17 @@ What is left, all on the RUST MongoDB server:
       RM-185.
       Backlog-ID: RM-432
       Verify: tests/backlog/test_rm_431_432.py::test_explain_parses_the_write_it_explains
+- [ ] **A rooted `$or` whose branches are tried has a FETCH over its OR.**
+      mongod 8.2.11 plans `{$or: [{a: {$gte: 2}, b: {$gte: 3}}, {a: 0, b:
+      0}]}` over `a_1` and `b_1` branch by branch, each branch's two plans
+      by trial, and its winning plan is SUBPLAN, OR, then each branch's
+      FETCH over its IXSCAN; this server's, in `explain` and in the profile
+      entry of the `find`, puts a FETCH between the SUBPLAN and the OR.
+      With one plan per branch (`find_or` in `test_rm_355_364.py`) there is
+      none. The counts are mongod's. Measured 2026-11-09; found while
+      working RM-349.
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm349.py::test_a_rooted_or_of_tried_branches_has_no_fetch_over_its_or
+      Backlog-ID: RM-459
 
 ### 7.074 Change streams, command by command -- 2026-10-11
 
@@ -2264,20 +2286,6 @@ differs on 5 scenarios. What is left:
       server derives. Measured 2026-11-09.
       Backlog-ID: RM-457
       Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_the_meta_index_buffers_its_buckets
-- [ ] **RUST MongoDB server: a cursor whose plan mongod picks by trial is
-      the result as it was when the command ran.** When two indexes could
-      answer a query, mongod runs both until one returns 101 documents (or
-      ends, or spends its works budget), keeps the winner's trial results
-      and then reads on from where the winner stopped; this server reads
-      everything at the command (`stream_plan` declines a contested plan).
-      Over 3,000 documents with `a_1` and `b_1` both usable, read two at a
-      time and all deleted after the first batch, mongod 8.2.11 returns 101
-      in all and this server 1,557. Streaming it means streaming the
-      winner after a buffer of its trial's results, with the trial's works
-      and results counted as mongod's are; RM-154 (the plan cache) works in
-      the same code (found 2026-10-27, RM-080's remainder).
-      Backlog-ID: RM-349
-      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_plan_mongod_tried_buffers_only_its_trial
 - **Not probed (RM-083's remainder, 2026-10-17)** -- `oplogReplay`,
   `$meta: "textScore"` sorts, an `explain: true` aggregate. Every
   `{$meta}` shape measured on 8.2.11 matches since 2026-10-17, except a

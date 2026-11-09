@@ -157,11 +157,12 @@ def _trial_reads(client: Any) -> int:
     return len(first + [d["_id"] for d in cur])
 
 
-@pytest.mark.backlog("RM-349")
+@pytest.mark.backlog_fixed("RM-349")
 def test_a_plan_mongod_tried_buffers_only_its_trial(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 picks between two usable indexes by a trial that stops
     at 101 results, returns those it buffered, then reads on: after every
-    document is deleted the cursor returns 101 in all."""
+    document is deleted the cursor returns 101 in all. This server read
+    such a plan whole when the command ran, and returned 1,557."""
     want = _trial_reads(mongod)
     assert want == 101
     assert _trial_reads(rust_mongo) == want
