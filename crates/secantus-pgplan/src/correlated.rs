@@ -604,6 +604,7 @@ pub(crate) fn correlate(
         sub_plan_def(&planned, lookup).ok().map(|d| d.columns.len()),
         outer,
     )?;
+    let mut typmod = -1;
     let result_type = match kind {
         SubLinkType::ExistsSublink | SubLinkType::AnySublink | SubLinkType::AllSublink => {
             "bool".to_string()
@@ -623,6 +624,10 @@ pub(crate) fn correlate(
                 .first()
                 .map(|c| c.pg_type.clone())
                 .unwrap_or_else(|| "text".into());
+            // `exprTypmod` of an EXPR or ARRAY sublink is its column's: a
+            // `(select f)` over a `char(3)` is described, and stored by a
+            // FROM-subquery, as a `character(3)` (RP-679).
+            typmod = def.columns.first().map_or(-1, |c| c.typmod);
             if kind == SubLinkType::ArraySublink {
                 format!("{first}[]")
             } else {
@@ -650,6 +655,7 @@ pub(crate) fn correlate(
         str_const(&op),
         sl.testexpr.as_deref().cloned().unwrap_or_else(null_const),
         int_const(i32::try_from(params.len()).unwrap_or(i32::MAX)),
+        int_const(typmod),
     ];
     // The statement's own parameters travel as arguments too: the inner SQL
     // numbers them `$1..$n`, exactly as the outer statement bound them.
@@ -816,7 +822,16 @@ fn outer_ref_type(
             }
             if let Some((_, def)) = from_item_def(item, lookup, params) {
                 if let Some(c) = def.columns.iter().find(|c| &c.name == col) {
-                    return Some(c.pg_type.clone());
+                    // With its length, so the probe's output carries the
+                    // column's modifier: `(select s.f)` over a `char(3)` is
+                    // a `character(3)` (`exprTypmod` of the outer Var), and
+                    // the sublink is typed by it (RP-679).
+                    return Some(match c.pg_type.as_str() {
+                        "bpchar" | "varchar" if c.typmod > 4 => {
+                            format!("{}({})", c.pg_type, c.typmod - 4)
+                        }
+                        _ => c.pg_type.clone(),
+                    });
                 }
             }
             if qualifier.is_some() {
@@ -1043,6 +1058,21 @@ pub(crate) fn correlated_type(f: &pg_query::protobuf::FuncCall) -> Option<String
     }
 }
 
+/// The modifier of a correlated call's result (`exprTypmod` of its
+/// sublink), when `f` is one and it carries one.
+pub(crate) fn correlated_typmod(f: &pg_query::protobuf::FuncCall) -> Option<i32> {
+    if !is_correlated(f) {
+        return None;
+    }
+    match f.args.get(6)?.node.as_ref()? {
+        N::AConst(pg_query::protobuf::AConst {
+            val: Some(Val::Ival(i)),
+            ..
+        }) => Some(i.ival),
+        _ => None,
+    }
+}
+
 /// Evaluate a correlated call over the row its arguments were read from, or
 /// `None` when `f` is not one.
 pub(crate) fn eval_correlated(
@@ -1083,7 +1113,8 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     let op = text(3)?;
     let n_params = usize::try_from(int(5)?).unwrap_or(0);
     let mut inner_params = Vec::new();
-    for i in 6..f.args.len() {
+    // Argument 6 is the result's modifier, read only for its type.
+    for i in 7..f.args.len() {
         inner_params.push(const_value(&f.args[i], params)?);
     }
     debug_assert!(inner_params.len() >= n_params);
@@ -1094,7 +1125,7 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     // Left as they were, `$1` took the outer row's first field's type, and
     // `outer.c = 'x'` over a `char(3)` compared an integer.
     let declared = PLAN_PARAM_TYPES.with(|t| t.borrow().clone());
-    let inner_types: Vec<Option<String>> = f.args[6..]
+    let inner_types: Vec<Option<String>> = f.args[7..]
         .iter()
         .map(|a| match a.node.as_ref() {
             Some(N::ParamRef(p)) => usize::try_from(p.number - 1)

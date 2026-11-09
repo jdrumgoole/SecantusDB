@@ -6,8 +6,9 @@ value's blanks) pinned and found:
   this server keeps a `char(n)` value trimmed and pads it only where it
   enters an expression. (Padding the aggregate's stored answer instead got
   every one of these wrong.)
-- a `char(n)` value that carries its blanks (a cast to `char(n)`, a scalar
-  subquery over a `char(n)` column) compares and sorts with them;
+- RP-679 (fixed since): a `char(n)` value that carried its blanks (a cast to
+  `char(n)`, a scalar subquery over a `char(n)` column) compared and sorted
+  with them;
 - a HAVING comparison of a `char(n)` `min` / `max` against a `char(n)`
   value, an `= ANY` array or `IS DISTINCT FROM` does not compare as `bpchar`;
 - `min` / `max` over a `varchar` column are typed `varchar`, not `text`;
@@ -109,7 +110,9 @@ def test_min_max_over_char_n_still_compare_as_bpchar(query: str, dsn: str) -> No
 
 # `bpchareq` / `bpcharcmp` drop the trailing blanks first (`bcTruelen`):
 # `'xy   '::char(5) = 'xy'` is true, and `'a  '` sorts before `'a\t '`.
-# Here a value that carries its blanks is compared with them.
+# Here a value that carried its blanks was compared with them, until RP-679
+# stored a FROM-subquery's `char(n)` cell trimmed and trimmed a `char(n)`
+# sort key.
 PADDED = {
     "select k from (select k, f::char(5) x from t671) s where x in ('a', 'xy') order by k": [
         (1,),
@@ -126,7 +129,7 @@ PADDED = {
 }
 
 
-@pytest.mark.backlog("RP-679")
+@pytest.mark.backlog_fixed("RP-679")
 @pytest.mark.parametrize("query", list(PADDED))
 def test_padded_char_n_compares_without_its_blanks(query: str, dsn: str) -> None:
     assert _rows(dsn, query) == PADDED[query]

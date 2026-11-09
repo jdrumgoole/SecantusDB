@@ -123,6 +123,11 @@ fn typed(node: &pg_query::protobuf::Node, cx: &Ctx) -> Option<(String, i32)> {
             };
             Some((ty, m))
         }
+        // A correlated subquery's per-row call: its sublink's modifier,
+        // which is its column's (RP-679).
+        N::FuncCall(f) => {
+            crate::correlated::correlated_type(f).zip(crate::correlated::correlated_typmod(f))
+        }
         N::SqlvalueFunction(f) if f.typmod >= 0 => {
             Some((sql_value_function_type(f).to_string(), f.typmod))
         }

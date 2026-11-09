@@ -10021,7 +10021,10 @@ impl PgHandler {
                             schema[i].datatype(),
                             &tz,
                         )?;
-                        out.insert(c.field(), v.unwrap_or(Bson::Null));
+                        out.insert(
+                            c.field(),
+                            secantus_pgplan::stored_bpchar_cell(v.unwrap_or(Bson::Null), c),
+                        );
                     }
                     let id = if sel.sub.is_some() {
                         d.get(LOCK_ROW_ID)
@@ -10056,12 +10059,12 @@ impl PgHandler {
         }
         let (_, rows) = self.rows_with_schema(stmt)?;
         // Each column's field name, once rather than once a row.
-        let fields: Vec<Option<String>> = def
+        let fields: Vec<Option<(String, &Column)>> = def
             .columns
             .iter()
             .enumerate()
             .map(|(i, c)| {
-                (!skip.is_some_and(|s| s.get(i).copied().unwrap_or(false))).then(|| c.field())
+                (!skip.is_some_and(|s| s.get(i).copied().unwrap_or(false))).then(|| (c.field(), c))
             })
             .collect();
         Ok(rows
@@ -10071,14 +10074,18 @@ impl PgHandler {
                 let mut values = r.into_iter();
                 for field in &fields {
                     let value = values.next().flatten();
-                    let Some(field) = field else {
+                    let Some((field, column)) = field else {
                         continue;
                     };
                     // A NULL cell is stored as an explicit `Bson::Null` rather
                     // than left out: the outer query's `col IS NULL` and its
                     // ORDER BY both read the field, and a missing one is not
                     // the same thing as a null one to an MQL filter.
-                    d.insert(field.clone(), value.unwrap_or(Bson::Null));
+                    let value = value.unwrap_or(Bson::Null);
+                    d.insert(
+                        field.clone(),
+                        secantus_pgplan::stored_bpchar_cell(value, column),
+                    );
                 }
                 d
             })
@@ -49801,7 +49808,7 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             for key in &item.order {
                 if let Some(expr) = &key.expr {
                     for r in &mut copy {
-                        let v = secantus_pgplan::apply_row_expr(expr, r).unwrap_or(Bson::Null);
+                        let v = secantus_pgplan::sort_key_value(expr, r).unwrap_or(Bson::Null);
                         r.insert(key.field.clone(), v);
                     }
                 }
@@ -50186,7 +50193,7 @@ fn materialise_windows(
         for key in w.partition_by.iter().chain(w.order_by.iter()) {
             if let Some(expr) = key.expr.as_ref() {
                 for d in docs.iter_mut() {
-                    let v = secantus_pgplan::apply_row_expr(expr, d)?;
+                    let v = secantus_pgplan::sort_key_value(expr, d)?;
                     d.insert(key.field.clone(), v);
                 }
             }
@@ -50951,7 +50958,7 @@ fn materialise_order_exprs(docs: &mut [Document], order: &[OrderKey]) -> Result<
             continue;
         };
         for d in docs.iter_mut() {
-            let v = secantus_pgplan::apply_row_expr(expr, d)?;
+            let v = secantus_pgplan::sort_key_value(expr, d)?;
             d.insert(key.field.clone(), v);
         }
     }

@@ -2429,17 +2429,17 @@ VALUES-only statements as written, the rest with the `_SETUP` tables of
 `char(n)` value trimmed and pads it where it enters an expression; a value
 that reaches a comparison carrying its blanks is compared with them.
 
-- [ ] **A `char(n)` value that carries its blanks compares and sorts with
-      them.** `bpchareq` / `bpcharcmp` drop the trailing blanks first
-      (`bcTruelen`), so on PostgreSQL 15.19 `select k from (select k,
-      f::char(5) x from t671) s where x = 'xy'` finds the `'xy'` row, and
-      `order by f::char(5)` puts `'a'` before `E'a\t'`. Here the cast's
-      value is `'xy   '`: the filter (`=`, `IN`) finds nothing and the sort
-      puts the tab first, and so for a scalar subquery over the column
-      (`(select f)`), which RP-666 pads. The comparisons and the sort keys
-      carry no type to say the value is a `bpchar`.
-      Verify: tests/backlog/test_rp_found_rp671.py::test_padded_char_n_compares_without_its_blanks
-      Backlog-ID: RP-679
+- [ ] **A correlated `ARRAY(...)` over a `char(n)` column drops its
+      elements' blanks.** On PostgreSQL 15.19 `select k, array(select t.f
+      from (values (1, 'a'::char(3)), ...) t(k, f) where t.f = s.f) from
+      (values ...) s(k, f)` answers `{"a  "}`, described `character(3)[]`
+      (modifier 7); here the elements are `{a}`. Since RP-679 the call is
+      described with the modifier, but the elements are the inner rows'
+      stored (trimmed) values: the uncorrelated sublink casts its array to
+      the column's `char(n)[]`, which pads each element (RP-666), and the
+      correlated call does not.
+      Verify: tests/backlog/test_rp_found_rp679.py::test_correlated_array_of_char_n_keeps_the_elements_blanks
+      Backlog-ID: RP-683
 - [ ] **A HAVING comparison of a `char(n)` `min` / `max` does not compare as
       `bpchar`.** On PostgreSQL 15.19, over `t671` (`'a'`, `'xy'`, `'b'`),
       `having max(f) is distinct from 'xy'` keeps the `'a'` and `'b'`

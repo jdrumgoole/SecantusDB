@@ -903,7 +903,7 @@ pub(crate) fn compute_order_keys(
                 continue;
             }
         }
-        match secantus_pgplan::apply_row_expr(expr, d) {
+        match secantus_pgplan::sort_key_value(expr, d) {
             Ok(v) => {
                 d.insert(key.field.clone(), v);
             }
