@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 
 from tests.backlog.conftest import mongo_answer
+from tests.backlog.opdebug import no_timed_yields
 
 
 def _coll(client: Any) -> Any:
@@ -404,8 +405,12 @@ def test_a_distinct_scan_groups_trial_scores_as_mongods(rust_mongo: Any, mongod:
     `groupByDistinctBonus` (`min(1 - p, 4p)` on productivity `p`), counts a
     fetching DISTINCT_SCAN as a fetch, lists the plans as its planner
     enumerates them with the winner swapped to the front, and saves the
-    winner once as the trial ends, as it saves the plans it beat."""
-    got, want = _distinct_group_trials(rust_mongo), _distinct_group_trials(mongod)
+    winner once as the trial ends, as it saves the plans it beat. Both run
+    without time-based yields: one during the trial adds a save and a
+    restore to every stage, which load decides (mongod 8.2.11 gave three
+    different counts in 15 runs on 2026-11-09, one with the period off)."""
+    with no_timed_yields(rust_mongo), no_timed_yields(mongod):
+        got, want = _distinct_group_trials(rust_mongo), _distinct_group_trials(mongod)
     assert [p[0] for p in want["sorted"]] == [3.0003, 3.0002, 3.0002, 3.0002]
     assert got == want
 

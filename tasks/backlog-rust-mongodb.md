@@ -2177,26 +2177,42 @@ member: 115 scenarios over a raw connection (what `$changeStream` accepts,
 every event's shape, `getMore`, the invalidating operations, resuming by
 `resumeAfter` / `startAfter` / `startAtOperationTime`, the three scopes,
 pre-images, transactions), each on a database of its own. The Rust server
-differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts database names per run, because
+differs on 1 result (re-measured 2026-11-09, the `queryShapeHash` of `explain`, RM-454; 2 on 2026-10-16, 5 before). The harness salts database names per run, because
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
-      server's plan.** mongod explains the oplog scan it would run, with
-      the full match over `local.oplog.rs`; not reproduced, like the rest
-      of mongod's planner output (1 of the 2). Sized 2026-10-20: mongod's
-      reply is a `$cursor` over `local.oplog.rs` whose `parsedQuery` (about
-      2,100 characters for a collection stream, 2,400 for the cluster) is the
-      oplog filter mongod's change-stream filter builders make from the
-      scope and options, a `PROJECTION_SIMPLE` of the oplog fields, then four
-      internal `$changeStream` stages (`internalUnwindTransaction` with the
-      same filter, `internalTransform` with the options,
-      `$_internalChangeStreamCheckInvalidate`,
-      `$_internalChangeStreamCheckResumability`) and a `$match` on
-      `operationType`. Reproducing it means transcribing those builders per
-      scope and option, not printing the namespace alone.
-      Backlog-ID: RM-076
-      Verify: tests/backlog/test_rm_057_084.py::test_explain_of_a_change_stream_scans_the_oplog
+- [ ] **RUST MongoDB server: a `$match` after a `$changeStream` is not
+      rewritten into the oplog filter.** mongod rewrites a `$match` on the
+      event's fields (`operationType`, `fullDocument`,
+      `fullDocumentBeforeChange`, `documentKey`, `ns`, ...) into predicates
+      on the oplog entry and adds them to the read's filter, so the
+      `explain`'s `parsedQuery` and its hashes change (`operationType:
+      "insert"` adds `op: {$eq: "i"}` beside the writes: `queryHash`
+      2CFDBDA8, not 90A52575; mongod 8.2.11, 2026-11-09). This server lists
+      the `$match` as mongod does after the read and leaves the filter as it
+      is without one. Needs mongod's per-field rewrites transcribed (found
+      working RM-076).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_a_match_on_an_event_field_joins_the_oplog_filter
+      Backlog-ID: RM-452
+- [ ] **RUST MongoDB server: `executionStats` of a change stream counts
+      nothing.** mongod 8.2.11 runs the oplog read under `executionStats`:
+      a stream started before three inserts counts the three entries at
+      every stage, and the `COLLSCAN` its `docsExamined` (2026-11-09). This
+      server reports what a new stream at the end of the oplog finds -- no
+      entry, at every stage -- which is mongod's answer only for that
+      stream. `docsExamined` also counts mongod's own oplog entries (its
+      periodic no-ops), which this server's oplog does not keep (found
+      working RM-076).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_execution_stats_count_what_the_read_found
+      Backlog-ID: RM-453
+- [ ] **RUST MongoDB server: the `explain` of a change stream has no
+      `queryShapeHash`.** mongod 8.2.11 prints one for a collection or
+      database stream (none for a cluster one); `query_shape.rs` does not
+      shape a `$changeStream` stage, so this server prints none (found
+      working RM-076; the one difference `tools/probes/change_stream_commands.py`
+      still finds).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_a_change_stream_has_a_query_shape_hash
+      Backlog-ID: RM-454
 
 ### 7.073 The cursor commands -- 2026-10-11
 

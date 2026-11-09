@@ -702,9 +702,12 @@ def _change_stream_explain_ns(client: Any) -> Any:
     return first.get("queryPlanner", {}).get("namespace")
 
 
-@pytest.mark.backlog("RM-076")
+@pytest.mark.backlog_fixed("RM-076")
 def test_explain_of_a_change_stream_scans_the_oplog(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11 explains a `$changeStream` as a scan of `local.oplog.rs`."""
+    """mongod 8.2.11 explained a `$changeStream` as a scan of `local.oplog.rs`,
+    and this server explained its own plan over the collection; it now
+    explains mongod's read (`tests/mongod_live/test_change_stream_explain.py`
+    compares the whole reply)."""
     expected = _change_stream_explain_ns(mongod_rs)
     assert expected == "local.oplog.rs"
     assert _change_stream_explain_ns(rust_mongo) == expected
