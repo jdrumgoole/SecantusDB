@@ -40628,9 +40628,17 @@ fn coerce_unknown_operand(
         v if op != "||" && is_numeric(v) => {
             Some(cast_value(Bson::String(text.clone()), "numeric")?)
         }
-        // An array literal takes the element type from the array beside it.
-        Bson::Array(items) => {
-            let element = items.first().map(inferred_type).unwrap_or("text");
+        // An array literal takes the element type from the array beside it
+        // -- one whose lower bound is not 1 (held as a tagged document)
+        // included: beside `'[0:1]={x,y}'::text[]` an unknown is `text[]`
+        // too, where it was left a string and every comparison over a
+        // column holding such an array was 42883 (RP-734). Its first
+        // element that is not NULL types it (a NULL says nothing).
+        v if matches!(v, Bson::Array(_)) || arrays::is_bounded(v) => {
+            let element = arrays::flatten(v)
+                .iter()
+                .find(|x| **x != Bson::Null)
+                .map_or("text", inferred_type);
             Some(cast_value(
                 Bson::String(text.clone()),
                 &format!("{element}[]"),
@@ -46828,6 +46836,25 @@ fn type_is_rowtype(t: &str) -> bool {
     t.eq_ignore_ascii_case("record") || user_composite(t).is_some()
 }
 
+/// `Unsupported` for an array column under `=`, `<>`, `<`, `<=`, `>`,
+/// `>=`, BETWEEN, IN or IS DISTINCT FROM, which the filter cannot express:
+/// PostgreSQL compares two arrays by `array_eq` / `array_cmp`
+/// (arrayfuncs.c) -- the elements in row-major order whatever the shapes,
+/// a NULL element after every other, then the counts, the dimensions and
+/// last the lower bounds. MQL compares a stored array as a nested BSON
+/// array and ALSO matches one whose element equals the operand, so `a =
+/// '{x,y}'` found `{{x,y},{z,w}}`, a NULL element sorted first, and an
+/// array whose lower bound is not 1 (held as a tagged document) fell in no
+/// range at all (RP-733). Evaluated per row it compares as `array_cmp`.
+fn array_compare_is_per_row(def: &TableDef, field: &str) -> Result<()> {
+    match field_type(def, field) {
+        Some(t) if t.ends_with("[]") => Err(Error::Unsupported(
+            "an array column compared with a constant".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// A filter that matches nothing. `{}` matches every document, so NOR of it
 /// matches none -- which is what `x NOT IN (.., NULL)` must answer.
 fn match_nothing() -> Document {
@@ -47466,6 +47493,9 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     if value == Bson::Null {
         return Ok(match_nothing());
     }
+    if op_to_mql(op).is_some() {
+        array_compare_is_per_row(def, &field)?;
+    }
     // A `date` column against a timestamp: the date is PROMOTED to midnight.
     if field_type(def, &field) == Some("date") && is_instant(&value) {
         let zoned = e
@@ -47678,6 +47708,9 @@ fn lower_distinct(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document
     if field_type(def, &field) == Some("jsonb") {
         return Err(Error::Unsupported("a jsonb comparison".into()));
     }
+    // Against NULL too: `{a: null}` also matches an array holding a NULL
+    // element, which IS DISTINCT FROM NULL.
+    array_compare_is_per_row(def, &field)?;
     if value == Bson::Null {
         return Ok(if not_distinct {
             doc! { field: Bson::Null }
@@ -47957,6 +47990,7 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     composite_compare_is_per_row(e, def, params)?;
     let negated = in_is_negated(e);
     let field = column_field(e.lexpr.as_deref(), def)?;
+    array_compare_is_per_row(def, &field)?;
     let items = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
         Some(N::List(l)) => &l.items,
         _ => return Err(Error::Unsupported("this IN list".into())),
@@ -48082,6 +48116,7 @@ fn comparison_operand(
 fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     composite_compare_is_per_row(e, def, params)?;
     let field = column_field(e.lexpr.as_deref(), def)?;
+    array_compare_is_per_row(def, &field)?;
     let bounds = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
         Some(N::List(l)) if l.items.len() == 2 => &l.items,
         _ => return Err(Error::Unsupported("this BETWEEN form".into())),
