@@ -683,14 +683,35 @@ These are explicit non-goals. Don't add them without a reason.
       `works: 2` and the UPDATE `needTime: 1`. Found 2026-11-09 (RM-376).
       Verify: tests/backlog/test_rm_found_rm376.py::test_a_writes_limit_of_one_is_done_after_one_work
       Backlog-ID: RM-474
-- [ ] **A SORT of index keys reports no `totalDataSizeSorted`.** mongod
-      8.2.11's SORT below a FETCH (`type: "default"`) counts the data it
-      sorted in a profile entry's `execStats` (780 for the twelve `{y, x}`
-      keys of `find({y: {$gte: 0}}).sort({x: 1})`). This server sorts the
-      index keys without its sorter and counts none; the stage's works are
-      mongod's. Found 2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_sort_of_index_keys_counts_the_data_it_sorted
-      Backlog-ID: RM-375
+- [ ] **A SORT of index keys past its budget does not spill.** mongod
+      8.2.11's SORT below a FETCH (`type: "default"`) spills past its
+      budget with `allowDiskUse`: 2000 65-byte members under a
+      100000-byte budget spill twice (`spilledRecords: 2000`,
+      `spilledBytes: 130000`), and the profile entry says `usedDisk` and
+      `sortSpills: 2`. This server's counts its members and refuses one
+      past the budget without disk use as mongod does (RM-375), but with
+      disk use sorts in memory and reports no spill
+      (`secantus_core::sorter::count_members`). Found 2026-11-09 (RM-375).
+      Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_of_index_keys_past_its_budget_spills
+      Backlog-ID: RM-475
+- [ ] **`explain` sizes a SORT of index keys as documents.** mongod
+      8.2.11's `executionStats` of a SORT below a FETCH counts each member
+      as its execution does (its sort key, its index key and 32 bytes: 780
+      for twelve `{y, x}` keys, whatever the documents hold). This
+      server's `explain` (`exec.rs` / `trial.rs`'s `sort_stats`) sizes the
+      documents behind the keys, as a sort of documents counts: 1440 over
+      documents with a 50-byte pad. A profile entry's `execStats` count as
+      mongod's (RM-375). Found 2026-11-09 (RM-375).
+      Verify: tests/backlog/test_rm_found_rm375.py::test_an_explained_sort_of_index_keys_counts_its_members
+      Backlog-ID: RM-476
+- [ ] **A sort beside a multikey field sorts documents, not index keys.**
+      mongod 8.2.11 plans `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1,
+      x: 1}`, `y` multikey and `x` not, as a SORT of index keys below the
+      FETCH (`type: "default"`, 780 counted for twelve members). This
+      server sorts the fetched documents above the FETCH (`simple`, 900).
+      Found 2026-11-09 (RM-375).
+      Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_beside_a_multikey_field_sorts_index_keys
+      Backlog-ID: RM-477
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
