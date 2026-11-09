@@ -279,22 +279,6 @@ These are explicit non-goals. Don't add them without a reason.
       Backlog-ID: RM-011
       Verify: none -- .NET gauge teardown stall (tooling)
 
-- [ ] **`rust-binary-build` links a WiredTiger it did not refresh
-      (2026-11-07).** The task rebuilds `build/rust-wt/wt-build` when a
-      `cmake/patch_wt_*.py` patcher changes (`_build_wiredtiger` stamps the
-      patch digest), then hands cargo whatever `_find_wt_build` finds
-      first. `build/cp312-*/wt-build`, the wheel's WiredTiger, sorts ahead
-      of `build/rust-wt/`, and only `rust-server-build` re-patches it. A
-      checkout that has built the wheel once therefore links an unpatched
-      WiredTiger into `secantusd-rs` after a patcher lands, and `gate_rm.py`
-      builds the binary before the wheel. Measured when RM-364's patcher
-      reached a lane: the binary lacked `txnNumUpdates` and RM-364's
-      regression test failed until `rust-server-build` had run and
-      `secantus-wt` was rebuilt. The task should link the directory
-      `_build_wiredtiger` returns.
-      Backlog-ID: RM-388
-      Verify: tests/backlog/test_rm_found_2026_11_07b.py::test_the_binary_links_the_wiredtiger_its_build_refreshed
-
 
 - [ ] **OPEN — `test_stop_ends_a_running_command` on Windows: the fix is not
       yet observed under the original race, and `test_opsboard.py`'s half was

@@ -25,17 +25,18 @@ def _complete_wt(d: Path) -> Path:
     return d
 
 
-@pytest.mark.backlog("RM-388")
+@pytest.mark.backlog_fixed("RM-388")
 def test_the_binary_links_the_wiredtiger_its_build_refreshed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """`rust-binary-build` refreshes `build/rust-wt/wt-build` (rebuilt when a
-    `cmake/patch_wt_*.py` patcher changes) and must link that one. It links
-    whatever `_find_wt_build` finds first instead, and `build/cp312-*/` sorts
-    ahead of `build/rust-wt/`: a checkout that has run `rust-server-build`
-    once links the wheel's WiredTiger, which is re-patched only when the
+    `cmake/patch_wt_*.py` patcher changes) and must link that one. It linked
+    whatever `_find_wt_build` found first instead, and `build/cp312-*/` sorts
+    ahead of `build/rust-wt/`: a checkout that had run `rust-server-build`
+    once linked the wheel's WiredTiger, which is re-patched only when the
     wheel is rebuilt (measured 2026-11-07: after RM-364's patcher landed, the
-    binary lacked `txnNumUpdates` until `rust-server-build` ran)."""
+    binary lacked `txnNumUpdates` until `rust-server-build` ran). The task
+    now hands cargo the directory `_build_wiredtiger` returned."""
     refreshed = _complete_wt(tmp_path / "build" / "rust-wt" / "wt-build")
     _complete_wt(tmp_path / "build" / "cp312-cp312-macosx_26_0_arm64" / "wt-build")
     monkeypatch.chdir(tmp_path)
