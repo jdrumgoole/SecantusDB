@@ -506,23 +506,35 @@ def test_a_read_names_its_query_shape(rust_mongo: Any, mongod_rs: Any) -> None:
 
 
 _UNSHAPED = {
-    "a geo predicate": {
+    "a $jsonSchema predicate": {
         "find": "c",
-        "filter": {"loc": {"$geoWithin": {"$center": [[0, 0], 5]}}},
+        "filter": {"$jsonSchema": {"required": ["x"], "properties": {"x": {"bsonType": "int"}}}},
     },
-    "an expression outside the nary operators": {
+    "$rankFusion": {
         "aggregate": "c",
-        "pipeline": [{"$project": {"d": {"$dateToString": {"date": "$t", "format": "%Y"}}}}],
+        "pipeline": [
+            {
+                "$rankFusion": {
+                    "input": {
+                        "pipelines": {"a": [{"$sort": {"x": 1}}], "b": [{"$sort": {"x": -1}}]}
+                    }
+                }
+            }
+        ],
         "cursor": {},
     },
-    "a stage outside the shaped ones": {
+    "$scoreFusion": {
         "aggregate": "c",
-        "pipeline": [{"$facet": {"a": [{"$match": {"x": 1}}]}}],
-        "cursor": {},
-    },
-    "a $lookup with a pipeline": {
-        "aggregate": "c",
-        "pipeline": [{"$lookup": {"from": "c", "pipeline": [{"$match": {"x": 1}}], "as": "j"}}],
+        "pipeline": [
+            {
+                "$scoreFusion": {
+                    "input": {
+                        "pipelines": {"a": [{"$score": {"score": "$x"}}]},
+                        "normalization": "none",
+                    }
+                }
+            }
+        ],
         "cursor": {},
     },
 }
@@ -530,13 +542,15 @@ _UNSHAPED = {
 
 @pytest.mark.backlog("RM-358")
 def test_a_query_of_every_kind_names_its_query_shape(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.1's `explain` (as its line and profile entry) carries a
+    """mongod 8.2's `explain` (as its line and profile entry) carries a
     `queryShapeHash` for every `find`, `distinct` and `aggregate` it parses
-    (measured 2026-11-07). This server shapes the common operators and
-    stages (`tests/mongod_live/test_query_shape_hash.py`) and prints none
-    for the rest: geo and text predicates, `$where`, `$jsonSchema`, the
-    aggregation operators with a serialization of their own, and stages
-    beyond the shaped list."""
+    (measured 2026-11-07, and on 8.2.11 2026-11-09). This server shapes the
+    predicates, operators, accumulators and stages in
+    `tests/mongod_live/test_query_shape_hash.py` and prints none for the
+    rest: `$jsonSchema`, which mongod shapes as the internal schema
+    predicates it translates the schema into, and `$rankFusion` and
+    `$scoreFusion`, which it shapes as the pipelines it desugars them
+    into."""
     name = fresh("qshape")
     answers = {}
     for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):

@@ -65,10 +65,12 @@ def _shape_hash(client: Any) -> Any:
     )
 
 
-@pytest.mark.backlog("RM-454")
+@pytest.mark.backlog_fixed("RM-454")
 def test_a_change_stream_has_a_query_shape_hash(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 prints a `queryShapeHash` for the explain of a
-    collection or database change stream (none for a cluster one)."""
+    collection or database change stream (none for a cluster one). This
+    server printed none until `query_shape.rs` shaped `$changeStream`
+    (RM-358)."""
     want = _shape_hash(mongod_rs)
     assert want is not None
     assert _shape_hash(rust_mongo) == want

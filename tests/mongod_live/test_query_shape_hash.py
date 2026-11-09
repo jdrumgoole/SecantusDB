@@ -7,16 +7,22 @@ and collection of the same names (the hash covers the namespace), and
 compares the hashes. The cases sweep what the shape is made of: the filter
 as mongod parses it (not as it optimizes it), the literal each value stands
 for, the projection, the sort and the options, and the pipeline stages a
-command is parsed into.
+command is parsed into. Geo predicates, `$text`, the aggregation operators
+and accumulators with arguments of their own, and the stages mongod
+desugars (`$bucket`, `$setWindowFields`, `$fill`, `$densify`, `$documents`,
+`$score`, ...) each have their own serializer, measured against mongod
+8.2.11 on 2026-11-09.
 """
 
 from __future__ import annotations
 
 import datetime
+import struct
 from typing import Any
 
 import pytest
-from bson import Binary, Decimal128, Int64, ObjectId, Regex
+from bson import Binary, Decimal128, Int64, ObjectId, Regex, Timestamp
+from bson.raw_bson import RawBSONDocument
 from bson.son import SON
 
 _DB = "qshape_live"
@@ -175,6 +181,280 @@ PIPELINES: list[list] = [
     [{"$match": {"$expr": {"$gt": ["$x", 2]}}}],
 ]
 
+_D = datetime.datetime(2020, 1, 1)
+
+#: Aggregation expressions, each the value of a `$project`ed field.
+EXPRESSIONS: list[Any] = [
+    {"$dateToString": {"date": "$t", "format": "%Y"}},
+    SON(
+        [
+            (
+                "$dateToString",
+                SON([("onNull", "n"), ("timezone", "UTC"), ("format", "%Y"), ("date", "$t")]),
+            )
+        ]
+    ),
+    {"$dateFromString": {"dateString": "$s", "onError": 1}},
+    SON([("$dateFromParts", SON([("hour", 1), ("isoWeekYear", 2020), ("isoWeek", 2)]))]),
+    {"$dateFromParts": {"year": 2020, "month": "$m"}},
+    {"$dateToParts": {"date": "$t", "iso8601": True}},
+    {"$year": "$t"},
+    {"$isoWeek": ["$t"]},
+    {"$dayOfWeek": {"date": "$t", "timezone": "UTC"}},
+    {"$dateAdd": {"startDate": _D, "unit": "$u", "amount": {"$add": ["$x", 1]}}},
+    {"$dateDiff": {"startDate": "$t", "endDate": "$u", "unit": "week", "startOfWeek": "mon"}},
+    {"$dateTrunc": {"date": "$t", "unit": "day", "binSize": 2}},
+    {"$convert": {"input": "$x", "to": "int", "onError": 0, "onNull": 1}},
+    {"$convert": {"input": "$x", "to": 2}},
+    {"$convert": {"input": "$x", "to": {"type": "binData", "subtype": 0}}},
+    {"$toString": "$x"},
+    {"$toInt": ["$x"]},
+    {"$toUUID": "$x"},
+    {"$let": {"vars": {"a": "$x", "b": 1}, "in": {"$add": ["$$a", "$$b"]}}},
+    {"$map": {"input": "$a", "in": "$$this"}},
+    {"$filter": {"input": "$a", "as": "e", "cond": {"$gt": ["$$e", 1]}, "limit": 2}},
+    {
+        "$reduce": {
+            "input": "$a",
+            "initialValue": [],
+            "in": {"$concatArrays": ["$$value", ["$$this"]]},
+        }
+    },
+    {"$switch": {"branches": [{"case": {"$gt": ["$x", 1]}, "then": "a"}], "default": "b"}},
+    {"$cond": {"if": "$b", "then": 1, "else": "$x"}},
+    {"$regexMatch": {"input": "$s", "regex": Regex("a"), "options": "i"}},
+    {"$regexFindAll": {"input": "$s", "regex": "a"}},
+    {"$rtrim": {"chars": "x", "input": "$s"}},
+    {"$getField": "a"},
+    {"$getField": {"field": {"$literal": "$a"}, "input": "$o"}},
+    {"$setField": {"field": "a", "input": "$$ROOT", "value": 1}},
+    {"$unsetField": {"field": "a", "input": "$$ROOT"}},
+    {"$sortArray": {"input": "$a", "sortBy": {"k": -1}}},
+    {"$zip": {"inputs": ["$a", [1, 2]], "useLongestLength": True, "defaults": [0, 0]}},
+    {"$meta": "indexKey"},
+    {"$rand": {}},
+    {"$replaceAll": {"input": "$s", "find": "a", "replacement": "$r"}},
+    {"$mergeObjects": ["$a", {"k": 1}]},
+    {"$maxN": {"n": 2, "input": "$a"}},
+    {"$median": {"input": "$a", "method": "approximate"}},
+    {"$percentile": {"input": "$a", "p": [0.5, 0.9], "method": "approximate"}},
+    {"$substr": ["$s", 0, 1]},
+    {"$sin": "$x"},
+    {"$bitAnd": ["$x", 1]},
+    {"$toHashedIndexKey": "$x"},
+    {"$sigmoid": "$x"},
+    {"$similarityCosine": ["$a", "$b"]},
+    {"$similarityEuclidean": {"vectors": [[1, 2], "$v"], "score": True}},
+]
+
+#: Accumulators, stages and the stages mongod desugars.
+STAGES: list[list] = [
+    [{"$group": {"_id": "$y", "r": {"$topN": {"n": 2, "output": "$x", "sortBy": {"x": 1}}}}}],
+    [{"$group": {"_id": "$y", "r": {"$bottom": {"sortBy": {"x": -1}, "output": ["$x", "$y"]}}}}],
+    [
+        {
+            "$group": {
+                "_id": "$y",
+                "r": {"$lastN": {"n": 2, "input": "$x"}},
+                "m": {"$mergeObjects": "$o"},
+            }
+        }
+    ],
+    [
+        {
+            "$group": {
+                "_id": None,
+                "m": {"$percentile": {"input": "$x", "p": [0.5], "method": "approximate"}},
+            }
+        }
+    ],
+    [
+        {
+            "$group": {
+                "_id": "$y",
+                "r": {
+                    "$accumulator": {
+                        "init": "function(){return 0}",
+                        "accumulate": "function(s,x){return s+x}",
+                        "accumulateArgs": ["$x"],
+                        "merge": "function(a,b){return a+b}",
+                        "lang": "js",
+                    }
+                },
+            }
+        }
+    ],
+    [{"$facet": {"a": [{"$match": {"x": 1}}], "b": [{"$count": "n"}]}}],
+    [{"$lookup": {"from": "c", "pipeline": [{"$match": {"x": 1}}], "as": "j"}}],
+    [
+        {
+            "$lookup": {
+                "from": "c",
+                "let": {"v": "$x", "k": 1},
+                "pipeline": [{"$limit": 1}],
+                "as": "j",
+            }
+        }
+    ],
+    [{"$lookup": {"from": "o", "localField": "x", "foreignField": "k", "pipeline": [], "as": "j"}}],
+    [
+        {
+            "$lookup": {
+                "from": "o",
+                "localField": "x",
+                "foreignField": "k",
+                "pipeline": [{"$limit": 1}],
+                "as": "j",
+            }
+        }
+    ],
+    [{"$bucket": {"groupBy": "$x", "boundaries": [0, 5, 10], "default": "o"}}],
+    [
+        {
+            "$bucket": {
+                "groupBy": "$x",
+                "boundaries": [0, 2],
+                "output": {"n": {"$sum": 1}, "m": {"$max": "$y"}},
+            }
+        }
+    ],
+    [{"$bucketAuto": {"groupBy": "$x", "buckets": 3, "granularity": "R5"}}],
+    [
+        {
+            "$graphLookup": {
+                "from": "c",
+                "startWith": "$x",
+                "connectFromField": "x",
+                "connectToField": "y",
+                "as": "g",
+                "maxDepth": 2,
+                "depthField": "d",
+                "restrictSearchWithMatch": {"z": 1},
+            }
+        }
+    ],
+    [{"$unionWith": "o"}],
+    [{"$unionWith": {"coll": "o", "pipeline": [{"$match": {"k": 1}}]}}],
+    [{"$redact": {"$cond": [{"$eq": ["$x", 1]}, "$$PRUNE", "$$DESCEND"]}}],
+    [
+        {
+            "$densify": {
+                "field": "x",
+                "partitionByFields": ["y"],
+                "range": {"step": 1, "bounds": "partition"},
+            }
+        }
+    ],
+    [{"$densify": {"field": "x", "range": {"step": 1, "bounds": [0, 10]}}}],
+    [{"$fill": {"output": {"x": {"value": 0}}}}],
+    [
+        {
+            "$fill": {
+                "sortBy": {"x": 1},
+                "partitionByFields": ["y"],
+                "output": {"z": {"method": "locf"}},
+            }
+        }
+    ],
+    [{"$fill": {"sortBy": {"x": 1}, "output": {"z": {"method": "linear"}, "w": {"value": "a"}}}}],
+    [
+        {
+            "$setWindowFields": {
+                "partitionBy": "$y",
+                "sortBy": {"x": 1},
+                "output": {"s": {"$sum": "$x", "window": {"documents": [-1, 1]}}},
+            }
+        }
+    ],
+    [{"$setWindowFields": {"partitionBy": {"$mod": ["$x", 2]}, "output": {"s": {"$push": "$x"}}}}],
+    [
+        {
+            "$setWindowFields": {
+                "sortBy": {"x": 1},
+                "output": {
+                    "n": {"$documentNumber": {}},
+                    "p": {"$shift": {"output": "$x", "by": 1}},
+                    "e": {"$expMovingAvg": {"input": "$x", "alpha": 0.5}},
+                },
+            }
+        }
+    ],
+    [{"$out": "outc"}],
+    [{"$merge": {"into": "mc", "let": {"v": 1}, "whenMatched": [{"$set": {"z": "$$v"}}]}}],
+    [{"$score": {"score": "$x", "normalization": "sigmoid", "weight": 0.5}}],
+    [{"$collStats": {"storageStats": {"scale": 1024}, "count": {}}}],
+    [{"$indexStats": {}}],
+    [{"$project": SON([("z", "$y"), ("a", SON([("q", 1)])), ("x", 1)])}],
+    [{"$project": SON([("a.b", 0), ("x", 0)])}],
+]
+
+#: Geo predicates (over `geo`, which has a 2d and a 2dsphere index), and
+#: the pathless predicates with a form of their own. (`$where`, `$function`,
+#: `$text` and a `$meta` sort, which this server refuses to run, are pinned
+#: against mongod's hashes in `query_shape.rs`'s unit tests.)
+GEO_FILTERS: list[Any] = [
+    {"loc": {"$geoWithin": {"$center": [[0, 0], 5]}}},
+    {"loc": {"$geoWithin": {"$centerSphere": [{"a": 0, "b": 0}, 0.1]}}},
+    {"loc": {"$geoWithin": {"$box": [[0, 0], [5, 5]]}}},
+    {"loc": {"$within": {"$polygon": [[0, 0], [5, 5], [0, 5]]}}},
+    {
+        "g": {
+            "$geoWithin": {
+                "$geometry": {"type": "Polygon", "coordinates": [[[0, 0], [5, 0], [5, 5], [0, 0]]]}
+            }
+        }
+    },
+    {
+        "g": {
+            "$geoIntersects": {
+                "$geometry": {"type": "LineString", "coordinates": [[0, 0], [3, 3], [5, 1]]}
+            }
+        }
+    },
+    {
+        "g": {
+            "$geoIntersects": {
+                "$geometry": {"type": "MultiLineString", "coordinates": [[[0, 0], [3, 3]]]}
+            }
+        }
+    },
+    {
+        "g": {
+            "$geoIntersects": {"$geometry": {"type": "MultiPoint", "coordinates": [[0, 0], [2, 2]]}}
+        }
+    },
+    {
+        "g": {
+            "$geoIntersects": {
+                "$geometry": {
+                    "type": "GeometryCollection",
+                    "geometries": [{"type": "Point", "coordinates": [0, 0]}],
+                }
+            }
+        }
+    },
+    {"loc": {"$near": [0, 0], "$maxDistance": 5}},
+    {
+        "g": {
+            "$nearSphere": {
+                "$geometry": {"type": "Point", "coordinates": [0, 0]},
+                "$minDistance": 1,
+            }
+        }
+    },
+    {"loc": {"$not": {"$geoWithin": {"$center": [[0, 0], 1]}}}},
+    {"$sampleRate": 0.5},
+]
+
+
+def _dbpointer(field: str) -> RawBSONDocument:
+    """`{field: DBPointer("a.b", <oid>)}`, which pymongo cannot build."""
+    element = (
+        b"\x0c" + field.encode() + b"\x00" + struct.pack("<i", 4) + b"a.b\x00" + bytes(range(12))
+    )
+    return RawBSONDocument(struct.pack("<i", len(element) + 5) + element + b"\x00")
+
+
 DISTINCTS: list[tuple[str, Any]] = [
     ("x", None),
     ("x", {"x": {"$gt": 5}}),
@@ -191,6 +471,9 @@ def servers(rust_mongo: Any, mongod_rs: Any) -> Any:
         db.c.insert_many([{"_id": n, "x": n, "y": n % 3, "a": [1, 2]} for n in range(6)])
         db.c.create_index("x")
         db.o.insert_one({"k": 1})
+        db.geo.insert_one({"loc": [0, 0], "g": {"type": "Point", "coordinates": [0, 0]}})
+        db.geo.create_index([("loc", "2d")])
+        db.geo.create_index([("g", "2dsphere")])
     yield rust_mongo, mongod_rs
     for client in (rust_mongo, mongod_rs):
         client.drop_database(_DB)
@@ -241,6 +524,81 @@ def test_an_aggregates_options(servers: Any) -> None:
             ]
         ),
     )
+
+
+@pytest.mark.parametrize("expression", EXPRESSIONS, ids=[str(e) for e in EXPRESSIONS])
+def test_an_expression(servers: Any, expression: Any) -> None:
+    pipeline = [{"$project": {"r": expression}}]
+    _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
+
+
+@pytest.mark.parametrize("pipeline", STAGES, ids=[str(p) for p in STAGES])
+def test_a_stage(servers: Any, pipeline: list) -> None:
+    _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
+
+
+@pytest.mark.parametrize("filt", GEO_FILTERS, ids=[str(f) for f in GEO_FILTERS])
+def test_a_geo_or_pathless_filter(servers: Any, filt: Any) -> None:
+    _check(servers, SON([("find", "geo"), ("filter", filt)]))
+
+
+def test_a_dbpointer_literal(servers: Any) -> None:
+    _check(servers, SON([("find", "c"), ("filter", _dbpointer("x"))]))
+
+
+def test_a_collectionless_aggregate(servers: Any) -> None:
+    """`aggregate: 1` runs on `<db>.$cmd.aggregate`; `$documents` is the
+    `$queue`, `$project`, `$unwind` and `$replaceRoot` mongod parses it into."""
+    for docs in (
+        [{"x": 1}, {"x": "a", "y": 2}],
+        {"$map": {"input": [1, 2], "in": {"x": "$$this"}}},
+    ):
+        pipeline = [{"$documents": docs}, {"$match": {"x": 1}}]
+        _check(servers, SON([("aggregate", 1), ("pipeline", pipeline), ("cursor", {})]))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        {},
+        {"fullDocument": "updateLookup", "fullDocumentBeforeChange": "whenAvailable"},
+        {"startAtOperationTime": Timestamp(5, 1), "showExpandedEvents": True},
+    ],
+    ids=str,
+)
+def test_a_change_stream(servers: Any, spec: dict) -> None:
+    """A change stream's shape fills in mongod's defaults, and the operation
+    time it starts at."""
+    pipeline = [{"$changeStream": spec}, {"$match": {"operationType": "insert"}}]
+    _check(servers, SON([("aggregate", "c"), ("pipeline", pipeline), ("cursor", {})]))
+
+
+def test_a_change_stream_resumed(servers: Any) -> None:
+    """A resume token's representative is the high-water mark at
+    `Timestamp(0, 0)`, under the key it was given. Each server resumes from
+    a token of its own."""
+    tokens = []
+    for client in servers:
+        stream = client[_DB].c.watch()
+        client[_DB].c.insert_one({"_id": "resume", "x": 0})
+        stream.try_next()
+        tokens.append(stream.resume_token)
+        stream.close()
+        client[_DB].c.delete_one({"_id": "resume"})
+    for key in ("resumeAfter", "startAfter"):
+        hashes = []
+        for client, token in zip(servers, tokens, strict=True):
+            command = SON(
+                [
+                    ("aggregate", "c"),
+                    ("pipeline", [{"$changeStream": {key: token}}]),
+                    ("cursor", {}),
+                ]
+            )
+            reply = client[_DB].command("explain", command, verbosity="queryPlanner")
+            hashes.append(reply.get("queryShapeHash"))
+        assert hashes[1], f"mongod printed no queryShapeHash for {key}"
+        assert hashes[0] == hashes[1], key
 
 
 @pytest.mark.parametrize("key,query", DISTINCTS, ids=[str(d) for d in DISTINCTS])
