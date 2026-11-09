@@ -2075,15 +2075,28 @@ What is left, all on the RUST MongoDB server:
       same index and lists none (found 2026-10-25).
       Backlog-ID: RM-310
       Verify: tests/backlog/test_rm_found_2026_10_25.py::test_explain_lists_the_distinct_scans_a_group_tried
-- [ ] **`explain` leaves a `$match` on a `$group`'s key behind the
-      group.** mongod 8.2.11 moves `[{$group: {_id: "$x", ...}}, {$match:
-      {_id: {$gt: 1}}}]`'s `$match` ahead of the group, onto `x` (and
-      `{_id: {k: "$x"}}`'s `_id.k` onto `x`), so the query reads it: the
-      DISTINCT_SCAN's bounds are `(1, inf]`. One on an accumulator stays
-      behind. This server lists the `$match` after the group and scans
-      every key; the documents are the same (found 2026-10-25).
-      Backlog-ID: RM-311
-      Verify: tests/backlog/test_rm_found_2026_10_25.py::test_explain_moves_a_match_on_the_group_key_ahead_of_the_group
+- [ ] **`explain` lists a `$match` after the cursor with its clauses
+      sorted.** mongod 8.2.11 lists a `$match` stage it does not move into
+      the query (behind a `$group` or a `$limit`) with its clauses in the
+      order they were written, and an `$expr`'s `$_internalExprEq` ahead of
+      the `$expr`: `[{$limit: 3}, {$match: {x: {$exists: true}, y: 1}}]`
+      lists `$and: [{x: {$exists: true}}, {y: {$eq: 1}}]`. This server
+      lists the clauses in the order mongod gives only the query's
+      `parsedQuery` (`MatchExpression::sortTree`): `y` first, and the
+      `$expr` before its `$_internalExprEq`. The documents are the same.
+      Found 2026-11-09 working RM-311.
+      Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
+      Backlog-ID: RM-444
+- [ ] **`explain` calls a renaming projection `PROJECTION_SIMPLE`.**
+      mongod 8.2.11 explains `[{$project: {w: "$x"}}]`'s projection as
+      `PROJECTION_DEFAULT`, with or without a `$match` moved ahead of it: a
+      field computed from a path is no inclusion. This server's
+      `projection_name` (`explain/plan.rs`) calls a projection general only
+      when a field is dotted or its value a document or array, so a string
+      value is `PROJECTION_SIMPLE`. The documents are the same. Found
+      2026-11-09 working RM-311.
+      Verify: tests/backlog/test_rm_found_2026_11_09.py::test_a_renaming_projection_is_projection_default
+      Backlog-ID: RM-445
 - [ ] **A blocking sort keeps equal documents in the order it read them;
       mongod's sort does not.** Over 200 documents in runs of equal keys,
       mongod 8.2.11's `find().sort({s: 1})` and `$sort` (with a collation

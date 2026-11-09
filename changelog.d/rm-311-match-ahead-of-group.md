@@ -1,0 +1,10 @@
+### A `$match` on a group's key now runs before the group, as on mongod
+
+A `$match` that filters on the key a `$group` just made, such as `[{$group: {_id: "$x", ...}}, {$match: {_id: {$gt: 1}}}]`, now moves ahead of the group onto the field the key came from. The query and its index read it first, as mongod 8.2 does, rather than grouping every document and filtering the groups afterwards. A document key moves its fields the same way (`_id.k` reads `k`'s field). A filter on an accumulator, a dotted key such as `"$a.b"`, or a computed key stays behind the group. The Rust MongoDB server follows mongod's own rule: a `$type` on the key, or an `$exists` on a key of one field, keeps the whole `$match` behind the group.
+
+Splitting a `$match` ahead of any stage now follows mongod too. An `$and` splits clause by clause and a `$nor` by its wholly movable children, while an `$or` or `$expr` moves whole, renamed. This applies ahead of `$project`, `$addFields` and `$set` as well. Before, a `$match` behind a renaming `$project` left an `$or` or `$expr` on the renamed field behind, and one behind an `$addFields` kept a whole `$and` back when only part of it read the new field. The documents returned do not change. `explain` and the plan that reads the collection now match mongod's.
+
+#### Fixed
+
+- `secantus-commands` `explain/hoist.rs`: `hoist_matches` moves a `$match` ahead of a `$group` onto the fields its key renames (mongod 8.2 `DocumentSourceGroupBase::getModifiedPaths`, `groupMatchSwapVerified`). It splits `$and` / `$nor` and renames inside `$or`, `$nor`, `$and` and `$expr` (`splitMatchExpressionByFunction`, `applyRenamesToExpression`). The executor and `explain` share it. Fixes RM-311 (tests/backlog/test_rm_found_2026_10_25.py::test_explain_moves_a_match_on_the_group_key_ahead_of_the_group); regression tests `tests/mongod_live/test_group_match_pushdown.py`.
+- Filed RM-444 (a `$match` listed after the cursor sorts its clauses; mongod keeps them as written) and RM-445 (a renaming `$project` is `PROJECTION_DEFAULT` on mongod), with gap tests in `tests/backlog/test_rm_found_2026_11_09.py`.

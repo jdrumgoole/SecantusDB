@@ -357,13 +357,14 @@ _MATCH_AFTER_GROUP = {
 }
 
 
-@pytest.mark.backlog("RM-311")
+@pytest.mark.backlog_fixed("RM-311")
 def test_explain_moves_a_match_on_the_group_key_ahead_of_the_group(
     rust_mongo: Any, mongod: Any
 ) -> None:
-    """mongod 8.2.11 moves a `$match` on a `$group`'s `_id` ahead of the
-    group, onto the field the key is, so the query reads it; one on an
-    accumulator stays behind."""
+    """mongod 8.2.11 moved a `$match` on a `$group`'s `_id` ahead of the
+    group, onto the field the key was, so the query read it; one on an
+    accumulator stayed behind. This server listed it after the group until
+    RM-311 was fixed."""
 
     def read(client: Any) -> dict:
         planners = _distinct_group_planners(client, _MATCH_AFTER_GROUP)
