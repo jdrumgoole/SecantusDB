@@ -138,3 +138,8 @@ def test_postgres_server_tests_run_only_when_its_answers_can_change() -> None:
     assert not g.is_pg_server_test("tests/test_crash_recovery.py")
     assert not g.pg_needed(["crates/secantus-commands/src/crud.rs", "changelog.d/x.md"])
     assert g.pg_needed(["crates/secantus-core/src/lib.rs"])
+
+
+def test_the_gate_checks_the_backlog_ids_it_adds() -> None:
+    text = (ROOT / "scripts/gate_rm.py").read_text()
+    assert '"check-ids", "--file", "backlog-rust-mongodb.md"' in text
