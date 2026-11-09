@@ -150,3 +150,43 @@ required-features = ["bin"]
 [profile.release]
 lto = "fat"
 codegen-units = 1
+
+# The debug build that the tests, the gauges and CI's pg-oracle shards run,
+# with the code the server spends its time in optimised. Measured 2026-11-09
+# on this Mac, at the same tree, with only our own crates rebuilt (what CI
+# compiles on a cache hit), at -n 4:
+#
+#   profile                                  compile  328 tests  backlog shard
+#   debug (before)                              50 s      292 s          546 s
+#   third-party crates at opt-level 2           48 s      212 s          340 s
+#   ... and our runtime crates at opt-level 1   72 s      170 s          252 s  <- this
+#   every crate at opt-level 1                 207 s      160 s          163 s
+#
+# (328 tests: the corpora, the rule trees and the builtin coverage.)
+# The two planner/server crates are 325k of our 458k lines and most of the
+# compile, so they stay at opt-level 0. `debug-assertions` and
+# `overflow-checks` stay on everywhere: a per-package opt-level changes
+# neither, so the tests still trap what a debug build traps.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.secantus-core]
+opt-level = 1
+
+[profile.dev.package.secantus-storage]
+opt-level = 1
+
+[profile.dev.package.secantus-wt]
+opt-level = 1
+
+[profile.dev.package.secantus-pgwire]
+opt-level = 1
+
+[profile.dev.package.secantus-pgcatalog]
+opt-level = 1
+
+[profile.dev.package.secantus-auth]
+opt-level = 1
+
+[profile.dev.package.secantus-pgplan]
+opt-level = 0
