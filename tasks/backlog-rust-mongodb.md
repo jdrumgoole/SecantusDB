@@ -2561,25 +2561,6 @@ dropped (four), and `listIndexes` lists by name.
   whatever the cause.
   Backlog-ID: RM-443
   Verify: none -- intermittent, not reproduced; tooling (the batch lander), no server behaviour
-- [ ] **NOT REPRODUCED -- left open as a watch item. A crash-recovery
-  test read at an acknowledged commit's time 16 minutes before its own
-  run (2026-11-07).** `test_crash_recovery.py::test_hard_kill_mid_transactions_keeps_every_acked_commit_and_its_history`
-  failed once, in a local `gate_rm.py` run under load: after the hard kill
-  and replay, a snapshot read at the first ack's cluster time,
-  `Timestamp(1794087900, 63)` (21:45:00 UTC), was refused as older than the
-  oldest timestamp, while the reopened server's own cluster time was
-  22:01:13. Every ack should be seconds old: `mint_ts` mints from the wall
-  clock, and the reopened store keeps 300 s of history. So either the
-  test's `acks.txt` was not this run's (the writer appends to it) or the
-  writer's server minted a stale timestamp. mongod 8.2.11 keeps snapshot
-  history across `kill -9` and a 1 s checkpoint cadence (probed
-  2026-11-07), so the test's expectation is right. Not reproduced: 8
-  serial and 20 four-way-parallel runs passed, and so did a variant that
-  spans several checkpoints. The test now asserts the ack file is fresh
-  and every ack falls inside the run's wall-clock window, so the next
-  failure names which cause it was.
-  Backlog-ID: RM-401
-  Verify: none -- intermittent, not reproduced; the test's new checks capture the cause on the next occurrence
 - [ ] **NOT REPRODUCED -- left open as a watch item. `test_tmp_retention_guard.py::test_default_tmp_retention_policy_is_allowed`
   timed out ONCE (2026-09-30).** It passed in every full-suite run of the
   2026-10-07 batch (14,500+ tests under `-n auto`). Its nested collect-only pytest hit the 300s
