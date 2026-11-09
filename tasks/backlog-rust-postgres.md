@@ -3221,7 +3221,11 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       cancel per 30 at 0.256-0.276 s on both. So some planning pass still
       runs a stretch that does not look for a cancel, as the rewrite
       passes did before RP-202; find which one by sampling the server when
-      a cancel is late.
+      a cancel is late. The tail reaches further under load: on the RP-733
+      branch (lane pg-batch-2, debug build) the whole file's run had the
+      cancel 0.62 s and 0.72 s late in two of three runs at a load average
+      of about 16, then passed ten runs at loads of 11 and 23, four of them
+      on a build of `aae69552`, before RP-733.
       Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
       Backlog-ID: RP-735
 
@@ -3267,25 +3271,27 @@ statement is VALUES-only and runs there as written.
       Verify: tests/backlog/test_rp_found_rp730.py::test_select_list_is_computed_before_the_sort
       Backlog-ID: RP-732
 
-## Found while working RP-722 (2026-11-09)
+## Found while working RP-733 (2026-11-09)
 
-Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
-`_SETUP` in `tests/backlog/test_rp_found_rp722.py`: `x722(k int, a text[])`
-holding `'{ab}'`, `'{cd,ab}'` and `'[0:1]={x,y}'`.
+Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
+`_SHAPES` in `tests/backlog/test_rp_found_rp722.py`: `x733(k int, a text[],
+b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
+`'[2:3]={1,2}'`, NULL and `'{NULL}'`.
 
-- [ ] **A WHERE range filter over an array column misses an array whose
-      lower bound is not 1.** `select a from x722 where a > '{b}'` is
-      `{cd,ab}` and `[0:1]={x,y}` on PostgreSQL 15.19 (`array_gt` is
-      `array_cmp`: the elements first, the bounds last); here only
-      `{cd,ab}`. `>=` and `BETWEEN` miss it the same way; `=` against
-      `'[0:1]={x,y}'` finds it. The sort over such a column is right since
-      RP-722.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_a_range_filter_finds_an_array_whose_lower_bound_is_not_1
-      Backlog-ID: RP-733
-- [ ] **An array column compared with an untyped literal in the select list
-      is 42883.** `select k, a > '{b}' from x722` answers per row on
-      PostgreSQL 15.19, the literal read as `text[]` as it is in a WHERE;
-      here it is 42883 `operator does not exist: text[] > text`, as is
-      `a = '{x,y}'`.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_an_untyped_literal_in_the_select_list
-      Backlog-ID: RP-734
+- [ ] **`IS NULL` over an array column matches an array holding a NULL
+      element.** `select k from x733 where b is null` is only the row whose
+      `b` is NULL on PostgreSQL 15.19; here it is also `{NULL,1}` and
+      `{NULL}`, and `IS NOT NULL` (`NOT (b IS NULL)`, `ISNULL` the same)
+      drops them. The null test lowers to the MQL `{b: null}`, which also
+      matches an array with a NULL element; `IS NOT DISTINCT FROM NULL` is
+      right since RP-733 took it per row.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
+      Backlog-ID: RP-739
+- [ ] **`a = ANY (array of arrays)` over an array column answers rows.**
+      `select k from x733 where a = any (array['{x,y}'::text[]])` is 42883
+      `operator does not exist: text[] = text` on PostgreSQL 15.19 (the
+      ARRAY constructor over `text[]` is a two-dimensional `text[]`, so ANY
+      compares `text[]` with `text`); here it answers the rows `a = '{x,y}'`
+      would, through the MQL filter.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_any_of_an_array_of_arrays
+      Backlog-ID: RP-740

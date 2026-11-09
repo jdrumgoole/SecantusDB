@@ -3613,6 +3613,14 @@ pub struct ExplainOptions {
     /// those conjuncts, as `clauselist_selectivity` reads it (RP-404).
     /// `None` for any other WHERE.
     pub scan_expr_quals: Option<Vec<ExprQual>>,
+    /// A single-relation statement whose WHERE compares an array column
+    /// with a constant: the WHERE's conjuncts lowered as though those
+    /// comparisons were filters, and whether every conjunct lowered
+    /// (RP-733). The comparisons run per row, by `array_cmp`, which no
+    /// filter expresses; PostgreSQL estimates them by `eqsel` /
+    /// `scalarineqsel` over the column's statistics, which is what the
+    /// estimate of such a filter reads. `None` for any other WHERE.
+    pub scan_array_cmp_filter: Option<(Document, bool)>,
     /// Each JOIN's ON condition, post-order, as its join node prints it.
     pub join_conds: Vec<String>,
     /// Each of `join_conds` as a hash or merge join prints it when the ON
@@ -10642,6 +10650,7 @@ fn plan_explain(
         scan_array_quals: None,
         scan_patterns: Vec::new(),
         scan_expr_quals: None,
+        scan_array_cmp_filter: None,
         setop_quals: Vec::new(),
         join_conds: Vec::new(),
         join_cond_splits: Vec::new(),
@@ -10731,7 +10740,13 @@ fn plan_explain(
     options.scan_in_lengths = explain_scan_in_lengths(&query, lookup).unwrap_or_default();
     options.scan_array_quals = explain_scan_array_quals(&query, lookup);
     options.scan_patterns = explain_scan_patterns(&query, lookup).unwrap_or_default();
-    options.scan_expr_quals = explain_scan_expr_quals(&query, lookup);
+    options.scan_array_cmp_filter = explain_scan_array_cmp_filter(&query, lookup);
+    // A comparison of an array column with a constant is estimated from
+    // `scan_array_cmp_filter`, so it is not an expression's conjunct here.
+    options.scan_expr_quals = {
+        let _filters = ArrayCompareAsFilter::set();
+        explain_scan_expr_quals(&query, lookup)
+    };
     let setop_quals = explain_setop_quals(&query, lookup).unwrap_or_default();
     options.subquery_quals = explain_subquery_quals(&query, lookup).unwrap_or_default();
     let mut join_cond_splits = Vec::new();
@@ -40628,9 +40643,17 @@ fn coerce_unknown_operand(
         v if op != "||" && is_numeric(v) => {
             Some(cast_value(Bson::String(text.clone()), "numeric")?)
         }
-        // An array literal takes the element type from the array beside it.
-        Bson::Array(items) => {
-            let element = items.first().map(inferred_type).unwrap_or("text");
+        // An array literal takes the element type from the array beside it
+        // -- one whose lower bound is not 1 (held as a tagged document)
+        // included: beside `'[0:1]={x,y}'::text[]` an unknown is `text[]`
+        // too, where it was left a string and every comparison over a
+        // column holding such an array was 42883 (RP-734). Its first
+        // element that is not NULL types it (a NULL says nothing).
+        v if matches!(v, Bson::Array(_)) || arrays::is_bounded(v) => {
+            let element = arrays::flatten(v)
+                .iter()
+                .find(|x| **x != Bson::Null)
+                .map_or("text", inferred_type);
             Some(cast_value(
                 Bson::String(text.clone()),
                 &format!("{element}[]"),
@@ -46828,6 +46851,77 @@ fn type_is_rowtype(t: &str) -> bool {
     t.eq_ignore_ascii_case("record") || user_composite(t).is_some()
 }
 
+/// `Unsupported` for an array column under `=`, `<>`, `<`, `<=`, `>`,
+/// `>=`, BETWEEN, IN or IS DISTINCT FROM, which the filter cannot express:
+/// PostgreSQL compares two arrays by `array_eq` / `array_cmp`
+/// (arrayfuncs.c) -- the elements in row-major order whatever the shapes,
+/// a NULL element after every other, then the counts, the dimensions and
+/// last the lower bounds. MQL compares a stored array as a nested BSON
+/// array and ALSO matches one whose element equals the operand, so `a =
+/// '{x,y}'` found `{{x,y},{z,w}}`, a NULL element sorted first, and an
+/// array whose lower bound is not 1 (held as a tagged document) fell in no
+/// range at all (RP-733). Evaluated per row it compares as `array_cmp`.
+fn array_compare_is_per_row(def: &TableDef, field: &str) -> Result<()> {
+    if ARRAY_COMPARE_AS_FILTER.with(std::cell::Cell::get) {
+        return Ok(());
+    }
+    match field_type(def, field) {
+        Some(t) if t.ends_with("[]") => Err(Error::Unsupported(
+            "an array column compared with a constant".into(),
+        )),
+        _ => Ok(()),
+    }
+}
+
+thread_local! {
+    /// Set while EXPLAIN lowers a WHERE for its estimate only: an array
+    /// column's comparison with a constant lowers to the filter the
+    /// estimate reads, though the statement runs it per row (RP-733).
+    static ARRAY_COMPARE_AS_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `ARRAY_COMPARE_AS_FILTER` for as long as the guard lives.
+struct ArrayCompareAsFilter(bool);
+
+impl ArrayCompareAsFilter {
+    fn set() -> Self {
+        Self(ARRAY_COMPARE_AS_FILTER.with(|f| f.replace(true)))
+    }
+}
+
+impl Drop for ArrayCompareAsFilter {
+    fn drop(&mut self) {
+        ARRAY_COMPARE_AS_FILTER.with(|f| f.set(self.0));
+    }
+}
+
+/// A single-relation statement's WHERE lowered for its estimate, an array
+/// column's comparisons with constants as filters
+/// (`ExplainOptions::scan_array_cmp_filter`): the filter, and whether
+/// every conjunct lowered. `None` where the WHERE lowers without them, or
+/// no conjunct does.
+fn explain_scan_array_cmp_filter(
+    query: &N,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<(Document, bool)> {
+    let (table, where_clause) = explain_scan_where(query)?;
+    let def = lookup(&table)?;
+    if def.columns.iter().all(|c| !c.pg_type.ends_with("[]")) {
+        return None;
+    }
+    if lower_where_nonvolatile(where_clause, &def, &[]).is_ok() {
+        return None;
+    }
+    let _filters = ArrayCompareAsFilter::set();
+    match lower_where_nonvolatile(where_clause, &def, &[]) {
+        Ok(filter) => Some((filter, true)),
+        Err(Error::Unsupported(_)) => {
+            split_lowerable_conjuncts(where_clause, &def, &[]).map(|(filter, _)| (filter, false))
+        }
+        Err(_) => None,
+    }
+}
+
 /// A filter that matches nothing. `{}` matches every document, so NOR of it
 /// matches none -- which is what `x NOT IN (.., NULL)` must answer.
 fn match_nothing() -> Document {
@@ -47466,6 +47560,9 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     if value == Bson::Null {
         return Ok(match_nothing());
     }
+    if op_to_mql(op).is_some() {
+        array_compare_is_per_row(def, &field)?;
+    }
     // A `date` column against a timestamp: the date is PROMOTED to midnight.
     if field_type(def, &field) == Some("date") && is_instant(&value) {
         let zoned = e
@@ -47678,6 +47775,9 @@ fn lower_distinct(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document
     if field_type(def, &field) == Some("jsonb") {
         return Err(Error::Unsupported("a jsonb comparison".into()));
     }
+    // Against NULL too: `{a: null}` also matches an array holding a NULL
+    // element, which IS DISTINCT FROM NULL.
+    array_compare_is_per_row(def, &field)?;
     if value == Bson::Null {
         return Ok(if not_distinct {
             doc! { field: Bson::Null }
@@ -47957,6 +48057,7 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     composite_compare_is_per_row(e, def, params)?;
     let negated = in_is_negated(e);
     let field = column_field(e.lexpr.as_deref(), def)?;
+    array_compare_is_per_row(def, &field)?;
     let items = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
         Some(N::List(l)) => &l.items,
         _ => return Err(Error::Unsupported("this IN list".into())),
@@ -48082,6 +48183,7 @@ fn comparison_operand(
 fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     composite_compare_is_per_row(e, def, params)?;
     let field = column_field(e.lexpr.as_deref(), def)?;
+    array_compare_is_per_row(def, &field)?;
     let bounds = match e.rexpr.as_ref().and_then(|r| r.node.as_ref()) {
         Some(N::List(l)) if l.items.len() == 2 => &l.items,
         _ => return Err(Error::Unsupported("this BETWEEN form".into())),

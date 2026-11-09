@@ -4939,6 +4939,90 @@ fn sorts_order_arrays_by_array_cmp() {
     );
 }
 
+/// RP-733: an array column compared with a constant is evaluated per row,
+/// by `array_cmp`, never as an MQL filter: MQL also matches an array whose
+/// ELEMENT equals the operand (`a = '{x,y}'` found `{{x,y},{z,w}}`), sorts a
+/// NULL element first, and puts an array whose lower bound is not 1 (a
+/// tagged document) in no range. A scalar column's comparison stays a
+/// filter.
+#[test]
+fn array_column_against_a_constant_is_per_row() {
+    let def = || {
+        TableDef::new(
+            "ta",
+            vec![
+                Column::new("k", "int4", false),
+                Column::new("a", "text[]", true),
+                Column::new("b", "int4[]", true),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "ta").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select k from ta where a = '{x,y}'",
+        "select k from ta where a <> '{x,y}'",
+        "select k from ta where a > '{b}'",
+        "select k from ta where a >= '{b}'::text[]",
+        "select k from ta where '{b}' < a",
+        "select k from ta where b <= array[1, 2]",
+        "select k from ta where a between '{b}' and '{y}'",
+        "select k from ta where a not between '{b}' and '{y}'",
+        "select k from ta where a in ('{x,y}', '{x}')",
+        "select k from ta where a not in ('{x,y}')",
+        "select k from ta where a is distinct from '{x,y}'",
+        "select k from ta where a is not distinct from null",
+        "select k from ta where a > '{b}' and k > 0",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    for sql in [
+        "select k from ta where k = 1",
+        "select k from ta where k between 1 and 2",
+        "select k from ta where a = null",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(!residual, "{sql} stays a filter: {filter:?}");
+    }
+}
+
+/// RP-734: an untyped literal beside an array is read as that array type
+/// -- beside one whose lower bound is not 1 too, where it was left a string
+/// and the comparison was 42883 -- its element type from the first element
+/// that is not NULL. Each answer was measured on PostgreSQL 15.19.
+#[test]
+fn an_unknown_beside_an_array_is_its_array_type() {
+    let value = |sql: &str| {
+        let parsed = pg_query::parse(&format!("select {sql}")).expect(sql);
+        let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+            .stmt
+            .as_ref()
+            .and_then(|n| n.node.as_ref())
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let Some(N::ResTarget(t)) = s.target_list[0].node.as_ref() else {
+            panic!("no target: {sql}");
+        };
+        const_value(t.val.as_deref().expect(sql), &[])
+    };
+    for (sql, want) in [
+        ("'[0:1]={x,y}'::text[] > '{b}'", true),
+        ("'{b}' < '[0:1]={x,y}'::text[]", true),
+        ("'[0:1]={x,y}'::text[] = '{x,y}'", false),
+        ("'[0:1]={x,y}'::text[] = '[0:1]={x,y}'", true),
+        ("'[0:1]={x,y}'::text[] < '{x}'", false),
+        ("'{NULL,2}'::int[] > '{NULL,1}'", true),
+        ("'[2:3]={NULL,2}'::int[] > '{NULL,1}'", true),
+    ] {
+        assert_eq!(value(sql), Ok(Bson::Boolean(want)), "{sql}");
+    }
+}
+
 /// RP-551: a domain's values are coerced to its base type at the base's
 /// modifier, `getBaseTypeAndTypmod`'s, through a domain over a domain too
 /// (`dc3n` over `dc3 char(3)` is a width-3 `bpchar`, though its own

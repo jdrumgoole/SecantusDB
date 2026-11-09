@@ -10,13 +10,26 @@ compared equal, so an ORDER BY -- a GROUP BY's, a DISTINCT's, a plain one,
 ASC or DESC -- over a column holding both came out scrambled. A plain array
 of two dimensions was compared row by row, not element by element.
 
-Found while working it (each a gap test below):
+Found while working it, and since fixed:
 
-- a WHERE range filter over an array column (`a > '{b}'`, `>=`,
-  `BETWEEN`) misses a row whose lower bound is not 1 (RP-733);
+- a WHERE comparison of an array column with a constant (`a > '{b}'`,
+  `=`, `<>`, BETWEEN, IN, IS DISTINCT FROM) was an MQL filter, which
+  missed a row whose lower bound is not 1, matched a two-dimensional array
+  holding the operand as a row (`a = '{x,y}'` found `{{x,y},{z,w}}`) and
+  sorted a NULL element first; it is evaluated per row by `array_cmp` now
+  (RP-733);
 - an array column compared with an untyped literal in the select list
-  (`select a > '{b}' from t`) is 42883 `operator does not exist: text[] >
-  text`, where PostgreSQL reads the literal as `text[]` (RP-734).
+  (`select a > '{b}' from t`) was 42883 `operator does not exist: text[] >
+  text` once a row held an array whose lower bound is not 1; the literal is
+  read as the column's array type now, as PostgreSQL does (RP-734).
+
+Found while working those (each a gap test below):
+
+- `a IS NULL` over an array column matches an array holding a NULL
+  element (RP-739);
+- `a = any (array['{x,y}'::text[]])` over a `text[]` column answers rows
+  where PostgreSQL resolves `text[] = text` and refuses it, 42883
+  (RP-740).
 
 The VALUES-only answers were measured on PostgreSQL 15.19 (the shared
 reference on port 5415). The ones over `x722` were measured on a private,
@@ -138,7 +151,7 @@ def test_a_stored_array_column_sorts_by_array_cmp(query: str, rows: list, dsn: s
     assert _answer(dsn, query) == rows
 
 
-@pytest.mark.backlog("RP-733")
+@pytest.mark.backlog_fixed("RP-733")
 @pytest.mark.parametrize(
     ("where", "rows"),
     [
@@ -153,14 +166,15 @@ def test_a_stored_array_column_sorts_by_array_cmp(query: str, rows: list, dsn: s
 def test_a_range_filter_finds_an_array_whose_lower_bound_is_not_1(
     where: str, rows: list, dsn: str
 ) -> None:
-    """`array_gt` and its kin compare by `array_cmp`, the bounds last."""
+    """`array_gt` and its kin compared by `array_cmp`, the bounds last, once
+    the comparison was taken off the MQL filter."""
     query = f"select a::text t from x722 where {where} order by k"
     assert _answer(dsn, query) == [(r,) for r in rows]
 
 
-@pytest.mark.backlog("RP-734")
+@pytest.mark.backlog_fixed("RP-734")
 def test_an_array_column_against_an_untyped_literal_in_the_select_list(dsn: str) -> None:
-    """The literal is read as the column's array type, as in a WHERE."""
+    """The literal was read as the column's array type, as in a WHERE."""
     assert _answer(dsn, "select k, a > '{b}' from x722 order by k") == [
         (1, False),
         (2, True),
@@ -171,3 +185,94 @@ def test_an_array_column_against_an_untyped_literal_in_the_select_list(dsn: str)
         (2, False, True),
         (5, False, False),
     ]
+
+
+# Measured on PostgreSQL 15.19 (the shared reference on port 5415) over the
+# same rows.
+_SHAPES = [
+    "drop table if exists x733",
+    "create table x733 (k int primary key, a text[], b int[])",
+    "insert into x733 values (1, '{{x,y},{z,w}}', '{}'), (2, '{x,NULL}', '{NULL,1}'),"
+    " (3, '{x}', '{1,2}'), (4, '{{a,b}}', '{{1,2},{3,4}}'), (5, '[0:1]={x,y}', '[2:3]={1,2}'),"
+    " (6, '{x,y}', null), (7, null, '{NULL}')",
+]
+
+
+@pytest.fixture(scope="module")
+def shapes(dsn: str) -> Iterator[str]:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SHAPES:
+            c.execute(q)
+    yield dsn
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute(_SHAPES[0])
+
+
+@pytest.mark.backlog_fixed("RP-733")
+@pytest.mark.parametrize(
+    ("where", "keys"),
+    [
+        ("a = '{x,y}'", [6]),
+        ("a <> '{x,y}'", [1, 2, 3, 4, 5]),
+        ("a > '{b}'", [1, 2, 3, 5, 6]),
+        ("a >= '{x,y}'", [1, 2, 6]),
+        ("a <= '{x,z}'", [1, 3, 4, 5, 6]),
+        ("a between '{b}' and '{x,z}'", [1, 3, 5, 6]),
+        ("a not between '{b}' and '{x,z}'", [2, 4]),
+        ("a in ('{x,y}', '{x}')", [3, 6]),
+        ("a not in ('{x,y}', '{x}')", [1, 2, 4, 5]),
+        ("a is distinct from '{x,y}'", [1, 2, 3, 4, 5, 7]),
+        ("a is not distinct from '{x,y}'", [6]),
+        ("a is not distinct from null", [7]),
+        ("a = array['x', 'y']", [6]),
+        ("a > '{x}' and k > 0", [1, 2, 5, 6]),
+        ("b > '{1}'", [2, 3, 4, 5, 7]),
+        ("b < '{1}'", [1]),
+        ("b = '{}'", [1]),
+        ("b > '{NULL,0}'", [2]),
+        ("b >= '{1,2}'", [2, 3, 4, 5, 7]),
+    ],
+)
+def test_an_array_column_compares_by_array_cmp(where: str, keys: list, shapes: str) -> None:
+    """Every comparison of an array column with a constant: two dimensions
+    element by element, a NULL element after every value, the bounds last."""
+    assert _answer(shapes, f"select k from x733 where {where} order by k") == [(k,) for k in keys]
+
+
+@pytest.mark.backlog_fixed("RP-733")
+def test_a_write_filters_an_array_column_by_array_cmp(shapes: str) -> None:
+    with psycopg.connect(shapes) as c:
+        try:
+            assert c.execute("update x733 set k = k + 100 where b >= '{1,2}'").rowcount == 5
+            assert c.execute("delete from x733 where a > '{x}'").rowcount == 4
+            left = c.execute("select k from x733 order by k").fetchall()
+        finally:
+            c.rollback()
+    assert left == [(103,), (104,), (107,)]
+
+
+@pytest.mark.backlog("RP-739")
+@pytest.mark.parametrize(
+    ("where", "keys"),
+    [
+        ("b is null", [6]),
+        ("b is not null", [1, 2, 3, 4, 5, 7]),
+        ("b isnull", [6]),
+        ("not (b is null)", [1, 2, 3, 4, 5, 7]),
+    ],
+)
+def test_a_null_test_over_an_array_column_reads_the_array(
+    where: str, keys: list, shapes: str
+) -> None:
+    """An array holding a NULL element is not NULL (`{NULL,1}`, `{NULL}`)."""
+    assert _answer(shapes, f"select k from x733 where {where} order by k") == [(k,) for k in keys]
+
+
+@pytest.mark.backlog("RP-740")
+def test_an_array_column_against_any_of_an_array_of_arrays(shapes: str) -> None:
+    """`array['{x,y}'::text[]]` is a `text[]`, so ANY compares `text[]` with
+    `text`, which has no operator."""
+    assert _answer(shapes, "select k from x733 where a = any (array['{x,y}'::text[]])") == (
+        "42883",
+        "operator does not exist: text[] = text",
+    )

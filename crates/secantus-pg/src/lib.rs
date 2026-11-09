@@ -42518,7 +42518,18 @@ impl PgHandler {
                             .scan_expr_quals
                             .as_deref()
                             .filter(|_| sel.residual.is_some() && array_quals.is_none());
-                        if (sel.residual.is_none() || array_quals.is_some() || expr_quals.is_some())
+                        // An array column's comparison with a constant runs
+                        // per row too, by `array_cmp`, and is estimated as
+                        // the filter it would be (RP-733).
+                        let array_cmp = options
+                            .scan_array_cmp_filter
+                            .as_ref()
+                            .filter(|_| sel.residual.is_some() && array_quals.is_none());
+                        let scan_filter = array_cmp.map_or(&sel.filter, |(f, _)| f);
+                        if (sel.residual.is_none()
+                            || array_quals.is_some()
+                            || expr_quals.is_some()
+                            || array_cmp.is_some_and(|(_, whole)| *whole))
                             && sel.sub.is_none()
                             && sel.series.is_none()
                             && sel.join.is_none()
@@ -42539,7 +42550,7 @@ impl PgHandler {
                                         (None, Some(exprs)) => (
                                             self.residual_scan_estimate(
                                                 &sel.table,
-                                                &sel.filter,
+                                                scan_filter,
                                                 exprs,
                                                 &fields,
                                                 &scan_estimate::computed_reads(sel),
@@ -42550,7 +42561,7 @@ impl PgHandler {
                                         // towards an index-only scan (RP-378).
                                         (None, None) => self.scan_estimate_reading(
                                             &sel.table,
-                                            &sel.filter,
+                                            scan_filter,
                                             &fields,
                                             &scan_estimate::computed_reads(sel),
                                         )?,
