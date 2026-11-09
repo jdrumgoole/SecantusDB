@@ -17,7 +17,7 @@ pub mod acl;
 mod agg_hoist;
 mod agg_support;
 mod domain_scope;
-pub use domain_scope::select_target_domain;
+pub use domain_scope::{select_output_domains, select_target_domain};
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;

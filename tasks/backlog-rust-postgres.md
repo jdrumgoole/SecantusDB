@@ -2509,16 +2509,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp687.py`: `dcc687` a `varchar(3)` with
 `check (value <> 'no')`, `dvv687` a domain over it.
 
-- [ ] **`SELECT ... INTO` a scalar variable truncates an overlong value and
-      skips its domain's CHECK.** `declare x varchar(3); begin select
-      'abcdef' into x;` is 22001 on PostgreSQL 15.19 (`exec_move_row`
-      assigns each column with `exec_assign_value`, the assignment rule),
-      and `select 'no' into x` for an `x dcc687` is the domain's 23514;
-      here the first stores `abc` and the second `no`. `assign_row` stores
-      the column's value as it is (`set_var`). Since RP-687 a `:=` and a
-      DEFAULT fit by the assignment rule (`eval_typed`).
-      Verify: tests/backlog/test_rp_found_rp687.py::test_select_into_variable_assigns_by_the_assignment_rule
-      Backlog-ID: RP-694
 - [ ] **An assignment to a `varchar(n)[]` variable truncates an overlong
       element.** `declare x varchar(3)[]; begin x := array['abcdef'];` is
       22001 on PostgreSQL 15.19 (the array's `ArrayCoerceExpr` applies the
@@ -2534,6 +2524,39 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Since RP-670 a trigger record's field of such a domain names it.
       Verify: tests/backlog/test_rp_found_rp687.py::test_cast_to_a_domain_over_a_domain_names_the_outer_domain
       Backlog-ID: RP-696
+
+## Found while working RP-694 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp694.py`: `dnn694` an `int` domain `not null`.
+
+- [ ] **An assignment with only an explicit cast uses it.** `declare x int;
+      begin x := true;` is 22P02 `invalid input syntax for type integer:
+      "t"` on PostgreSQL 15.19, as are `select true into x` and `x bool :=
+      5`: PL/pgSQL coerces with `COERCION_PLPGSQL`, which with no implicit
+      or assignment cast converts through the source's output and the
+      target's input (`get_cast_hashentry`). Here the explicit cast runs
+      and `x` is 1 (`t` for the `bool`). `eval_typed` and `coerce_moved`
+      both cast with `::`.
+      Verify: tests/backlog/test_rp_found_rp694.py::test_assignment_with_only_an_explicit_cast_converts_through_text
+      Backlog-ID: RP-705
+- [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
+      variable targets.** `for x in select '7'::text loop` over an `int`
+      `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
+      assign on PostgreSQL 15.19 (the grammar makes the list a row target
+      that `exec_move_row` fills); here each is 0A000 `this FOR target` /
+      `this EXECUTE INTO target ... is not supported yet`. Both read only
+      the target's `dno`, which a scalar list has none of (a plain `INTO`
+      goes through `target_datum`).
+      Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
+      Backlog-ID: RP-706
+- [ ] **A NOT NULL domain variable with no default starts NULL.** `declare
+      x dnn694; begin end` is 23502 `domain dnn694 does not allow null
+      values` on PostgreSQL 15.19 (`exec_stmt_block` assigns the NULL
+      through `exec_assign_value`); here the block runs, and a later
+      `select 5 into x` succeeds.
+      Verify: tests/backlog/test_rp_found_rp694.py::test_a_not_null_domain_variable_without_a_default_is_refused
+      Backlog-ID: RP-707
 
 ## Found while working RP-668 (2026-11-09)
 

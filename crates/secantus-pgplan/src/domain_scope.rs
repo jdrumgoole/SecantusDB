@@ -261,10 +261,20 @@ pub(crate) fn output_columns(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     ctes: &Ctes,
 ) -> Option<Columns> {
+    output_columns_with(s, lookup, ctes, &[])
+}
+
+/// [`output_columns`], with `params` the domain each parameter is of.
+fn output_columns_with(
+    s: &SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    ctes: &Ctes,
+    params: &[Option<String>],
+) -> Option<Columns> {
     if s.op != SetOperation::SetopNone as i32 {
         let ctes = with_ctes(s, lookup, ctes);
-        let left = output_columns(s.larg.as_deref()?, lookup, &ctes)?;
-        let right = output_columns(s.rarg.as_deref()?, lookup, &ctes)?;
+        let left = output_columns_with(s.larg.as_deref()?, lookup, &ctes, params)?;
+        let right = output_columns_with(s.rarg.as_deref()?, lookup, &ctes, params)?;
         if left.len() != right.len() {
             return None;
         }
@@ -279,7 +289,8 @@ pub(crate) fn output_columns(
         return None;
     }
     let ctes = with_ctes(s, lookup, ctes);
-    let scope = Scope::of_from(&s.from_clause, lookup, &ctes);
+    let mut scope = Scope::of_from(&s.from_clause, lookup, &ctes);
+    scope.params = params.to_vec();
     let mut out = Columns::new();
     for target in &s.target_list {
         let Some(N::ResTarget(rt)) = target.node.as_ref() else {
@@ -496,6 +507,38 @@ pub fn select_target_domain(
         .map(|t| domains::user_domain(t).map(|_| t.clone()))
         .collect();
     expr_domain(rt.val.as_deref()?, &scope, lookup, &ctes)
+}
+
+/// The domain each column a query's row returns is of, in order, for
+/// `exec_move_row`: a column of the domain its `INTO` variable is declared
+/// of is assigned with no coercion, as PostgreSQL's `exec_cast_value` skips
+/// one between equal types (RP-694). A parameter is of the domain `types`
+/// names. Empty when the columns are not known (not a SELECT, a VALUES
+/// list).
+pub fn select_output_domains(
+    sql: &str,
+    types: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<Option<String>> {
+    let Ok(parsed) = pg_query::parse(sql) else {
+        return Vec::new();
+    };
+    let Some(N::SelectStmt(s)) = parsed
+        .protobuf
+        .stmts
+        .first()
+        .and_then(|r| r.stmt.as_deref())
+        .and_then(|n| n.node.as_ref())
+    else {
+        return Vec::new();
+    };
+    let params: Vec<Option<String>> = types
+        .iter()
+        .map(|t| domains::user_domain(t).map(|_| t.clone()))
+        .collect();
+    output_columns_with(s, lookup, &Ctes::new(), &params)
+        .map(|columns| columns.into_iter().map(|(_, d)| d).collect())
+        .unwrap_or_default()
 }
 
 /// The domain column `i` of a subquery's row is of.

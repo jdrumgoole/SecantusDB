@@ -2119,6 +2119,11 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn output_domains(&self, sql: &str, types: &[String]) -> Vec<Option<String>> {
+        let lookup = |n: &str| self.h.lookup(n);
+        secantus_pgplan::select_output_domains(sql, types, &lookup)
+    }
+
     fn assignment_length(&self, ty: &str, sql: &str, types: &[String]) -> Option<(String, i32)> {
         let (base, typmod) = match secantus_pgplan::domains::base_type_and_typmod(ty) {
             Some((base, typmod, _)) => {

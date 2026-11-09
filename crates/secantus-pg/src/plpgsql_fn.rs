@@ -168,6 +168,14 @@ pub trait Host {
         let _ = (base, typmod);
         Ok(value)
     }
+    /// The domain each column of the query `sql` (over parameters of
+    /// `types`) is of, in order; empty when not known. A column of the
+    /// domain its `INTO` variable is of moves into it with no coercion
+    /// (RP-694).
+    fn output_domains(&self, sql: &str, types: &[String]) -> Vec<Option<String>> {
+        let _ = (sql, types);
+        Vec::new()
+    }
     /// Enter a block with EXCEPTION handlers: a subtransaction, so a caught
     /// error undoes the block's writes. Answers a token for `subtxn_end`.
     fn subtxn_begin(&self) -> Result<u64, PlError> {
@@ -1686,6 +1694,58 @@ impl Interp<'_> {
         }
     }
 
+    /// The value `exec_move_row` stores in variable `no` from a column of
+    /// type `src` (a `SELECT`, `FETCH` or `EXECUTE ... INTO`, a `FOR` over
+    /// a query): `exec_assign_value`'s coercion, the one a `:=` makes
+    /// ([`Self::eval_typed`]). No coercion when the column is of the
+    /// variable's own type and the declaration has no modifier
+    /// (`exec_cast_value` compares the types and modifiers); otherwise the
+    /// value is cast to the declared type, a length fitted by the
+    /// assignment rule -- an overlong `varchar(3)` value is 22001, not
+    /// truncated -- and a domain's constraints checked (RP-694).
+    fn coerce_moved(&self, no: usize, v: Bson, src: &str) -> Result<Bson, PlError> {
+        let Some(Datum::Var { ty, .. }) = self.datums.get(no) else {
+            return Ok(v);
+        };
+        let ty = ty.clone();
+        let unmodified_same = secantus_pgplan::declared_type_and_typmod(&ty)
+            .is_some_and(|(base, typmod)| typmod < 0 && base == src);
+        if unmodified_same || secantus_pgplan::domains::same_domain(src, &ty) {
+            return Ok(v);
+        }
+        let types = [src.to_string()];
+        let length = self.host.assignment_length(&ty, "SELECT $1", &types);
+        let read = match &length {
+            // `varbit` reads a bit string at its own length, for the fit
+            // to measure (as `eval_typed` does).
+            Some((base, _)) if base == "bit" => "varbit".to_string(),
+            Some((base, _)) => base.clone(),
+            None => sql_type(&ty),
+        };
+        let first = |out: QueryOut| {
+            out.rows
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or(Bson::Null)
+        };
+        let v = first(
+            self.host
+                .query(&format!("SELECT $1::{read}"), &[v], &types)?,
+        );
+        match length {
+            Some((base, typmod)) => {
+                let v = self.host.fit_assigned(v, &base, typmod)?;
+                Ok(first(self.host.query(
+                    &format!("SELECT $1::{}", sql_type(&ty)),
+                    &[v],
+                    std::slice::from_ref(&base),
+                )?))
+            }
+            None => Ok(v),
+        }
+    }
+
     /// The value an assignment stores in a record field of type `ty`
     /// (`exec_assign_value` over a `PLpgSQL_recfield`): the expression's
     /// value cast from its own type to the field's. A field of a domain
@@ -1780,12 +1840,25 @@ impl Interp<'_> {
         })
     }
 
+    /// `domains` names the domain each column is of, where known
+    /// ([`Host::output_domains`]). A record takes the row as it is; a
+    /// variable, or each variable of a row, is assigned its column's value
+    /// by the assignment rule ([`Self::coerce_moved`]).
     fn assign_row(
         &mut self,
         target: usize,
         columns: &[(String, String)],
         row: Option<&[Bson]>,
+        domains: &[Option<String>],
     ) -> Result<(), PlError> {
+        let source = |i: usize| -> String {
+            domains
+                .get(i)
+                .cloned()
+                .flatten()
+                .or_else(|| columns.get(i).map(|(_, t)| t.clone()))
+                .unwrap_or_else(|| "text".to_string())
+        };
         match self.datums.get(target) {
             Some(Datum::Rec { .. }) => {
                 // No row still gives the record the query's row type, every
@@ -1803,12 +1876,14 @@ impl Interp<'_> {
                 let fields = fields.clone();
                 for (i, f) in fields.iter().enumerate() {
                     let v = row.and_then(|r| r.get(i).cloned()).unwrap_or(Bson::Null);
+                    let v = self.coerce_moved(*f, v, &source(i))?;
                     self.set_var(*f, v)?;
                 }
                 Ok(())
             }
             Some(Datum::Var { .. }) => {
                 let v = row.and_then(|r| r.first().cloned()).unwrap_or(Bson::Null);
+                let v = self.coerce_moved(target, v, &source(0))?;
                 self.set_var(target, v)
             }
             _ => Err(PlError::unsupported("this INTO target")),
@@ -2200,18 +2275,20 @@ impl Interp<'_> {
                     .and_then(Value::as_u64)
                     .map(|n| n as usize)
                     .ok_or_else(|| PlError::unsupported("this FOR target"))?;
-                let out = if kind == "PLpgSQL_stmt_dynfors" {
+                let (out, domains) = if kind == "PLpgSQL_stmt_dynfors" {
                     let sql = self.dynamic_sql(body.get("query").unwrap_or(&Value::Null))?;
-                    self.host.query(&sql, &[], &[])?
+                    let out = self.host.query(&sql, &[], &[])?;
+                    (out, self.host.output_domains(&sql, &[]))
                 } else {
                     let (text, _) = expr_query(body.get("query").unwrap_or(&Value::Null))
                         .ok_or_else(|| PlError::new("XX000", "a FOR without a query"))?;
                     let (sql, params, types) = self.bind(text)?;
-                    self.host.query(&sql, &params, &types)?
+                    let out = self.host.query(&sql, &params, &types)?;
+                    (out, self.host.output_domains(&sql, &types))
                 };
                 self.set_found(!out.rows.is_empty());
                 for row in &out.rows {
-                    self.assign_row(target, &out.columns, Some(row))?;
+                    self.assign_row(target, &out.columns, Some(row), &domains)?;
                     match self.stmts(body.get("body").unwrap_or(&Value::Null))? {
                         Flow::Exit(l) if Self::label_matches(&l, label.as_deref()) => break,
                         Flow::Continue(l) if Self::label_matches(&l, label.as_deref()) => {}
@@ -2357,7 +2434,12 @@ impl Interp<'_> {
                     }
                     let target = self.target_datum(body)?;
                     let first = out.rows.first().map(|r| r.as_slice());
-                    self.assign_row(target, &out.columns, first)?;
+                    let domains = if is_query {
+                        self.host.output_domains(&sql, &types)
+                    } else {
+                        Vec::new()
+                    };
+                    self.assign_row(target, &out.columns, first, &domains)?;
                     self.set_found(!out.rows.is_empty());
                     self.row_count = out.rows.len().min(1) as u64;
                     return Ok(Flow::Next);
@@ -2395,7 +2477,8 @@ impl Interp<'_> {
                         .map(|n| n as usize)
                         .ok_or_else(|| PlError::unsupported("this EXECUTE INTO target"))?;
                     let first = out.rows.first().map(|r| r.as_slice());
-                    self.assign_row(target, &out.columns, first)?;
+                    let domains = self.host.output_domains(&sql, &types);
+                    self.assign_row(target, &out.columns, first, &domains)?;
                     self.set_found(!out.rows.is_empty());
                 } else {
                     let head = sql.trim_start().to_ascii_lowercase();
