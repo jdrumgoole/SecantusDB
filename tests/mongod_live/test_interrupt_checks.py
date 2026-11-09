@@ -255,6 +255,20 @@ def test_a_line_counts_mongods_interrupt_checks(
     assert ours == theirs, f"{label}: ours {ours}, mongod {theirs}"
 
 
+#: The scenarios whose count is a race inside mongod. A `j` write waits
+#: for the journal flusher's next round (`JournalFlusher::
+#: waitForJournalFlush`, `myFuture.get(opCtx)`), and a future already
+#: finished when it is waited on returns without a check
+#: (`SharedStateBase::wait`, 8.2.12 `future_impl.h`), where one still
+#: pending checks before it waits and when it wakes: two checks fewer when
+#: the flusher thread won. macOS mongod 8.2.11, whose journal sync takes
+#: 4-8 ms, waited in 40 runs of 40; Linux mongod 8.2.12 in CI did not, once
+#: (17 against 19, 2026-11-09). This server flushes on the request thread,
+#: so it always takes the branch that waited -- one of mongod's answers,
+#: which these scenarios look for in a few of mongod's runs.
+JOURNAL_RACE = ("insert, j", "update matching nothing, j")
+
+
 @pytest.mark.parametrize("label", list(WRITES))
 def test_a_write_line_counts_mongods_interrupt_checks(
     rust_mongo: Any, mongod_rs: Any, label: str
@@ -264,6 +278,12 @@ def test_a_write_line_counts_mongods_interrupt_checks(
     ours = _counts(rust_mongo, False, scenario)
     assert theirs, f"{label}: mongod wrote no line"
     assert all(n is not None for _, n, _ in theirs), theirs
+    if label in JOURNAL_RACE:
+        seen = [theirs]
+        while ours != seen[-1] and len(seen) < 5:
+            seen.append(_counts(mongod_rs, True, scenario))
+        assert ours in seen, f"{label}: ours {ours}, mongod's runs {seen}"
+        return
     assert ours == theirs, f"{label}: ours {ours}, mongod {theirs}"
 
 

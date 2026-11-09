@@ -492,8 +492,9 @@ fn command_shown(request: &Document) -> Document {
 }
 
 /// The attributes of one `Slow query` line. `ns` is `db.collection` for a
-/// command that names a collection and `db.$cmd` otherwise, as mongod has
-/// it; an `update` or `delete` is `db.$cmd` too, its statements' lines
+/// command that names a collection, `db.$cmd.aggregate` for an aggregate
+/// that names none, and `db.$cmd` otherwise, as mongod has it; an `update`
+/// or `delete` is `db.$cmd` too, its statements' lines
 /// naming the collection. `read` is [`read_attributes`]' part. The whole
 /// in mongod's order (`opdebug::LINE_ORDER`).
 pub fn attributes(
@@ -508,6 +509,9 @@ pub fn attributes(
     let ns = match target_collection(name, request) {
         Some(_) if matches!(name, "update" | "delete") => format!("{db}.$cmd"),
         Some(coll) => format!("{db}.{coll}"),
+        // A collectionless aggregate runs on its own namespace (measured
+        // 8.2.11, 2026-11-09).
+        None if name == "aggregate" => format!("{db}.$cmd.aggregate"),
         None => format!("{db}.$cmd"),
     };
     let mut attr = Document::new();
@@ -667,6 +671,21 @@ mod tests {
             line,
             r#"{"type":"command","ns":"a.$cmd","command":{"ping":1,"$db":"a"},"ok":0,"errMsg":"x","errName":"BadValue","errCode":2,"workingMillis":150,"durationMillis":1150}"#
         );
+    }
+
+    /// A collectionless `aggregate` names `<db>.$cmd.aggregate`, as mongod
+    /// 8.2.11's line does.
+    #[test]
+    fn a_collectionless_aggregate_names_its_own_namespace() {
+        let attr = attributes(
+            &doc! {"aggregate": 1_i32, "pipeline": [{"$documents": [{"a": 1_i32}]}], "$db": "a"},
+            &doc! {"ok": 1.0},
+            Document::new(),
+            "a",
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+        assert_eq!(attr.get_str("ns"), Ok("a.$cmd.aggregate"));
     }
 
     /// mongod 8.2.11's order for a write statement's counts, whatever order

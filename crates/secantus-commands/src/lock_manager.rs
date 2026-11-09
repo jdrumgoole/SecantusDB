@@ -1025,6 +1025,12 @@ pub fn statement_rounds(
                 d.contains_key("$out") || d.contains_key("$merge")
             })));
             if !writes {
+                // A collectionless aggregate (`aggregate: 1`: `$documents`,
+                // `$currentOp`, `$listLocalSessions`) takes no lock of its
+                // own (measured 8.2.11, 2026-11-09).
+                if collectionless_without_reads(doc) {
+                    return Some(Vec::new());
+                }
                 return read();
             }
             let merges = matches!(doc.get("pipeline"), Some(bson::Bson::Array(stages))
@@ -1185,6 +1191,34 @@ pub fn statement_rounds(
         }
         _ => None,
     }
+}
+
+/// Stages that read a collection or the oplog, at any depth of a pipeline.
+const READING_STAGES: [&str; 6] = [
+    "$lookup",
+    "$unionWith",
+    "$graphLookup",
+    "$out",
+    "$merge",
+    "$changeStream",
+];
+
+/// Whether `doc` is an `aggregate` on no collection whose pipeline reads
+/// none either: mongod's `runAggregate` takes no collection or global lock
+/// for a collectionless namespace (`<db>.$cmd.aggregate`), only what its
+/// stages read.
+fn collectionless_without_reads(doc: &bson::Document) -> bool {
+    fn reads(value: &bson::Bson) -> bool {
+        match value {
+            bson::Bson::Document(d) => d
+                .iter()
+                .any(|(k, v)| READING_STAGES.contains(&k.as_str()) || reads(v)),
+            bson::Bson::Array(items) => items.iter().any(reads),
+            _ => false,
+        }
+    }
+    !matches!(doc.get("aggregate"), Some(bson::Bson::String(_)))
+        && doc.get("pipeline").is_some_and(|p| !reads(p))
 }
 
 /// An `aggregate` that ends in `$out` (mongod 8.2.12 on Linux x86-64, the
@@ -2216,6 +2250,29 @@ mod tests {
             "validateDBMetadata": 1, "db": "nosuch", "collection": "q", "apiParameters": api
         });
         assert_eq!(reads(&missing), (1, vec![]));
+    }
+
+    /// A collectionless aggregate takes no lock unless a stage reads a
+    /// collection (measured 8.2.11, RM-357).
+    #[test]
+    fn a_collectionless_aggregate_takes_no_lock() {
+        use super::statement_rounds;
+        let rounds = |pipeline: bson::Bson, target: bson::Bson| {
+            statement_rounds(
+                &bson::doc! {"aggregate": target, "pipeline": pipeline},
+                "a",
+                &Catalog,
+            )
+            .unwrap()
+        };
+        let docs = bson::bson!([{"$documents": [{"a": 1}]}, {"$facet": {"x": [{"$match": {}}]}}]);
+        assert!(rounds(docs.clone(), bson::Bson::Int32(1)).is_empty());
+        assert_eq!(rounds(docs, "x".into()).len(), 1);
+        let lookup = bson::bson!([
+            {"$documents": [{"a": 1}]},
+            {"$facet": {"x": [{"$lookup": {"from": "x", "pipeline": [], "as": "j"}}]}},
+        ]);
+        assert_eq!(rounds(lookup, bson::Bson::Int32(1)).len(), 1);
     }
 
     // ------------------------------------------- execution tickets (RM-355)
