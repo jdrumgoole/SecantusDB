@@ -1258,6 +1258,12 @@ fn retryable_write(
             }
         }
     }
+    // mongod checks the session out before the write runs, waiting until
+    // no other operation has it (`SessionCatalog::_checkOutSessionInner`):
+    // a check before it waits (RM-360).
+    if let Err(e) = secantus_core::deadline::check_for_interrupt() {
+        return crate::CommandError::from(e).into_reply();
+    }
     let done = match registry.begin_retryable(lsid, txn_number) {
         Ok(done) => done,
         Err(reply) => return reply,

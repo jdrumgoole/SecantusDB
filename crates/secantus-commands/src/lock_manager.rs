@@ -352,7 +352,6 @@ impl LockManager {
         {
             let head = inner.heads.entry(resource.clone()).or_default();
             if !head.blocks(owner, mode) && (head.queue.is_empty() || head.holds(owner)) {
-                let first = !head.holds(owner);
                 head.holders.push((owner, mode));
                 drop(inner);
                 if ticket_first {
@@ -362,14 +361,14 @@ impl LockManager {
                 note_taken(resource);
                 // mongod's `Locker::_lockBegin`: a lock granted at once is
                 // not granted to an operation that was killed or ran out of
-                // time, and the check counts (RM-360). A re-take by the
-                // owner already holding it (`recursiveCount` > 1) checks
-                // nothing.
-                if first {
-                    if let Err(e) = secantus_core::deadline::check_for_interrupt() {
-                        self.release_one(owner, resource);
-                        return Err(e);
-                    }
+                // time, and the check counts (RM-360) -- a re-take by the
+                // owner already holding it (`recursiveCount` > 1) too, as
+                // its acquisition counts in the line's `locks` (r8.2.11
+                // `locker.cpp`: only a lock its unit of work still holds to
+                // its end is re-used without either).
+                if let Err(e) = secantus_core::deadline::check_for_interrupt() {
+                    self.release_one(owner, resource);
+                    return Err(e);
                 }
                 return Ok(());
             }
@@ -1836,6 +1835,15 @@ pub fn journal_wait(lm: Option<&std::sync::Arc<LockManager>>) -> Option<JournalW
         lm: lm.clone(),
         owner,
     })
+}
+
+/// The locks mongod's `ReplicationCoordinatorImpl::getLatestWriteOpTime`
+/// reads the oplog's latest entry under: the global lock in IS, with the
+/// transition lock in IX beside it -- the same pair as a journal wait's,
+/// one more of each in the line's `locks` per read (measured 8.2.11: an
+/// `update` that matched nothing reads it twice; RM-360).
+pub fn latest_write_optime_locks(lm: Option<&std::sync::Arc<LockManager>>) -> Option<JournalWait> {
+    journal_wait(lm)
 }
 
 /// The journal wait's locks, let go on drop.

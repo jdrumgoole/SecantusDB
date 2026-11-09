@@ -812,6 +812,23 @@ thread_local! {
     /// thread (`mint_and_enqueue`).
     static LAST_ENQUEUED_TS: std::cell::Cell<Option<bson::Timestamp>> =
         const { std::cell::Cell::new(None) };
+    /// The seq of the latest oplog entry a write on this thread logged and
+    /// committed since [`take_last_logged_seq`] last read it.
+    static LAST_LOGGED_SEQ: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A write on this thread committed the oplog entries `start..end`.
+fn note_logged(end: i64) {
+    LAST_LOGGED_SEQ.with(|l| l.set(Some(l.get().map_or(end - 1, |s| s.max(end - 1)))));
+}
+
+/// The seq of the latest oplog entry the writes on this thread logged and
+/// committed since the last call, once; `None` when they logged none. It is
+/// what mongod keeps as a client's last op (`ReplClientInfo::setLastOp`,
+/// called as each write's unit of work commits): the time a write concern
+/// waits for (RM-360).
+pub fn take_last_logged_seq() -> Option<i64> {
+    LAST_LOGGED_SEQ.with(std::cell::Cell::take)
 }
 
 /// Writes this thread's writes without oplog entries while it lives.
@@ -8407,6 +8424,9 @@ impl Storage {
                 let held = self.0.deregister_in_flight(&ranges);
                 if self.1 {
                     note_oplog_slot_held(held);
+                    if let Some(end) = ranges.iter().map(|r| r.1).max() {
+                        note_logged(end);
+                    }
                 }
                 let reserved = STMT_RESERVED.with(|r| r.replace(0));
                 if reserved != 0 {
@@ -9122,6 +9142,8 @@ impl Storage {
         let rw_at = pending.iter().rposition(|(e, _)| has_retryable_stamp(e));
         let (start, ts) = self.mint_seq_and_ts(n, false);
         LAST_ENQUEUED_TS.with(|t| t.set(ts.first().copied()));
+        // Minted after the data committed: the entries are the write's.
+        note_logged(start + n as i64);
         if let Some(i) = rw_at {
             LAST_RETRYABLE_TS.with(|t| t.set(Some(ts[i])));
         }
@@ -11550,6 +11572,9 @@ impl Storage {
                     return Err(e.into());
                 }
                 LAST_COMMIT_TS.with(|t| t.set(first_ts.map(u64_ts)));
+                if let Some(end) = handle.minted_ranges.iter().map(|r| r.1).max() {
+                    note_logged(end);
+                }
                 // Deregister the transaction's minted ranges — its oplog rows
                 // became visible at this commit, not at emit — advancing the
                 // visible tail and waking tailable change-stream waiters. The

@@ -73,6 +73,7 @@ pub mod ftdc;
 pub mod handshake;
 mod hostinfo;
 mod interrupt;
+mod lastop;
 mod list_catalog;
 pub mod lock_manager;
 pub mod logbuf;
@@ -297,6 +298,12 @@ pub struct CommandContext {
     pub modified: Option<i64>,
     /// How long the operation waited for its write concern, in ms.
     pub write_concern_wait: Option<i64>,
+    /// The connection's last op while a command runs: the oplog seq of the
+    /// latest entry its writes logged, or of the system's latest when a
+    /// write that logged none moved it there (mongod's `ReplClientInfo`
+    /// lastOp; see [`lastop`]). Kept between commands on the connection's
+    /// `ConnectionAuth`. 0 until it has one.
+    pub last_op_seq: i64,
     /// The CPU time the operation's thread spent on it, where mongod
     /// measures it (Linux).
     pub cpu_nanos: Option<i64>,
@@ -406,6 +413,7 @@ impl CommandContext {
             resolved_views: None,
             modified: None,
             write_concern_wait: None,
+            last_op_seq: 0,
             cpu_nanos: None,
             raw_insert_documents: None,
             locks: None,
@@ -943,11 +951,33 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
     ctx.write_concern_wait = None;
     ctx.cpu_nanos = None;
     ctx.profiling = profiler::begin(name, doc, ctx);
+    lastop::begin(ctx, doc);
+    let last_op_before = ctx.last_op_seq;
     let mut reply = dispatch_inner(doc, ctx);
-    // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
-    // as mongod does: 11601 for a kill, under the wrapper its command takes,
-    // and a write's interrupted write-concern wait (RM-216, RM-313).
-    interrupt::finish(name, doc, &mut reply, ctx, client_wc, default_wc.as_ref());
+    // The connection's last op, and the reads of the system's a write that
+    // logged nothing makes before its write concern waits (RM-360).
+    // `createIndexes` moves it to the system's whatever it did, as mongod's
+    // does (its build may log on a thread of its own).
+    let counted_write = !doc.contains_key("autocommit")
+        && ctx.replica_set_name.is_some()
+        && matches!(
+            name,
+            "insert" | "update" | "delete" | "findAndModify" | "findandmodify"
+        );
+    let logged = if counted_write {
+        lastop::finish_write(name, doc, &reply, ctx, last_op_before)
+    } else {
+        let logged = lastop::fold(ctx);
+        if name == "createIndexes" && ctx.replica_set_name.is_some() {
+            lastop::move_to_system(ctx);
+        }
+        logged
+    };
+    lastop::end(ctx);
+    let wait_shape = lastop::wait_shape(client_wc, default_wc.as_ref());
+    if counted_write && wait_shape == lastop::WaitShape::Unmatched {
+        secantus_core::deadline::unmatched();
+    }
     // A journaled write is acknowledged only once the journal holds it:
     // mongod's `waitUntilDurable`. Before this, `j` was echoed and no sync
     // followed, and a SIGKILL lost writes acknowledged with `j: true`.
@@ -955,7 +985,17 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
         if let Some(storage) = &ctx.storage {
             let waited = std::time::Instant::now();
             let wait_locks = lock_manager::journal_wait(ctx.locks.as_ref());
-            let flushed = storage.flush_journal();
+            let mut flushed = None;
+            let mut flush = || flushed = Some(storage.flush_journal());
+            if counted_write {
+                lastop::write_concern_checks(wait_shape, logged, &mut flush);
+            }
+            // Flushed whatever the checks found: an acknowledged `j` write
+            // is in the journal, interrupted or not.
+            let flushed = match flushed {
+                Some(flushed) => flushed,
+                None => storage.flush_journal(),
+            };
             drop(wait_locks);
             if let Err(e) = flushed {
                 // The write is not durable: that is the answer, not a
@@ -973,6 +1013,11 @@ fn dispatch_named(doc: &Document, ctx: &mut CommandContext) -> Document {
             }
         }
     }
+    // An interrupted operation -- killed, or out of `maxTimeMS` -- answers
+    // as mongod does: 11601 for a kill, under the wrapper its command takes,
+    // and a write's interrupted write-concern wait (RM-216, RM-313). After
+    // the wait, whose checks can find it (RM-360).
+    interrupt::finish(name, doc, &mut reply, ctx, client_wc, default_wc.as_ref());
     // An unacknowledged write's reply is zeroed below; its profile entry
     // records what it did.
     let inner_n = ctx.profiling.as_ref().and_then(|_| match reply.get("n") {

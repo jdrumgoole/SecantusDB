@@ -590,16 +590,25 @@ These are explicit non-goals. Don't add them without a reason.
       journal wait (`j`, `w: "majority"`) its transition lock and global
       IS, so an insert, `drop` or `create` reads as mongod 8.2.11's. Still
       different, measured against a one-member replica set:
-      - a write that writes nothing (a duplicate key, an `update` or
-        `delete` matching nothing, `create` of a collection there): mongod
-        reads the latest optime for the client's last op under the global IS
-        with the transition lock, twice for an insert, update or delete (the
-        write path and the command), once for another command;
+      - a command other than `insert`, `update` and `delete` that writes
+        nothing (`create` of a collection there): mongod reads the latest
+        optime for the client's last op under the global IS with the
+        transition lock (`setLastOpToSystemLastOpTime`), once; those three
+        do it as mongod does since RM-360 (`lastop.rs`), and
+        `createIndexes`'s read is among the rounds its line already counts;
+      - an `insert` of several documents one of which fails: mongod inserts
+        them again a document at a time, each under a transition, global,
+        database and collection lock of its own
+        (`insertBatchAndHandleErrors`), and counts an interrupt check for
+        each lock; this server takes no such rounds, and its line prints no
+        `numInterruptChecks` (RM-360);
       - an `update` or `delete` keeps its session row per statement, under
         the statement's own locks, and takes each statement's round as the
         statement runs (this server takes every round first and writes the
         row once, after); a profiled statement's own entry is counted in its
-        command's locks (`Metadata: {W: 1}`, one more global IX);
+        command's locks (`Metadata: {W: 1}`, one more global IX), taken
+        without interrupt checks (the command's `numInterruptChecks` is
+        mongod's without them);
       - a retryable `findAndModify` writes its image under its locks (one
         more transition, global and collection IX), and one that removes
         takes a single round;
@@ -685,18 +694,26 @@ These are explicit non-goals. Don't add them without a reason.
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
-      each lock it is granted, once per index scan of its one plan and once
-      when planning is done, in the express executor, in a `getMore` once
-      it has its cursor, as a cursor left open is checked back in, at the
-      lock it takes to read the line's storage statistics, and at each
-      yield (two: the yield's, and the locks it takes again), the
-      per-document polls having become mongod's yield every
-      `internalQueryExecYieldPeriodMS` (10 ms, a parameter here too). The
-      line of a `find`, `count` or `distinct` of a collection with one
-      candidate plan, a `getMore` of a `find`, `listIndexes`,
-      `listCollections`, `collStats`, `ping` and `buildInfo` prints mongod's
-      count (26 shapes in `tests/mongod_live/test_interrupt_checks.py`).
-      Every other line prints none, where mongod prints one:
+      each lock it is granted (a re-take by its holder included, as
+      mongod's `Locker::_lockBegin` counts one), once per index scan of its
+      one plan and once when planning is done, in the express executor
+      (none for IDHACK, which mongod builds without its planner), in a
+      `getMore` once it has its cursor, as a cursor left open is checked
+      back in, at the lock it takes to read the line's storage statistics,
+      and at each yield (two: the yield's, and the locks it takes again),
+      the per-document polls having become mongod's yield every
+      `internalQueryExecYieldPeriodMS` (10 ms, a parameter here too). Since
+      2026-11-09 a write checks as mongod's does as it finishes: a
+      retryable write's session check-out, the reads of the system's
+      latest optime for the client's last op that a write which logged
+      nothing makes (`lastop.rs`), and its write concern's waits (the
+      oplog's holes, the journal flush, the commit point). The line of a
+      `find`, `count` or `distinct` of a collection with one candidate
+      plan, a `getMore` of a `find`, `listIndexes`, `listCollections`,
+      `collStats`, `ping`, `buildInfo`, and an `insert`, `update` or
+      `delete` on a member of a replica set prints mongod's count (52
+      shapes in `tests/mongod_live/test_interrupt_checks.py`). Every other
+      line prints none, where mongod prints one:
       - a read with more than one candidate plan, a plan from the plan
         cache, or a subplanned `$or`: mongod checks once per index scan of
         every plan its `PlanEnumerator` builds (with indexes on `x` and
@@ -708,12 +725,22 @@ These are explicit non-goals. Don't add them without a reason.
         `getNext` ticks mongod's `ExpressionContext` interrupt checker,
         which checks every 128th tick (an `$unwind` of 900 documents counted
         17), and its stages are not this server's;
-      - writes and DDL (`insert` and `create` 13, `update` and `delete` 15,
-        `findAndModify` and `drop` 17, `createIndexes` 73, measured
-        2026-11-07): their write units, retries, write concern waits and
-        index build phases check where this server has not been made to;
-        the coarse `deadline::check_now` polls of the pipeline, the index
-        build and `findAndModify` are this server's own, uncounted;
+      - `findAndModify`: counted as the other writes are, it matches mongod
+        8.2.11 but where its locks do not (RM-357: a retryable one's image,
+        19 to this server's 16; one that removes, 7 to 10), and an IDHACK
+        upsert counts 10 to mongod's 9; it prints none until all do;
+      - an `insert` of several documents one of which fails (RM-357's
+        rounds: an unordered pair with a duplicate key first, 27 to 19);
+      - a write whose write concern waits in a way not modelled: `fsync`,
+        a numbered `w` above 1, a tag, `w: 0`, or `majority` with `j:
+        false` (mongod 8.2.11 counts 13 for it, as for `majority`, and
+        takes the oplog's read locks, which its source's `NONE` sync mode
+        does not explain);
+      - DDL (`create` 13, `drop` 17, `createIndexes` 73, measured
+        2026-11-07): their write units and index build phases check where
+        this server has not been made to; the coarse `deadline::check_now`
+        polls of the pipeline, the index build and `findAndModify` are this
+        server's own, uncounted; `bulkWrite`;
       - a statement inside a transaction, a lock granted after a wait
         (mongod checks at each wake), and the commands not probed.
       A yield here counts the re-take of the statement's locks without

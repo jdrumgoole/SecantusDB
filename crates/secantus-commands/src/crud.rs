@@ -1199,6 +1199,7 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let mut statements = crate::profiler::Statements::start(Some(storage), doc);
     for (index, spec) in deletes.iter().copied().enumerate() {
         statements.close(n, 0, 0, &write_errors);
+        crate::lastop::starting_op(storage, index);
         let Bson::Document(spec) = spec else { continue };
         let mut refused: Option<(i32, String)> = let_problem.clone();
         if refused.is_none() {
@@ -2189,6 +2190,7 @@ pub(crate) fn update_in(
     let mut statements = crate::profiler::Statements::start(Some(storage), doc);
     for (index, spec) in updates.iter().enumerate() {
         statements.close(n, n_modified, upserted.len(), &write_errors);
+        crate::lastop::starting_op(storage, index);
         let Bson::Document(spec) = spec else { continue };
 
         if let Some((code, errmsg)) = &let_problem {
