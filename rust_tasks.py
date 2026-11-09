@@ -215,7 +215,7 @@ def _libclang_dir() -> str | None:
     return None
 
 
-def _rust_env() -> dict[str, str]:
+def _rust_env(wt: pathlib.Path | None = None) -> dict[str, str]:
     """Build-environment defaults for the WiredTiger-linking Rust crates.
 
     The WT-linked crates (``secantus-wt`` / ``-storage`` / ``-storage-adapter`` /
@@ -230,6 +230,12 @@ def _rust_env() -> dict[str, str]:
     ``_find_wt_build`` and export those two — which is what makes ``./inv
     rust-*`` build inside a git worktree (it reuses the main checkout's WT).
 
+    ``wt`` names the WiredTiger to link instead of the first one
+    ``_find_wt_build`` finds: a task that refreshed one with
+    ``_build_wiredtiger`` passes the directory it returned, since
+    ``build/cp312-*/wt-build`` (the wheel's, re-patched only by
+    ``rust-server-build``) sorts ahead of ``build/rust-wt/`` (RM-388).
+
     On Windows it also folds in the MSVC environment (``_vcvars_env``) so bindgen
     and CMake's Ninja build find the compiler + SDK headers without the caller
     opening a Developer Command Prompt.
@@ -238,7 +244,7 @@ def _rust_env() -> dict[str, str]:
     if os.name == "nt":
         env.update(_vcvars_env())
     if not (os.environ.get("SECANTUS_WT_INCLUDE") and os.environ.get("SECANTUS_WT_LIB")):
-        wt = _find_wt_build()
+        wt = wt or _find_wt_build()
         if wt is not None:
             env["SECANTUS_WT_INCLUDE"] = str(wt / "include")
             env["SECANTUS_WT_LIB"] = str(wt)
@@ -784,8 +790,8 @@ def rust_binary_test(c: Context) -> None:
     port, pymongo round-trip, clean SIGTERM exit) in an isolated interpreter.
     Same WiredTiger / libclang prerequisites as ``rust-wt-test``.
     """
-    _build_wiredtiger()
-    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=os.name != "nt", env=_rust_env())
+    wt = _build_wiredtiger()
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build", pty=os.name != "nt", env=_rust_env(wt))
     c.run(
         "uv run --no-project --with pymongo --with pytest "
         "python -m pytest tests/test_rust_binary_smoke.py "
@@ -804,9 +810,9 @@ def rust_binary_build(c: Context, release: bool = False) -> None:
     ``--release`` for an optimised build. WiredTiger / libclang prerequisites are
     auto-filled when unset (see ``_rust_env`` / ``_build_wiredtiger``).
     """
-    _build_wiredtiger()
+    wt = _build_wiredtiger()
     flag = " --release" if release else ""
-    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=os.name != "nt", env=_rust_env())
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=os.name != "nt", env=_rust_env(wt))
     sub = "release" if release else "debug"
     ext = ".exe" if os.name == "nt" else ""
     print(f"binary: {_RUST_BINARY_DIR}/target/{sub}/secantusd-rs{ext}")
@@ -822,7 +828,7 @@ def rust_mdb_coverage(c: Context, gauges: str = "", out: str = "", keep: bool = 
     minutes. ``--gauges none`` measures the suites alone; ``--gauges go,java``
     picks gauges. WiredTiger / libclang prerequisites as ``rust-binary-build``.
     """
-    _build_wiredtiger()
+    wt = _build_wiredtiger()
     args = []
     if gauges:
         args += ["--gauges", gauges]
@@ -831,7 +837,7 @@ def rust_mdb_coverage(c: Context, gauges: str = "", out: str = "", keep: bool = 
     if keep:
         args.append("--keep")
     cmd = shlex.join([sys.executable, "scripts/rust_mdb_coverage.py", *args])
-    c.run(cmd, pty=os.name != "nt", env=_rust_env())
+    c.run(cmd, pty=os.name != "nt", env=_rust_env(wt))
 
 
 @task(name="rust-server-build")
@@ -1145,9 +1151,10 @@ def rust_repro(c: Context, script: str, release: bool = True) -> None:
     editor, then ``./inv rust-repro <script>`` — no bespoke ``uv run python …``."""
     sub = "release" if release else "debug"
     flag = " --release" if release else ""
-    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=PTY, env=_rust_env())
+    wt = _build_wiredtiger()
+    c.run(f"cd {_RUST_BINARY_DIR} && cargo build{flag}", pty=PTY, env=_rust_env(wt))
     binpath = f"{_RUST_BINARY_DIR}/target/{sub}/secantusd-rs"
-    c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=PTY, env=_rust_env())
+    c.run(f"uv run python {shlex.quote(script)} --binary {binpath}", pty=PTY, env=_rust_env(wt))
 
 
 @task(name="gh-watch", help={"pr": "PR number"})

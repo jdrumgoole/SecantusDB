@@ -11,11 +11,15 @@ for being plausible. The counts are this server's own, made as the
 operation ran.
 
 Left out of the comparison, each an open backlog item with a gap test of
-its own: `queryShapeHash` (RM-358), `numInterruptChecks` (RM-360), `queues`
-(RM-355), a profile entry's `execStats` (RM-359), and the `locks` of
-the writes RM-357 has left (`KNOWN_GAPS`). The `storage` section is compared for its
-shape only: mongod's always has `storageExecutionMicros` (RM-355), and what
-each engine reads from disk is its own.
+its own: `queryShapeHash` (RM-358), `numInterruptChecks` (RM-360), a
+profile entry's `execStats` (RM-359), and the `locks` of the writes RM-357
+has left (`KNOWN_GAPS`), with the `queues` and `storage` that follow from
+them: an execution ticket is taken with each global lock an operation takes
+apart, so where the locks differ, so do the admissions and the wait for
+them. The `storage` section is
+compared for its shape only: what each engine reads from disk is its own,
+and `storageExecutionMicros`, the time spent acquiring execution tickets,
+is there whenever one was taken (RM-355).
 """
 
 from __future__ import annotations
@@ -34,9 +38,7 @@ UNMODELLED = frozenset(
     {
         "queryShapeHash",
         "numInterruptChecks",
-        "queues",
         "execStats",
-        "storage",
     }
 )
 
@@ -106,6 +108,7 @@ EXACT = (
     "writeConcern",
     "protocol",
     "flowControl",
+    "queues",
 )
 
 #: Fields that hold a time or a size: an integer, and not negative.
@@ -131,8 +134,12 @@ STORAGE = {
         "timeWritingMicros",
         "txnBytesDirty",
     },
-    "timeWaitingMicros": {"cacheMicros", "schemaLock", "handleLock"},
+    "timeWaitingMicros": {"cacheMicros", "schemaLock", "handleLock", "storageExecutionMicros"},
 }
+
+#: A `storage` time that can be under a microsecond, and so 0: an execution
+#: ticket that was free at once.
+MAY_BE_ZERO = {"storageExecutionMicros"}
 
 
 def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list[str]:
@@ -144,6 +151,11 @@ def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list
     yielded = theirs.get("numYields", theirs.get("numYield", 0)) > 0
     if yielded:
         leave_out |= {"locks"}
+    # Each global lock taken apart takes an execution ticket: admissions,
+    # and the wait for them that makes a `storage` section, are compared
+    # where the locks are.
+    if "locks" in leave_out:
+        leave_out |= {"queues", "storage"}
         ours = {k: v for k, v in ours.items() if k not in ("numYields", "numYield")}
         theirs = {k: v for k, v in theirs.items() if k not in ("numYields", "numYield")}
     # The journal wait is printed once it reaches a millisecond, so whether
@@ -164,12 +176,20 @@ def _compare(label: str, ours: dict, theirs: dict, gaps: frozenset[str]) -> list
     for field in TIMED:
         if field in ours and not (isinstance(ours[field], int) and ours[field] >= 0):
             problems.append(f"{label}: {field} is {ours[field]!r}")
+    # The section is there, on both, whenever an execution ticket was taken.
+    waited = [
+        "storageExecutionMicros" in (side.get("storage") or {}).get("timeWaitingMicros", {})
+        for side in (ours, theirs)
+    ]
+    if "storage" not in leave_out and waited[0] != waited[1]:
+        problems.append(f"{label}: storageExecutionMicros: ours {waited[0]}, mongod {waited[1]}")
     storage = ours.get("storage")
     if storage is not None:
         for section, values in storage.items():
             allowed = STORAGE.get(section, set())
             for name, n in values.items():
-                if name not in allowed or not (isinstance(n, int) and n > 0):
+                least = 0 if name in MAY_BE_ZERO else 1
+                if name not in allowed or not (isinstance(n, int) and n >= least):
                     problems.append(f"{label}: storage.{section}.{name} = {n!r}")
     return problems
 

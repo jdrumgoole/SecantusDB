@@ -11,8 +11,8 @@ servers are this module's own, so emptying the pool reaches no other test.
 
 Execution control's `queues.execution` is `test_execution_admission.py`'s;
 what it adds to the line (its `execution` admissions and
-`storage.timeWaitingMicros.storageExecutionMicros`) is RM-355's remainder,
-left out here.
+`storage.timeWaitingMicros.storageExecutionMicros`) is compared by
+`test_slow_query_lines.py`.
 """
 
 from __future__ import annotations

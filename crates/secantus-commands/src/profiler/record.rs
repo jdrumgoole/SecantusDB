@@ -700,10 +700,8 @@ fn execution(name: &str, doc: &Document, ok: bool, ctx: &CommandContext, entry: 
     if let Some(n) = ctx.cpu_nanos {
         entry.insert("cpuNanos", n);
     }
-    if let Some(storage) = ctx
-        .op_counts
-        .as_ref()
-        .and_then(crate::opdebug::storage_section)
+    if let Some(storage) =
+        crate::opdebug::storage_section(ctx.op_counts.as_ref(), Some(&ctx.execution_admission))
     {
         entry.insert("storage", storage);
     }
@@ -1314,7 +1312,10 @@ impl<'a> Statements<'a> {
                 .cpu
                 .zip(crate::opdebug::thread_cpu_nanos())
                 .map(|(a, b)| b - a),
-            storage: now.as_ref().and_then(crate::opdebug::storage_section),
+            storage: crate::opdebug::storage_section(
+                now.as_ref(),
+                crate::lock_manager::execution_admission().as_deref(),
+            ),
             remote: crate::slowop::remote(),
             exec_stats: exec
                 .as_ref()

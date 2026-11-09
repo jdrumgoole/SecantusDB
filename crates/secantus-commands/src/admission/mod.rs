@@ -50,6 +50,10 @@ pub struct AdmissionContext {
     delinquent_acquisitions: AtomicI32,
     total_acquisition_delinquency_millis: AtomicI64,
     max_acquisition_delinquency_millis: AtomicI64,
+    /// The time it spent acquiring tickets, in nanoseconds: the wait in the
+    /// queue and the acquisition that needed none alike (mongod's
+    /// `storageExecutionMicros`).
+    acquiring_nanos: AtomicI64,
 }
 
 impl Default for AdmissionContext {
@@ -64,6 +68,7 @@ impl Default for AdmissionContext {
             delinquent_acquisitions: AtomicI32::new(0),
             total_acquisition_delinquency_millis: AtomicI64::new(0),
             max_acquisition_delinquency_millis: AtomicI64::new(0),
+            acquiring_nanos: AtomicI64::new(0),
         }
     }
 }
@@ -114,6 +119,19 @@ impl AdmissionContext {
             .load(Ordering::Relaxed)
     }
 
+    /// Count `spent` acquiring a ticket, whether or not it queued.
+    pub fn record_acquiring(&self, spent: Duration) {
+        let nanos = i64::try_from(spent.as_nanos()).unwrap_or(i64::MAX);
+        self.acquiring_nanos.fetch_add(nanos, Ordering::Relaxed);
+    }
+
+    /// The time it spent acquiring tickets, in microseconds: the `Slow
+    /// query` line's and profile entry's
+    /// `storage.timeWaitingMicros.storageExecutionMicros`.
+    pub fn acquiring_micros(&self) -> i64 {
+        self.acquiring_nanos.load(Ordering::Relaxed) / 1_000
+    }
+
     /// mongod's `recordDelinquentAcquisition`.
     fn record_delinquent_acquisition(&self, millis: i64) {
         self.delinquent_acquisitions.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +164,45 @@ impl AdmissionContext {
             original,
         }
     }
+}
+
+/// The `queues` of an operation's `Slow query` line (mongod's
+/// `TicketHolderQueueStats::toBson`): its `ingress` and `execution`
+/// admissions, each pool's admissions and time queued, either left out at
+/// zero. `None` is a pool that admitted nothing for the work (an index
+/// build's thread, which no command admitted through ingress).
+pub fn line_queues(
+    ingress: Option<&AdmissionContext>,
+    execution: Option<&AdmissionContext>,
+) -> Document {
+    let pool = |ctx: Option<&AdmissionContext>| {
+        let mut out = Document::new();
+        if let Some(ctx) = ctx {
+            if ctx.admissions() > 0 {
+                out.insert("admissions", ctx.admissions());
+            }
+            let queued = ctx.total_time_queued_micros();
+            if queued > 0 {
+                out.insert("totalTimeQueuedMicros", queued);
+            }
+        }
+        out
+    };
+    doc! { "ingress": pool(ingress), "execution": pool(execution) }
+}
+
+/// The `delinquencyInfo` of an operation's `Slow query` line: the
+/// execution tickets it held past their pool's delinquency interval, how
+/// long it held them in all and the longest, printed only when it held one
+/// (measured 8.2.11; its profile entry has none).
+pub fn line_delinquency(execution: &AdmissionContext) -> Option<Document> {
+    (execution.delinquent_acquisitions() > 0).then(|| {
+        doc! {
+            "totalDelinquentAcquisitions": execution.delinquent_acquisitions(),
+            "totalAcquisitionDelinquencyMillis": execution.total_acquisition_delinquency_millis(),
+            "maxAcquisitionDelinquencyMillis": execution.max_acquisition_delinquency_millis(),
+        }
+    })
 }
 
 /// Restores an operation's priority when dropped.
@@ -699,6 +756,57 @@ mod tests {
             bson::Bson::Int32(n) => i64::from(*n),
             other => panic!("{field}: {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_line_leaves_out_what_is_zero() {
+        assert_eq!(
+            line_queues(None, None),
+            doc! {"ingress": {}, "execution": {}}
+        );
+        let ingress = AdmissionContext::default();
+        let execution = AdmissionContext::default();
+        assert_eq!(
+            line_queues(Some(&ingress), Some(&execution)),
+            doc! {"ingress": {}, "execution": {}}
+        );
+        ingress.admissions.store(1, Ordering::Relaxed);
+        execution.admissions.store(2, Ordering::Relaxed);
+        execution
+            .total_time_queued_micros
+            .store(7, Ordering::Relaxed);
+        assert_eq!(
+            line_queues(Some(&ingress), Some(&execution)),
+            doc! {
+                "ingress": {"admissions": 1},
+                "execution": {"admissions": 2, "totalTimeQueuedMicros": 7_i64},
+            }
+        );
+    }
+
+    #[test]
+    fn the_line_says_what_was_held_too_long_only_when_something_was() {
+        let ctx = AdmissionContext::default();
+        assert_eq!(line_delinquency(&ctx), None);
+        ctx.record_delinquent_acquisition(27);
+        ctx.record_delinquent_acquisition(51);
+        assert_eq!(
+            line_delinquency(&ctx),
+            Some(doc! {
+                "totalDelinquentAcquisitions": 2,
+                "totalAcquisitionDelinquencyMillis": 78_i64,
+                "maxAcquisitionDelinquencyMillis": 51_i64,
+            })
+        );
+    }
+
+    #[test]
+    fn acquiring_is_counted_in_whole_microseconds() {
+        let ctx = AdmissionContext::default();
+        ctx.record_acquiring(Duration::from_nanos(700));
+        assert_eq!(ctx.acquiring_micros(), 0);
+        ctx.record_acquiring(Duration::from_nanos(2_600));
+        assert_eq!(ctx.acquiring_micros(), 3);
     }
 
     #[test]

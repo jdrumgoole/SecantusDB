@@ -229,13 +229,15 @@ def test_storage_says_what_the_engine_read(tmp_path: Any) -> None:
 # ------------------------------------------------------------- RM-355 --
 
 
-@pytest.mark.backlog("RM-355")
+@pytest.mark.backlog_fixed("RM-355")
 def test_a_line_says_what_execution_control_admitted(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11's line for every command carries `queues` (the
     ingress and execution admissions it took) and its `storage` section
     `timeWaitingMicros.storageExecutionMicros`, the time it waited for
     execution admission, so a `find` always has `storage` (measured
-    2026-10-27). This server has no execution admission control."""
+    2026-10-27). This server's line printed neither until 2026-11-09; the
+    counts are compared operation by operation in
+    `tests/mongod_live/test_slow_query_lines.py`."""
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.find({"x": {"$gt": 1}})))
     answers = {}
     for server, (lines, _) in got.items():
@@ -246,6 +248,36 @@ def test_a_line_says_what_execution_control_admitted(rust_mongo: Any, mongod_rs:
             "storageExecutionMicros" in waiting,
         )
     assert answers["mongod"] == (["execution", "ingress"], True)
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-355")
+def test_admission_control_is_reported_where_mongod_reports_it(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's `serverStatus.queues` has the connection limiter's
+    `ingressSessionEstablishment` beside `execution` and `ingress`, and a
+    `$currentOp` row has the operation's `queues` (each pool's
+    `admissions`, `totalTimeQueuedMicros`, `isHoldingTicket`) and its
+    `currentQueue` (measured 2026-11-09). This server's have neither."""
+    answers = {}
+    for server, client in (("rust", rust_mongo), ("mongod", mongod_rs)):
+        status = client.admin.command("serverStatus")["queues"]
+        rows = list(
+            client.admin.aggregate([{"$currentOp": {}}, {"$match": {"command.aggregate": 1}}])
+        )
+        assert len(rows) == 1, server
+        answers[server] = (
+            sorted(status),
+            {pool: sorted(q) for pool, q in rows[0].get("queues", {}).items()},
+            "currentQueue" in rows[0],
+        )
+    pool = ["admissions", "isHoldingTicket", "totalTimeQueuedMicros"]
+    assert answers["mongod"] == (
+        ["execution", "ingress", "ingressSessionEstablishment"],
+        {"ingress": pool, "execution": pool},
+        True,
+    )
     assert answers["rust"] == answers["mongod"]
 
 
