@@ -357,14 +357,35 @@ These are explicit non-goals. Don't add them without a reason.
     `TestCausalConsistency_Supported` (29/29 passed). Re-include them.
   - Rust's `diagnostics::ok_transaction` ("no-op commit/abort") is dead code
     that nothing dispatches to.
-- [ ] **An `aggregate` without `pipeline` is not refused as mongod refuses
-      it.** `pipeline` is a required field: mongod 8.2.11 answers 40414
-      "BSON field 'aggregate.pipeline' is missing but a required field" to
-      `{aggregate: "x"}` and `{aggregate: 1}`, with or without `cursor`.
-      This server asks for the cursor (9), and given one runs an empty
-      pipeline and answers `ok`. Found 2026-11-08 working RM-185.
-      Backlog-ID: RM-431
-      Verify: tests/backlog/test_rm_431_432.py::test_an_aggregate_without_a_pipeline_is_refused
+- [ ] **`aggregate` ignores a mistyped `writeConcern` or
+      `bypassDocumentValidation`.** mongod 8.2.11 type-checks both in its
+      parse of the command: `writeConcern: 5` is 14 "BSON field
+      'aggregate.writeConcern' is the wrong type 'int', expected type
+      'object'", `bypassDocumentValidation: "a"` is 14 with the type list
+      "[decimal, bool, double, long, int]". This server answers ok to both.
+      Both belong in `aggregate()`'s document-order field pass, as RM-431
+      left it. Found 2026-11-09 working RM-431.
+      Verify: tests/backlog/test_rm_aggregate_parse.py::test_aggregate_type_checks_write_concern_and_bypass
+      Backlog-ID: RM-463
+- [ ] **A non-string, non-number `aggregate` namespace is BadValue, not
+      InvalidNamespace.** mongod 8.2.11 answers `{aggregate: true, pipeline:
+      [], cursor: {}}` (and `null`, `{}`) with 73 "Collection name has invalid
+      type bool" (`null`, `object`); this server answers 2 "Invalid command
+      format: the 'aggregate' field must specify a collection name or 1",
+      which mongod keeps for a number other than 1. Found 2026-11-09 working
+      RM-431.
+      Verify: tests/backlog/test_rm_aggregate_parse.py::test_aggregate_names_a_mistyped_namespace
+      Backlog-ID: RM-464
+- [ ] **A wrong-type error lists the expected types in another order than
+      mongod's.** mongod 8.2.11's order is per field: `cursor.batchSize`
+      "[double, decimal, long, int]", `aggregate.maxTimeMS` "[double, int,
+      long, decimal]", `FindCommandRequest.batchSize` "[decimal, double, long,
+      int]". This server answers "[decimal, int, double, long]" for all
+      three. Other fields already carry their own list (`generic.rs`,
+      `cluster_params.rs`), so the order is per field, not one rule. Found
+      2026-11-09 working RM-431.
+      Verify: tests/backlog/test_rm_aggregate_parse.py::test_wrong_type_lists_the_types_in_mongods_order
+      Backlog-ID: RM-465
 
 ### 2026-09-01: two PLANNER differences, measured and dispositioned
 

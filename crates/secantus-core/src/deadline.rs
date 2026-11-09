@@ -510,11 +510,16 @@ mod tests {
         begin_operation();
         let _g = arm(Some(1));
         std::thread::sleep(Duration::from_millis(5));
+        // The yield clock is set, not slept against: a 5ms sleep on a loaded
+        // machine overran the 10ms period and the first poll yielded
+        // (2026-11-09, load 10-17).
+        let period = Duration::from_millis(yield_period_ms() as u64);
+        YIELD_MARK.with(|m| m.set(Some(Instant::now() + Duration::from_secs(3600))));
         for _ in 0..POLL_EVERY * 4 {
             assert_eq!(check(), Ok(()), "no yield before the period passes");
         }
         assert_eq!(interrupt_checks(), 0);
-        std::thread::sleep(Duration::from_millis(yield_period_ms() as u64 + 2));
+        YIELD_MARK.with(|m| m.set(Some(Instant::now() - period - Duration::from_millis(2))));
         let failed = (0..POLL_EVERY).position(|_| check().is_err());
         assert!(
             failed.is_some(),

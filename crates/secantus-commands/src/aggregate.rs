@@ -131,56 +131,76 @@ pub(crate) const AGGREGATE_FIELDS: &[&str] = &[
 
 /// `aggregate` — run a pipeline and return a cursor over the results.
 pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
-    // `cursor` means "missing or an object" literally: an explicit `cursor: null`
-    // is rejected where an absent one is fine. `let` is the BSON-field family.
-    argtypes::require_cursor_object(doc)?;
-    // `cursor` is required unless the command is an inline explain (measured
-    // 8.2.11, 2026-10-01); an aggregate without one used to run and return a
-    // cursor anyway.
-    if let Some(other) = doc.get("explain") {
-        if !matches!(other, Bson::Boolean(_)) {
-            return Err(CommandError::new(
-                14,
-                "TypeMismatch",
-                "explain must be a boolean",
-            ));
+    // mongod parses the command as its IDL does: ONE pass over the fields in
+    // document order, each checked as it is met and an unknown one refused
+    // there, so the first bad field wins. Only after the pass does it find a
+    // required field missing, then resolve the namespace, then ask for
+    // `cursor` (measured 8.2.11, 2026-11-09).
+    for key in doc.keys() {
+        match key.as_str() {
+            "explain" => {
+                if !matches!(doc.get("explain"), Some(Bson::Boolean(_))) {
+                    return Err(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        "explain must be a boolean",
+                    ));
+                }
+            }
+            // "missing or an object" literally: an explicit `cursor: null` is
+            // rejected where an absent one is fine.
+            "cursor" => {
+                argtypes::require_cursor_object(doc)?;
+                argtypes::require_cursor_options(doc, "cursor")?;
+            }
+            "let" => argtypes::require_object(doc, "let", "aggregate.let")?,
+            "collation" => argtypes::require_object(doc, "collation", "aggregate.collation")?,
+            "readConcern" => argtypes::require_object(doc, "readConcern", "aggregate.readConcern")?,
+            "hint" => argtypes::require_hint(doc, "hint")?,
+            // The `Field '<name>' should be a boolean value` family, which
+            // rejects an explicit null -- not the BSON-field family above.
+            "allowDiskUse" => argtypes::require_bool_value(doc, "allowDiskUse")?,
+            // `pipeline` is checked before it is READ: the read below falls
+            // back to an empty pipeline for a non-array, which silently ran
+            // the whole collection through no stages and answered ok. Its
+            // elements are part of the field's parse; a malformed stage is not.
+            "pipeline" => match doc.get("pipeline") {
+                Some(Bson::Array(stages)) => {
+                    if !stages.iter().all(|s| matches!(s, Bson::Document(_))) {
+                        return Ok(CommandError::new(14, "TypeMismatch", PIPELINE_ELEMENT_MSG)
+                            .into_reply());
+                    }
+                }
+                _ => {
+                    return Ok(CommandError::new(
+                        14,
+                        "TypeMismatch",
+                        "A pipeline must be an array of objects",
+                    )
+                    .into_reply())
+                }
+            },
+            k if !k.starts_with('$')
+                && !AGGREGATE_FIELDS.contains(&k)
+                && !argtypes::is_generic_field(k) =>
+            {
+                return Err(CommandError::new(
+                    40415,
+                    "IDLUnknownField",
+                    format!("BSON field 'aggregate.{k}' is an unknown field."),
+                ));
+            }
+            _ => {}
         }
     }
-    if !doc.contains_key("cursor") && doc.get("explain") != Some(&Bson::Boolean(true)) {
+    // `pipeline` is required: without one mongod refuses the command before it
+    // looks at the namespace or the cursor (RM-431); it used to ask for the
+    // cursor, and given one ran an empty pipeline.
+    if !doc.contains_key("pipeline") {
         return Err(CommandError::new(
-            9,
-            "FailedToParse",
-            "The 'cursor' option is required, except for aggregate with the explain argument",
-        ));
-    }
-    argtypes::require_object(doc, "let", "aggregate.let")?;
-    argtypes::require_object(doc, "collation", "aggregate.collation")?;
-    argtypes::require_object(doc, "readConcern", "aggregate.readConcern")?;
-    argtypes::require_hint(doc, "hint")?;
-    // The `Field '<name>' should be a boolean value` family, which rejects an
-    // explicit null — not the BSON-field family used two lines up.
-    argtypes::require_bool_value(doc, "allowDiskUse")?;
-    // `pipeline` is checked before it is READ: the read below falls back to an
-    // empty pipeline for a non-array, which silently ran the whole collection
-    // through no stages and answered ok.
-    match doc.get("pipeline") {
-        None | Some(Bson::Array(_)) => {}
-        Some(_) => {
-            return Ok(CommandError::new(
-                14,
-                "TypeMismatch",
-                "A pipeline must be an array of objects",
-            )
-            .into_reply())
-        }
-    }
-    argtypes::require_cursor_options(doc, "cursor")?;
-    const FIELDS: &[&str] = AGGREGATE_FIELDS;
-    if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
-        return Err(CommandError::new(
-            40415,
-            "IDLUnknownField",
-            format!("BSON field 'aggregate.{key}' is an unknown field."),
+            40414,
+            "IDLFailedToParse",
+            "BSON field 'aggregate.pipeline' is missing but a required field",
         ));
     }
     // `aggregate: <coll>` (string) or `aggregate: 1` (collectionless).
@@ -203,6 +223,16 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ))
         }
     };
+    // `cursor` is required unless the command is an inline explain (measured
+    // 8.2.11, 2026-10-01); an aggregate without one used to run and return a
+    // cursor anyway.
+    if !doc.contains_key("cursor") && doc.get("explain") != Some(&Bson::Boolean(true)) {
+        return Err(CommandError::new(
+            9,
+            "FailedToParse",
+            "The 'cursor' option is required, except for aggregate with the explain argument",
+        ));
+    }
     let pipeline: Vec<Bson> = match doc.get("pipeline") {
         Some(Bson::Array(a)) => a.clone(),
         _ => Vec::new(),
