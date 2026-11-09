@@ -132,13 +132,49 @@ fn need_array<'a>(name: &str, v: &'a Bson) -> Result<&'a Vec<Bson>> {
     }
 }
 
-/// Equality as the SEARCH functions use it: NULL matches NULL.
+thread_local! {
+    /// Set for one search over a `char(n)[]` array ([`call_bpchar`]).
+    static BPCHAR_EQUALITY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Equality as the SEARCH functions use it: NULL matches NULL. Over a
+/// `char(n)[]` array the element type's `bpchareq` decides, which ignores
+/// trailing blanks.
 fn same(a: &Bson, b: &Bson) -> bool {
     match (a == &Bson::Null, b == &Bson::Null) {
         (true, true) => true,
         (true, false) | (false, true) => false,
-        (false, false) => compare_constants(a, b) == Some(std::cmp::Ordering::Equal),
+        (false, false) => match (a, b) {
+            (Bson::String(x), Bson::String(y)) if BPCHAR_EQUALITY.with(std::cell::Cell::get) => {
+                x.trim_end_matches(' ') == y.trim_end_matches(' ')
+            }
+            _ => compare_constants(a, b) == Some(std::cmp::Ordering::Equal),
+        },
     }
+}
+
+/// [`call`] of a search function (`array_position(s)`, `array_remove`,
+/// `array_replace`) over a `char(n)[]` array: each element is compared with
+/// `bpchareq`, as `array_position` looks up the element type's equality
+/// (`'{ab}'::char(3)[]`'s `ab ` is found by `'ab'` on 15.19, RP-719). The
+/// elements the answer keeps keep their blanks.
+pub fn call_bpchar(name: &str, args: &[Bson]) -> Result<Bson> {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BPCHAR_EQUALITY.with(|f| f.set(self.0));
+        }
+    }
+    let _reset = Reset(BPCHAR_EQUALITY.with(|f| f.replace(true)));
+    call(name, args)
+}
+
+/// The search functions [`call_bpchar`] is for.
+pub fn is_search_function(name: &str) -> bool {
+    matches!(
+        name,
+        "array_position" | "array_positions" | "array_remove" | "array_replace"
+    )
 }
 
 /// Equality as the CONTAINMENT operators use it: a NULL matches nothing, not

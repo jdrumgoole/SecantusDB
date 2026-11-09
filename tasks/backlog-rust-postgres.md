@@ -2577,23 +2577,6 @@ char(3)[], b bit(3)[])`.
       Verify: tests/backlog/test_rp_found_rp695.py::test_assignment_to_an_array_element
       Backlog-ID: RP-711
 
-## Found while working RP-710 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the setups in
-`tests/backlog/test_rp_found_rp710.py`.
-
-- [ ] **A `char(n)[]` column's elements are stored unpadded.** `insert into
-      t710 (k, c) values (5, array['ab']) returning c, octet_length(c[1])`
-      is `{"ab "}`, 3 on PostgreSQL 15.19 (the element coercion is
-      `bpchar(text, typmod)`, and a `'{ab}'` literal's is `bpcharin` at the
-      modifier, both of which pad); here it is `{ab}`, 2. A scalar
-      `char(n)` column is stored trimmed and padded where it enters an
-      expression, which an array's elements are not. Padding them at the
-      write reaches every comparison of a `char(n)[]` value, which
-      PostgreSQL makes blank-insensitively (`bpchareq` per element).
-      Verify: tests/backlog/test_rp_found_rp710.py::test_a_char_n_array_element_is_padded_to_its_width
-      Backlog-ID: RP-719
-
 ## Found while working RP-668 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
@@ -3182,6 +3165,56 @@ the column written out, so none is the star's. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
       Backlog-ID: RP-705
 
+## Found while working RP-719 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp719.py`.
+
+- [ ] **`&&` with an untyped array literal is 42883.** `select k from x719
+      where a && '{ab,y}'`, `a` a `text[]` column, resolves the literal to
+      `text[]` on PostgreSQL 15.19 and finds 1, 2 and 5; here it is
+      `operator does not exist: text[] && text`. The same overlap with
+      `'{ab,y}'::text[]` is answered.
+      Verify: tests/backlog/test_rp_found_rp719.py::test_an_overlap_with_an_untyped_array_literal
+      Backlog-ID: RP-720
+- [ ] **`&&` misses a stored array whose lower bound is not 1.** `select k
+      from x719 where a && '{y}'::text[]` finds row 5, `'[0:1]={x,y}'`, on
+      PostgreSQL 15.19 (`arrayoverlap` compares elements, not bounds); here
+      it finds nothing. `@>` over the same row is answered.
+      Verify: tests/backlog/test_rp_found_rp719.py::test_an_overlap_finds_an_array_with_its_own_lower_bound
+      Backlog-ID: RP-721
+- [ ] **GROUP BY over an array column returns its groups out of the ORDER
+      BY's order.** `select count(*), a from x719 group by a order by 2` is
+      `{ab}`, `{cd,ab}`, `{x,y}` on PostgreSQL 15.19 (`array_cmp`, element
+      by element); here `{cd,ab}`, `{x,y}`, `{ab}`. A plain `select a from
+      x719 order by a` is in the right order.
+      Verify: tests/backlog/test_rp_found_rp719.py::test_groups_of_an_array_column_follow_the_order_by
+      Backlog-ID: RP-722
+- [ ] **In a join's WHERE, an untyped array literal against an array
+      column matches nothing.** `select x.k from x719 x join u719 u on x.k
+      = u.k where x.a = '{ab}'` is row 1 on PostgreSQL 15.19; here it is
+      empty, for `text[]` and `char(n)[]` columns alike. The literal is not
+      read as the column's type, as `coerce_to_column` does in a one-table
+      filter.
+      Verify: tests/backlog/test_rp_found_rp719.py::test_a_join_filter_reads_an_untyped_literal_as_the_array_column
+      Backlog-ID: RP-723
+- [ ] **In a join's WHERE, a `char(n)` column against a padded `char(n)`
+      constant matches nothing.** `... where s.c = 'ab '::char(3)` over a
+      join is row 1 on PostgreSQL 15.19 (`bpchareq` ignores trailing
+      blanks); here it is empty. `s.c = 'ab'` is answered, and so is the
+      same filter over one table.
+      Verify: tests/backlog/test_rp_found_rp719.py::test_a_join_filter_compares_a_char_n_column_without_its_blanks
+      Backlog-ID: RP-724
+- [ ] **GROUP BY a `char(n)` value splits it from the same value
+      unpadded.** `select count(*) from (values ('ab'::char(3)),
+      ('ab'::bpchar)) v(a) group by a` is one group of 2 on PostgreSQL
+      15.19 (`bpchar`'s equality and hash ignore trailing blanks), here two
+      groups of 1; `count(distinct a)` is 2 for 1. The same holds for
+      `char(n)[]` values. A stored column groups correctly, as its values
+      are kept trimmed.
+      Verify: tests/backlog/test_rp_found_rp719.py::test_grouping_a_char_n_value_ignores_its_blanks
+      Backlog-ID: RP-725
+
 ## Found while working RP-681 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
@@ -3208,20 +3241,22 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
       Backlog-ID: RP-707
 
-## Found while working RP-683 (2026-11-09)
+## Found while working RP-729 (2026-11-09)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **A correlated `ARRAY(...)` over an array column is typed one
-      dimension too many.** `select k, array(select t.f from (values (1,
-      array[1, null]), (2, array[2, 3])) t(k, f) where t.k >= s.k) from
-      ... s(k, f)` is described `integer[]` (1007) on 15.19, rows
-      `{{1,NULL},{2,3}}`, and `pg_typeof` of it is `integer[]`
-      (`get_promoted_array_type`: an array column's ARRAY sublink is its
-      own type, one more dimension of it). Here it is described 1043 and
-      reaches the client as the text `{{1,NULL},{2,3}}`, and `pg_typeof`
-      is `integer[][]`: `correlate` appends `[]` to a column type that is
-      already an array, which the uncorrelated sublink does not.
-      Verify: tests/backlog/test_rp_found_rp683.py::test_correlated_array_of_an_array_column_is_its_own_type
-      Backlog-ID: RP-729
+- [ ] **An ARRAY sublink accumulates arrays of different shapes, or a NULL
+      one.** `select array(select f from (values (array[1,2]), (array[3]))
+      t(f))` is 2202E `cannot accumulate arrays of different
+      dimensionality` on 15.19 (`accumArrayResultArr` requires every
+      element array to have the first one's dimensions and lengths), as is
+      a mix of `array[1]` with `array[[3]]` or with `'{}'::int[]`; a NULL
+      element array is 22004 `cannot accumulate null arrays`. Here the
+      first answers the ragged `{{1,2},{3}}` (1007), the `'{}'` mix
+      `{{1},{}}`, and the `array[[3]]` and NULL mixes fail in the binary
+      send as 22P03 `cannot send this value as a binary _int4`. The
+      correlated form (`array(select t.f ... where t.k >= s.k)`) answers
+      the same.
+      Verify: tests/backlog/test_rp_found_rp729.py::test_array_sublink_refuses_ragged_or_null_element_arrays
+      Backlog-ID: RP-730

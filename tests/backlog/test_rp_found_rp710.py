@@ -5,9 +5,10 @@ tests of divergences found while working it:
   or array: an overlong `varchar(3)` value was stored, a `numeric(4,1)` one
   kept its digits, where PostgreSQL's `CopyFrom` reads each field with its
   input function AT the column's modifier (fixed, RP-718);
-- a `char(n)[]` column's elements are stored unpadded, where PostgreSQL's
+- a `char(n)[]` column's elements were stored unpadded, where PostgreSQL's
   element coercion (`bpchar(text, typmod)`, or `bpcharin` at the modifier
-  for a literal or a COPY field) pads each one to the width.
+  for a literal or a COPY field) pads each one to the width (fixed by
+  RP-719).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with each test's setup.
@@ -221,7 +222,9 @@ def test_binary_copy_reads_a_field_at_its_columns_modifier(
 
 
 # A `char(3)[]` element is padded to the width: `bpchar(text, 7, false)` over
-# each element of an ARRAY[], `bpcharin` at the modifier for a literal.
+# each element of an ARRAY[], `bpcharin` at the modifier for a literal. The
+# elements were stored and shown unpadded until RP-719; the wider matrix is
+# in `test_rp_found_rp719.py`.
 CHAR_ARRAY = {
     "insert into t710 (k, c) values (5, array['ab']) returning c, octet_length(c[1])": (
         "ok",
@@ -231,7 +234,7 @@ CHAR_ARRAY = {
 }
 
 
-@pytest.mark.backlog("RP-719")
+@pytest.mark.backlog_fixed("RP-719")
 @pytest.mark.parametrize("query", list(CHAR_ARRAY))
 def test_a_char_n_array_element_is_padded_to_its_width(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == CHAR_ARRAY[query]
