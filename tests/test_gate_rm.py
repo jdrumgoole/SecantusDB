@@ -82,3 +82,27 @@ def test_rebuilds_the_core_extension_before_the_suites() -> None:
     src = (ROOT / "scripts/gate_rm.py").read_text()
     assert 'g.step("core-sync", ["./inv", "sync"])' in src
     assert src.index('"core-sync"') < src.index('"ci-selected"')
+
+
+def test_storage_tests_run_only_when_the_storage_crates_change() -> None:
+    g = _gate_rm()
+    assert not g.touches_storage(
+        ["crates/secantus-commands/src/crud.rs", "tasks/backlog-rust-mongodb.md"]
+    )
+    assert not g.touches_storage(["crates/secantus-storage-adapter/tests/profiler_wt.rs"])
+    assert g.touches_storage(["crates/secantus-storage/src/lib.rs"])
+    assert g.touches_storage(["cmake/patch_wt_dsync.py"])
+    assert g.touches_storage(["vendor/wiredtiger"])
+
+
+def test_only_runs_the_named_steps_and_skip_is_recorded(tmp_path: Path) -> None:
+    g = _gate_rm()
+    gate = g.Gate(tmp_path, only={"a", "c"})
+    gate.step("a", ["true"])
+    gate.step("b", ["true"])
+    gate.skip("c", "nothing changed")
+    gate.skip("d", "not asked for")
+    assert (tmp_path / "a.rc").read_text().strip() == "0"
+    assert not (tmp_path / "b.rc").exists()
+    assert (tmp_path / "c.rc").read_text().strip() == "skipped"
+    assert not (tmp_path / "d.rc").exists()
