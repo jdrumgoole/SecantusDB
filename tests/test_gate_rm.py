@@ -7,6 +7,7 @@ run fewer files than CI does.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -113,3 +114,17 @@ def test_only_runs_the_named_steps_and_skip_is_recorded(
     assert not (tmp_path / "b.rc").exists()
     assert (tmp_path / "c.rc").read_text().strip() == "skipped"
     assert not (tmp_path / "d.rc").exists()
+
+
+def test_a_step_line_gives_its_time_and_the_load_beside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("SECANTUS_LOAD_MAX_WAIT", "0")
+    g = _gate_rm()
+    g.Gate(tmp_path).step("a", ["true"])
+    assert re.search(r"^    a=0 \(\d+s\) load \d+\.\d->\d+\.\d$", capsys.readouterr().out, re.M)
+
+
+def test_ci_selected_logs_its_slowest_tests() -> None:
+    text = (ROOT / "scripts/gate_rm.py").read_text()
+    assert '"--durations=25"' in text
