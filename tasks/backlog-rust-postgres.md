@@ -2481,20 +2481,56 @@ a plain WHERE over a `char(n)` column, in a FROM-subquery's column over a
       Verify: tests/backlog/test_rp_found_rp680.py::test_any_of_a_char_n_array_compares_as_bpchar
       Backlog-ID: RP-684
 
-## Found while working RP-664 (2026-11-08)
+## Found while working RP-670 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp664.py`.
+`tests/backlog/test_rp_found_rp670.py`: `t687(a d687, v varchar(3), w
+dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
+`varchar(3)`.
 
-- [ ] **A PL/pgSQL assignment to a record's field does not check the
-      field's domain.** In a BEFORE trigger on `t664t(a d664t, b int)`,
-      whose domain has a CHECK `value > 0`, `new.a := -5; new.a := 7;
-      return new;` is 23514 on PostgreSQL 15.19 for an INSERT or an UPDATE
-      (the assignment coerces `-5` into the column's domain); here the row
-      is written with `a` = 7. Only the value the trigger leaves in the row
-      is checked, after it returns (RP-664).
-      Verify: tests/backlog/test_rp_found_rp664.py::test_plpgsql_assignment_to_a_record_field_checks_its_domain
-      Backlog-ID: RP-670
+- [ ] **A PL/pgSQL assignment to a `varchar(n)` or `char(n)` variable
+      truncates an overlong value.** `declare x varchar(3); begin x :=
+      'abcdef';` is 22001 `value too long for type character varying(3)`
+      on PostgreSQL 15.19 (`exec_cast_value` coerces by the assignment
+      rule), as are a `char(3)` variable and one of a domain over
+      `varchar(3)`; here each stores `abc`. The interpreter assigns through
+      an explicit cast, `SELECT (expr)::type` (`eval_typed`), which
+      truncates. Since RP-670 a trigger record's domain field fits its
+      value by the assignment rule (`fit_assigned_length`).
+      Verify: tests/backlog/test_rp_found_rp670.py::test_variable_assignment_refuses_an_overlong_value
+      Backlog-ID: RP-687
+- [ ] **A `SELECT ... INTO` record's fields are typed without their
+      domain or modifier.** After `select * into r from t687`, `r.a :=
+      -5` is 23514 and `r.v := 'abcdef'` 22001 on PostgreSQL 15.19, and
+      `pg_typeof(r.a)` is `d687`; here both assignments are stored and
+      `pg_typeof` is `integer`. The record's field types come from the
+      query's RowDescription (`PlHost::query`), which names a domain
+      column by its base type and carries no modifier. Since RP-670 a
+      trigger's NEW and OLD fields are typed by the column's domain.
+      Verify: tests/backlog/test_rp_found_rp670.py::test_select_into_record_fields_keep_their_declared_types
+      Backlog-ID: RP-688
+- [ ] **A variable of a table's row type has no assignable fields.**
+      `declare r t687; begin r.a := 5;` assigns the field on PostgreSQL
+      15.19 (and `r.a := -5` is the domain's 23514); here it is 42601
+      `"r.a" is not a known variable`, and `raise exception '%', r` after a
+      `select * into r` is 0A000 `a cast of int32 to t687 is not supported
+      yet` where PostgreSQL prints `(5,ab,q,"x  ")`.
+      Verify: tests/backlog/test_rp_found_rp670.py::test_row_variable_fields_are_assignable
+      Backlog-ID: RP-689
+- [ ] **OPEN -- `stop()` with an idle connection open took 3.8 s once
+      under load.** `crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection`
+      failed in a local `scripts/gate_pg.sh --fast` run on 2026-11-09
+      (`stop() waited 3.826650542s on an idle connection`, against its 3 s
+      budget) while the machine's load average was 21 on 12 cores, two
+      gates running, and the `embedded` tests running four at a time. The
+      same commit passed the step before the rebase that preceded it, and
+      the test alone passed five times running at load 17-20 (2.0-2.6 s
+      for the whole test, reopen included). Not diagnosed: whether the time
+      is the shutdown watch telling the connection to finish, the drain, or
+      the closing checkpoint under disk contention; the next step is the
+      three phases' durations from a slow run.
+      Backlog-ID: RP-690
+      Verify: none -- seen once, under load; a timing that does not fail on demand
 
 ## Found while working RP-668 (2026-11-09)
 

@@ -43,6 +43,10 @@ pub(crate) struct Scope {
     /// join merges columns (`USING`, `NATURAL`) or hides its tables behind
     /// an alias.
     opaque: bool,
+    /// The domain each parameter (`$1`, ...) is declared of, if it is one:
+    /// a PL/pgSQL variable bound into an expression is of its declared
+    /// type (RP-670). Empty for a statement's own scope.
+    params: Vec<Option<String>>,
 }
 
 impl Scope {
@@ -51,6 +55,7 @@ impl Scope {
         Scope {
             items: vec![(alias, Some(table_columns(def)))],
             opaque: false,
+            params: Vec::new(),
         }
     }
 
@@ -65,6 +70,7 @@ impl Scope {
         let mut scope = Scope {
             items: Vec::new(),
             opaque: false,
+            params: Vec::new(),
         };
         for item in from {
             scope.add(item, lookup, ctes);
@@ -436,6 +442,9 @@ fn expr_domain(
             domains::user_domain(&name).map(|_| name)
         }
         N::ColumnRef(_) => scope.domain_of(node).map(str::to_string),
+        N::ParamRef(p) => usize::try_from(p.number - 1)
+            .ok()
+            .and_then(|i| scope.params.get(i)?.clone()),
         N::CoalesceExpr(c) => common_domain(c.args.iter().map(of)),
         N::MinMaxExpr(m) => common_domain(m.args.iter().map(of)),
         N::CaseExpr(c) => {
@@ -457,6 +466,36 @@ fn expr_domain(
         }
         _ => None,
     }
+}
+
+/// The domain the one target of `sql`, a `SELECT <expr>` whose parameters
+/// are declared of `types`, is already of (`exprType`), when it is one.
+/// PL/pgSQL's `exec_assign_value` casts an assigned value from that type
+/// to its target's, so a value already of the target's domain is no
+/// coercion and checks nothing (RP-670).
+pub fn select_target_domain(
+    sql: &str,
+    types: &[String],
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let parsed = pg_query::parse(sql).ok()?;
+    let stmt = parsed.protobuf.stmts.first()?.stmt.as_deref()?;
+    let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+        return None;
+    };
+    let [target] = s.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return None;
+    };
+    let ctes = with_ctes(s, lookup, &Ctes::new());
+    let mut scope = Scope::of_from(&s.from_clause, lookup, &ctes);
+    scope.params = types
+        .iter()
+        .map(|t| domains::user_domain(t).map(|_| t.clone()))
+        .collect();
+    expr_domain(rt.val.as_deref()?, &scope, lookup, &ctes)
 }
 
 /// The domain column `i` of a subquery's row is of.
@@ -485,6 +524,7 @@ fn write_scope(
     let mut scope = Scope {
         items: Vec::new(),
         opaque: false,
+        params: Vec::new(),
     };
     let (name, columns) = aliased(
         target.relname.clone(),

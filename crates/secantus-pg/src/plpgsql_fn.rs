@@ -134,6 +134,22 @@ pub trait Host {
         let _ = (sql, params, types);
         Err(PlError::unsupported("CALL"))
     }
+    /// `exec_assign_value`'s cast of an assigned value into a record field
+    /// of type `ty`, when `ty` is a domain (`None` when it is not one).
+    /// `sql` is the assigned expression as `SELECT <expr>`, bound over
+    /// parameters of `types`. A value already of the domain (`exprType`)
+    /// is no coercion and is kept as it is; any other is cast to the
+    /// domain's base type and checked against its constraints (RP-670).
+    fn coerce_to_domain(
+        &self,
+        ty: &str,
+        sql: &str,
+        types: &[String],
+        value: Bson,
+    ) -> Option<Result<Bson, PlError>> {
+        let _ = (ty, sql, types, value);
+        None
+    }
     /// Enter a block with EXCEPTION handlers: a subtransaction, so a caught
     /// error undoes the block's writes. Answers a token for `subtxn_end`.
     fn subtxn_begin(&self) -> Result<u64, PlError> {
@@ -1621,6 +1637,29 @@ impl Interp<'_> {
             .unwrap_or(Bson::Null))
     }
 
+    /// The value an assignment stores in a record field of type `ty`
+    /// (`exec_assign_value` over a `PLpgSQL_recfield`): the expression's
+    /// value cast from its own type to the field's. A field of a domain
+    /// checks the domain's constraints unless the value is already of the
+    /// domain, so `new.a := -5` fails on its own line, whatever the trigger
+    /// assigns after it (RP-670).
+    fn assign_field(&self, e: &Value, ty: &str) -> Result<Bson, PlError> {
+        let v = self.eval(e)?;
+        let bound = expr_query(e).and_then(|(text, mode)| {
+            let body = match mode {
+                3 | 4 => text.split_once(":=").map_or(text, |(_, r)| r).trim(),
+                _ => text,
+            };
+            self.bind(&format!("SELECT {body}")).ok()
+        });
+        if let Some((sql, _, types)) = bound {
+            if let Some(out) = self.host.coerce_to_domain(ty, &sql, &types, v.clone()) {
+                return out;
+            }
+        }
+        self.cast(v, ty)
+    }
+
     fn eval_bool(&self, e: &Value) -> Result<bool, PlError> {
         Ok(matches!(self.eval(e)?, Bson::Boolean(true)))
     }
@@ -1931,10 +1970,9 @@ impl Interp<'_> {
                             }
                             _ => None,
                         };
-                        let v = self.eval(&expr)?;
                         match ty {
-                            Some(t) => self.cast(v, &t)?,
-                            None => v,
+                            Some(t) => self.assign_field(&expr, &t)?,
+                            None => self.eval(&expr)?,
                         }
                     }
                     _ => self.eval_typed(&expr, no)?,
