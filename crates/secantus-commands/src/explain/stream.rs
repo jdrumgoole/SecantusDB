@@ -39,15 +39,22 @@
 //! - a SORT of index keys below the FETCH: every key read and sorted for the
 //!   first batch, each document fetched as a batch reaches it.
 //!
+//! - GEO_NEAR_2D / GEO_NEAR_2DSPHERE: a `$near`'s ring search, its rings,
+//!   queue and increment kept between batches, each ring reading the
+//!   collection as it is when the search reaches it, and the queue handing
+//!   out the documents it buffered as it buffered them (RM-347).
+//!
 //! What does not stream reads as before ([`super::order`]): a sort of whole
 //! documents (mongod reads it whole for the first batch too), plans that
-//! intersect, and a geo or text read.
+//! intersect, and a geo read other than a `$near`, or a text read.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use bson::{doc, Bson, Document};
 use secantus_core::collation::Collation;
+use secantus_core::geoorder::near::{Candidate, Measure, NearSearch, Source};
+use secantus_core::geoorder::FieldBounds;
 use secantus_core::heap::{Heap, HeapOrder};
 use secantus_core::sortkey::{self, COMPOUND_SEP};
 
@@ -867,6 +874,52 @@ impl Merge {
     }
 }
 
+/// A `$near`'s search: mongod's `GeoNear2DStage` / `GeoNear2DSphereStage`,
+/// run as the batches ask.
+struct NearStage {
+    search: NearSearch<Vec<u8>>,
+    measure: Measure,
+    /// The command's filter, which each document the search hands out is
+    /// matched against (the rest of the query is a filter over what the
+    /// stage returns).
+    filter: Option<Document>,
+    /// The collection as this batch's rings read it: read when the batch
+    /// first reaches a ring, dropped at its end.
+    held: Option<Vec<Candidate<Vec<u8>>>>,
+    t: Tally,
+}
+
+/// The collection as a `$near` ring reads it: every document as it is now,
+/// read once a batch (nothing writes to it while a batch reads).
+struct NearSource<'s, 'c, 'a> {
+    cx: &'c Cx<'a>,
+    measure: &'s Measure,
+    held: &'s mut Option<Vec<Candidate<Vec<u8>>>>,
+}
+
+impl Source<Vec<u8>> for NearSource<'_, '_, '_> {
+    type Error = StorageError;
+
+    fn candidates(&mut self) -> Result<&[Candidate<Vec<u8>>], StorageError> {
+        if self.held.is_none() {
+            let Some(rows) =
+                self.cx
+                    .storage
+                    .collection_at_most(self.cx.db, self.cx.coll, usize::MAX)?
+            else {
+                return Err(StorageError::Internal("this store cannot stream".into()));
+            };
+            let mut out = Vec::with_capacity(rows.len());
+            for (rid, blob) in rows {
+                let doc = secantus_core::bsondoc::from_bytes(&blob).map_err(undecodable)?;
+                out.push(self.measure.candidate(rid, &doc, true, blob));
+            }
+            *self.held = Some(out);
+        }
+        Ok(self.held.as_deref().unwrap_or(&[]))
+    }
+}
+
 /// A stage of the plan, as the stream runs it.
 enum Stage {
     /// A point read through a unique index (`EXPRESS_IXSCAN`, `IDHACK`):
@@ -931,6 +984,7 @@ enum Stage {
         /// What its sorter counted (`totalDataSizeSorted`, the spills).
         report: Option<Box<secantus_core::memlimit::SpillReport>>,
     },
+    Near(Box<NearStage>),
 }
 
 /// Sort `all` by `pattern` as mongod's `SORT` does, holding it to its
@@ -1038,6 +1092,7 @@ impl Stage {
             Stage::Merge(m) => &mut m.t,
             Stage::Coll(s) => &mut s.t,
             Stage::Ix(s) => &mut s.t,
+            Stage::Near(n) => &mut n.t,
         }
     }
 
@@ -1052,6 +1107,7 @@ impl Stage {
             Stage::Merge(m) => &m.t,
             Stage::Coll(s) => &s.t,
             Stage::Ix(s) => &s.t,
+            Stage::Near(n) => &n.t,
         }
     }
 
@@ -1079,6 +1135,7 @@ impl Stage {
             Stage::Skip { input, .. } => input.is_eof(),
             Stage::Or { inputs, pos, .. } => *pos >= inputs.len(),
             Stage::Merge(m) => m.is_eof(),
+            Stage::Near(n) => n.search.is_eof(),
         }
     }
 
@@ -1135,6 +1192,48 @@ impl Stage {
             }
             Stage::Coll(_) | Stage::Ix(_) | Stage::Merge(_) => {
                 unreachable!("counted by Stage::next")
+            }
+            Stage::Near(n) => {
+                let NearStage {
+                    search,
+                    measure,
+                    filter,
+                    held,
+                    t,
+                } = n.as_mut();
+                let (keys, docs) = (search.keys_examined, search.docs_examined);
+                let out = {
+                    let mut source = NearSource {
+                        cx: &*cx,
+                        measure,
+                        held,
+                    };
+                    loop {
+                        t.own += 1;
+                        let Some((rid, blob)) = search.next(&mut source)? else {
+                            t.eof_work = true;
+                            break None;
+                        };
+                        if let Some(f) = filter.as_ref() {
+                            if !source.cx.matches(&blob, f)? {
+                                continue;
+                            }
+                        }
+                        break Some(Member {
+                            rid,
+                            doc: Some(blob),
+                            entry: None,
+                            stale: false,
+                        });
+                    }
+                };
+                let keys = search.keys_examined - keys;
+                let docs = search.docs_examined - docs;
+                cx.keys += keys;
+                cx.docs += docs;
+                t.keys += keys;
+                t.docs += docs;
+                Ok(out)
             }
             Stage::Fetch {
                 filter,
@@ -1373,6 +1472,9 @@ impl Stage {
     fn yield_children(&mut self) {
         match self {
             Stage::Point { .. } => {}
+            // What the rings read is read again by the next ring; the queue
+            // keeps what it buffered.
+            Stage::Near(n) => n.held = None,
             Stage::Coll(scan) => {
                 scan.buf.clear();
                 scan.end = false;
@@ -1404,7 +1506,7 @@ impl Stage {
     fn sorts(&self) -> bool {
         match self {
             Stage::SortKeys { .. } | Stage::SortDocs { .. } => true,
-            Stage::Point { .. } | Stage::Coll(_) | Stage::Ix(_) => false,
+            Stage::Point { .. } | Stage::Coll(_) | Stage::Ix(_) | Stage::Near(_) => false,
             Stage::Fetch { input, .. } | Stage::Skip { input, .. } => input.sorts(),
             Stage::Or { inputs, .. } => inputs.iter().any(Stage::sorts),
             Stage::Merge(merge) => merge.inputs.iter().any(Stage::sorts),
@@ -1974,6 +2076,51 @@ impl Stream {
         }))
     }
 
+    /// A `$near`'s read over `db.coll`: the ring search `measure` makes,
+    /// bounded on the index's other fields by `base`, each document it
+    /// returns matched against `filter`, after `skip`, up to `limit` (0: no
+    /// limit).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn of_near(
+        db: &str,
+        coll: &str,
+        filter: &Document,
+        vars: &Document,
+        measure: Measure,
+        base: Vec<FieldBounds>,
+        skip: i64,
+        limit: i64,
+    ) -> Stream {
+        let root = Stage::Near(Box::new(NearStage {
+            search: NearSearch::new(measure.clone(), base),
+            measure,
+            filter: (!filter.is_empty()).then(|| filter.clone()),
+            held: None,
+            t: Tally::default(),
+        }));
+        Stream {
+            db: db.to_string(),
+            coll: coll.to_string(),
+            root,
+            vars: vars.clone(),
+            skip: skip.max(0),
+            limit: (limit > 0).then_some(limit),
+            stashed: VecDeque::new(),
+            done: false,
+            keys: 0,
+            docs: 0,
+            want_keys: false,
+            keys_only: false,
+            skip_given: skip.max(0),
+            limit_reached: false,
+            limit_eof_work: false,
+            first: true,
+            yields: Yields::default(),
+            shown: Yields::default(),
+            failed: None,
+        }
+    }
+
     /// The read of a `count`'s plan below its COUNT stage (`input`), when it
     /// streams: a COUNT_SCAN reads index entries alone, anything else as a
     /// `find` of the same plan reads.
@@ -2065,7 +2212,7 @@ impl Stream {
         fn scans(stage: &Stage) -> usize {
             match stage {
                 Stage::Coll(_) => 0,
-                Stage::Ix(_) | Stage::Point { .. } => 1,
+                Stage::Ix(_) | Stage::Point { .. } | Stage::Near(_) => 1,
                 Stage::Fetch { input, .. } | Stage::Skip { input, .. } => scans(input),
                 Stage::Or { inputs, .. } => inputs.iter().map(scans).sum(),
                 Stage::Merge(merge) => merge.inputs.iter().map(scans).sum(),

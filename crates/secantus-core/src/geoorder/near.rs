@@ -28,19 +28,20 @@ const MAX_EARTH_DISTANCE: f64 = PI * EARTH_RADIUS_METERS;
 const METERS_PER_DEGREE_AT_EQUATOR: f64 = 2.0 * PI * EARTH_RADIUS_METERS / 360.0;
 
 /// `NearStage::SearchResult`: the nearer is the greater, so it is on top.
-struct Found {
+struct Found<P> {
     distance: f64,
-    doc: usize,
+    rid: i64,
+    payload: P,
 }
 
-impl HeapOrder for Found {
+impl<P> HeapOrder for Found<P> {
     fn heap_less(&self, other: &Self) -> bool {
         self.distance > other.distance
     }
 }
 
 /// `R2Annulus`.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct Annulus {
     centre: (f64, f64),
     inner: f64,
@@ -54,14 +55,95 @@ impl Annulus {
     }
 }
 
-/// A document as the search sees it.
-struct Doc {
+/// A document as the search sees it: its RecordId, its index keys, whether
+/// the ring scans' fetch lets it through, its distance and what the caller
+/// keeps of it (the document, as the queue buffers it).
+pub struct Candidate<P> {
+    pub rid: i64,
     keys: Vec<Key>,
-    /// The rest of the query (all but the `$near`) and, in the plane, the
-    /// whole-search annulus: what the ring scans' fetch tests.
+    /// The near stage's own filter and, in the plane, the whole-search
+    /// annulus: what the ring scans' fetch tests.
     fetched: bool,
     /// `computeGeoNearDistance`; -1 when it holds nothing to measure.
     distance: f64,
+    pub payload: P,
+}
+
+/// The collection as the search reads it, each time it reads it: the
+/// density estimate's scan and each ring's.
+pub trait Source<P> {
+    type Error;
+    /// Every document of the collection as it is now, in RecordId order.
+    fn candidates(&mut self) -> Result<&[Candidate<P>], Self::Error>;
+}
+
+/// How a search measures a document: the index, the query, and the
+/// annulus the whole search covers (`geoNearDistanceBounds` /
+/// `twoDDistanceBounds`).
+#[derive(Clone, Debug)]
+pub struct Measure {
+    index: GeoIndex,
+    near: Near,
+    full: Annulus,
+    flat: bool,
+}
+
+impl Measure {
+    /// `None` when the query is one this does not replay, or a `2d`
+    /// index's range does not hold the centre (mongod's 16433, which the
+    /// caller reports).
+    pub fn new(index: &GeoIndex, near: &Near) -> Option<Measure> {
+        let min = near.min.unwrap_or(0.0);
+        let max = near.max.unwrap_or(f64::MAX);
+        let (centre, spherical) = (near.centre, near.spherical);
+        let full = match &index.kind {
+            Kind::Flat(conv) if !spherical => Annulus {
+                centre,
+                inner: min,
+                outer: max.min(1.5 * (conv.max - conv.min)),
+            },
+            Kind::Flat(_) | Kind::Sphere { .. } => {
+                if !spherical {
+                    return None;
+                }
+                Annulus {
+                    centre,
+                    inner: min.min(MAX_EARTH_DISTANCE),
+                    outer: max.min(MAX_EARTH_DISTANCE),
+                }
+            }
+        };
+        if let Kind::Flat(conv) = &index.kind {
+            conv.hash(centre.0, centre.1)?;
+        }
+        Some(Measure {
+            index: index.clone(),
+            near: near.clone(),
+            full,
+            flat: matches!(index.kind, Kind::Flat(_)) && !spherical,
+        })
+    }
+
+    /// `doc` (RecordId `rid`) as the search sees it; `passes`: the near
+    /// stage's own filter lets it through.
+    pub fn candidate<P>(&self, rid: i64, doc: &Document, passes: bool, payload: P) -> Candidate<P> {
+        let value = crate::get_path(doc, self.index.geo_field());
+        let in_annulus = !self.flat
+            || value.is_some_and(|v| {
+                super::flat_points(v)
+                    .into_iter()
+                    .any(|p| self.full.contains(p))
+            });
+        Candidate {
+            rid,
+            keys: self.index.keys(doc),
+            fetched: passes && in_annulus,
+            distance: value
+                .and_then(|v| distance(&self.near, self.flat, v))
+                .unwrap_or(-1.0),
+            payload,
+        }
+    }
 }
 
 /// One ring: the covering's key intervals and its distance bounds.
@@ -72,13 +154,189 @@ struct Ring {
     inclusive_max: bool,
 }
 
-/// The order mongod returns the documents of a `$near` in, as indexes into
-/// `docs` (the collection, in insertion order). `passes[i]` is whether the
-/// near stage's own filter lets document `i` through; `base` holds the
-/// bounds of the index's other fields (the geo field's entry is ignored).
-/// The rest of a query is a filter mongod runs over what the stage returns,
-/// so it does not change the order. `None` when the query is one this does
-/// not replay.
+/// mongod's `NearStage` as it runs: the search's rings, its queue and its
+/// increment, kept between calls, so a cursor reads it ring by ring as
+/// `getMore` asks. Each ring scans the collection as it is when the search
+/// reaches it; the queue holds what earlier rings buffered, as they
+/// buffered it. Nearest first, then; but documents at one distance come out
+/// in whatever order the heap's sift steps leave them, which depends on what
+/// was pushed, in what order, and what was still in the queue.
+pub struct NearSearch<P> {
+    measure: Measure,
+    /// The bounds of the index's other fields (the geo field's entry is
+    /// ignored).
+    base: Vec<FieldBounds>,
+    /// `None` until the first call runs the density estimate.
+    search: Option<Search>,
+    heap: Heap<Found<P>>,
+    seen: HashSet<i64>,
+    /// The ring being handed out, and how many it has returned.
+    ring: Option<Ring>,
+    returned: usize,
+    last_returned: Option<usize>,
+    done: bool,
+    /// Index entries the ring scans read, and documents they fetched.
+    pub keys_examined: i64,
+    pub docs_examined: i64,
+}
+
+impl<P: Clone> NearSearch<P> {
+    pub fn new(measure: Measure, base: Vec<FieldBounds>) -> NearSearch<P> {
+        NearSearch {
+            measure,
+            base,
+            search: None,
+            heap: Heap::new(),
+            seen: HashSet::new(),
+            ring: None,
+            returned: 0,
+            last_returned: None,
+            done: false,
+            keys_examined: 0,
+            docs_examined: 0,
+        }
+    }
+
+    pub fn measure(&self) -> &Measure {
+        &self.measure
+    }
+
+    /// The search has handed out its last document.
+    pub fn is_eof(&self) -> bool {
+        self.done
+    }
+
+    fn bounded(&self, key: &Key, geo: &FieldBounds, others: bool) -> bool {
+        let geo_at = self.measure.index.geo_at;
+        key.iter().enumerate().all(|(at, part)| {
+            if at == geo_at {
+                geo.admits(part)
+            } else {
+                !others || self.base.get(at).is_none_or(|b| b.admits(part))
+            }
+        })
+    }
+
+    /// The next document, with its RecordId: what the queue holds inside
+    /// the ring being handed out, else the next ring's, read from `source`
+    /// as it is now.
+    pub fn next<S: Source<P>>(&mut self, source: &mut S) -> Result<Option<(i64, P)>, S::Error> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            if self.search.is_none() {
+                // The density estimator's index scan, which fetches nothing.
+                // A `2d` index's estimate bounds only the geo field.
+                let docs = source.candidates()?;
+                let sphere = self.measure.index.is_sphere();
+                let any_entry = |geo: &FieldBounds| {
+                    docs.iter()
+                        .any(|d| d.keys.iter().any(|k| self.bounded(k, geo, sphere)))
+                };
+                let (centre, full) = (self.measure.near.centre, self.measure.full);
+                let search = match &self.measure.index.kind {
+                    Kind::Sphere { coarsest, .. } => {
+                        Search::Sphere(SphereSearch::new(centre, full, *coarsest, &any_entry))
+                    }
+                    Kind::Flat(conv) => Search::Flat(
+                        FlatSearch::new(
+                            *conv,
+                            centre,
+                            full,
+                            self.measure.near.spherical,
+                            &any_entry,
+                        )
+                        .expect("a centre Measure::new hashed"),
+                    ),
+                };
+                self.search = Some(search);
+            }
+            // Advancing: hand out what is inside the ring.
+            if let Some(ring) = &self.ring {
+                while let Some(top) = self.heap.top() {
+                    if top.distance < ring.min {
+                        let gone = self.heap.pop().expect("a top to pop");
+                        self.seen.remove(&gone.rid);
+                        continue;
+                    }
+                    let inside = if ring.inclusive_max {
+                        top.distance <= ring.max
+                    } else {
+                        top.distance < ring.max
+                    };
+                    if !inside {
+                        break;
+                    }
+                    let found = self.heap.pop().expect("a top to pop");
+                    self.seen.remove(&found.rid);
+                    self.returned += 1;
+                    return Ok(Some((found.rid, found.payload)));
+                }
+                self.last_returned = Some(self.returned);
+                self.ring = None;
+            }
+            let next = self
+                .search
+                .as_mut()
+                .expect("a search")
+                .next(self.last_returned);
+            let Some(ring) = next else {
+                self.done = true;
+                return Ok(None);
+            };
+            // Buffering: the ring's index scan, its fetch, and the queue.
+            let docs = source.candidates()?;
+            let mut entries: Vec<(&Key, usize)> = Vec::new();
+            for (i, d) in docs.iter().enumerate() {
+                for k in &d.keys {
+                    if self.bounded(k, &ring.geo, true) {
+                        entries.push((k, i));
+                    }
+                }
+            }
+            entries.sort_by(|a, b| a.0.cmp(b.0).then(docs[a.1].rid.cmp(&docs[b.1].rid)));
+            self.keys_examined += entries.len() as i64;
+            let mut scanned: HashSet<usize> = HashSet::new();
+            for (_, i) in entries {
+                if !scanned.insert(i) {
+                    continue;
+                }
+                let d = &docs[i];
+                self.docs_examined += 1;
+                if !d.fetched || self.seen.contains(&d.rid) {
+                    continue;
+                }
+                self.heap.push(Found {
+                    distance: d.distance,
+                    rid: d.rid,
+                    payload: d.payload.clone(),
+                });
+                self.seen.insert(d.rid);
+            }
+            self.ring = Some(ring);
+            self.returned = 0;
+        }
+    }
+}
+
+/// A collection that does not change while it is read.
+struct Fixed<P>(Vec<Candidate<P>>);
+
+impl<P> Source<P> for Fixed<P> {
+    type Error = std::convert::Infallible;
+    fn candidates(&mut self) -> Result<&[Candidate<P>], Self::Error> {
+        Ok(&self.0)
+    }
+}
+
+/// The order mongod returns the documents of a `$near` in, read at once
+/// from a collection that does not change, as indexes into `docs` (the
+/// collection, in insertion order). `passes[i]` is whether the near stage's
+/// own filter lets document `i` through; `base` holds the bounds of the
+/// index's other fields (the geo field's entry is ignored). The rest of a
+/// query is a filter mongod runs over what the stage returns, so it does
+/// not change the order. `None` when the query is one this does not replay.
 pub fn near_order(
     index: &GeoIndex,
     base: &[FieldBounds],
@@ -86,123 +344,18 @@ pub fn near_order(
     docs: &[Document],
     passes: &[bool],
 ) -> Option<Vec<usize>> {
-    let field = index.geo_field();
-    let min = near.min.unwrap_or(0.0);
-    let max = near.max.unwrap_or(f64::MAX);
-    let (centre, spherical) = (near.centre, near.spherical);
-    // `geoNearDistanceBounds` / `twoDDistanceBounds`.
-    let full = match &index.kind {
-        Kind::Flat(conv) if !spherical => Annulus {
-            centre,
-            inner: min,
-            outer: max.min(1.5 * (conv.max - conv.min)),
-        },
-        Kind::Flat(_) | Kind::Sphere { .. } => {
-            if !spherical {
-                return None;
-            }
-            Annulus {
-                centre,
-                inner: min.min(MAX_EARTH_DISTANCE),
-                outer: max.min(MAX_EARTH_DISTANCE),
-            }
-        }
-    };
-    let flat = matches!(index.kind, Kind::Flat(_)) && !spherical;
-    let docs: Vec<Doc> = docs
-        .iter()
-        .zip(passes)
-        .map(|(doc, &passes)| {
-            let value = crate::get_path(doc, field);
-            let in_annulus = !flat
-                || value
-                    .is_some_and(|v| super::flat_points(v).into_iter().any(|p| full.contains(p)));
-            Doc {
-                keys: index.keys(doc),
-                fetched: passes && in_annulus,
-                distance: value.and_then(|v| distance(near, flat, v)).unwrap_or(-1.0),
-            }
-        })
-        .collect();
-    let geo_at = index.geo_at;
-    let bounded = |key: &Key, geo: &FieldBounds, others: bool| {
-        key.iter().enumerate().all(|(at, part)| {
-            if at == geo_at {
-                geo.admits(part)
-            } else {
-                !others || base.get(at).is_none_or(|b| b.admits(part))
-            }
-        })
-    };
-    // Does any entry fall inside these bounds of the geo field? (The
-    // density estimator's index scan, which fetches nothing. A `2d`
-    // index's estimate bounds only the geo field.)
-    let sphere = index.is_sphere();
-    let any_entry = |geo: &FieldBounds| {
+    let measure = Measure::new(index, near)?;
+    let mut source = Fixed(
         docs.iter()
-            .any(|d| d.keys.iter().any(|k| bounded(k, geo, sphere)))
-    };
-
-    let mut search = match &index.kind {
-        Kind::Sphere { coarsest, .. } => {
-            Search::Sphere(SphereSearch::new(centre, full, *coarsest, &any_entry))
-        }
-        Kind::Flat(conv) => {
-            Search::Flat(FlatSearch::new(*conv, centre, full, spherical, &any_entry)?)
-        }
-    };
-
-    let mut heap: Heap<Found> = Heap::new();
-    let mut seen: HashSet<usize> = HashSet::new();
+            .zip(passes)
+            .enumerate()
+            .map(|(i, (doc, &passes))| measure.candidate(i as i64, doc, passes, ()))
+            .collect(),
+    );
+    let mut search = NearSearch::new(measure, base.to_vec());
     let mut out = Vec::new();
-    let mut last_returned: Option<usize> = None;
-    while let Some(ring) = search.next(last_returned) {
-        // Buffering: the ring's index scan, its fetch, and the queue.
-        let mut entries: Vec<(&Key, usize)> = Vec::new();
-        for (i, d) in docs.iter().enumerate() {
-            for k in &d.keys {
-                if bounded(k, &ring.geo, true) {
-                    entries.push((k, i));
-                }
-            }
-        }
-        entries.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(&b.1)));
-        let mut scanned = vec![false; docs.len()];
-        for (_, i) in entries {
-            if std::mem::replace(&mut scanned[i], true) {
-                continue;
-            }
-            if !docs[i].fetched || seen.contains(&i) {
-                continue;
-            }
-            heap.push(Found {
-                distance: docs[i].distance,
-                doc: i,
-            });
-            seen.insert(i);
-        }
-        // Advancing: hand out what is inside the ring.
-        let mut returned = 0;
-        while let Some(top) = heap.top() {
-            if top.distance < ring.min {
-                let gone = heap.pop().expect("a top to pop");
-                seen.remove(&gone.doc);
-                continue;
-            }
-            let inside = if ring.inclusive_max {
-                top.distance <= ring.max
-            } else {
-                top.distance < ring.max
-            };
-            if !inside {
-                break;
-            }
-            let found = heap.pop().expect("a top to pop");
-            seen.remove(&found.doc);
-            out.push(found.doc);
-            returned += 1;
-        }
-        last_returned = Some(returned);
+    while let Some((i, ())) = search.next(&mut source).unwrap_or_else(|e| match e {}) {
+        out.push(i as usize);
     }
     Some(out)
 }

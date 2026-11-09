@@ -104,11 +104,12 @@ def _near_reads(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-347")
+@pytest.mark.backlog_fixed("RM-347")
 def test_a_near_read_goes_ring_by_ring(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 reads a `$near` / `$geoNear` ring by ring as the cursor
-    is read: a document inserted in a ring not yet searched is returned, one
-    deleted from it is not; the ring searched buffers its documents."""
+    """mongod 8.2.11 read a `$near` / `$geoNear` ring by ring as the cursor
+    was read, and this server came to read it so: a document inserted in a
+    ring not yet searched was returned, one deleted from it was not; the
+    ring searched buffered its documents."""
     got, want = _near_reads(rust_mongo), _near_reads(mongod)
     assert want["find $near"] == [0, 20, 1, 2, 4, 21, 5]
     assert got == want

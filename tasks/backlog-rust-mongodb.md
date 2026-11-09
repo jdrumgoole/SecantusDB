@@ -2205,22 +2205,6 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a `$near` or `$geoNear` cursor is the result
-      as it was when the command ran.** mongod searches rings around the
-      centre as the cursor is read: the ring searched buffers its documents,
-      and a later ring is searched against the collection as it is then, so
-      a `getMore` returns a document inserted in a ring not yet searched and
-      not one deleted from it (`find` with `$near` and `batchSize: 1` over
-      points at 0..5 degrees, then an insert at 0.5 and 4.5 and a delete at
-      3: mongod 8.2.11 returns `0, 20, 1, 2, 4, 21, 5`; this server `0..5`).
-      The ring order itself is mongod's (`secantus_core::geoorder::near`, a
-      replay over the whole collection); what is missing is running it ring
-      by ring across batches, the search's state (rings, queue, increment)
-      kept between them, each ring reading the store as it is then, and an
-      aggregate's `$geoNear` through its cursor stage (found 2026-10-27,
-      RM-080's remainder).
-      Backlog-ID: RM-347
-      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_near_read_goes_ring_by_ring
 - [ ] **RUST MongoDB server: a time-series cursor is not read bucket by
       bucket.** mongod reads a time-series collection's buckets through its
       cursor stage (32 bucket documents first, twice as many at each refill)

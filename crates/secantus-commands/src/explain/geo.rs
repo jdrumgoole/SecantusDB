@@ -19,7 +19,8 @@
 use crate::near::Found;
 use crate::storage::{Storage, StorageError};
 use bson::{Bson, Document};
-use secantus_core::geoorder::{near::near_order, FieldBounds, GeoIndex};
+use secantus_core::geoorder::near::{near_order, Measure};
+use secantus_core::geoorder::{FieldBounds, GeoIndex};
 
 type Rows = Vec<(i64, Vec<u8>)>;
 
@@ -382,6 +383,30 @@ fn collection(
         .into_iter()
         .map(|(rid, blob)| decode(&blob).map(|d| (rid, d)))
         .collect())
+}
+
+/// What a `$near` read through `index` searches with, read as the
+/// cursor asks: how it measures each document and the bounds of the
+/// index's other fields. `None` when the search is not replayed here (as
+/// [`near_rows`] declines it).
+pub(crate) fn near_search(
+    storage: &dyn Storage,
+    db: &str,
+    coll: &str,
+    filter: &Document,
+    index: &GeoIndex,
+    near: &secantus_core::geoshape::Near,
+) -> Result<Option<(Measure, Vec<FieldBounds>)>, StorageError> {
+    let Some(base) = trailing_bounds(index, filter) else {
+        return Ok(None);
+    };
+    if storage
+        .collection_count_at_most(db, coll, NEAR_COLLECTION)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    Ok(Measure::new(index, near).map(|m| (m, base)))
 }
 
 /// `rows` (the documents a `$near` matched) in mongod's order, or `Err`

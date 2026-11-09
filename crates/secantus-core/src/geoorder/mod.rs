@@ -539,4 +539,48 @@ mod tests {
         let order = near::near_order(&ix, &base, &near, &docs, &[true; 4]).unwrap();
         assert_eq!(order, [2, 1, 3, 0]);
     }
+
+    /// A collection the test writes to between reads.
+    struct Live {
+        measure: near::Measure,
+        docs: Vec<(i64, Document)>,
+        held: Vec<near::Candidate<()>>,
+    }
+
+    impl near::Source<()> for Live {
+        type Error = std::convert::Infallible;
+        fn candidates(&mut self) -> Result<&[near::Candidate<()>], Self::Error> {
+            self.held = self
+                .docs
+                .iter()
+                .map(|(rid, d)| self.measure.candidate(*rid, d, true, ()))
+                .collect();
+            Ok(&self.held)
+        }
+    }
+
+    #[test]
+    fn a_near_search_reads_each_ring_as_the_collection_is_then() {
+        // RM-347: mongod searches a ring only when the cursor reaches it,
+        // so a document written into a ring not yet searched is returned
+        // (or, deleted, is not), as on mongod 8.2.11's `$near` cursor.
+        let point = |rid: i64, x: f64| (rid, doc! { "_id": rid, "loc": [x, 0.0] });
+        let near = crate::geoshape::near_condition(&doc! { "$near": [0, 0] })
+            .unwrap()
+            .unwrap();
+        let measure = near::Measure::new(&flat_index(), &near).unwrap();
+        let mut live = Live {
+            measure: measure.clone(),
+            docs: (0..6).map(|i| point(i, i as f64)).collect(),
+            held: Vec::new(),
+        };
+        let mut search = near::NearSearch::new(measure, vec![FieldBounds::Full]);
+        let mut next = |live: &mut Live| search.next(live).unwrap().map(|(rid, ())| rid);
+        assert_eq!(next(&mut live), Some(0));
+        live.docs.push(point(20, 0.5));
+        live.docs.push(point(21, 4.5));
+        live.docs.retain(|(rid, _)| *rid != 3);
+        let rest: Vec<i64> = std::iter::from_fn(|| next(&mut live)).collect();
+        assert_eq!(rest, [20, 1, 2, 4, 21, 5]);
+    }
 }

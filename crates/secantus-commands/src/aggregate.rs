@@ -758,7 +758,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 // A pipeline whose stages pass documents on as they arrive
                 // reads on as `getMore` asks (RM-080), as mongod's does,
                 // through a view and under a collation too.
-                if geonear_candidate_none {
+                // A leading `$geoNear` is its ring search, read as `getMore`
+                // asks (RM-347).
+                let leads_geo_near = read_pipeline
+                    .first()
+                    .and_then(Bson::as_document)
+                    .is_some_and(|d| d.contains_key("$geoNear"));
+                if geonear_candidate_none || leads_geo_near {
                     let ask = crate::agg_stream::Ask {
                         db: &ctx.db_name,
                         coll: c,
@@ -3469,7 +3475,7 @@ fn graph_values_match(a: &Bson, target: Option<&Bson>) -> bool {
 /// for `$lookup`'s `as` target. `set_path` in `secantus-core` is deliberately
 /// private (its `Result<_, ()>` defer signal isn't public API), so this is a
 /// small local setter; `as` is almost always a top-level field.
-fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
+pub(crate) fn set_field_path(doc: &mut Document, path: &str, value: Bson) {
     match path.split_once('.') {
         None => {
             doc.insert(path, value);
@@ -3670,7 +3676,7 @@ pub(crate) fn collection_documents(
 /// what lies within it: a `$geoIntersects` with a polygon drawn around the
 /// disc, its edges tangent to a slightly larger circle. In the plane a `2d`
 /// index holds points only, and a `$center` holds every point inside.
-fn geo_near_index_filter(
+pub(crate) fn geo_near_index_filter(
     spec: &Bson,
     db: &str,
     coll: Option<&str>,
@@ -4141,6 +4147,9 @@ fn near_stage(
         }
         scored.push((d, shaped, out));
     }
+    if scored.is_empty() {
+        return Ok(Vec::new());
+    }
     scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     // mongod's own order: its ring search over the index, which leaves
     // documents at one distance as its queue does.
@@ -4154,6 +4163,83 @@ fn near_stage(
         scored.sort_by_key(|(_, _, d)| at(d));
     }
     Ok(scored.into_iter().map(|(_, _, d)| d).collect())
+}
+
+/// A leading `$geoNear`, read as the cursor asks (RM-347): what its
+/// search measures and what it gives each document it returns.
+pub(crate) struct GeoNearRead {
+    pub near: secantus_core::geoshape::Near,
+    pub key: String,
+    pub query: Document,
+    distance_field: Option<String>,
+    include_locs: Option<String>,
+    /// What a distance is divided by to be given in the stage's units.
+    unit: f64,
+    multiplier: f64,
+}
+
+impl GeoNearRead {
+    /// `doc` as the stage returns it: with its distance and its location
+    /// in the fields the stage names. `None`: it holds nothing the stage
+    /// measures within its bounds.
+    pub(crate) fn annotate(&self, mut doc: Document) -> Option<Document> {
+        let value = secantus_core::get_path(&doc, &self.key).cloned()?;
+        let d = self
+            .near
+            .distance(&value)
+            .filter(|d| self.near.admits(*d))?;
+        if let Some(field) = &self.distance_field {
+            set_field_path(
+                &mut doc,
+                field,
+                Bson::Double(d / self.unit * self.multiplier),
+            );
+        }
+        if let Some(field) = &self.include_locs {
+            set_field_path(&mut doc, field, value);
+        }
+        Some(doc)
+    }
+}
+
+/// The `$geoNear` `spec` over `db.coll` as a read the cursor makes, when
+/// the stage is one mongod runs: `None` when it refuses it, which the read
+/// of the whole pipeline then reports as it does.
+pub(crate) fn geo_near_read(
+    spec: &Bson,
+    db: &str,
+    coll: &str,
+    storage: &dyn crate::storage::Storage,
+) -> Option<GeoNearRead> {
+    // Every refusal the stage makes before it reads a document.
+    near_stage(
+        Some(spec),
+        Vec::new(),
+        db,
+        Some(coll),
+        &Document::new(),
+        storage,
+        None,
+    )
+    .ok()?;
+    let stage = geo_near_stage(spec.as_document()?).ok()?;
+    let key = match stage.key {
+        Some(k) => k.to_string(),
+        None => infer_geo_near_key(db, Some(coll), storage).ok()?,
+    };
+    Some(GeoNearRead {
+        near: stage.near,
+        key,
+        query: stage.query.cloned().unwrap_or_default(),
+        distance_field: stage.distance_field.map(str::to_string),
+        include_locs: stage.include_locs.map(str::to_string),
+        unit: if stage.radians {
+            secantus_core::geoshape::EARTH_RADIUS_METERS
+        } else {
+            1.0
+        },
+        multiplier: stage.multiplier,
+    })
 }
 
 /// mongod's message for a `$geoNear` it could not plan, for `reason`.
