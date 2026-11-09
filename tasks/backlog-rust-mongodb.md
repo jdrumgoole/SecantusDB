@@ -2445,17 +2445,6 @@ What is left, there and beside it:
       CI job.
       Backlog-ID: RM-091
       Verify: tests/backlog/test_rm_085_112.py::test_canonically_equivalent_strings_differ_without_normalization
-- [ ] **RUST MongoDB server: collated `_id` uniqueness, what is left.**
-      (The rule: a claim per document in the unique-keys table under the
-      collated key; documents stored before it, or by the Python server, are
-      claimed when the store opens.) A duplicate whose `_id` is a document
-      shows the value as written (mongod shows each string in it as raw
-      sort-key bytes). The Python server does not enforce the rule itself:
-      as the server holding the store it accepts a second spelling, and the
-      Rust server, which walks the documents again after it, keeps both and
-      logs them.
-      Backlog-ID: RM-092
-      Verify: tests/backlog/test_rm_085_112.py::test_collated_duplicate_document_id_shows_sort_key
 - [ ] **RUST MongoDB server: a query never uses a collated index.** An index
       with a collation now holds collation sort keys (catalog marker
       `collationKeys`), which is what makes its `unique` right, and the
@@ -2480,9 +2469,8 @@ What is left, there and beside it:
       five types come from its data.
       The same ICU 57 work also settles a duplicate-key error over a
       collated key: its key bytes are ICU4X's (`2b0105`) where mongod's are
-      ICU 57's (`290105`), and for a string inside a document this server
-      quotes the string where mongod quotes the key (this was RM-096's last
-      residual).
+      ICU 57's (`290105`), inside a document `_id` as well (RM-092 gave
+      that case mongod's shape: the raw key bytes in place of each string).
       Backlog-ID: RM-095
       Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
 

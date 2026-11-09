@@ -2340,9 +2340,13 @@ impl UniqueConflict {
         let mut key_value = conflict_key_value(doc, key_pattern, kb, coll);
         if let Some(c) = coll {
             for (_, v) in key_value.iter_mut() {
-                if let Bson::String(s) = v {
-                    let key = secantus_core::collation::sort_key(s, c);
-                    *v = Bson::String(key.iter().map(|b| format!("{b:02x}")).collect());
+                match v {
+                    Bson::String(s) => {
+                        let key = secantus_core::collation::sort_key(s, c);
+                        *v = Bson::String(key.iter().map(|b| format!("{b:02x}")).collect());
+                    }
+                    Bson::Document(_) | Bson::Array(_) => nested_sort_keys(v, c),
+                    _ => {}
                 }
             }
         }
@@ -2443,6 +2447,25 @@ impl UniqueConflict {
             out.insert("foundValue", Document::new());
         }
         Some(out)
+    }
+}
+
+/// Replace every string inside a document or array key value with its raw
+/// collation sort key, as mongod reports a duplicate under a collated index:
+/// `{ _id: { a: "W\x01\x05" } }` for `{_id: {a: "x"}}` under `en`, strength 2,
+/// with no `hexEncoded` (measured 8.2.11, 2026-11-09; RM-092). The bytes are
+/// often not UTF-8 (`"É"` keys to `31 01 45 88`), so they go in a carrier.
+fn nested_sort_keys(v: &mut Bson, c: &Collation) {
+    if let Some(bytes) = secantus_core::bsondoc::str_bytes(v) {
+        let text = secantus_core::bsondoc::lossy(bytes).into_owned();
+        *v =
+            secantus_core::bsondoc::string_from_bytes(secantus_core::collation::sort_key(&text, c));
+        return;
+    }
+    match v {
+        Bson::Document(d) => d.iter_mut().for_each(|(_, x)| nested_sort_keys(x, c)),
+        Bson::Array(a) => a.iter_mut().for_each(|x| nested_sort_keys(x, c)),
+        _ => {}
     }
 }
 
