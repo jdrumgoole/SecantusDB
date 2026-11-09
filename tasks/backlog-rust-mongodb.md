@@ -647,14 +647,6 @@ These are explicit non-goals. Don't add them without a reason.
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **A DISTINCT_SCAN examines one key fewer than mongod's.** mongod
-      8.2.11's DISTINCT_SCAN for `distinct("x", {x: {$lt: 4}})` over keys
-      0 to 11 examines five keys -- the four it returns and the one past
-      its bounds that its last seek lands on -- in the entry's and the
-      line's `keysExamined` and its `execStats`. This server's scan ends at
-      the bound without counting that key (four). Found 2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_distinct_scan_examines_the_key_past_its_bounds
-      Backlog-ID: RM-377
 - [ ] **A projection is not where mongod's plan puts it.** mongod 8.2.11
       projects below a blocking SORT (`SORT` over `PROJECTION_SIMPLE` or
       `PROJECTION_COVERED`, so the SORT sorts the projected documents:
@@ -2131,9 +2123,12 @@ What is left, all on the RUST MongoDB server:
       `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
       (i 1 to 24) returns three keys and examines six, in eight works, in
       its `executionStats` and in a `$group`'s trial. This server's
-      examines three, in four works. The plans ranked are the same. Perhaps
-      RM-377's seek past the bounds, once per value of `x`: not confirmed
-      in the source. Found 2026-11-08 (RM-310).
+      examines three, in four works. The plans ranked are the same. Not
+      RM-377's key past the bounds (fixed 2026-11-09, and none is past
+      these): by the source, `explain`'s DISTINCT_SCAN (`explain/exec.rs`)
+      counts one key per value it returns plus a key past the bounds,
+      never a key a seek lands on that the bounds on `y` reject. Found
+      2026-11-08 (RM-310).
       Backlog-ID: RM-447
       Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
 - [ ] **`explain` lists a `$match` after the cursor with its clauses
