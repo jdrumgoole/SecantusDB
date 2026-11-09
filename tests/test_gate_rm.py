@@ -95,7 +95,14 @@ def test_storage_tests_run_only_when_the_storage_crates_change() -> None:
     assert g.touches_storage(["vendor/wiredtiger"])
 
 
-def test_only_runs_the_named_steps_and_skip_is_recorded(tmp_path: Path) -> None:
+def test_only_runs_the_named_steps_and_skip_is_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A step first waits for the load average to fall under 10, up to 30
+    # minutes: under the gate's own load this test blocked past the per-test
+    # timeout and took its xdist worker down (2026-11-09). It checks which
+    # steps run, not the wait.
+    monkeypatch.setenv("SECANTUS_LOAD_MAX_WAIT", "0")
     g = _gate_rm()
     gate = g.Gate(tmp_path, only={"a", "c"})
     gate.step("a", ["true"])
