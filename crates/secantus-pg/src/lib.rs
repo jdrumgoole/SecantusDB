@@ -2119,6 +2119,11 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn output_domains(&self, sql: &str, types: &[String]) -> Vec<Option<String>> {
+        let lookup = |n: &str| self.h.lookup(n);
+        secantus_pgplan::select_output_domains(sql, types, &lookup)
+    }
+
     fn assignment_length(&self, ty: &str, sql: &str, types: &[String]) -> Option<(String, i32)> {
         let (base, typmod) = match secantus_pgplan::domains::base_type_and_typmod(ty) {
             Some((base, typmod, _)) => {
@@ -19100,7 +19105,11 @@ impl PgHandler {
     /// enum, `array_agg(mood)` its array.
     fn agg_wire_type(&self, item: &AggItem) -> Type {
         let user = match item.func {
-            AggFunc::Min | AggFunc::Max => item.source_type.clone(),
+            // The overload's input type: an enum's own, a domain's base.
+            AggFunc::Min | AggFunc::Max => item
+                .source_type
+                .as_deref()
+                .map(secantus_pgplan::min_max_result_type),
             // `array_agg(int2vector)` is `array_agg(anyarray)`: the vector
             // type itself (RP-575).
             AggFunc::ArrayAgg => item
@@ -38349,16 +38358,60 @@ impl PgHandler {
                 }
             }
         }
+        // A `char(n)` value is stored here trimmed and padded on the way out
+        // to its column's width. A result column of the sides' common
+        // `bpchar` type with another modifier (a `text`, a `varchar` or
+        // another width on the other side: `select_common_typmod` is -1)
+        // pads nothing, so each `char(n)` side's values are padded to their
+        // own width here, as PostgreSQL stores them (RP-672).
+        for (i, field) in schema.iter().enumerate() {
+            if *field.datatype() != Type::BPCHAR {
+                continue;
+            }
+            for (side, rows) in [(&left_schema, &mut left), (&right_schema, &mut right)] {
+                let Some(f) = side.get(i) else { continue };
+                let m = f.type_modifier();
+                if *f.datatype() != Type::BPCHAR || m <= 4 || m == field.type_modifier() {
+                    continue;
+                }
+                let width = usize::try_from(m - 4).unwrap_or(0);
+                for row in rows.iter_mut() {
+                    if let Some(Some(Bson::String(t))) = row.get_mut(i) {
+                        let len = t.chars().count();
+                        if len < width {
+                            t.extend(std::iter::repeat_n(' ', width - len));
+                        }
+                    }
+                }
+            }
+        }
         let jsonb_cols: Vec<bool> = schema
             .iter()
             .map(|f| *f.datatype() == Type::JSONB)
             .collect();
+        // `bpchar`'s equality and order ignore trailing blanks
+        // (`bpchareq`, `bpcharcmp`), which a padded value carries.
+        let bpchar_cols: Vec<bool> = schema
+            .iter()
+            .map(|f| *f.datatype() == Type::BPCHAR)
+            .collect();
+        let is_bpchar = |i: usize| bpchar_cols.get(i).copied().unwrap_or(false);
+        let unpadded = |i: usize, v: Option<&Bson>| -> Option<Bson> {
+            match v {
+                Some(Bson::String(t)) if is_bpchar(i) => {
+                    Some(Bson::String(t.trim_end_matches(' ').to_string()))
+                }
+                v => v.cloned(),
+            }
+        };
         let ident = |row: &Vec<Option<Bson>>| -> Vec<Option<Bson>> {
             row.iter()
                 .enumerate()
                 .map(|(i, v)| {
                     if jsonb_cols.get(i).copied().unwrap_or(false) {
                         jsonb_ident(v)
+                    } else if is_bpchar(i) {
+                        set_op_ident(&unpadded(i, v.as_ref()))
                     } else {
                         set_op_ident(v)
                     }
@@ -38425,7 +38478,16 @@ impl PgHandler {
                         Nulls::Last => Ordering::Less,
                     },
                     (false, false) => {
-                        let cmp = compare_values(l.expect("not null"), r.expect("not null"));
+                        let (l, r) = (l.expect("not null"), r.expect("not null"));
+                        let cmp = match (l, r) {
+                            (Bson::String(a), Bson::String(b)) if is_bpchar(key.index) => {
+                                compare_values(
+                                    &Bson::String(a.trim_end_matches(' ').to_string()),
+                                    &Bson::String(b.trim_end_matches(' ').to_string()),
+                                )
+                            }
+                            _ => compare_values(l, r),
+                        };
                         if key.ascending {
                             cmp
                         } else {
@@ -49647,7 +49709,9 @@ fn aggregate_result_typmod(item: &AggItem) -> i32 {
 /// The wire type an aggregate's result carries.
 ///
 /// Probed against PostgreSQL 14: `count(*)` and `count(col)` are int8 (oid 20),
-/// `sum(int4)` is **int8**, not int4, and `min`/`max` return the INPUT type.
+/// `sum(int4)` is **int8**, not int4, and `min`/`max` return their
+/// overload's input type, which is the argument's unless an implicit cast
+/// chose it (`max(varchar)` is `text`, RP-681).
 fn aggregate_wire_type(item: &AggItem) -> Type {
     if aggregates::is_extended(item.func) {
         return wire_type(&secantus_pgplan::aggregate_item_type(item));
@@ -49666,10 +49730,11 @@ fn aggregate_wire_type(item: &AggItem) -> Type {
         AggFunc::Sum => wire_type(secantus_pgplan::sum_result_type(
             item.source_type.as_deref(),
         )),
+        // `max(varchar)` is `max(text)` (`secantus_pgplan::min_max_result_type`).
         AggFunc::Min | AggFunc::Max => item
             .source_type
             .as_deref()
-            .map(wire_type)
+            .map(|t| wire_type(&secantus_pgplan::min_max_result_type(t)))
             .unwrap_or(Type::VARCHAR),
         // An array of arrays is the same array type, and so is an array of
         // vectors (`aggregate_item_type`).

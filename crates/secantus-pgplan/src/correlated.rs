@@ -1024,8 +1024,23 @@ pub(crate) fn from_item_def(
             }
             Some((vec![alias.aliasname.clone()], def))
         }
+        // A FROM function's columns, typed by planning it (RP-699): an
+        // outer `f.x` over `generate_series(1, 2) f(x)` is an integer.
+        N::RangeFunction(rf) => {
+            let def = crate::joins::function_def(rf, lookup, params)?;
+            Some((vec![range_function_visible_name(rf)?], def))
+        }
         _ => None,
     }
+}
+
+/// The name a FROM function answers to: its alias, or the function's name.
+fn range_function_visible_name(rf: &pg_query::protobuf::RangeFunction) -> Option<String> {
+    rf.alias
+        .as_ref()
+        .map(|a| a.aliasname.clone())
+        .filter(|a| !a.is_empty())
+        .or_else(|| crate::joins::range_function_name(rf))
 }
 
 /// The type of an outer reference, innermost enclosing query first.
@@ -1049,6 +1064,10 @@ fn outer_ref_type(
                 }
             } else if let Some(N::RangeSubselect(rs)) = item.node.as_ref() {
                 if qualifier.is_some_and(|q| rs.alias.as_ref().is_none_or(|a| &a.aliasname != q)) {
+                    continue;
+                }
+            } else if let Some(N::RangeFunction(rf)) = item.node.as_ref() {
+                if qualifier.is_some_and(|q| range_function_visible_name(rf).as_ref() != Some(q)) {
                     continue;
                 }
             } else if let Some(N::JoinExpr(_)) = item.node.as_ref() {
@@ -1113,6 +1132,14 @@ fn outer_whole_row_type(name: &str, lookup: &dyn Fn(&str) -> Option<TableDef>) -
                 .into_iter()
                 .flatten()
                 .find_map(|side| whole_row_type(side, name, lookup)),
+            // A function's is its result's type: the scalar a scalar
+            // function returns, whatever its column is called (`f` over
+            // `generate_series(1, 2) f(x)` is an integer), or its row type
+            // (RP-699). Read from the planner, which types the whole row of
+            // a FROM function as the statement's own select list does.
+            N::RangeFunction(rf) if range_function_visible_name(rf).as_deref() == Some(name) => {
+                function_whole_row_type(rf, name, lookup)
+            }
             _ => None,
         }
     }
@@ -1122,6 +1149,57 @@ fn outer_whole_row_type(name: &str, lookup: &dyn Fn(&str) -> Option<TableDef>) -
         .rev()
         .flat_map(|level| level.iter())
         .find_map(|item| whole_row_type(item, name, lookup))
+}
+
+/// The type `select <name> from <rf>` gives its one column: a FROM
+/// function's whole row. Its arguments' column references are planned as
+/// NULLs, as `joins::function_def` plans them: the type does not depend on
+/// the values.
+fn function_whole_row_type(
+    rf: &pg_query::protobuf::RangeFunction,
+    name: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<String> {
+    let mut bare = rf.clone();
+    bare.lateral = false;
+    for f in &mut bare.functions {
+        if let Some(N::List(l)) = f.node.as_mut() {
+            for arg in &mut l.items {
+                let _ = walk_expr(arg, &mut |n| {
+                    if matches!(n.node.as_ref(), Some(N::ColumnRef(_))) {
+                        *n = null_const();
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+    let select = pg_query::protobuf::SelectStmt {
+        target_list: vec![pg_query::protobuf::Node {
+            node: Some(N::ResTarget(Box::new(pg_query::protobuf::ResTarget {
+                val: Some(Box::new(pg_query::protobuf::Node {
+                    node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                        fields: vec![string_node(name)],
+                        location: -1,
+                    })),
+                })),
+                location: -1,
+                ..Default::default()
+            }))),
+        }],
+        from_clause: vec![pg_query::protobuf::Node {
+            node: Some(N::RangeFunction(bare)),
+        }],
+        limit_option: pg_query::protobuf::LimitOption::Default as i32,
+        op: pg_query::protobuf::SetOperation::SetopNone as i32,
+        ..Default::default()
+    };
+    let plan = probing(|| without_calls(|| plan_select(&select, lookup, &[]))).ok()?;
+    let def = sub_plan_def(&plan, lookup).ok()?;
+    match def.columns.as_slice() {
+        [only] => Some(only.pg_type.clone()),
+        _ => None,
+    }
 }
 
 /// The row type an outer reference carries when it is a FROM item's whole
@@ -1145,6 +1223,17 @@ fn outer_ref_whole_row(
                 .is_some_and(|(_, def)| def.columns.iter().any(|c| &c.name == name)),
         });
     if is_column {
+        return None;
+    }
+    // A FROM function's whole row is passed as it is: it is the function's
+    // own value, typed for the probe by `outer_ref_type` (RP-699).
+    let function = levels.iter().rev().find_map(|level| {
+        level
+            .iter()
+            .find_map(|item| named_item(item, name))
+            .map(|item| matches!(item.node.as_ref(), Some(N::RangeFunction(_))))
+    });
+    if function == Some(true) {
         return None;
     }
     outer_whole_row_type(name, lookup)
@@ -1229,6 +1318,121 @@ pub(crate) fn expand_outer_stars(
     s.target_list = expanded;
 }
 
+/// `(v).a` and `(v).*` in a subquery, where `v` is the whole row of a FROM
+/// item of an enclosing query, are that item's column `v.a` and its star
+/// `v.*` (RP-699): PostgreSQL's `transformIndirection` selects the field
+/// of the outer whole-row Var, which `ParseFuncOrColumn` turns into the
+/// item's own column (`scanNSItemForColumn`), so `(select (v).a)` is
+/// typed as `(select v.a)` is, and a field the item lacks is 42703 `column
+/// v.zz does not exist` at the `v`. Rewritten here into the qualified
+/// reference the correlated rewrite already reads (and `v.*` into the
+/// columns `expand_outer_stars` expands it to, so this runs first).
+///
+/// Only at this level: a nested subquery is rewritten when it is resolved,
+/// with this level around it. Not where `v` is a column of this level's
+/// FROM or of an enclosing one -- a column is found before a relation of
+/// the name -- and not over a FROM function, whose whole row is the
+/// function's result (`(f).x` of an integer is 42809).
+pub(crate) fn outer_field_selections(
+    s: &mut pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) {
+    if s.larg.is_some() || s.rarg.is_some() {
+        for arm in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            outer_field_selections(arm, lookup, params);
+        }
+        return;
+    }
+    let own = level_names(s);
+    let ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    let mut own_columns = Vec::new();
+    for item in &s.from_clause {
+        collect_from_columns(item, lookup, &ctes, &mut own_columns);
+    }
+    // The outer FROM item `name` is the whole row of, when `(name).x` is
+    // that item's `name.x`.
+    let whole_row = |name: &str| -> bool {
+        if own.iter().any(|n| n == name) || own_columns.iter().any(|c| c == name) {
+            return false;
+        }
+        let levels = OUTER_FROM.with(|o| o.borrow().clone());
+        let Some(item) = levels
+            .iter()
+            .rev()
+            .find_map(|level| level.iter().find_map(|item| named_item(item, name)))
+        else {
+            return false;
+        };
+        !matches!(item.node.as_ref(), Some(N::RangeFunction(_)))
+            && outer_ref_whole_row(&[name.to_string()], lookup, params).is_some()
+    };
+    // `(name).field` / `(name).*`: the name, and the field (`None` for `*`).
+    let selection = |n: &pg_query::protobuf::Node| -> Option<(String, Option<String>, i32)> {
+        let Some(N::AIndirection(ind)) = n.node.as_ref() else {
+            return None;
+        };
+        let Some(N::ColumnRef(c)) = ind.arg.as_deref().and_then(|a| a.node.as_ref()) else {
+            return None;
+        };
+        let [name] = parts_of(c)?.try_into().ok()?;
+        let field = match ind.indirection.as_slice() {
+            [f] => match f.node.as_ref()? {
+                N::String(f) => Some(f.sval.clone()),
+                N::AStar(_) => None,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        Some((name, field, c.location))
+    };
+    let column = |fields: Vec<pg_query::protobuf::Node>, location: i32| {
+        N::ColumnRef(pg_query::protobuf::ColumnRef { fields, location })
+    };
+    // A star selection is a star only as a select-list item of its own.
+    for t in &mut s.target_list {
+        let Some(N::ResTarget(rt)) = t.node.as_mut() else {
+            continue;
+        };
+        if !rt.name.is_empty() {
+            continue;
+        }
+        let Some(val) = rt.val.as_deref_mut() else {
+            continue;
+        };
+        if let Some((name, None, at)) = selection(val) {
+            if whole_row(&name) {
+                let star = pg_query::protobuf::Node {
+                    node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                };
+                val.node = Some(column(vec![string_node(&name), star], at));
+            }
+        }
+    }
+    let mut rewrite = |n: &mut pg_query::protobuf::Node| -> Result<()> {
+        if let Some((name, Some(field), at)) = selection(n) {
+            if whole_row(&name) {
+                n.node = Some(column(vec![string_node(&name), string_node(&field)], at));
+            }
+        }
+        Ok(())
+    };
+    for n in s
+        .target_list
+        .iter_mut()
+        .chain(s.group_clause.iter_mut())
+        .chain(s.sort_clause.iter_mut())
+        .chain(s.distinct_clause.iter_mut())
+        .chain(s.where_clause.as_deref_mut())
+        .chain(s.having_clause.as_deref_mut())
+    {
+        let _ = walk_expr(n, &mut rewrite);
+    }
+}
+
 /// The FROM item of one list that answers to `name`: a relation or a
 /// derived table by its alias (a relation without one by its name), an
 /// aliased JOIN by its alias alone, an unaliased one by its sides' names.
@@ -1284,14 +1488,28 @@ pub(crate) fn star_sublink_name(
     if !rt.name.is_empty() {
         return None;
     }
-    let Some(N::ColumnRef(c)) = rt.val.as_deref()?.node.as_ref() else {
-        return None;
-    };
     let is_star = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AStar(_)));
-    let qualifier = match c.fields.as_slice() {
-        [star] if is_star(star) => None,
-        [q, star] if is_star(star) => match q.node.as_ref() {
-            Some(N::String(q)) => Some(q.sval.clone()),
+    let qualifier = match rt.val.as_deref()?.node.as_ref()? {
+        N::ColumnRef(c) => match c.fields.as_slice() {
+            [star] if is_star(star) => None,
+            [q, star] if is_star(star) => match q.node.as_ref() {
+                Some(N::String(q)) => Some(q.sval.clone()),
+                _ => return None,
+            },
+            _ => return None,
+        },
+        // `(v).*` over an outer item's whole row is its `v.*` (RP-699).
+        N::AIndirection(ind) => match (
+            ind.arg.as_deref().and_then(|a| a.node.as_ref()),
+            ind.indirection.as_slice(),
+        ) {
+            (Some(N::ColumnRef(c)), [star]) if is_star(star) => match c.fields.as_slice() {
+                [q] => match q.node.as_ref() {
+                    Some(N::String(q)) => Some(q.sval.clone()),
+                    _ => return None,
+                },
+                _ => return None,
+            },
             _ => return None,
         },
         _ => return None,

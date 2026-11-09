@@ -17,7 +17,7 @@ pub mod acl;
 mod agg_hoist;
 mod agg_support;
 mod domain_scope;
-pub use domain_scope::select_target_domain;
+pub use domain_scope::{select_output_domains, select_target_domain};
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
@@ -13234,6 +13234,58 @@ pub fn avg_result_type(source: Option<&str>) -> &'static str {
     }
 }
 
+/// The type `min` / `max` answer over a value of type `source`: the input
+/// type of the overload `func_select_candidate` picks among PostgreSQL 15's
+/// 22 (`pg_aggregate`), a domain reduced to its base type first. Most types
+/// have their own, so keep their type; the others take the one an implicit
+/// cast reaches: `varchar`, `name` and `"char"` are `max(text)` (measured
+/// on 15.19, RP-681). A polymorphic answer (`anyarray`, `anyenum`) is the
+/// input type itself.
+///
+/// Only a `text` answer is taken, whose value is the input's string as it
+/// is. A `reg*` is `max(oid)` and `cidr` is `max(inet)` on 15.19 too, but
+/// there each input is COERCED before it is compared (`max(regclass)` is
+/// the largest OID, not name), which the engines computing min / max do not
+/// do yet: those keep their input type (RP-706).
+pub fn min_max_result_type(source: &str) -> String {
+    let base = domains::base_type_and_typmod(source).map_or_else(|| source.to_string(), |b| b.0);
+    if funcsig::has_exact("max", std::slice::from_ref(&base)) {
+        return base;
+    }
+    match funcsig::selected_result_type("max", std::slice::from_ref(&base)) {
+        Some(t) if t == "text" => t,
+        _ if base == source => base,
+        // A domain over a type with no `max` of its own and no text
+        // answer: as before, its own type.
+        _ => source.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod min_max_result_type_tests {
+    use super::min_max_result_type as t;
+
+    #[test]
+    fn resolves_as_func_select_candidate_does() {
+        // No overload of their own: the string category's preferred type.
+        assert_eq!(t("varchar"), "text");
+        assert_eq!(t("name"), "text");
+        assert_eq!(t(crate::QUOTED_CHAR), "text");
+        // An overload of their own.
+        for own in [
+            "text", "bpchar", "int2", "int4", "numeric", "date", "inet", "oid",
+        ] {
+            assert_eq!(t(own), own);
+        }
+        // `max(anyarray)`: the array type itself.
+        assert_eq!(t("varchar[]"), "varchar[]");
+        // `max(oid)` / `max(inet)` on 15.19, kept until the input is
+        // coerced (RP-706).
+        assert_eq!(t("regclass"), "regclass");
+        assert_eq!(t("cidr"), "cidr");
+    }
+}
+
 pub fn sum_result_type(source: Option<&str>) -> &'static str {
     match source {
         Some("float4" | "real") => "float4",
@@ -13419,9 +13471,9 @@ fn window_result_type(func: WindowFunc, source: Option<&str>) -> String {
         | WindowFunc::Lead
         | WindowFunc::FirstValue
         | WindowFunc::LastValue
-        | WindowFunc::NthValue
-        | WindowFunc::Min
-        | WindowFunc::Max => source.unwrap_or("text").to_string(),
+        | WindowFunc::NthValue => source.unwrap_or("text").to_string(),
+        // An aggregate's overload, as without OVER.
+        WindowFunc::Min | WindowFunc::Max => min_max_result_type(source.unwrap_or("text")),
     }
 }
 
@@ -19030,10 +19082,9 @@ pub fn aggregate_item_type(item: &AggItem) -> String {
         AggFunc::CountStar | AggFunc::Count => "int8".to_string(),
         AggFunc::Sum => sum_result_type(item.source_type.as_deref()).to_string(),
         AggFunc::Avg => avg_result_type(item.source_type.as_deref()).to_string(),
-        AggFunc::Min | AggFunc::Max => item
-            .source_type
-            .clone()
-            .unwrap_or_else(|| "text".to_string()),
+        AggFunc::Min | AggFunc::Max => {
+            min_max_result_type(item.source_type.as_deref().unwrap_or("text"))
+        }
         // An array of arrays is an array of one more dimension, and the
         // same type: `array_agg(int4[])` is `int4[]`. So is a vector's:
         // `int2vector` / `oidvector` are array types to the polymorphic
@@ -22723,6 +22774,9 @@ fn resolve_one_sublink(
     // A qualifier no level has is an error before anything else is done
     // with the subquery -- before an EXISTS drops the select list holding it.
     check_subquery_qualifiers(&inner)?;
+    // A field of an outer FROM item's whole row is that item's column, and
+    // its star the item's star (RP-699).
+    correlated::outer_field_selections(&mut inner, lookup, params);
     // A star over an outer FROM item is that item's columns (RP-517).
     correlated::expand_outer_stars(&mut inner, lookup);
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {
@@ -42402,6 +42456,14 @@ fn assign_value(value: Bson, source: &str, target: &str) -> Result<Bson> {
     }
     if source == "timestamptz[]" && target == "timestamptz[]" && matches!(value, Bson::Array(_)) {
         return Ok(value);
+    }
+    // `bpchar` assigned to `text` / `varchar` (`rtrim1`) or `name`
+    // (`bpchar_name`) drops its trailing blanks, which a padded value
+    // carries (`'xy '::bpchar`, a `char(n)` through a set operation; RP-672).
+    if source == "bpchar" && matches!(target, "text" | "varchar" | "name") {
+        if let Bson::String(t) = &value {
+            return cast_value(Bson::String(t.trim_end_matches(' ').to_string()), target);
+        }
     }
     // A pg_lsn is carried as its position, a numeric, and there is no
     // numeric -> pg_lsn cast: `set l = l + 1` assigns a pg_lsn.

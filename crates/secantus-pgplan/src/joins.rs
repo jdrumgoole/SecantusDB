@@ -1877,6 +1877,17 @@ pub(crate) fn function_columns(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Option<Vec<String>> {
+    function_def(rf, lookup, params).map(|d| d.columns.into_iter().map(|c| c.name).collect())
+}
+
+/// A FROM function's columns with their types, named as `function_columns`
+/// names them: what an outer reference to one of them is typed by in a
+/// correlated subquery (RP-699).
+pub(crate) fn function_def(
+    rf: &pg_query::protobuf::RangeFunction,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<TableDef> {
     let alias = rf
         .alias
         .as_ref()
@@ -1922,13 +1933,13 @@ pub(crate) fn function_columns(
         .collect();
     let named_alias = rf.alias.as_ref().is_some_and(|a| !a.aliasname.is_empty());
     let names = scalar_alias(names, named_alias, &alias, def.columns.len());
-    Some(
-        def.columns
-            .iter()
-            .enumerate()
-            .map(|(i, c)| names.get(i).cloned().unwrap_or_else(|| c.name.clone()))
-            .collect(),
-    )
+    let mut def = def;
+    for (i, c) in def.columns.iter_mut().enumerate() {
+        if let Some(n) = names.get(i) {
+            c.name = n.clone();
+        }
+    }
+    Some(def)
 }
 
 /// The names of a SELECT's output columns as PostgreSQL derives them

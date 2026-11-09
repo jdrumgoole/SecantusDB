@@ -1003,6 +1003,31 @@ one beside it.
       Backlog-ID: RP-312
       Verify: none -- seen once in CI, not reproduced; a gap test needs the writer named first (the job now reports it)
 
+## Found by a CI run (2026-11-09)
+
+- [ ] **OPEN — any DDL statement makes the next catalog query re-decode
+      every catalog collection.** `bump_catalog_version` (`lib.rs`, the
+      `CatalogCache` comment) moves one version after every statement that
+      may change the catalog, and the next read of any catalog then decodes
+      all of them again. PostgreSQL invalidates only the cache entries for
+      the rows that changed (`inval.c`, `CatCacheInvalidate`, a relation's
+      relcache entry), so its first query after DDL costs about what the
+      next one does. Measured 2026-11-09 with psql's `\d` collation
+      subquery (`tests/backlog/test_rp_catalog_latency.py`) after a
+      `CREATE TABLE`:
+      - PostgreSQL 15.19 (private cluster): 0.9 ms first, 0.2 ms after.
+      - Debug `secantusd-pg`: 0.58 s first, 0.016 s after; and the first
+        query grows with the schema: 0.68 s with 50 more tables, 0.97 s
+        with 150, 1.79 s with 400 (0.044 s after).
+      A slow CI runner took the first query to 2.2 s and failed RP-077's
+      latency test on PR #2552 (job 129166397146), which until then timed
+      that cold read instead of the subquery it was written for.
+      The faithful fix keys the decoded rows per catalog row, or per
+      relation, and invalidates what a statement changed, as `inval.c` does;
+      `catcache.rs` already models which lookups miss.
+      Backlog-ID: RP-715
+      Verify: tests/backlog/test_rp_catalog_latency.py::test_the_first_catalog_query_after_ddl_costs_what_the_next_does
+
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
@@ -2355,14 +2380,6 @@ char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
 its domain through a join, a WITH, a FROM subquery and a set operation all
 of whose branches are of the domain (`domain_scope.rs`).
 
-- [ ] **A set operation of a `char(n)` domain column and a `text` one drops
-      the domain's blanks.** `select array(select a from t657d union all
-      select a::text from t657e)` is `character[]` on PostgreSQL 15.19 with
-      `{"a b","xy ",e}`; here the type matches and `xy` loses its blank.
-      The branches disagree, so no branch is cast to the domain, and the
-      stored value is read without its padding.
-      Verify: tests/backlog/test_rp_found_rp657.py::test_set_operation_of_char_domain_and_text_keeps_blanks
-      Backlog-ID: RP-672
 - [ ] **`ARRAY(select * ...)` over a one-column domain subquery is typed by
       the domain's base.** `select array(select * from (select a from
       t657d) s order by 1)` is `d657c[]` on PostgreSQL 15.19, as the same
@@ -2379,6 +2396,41 @@ of whose branches are of the domain (`domain_scope.rs`).
       references, so its column's type is not known.
       Verify: tests/backlog/test_rp_found_rp657.py::test_lateral_column_of_an_outer_domain_column_is_the_domains
       Backlog-ID: RP-674
+
+## Found while working RP-672 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp672.py`: `t672c(a char(3))` holding `'xy'`.
+
+- [ ] **`CREATE TABLE AS` of an unsized `bpchar` drops its blanks.** `create
+      table c as select 'xy '::bpchar a` makes a `bpchar` column with no
+      modifier on PostgreSQL 15.19, and `octet_length(a)` is 3; so is a
+      value over a `char(3)` column UNIONed with `text` inserted into it.
+      Here the column holds `xy`, 2 bytes: a `bpchar` column is stored
+      trimmed and padded on the way out to its width, and one with no
+      width pads nothing. The same holds for any unsized `bpchar` column
+      (`create table u (a bpchar)`: `'ab  '` reads back `ab`), and for a
+      `max`, a GROUP BY or a DISTINCT over one. Sized while working RP-681
+      (2026-11-09): comparisons, `IN`, ranges and joins already agree with
+      PostgreSQL, but keeping the blanks breaks the keys -- a UNIQUE
+      constraint and a primary key are storage indexes over the stored
+      value (the PK is `_id`), so `'k'` and `'k '` would stop colliding
+      (both are 23505 on 15.19 today, rightly) -- and GROUP BY, DISTINCT
+      and an indexed `=` would separate them too. The faithful fix keeps
+      the value as written and keys it by `bpchar`'s comparison (trailing
+      blanks ignored), which reaches the storage keys: more than one PR.
+      Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
+      Backlog-ID: RP-693
+- [ ] **INTERSECT keeps the left side's value, not the smaller input's.**
+      PostgreSQL 15.19 plans an INTERSECT with the input it estimates
+      smaller first (`generate_nonunion_paths`), and a group's value is the
+      one that input gave: `select a from t672c intersect select
+      'xy'::text` is `xy`, unpadded, as the one-row constant is estimated
+      smaller than the unanalysed table (1850 rows). Here the left side's
+      row is always the one returned, `xy ` with its blank. Over equal
+      estimates (two VALUES lists) the left side comes first, as here.
+      Verify: tests/backlog/test_rp_found_rp672.py::test_intersect_keeps_the_smaller_inputs_value
+      Backlog-ID: RP-692
 
 ## Found while working RP-655 (2026-11-08)
 
@@ -2430,13 +2482,6 @@ that reaches a comparison carrying its blanks is compared with them.
       correlated call does not.
       Verify: tests/backlog/test_rp_found_rp679.py::test_correlated_array_of_char_n_keeps_the_elements_blanks
       Backlog-ID: RP-683
-- [ ] **`min` / `max` over a `varchar` column are typed `varchar`.**
-      PostgreSQL has no `max(varchar)`: `select max(v) from (values
-      ('ab'::varchar(4)), ('cd')) s(v)` resolves to `max(text)` and is
-      described `text` (25) on 15.19; here it is `varchar` (1043), as are
-      `min` and the column of a FROM-subquery over either.
-      Verify: tests/backlog/test_rp_found_rp671.py::test_min_max_over_varchar_is_text
-      Backlog-ID: RP-681
 - [ ] **OVER on a plain function is 0A000.** `select octet_length('x')
       over ()` is 42809 `OVER specified, but octet_length is not a window
       function nor an aggregate function` on PostgreSQL 15.19 (`ParseFuncOrColumn`);
@@ -2492,16 +2537,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp687.py`: `dcc687` a `varchar(3)` with
 `check (value <> 'no')`, `dvv687` a domain over it.
 
-- [ ] **`SELECT ... INTO` a scalar variable truncates an overlong value and
-      skips its domain's CHECK.** `declare x varchar(3); begin select
-      'abcdef' into x;` is 22001 on PostgreSQL 15.19 (`exec_move_row`
-      assigns each column with `exec_assign_value`, the assignment rule),
-      and `select 'no' into x` for an `x dcc687` is the domain's 23514;
-      here the first stores `abc` and the second `no`. `assign_row` stores
-      the column's value as it is (`set_var`). Since RP-687 a `:=` and a
-      DEFAULT fit by the assignment rule (`eval_typed`).
-      Verify: tests/backlog/test_rp_found_rp687.py::test_select_into_variable_assigns_by_the_assignment_rule
-      Backlog-ID: RP-694
 - [ ] **An assignment to a `varchar(n)[]` variable truncates an overlong
       element.** `declare x varchar(3)[]; begin x := array['abcdef'];` is
       22001 on PostgreSQL 15.19 (the array's `ArrayCoerceExpr` applies the
@@ -2517,6 +2552,39 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Since RP-670 a trigger record's field of such a domain names it.
       Verify: tests/backlog/test_rp_found_rp687.py::test_cast_to_a_domain_over_a_domain_names_the_outer_domain
       Backlog-ID: RP-696
+
+## Found while working RP-694 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp694.py`: `dnn694` an `int` domain `not null`.
+
+- [ ] **An assignment with only an explicit cast uses it.** `declare x int;
+      begin x := true;` is 22P02 `invalid input syntax for type integer:
+      "t"` on PostgreSQL 15.19, as are `select true into x` and `x bool :=
+      5`: PL/pgSQL coerces with `COERCION_PLPGSQL`, which with no implicit
+      or assignment cast converts through the source's output and the
+      target's input (`get_cast_hashentry`). Here the explicit cast runs
+      and `x` is 1 (`t` for the `bool`). `eval_typed` and `coerce_moved`
+      both cast with `::`.
+      Verify: tests/backlog/test_rp_found_rp694.py::test_assignment_with_only_an_explicit_cast_converts_through_text
+      Backlog-ID: RP-712
+- [ ] **A `FOR` over a query or an `EXECUTE ... INTO` refuses scalar
+      variable targets.** `for x in select '7'::text loop` over an `int`
+      `x`, `for x, y in select 1, 'a'` and `execute 'select 7' into x` each
+      assign on PostgreSQL 15.19 (the grammar makes the list a row target
+      that `exec_move_row` fills); here each is 0A000 `this FOR target` /
+      `this EXECUTE INTO target ... is not supported yet`. Both read only
+      the target's `dno`, which a scalar list has none of (a plain `INTO`
+      goes through `target_datum`).
+      Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
+      Backlog-ID: RP-713
+- [ ] **A NOT NULL domain variable with no default starts NULL.** `declare
+      x dnn694; begin end` is 23502 `domain dnn694 does not allow null
+      values` on PostgreSQL 15.19 (`exec_stmt_block` assigns the NULL
+      through `exec_assign_value`); here the block runs, and a later
+      `select 5 into x` succeeds.
+      Verify: tests/backlog/test_rp_found_rp694.py::test_a_not_null_domain_variable_without_a_default_is_refused
+      Backlog-ID: RP-714
 
 ## Found while working RP-668 (2026-11-09)
 
@@ -3046,17 +3114,6 @@ the column written out, so none is the star's. The gap tests are in
       reference is not found.
       Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_set_operation
       Backlog-ID: RP-698
-- [ ] **A correlated subquery that passes an outer FROM function's column
-      or a whole row's field through answers it as text.** `select (select
-      f.x) from generate_series(1, 2) f(x)`, `(select f)` over
-      `generate_series(1, 2) f` and `select (select (v).a) from (values (1))
-      v(a)` answer integers on PostgreSQL 15.19 (the subquery's column is
-      the outer Var, of its type); here they are the strings `'1'`, `'2'`,
-      though `(select f.x + 1)` is an integer. And `(select (v).*)` is 0A000
-      `this field selection is not supported yet`, where PostgreSQL answers
-      `1`.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_pass_through_keeps_its_type
-      Backlog-ID: RP-699
 - [ ] **A GROUP BY naming a correlated subquery target is refused.**
       `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
       v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
@@ -3080,3 +3137,65 @@ the column written out, so none is the star's. The gap tests are in
       subquery only.
       Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
       Backlog-ID: RP-701
+- [ ] **A FROM function's whole row under a column alias is 42703 inside an
+      expression.** `select f + 1 from generate_series(1, 2) f(x)` answers
+      2, 3 on PostgreSQL 15.19, `coalesce(f)` and `(select f)` 1, 2 (the
+      whole row of a function returning a base type is that value), and
+      `(select (f).x)` is 42809 `column notation .x applied to type integer,
+      which is not a composite type` at 17; here each is 42703 `column "f"
+      does not exist`, though a bare `select f` answers, as does every form
+      over an unaliased `generate_series(1, 2) f`.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
+      Backlog-ID: RP-702
+- [ ] **A correlated subquery in the WHERE of a query over a FROM function
+      is 42883 and names the internal call.** `select 1 from
+      generate_series(1, 2) f(x) where (select f.x + 1) > 0` answers two
+      rows on PostgreSQL 15.19 and `where exists (select 1 where f.x > 1)`
+      one; here each is 42883 `function \x1fcorrelated(integer, unknown,
+      ...) does not exist`, the per-row call that stands in for the
+      subquery leaking into the client's error. The same subquery in the
+      select list, or over a VALUES list, is answered.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_correlated_subquery_in_a_function_scan_where
+      Backlog-ID: RP-703
+- [ ] **`(v).*` in a select list is 0A000.** `select (v).* from (values
+      (1)) v(a)` answers `1`, column `a`, on PostgreSQL 15.19 and over `v(a,
+      b)` both columns (`transformIndirection` expands a whole row's star
+      as `v.*`); here each is 0A000 `this field selection is not supported
+      yet`. Since RP-699 the same star inside an expression subquery is
+      answered.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_whole_row_star_in_a_select_list
+      Backlog-ID: RP-704
+- [ ] **A field of an outer item's whole row in a LATERAL subquery is
+      42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
+      as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k
+      where (v).a = 3)` `1`; here each is 42703 `column "v" does not exist`
+      at the `v`. `v.a` there is answered, and since RP-699 `(v).a` in an
+      expression subquery is too.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
+      Backlog-ID: RP-705
+
+## Found while working RP-681 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp681.py`: `t681(k int, v varchar(4), ...)`.
+
+- [ ] **`min` / `max` over a `reg*` or `cidr` value keep its type and
+      compare it as itself.** PostgreSQL 15.19 resolves `max(regclass)` to
+      `max(oid)` and `max(cidr)` to `max(inet)` (`func_select_candidate`
+      over `pg_aggregate`'s 22 overloads), coercing each input first:
+      `max(x)` over `'pg_class'::regclass` and `'pg_type'::regclass` is
+      1259, an `oid`, the larger OID. Here it is `pg_class`, a `regclass`
+      chosen by NAME (`pg_type` is larger as text), and `max(cidr)` is
+      described `cidr` (650), not `inet` (869). Since RP-681
+      `min_max_result_type` takes the overload's type only where it is
+      `text`, whose value is the input's string unchanged; these need the
+      input coerced in each engine that computes min / max.
+      Verify: tests/backlog/test_rp_found_rp681.py::test_min_max_coerce_their_input_to_the_overloads_type
+      Backlog-ID: RP-706
+- [ ] **`pg_typeof` of a `text` scalar subquery is 42P18.** `select
+      pg_typeof((select max(v) from t681))` is `text` on PostgreSQL 15.19;
+      here it is 42P18 `could not determine data type of parameter $1`, as
+      for `(select upper(v) ...)` and `(select string_agg(v, ',') ...)`,
+      while one over an `int` column or a bare `varchar` column answers.
+      Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
+      Backlog-ID: RP-707
