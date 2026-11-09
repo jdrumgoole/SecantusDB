@@ -153,6 +153,16 @@ fn build(
     if crate::ts_buckets::bucketed(storage, ask.db, ask.coll).is_some() {
         return Ok(None);
     }
+    if storage
+        .get_collection_options(ask.db, ask.coll)
+        .is_ok_and(|o| o.contains_key("timeseries"))
+    {
+        return if buffered {
+            Ok(None)
+        } else {
+            time_series(storage, ask)
+        };
+    }
     let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
     if let Some(spec) = ask
         .pipeline
@@ -274,10 +284,108 @@ fn build(
         let end = stages.len();
         stages = secantus_core::sbe::mark(stages, 0, end);
     }
-    let mut cursor = AggStream::new(source, (!per_batch).then_some(FIRST_BUFFER), stages, ask);
+    let mut cursor = AggStream::new(
+        Feed::Plan(Box::new(source)),
+        (!per_batch).then_some(FIRST_BUFFER),
+        stages,
+        ask,
+    );
     cursor.sbe = sbe;
     cursor.metas = (metas.record_id, metas.index_key);
     Ok(Some((cursor, indexes)))
+}
+
+/// The stages after which mongod 8.2.11 still reads a time-series
+/// collection through its cursor stage, 32 buckets first (measured
+/// 2026-11-09). They need the whole measurement; once the pipeline needs
+/// only some fields (an inclusion `$project`), mongod reads it otherwise,
+/// one bucket at a time, and the pipeline is read whole here.
+const TIME_SERIES_STAGES: &[&str] = &[
+    "$match",
+    "$addFields",
+    "$set",
+    "$unset",
+    "$unwind",
+    "$redact",
+    "$skip",
+    "$limit",
+];
+
+/// A `$project` that only leaves fields out.
+fn excludes_only(spec: &Bson) -> bool {
+    fn zero(v: &Bson) -> bool {
+        match v {
+            Bson::Boolean(b) => !b,
+            Bson::Int32(n) => *n == 0,
+            Bson::Int64(n) => *n == 0,
+            Bson::Double(n) => *n == 0.0,
+            Bson::Document(d) => !d.is_empty() && d.values().all(zero),
+            _ => false,
+        }
+    }
+    matches!(spec, Bson::Document(d) if !d.is_empty() && d.values().all(zero))
+}
+
+/// The cursor of a pipeline over a time-series collection: its buckets read
+/// through the cursor stage, each unpacked as the cursor reaches it
+/// (`ts_buckets::BucketScan`, RM-348). Read whole instead: under a hint or
+/// a collation, when the filter names the meta field or the collection has
+/// an index of its own (mongod could read an index over the buckets), and
+/// for any other stage.
+fn time_series(
+    storage: &dyn Storage,
+    ask: &Ask,
+) -> Result<Option<(AggStream, Vec<String>)>, CommandError> {
+    let fits = |s: &Bson| {
+        let name = stage_name(s);
+        TIME_SERIES_STAGES.contains(&name)
+            || (name == "$project"
+                && s.as_document()
+                    .and_then(|d| d.get("$project"))
+                    .is_some_and(excludes_only))
+    };
+    if ask.hint.is_some()
+        || ask.collation.is_some()
+        || !ask.pipeline.iter().all(fits)
+        || ask.pipeline.iter().any(mentions_meta)
+    {
+        return Ok(None);
+    }
+    let hoisted = crate::explain::hoist::hoist_matches(ask.pipeline);
+    if crate::explain::sbe_pushdown(storage, ask.db, ask.coll, &hoisted, None, None).is_some() {
+        return Ok(None);
+    }
+    let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
+    let default_index = storage
+        .get_collection_options(ask.db, ask.coll)
+        .ok()
+        .and_then(|o| crate::timeseries::Fields::of(&o))
+        .and_then(|f| f.default_index())
+        .map(|(name, _)| name);
+    let own_index = storage
+        .list_indexes(ask.db, ask.coll)
+        .map_err(read_error)?
+        .iter()
+        .filter_map(|spec| spec.get_str("name").ok())
+        .any(|name| name != "_id_" && Some(name) != default_index.as_deref());
+    if own_index {
+        return Ok(None);
+    }
+    let filter = crate::explain::pipeline_canonical(ask.coll, ask.pipeline).filter;
+    let Some(scan) = crate::ts_buckets::BucketScan::of(storage, ask.db, ask.coll, ask.ns, &filter)?
+    else {
+        return Ok(None);
+    };
+    if scan.filters_meta() {
+        return Ok(None);
+    }
+    let cursor = AggStream::new(
+        Feed::Buckets(Box::new(scan)),
+        Some(FIRST_BUFFER),
+        ask.pipeline.to_vec(),
+        ask,
+    );
+    Ok(Some((cursor, Vec::new())))
 }
 
 /// The cursor of a pipeline that opens with a `$geoNear`: mongod's ring
@@ -339,7 +447,12 @@ fn geo_near(
         crate::explain::order::count_index_use(storage, &order, crate::explain::order::Uses::Find);
     }
     let source = Stream::of_near(ask.db, ask.coll, &read.query, ask.vars, measure, base, 0, 0);
-    let mut cursor = AggStream::new(source, Some(FIRST_BUFFER), rest.to_vec(), ask);
+    let mut cursor = AggStream::new(
+        Feed::Plan(Box::new(source)),
+        Some(FIRST_BUFFER),
+        rest.to_vec(),
+        ask,
+    );
     cursor.geo_near = Some(read);
     Ok(Some((cursor, vec![index.name])))
 }
@@ -375,7 +488,12 @@ fn distinct_group(
     let whole = !rest.iter().all(streams);
     let mut stages = vec![Bson::Document(doc! { "$replaceRoot": { "newRoot": root } })];
     stages.extend(rest);
-    let mut cursor = AggStream::new(source, Some(FIRST_BUFFER), stages, ask);
+    let mut cursor = AggStream::new(
+        Feed::Plan(Box::new(source)),
+        Some(FIRST_BUFFER),
+        stages,
+        ask,
+    );
     if whole {
         cursor.unions.clear();
         cursor.whole = true;
@@ -429,6 +547,7 @@ fn only_kept_meta(v: &Bson) -> bool {
 /// `$unionWith`'s pipeline read as it goes, or one read whole.
 enum Feed {
     Plan(Box<Stream>),
+    Buckets(Box<crate::ts_buckets::BucketScan>),
     Union(Box<AggStream>),
     Read(Vec<Vec<u8>>),
 }
@@ -493,7 +612,7 @@ fn stage_name(s: &Bson) -> &str {
 }
 
 impl AggStream {
-    fn new(source: Stream, buffer: Option<usize>, stages: Vec<Bson>, ask: &Ask) -> AggStream {
+    fn new(feed: Feed, buffer: Option<usize>, stages: Vec<Bson>, ask: &Ask) -> AggStream {
         let counts = stages
             .iter()
             .map(|s| match stage_name(s) {
@@ -505,7 +624,7 @@ impl AggStream {
             })
             .collect();
         AggStream {
-            feed: Feed::Plan(Box::new(source)),
+            feed,
             buffer,
             multiplies: stages.iter().any(|s| stage_name(s) == "$unwind"),
             unions: (0..stages.len())
@@ -674,6 +793,17 @@ impl AggStream {
                     exhausted: read.exhausted,
                     keys_examined: read.keys_examined,
                     docs_examined: read.docs_examined,
+                })
+            }
+            Feed::Buckets(scan) => {
+                let n = self.buffer.unwrap_or(FIRST_BUFFER);
+                self.buffer = Some(n * 2);
+                let read = scan.next_buffer(storage, n, BUFFER_BYTES)?;
+                Ok(StreamedBatch {
+                    docs: read.docs,
+                    exhausted: read.exhausted,
+                    keys_examined: 0,
+                    docs_examined: read.examined,
                 })
             }
             Feed::Union(inner) => inner.next_batch(storage, left, max_bytes),

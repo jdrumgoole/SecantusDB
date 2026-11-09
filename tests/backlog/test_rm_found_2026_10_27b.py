@@ -134,12 +134,13 @@ def _time_series_reads(client: Any) -> dict:
     return out
 
 
-@pytest.mark.backlog("RM-348")
+@pytest.mark.backlog_fixed("RM-348")
 def test_a_time_series_read_goes_bucket_by_bucket(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 reads a time-series collection's buckets through its
+    """mongod 8.2.11 read a time-series collection's buckets through its
     cursor stage, 32 buckets first and twice as many at each refill, each
-    bucket unpacked as the cursor reaches it: what a getMore returns after a
-    delete depends on how many buckets were buffered."""
+    bucket unpacked as the cursor reached it, and this server came to read
+    a time-series `aggregate` so: what a getMore returned after a delete
+    depended on how many buckets were buffered."""
     got, want = _time_series_reads(rust_mongo), _time_series_reads(mongod)
     assert want[300][1] == "ok"
     assert got == want
