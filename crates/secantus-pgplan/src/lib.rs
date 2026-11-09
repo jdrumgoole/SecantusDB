@@ -23406,6 +23406,45 @@ fn resolve_one_sublink(
                     _ => None,
                 })
                 .unwrap_or_else(|| "=".to_string());
+            // Rows that are themselves arrays cannot ride in one array: an
+            // array's elements are walked whole-array, every dimension at
+            // once (RP-740), so `array[1] = any (select array[1])` would
+            // meet `1`. Each row is its own comparison instead, OR'd for
+            // ANY and AND'd for ALL, whose three-valued logic is ANY's and
+            // ALL's over a non-empty list.
+            if values
+                .iter()
+                .any(|v| matches!(v, Bson::Array(_)) || arrays::is_bounded(v))
+            {
+                let arms: Vec<pg_query::protobuf::Node> = values
+                    .into_iter()
+                    .map(|v| pg_query::protobuf::Node {
+                        node: Some(N::AExpr(Box::new(AExpr {
+                            kind: AExprKind::AexprOp as i32,
+                            name: vec![string_node(&op)],
+                            lexpr: Some(Box::new(test.clone())),
+                            rexpr: Some(Box::new(param_node(params, v))),
+                            location: sl.location,
+                        }))),
+                    })
+                    .collect();
+                if arms.len() == 1 {
+                    return Ok(arms.into_iter().next().expect("one"));
+                }
+                let boolop = if kind == SubLinkType::AnySublink {
+                    BoolExprType::OrExpr
+                } else {
+                    BoolExprType::AndExpr
+                };
+                return Ok(pg_query::protobuf::Node {
+                    node: Some(N::BoolExpr(Box::new(pg_query::protobuf::BoolExpr {
+                        boolop: boolop as i32,
+                        args: arms,
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                });
+            }
             let kind = if kind == SubLinkType::AnySublink {
                 AExprKind::AexprOpAny
             } else {
@@ -45771,7 +45810,9 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             let rhs = const_value(rexpr, params)?;
             // A vector array's elements are compared as the vectors they are,
             // not as the text they are carried as inside it (RP-575).
-            let rhs = match vectors::vector_array_element(&static_type(rexpr, &rhs)) {
+            let vector =
+                vectors::vector_array_element(&static_type(rexpr, &rhs)).map(str::to_string);
+            let rhs = match vector.as_deref() {
                 Some(elem) => {
                     let lower = arrays::lower_bounds(&rhs);
                     arrays::bounded(vectors::scalars(arrays::strip(&rhs), elem), &lower)
@@ -45805,13 +45846,19 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     Bson::String(t) => json::jsonb_value_key(t).map_or(v, Bson::String),
                     _ => v,
                 };
-                let rhs = match arrays::strip(&rhs) {
+                let rhs = match any_elements(&rhs) {
                     Bson::Array(items) => Bson::Array(items.into_iter().map(key).collect()),
                     other => other,
                 };
                 return eval_scalar_array_const(&op, key(lhs), rhs, is_any);
             }
-            return eval_scalar_array_const(&op, lhs, arrays::strip(&rhs), is_any);
+            // A vector is itself held as an array: its elements stay whole.
+            let rhs = if vector.is_some() {
+                arrays::strip(&rhs)
+            } else {
+                any_elements(&rhs)
+            };
+            return eval_scalar_array_const(&op, lhs, rhs, is_any);
         }
         // `LIKE` / `ILIKE` as a VALUE (`select a like 'a%'`), not just as a
         // WHERE predicate. Their own AExpr kind, so they never reached the
@@ -47875,6 +47922,17 @@ fn op_to_mql(op: &str) -> Option<&'static str> {
     })
 }
 
+/// The elements `x op ANY / ALL (array)` compares `x` with: every element,
+/// in row-major order, whatever the array's dimensions or bounds
+/// (`ExecEvalScalarArrayOp` walks `ARR_DATA_PTR`), so `1 = any ('{{1}}')`
+/// is true (RP-740). Anything that is not an array is returned unchanged.
+fn any_elements(rhs: &Bson) -> Bson {
+    match arrays::strip(rhs) {
+        Bson::Array(_) => Bson::Array(arrays::flatten(rhs)),
+        other => other,
+    }
+}
+
 /// `scalar <op> ANY(array)` / `scalar <op> ALL(array)` as a constant.
 ///
 /// Three-valued, matching PostgreSQL: a NULL scalar is NULL; `ANY` is TRUE on
@@ -47899,11 +47957,26 @@ fn eval_scalar_array_const(op: &str, lhs: Bson, rhs: Bson, is_any: bool) -> Resu
         other => {
             return Err(Error::UndefinedFunction(format!(
                 "operator does not exist: {} {op} {}",
-                inferred_type(&lhs),
-                inferred_type(&other)
+                display_type(inferred_type(&lhs)),
+                display_type(inferred_type(&other))
             )))
         }
     };
+    // An array beside an element that is not one: no comparison operator
+    // takes them (`text[] = text`, 42883), however the array was built --
+    // `ARRAY['{x,y}'::text[]]` holds `text` elements. Typing catches this
+    // at plan time where it sees both types; here the values say (RP-740).
+    let is_array = |v: &Bson| matches!(v, Bson::Array(_)) || arrays::is_bounded(v);
+    if is_array(&lhs) && op_to_mql(op).is_some() {
+        if let Some(el) = elems.iter().find(|el| **el != Bson::Null && !is_array(el)) {
+            return Err(Error::UndefinedFunction(format!(
+                "operator does not exist: {} {} {}",
+                display_type(inferred_type(&lhs)),
+                if op == "!=" { "<>" } else { op },
+                display_type(inferred_type(el))
+            )));
+        }
+    }
     let mut any_null = false;
     for el in elems {
         if el == Bson::Null {
@@ -47969,6 +48042,15 @@ fn lower_scalar_array(
             "a varchar column against a char(n) array".into(),
         ));
     }
+    // An untyped literal is read as the array type of an array column's
+    // type, which has none (`could not find array type`, parse_oper.c).
+    if elem_type.ends_with("[]") && unknown_operand(rexpr) && matches!(rhs, Bson::String(_)) {
+        set_error_location(e.location);
+        return Err(Error::UndefinedObject(format!(
+            "could not find array type for data type {}",
+            display_type(elem_type)
+        )));
+    }
     let rhs = coerce_any_array(rhs, elem_type)?;
     let rhs = if trim_elems {
         match arrays::strip(&rhs) {
@@ -47985,6 +48067,31 @@ fn lower_scalar_array(
     } else {
         rhs
     };
+    // A vector is itself held as an array: its elements stay whole.
+    let rhs = if vectors::is_vector(elem_type) {
+        rhs
+    } else {
+        any_elements(&rhs)
+    };
+    // An array column beside a scalar element: `text[] = text` has no
+    // operator (42883), where the filter matched an array holding the
+    // element (RP-740). Typing refuses this first over a table's column;
+    // a VALUES or subquery column reaches here.
+    if elem_type.ends_with("[]") && !vectors::is_vector(elem_type) {
+        if let Bson::Array(items) = &rhs {
+            if let Some(el) = items.iter().find(|el| {
+                **el != Bson::Null && !matches!(el, Bson::Array(_)) && !arrays::is_bounded(el)
+            }) {
+                set_error_location(e.location);
+                return Err(Error::UndefinedFunction(format!(
+                    "operator does not exist: {} {} {}",
+                    display_type(elem_type),
+                    if op == "!=" { "<>" } else { op.as_str() },
+                    display_type(inferred_type(el))
+                )));
+            }
+        }
+    }
     let elems = match rhs {
         Bson::Array(v) => v,
         // A NULL array (a genuine NULL operand, or an unbound parameter at

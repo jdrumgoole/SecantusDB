@@ -3303,11 +3303,17 @@ b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
       FILTER probably needs since RP-733 as well (unmeasured).
       Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
       Backlog-ID: RP-739
-- [ ] **`a = ANY (array of arrays)` over an array column answers rows.**
-      `select k from x733 where a = any (array['{x,y}'::text[]])` is 42883
-      `operator does not exist: text[] = text` on PostgreSQL 15.19 (the
-      ARRAY constructor over `text[]` is a two-dimensional `text[]`, so ANY
-      compares `text[]` with `text`); here it answers the rows `a = '{x,y}'`
-      would, through the MQL filter.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_any_of_an_array_of_arrays
-      Backlog-ID: RP-740
+
+## Found while working RP-740 (2026-11-09)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415).
+
+- [ ] **A scalar compared with an array value names the types by their
+      internal names.** `select 1 = (select array[1])`, `select x = y from
+      (values (1, array[1])) v(x, y)` and `select 1 = any (select
+      array[1])` are each 42883 `operator does not exist: integer =
+      integer[]` on PostgreSQL 15.19; here the message reads `int4 =
+      int4[]`: the per-row evaluation's mismatch prints `inferred_type`
+      without `display_type`.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_a_scalar_against_an_array_value_names_its_types
+      Backlog-ID: RP-742

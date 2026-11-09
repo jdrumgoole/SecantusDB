@@ -1184,6 +1184,44 @@ fn mismatch(op: &str, l: &str, r: &str, location: i32) -> Error {
     ))
 }
 
+/// The element type of the array operand of `x op ANY / ALL (r)`, every
+/// dimension's `[]` dropped: an array type carries no dimension count, so
+/// `ARRAY[b]` over an `int[]` `b` and `'{{1}}'::int[]` both hold `int4`
+/// elements (`make_scalar_array_op` takes `get_base_element_type`). An
+/// ARRAY of untyped literals alone is a `text[]`; `None` when not typed.
+fn any_element_type(r: &pg_query::protobuf::Node, scope: &Scope) -> Option<String> {
+    use pg_query::protobuf::a_const::Val;
+    let base = |t: &str| {
+        let t = t.trim_end_matches("[]").to_string();
+        crate::domains::domain_base(&t).unwrap_or(t)
+    };
+    match r.node.as_ref()? {
+        N::AArrayExpr(a) => {
+            let mut literal = false;
+            for el in &a.elements {
+                let t = match el.node.as_ref() {
+                    Some(N::AConst(c)) if matches!(c.val, Some(Val::Sval(_))) => {
+                        literal = true;
+                        None
+                    }
+                    Some(N::TypeCast(tc)) => tc.type_name.as_ref().map(type_name_of),
+                    Some(N::AArrayExpr(_)) => any_element_type(el, scope),
+                    _ => operand_type(el, scope),
+                };
+                if let Some(t) = t {
+                    return Some(base(&t));
+                }
+            }
+            literal.then(|| "text".to_string())
+        }
+        N::TypeCast(tc) => {
+            let t = type_name_of(tc.type_name.as_ref()?);
+            t.ends_with("[]").then(|| base(&t))
+        }
+        _ => operand_type(r, scope).and_then(|t| t.ends_with("[]").then(|| base(&t))),
+    }
+}
+
 /// The operators `pg_operator` has over `(record, record)` in PostgreSQL
 /// 15: `record_eq` .. `record_ge` and their `record_image_*` forms. (`!=`
 /// is the parser's spelling of `<>`.)
@@ -1588,6 +1626,37 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             }
         }
     }
+    // `x op ANY / ALL (array)` compares `x` with the array's ELEMENT type
+    // (`make_scalar_array_op`), and an array's element type is never an
+    // array: `ARRAY['{x,y}'::text[]]` and `'{{x,y}}'::text[]` are both a
+    // `text[]` of two dimensions. So an array `x` meets a scalar, which no
+    // comparison operator takes (`text[] = text`, 42883), where the
+    // evaluation compared it with each sub-array and answered rows (RP-740).
+    if matches!(kind, Some(K::AexprOpAny | K::AexprOpAll))
+        && matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=")
+        && l.strip_suffix("[]")
+            .is_some_and(|el| category(el).is_some())
+    {
+        if let Some(r) = e.rexpr.as_deref() {
+            // An untyped literal is read as `x`'s array type, and an array
+            // type has none of its own (42704, parse_oper.c).
+            if matches!(r.node.as_ref(), Some(N::AConst(c))
+                if matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+            {
+                set_error_location(e.location);
+                return Err(Error::UndefinedObject(format!(
+                    "could not find array type for data type {}",
+                    display_type(&l)
+                )));
+            }
+            if let Some(el) = any_element_type(r, scope) {
+                if category(&el).is_some() {
+                    let op = if op == "!=" { "<>" } else { op.as_str() };
+                    return Err(mismatch(op, &l, &el, e.location));
+                }
+            }
+        }
+    }
     let Some(lc) = category(&l) else {
         return Ok(());
     };
@@ -1619,6 +1688,17 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                 .and_then(|t| t.strip_suffix("[]").map(str::to_string))
                 .into_iter()
                 .collect(),
+        };
+        // A nested array's elements (`1 = any (array['{x}'::text[]])` is
+        // `integer = text`), which `operand_type` leaves untyped.
+        let elements = if elements.is_empty() {
+            e.rexpr
+                .as_deref()
+                .and_then(|r| any_element_type(r, scope))
+                .into_iter()
+                .collect()
+        } else {
+            elements
         };
         if let Some(r) = elements
             .iter()
