@@ -1960,20 +1960,37 @@ impl Interp<'_> {
         });
         for (name, d) in vars {
             if self.active.last().is_some_and(|l| l.init.contains(&d)) {
+                let frame = |mut e: PlError| {
+                    if !e.framed {
+                        let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);
+                        e.push_context(format!(
+                            "PL/pgSQL function {} line {line} during statement block \
+                             local variable initialization",
+                            self.label
+                        ));
+                        e.framed = true;
+                    }
+                    e
+                };
                 let value = match self.defaults.get(&d).cloned() {
-                    Some(e) => Some(self.eval_typed(&e, d).map_err(|mut e| {
-                        if !e.framed {
-                            let line = body.get("lineno").and_then(Value::as_u64).unwrap_or(0);
-                            e.push_context(format!(
-                                "PL/pgSQL function {} line {line} during statement block \
-                                 local variable initialization",
-                                self.label
-                            ));
-                            e.framed = true;
+                    Some(e) => Some(self.eval_typed(&e, d).map_err(frame)?),
+                    None => {
+                        // With no DEFAULT, a variable of a domain is
+                        // assigned its NULL through `exec_assign_value`,
+                        // claimed to be of type `unknown` so the coercion
+                        // runs: the domain's NOT NULL and CHECKs judge it,
+                        // and `x dnn int not null` refuses the block's
+                        // entry (RP-714).
+                        if let Some(Datum::Var { ty, .. }) = self.datums.get(d) {
+                            if let Some(checked) =
+                                self.host
+                                    .coerce_to_domain(ty, "SELECT NULL", &[], Bson::Null)
+                            {
+                                checked.map_err(frame)?;
+                            }
                         }
-                        e
-                    })?),
-                    None => None,
+                        None
+                    }
                 };
                 match (self.datums.get_mut(d), value) {
                     (Some(Datum::Rec { rec, .. }), _) => *rec = None,

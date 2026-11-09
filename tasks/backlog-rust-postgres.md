@@ -2571,13 +2571,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       goes through `target_datum`).
       Verify: tests/backlog/test_rp_found_rp694.py::test_for_and_execute_into_scalar_variables
       Backlog-ID: RP-713
-- [ ] **A NOT NULL domain variable with no default starts NULL.** `declare
-      x dnn694; begin end` is 23502 `domain dnn694 does not allow null
-      values` on PostgreSQL 15.19 (`exec_stmt_block` assigns the NULL
-      through `exec_assign_value`); here the block runs, and a later
-      `select 5 into x` succeeds.
-      Verify: tests/backlog/test_rp_found_rp694.py::test_a_not_null_domain_variable_without_a_default_is_refused
-      Backlog-ID: RP-714
 
 ## Found while working RP-695 (2026-11-09)
 
