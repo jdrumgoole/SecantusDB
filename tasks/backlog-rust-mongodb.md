@@ -1951,6 +1951,17 @@ A `readConcern` with an `atClusterTime` older than the oldest timestamp is
       Backlog-ID: RM-170
       Verify: tests/backlog/test_rm_found_2026_10_16.py::test_include_query_stats_metrics_adds_a_metrics_document
 
+- [ ] **RUST MongoDB server: `insert`, `update` and `delete` take fields
+      mongod refuses as unknown.** `originalQuery` and `originalCollation`
+      on any of the three, and a command-level `sampleId` on `update`:
+      mongod 8.2.11 answers 40415 (`BSON field 'insert.originalQuery' is an
+      unknown field.`) and writes nothing; this server takes them, ignores
+      them and runs the write. Its field lists (`write_command_problem`,
+      `update_command_problem` in `crud.rs`) name them. Found 2026-11-09
+      while working RM-087.
+      Backlog-ID: RM-460
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm087.py::test_a_write_refuses_fields_mongod_does_not_know
+
 ### 7.077 `update` and `findAndModify` -- 2026-10-12
 
 `tools/probes/update_commands.py`, mongod 8.2.11: 30 scenarios, 1,295
@@ -2280,24 +2291,30 @@ differs on 5 scenarios. What is left:
 
 ### 7.072 Sessions, transactions and retryable writes -- 2026-10-11
 
-`tools/probes/transactions.py`, mongod 8.2.11 as a replica-set member: 251
+`tools/probes/transactions.py`, mongod 8.2.11 as a replica-set member: 267
 scenarios, each a script of commands over raw connections with the session
 fields written out (the transaction state rules, what a transaction refuses,
 conflicts, collections made in a transaction, cursors, the session commands,
-retryable writes). The Rust server differs on 11 scenarios. What is left:
+retryable writes). The Rust server differs on 4 (2026-11-09): two `$where`
+scenarios (no server-side JavaScript, a scope decision), the collation key
+of a duplicate-key message (7.078) and the `createIndexes` below. The probe
+masks only the write-conflict cause. What is left:
 
-- [ ] **RUST MongoDB server: smaller differences.** An error that names
-      the request or mongod's oplog entry has the code and a shorter text:
-      40606 / 40607 / 40608 / 40611 / 40612 on an incompatible
-      `findAndModify` retry (which cases refuse is mongod's since
-      2026-10-20, RM-203), and the two statement-id errors. A write conflict
-      on an insert has an empty cause where mongod names its index table.
-      The other session errors are worded for a session with no user.
-      (A write that waits on a transaction's document past `maxTimeMS`
-      answers a plain 50, which is what mongod 8.2.11 answered in 12 runs
-      of 12; the `writeConcernError` one probe run saw did not recur.)
+- [ ] **RUST MongoDB server: smaller differences.** A write conflict on
+      an insert has an empty cause where mongod names its index and table
+      (`Caused by :: WiredTigerIdIndex::_insert: index: _id_; uri:
+      table:<ident> ::`). A retryable insert counts a null among its
+      `documents` against `stmtIds` and refuses it (16), where mongod drops
+      the null first and inserts. The other session errors are worded for a
+      session with no user (not measured with one). A `createIndexes` that
+      waits on a transaction past `maxTimeMS` (the probe's "an index built
+      under a transaction"): mongod 8.2.11 adds a `writeConcernError` (50)
+      to its 50 in 2 runs of 2 on 2026-11-09, where this server answers a
+      plain 50; 12 runs of 12 had answered a plain 50 before. (The request
+      and oplog-entry dumps of the statement-id and `findAndModify` retry
+      errors are mongod's since 2026-11-09.)
       Backlog-ID: RM-087
-      Verify: tests/backlog/test_rm_085_112.py::test_statement_id_count_error_names_the_request
+      Verify: tests/backlog/test_rm_085_112.py::test_an_insert_conflict_names_the_index_table, tests/backlog/test_rm_085_112.py::test_a_retryable_insert_does_not_count_a_null
 
 ### 7.071 Time-series collections -- 2026-10-11
 

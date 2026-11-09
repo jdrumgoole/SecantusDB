@@ -1221,7 +1221,17 @@ fn retryable_write(
     };
     let ids = match statement_ids(name, doc, count) {
         Ok(ids) => ids,
-        Err(e) => return e.into_reply(),
+        // mongod parses the command before the session sees it: what its
+        // parse refuses, in the order it checks, comes first (RM-087).
+        Err(e) => {
+            let parsed = match name {
+                "insert" | "update" | "delete" => {
+                    crate::crud::write_parse_problem(name, doc, ctx.raw_insert_documents.as_deref())
+                }
+                _ => None,
+            };
+            return parsed.unwrap_or(e).into_reply();
+        }
     };
     let session = logical_session_id(lsid, &authenticated(ctx));
     if !registry.knows(lsid) {
@@ -1259,7 +1269,9 @@ fn retryable_write(
     let (mut reply, records) = match name {
         "insert" => retry_insert(handler, doc, ctx, &ids, &done),
         "update" | "delete" => retry_batch(name, handler, doc, ctx, &ids, &done),
-        "findAndModify" | "findandmodify" => retry_find_and_modify(handler, doc, ctx, &ids, &done),
+        "findAndModify" | "findandmodify" => {
+            retry_find_and_modify(handler, doc, ctx, &ids, &done, (&session, txn_number))
+        }
         "bulkWrite" => {
             crate::bulkwrite::with_retry(&ids, &done, || crate::run_handler(handler, doc, ctx))
         }
@@ -1737,12 +1749,41 @@ fn retry_batch(
     (with_retried(reply, retried), records)
 }
 
+/// The oplog entry of statement `stmt_id` of the session's transaction
+/// `txn_number`, as a refused `findAndModify` retry quotes it
+/// (`request_dump::oplog_entry`).
+fn statement_entry(
+    storage: &dyn crate::Storage,
+    session: &Document,
+    txn_number: i64,
+    stmt_id: i32,
+) -> Option<String> {
+    let entries = storage
+        .find(
+            "local",
+            "oplog.rs",
+            &doc! {"lsid": session.clone(), "txnNumber": txn_number},
+            None,
+            None,
+        )
+        .ok()?;
+    entries.iter().find_map(|bytes| {
+        let entry = secantus_core::bsondoc::from_bytes(bytes).ok()?;
+        let own = entry.get("stmtId").and_then(crate::util::as_i64) == Some(i64::from(stmt_id));
+        let grouped = entry.get_str("op") == Ok("c");
+        (own || grouped)
+            .then(|| crate::request_dump::oplog_entry(&entry, stmt_id))
+            .flatten()
+    })
+}
+
 fn retry_find_and_modify(
     handler: Handler,
     doc: &Document,
     ctx: &mut CommandContext,
     ids: &[i32],
     done: &transactions::Applied,
+    (session, txn_number): (&Document, i64),
 ) -> Ran {
     let id = ids.first().copied().unwrap_or(0);
     let remove = doc.get("remove").is_some_and(crate::util::truthy);
@@ -1755,16 +1796,30 @@ fn retry_find_and_modify(
                 Vec::new(),
             )
         };
+        // mongod quotes the request as it parsed it, then the oplog entry of
+        // the write it does not fit (measured 8.2.11, RM-087).
+        let request = crate::request_dump::find_and_modify(doc);
+        let entry = ctx
+            .storage
+            .as_ref()
+            .and_then(|s| statement_entry(s.as_ref(), session, txn_number, id))
+            .map_or(String::new(), |entry| format!(", {entry}"));
         let incompatible = |kind: &str| {
             format!(
-                "findAndModify retry request is not compatible with previous write in the \
-                 transaction of type: {kind}"
+                "findAndModify retry request: {request} is not compatible with previous write \
+                 in the transaction of type: {kind}{entry}"
             )
         };
-        let no_after = "findAndModify retry request wants the document after update returned, \
-                        but only before update document is stored";
-        let no_before = "findAndModify retry request wants the document before update \
-                         returned, but only after update document is stored";
+        let no_after = format!(
+            "findAndModify retry request: {request} wants the document after update returned, \
+             but only before update document is stored{entry}"
+        );
+        let no_before = format!(
+            "findAndModify retry request: {request} wants the document before update \
+             returned, but only after update document is stored{entry}"
+        );
+        let no_pre_image =
+            format!("No pre-image available for findAndModify retry request:{request}");
         let answer = |last_error: Document, value: Bson| {
             (
                 doc! {
@@ -1877,12 +1932,9 @@ fn retry_find_and_modify(
             // An update statement keeps no image of the document.
             StmtRecord::Update { upserted: None } => refuse(
                 if new { 40611 } else { 40612 },
-                if new { no_after } else { no_before },
+                if new { &no_after } else { &no_before },
             ),
-            StmtRecord::Delete if remove => refuse(
-                40607,
-                "No pre-image available for findAndModify retry request",
-            ),
+            StmtRecord::Delete if remove => refuse(40607, &no_pre_image),
             StmtRecord::Delete => refuse(40606, &incompatible("d")),
         };
     }

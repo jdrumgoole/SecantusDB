@@ -1867,15 +1867,8 @@ def resolve(value, run, db, cursors):
 UUID_TEXT = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
-#: Errors whose text mongod fills with a dump of the request or of its own
-#: oplog entry. The code is compared and the text is not.
-DUMPS = (40606, 40607, 40608, 40612)
-
-
 def clean(value, key=None):
     if isinstance(value, dict):
-        if value.get("code") in DUMPS and "errmsg" in value:
-            value = {**value, "errmsg": "<names the request and the oplog entry>"}
         out = {}
         for k, v in value.items():
             if k in NOISE:
@@ -1906,9 +1899,7 @@ def clean(value, key=None):
         text = UUID_TEXT.sub("UUID", value)
         text = re.sub(r"Timestamp\(\d+, \d+\)", "Timestamp(T)", text)
         text = re.sub(r"cursor (id )?\d{6,}", r"cursor \1N", text)
-        # mongod goes on to print the statement ids and the whole command.
-        text = re.sub(r"\. (Statement ids|Got \{|Write command): .*$", ".", text)
-        text = re.sub(r"\. Got \{.*$", ".", text)
+        text = re.sub(r"new Date\(\d+\)", "new Date(D)", text)
         # A conflict on an index names mongod's own table for it, or nothing.
         text = re.sub(
             r"Caused by :: (WiredTiger\S+ index: \S+ uri: \S+)? ::", "Caused by :: <index> ::", text

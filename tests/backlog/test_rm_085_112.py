@@ -207,11 +207,11 @@ def test_fast_count_sees_another_sessions_uncommitted_insert(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-087")
+@pytest.mark.backlog_fixed("RM-087")
 def test_statement_id_count_error_names_the_request(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11: a retryable insert whose `stmtIds` do not match its
     documents answers 16, naming the statement ids and the whole write
-    command; the Rust server has the code and only the first sentence."""
+    command; the Rust server had the code and only the first sentence."""
     lsid = {"id": bson.Binary(uuid.uuid4().bytes, 4)}
     coll = _name("rm087")
     request = SON(
@@ -230,6 +230,187 @@ def test_statement_id_count_error_names_the_request(rust_mongo: Any, mongod_rs: 
 
     got, ref = _both(rust_mongo, mongod_rs, probe)
     assert ref[0] == 16
+    assert got == ref
+
+
+_DUMP_NOISE = (
+    (re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "UUID"),
+    (re.compile(r"Timestamp\(\d{6,}, \d+\)"), "Timestamp(T)"),
+    (re.compile(r"new Date\(\d+\)"), "new Date(D)"),
+)
+
+
+def _without_ids(text: str) -> str:
+    """A message with its session ids, collection UUIDs, oplog times and wall
+    clock replaced: what differs between two servers, not in their text."""
+    for pattern, stand_in in _DUMP_NOISE:
+        text = pattern.sub(stand_in, text)
+    return text
+
+
+@pytest.mark.backlog_fixed("RM-087")
+def test_statement_ids_are_checked_outside_a_session(rust_mongo: Any, mongod: Any) -> None:
+    """mongod 8.2.11 checks a write's statement ids when it parses it, in a
+    session or not: an `update` with two ids for one statement, and one
+    with both `stmtId` and `stmtIds`, are refused with 16 and 72, quoting
+    the command as its parser serialises it, and change nothing. The Rust
+    server checked them on a retryable write only, and ran these."""
+    coll = _name("rm087")
+
+    def probe(client: Any) -> Any:
+        db = client["rm087"]
+        db[coll].insert_one({"_id": 1})
+        answers = []
+        for extra in ([("stmtIds", [1, 2])], [("stmtId", 3), ("stmtIds", [1])]):
+            body = SON(
+                [
+                    ("update", coll),
+                    ("updates", [{"q": {"_id": 1}, "u": {"$set": {"a": 1}}, "hint": "_id_"}]),
+                    *extra,
+                    ("writeConcern", {"j": True}),
+                    ("comment", "x"),
+                ]
+            )
+            reply = _raw_command(client, "rm087", body)
+            answers.append((reply.get("code"), reply.get("errmsg")))
+        return answers, list(db[coll].find())
+
+    got, ref = _both(rust_mongo, mongod, probe)
+    assert [code for code, _ in ref[0]] == [16, 72]
+    assert ref[1] == [{"_id": 1}]
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-087")
+def test_statement_ids_that_do_not_parse_start_no_transaction(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11: an insert that starts a transaction with both `stmtId`
+    and `stmtIds` is refused (72) before the transaction exists, so its
+    commit finds none (251). The Rust server inserted the document."""
+    coll = _name("rm087")
+
+    def probe(client: Any) -> Any:
+        lsid = {"id": bson.Binary(uuid.uuid4().bytes, 4)}
+        txn = [("lsid", lsid), ("txnNumber", bson.Int64(1)), ("autocommit", False)]
+        bad = _raw_command(
+            client,
+            "rm087",
+            SON(
+                [
+                    ("insert", coll),
+                    ("documents", [{"_id": 1}]),
+                    ("stmtIds", [1]),
+                    ("stmtId", 1),
+                    *txn,
+                    ("startTransaction", True),
+                ]
+            ),
+        )
+        commit = _raw_command(client, "admin", SON([("commitTransaction", 1), *txn]))
+        return bad.get("code"), commit.get("code"), client["rm087"][coll].count_documents({})
+
+    got, ref = _both(rust_mongo, mongod_rs, probe)
+    assert ref == (72, 251, 0)
+    assert got == ref
+
+
+@pytest.mark.backlog_fixed("RM-087")
+def test_a_find_and_modify_retry_quotes_the_request_and_its_oplog_entry(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11 refuses a `findAndModify` retry that does not fit the
+    write it retries (40608, 40612, 40607), quoting the request as its
+    parser serialises it and the oplog entry of the write -- one operation
+    of an insert batch's `applyOps` included. The Rust server had the code
+    and the first words."""
+    coll = _name("rm087")
+
+    def probe(client: Any) -> Any:
+        lsid = {"id": bson.Binary(uuid.uuid4().bytes, 4)}
+        session = [("lsid", lsid)]
+        out = []
+
+        def send(number: int, body: list) -> None:
+            reply = _raw_command(
+                client, "rm087", SON([*body, *session, ("txnNumber", bson.Int64(number))])
+            )
+            if reply.get("ok") != 1.0:
+                out.append((reply.get("code"), _without_ids(reply.get("errmsg", ""))))
+
+        send(1, [("insert", coll), ("documents", [{"_id": 1}, {"_id": 2}])])
+        send(
+            1,
+            [
+                ("findAndModify", coll),
+                ("update", {"$set": {"v": 1}}),
+                ("query", {"_id": 2}),
+                ("hint", "_id_"),
+                ("stmtId", 1),
+                ("writeConcern", {"w": 1}),
+            ],
+        )
+        send(2, [("update", coll), ("updates", [{"q": {"_id": 1}, "u": {"$set": {"v": 2}}}])])
+        send(2, [("findAndModify", coll), ("query", {"_id": 1}), ("update", {"$inc": {"v": 1}})])
+        send(3, [("delete", coll), ("deletes", [{"q": {"_id": 2}, "limit": 1}])])
+        send(3, [("findandmodify", coll), ("query", {"_id": 2}), ("remove", True)])
+        return out
+
+    got, ref = _both(rust_mongo, mongod_rs, probe)
+    assert [code for code, _ in ref] == [40608, 40612, 40607]
+    assert got == ref
+
+
+@pytest.mark.backlog("RM-087")
+def test_an_insert_conflict_names_the_index_table(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11: a transaction's insert of an `_id` another open
+    transaction inserted answers 112, naming the index and the table it
+    conflicted in (`WiredTigerIdIndex::_insert: index: _id_; uri:
+    table:<ident>`); the Rust server's cause is empty."""
+    coll = _name("rm087")
+
+    def probe(client: Any) -> str:
+        db = client["rm087"]
+        db[coll].insert_one({"_id": 0})
+        with client.start_session() as first, client.start_session() as second:
+            first.start_transaction()
+            second.start_transaction()
+            db[coll].insert_one({"_id": 3}, session=first)
+            answer = mongo_answer(lambda: db[coll].insert_one({"_id": 3}, session=second))
+            for s in (first, second):
+                with contextlib.suppress(pymongo.errors.PyMongoError):
+                    s.abort_transaction()
+        assert answer[:2] == ("err", 112)
+        return re.sub(r"uri: table:\S+ ::", "uri: table:<ident> ::", answer[2])
+
+    got, ref = _both(rust_mongo, mongod_rs, probe)
+    assert "WiredTigerIdIndex::_insert: index: _id_; uri: table:<ident>" in ref
+    assert got == ref
+
+
+@pytest.mark.backlog("RM-087")
+def test_a_retryable_insert_does_not_count_a_null(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11 drops a null from an insert's `documents` before it
+    counts them against `stmtIds`: a retryable insert of `[{_id: 1}, null]`
+    with one statement id inserts the document. The Rust server's session
+    layer counts the null and refuses it (16)."""
+    coll = _name("rm087")
+    request = SON(
+        [
+            ("insert", coll),
+            ("documents", [{"_id": 1}, None]),
+            ("stmtIds", [1]),
+            ("lsid", {"id": bson.Binary(uuid.uuid4().bytes, 4)}),
+            ("txnNumber", bson.Int64(1)),
+        ]
+    )
+
+    def probe(client: Any) -> Any:
+        reply = _raw_command(client, "rm087", request)
+        return reply.get("code"), reply.get("n")
+
+    got, ref = _both(rust_mongo, mongod_rs, probe)
+    assert ref == (None, 1)
     assert got == ref
 
 

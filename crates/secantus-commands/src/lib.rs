@@ -93,6 +93,7 @@ pub mod query_settings;
 mod query_shape;
 pub mod rbac;
 mod replset_admin;
+mod request_dump;
 mod resume_keystring;
 pub mod roles;
 mod rwconcern;
