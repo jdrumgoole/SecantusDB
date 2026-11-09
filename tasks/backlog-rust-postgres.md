@@ -3256,17 +3256,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **An accumulated array whose lower bounds are not 1 is lost.**
-      `select array(select f from (values ('[2:3]={3,4}'::int[])) t(f))`
-      is `[1:1][2:3]={{3,4}}` on 15.19 (`accumArrayResultArr` copies the
-      first element array's lower bounds into the inner dimensions), and
-      `array_agg` over two such arrays `[1:2][2:3]={{3,4},{5,6}}`. Here
-      the sublink answers `{NULL}` -- each bounded element becomes a NULL
-      -- and as text `{"[2:3]={3,4}"}`, an array of strings; `array_agg`
-      the same. The shape checks already read the bounds (RP-730); the
-      result does not carry them.
-      Verify: tests/backlog/test_rp_found_rp730.py::test_accumulated_arrays_keep_their_lower_bounds
-      Backlog-ID: RP-731
 - [ ] **A query with ORDER BY computes its select list after the sort.**
       PostgreSQL 15.19 projects the select list below the Sort, in scan
       order, so `select k, case when k = 1 then 1/0 else ('x' || k)::int

@@ -23242,15 +23242,20 @@ fn resolve_one_sublink(
             // dimension (`ExecScanSubPlan`'s `accumArrayResultAny`), which
             // refuses a NULL array, an empty first one, and any of another
             // shape than the first (RP-730).
-            if ty.as_deref().is_some_and(|t| t.ends_with("[]")) {
+            // The result's inner dimensions take the first array's lower
+            // bounds (`accumArrayResultArr`, RP-731).
+            let values = if ty.as_deref().is_some_and(|t| t.ends_with("[]")) {
                 arrays::check_accumulable(&values)?;
-            }
+                arrays::accumulate(values)
+            } else {
+                Bson::Array(values)
+            };
             // An `int2vector` / `oidvector` row value is one element of the
             // array, carried as its text there: as the int array it is
             // carried as, it read as one more dimension of ints (RP-575).
             let values = match ty.as_deref().filter(|t| vectors::is_vector(t)) {
-                Some(elem) => vectors::elements(Bson::Array(values), elem)?,
-                None => Bson::Array(values),
+                Some(elem) => vectors::elements(values, elem)?,
+                None => values,
             };
             let node = param_node(params, values);
             // `transformSubLink` types an ARRAY sublink as the array of its

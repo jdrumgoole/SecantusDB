@@ -1,8 +1,8 @@
 """What working RP-730 (an ARRAY sublink refuses ragged or NULL element
 arrays) found:
 
-- an element array whose lower bounds are not 1 is lost when an ARRAY
-  sublink or `array_agg` accumulates it (RP-731);
+- an element array whose lower bounds are not 1 was lost when an ARRAY
+  sublink or `array_agg` accumulated it (RP-731, fixed);
 - a query with ORDER BY computes its select list after the sort, so a
   later row's error is raised first (RP-732).
 
@@ -34,10 +34,12 @@ def _answer(dsn: str, query: str) -> object:
             return (e.sqlstate, str(e).splitlines()[0])
 
 
-@pytest.mark.backlog("RP-731")
+@pytest.mark.backlog_fixed("RP-731")
 def test_accumulated_arrays_keep_their_lower_bounds(dsn: str) -> None:
     """`accumArrayResultArr` (PostgreSQL 15.19) copies the first element
-    array's lower bounds into the result's inner dimensions."""
+    array's lower bounds into the result's inner dimensions. Here each
+    bounded element became a NULL, and as text an array of strings, until
+    the sublinks and `array_agg` accumulated as it does."""
     assert _answer(
         dsn, "select array(select f from (values ('[2:3]={3,4}'::int[])) t(f))::text"
     ) == [("[1:1][2:3]={{3,4}}",)]
@@ -46,6 +48,17 @@ def test_accumulated_arrays_keep_their_lower_bounds(dsn: str) -> None:
         "select array_agg(f)::text"
         " from (values ('[2:3]={3,4}'::int[]), ('[2:3]={5,6}'::int[])) t(f)",
     ) == [("[1:2][2:3]={{3,4},{5,6}}",)]
+    # The correlated sublink and the window aggregate accumulate the same way.
+    assert _answer(
+        dsn,
+        "select k, array(select f from (values ('[0:1]={a,b}'::text[])) t(f)"
+        " where k = 1)::text from (values (1), (2)) s(k)",
+    ) == [(1, "[1:1][0:1]={{a,b}}"), (2, "{}")]
+    assert _answer(
+        dsn,
+        "select array_agg(f) over (order by f)::text"
+        " from (values ('[2:3]={3,4}'::int[]), ('[2:3]={5,6}'::int[])) t(f)",
+    ) == [("[1:1][2:3]={{3,4}}",), ("[1:2][2:3]={{3,4},{5,6}}",)]
 
 
 @pytest.mark.backlog("RP-732")

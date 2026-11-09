@@ -49861,6 +49861,22 @@ fn array_agg_refuses(values: impl Iterator<Item = Bson>) -> bool {
     }
 }
 
+/// `array_agg`'s result: over an array column the inputs are accumulated
+/// into one more dimension whose inner bounds are the first input's
+/// (`secantus_pgplan::arrays::accumulate`, RP-731); otherwise the values as
+/// they are.
+fn accumulate_if_arrays(item: &AggItem, values: Vec<Bson>) -> Bson {
+    if item
+        .source_type
+        .as_deref()
+        .is_some_and(|t| t.ends_with("[]"))
+    {
+        secantus_pgplan::arrays::accumulate(values)
+    } else {
+        Bson::Array(values)
+    }
+}
+
 /// The float8 sum of `values` in order, as `sum` / `avg` of a
 /// `double precision` add them -- or `None`, with `FLOAT_SUM_OVERFLOW` set,
 /// when an addition of two finite values overflows: PostgreSQL's `float8pl`
@@ -50168,9 +50184,10 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                     (false, false) => compare_values(b, a),
                 },
             );
-            Bson::Array(kept)
+            accumulate_if_arrays(item, kept)
         }
-        AggFunc::ArrayAgg => Bson::Array(
+        AggFunc::ArrayAgg => accumulate_if_arrays(
+            item,
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
                 .collect(),
