@@ -3168,15 +3168,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       x719 order by a` is in the right order.
       Verify: tests/backlog/test_rp_found_rp719.py::test_groups_of_an_array_column_follow_the_order_by
       Backlog-ID: RP-722
-- [ ] **GROUP BY a `char(n)` value splits it from the same value
-      unpadded.** `select count(*) from (values ('ab'::char(3)),
-      ('ab'::bpchar)) v(a) group by a` is one group of 2 on PostgreSQL
-      15.19 (`bpchar`'s equality and hash ignore trailing blanks), here two
-      groups of 1; `count(distinct a)` is 2 for 1. The same holds for
-      `char(n)[]` values. A stored column groups correctly, as its values
-      are kept trimmed.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_grouping_a_char_n_value_ignores_its_blanks
-      Backlog-ID: RP-725
 
 ## Found while working RP-697 (2026-11-09)
 

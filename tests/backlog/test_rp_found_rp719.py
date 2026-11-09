@@ -21,8 +21,10 @@ Found while working it (each a gap test below):
   matched nothing, and so did a `char(n)` column against a padded
   `char(n)` constant (both fixed since: the narrow join path reads each
   WHERE constant as its column's type);
-- GROUP BY a `char(n)` (or `char(n)[]`) value splits a padded value from
-  the same value unpadded.
+- GROUP BY a `char(n)` (or `char(n)[]`) value split a padded value from
+  the same value unpadded (RP-725, since fixed: GROUP BY, DISTINCT,
+  DISTINCT ON, an aggregate's DISTINCT and PARTITION BY now match a
+  `char(n)` value without its trailing blanks).
 
 Every expected answer was measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`.
@@ -234,12 +236,47 @@ def test_a_join_filter_compares_a_char_n_column_without_its_blanks(
     assert _answer(dsn, query) == ("ok", rows)
 
 
-@pytest.mark.backlog("RP-725")
+@pytest.mark.backlog_fixed("RP-725")
 @pytest.mark.parametrize(
     "values",
     ["('ab'::char(3)), ('ab'::bpchar)", "('{ab}'::char(3)[]), ('{ab}'::bpchar[])"],
 )
 def test_grouping_a_char_n_value_ignores_its_blanks(values: str, dsn: str) -> None:
-    # `bpchar`'s hash and equality ignore trailing blanks: one group of two.
+    # `bpchar`'s hash and equality ignore trailing blanks: one group of two,
+    # where this server made two groups of one.
     query = f"select count(*) from (values {values}) v(a) group by a"
     assert _answer(dsn, query) == ("ok", [(2,)])
+
+
+_PAD, _BARE = "('ab'::char(3)), ('ab'::bpchar)", "('ab'::bpchar), ('ab'::char(3))"
+_ARR = "('{ab}'::char(3)[]), ('{ab}'::bpchar[])"
+
+# Every way a query matches values by equality, over a padded `char(n)` and
+# the same value unpadded (the VALUES column is a `bpchar` with no width, so
+# each keeps its own blanks). The value a group or a DISTINCT prints is its
+# first row's, blanks and all.
+BLANK_INSENSITIVE = {
+    f"select a, octet_length(a), count(*) from (values {_PAD}) v(a) group by a": [("ab ", 3, 2)],
+    f"select a, octet_length(a), count(*) from (values {_BARE}) v(a) group by a": [("ab", 2, 2)],
+    f"select count(distinct a) from (values {_PAD}) v(a)": [(1,)],
+    f"select array_agg(distinct a) from (values {_PAD}) v(a)": [(["ab "],)],
+    f"select distinct a from (values {_PAD}) v(a)": [("ab ",)],
+    f"select distinct on (a) a, octet_length(a) from (values {_PAD}) v(a)": [("ab ", 3)],
+    f"select count(*) over (partition by a) from (values {_PAD}) v(a)": [(2,), (2,)],
+    f"select count(distinct a) from (values {_ARR}) v(a)": [(1,)],
+    f"select distinct a from (values {_ARR}) v(a)": [(["ab "],)],
+    # A `text` or `varchar` keeps its blanks: two groups.
+    "select count(*) from (values ('ab '::text), ('ab'::text)) v(a) group by a": [(1,), (1,)],
+    "select count(*) from (values ('ab '::varchar), ('ab'::varchar)) v(a) group by a": [
+        (1,),
+        (1,),
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RP-725")
+@pytest.mark.parametrize("query", list(BLANK_INSENSITIVE))
+def test_distinct_and_partitions_match_a_char_n_value_without_its_blanks(
+    query: str, dsn: str
+) -> None:
+    assert _answer(dsn, query) == ("ok", BLANK_INSENSITIVE[query])

@@ -2443,9 +2443,11 @@ pub struct WindowItem {
     /// `OrderKey` so one comparator serves partitioning and ordering both;
     /// the direction and null placement are unused here.
     pub partition_by: Vec<OrderKey>,
-    /// Per `partition_by` key, whether it is a `jsonb` column -- partitioned
-    /// by VALUE (`{"x":1}` and `{"x":1.0}` are one partition).
-    pub partition_jsonb: Vec<bool>,
+    /// Per `partition_by` key, the type of a bare column key (empty for an
+    /// expression): a `jsonb` one is partitioned by VALUE (`{"x":1}` and
+    /// `{"x":1.0}` are one partition), a `char(n)` one without its trailing
+    /// blanks (RP-725).
+    pub partition_types: Vec<String>,
     pub order_by: Vec<OrderKey>,
     pub frame: WindowFrame,
     /// Fixed at plan time, for the DESCRIBE pass that never sees a row.
@@ -13900,9 +13902,12 @@ fn plan_window_call(
         }
     };
     extra.push(Column::new(&field, &result_type, false));
-    let partition_jsonb = partition_by
+    let partition_types = partition_by
         .iter()
-        .map(|k| k.expr.is_none() && field_type(def, &k.field) == Some("jsonb"))
+        .map(|k| match k.expr {
+            None => field_type(def, &k.field).unwrap_or_default().to_string(),
+            Some(_) => String::new(),
+        })
         .collect();
     // `OVER (w)` with nothing added is `OVER w` (`transformWindowFuncCall`).
     let reference = if !over.name.is_empty() {
@@ -13933,7 +13938,7 @@ fn plan_window_call(
         arg_field,
         args,
         partition_by,
-        partition_jsonb,
+        partition_types,
         order_by,
         frame,
         result_type,
@@ -16886,7 +16891,7 @@ pub fn pad_bpchar_elements(v: Bson, n: usize) -> Bson {
 /// a `char(n)[]` one so, through its nesting and bounds: what `bpchareq` /
 /// `bpcharcmp` compare, element by element in `array_eq` / `array_cmp` /
 /// `array_contains` (RP-719).
-pub(crate) fn trim_bpchar_deep(v: Bson) -> Bson {
+pub fn trim_bpchar_deep(v: Bson) -> Bson {
     match v {
         Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
         Bson::Array(items) => Bson::Array(items.into_iter().map(trim_bpchar_deep).collect()),
@@ -16902,6 +16907,14 @@ pub(crate) fn trim_bpchar_deep(v: Bson) -> Bson {
 /// array of a domain over it.
 pub(crate) fn is_bpchar_array_type(t: &str) -> bool {
     t.strip_suffix("[]").is_some_and(is_bpchar_type)
+}
+
+/// Whether two values of type `t` are equal regardless of trailing blanks:
+/// a `char(n)` (`bpchareq`, and `hashbpchar` hashes the value without them),
+/// a `char(n)[]` (`array_eq` over `bpchareq`), or a domain over either. What
+/// GROUP BY, DISTINCT and PARTITION BY group on (RP-725).
+pub fn blank_insensitive_type(t: &str) -> bool {
+    is_bpchar_type(t) || is_bpchar_array_type(t)
 }
 
 /// `make_const`'s reading of a `Float` literal that is really an integer
