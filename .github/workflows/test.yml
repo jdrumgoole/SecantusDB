@@ -1720,9 +1720,11 @@ jobs:
           df -h / | tail -1
           # --durations: every test over a second, so the shard can be split
           # by measured time rather than by guess (2026-11-09: this step is
-          # the PR run's critical path at 21-31 min).
+          # the PR run's critical path at 14-28 min). --dist worksteal for
+          # the reason the suites step gives: the isolation specs run up to
+          # 126 s each, and the default hands them out up front.
           uv run python -m pytest -m backlog_fixed tests/backlog/test_rust_postgres_gaps.py \
-            tests/backlog/test_rp_*.py -q -n auto -p no:cacheprovider -rs \
+            tests/backlog/test_rp_*.py -q -n auto --dist worksteal -p no:cacheprovider -rs \
             --durations=0 --durations-min=1.0
           df -h / | tail -1
           # And the OPEN items' gap tests, through the backlog's own runner: it
