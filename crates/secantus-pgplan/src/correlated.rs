@@ -2497,6 +2497,8 @@ pub struct UserFn {
     pub strict: bool,
     /// Each input parameter's `DEFAULT` as SQL, `None` where it has none.
     pub defaults: Vec<Option<String>>,
+    /// `procost`: its `COST`, 100 by default for `sql` and `plpgsql`.
+    pub cost: f64,
 }
 
 impl UserFn {

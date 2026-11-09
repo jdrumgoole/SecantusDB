@@ -3251,21 +3251,42 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
       Backlog-ID: RP-707
 
-## Found while working RP-730 (2026-11-09)
+## Found while working RP-732 (2026-11-09)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written.
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp732.py`.
 
-- [ ] **A query with ORDER BY computes its select list after the sort.**
-      PostgreSQL 15.19 projects the select list below the Sort, in scan
-      order, so `select k, case when k = 1 then 1/0 else ('x' || k)::int
-      end from (values (1), (2)) s(k) order by k desc` raises the first
-      row's 22012 `division by zero`. Here it raises the second row's 22P02
-      `invalid input syntax for type integer: "x2"`, the row that sorts
-      first: the error a client sees, and the order a volatile select-list
-      expression runs in, follow the sort rather than the scan.
-      Verify: tests/backlog/test_rp_found_rp730.py::test_select_list_is_computed_before_the_sort
-      Backlog-ID: RP-732
+- [ ] **A DECLARE CURSOR computes every row's select list at the DECLARE.**
+      `declare c cursor for select 1/(k - 1) from (values (2), (1)) s(k)`
+      then `fetch 1 from c` answers `1` on PostgreSQL 15.19, whose cursor
+      runs its plan as it is fetched; here the DECLARE itself raises the
+      second row's 22012 `division by zero`, and the cursor is not
+      created.
+      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cursor_computes_its_rows_as_they_are_fetched
+      Backlog-ID: RP-744
+- [ ] **A sorted cursor computes an expensive column below its Sort.** A
+      cursor is planned with `cursor_tuple_fraction` (0.1), and
+      `make_sort_input_target` postpones an expensive column (more than
+      10 x `cpu_operator_cost`, `to_tsvector`'s `procost` is 100) past the
+      Sort whenever `tuple_fraction > 0`, as for a LIMIT: `declare c
+      cursor for select k, to_tsvector(case when k = 1 then 'nope' else
+      'simple' end::regconfig, 'a')::text from (values (1), (2)) s(k) order
+      by k desc` then `fetch 1` answers `(2, 'a':1)` on PostgreSQL 15.19.
+      Since RP-732 `sort_input.rs` sees only a LIMIT, so the column is
+      computed for every row and the first row's 42704 is raised. Needs the
+      item above first: today the DECLARE computes every row anyway.
+      Verify: tests/backlog/test_rp_found_rp732.py::test_a_sorted_cursor_postpones_an_expensive_column
+      Backlog-ID: RP-745
+- [ ] **A cast over a CASE of untyped literals reports a branch's input
+      error at the literal.** `select (case when k = 1 then 'x' else '5'
+      end)::int from (values (1)) s(k)` is 22P02 `invalid input syntax for
+      type integer: "x"` with no position on PostgreSQL 15.19, which
+      resolves the CASE to `text` and casts its result as the row runs;
+      here the error carries the position of `'x'`, the cast having been
+      applied to each branch's literal.
+      Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
+      Backlog-ID: RP-746
 
 ## Found while working RP-733 (2026-11-09)
 

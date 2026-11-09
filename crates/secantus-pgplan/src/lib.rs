@@ -148,6 +148,7 @@ pub use funcsig::{select_routine, RoutineChoice};
 mod optype;
 mod semijoin;
 mod semijoin_hash;
+mod sort_input;
 pub use errpos::{alter_finds_relation_by_name, error_position};
 pub use semijoin_hash::{with_fresh_subquery_cache, with_scan_cache, ScanCache};
 pub mod alter_routine;
@@ -1645,6 +1646,13 @@ pub struct Select {
     /// (a join, a FROM-subquery, a view): the executor locks the base-table
     /// rows behind the rows it returns (see [`lock_targets`]).
     pub lock_clauses: Vec<LockClause>,
+    /// Per output column, parallel to `columns`: computed BELOW the ORDER
+    /// BY's Sort, once a row in scan order (`true`), or postponed to the
+    /// projection above it (`false`) -- PostgreSQL's
+    /// `make_sort_input_target` (RP-732, `sort_input.rs`). Empty when
+    /// there is no ORDER BY, which leaves every computed column to the
+    /// projection as the rows are sent.
+    pub sort_input: Vec<bool>,
 }
 
 /// How a `SELECT ... FOR UPDATE` treats a row another transaction holds.
@@ -16385,6 +16393,7 @@ fn plan_series_select(
             .find(|(out, _)| out == name)
             .map(|(_, f)| f.clone())
     })?;
+    let sort_input = sort_input::sort_input_columns(s, &columns);
 
     Ok(Statement::Select(Select {
         table: String::new(),
@@ -16403,6 +16412,7 @@ fn plan_series_select(
         distinct,
         lock: None,
         lock_clauses: Vec::new(),
+        sort_input,
     }))
 }
 
@@ -27041,6 +27051,7 @@ fn plan_select_rest(
     } else {
         Vec::new()
     };
+    let sort_input = sort_input::sort_input_columns(s, &columns);
 
     Ok(Statement::Select(Select {
         series: None,
@@ -27059,6 +27070,7 @@ fn plan_select_rest(
         distinct,
         lock,
         lock_clauses,
+        sort_input,
     }))
 }
 
@@ -27605,6 +27617,7 @@ fn plan_join_plain_select(
         distinct,
         lock: None,
         lock_clauses: Vec::new(),
+        sort_input: Vec::new(),
     }))
 }
 
@@ -31040,6 +31053,7 @@ fn plan_select_srf(
         distinct: plan_distinct(s, &|_| None)?,
         lock: None,
         lock_clauses: Vec::new(),
+        sort_input: Vec::new(),
     })))
 }
 

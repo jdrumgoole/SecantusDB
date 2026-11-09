@@ -1609,6 +1609,8 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
             .get_array("param_defaults")
             .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default(),
+        // What `pg_proc.procost` shows for it (`catalog_fill`).
+        cost: d.get_f64("cost").unwrap_or(100.0),
     }
 }
 
@@ -10158,8 +10160,9 @@ impl PgHandler {
                 .map(|d| {
                     let mut out = Document::new();
                     for (i, ((_, field), c)) in sel.columns.iter().zip(&def.columns).enumerate() {
-                        let v = resolve_cell(
+                        let v = resolve_select_cell(
                             d,
+                            i,
                             field,
                             sel.casts.get(i).and_then(|c| c.as_ref()),
                             schema[i].datatype(),
@@ -37586,6 +37589,14 @@ impl PgHandler {
                 }
                 trailing_rows = !seen.insert(ident);
                 if !trailing_rows {
+                    // The select list is computed once a row, below the
+                    // DISTINCT: the value printed is the one compared.
+                    let mut d = d;
+                    for (i, v) in values.iter().enumerate() {
+                        if sel.casts.get(i).is_some_and(Option::is_some) {
+                            d.insert(sort_input_key(i), v.clone().unwrap_or(Bson::Null));
+                        }
+                    }
                     kept.push(d);
                     kept_keys.push(values);
                 }
@@ -37648,7 +37659,7 @@ impl PgHandler {
             && !presorted
             && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
         {
-            materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
+            self.materialise_sort_input(&mut docs, sel, &def)?;
             // A LIMIT directly over the Sort bounds it (`ExecSetTupleBound`,
             // OFFSET + LIMIT), which changes where ties land; a Unique (any
             // DISTINCT) or a LockRows between them passes no bound down.
@@ -37727,7 +37738,7 @@ impl PgHandler {
                 for d in docs.iter().take(skip) {
                     for (i, (_, field)) in sel.columns.iter().enumerate() {
                         if let Some(c) = sel.casts.get(i).and_then(|c| c.as_ref()) {
-                            resolve_cell(d, field, Some(c), schema[i].datatype(), &tz)?;
+                            resolve_select_cell(d, i, field, Some(c), schema[i].datatype(), &tz)?;
                         }
                     }
                 }
@@ -37782,6 +37793,75 @@ impl PgHandler {
             self.lock_selected_rows(&t.table, &base, t.lock)?;
         }
         Ok((docs, def))
+    }
+
+    /// The rows a select's Sort reads: each row's select-list columns
+    /// that are computed below the Sort (`Select::sort_input`), then its
+    /// computed ORDER BY keys, a row at a time in scan order -- the Sort's
+    /// input target list PostgreSQL projects as it scans, so the first
+    /// row scanned raises its error first, whatever sorts first (RP-732).
+    /// The columns ride the row under `sort_input_key`; a postponed one
+    /// (volatile, or expensive under a LIMIT) is left to the projection
+    /// after the Sort.
+    fn materialise_sort_input(
+        &self,
+        docs: &mut [Document],
+        sel: &secantus_pgplan::Select,
+        def: &TableDef,
+    ) -> PgWireResult<()> {
+        let cols: Vec<usize> = (0..sel.columns.len())
+            .filter(|i| {
+                sel.sort_input.get(*i).copied().unwrap_or(false)
+                    && sel.casts.get(*i).is_some_and(Option::is_some)
+            })
+            .collect();
+        if cols.is_empty() {
+            return materialise_order_exprs(docs, &sel.order).map_err(|e| Self::err(&e));
+        }
+        let schema = self.row_schema(def, &sel.columns, &sel.casts);
+        let tz = self.session_timezone();
+        let keys: Vec<String> = cols.iter().map(|i| sort_input_key(*i)).collect();
+        let mut run = || -> PgWireResult<()> {
+            let mut values: Vec<(String, Bson)> = Vec::new();
+            for d in docs.iter_mut() {
+                values.clear();
+                for (&i, key) in cols.iter().zip(&keys) {
+                    // A DISTINCT below the Sort computed it already.
+                    if d.contains_key(key) {
+                        continue;
+                    }
+                    let v = resolve_cell(
+                        d,
+                        &sel.columns[i].1,
+                        sel.casts[i].as_ref(),
+                        schema[i].datatype(),
+                        &tz,
+                    )?;
+                    values.push((key.clone(), v.unwrap_or(Bson::Null)));
+                }
+                for k in &sel.order {
+                    if let Some(expr) = k.expr.as_ref() {
+                        let v =
+                            secantus_pgplan::sort_key_value(expr, d).map_err(|e| Self::err(&e))?;
+                        values.push((k.field.clone(), v));
+                    }
+                }
+                for (key, v) in values.drain(..) {
+                    d.insert(key, v);
+                }
+            }
+            Ok(())
+        };
+        let correlated = cols.iter().any(|i| {
+            sel.casts[*i]
+                .as_ref()
+                .is_some_and(secantus_pgplan::correlated::has_correlated)
+        });
+        if correlated {
+            self.correlated_scope(run)
+        } else {
+            run()
+        }
     }
 
     /// Does another session's open transaction hold the row of `table`
@@ -38213,8 +38293,9 @@ impl PgHandler {
                             .iter()
                             .enumerate()
                             .map(|(i, (_, field))| {
-                                resolve_cell(
+                                resolve_select_cell(
                                     d,
+                                    i,
                                     field,
                                     sel.casts.get(i).and_then(|c| c.as_ref()),
                                     schema[i].datatype(),
@@ -38614,8 +38695,9 @@ impl PgHandler {
                             .iter()
                             .enumerate()
                             .map(|(i, (_, field))| {
-                                resolve_cell(
+                                resolve_select_cell(
                                     d,
+                                    i,
                                     field,
                                     sel.casts.get(i).and_then(|c| c.as_ref()),
                                     schema[i].datatype(),
@@ -38664,9 +38746,14 @@ impl PgHandler {
                         continue;
                     };
                     let key = format!("\u{1f}correlated{i}");
+                    let computed = sort_input_key(i);
                     for d in docs.iter_mut() {
-                        let v =
-                            secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                        // Computed below the Sort already (RP-732).
+                        let v = match d.get(&computed) {
+                            Some(v) => v.clone(),
+                            None => secantus_pgplan::apply_row_expr(expr, d)
+                                .map_err(|e| Self::err(&e))?,
+                        };
                         d.insert(key.clone(), v);
                     }
                     *cast = None;
@@ -38735,6 +38822,7 @@ impl PgHandler {
                 .is_some();
             armed.then(|| self.cursor_capture.clone())
         });
+        let computed: Vec<String> = (0..fields.len()).map(sort_input_key).collect();
         let rows = source.map(move |d| {
             let d = d?;
             if let Some(ids) = &ids {
@@ -38749,6 +38837,21 @@ impl PgHandler {
                 // A computed column is applied per row -- the cast
                 // chain or the scalar call the planner recorded.
                 if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
+                    // Computed below the Sort (RP-732) or the DISTINCT.
+                    if let Some(v) = d.get(&computed[i]) {
+                        encode_field_value(
+                            &mut enc,
+                            column_at(&schema_ref, i)?,
+                            Some(v),
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
+                        if let Some(row) = captured.as_mut() {
+                            row.push(Some(v.clone()));
+                        }
+                        continue;
+                    }
                     let stop = || -> Option<&'static str> {
                         if backend.cancelled() {
                             return Some("canceling statement due to user request");
@@ -47798,6 +47901,32 @@ fn lateral_base_params(sql: &str, params: &[Bson]) -> Vec<Bson> {
         .zip(used)
         .map(|(p, u)| if u { p.clone() } else { Bson::Null })
         .collect()
+}
+
+/// The key a select-list column computed below the ORDER BY's Sort (or
+/// a DISTINCT) rides its row under, so the projection that sends the row
+/// does not compute it again (RP-732). Prefixed with U+001F, which no
+/// column name and no joined-row key starts with.
+fn sort_input_key(i: usize) -> String {
+    format!("\u{1f}sortinput{i}")
+}
+
+/// Output column `i` of a select's row: the value computed below its Sort
+/// when it was (`sort_input_key`), else [`resolve_cell`]'s.
+fn resolve_select_cell(
+    doc: &Document,
+    i: usize,
+    field: &str,
+    expr: Option<&secantus_pgplan::ColumnExpr>,
+    datatype: &Type,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<Option<Bson>> {
+    if expr.is_some() {
+        if let Some(v) = doc.get(sort_input_key(i)) {
+            return Ok(Some(v.clone()));
+        }
+    }
+    resolve_cell(doc, field, expr, datatype, tz)
 }
 
 fn resolve_cell(
