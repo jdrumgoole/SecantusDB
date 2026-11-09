@@ -17523,6 +17523,36 @@ fn walk_window_def(
         .try_for_each(|a| walk_expr(a, visit))
 }
 
+/// A computed sort key's value over one row: the expression's, with a
+/// `char(n)` key's trailing blanks dropped. `bpcharcmp` compares the two
+/// values' `bcTruelen` lengths only, so `'a    '` sorts before `E'a\t   '`
+/// (RP-679); compared with its blanks the tab came first. The key is never
+/// shown to the client, so nothing needs the padding back.
+pub fn sort_key_value(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
+    let v = apply_row_expr(expr, row)?;
+    Ok(if is_bpchar_type(column_expr_type(expr)) {
+        trim_bpchar(v)
+    } else {
+        v
+    })
+}
+
+/// A materialised row's `char(n)` cell as this server stores one: without
+/// its trailing blanks. A cast to `char(n)` or a scalar subquery over a
+/// `char(n)` column answers the PADDED value (`'xy'::char(5)` is `'xy   '`),
+/// and a FROM-subquery that kept it so compared it with its blanks: `x =
+/// 'xy'` found nothing (RP-679). Trimmed, the cell is a `char(n)` column's
+/// value like any stored one -- compared trimmed by the outer filter, padded
+/// again where it enters an expression (its width is the subquery's output
+/// modifier) and on output.
+pub fn stored_bpchar_cell(v: Bson, column: &Column) -> Bson {
+    if column.pg_type == "bpchar" && column.typmod > 4 {
+        trim_bpchar(v)
+    } else {
+        v
+    }
+}
+
 /// Evaluate a `ColumnExpr::Row` over one row.
 pub fn apply_row_expr(expr: &ColumnExpr, row: &Document) -> Result<Bson> {
     let ColumnExpr::Row {
