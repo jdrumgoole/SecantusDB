@@ -1,0 +1,96 @@
+"""Gap tests of divergences found while working RP-687 (a PL/pgSQL
+assignment to a `varchar(n)` / `char(n)` variable truncated an overlong
+value):
+
+- `SELECT ... INTO` a scalar variable fits the column's value by an explicit
+  cast, so an overlong one is stored truncated and a domain's CHECK is not
+  checked, where PostgreSQL assigns it by the assignment rule (RP-694);
+- an assignment to a variable of `varchar(n)[]` truncates each overlong
+  element where PostgreSQL raises 22001 (RP-695);
+- a cast to a domain over a domain names the INNER domain in its 23514,
+  where PostgreSQL names the one cast to (RP-696).
+
+The expected answers were measured on a private, freshly initdb'd
+PostgreSQL 15.19 cluster with `_SETUP`.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+
+import psycopg
+import pytest
+
+from tests.backlog.test_rp_batch26 import _dsn
+
+_SETUP = [
+    "drop domain if exists dcc687, dvv687 cascade",
+    "create domain dcc687 as varchar(3) check (value <> 'no')",
+    "create domain dvv687 as dcc687",
+]
+_VARCHAR3 = ("error", "22001", "value too long for type character varying(3)")
+
+
+@pytest.fixture(scope="module")
+def dsn(rust_pg: object) -> Iterator[str]:
+    yield _dsn(rust_pg) + " dbname=postgres"
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        c.execute(_SETUP[0])
+
+
+def _answer(dsn: str, query: str) -> object:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP:
+            c.execute(q)
+        try:
+            return c.execute(query).statusmessage
+        except psycopg.Error as e:
+            return ("error", e.sqlstate, str(e).splitlines()[0])
+
+
+# `exec_move_row` assigns each column to its variable with
+# `exec_assign_value`, the assignment rule `:=` uses.
+SELECT_INTO = {
+    "do $$ declare x varchar(3); begin select 'abcdef' into x; end $$": _VARCHAR3,
+    "do $$ declare x dcc687; begin select 'no' into x; end $$": (
+        "error",
+        "23514",
+        'value for domain dcc687 violates check constraint "dcc687_check"',
+    ),
+}
+
+
+@pytest.mark.backlog("RP-694")
+@pytest.mark.parametrize("query", list(SELECT_INTO))
+def test_select_into_variable_assigns_by_the_assignment_rule(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == SELECT_INTO[query]
+
+
+# An array's assignment coercion is an `ArrayCoerceExpr` whose element step
+# is the element type's length coercion, by the same rule.
+ARRAY_VARIABLE = {
+    "do $$ declare x varchar(3)[]; begin x := array['abcdef']; end $$": _VARCHAR3,
+    "do $$ declare x varchar(3)[] := array['abcdef']; begin end $$": _VARCHAR3,
+}
+
+
+@pytest.mark.backlog("RP-695")
+@pytest.mark.parametrize("query", list(ARRAY_VARIABLE))
+def test_array_variable_assignment_refuses_an_overlong_element(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == ARRAY_VARIABLE[query]
+
+
+# One `CoerceToDomain` checks the whole chain and names the domain it
+# coerces to.
+_DVV687 = ("error", "23514", 'value for domain dvv687 violates check constraint "dcc687_check"')
+NESTED_DOMAIN = {
+    "select 'no'::dvv687": _DVV687,
+    "select 'no'::text::dvv687": _DVV687,
+    "do $$ declare x dvv687; begin x := 'no'; end $$": _DVV687,
+}
+
+
+@pytest.mark.backlog("RP-696")
+@pytest.mark.parametrize("query", list(NESTED_DOMAIN))
+def test_cast_to_a_domain_over_a_domain_names_the_outer_domain(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == NESTED_DOMAIN[query]
