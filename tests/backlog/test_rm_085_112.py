@@ -668,11 +668,13 @@ def test_canonically_equivalent_strings_differ_without_normalization(
     assert got == ref
 
 
-@pytest.mark.backlog("RM-092")
+@pytest.mark.backlog_fixed("RM-092")
 def test_collated_duplicate_document_id_shows_sort_key(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11: a duplicate under a collated `_id` whose value is a
     document reports the string inside it as its sort key (`"W\\x01\\x05"`
-    for `"x"` under `en`, strength 2), not as written."""
+    for `"x"` under `en`, strength 2), not as written. The Rust server
+    reported the string as written; it now reports its sort key (ICU4X's
+    bytes until RM-091 links ICU 57)."""
 
     def probe(client: Any) -> Any:
         db = client[_name("rm092")]

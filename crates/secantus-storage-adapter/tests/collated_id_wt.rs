@@ -146,6 +146,74 @@ fn an_aborted_transaction_releases_its_claim() {
     });
 }
 
+fn first_error(reply: &Document) -> Document {
+    reply.get_array("writeErrors").expect("a write error")[0]
+        .as_document()
+        .unwrap()
+        .clone()
+}
+
+/// The sort key of `s` under the collection's collation, read from the hex
+/// mongod reports for a duplicate STRING `_id`.
+fn string_sort_key(c: &mut CommandContext, name: &str, s: &str) -> Vec<u8> {
+    collated(c, name);
+    let reply = insert(c, name, &[s, s]);
+    let hex = first_error(&reply)
+        .get_document("keyValue")
+        .unwrap()
+        .get_str("_id")
+        .unwrap()
+        .to_string();
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// A duplicate whose `_id` is a document reports each string inside it as its
+/// raw sort key, in `keyValue` and in the message, with no `hexEncoded`
+/// (mongod 8.2.11: `dup key: { _id: { a: "W\x01\x05" } }` for `{a: "x"}`;
+/// RM-092). A key that is not UTF-8 (`"É"`) goes out as those bytes.
+#[test]
+fn a_document_id_duplicate_reports_its_strings_as_sort_keys() {
+    with_wt(|c| {
+        let x = string_sort_key(c, "kx", "x");
+        let e = string_sort_key(c, "ke", "É");
+        assert!(std::str::from_utf8(&e).is_err(), "{e:?}");
+        collated(c, "d");
+        let first = doc! {"_id": {"a": "X", "n": ["X", 1, {"b": "É"}], "z": null}};
+        let second = doc! {"_id": {"a": "x", "n": ["x", 1, {"b": "é"}], "z": null}};
+        dispatch(&doc! {"insert": "d", "documents": [first]}, c);
+        let reply = dispatch(&doc! {"insert": "d", "documents": [second]}, c);
+        let error = first_error(&reply);
+        assert_eq!(error.get_i32("code").ok(), Some(11000), "{reply}");
+        assert!(!error.contains_key("hexEncoded"), "{error}");
+        let id = error
+            .get_document("keyValue")
+            .unwrap()
+            .get_document("_id")
+            .unwrap();
+        let bytes = |v: &Bson| secantus_commands::bsondoc::str_bytes(v).unwrap().to_vec();
+        assert_eq!(bytes(id.get("a").unwrap()), x);
+        let n = id.get_array("n").unwrap();
+        assert_eq!(bytes(&n[0]), x);
+        assert_eq!(n[1], Bson::Int32(1));
+        assert_eq!(bytes(n[2].as_document().unwrap().get("b").unwrap()), e);
+        assert_eq!(id.get("z"), Some(&Bson::Null));
+        let errmsg = bytes(error.get("errmsg").unwrap());
+        let x = String::from_utf8(x).unwrap();
+        let mut shown =
+            format!("dup key: {{ _id: {{ a: \"{x}\", n: [ \"{x}\", 1, {{ b: \"").into_bytes();
+        shown.extend(&e);
+        shown.extend(b"\" } ], z: null } }");
+        assert!(
+            errmsg.ends_with(&shown),
+            "{:?}",
+            String::from_utf8_lossy(&errmsg)
+        );
+    });
+}
+
 /// A clustered collection's duplicate names no index and adds what it found.
 #[test]
 fn a_clustered_duplicate_names_no_index() {
