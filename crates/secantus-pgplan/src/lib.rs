@@ -27485,7 +27485,12 @@ fn qualified_col(n: Option<&pg_query::protobuf::Node>) -> Option<(String, String
     }
 }
 
-fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Vec<JoinPred>> {
+/// Each predicate comes with its constant's node, which decides how the
+/// constant is read against the column (`comparison_operand`).
+fn join_where_preds(
+    node: &pg_query::protobuf::Node,
+    params: &[Bson],
+) -> Result<Vec<(JoinPred, Option<pg_query::protobuf::Node>)>> {
     use pg_query::protobuf::BoolExprType;
     match node.node.as_ref() {
         // AND of sub-predicates -> flatten each.
@@ -27504,12 +27509,15 @@ fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
             let (alias, col) = qualified_col(Some(inner))
                 .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
-            Ok(vec![JoinPred {
-                alias,
-                col,
-                op: JoinOp::NotTrue,
-                value: Bson::Null,
-            }])
+            Ok(vec![(
+                JoinPred {
+                    alias,
+                    col,
+                    op: JoinOp::NotTrue,
+                    value: Bson::Null,
+                },
+                None,
+            )])
         }
         // alias.col <op> const
         Some(N::AExpr(e)) => {
@@ -27523,18 +27531,20 @@ fn join_where_preds(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             };
             let (alias, col) = qualified_col(e.lexpr.as_deref())
                 .ok_or_else(|| Error::Unsupported("this subquery WHERE".into()))?;
-            let value = const_value(
-                e.rexpr
-                    .as_ref()
-                    .ok_or_else(|| Error::Parse("no right operand".into()))?,
-                params,
-            )?;
-            Ok(vec![JoinPred {
-                alias,
-                col,
-                op,
-                value,
-            }])
+            let rexpr = e
+                .rexpr
+                .as_deref()
+                .ok_or_else(|| Error::Parse("no right operand".into()))?;
+            let value = const_value(rexpr, params)?;
+            Ok(vec![(
+                JoinPred {
+                    alias,
+                    col,
+                    op,
+                    value,
+                },
+                Some(rexpr.clone()),
+            )])
         }
         _ => Err(Error::Unsupported("this subquery WHERE".into())),
     }
@@ -27809,25 +27819,61 @@ fn plan_join_select(
         }
     }
 
+    let side_def = |sub: &Option<Box<Statement>>, table: &str| -> Option<TableDef> {
+        match sub {
+            Some(stmt) => sub_plan_def(stmt, lookup).ok(),
+            None => lookup(table),
+        }
+    };
+    let ldef = side_def(&left_sub, &left.0);
+    let rdef = side_def(&right_sub, &right.0);
     // WHERE: one predicate, or an AND of several, each `alias.col <op> const`
-    // or `NOT alias.col`. Evaluated now against the constants.
+    // or `NOT alias.col`. Evaluated now against the constants, each read as
+    // its column's type first, as a one-table filter reads it: an untyped
+    // `x.k = '1'` is `int4 = int4`, `x.a = '{ab}'` an array of the column's
+    // type and `s.c = 'ab '::char(3)` `bpchareq`. Compared raw, a string
+    // met an int or an array and matched nothing (RP-723, RP-724).
     let filter = match s.where_clause.as_deref() {
         None => Vec::new(),
-        Some(node) => join_where_preds(node, params)?,
+        Some(node) => join_where_preds(node, params)?
+            .into_iter()
+            .map(|(mut pred, rexpr)| {
+                let def = if pred.alias == left.1 {
+                    ldef.as_ref()
+                } else if pred.alias == right.1 {
+                    rdef.as_ref()
+                } else {
+                    None
+                };
+                if let (Some(def), JoinOp::Eq | JoinOp::Gt | JoinOp::Ge | JoinOp::Lt | JoinOp::Le) =
+                    (def, &pred.op)
+                {
+                    let field = def.field_of(&pred.col).unwrap_or_else(|| pred.col.clone());
+                    // A date against a timestamp is promoted to midnight, and
+                    // a scalar against an array is 42883: the general join
+                    // planner's one-table filter does both.
+                    if pred.value != Bson::Null
+                        && ((field_type(def, &field) == Some("date") && is_instant(&pred.value))
+                            || (matches!(pred.value, Bson::Array(_))
+                                && !field_type(def, &field).is_some_and(|t| t.ends_with("[]"))))
+                    {
+                        return Err(Error::Unsupported(
+                            "this JOIN WHERE comparison on this path".into(),
+                        ));
+                    }
+                    if pred.value != Bson::Null {
+                        pred.value = comparison_operand(def, &field, rexpr.as_ref(), pred.value)?;
+                    }
+                }
+                Ok(pred)
+            })
+            .collect::<Result<Vec<_>>>()?,
     };
     // Column references this path would resolve LOOSELY -- a bare name both
     // sides have (it took the left one), a qualifier naming neither side,
     // a column the named side lacks -- go to the general planner, whose
     // answers are PostgreSQL's 42702 / 42P01 / 42703.
     {
-        let side_def = |sub: &Option<Box<Statement>>, table: &str| -> Option<TableDef> {
-            match sub {
-                Some(stmt) => sub_plan_def(stmt, lookup).ok(),
-                None => lookup(table),
-            }
-        };
-        let ldef = side_def(&left_sub, &left.0);
-        let rdef = side_def(&right_sub, &right.0);
         let has = |d: &Option<TableDef>, c: &str| d.as_ref().is_some_and(|d| d.column(c).is_some());
         for (i, (_, alias, col)) in columns.iter().enumerate() {
             if matches!(exprs.get(i), Some(Some(ColumnExpr::Const { .. }))) {
@@ -47328,14 +47374,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // 14.24). The stored value is unpadded -- padding happens on output --
     // so the literal is stripped to match it, rather than padded to a width
     // the stored side does not carry.
-    let value = bpchar_operand(def, &field, e.rexpr.as_deref(), value, true);
-    // A regtype / regclass value filters by its OID -- the stored column is
-    // a number.
-    let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
-        Some(oid) => Bson::Int64(oid),
-        None => value,
-    };
-    let value = coerce_to_column(def, &field, value)?;
+    let value = comparison_operand(def, &field, e.rexpr.as_deref(), value)?;
 
     // `=` and the range operators are already NULL-correct: MQL brackets by
     // type, so a null column value matches none of them -- which is what
@@ -47893,6 +47932,26 @@ fn bpchar_operand(
     } else {
         Bson::String(text.trim_end_matches(' ').to_string())
     }
+}
+
+/// The constant `value` (the node `node`) compared with column `field` of
+/// `def`, read as PostgreSQL resolves the operator: blanks dropped against
+/// a `char(n)` column (`bpchar_operand`), a regtype / regclass by its OID --
+/// the stored column is a number -- and an untyped literal as the column's
+/// own type (`coerce_to_column`). The one-table filter and the narrow join
+/// path's WHERE both read their constants here.
+fn comparison_operand(
+    def: &TableDef,
+    field: &str,
+    node: Option<&pg_query::protobuf::Node>,
+    value: Bson,
+) -> Result<Bson> {
+    let value = bpchar_operand(def, field, node, value, true);
+    let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
+        Some(oid) => Bson::Int64(oid),
+        None => value,
+    };
+    coerce_to_column(def, field, value)
 }
 
 /// `x BETWEEN a AND b` / `x NOT BETWEEN a AND b`.

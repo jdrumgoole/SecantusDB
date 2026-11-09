@@ -18,8 +18,9 @@ Found while working it (each a gap test below):
 - GROUP BY over an array column returns its groups out of the ORDER BY's
   order;
 - in a join's WHERE, an untyped array literal against an array column
-  matches nothing, and so does a `char(n)` column against a padded
-  `char(n)` constant;
+  matched nothing, and so did a `char(n)` column against a padded
+  `char(n)` constant (both fixed since: the narrow join path reads each
+  WHERE constant as its column's type);
 - GROUP BY a `char(n)` (or `char(n)[]`) value splits a padded value from
   the same value unpadded.
 
@@ -132,12 +133,19 @@ def test_a_char_n_array_is_padded_and_compared_without_its_blanks(query: str, ds
 
 
 @pytest.mark.backlog_fixed("RP-720")
-def test_an_overlap_with_an_untyped_array_literal(dsn: str) -> None:
-    # `&&` resolves the untyped side to the column's `text[]`. Row 5's
-    # `'[0:1]={x,y}'` was not taken for an array, so the literal stayed
-    # text and the operator did not resolve (42883).
-    query = "select k from x719 where a && '{ab,y}' order by k"
-    assert _answer(dsn, query) == ("ok", [(1,), (2,), (5,)])
+@pytest.mark.parametrize(
+    ("query", "rows"),
+    [
+        ("select k from x719 where a && '{ab,y}' order by k", [(1,), (2,), (5,)]),
+        ("select k from x719 where a @> '{ab}' order by k", [(1,), (2,)]),
+        ("select k from x719 where a <@ '{ab,cd}' order by k", [(1,), (2,)]),
+    ],
+)
+def test_an_overlap_with_an_untyped_array_literal(query: str, rows: list, dsn: str) -> None:
+    # `&&`, `@>` and `<@` resolve the untyped side to the column's `text[]`.
+    # Row 5's `'[0:1]={x,y}'` was not taken for an array, so the literal
+    # stayed text and the operator did not resolve (42883).
+    assert _answer(dsn, query) == ("ok", rows)
 
 
 @pytest.mark.backlog_fixed("RP-721")
@@ -180,17 +188,50 @@ def test_groups_of_an_array_column_follow_the_order_by(dsn: str) -> None:
     assert _answer(dsn, query) == ("ok", [(1, ["ab"]), (1, ["cd", "ab"]), (1, ["x", "y"])])
 
 
-@pytest.mark.backlog("RP-723")
-def test_a_join_filter_reads_an_untyped_literal_as_the_array_column(dsn: str) -> None:
-    query = "select x.k from x719 x join u719 u on x.k = u.k where x.a = '{ab}'"
-    assert _answer(dsn, query) == ("ok", [(1,)])
+@pytest.mark.backlog_fixed("RP-723")
+@pytest.mark.parametrize(
+    "where",
+    [
+        "x.a = '{ab}'",
+        "u.c = '{ab}'",
+        "x.a = '{ab}' and u.c = '{ab}'",
+        # Not only arrays: every untyped literal against a column stored as
+        # something other than its text matched nothing (an int here).
+        "x.k = '1'",
+        "x.k < '2'",
+    ],
+)
+def test_a_join_filter_reads_an_untyped_literal_as_the_array_column(where: str, dsn: str) -> None:
+    # The narrow two-table join path compared the literal as the string it
+    # was written; it is the column's type, as in a one-table filter.
+    for join in ("join u719 u on x.k = u.k", "left join u719 u on x.k = u.k"):
+        query = f"select x.k from x719 x {join} where {where}"
+        assert _answer(dsn, query) == ("ok", [(1,)]), query
+    if "u.c" not in where:
+        query = f"select x.k from x719 x cross join (select 1 as k) u where {where}"
+        assert _answer(dsn, query) == ("ok", [(1,)]), query
 
 
-@pytest.mark.backlog("RP-724")
-def test_a_join_filter_compares_a_char_n_column_without_its_blanks(dsn: str) -> None:
+@pytest.mark.backlog_fixed("RP-724")
+@pytest.mark.parametrize(
+    ("where", "rows"),
+    [
+        ("s.c = 'ab '::char(3)", [(1,)]),
+        ("s.c = 'ab '", [(1,)]),
+        ("u.c = '{ab}'::char(3)[]", [(1,)]),
+        # A `text` constant compares as text: the column's blanks are gone.
+        ("s.c = 'ab '::text", []),
+    ],
+)
+def test_a_join_filter_compares_a_char_n_column_without_its_blanks(
+    where: str, rows: list, dsn: str
+) -> None:
     # `bpchareq` ignores the constant's padding, which its cast added.
-    query = "select s.k from s719 s join s719b b on s.k = b.k where s.c = 'ab '::char(3)"
-    assert _answer(dsn, query) == ("ok", [(1,)])
+    if where.startswith("u."):
+        query = f"select u.k from x719 x join u719 u on x.k = u.k where {where}"
+    else:
+        query = f"select s.k from s719 s join s719b b on s.k = b.k where {where}"
+    assert _answer(dsn, query) == ("ok", rows)
 
 
 @pytest.mark.backlog("RP-725")

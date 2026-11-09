@@ -3791,6 +3791,50 @@ fn left_join_reduced_by_a_strict_where_on_its_nullable_side() {
     );
 }
 
+/// The narrow join path reads each WHERE constant as its column's type, as
+/// a one-table filter does: an untyped `'1'` against an `int4` column is
+/// the integer, `'{ab}'` against a `text[]` the array, and a `char(n)`
+/// constant loses the blanks its cast added. Compared as written, each
+/// matched nothing (RP-723, RP-724).
+#[test]
+fn a_narrow_join_reads_its_where_constants_as_the_columns_type() {
+    let two = |name: &str| -> Option<TableDef> {
+        matches!(name, "e" | "k").then(|| {
+            TableDef::new(
+                name,
+                vec![
+                    Column::new("a", "int4", false),
+                    Column::new("c", "bpchar", false),
+                    Column::new("t", "text[]", false),
+                ],
+            )
+        })
+    };
+    let value_of = |sql: &str| match plan(sql, &two) {
+        Ok(Statement::Select(s)) => s
+            .join
+            .and_then(|j| j.filter.first().map(|p| p.value.clone())),
+        other => panic!("{sql}: {other:?}"),
+    };
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where e.a = '1'"),
+        Some(Bson::Int32(1))
+    );
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where k.c = 'ab '::char(3)"),
+        Some(Bson::String("ab".into()))
+    );
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where e.t = '{ab}'"),
+        Some(Bson::Array(vec![Bson::String("ab".into())]))
+    );
+    // A text constant is compared as text, blanks and all.
+    assert_eq!(
+        value_of("select e.a from e join k on e.a = k.a where k.c = 'ab '::text"),
+        Some(Bson::String("ab ".into()))
+    );
+}
+
 /// A join qual over two aliases of the same column name: each reference
 /// reads its own side's row (RP-390).
 #[test]

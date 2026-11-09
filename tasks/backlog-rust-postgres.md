@@ -3168,21 +3168,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       x719 order by a` is in the right order.
       Verify: tests/backlog/test_rp_found_rp719.py::test_groups_of_an_array_column_follow_the_order_by
       Backlog-ID: RP-722
-- [ ] **In a join's WHERE, an untyped array literal against an array
-      column matches nothing.** `select x.k from x719 x join u719 u on x.k
-      = u.k where x.a = '{ab}'` is row 1 on PostgreSQL 15.19; here it is
-      empty, for `text[]` and `char(n)[]` columns alike. The literal is not
-      read as the column's type, as `coerce_to_column` does in a one-table
-      filter.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_a_join_filter_reads_an_untyped_literal_as_the_array_column
-      Backlog-ID: RP-723
-- [ ] **In a join's WHERE, a `char(n)` column against a padded `char(n)`
-      constant matches nothing.** `... where s.c = 'ab '::char(3)` over a
-      join is row 1 on PostgreSQL 15.19 (`bpchareq` ignores trailing
-      blanks); here it is empty. `s.c = 'ab'` is answered, and so is the
-      same filter over one table.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_a_join_filter_compares_a_char_n_column_without_its_blanks
-      Backlog-ID: RP-724
 - [ ] **GROUP BY a `char(n)` value splits it from the same value
       unpadded.** `select count(*) from (values ('ab'::char(3)),
       ('ab'::bpchar)) v(a) group by a` is one group of 2 on PostgreSQL
