@@ -49150,10 +49150,22 @@ fn untranslatable_char(ch: char, cenc: ClientEncoding) -> PgWireError {
 fn blank_padded<'a>(field: &FieldInfo, v: Option<&'a Bson>) -> Option<std::borrow::Cow<'a, Bson>> {
     use std::borrow::Cow;
     let v = v?;
-    if *field.datatype() != Type::BPCHAR || field.type_modifier() <= 4 {
+    if field.type_modifier() <= 4 {
         return Some(Cow::Borrowed(v));
     }
     let width = (field.type_modifier() - 4) as usize;
+    // A `char(n)[]` column's modifier is its elements' (`atttypmod` 7 for
+    // `char(3)[]`), and each element prints padded: `{"ab "}` (15.19,
+    // RP-719). The elements are stored trimmed, as a scalar `char(n)` is.
+    if *field.datatype() == Type::BPCHAR_ARRAY {
+        return Some(Cow::Owned(secantus_pgplan::pad_bpchar_elements(
+            v.clone(),
+            width,
+        )));
+    }
+    if *field.datatype() != Type::BPCHAR {
+        return Some(Cow::Borrowed(v));
+    }
     match v {
         Bson::String(text) if text.chars().count() < width => {
             let mut padded = text.clone();

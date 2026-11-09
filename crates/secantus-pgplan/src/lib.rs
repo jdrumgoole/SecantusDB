@@ -16809,7 +16809,7 @@ thread_local! {
 fn note_bpchar_width(c: &Column) {
     ROW_WIDTHS.with(|w| {
         let mut w = w.borrow_mut();
-        if c.pg_type == "bpchar" && c.typmod > 4 {
+        if matches!(c.pg_type.as_str(), "bpchar" | "bpchar[]") && c.typmod > 4 {
             w.insert(c.field(), (c.typmod - 4) as usize);
         } else {
             w.remove(&c.field());
@@ -16846,15 +16846,62 @@ pub fn bpchar_min_max_typmod(item: &AggItem) -> i32 {
     }
 }
 
-/// Pad a `char(n)` value to its width.
+/// Pad a `char(n)` value to its width -- or each element of a `char(n)[]`
+/// one, through its nesting and bounds: PostgreSQL keeps every element of a
+/// `char(3)[]` column padded (`bpchar(text, 7, false)` over an `ARRAY[]`,
+/// `bpcharin` at the modifier for a literal), so `octet_length(c[1])` is 3
+/// and the column prints `{"ab "}` (15.19, RP-719). This server stores the
+/// elements trimmed, as it does a scalar `char(n)`, and pads them here.
 fn pad_bpchar(v: Bson, width: Option<usize>) -> Bson {
     match (v, width) {
         (Bson::String(t), Some(n)) if t.chars().count() < n => {
             let len = t.chars().count();
             Bson::String(format!("{t}{}", " ".repeat(n - len)))
         }
+        (Bson::Array(items), Some(_)) => Bson::Array(
+            items
+                .into_iter()
+                .map(|item| pad_bpchar(item, width))
+                .collect(),
+        ),
+        (v, Some(_)) if arrays::is_bounded(&v) => {
+            let lower = arrays::lower_bounds(&v);
+            arrays::bounded(pad_bpchar(arrays::strip(&v), width), &lower)
+        }
         (v, _) => v,
     }
+}
+
+/// Every element of a `char(n)[]` value padded to the width `n`, for
+/// output (RP-719).
+pub fn pad_bpchar_elements(v: Bson, n: usize) -> Bson {
+    if matches!(v, Bson::Array(_)) || arrays::is_bounded(&v) {
+        pad_bpchar(v, Some(n))
+    } else {
+        v
+    }
+}
+
+/// A `char(n)` value with its trailing blanks dropped, or every element of
+/// a `char(n)[]` one so, through its nesting and bounds: what `bpchareq` /
+/// `bpcharcmp` compare, element by element in `array_eq` / `array_cmp` /
+/// `array_contains` (RP-719).
+pub(crate) fn trim_bpchar_deep(v: Bson) -> Bson {
+    match v {
+        Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
+        Bson::Array(items) => Bson::Array(items.into_iter().map(trim_bpchar_deep).collect()),
+        v if arrays::is_bounded(&v) => {
+            let lower = arrays::lower_bounds(&v);
+            arrays::bounded(trim_bpchar_deep(arrays::strip(&v)), &lower)
+        }
+        other => other,
+    }
+}
+
+/// Whether a value of type `t` is an array of `char(n)`: `bpchar[]`, or an
+/// array of a domain over it.
+pub(crate) fn is_bpchar_array_type(t: &str) -> bool {
+    t.strip_suffix("[]").is_some_and(is_bpchar_type)
 }
 
 /// `make_const`'s reading of a `Float` literal that is really an integer
@@ -16910,6 +16957,53 @@ fn fit_array_elements(value: Bson, element: &str, typmod: i32) -> Result<Bson> {
             .map(Bson::Array),
         Bson::Null => Ok(Bson::Null),
         v => fit_length(v, element, typmod),
+    }
+}
+
+#[cfg(test)]
+mod bpchar_array_tests {
+    use super::{arrays, pad_bpchar, trim_bpchar_deep};
+    use bson::Bson;
+
+    fn arr(items: &[&str]) -> Bson {
+        Bson::Array(items.iter().map(|s| Bson::String((*s).into())).collect())
+    }
+
+    #[test]
+    fn pads_and_trims_every_element_through_nesting_and_bounds() {
+        // RP-719: a `char(3)[]` value's elements pad to the width and
+        // compare trimmed; a NULL element and the bounds stay.
+        let nested = Bson::Array(vec![arr(&["ab", "abc"]), Bson::Array(vec![Bson::Null])]);
+        let padded = Bson::Array(vec![arr(&["ab ", "abc"]), Bson::Array(vec![Bson::Null])]);
+        assert_eq!(pad_bpchar(nested.clone(), Some(3)), padded);
+        assert_eq!(trim_bpchar_deep(padded), nested);
+        let bounded = arrays::bounded(arr(&["x", "y"]), &[0]);
+        let out = pad_bpchar(bounded, Some(2));
+        assert_eq!(arrays::lower_bounds(&out), vec![0]);
+        assert_eq!(arrays::strip(&out), arr(&["x ", "y "]));
+        assert_eq!(arrays::strip(&trim_bpchar_deep(out)), arr(&["x", "y"]));
+        // No width, nothing to pad.
+        assert_eq!(pad_bpchar(arr(&["ab"]), None), arr(&["ab"]));
+    }
+
+    #[test]
+    fn a_char_n_array_search_ignores_trailing_blanks_for_that_call_only() {
+        let padded = arr(&["ab ", "cd "]);
+        let ab = Bson::String("ab".into());
+        assert_eq!(
+            arrays::call_bpchar("array_position", &[padded.clone(), ab.clone()]).unwrap(),
+            Bson::Int32(1)
+        );
+        // The kept element keeps its blanks.
+        assert_eq!(
+            arrays::call_bpchar("array_remove", &[padded.clone(), ab.clone()]).unwrap(),
+            arr(&["cd "])
+        );
+        // A plain search afterwards is blank-sensitive again (text[]).
+        assert_eq!(
+            arrays::call("array_position", &[padded, ab]).unwrap(),
+            Bson::Null
+        );
     }
 }
 
@@ -17251,7 +17345,7 @@ fn row_column_expr(
         fields
             .iter()
             .map(|(_, f, t)| {
-                if t == "bpchar" {
+                if t == "bpchar" || t == "bpchar[]" {
                     w.get(f).copied()
                 } else {
                     None
@@ -17902,7 +17996,11 @@ fn plan_table_targets(
                 if !cast_chain_has_typmod(tc)
                     && !cast_chain_has_relabel(tc)
                     && cast_chain_over_column(tc).is_ok_and(|(col, chain)| {
-                        def.column(&col).is_none_or(|c| c.pg_type != "bpchar")
+                        // A `char(n)` column, or a `char(n)[]` one (RP-719),
+                        // is padded where it enters an expression, which
+                        // this shortcut over the stored value skips.
+                        def.column(&col)
+                            .is_none_or(|c| !matches!(c.pg_type.as_str(), "bpchar" | "bpchar[]"))
                             && !user_casts::in_chain(
                                 def.column(&col).map(|c| c.pg_type.as_str()),
                                 &chain,
@@ -27551,8 +27649,21 @@ fn plan_join_select(
             // CONSTANT (`'t1'::regclass::oid`) is a constant target, below.
             Some(N::TypeCast(tc))
                 if !cast_chain_has_typmod(tc)
-                    && cast_chain_over_column_qualified(tc)
-                        .is_ok_and(|(_, (_, chain))| !user_casts::in_chain(None, &chain)) =>
+                    && cast_chain_over_column_qualified(tc).is_ok_and(
+                        |(col_name, (_, chain))| {
+                            !user_casts::in_chain(None, &chain)
+                            // A `char(n)[]` column's elements are padded
+                            // where it enters an expression, which this
+                            // shortcut over the stored value skips (RP-719).
+                            && ![(&left, &left_sub), (&right, &right_sub)]
+                                .iter()
+                                .find(|((_, alias), sub)| *alias == col_name.0 && sub.is_none())
+                                .and_then(|((table, _), _)| lookup(table))
+                                .is_some_and(|d| {
+                                    d.column(&col_name.1).is_some_and(|c| c.pg_type == "bpchar[]")
+                                })
+                        },
+                    ) =>
             {
                 let (col_name, chain) = cast_chain_over_column_qualified(tc)?;
                 // An unnamed cast over a column keeps the COLUMN's name
@@ -31338,7 +31449,7 @@ fn plan_select_constant(s: &pg_query::protobuf::SelectStmt, params: &[Bson]) -> 
                             ),
                         )?,
                     };
-                    if let Some(result) = scalar::call(&name, &args) {
+                    if let Some(result) = typed_scalar_call(f, &name, &args) {
                         let value = result?;
                         // A NULL result cannot say its type -- and at DESCRIBE
                         // time every parameter IS null, so `ascii($1)` typed
@@ -39801,6 +39912,25 @@ fn printing_function(f: &pg_query::protobuf::FuncCall) -> bool {
     )
 }
 
+/// [`scalar::call`] with what the arguments' static types decide: a search
+/// over a `char(n)[]` array compares its elements with `bpchareq`
+/// ([`arrays::call_bpchar`], RP-719).
+fn typed_scalar_call(
+    f: &pg_query::protobuf::FuncCall,
+    name: &str,
+    args: &[Bson],
+) -> Option<Result<Bson>> {
+    if arrays::is_search_function(name)
+        && f.args
+            .first()
+            .zip(args.first())
+            .is_some_and(|(n, v)| is_bpchar_array_type(&static_type(n, v)))
+    {
+        return Some(arrays::call_bpchar(name, args));
+    }
+    scalar::call(name, args)
+}
+
 /// A built-in's arguments with each `char(n)` one trimmed, as the
 /// bpchar-to-text cast in front of a text function trims it -- except for
 /// the functions that take the value as it is (`octet_length` counts the
@@ -43985,6 +44115,15 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             && is_bpchar_type(&arg_type)
         {
             trim_bpchar(value)
+        } else if target
+            .strip_suffix("[]")
+            .is_some_and(|t| matches!(t, "text" | "varchar" | "name"))
+            && is_bpchar_array_type(&arg_type)
+        {
+            // `char(n)[]` to a text array is the same `rtrim1` over each
+            // element (`array_coerce`): `'{ab}'::char(3)[]::text[]` is
+            // `{ab}` (15.19, RP-719).
+            trim_bpchar_deep(value)
         } else {
             value
         };
@@ -44950,7 +45089,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     .collect::<Result<Vec<_>>>()?;
                 let args = bpchar_args(f, &name, args);
                 let args = vector_element_args(f, &name, args)?;
-                if let Some(result) = scalar::call(&name, &args) {
+                if let Some(result) = typed_scalar_call(f, &name, &args) {
                     return result;
                 }
             }
@@ -45708,6 +45847,41 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     if rb {
                         rhs = trim_bpchar(rhs);
                     }
+                }
+            }
+        }
+        // A `char(n)[]` operand is compared element by element with
+        // `bpchareq` / `bpcharcmp`, which ignore each element's trailing
+        // blanks: `'{ab}'::char(3)[] = '{ab}'` and `@> '{ab}'` are true on
+        // 15.19, though the left side's element is `ab ` (RP-719). An
+        // untyped literal against one is read as `bpchar[]` too. `||` keeps
+        // the elements as they are (`array_cat`).
+        if matches!(
+            op.as_str(),
+            "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=" | "@>" | "<@" | "&&"
+        ) {
+            let ba = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+                n.is_some_and(|n| is_bpchar_array_type(&static_type(n, v)))
+            };
+            let (la, ra) = (ba(e.lexpr.as_deref(), &lhs), ba(e.rexpr.as_deref(), &rhs));
+            // An untyped literal is still its text here (`'{"ab "}'`): read
+            // it as the array first, or its quoted blanks would survive. A
+            // literal that does not read keeps its text for the error the
+            // comparison itself reports.
+            let read = |v: Bson| match v {
+                Bson::String(_) => cast_value(v.clone(), "bpchar[]").unwrap_or(v),
+                v => v,
+            };
+            if la || ra {
+                if la {
+                    lhs = trim_bpchar_deep(lhs);
+                } else if unknown_operand(e.lexpr.as_deref()) {
+                    lhs = trim_bpchar_deep(read(lhs));
+                }
+                if ra {
+                    rhs = trim_bpchar_deep(rhs);
+                } else if unknown_operand(e.rexpr.as_deref()) {
+                    rhs = trim_bpchar_deep(read(rhs));
                 }
             }
         }
@@ -46540,6 +46714,17 @@ fn coerce_to_column(def: &TableDef, field: &str, value: Bson) -> Result<Bson> {
         if let Some(oid) = oid {
             return Ok(regobj::value(ty, oid));
         }
+    }
+    // A `char(n)[]` column's elements are stored trimmed and compared by
+    // `bpchareq`, which ignores trailing blanks: a constant whose elements
+    // carry them (`c = '{ab}'::char(3)[]`, padded by its cast) is compared
+    // trimmed, or it matched nothing (RP-719).
+    if field_type(def, field) == Some("bpchar[]") {
+        let value = match value {
+            Bson::String(_) => cast_value(value, "bpchar[]")?,
+            other => other,
+        };
+        return Ok(trim_bpchar_deep(value));
     }
     let Bson::String(_) = &value else {
         return Ok(value);
