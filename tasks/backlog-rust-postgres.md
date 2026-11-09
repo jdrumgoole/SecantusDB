@@ -2463,17 +2463,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 `varchar(3)`.
 
-- [ ] **A PL/pgSQL assignment to a `varchar(n)` or `char(n)` variable
-      truncates an overlong value.** `declare x varchar(3); begin x :=
-      'abcdef';` is 22001 `value too long for type character varying(3)`
-      on PostgreSQL 15.19 (`exec_cast_value` coerces by the assignment
-      rule), as are a `char(3)` variable and one of a domain over
-      `varchar(3)`; here each stores `abc`. The interpreter assigns through
-      an explicit cast, `SELECT (expr)::type` (`eval_typed`), which
-      truncates. Since RP-670 a trigger record's domain field fits its
-      value by the assignment rule (`fit_assigned_length`).
-      Verify: tests/backlog/test_rp_found_rp670.py::test_variable_assignment_refuses_an_overlong_value
-      Backlog-ID: RP-687
 - [ ] **A `SELECT ... INTO` record's fields are typed without their
       domain or modifier.** After `select * into r from t687`, `r.a :=
       -5` is 23514 and `r.v := 'abcdef'` 22001 on PostgreSQL 15.19, and
@@ -2506,6 +2495,38 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       three phases' durations from a slow run.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
+
+## Found while working RP-687 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp687.py`: `dcc687` a `varchar(3)` with
+`check (value <> 'no')`, `dvv687` a domain over it.
+
+- [ ] **`SELECT ... INTO` a scalar variable truncates an overlong value and
+      skips its domain's CHECK.** `declare x varchar(3); begin select
+      'abcdef' into x;` is 22001 on PostgreSQL 15.19 (`exec_move_row`
+      assigns each column with `exec_assign_value`, the assignment rule),
+      and `select 'no' into x` for an `x dcc687` is the domain's 23514;
+      here the first stores `abc` and the second `no`. `assign_row` stores
+      the column's value as it is (`set_var`). Since RP-687 a `:=` and a
+      DEFAULT fit by the assignment rule (`eval_typed`).
+      Verify: tests/backlog/test_rp_found_rp687.py::test_select_into_variable_assigns_by_the_assignment_rule
+      Backlog-ID: RP-694
+- [ ] **An assignment to a `varchar(n)[]` variable truncates an overlong
+      element.** `declare x varchar(3)[]; begin x := array['abcdef'];` is
+      22001 on PostgreSQL 15.19 (the array's `ArrayCoerceExpr` applies the
+      element's length coercion by the assignment rule), as is the same
+      DEFAULT; here `x` is `{abc}`, the explicit cast's answer.
+      Verify: tests/backlog/test_rp_found_rp687.py::test_array_variable_assignment_refuses_an_overlong_element
+      Backlog-ID: RP-695
+- [ ] **A cast to a domain over a domain names the inner domain.** `select
+      'no'::dvv687` is 23514 `value for domain dvv687 violates check
+      constraint "dcc687_check"` on PostgreSQL 15.19 (one `CoerceToDomain`
+      names the domain it coerces to); here the message names `dcc687`,
+      for `'no'::text::dvv687` and a PL/pgSQL `x dvv687 := 'no'` alike.
+      Since RP-670 a trigger record's field of such a domain names it.
+      Verify: tests/backlog/test_rp_found_rp687.py::test_cast_to_a_domain_over_a_domain_names_the_outer_domain
+      Backlog-ID: RP-696
 
 ## Found while working RP-668 (2026-11-09)
 

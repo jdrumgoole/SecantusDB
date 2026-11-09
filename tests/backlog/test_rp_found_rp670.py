@@ -2,8 +2,8 @@
 assignment to a trigger record's domain field did not check the domain):
 
 - a PL/pgSQL assignment to a `varchar(n)` / `char(n)` variable, or one of a
-  domain over `varchar(n)`, truncates an overlong value where PostgreSQL's
-  assignment coercion raises 22001 (RP-687);
+  domain over `varchar(n)`, truncated an overlong value where PostgreSQL's
+  assignment coercion raises 22001 (RP-687, fixed: now regression tests);
 - a record filled by `SELECT ... INTO` types its fields by the wire's base
   type, without the column's domain or modifier, so an assignment to a
   field checks neither (RP-688);
@@ -67,13 +67,86 @@ VARIABLE_LENGTH = {
         "22001",
         "value too long for type character(3)",
     ),
+    # A DEFAULT is assigned by the same rule (`exec_stmt_block`).
+    "do $$ declare x varchar(3) := 'abcdef'; begin end $$": _VARCHAR3,
+    "do $$ declare x dv687 := 'abcdef'; begin end $$": _VARCHAR3,
+    # A bare `char` is `char(1)`.
+    "do $$ declare x char; begin x := 'ab'; end $$": (
+        "error",
+        "22001",
+        "value too long for type character(1)",
+    ),
+    "do $$ declare x character varying(2); begin x := 12345; end $$": (
+        "error",
+        "22001",
+        "value too long for type character varying(2)",
+    ),
+    "do $$ declare x varchar(3); y text := 'abcdef'; begin x := y; end $$": _VARCHAR3,
+    # A `bit(n)` of another length is 22026 either way; a `varbit(n)` too
+    # long is 22001.
+    "do $$ declare x bit(3); begin x := B'10101'; end $$": (
+        "error",
+        "22026",
+        "bit string length 5 does not match type bit(3)",
+    ),
+    "do $$ declare x bit(3); begin x := B'1'; end $$": (
+        "error",
+        "22026",
+        "bit string length 1 does not match type bit(3)",
+    ),
+    "do $$ declare x varbit(3); begin x := B'10101'; end $$": (
+        "error",
+        "22001",
+        "bit string too long for type bit varying(3)",
+    ),
 }
 
 
-@pytest.mark.backlog("RP-687")
+@pytest.mark.backlog_fixed("RP-687")
 @pytest.mark.parametrize("query", list(VARIABLE_LENGTH))
 def test_variable_assignment_refuses_an_overlong_value(query: str, dsn: str) -> None:
+    """Was: each value was cast explicitly and stored truncated (RP-687)."""
     assert _answer(dsn, query) == VARIABLE_LENGTH[query]
+
+
+# What fits is stored as the declared type: excess blanks dropped, a
+# `char(n)` padded, a domain's CHECK and a NOT NULL still checked.
+VARIABLE_FITS = {
+    "do $$ declare x char(3); begin x := 'ab   '; raise exception '[%]', x; end $$": (
+        "error",
+        "P0001",
+        "[ab ]",
+    ),
+    "do $$ declare x char(3); begin x := 'a'; "
+    "raise exception '[%] %', x, octet_length(x); end $$": (
+        "error",
+        "P0001",
+        "[a  ] 3",
+    ),
+    "do $$ declare x varchar(3); begin x := 'abc   '; raise exception '[%]', x; end $$": (
+        "error",
+        "P0001",
+        "[abc]",
+    ),
+    "do $$ declare x bit(3); begin x := B'101'; raise exception '[%]', x; end $$": (
+        "error",
+        "P0001",
+        "[101]",
+    ),
+    "do $$ declare x numeric(3,1); begin x := 12.345; raise exception '[%]', x; end $$": (
+        "error",
+        "P0001",
+        "[12.3]",
+    ),
+    "do $$ declare x d687; begin x := -5; end $$": _D687,
+}
+
+
+@pytest.mark.backlog_fixed("RP-687")
+@pytest.mark.parametrize("query", list(VARIABLE_FITS))
+def test_variable_assignment_stores_a_fitting_value(query: str, dsn: str) -> None:
+    """A value that fits is stored as the declared type (RP-687)."""
+    assert _answer(dsn, query) == VARIABLE_FITS[query]
 
 
 # A record's fields are the query's columns, of their declared types

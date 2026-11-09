@@ -2119,6 +2119,45 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn assignment_length(&self, ty: &str, sql: &str, types: &[String]) -> Option<(String, i32)> {
+        let (base, typmod) = match secantus_pgplan::domains::base_type_and_typmod(ty) {
+            Some((base, typmod, _)) => {
+                // A value already of the domain is no coercion
+                // (`coerce_type` relabels it), and fits its modifier.
+                let lookup = |n: &str| self.h.lookup(n);
+                let already = secantus_pgplan::select_target_domain(sql, types, &lookup)
+                    .is_some_and(|d| secantus_pgplan::domains::same_domain(&d, ty));
+                if already {
+                    return None;
+                }
+                (base, typmod)
+            }
+            None => secantus_pgplan::declared_type_and_typmod(ty)?,
+        };
+        let length = match base.as_str() {
+            "bpchar" | "varchar" => typmod > 4,
+            "bit" | "varbit" => typmod >= 0,
+            _ => false,
+        };
+        length.then_some((base, typmod))
+    }
+
+    fn fit_assigned(
+        &self,
+        value: Bson,
+        base: &str,
+        typmod: i32,
+    ) -> Result<Bson, plpgsql_fn::PlError> {
+        secantus_pgplan::fit_assigned_length(value, base, typmod).map_err(|e| match PgHandler::err(
+            &e,
+        ) {
+            PgWireError::UserError(info) => {
+                plpgsql_fn::PlError::new(&info.code, info.message.clone())
+            }
+            other => plpgsql_fn::PlError::new("XX000", other.to_string()),
+        })
+    }
+
     fn coerce_to_domain(
         &self,
         ty: &str,

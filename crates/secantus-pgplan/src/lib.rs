@@ -16830,6 +16830,51 @@ pub fn fit_assigned_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> 
     fit_length(v, pg_type, typmod)
 }
 
+/// The type a declared type text names and the modifier it is written
+/// with, as the grammar reads it (`typenameTypeIdAndMod`): `varchar(3)` is
+/// `varchar` at 7, a bare `char` is `bpchar` at 5 (`char(1)`), `bit(3)`
+/// `bit` at 3, and an unmodified type is at -1. `None` when the text is no
+/// type name.
+pub fn declared_type_and_typmod(text: &str) -> Option<(String, i32)> {
+    let parsed = pg_query::parse(&format!("SELECT NULL::{text}")).ok()?;
+    let stmt = parsed
+        .protobuf
+        .stmts
+        .first()?
+        .stmt
+        .as_ref()?
+        .node
+        .as_ref()?;
+    let N::SelectStmt(s) = stmt else { return None };
+    let target = s.target_list.first()?.node.as_ref()?;
+    let N::ResTarget(rt) = target else {
+        return None;
+    };
+    let N::TypeCast(tc) = rt.val.as_ref()?.node.as_ref()? else {
+        return None;
+    };
+    let tn = tc.type_name.as_ref()?;
+    Some((type_name_of(tn), declared_typmod(tn)))
+}
+
+#[cfg(test)]
+mod declared_type_and_typmod_tests {
+    use super::declared_type_and_typmod as d;
+
+    #[test]
+    fn reads_the_grammar_s_type_and_modifier() {
+        assert_eq!(d("varchar(3)"), Some(("varchar".into(), 7)));
+        assert_eq!(d("character varying(2)"), Some(("varchar".into(), 6)));
+        assert_eq!(d("char(3)"), Some(("bpchar".into(), 7)));
+        // A bare `char` is `char(1)`, a bare `varchar` unbounded.
+        assert_eq!(d("char"), Some(("bpchar".into(), 5)));
+        assert_eq!(d("varchar"), Some(("varchar".into(), -1)));
+        assert_eq!(d("bit(3)"), Some(("bit".into(), 3)));
+        assert_eq!(d("int4"), Some(("int4".into(), -1)));
+        assert_eq!(d("not a ( type"), None);
+    }
+}
+
 /// An EXPLICIT cast's `coerce_type_typmod` over a value already of type
 /// `pg_type`: `char(n)` / `varchar(n)` truncate silently and `char(n)` pads
 /// (the padded text is the value, as `'ab'::char(3)` answers), `bit(n)`

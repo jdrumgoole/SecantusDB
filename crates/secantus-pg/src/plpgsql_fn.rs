@@ -150,6 +150,24 @@ pub trait Host {
         let _ = (ty, sql, types, value);
         None
     }
+    /// The base type and modifier an assignment to a variable of declared
+    /// type `ty` fits its value to by the assignment rule, when that is not
+    /// what an explicit cast does: `ty` is (a domain over) `char(n)`,
+    /// `varchar(n)`, `bit(n)` or `varbit(n)`, and the expression `sql`
+    /// over parameters of `types` is not already of the domain. `None`
+    /// otherwise (RP-687).
+    fn assignment_length(&self, ty: &str, sql: &str, types: &[String]) -> Option<(String, i32)> {
+        let _ = (ty, sql, types);
+        None
+    }
+    /// `value`, of type `base`, fitted to modifier `typmod` by the
+    /// assignment rule: an overlong `char(n)` / `varchar(n)` value is
+    /// 22001 unless the excess is blanks, a `bit(n)` of another length
+    /// 22026 (`exec_cast_value`, RP-687).
+    fn fit_assigned(&self, value: Bson, base: &str, typmod: i32) -> Result<Bson, PlError> {
+        let _ = (base, typmod);
+        Ok(value)
+    }
     /// Enter a block with EXCEPTION handlers: a subtransaction, so a caught
     /// error undoes the block's writes. Answers a token for `subtxn_end`.
     fn subtxn_begin(&self) -> Result<u64, PlError> {
@@ -1592,7 +1610,13 @@ impl Interp<'_> {
             .unwrap_or(Bson::Null))
     }
 
-    /// Evaluate an expression cast to datum `no`'s declared type.
+    /// Evaluate an expression cast to datum `no`'s declared type, by the
+    /// assignment rule (`exec_assign_value` -> `exec_cast_value`): a
+    /// variable of (a domain over) `varchar(3)` refuses an overlong value
+    /// with 22001 where an explicit cast would truncate it (RP-687). The
+    /// value is read as the bare base type, fitted to the modifier, and
+    /// only then cast to the declared type, which pads a `char(n)` and
+    /// checks a domain's constraints.
     fn eval_typed(&self, e: &Value, no: usize) -> Result<Bson, PlError> {
         let ty = match self.datums.get(no) {
             Some(Datum::Var { ty, .. }) => Some(ty.clone()),
@@ -1608,9 +1632,17 @@ impl Interp<'_> {
                 .to_string(),
             _ => text.to_string(),
         };
-        let sql = match ty {
-            Some(ty) => format!("SELECT ({body})::{}", sql_type(&ty)),
-            None => format!("SELECT {body}"),
+        let length = ty.as_deref().and_then(|ty| {
+            let (sql, _, types) = self.bind(&format!("SELECT {body}")).ok()?;
+            self.host.assignment_length(ty, &sql, &types)
+        });
+        let sql = match (&ty, &length) {
+            // A bare `bit` is the grammar's `bit(1)`; `varbit` reads the
+            // value at its own length, for the fit to measure.
+            (_, Some((base, _))) if base == "bit" => format!("SELECT ({body})::varbit"),
+            (_, Some((base, _))) => format!("SELECT ({body})::{base}"),
+            (Some(ty), None) => format!("SELECT ({body})::{}", sql_type(ty)),
+            (None, None) => format!("SELECT {body}"),
         };
         let raw = sql.clone();
         let (sql, params, types) = self
@@ -1629,12 +1661,29 @@ impl Interp<'_> {
             };
             e.with_sql_frame(|| frame)
         })?;
-        Ok(out
+        let v = out
             .rows
             .into_iter()
             .next()
             .and_then(|r| r.into_iter().next())
-            .unwrap_or(Bson::Null))
+            .unwrap_or(Bson::Null);
+        match (ty, length) {
+            (Some(ty), Some((base, typmod))) => {
+                let v = self.host.fit_assigned(v, &base, typmod)?;
+                let out = self.host.query(
+                    &format!("SELECT $1::{}", sql_type(&ty)),
+                    &[v],
+                    std::slice::from_ref(&base),
+                )?;
+                Ok(out
+                    .rows
+                    .into_iter()
+                    .next()
+                    .and_then(|r| r.into_iter().next())
+                    .unwrap_or(Bson::Null))
+            }
+            _ => Ok(v),
+        }
     }
 
     /// The value an assignment stores in a record field of type `ty`
