@@ -614,7 +614,9 @@ pub struct ExecutionControl {
     probing: Option<Arc<ThroughputProbing>>,
 }
 
-/// mongod's `ProcessInfo::getNumLogicalCores`.
+/// mongod's `ProcessInfo::getNumLogicalCores`: `sysconf(_SC_NPROCESSORS_ONLN)`
+/// on POSIX (`processinfo_linux.cpp`, `processinfo_osx.mm`).
+#[cfg(unix)]
 pub fn logical_cores() -> i32 {
     // SAFETY: `sysconf` reads a system constant and touches no memory of ours.
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
@@ -623,6 +625,15 @@ pub fn logical_cores() -> i32 {
     } else {
         1
     }
+}
+
+/// mongod's `ProcessInfo::getNumLogicalCores` off POSIX: on Windows it is
+/// `GetSystemInfo`'s `dwNumberOfProcessors` (`processinfo_windows.cpp`),
+/// which is what `available_parallelism` reads there. `libc` is a
+/// unix-only dependency of this crate.
+#[cfg(not(unix))]
+pub fn logical_cores() -> i32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as i32)
 }
 
 impl ExecutionControl {
