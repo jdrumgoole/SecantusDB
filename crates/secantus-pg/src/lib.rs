@@ -2119,6 +2119,55 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn coerce_to_domain(
+        &self,
+        ty: &str,
+        sql: &str,
+        types: &[String],
+        value: Bson,
+    ) -> Option<Result<Bson, plpgsql_fn::PlError>> {
+        let (base, typmod, chain) = secantus_pgplan::domains::base_type_and_typmod(ty)?;
+        let lookup = |n: &str| self.h.lookup(n);
+        let already = secantus_pgplan::select_target_domain(sql, types, &lookup)
+            .is_some_and(|d| secantus_pgplan::domains::same_domain(&d, ty));
+        if already {
+            return Some(Ok(value));
+        }
+        Some((|| {
+            let out = self.query(
+                &format!("SELECT $1::{base}"),
+                &[value],
+                std::slice::from_ref(&base),
+            )?;
+            let v = out
+                .rows
+                .into_iter()
+                .next()
+                .and_then(|r| r.into_iter().next())
+                .unwrap_or(Bson::Null);
+            let plan_error = |e: secantus_pgplan::Error| match PgHandler::err(&e) {
+                PgWireError::UserError(info) => {
+                    plpgsql_fn::PlError::new(&info.code, info.message.clone())
+                }
+                other => plpgsql_fn::PlError::new("XX000", other.to_string()),
+            };
+            // The base type AT the domain's modifier, by the assignment
+            // rule: a `varchar(3)` domain's overlong value is 22001.
+            let v = secantus_pgplan::fit_assigned_length(v, &base, typmod).map_err(plan_error)?;
+            // One `CoerceToDomain` checks the constraints of the whole
+            // chain, the innermost domain's first, and names the domain it
+            // coerces to (`value for domain dd violates check constraint
+            // "d_check"`, 15.19).
+            let outer = chain.first().map(|d| d.name.clone()).unwrap_or_default();
+            for d in chain.iter().rev() {
+                let mut d = d.clone();
+                d.name.clone_from(&outer);
+                secantus_pgplan::domains::check_domain(&d, &v).map_err(plan_error)?;
+            }
+            Ok(v)
+        })())
+    }
+
     fn open_cursor(
         &self,
         name: Option<&str>,

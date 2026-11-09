@@ -390,6 +390,17 @@ impl PgHandler {
             .collect())
     }
 
+    /// A column's type as a trigger's record field has it: the column's
+    /// domain where it is of one (`atttypid`), so an assignment to the
+    /// field coerces into the domain (RP-670) and `pg_typeof(new.a)` is
+    /// the domain, as on PostgreSQL.
+    fn field_type(c: &secantus_pgcatalog::Column) -> String {
+        match c.extra.get_str("domain_type") {
+            Ok(d) if secantus_pgplan::domains::user_domain(d).is_some() => d.to_string(),
+            _ => c.pg_type.clone(),
+        }
+    }
+
     /// A stored row as the record a trigger sees.
     pub(crate) fn row_record(&self, def: &TableDef, row: &Document) -> PgWireResult<Record> {
         let tz = self.session_timezone();
@@ -400,7 +411,7 @@ impl PgHandler {
                 .user_wire_type(&c.pg_type)
                 .unwrap_or_else(|| crate::wire_type(&c.pg_type));
             let v = crate::resolve_cell(row, &c.field(), None, &wire, &tz)?;
-            columns.push((c.name.clone(), c.pg_type.clone()));
+            columns.push((c.name.clone(), Self::field_type(c)));
             values.push(v.unwrap_or(Bson::Null));
         }
         Ok(Record { columns, values })
@@ -439,7 +450,7 @@ impl PgHandler {
                 .map(|def| {
                     def.columns
                         .iter()
-                        .map(|c| (c.name.clone(), c.pg_type.clone()))
+                        .map(|c| (c.name.clone(), Self::field_type(c)))
                         .collect()
                 })
                 .unwrap_or_default()

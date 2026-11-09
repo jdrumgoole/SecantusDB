@@ -17,6 +17,7 @@ pub mod acl;
 mod agg_hoist;
 mod agg_support;
 mod domain_scope;
+pub use domain_scope::select_target_domain;
 mod targetlist_size;
 pub use targetlist_size::MAX_HEAP_ATTRIBUTE_NUMBER;
 mod cmpfn;
@@ -16820,6 +16821,13 @@ fn fval_integer(text: &str) -> Option<Bson> {
 /// assignment rule -- an explicit CAST truncates instead).
 pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
     fit_length(v, &column.pg_type, column.typmod)
+}
+
+/// `fit_to_column` for a value of type `pg_type` at modifier `typmod`: an
+/// assignment's length coercion, as PL/pgSQL's into a domain field over
+/// `varchar(n)` (RP-670).
+pub fn fit_assigned_length(v: Bson, pg_type: &str, typmod: i32) -> Result<Bson> {
+    fit_length(v, pg_type, typmod)
 }
 
 /// An EXPLICIT cast's `coerce_type_typmod` over a value already of type
@@ -43406,6 +43414,39 @@ fn case_label(
     })
 }
 
+/// What makes a cast to a domain no coercion.
+#[derive(Debug, PartialEq, Eq)]
+enum OwnDomain {
+    /// `$n::d` over a parameter declared of `d`.
+    Param,
+    /// `x::d::d`: the operand is a cast to `d`.
+    Cast,
+}
+
+/// Whether a cast to a domain `d` is no coercion because its operand is
+/// already of `d` (`coerce_type` returns it as it is): a parameter
+/// declared of `d`, as a PL/pgSQL variable of the domain is when its body
+/// binds it (`$1::d`, and `$1::d::d` for `v::d`), or a cast to `d`
+/// (RP-670).
+fn own_domain_cast(tc: &pg_query::protobuf::TypeCast) -> Option<OwnDomain> {
+    /// The plain type a cast names, without a modifier or array bounds.
+    fn plain(t: Option<&pg_query::protobuf::TypeName>) -> Option<String> {
+        let t = t?;
+        (t.typmods.is_empty() && t.array_bounds.is_empty() && !t.setof && !t.pct_type)
+            .then(|| type_name_of(t))
+    }
+    let target = plain(tc.type_name.as_ref())?;
+    let (operand, kind) = match tc.arg.as_deref().and_then(|a| a.node.as_ref())? {
+        N::ParamRef(p) => (
+            declared_param_type(usize::try_from(p.number).ok()?)?,
+            OwnDomain::Param,
+        ),
+        N::TypeCast(inner) => (plain(inner.type_name.as_ref())?, OwnDomain::Cast),
+        _ => return None,
+    };
+    domains::same_domain(&operand, &target).then_some(kind)
+}
+
 fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<Bson> {
     // A hashed SubPlan (`hashed_subplan`), whose arguments are not all
     // values to evaluate.
@@ -43418,8 +43459,17 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
     // operand evaluates to, so a bound parameter casts exactly like a literal.
     if let Some(N::TypeCast(tc)) = node.node.as_ref() {
         // A cast that is no coercion checks no domain constraint (RP-655).
-        if is_relabel(tc) && !domains::relabelling() {
+        if (is_relabel(tc) || own_domain_cast(tc) == Some(OwnDomain::Param))
+            && !domains::relabelling()
+        {
             return domains::relabel(|| const_value_node(node, params));
+        }
+        // `x::d::d`: the inner cast coerces (and checks); the outer one is
+        // no coercion, so the value is the inner cast's.
+        if own_domain_cast(tc) == Some(OwnDomain::Cast) {
+            if let Some(arg) = tc.arg.as_deref() {
+                return const_value_node(arg, params);
+            }
         }
         let arg = tc
             .arg

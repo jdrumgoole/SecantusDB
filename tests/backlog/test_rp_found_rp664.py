@@ -15,9 +15,9 @@ found while working them:
   target's name read as the subquery's own;
 - RETURNING a FROM item's column, when the join condition reads a column
   the UPDATE assigns, is a named 0A000 (RP-686);
-- a PL/pgSQL assignment to a record's field (`NEW.a := -5`) does not check
-  the field's domain, so a trigger that assigns a bad value and then a good
-  one is not refused.
+- a PL/pgSQL assignment to a record's field (`NEW.a := -5`) did not check
+  the field's domain, so a trigger that assigned a bad value and then a
+  good one was not refused (RP-670, fixed).
 
 The expected answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`, which each statement runs after.
@@ -401,16 +401,147 @@ def test_triggered_write_checks_a_domain_where_it_coerces(case: tuple[str, str],
 
 
 # The assignment checks the domain, so the row the trigger finally returns
-# (`a` = 7) is never reached.
+# (`a` = 7) is never reached. The field was typed by the domain's base and
+# the assigned value cast to it, which checked nothing (RP-670).
 ASSIGNED_IN_TRIGGER = {
     ("new.a := -5; new.a := 7;", "insert into t664t values (7, 1)"): _D664T,
     ("new.a := -5; new.a := 7;", "update t664t set b = 0 where b = 5"): _D664T,
 }
 
 
-@pytest.mark.backlog("RP-670")
+@pytest.mark.backlog_fixed("RP-670")
 @pytest.mark.parametrize("case", list(ASSIGNED_IN_TRIGGER))
 def test_plpgsql_assignment_to_a_record_field_checks_its_domain(
     case: tuple[str, str], dsn: str
 ) -> None:
     assert _triggered(dsn, *case) == ASSIGNED_IN_TRIGGER[case]
+
+
+# What an assignment to a trigger record's domain field coerces, measured on
+# a private, freshly initdb'd PostgreSQL 15.19 cluster with `_SETUP_670`
+# (RP-670). `exec_assign_value` casts the value from its own type to the
+# field's, which is the column's domain (`pg_typeof(new.a)` is it): a value
+# already of the domain (`old.a`, a COALESCE of it, a cast to the domain)
+# is no coercion and checks nothing, so a row stored before a NOT VALID
+# CHECK still passes through; any other is coerced to the base type AT the
+# domain's modifier (an overlong `varchar(3)` is 22001 at the assignment,
+# not truncated) and checked against every domain of the chain, under the
+# name of the domain it is coerced to.
+_SETUP_670 = [
+    "drop table if exists t670, t670n cascade",
+    "drop domain if exists dv670, dd670, d670, d670n cascade",
+    "create domain dv670 as varchar(3)",
+    "create domain d670 as int check (value > 0)",
+    "create domain dd670 as d670 check (value < 100)",
+    "create table t670 (w dv670, n dd670, b int)",
+    "insert into t670 values ('ab', 5, 5)",
+    "create domain d670n as int",
+    "create table t670n (a d670n, b int)",
+    "insert into t670n values (-1, -1)",
+    "alter domain d670n add constraint d670n_pos check (value > 0) not valid",
+]
+_D670N = ("error", "23514", 'value for domain d670n violates check constraint "d670n_pos"')
+_UPDATE_670N = "update t670n set b = 0 where b < 0"
+_INSERT_670 = "insert into t670 values ('x', 5, 1)"
+
+FIELD_ASSIGNMENTS = {
+    ("t670n", "new.a := old.a;", _UPDATE_670N): "UPDATE 1",
+    ("t670n", "new.a := coalesce(old.a, old.a);", _UPDATE_670N): "UPDATE 1",
+    ("t670n", "new.a := old.a::d670n;", _UPDATE_670N): "UPDATE 1",
+    ("t670n", "new.a := old.a + 0;", _UPDATE_670N): _D670N,
+    ("t670n", "new.a := old.a::int;", _UPDATE_670N): _D670N,
+    ("t670n", "new.a := null;", _UPDATE_670N): "UPDATE 1",
+    ("t670n", "raise exception '%', pg_typeof(new.a);", "insert into t670n values (7, 1)"): (
+        "error",
+        "P0001",
+        "d670n",
+    ),
+    ("t670", "new.w := 'abcdef'; new.w := 'ab';", _INSERT_670): (
+        "error",
+        "22001",
+        "value too long for type character varying(3)",
+    ),
+    ("t670", "new.w := 'ab    '; raise exception '[%]', new.w;", _INSERT_670): (
+        "error",
+        "P0001",
+        "[ab ]",
+    ),
+    ("t670", "new.n := 500; new.n := 5;", _INSERT_670): (
+        "error",
+        "23514",
+        'value for domain dd670 violates check constraint "dd670_check"',
+    ),
+    ("t670", "new.n := -5; new.n := 5;", _INSERT_670): (
+        "error",
+        "23514",
+        'value for domain dd670 violates check constraint "d670_check"',
+    ),
+    ("t670", "new.n := '7'; new.b := new.n + 1;", _INSERT_670 + " returning n, b"): [(7, 8)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-670")
+@pytest.mark.parametrize("case", list(FIELD_ASSIGNMENTS))
+def test_assignment_to_a_domain_field_coerces_only_what_is_not_of_it(
+    case: tuple[str, str, str], dsn: str
+) -> None:
+    table, body, query = case
+    kind = "insert" if query.startswith("insert") else "update"
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP_670:
+            c.execute(q)
+        c.execute(
+            "create or replace function f670() returns trigger language plpgsql as "
+            f"$$ begin {body} return new; end $$"
+        )
+        c.execute(
+            f"create trigger tr670 before {kind} on {table} for each row execute function f670()"
+        )
+        try:
+            cur = c.execute(query)
+            got: object = cur.fetchall() if "returning" in query else cur.statusmessage
+        except psycopg.Error as e:
+            got = ("error", e.sqlstate, str(e).splitlines()[0])
+        c.execute("drop table if exists t670, t670n cascade")
+        c.execute("drop function if exists f670()")
+    assert got == FIELD_ASSIGNMENTS[case]
+
+
+# A cast of a value already of the domain is no coercion, but one over a
+# cast that coerces still checks; a client's parameter declared of the
+# domain is checked on its way in (15.19).
+DOMAIN_CASTS = {
+    "select (-5)::d670::d670": (
+        "error",
+        "23514",
+        'value for domain d670 violates check constraint "d670_check"',
+    ),
+    "execute p670(-1)": (
+        "error",
+        "23514",
+        'value for domain d670 violates check constraint "d670_check"',
+    ),
+    "execute p670c(-1)": (
+        "error",
+        "23514",
+        'value for domain d670 violates check constraint "d670_check"',
+    ),
+    "do $$ declare x d670 := 5; y d670; begin y := x::d670; end $$": "DO",
+}
+
+
+@pytest.mark.backlog_fixed("RP-670")
+@pytest.mark.parametrize("query", list(DOMAIN_CASTS))
+def test_cast_to_a_domain_of_a_value_already_of_it(query: str, dsn: str) -> None:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SETUP_670:
+            c.execute(q)
+        c.execute("prepare p670(d670) as select $1")
+        c.execute("prepare p670c(d670) as select $1::d670::d670")
+        try:
+            cur = c.execute(query)
+            got: object = cur.fetchall() if cur.description else cur.statusmessage
+        except psycopg.Error as e:
+            got = ("error", e.sqlstate, str(e).splitlines()[0])
+        c.execute("drop table if exists t670, t670n cascade")
+    assert got == DOMAIN_CASTS[query]
