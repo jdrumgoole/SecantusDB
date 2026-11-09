@@ -30,6 +30,15 @@ case "$branch" in
     *) server="Rust PG server"; gate="scripts/gate_pg.sh --fast" ;;
 esac
 cd "$(dirname "$0")/.."
+# Keep the Mac awake while this runs. An idle Mac on AC power drops into
+# "Maintenance Sleep" for 10-20 minutes at a time, and every process stops
+# with it: on 2026-11-08 a lander's `sleep 300` came back after 63 minutes
+# and the fix-one sessions beside it stalled the same way (RM-443, from
+# `pmset -g log`). `caffeinate -i -w $$` holds a no-idle-sleep assertion
+# until this script exits, and does nothing where it is not installed.
+if command -v caffeinate >/dev/null 2>&1; then
+    caffeinate -i -w $$ &
+fi
 repo=$(gh repo view --json nameWithOwner -q .nameWithOwner) || exit 2
 while :; do
     git fetch -q origin
