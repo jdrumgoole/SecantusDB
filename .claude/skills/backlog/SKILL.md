@@ -47,6 +47,11 @@ Rust servers goes in both files, each copy with its own ID and test.
   2026-11-08 -- the second pair reached main and failed
   `test_backlog_markers` for every PR. With no network `ids` refuses
   rather than write an unreserved ID; file the item later.
+  `python tools/backlog.py check-ids` (a cheap step of `gate_pg.sh`)
+  refuses a new ID this branch did not reserve, unless another branch on
+  origin already holds the same item under it, and a duplicate ID in the
+  file: a lane's hand-written RP-731/RP-732, reserved by another lane,
+  passed the gate and turned snapshot PR #2580 red (2026-11-09).
 - **`Verify:`** names the gap test(s), comma separated -- or `none --
   <reason>` when no test can check it: a performance budget, a CI or
   tooling behaviour, a crash needing a hard reboot, a design decision. Not

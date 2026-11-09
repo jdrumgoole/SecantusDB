@@ -17,6 +17,8 @@ Usage::
 
     python tools/backlog.py ids              # give every open item an ID
                                              # (each reserved on origin first)
+    python tools/backlog.py check-ids [--file F]  # every ID this branch adds is
+                                             # its own reservation (the gates)
     python tools/backlog.py list [--file F]  # ID, verify, headline
     python tools/backlog.py verify [--file F] [--id ID ...]
     python tools/backlog.py verify --file F --regressions   # what CI runs
@@ -101,9 +103,12 @@ class Verdict:
     detail: list[str] = field(default_factory=list)
 
 
-def parse(name: str) -> list[Item]:
-    """Every open item in one backlog file, with its ID and Verify lines."""
-    lines = (TASKS / name).read_text(encoding="utf-8").splitlines()
+def parse(name: str, text: str | None = None) -> list[Item]:
+    """Every open item in one backlog file, with its ID and Verify lines:
+    this checkout's copy, or `text` (another branch's)."""
+    if text is None:
+        text = (TASKS / name).read_text(encoding="utf-8")
+    lines = text.splitlines()
     items: list[Item] = []
     in_code = False
     for i, line in enumerate(lines):
@@ -270,6 +275,104 @@ def assign_ids(repo: pathlib.Path = REPO, remote: str = REMOTE) -> int:
     return added
 
 
+#: The branch a reservation was made on, from the commit `reserve` writes.
+OWNER = re.compile(r" on (?P<branch>\S+?)(?:, nonce \w+)?\s*$", re.M)
+
+
+def _owners(idents: list[str], repo: pathlib.Path, remote: str) -> dict[str, str | None]:
+    """Each ID's reservation on `remote`: the branch it was reserved on
+    ("" when the message names none), or None when it was never reserved."""
+    ls = _git(repo, "ls-remote", remote, f"{RESERVED}*")
+    if ls.returncode:
+        raise ReservationError(f"git ls-remote {remote}: {ls.stderr.strip()}")
+    shas = {
+        ref.rsplit("/", 1)[1]: sha
+        for sha, ref in (line.split("\t") for line in ls.stdout.splitlines() if "\t" in line)
+    }
+    reserved = [i for i in idents if i in shas]
+    if reserved:
+        # Into FETCH_HEAD only: the commits, not a hundred local refs.
+        fetch = _git(repo, "fetch", "--quiet", remote, *(f"{RESERVED}{i}" for i in reserved))
+        if fetch.returncode:
+            raise ReservationError(f"git fetch {remote} {RESERVED}...: {fetch.stderr.strip()}")
+    owners: dict[str, str | None] = {}
+    for ident in idents:
+        if ident not in shas:
+            owners[ident] = None
+            continue
+        msg = _git(repo, "cat-file", "commit", shas[ident]).stdout
+        m = OWNER.search(msg)
+        owners[ident] = m.group("branch") if m else ""
+    return owners
+
+
+def check_ids(names: Iterable[str], repo: pathlib.Path = REPO, remote: str = REMOTE) -> list[str]:
+    """What is wrong with the IDs this branch adds: one line per problem.
+
+    An ID is this branch's to write when it is not on `remote`'s main and
+    either this branch reserved it, or another branch on `remote` already
+    holds the same item under it (an item inherited from an integration
+    branch such as pg-batch). Any other new ID is a number someone else
+    reserved, or one never reserved: CI's test_backlog_markers finds the
+    duplicate only once both items meet on a PR, a CI cycle later.
+
+    Why (2026-11-09): a pg-batch lane wrote RP-731 and RP-732 by hand,
+    without `ids`; another lane had reserved both. Its gate passed, the
+    other lane landed its own RP-732 beside it, and snapshot PR #2580 went
+    red on the duplicate.
+    """
+    problems: list[str] = []
+    fetch = _git(repo, "fetch", "--quiet", remote)
+    if fetch.returncode:
+        raise ReservationError(f"git fetch {remote}: {fetch.stderr.strip()}")
+    branch = _git(repo, "branch", "--show-current").stdout.strip()
+    refs = [
+        r
+        for r in _git(
+            repo, "for-each-ref", "--format=%(refname:short)", f"refs/remotes/{remote}"
+        ).stdout.split()
+        if r not in (f"{remote}/{branch}", f"{remote}/HEAD", remote)
+    ]
+    for name in names:
+        items = parse(name)
+        seen: dict[str, Item] = {}
+        for it in items:
+            if not it.id:
+                continue
+            if it.id in seen:
+                problems.append(f"{it.id} twice in {name}: lines {seen[it.id].line} and {it.line}")
+            seen.setdefault(it.id, it)
+        main = _git(repo, "show", f"{remote}/main:tasks/{name}")
+        on_main = {it.id for it in parse(name, main.stdout)} if main.returncode == 0 else set()
+        new = sorted(i for i in seen if i not in on_main)
+        if not new:
+            continue
+        elsewhere: dict[str, set[tuple[str, str | None]]] = {}
+        for ref in refs:
+            blob = _git(repo, "show", f"{ref}:tasks/{name}")
+            if blob.returncode:
+                continue
+            for it in parse(name, blob.stdout):
+                if it.id in seen:
+                    elsewhere.setdefault(it.id, set()).add((it.headline, it.verify))
+        owners = _owners(new, repo, remote)
+        for ident in new:
+            it, owner = seen[ident], owners[ident]
+            where = f"{ident} ({name}:{it.line})"
+            if owner is None:
+                problems.append(
+                    f"{where} was never reserved on {remote}: number new items with "
+                    "`python tools/backlog.py ids`, never by hand"
+                )
+            elif owner != branch and (it.headline, it.verify) not in elsewhere.get(ident, set()):
+                problems.append(
+                    f"{where} was reserved on branch {owner or '(unnamed)'}, not this one "
+                    f"({branch or 'detached'}), and no branch on {remote} holds this item "
+                    "under it: remove the ID line and run `python tools/backlog.py ids`"
+                )
+    return problems
+
+
 def own_end(lines: list[str], it: Item) -> int:
     """Index just past the item's OWN text: before a nested item, and before
     the blank lines that end it."""
@@ -410,6 +513,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ids")
+    sub.add_parser("check-ids").add_argument("--file", action="append", choices=list(FILES))
     for name in ("list", "verify"):
         p = sub.add_parser(name)
         p.add_argument("--file", action="append", choices=list(FILES))
@@ -436,6 +540,16 @@ def main() -> int:
             print(f"backlog.py ids: could not reserve an ID: {exc}", file=sys.stderr)
             return 1
         return 0
+    if args.cmd == "check-ids":
+        try:
+            problems = check_ids(args.file or list(FILES))
+        except ReservationError as exc:
+            print(f"backlog.py check-ids: could not read the reservations: {exc}", file=sys.stderr)
+            return 1
+        for p in problems:
+            print(p)
+        print(f"check-ids: {len(problems)} problem(s)")
+        return 1 if problems else 0
     items = selected(args.file, args.id)
     if args.cmd == "list":
         for it in items:

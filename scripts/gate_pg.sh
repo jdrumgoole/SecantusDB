@@ -23,7 +23,7 @@
 #   scripts/gate_pg.sh --only fmt,lint   # rerun just these steps
 #   scripts/gate_pg.sh --list     # print the steps a run would take, and stop
 #
-# The cheap checks (fmt, lint, ruff) run FIRST and stop the gate when one
+# The cheap checks (fmt, lint, ruff, backlog-ids) run FIRST and stop the gate when one
 # fails: a session reran a whole 40-min gate for one `cargo fmt` slip on
 # 2026-11-06. Every other step still runs whatever the others did.
 #
@@ -115,6 +115,11 @@ step fmt bash -c 'cd crates/secantus-pg && cargo fmt --check && cd .. && cargo f
 step lint ./inv lint
 step ruff-check uvx ruff@0.15.20 check .
 step ruff-format uvx ruff@0.15.20 format --check .
+# Every Backlog-ID this branch adds is its own reservation on origin (or an
+# item it inherited from another branch there). A hand-numbered ID that
+# another lane had reserved passed this gate and went red in CI a cycle
+# later on snapshot PR #2580 (2026-11-09).
+step backlog-ids "$py" tools/backlog.py check-ids --file backlog-rust-postgres.md
 if [[ $failed -ne 0 ]]; then
     echo "    a cheap check failed: fix it and rerun the gate (nothing slower ran)"
     summary
