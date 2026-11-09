@@ -5875,3 +5875,24 @@ fn a_star_over_an_outer_from_item_is_its_columns() {
     );
     assert_eq!(target_refs(&own), ["v.*"]);
 }
+
+/// A `bpchar` value assigned to `text`, `varchar` or `name` drops its
+/// trailing blanks (`rtrim1`, `bpchar_name` on PostgreSQL 15.19; RP-672).
+/// (One assigned to `bpchar` is stored trimmed, as every `char(n)` value
+/// is here; an unsized column's blanks are RP-693.)
+#[test]
+fn bpchar_assigned_to_a_string_type_drops_its_blanks() {
+    let padded = || Bson::String("xy  ".into());
+    for target in ["text", "varchar", "name"] {
+        assert_eq!(
+            assign_value(padded(), "bpchar", target).unwrap(),
+            Bson::String("xy".into()),
+            "{target}"
+        );
+    }
+    assert_eq!(
+        assign_value(padded(), "text", "text").unwrap(),
+        padded(),
+        "a text value keeps its blanks"
+    );
+}

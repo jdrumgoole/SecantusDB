@@ -42403,6 +42403,14 @@ fn assign_value(value: Bson, source: &str, target: &str) -> Result<Bson> {
     if source == "timestamptz[]" && target == "timestamptz[]" && matches!(value, Bson::Array(_)) {
         return Ok(value);
     }
+    // `bpchar` assigned to `text` / `varchar` (`rtrim1`) or `name`
+    // (`bpchar_name`) drops its trailing blanks, which a padded value
+    // carries (`'xy '::bpchar`, a `char(n)` through a set operation; RP-672).
+    if source == "bpchar" && matches!(target, "text" | "varchar" | "name") {
+        if let Bson::String(t) = &value {
+            return cast_value(Bson::String(t.trim_end_matches(' ').to_string()), target);
+        }
+    }
     // A pg_lsn is carried as its position, a numeric, and there is no
     // numeric -> pg_lsn cast: `set l = l + 1` assigns a pg_lsn.
     if let Some(out) = systypes_cast(Some(source), target, &value) {

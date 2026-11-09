@@ -2355,14 +2355,6 @@ char(3)`, `t657d(a d657c, i int)` holding `('a b', 1)` and `('xy', 2)`, and
 its domain through a join, a WITH, a FROM subquery and a set operation all
 of whose branches are of the domain (`domain_scope.rs`).
 
-- [ ] **A set operation of a `char(n)` domain column and a `text` one drops
-      the domain's blanks.** `select array(select a from t657d union all
-      select a::text from t657e)` is `character[]` on PostgreSQL 15.19 with
-      `{"a b","xy ",e}`; here the type matches and `xy` loses its blank.
-      The branches disagree, so no branch is cast to the domain, and the
-      stored value is read without its padding.
-      Verify: tests/backlog/test_rp_found_rp657.py::test_set_operation_of_char_domain_and_text_keeps_blanks
-      Backlog-ID: RP-672
 - [ ] **`ARRAY(select * ...)` over a one-column domain subquery is typed by
       the domain's base.** `select array(select * from (select a from
       t657d) s order by 1)` is `d657c[]` on PostgreSQL 15.19, as the same
@@ -2379,6 +2371,31 @@ of whose branches are of the domain (`domain_scope.rs`).
       references, so its column's type is not known.
       Verify: tests/backlog/test_rp_found_rp657.py::test_lateral_column_of_an_outer_domain_column_is_the_domains
       Backlog-ID: RP-674
+
+## Found while working RP-672 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp672.py`: `t672c(a char(3))` holding `'xy'`.
+
+- [ ] **`CREATE TABLE AS` of an unsized `bpchar` drops its blanks.** `create
+      table c as select 'xy '::bpchar a` makes a `bpchar` column with no
+      modifier on PostgreSQL 15.19, and `octet_length(a)` is 3; so is a
+      value over a `char(3)` column UNIONed with `text` inserted into it.
+      Here the column holds `xy`, 2 bytes: a `bpchar` column is stored
+      trimmed and padded on the way out to its width, and one with no
+      width pads nothing.
+      Verify: tests/backlog/test_rp_found_rp672.py::test_create_table_as_of_an_unsized_bpchar_keeps_its_blanks
+      Backlog-ID: RP-693
+- [ ] **INTERSECT keeps the left side's value, not the smaller input's.**
+      PostgreSQL 15.19 plans an INTERSECT with the input it estimates
+      smaller first (`generate_nonunion_paths`), and a group's value is the
+      one that input gave: `select a from t672c intersect select
+      'xy'::text` is `xy`, unpadded, as the one-row constant is estimated
+      smaller than the unanalysed table (1850 rows). Here the left side's
+      row is always the one returned, `xy ` with its blank. Over equal
+      estimates (two VALUES lists) the left side comes first, as here.
+      Verify: tests/backlog/test_rp_found_rp672.py::test_intersect_keeps_the_smaller_inputs_value
+      Backlog-ID: RP-692
 
 ## Found while working RP-655 (2026-11-08)
 

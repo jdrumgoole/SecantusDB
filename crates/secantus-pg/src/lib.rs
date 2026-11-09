@@ -38349,16 +38349,60 @@ impl PgHandler {
                 }
             }
         }
+        // A `char(n)` value is stored here trimmed and padded on the way out
+        // to its column's width. A result column of the sides' common
+        // `bpchar` type with another modifier (a `text`, a `varchar` or
+        // another width on the other side: `select_common_typmod` is -1)
+        // pads nothing, so each `char(n)` side's values are padded to their
+        // own width here, as PostgreSQL stores them (RP-672).
+        for (i, field) in schema.iter().enumerate() {
+            if *field.datatype() != Type::BPCHAR {
+                continue;
+            }
+            for (side, rows) in [(&left_schema, &mut left), (&right_schema, &mut right)] {
+                let Some(f) = side.get(i) else { continue };
+                let m = f.type_modifier();
+                if *f.datatype() != Type::BPCHAR || m <= 4 || m == field.type_modifier() {
+                    continue;
+                }
+                let width = usize::try_from(m - 4).unwrap_or(0);
+                for row in rows.iter_mut() {
+                    if let Some(Some(Bson::String(t))) = row.get_mut(i) {
+                        let len = t.chars().count();
+                        if len < width {
+                            t.extend(std::iter::repeat_n(' ', width - len));
+                        }
+                    }
+                }
+            }
+        }
         let jsonb_cols: Vec<bool> = schema
             .iter()
             .map(|f| *f.datatype() == Type::JSONB)
             .collect();
+        // `bpchar`'s equality and order ignore trailing blanks
+        // (`bpchareq`, `bpcharcmp`), which a padded value carries.
+        let bpchar_cols: Vec<bool> = schema
+            .iter()
+            .map(|f| *f.datatype() == Type::BPCHAR)
+            .collect();
+        let is_bpchar = |i: usize| bpchar_cols.get(i).copied().unwrap_or(false);
+        let unpadded = |i: usize, v: Option<&Bson>| -> Option<Bson> {
+            match v {
+                Some(Bson::String(t)) if is_bpchar(i) => {
+                    Some(Bson::String(t.trim_end_matches(' ').to_string()))
+                }
+                v => v.cloned(),
+            }
+        };
         let ident = |row: &Vec<Option<Bson>>| -> Vec<Option<Bson>> {
             row.iter()
                 .enumerate()
                 .map(|(i, v)| {
                     if jsonb_cols.get(i).copied().unwrap_or(false) {
                         jsonb_ident(v)
+                    } else if is_bpchar(i) {
+                        set_op_ident(&unpadded(i, v.as_ref()))
                     } else {
                         set_op_ident(v)
                     }
@@ -38425,7 +38469,16 @@ impl PgHandler {
                         Nulls::Last => Ordering::Less,
                     },
                     (false, false) => {
-                        let cmp = compare_values(l.expect("not null"), r.expect("not null"));
+                        let (l, r) = (l.expect("not null"), r.expect("not null"));
+                        let cmp = match (l, r) {
+                            (Bson::String(a), Bson::String(b)) if is_bpchar(key.index) => {
+                                compare_values(
+                                    &Bson::String(a.trim_end_matches(' ').to_string()),
+                                    &Bson::String(b.trim_end_matches(' ').to_string()),
+                                )
+                            }
+                            _ => compare_values(l, r),
+                        };
                         if key.ascending {
                             cmp
                         } else {

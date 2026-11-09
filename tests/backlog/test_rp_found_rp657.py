@@ -62,11 +62,13 @@ def _answer(c: psycopg.Connection, query: str) -> tuple[object, ...]:
     return ([t[0] for t in types if t], [tuple(str(v) for v in r) for r in cur.fetchall()])
 
 
-@pytest.mark.backlog("RP-672")
+@pytest.mark.backlog_fixed("RP-672")
 def test_set_operation_of_char_domain_and_text_keeps_blanks(dsn: str) -> None:
     """`select array(select a from t657d union all select a::text from
     t657e)` is `character[]` on PostgreSQL 15.19, each value with its
-    blanks: `{"a b","xy ",e}`. Here `xy` loses its blank."""
+    blanks: `{"a b","xy ",e}`. Here `xy` lost its blank: the set
+    operation's column has no modifier, and the stored value was not padded
+    (RP-672)."""
     with _connect(dsn) as c:
         got = _answer(c, "select array(select a from t657d union all select a::text from t657e)")
     assert got == (["character[]"], [("['a b', 'xy ', 'e']",)])
