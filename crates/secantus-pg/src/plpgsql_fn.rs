@@ -1647,8 +1647,7 @@ impl Interp<'_> {
         let sql = match (&ty, &length) {
             // A bare `bit` is the grammar's `bit(1)`; `varbit` reads the
             // value at its own length, for the fit to measure.
-            (_, Some((base, _))) if base == "bit" => format!("SELECT ({body})::varbit"),
-            (_, Some((base, _))) => format!("SELECT ({body})::{base}"),
+            (_, Some((base, _))) => format!("SELECT ({body})::{}", length_read_type(base)),
             (Some(ty), None) => format!("SELECT ({body})::{}", sql_type(ty)),
             (None, None) => format!("SELECT {body}"),
         };
@@ -1718,8 +1717,7 @@ impl Interp<'_> {
         let read = match &length {
             // `varbit` reads a bit string at its own length, for the fit
             // to measure (as `eval_typed` does).
-            Some((base, _)) if base == "bit" => "varbit".to_string(),
-            Some((base, _)) => base.clone(),
+            Some((base, _)) => length_read_type(base),
             None => sql_type(&ty),
         };
         let first = |out: QueryOut| {
@@ -2769,6 +2767,18 @@ fn is_sqlstate_text(s: &str) -> bool {
 
 /// A type name as a cast can write it: an array type keeps its brackets, and
 /// a name PostgreSQL would need quoted is not produced by `canonical_type`.
+/// The type an assignment reads its value as before fitting it to a
+/// length modifier ([`Host::assignment_length`]'s base): a bare `bit` is
+/// the grammar's `bit(1)`, so a bit string -- or an array of them -- is read
+/// as `varbit`, at its own length, for the fit to measure (RP-687, RP-695).
+fn length_read_type(base: &str) -> String {
+    match base {
+        "bit" => "varbit".to_string(),
+        "bit[]" => "varbit[]".to_string(),
+        other => other.to_string(),
+    }
+}
+
 fn sql_type(ty: &str) -> String {
     ty.to_string()
 }
