@@ -455,12 +455,14 @@ pub fn blocking_sort(
 
     if let Some(k) = limit {
         // mongod's top-k sorter keeps only the k first; a limit of one never
-        // goes near its budget.
+        // goes near its budget. Its sorter for a limit of one (sorter.cpp's
+        // `LimitOneSorter`) counts the keys it saw but no bytes: mongod
+        // 8.2.11 reports `totalDataSizeSorted: 0` for it (RM-374).
         let mut items: Vec<Held> = items.collect();
         items.sort_by(|a, b| cmp(&a.0, &b.0));
         items.truncate(k);
         let held: usize = items.iter().map(size).sum();
-        record(held);
+        record(if k == 1 { 0 } else { held });
         if k > 1 && held > effective && !memlimit::disk_allowed() {
             return Err(refused(budget));
         }
@@ -658,6 +660,33 @@ mod tests {
             report.sort_spilled_bytes,
             report.sort_spilled_data_storage_size,
         )
+    }
+
+    #[test]
+    fn a_sort_of_one_counts_no_data_sorted() {
+        // mongod 8.2.11, `find({z: 0}).sort({y: 1})` over six documents:
+        // `totalDataSizeSorted` 0 for a limit of 1, 134 for 2 (RM-374).
+        let sizing = Sizing {
+            source: SortSource::QueryLayer,
+            fields: None,
+            added: None,
+            budget: memlimit::MAX_BYTES,
+        };
+        let docs = || {
+            (0..6)
+                .map(|i| (vec![Bson::Int32(i % 3)], doc! { "_id": i, "y": i % 3 }))
+                .collect::<Vec<_>>()
+        };
+        let sorted = |k: usize| {
+            let (out, report) =
+                memlimit::captured(|| blocking_sort(docs(), &cmp, &sizing, Some(k)));
+            (ids(&out.unwrap()), report.sort_total_data_size)
+        };
+        let (one, bytes) = sorted(1);
+        assert_eq!((one, bytes), (vec![0], 0));
+        let (two, bytes) = sorted(2);
+        assert_eq!(two, vec![0, 3]);
+        assert!(bytes > 0);
     }
 
     #[test]
