@@ -4,8 +4,9 @@ compares as `bpchar`) found:
 - RP-685: a `char(n)` column compared with a `text` value compares as
   `bpchar`, dropping the constant's blanks, where PostgreSQL casts the
   column to `text` and compares `text`s;
-- RP-684: `= ANY` of a `char(n)` array finds nothing over a `char(n)`
-  column, as the array's padded elements are compared with their blanks.
+- RP-684 (fixed): `= ANY` of a `char(n)` array found nothing over a
+  `char(n)` column, as the array's padded elements were compared with their
+  blanks.
 
 Each is wrong in a plain WHERE, in a FROM-subquery's column over a `min` /
 `max` and in a HAVING alike. Measured on a private PostgreSQL 15.19 cluster
@@ -66,8 +67,16 @@ def test_char_n_against_text_compares_as_text(query: str, dsn: str) -> None:
     assert _rows(dsn, query) == TEXT[query]
 
 
-# `bpchareq` drops the trailing blanks of both sides (`bcTruelen`).
+# `bpchareq` drops the trailing blanks of both sides (`bcTruelen`); a
+# `char(n)` side meets a `text[]` as `text` through `rtrim`, so the text
+# elements keep theirs. Each measured on 15.19.
 ANY = {
+    """select k from t680 where f = any('{"a ",xy}'::text[]) order by k""": [(2,)],
+    "select k from t680 where f = any(array['a ']) order by k": [],
+    """select k from t680 where f = any('{"a ",xy}') order by k""": [(1,), (2,)],
+    """select k from t680 where f <> all('{"a  ",b}'::char(3)[]) order by k""": [(2,)],
+    """select k from t680 where f < all('{"b ",xy}'::char(3)[]) order by k""": [(1,)],
+    """select k from t680 where (f || '') = any('{"a  "}'::char(3)[]) order by k""": [(1,)],
     "select k from t680 where f = any('{a,xy}'::char(3)[]) order by k": [(1,), (2,)],
     f"select k from {_GROUPED} where x = any('{{a,xy}}'::char(3)[]) order by k": [
         (1,),
@@ -80,7 +89,9 @@ ANY = {
 }
 
 
-@pytest.mark.backlog("RP-684")
+@pytest.mark.backlog_fixed("RP-684")
 @pytest.mark.parametrize("query", list(ANY))
 def test_any_of_a_char_n_array_compares_as_bpchar(query: str, dsn: str) -> None:
+    """An array's padded `char(n)` elements were compared with their blanks
+    against the trimmed stored value, and found nothing."""
     assert _rows(dsn, query) == ANY[query]

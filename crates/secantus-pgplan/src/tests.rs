@@ -5746,3 +5746,33 @@ fn a_name_bound_inside_a_derived_table_is_not_bound_beside_it() {
         assert_eq!(foreign_qualifier(&body).as_deref(), outer, "{sql}");
     }
 }
+
+/// Which sides of `x op ANY (array)` drop their trailing blanks, each pair
+/// measured on PostgreSQL 15.19 (RP-684).
+#[test]
+fn any_array_bpchar_trims_follow_operator_resolution() {
+    for (lhs, lu, array, au, want) in [
+        // `bpchareq` over both sides.
+        ("bpchar", false, "bpchar[]", false, (true, true)),
+        // An untyped literal on either side is read as the `char(n)` one.
+        ("bpchar", false, "text", true, (true, true)),
+        ("text", true, "bpchar[]", false, (true, true)),
+        // A `varchar` side against a `char(n)` one is compared as `bpchar`.
+        ("bpchar", false, "varchar[]", false, (true, true)),
+        ("varchar", false, "bpchar[]", false, (true, true)),
+        // `text` / `name` against `char(n)`: the `char(n)` side through
+        // `rtrim`, the text side as it is.
+        ("bpchar", false, "text[]", false, (true, false)),
+        ("bpchar", false, "name[]", false, (true, false)),
+        ("text", false, "bpchar[]", false, (false, true)),
+        // No `char(n)` side: nothing is trimmed.
+        ("text", false, "text[]", false, (false, false)),
+        ("varchar", false, "varchar[]", false, (false, false)),
+    ] {
+        assert_eq!(
+            any_array_bpchar_trims(lhs, lu, array, au),
+            want,
+            "{lhs} op ANY ({array})"
+        );
+    }
+}
