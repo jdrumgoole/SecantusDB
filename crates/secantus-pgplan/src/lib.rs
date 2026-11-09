@@ -17329,6 +17329,41 @@ pub(crate) fn trim_bpchar(v: Bson) -> Bson {
     }
 }
 
+/// The two operands of a comparison (`=`, `<>`, the orderings) as the
+/// operator their types resolve to compares them, where one side is a
+/// `char(n)`: against another `char(n)`, an untyped literal or a `varchar`
+/// (read as `bpchar` by the implicit cast) both sides are `bpchar`, and
+/// `bpchareq` / `bpcharcmp` ignore the trailing blanks on each; against
+/// `text` the operator is `texteq`, the `char(n)` side cast to text (its
+/// blanks dropped, as `rtrim1` does) and the text side as it is. The binary
+/// operators, a simple CASE's `test = label` and NULLIF's `a = b` all
+/// compare through it (RP-726, RP-737).
+fn bpchar_compared_operands(
+    l: Option<&pg_query::protobuf::Node>,
+    mut lhs: Bson,
+    r: Option<&pg_query::protobuf::Node>,
+    mut rhs: Bson,
+) -> (Bson, Bson) {
+    let bp = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+        n.is_some_and(|n| is_bpchar_type(&static_type(n, v)))
+    };
+    let (lb, rb) = (bp(l, &lhs), bp(r, &rhs));
+    if !(lb || rb) {
+        return (lhs, rhs);
+    }
+    let vc = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+        n.is_some_and(|n| is_varchar_type(&static_type(n, v)))
+    };
+    let (lu, ru) = (unknown_operand(l), unknown_operand(r));
+    if lb || (rb && (lu || vc(l, &lhs))) {
+        lhs = trim_bpchar(lhs);
+    }
+    if rb || (lb && (ru || vc(r, &rhs))) {
+        rhs = trim_bpchar(rhs);
+    }
+    (lhs, rhs)
+}
+
 /// Which sides of `x op ANY / ALL (array)` drop their trailing blanks:
 /// `(x, the array's elements)`, given `x`'s type and the array's.
 ///
@@ -45421,9 +45456,19 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 Some(subject) => {
                     let label =
                         case_label(c.arg.as_deref(), subject, test, const_value(test, params)?)?;
-                    *subject != Bson::Null
+                    // `test = label` through the operator the two types
+                    // resolve to: a `char(n)` side against a `varchar` one
+                    // is `bpchareq`, against `text` `texteq` over its text,
+                    // so its padding does not count (RP-737).
+                    let (s, label) = bpchar_compared_operands(
+                        c.arg.as_deref(),
+                        subject.clone(),
+                        Some(test),
+                        label,
+                    );
+                    s != Bson::Null
                         && label != Bson::Null
-                        && eval_binary("=", subject.clone(), label)? == Bson::Boolean(true)
+                        && eval_binary("=", s, label)? == Bson::Boolean(true)
                 }
                 // Searched form: only TRUE takes the branch.
                 None => const_value(test, params)? == Bson::Boolean(true),
@@ -45670,9 +45715,18 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 }
                 return Ok(lhs);
             }
-            if lhs != Bson::Null
-                && rhs != Bson::Null
-                && compare_constants(&lhs, &rhs) == Some(std::cmp::Ordering::Equal)
+            // `a = b` through the operator the two types resolve to: a
+            // `char(n)` side's padding does not count (RP-737). The value
+            // returned is still the left operand as it was.
+            let (lc, rc) = bpchar_compared_operands(
+                e.lexpr.as_deref(),
+                lhs.clone(),
+                e.rexpr.as_deref(),
+                rhs.clone(),
+            );
+            if lc != Bson::Null
+                && rc != Bson::Null
+                && compare_constants(&lc, &rc) == Some(std::cmp::Ordering::Equal)
             {
                 return Ok(Bson::Null);
             }
@@ -46073,23 +46127,12 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             };
             let (lb, rb) = (bp(e.lexpr.as_deref(), &lhs), bp(e.rexpr.as_deref(), &rhs));
             if lb || rb {
-                let (lu, ru) = (
-                    unknown_operand(e.lexpr.as_deref()),
-                    unknown_operand(e.rexpr.as_deref()),
-                );
                 if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
                     // A `varchar` side against a `char(n)` one is read as
                     // `bpchar` too: `'ab '::varchar = 'ab'::char(3)` is true
                     // on 15.19 (RP-726).
-                    let vc = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
-                        n.is_some_and(|n| is_varchar_type(&static_type(n, v)))
-                    };
-                    if lb || (rb && (lu || vc(e.lexpr.as_deref(), &lhs))) {
-                        lhs = trim_bpchar(lhs);
-                    }
-                    if rb || (lb && (ru || vc(e.rexpr.as_deref(), &rhs))) {
-                        rhs = trim_bpchar(rhs);
-                    }
+                    (lhs, rhs) =
+                        bpchar_compared_operands(e.lexpr.as_deref(), lhs, e.rexpr.as_deref(), rhs);
                 } else if op == "||" {
                     if lb {
                         lhs = trim_bpchar(lhs);
