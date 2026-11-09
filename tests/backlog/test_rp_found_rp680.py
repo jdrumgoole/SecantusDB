@@ -1,9 +1,9 @@
 """What working RP-680 (a HAVING comparison of a `char(n)` `min` / `max`
 compares as `bpchar`) found:
 
-- RP-685: a `char(n)` column compared with a `text` value compares as
+- RP-685: a `char(n)` column compared with a `text` value compared as
   `bpchar`, dropping the constant's blanks, where PostgreSQL casts the
-  column to `text` and compares `text`s;
+  column to `text` and compares `text`s (fixed);
 - RP-684 (fixed): `= ANY` of a `char(n)` array found nothing over a
   `char(n)` column, as the array's padded elements were compared with their
   blanks.
@@ -11,6 +11,11 @@ compares as `bpchar`) found:
 Each is wrong in a plain WHERE, in a FROM-subquery's column over a `min` /
 `max` and in a HAVING alike. Measured on a private PostgreSQL 15.19 cluster
 with `_SETUP`, and on the shared one with the table temporary: the same rows.
+
+What working RP-685 found:
+
+- RP-691: an IN list or a BETWEEN over a `char(n)` column compared with the
+  constants' blanks, so `in ('xy  ')` found nothing (fixed).
 """
 
 from __future__ import annotations
@@ -58,10 +63,21 @@ TEXT = {
     "select k from t680 where f = 'xy'::text order by k": [(2,)],
     f"select k from {_GROUPED} where x = 'xy  '::text order by k": [],
     "select k from t680 group by k having max(f) = 'xy  '::text order by k": [],
+    # `name` compares as `text` too; a `varchar` is cast to `bpchar`.
+    "select k from t680 where f = 'xy  '::name order by k": [],
+    "select k from t680 where f = 'xy  '::varchar order by k": [(2,)],
+    # The column is `rtrim`med, the constant kept: `'xy' < 'xy '`.
+    "select k from t680 where f < 'xy '::text order by k": [(1,), (2,), (3,)],
+    "select k from t680 where f <> 'xy  '::text order by k": [(1,), (2,), (3,)],
+    "select k from t680 where f = 'xy' || ' ' order by k": [],
+    "select k from t680 where f = rpad('xy', 4) order by k": [],
+    "select k from t680 where k = 1 or f = 'xy  '::text order by k": [(1,)],
+    # An untyped literal is `bpchar`: its blanks are dropped.
+    "select k from t680 where f = 'xy  ' order by k": [(2,)],
 }
 
 
-@pytest.mark.backlog("RP-685")
+@pytest.mark.backlog_fixed("RP-685")
 @pytest.mark.parametrize("query", list(TEXT))
 def test_char_n_against_text_compares_as_text(query: str, dsn: str) -> None:
     assert _rows(dsn, query) == TEXT[query]
@@ -95,3 +111,23 @@ def test_any_of_a_char_n_array_compares_as_bpchar(query: str, dsn: str) -> None:
     """An array's padded `char(n)` elements were compared with their blanks
     against the trimmed stored value, and found nothing."""
     assert _rows(dsn, query) == ANY[query]
+
+
+# An IN list's members take the column's type (`select_common_type` keeps
+# `bpchar`, even beside a `text` member); BETWEEN is two operators, each
+# resolved on its own.
+IN_BETWEEN = {
+    "select k from t680 where f in ('xy  ', 'q') order by k": [(2,)],
+    "select k from t680 where f in ('xy  ') order by k": [(2,)],
+    "select k from t680 where f in ('xy  '::text, 'q'::text) order by k": [(2,)],
+    "select k from t680 where f not in ('xy  ', 'q') order by k": [(1,), (3,)],
+    "select k from t680 where f between 'xy  ' and 'xy  ' order by k": [(2,)],
+    "select k from t680 where f between 'xy '::char(3) and 'xy'::char(3) order by k": [(2,)],
+    "select k from t680 where f between 'xy '::text and 'xz'::text order by k": [],
+}
+
+
+@pytest.mark.backlog_fixed("RP-691")
+@pytest.mark.parametrize("query", list(IN_BETWEEN))
+def test_in_and_between_over_char_n_compare_as_bpchar(query: str, dsn: str) -> None:
+    assert _rows(dsn, query) == IN_BETWEEN[query]

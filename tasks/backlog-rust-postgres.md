@@ -2456,23 +2456,6 @@ that reaches a comparison carrying its blanks is compared with them.
       Verify: tests/backlog/test_rp_found_rp671.py::test_over_on_a_plain_function_is_42809
       Backlog-ID: RP-682
 
-## Found while working RP-680 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster (and the shared one, alike)
-with the `_SETUP` in `tests/backlog/test_rp_found_rp680.py`. Each is wrong in
-a plain WHERE over a `char(n)` column, in a FROM-subquery's column over a
-`min` / `max` and in a HAVING alike.
-
-- [ ] **A `char(n)` column compared with a `text` value compares as
-      `bpchar`.** There is no `bpchar = text` operator: PostgreSQL 15.19
-      casts the column to `text` (`rtrim`, the implicit cast) and compares
-      `text`s, so `select k from t680 where f = 'xy  '::text` finds no row,
-      and `= 'xy'::text` finds the `'xy'` one. Here the first finds the
-      `'xy'` row too: the constant's blanks are dropped as `bpchar`'s
-      operator would.
-      Verify: tests/backlog/test_rp_found_rp680.py::test_char_n_against_text_compares_as_text
-      Backlog-ID: RP-685
-
 ## Found while working RP-670 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in

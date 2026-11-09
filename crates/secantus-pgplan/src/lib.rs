@@ -46895,12 +46895,7 @@ fn lower_aexpr(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     // 14.24). The stored value is unpadded -- padding happens on output --
     // so the literal is stripped to match it, rather than padded to a width
     // the stored side does not carry.
-    let value = match (&value, def.columns.iter().find(|c| c.name == col)) {
-        (Bson::String(text), Some(c)) if c.pg_type == "bpchar" => {
-            Bson::String(text.trim_end_matches(' ').to_string())
-        }
-        _ => value,
-    };
+    let value = bpchar_operand(def, &field, e.rexpr.as_deref(), value, true);
     // A regtype / regclass value filters by its OID -- the stored column is
     // a number.
     let value = match regtype_oid(&value).or_else(|| regclass_oid(&value)) {
@@ -47373,7 +47368,12 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     let mut values = Vec::new();
     let mut saw_null = false;
     for item in items {
-        let v = coerce_to_column(def, &field, reg_oid_operand(const_value(item, params)?))?;
+        // An IN list's members take the column's type (`select_common_type`
+        // keeps the first, `bpchar`, as `text` and `bpchar` coerce both
+        // ways), so a `char(n)` column compares each as `bpchar`, even a
+        // `text` one: `f in ('xy  '::text)` finds `'xy'` (RP-691).
+        let v = bpchar_operand(def, &field, Some(item), const_value(item, params)?, false);
+        let v = coerce_to_column(def, &field, reg_oid_operand(v))?;
         if v == Bson::Null {
             saw_null = true;
         } else {
@@ -47426,6 +47426,42 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     Ok(doc! { field: { "$in": values } })
 }
 
+/// A constant compared with the column `field` of `def`: a `char(n)`
+/// column's comparison IGNORES TRAILING BLANKS (`bpchareq`, `bcTruelen`),
+/// and the stored value carries none, so the constant is stripped to match.
+///
+/// Only when the comparison is `bpchar`'s: an untyped literal, a `char(n)`
+/// or a `varchar` value (cast to `bpchar` implicitly). There is no `bpchar
+/// = text` operator, so where `text_wins`, against a `text` or `name`
+/// value PostgreSQL 15.19 casts the column to `text` (`rtrim`) and compares
+/// `text`s: `f = 'xy  '::text` finds nothing and `f < 'xy '::text` finds
+/// `'xy'` (RP-685). The stored value is the column's `rtrim` already, so
+/// that constant is compared as it is. An IN list passes `false`: its
+/// members are coerced to the column's type first (RP-691).
+fn bpchar_operand(
+    def: &TableDef,
+    field: &str,
+    node: Option<&pg_query::protobuf::Node>,
+    value: Bson,
+    text_wins: bool,
+) -> Bson {
+    let Bson::String(text) = &value else {
+        return value;
+    };
+    if field_type(def, field) != Some("bpchar") {
+        return value;
+    }
+    let text_compare = text_wins
+        && node.is_some_and(|n| {
+            !unknown_operand(Some(n)) && matches!(static_type(n, &value).as_str(), "text" | "name")
+        });
+    if text_compare {
+        value
+    } else {
+        Bson::String(text.trim_end_matches(' ').to_string())
+    }
+}
+
 /// `x BETWEEN a AND b` / `x NOT BETWEEN a AND b`.
 fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
     composite_compare_is_per_row(e, def, params)?;
@@ -47434,8 +47470,15 @@ fn lower_between(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document>
         Some(N::List(l)) if l.items.len() == 2 => &l.items,
         _ => return Err(Error::Unsupported("this BETWEEN form".into())),
     };
-    let lo = coerce_to_column(def, &field, const_value(&bounds[0], params)?)?;
-    let hi = coerce_to_column(def, &field, const_value(&bounds[1], params)?)?;
+    // BETWEEN is `x >= lo AND x <= hi`, each operator resolved on its own:
+    // a `char(n)` column's bound is compared as `bpchar` (blanks dropped)
+    // unless it is `text` (RP-691).
+    let bound = |n: &pg_query::protobuf::Node| -> Result<Bson> {
+        let v = bpchar_operand(def, &field, Some(n), const_value(n, params)?, true);
+        coerce_to_column(def, &field, v)
+    };
+    let lo = bound(&bounds[0])?;
+    let hi = bound(&bounds[1])?;
     if field_type(def, &field) == Some("date") && (is_instant(&lo) || is_instant(&hi)) {
         let bound = |v: &Bson, node: &pg_query::protobuf::Node, op: &str| {
             if is_instant(v) {
