@@ -29961,8 +29961,10 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                     // Typed from the `=` PostgreSQL resolves: its LEFT input
                     // type, which an implicit cast may widen (RP-076).
                     (Some(l), Some(r)) => {
+                        // An untyped right side reads as the left's type
+                        // (RP-741).
                         let lt = static_type(l, value);
-                        let rt = static_type(r, &Bson::Null);
+                        let rt = nullif_right_type(r, &Bson::Null, &lt);
                         funcsig::operator_left_input("=", &lt, &rt).unwrap_or(lt)
                     }
                     (Some(l), _) => static_type(l, value),
@@ -40369,6 +40371,23 @@ fn unknown_operand(n: Option<&pg_query::protobuf::Node>) -> bool {
     }
 }
 
+/// The type NULLIF's `=` reads its right operand as, given the left one's
+/// type `lt`: an untyped literal or a bare NULL is `unknown`, which operator
+/// resolution reads as the other side's type (`oper_select_candidate`'s
+/// "unknown is the same type as the known input"). So
+/// `nullif('ab'::char(4), 'zz')` is `bpchareq`, the result the left operand
+/// as it is, `character` with its padding; `nullif('a'::varchar, 'b')` is
+/// still `texteq` and `text`, as `varchar = varchar` resolves there
+/// (RP-741).
+fn nullif_right_type(r: &pg_query::protobuf::Node, v: &Bson, lt: &str) -> String {
+    let null = matches!(r.node.as_ref(), Some(N::AConst(c)) if c.isnull);
+    if null || unknown_operand(Some(r)) {
+        lt.to_string()
+    } else {
+        static_type(r, v)
+    }
+}
+
 /// The full-text operators: `@@` / `@@@` (with `text` sides converted as
 /// PostgreSQL's `ts_match_tt` / `ts_match_tq` do), `||` / `&&` / `<->` on
 /// queries, `||` on vectors. `None`: not a full-text operation.
@@ -45773,7 +45792,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             if let (Some(l), Some(r)) = (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                 if lhs != Bson::Null && !l_bare {
                     let lt = static_type(l, &lhs);
-                    let rt = static_type(r, &rhs);
+                    let rt = nullif_right_type(r, &rhs, &lt);
                     if let Some(input) = funcsig::operator_left_input("=", &lt, &rt) {
                         if input != lt {
                             // A `char(n)` loses its padding on the way to

@@ -3202,19 +3202,6 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 
 ## Found while working RP-737 (2026-11-09)
 
-Measured on PostgreSQL 15.19 (the shared reference on port 5415) with
-FROM-less statements and a VALUES list; the gap tests are in
-`tests/backlog/test_rp_found_rp737.py`.
-
-- [ ] **NULLIF of a `char(n)` against an untyped literal or NULL is typed
-      `text` and drops its padding.** `select nullif('ab'::char(4), 'zz')`
-      is `character` `ab  ` on PostgreSQL 15.19 (`bpchareq`, the literal
-      read as `bpchar`, so the result keeps the left operand's type);
-      here it is `text` `ab`, and so is `nullif('ab'::char(4), null)` and
-      `nullif(c, 'zz')` over a `char(3)` column. Against a typed
-      `char(n)`, `varchar` or `text` operand the type and value match.
-      Verify: tests/backlog/test_rp_found_rp737.py::test_nullif_char_n_against_untyped_keeps_bpchar
-      Backlog-ID: RP-741
 - [ ] **A cancel while a 200,000-item `IN` list is planned still waits
       up to ~0.25 s, about one time in twenty.** RP-202's
       `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`
@@ -3231,7 +3218,10 @@ FROM-less statements and a VALUES list; the gap tests are in
       branch (lane pg-batch-2, debug build) the whole file's run had the
       cancel 0.62 s and 0.72 s late in two of three runs at a load average
       of about 16, then passed ten runs at loads of 11 and 23, four of them
-      on a build of `aae69552`, before RP-733.
+      on a build of `aae69552`, before RP-733. Again on the RP-741 branch
+      (lane pg-batch-3, debug build, 2026-11-10): 0.32 s late once in the
+      gate's backlog step at a load of about 13, then the file passed five
+      runs in a row at loads of 13-16.
       Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
       Backlog-ID: RP-735
 
