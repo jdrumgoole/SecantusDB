@@ -493,6 +493,12 @@ pub(crate) fn spill_dir() -> PathBuf {
         .unwrap_or_else(std::env::temp_dir)
 }
 
+/// The BSON size of an index key holding `values`: an object whose fields
+/// have empty names, as mongod's index key data is.
+pub fn index_key_len(values: &[Bson]) -> usize {
+    5 + values.iter().map(|v| 2 + value_len(v)).sum::<usize>()
+}
+
 /// The BSON size of `doc`, without encoding it.
 pub fn bson_len(doc: &Document) -> usize {
     5 + doc

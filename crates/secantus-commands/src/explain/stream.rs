@@ -979,7 +979,10 @@ enum Stage {
         /// The command's collation: the keys' values compare under it, as
         /// mongod's sort compares them whatever the index's collation.
         collation: Option<Collation>,
+        budget: Option<(secantus_core::memlimit::Budgets, bool)>,
         t: Tally,
+        /// What its sorter counted (`totalDataSizeSorted`).
+        report: Option<Box<secantus_core::memlimit::SpillReport>>,
     },
     /// A blocking sort of whole documents above the FETCH: every document
     /// read, and examined, for the first batch, then sorted -- documents
@@ -997,6 +1000,55 @@ enum Stage {
         report: Option<Box<secantus_core::memlimit::SpillReport>>,
     },
     Near(Box<NearStage>),
+}
+
+/// A sort's refusal (292 past its budget) as the executor reports it.
+fn sort_fault(f: secantus_core::fallback::Fallback) -> StorageError {
+    match f.as_mongo() {
+        Some((code, msg)) => StorageError::WriteError {
+            code,
+            errmsg: msg.to_string(),
+            exec: true,
+        },
+        None => fault(f),
+    }
+}
+
+/// What mongod's sort of index keys counts of `m` (`sorter::member_size`):
+/// the values of the index key it was found at, read from `blob`, its
+/// document -- of a multikey field, the element the entry keys -- and of
+/// those, the sort pattern's.
+fn member_size(pattern: &[(String, bool)], m: &Member, blob: &[u8]) -> Result<usize, StorageError> {
+    let Some(entry) = &m.entry else {
+        return Ok(0);
+    };
+    let doc = secantus_core::bsondoc::from_bytes(blob).map_err(undecodable)?;
+    let meta = &entry.meta;
+    let values: Vec<Bson> = meta
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(at, field)| {
+            let keys = secantus_core::index_keys::field_keys(&doc, field, meta.sparse);
+            let part = entry.parts.get(at);
+            let keyed = keys.mongod.iter().find(|v| {
+                part.is_some_and(|p| {
+                    sortkey::encode_value(v, meta.collation.as_ref()).is_ok_and(|k| k == *p)
+                })
+            });
+            keyed.or(keys.mongod.first()).cloned().unwrap_or(Bson::Null)
+        })
+        .collect();
+    let sort_key: Vec<Bson> = pattern
+        .iter()
+        .map(|(field, _)| {
+            meta.fields
+                .iter()
+                .position(|f| f == field)
+                .map_or(Bson::Null, |at| values[at].clone())
+        })
+        .collect();
+    Ok(secantus_core::sorter::member_size(&sort_key, &values))
 }
 
 /// Sort `all` by `pattern` as mongod's `SORT` does, holding it to its
@@ -1040,14 +1092,7 @@ fn sort_members(
             &sizing,
             top,
         )
-        .map_err(|f| match f.as_mongo() {
-            Some((code, msg)) => StorageError::WriteError {
-                code,
-                errmsg: msg.to_string(),
-                exec: true,
-            },
-            None => fault(f),
-        })?;
+        .map_err(sort_fault)?;
         report = Some(secantus_core::memlimit::report().less(&before));
     }
     let blobs: Vec<&[u8]> = all
@@ -1399,29 +1444,47 @@ impl Stage {
                 input,
                 sorted,
                 collation,
+                budget,
                 t,
+                report,
             } => {
                 if sorted.is_none() {
-                    let mut all: Vec<(Vec<Vec<u8>>, Member)> = Vec::new();
+                    let mut all: Vec<(Vec<Vec<u8>>, Member, usize)> = Vec::new();
                     while let Some(m) = input.next(cx)? {
-                        let key = match collation {
-                            // The values the keys hold, compared under the
-                            // collation: read from the document as it is
-                            // at the sort (a key is not its value here),
-                            // which is no FETCH of mongod's, so not counted.
-                            Some(c) => match cx.read(m.rid)? {
-                                Some(blob) => collated_key(pattern, &blob, c)?,
-                                None => pattern_key(pattern, &m),
-                            },
-                            None => pattern_key(pattern, &m),
+                        // The values the keys hold, to compare under the
+                        // collation and to count as the sorter does: read
+                        // from the document as it is at the sort (a key
+                        // here does not keep its value's type), which is
+                        // no FETCH of mongod's, so not counted.
+                        let blob = if collation.is_some() || budget.is_some() {
+                            cx.read(m.rid)?
+                        } else {
+                            None
                         };
-                        all.push((key, m));
+                        let key = match (collation.as_ref(), blob.as_deref()) {
+                            (Some(c), Some(b)) => collated_key(pattern, b, c)?,
+                            _ => pattern_key(pattern, &m),
+                        };
+                        let size = match (budget.is_some(), blob.as_deref()) {
+                            (true, Some(b)) => member_size(pattern, &m, b)?,
+                            _ => 0,
+                        };
+                        all.push((key, m, size));
                     }
                     all.sort_by(|a, b| a.0.cmp(&b.0));
-                    if let Some(n) = limit.filter(|n| *n > 0) {
-                        all.truncate(n as usize);
+                    let top = limit.filter(|n| *n > 0).map(|n| n as usize);
+                    if let Some((budgets, disk)) = budget {
+                        let before = secantus_core::memlimit::report();
+                        let _disk = secantus_core::memlimit::allow_disk_use(*disk);
+                        let sizes: Vec<usize> = all.iter().map(|a| a.2).collect();
+                        secantus_core::sorter::count_members(&sizes, budgets.sort, top)
+                            .map_err(sort_fault)?;
+                        *report = Some(Box::new(secantus_core::memlimit::report().less(&before)));
                     }
-                    *sorted = Some(all.into_iter().map(|(_, m)| m).collect());
+                    if let Some(n) = top {
+                        all.truncate(n);
+                    }
+                    *sorted = Some(all.into_iter().map(|(_, m, _)| m).collect());
                 }
                 Ok(sorted_next(sorted, t))
             }
@@ -1845,7 +1908,9 @@ fn stage_of(
                 input: Box::new(input),
                 sorted: None,
                 collation: opts.collation.cloned(),
+                budget: opts.sort_budget,
                 t: Tally::default(),
+                report: None,
             })
         }
         Node::SortMerge { pattern, inputs } => {
@@ -2829,15 +2894,15 @@ fn report(node: &Node, stage: &Stage, y: Yields) -> Option<Report> {
             let children = children_of(nodes, &merge.inputs, y)?;
             Some(above(stage, &merge.t, children, dups(&merge.t), y))
         }
-        (Node::Sort { input: n, .. }, Stage::SortKeys { input, t, .. }) => {
-            let c = report(n, input, y)?;
-            let mut extra = Document::new();
-            super::exec::fixed_extra(node, &mut extra);
-            Some(above(stage, t, vec![c], extra, y))
-        }
         (
             Node::Sort { input: n, .. },
-            Stage::SortDocs {
+            Stage::SortKeys {
+                input,
+                t,
+                report: counted,
+                ..
+            }
+            | Stage::SortDocs {
                 input,
                 t,
                 report: counted,

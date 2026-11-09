@@ -116,12 +116,12 @@ def test_a_sort_of_one_document_counts_no_data_sorted(rust_mongo: Any, mongod: A
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-375")
+@pytest.mark.backlog_fixed("RM-375")
 def test_a_sort_of_index_keys_counts_the_data_it_sorted(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SORT of index keys below a FETCH (`type:
     "default"`) counts the data it sorted: 780 for the twelve `{y, x}`
-    keys of `find({y: {$gte: 0}}).sort({x: 1})`. This server sorts the keys
-    without its sorter and reports no `totalDataSizeSorted`."""
+    keys of `find({y: {$gte: 0}}).sort({x: 1})`. This server sorted the
+    keys without its sorter and reported no `totalDataSizeSorted`."""
 
     def op(d: Any) -> Any:
         return list(d.c.find({"y": {"$gte": 0}}).sort("x", 1))

@@ -516,6 +516,45 @@ pub fn blocking_sort(
     Ok(out)
 }
 
+/// What mongod 8.2.11's `SORT` of index keys (`type: "default"`, below the
+/// FETCH) counts of each working-set member it sorts: its sort key, the
+/// index key it carries, and 32 bytes beside them (65 for an int sort key
+/// over a `{y: 1, x: 1}` key of two ints, measured over the key's types,
+/// its width and the sort's arity, 2026-11-09).
+const MEMBER: usize = 32;
+
+/// What one working-set member counts in a sort of index keys: `sort_key`
+/// its sort key's values, `index_key` the values of the index key it was
+/// found at.
+pub fn member_size(sort_key: &[Bson], index_key: &[Bson]) -> usize {
+    key_size(sort_key) + memlimit::index_key_len(index_key) + MEMBER
+}
+
+/// Count a sort of index keys as mongod's sorter counts it, `sizes` each
+/// member's [`member_size`] in sorted order, and hold it to `budget` as
+/// [`blocking_sort`] holds a sort of documents: refused (292) past it
+/// without disk use. `limit`: the sort's own, which keeps that many.
+pub fn count_members(sizes: &[usize], budget: usize, limit: Option<usize>) -> R<()> {
+    let effective = budget.saturating_sub(reserved(budget, FILE_ITERATOR));
+    let n = sizes.len() as i64;
+    if let Some(k) = limit {
+        // The top-k sorter keeps the k first, and its sorter of one counts
+        // no bytes (as `blocking_sort`'s, RM-374).
+        let held: usize = sizes.iter().take(k).sum();
+        memlimit::record_sort(n, if k == 1 { 0 } else { held as i64 });
+        if k > 1 && held > effective && !memlimit::disk_allowed() {
+            return Err(refused(budget));
+        }
+        return Ok(());
+    }
+    let total: usize = sizes.iter().sum();
+    if total > effective && !memlimit::disk_allowed() {
+        return Err(refused(budget));
+    }
+    memlimit::record_sort(n, total as i64);
+    Ok(())
+}
+
 /// `docs` sorted by the `$sort` spec `spec` (stable), held to the budget
 /// (see [`blocking_sort`]).
 pub fn sort_documents(
@@ -660,6 +699,34 @@ mod tests {
             report.sort_spilled_bytes,
             report.sort_spilled_data_storage_size,
         )
+    }
+
+    #[test]
+    fn a_sort_of_index_keys_counts_its_members_as_mongods_does() {
+        // mongod 8.2.11, `find({y: {$gte: 0}}).sort({x: 1})` over `{y: 1,
+        // x: 1}`: 65 a member (an int key, a two-int index key and 32),
+        // 137 for the sort `{x: 1, y: -1}`, 61 for a missing `x` (RM-375).
+        let ints = [Bson::Int32(1), Bson::Int32(7)];
+        assert_eq!(member_size(&ints[1..], &ints), 65);
+        assert_eq!(member_size(&[ints[1].clone(), ints[0].clone()], &ints), 137);
+        assert_eq!(
+            member_size(&[Bson::Null], &[Bson::Int32(1), Bson::Null]),
+            61
+        );
+        let counted = |sizes: &[usize], budget: usize, limit: Option<usize>| {
+            let _off = memlimit::allow_disk_use(false);
+            let (ran, report) = memlimit::captured(|| count_members(sizes, budget, limit));
+            ran.map(|()| report.sort_total_data_size)
+                .map_err(|f| f.as_mongo().map(|(code, _)| code))
+        };
+        // Twelve members need the budget less one 136-byte file iterator;
+        // a limit of three keeps three, a limit of one counts no bytes.
+        let twelve = [65; 12];
+        assert_eq!(counted(&twelve, 916, None), Ok(780));
+        assert_eq!(counted(&twelve, 915, None), Err(Some(292)));
+        assert_eq!(counted(&twelve, 331, Some(3)), Ok(195));
+        assert_eq!(counted(&twelve, 330, Some(3)), Err(Some(292)));
+        assert_eq!(counted(&twelve, 1, Some(1)), Ok(0));
     }
 
     #[test]
