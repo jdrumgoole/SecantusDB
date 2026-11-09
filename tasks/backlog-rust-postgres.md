@@ -3162,15 +3162,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
 `ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **A `varchar` compared with a `char(n)` counts the trailing blanks.**
-      `select v = c` over `'ab '::varchar(4)` and `'ab'::char(3)` is true on
-      PostgreSQL 15.19 both ways round: `varchar = bpchar` resolves to
-      `bpchareq`, the `varchar` side cast to `bpchar`, which ignores
-      trailing blanks. Here it is false, and a row comparison whose pair is
-      a `varchar` and a `char(n)` (`(v, k) = (select x.c, x.k ...)`)
-      inherits it.
-      Verify: tests/backlog/test_rp_found_rp697.py::test_varchar_against_bpchar_ignores_trailing_blanks
-      Backlog-ID: RP-726
 - [ ] **An uncorrelated `row op ANY / ALL (subquery)` with an ordering
       operator is refused.** `select k, (k, a) < any (select 2, 3) from
       rn697` answers per row on PostgreSQL 15.19 (each subquery row a
@@ -3191,6 +3182,48 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       over no rows.
       Verify: tests/backlog/test_rp_found_rp697.py::test_row_pair_with_no_operator_is_42883
       Backlog-ID: RP-728
+
+## Found while working RP-726 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp726.py`: `ch726(k int, c char(3), v
+varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
+'ab ')`.
+
+- [ ] **A JOIN ... ON a `varchar` column equal to a `char(n)` one misses
+      the row whose `varchar` has trailing blanks.** `select x.k, y.k from
+      ch726 x join ch726 y on x.v = y.c` is `(1, 1), (2, 2)` on PostgreSQL
+      15.19 (`bpchareq`, hashed by `hashbpchar`, ignores the blanks); here
+      `(1, 1)` only, and a LEFT join gives row 2 no partner. The bare
+      equality is a hash-join key (`joins::equalities`) compared as the raw
+      stored values. The comma-join WHERE form is answered.
+      Verify: tests/backlog/test_rp_found_rp726.py::test_join_on_varchar_against_char_n
+      Backlog-ID: RP-731
+- [ ] **A simple CASE and NULLIF over a `char(n)` and another string type
+      compare without the operator their types resolve to.** `case c when
+      v` and `nullif(v, c)`, `c` a `char(3)` `y` and `v` a `varchar` `y`,
+      are `eq` / NULL on PostgreSQL 15.19 (`bpchareq`); here `ne` / `y`, the
+      `char(n)` side compared with its padding. Against `text` (`texteq`,
+      the `char(n)` side cast to text) `case t when c` over `ab ` and `ab`
+      is `ne` there, `eq` here, and `nullif(t, c)` over `y` and `y` is
+      NULL there, `y` here. Two `char(n)` operands are answered.
+      Verify: tests/backlog/test_rp_found_rp726.py::test_case_and_nullif_compare_by_type
+      Backlog-ID: RP-732
+- [ ] **A cancel while a 200,000-item `IN` list is planned still waits
+      up to ~0.25 s, about one time in twenty.** RP-202's
+      `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`
+      measured 0.33 s and then 0.31 s (its bound is 0.3 s) in the backlog
+      step of `gate_pg.sh --fast` on 2026-11-09, at load 10-25 on 12
+      cores. With that test's own `_cancel_after` at delay 0.7 against a
+      debug `secantusd-pg`: at `b484522c`, 24 runs, 23 at 0.013-0.023 s
+      and one at 0.238 s; at the `pg-batch` tip `adb234a2`, without RP-726
+      and with it, 30 runs each, twice, medians 0.021-0.022 s and one late
+      cancel per 30 at 0.256-0.276 s on both. So some planning pass still
+      runs a stretch that does not look for a cancel, as the rewrite
+      passes did before RP-202; find which one by sampling the server when
+      a cancel is late.
+      Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
+      Backlog-ID: RP-735
 
 ## Found while working RP-681 (2026-11-09)
 

@@ -17299,6 +17299,14 @@ pub(crate) fn is_bpchar_type(t: &str) -> bool {
     t == "bpchar" || domains::base_type_and_typmod(t).is_some_and(|(base, _, _)| base == "bpchar")
 }
 
+/// A `varchar` type, or a domain over one. Against a `char(n)` operand it is
+/// read as `bpchar` (the implicit `varchar` -> `bpchar` cast makes
+/// `bpchareq` and the `bpchar` ordering the operators PostgreSQL resolves),
+/// so its trailing blanks do not count either (RP-726).
+pub(crate) fn is_varchar_type(t: &str) -> bool {
+    t == "varchar" || domains::base_type_and_typmod(t).is_some_and(|(base, _, _)| base == "varchar")
+}
+
 pub(crate) fn trim_bpchar(v: Bson) -> Bson {
     match v {
         Bson::String(t) => Bson::String(t.trim_end_matches(' ').to_string()),
@@ -17328,7 +17336,10 @@ fn any_array_bpchar_trims(
         is_bpchar_type(lhs_type),
         !array_unknown && is_bpchar_type(elem),
     );
-    let (lv, rv) = (lhs_type == "varchar", !array_unknown && elem == "varchar");
+    let (lv, rv) = (
+        is_varchar_type(lhs_type),
+        !array_unknown && is_varchar_type(elem),
+    );
     (
         lb || ((lhs_unknown || lv) && rb),
         rb || ((array_unknown || rv) && lb),
@@ -23095,6 +23106,12 @@ fn resolve_one_sublink(
                     if !matches!(c.pg_type.as_str(), "" | "unknown" | "record" | "text") {
                         declare_sublink_param(params.len() - 1, &c.pg_type);
                     }
+                    // A `char(n)` column's value says its type as it is
+                    // compared, so a `varchar` field against it is read as
+                    // `bpchar` and its trailing blanks do not count (RP-726).
+                    if is_bpchar_type(&c.pg_type) {
+                        return relabel_cast(node, &c.pg_type);
+                    }
                 }
                 node
             })
@@ -23425,14 +23442,26 @@ fn row_subquery_comparison(
             .args
             .iter()
             .zip(r)
-            .map(|(lhs, v)| pg_query::protobuf::Node {
-                node: Some(N::AExpr(Box::new(AExpr {
-                    kind: AExprKind::AexprOp as i32,
-                    name: vec![string_node(&op)],
-                    lexpr: Some(Box::new(lhs.clone())),
-                    rexpr: Some(Box::new(param_node(params, v))),
-                    location: -1,
-                }))),
+            .enumerate()
+            .map(|(i, (lhs, v))| {
+                // A `char(n)` subquery column's value keeps its type, so the
+                // pair takes the operator the two types resolve to: against
+                // a `varchar` field that is `bpchareq`, which ignores the
+                // trailing blanks on both sides (RP-726).
+                let value = param_node(params, v);
+                let rhs = match types.and_then(|t| t.get(i)) {
+                    Some(t) if is_bpchar_type(t) => relabel_cast(value, t),
+                    _ => value,
+                };
+                pg_query::protobuf::Node {
+                    node: Some(N::AExpr(Box::new(AExpr {
+                        kind: AExprKind::AexprOp as i32,
+                        name: vec![string_node(&op)],
+                        lexpr: Some(Box::new(lhs.clone())),
+                        rexpr: Some(Box::new(rhs)),
+                        location: -1,
+                    }))),
+                }
             })
             .collect();
         arms.push(if cmps.len() == 1 {
@@ -32803,6 +32832,34 @@ fn compared_fields(v: &Bson) -> Option<Vec<Bson>> {
             })
             .collect(),
     )
+}
+
+/// Two row constructors compare pair by pair, each pair through the
+/// operator its two types resolve to (`make_row_comparison_op`), not
+/// through `record_eq`: a `varchar` field against a `char(n)` one is
+/// `bpchareq` / the `bpchar` ordering, which ignore the `varchar` side's
+/// trailing blanks too (`('ab '::varchar) = ('ab'::char(3))` is true on
+/// 15.19, RP-726). `compared_fields` has already trimmed each `bpchar`
+/// field.
+fn row_ctor_bpchar_pairs(
+    a: &mut [Bson],
+    b: &mut [Bson],
+    ta: Option<&[String]>,
+    tb: Option<&[String]>,
+) {
+    let (Some(ta), Some(tb)) = (ta, tb) else {
+        return;
+    };
+    for (i, (x, y)) in a.iter_mut().zip(b.iter_mut()).enumerate() {
+        let (Some(tx), Some(ty)) = (ta.get(i), tb.get(i)) else {
+            continue;
+        };
+        if is_varchar_type(tx) && is_bpchar_type(ty) {
+            *x = trim_bpchar(std::mem::take(x));
+        } else if is_bpchar_type(tx) && is_varchar_type(ty) {
+            *y = trim_bpchar(std::mem::take(y));
+        }
+    }
 }
 
 /// `array_eq` / `array_cmp` over arrays of `ROW(...)` records
@@ -45992,10 +46049,16 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                     unknown_operand(e.rexpr.as_deref()),
                 );
                 if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-                    if lb || (lu && rb) {
+                    // A `varchar` side against a `char(n)` one is read as
+                    // `bpchar` too: `'ab '::varchar = 'ab'::char(3)` is true
+                    // on 15.19 (RP-726).
+                    let vc = |n: Option<&pg_query::protobuf::Node>, v: &Bson| {
+                        n.is_some_and(|n| is_varchar_type(&static_type(n, v)))
+                    };
+                    if lb || (rb && (lu || vc(e.lexpr.as_deref(), &lhs))) {
                         lhs = trim_bpchar(lhs);
                     }
-                    if rb || (ru && lb) {
+                    if rb || (lb && (ru || vc(e.rexpr.as_deref(), &rhs))) {
                         rhs = trim_bpchar(rhs);
                     }
                 } else if op == "||" {
@@ -46050,13 +46113,16 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         // else -- and only three-valued NULL logic applies when BOTH sides are
         // row constructors. `eval_binary` has no AST, so decide here.
         if matches!(op.as_str(), "=" | "<>" | "!=" | "<" | "<=" | ">" | ">=") {
-            if let (Some(a), Some(b)) = (compared_fields(&lhs), compared_fields(&rhs)) {
+            if let (Some(mut a), Some(mut b)) = (compared_fields(&lhs), compared_fields(&rhs)) {
                 let is_row_ctor = |n: Option<&pg_query::protobuf::Node>| {
                     matches!(n.and_then(|n| n.node.as_ref()), Some(N::RowExpr(_)))
                 };
                 let composite =
                     !(is_row_ctor(e.lexpr.as_deref()) && is_row_ctor(e.rexpr.as_deref()));
                 let (ta, tb) = (record_field_types(&lhs), record_field_types(&rhs));
+                if !composite {
+                    row_ctor_bpchar_pairs(&mut a, &mut b, ta.as_deref(), tb.as_deref());
+                }
                 return record_compare(&op, &a, &b, composite, ta.as_deref().zip(tb.as_deref()));
             }
         }
