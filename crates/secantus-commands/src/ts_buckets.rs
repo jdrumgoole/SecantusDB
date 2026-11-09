@@ -14,13 +14,15 @@
 //! storing it (`crud::insert`), which is what lets the stored order stand
 //! for the order `mongod` placed them in. A bucket never closes for size
 //! here: `mongod`'s limit depends on its cache size and on how many buckets
-//! the whole server has open. Shapes were read from `mongod` 8.2.11.
+//! the whole server has open. Shapes were read from `mongod` 8.2.11, and
+//! each data column holds `mongod`'s compressed bytes.
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use bson::spec::BinarySubtype;
 use bson::{doc, Binary, Bson, Document};
+use secantus_core::bsoncolumn::{ColumnBuilder, Element};
 
 use crate::CommandError;
 
@@ -422,46 +424,35 @@ fn fold(acc: Option<Bson>, v: &Bson, want_max: bool) -> Bson {
     }
 }
 
-/// One simple8b word holding a single "no value here" slot.
-const SKIP_WORD: u64 = 0xFFFF_FFFF_FFFF_FFFE;
-
 /// A bucket column (BSON binary subtype 7): one field's values across the
-/// bucket's measurements, `None` where a measurement has no such field.
-///
-/// Every value is written as a literal element and every gap as a skip. That
-/// is a valid column, and `mongod` unpacks it to the same measurements, but
-/// it is not the bytes `mongod` writes: `mongod` delta-encodes runs.
+/// bucket's measurements, `None` where a measurement has no such field, in
+/// the bytes `mongod`'s `BSONColumnBuilder` writes
+/// (`secantus_core::bsoncolumn`).
 fn column(values: &[Option<&Bson>]) -> Result<Bson, CommandError> {
-    let mut out: Vec<u8> = Vec::new();
-    let mut i = 0;
-    while i < values.len() {
-        match values[i] {
+    let mut raw: Vec<Option<Vec<u8>>> = Vec::with_capacity(values.len());
+    for v in values {
+        raw.push(match v {
             Some(v) => {
-                let element = crate::bsondoc::to_vec(&doc! {"": v.clone()})
+                let element = crate::bsondoc::to_vec(&doc! {"": (*v).clone()})
                     .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?;
                 // The element alone: without the document's length and its
                 // closing zero.
-                out.extend_from_slice(&element[4..element.len() - 1]);
-                i += 1;
+                Some(element[4..element.len() - 1].to_vec())
             }
-            None => {
-                let run = values[i..]
-                    .iter()
-                    .take(16)
-                    .take_while(|v| v.is_none())
-                    .count();
-                out.push(0x80 | (run as u8 - 1));
-                for _ in 0..run {
-                    out.extend_from_slice(&SKIP_WORD.to_le_bytes());
-                }
-                i += run;
-            }
-        }
+            None => None,
+        });
     }
-    out.push(0);
+    let mut builder = ColumnBuilder::new();
+    for element in &raw {
+        // Type byte, the empty name's terminator, then the value.
+        builder.append(element.as_ref().map(|e| Element {
+            ty: e[0],
+            value: &e[2..],
+        }));
+    }
     Ok(Bson::Binary(Binary {
         subtype: BinarySubtype::Column,
-        bytes: out,
+        bytes: builder.finalize(),
     }))
 }
 
@@ -1170,13 +1161,14 @@ mod tests {
             control.get_document("max").unwrap(),
             &doc! {"_id": 3, "t": at(2), "v": 3.5, "s": "x", "o": {"k": [1, 2]}}
         );
-        // `s` is a literal string, then one skipped slot, then the end.
+        // `s` is a literal string, then one skipped slot (a Simple-8b block
+        // holding one all-ones 60-bit slot), then the end.
         let Some(Bson::Binary(s)) = b.get_document("data").unwrap().get("s") else {
             panic!("no column");
         };
         assert_eq!(s.subtype, BinarySubtype::Column);
         let mut expected = vec![0x02, 0x00, 0x02, 0x00, 0x00, 0x00, b'x', 0x00, 0x80];
-        expected.extend_from_slice(&SKIP_WORD.to_le_bytes());
+        expected.extend_from_slice(&0xFFFF_FFFF_FFFF_FFFEu64.to_le_bytes());
         expected.push(0);
         assert_eq!(s.bytes, expected);
     }

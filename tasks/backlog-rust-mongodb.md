@@ -2349,10 +2349,6 @@ is left follows from that:
         measurements stays open for large ones: modelling that state is a
         decision for Joe. The reopening query's own size filter is left out
         for the same reason.
-      - **A bucket's `data` columns are valid but not mongod's bytes.** Each
-        value is a literal and each gap a skip. mongod 8.2.11 unpacks them to
-        the same measurements (checked by inserting one into its
-        `system.buckets`), but it writes delta-encoded runs.
       - **A bucket cannot be written.** An insert that passes the bucket
         schema, and any update or delete on `system.buckets.<name>`, answers
         115. `renameCollection` on it answers 166 (mongod renames it).
@@ -2373,10 +2369,22 @@ is left follows from that:
       **Decided 2026-10-16 (Joe):** store real buckets in mongod's
       compressed column format (BSONColumn), kept by the server-wide
       catalog, in place of measurements kept as documents. Existing stores
-      are converted on open. This also closes the `data` bytes, the bucket
-      writes, the `collStats` counters and the whole-collection read above.
+      are converted on open. This also closes the bucket writes, the
+      `collStats` counters and the whole-collection read above. (The
+      encoder exists: `secantus_core::bsoncolumn` writes mongod's column
+      bytes since 2026-11-09, and the derived buckets use it.)
       Backlog-ID: RM-088
       Verify: tests/backlog/test_rm_085_112.py::test_bucket_collection_can_be_deleted_from
+- [ ] **RUST MongoDB server: a measurement holding a BSONColumn binary
+      is stored** (found 2026-11-09 while building the bucket encoder).
+      mongod 8.2.11 refuses a measurement whose data field is, or holds at
+      any depth, a binary of subtype 7: `12506300`, `time-series insert
+      failed: <ns> :: caused by :: Timeseries collections cannot store
+      BSONColumn data`, and stores nothing; this server inserts it. The
+      check is `BSONColumnBuilder::append`'s, so it covers the data fields
+      only (the meta field is not appended to a column; not measured).
+      Backlog-ID: RM-462
+      Verify: tests/backlog/test_rm_462.py::test_a_measurement_cannot_hold_a_bsoncolumn
 - **Scope decision — a `hashed` index on a time-series collection** is
   refused as on any collection: hashed indexes are out of scope.
 - **Scope decision — `listCollections` order around time-series buckets.**
