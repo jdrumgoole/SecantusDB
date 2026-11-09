@@ -3286,7 +3286,7 @@ b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
       matches an array with a NULL element; `IS NOT DISTINCT FROM NULL` is
       right since RP-733 took it per row.
       Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
-      Backlog-ID: RP-736
+      Backlog-ID: RP-739
 - [ ] **`a = ANY (array of arrays)` over an array column answers rows.**
       `select k from x733 where a = any (array['{x,y}'::text[]])` is 42883
       `operator does not exist: text[] = text` on PostgreSQL 15.19 (the
@@ -3294,4 +3294,4 @@ b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
       compares `text[]` with `text`); here it answers the rows `a = '{x,y}'`
       would, through the MQL filter.
       Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_any_of_an_array_of_arrays
-      Backlog-ID: RP-737
+      Backlog-ID: RP-740

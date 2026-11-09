@@ -26,10 +26,10 @@ Found while working it, and since fixed:
 Found while working those (each a gap test below):
 
 - `a IS NULL` over an array column matches an array holding a NULL
-  element (RP-736);
+  element (RP-739);
 - `a = any (array['{x,y}'::text[]])` over a `text[]` column answers rows
   where PostgreSQL resolves `text[] = text` and refuses it, 42883
-  (RP-737).
+  (RP-740).
 
 The VALUES-only answers were measured on PostgreSQL 15.19 (the shared
 reference on port 5415). The ones over `x722` were measured on a private,
@@ -251,7 +251,7 @@ def test_a_write_filters_an_array_column_by_array_cmp(shapes: str) -> None:
     assert left == [(103,), (104,), (107,)]
 
 
-@pytest.mark.backlog("RP-736")
+@pytest.mark.backlog("RP-739")
 @pytest.mark.parametrize(
     ("where", "keys"),
     [
@@ -268,7 +268,7 @@ def test_a_null_test_over_an_array_column_reads_the_array(
     assert _answer(shapes, f"select k from x733 where {where} order by k") == [(k,) for k in keys]
 
 
-@pytest.mark.backlog("RP-737")
+@pytest.mark.backlog("RP-740")
 def test_an_array_column_against_any_of_an_array_of_arrays(shapes: str) -> None:
     """`array['{x,y}'::text[]]` is a `text[]`, so ANY compares `text[]` with
     `text`, which has no operator."""
