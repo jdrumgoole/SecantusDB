@@ -1,10 +1,10 @@
 """Every write path of an array column fitting its elements (RP-710), and
-gap tests of divergences found while working it:
+tests of divergences found while working it:
 
-- COPY FROM reads a field with no regard to its column's modifier, scalar
-  or array: an overlong `varchar(3)` value is stored, a `numeric(4,1)` one
-  keeps its digits, where PostgreSQL's `CopyFrom` reads each field with its
-  input function AT the column's modifier;
+- COPY FROM read a field with no regard to its column's modifier, scalar
+  or array: an overlong `varchar(3)` value was stored, a `numeric(4,1)` one
+  kept its digits, where PostgreSQL's `CopyFrom` reads each field with its
+  input function AT the column's modifier (fixed, RP-718);
 - a `char(n)[]` column's elements are stored unpadded, where PostgreSQL's
   element coercion (`bpchar(text, typmod)`, or `bpcharin` at the modifier
   for a literal or a COPY field) pads each one to the width.
@@ -116,7 +116,7 @@ COPY_FIELDS = {
 }
 
 
-@pytest.mark.backlog("RP-718")
+@pytest.mark.backlog_fixed("RP-718")
 @pytest.mark.parametrize("column, field", list(COPY_FIELDS))
 def test_copy_reads_a_field_at_its_columns_modifier(column: str, field: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:
@@ -131,6 +131,93 @@ def test_copy_reads_a_field_at_its_columns_modifier(column: str, field: str, dsn
         except psycopg.Error as e:
             got = ("error", e.sqlstate, str(e).splitlines()[0])
     assert got == COPY_FIELDS[(column, field)]
+
+
+# The other modifiers an input function reads, and the CONTEXT that names
+# the field (`CopyFromErrorCallback`): measured on a private, freshly
+# initdb'd PostgreSQL 15.19 cluster.
+_COPY_MORE_SETUP = (
+    "create table cp718 (c char(3), b bit(3), vb varbit(2), ts timestamp(0),"
+    " tm time(1), na numeric(4,1)[])"
+)
+COPY_MORE = {
+    ("c", "abcd"): (
+        "error",
+        "22001",
+        "value too long for type character(3)",
+        'COPY cp718, line 1, column c: "abcd"',
+    ),
+    ("b", "1"): (
+        "error",
+        "22026",
+        "bit string length 1 does not match type bit(3)",
+        'COPY cp718, line 1, column b: "1"',
+    ),
+    ("vb", "101"): (
+        "error",
+        "22001",
+        "bit string too long for type bit varying(2)",
+        'COPY cp718, line 1, column vb: "101"',
+    ),
+    ("na", "{12345}"): (
+        "error",
+        "22003",
+        "numeric field overflow",
+        'COPY cp718, line 1, column na: "{12345}"',
+    ),
+    ("ts", "2020-01-01 00:00:00.6"): ("ok", [("2020-01-01 00:00:01",)]),
+    ("tm", "10:00:00.26"): ("ok", [("10:00:00.3",)]),
+}
+
+
+def _copy(dsn: str, column: str, binary: bool, write) -> object:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("drop table if exists cp718")
+        c.execute(
+            _COPY_MORE_SETUP if not binary else "create table cp718 (s varchar(3), n numeric(4,1))"
+        )
+        try:
+            fmt = " (format binary)" if binary else ""
+            with c.cursor().copy(f"copy cp718 ({column}) from stdin{fmt}") as cp:
+                write(cp)
+            return ("ok", c.execute(f"select {column}::text from cp718").fetchall())
+        except psycopg.Error as e:
+            return ("error", e.sqlstate, str(e).splitlines()[0], e.diag.context)
+        finally:
+            c.execute("drop table if exists cp718")
+
+
+@pytest.mark.backlog_fixed("RP-718")
+@pytest.mark.parametrize("column, field", list(COPY_MORE))
+def test_copy_reads_every_modifier_and_names_the_field(column: str, field: str, dsn: str) -> None:
+    got = _copy(dsn, column, False, lambda cp: cp.write(field + "\n"))
+    assert got == COPY_MORE[(column, field)]
+
+
+# `CopyReadBinaryAttribute` calls `ReceiveFunctionCall(..., typmod)`, and a
+# binary field's CONTEXT names its line and column with no text.
+COPY_BINARY = {
+    ("s", "text", "abcdef"): (
+        "error",
+        "22001",
+        "value too long for type character varying(3)",
+        "COPY cp718, line 1, column s",
+    ),
+    ("s", "text", "abc  "): ("ok", [("abc",)]),
+    ("n", "numeric", Decimal("1.25")): ("ok", [("1.3",)]),
+}
+
+
+@pytest.mark.backlog_fixed("RP-718")
+@pytest.mark.parametrize("column, ty, value", list(COPY_BINARY))
+def test_binary_copy_reads_a_field_at_its_columns_modifier(
+    column: str, ty: str, value: object, dsn: str
+) -> None:
+    def write(cp: psycopg.Copy) -> None:
+        cp.set_types([ty])
+        cp.write_row([value])
+
+    assert _copy(dsn, column, True, write) == COPY_BINARY[(column, ty, value)]
 
 
 # A `char(3)[]` element is padded to the width: `bpchar(text, 7, false)` over

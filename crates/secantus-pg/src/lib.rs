@@ -4831,6 +4831,9 @@ struct CopyInState {
     fields: Vec<String>,
     /// The declared PostgreSQL type of each target column, for parsing.
     types: Vec<String>,
+    /// Each target column's modifier: a field is read AT it, as `CopyFrom`
+    /// reads one with `InputFunctionCall(..., typmod)` (RP-718).
+    typmods: Vec<i32>,
     /// The bytes received that do not yet make a whole row.
     buffer: Vec<u8>,
     /// `HEADER`: the first line is column names, skipped -- still to come.
@@ -29021,8 +29024,9 @@ impl PgHandler {
     fn parse_binary_copy(
         &self,
         buffer: &[u8],
-        types: &[String],
+        state: &CopyInState,
     ) -> PgWireResult<Vec<Vec<Option<Bson>>>> {
+        let table = secantus_pgplan::schemas::split_key(&state.table).1;
         const SIGNATURE: &[u8] = b"PGCOPY\n\xff\r\n\0";
         let bad = || {
             PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -29071,14 +29075,28 @@ impl PgHandler {
                 let n = len as usize;
                 let raw = buffer.get(pos..pos + n).ok_or_else(bad)?;
                 pos += n;
-                let ty = types.get(i).map(String::as_str).unwrap_or("text");
+                let ty = state.types.get(i).map(String::as_str).unwrap_or("text");
+                // `ReceiveFunctionCall(..., typmod)`: `varchar_recv`,
+                // `numeric_recv`, `array_recv` and the rest apply the
+                // column's modifier as their input functions do (RP-718).
+                let typmod = state.typmods.get(i).copied().unwrap_or(-1);
                 let value = decode_parameter(
                     Some(&Bytes::copy_from_slice(raw)),
                     Some(&wire_type(ty)),
                     true,
                     &tz,
                     self.client_encoding(),
-                )?;
+                )
+                .and_then(|v| {
+                    secantus_pgplan::fit_assigned_length(v, ty, typmod).map_err(|e| Self::err(&e))
+                })
+                .map_err(|e| {
+                    // `CopyFromErrorCallback` of a binary field: its line
+                    // and column, no text (15.19).
+                    let line = state.lineno + rows.len() as u64 + 1;
+                    let column = state.names.get(i).map_or("", String::as_str);
+                    with_where_context(e, format!("COPY {table}, line {line}, column {column}"))
+                })?;
                 row.push(Some(value));
             }
             rows.push(row);
@@ -43808,6 +43826,7 @@ impl PgHandler {
                     table: cf.table.clone(),
                     fields: cols.iter().map(|c| c.field()).collect(),
                     types: cols.iter().map(|c| c.pg_type.clone()).collect(),
+                    typmods: cols.iter().map(|c| c.typmod).collect(),
                     buffer: Vec::new(),
                     header_left: cf.header,
                     binary_header: None,
@@ -54519,7 +54538,7 @@ impl PgHandler {
         // written once.
         let rows: Vec<CopyRow> = match state.format {
             CopyFormat::Binary => self
-                .parse_binary_copy(bytes, &state.types)?
+                .parse_binary_copy(bytes, state)?
                 .into_iter()
                 .map(|row| {
                     state.lineno += 1;
@@ -54587,7 +54606,19 @@ impl PgHandler {
                             Some(text) => {
                                 let ty = state.types.get(i).map(String::as_str).unwrap_or("text");
                                 let wire = self.user_wire_type(ty).unwrap_or_else(|| wire_type(ty));
-                                match copy_field(&text, ty, &wire, &tz) {
+                                let typmod = state.typmods.get(i).copied().unwrap_or(-1);
+                                // Read AT the column's modifier, as
+                                // `InputFunctionCall(..., typmod)` reads it:
+                                // an overlong `varchar(3)` field is 22001, a
+                                // `numeric(4,1)` one rounds, and `array_in`
+                                // passes the modifier to every element
+                                // (RP-718). Stored as written, the column
+                                // held what its type refuses.
+                                let fitted = copy_field(&text, ty, &wire, &tz).and_then(|v| {
+                                    secantus_pgplan::fit_assigned_length(v, ty, typmod)
+                                        .map_err(|e| PgHandler::err(&e))
+                                });
+                                match fitted {
                                     Ok(v) => Some(v),
                                     Err(e) => {
                                         let column =

@@ -2600,17 +2600,6 @@ char(3)[], b bit(3)[])`.
 Measured on a private PostgreSQL 15.19 cluster with the setups in
 `tests/backlog/test_rp_found_rp710.py`.
 
-- [ ] **COPY FROM ignores its column's modifier.** `copy cp710 (s) from
-      stdin` of `abcdef` into a `varchar(3)` column is 22001 on PostgreSQL
-      15.19, and `1.25` into a `numeric(4,1)` one stores `1.3` (`CopyFrom`
-      reads each field with `InputFunctionCall(..., typmod)`; `array_in`
-      passes the modifier to every element, so `{abcdef}` into a
-      `varchar(3)[]` is 22001 and `{1.25}` into a `numeric(4,1)[]` is
-      `{1.3}`); here each field is stored as written, and `abc   ` keeps its
-      blanks. `copy_field` reads by type only and `copy_load` fits nothing;
-      an INSERT fits through `fit_to_column`.
-      Verify: tests/backlog/test_rp_found_rp710.py::test_copy_reads_a_field_at_its_columns_modifier
-      Backlog-ID: RP-718
 - [ ] **A `char(n)[]` column's elements are stored unpadded.** `insert into
       t710 (k, c) values (5, array['ab']) returning c, octet_length(c[1])`
       is `{"ab "}`, 3 on PostgreSQL 15.19 (the element coercion is
