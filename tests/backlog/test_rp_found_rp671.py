@@ -9,8 +9,10 @@ value's blanks) pinned and found:
 - RP-679 (fixed since): a `char(n)` value that carried its blanks (a cast to
   `char(n)`, a scalar subquery over a `char(n)` column) compared and sorted
   with them;
-- a HAVING comparison of a `char(n)` `min` / `max` against a `char(n)`
-  value, an `= ANY` array or `IS DISTINCT FROM` does not compare as `bpchar`;
+- RP-680 (fixed): a HAVING comparison of a `char(n)` `min` / `max` against
+  a `char(n)` value, an `= ANY` array or `IS DISTINCT FROM` did not compare
+  as `bpchar`, and `IS DISTINCT FROM`, `= ANY` and `<> ALL` over any grouped
+  value were read as a plain `=` / `<>`;
 - `min` / `max` over a `varchar` column are typed `varchar`, not `text`;
 - OVER on a function that is not a window function or an aggregate is
   0A000, not 42809.
@@ -147,10 +149,47 @@ HAVING = {
 }
 
 
-@pytest.mark.backlog("RP-680")
+@pytest.mark.backlog_fixed("RP-680")
 @pytest.mark.parametrize("query", list(HAVING))
 def test_having_over_char_n_min_max_compares_as_bpchar(query: str, dsn: str) -> None:
     assert _rows(dsn, query) == HAVING[query]
+
+
+# What fixing RP-680 measured besides its own five: the HAVING shortcut read
+# `IS DISTINCT FROM`, `= ANY` and `<> ALL` as a plain `=` / `<>` over every
+# type, and compared a grouped `char(n)` key with a constant's blanks.
+# PostgreSQL 15.19, on a private cluster and the shared one alike.
+HAVING_SHAPES = {
+    "select k from t671 group by k having max(k) is distinct from 2 order by k": [(1,), (3,)],
+    "select k from t671 group by k having max(k) is distinct from null order by k": [
+        (1,),
+        (2,),
+        (3,),
+    ],
+    "select k from t671 group by k having max(k) is not distinct from 2 order by k": [(2,)],
+    "select k from t671 group by k having max(k) = any('{1,2}') order by k": [(1,), (2,)],
+    "select k from t671 group by k having max(f) <> all('{a,xy}') order by k": [(3,)],
+    "select k from t671 group by k having 'xy  ' = max(f) order by k": [(2,)],
+    "select k from t671 group by k having max(f) = 'xy  '::varchar order by k": [(2,)],
+    "select k from t671 group by k having max(f) = 'xy' order by k": [(2,)],
+    "select k from t671 group by k having max(f) > 'a  ' order by k": [(2,), (3,)],
+    "select f from t671 group by f having f = 'xy  ' order by f": [("xy ",)],
+    "select f from t671 group by f having f = 'xy  '::char(5) order by f": [("xy ",)],
+    "select f from t671 group by f having f is distinct from 'xy' order by f": [
+        ("a  ",),
+        ("b  ",),
+    ],
+    "select f from t671 group by f having f = any('{a,xy}') order by f": [
+        ("a  ",),
+        ("xy ",),
+    ],
+}
+
+
+@pytest.mark.backlog_fixed("RP-680")
+@pytest.mark.parametrize("query", list(HAVING_SHAPES))
+def test_having_reads_each_expression_kind(query: str, dsn: str) -> None:
+    assert _rows(dsn, query) == HAVING_SHAPES[query]
 
 
 _TEXT = 25

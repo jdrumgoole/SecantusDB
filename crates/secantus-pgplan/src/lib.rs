@@ -18202,6 +18202,14 @@ fn plan_having(
             Ok(Having::IsNull { subject, negated })
         }
         Some(N::AExpr(e)) => {
+            // Only a plain operator: `IS [NOT] DISTINCT FROM`, `= ANY (...)`,
+            // `<> ALL (...)`, `IN`, `BETWEEN` and `NULLIF` carry an operator
+            // name too, and read as one they answer the opposite rows
+            // (`max(k) is distinct from 2` kept only the 2; RP-680). The
+            // grouped query's split plans them as a WHERE over the groups.
+            if AExprKind::try_from(e.kind) != Ok(AExprKind::AexprOp) {
+                return Err(Error::Unsupported("this HAVING expression".into()));
+            }
             let op = operator_name(e)?;
             if !matches!(op, "=" | "<>" | "!=" | ">" | ">=" | "<" | "<=") {
                 return Err(Error::Unsupported(format!("HAVING operator {op}")));
@@ -18247,6 +18255,23 @@ fn plan_having(
                 }
             };
             let subject = having_subject(subject_node, def, group_by, items, params, groupings)?;
+            // A `char(n)` subject is compared as `bpchar`, whose operators
+            // drop trailing blanks (`bcTruelen`) and whose constant's type
+            // decides the operator (`= 'xy  '::text` is `text`'s): the
+            // constant here is a bare value with no type. The split plans
+            // the comparison as a typed WHERE over the groups (RP-680).
+            let bpchar_subject = match &subject {
+                OutputCol::Group(i) => group_by.get(*i).is_some_and(|k| is_bpchar_type(&k.pg_type)),
+                OutputCol::Agg(i) => items
+                    .get(*i)
+                    .is_some_and(|it| is_bpchar_type(&aggregate_item_type(it))),
+                _ => false,
+            };
+            if bpchar_subject {
+                return Err(Error::Unsupported(
+                    "a HAVING comparison over a char(n) value".into(),
+                ));
+            }
             let value = const_value(
                 value_node.ok_or_else(|| Error::Parse("HAVING without an operand".into()))?,
                 params,

@@ -2440,16 +2440,6 @@ that reaches a comparison carrying its blanks is compared with them.
       correlated call does not.
       Verify: tests/backlog/test_rp_found_rp679.py::test_correlated_array_of_char_n_keeps_the_elements_blanks
       Backlog-ID: RP-683
-- [ ] **A HAVING comparison of a `char(n)` `min` / `max` does not compare as
-      `bpchar`.** On PostgreSQL 15.19, over `t671` (`'a'`, `'xy'`, `'b'`),
-      `having max(f) is distinct from 'xy'` keeps the `'a'` and `'b'`
-      groups; here it keeps only `'xy'`, the opposite. `having max(f) =
-      any('{a,xy}')`, `= 'xy'::char(3)`, `= 'xy  '::char(5)` and `= 'xy  '`
-      each keep `'xy'` (and `'a'`) there and nothing here: the constant is
-      compared with its blanks, or the shape leaves `plan_having`'s
-      comparison for one that is not `bpchar`'s.
-      Verify: tests/backlog/test_rp_found_rp671.py::test_having_over_char_n_min_max_compares_as_bpchar
-      Backlog-ID: RP-680
 - [ ] **`min` / `max` over a `varchar` column are typed `varchar`.**
       PostgreSQL has no `max(varchar)`: `select max(v) from (values
       ('ab'::varchar(4)), ('cd')) s(v)` resolves to `max(text)` and is
@@ -2465,6 +2455,31 @@ that reaches a comparison carrying its blanks is compared with them.
       refuses is reported as a gap in this server.
       Verify: tests/backlog/test_rp_found_rp671.py::test_over_on_a_plain_function_is_42809
       Backlog-ID: RP-682
+
+## Found while working RP-680 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster (and the shared one, alike)
+with the `_SETUP` in `tests/backlog/test_rp_found_rp680.py`. Each is wrong in
+a plain WHERE over a `char(n)` column, in a FROM-subquery's column over a
+`min` / `max` and in a HAVING alike.
+
+- [ ] **A `char(n)` column compared with a `text` value compares as
+      `bpchar`.** There is no `bpchar = text` operator: PostgreSQL 15.19
+      casts the column to `text` (`rtrim`, the implicit cast) and compares
+      `text`s, so `select k from t680 where f = 'xy  '::text` finds no row,
+      and `= 'xy'::text` finds the `'xy'` one. Here the first finds the
+      `'xy'` row too: the constant's blanks are dropped as `bpchar`'s
+      operator would.
+      Verify: tests/backlog/test_rp_found_rp680.py::test_char_n_against_text_compares_as_text
+      Backlog-ID: RP-685
+- [ ] **`= ANY` of a `char(n)` array finds nothing over a `char(n)`
+      column.** `select k from t680 where f = any('{a,xy}'::char(3)[])` finds
+      the `'a'` and `'xy'` rows on PostgreSQL 15.19 (`bpchareq` drops the
+      blanks); here it finds none: the array's elements are padded
+      (`'a  '`) and compared with their blanks against the trimmed stored
+      value, the shape of RP-679 for an array's elements.
+      Verify: tests/backlog/test_rp_found_rp680.py::test_any_of_a_char_n_array_compares_as_bpchar
+      Backlog-ID: RP-684
 
 ## Found while working RP-664 (2026-11-08)
 
