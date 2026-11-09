@@ -623,38 +623,35 @@ These are explicit non-goals. Don't add them without a reason.
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a
       `find`'s, `distinct`'s and `aggregate`'s line, profile entry and
       `explain` carry mongod's `queryShapeHash` (`secantus-commands`
-      `query_shape.rs`, 130 shapes matching mongod 8.2.1 in
-      `tests/mongod_live/test_query_shape_hash.py`). A query using
-      something the module does not shape prints none, where mongod
-      prints one:
-      - geo (`$geoWithin`, `$geoIntersects`, `$near`) and `$text`
-        predicates, `$where`, `$jsonSchema`, `$sampleRate`;
-      - aggregation operators that serialize their own way (the date
-        operators, `$convert` and the `$toX` family, `$let`, `$map`,
-        `$filter`, `$reduce`, `$switch`, the regex and trim operators,
-        `$getField`, `$setField`, `$sortArray`, `$zip`, `$meta`, ...), and
-        accumulators other than `$sum`, `$avg`, `$min`, `$max`, `$first`,
-        `$last`, `$push`, `$addToSet`, `$stdDevPop`, `$stdDevSamp`,
-        `$count`;
-      - stages other than `$match`, `$sort`, `$limit`, `$skip`, `$count`,
-        `$group`, `$project`, `$addFields`, `$set`, `$unset`, `$unwind`,
-        `$replaceRoot`, `$replaceWith`, `$sample`, `$sortByCount` and a
-        `$lookup` on `localField` / `foreignField`, and a collectionless
-        `aggregate: 1`;
-      - a DBPointer literal (the bson crate cannot build mongod's
-        representative one).
+      `query_shape.rs`); since 2026-11-09 it covers geo, `$text`, `$where`
+      and `$sampleRate` predicates, the aggregation operators and
+      accumulators with arguments of their own, the stages mongod desugars,
+      change streams, `aggregate: 1` and DBPointer literals
+      (`tests/mongod_live/test_query_shape_hash.py`, against mongod
+      8.2.11). A query using one of these prints none, where mongod prints
+      one:
+      - `$jsonSchema`, which mongod shapes as the `$_internalSchema*`
+        predicates its JSON Schema parser translates the schema into
+        (`json_schema_parser.cpp`, each keyword's translation);
+      - `$rankFusion` and `$scoreFusion`, which it shapes as the 10-15
+        stage pipelines it desugars them into (window ranks, `$unionWith`
+        per input pipeline, `$group`, `$setMetadata`);
+      - options measured nowhere yet: a `$lookup` `from` naming another
+        database, `$out` to a time-series collection, change stream
+        options beyond `fullDocument`, `fullDocumentBeforeChange`,
+        `allChangesForCluster` and `showExpandedEvents`.
       Each is mongod's serializer for that node, transcribed and checked as
       the shaped ones were.
       Backlog-ID: RM-358
       Verify: tests/backlog/test_rm_355_364.py::test_a_query_of_every_kind_names_its_query_shape
-- [ ] **A DISTINCT_SCAN examines one key fewer than mongod's.** mongod
-      8.2.11's DISTINCT_SCAN for `distinct("x", {x: {$lt: 4}})` over keys
-      0 to 11 examines five keys -- the four it returns and the one past
-      its bounds that its last seek lands on -- in the entry's and the
-      line's `keysExamined` and its `execStats`. This server's scan ends at
-      the bound without counting that key (four). Found 2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_distinct_scan_examines_the_key_past_its_bounds
-      Backlog-ID: RM-377
+- [ ] **An `explain` of `$planCacheStats` fails.** mongod 8.2.11 explains
+      `aggregate` of `[{$planCacheStats: {}}]`: `stages` holds
+      `{$planCacheStats: {allHosts: false}}`, then `queryShapeHash`. This
+      server's `explain` runs the pipeline against a namespace of its own
+      (`explain.dry.run`, `explain/mod.rs`) and fails with 50933 (`collection
+      '<db>.explain.dry.run' does not exist`). Found 2026-11-09 (RM-358).
+      Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_plan_cache_stats_names_its_stage
+      Backlog-ID: RM-466
 - [ ] **A projection is not where mongod's plan puts it.** mongod 8.2.11
       projects below a blocking SORT (`SORT` over `PROJECTION_SIMPLE` or
       `PROJECTION_COVERED`, so the SORT sorts the projected documents:
@@ -2131,9 +2128,12 @@ What is left, all on the RUST MongoDB server:
       `distinct("x", {x: {$gt: 0}, y: {$gt: 3}})` over `x = i % 4, y = i`
       (i 1 to 24) returns three keys and examines six, in eight works, in
       its `executionStats` and in a `$group`'s trial. This server's
-      examines three, in four works. The plans ranked are the same. Perhaps
-      RM-377's seek past the bounds, once per value of `x`: not confirmed
-      in the source. Found 2026-11-08 (RM-310).
+      examines three, in four works. The plans ranked are the same. Not
+      RM-377's key past the bounds (fixed 2026-11-09, and none is past
+      these): by the source, `explain`'s DISTINCT_SCAN (`explain/exec.rs`)
+      counts one key per value it returns plus a key past the bounds,
+      never a key a seek lands on that the bounds on `y` reject. Found
+      2026-11-08 (RM-310).
       Backlog-ID: RM-447
       Verify: tests/backlog/test_rm_found_2026_11_08_rm310.py::test_a_distinct_scan_bounded_on_a_trailing_field_examines_mongods_keys
 - [ ] **`explain` lists a `$match` after the cursor with its clauses
@@ -2237,7 +2237,7 @@ member: 115 scenarios over a raw connection (what `$changeStream` accepts,
 every event's shape, `getMore`, the invalidating operations, resuming by
 `resumeAfter` / `startAfter` / `startAtOperationTime`, the three scopes,
 pre-images, transactions), each on a database of its own. The Rust server
-differs on 1 result (re-measured 2026-11-09, the `queryShapeHash` of `explain`, RM-454; 2 on 2026-10-16, 5 before). The harness salts database names per run, because
+differs on none (re-measured 2026-11-09 after RM-454; 1 earlier that day, 2 on 2026-10-16, 5 before). The harness salts database names per run, because
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
@@ -2265,14 +2265,6 @@ would see them. What is left:
       working RM-076).
       Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_execution_stats_count_what_the_read_found
       Backlog-ID: RM-453
-- [ ] **RUST MongoDB server: the `explain` of a change stream has no
-      `queryShapeHash`.** mongod 8.2.11 prints one for a collection or
-      database stream (none for a cluster one); `query_shape.rs` does not
-      shape a `$changeStream` stage, so this server prints none (found
-      working RM-076; the one difference `tools/probes/change_stream_commands.py`
-      still finds).
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm076.py::test_a_change_stream_has_a_query_shape_hash
-      Backlog-ID: RM-454
 
 ### 7.073 The cursor commands -- 2026-10-11
 
@@ -2986,7 +2978,9 @@ touched:
   11 on 12 cores) mongod answered two connections with no queue, where
   it answers one: the six connects took longer than a second to land, so
   the bucket refilled. The test passed three runs out of three on its own
-  at low load. The test depends on six connects landing within one
+  at low load. The same happened to this server's side in the RM gate of
+  2026-11-09 (load average about 9: it answered two with `maxQueueDepth`
+  2, where mongod answered one); three runs on their own passed. The test depends on six connects landing within one
   second, so it is flaky by construction: it needs a measurement that
   load cannot change (connect all six behind a barrier and record how
   long they took to land, or compare with the answer mongod gives when

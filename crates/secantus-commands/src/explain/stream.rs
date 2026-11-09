@@ -577,6 +577,16 @@ impl IndexScan {
                     self.pop();
                     continue;
                 }
+                // An IXSCAN's cursor stops at the end key, but a
+                // DISTINCT_SCAN has none: its last seek lands on the key past
+                // the bounds, which it examines before it finds it is done
+                // (`DistinctScan::doWork` counts each key a seek returns;
+                // measured 8.2.11: `distinct("x", {x: {$lt: 4}})` over keys 0
+                // to 11 examines 5). RM-377.
+                if self.distinct.is_some() {
+                    cx.keys += 1;
+                    self.t.keys += 1;
+                }
                 self.done = true;
                 return Ok(Step::End);
             }

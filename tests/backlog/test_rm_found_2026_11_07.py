@@ -22,12 +22,13 @@ def _sort_stage(stats: Any) -> dict:
     raise AssertionError("no SORT stage")
 
 
-@pytest.mark.backlog("RM-377")
+@pytest.mark.backlog_fixed("RM-377")
 def test_a_distinct_scan_examines_the_key_past_its_bounds(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's DISTINCT_SCAN for `distinct("x", {x: {$lt: 4}})` over
     keys 0 to 11 examines five keys: the four it returns and the 4 it seeks
     to and finds past its bounds (the entry's `keysExamined`, and its
-    `execStats`'). This server's examines four."""
+    `execStats`'). This server's examined four, ending its streamed scan at
+    the bound without counting that key."""
 
     def op(d: Any) -> Any:
         return d.c.distinct("x", {"x": {"$lt": 4}})
