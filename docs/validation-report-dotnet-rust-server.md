@@ -1,6 +1,6 @@
 # mongo-csharp-driver Validation Report
 
-Measured 2026-10-15 (raw artifact), generated 2026-10-15 — SecantusDB 0.7.0b3 vs mongo-csharp-driver 8297e62 (`vendor/mongo-csharp-driver/`).
+Measured 2026-11-09 (raw artifact), generated 2026-11-09 — SecantusDB 0.7.0b3 vs mongo-csharp-driver 8297e62 (`vendor/mongo-csharp-driver/`).
 
 Run `uv run python -m invoke validate-dotnet` to refresh. The official MongoDB **C# / .NET** driver — its xUnit integration suite (`MongoDB.Driver.Tests`) run unmodified against an embedded SecantusDB daemon via `dotnet test`.
 
@@ -9,8 +9,17 @@ Run `uv run python -m invoke validate-dotnet` to refresh. The official MongoDB *
 | Namespace | Passed | Failed | Skipped | Total | Pass rate |
 |---|---:|---:|---:|---:|---:|
 | `MongoDB.Driver.Tests.Specifications.crud` | 196 | 0 | 0 | 196 | 100.0% |
-| `MongoDB.Driver.Tests.Specifications.crud.prose_tests` | 32 | 0 | 0 | 32 | 100.0% |
-| **Overall** | **228** | **0** | **0** | **228** | **100.0%** |
+| `MongoDB.Driver.Tests.Specifications.crud.prose_tests` | 30 | 2 | 0 | 32 | 93.7% |
+| **Overall** | **226** | **2** | **0** | **228** | **99.1%** |
+
+## Failures (2)
+
+First 30 failed tests for triage:
+
+```
+MongoDB.Driver.Tests.Specifications.crud.prose_tests.CrudProseTests.MongoClient_bulkWrite_collects_WriteConcernError_across_batches(async: False)
+MongoDB.Driver.Tests.Specifications.crud.prose_tests.CrudProseTests.MongoClient_bulkWrite_collects_WriteConcernError_across_batches(async: True)
+```
 
 ## How this is generated
 
