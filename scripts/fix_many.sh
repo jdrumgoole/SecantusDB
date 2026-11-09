@@ -71,10 +71,13 @@ cd "$(dirname "$0")/.."
 # "Maintenance Sleep" for 10-20 minutes at a time, and every process stops
 # with it: on 2026-11-08 a lander's `sleep 300` came back after 63 minutes
 # and the fix-one sessions beside it stalled the same way (RM-443, from
-# `pmset -g log`). `caffeinate -i -w $$` holds a no-idle-sleep assertion
-# until this script exits, and does nothing where it is not installed.
+# `pmset -g log`). `-i` alone was not enough: once the Mac had slept, it
+# kept going "back to sleep" from each short dark wake (`Sleep Service Back
+# to Sleep`), which only `-s` (no system sleep, honoured on AC power) stops.
+# `caffeinate -i -s -w $$` holds both until this script exits, and does
+# nothing where caffeinate is not installed.
 if command -v caffeinate >/dev/null 2>&1; then
-    caffeinate -i -w $$ &
+    caffeinate -i -s -w $$ &
 fi
 out=.scratch/fix_many
 mkdir -p "$out"
