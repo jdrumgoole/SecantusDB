@@ -23177,13 +23177,10 @@ fn foreign_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
     // queries ENCLOSING this subquery -- so a qualifier its own FROM does not
     // define reads the enclosing row. Its names follow PostgreSQL: an
     // aliased relation goes by the alias only, so an inner `t q` does not
-    // hide the outer `t`.
-    for item in &s.from_clause {
-        if let Some(f) = derived_foreign_qualifier(item) {
-            return Some(f);
-        }
-    }
-    None
+    // hide the outer `t`. Each level inside it binds only its own names: a
+    // table one UNION arm reads does not hide the other arm's outer
+    // reference, and a LATERAL one sees this level's items as well (RP-668).
+    correlated::derived_outer_qualifier(&s)
 }
 
 /// One entry of a query level's range table, as PostgreSQL's
@@ -23657,45 +23654,6 @@ fn check_write_qualifiers(node: &pg_query::protobuf::Node) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn derived_foreign_qualifier(item: &pg_query::protobuf::Node) -> Option<String> {
-    match item.node.as_ref()? {
-        N::RangeSubselect(rs) if !rs.lateral => {
-            let Some(N::SelectStmt(body)) = rs.subquery.as_deref().and_then(|q| q.node.as_ref())
-            else {
-                return None;
-            };
-            let names = correlated::inner_names(body);
-            let mut found = None;
-            let mut b = (**body).clone();
-            let _ = correlated::walk_select(&mut b, &mut |n| {
-                if found.is_some() {
-                    return Ok(());
-                }
-                if let Some(N::ColumnRef(c)) = n.node.as_ref() {
-                    if c.fields.len() >= 2 {
-                        if let Some(N::String(q)) = c.fields[c.fields.len() - 2].node.as_ref() {
-                            if !names.contains(&q.sval) {
-                                found = Some(format!(
-                                    "{}.{}",
-                                    q.sval,
-                                    column_ref_name(c).unwrap_or_default()
-                                ));
-                            }
-                        }
-                    }
-                }
-                Ok(())
-            });
-            found.or_else(|| body.from_clause.iter().find_map(derived_foreign_qualifier))
-        }
-        N::JoinExpr(j) => [j.larg.as_deref(), j.rarg.as_deref()]
-            .into_iter()
-            .flatten()
-            .find_map(derived_foreign_qualifier),
-        _ => None,
-    }
 }
 
 /// Every name a FROM item can be addressed by: its alias when it has one, and

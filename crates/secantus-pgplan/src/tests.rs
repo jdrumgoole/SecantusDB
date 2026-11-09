@@ -5708,3 +5708,41 @@ fn alter_column_type_follows_the_assignment_pathway() {
         assert_eq!(alter_type_is_automatic(from, to), ok, "{from} -> {to}");
     }
 }
+
+/// The body of the subquery `select ... ` as `foreign_qualifier` sees it.
+fn subquery_body(sql: &str) -> pg_query::protobuf::SelectStmt {
+    let parsed = pg_query::parse(sql).expect("parses");
+    match parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|s| s.node.as_ref())
+    {
+        Some(N::SelectStmt(s)) => (**s).clone(),
+        other => panic!("not a SELECT: {other:?}"),
+    }
+}
+
+/// RP-668: a table a derived table, a UNION arm or a nested subquery binds is
+/// visible only inside it, so the same name beside it is the enclosing
+/// query's, and the subquery is correlated.
+#[test]
+fn a_name_bound_inside_a_derived_table_is_not_bound_beside_it() {
+    for (sql, outer) in [
+        ("select x.a from (select a from t where n < 0) x where t.n < 0", Some("t.n")),
+        (
+            "select 1 from (select id from t where n < 0 union all select id from u where id > t.id) x",
+            Some("t.id"),
+        ),
+        (
+            "select 1 from u, lateral (select id from t i where i.id = u.id and t.n = i.n) x",
+            Some("t.n"),
+        ),
+        // The derived table's own `t` is its own, not the outer row's.
+        ("select 1 from (select id from t where t.n > 0) x", None),
+        ("select 1 from u, lateral (select id from t i where i.id = u.id) x", None),
+        ("select 1 from (select id from (select id, n from t) y where y.n > 0) x", None),
+    ] {
+        let body = subquery_body(sql);
+        assert_eq!(foreign_qualifier(&body).as_deref(), outer, "{sql}");
+    }
+}

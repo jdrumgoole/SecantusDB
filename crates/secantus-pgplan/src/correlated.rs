@@ -352,6 +352,241 @@ pub(crate) fn inner_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     names
 }
 
+/// The names ONE query level binds, as PostgreSQL's namespace for that level
+/// holds them: its FROM items (an aliased relation by its alias alone, a
+/// join's alias, an aliased JOIN hiding its sides -- the rules of
+/// `inner_names`) and its WITH's CTE names, but nothing inside a derived
+/// table or a subquery, which are levels of their own.
+fn level_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    fn from_item(item: &pg_query::protobuf::Node, names: &mut Vec<String>) {
+        match item.node.as_ref() {
+            Some(N::RangeVar(r)) => names.push(
+                r.alias
+                    .as_ref()
+                    .map(|a| a.aliasname.clone())
+                    .unwrap_or_else(|| r.relname.clone()),
+            ),
+            Some(N::JoinExpr(j)) => {
+                names.extend(j.alias.as_ref().map(|a| a.aliasname.clone()));
+                names.extend(j.join_using_alias.as_ref().map(|a| a.aliasname.clone()));
+                if j.alias.is_none() {
+                    for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                        from_item(side, names);
+                    }
+                } else {
+                    let mut hidden = Vec::new();
+                    for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                        from_item(side, &mut hidden);
+                    }
+                    let outer = OUTER_RELATIONS.with(|o| o.borrow().clone());
+                    names.extend(hidden.into_iter().filter(|n| !outer.contains(n)));
+                }
+            }
+            _ => collect_from_names(item, names),
+        }
+    }
+    let mut names = cte_names(s);
+    for item in &s.from_clause {
+        from_item(item, &mut names);
+    }
+    names
+}
+
+fn cte_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
+    s.with_clause
+        .iter()
+        .flat_map(|w| &w.ctes)
+        .filter_map(|cte| match cte.node.as_ref() {
+            Some(N::CommonTableExpr(c)) => Some(c.ctename.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `walk_select` that also passes each node the names bound between it and
+/// the top of `s` -- PostgreSQL's namespace stack, innermost level last. A
+/// qualifier in it is a relation of the subquery; one that is not is the
+/// enclosing query's. A derived table, a set operation's arm, a CTE body
+/// and a subquery in an expression are each a level of their own, so a
+/// name bound only inside one of them is NOT visible beside it:
+/// `(select x.a from (select a from t where b < 0) x where t.b < 0)` reads
+/// the OUTER `t` (RP-668). A non-LATERAL derived table does not see its
+/// siblings (`scanNameSpaceForRefname` skips `p_lateral_only` items), only
+/// the levels around them.
+pub(crate) fn walk_select_scoped(
+    s: &mut pg_query::protobuf::SelectStmt,
+    bound: &[String],
+    visit: &mut dyn FnMut(&mut pg_query::protobuf::Node, &[String]) -> Result<()>,
+) -> Result<()> {
+    let mut with_ctes = bound.to_vec();
+    with_ctes.extend(cte_names(s));
+    let mut here = bound.to_vec();
+    here.extend(level_names(s));
+    fn expr(
+        n: &mut pg_query::protobuf::Node,
+        here: &[String],
+        visit: &mut dyn FnMut(&mut pg_query::protobuf::Node, &[String]) -> Result<()>,
+    ) -> Result<()> {
+        walk_expr(n, &mut |node| {
+            visit(node, here)?;
+            if let Some(N::SubLink(sl)) = node.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    sl.subselect.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    walk_select_scoped(body, here, visit)?;
+                }
+            }
+            Ok(())
+        })
+    }
+    fn from(
+        item: &mut pg_query::protobuf::Node,
+        outside: &[String],
+        here: &[String],
+        visit: &mut dyn FnMut(&mut pg_query::protobuf::Node, &[String]) -> Result<()>,
+    ) -> Result<()> {
+        match item.node.as_mut() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref_mut(), j.rarg.as_deref_mut()]
+                    .into_iter()
+                    .flatten()
+                {
+                    from(side, outside, here, visit)?;
+                }
+                if let Some(q) = j.quals.as_deref_mut() {
+                    expr(q, here, visit)?;
+                }
+                Ok(())
+            }
+            Some(N::RangeSubselect(rs)) => {
+                let scope = if rs.lateral { here } else { outside };
+                match rs.subquery.as_deref_mut().and_then(|q| q.node.as_mut()) {
+                    Some(N::SelectStmt(body)) => walk_select_scoped(body, scope, visit),
+                    _ => Ok(()),
+                }
+            }
+            Some(N::RangeFunction(rf)) => {
+                for f in &mut rf.functions {
+                    if let Some(N::List(l)) = f.node.as_mut() {
+                        for item in &mut l.items {
+                            expr(item, here, visit)?;
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+    for n in s
+        .target_list
+        .iter_mut()
+        .chain(s.group_clause.iter_mut())
+        .chain(s.sort_clause.iter_mut())
+        .chain(s.distinct_clause.iter_mut())
+        .chain(s.window_clause.iter_mut())
+    {
+        expr(n, &here, visit)?;
+    }
+    for n in [
+        s.where_clause.as_deref_mut(),
+        s.having_clause.as_deref_mut(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        expr(n, &here, visit)?;
+    }
+    for row in &mut s.values_lists {
+        expr(row, &here, visit)?;
+    }
+    for item in &mut s.from_clause {
+        from(item, &with_ctes, &here, visit)?;
+    }
+    for side in [s.larg.as_deref_mut(), s.rarg.as_deref_mut()]
+        .into_iter()
+        .flatten()
+    {
+        walk_select_scoped(side, &with_ctes, visit)?;
+    }
+    if let Some(with) = s.with_clause.as_mut() {
+        for cte in &mut with.ctes {
+            if let Some(N::CommonTableExpr(c)) = cte.node.as_mut() {
+                if let Some(N::SelectStmt(body)) =
+                    c.ctequery.as_deref_mut().and_then(|q| q.node.as_mut())
+                {
+                    walk_select_scoped(body, &with_ctes, visit)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first qualified reference, inside one of the derived tables in the
+/// FROM of `s`, whose qualifier no level between it and `s` binds: it reads
+/// a query enclosing `s`, so `s` is correlated. A non-LATERAL derived table
+/// sees `s`'s CTEs but not its FROM items; a LATERAL one sees both.
+pub(crate) fn derived_outer_qualifier(s: &pg_query::protobuf::SelectStmt) -> Option<String> {
+    fn item(
+        n: &pg_query::protobuf::Node,
+        outside: &[String],
+        here: &[String],
+        found: &mut Option<String>,
+    ) {
+        match n.node.as_ref() {
+            Some(N::JoinExpr(j)) => {
+                for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                    item(side, outside, here, found);
+                }
+            }
+            Some(N::RangeSubselect(rs)) => {
+                let Some(N::SelectStmt(body)) =
+                    rs.subquery.as_deref().and_then(|q| q.node.as_ref())
+                else {
+                    return;
+                };
+                let scope = if rs.lateral { here } else { outside };
+                let mut body = (**body).clone();
+                let _ = walk_select_scoped(&mut body, scope, &mut |n, bound| {
+                    if found.is_some() {
+                        return Ok(());
+                    }
+                    // `q.c`, `schema.q.c` and `q.*` alike: the qualifier is
+                    // the second-to-last part.
+                    if let Some(N::ColumnRef(c)) = n.node.as_ref() {
+                        if let Some(N::String(q)) = c
+                            .fields
+                            .len()
+                            .checked_sub(2)
+                            .and_then(|i| c.fields[i].node.as_ref())
+                        {
+                            if !bound.contains(&q.sval) {
+                                *found = Some(format!(
+                                    "{}.{}",
+                                    q.sval,
+                                    column_ref_name(c).unwrap_or_default()
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            _ => {}
+        }
+    }
+    let outside = cte_names(s);
+    let here = level_names(s);
+    let mut found = None;
+    for n in &s.from_clause {
+        if found.is_none() {
+            item(n, &outside, &here, &mut found);
+        }
+    }
+    found
+}
+
 /// The bare column names in the arguments of the subquery's FROM functions.
 fn function_arg_names(s: &pg_query::protobuf::SelectStmt) -> Vec<String> {
     let mut out = Vec::new();
@@ -459,13 +694,18 @@ fn substitute(
     first_param: usize,
 ) -> pg_query::protobuf::SelectStmt {
     let mut out = s.clone();
-    let _ = walk_select(&mut out, &mut |n| {
+    let _ = walk_select_scoped(&mut out, &[], &mut |n, bound| {
         let Some(N::ColumnRef(c)) = n.node.as_ref() else {
             return Ok(());
         };
         let Some(parts) = parts_of(c) else {
             return Ok(());
         };
+        // A qualified reference a level inside binds is that level's own,
+        // whatever an outer one of the same text means (RP-668).
+        if parts.len() >= 2 && bound.contains(&parts[parts.len() - 2]) {
+            return Ok(());
+        }
         if let Some(i) = outer_refs.iter().position(|r| *r == parts) {
             n.node = Some(N::ParamRef(pg_query::protobuf::ParamRef {
                 number: i32::try_from(first_param + i).unwrap_or(i32::MAX),
@@ -522,8 +762,9 @@ pub(crate) fn correlate(
     ) {
         return Err(Error::Unsupported("this correlated subquery form".into()));
     }
-    // Qualified references whose qualifier names nothing inside.
-    let names = inner_names(inner);
+    // Qualified references whose qualifier no level between them and the
+    // subquery's top binds (RP-668: a name bound only inside a derived
+    // table is not visible beside it).
     let mut outer_refs: Vec<Vec<String>> = Vec::new();
     // Where each reference was first written, for the argument it becomes:
     // an error resolving it in the outer query (42P01, 42703) is reported
@@ -531,7 +772,7 @@ pub(crate) fn correlate(
     // not at the subquery around it (RP-443).
     let mut locations: Vec<i32> = Vec::new();
     let mut probe = inner.clone();
-    walk_select(&mut probe, &mut |n| {
+    walk_select_scoped(&mut probe, &[], &mut |n, bound| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = parts_of(c) {
                 // With no FROM of its own, a bare name can only be the
@@ -539,7 +780,7 @@ pub(crate) fn correlate(
                 let bare_outer = parts.len() == 1
                     && inner.from_clause.is_empty()
                     && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
-                if (bare_outer || parts.len() >= 2 && !names.contains(&parts[parts.len() - 2]))
+                if (bare_outer || parts.len() >= 2 && !bound.contains(&parts[parts.len() - 2]))
                     && !outer_refs.contains(&parts)
                 {
                     outer_refs.push(parts);

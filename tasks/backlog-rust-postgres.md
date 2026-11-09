@@ -2471,16 +2471,6 @@ that reaches a comparison carrying its blanks is compared with them.
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp664.py`.
 
-- [ ] **An `UPDATE ... FROM` a subquery over the target whose WHERE names
-      the target is 42P01.** `update t664 set a = x.a from (select a from
-      t664 where b < 0) x where t664.b < 0` is `UPDATE 1` on PostgreSQL
-      15.19, with or without a domain column; here it is 42P01 `missing
-      FROM-clause entry for table "t664"`. Without the subquery's own
-      WHERE the statement runs, so the rewrite of an UPDATE ... FROM into
-      correlated subqueries (`rewrite_dml_from`) loses the target's name
-      when the FROM subquery has a WHERE of its own.
-      Verify: tests/backlog/test_rp_found_rp664.py::test_update_from_subquery_over_the_target
-      Backlog-ID: RP-668
 - [ ] **A PL/pgSQL assignment to a record's field does not check the
       field's domain.** In a BEFORE trigger on `t664t(a d664t, b int)`,
       whose domain has a CHECK `value > 0`, `new.a := -5; new.a := 7;
@@ -2490,6 +2480,25 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       is checked, after it returns (RP-664).
       Verify: tests/backlog/test_rp_found_rp664.py::test_plpgsql_assignment_to_a_record_field_checks_its_domain
       Backlog-ID: RP-670
+
+## Found while working RP-668 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SCOPE_SETUP` in
+`tests/backlog/test_rp_found_rp664.py`.
+
+- [ ] **RETURNING a FROM item's column is refused when the join condition
+      reads a column the UPDATE assigns.** `update t668 set b = u668.v
+      from u668 where t668.b < 0 and u668.k = 5 returning t668.a, u668.v`
+      returns the joined row's `v` for each updated row on PostgreSQL
+      15.19 (the join is done once, before the rows are written); here it
+      is 0A000 `RETURNING a FROM item's column when the join condition
+      reads an updated column is not supported yet`, whether the FROM item
+      is a table or a subquery over the target. `rewrite_dml_from` finds
+      the joining row again for RETURNING with a correlated subquery over
+      the NEW row, so it refuses the case where the new row no longer
+      joins.
+      Verify: tests/backlog/test_rp_found_rp664.py::test_returning_a_from_item_when_the_join_reads_an_assigned_column
+      Backlog-ID: RP-686
 
 ## Found while working RP-570 (2026-11-08)
 

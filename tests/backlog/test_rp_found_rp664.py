@@ -1,6 +1,6 @@
 """Regression tests of RP-664 (a write re-checked a domain value it did not
-coerce into the domain), and the gap test of a divergence found while
-working it:
+coerce into the domain) and of RP-668, and the gap tests of divergences
+found while working them:
 
 - PostgreSQL checks a domain where a value is COERCED into it: a column an
   UPDATE does not assign is stored as it was, and a value already of the
@@ -10,7 +10,11 @@ working it:
   stored before a `NOT VALID` CHECK can still be updated, copied and
   upserted, while every computed or other-typed value is checked;
 - an `UPDATE ... FROM` a subquery over the target, whose WHERE names the
-  target, is 42P01;
+  target, was 42P01 (RP-668, fixed): a table named inside a derived table,
+  a UNION arm or a nested subquery was taken as bound beside it, so the
+  target's name read as the subquery's own;
+- RETURNING a FROM item's column, when the join condition reads a column
+  the UPDATE assigns, is a named 0A000 (RP-686);
 - a PL/pgSQL assignment to a record's field (`NEW.a := -5`) does not check
   the field's domain, so a trigger that assigns a bad value and then a good
   one is not refused.
@@ -49,7 +53,9 @@ _SETUP = [
 def dsn(rust_pg: object) -> Iterator[str]:
     yield _dsn(rust_pg) + " dbname=postgres"
     with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
-        for q in _SETUP[:2] + _TRIGGER_SETUP[:2] + ["drop function if exists f664t()"]:
+        for q in (
+            _SETUP[:2] + _TRIGGER_SETUP[:2] + ["drop function if exists f664t()"] + _SCOPE_SETUP[:1]
+        ):
             c.execute(q)
 
 
@@ -223,19 +229,121 @@ def test_write_checks_a_domain_only_where_it_coerces(query: str, dsn: str) -> No
 
 
 # The FROM subquery reads the target table; the outer WHERE names the
-# target. Without the subquery's own WHERE (or with no domain at all) the
-# statement runs, so the rewrite of an UPDATE ... FROM into correlated
-# subqueries loses the target's name.
+# target. The rewrite of an UPDATE ... FROM into correlated subqueries is
+# right; the subquery it makes was not seen to read the target, because a
+# table named inside a derived table was taken as bound beside it.
 FROM_SUBQUERY = {
     "update t664 set a = x.a from (select a from t664 where b < 0) x where t664.b < 0": "UPDATE 1",
     "update t664 set b = x.b from (select b from t664 where b < 0) x where t664.b < 0": "UPDATE 1",
 }
 
 
-@pytest.mark.backlog("RP-668")
+@pytest.mark.backlog_fixed("RP-668")
 @pytest.mark.parametrize("query", list(FROM_SUBQUERY))
 def test_update_from_subquery_over_the_target(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == FROM_SUBQUERY[query]
+
+
+# RP-668's cause, in a subquery of any statement: a name a derived table, a
+# UNION arm or a subquery inside the subquery binds is visible only there
+# (PostgreSQL's namespace is per query level), so the same name beside it
+# is the enclosing query's. Here every one was 42P01 `missing FROM-clause
+# entry for table "t668"`, or -- a name qualified inside the derived table
+# -- would have been read as the outer row's.
+_SCOPE_SETUP = [
+    "drop table if exists t668, u668 cascade",
+    "create table t668 (a int, b int)",
+    "insert into t668 values (-1, -1), (5, 5), (7, -3)",
+    "create table u668 (k int, v int)",
+    "insert into u668 values (-1, 10), (5, 50), (7, 70)",
+]
+
+
+def _scoped_answer(dsn: str, query: str) -> object:
+    """The statement's answer, and `t668` after it."""
+    with psycopg.connect(dsn, autocommit=True) as c:
+        for q in _SCOPE_SETUP:
+            c.execute(q)
+        try:
+            cur = c.execute(query)
+        except psycopg.Error as e:
+            return ("error", e.sqlstate, str(e).splitlines()[0])
+        out = cur.fetchall() if cur.description else cur.statusmessage
+        return out, c.execute("select * from t668 order by a, b").fetchall()
+
+
+_T668 = [(-1, -1), (5, 5), (7, -3)]
+
+# PostgreSQL 15.19's answers, on a private cluster.
+SCOPED = {
+    "select (select x.a from (select a from t668 where b < 0) x where t668.b < 0 limit 1) v"
+    " from t668 order by t668.a": ([(-1,), (None,), (-1,)], _T668),
+    "select a, (select count(*) from (select a from t668 where t668.b > 0) x"
+    " where t668.b < 0) from t668 order by a": ([(-1, 1), (5, 0), (7, 1)], _T668),
+    "select a, (select max(x.a) from (select a from t668 where t668.b < t668.a) x"
+    " where x.a <> t668.a) from t668 order by a": ([(-1, 7), (5, 7), (7, None)], _T668),
+    "select a, (select sum(x.v) from u668, lateral (select v from u668 i"
+    " where i.k = u668.k and t668.a = i.k) x) from t668 order by a": (
+        [(-1, 10), (5, 50), (7, 70)],
+        _T668,
+    ),
+    "select a, (with w as (select a from t668 where b > 0) select count(*) from w"
+    " where t668.b < 0) from t668 order by a": ([(-1, 1), (5, 0), (7, 1)], _T668),
+    "select a, (select count(*) from (select a from t668 union all select k from u668) x"
+    " where t668.b < 0) from t668 order by a": ([(-1, 6), (5, 0), (7, 6)], _T668),
+    "select a, (select count(*) from (select a from t668 where b < 0 union all"
+    " select k from u668 where k > t668.a) x) from t668 order by a": (
+        [(-1, 4), (5, 3), (7, 2)],
+        _T668,
+    ),
+    "select a, (select count(*) from (select k from u668 where exists"
+    " (select 1 from t668 where t668.a = u668.k)) x where t668.b < 0) from t668 order by a": (
+        [(-1, 3), (5, 0), (7, 3)],
+        _T668,
+    ),
+    "select * from t668 where exists (select 1 from (select a from t668 where b < 0) x"
+    " where t668.b < 0) order by a": ([(-1, -1), (7, -3)], _T668),
+    "update t668 set a = x.v from (select k, v from u668 where v > 20) x"
+    " where t668.b < 0 and x.k = t668.a returning t668.a, t668.b": (
+        [(70, -3)],
+        [(-1, -1), (5, 5), (70, -3)],
+    ),
+    "delete from t668 using (select a from t668 where b < 0) x where t668.b < 0": (
+        "DELETE 2",
+        [(5, 5)],
+    ),
+    "delete from t668 using (select a from t668 where t668.b > 0) x"
+    " where t668.a > x.a returning t668.*": ([(7, -3)], [(-1, -1), (5, 5)]),
+}
+
+
+@pytest.mark.backlog_fixed("RP-668")
+@pytest.mark.parametrize("query", list(SCOPED))
+def test_a_name_bound_inside_a_derived_table_is_not_bound_beside_it(query: str, dsn: str) -> None:
+    assert _scoped_answer(dsn, query) == SCOPED[query]
+
+
+# Found while working RP-668. An UPDATE ... FROM whose join condition reads
+# a column the UPDATE assigns, with a RETURNING item over the FROM item:
+# PostgreSQL returns the joined row's value; here it is a named 0A000.
+RETURNING_FROM = {
+    "update t668 set b = x.b from (select b from t668 where a = 5) x"
+    " where t668.b < 0 returning t668.a, x.b": (
+        [(-1, 5), (7, 5)],
+        [(-1, 5), (5, 5), (7, 5)],
+    ),
+    "update t668 set b = u668.v from u668 where t668.b < 0 and u668.k = 5"
+    " returning t668.a, u668.v": (
+        [(-1, 50), (7, 50)],
+        [(-1, 50), (5, 5), (7, 50)],
+    ),
+}
+
+
+@pytest.mark.backlog("RP-686")
+@pytest.mark.parametrize("query", list(RETURNING_FROM))
+def test_returning_a_from_item_when_the_join_reads_an_assigned_column(query: str, dsn: str) -> None:
+    assert _scoped_answer(dsn, query) == RETURNING_FROM[query]
 
 
 # A BEFORE ROW trigger on `t664t`, by the body of its function. PostgreSQL
