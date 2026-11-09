@@ -3086,17 +3086,6 @@ the column written out, so none is the star's. The gap tests are in
       reference is not found.
       Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_set_operation
       Backlog-ID: RP-698
-- [ ] **A correlated subquery that passes an outer FROM function's column
-      or a whole row's field through answers it as text.** `select (select
-      f.x) from generate_series(1, 2) f(x)`, `(select f)` over
-      `generate_series(1, 2) f` and `select (select (v).a) from (values (1))
-      v(a)` answer integers on PostgreSQL 15.19 (the subquery's column is
-      the outer Var, of its type); here they are the strings `'1'`, `'2'`,
-      though `(select f.x + 1)` is an integer. And `(select (v).*)` is 0A000
-      `this field selection is not supported yet`, where PostgreSQL answers
-      `1`.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_correlated_pass_through_keeps_its_type
-      Backlog-ID: RP-699
 - [ ] **A GROUP BY naming a correlated subquery target is refused.**
       `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
       v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
@@ -3120,3 +3109,39 @@ the column written out, so none is the star's. The gap tests are in
       subquery only.
       Verify: tests/backlog/test_rp_found_rp517.py::test_lateral_outer_columns
       Backlog-ID: RP-701
+- [ ] **A FROM function's whole row under a column alias is 42703 inside an
+      expression.** `select f + 1 from generate_series(1, 2) f(x)` answers
+      2, 3 on PostgreSQL 15.19, `coalesce(f)` and `(select f)` 1, 2 (the
+      whole row of a function returning a base type is that value), and
+      `(select (f).x)` is 42809 `column notation .x applied to type integer,
+      which is not a composite type` at 17; here each is 42703 `column "f"
+      does not exist`, though a bare `select f` answers, as does every form
+      over an unaliased `generate_series(1, 2) f`.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
+      Backlog-ID: RP-702
+- [ ] **A correlated subquery in the WHERE of a query over a FROM function
+      is 42883 and names the internal call.** `select 1 from
+      generate_series(1, 2) f(x) where (select f.x + 1) > 0` answers two
+      rows on PostgreSQL 15.19 and `where exists (select 1 where f.x > 1)`
+      one; here each is 42883 `function \x1fcorrelated(integer, unknown,
+      ...) does not exist`, the per-row call that stands in for the
+      subquery leaking into the client's error. The same subquery in the
+      select list, or over a VALUES list, is answered.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_correlated_subquery_in_a_function_scan_where
+      Backlog-ID: RP-703
+- [ ] **`(v).*` in a select list is 0A000.** `select (v).* from (values
+      (1)) v(a)` answers `1`, column `a`, on PostgreSQL 15.19 and over `v(a,
+      b)` both columns (`transformIndirection` expands a whole row's star
+      as `v.*`); here each is 0A000 `this field selection is not supported
+      yet`. Since RP-699 the same star inside an expression subquery is
+      answered.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_whole_row_star_in_a_select_list
+      Backlog-ID: RP-704
+- [ ] **A field of an outer item's whole row in a LATERAL subquery is
+      42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
+      as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k
+      where (v).a = 3)` `1`; here each is 42703 `column "v" does not exist`
+      at the `v`. `v.a` there is answered, and since RP-699 `(v).a` in an
+      expression subquery is too.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
+      Backlog-ID: RP-705

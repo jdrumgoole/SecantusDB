@@ -5,9 +5,9 @@ explicitly as well as through a star, so they are not the star's:
 - a row compared with a correlated subquery (`(a, c) in (select fs.a,
   fs.c)`) is refused (RP-697);
 - a correlated set operation is 42P01 (RP-698);
-- a correlated subquery that passes an outer FROM function's column, or a
-  field of an outer whole row, through unchanged answers it as text, and
-  `(v).*` there is refused (RP-699);
+- a correlated subquery that passed an outer FROM function's column, or a
+  field of an outer whole row, through unchanged answered it as text, and
+  `(v).*` there was refused (RP-699, fixed);
 - a GROUP BY naming a correlated subquery target is 42803 (RP-700);
 - a LATERAL subquery's outer column is named by its type, and a star over
   an outer item there is 42P01 (RP-701).
@@ -92,10 +92,10 @@ def test_correlated_set_operation(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CORRELATED_SET_OPERATION[query]
 
 
-# The subquery's column is the outer Var, of its type. Here a FROM
-# function's column, or a field of an outer whole row, passed through
-# unchanged answers as text (`'1'`), though `f.x + 1` is an integer; and
-# `(v).*` is 0A000 `this field selection is not supported yet`.
+# The subquery's column is the outer Var, of its type. A FROM function's
+# column, or a field of an outer whole row, passed through unchanged
+# answered as text (`'1'`), though `f.x + 1` was an integer; and `(v).*`
+# was 0A000 `this field selection is not supported yet` (RP-699, fixed).
 CORRELATED_PASS_THROUGH_TYPE = {
     "select (select f.x) from generate_series(1, 2) f(x)": ([(1,), (2,)], ["x"]),
     "select (select f) from generate_series(1, 2) f": ([(1,), (2,)], ["f"]),
@@ -104,7 +104,7 @@ CORRELATED_PASS_THROUGH_TYPE = {
 }
 
 
-@pytest.mark.backlog("RP-699")
+@pytest.mark.backlog_fixed("RP-699")
 @pytest.mark.parametrize("query", list(CORRELATED_PASS_THROUGH_TYPE))
 def test_correlated_pass_through_keeps_its_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CORRELATED_PASS_THROUGH_TYPE[query]

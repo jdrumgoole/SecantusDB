@@ -22723,6 +22723,9 @@ fn resolve_one_sublink(
     // A qualifier no level has is an error before anything else is done
     // with the subquery -- before an EXISTS drops the select list holding it.
     check_subquery_qualifiers(&inner)?;
+    // A field of an outer FROM item's whole row is that item's column, and
+    // its star the item's star (RP-699).
+    correlated::outer_field_selections(&mut inner, lookup, params);
     // A star over an outer FROM item is that item's columns (RP-517).
     correlated::expand_outer_stars(&mut inner, lookup);
     if sl.sub_link_type == SubLinkType::ExistsSublink as i32 {

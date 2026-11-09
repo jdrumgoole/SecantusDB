@@ -5896,3 +5896,25 @@ fn bpchar_assigned_to_a_string_type_drops_its_blanks() {
         "a text value keeps its blanks"
     );
 }
+
+#[test]
+fn a_field_of_an_outer_whole_row_is_its_column() {
+    // RP-699: `(v).a` over an outer FROM item's whole row is `v.a`, and
+    // `(v).*` is `v.*`, which the star expansion then reads; a name this
+    // level binds, one of its columns and a FROM function's whole row stay
+    // field selections.
+    let outer =
+        parsed_select("select 1 from t, (values (1, 2)) v(a, c), generate_series(1, 2) f(x)");
+    let depth = correlated::push_outer_from(&outer.from_clause);
+    let mut inner = parsed_select("select (v).a, (v).*, (f).x");
+    correlated::outer_field_selections(&mut inner, &lookup, &[]);
+    correlated::expand_outer_stars(&mut inner, &lookup);
+    let mut own = parsed_select("select (v).a from (values (7)) w(v)");
+    correlated::outer_field_selections(&mut own, &lookup, &[]);
+    let mut bound = parsed_select("select (v).a from (values (7)) v(a)");
+    correlated::outer_field_selections(&mut bound, &lookup, &[]);
+    correlated::pop_outer_from(depth);
+    assert_eq!(target_refs(&inner), ["v.a", "v.a", "v.c", "?"]);
+    assert_eq!(target_refs(&own), ["?"]);
+    assert_eq!(target_refs(&bound), ["?"]);
+}
