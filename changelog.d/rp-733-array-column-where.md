@@ -9,6 +9,8 @@ whose lower bound is not 1 at all. The comparison is now evaluated row by
 row, the way PostgreSQL's `array_eq` / `array_cmp` do it: the elements in
 row-major order, a NULL element after every value, then the counts, the
 dimensions and last the lower bounds. The same holds for UPDATE and DELETE.
+EXPLAIN still estimates such a comparison from the column's statistics, as
+PostgreSQL's `eqsel` / `scalarineqsel` do.
 
 An untyped literal beside an array is now read as that array's type even when
 the array's lower bound is not 1. `select a > '{b}' from t` was 42883 once a

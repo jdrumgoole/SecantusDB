@@ -2602,6 +2602,7 @@ mod heap_fetches_tests {
             scan_array_quals: None,
             scan_patterns: Vec::new(),
             scan_expr_quals: None,
+            scan_array_cmp_filter: None,
             setop_quals: Vec::new(),
             join_conds: Vec::new(),
             join_cond_splits: Vec::new(),
