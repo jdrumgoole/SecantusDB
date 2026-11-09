@@ -230,8 +230,13 @@ def _write_after_killed_build(client: Any) -> tuple:
         s.start_transaction()
         db.other.find_one({}, session=s)
         # The build started before the snapshot; its abort comes after it.
-        client.admin.command("killOp", op=build.ops()[0]["opid"])
-        build.finish()
+        # `finish` turns the pause off even when the kill fails: left on, it
+        # holds the next test's build on this module's mongod until the
+        # worker's timeout kills it (RM gate, 2026-11-09).
+        try:
+            client.admin.command("killOp", op=build.held_op())
+        finally:
+            build.finish()
         out = _outcome(lambda: db.c.insert_one({"_id": 100}, session=s))
         out += _outcome(s.commit_transaction)[:2]
     indexes = sorted(i["name"] for i in db.c.list_indexes())

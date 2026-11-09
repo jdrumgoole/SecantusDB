@@ -198,7 +198,12 @@ class _Build:
         ]
 
     def held_op(self) -> Any:
-        """The opid of the build's operation once the build itself runs.
+        """The opid of `held()`."""
+        return self.held()["opid"]
+
+    def held(self) -> dict:
+        """The build's operation, as `currentOp` lists it, once the build
+        itself runs.
 
         `_Build` may return while mongod still sets the build up: mongod
         8.2.11 lists the operation then, lists none for a moment, and lists
@@ -215,10 +220,10 @@ class _Build:
             ops = self.ops()
             now = time.monotonic()
             if ops and "msg" in ops[0]:
-                return ops[0]["opid"]
+                return ops[0]
             listed_since = (listed_since or now) if ops else None
             if listed_since is not None and now - listed_since >= 0.5:
-                return ops[0]["opid"]
+                return ops[0]
             assert now < deadline, "the build operation was never listed"
             time.sleep(0.02)
 
@@ -312,7 +317,7 @@ def _writes_meanwhile(client: Any, remove_duplicate: bool) -> dict:
         "hangAfterStartingIndexBuild",
     )
     # The build's own operation, as `currentOp` lists it.
-    op = build.ops()[0]
+    op = build.held()
     listed_op = norm({k: op.get(k) for k in ("isFromUserConnection", "op", "ns")}) | {
         "indexes": norm(op["command"]["indexes"])
     }
