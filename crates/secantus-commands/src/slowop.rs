@@ -236,6 +236,29 @@ fn target_collection<'a>(name: &str, request: &'a Document) -> Option<&'a str> {
     }
 }
 
+/// The database and collection a line names. A `renameCollection` runs
+/// against `admin` and names a full namespace: mongod's line names the
+/// collection it renamed once it has, and the command's own `admin.$cmd`
+/// when it failed -- a source that does not exist, a target that does, a
+/// view, a bad name (measured 8.2.1, 2026-11-09).
+fn line_target<'a>(
+    name: &str,
+    request: &'a Document,
+    reply: &Document,
+    db: &'a str,
+) -> (&'a str, Option<&'a str>) {
+    if name != "renameCollection" {
+        return (db, target_collection(name, request));
+    }
+    let renamed = reply.get_f64("ok").unwrap_or(1.0) == 1.0;
+    match request.get_str(name).ok().and_then(|ns| ns.split_once('.')) {
+        Some((source_db, coll)) if renamed && !source_db.is_empty() && !coll.is_empty() => {
+            (source_db, Some(coll))
+        }
+        _ => (db, None),
+    }
+}
+
 /// Whether `name` plans a query of its own, so its line has the planner's
 /// fields (`planningTimeMicros`).
 fn plans(name: &str) -> bool {
@@ -256,13 +279,13 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     let name = request.keys().next().map(String::as_str).unwrap_or("");
     let mut out = Document::new();
     out.insert("isFromUserConnection", true);
-    let coll = target_collection(name, request).unwrap_or("$cmd");
+    let (db, coll) = line_target(name, request, reply, &ctx.db_name);
     // mongod names the namespace's kind as the operation found it: what a
     // `create` creates was not there.
     let kind = if name == "create" {
         "normal"
     } else {
-        crate::opdebug::collection_type(ctx, &ctx.db_name, coll)
+        crate::opdebug::collection_type(ctx, db, coll.unwrap_or("$cmd"))
     };
     out.insert("collectionType", kind);
     // A query that parsed has its shape, whether or not it then ran (RM-358).
@@ -493,7 +516,8 @@ fn command_shown(request: &Document) -> Document {
 
 /// The attributes of one `Slow query` line. `ns` is `db.collection` for a
 /// command that names a collection, `db.$cmd.aggregate` for an aggregate
-/// that names none, and `db.$cmd` otherwise, as mongod has it; an `update`
+/// that names none, and `db.$cmd` otherwise, as mongod has it (a
+/// `renameCollection`'s: [`line_target`]); an `update`
 /// or `delete` is `db.$cmd` too, its statements' lines
 /// naming the collection. `read` is [`read_attributes`]' part. The whole
 /// in mongod's order (`opdebug::LINE_ORDER`).
@@ -506,7 +530,8 @@ pub fn attributes(
     total: Duration,
 ) -> Document {
     let name = request.keys().next().map(String::as_str).unwrap_or("");
-    let ns = match target_collection(name, request) {
+    let (db, coll) = line_target(name, request, reply, db);
+    let ns = match coll {
         Some(_) if matches!(name, "update" | "delete") => format!("{db}.$cmd"),
         Some(coll) => format!("{db}.{coll}"),
         // A collectionless aggregate runs on its own namespace (measured
@@ -686,6 +711,29 @@ mod tests {
             Duration::ZERO,
         );
         assert_eq!(attr.get_str("ns"), Ok("a.$cmd.aggregate"));
+    }
+
+    /// A `renameCollection` names the collection it renamed, and the
+    /// command's own `admin.$cmd` when it failed, as mongod 8.2.1's line
+    /// does (RM-378).
+    #[test]
+    fn a_rename_names_what_it_renamed_and_a_failed_one_its_own_namespace() {
+        let ns = |reply: Document| {
+            let attr = attributes(
+                &doc! {"renameCollection": "d.c.x", "to": "d.c2", "$db": "admin"},
+                &reply,
+                Document::new(),
+                "admin",
+                Duration::ZERO,
+                Duration::ZERO,
+            );
+            attr.get_str("ns").unwrap().to_string()
+        };
+        assert_eq!(ns(doc! {"ok": 1.0}), "d.c.x");
+        assert_eq!(
+            ns(doc! {"ok": 0.0, "code": 48_i32, "errmsg": "target namespace exists"}),
+            "admin.$cmd"
+        );
     }
 
     /// mongod 8.2.11's order for a write statement's counts, whatever order

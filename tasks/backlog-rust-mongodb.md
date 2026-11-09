@@ -806,14 +806,46 @@ These are explicit non-goals. Don't add them without a reason.
       synchronous oplog.
       Backlog-ID: RM-379
       Verify: tests/backlog/test_rm_355_364.py::test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot
-- [ ] **A `renameCollection` line names the wrong namespace.** mongod
-      8.2.1's `Slow query` line for a `renameCollection` (which runs
-      against `admin`) names the collection it renames, `ns: "<db>.c"`;
-      this server's names `admin.<db>.c` -- the command's database joined to
-      its argument, which is already a full namespace. Found while working
-      RM-361, 2026-11-07.
-      Backlog-ID: RM-378
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_rename_line_names_the_collection_it_renames
+- [ ] **A line on `admin`, `local` or `config` says its collection is
+      `normal`.** mongod 8.2.1's `Slow query` line for an operation on one
+      of its internal databases -- a `ping` (`admin.$cmd`), a `find` of
+      `admin.c` -- says `collectionType: "admin"` (`"local"`, `"config"`);
+      this server's says `"normal"`. A failed `renameCollection`, whose
+      line names `admin.$cmd` since RM-378, says `"normal"` for the same
+      reason. Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_line_on_an_internal_database_names_its_kind
+      Backlog-ID: RM-478
+- [ ] **A failed `renameCollection` is profiled.** mongod 8.2.1 profiles a
+      `renameCollection` that renamed in its source's database (`ns:
+      "<db>.c"`) and one that failed nowhere: its namespace is the
+      command's own `admin.$cmd`, and `admin` profiles no command. This
+      server profiles a failed one in the source's database as well (`ns:
+      "<db>.nope"`). Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_failed_rename_is_not_profiled
+      Backlog-ID: RM-479
+- [ ] **A `dataSize` line names `<db>.<db>.c`.** mongod 8.2.1's `Slow
+      query` line for a `dataSize`, whose argument is a full namespace,
+      names `<db>.$cmd`; this server's joins the command's database to the
+      argument. Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
+      Backlog-ID: RM-480
+- [ ] **A command refused as it parses writes a `Slow query` line.**
+      mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
+      mistyped or missing field (14, 40414: `renameCollection: 5`, no
+      `to`), an unknown one (40415: `find` with `bogus`), a collection name
+      that is not a string (73: `find: 5`, `count: 5`) -- as the operation
+      never ran; this server writes one for each, since its handlers parse
+      and run in one step (as RM-386 has it).
+      Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
+      Backlog-ID: RM-481
+- [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
+      refuses it as a write to the namespace (20 IllegalOperation, "error
+      with source namespace: cannot write to <db>.system.views"); this
+      server answers 166 "cannot rename view: <db>.system.views". Found
+      while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_rename_errors.py::test_renaming_system_views_is_a_write_to_it
+      Backlog-ID: RM-482
 - [ ] **A line names the wrong namespace or kind around a view.**
       mongod 8.2.1's `Slow query` line for a `getMore` of a cursor over a
       view, and for a `findAndModify` of a view (which it refuses), says
