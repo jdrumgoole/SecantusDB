@@ -177,7 +177,7 @@ class Gate:
         # Each step waits its turn on a busy machine (another lane's gate,
         # another session's build): scripts/wait_for_load.sh has the numbers.
         subprocess.run(["scripts/wait_for_load.sh", f"gate {name}"], check=False)
-        start = time.monotonic()
+        start, load = time.monotonic(), os.getloadavg()[0]
         with (self.out / f"{name}.log").open("w") as log:
             rc = subprocess.run(
                 cmd,
@@ -187,7 +187,11 @@ class Gate:
                 cwd=cwd,
             ).returncode
         (self.out / f"{name}.rc").write_text(f"{rc}\n")
-        print(f"    {name}={rc} ({int(time.monotonic() - start)}s)", flush=True)
+        # The load average beside the time: a step's time on this machine is
+        # as much the other lane's work as its own (ci-selected ran 100 s or
+        # 400-850 s on the same tests, 2026-11-08/09).
+        took = int(time.monotonic() - start)
+        print(f"    {name}={rc} ({took}s) load {load:.1f}->{os.getloadavg()[0]:.1f}", flush=True)
         if rc != 0:
             self.failed = True
 
@@ -296,7 +300,9 @@ def main() -> int:
 
     pytest = [str(py), "-m", "pytest", "-p", "no:cacheprovider", "-q", "-rs"]
     timeouts = ["--timeout=120", "--timeout-method=thread", "--max-worker-restart=3"]
-    g.step("ci-selected", [*pytest, *selected, "-n", WORKERS, *timeouts])
+    # --durations: which tests a slow run spent its time in, in the step's log.
+    durations = ["--durations=25", "--durations-min=5"]
+    g.step("ci-selected", [*pytest, *selected, "-n", WORKERS, *timeouts, *durations])
     g.step("ci-selected-slow", [*pytest, "-m", "slow", *selected, "-n", WORKERS, *timeouts])
     g.step("storage-engine", [*pytest, *se_files, "-o", "addopts=", "-n", WORKERS])
     g.step(
