@@ -16,7 +16,7 @@ the `varchar` side's blanks, so `'ab '::varchar = 'ab'::char(3)` was false.
 
 Fixes RP-726 (tests/backlog/test_rp_found_rp697.py::test_varchar_against_bpchar_ignores_trailing_blanks, tests/backlog/test_rp_found_rp726.py::test_varchar_against_char_n_every_form)
 
-Filed while working it: RP-731 (a JOIN ... ON a `varchar` column against a
-`char(n)` one), RP-732 (a simple CASE and NULLIF compare without their
+Filed while working it: RP-736 (a JOIN ... ON a `varchar` column against a
+`char(n)` one), RP-737 (a simple CASE and NULLIF compare without their
 types' operator) and RP-735 (a cancel during a huge `IN` list's planning
 still has a ~0.25 s tail, measured before and after this change alike).

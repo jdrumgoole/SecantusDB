@@ -3190,15 +3190,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
 'ab ')`.
 
-- [ ] **A JOIN ... ON a `varchar` column equal to a `char(n)` one misses
-      the row whose `varchar` has trailing blanks.** `select x.k, y.k from
-      ch726 x join ch726 y on x.v = y.c` is `(1, 1), (2, 2)` on PostgreSQL
-      15.19 (`bpchareq`, hashed by `hashbpchar`, ignores the blanks); here
-      `(1, 1)` only, and a LEFT join gives row 2 no partner. The bare
-      equality is a hash-join key (`joins::equalities`) compared as the raw
-      stored values. The comma-join WHERE form is answered.
-      Verify: tests/backlog/test_rp_found_rp726.py::test_join_on_varchar_against_char_n
-      Backlog-ID: RP-731
 - [ ] **A simple CASE and NULLIF over a `char(n)` and another string type
       compare without the operator their types resolve to.** `case c when
       v` and `nullif(v, c)`, `c` a `char(3)` `y` and `v` a `varchar` `y`,
@@ -3208,7 +3199,16 @@ varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
       is `ne` there, `eq` here, and `nullif(t, c)` over `y` and `y` is
       NULL there, `y` here. Two `char(n)` operands are answered.
       Verify: tests/backlog/test_rp_found_rp726.py::test_case_and_nullif_compare_by_type
-      Backlog-ID: RP-732
+      Backlog-ID: RP-737
+- [ ] **EXPLAIN of a JOIN ... ON a `varchar` column equal to a `char(n)`
+      one prints the Hash Cond through `text` casts.** `explain (costs
+      off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c` prints
+      `Hash Cond: ((x.v)::bpchar = y.c)` on PostgreSQL 15.19, the operator
+      it resolved (`bpchareq`, the `varchar` side relabelled); here
+      `((x.v)::text = (y.c)::text)`. The rows are right since RP-736.
+      Found while working RP-736 (2026-11-09).
+      Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
+      Backlog-ID: RP-738
 - [ ] **A cancel while a 200,000-item `IN` list is planned still waits
       up to ~0.25 s, about one time in twenty.** RP-202's
       `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`

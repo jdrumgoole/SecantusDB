@@ -3,8 +3,10 @@ what it found:
 
 - every form of the comparison the expression evaluator answers now reads
   the `varchar` side as `bpchar` (the regression test below);
-- a JOIN ... ON a `varchar` column equal to a `char(n)` one misses the row
-  whose `varchar` has trailing blanks;
+- a JOIN ... ON a `varchar` column equal to a `char(n)` one missed the row
+  whose `varchar` has trailing blanks (fixed by RP-736: the join's hash
+  drops trailing blanks, as `hashbpchar` does), and its EXPLAIN prints the
+  Hash Cond through `text` casts;
 - a simple CASE and NULLIF over a `char(n)` and another string type
   compare without the operator their types resolve to, so the `char(n)`
   operand keeps its blanks.
@@ -101,7 +103,10 @@ def test_varchar_against_char_n_every_form(query: str, dsn: str) -> None:
 
 # `x.v = y.c` is `bpchareq` over `x.v::bpchar`, and the hash join hashes it
 # with `hashbpchar`: both ignore trailing blanks, so `'ab '` meets `'ab'`.
-# Here the bare equality is a hash-join key compared as the stored values.
+# The bare equality was a hash-join key hashed as the stored values, which
+# kept the `varchar` side's blanks, and so was the explicit cast's
+# expression key. `text = bpchar` is `texteq` (the `char(n)` side cast to
+# text), so there `'ab '` rightly meets nothing.
 JOIN_ON_VARCHAR_AGAINST_CHAR_N = {
     "select x.k, y.k from ch726 x join ch726 y on x.v = y.c order by 1, 2": (
         [(1, 1), (2, 2)],
@@ -115,13 +120,57 @@ JOIN_ON_VARCHAR_AGAINST_CHAR_N = {
         [(1, 1), (2, 2)],
         ["k", "k"],
     ),
+    "select x.k, y.k from ch726 x right join ch726 y on x.v = y.c order by 1, 2": (
+        [(1, 1), (2, 2)],
+        ["k", "k"],
+    ),
+    "select x.k, y.k from ch726 x full join ch726 y on x.v = y.c order by 1, 2": (
+        [(1, 1), (2, 2)],
+        ["k", "k"],
+    ),
+    "select x.k, y.k from ch726 x join ch726 y on x.v = y.c and x.k = y.k order by 1, 2": (
+        [(1, 1), (2, 2)],
+        ["k", "k"],
+    ),
+    "select x.k, y.k from ch726 x join ch726 y on x.v::bpchar = y.c order by 1, 2": (
+        [(1, 1), (2, 2)],
+        ["k", "k"],
+    ),
+    "select x.k, y.k from ch726 x join ch726 y on x.t = y.c order by 1, 2": (
+        [(1, 1)],
+        ["k", "k"],
+    ),
 }
 
 
-@pytest.mark.backlog("RP-731")
+@pytest.mark.backlog_fixed("RP-736")
 @pytest.mark.parametrize("query", list(JOIN_ON_VARCHAR_AGAINST_CHAR_N))
 def test_join_on_varchar_against_char_n(query: str, dsn: str) -> None:
     assert answer(dsn, query) == JOIN_ON_VARCHAR_AGAINST_CHAR_N[query]
+
+
+# PostgreSQL prints the condition as it resolved it: the `varchar` side
+# relabelled to `bpchar`, the `char(n)` column bare. Here both sides are
+# printed cast to `text`, the operator the hash compares by, which is not the
+# one PostgreSQL chose.
+EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N = {
+    "explain (costs off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c": (
+        [
+            ("Hash Join",),
+            ("  Hash Cond: ((x.v)::bpchar = y.c)",),
+            ("  ->  Seq Scan on ch726 x",),
+            ("  ->  Hash",),
+            ("        ->  Seq Scan on ch726 y",),
+        ],
+        ["QUERY PLAN"],
+    ),
+}
+
+
+@pytest.mark.backlog("RP-738")
+@pytest.mark.parametrize("query", list(EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N))
+def test_explain_join_on_varchar_against_char_n(query: str, dsn: str) -> None:
+    assert answer(dsn, query) == EXPLAIN_JOIN_ON_VARCHAR_AGAINST_CHAR_N[query]
 
 
 # A simple CASE is `test = when-value` and NULLIF is `a = b`, each through
@@ -149,7 +198,7 @@ CASE_AND_NULLIF = {
 }
 
 
-@pytest.mark.backlog("RP-732")
+@pytest.mark.backlog("RP-737")
 @pytest.mark.parametrize("query", list(CASE_AND_NULLIF))
 def test_case_and_nullif_compare_by_type(query: str, dsn: str) -> None:
     assert answer(dsn, query) == CASE_AND_NULLIF[query]
