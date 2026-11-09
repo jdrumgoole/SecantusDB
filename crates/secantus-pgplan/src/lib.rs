@@ -46127,7 +46127,10 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             return Err(err);
         }
         // An untyped literal beside an array IS that array type: `array[1,2]
-        // @> '{1}'` reads `'{1}'` as `int4[]`.
+        // @> '{1}'` reads `'{1}'` as `int4[]`. An array whose lower bound is
+        // not 1 is an array here too (a tagged document, `arrays::bounded`):
+        // `'[0:1]={x,y}'::text[] && '{y}'` is true on 15.19 (RP-720, RP-721).
+        let arrayish = |v: &Bson| matches!(v, Bson::Array(_)) || arrays::is_bounded(v);
         let (lhs, rhs) = if matches!(op.as_str(), "@>" | "<@" | "&&") {
             let as_array_of =
                 |other: &pg_query::protobuf::Node, ov: &Bson, v: Bson| -> Result<Bson> {
@@ -46141,7 +46144,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
             match (e.lexpr.as_deref(), e.rexpr.as_deref()) {
                 (Some(l), Some(_))
                     if matches!(lhs, Bson::String(_))
-                        && matches!(rhs, Bson::Array(_))
+                        && arrayish(&rhs)
                         && unknown_operand(e.lexpr.as_deref()) =>
                 {
                     let r_node = e.rexpr.as_deref().expect("checked");
@@ -46150,7 +46153,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
                 }
                 (Some(l), Some(_))
                     if matches!(rhs, Bson::String(_))
-                        && matches!(lhs, Bson::Array(_))
+                        && arrayish(&lhs)
                         && unknown_operand(e.rexpr.as_deref()) =>
                 {
                     (lhs.clone(), as_array_of(l, &lhs, rhs)?)
@@ -46160,9 +46163,7 @@ fn const_value_node(node: &pg_query::protobuf::Node, params: &[Bson]) -> Result<
         } else {
             (lhs, rhs)
         };
-        if matches!(op.as_str(), "@>" | "<@" | "&&")
-            && (matches!(lhs, Bson::Array(_)) || matches!(rhs, Bson::Array(_)))
-        {
+        if matches!(op.as_str(), "@>" | "<@" | "&&") && (arrayish(&lhs) || arrayish(&rhs)) {
             if lhs == Bson::Null || rhs == Bson::Null {
                 return Ok(Bson::Null);
             }

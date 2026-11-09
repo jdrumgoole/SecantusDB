@@ -112,11 +112,16 @@ pub fn dim_lengths(v: &Bson) -> Vec<usize> {
 }
 
 /// Every leaf element, in row-major order. `[[1,2],[3,4]]` is `[1,2,3,4]`.
+/// An array whose lower bound is not 1 gives its elements too: the bounds
+/// play no part in which elements an array holds (`'[0:1]={x,y}'` holds `x`
+/// and `y`), so `@>`, `<@` and `&&` find them (`arrayoverlap` and
+/// `array_contain_compare` walk the elements alone, RP-721).
 pub fn flatten(v: &Bson) -> Vec<Bson> {
     let mut out = Vec::new();
     fn walk(v: &Bson, out: &mut Vec<Bson>) {
         match v {
             Bson::Array(items) => items.iter().for_each(|i| walk(i, out)),
+            bounded if is_bounded(bounded) => walk(&strip(bounded), out),
             other => out.push(other.clone()),
         }
     }
@@ -945,6 +950,22 @@ mod tests {
         assert!(contains(&arr(vec![i(1), i(2)]), &arr(vec![])));
         assert!(overlaps(&arr(vec![i(1), i(2)]), &arr(vec![i(2), i(9)])));
         assert!(!overlaps(&arr(vec![i(1)]), &arr(vec![i(9)])));
+    }
+
+    #[test]
+    fn containment_reads_an_array_with_its_own_lower_bound() {
+        // `'[0:1]={1,2}'` and `'[0:1][2:3]={{1,2},{3,4}}'`: the bounds play
+        // no part in `@>`, `<@` or `&&` on 15.19 (RP-721).
+        let shifted = bounded(arr(vec![i(1), i(2)]), &[0]);
+        assert!(is_bounded(&shifted));
+        assert_eq!(flatten(&shifted), vec![i(1), i(2)]);
+        assert!(overlaps(&shifted, &arr(vec![i(2)])));
+        assert!(overlaps(&arr(vec![i(2)]), &shifted));
+        assert!(contains(&shifted, &arr(vec![i(2), i(1)])));
+        assert!(contains(&arr(vec![i(1), i(2), i(3)]), &shifted));
+        assert!(!overlaps(&shifted, &arr(vec![i(9)])));
+        let grid = bounded(two_by_two(), &[0, 2]);
+        assert!(contains(&grid, &arr(vec![i(4)])));
     }
 
     #[test]

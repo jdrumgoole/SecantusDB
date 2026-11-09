@@ -11,8 +11,10 @@ and where they enter an expression, and compares them trimmed.
 
 Found while working it (each a gap test below):
 
-- `text[] && '{...}'` with an untyped literal is 42883 here;
-- `&&` misses a stored array whose lower bound is not 1;
+- `text[] && '{...}'` with an untyped literal was 42883 here, and `&&`
+  missed a stored array whose lower bound is not 1 -- one cause: the
+  containment operators took an array with its own lower bound (a tagged
+  document) for a scalar (fixed, RP-720 and RP-721);
 - GROUP BY over an array column returns its groups out of the ORDER BY's
   order;
 - in a join's WHERE, an untyped array literal against an array column
@@ -129,18 +131,46 @@ def test_a_char_n_array_is_padded_and_compared_without_its_blanks(query: str, ds
     assert _answer(dsn, query) == ("ok", PADDED[query])
 
 
-@pytest.mark.backlog("RP-720")
+@pytest.mark.backlog_fixed("RP-720")
 def test_an_overlap_with_an_untyped_array_literal(dsn: str) -> None:
-    # `&&` resolves the untyped side to the column's `text[]`.
+    # `&&` resolves the untyped side to the column's `text[]`. Row 5's
+    # `'[0:1]={x,y}'` was not taken for an array, so the literal stayed
+    # text and the operator did not resolve (42883).
     query = "select k from x719 where a && '{ab,y}' order by k"
     assert _answer(dsn, query) == ("ok", [(1,), (2,), (5,)])
 
 
-@pytest.mark.backlog("RP-721")
+@pytest.mark.backlog_fixed("RP-721")
 def test_an_overlap_finds_an_array_with_its_own_lower_bound(dsn: str) -> None:
-    # `arrayoverlap` compares elements; the bounds play no part.
+    # `arrayoverlap` compares elements; the bounds play no part. Row 5 was
+    # missed, as were `@>` and `<@` over it.
     query = "select k from x719 where a && '{y}'::text[] order by k"
     assert _answer(dsn, query) == ("ok", [(5,)])
+
+
+CONTAINMENT_OF_A_BOUNDED_ARRAY = {
+    "select '[0:1]={x,y}'::text[] && '{y}'::text[], '[0:1]={x,y}'::text[] @> '{y}'::text[],"
+    " '[0:1]={x,y}'::text[] <@ '{x,y,z}'::text[], '{y}'::text[] <@ '[0:1]={x,y}'::text[]": [
+        (True, True, True, True)
+    ],
+    "select '[0:1][2:3]={{1,2},{3,4}}'::int[] @> '{4}',"
+    " '[0:1]={x,NULL}'::text[] && '{NULL}'::text[]": [(True, False)],
+    "select '[0:0]={ab}'::char(3)[] && '{ab}'::char(3)[], '[0:0]={ab}'::char(3)[] @> '{\"ab \"}'": [
+        (True, True)
+    ],
+    "select array_fill(7, array[2], array[3]) && array[7],"
+    " array[7] <@ array_fill(7, array[2], array[3])": [(True, True)],
+    "select k from t719 where c @> '{y}' order by k": [(5,)],
+    "select k from x719 where a <@ '{x,y,z}' order by k": [(5,)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-721")
+@pytest.mark.parametrize("query", list(CONTAINMENT_OF_A_BOUNDED_ARRAY))
+def test_containment_reads_an_array_with_its_own_lower_bound(dsn: str, query: str) -> None:
+    # Each was false (or 42883 beside an untyped literal) here; measured on
+    # 15.19.
+    assert _answer(dsn, query) == ("ok", CONTAINMENT_OF_A_BOUNDED_ARRAY[query])
 
 
 @pytest.mark.backlog("RP-722")

@@ -3161,19 +3161,6 @@ the column written out, so none is the star's. The gap tests are in
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp719.py`.
 
-- [ ] **`&&` with an untyped array literal is 42883.** `select k from x719
-      where a && '{ab,y}'`, `a` a `text[]` column, resolves the literal to
-      `text[]` on PostgreSQL 15.19 and finds 1, 2 and 5; here it is
-      `operator does not exist: text[] && text`. The same overlap with
-      `'{ab,y}'::text[]` is answered.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_an_overlap_with_an_untyped_array_literal
-      Backlog-ID: RP-720
-- [ ] **`&&` misses a stored array whose lower bound is not 1.** `select k
-      from x719 where a && '{y}'::text[]` finds row 5, `'[0:1]={x,y}'`, on
-      PostgreSQL 15.19 (`arrayoverlap` compares elements, not bounds); here
-      it finds nothing. `@>` over the same row is answered.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_an_overlap_finds_an_array_with_its_own_lower_bound
-      Backlog-ID: RP-721
 - [ ] **GROUP BY over an array column returns its groups out of the ORDER
       BY's order.** `select count(*), a from x719 group by a order by 2` is
       `{ab}`, `{cd,ab}`, `{x,y}` on PostgreSQL 15.19 (`array_cmp`, element
