@@ -23221,6 +23221,13 @@ fn resolve_one_sublink(
                 .and_then(|d| d.columns.first().map(|c| (c.pg_type.clone(), c.typmod)));
             let typmod = column.as_ref().map_or(-1, |(_, m)| *m);
             let ty = column.map(|(t, _)| t);
+            // Over an array column the rows are accumulated into one more
+            // dimension (`ExecScanSubPlan`'s `accumArrayResultAny`), which
+            // refuses a NULL array, an empty first one, and any of another
+            // shape than the first (RP-730).
+            if ty.as_deref().is_some_and(|t| t.ends_with("[]")) {
+                arrays::check_accumulable(&values)?;
+            }
             // An `int2vector` / `oidvector` row value is one element of the
             // array, carried as its text there: as the int array it is
             // carried as, it read as one more dimension of ints (RP-575).

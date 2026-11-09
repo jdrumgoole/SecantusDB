@@ -3218,25 +3218,32 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
       Backlog-ID: RP-707
 
-## Found while working RP-729 (2026-11-09)
+## Found while working RP-730 (2026-11-09)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **An ARRAY sublink accumulates arrays of different shapes, or a NULL
-      one.** `select array(select f from (values (array[1,2]), (array[3]))
-      t(f))` is 2202E `cannot accumulate arrays of different
-      dimensionality` on 15.19 (`accumArrayResultArr` requires every
-      element array to have the first one's dimensions and lengths), as is
-      a mix of `array[1]` with `array[[3]]` or with `'{}'::int[]`; a NULL
-      element array is 22004 `cannot accumulate null arrays`. Here the
-      first answers the ragged `{{1,2},{3}}` (1007), the `'{}'` mix
-      `{{1},{}}`, and the `array[[3]]` and NULL mixes fail in the binary
-      send as 22P03 `cannot send this value as a binary _int4`. The
-      correlated form (`array(select t.f ... where t.k >= s.k)`) answers
-      the same.
-      Verify: tests/backlog/test_rp_found_rp729.py::test_array_sublink_refuses_ragged_or_null_element_arrays
-      Backlog-ID: RP-730
+- [ ] **An accumulated array whose lower bounds are not 1 is lost.**
+      `select array(select f from (values ('[2:3]={3,4}'::int[])) t(f))`
+      is `[1:1][2:3]={{3,4}}` on 15.19 (`accumArrayResultArr` copies the
+      first element array's lower bounds into the inner dimensions), and
+      `array_agg` over two such arrays `[1:2][2:3]={{3,4},{5,6}}`. Here
+      the sublink answers `{NULL}` -- each bounded element becomes a NULL
+      -- and as text `{"[2:3]={3,4}"}`, an array of strings; `array_agg`
+      the same. The shape checks already read the bounds (RP-730); the
+      result does not carry them.
+      Verify: tests/backlog/test_rp_found_rp730.py::test_accumulated_arrays_keep_their_lower_bounds
+      Backlog-ID: RP-731
+- [ ] **A query with ORDER BY computes its select list after the sort.**
+      PostgreSQL 15.19 projects the select list below the Sort, in scan
+      order, so `select k, case when k = 1 then 1/0 else ('x' || k)::int
+      end from (values (1), (2)) s(k) order by k desc` raises the first
+      row's 22012 `division by zero`. Here it raises the second row's 22P02
+      `invalid input syntax for type integer: "x2"`, the row that sorts
+      first: the error a client sees, and the order a volatile select-list
+      expression runs in, follow the sort rather than the scan.
+      Verify: tests/backlog/test_rp_found_rp730.py::test_select_list_is_computed_before_the_sort
+      Backlog-ID: RP-732
 
 ## Found while working RP-722 (2026-11-09)
 
