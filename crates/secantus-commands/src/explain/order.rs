@@ -1113,6 +1113,44 @@ pub(crate) fn stream_plan(
     Ok(Some(plan))
 }
 
+/// A `find` with a `$near` read as mongod's ring search runs, as `getMore`
+/// asks (RM-347): `None` when the read is not one the search is replayed
+/// for (a sort over it, a compound index bounded otherwise than this
+/// replays, a collection past what it replays), which reads whole as
+/// before. Refuses the `$near` as the whole read does.
+pub(crate) fn near_stream(
+    storage: &dyn Storage,
+    ask: &Ask,
+    skip: i64,
+    limit: i64,
+) -> Result<Option<super::stream::Stream>, StorageError> {
+    let Some(near) = crate::near::find_near(ask.filter)? else {
+        return Ok(None);
+    };
+    let hinted = geo::check_near_hint(storage, ask.db, ask.coll, ask.hint, &near, |why| {
+        near.unplannable(ask.db, ask.coll, ask.asked, why)
+    })?;
+    near.check_index(storage, ask.db, ask.coll, ask.asked)?;
+    if !storage.can_stream(ask.db, ask.coll)? || ask.sort.is_some_and(|s| !s.is_empty()) {
+        return Ok(None);
+    }
+    let index = match hinted {
+        Some(ix) => Some(ix),
+        None => geo::near_index(storage, ask.db, ask.coll, &near.field, &near.near)?,
+    };
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    let Some((measure, base)) =
+        geo::near_search(storage, ask.db, ask.coll, ask.filter, &index, &near.near)?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(super::stream::Stream::of_near(
+        ask.db, ask.coll, ask.filter, ask.vars, measure, base, skip, limit,
+    )))
+}
+
 /// The documents `ask` matches with their RecordIds, in mongod's order.
 /// `None`: the store does not offer the matched set for this collection, or
 /// the sort is one this does not read; the caller reads as it did before.

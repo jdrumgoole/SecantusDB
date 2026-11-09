@@ -1464,18 +1464,40 @@ fn stream_find(
         show_record_id: asked.show_record_id,
         sorts_documents: true,
     };
-    let Some(plan) = crate::explain::order::stream_plan(
-        storage.as_ref(),
-        &ask,
-        skip,
-        limit,
-        projection.as_ref(),
-        doc.contains_key("batchSize"),
-        flags,
-    )
-    .map_err(read_error)?
-    else {
-        return Ok(None);
+    // A `$near` is its ring search, read as `getMore` asks (RM-347). It
+    // keeps no index key to return.
+    let near = if crate::near::find_near(asked.filter)
+        .map_err(read_error)?
+        .is_some()
+    {
+        if asked.return_key || asked.min.is_some() || asked.max.is_some() {
+            return Ok(None);
+        }
+        match crate::explain::order::near_stream(storage.as_ref(), &ask, skip, limit)
+            .map_err(read_error)?
+        {
+            Some(stream) => Some(stream),
+            None => return Ok(None),
+        }
+    } else {
+        None
+    };
+    let plan = match near {
+        Some(_) => crate::explain::Node::Eof("GEO_NEAR"),
+        None => match crate::explain::order::stream_plan(
+            storage.as_ref(),
+            &ask,
+            skip,
+            limit,
+            projection.as_ref(),
+            doc.contains_key("batchSize"),
+            flags,
+        )
+        .map_err(read_error)?
+        {
+            Some(plan) => plan,
+            None => return Ok(None),
+        },
     };
     fn asks_index_key(v: &Bson) -> bool {
         match v {
@@ -1500,17 +1522,22 @@ fn stream_find(
             doc.get_bool("allowDiskUse").unwrap_or(true),
         )),
     };
-    let Some(stream) = crate::explain::stream::Stream::of_plan_with(
-        &plan,
-        &ctx.db_name,
-        asked.coll,
-        asked.filter,
-        asked.let_vars,
-        &opts,
-    )
-    .map_err(read_error)?
-    else {
-        return Ok(None);
+    let stream = match near {
+        Some(_) if wants_index_key => return Ok(None),
+        Some(stream) => stream,
+        None => match crate::explain::stream::Stream::of_plan_with(
+            &plan,
+            &ctx.db_name,
+            asked.coll,
+            asked.filter,
+            asked.let_vars,
+            &opts,
+        )
+        .map_err(read_error)?
+        {
+            Some(stream) => stream,
+            None => return Ok(None),
+        },
     };
     let mut cursor = FindStream {
         stream,

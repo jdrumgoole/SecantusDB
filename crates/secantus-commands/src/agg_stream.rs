@@ -154,6 +154,17 @@ fn build(
         return Ok(None);
     }
     let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
+    if let Some(spec) = ask
+        .pipeline
+        .first()
+        .and_then(Bson::as_document)
+        .and_then(|d| d.get("$geoNear"))
+    {
+        if buffered || !ask.direct {
+            return Ok(None);
+        }
+        return geo_near(storage, ask, spec);
+    }
     // Under a collation, a DISTINCT_SCAN of an index with that collation
     // (entry format 6 keeps every index in mongod's order: RM-309).
     if !buffered {
@@ -267,6 +278,70 @@ fn build(
     cursor.sbe = sbe;
     cursor.metas = (metas.record_id, metas.index_key);
     Ok(Some((cursor, indexes)))
+}
+
+/// The cursor of a pipeline that opens with a `$geoNear`: mongod's ring
+/// search, kept between buffers, each ring reading the collection as it is
+/// when the search reaches it (RM-347), read through the cursor stage
+/// (`DocumentSourceGeoNearCursor`), which gives each document its distance
+/// as it buffers it. Anything after it that does not pass each document on
+/// reads the whole pipeline at once, as before.
+fn geo_near(
+    storage: &dyn Storage,
+    ask: &Ask,
+    spec: &Bson,
+) -> Result<Option<(AggStream, Vec<String>)>, CommandError> {
+    let read_error = |e| crate::util::read_error_on_namespace(e, "aggregate", ask.ns);
+    let rest = &ask.pipeline[1..];
+    if !rest.iter().all(streams) || rest.iter().any(mentions_meta) {
+        return Ok(None);
+    }
+    if !storage.can_stream(ask.db, ask.coll).map_err(read_error)? {
+        return Ok(None);
+    }
+    let Some(read) = crate::aggregate::geo_near_read(spec, ask.db, ask.coll, storage) else {
+        return Ok(None);
+    };
+    let Some(index) =
+        crate::explain::geo::near_index(storage, ask.db, ask.coll, &read.key, &read.near)
+            .map_err(read_error)?
+    else {
+        return Ok(None);
+    };
+    let Some((measure, base)) = crate::explain::geo::near_search(
+        storage,
+        ask.db,
+        ask.coll,
+        &read.query,
+        &index,
+        &read.near,
+    )
+    .map_err(read_error)?
+    else {
+        return Ok(None);
+    };
+    // The index use the whole read counts: the plan of the stage's
+    // candidate read, when it has one.
+    if let Some(filter) =
+        crate::aggregate::geo_near_index_filter(spec, ask.db, Some(ask.coll), storage)
+    {
+        let order = crate::explain::order::Ask {
+            db: ask.db,
+            coll: ask.coll,
+            filter: &filter,
+            sort: None,
+            hint: ask.hint,
+            collation: ask.collation,
+            vars: ask.vars,
+            limit: 0,
+            asked: Default::default(),
+        };
+        crate::explain::order::count_index_use(storage, &order, crate::explain::order::Uses::Find);
+    }
+    let source = Stream::of_near(ask.db, ask.coll, &read.query, ask.vars, measure, base, 0, 0);
+    let mut cursor = AggStream::new(source, Some(FIRST_BUFFER), rest.to_vec(), ask);
+    cursor.geo_near = Some(read);
+    Ok(Some((cursor, vec![index.name])))
 }
 
 /// The cursor of a pipeline that opens with a `$group` mongod answers from
@@ -406,6 +481,9 @@ struct AggStream {
     /// The documents read are given their RecordId and their index key, for
     /// the `$meta`s rewritten into reads of them (`agg_meta`).
     metas: (bool, bool),
+    /// The read is a leading `$geoNear`'s, which gives each document what
+    /// the stage adds to it.
+    geo_near: Option<crate::aggregate::GeoNearRead>,
 }
 
 fn stage_name(s: &Bson) -> &str {
@@ -452,6 +530,7 @@ impl AggStream {
             budgets: Default::default(),
             notablescan: None,
             metas: (false, false),
+            geo_near: None,
         }
     }
 
@@ -568,7 +647,15 @@ impl AggStream {
                 let (record_id, index_key) = self.metas;
                 // mongod has an index key only for a read of one index scan.
                 let index_key = index_key && source.single_scan();
-                let docs = if record_id || index_key {
+                let docs = if let Some(geo) = &self.geo_near {
+                    let decoded = crate::util::decode_docs(read.docs)?;
+                    crate::util::encode_docs(
+                        decoded
+                            .into_iter()
+                            .filter_map(|d| geo.annotate(d))
+                            .collect(),
+                    )?
+                } else if record_id || index_key {
                     let mut decoded = crate::util::decode_docs(read.docs)?;
                     for (i, doc) in decoded.iter_mut().enumerate() {
                         if record_id {

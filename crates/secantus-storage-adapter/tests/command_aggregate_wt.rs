@@ -214,7 +214,7 @@ fn geo_near_sorts_by_distance_and_attaches_field() {
             ], "cursor": {}},
             c,
         );
-        let out = docs_of(&reply);
+        let out = batch_docs(&reply, c);
         let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
         assert_eq!(ids, vec![1, 3, 2]);
         let dists: Vec<f64> = out.iter().map(|d| d.get_f64("d").unwrap()).collect();
@@ -244,7 +244,7 @@ fn geo_near_max_distance_and_multiplier() {
             ], "cursor": {}},
             c,
         );
-        let out = docs_of(&reply);
+        let out = batch_docs(&reply, c);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].get_i32("_id").unwrap(), 1);
         assert_eq!(out[0].get_f64("d").unwrap(), 0.0);

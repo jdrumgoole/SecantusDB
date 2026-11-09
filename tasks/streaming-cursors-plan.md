@@ -84,7 +84,12 @@ connection thread; no WT cursor may outlive its call):
      the sort of keys (whose documents are fetched as a batch reaches them,
      as mongod's are) stream. A sort of whole documents is read whole for
      the first batch, as mongod reads it.
-   - Left: a plan mongod picks by trial (RM-349), `$near` (RM-347).
+   - Done 2026-11-09 (branch `fix-rm-347-near-ring-cursor`, RM-347): a
+     `$near` streams through its ring search (`Stage::Near`), the search's
+     rings, queue and increment kept between batches
+     (`secantus_core::geoorder::near::NearSearch`), each ring reading the
+     collection as it is when the search reaches it.
+   - Left: a plan mongod picks by trial (RM-349).
 3. **`aggregate`.**
    - Done (2026-10-24, branch `rust-mdb-stream3`, `agg_stream.rs`): a
      pipeline of `$match`, `$project`, `$unset`, `$addFields` / `$set`,
@@ -135,7 +140,10 @@ connection thread; no WT cursor may outlive its call):
      sort of whole documents (`Stage::SortDocs`, read whole for the first
      batch and held) and an `_id` or unique-index point read
      (`Stage::Point`).
-   - Left: a time-series collection (RM-348), `$geoNear` (RM-347), a plan
+   - Done 2026-11-09 (RM-347): a leading `$geoNear` streams through the
+     same search, read through the cursor stage, which gives each document
+     its distance as it buffers it (`agg_stream::geo_near`).
+   - Left: a time-series collection (RM-348), a plan
      chosen by trial (RM-349); their counts (RM-363).
 4. **`storage` on the line.** Done (2026-10-27, RM-023): WiredTiger's
    per-session statistics, read from each session the operation closes and
