@@ -667,11 +667,11 @@ def test_type_bits_that_change_a_number(rust_mongo: Any, mongod_rs: Any) -> None
     assert _type_bits_token(rust_mongo, Binary(b"\x01", 0)) == expected
 
 
-@pytest.mark.backlog("RM-075")
+@pytest.mark.backlog_fixed("RM-075")
 def test_a_decimal_from_a_double_in_a_token(rust_mongo: Any, mongod_rs: Any) -> None:
-    """A small-magnitude number whose type bits say decimal: mongod 8.2.11
-    rebuilds the decimal from the double and its continuation, and rescales
-    its exponent, which fails here with 50830."""
+    """A small-magnitude number whose type bits said decimal: mongod 8.2.11
+    rebuilt the decimal from the double and its continuation, and rescaling
+    its exponent failed with 50830, where this server answered 40647."""
 
     def answer(client: Any) -> Any:
         c = client["rm075d"][_name()]

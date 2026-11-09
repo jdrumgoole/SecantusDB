@@ -11,11 +11,15 @@
 //! was measured against mongod 8.2.11.
 //!
 //! `_typeBits` is read as mongod reads it, so a number decodes as the type
-//! its bits name. What is not reproduced answers [`Verdict::Unmodelled`]: a
-//! decimal (whose exponent adjustment is Decimal128 arithmetic), and a token
-//! that decodes cleanly -- mongod goes on to look for it in its oplog.
+//! its bits name, a decimal included: one mongod rebuilds from a double and a
+//! continuation goes through the same Decimal128 arithmetic ([`dec128`]).
+//! A token that decodes cleanly is not answered here -- mongod goes on to look
+//! for it in its oplog.
+
+mod dec128;
 
 use bson::{Bson, Document};
+use dec128::{Dec, Round};
 
 /// mongod's answer for a token's `_data`.
 #[derive(Debug, PartialEq)]
@@ -45,7 +49,6 @@ enum Elem {
 
 enum Stop {
     Error(i32, &'static str, String),
-    Unmodelled,
 }
 
 fn overflow(want: usize, remaining: usize) -> Stop {
@@ -311,74 +314,125 @@ fn value(ctype: u8, r: &mut Reader<'_>, bits: &mut Bits, depth: u32) -> Result<E
         // Large magnitudes.
         31 | 51 => {
             let original = bits.numeric()?;
-            let encoded = r.be(8, ctype == 31)?;
+            let inverted = ctype == 31;
+            let encoded = r.be(8, inverted)?;
             if encoded & (1 << 63) != 0 && encoded != u64::MAX {
+                // A huge decimal, its Decimal128 bits written out directly.
                 if original != K_DECIMAL {
                     return Err(format_error(50818, "Invalid type bits for decimal number."));
                 }
-                return Err(Stop::Unmodelled);
+                let high = encoded & !(1 << 63);
+                let low = r.be(8, inverted)?;
+                raw_decimal(high, low, bits)?;
+                return Ok(Elem::Other);
             }
+            // In the range of doubles (or infinity), rounded toward zero for
+            // a decimal, with a continuation marker in the low bit.
+            let continued = encoded != u64::MAX && encoded & 1 != 0;
+            let bin = if encoded == u64::MAX {
+                f64::INFINITY
+            } else {
+                f64::from_bits((encoded >> 1) | (1 << 62))
+            };
             match original {
                 K_DOUBLE => Elem::Other,
                 K_LONG => {
                     // Only the most negative long is this large.
-                    let mut bin = if encoded == u64::MAX {
-                        f64::INFINITY
-                    } else {
-                        f64::from_bits((encoded >> 1) | (1 << 62))
-                    };
-                    if ctype == 31 {
-                        bin = -bin;
-                    }
+                    let bin = if ctype == 31 { -bin } else { bin };
                     if bin != i64::MIN as f64 {
                         return Err(format_error(50821, "Unexpected value for large number."));
                     }
                     Elem::Other
                 }
-                K_DECIMAL => return Err(Stop::Unmodelled),
+                K_DECIMAL => {
+                    if !bin.is_finite() {
+                        // An infinity, or a NaN the bits spell: only a
+                        // continuation is checked, and it is refused.
+                        if continued {
+                            r.be(8, inverted)?;
+                            return Err(format_error(50850, "Invalid decimal continuation."));
+                        }
+                        return Ok(Elem::Other);
+                    }
+                    // Rounded away from zero, so the continuation adds to it.
+                    let mut dec = dec128::from_f64(bin, Round::Up);
+                    if continued {
+                        dec = continuation(r, inverted, dec)?;
+                    }
+                    adjust(dec, bits)?;
+                    Elem::Other
+                }
                 _ => return Err(format_error(50826, "Unexpected type of large number.")),
             }
         }
         // Small magnitudes: a fraction.
         40 | 42 => {
             let original = bits.numeric()?;
-            let encoded = r.be(8, ctype == 40)?;
+            let inverted = ctype == 40;
+            let encoded = r.be(8, inverted)?;
             match encoded >> 62 {
                 0 => {
-                    let low = r.be(8, ctype == 40)?;
-                    let coeff = (u128::from(encoded & ((1u64 << 49) - 1)) << 64) | u128::from(low);
-                    if coeff == 0 || coeff >= 10u128.pow(34) {
-                        return Err(format_error(50829, "Expected non-zero number for decimal."));
-                    }
                     // A teeny tiny decimal: the high word is Decimal128's
                     // own, its exponent in the 14 bits above the coefficient.
-                    decimal_exponent(coeff, ((encoded >> 49) & 0x3fff) as u32, bits)?;
+                    let low = r.be(8, inverted)?;
+                    let coeff = (u128::from(encoded & ((1u64 << 49) - 1)) << 64) | u128::from(low);
+                    let coeff = if coeff > dec128::MAX_COEFF { 0 } else { coeff };
+                    let exp = ((encoded >> 49) & 0x3fff) as i32 + dec128::MIN_EXP;
+                    adjust(Dec { coeff, exp }, bits)?;
                     Elem::Other
                 }
                 1 | 2 => {
+                    // A tiny double or decimal, its exponent shifted up by
+                    // 256 to keep it out of the subnormals.
                     let continued = encoded & 1 != 0;
+                    let scaled = f64::from_bits((encoded - (1 << 62)) >> 1);
                     if original == K_DOUBLE {
                         if continued {
                             return Err(format_error(50822, "Unexpected decimal continuation."));
                         }
-                        Elem::Other
-                    } else if original == K_DECIMAL && continued {
-                        return Err(Stop::Unmodelled);
-                    } else {
+                        return Ok(Elem::Other);
+                    }
+                    if original != K_DECIMAL || !continued {
                         return Err(format_error(50823, "Expected decimal continuation."));
                     }
+                    let dec = if scaled < f64::MIN_POSITIVE * TINY_UPSHIFT {
+                        // Would be subnormal: scaled down in decimal,
+                        // rounding toward zero throughout.
+                        let down = dec128::from_f64(TINY_DOWNSHIFT, Round::Down);
+                        dec128::multiply(dec128::from_f64(scaled, Round::Down), down, Round::Down)
+                    } else {
+                        dec128::from_f64(scaled * TINY_DOWNSHIFT, Round::Up)
+                    };
+                    adjust(continuation(r, inverted, dec)?, bits)?;
+                    Elem::Other
                 }
-                _ => match original {
-                    K_DOUBLE if encoded & 3 == 0 => Elem::Other,
-                    K_DOUBLE => return Err(format_error(50824, "Decimal contuation mismatch.")),
-                    K_DECIMAL => return Err(Stop::Unmodelled),
-                    _ => {
-                        return Err(format_error(
-                            50825,
-                            "Unexpected type for small number, expected decimal.",
-                        ))
+                _ => {
+                    // A small double, 2**-255 or more, with a two-bit
+                    // decimal continuation marker.
+                    let dcm = encoded & 3;
+                    let bin = f64::from_bits(encoded >> 2);
+                    match original {
+                        K_DOUBLE if dcm == DCM_EQUAL_TO_DOUBLE => Elem::Other,
+                        K_DOUBLE => {
+                            return Err(format_error(50824, "Decimal contuation mismatch."))
+                        }
+                        K_DECIMAL => {
+                            let dec = match dcm {
+                                DCM_EQUAL_TO_DOUBLE_15 => dec128::from_f64_15(bin, Round::Up),
+                                DCM_EQUAL_TO_DOUBLE => dec128::from_f64(bin, Round::Up),
+                                _ => continuation(r, inverted, dec128::from_f64(bin, Round::Up))?,
+                            };
+                            adjust(dec, bits)?;
+                            Elem::Other
+                        }
+                        _ => {
+                            return Err(format_error(
+                                50825,
+                                "Unexpected type for small number, expected decimal.",
+                            ))
+                        }
                     }
-                },
+                }
             }
         }
         32..=39 | 43..=50 => {
@@ -392,10 +446,45 @@ fn value(ctype: u8, r: &mut Reader<'_>, bits: &mut Bits, depth: u32) -> Result<E
             let encoded = r.be(n, negative)?;
             if encoded & 1 != 0 {
                 // A fractional part, read to a full eight bytes first.
-                r.be(8 - n, negative)?;
+                let integer = encoded >> 1;
+                let frac_bytes = 8 - n;
+                let fraction = r.be(frac_bytes, negative)?;
+                let all = if frac_bytes == 0 {
+                    integer
+                } else {
+                    (integer << (8 * frac_bytes)) | fraction
+                };
+                // The low two bits are the marker; the rest a binary fraction
+                // (`static_cast<double>` rounds to nearest, as `as` does).
+                let bin = (all & !3) as f64 / 256f64.powi(frac_bytes as i32);
                 return match original {
                     K_DOUBLE => Ok(Elem::Other),
-                    K_DECIMAL => Err(Stop::Unmodelled),
+                    K_DECIMAL => {
+                        // The eight-byte case has no room for a marker and
+                        // always carries a continuation.
+                        let dcm = if frac_bytes == 0 {
+                            DCM_CONTINUATION_ABOVE_15
+                        } else {
+                            all & 3
+                        };
+                        let dec = match dcm {
+                            DCM_EQUAL_TO_DOUBLE_15 => dec128::from_f64_15(bin, Round::Up),
+                            DCM_EQUAL_TO_DOUBLE => dec128::from_f64(bin, Round::Up),
+                            _ => {
+                                let start = if integer as i64 as f64 > MAX_INT_FOR_DOUBLE {
+                                    Dec {
+                                        coeff: u128::from(integer),
+                                        exp: 0,
+                                    }
+                                } else {
+                                    dec128::from_f64(bin, Round::Up)
+                                };
+                                continuation(r, negative, start)?
+                            }
+                        };
+                        adjust(dec, bits)?;
+                        Ok(Elem::Other)
+                    }
                     _ => Err(format_error(50810, "Expected type Decimal.")),
                 };
             }
@@ -408,7 +497,13 @@ fn value(ctype: u8, r: &mut Reader<'_>, bits: &mut Bits, depth: u32) -> Result<E
                     Elem::Int(v as i32)
                 }
                 K_DECIMAL => {
-                    integral_decimal_exponent(u128::from(encoded >> 1), bits)?;
+                    adjust(
+                        Dec {
+                            coeff: u128::from(encoded >> 1),
+                            exp: 0,
+                        },
+                        bits,
+                    )?;
                     Elem::Other
                 }
                 _ => Elem::Other,
@@ -418,10 +513,49 @@ fn value(ctype: u8, r: &mut Reader<'_>, bits: &mut Bits, depth: u32) -> Result<E
     })
 }
 
-/// `adjustDecimalExponent` for a decimal made from a whole number (exponent
-/// 0, biased 6176).
-fn integral_decimal_exponent(coefficient: u128, bits: &mut Bits) -> Result<(), Stop> {
-    decimal_exponent(coefficient, 6176, bits)
+/// The decimal continuation markers of a small double or a fraction.
+const DCM_EQUAL_TO_DOUBLE: u64 = 0;
+const DCM_EQUAL_TO_DOUBLE_15: u64 = 2;
+const DCM_CONTINUATION_ABOVE_15: u64 = 3;
+
+/// `kTinyDoubleExponentUpshiftFactor` and its inverse, 2**256 and 2**-256.
+const TINY_UPSHIFT: f64 = f64::from_bits((1023 + 256) << 52);
+const TINY_DOWNSHIFT: f64 = f64::from_bits((1023 - 256) << 52);
+
+/// `kMaxIntForDouble`, 2**53.
+const MAX_INT_FOR_DOUBLE: f64 = 9_007_199_254_740_992.0;
+
+/// `readDecimalContinuation`: eight more bytes, added at the exponent of
+/// `num` widened to 34 digits, exactly or not at all.
+fn continuation(r: &mut Reader<'_>, inverted: bool, num: Dec) -> Result<Dec, Stop> {
+    let more = r.be(8, inverted)?;
+    dec128::add_continuation(dec128::normalize(num), more)
+        .ok_or_else(|| format_error(50815, "Unexpected inexact flag set after Decimal addition."))
+}
+
+/// A Decimal128 from its two words: a non-finite one is not adjusted, a
+/// non-canonical one is a zero.
+fn raw_decimal(high: u64, low: u64, bits: &mut Bits) -> Result<(), Stop> {
+    let combination = (high >> 46) & 0x1ffff;
+    if combination >= 0x1e << 12 {
+        return Ok(());
+    }
+    let (coeff, exp) = if combination >= 3 << 15 {
+        (0, 0)
+    } else {
+        let coeff = (u128::from(high & ((1 << 49) - 1)) << 64) | u128::from(low);
+        let coeff = if coeff > dec128::MAX_COEFF { 0 } else { coeff };
+        (coeff, (combination >> 3) as i32 + dec128::MIN_EXP)
+    };
+    adjust(Dec { coeff, exp }, bits)
+}
+
+/// `adjustDecimalExponent` of a finite decimal.
+fn adjust(num: Dec, bits: &mut Bits) -> Result<(), Stop> {
+    if num.coeff == 0 {
+        return Err(format_error(50829, "Expected non-zero number for decimal."));
+    }
+    decimal_exponent(num.coeff, (num.exp - dec128::MIN_EXP) as u32, bits)
 }
 
 /// `adjustDecimalExponent`: the stored low six bits of the exponent the
@@ -615,7 +749,6 @@ pub fn mongod_verdict(tok: &Document) -> Verdict {
         Some(Bson::Binary(b)) => match Bits::from_buffer(&b.bytes) {
             Ok(bits) => bits,
             Err(Stop::Error(code, name, msg)) => return Verdict::Error(code, name, msg),
-            Err(Stop::Unmodelled) => return Verdict::Unmodelled,
         },
         Some(_) => {
             return Verdict::Error(
@@ -644,7 +777,6 @@ pub fn mongod_verdict(tok: &Document) -> Verdict {
     match decode(&bytes, &mut bits) {
         Ok(elems) => check_fields(&elems),
         Err(Stop::Error(code, name, msg)) => Verdict::Error(code, name, msg),
-        Err(Stop::Unmodelled) => Verdict::Unmodelled,
     }
 }
 
