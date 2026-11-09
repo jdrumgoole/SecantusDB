@@ -2,9 +2,9 @@
 assignment to a `varchar(n)[]` variable truncated an overlong element):
 
 - an INSERT or UPDATE of a `varchar(n)[]`, `char(n)[]` or `bit(n)[]`
-  column fits no element to the column's modifier, where PostgreSQL's
+  column fitted no element to the column's modifier, where PostgreSQL's
   `ArrayCoerceExpr` applies the element's length coercion by the
-  assignment rule;
+  assignment rule (fixed by RP-710);
 - a PL/pgSQL assignment to an array element, `x[1] := v`, is refused.
 
 The expected answers were measured on a private, freshly initdb'd
@@ -70,7 +70,7 @@ ARRAY_COLUMN = {
 }
 
 
-@pytest.mark.backlog("RP-710")
+@pytest.mark.backlog_fixed("RP-710")
 @pytest.mark.parametrize("query", list(ARRAY_COLUMN))
 def test_array_column_assignment_fits_each_element(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == ARRAY_COLUMN[query]

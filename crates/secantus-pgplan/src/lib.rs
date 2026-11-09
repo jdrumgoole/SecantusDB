@@ -3708,6 +3708,9 @@ pub struct SubscriptAssign {
     /// The type the assigned value is cast to: the element type for an
     /// element assignment, the array type itself for a slice.
     pub value_type: String,
+    /// The column's element modifier, which the assigned value is fitted
+    /// to by the assignment rule (`varchar(3)[]`'s 7; RP-710).
+    pub typmod: i32,
     pub subs: Vec<SubscriptTarget>,
     pub value: ColumnExpr,
 }
@@ -16870,9 +16873,11 @@ fn fval_integer(text: &str) -> Option<Bson> {
 /// An assigned value fitted to its column's declared length: a
 /// `char(n)` / `varchar(n)` value too long is 22001, unless everything past
 /// the length is blanks, which are silently dropped (PostgreSQL's
-/// assignment rule -- an explicit CAST truncates instead).
+/// assignment rule -- an explicit CAST truncates instead). An array
+/// column fits each element (`transformAssignedExpr`'s `ArrayCoerceExpr`
+/// over the element's length coercion; RP-710).
 pub(crate) fn fit_to_column(v: Bson, column: &Column) -> Result<Bson> {
-    fit_length(v, &column.pg_type, column.typmod)
+    fit_assigned_length(v, &column.pg_type, column.typmod)
 }
 
 /// `fit_to_column` for a value of type `pg_type` at modifier `typmod`: an
@@ -42474,7 +42479,7 @@ pub fn on_conflict_row_sets(
     let mut set = Document::new();
     let mut unset = Vec::new();
     for (field, pg_type, typmod, expr) in set_exprs {
-        let value = fit_length(
+        let value = fit_assigned_length(
             assign_value(apply_row_expr(expr, row)?, column_expr_type(expr), pg_type)?,
             pg_type,
             *typmod,
@@ -42549,7 +42554,7 @@ pub fn update_row_sets(upd: &Update, row: &Document) -> Result<(Document, Vec<St
                 column_expr_type(expr).to_string(),
             ),
         };
-        let value = fit_length(assign_value(value, &source, pg_type)?, pg_type, *typmod)?;
+        let value = fit_assigned_length(assign_value(value, &source, pg_type)?, pg_type, *typmod)?;
         set_stored_value(&mut set, &mut unset, field.clone(), value);
     }
     for a in &upd.set_subscripts {
@@ -42629,6 +42634,7 @@ fn plan_subscript_assign(
         field: field.to_string(),
         pg_type: column.pg_type.clone(),
         value_type,
+        typmod: column.typmod,
         subs,
         value: row_column_expr(val, fields, params, sample)?,
     })
@@ -42642,7 +42648,15 @@ fn plan_subscript_assign(
 /// the range is PostgreSQL's own "source array too small"; a longer one has
 /// its tail ignored.
 fn apply_subscript_assign(a: &SubscriptAssign, row: &Document, current: Bson) -> Result<Bson> {
-    let value = cast_value(apply_row_expr(&a.value, row)?, &a.value_type)?;
+    // The new element (or slice) is coerced to the element type at the
+    // column's modifier by the assignment rule, as
+    // `transformAssignmentSubscripts` does: an overlong `varchar(3)` element
+    // is 22001, trailing blanks past the length drop (RP-710).
+    let value = fit_assigned_length(
+        cast_value(apply_row_expr(&a.value, row)?, &a.value_type)?,
+        &a.value_type,
+        a.typmod,
+    )?;
     let index = |e: &ColumnExpr| -> Result<i64> {
         let i = arrays::subscript_index(&apply_row_expr(e, row)?)?;
         // A subscript past the end EXTENDS the array, so the subscript is the
