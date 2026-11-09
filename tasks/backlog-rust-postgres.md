@@ -3278,15 +3278,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
 b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
 `'[2:3]={1,2}'`, NULL and `'{NULL}'`.
 
-- [ ] **`IS NULL` over an array column matches an array holding a NULL
-      element.** `select k from x733 where b is null` is only the row whose
-      `b` is NULL on PostgreSQL 15.19; here it is also `{NULL,1}` and
-      `{NULL}`, and `IS NOT NULL` (`NOT (b IS NULL)`, `ISNULL` the same)
-      drops them. The null test lowers to the MQL `{b: null}`, which also
-      matches an array with a NULL element; `IS NOT DISTINCT FROM NULL` is
-      right since RP-733 took it per row.
-      Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
-      Backlog-ID: RP-739
 - [ ] **`a = ANY (array of arrays)` over an array column answers rows.**
       `select k from x733 where a = any (array['{x,y}'::text[]])` is 42883
       `operator does not exist: text[] = text` on PostgreSQL 15.19 (the
