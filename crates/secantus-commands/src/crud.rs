@@ -460,6 +460,11 @@ fn write_command_problem(doc: &Document, command: &str, in_sequence: bool) -> Op
                     return Some(e);
                 }
             }
+            "stmtId" | "stmtIds" => {
+                if let Some(e) = statement_id_type_problem(command, key, value) {
+                    return Some(e);
+                }
+            }
             "let" if command == "delete" => {
                 if !matches!(value, Bson::Null | Bson::Document(_)) {
                     return Some(wrong_type("delete.let".to_string(), value, "object"));
@@ -491,6 +496,118 @@ fn write_command_problem(doc: &Document, command: &str, in_sequence: bool) -> Op
         return Some(missing(format!("{command}.{array}")));
     }
     None
+}
+
+/// The IDL types of a write's statement ids: `stmtId` is an int and
+/// `stmtIds` an array of ints, a null being no value (mongod 8.2.11 names
+/// an `Int64` or a double `'long'` / `'double'`, expected `'int'`).
+fn statement_id_type_problem(command: &str, key: &str, value: &Bson) -> Option<CommandError> {
+    let wrong = |path: String, v: &Bson, expected: &str| {
+        Some(CommandError::new(
+            14,
+            "TypeMismatch",
+            format!(
+                "BSON field '{path}' is the wrong type '{}', expected type '{expected}'",
+                secantus_core::query::bson_type_name(v)
+            ),
+        ))
+    };
+    match (key, value) {
+        (_, Bson::Null) | ("stmtId", Bson::Int32(_)) => None,
+        ("stmtId", other) => wrong(format!("{command}.stmtId"), other, "int"),
+        ("stmtIds", Bson::Array(ids)) => ids.iter().enumerate().find_map(|(i, id)| match id {
+            Bson::Null | Bson::Int32(_) => None,
+            other => wrong(format!("{command}.stmtIds.{i}"), other, "int"),
+        }),
+        (_, other) => wrong(format!("{command}.stmtIds"), other, "array"),
+    }
+}
+
+/// mongod's `checkOpCountForCommand` on the statement ids of an `insert`,
+/// `update` or `delete` that parsed: `stmtIds` must name one id per
+/// statement (16), and may not come with `stmtId` (72), checked in that
+/// order. Both messages go on to quote the ids and the whole command as
+/// mongod serialises it (`request_dump`). mongod checks this on every
+/// write, in a session or not; this server checked it only on a retryable
+/// write, and in the first sentence (RM-087, measured 8.2.11 2026-11-09).
+/// `statements` gives the statements, nulls dropped, for the message only.
+fn statement_id_problem(
+    command: &str,
+    doc: &Document,
+    count: usize,
+    statements: impl FnOnce() -> Vec<Bson>,
+) -> Option<CommandError> {
+    let ids = crate::request_dump::statement_id_list(doc)?;
+    let dump =
+        |statements: Vec<Bson>| crate::request_dump::write_command(command, doc, &statements);
+    if ids.len() != count {
+        return Some(CommandError::new(
+            16,
+            "InvalidLength",
+            format!(
+                "Number of statement ids must match the number of batch entries. Got {} \
+                 statement ids but {count} operations. Statement ids: {}. Write command: {}",
+                ids.len(),
+                crate::request_dump::object(&doc! { "stmtIds": ids }),
+                dump(statements()),
+            ),
+        ));
+    }
+    let first = doc.get("stmtId").filter(|v| !matches!(v, Bson::Null))?;
+    Some(CommandError::new(
+        72,
+        "InvalidOptions",
+        format!(
+            "May not specify both stmtId and stmtIds in write command. Got {}. Write command: {}",
+            crate::request_dump::object(&doc! { "stmtId": first.clone(), "stmtIds": ids }),
+            dump(statements()),
+        ),
+    ))
+}
+
+/// What mongod refuses when it parses an `insert`, `update` or `delete`,
+/// before anything runs: the command's own fields (`write_command_problem`,
+/// `update_command_problem`), an empty batch, then its statement ids.
+/// `sequence` holds the documents of an insert that arrived as a document
+/// sequence. The session layer asks the same question of a retryable write
+/// whose statement ids it cannot use, so the two answer alike.
+pub(crate) fn write_parse_problem(
+    command: &str,
+    doc: &Document,
+    sequence: Option<&[Vec<u8>]>,
+) -> Option<CommandError> {
+    let (array, problem) = match command {
+        "insert" => (
+            "documents",
+            write_command_problem(doc, "insert", sequence.is_some()),
+        ),
+        "update" => (
+            "updates",
+            argtypes::require_object(doc, "let", "update.let")
+                .and_then(|()| argtypes::require_bool_field(doc, "ordered", "update.ordered"))
+                .err()
+                .or_else(|| update_command_problem(doc)),
+        ),
+        _ => ("deletes", write_command_problem(doc, "delete", false)),
+    };
+    if problem.is_some() {
+        return problem;
+    }
+    let count = match sequence {
+        Some(raw) if command == "insert" => raw.len(),
+        _ => write_statements(doc, array).len(),
+    };
+    if count == 0 {
+        return Some(empty_batch_error());
+    }
+    statement_id_problem(command, doc, count, || match sequence {
+        Some(raw) if command == "insert" => raw
+            .iter()
+            .filter_map(|b| secantus_core::bsondoc::from_bytes(b).ok())
+            .map(Bson::Document)
+            .collect(),
+        _ => write_statements(doc, array).into_iter().cloned().collect(),
+    })
 }
 
 /// `bypassEmptyTsReplacement` is a bool on every write command that takes it.
@@ -644,22 +761,6 @@ fn insert_raw_path(
     storage.set_insert_positions(None);
     let (inserted, errors) = inserted.map_err(command_error)?;
     insert_reply(inserted, errors, pre_errors, &survivor_to_orig, ordered)
-}
-
-/// `insert` — batch document insert.
-/// mongod's empty-batch rule, which `insert` already applied and `update` /
-/// `delete` did not: an absent, non-array or empty write array is
-/// InvalidLength (16), not a no-op success. Both used to answer ok:1 with
-/// `n: 0`, telling the caller a batch it never sent had been applied.
-fn empty_batch(doc: &Document, field: &str) -> Result<(), CommandError> {
-    match doc.get(field) {
-        Some(Bson::Array(a)) if !a.is_empty() => Ok(()),
-        _ => Err(CommandError::new(
-            16,
-            "InvalidLength",
-            "Write batch sizes must be between 1 and 100000. Got 0 operations.",
-        )),
-    }
 }
 
 /// A `$text` query needs a text index, and this server builds none: mongod's
@@ -827,7 +928,7 @@ pub fn insert(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     // Take the raw-BSON write side-channel first, releasing the `&mut` borrow
     // before the immutable `storage()` / `db_name` borrows below.
     let raw_docs = ctx.raw_insert_documents.take();
-    if let Some(problem) = write_command_problem(doc, "insert", raw_docs.is_some()) {
+    if let Some(problem) = write_parse_problem("insert", doc, raw_docs.as_deref()) {
         return Err(problem);
     }
     let db = ctx.db_name.clone();
@@ -1071,13 +1172,10 @@ pub fn delete(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     if let Some(e) = crate::admin::invalid_write_namespace(&ctx.db_name, &coll) {
         return Ok(e.into_reply());
     }
-    if let Some(problem) = write_command_problem(doc, "delete", false) {
+    if let Some(problem) = write_parse_problem("delete", doc, None) {
         return Err(problem);
     }
     let deletes = write_statements(doc, "deletes");
-    if deletes.is_empty() {
-        return Err(empty_batch_error());
-    }
     let storage = ctx.storage()?;
     // NOTE: an unresolvable `hint` is a PER-STATEMENT writeError, not a
     // command-level failure. mongod answers `ok: 1` with
@@ -1913,6 +2011,13 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
     if let Some(key) = argtypes::unknown_field(doc, FIELDS) {
         return Some(unknown(format!("update.{key}")));
     }
+    if let Some(problem) = doc
+        .iter()
+        .filter(|(k, _)| matches!(k.as_str(), "stmtId" | "stmtIds"))
+        .find_map(|(k, v)| statement_id_type_problem("update", k, v))
+    {
+        return Some(problem);
+    }
     if let Some(problem) = empty_ts_flag_problem(doc) {
         return Some(problem);
     }
@@ -1954,6 +2059,33 @@ fn update_command_problem(doc: &Document) -> Option<CommandError> {
         {
             return Some(unknown(format!("update.updates.{key}")));
         }
+        // A statement's own types are parsed with it, so a mistyped one
+        // fails the command before any statement runs: the statements ahead
+        // of it were applied before the command failed (RM-461).
+        //
+        // `multi` and `upsert` are strict bools, unlike findAndModify's
+        // `upsert`, which takes a bool OR any number. Adjacent slots,
+        // different rules -- probed, not inferred.
+        let typed = argtypes::require_write_statement(statement, "update")
+            .and_then(|()| argtypes::require_bool_field(statement, "multi", "update.updates.multi"))
+            .and_then(|()| {
+                argtypes::require_bool_field(statement, "upsert", "update.updates.upsert")
+            })
+            .and_then(|()| {
+                argtypes::require_object(statement, "collation", "update.updates.collation")
+            })
+            .and_then(|()| {
+                argtypes::require_array_of_objects(
+                    statement,
+                    "arrayFilters",
+                    "update.updates.arrayFilters",
+                )
+            })
+            .and_then(|()| argtypes::require_hint(statement, "hint"))
+            .and_then(|()| argtypes::require_object(statement, "c", "update.updates.c"));
+        if let Err(problem) = typed {
+            return Some(problem);
+        }
     }
     None
 }
@@ -1987,12 +2119,9 @@ pub(crate) fn update_in(
     status_counters: Option<&crate::topstats::TopStats>,
     cluster_time: Result<bson::Timestamp, bool>,
 ) -> HandlerResult {
-    argtypes::require_object(doc, "let", "update.let")?;
-    argtypes::require_bool_field(doc, "ordered", "update.ordered")?;
-    if let Some(problem) = update_command_problem(doc) {
+    if let Some(problem) = write_parse_problem("update", doc, None) {
         return Err(problem);
     }
-    empty_batch(doc, "updates")?;
     let coll = coll_arg(doc, "update")?;
     if let Some(e) = crate::admin::invalid_write_namespace(db_name, &coll) {
         return Ok(e.into_reply());
@@ -2062,7 +2191,6 @@ pub(crate) fn update_in(
         statements.close(n, n_modified, upserted.len(), &write_errors);
         let Bson::Document(spec) = spec else { continue };
 
-        argtypes::require_write_statement(spec, "update")?;
         if let Some((code, errmsg)) = &let_problem {
             write_errors.push(Bson::Document(doc! {
                 "index": index as i32, "code": *code, "errmsg": errmsg.clone(),
@@ -2072,15 +2200,6 @@ pub(crate) fn update_in(
             }
             continue;
         }
-        // Strict bool, unlike findAndModify's `upsert`, which takes a bool OR any
-        // number. Adjacent slots, different rules -- probed, not inferred.
-        argtypes::require_bool_field(spec, "multi", "update.updates.multi")?;
-        argtypes::require_bool_field(spec, "upsert", "update.updates.upsert")?;
-        argtypes::require_object(spec, "collation", "update.updates.collation")?;
-        argtypes::require_array_of_objects(spec, "arrayFilters", "update.updates.arrayFilters")?;
-        argtypes::require_hint(spec, "hint")?;
-        argtypes::require_object(spec, "c", "update.updates.c")?;
-
         // A time-series collection takes a multi update of its meta field
         // and no other; mongod says which rule a statement breaks before it
         // looks at the hint.

@@ -548,9 +548,11 @@ pub(crate) fn read_error_on_namespace(err: StorageError, command: &str, ns: &str
 pub(crate) fn did_not_parse(reply: &Document) -> bool {
     reply.get_f64("ok").unwrap_or(0.0) != 1.0
         && (matches!(reply.get_i32("code").unwrap_or(0), 16 | 40414 | 40415)
-            || reply
-                .get_str("errmsg")
-                .is_ok_and(|m| m.starts_with("BSON field '") || m.starts_with("Expected field ")))
+            || reply.get_str("errmsg").is_ok_and(|m| {
+                m.starts_with("BSON field '")
+                    || m.starts_with("Expected field ")
+                    || m.starts_with("May not specify both stmtId and stmtIds")
+            }))
 }
 
 pub(crate) fn command_error(err: StorageError) -> CommandError {
