@@ -590,12 +590,13 @@ These are explicit non-goals. Don't add them without a reason.
         rounds (`$out`'s were measured on a standalone, RM-185);
       - each global lock taken apart takes an execution ticket, so where
         these locks differ the line's `queues.execution` admissions differ
-        too (RM-355; `collMod`'s line has 3 here, 4 on mongod), and an
-        `aggregate` of `$documents`, which takes no lock on mongod, has no
-        admission and no `storage` section there;
+        too (RM-355; `collMod`'s line has 3 here, 4 on mongod);
       - a statement of a transaction shows `{}` on mongod's line and the
-        transaction's initial locks in its entry; an `aggregate` of
-        `$documents` takes no lock on mongod, and the global IS here.
+        transaction's initial locks in its entry;
+      - a collectionless `aggregate` takes no lock of its own since
+        2026-11-09, as on mongod, but one whose `$lookup` or `$unionWith`
+        reads a collection takes the global IS three times on mongod's line
+        (four in its entry, four execution admissions) and once here.
       Backlog-ID: RM-357
       Verify: tests/backlog/test_rm_355_364.py::test_more_writes_report_mongods_locks
 - [ ] **Some queries have no `queryShapeHash`.** Since 2026-11-07 a

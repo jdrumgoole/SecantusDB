@@ -411,7 +411,6 @@ _DIVERGING_WRITES = {
     # A statement of a transaction prints `{}`; its entry has the
     # transaction's locks.
     "insert in a transaction": lambda d: _in_transaction(d),
-    "aggregate of $documents": lambda d: list(d.aggregate([{"$documents": [{"a": 1}]}])),
 }
 
 
@@ -429,6 +428,49 @@ def test_more_writes_report_mongods_locks(rust_mongo: Any, mongod_rs: Any, name:
     answers = _write_locks(rust_mongo, mongod_rs, _DIVERGING_WRITES[name])
     assert answers["mongod"]
     assert answers["rust"] == answers["mongod"]
+
+
+#: Aggregates on no collection whose pipelines read none.
+_COLLECTIONLESS = {
+    "$documents": [{"$documents": [{"a": 1}]}],
+    "$documents, $match and $facet": [
+        {"$documents": [{"a": 1}, {"a": 2}]},
+        {"$match": {"a": 1}},
+        {"$facet": {"x": [{"$project": {"a": 1}}]}},
+    ],
+    "$listLocalSessions": [{"$listLocalSessions": {}}],
+}
+
+
+@pytest.mark.backlog_fixed("RM-357")
+@pytest.mark.parametrize("name", list(_COLLECTIONLESS))
+def test_a_collectionless_aggregate_takes_no_lock(
+    rust_mongo: Any, mongod_rs: Any, name: str
+) -> None:
+    """mongod 8.2.11 takes no lock for an `aggregate: 1` whose pipeline
+    reads no collection (`runAggregate` on `<db>.$cmd.aggregate`): its line
+    and entry print `locks: {}`, the line no execution admission and no
+    `storage`, as the global lock was never taken, and the line names
+    `<db>.$cmd.aggregate` (measured 2026-11-09). This server took the
+    global IS, and an execution ticket with it, and named `<db>.$cmd`."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.aggregate(_COLLECTIONLESS[name])))
+    out = {
+        server: (
+            [
+                (
+                    a.get("ns", "").split(".", 1)[-1],
+                    a.get("locks"),
+                    a.get("queues", {}).get("execution"),
+                    "storage" in a,
+                )
+                for _, a in lines
+            ],
+            [(e.get("locks"), e.get("flowControl"), "storage" in e) for e in entries],
+        )
+        for server, (lines, entries) in got.items()
+    }
+    assert out["mongod"] == ([("$cmd.aggregate", {}, {}, False)], [({}, {}, False)])
+    assert out["rust"] == out["mongod"]
 
 
 # ------------------------------------------------------------- RM-358 --
