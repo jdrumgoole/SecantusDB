@@ -3156,19 +3156,6 @@ the column written out, so none is the star's. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp699.py::test_lateral_whole_row_field
       Backlog-ID: RP-705
 
-## Found while working RP-719 (2026-11-09)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp719.py`.
-
-- [ ] **GROUP BY over an array column returns its groups out of the ORDER
-      BY's order.** `select count(*), a from x719 group by a order by 2` is
-      `{ab}`, `{cd,ab}`, `{x,y}` on PostgreSQL 15.19 (`array_cmp`, element
-      by element); here `{cd,ab}`, `{x,y}`, `{ab}`. A plain `select a from
-      x719 order by a` is in the right order.
-      Verify: tests/backlog/test_rp_found_rp719.py::test_groups_of_an_array_column_follow_the_order_by
-      Backlog-ID: RP-722
-
 ## Found while working RP-697 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
@@ -3250,3 +3237,26 @@ statement is VALUES-only and runs there as written.
       the same.
       Verify: tests/backlog/test_rp_found_rp729.py::test_array_sublink_refuses_ragged_or_null_element_arrays
       Backlog-ID: RP-730
+
+## Found while working RP-722 (2026-11-09)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp722.py`: `x722(k int, a text[])`
+holding `'{ab}'`, `'{cd,ab}'` and `'[0:1]={x,y}'`.
+
+- [ ] **A WHERE range filter over an array column misses an array whose
+      lower bound is not 1.** `select a from x722 where a > '{b}'` is
+      `{cd,ab}` and `[0:1]={x,y}` on PostgreSQL 15.19 (`array_gt` is
+      `array_cmp`: the elements first, the bounds last); here only
+      `{cd,ab}`. `>=` and `BETWEEN` miss it the same way; `=` against
+      `'[0:1]={x,y}'` finds it. The sort over such a column is right since
+      RP-722.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_a_range_filter_finds_an_array_whose_lower_bound_is_not_1
+      Backlog-ID: RP-733
+- [ ] **An array column compared with an untyped literal in the select list
+      is 42883.** `select k, a > '{b}' from x722` answers per row on
+      PostgreSQL 15.19, the literal read as `text[]` as it is in a WHERE;
+      here it is 42883 `operator does not exist: text[] > text`, as is
+      `a = '{x,y}'`.
+      Verify: tests/backlog/test_rp_found_rp722.py::test_an_array_column_against_an_untyped_literal_in_the_select_list
+      Backlog-ID: RP-734

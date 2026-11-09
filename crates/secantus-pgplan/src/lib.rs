@@ -41316,57 +41316,90 @@ fn infinite_instant(v: &Bson) -> Option<i8> {
     }
 }
 
+/// PostgreSQL's `array_cmp` (arrayfuncs.c), the btree order of every array
+/// type: the elements first, in storage (row-major) order, whatever the
+/// shapes; when one array's elements run out, or all of them are equal,
+/// the one with fewer elements first, then the one with fewer dimensions,
+/// then dimension by dimension the shorter one, and last the lower bounds
+/// (`'[0:0]={ab}' < '{ab}' < '[2:2]={ab}'`). An array whose lower bound is
+/// not 1 is held as a tagged document; comparing one with a plain array
+/// had no arm, so it answered no order, and a sort over a column holding
+/// both came out scrambled (RP-722).
+fn array_cmp(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    let (ex_all, ey_all) = (arrays::flatten(a), arrays::flatten(b));
+    for (ex, ey) in ex_all.iter().zip(ey_all.iter()) {
+        // Inside an array, PostgreSQL compares NULLs directly rather
+        // than through scalar `=`: two NULLs are equal, and a NULL
+        // sorts after any non-NULL. (Probed, not assumed - scalar
+        // `NULL = NULL` is NULL, so the array rule is the surprise.)
+        match (ex == &Bson::Null, ey == &Bson::Null) {
+            (true, true) => continue,
+            (true, false) => return Some(Ordering::Greater),
+            (false, true) => return Some(Ordering::Less),
+            (false, false) => {}
+        }
+        // Records inside an array compare as `record_cmp` does, field
+        // by field (`array[row(1)] = array[row(1)]` is true).
+        if let (Some(rx), Some(ry)) = (record_fields(ex), record_fields(ey)) {
+            // A field still `unknown` (a bare literal or NULL in the
+            // ROW) has no comparison there: PostgreSQL refuses at
+            // execution, so this does not answer either.
+            let untyped = |v: &Bson| {
+                record_field_types(v).is_some_and(|ts| ts.iter().any(|t| t == "unknown"))
+            };
+            if untyped(ex) || untyped(ey) {
+                return None;
+            }
+            let is = |op: &str| {
+                record_compare(op, rx, ry, true, None)
+                    .ok()
+                    .map(|v| v == Bson::Boolean(true))
+            };
+            if is("<")? {
+                return Some(Ordering::Less);
+            }
+            if !is("=")? {
+                return Some(Ordering::Greater);
+            }
+            continue;
+        }
+        match compare_constants(ex, ey)? {
+            Ordering::Equal => continue,
+            other => return Some(other),
+        }
+    }
+    // The bounds hold one entry per dimension (none for `'{}'`, one for a
+    // one-dimensional empty array, which has a dimension of length 0).
+    let (lx, ly) = (arrays::lower_bounds(a), arrays::lower_bounds(b));
+    let dims = |v: &Bson, n: usize| {
+        let mut d = arrays::dim_lengths(&arrays::strip(v));
+        d.resize(n, 0);
+        d
+    };
+    Some(
+        ex_all
+            .len()
+            .cmp(&ey_all.len())
+            .then(lx.len().cmp(&ly.len()))
+            .then_with(|| dims(a, lx.len()).cmp(&dims(b, ly.len())))
+            .then_with(|| lx.cmp(&ly)),
+    )
+}
+
 pub(crate) fn compare_constants(a: &Bson, b: &Bson) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Bson::String(x), Bson::String(y)) => Some(x.cmp(y)),
         // `bytea` orders by UNSIGNED byte value, lexicographically -- exactly
         // what `Vec<u8>` gives -- so `'\\x01' < '\\x02'` and a prefix sorts first.
         (Bson::Binary(x), Bson::Binary(y)) => Some(x.bytes.cmp(&y.bytes)),
-        // PostgreSQL orders arrays element by element, and when one is a
-        // prefix of the other the shorter one sorts first.
-        (Bson::Array(x), Bson::Array(y)) => {
-            for (ex, ey) in x.iter().zip(y.iter()) {
-                // Inside an array, PostgreSQL compares NULLs directly rather
-                // than through scalar `=`: two NULLs are equal, and a NULL
-                // sorts after any non-NULL. (Probed, not assumed - scalar
-                // `NULL = NULL` is NULL, so the array rule is the surprise.)
-                match (ex == &Bson::Null, ey == &Bson::Null) {
-                    (true, true) => continue,
-                    (true, false) => return Some(std::cmp::Ordering::Greater),
-                    (false, true) => return Some(std::cmp::Ordering::Less),
-                    (false, false) => {}
-                }
-                // Records inside an array compare as `record_cmp` does, field
-                // by field (`array[row(1)] = array[row(1)]` is true).
-                if let (Some(rx), Some(ry)) = (record_fields(ex), record_fields(ey)) {
-                    // A field still `unknown` (a bare literal or NULL in the
-                    // ROW) has no comparison there: PostgreSQL refuses at
-                    // execution, so this does not answer either.
-                    let untyped = |v: &Bson| {
-                        record_field_types(v).is_some_and(|ts| ts.iter().any(|t| t == "unknown"))
-                    };
-                    if untyped(ex) || untyped(ey) {
-                        return None;
-                    }
-                    let is = |op: &str| {
-                        record_compare(op, rx, ry, true, None)
-                            .ok()
-                            .map(|v| v == Bson::Boolean(true))
-                    };
-                    if is("<")? {
-                        return Some(std::cmp::Ordering::Less);
-                    }
-                    if !is("=")? {
-                        return Some(std::cmp::Ordering::Greater);
-                    }
-                    continue;
-                }
-                match compare_constants(ex, ey)? {
-                    std::cmp::Ordering::Equal => continue,
-                    other => return Some(other),
-                }
-            }
-            Some(x.len().cmp(&y.len()))
+        // Two arrays, either of them one whose lower bound is not 1 (held
+        // as a tagged document): PostgreSQL's `array_cmp`.
+        (x, y)
+            if (matches!(x, Bson::Array(_)) || arrays::is_bounded(x))
+                && (matches!(y, Bson::Array(_)) || arrays::is_bounded(y)) =>
+        {
+            array_cmp(x, y)
         }
         (Bson::Boolean(x), Bson::Boolean(y)) => Some(x.cmp(y)),
         // A regtype compares as its OID: `where t.oid = to_regtype('text')`;

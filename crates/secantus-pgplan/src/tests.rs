@@ -4879,6 +4879,66 @@ fn sorts_order_records_by_record_cmp() {
     );
 }
 
+/// RP-722: the sorts order two arrays by `array_cmp` -- the elements in
+/// row-major order, then their count, the dimensions, each dimension's
+/// length and last the lower bounds -- an array whose lower bound is not 1
+/// (a tagged document) included; before, one beside a plain array had no
+/// order. Each pair's order was measured on PostgreSQL 15.19.
+#[test]
+fn sorts_order_arrays_by_array_cmp() {
+    use std::cmp::Ordering;
+    let ints = |v: &[i32]| Bson::Array(v.iter().map(|i| Bson::Int32(*i)).collect());
+    let texts = |v: &[&str]| Bson::Array(v.iter().map(|s| Bson::String((*s).into())).collect());
+    let ab = texts(&["ab"]);
+    let ab_at_0 = arrays::bounded(ab.clone(), &[0]);
+    let ab_at_2 = arrays::bounded(ab.clone(), &[2]);
+    let xy_at_0 = arrays::bounded(texts(&["x", "y"]), &[0]);
+    let cd_ab = texts(&["cd", "ab"]);
+    // `'[0:0]={ab}' < '{ab}' < '[2:2]={ab}' < '{cd,ab}' < '[0:1]={x,y}'`.
+    let chain = [&ab_at_0, &ab, &ab_at_2, &cd_ab, &xy_at_0];
+    for pair in chain.windows(2) {
+        assert_eq!(
+            compare_values(pair[0], pair[1]),
+            Some(Ordering::Less),
+            "{pair:?}"
+        );
+        assert_eq!(
+            compare_values(pair[1], pair[0]),
+            Some(Ordering::Greater),
+            "{pair:?}"
+        );
+    }
+    assert_eq!(
+        compare_values(&ab_at_2, &ab_at_2.clone()),
+        Some(Ordering::Equal)
+    );
+    // Two dimensions: elements first (`{{1,2},{3,4}}` > `{{1,2,3}}`, one
+    // more element), then the dimension count (`{1,2,3}` < `{{1,2,3}}`),
+    // then the lengths (`[1:1][0:3]={{1,2,3,4}}` < `{{1,2},{3,4}}`).
+    let m22 = Bson::Array(vec![ints(&[1, 2]), ints(&[3, 4])]);
+    let m13 = Bson::Array(vec![ints(&[1, 2, 3])]);
+    let m14_at_0 = arrays::bounded(Bson::Array(vec![ints(&[1, 2, 3, 4])]), &[1, 0]);
+    let m22_at_0 = arrays::bounded(m22.clone(), &[0, 1]);
+    assert_eq!(compare_values(&m13, &m22), Some(Ordering::Less));
+    assert_eq!(
+        compare_values(&ints(&[1, 2, 3]), &m13),
+        Some(Ordering::Less)
+    );
+    assert_eq!(
+        compare_values(&ints(&[1, 2, 3, 4]), &m14_at_0),
+        Some(Ordering::Less)
+    );
+    assert_eq!(compare_values(&m14_at_0, &m22_at_0), Some(Ordering::Less));
+    assert_eq!(compare_values(&m22_at_0, &m22), Some(Ordering::Less));
+    // A NULL element after every value, and `'{}'` first of all.
+    let one_null = Bson::Array(vec![Bson::Int32(1), Bson::Null]);
+    assert_eq!(compare_values(&m22, &one_null), Some(Ordering::Less));
+    assert_eq!(
+        compare_values(&Bson::Array(vec![]), &ints(&[1])),
+        Some(Ordering::Less)
+    );
+}
+
 /// RP-551: a domain's values are coerced to its base type at the base's
 /// modifier, `getBaseTypeAndTypmod`'s, through a domain over a domain too
 /// (`dc3n` over `dc3 char(3)` is a width-3 `bpchar`, though its own

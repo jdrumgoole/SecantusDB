@@ -15,8 +15,9 @@ Found while working it (each a gap test below):
   missed a stored array whose lower bound is not 1 -- one cause: the
   containment operators took an array with its own lower bound (a tagged
   document) for a scalar (fixed, RP-720 and RP-721);
-- GROUP BY over an array column returns its groups out of the ORDER BY's
-  order;
+- GROUP BY over an array column returned its groups out of the ORDER BY's
+  order: an array whose lower bound is not 1 had no order beside a plain
+  one (fixed, RP-722);
 - in a join's WHERE, an untyped array literal against an array column
   matched nothing, and so did a `char(n)` column against a padded
   `char(n)` constant (both fixed since: the narrow join path reads each
@@ -183,7 +184,7 @@ def test_containment_reads_an_array_with_its_own_lower_bound(dsn: str, query: st
     assert _answer(dsn, query) == ("ok", CONTAINMENT_OF_A_BOUNDED_ARRAY[query])
 
 
-@pytest.mark.backlog("RP-722")
+@pytest.mark.backlog_fixed("RP-722")
 def test_groups_of_an_array_column_follow_the_order_by(dsn: str) -> None:
     # `array_cmp` orders element by element: `{ab}` < `{cd,ab}` < `{x,y}`.
     query = "select count(*), a from x719 group by a order by 2"
