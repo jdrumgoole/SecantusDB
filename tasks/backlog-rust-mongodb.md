@@ -2169,20 +2169,6 @@ differs on 2 results (re-measured 2026-10-16; 5 before). The harness salts datab
 mongod keeps the oplog of earlier runs and a stream started in the past
 would see them. What is left:
 
-- [ ] **RUST MongoDB server: a resume token in mongod's own format whose
-      number is a decimal built from a double gets 40647.** A token in
-      mongod's format is read by a transcription of mongod's KeyString
-      decoder (`secantus-commands/src/resume_keystring.rs`). Since
-      2026-10-20 that includes `_typeBits`, read as mongod's `TypeBits`
-      reader reads them, and a decimal that is a whole number or a teeny
-      decimal, whose exponent `adjustDecimalExponent` rescales (695 + 1,384
-      tokens, no difference). What is left is a decimal mongod rebuilds from
-      a double plus a continuation: a small or large magnitude, or a
-      fraction, whose type bits say decimal. That needs Decimal128's rounding
-      from a double; such a token answers 40647, where mongod answers the
-      decoder's own error (50830, for example) or reads it.
-      Backlog-ID: RM-075
-      Verify: tests/backlog/test_rm_057_084.py::test_a_decimal_from_a_double_in_a_token
 - [ ] **RUST MongoDB server: `explain` of a `$changeStream` is this
       server's plan.** mongod explains the oplog scan it would run, with
       the full match over `local.oplog.rs`; not reproduced, like the rest
