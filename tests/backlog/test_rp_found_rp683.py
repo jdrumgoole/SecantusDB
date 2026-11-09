@@ -1,8 +1,9 @@
 """What working RP-683 (a correlated `ARRAY(...)` over a `char(n)` column
 keeps its elements' blanks) found:
 
-- a correlated `ARRAY(...)` over an array column is typed one dimension too
-  many, and reaches the client as text (RP-729).
+- a correlated `ARRAY(...)` over an array column was typed one dimension too
+  many, and reached the client as text (RP-729, fixed: the regression test
+  below).
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
@@ -36,7 +37,7 @@ def _answer(dsn: str, query: str) -> object:
             return ("error", e.sqlstate, str(e).splitlines()[0])
 
 
-@pytest.mark.backlog("RP-729")
+@pytest.mark.backlog_fixed("RP-729")
 def test_correlated_array_of_an_array_column_is_its_own_type(dsn: str) -> None:
     sub = f"array(select t.f from {W} t(k, f) where t.k >= s.k)"
     assert _answer(dsn, f"select k, {sub} from {W} s(k, f) order by k") == (

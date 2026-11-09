@@ -870,7 +870,7 @@ pub(crate) fn correlate(
             // FROM-subquery, as a `character(3)` (RP-679).
             typmod = def.columns.first().map_or(-1, |c| c.typmod);
             if kind == SubLinkType::ArraySublink {
-                format!("{first}[]")
+                array_sublink_type(first)
             } else {
                 first
             }
@@ -1836,6 +1836,19 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
     }
 }
 
+/// The type of an ARRAY sublink over a column of type `column`
+/// (`get_promoted_array_type`): the column's array type, or, for an array
+/// column, its own type -- the result is one more dimension of it, as the
+/// uncorrelated sublink types it. `int4[][]` was described as text and
+/// named so by `pg_typeof` (RP-729).
+fn array_sublink_type(column: String) -> String {
+    if column.ends_with("[]") {
+        column
+    } else {
+        format!("{column}[]")
+    }
+}
+
 /// The `char(n)` width of a correlated call's result: its type is `bpchar`
 /// (or an array of it, any depth) at a modifier `n + 4`.
 fn bpchar_width(result_type: &str, typmod: i64) -> Option<usize> {
@@ -2619,6 +2632,15 @@ pub(crate) fn call_user_function(u: &UserFn, args: &[Bson]) -> Result<FnResult> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A correlated `array(select t.f ...)` over an `integer[]` column is
+    // `integer[]` on 15.19, not `integer[][]` (RP-729).
+    #[test]
+    fn an_array_sublink_over_an_array_column_is_its_own_type() {
+        assert_eq!(array_sublink_type("int4".into()), "int4[]");
+        assert_eq!(array_sublink_type("int4[]".into()), "int4[]");
+        assert_eq!(array_sublink_type("bpchar[]".into()), "bpchar[]");
+    }
 
     // `array(select t.f ...)` over a `char(3)` column, correlated, is
     // `{"a  ","xy ",NULL}` on 15.19: each element at the column's width

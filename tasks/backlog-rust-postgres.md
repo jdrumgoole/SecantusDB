@@ -3241,20 +3241,22 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp681.py::test_pg_typeof_of_a_text_scalar_subquery
       Backlog-ID: RP-707
 
-## Found while working RP-683 (2026-11-09)
+## Found while working RP-729 (2026-11-09)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **A correlated `ARRAY(...)` over an array column is typed one
-      dimension too many.** `select k, array(select t.f from (values (1,
-      array[1, null]), (2, array[2, 3])) t(k, f) where t.k >= s.k) from
-      ... s(k, f)` is described `integer[]` (1007) on 15.19, rows
-      `{{1,NULL},{2,3}}`, and `pg_typeof` of it is `integer[]`
-      (`get_promoted_array_type`: an array column's ARRAY sublink is its
-      own type, one more dimension of it). Here it is described 1043 and
-      reaches the client as the text `{{1,NULL},{2,3}}`, and `pg_typeof`
-      is `integer[][]`: `correlate` appends `[]` to a column type that is
-      already an array, which the uncorrelated sublink does not.
-      Verify: tests/backlog/test_rp_found_rp683.py::test_correlated_array_of_an_array_column_is_its_own_type
-      Backlog-ID: RP-729
+- [ ] **An ARRAY sublink accumulates arrays of different shapes, or a NULL
+      one.** `select array(select f from (values (array[1,2]), (array[3]))
+      t(f))` is 2202E `cannot accumulate arrays of different
+      dimensionality` on 15.19 (`accumArrayResultArr` requires every
+      element array to have the first one's dimensions and lengths), as is
+      a mix of `array[1]` with `array[[3]]` or with `'{}'::int[]`; a NULL
+      element array is 22004 `cannot accumulate null arrays`. Here the
+      first answers the ragged `{{1,2},{3}}` (1007), the `'{}'` mix
+      `{{1},{}}`, and the `array[[3]]` and NULL mixes fail in the binary
+      send as 22P03 `cannot send this value as a binary _int4`. The
+      correlated form (`array(select t.f ... where t.k >= s.k)`) answers
+      the same.
+      Verify: tests/backlog/test_rp_found_rp729.py::test_array_sublink_refuses_ragged_or_null_element_arrays
+      Backlog-ID: RP-730
