@@ -278,11 +278,13 @@ Size: one or two batches; scan order is the hard part.
       schema-change rollover and reopening done, `{_id: 1}` index built;
       size closing needs mongod's server-wide catalog state (a decision),
       a measurement with no `_id` changes the Python server's documents.
-- [ ] Collation (7.070): `normalization: false` (ICU4X always normalises),
+- [x] Collation (7.070): `normalization: false` (ICU4X always normalises),
       the five collation types ICU4X lacks, `$densify` `bounds: "full"` across
       partitions, re-measure `$setWindowFields` partition order.
       **2026-10-16:** `$densify` and `$setWindowFields` done; the other two
       need ICU (sized in the backlog items).
+      **2026-11-09:** both done by linking mongo's ICU 57.1 (RM-091,
+      RM-095).
 - [x] Change streams (7.074): mongod's token-decode errors (15, 50811),
       `startAfter` a `dropDatabase` token, the unprobed items.
       **2026-10-16:** decode errors transcribed; `startAfter` /
@@ -344,7 +346,7 @@ Each unblocks rows that otherwise stay open.
 | Record ids (RM-083) | per-collection counters on disk, mongod's numbers |
 | Role order (RM-029) | a side table the Rust server alone writes |
 | Time-series size closing (RM-088) | model mongod's server-wide bucket catalog |
-| Collation (RM-091, RM-095) | link C ICU 57.1 in place of ICU4X |
+| Collation (RM-091, RM-095) | done 2026-11-09: mongo's ICU 57.1, vendored and linked in place of ICU4X |
 | SBE explain (RM-071, RM-072) | transcribe mongod's stage builders and execute the slot programs |
 | Python-server compatibility | no longer a constraint, on-disk format included (`CLAUDE.md`) |
 | Unknown-hint wording (RM-051) | not reproduced; scope decision. Still to do: mark the rows accepted in each probe |

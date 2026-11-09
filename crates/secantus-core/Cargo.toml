@@ -37,17 +37,10 @@ snap = "1"
 # pattern matching at each length; `regex` only offers leftmost-first. Already
 # in the lock tree as a dependency of `regex`.
 regex-automata = "0.4"
-# Collation. ICU4X is the Rust implementation of the algorithm and data
-# mongod gets from ICU; see `src/collation.rs` for how closely the two were
-# measured to agree. `unstable` is what exposes sort keys, which an index
-# entry and a group key need. The versions are pinned exactly because a sort
-# key is written to disk (`collation::KEY_FORMAT`): a data update that changes
-# its bytes has to be a deliberate bump, not something `cargo update` does.
-icu_collator = { version = "=2.3.1", features = ["unstable"] }
-icu_collator_data = "=2.3.0"
-icu_normalizer = "2"
-icu_locale_core = "2"
-icu_provider = { version = "2", features = ["sync"] }
+# Collation: the ICU 57.1 mongod links, built from mongo's own copy
+# (`vendor/icu4c-57.1`). A sort key is written to disk
+# (`collation::KEY_FORMAT`), and this is the collator that makes its bytes.
+secantus-icu = { version = "=0.5.3-beta.196", path = "../secantus-icu" }
 # Backtracking regex with lookaround + backreference support (Python `re`-style),
 # used only when the linear `regex` engine above can't compile a pattern — e.g.
 # the negative-lookahead `^(?!system\.)` pymongo emits for listCollections name

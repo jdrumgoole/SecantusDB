@@ -2397,54 +2397,12 @@ is left follows from that:
 `tools/probes/collation.py`, mongod 8.2.11: 764 scenarios (reads under 29
 collations, 39 malformed specs on every command, the expression and query
 operators, and a fresh database per scenario for defaults, indexes, views and
-writes). The Rust server differs on 4 (`tasks/rust-mongod-remaining-plan.md`,
-2026-10-14). It compares through ICU4X
-(`crates/secantus-core/src/collation.rs`), which ordered 157 strings as
-mongod does under 40 collations with the one exception listed first below.
-What is left, there and beside it:
+writes). The Rust server differs on 2 (2026-11-09): hashed and text
+indexes, which it does not build. It compares through the ICU
+57.1 mongod links, built from mongo's own copy (`crates/secantus-icu`,
+`vendor/icu4c-57.1`), so locales, per-locale defaults, order and sort-key
+bytes are ICU's. What is left, there and beside it:
 
-- [ ] **RUST MongoDB server: canonically equivalent strings are always
-      equal.** mongod with `normalization: false` (the default) tells
-      `"ọ̈"` from `"ọ̈"`; ICU4X normalises always, so the
-      Rust server calls them equal under every collation. Also, under
-      `alternate: "shifted", maxVariable: "space"` the Rust server calls
-      `"a b"` and `"a​b"` equal to their neighbours and mongod
-      does not. mongod links ICU 57.1 and ICU4X carries newer CLDR data, so a
-      character or tailoring added since can order differently; none was
-      found in 24 locales. ICU4X cannot turn normalization off (its
-      `CollatorOptions` documents it as always on, no BCP47 `kk`), so this
-      needs ICU itself or a collator of our own: a decision, not a fix
-      (checked 2026-10-16, icu_collator 2.3.1).
-      **Decided 2026-10-16 (Joe):** link the C ICU 57.1 that mongod links,
-      in place of ICU4X, so `normalization: false` and the `alternate:
-      "shifted"` cases match.
-      **Decided (Joe, 2026-11-09): vendor mongo's copy, option (a)** -- commit mongod r8.2.11's `src/third_party/icu4c-57.1` sources and its trimmed `mongo_sources/icudt57l.dat` (and `icudt57b.dat`) under `vendor/icu4c-57.1/`, built from there with no network, and give the `.dat` files the same named exception to the no-generated-binaries guard (`tests/test_no_tracked_build_output.py`) that the PGO profile has. Measured when it was asked (2026-11-09): how ICU 57.1 gets into the build.
-      Sized from what mongod links, `mongodb/mongo` r8.2.11
-      `src/third_party/icu4c-57.1/source/`: `common/` 379 files, 7.6 MB;
-      `i18n/` 423 files, 8.1 MB; `stubdata/`; and mongo's trimmed data
-      `mongo_sources/icudt57l.dat`, a 3.3 MB prebuilt binary
-      (`icudt57b.dat` for big-endian). The gap test is still OPEN on
-      `18ce0753` (Rust server 1, mongod 8.2.11 0). The swap in Rust is
-      contained: `build` / `compare` / `sort_key` in
-      `secantus-core/src/collation.rs`, with `KEY_FORMAT` going to 2 so
-      collated indexes are re-keyed on open (that rebuild path exists). The
-      cost: a C++ build of ~800 files in everything that links
-      `secantus-core`, `secantusd-pg` and its Windows lane included, plus
-      the release binaries. The sort-key bytes change, which also settles
-      RM-095's `2b0105` vs `290105`. Options:
-      (a) **recommended**: commit mongo's copy, the sources and
-      `icudt57l.dat`, under `vendor/icu4c-57.1/`. That is exactly what
-      mongod links (mongo's patches, mongo's data trim), with no network
-      at build time. The 3.3 MB `.dat` needs an exception to "never commit
-      a generated binary", as the PGO profile has.
-      (b) a `unicode-org/icu` submodule at `release-57-1`: upstream without
-      mongo's patches. Not checked: whether that tag carries a prebuilt
-      `.dat`. If it does not, the build needs ICU's own data tools.
-      (c) fetch mongo's directory, pinned to r8.2.11, at build time: no
-      blob in git, but a network dependency in every clean build and every
-      CI job.
-      Backlog-ID: RM-091
-      Verify: tests/backlog/test_rm_085_112.py::test_canonically_equivalent_strings_differ_without_normalization
 - [ ] **RUST MongoDB server: a query never uses a collated index.** An index
       with a collation now holds collation sort keys (catalog marker
       `collationKeys`), which is what makes its `unique` right, and the
@@ -2456,23 +2414,6 @@ What is left, there and beside it:
       brought to the plan. Each such place is a performance bug.
       Backlog-ID: RM-094
       Verify: none -- explain already reports IXSCAN (derived from mongod's rules); the gap is the router scanning, a cost no reply shows
-- [ ] **RUST MongoDB server: five collation types are refused.** `search`,
-      `searchjl`, `big5han`, `gb2312han` and `phonetic` (as
-      `@collation=<type>`) are not in ICU4X's bundled data; the server
-      answers 2 naming the type, mongod accepts them. Sized 2026-10-16:
-      current CLDR still has `search` (root, ko), `searchjl` (ko) and
-      `phonetic` (ln), so ICU4X data generated with them (icu4x-datagen,
-      a baked data module) could carry those three; `big5han` and
-      `gb2312han` are no longer in CLDR at all and exist only in ICU 57's
-      data. Either way a build-time data pipeline: a decision for Joe.
-      **Decided 2026-10-16 (Joe):** as RM-091: with ICU 57.1 linked, all
-      five types come from its data.
-      The same ICU 57 work also settles a duplicate-key error over a
-      collated key: its key bytes are ICU4X's (`2b0105`) where mongod's are
-      ICU 57's (`290105`), inside a document `_id` as well (RM-092 gave
-      that case mongod's shape: the raw key bytes in place of each string).
-      Backlog-ID: RM-095
-      Verify: tests/backlog/test_rm_085_112.py::test_five_collation_types_are_accepted
 
 
 ### 7.069 A WiredTiger panic opening a store, in CI on macOS -- 2026-10-10

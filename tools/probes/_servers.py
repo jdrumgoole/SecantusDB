@@ -157,7 +157,11 @@ def probe_targets(
             require_fresh_server_extension(_secantus_server)
             rust_store = probe_store()
             stores.append(rust_store)
-            rust_server = _secantus_server.RustServer(rust_store, 0)
+            # The same replica-set advertisement as mongod and the Python
+            # server: without it a replica-set probe compared a standalone
+            # Rust server (no `commitQuorum`, 22 false divergences in
+            # time_series.py, 2026-11-09).
+            rust_server = _secantus_server.RustServer(rust_store, 0, replica_set_name=replica_set)
             rhost, rport = rust_server.address
             targets.append(("rust", pymongo.MongoClient(rhost, rport, directConnection=True)))
 

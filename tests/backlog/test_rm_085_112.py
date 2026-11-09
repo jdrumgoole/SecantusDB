@@ -649,12 +649,14 @@ def test_compact_refuses_an_unknown_field(rust_mongo: Any, mongod: Any) -> None:
 # ------------------------------------------------------- 7.070 collation --
 
 
-@pytest.mark.backlog("RM-091")
+@pytest.mark.backlog_fixed("RM-091")
 def test_canonically_equivalent_strings_differ_without_normalization(
     rust_mongo: Any, mongod: Any
 ) -> None:
     """mongod 8.2.11, `normalization: false` (the default): the two orderings
-    of a dot below and a diaeresis on `o` are not equal."""
+    of a dot below and a diaeresis on `o` are not equal. The Rust server
+    called them equal under every collation until it linked mongod's ICU
+    57.1 in place of ICU4X, which always normalised."""
     a = "ọ̈"  # o-dot-below, then diaeresis
     b = "ọ̈"  # o-diaeresis, then dot below
 
@@ -673,8 +675,8 @@ def test_collated_duplicate_document_id_shows_sort_key(rust_mongo: Any, mongod: 
     """mongod 8.2.11: a duplicate under a collated `_id` whose value is a
     document reports the string inside it as its sort key (`"W\\x01\\x05"`
     for `"x"` under `en`, strength 2), not as written. The Rust server
-    reported the string as written; it now reports its sort key (ICU4X's
-    bytes until RM-091 links ICU 57)."""
+    reported the string as written; it reported its sort key from RM-092,
+    and mongod's very bytes once RM-095 linked ICU 57.1."""
 
     def probe(client: Any) -> Any:
         db = client[_name("rm092")]
@@ -688,7 +690,7 @@ def test_collated_duplicate_document_id_shows_sort_key(rust_mongo: Any, mongod: 
 
     got, ref = _both(rust_mongo, mongod, probe)
     assert ref == "W\x01\x05"
-    assert got not in ("x", "X", "no error")
+    assert got == ref
 
 
 @pytest.mark.backlog_fixed("RM-093")
@@ -710,9 +712,11 @@ def test_out_change_stream_sees_rename_then_invalidate(rust_mongo: Any, mongod_r
     assert got == ref
 
 
-@pytest.mark.backlog("RM-095")
+@pytest.mark.backlog_fixed("RM-095")
 def test_five_collation_types_are_accepted(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 accepts each of these `@collation=` types."""
+    """mongod 8.2.11 accepts each of these `@collation=` types. The Rust
+    server refused them (2) while it compared through ICU4X, whose data
+    lacked them, until it linked mongod's ICU 57.1 and mongo's data."""
     locales = [
         "ko@collation=search",
         "ko@collation=searchjl",
