@@ -255,18 +255,23 @@ def test_a_line_counts_mongods_interrupt_checks(
     assert ours == theirs, f"{label}: ours {ours}, mongod {theirs}"
 
 
-#: The scenarios whose count is a race inside mongod. A `j` write waits
-#: for the journal flusher's next round (`JournalFlusher::
-#: waitForJournalFlush`, `myFuture.get(opCtx)`), and a future already
-#: finished when it is waited on returns without a check
-#: (`SharedStateBase::wait`, 8.2.12 `future_impl.h`), where one still
-#: pending checks before it waits and when it wakes: two checks fewer when
-#: the flusher thread won. macOS mongod 8.2.11, whose journal sync takes
-#: 4-8 ms, waited in 40 runs of 40; Linux mongod 8.2.12 in CI did not, once
-#: (17 against 19, 2026-11-09). This server flushes on the request thread,
-#: so it always takes the branch that waited -- one of mongod's answers,
-#: which these scenarios look for in a few of mongod's runs.
-JOURNAL_RACE = ("insert, j", "update matching nothing, j")
+#: How many of mongod's runs a write's count is looked for in. Each wait a
+#: write's write concern makes -- the oplog's holes, the `j` journal flush,
+#: the `majority` commit point -- is a race inside mongod. Each waits on a
+#: future (`JournalFlusher::waitForJournalFlush`, `awaitReplication`'s
+#: `_futureGetNoThrowWithDeadline`), and a future already finished returns
+#: without a check: `_startWaitingForReplication` hands back a ready one
+#: when the commit point is there already, and `SharedStateBase::wait`
+#: (8.2.12 `future_impl.h`) returns early on a finished state. A future
+#: that finishes while it is being waited on skips only the wake's check.
+#: So mongod counts the wait's two checks, one or none, by which thread won.
+#: macOS mongod 8.2.11, whose journal sync takes 4-8 ms, waited every time
+#: (25 runs of each write, 2026-11-09). Linux mongod 8.2.12 in CI did not,
+#: twice in a day: 17 against 19 for `update matching nothing, j`, 18
+#: against 19 for `insert of several`. This server flushes and advances
+#: its commit point on the request thread, so it always counts the branch
+#: that waited, which is one of mongod's answers.
+MONGOD_RUNS = 5
 
 
 @pytest.mark.parametrize("label", list(WRITES))
@@ -278,13 +283,10 @@ def test_a_write_line_counts_mongods_interrupt_checks(
     ours = _counts(rust_mongo, False, scenario)
     assert theirs, f"{label}: mongod wrote no line"
     assert all(n is not None for _, n, _ in theirs), theirs
-    if label in JOURNAL_RACE:
-        seen = [theirs]
-        while ours != seen[-1] and len(seen) < 5:
-            seen.append(_counts(mongod_rs, True, scenario))
-        assert ours in seen, f"{label}: ours {ours}, mongod's runs {seen}"
-        return
-    assert ours == theirs, f"{label}: ours {ours}, mongod {theirs}"
+    seen = [theirs]
+    while ours != seen[-1] and len(seen) < MONGOD_RUNS:
+        seen.append(_counts(mongod_rs, True, scenario))
+    assert ours in seen, f"{label}: ours {ours}, mongod's runs {seen}"
 
 
 def test_the_yield_period_is_a_parameter(rust_mongo: Any) -> None:
