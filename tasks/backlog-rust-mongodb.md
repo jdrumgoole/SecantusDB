@@ -791,8 +791,8 @@ These are explicit non-goals. Don't add them without a reason.
       - a time-series collection's read and a geo, `$near` or `$text` read.
         mongod counts the buckets its cursor stage buffered (all 15 of 300
         measurements in the first batch of 101, 0 after); counting them
-        needs the buckets this server derives to be read as mongod reads
-        them, which is RM-348.
+        needs `find` to read the buckets as a time-series `aggregate` does
+        since RM-348, which is RM-455.
       Measured 2026-10-27 and 2026-11-07.
       Backlog-ID: RM-363
       Verify: tests/backlog/test_rm_355_364.py::test_a_contested_read_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
@@ -2221,20 +2221,38 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a time-series cursor is not read bucket by
-      bucket.** mongod reads a time-series collection's buckets through its
-      cursor stage (32 bucket documents first, twice as many at each refill)
-      and unpacks each as the cursor reaches it, so what a `getMore` returns
-      after a delete depends on how many buckets were buffered: over 4,000
+- [ ] **RUST MongoDB server: a `find` of a time-series collection reads
+      it whole.** mongod answers it with an aggregation over the buckets,
+      read through its cursor stage (32 buckets first, twice as many at each
+      refill) as a time-series `aggregate` is here since RM-348: over 4,000
       measurements in 100 buckets, read one at a time and all deleted after
-      the first, mongod 8.2.11 returns 2,303 more. This server keeps
-      measurements as ordinary documents and works the buckets out when
-      asked (section 7.071, the derived buckets), so it has no bucket to
-      buffer; it reads 3,999. Depends on keeping buckets, or deriving them
-      stably enough to resume after one (found 2026-10-27, RM-080's
-      remainder).
-      Backlog-ID: RM-348
-      Verify: tests/backlog/test_rm_found_2026_10_27b.py::test_a_time_series_read_goes_bucket_by_bucket
+      the first, mongod 8.2.11 returns 2,303 more and this server 3,999.
+      `find` reads the collection at the command (`find.rs`, `as_read`), so
+      its line also counts nothing examined (RM-363). Measured 2026-11-09.
+      Backlog-ID: RM-455
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_find_goes_bucket_by_bucket
+- [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
+      some fields reads the collection at the command.** Behind an inclusion
+      `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one
+      at a time as the cursor asks, not 32 at once: over the same 100
+      buckets it returns 71 more after the delete (the rest of the first
+      bucket), and this server, which streams only stages that need the
+      whole measurement, 3,999. Likely its slot-based engine, which takes
+      `$_internalUnpackBucket` once the fields it must unpack are known;
+      not yet confirmed from `explain`. Measured 2026-11-09.
+      Backlog-ID: RM-456
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_projection_reads_a_bucket_at_a_time
+- [ ] **RUST MongoDB server: a time-series read an index over the buckets
+      could answer reads the collection at the command.** A filter on the
+      meta field (`{m: {$lt: 40}}`) is an index scan of the default
+      `m_1_t_1` index for mongod 8.2.11, which buffers 32 buckets in that
+      index's order -- series by series -- and returns 1,279 more after the
+      delete; this server reads such a read (and any over a collection with
+      an index of its own, or under a hint or a collation) whole: 3,199.
+      Streaming it means a bucket scan in an index's order over buckets this
+      server derives. Measured 2026-11-09.
+      Backlog-ID: RM-457
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_read_of_the_meta_index_buffers_its_buckets
 - [ ] **RUST MongoDB server: a cursor whose plan mongod picks by trial is
       the result as it was when the command ran.** When two indexes could
       answer a query, mongod runs both until one returns 101 documents (or

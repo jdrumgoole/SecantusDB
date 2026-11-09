@@ -109,6 +109,8 @@ pub(crate) struct Bucket {
     start_ms: i64,
     meta: Option<Bson>,
     pub members: Vec<usize>,
+    /// The measurement that opened it (an index into the input).
+    first: usize,
     /// The types its measurements' fields have had ([`Schema`]).
     schema: Schema,
 }
@@ -349,6 +351,7 @@ pub(crate) fn place(docs: &[Document], layout: &Layout) -> Vec<Bucket> {
             start_ms: t.div_euclid(layout.rounding_ms) * layout.rounding_ms,
             meta,
             members: vec![i],
+            first: i,
             schema,
         });
     }
@@ -482,52 +485,63 @@ pub(crate) fn documents(
     docs: &[Document],
     layout: &Layout,
 ) -> Result<Vec<Document>, CommandError> {
-    let mut out = Vec::new();
-    for (opened, bucket) in place(docs, layout).into_iter().enumerate() {
-        // The data fields, in the order the bucket first met them.
-        let mut fields: Vec<&String> = Vec::new();
-        for &i in &bucket.members {
-            for k in docs[i].keys() {
-                if Some(k) != layout.meta.as_ref() && !fields.contains(&k) {
-                    fields.push(k);
-                }
+    place(docs, layout)
+        .into_iter()
+        .enumerate()
+        .map(|(opened, bucket)| bucket_document(ns, opened, bucket, docs, layout))
+        .collect()
+}
+
+/// `bucket`'s document, the `opened`-th of `ns` in `system.buckets` order.
+fn bucket_document(
+    ns: &str,
+    opened: usize,
+    bucket: Bucket,
+    docs: &[Document],
+    layout: &Layout,
+) -> Result<Document, CommandError> {
+    // The data fields, in the order the bucket first met them.
+    let mut fields: Vec<&String> = Vec::new();
+    for &i in &bucket.members {
+        for k in docs[i].keys() {
+            if Some(k) != layout.meta.as_ref() && !fields.contains(&k) {
+                fields.push(k);
             }
         }
-        let mut min = Document::new();
-        let mut max = Document::new();
-        let mut data = Document::new();
-        for field in fields {
-            let values: Vec<Option<&Bson>> =
-                bucket.members.iter().map(|&i| docs[i].get(field)).collect();
-            for v in values.iter().flatten() {
-                let low = fold(min.remove(field), v, false);
-                min.insert(field.clone(), low);
-                let high = fold(max.remove(field), v, true);
-                max.insert(field.clone(), high);
-            }
-            data.insert(field.clone(), column(&values)?);
-        }
-        // The minimum time is the start of the window, not the first reading.
-        min.insert(
-            layout.time.clone(),
-            bson::DateTime::from_millis(bucket.start_ms),
-        );
-        let mut doc = doc! {
-            "_id": bucket_id(ns, bucket.start_ms, opened),
-            "control": {
-                "version": 2,
-                "min": min,
-                "max": max,
-                "count": bucket.members.len() as i32,
-            },
-        };
-        if let Some(meta) = bucket.meta {
-            doc.insert("meta", meta);
-        }
-        doc.insert("data", data);
-        out.push(doc);
     }
-    Ok(out)
+    let mut min = Document::new();
+    let mut max = Document::new();
+    let mut data = Document::new();
+    for field in fields {
+        let values: Vec<Option<&Bson>> =
+            bucket.members.iter().map(|&i| docs[i].get(field)).collect();
+        for v in values.iter().flatten() {
+            let low = fold(min.remove(field), v, false);
+            min.insert(field.clone(), low);
+            let high = fold(max.remove(field), v, true);
+            max.insert(field.clone(), high);
+        }
+        data.insert(field.clone(), column(&values)?);
+    }
+    // The minimum time is the start of the window, not the first reading.
+    min.insert(
+        layout.time.clone(),
+        bson::DateTime::from_millis(bucket.start_ms),
+    );
+    let mut doc = doc! {
+        "_id": bucket_id(ns, bucket.start_ms, opened),
+        "control": {
+            "version": 2,
+            "min": min,
+            "max": max,
+            "count": bucket.members.len() as i32,
+        },
+    };
+    if let Some(meta) = bucket.meta {
+        doc.insert("meta", meta);
+    }
+    doc.insert("data", data);
+    Ok(doc)
 }
 
 /// The order a scan returns measurements in: bucket by bucket, each in time
@@ -640,6 +654,233 @@ pub(crate) fn as_read(
         .collect();
     placed.sort_by_key(|(position, _)| *position);
     placed.into_iter().map(|(_, raw)| shaped(raw)).collect()
+}
+
+/// A read of a time-series collection bucket by bucket, as `mongod`'s
+/// cursor stage reads `system.buckets.<name>` under `$_internalUnpackBucket`
+/// (measured 8.2.11, 2026-11-09): it buffers bucket documents, those the
+/// bucket-level filter passes, and the stage after it unpacks each into its
+/// measurements as the cursor reaches it. A refill derives the buckets from
+/// the collection as it is then and goes on after the last bucket buffered:
+/// one whose window starts later, or starts with it and was opened by a
+/// later measurement, which is the order `system.buckets` holds them in.
+pub(crate) struct BucketScan {
+    db: String,
+    coll: String,
+    ns: String,
+    layout: Layout,
+    /// The bucket-level filter (`timeseries::bucket_filter`).
+    filter: Document,
+    /// The last bucket buffered: its window's start, in seconds as its
+    /// `_id` holds it, and the RecordId of the measurement that opened it.
+    after: Option<(i64, i64)>,
+}
+
+/// What one refill of a [`BucketScan`] buffered.
+pub(crate) struct Buffered {
+    /// The buffered buckets' measurements, in scan order.
+    pub docs: Vec<Vec<u8>>,
+    /// The scan reached the last bucket.
+    pub exhausted: bool,
+    /// Bucket documents examined.
+    pub examined: i64,
+}
+
+impl BucketScan {
+    /// A scan of `db.coll`, when it is a time-series collection this store
+    /// can read by RecordId; `filter` is the measurement-level query.
+    pub(crate) fn of(
+        storage: &dyn crate::storage::Storage,
+        db: &str,
+        coll: &str,
+        ns: &str,
+        filter: &Document,
+    ) -> Result<Option<BucketScan>, CommandError> {
+        let Some(layout) = storage
+            .get_collection_options(db, coll)
+            .ok()
+            .as_ref()
+            .and_then(Layout::of)
+        else {
+            return Ok(None);
+        };
+        let readable = storage
+            .records_after(db, coll, None, 0, false)
+            .map_err(crate::util::command_error)?
+            .is_some();
+        if !readable {
+            return Ok(None);
+        }
+        let filter = crate::timeseries::bucket_filter(
+            filter,
+            &layout.time,
+            layout.meta.as_deref(),
+            layout.span_ms / 1000,
+        );
+        Ok(Some(BucketScan {
+            db: db.to_string(),
+            coll: coll.to_string(),
+            ns: ns.to_string(),
+            layout,
+            filter,
+            after: None,
+        }))
+    }
+
+    /// The bucket-level filter names the meta field, which an index over
+    /// the buckets can answer.
+    pub(crate) fn filters_meta(&self) -> bool {
+        fn names_meta(d: &Document) -> bool {
+            d.iter().any(|(k, v)| {
+                k == "meta"
+                    || k.starts_with("meta.")
+                    || match v {
+                        Bson::Array(items) => {
+                            items.iter().filter_map(Bson::as_document).any(names_meta)
+                        }
+                        _ => false,
+                    }
+            })
+        }
+        names_meta(&self.filter)
+    }
+
+    /// The next `want` buckets the filter passes, stopping early once they
+    /// come to more than `max_bytes`, unpacked.
+    pub(crate) fn next_buffer(
+        &mut self,
+        storage: &dyn crate::storage::Storage,
+        want: usize,
+        max_bytes: usize,
+    ) -> Result<Buffered, CommandError> {
+        let rows = storage
+            .records_after(&self.db, &self.coll, None, usize::MAX, false)
+            .map_err(crate::util::command_error)?
+            .unwrap_or_default();
+        let (rids, raw): (Vec<i64>, Vec<Vec<u8>>) = rows.into_iter().unzip();
+        let docs = decoded(&raw)?;
+        let mut out = Buffered {
+            docs: Vec::new(),
+            exhausted: true,
+            examined: 0,
+        };
+        let (mut count, mut bytes) = (0usize, 0usize);
+        for (opened, bucket) in place(&docs, &self.layout).into_iter().enumerate() {
+            let key = (bucket.start_ms.div_euclid(1000), rids[bucket.first]);
+            if self.after.is_some_and(|after| key <= after) {
+                continue;
+            }
+            if count >= want || (count > 0 && bytes > max_bytes) {
+                out.exhausted = false;
+                break;
+            }
+            out.examined += 1;
+            self.after = Some(key);
+            let members = bucket.members.clone();
+            let document = bucket_document(&self.ns, opened, bucket, &docs, &self.layout)?;
+            if !self.filter.is_empty() && !bucket_matches(&document, &self.filter)? {
+                continue;
+            }
+            bytes += crate::bsondoc::to_vec(&document)
+                .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?
+                .len();
+            count += 1;
+            for i in members {
+                out.docs.push(
+                    crate::bsondoc::to_vec(&measurement(&docs[i], &self.layout))
+                        .map_err(|e| CommandError::new(8, "UnknownError", e.to_string()))?,
+                );
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Whether bucket document `bucket` passes the bucket-level filter. The
+/// `$_internalExpr*` comparisons are `mongod`'s: no type bracketing, a
+/// missing field below everything, and an array met on the path always
+/// matching (`InternalExprComparisonMatchExpression`); the rest is an
+/// ordinary query.
+fn bucket_matches(bucket: &Document, filter: &Document) -> Result<bool, CommandError> {
+    for (key, value) in filter {
+        let ok = match (key.as_str(), value) {
+            ("$and", Bson::Array(items)) => {
+                let mut all = true;
+                for item in items.iter().filter_map(Bson::as_document) {
+                    if !bucket_matches(bucket, item)? {
+                        all = false;
+                        break;
+                    }
+                }
+                all
+            }
+            ("$or", Bson::Array(items)) => {
+                let mut any = false;
+                for item in items.iter().filter_map(Bson::as_document) {
+                    if bucket_matches(bucket, item)? {
+                        any = true;
+                        break;
+                    }
+                }
+                any
+            }
+            (path, Bson::Document(ops))
+                if ops.keys().any(|op| op.starts_with("$_internalExpr")) =>
+            {
+                ops.iter()
+                    .all(|(op, arg)| internal_expr(bucket, path, op, arg))
+            }
+            _ => {
+                let mut one = Document::new();
+                one.insert(key.clone(), value.clone());
+                secantus_core::query::matches(bucket, &one, &Document::new(), None).map_err(
+                    |f| match f {
+                        secantus_core::fallback::Fallback::Mongo { code, message, .. } => {
+                            CommandError::new(code, crate::util::error_code_name(code), message)
+                        }
+                        _ => CommandError::new(2, "BadValue", "unsupported bucket filter"),
+                    },
+                )?
+            }
+        };
+        if !ok {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `{path: {op: arg}}` for one `$_internalExpr*` comparison over `doc`.
+fn internal_expr(doc: &Document, path: &str, op: &str, arg: &Bson) -> bool {
+    let mut at: Option<&Bson> = None;
+    let mut current = doc;
+    for (n, part) in path.split('.').enumerate() {
+        match current.get(part) {
+            None => {
+                at = None;
+                break;
+            }
+            Some(Bson::Array(_)) => return true,
+            Some(Bson::Document(d)) if n + 1 < path.split('.').count() => current = d,
+            Some(v) if n + 1 == path.split('.').count() => at = Some(v),
+            Some(_) => {
+                at = None;
+                break;
+            }
+        }
+    }
+    let ordering = match at {
+        Some(v) => secantus_core::order::cmp(v, arg),
+        None => Ordering::Less,
+    };
+    match op {
+        "$_internalExprEq" => ordering == Ordering::Equal,
+        "$_internalExprGt" => ordering == Ordering::Greater,
+        "$_internalExprGte" => ordering != Ordering::Less,
+        "$_internalExprLt" => ordering == Ordering::Less,
+        "$_internalExprLte" => ordering != Ordering::Greater,
+        _ => true,
+    }
 }
 
 /// A stable UUID for a namespace that is derived rather than stored, from
@@ -818,6 +1059,37 @@ mod tests {
         Layout::of(&doc! {"timeseries": {"timeField": "t", "metaField": "m",
         "granularity": "seconds", "bucketMaxSpanSeconds": 3600}})
         .unwrap()
+    }
+
+    /// The bucket-level filter's `$_internalExpr*` comparisons: across
+    /// types by BSON order, a missing field below everything, an array on
+    /// the path matching whatever is asked (RM-348).
+    #[test]
+    fn a_bucket_filter_compares_as_mongod_does() {
+        let bucket = doc! {
+            "control": {"min": {"v": 3, "s": "a", "a": [1, 9]}, "max": {"v": 7, "s": "z"}},
+            "meta": 4,
+        };
+        let passes = |f: Document| bucket_matches(&bucket, &f).unwrap();
+        assert!(passes(doc! {"control.max.v": {"$_internalExprGte": 7}}));
+        assert!(!passes(doc! {"control.max.v": {"$_internalExprGt": 7}}));
+        assert!(passes(doc! {"control.min.v": {"$_internalExprLte": 3}}));
+        // A number sorts below a string, whatever its value.
+        assert!(passes(doc! {"control.max.v": {"$_internalExprLt": "0"}}));
+        assert!(passes(doc! {"control.min.s": {"$_internalExprGt": 1000}}));
+        // Missing: below everything.
+        assert!(!passes(doc! {"control.max.w": {"$_internalExprGte": 0}}));
+        assert!(passes(doc! {"control.min.w": {"$_internalExprLt": 0}}));
+        // An array on the path matches.
+        assert!(passes(doc! {"control.min.a": {"$_internalExprGt": 100}}));
+        assert!(passes(doc! {"$or": [
+            {"control.max.v": {"$_internalExprGt": 100}},
+            {"meta": 4},
+        ]}));
+        assert!(!passes(doc! {"$and": [
+            {"control.max.v": {"$_internalExprGte": 0}},
+            {"meta": 5},
+        ]}));
     }
 
     fn at(minutes: i64) -> Bson {

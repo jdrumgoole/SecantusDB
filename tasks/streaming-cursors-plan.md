@@ -143,8 +143,12 @@ connection thread; no WT cursor may outlive its call):
    - Done 2026-11-09 (RM-347): a leading `$geoNear` streams through the
      same search, read through the cursor stage, which gives each document
      its distance as it buffers it (`agg_stream::geo_near`).
-   - Left: a time-series collection (RM-348), a plan
-     chosen by trial (RM-349); their counts (RM-363).
+   - Done 2026-11-09 (RM-348): a time-series `aggregate` reads its
+     buckets through the cursor stage, each derived again at a refill and
+     unpacked as the cursor reaches it (`ts_buckets::BucketScan`).
+   - Left: a time-series `find` (RM-455), one behind an inclusion
+     `$project` (RM-456) or read from an index over the buckets (RM-457),
+     a plan chosen by trial (RM-349); their counts (RM-363).
 4. **`storage` on the line.** Done (2026-10-27, RM-023): WiredTiger's
    per-session statistics, read from each session the operation closes and
    from a transaction's session at each statement's end
