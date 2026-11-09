@@ -295,6 +295,14 @@ def main() -> int:
         )
     # The cargo lanes: the clean workspace, then each WiredTiger-linked crate
     # the workspace commands do not compile.
+    # Every Backlog-ID this work adds is one it reserved, or an item another
+    # origin branch already holds (one inherited from rm-batch): a number
+    # written by hand meets its twin only on a snapshot PR, a CI cycle
+    # later (tools/backlog.py check-ids; #2580 went red on one, 2026-11-09).
+    g.step(
+        "backlog-ids",
+        [str(py), "tools/backlog.py", "check-ids", "--file", "backlog-rust-mongodb.md"],
+    )
     g.step("rust-test", ["./inv", "rust-test"])
     g.step("wt-test", ["./inv", "rust-wt-test"])
     if storage:
