@@ -662,14 +662,18 @@ These are explicit non-goals. Don't add them without a reason.
       profile entry's `execStats` alike. Found 2026-11-07 (RM-359).
       Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_projection_is_where_mongods_plan_puts_it
       Backlog-ID: RM-373
-- [ ] **A SORT with a limit of 1 counts the data it sorted.** mongod
-      8.2.11's SORT keeps its one best document and reports
-      `totalDataSizeSorted: 0` (a `find`'s and a `findAndModify`'s, in a
-      profile entry's `execStats` and in `explain`; a limit of 3 counts
-      201). This server's sorter counts the document it kept (67).
-      Found 2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_sort_of_one_document_counts_no_data_sorted
-      Backlog-ID: RM-374
+- [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
+      8.2.11 adds every document its sort read to
+      `metrics.query.sort.totalKeysSorted` for a leading `$sort` and
+      `$limit` (6 for `[{$match: {z: 0}}, {$sort: {y: 1}}, {$limit: 1}]`
+      over six matching documents, 12 for `[{$sort: {y: 1}}, {$limit: 2}]`
+      over twelve), as a `find` with the same sort and limit does. This
+      server's read sorts and limits without counting
+      (`aggregate.rs`'s `lead.limit` read), and the pipeline's `$sort` then
+      counts the k documents it is handed: 1 and 2. Found 2026-11-09
+      (RM-374).
+      Verify: tests/backlog/test_rm_found_rm374.py::test_an_aggregate_sort_with_a_limit_counts_every_key_it_sorted
+      Backlog-ID: RM-468
 - [ ] **Two updates are planned as an `_id` express write where mongod's
       are not.** mongod 8.2.11 plans an update with a `sort` (8.0) as
       UPDATE over a SORT over its read (`planSummary: COLLSCAN`, 0 keys

@@ -93,12 +93,12 @@ def test_a_projection_is_where_mongods_plan_puts_it(rust_mongo: Any, mongod: Any
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-374")
+@pytest.mark.backlog_fixed("RM-374")
 def test_a_sort_of_one_document_counts_no_data_sorted(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11's SORT with a limit of 1 keeps the one best document
     and counts no data sorted (`totalDataSizeSorted: 0`, a `find`'s and a
     `findAndModify`'s alike; 201 for a limit of 3). This server's sorter
-    counts the documents it kept (67)."""
+    counted the document it kept (67)."""
 
     def op(d: Any) -> Any:
         return list(d.c.find({"z": 0}).sort("y", 1).limit(1))
