@@ -2585,18 +2585,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp695.py`: `t695(k int, a varchar(3)[], c
 char(3)[], b bit(3)[])`.
 
-- [ ] **An INSERT or UPDATE of a `varchar(n)[]` column keeps an overlong
-      element.** `insert into t695 (a) values (array['abcdef'])` is 22001
-      on PostgreSQL 15.19 (`transformAssignedExpr`'s `ArrayCoerceExpr`
-      applies the element's length coercion by the assignment rule), as
-      are a `'{abcdef}'` literal, an UPDATE, a `char(3)[]` column's
-      `'abcd'` and a `bit(3)[]` column's `B'1'` (22026); here each row is
-      stored as given, and `array['abc   ']` keeps its six characters
-      where PostgreSQL stores `{abc}`. `fit_to_column` fits only a scalar;
-      since RP-695 `fit_assigned_length` fits an array's elements for
-      PL/pgSQL.
-      Verify: tests/backlog/test_rp_found_rp695.py::test_array_column_assignment_fits_each_element
-      Backlog-ID: RP-710
 - [ ] **A PL/pgSQL assignment to an array element is refused.** `declare x
       int[]; begin x[1] := 5;` makes `{5}` on PostgreSQL 15.19, and
       `x[2] := 'ab'` over a `text[]` `{a}` makes `{a,ab}`
@@ -2606,6 +2594,34 @@ char(3)[], b bit(3)[])`.
       `cannot cast int4 to int4[]` / `malformed array literal: "ab"`.
       Verify: tests/backlog/test_rp_found_rp695.py::test_assignment_to_an_array_element
       Backlog-ID: RP-711
+
+## Found while working RP-710 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the setups in
+`tests/backlog/test_rp_found_rp710.py`.
+
+- [ ] **COPY FROM ignores its column's modifier.** `copy cp710 (s) from
+      stdin` of `abcdef` into a `varchar(3)` column is 22001 on PostgreSQL
+      15.19, and `1.25` into a `numeric(4,1)` one stores `1.3` (`CopyFrom`
+      reads each field with `InputFunctionCall(..., typmod)`; `array_in`
+      passes the modifier to every element, so `{abcdef}` into a
+      `varchar(3)[]` is 22001 and `{1.25}` into a `numeric(4,1)[]` is
+      `{1.3}`); here each field is stored as written, and `abc   ` keeps its
+      blanks. `copy_field` reads by type only and `copy_load` fits nothing;
+      an INSERT fits through `fit_to_column`.
+      Verify: tests/backlog/test_rp_found_rp710.py::test_copy_reads_a_field_at_its_columns_modifier
+      Backlog-ID: RP-718
+- [ ] **A `char(n)[]` column's elements are stored unpadded.** `insert into
+      t710 (k, c) values (5, array['ab']) returning c, octet_length(c[1])`
+      is `{"ab "}`, 3 on PostgreSQL 15.19 (the element coercion is
+      `bpchar(text, typmod)`, and a `'{ab}'` literal's is `bpcharin` at the
+      modifier, both of which pad); here it is `{ab}`, 2. A scalar
+      `char(n)` column is stored trimmed and padded where it enters an
+      expression, which an array's elements are not. Padding them at the
+      write reaches every comparison of a `char(n)[]` value, which
+      PostgreSQL makes blank-insensitively (`bpchareq` per element).
+      Verify: tests/backlog/test_rp_found_rp710.py::test_a_char_n_array_element_is_padded_to_its_width
+      Backlog-ID: RP-719
 
 ## Found while working RP-668 (2026-11-09)
 
