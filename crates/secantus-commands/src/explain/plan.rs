@@ -2062,8 +2062,14 @@ fn write_plan(
     upsert: bool,
     returns: bool,
 ) -> Node {
+    // An `_id` point write skips the planner only under the `_id` index's
+    // own collation: under another, a number's bounds still read the index
+    // (UPDATE, FETCH, `IXSCAN { _id: 1 }`) and a string's do not (COLLSCAN),
+    // an upsert included (measured 8.2.11, 2026-11-09, RM-376).
     if let (Hint::None, Some(("_id", value))) = (&q.hint, point_lookup(q.canonical)) {
-        let id_index = catalog.iter().find(|ix| ix.name == "_id_");
+        let id_index = catalog
+            .iter()
+            .find(|ix| ix.name == "_id_" && !collation_differs(ix, q.collation));
         match id_index {
             Some(_) if upsert => {
                 return Node::Update(Box::new(Node::IdHack(value.clone())));
@@ -2078,9 +2084,12 @@ fn write_plan(
             None => {}
         }
     }
-    let sorted = returns && sort_of(q).is_some();
+    // A findAndModify's sort, or an update's (8.0): a SORT of one document
+    // over the read, or a read in the sort's order and a LIMIT of one
+    // (measured 8.2.11, 2026-11-09, RM-376).
+    let sorted = sort_of(q).is_some();
     let read = Query {
-        sort: q.sort.filter(|_| returns),
+        sort: q.sort,
         projection: None,
         skip: 0,
         limit: i64::from(sorted),
@@ -2090,7 +2099,7 @@ fn write_plan(
         Node::Eof("predicateEvalsToFalse")
     } else {
         match wrap(access(&read, catalog), &read) {
-            // The one document a findAndModify sorts for: mongod labels it so.
+            // The one document a write sorts for: mongod labels it so.
             Node::Sort {
                 pattern,
                 limit,

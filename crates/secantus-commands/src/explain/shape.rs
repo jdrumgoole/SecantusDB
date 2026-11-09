@@ -223,6 +223,12 @@ pub(crate) fn update(coll: &str, inner: &Document) -> Result<Shape, CommandError
     check_update(u)?;
     let mut s = Shape::new(coll, kind, st);
     s.filter = doc_arg(st, "q", "update.updates.q")?;
+    // An update of one document under a sort (8.0) reads one, in its order.
+    s.sort = st
+        .get_document("sort")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .cloned();
     Ok(s)
 }
 

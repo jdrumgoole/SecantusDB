@@ -532,10 +532,17 @@ fn catalog(
             partial: spec.get_document("partialFilterExpression").ok().cloned(),
             multikey_paths,
             version: spec.get("v").and_then(as_i64).unwrap_or(2) as i32,
+            // The `_id` index of a collection with a default collation
+            // carries it, as `listIndexes` shows (RM-376).
             collation: spec
                 .get_document("collation")
                 .ok()
-                .and_then(secantus_core::collation::parse),
+                .and_then(secantus_core::collation::parse)
+                .or_else(|| {
+                    (name == "_id_")
+                        .then(|| crate::util::default_collation(storage, db, coll))
+                        .flatten()
+                }),
             plain,
             key: key.clone(),
             name,
