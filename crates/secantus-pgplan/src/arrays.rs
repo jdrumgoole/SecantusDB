@@ -455,6 +455,28 @@ pub fn check_accumulable<B: std::borrow::Borrow<Bson>>(
     Ok(())
 }
 
+/// The arrays `values` accumulated into one array of one more dimension,
+/// as `accumArrayResultArr` / `makeArrayResultArr` (PostgreSQL 15
+/// `arrayfuncs.c`) build an ARRAY sublink's or `array_agg(anyarray)`'s
+/// result: the new outer dimension starts at 1, and the inner ones take the
+/// FIRST array's lower bounds. `array(select '[2:3]={3,4}'::int[])` is
+/// `[1:1][2:3]={{3,4}}`; before this each bounded element stayed a tagged
+/// document inside the result and read as a NULL (RP-731). Call it after
+/// [`check_accumulable`], which makes every array's bounds the first's.
+pub fn accumulate(values: Vec<Bson>) -> Bson {
+    let Some(first) = values.first() else {
+        return Bson::Array(values);
+    };
+    // An array of one dimension and no elements keeps its own form: there
+    // are no elements to carry bounds.
+    if !is_bounded(first) || is_one_dimensional_empty(first) {
+        return Bson::Array(values);
+    }
+    let mut lbs = vec![1];
+    lbs.extend(lower_bounds(first));
+    bounded(Bson::Array(values.iter().map(strip).collect()), &lbs)
+}
+
 /// `v` as a plain array, its bounds dropped (anything else unchanged).
 pub fn strip(v: &Bson) -> Bson {
     match v {
@@ -970,6 +992,26 @@ mod tests {
         }
         assert_eq!(dim_lengths(&deep).len(), 6);
         assert_eq!(code(vec![deep]), Some("54000"));
+    }
+
+    /// `accumArrayResultArr` on PostgreSQL 15.19 (RP-731): the new outer
+    /// dimension starts at 1 and the inner ones take the first array's
+    /// lower bounds, so `array(select f ...)` over `[2:3]={3,4}` and
+    /// `[2:3]={5,6}` is `[1:2][2:3]={{3,4},{5,6}}`.
+    #[test]
+    fn accumulated_arrays_keep_the_first_ones_lower_bounds() {
+        let from_two = |a, b| bounded(arr(vec![i(a), i(b)]), &[2]);
+        let both = accumulate(vec![from_two(3, 4), from_two(5, 6)]);
+        assert_eq!(strip(&both), two_by_two_of(3, 4, 5, 6));
+        assert_eq!(lower_bounds(&both), vec![1, 2]);
+        assert_eq!(dims_text(&both).as_deref(), Some("[1:2][2:3]"));
+        // Plain arrays accumulate into a plain array.
+        assert_eq!(accumulate(vec![two_by_two()]), arr(vec![two_by_two()]));
+        assert_eq!(accumulate(vec![]), arr(vec![]));
+    }
+
+    fn two_by_two_of(a: i32, b: i32, c: i32, d: i32) -> Bson {
+        arr(vec![arr(vec![i(a), i(b)]), arr(vec![i(c), i(d)])])
     }
 
     #[test]

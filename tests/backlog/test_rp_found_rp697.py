@@ -1,6 +1,6 @@
 """What working RP-697 (a row compared with a correlated subquery) found:
 
-- a `varchar` compared with a `char(n)` counts the trailing blanks;
+- a `varchar` compared with a `char(n)` counted the trailing blanks (fixed);
 - an uncorrelated `row op ANY / ALL (subquery)` with an ordering operator
   is refused;
 - a row compared with a subquery whose column types have no operator
@@ -52,8 +52,8 @@ def answer(dsn: str, query: str) -> Any:
 
 # `varchar = bpchar` resolves to `bpchareq` (the `varchar` side cast to
 # `bpchar`), which ignores trailing blanks on both sides: `'ab '::varchar`
-# equals `'ab'::char(3)`. Here row 2 is false both ways round, and a row
-# comparison whose pair is a `varchar` and a `char(n)` inherits it.
+# equals `'ab'::char(3)`. Row 2 was false both ways round, and a row
+# comparison whose pair is a `varchar` and a `char(n)` inherited it.
 VARCHAR_AGAINST_BPCHAR = {
     "select k, v = c, c = v from ch697 order by k": (
         [(1, True, True), (2, True, True)],
@@ -66,7 +66,7 @@ VARCHAR_AGAINST_BPCHAR = {
 }
 
 
-@pytest.mark.backlog("RP-726")
+@pytest.mark.backlog_fixed("RP-726")
 @pytest.mark.parametrize("query", list(VARCHAR_AGAINST_BPCHAR))
 def test_varchar_against_bpchar_ignores_trailing_blanks(query: str, dsn: str) -> None:
     assert answer(dsn, query) == VARCHAR_AGAINST_BPCHAR[query]

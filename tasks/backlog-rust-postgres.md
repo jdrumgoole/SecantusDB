@@ -3162,15 +3162,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
 `ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **A `varchar` compared with a `char(n)` counts the trailing blanks.**
-      `select v = c` over `'ab '::varchar(4)` and `'ab'::char(3)` is true on
-      PostgreSQL 15.19 both ways round: `varchar = bpchar` resolves to
-      `bpchareq`, the `varchar` side cast to `bpchar`, which ignores
-      trailing blanks. Here it is false, and a row comparison whose pair is
-      a `varchar` and a `char(n)` (`(v, k) = (select x.c, x.k ...)`)
-      inherits it.
-      Verify: tests/backlog/test_rp_found_rp697.py::test_varchar_against_bpchar_ignores_trailing_blanks
-      Backlog-ID: RP-726
 - [ ] **An uncorrelated `row op ANY / ALL (subquery)` with an ordering
       operator is refused.** `select k, (k, a) < any (select 2, 3) from
       rn697` answers per row on PostgreSQL 15.19 (each subquery row a
@@ -3191,6 +3182,48 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       over no rows.
       Verify: tests/backlog/test_rp_found_rp697.py::test_row_pair_with_no_operator_is_42883
       Backlog-ID: RP-728
+
+## Found while working RP-726 (2026-11-09)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp726.py`: `ch726(k int, c char(3), v
+varchar(4), t text)` holding `(1, 'y', 'y', 'y')` and `(2, 'ab', 'ab ',
+'ab ')`.
+
+- [ ] **A simple CASE and NULLIF over a `char(n)` and another string type
+      compare without the operator their types resolve to.** `case c when
+      v` and `nullif(v, c)`, `c` a `char(3)` `y` and `v` a `varchar` `y`,
+      are `eq` / NULL on PostgreSQL 15.19 (`bpchareq`); here `ne` / `y`, the
+      `char(n)` side compared with its padding. Against `text` (`texteq`,
+      the `char(n)` side cast to text) `case t when c` over `ab ` and `ab`
+      is `ne` there, `eq` here, and `nullif(t, c)` over `y` and `y` is
+      NULL there, `y` here. Two `char(n)` operands are answered.
+      Verify: tests/backlog/test_rp_found_rp726.py::test_case_and_nullif_compare_by_type
+      Backlog-ID: RP-737
+- [ ] **EXPLAIN of a JOIN ... ON a `varchar` column equal to a `char(n)`
+      one prints the Hash Cond through `text` casts.** `explain (costs
+      off) select x.k, y.k from ch726 x join ch726 y on x.v = y.c` prints
+      `Hash Cond: ((x.v)::bpchar = y.c)` on PostgreSQL 15.19, the operator
+      it resolved (`bpchareq`, the `varchar` side relabelled); here
+      `((x.v)::text = (y.c)::text)`. The rows are right since RP-736.
+      Found while working RP-736 (2026-11-09).
+      Verify: tests/backlog/test_rp_found_rp726.py::test_explain_join_on_varchar_against_char_n
+      Backlog-ID: RP-738
+- [ ] **A cancel while a 200,000-item `IN` list is planned still waits
+      up to ~0.25 s, about one time in twenty.** RP-202's
+      `test_a_cancel_while_a_huge_in_list_is_planned_over_a_table[0.7]`
+      measured 0.33 s and then 0.31 s (its bound is 0.3 s) in the backlog
+      step of `gate_pg.sh --fast` on 2026-11-09, at load 10-25 on 12
+      cores. With that test's own `_cancel_after` at delay 0.7 against a
+      debug `secantusd-pg`: at `b484522c`, 24 runs, 23 at 0.013-0.023 s
+      and one at 0.238 s; at the `pg-batch` tip `adb234a2`, without RP-726
+      and with it, 30 runs each, twice, medians 0.021-0.022 s and one late
+      cancel per 30 at 0.256-0.276 s on both. So some planning pass still
+      runs a stretch that does not look for a cancel, as the rewrite
+      passes did before RP-202; find which one by sampling the server when
+      a cancel is late.
+      Verify: none -- a timing tail that does not fail on demand; RP-202's own test is the check
+      Backlog-ID: RP-735
 
 ## Found while working RP-681 (2026-11-09)
 
@@ -3223,17 +3256,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **An accumulated array whose lower bounds are not 1 is lost.**
-      `select array(select f from (values ('[2:3]={3,4}'::int[])) t(f))`
-      is `[1:1][2:3]={{3,4}}` on 15.19 (`accumArrayResultArr` copies the
-      first element array's lower bounds into the inner dimensions), and
-      `array_agg` over two such arrays `[1:2][2:3]={{3,4},{5,6}}`. Here
-      the sublink answers `{NULL}` -- each bounded element becomes a NULL
-      -- and as text `{"[2:3]={3,4}"}`, an array of strings; `array_agg`
-      the same. The shape checks already read the bounds (RP-730); the
-      result does not carry them.
-      Verify: tests/backlog/test_rp_found_rp730.py::test_accumulated_arrays_keep_their_lower_bounds
-      Backlog-ID: RP-731
 - [ ] **A query with ORDER BY computes its select list after the sort.**
       PostgreSQL 15.19 projects the select list below the Sort, in scan
       order, so `select k, case when k = 1 then 1/0 else ('x' || k)::int

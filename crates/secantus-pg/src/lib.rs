@@ -2563,6 +2563,13 @@ pub(crate) fn join_hash_key(d: &Document, keys: &[&String]) -> Option<Vec<String
 }
 
 fn join_text_hash(v: &str) -> String {
+    // Trailing blanks do not count: an equality of a `char(n)` and a
+    // `varchar` (or of two `char(n)`) is `bpchareq`, hashed by `hashbpchar`
+    // over the value without them, so `'ab '::varchar` must meet the stored
+    // `char(3)` `'ab'` (PostgreSQL 15.19, RP-736). Dropping them for every
+    // string only makes buckets coarser: `texteq` still tells `'ab '` from
+    // `'ab'` in ON.
+    let v = v.trim_end_matches(' ');
     if v.starts_with([
         '{', '[', '-', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
     ]) {
@@ -49861,6 +49868,22 @@ fn array_agg_refuses(values: impl Iterator<Item = Bson>) -> bool {
     }
 }
 
+/// `array_agg`'s result: over an array column the inputs are accumulated
+/// into one more dimension whose inner bounds are the first input's
+/// (`secantus_pgplan::arrays::accumulate`, RP-731); otherwise the values as
+/// they are.
+fn accumulate_if_arrays(item: &AggItem, values: Vec<Bson>) -> Bson {
+    if item
+        .source_type
+        .as_deref()
+        .is_some_and(|t| t.ends_with("[]"))
+    {
+        secantus_pgplan::arrays::accumulate(values)
+    } else {
+        Bson::Array(values)
+    }
+}
+
 /// The float8 sum of `values` in order, as `sum` / `avg` of a
 /// `double precision` add them -- or `None`, with `FLOAT_SUM_OVERFLOW` set,
 /// when an addition of two finite values overflows: PostgreSQL's `float8pl`
@@ -50168,9 +50191,10 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
                     (false, false) => compare_values(b, a),
                 },
             );
-            Bson::Array(kept)
+            accumulate_if_arrays(item, kept)
         }
-        AggFunc::ArrayAgg => Bson::Array(
+        AggFunc::ArrayAgg => accumulate_if_arrays(
+            item,
             rows.iter()
                 .map(|d| d.get(field).cloned().unwrap_or(Bson::Null))
                 .collect(),
@@ -55110,6 +55134,28 @@ impl PgWireServerHandlers for HandlerFactory {
                 handler.backend.wake.notified().await;
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod join_hash_key_tests {
+    use super::*;
+
+    fn key(v: &str) -> Option<Vec<String>> {
+        let d = bson::doc! { "k": v };
+        join_hash_key(&d, &[&"k".to_string()])
+    }
+
+    /// A `varchar` `'ab '` and a stored `char(3)` `'ab'` are equal under
+    /// `bpchareq`, so they share a bucket (RP-736); ON then decides, and
+    /// tells `'ab '` from `'ab'` when the operator is `texteq`.
+    #[test]
+    fn trailing_blanks_share_a_bucket() {
+        assert_eq!(key("ab "), key("ab"));
+        assert_eq!(key("ab   "), key("ab"));
+        assert_ne!(key(" ab"), key("ab"));
+        assert_ne!(key("ab\t"), key("ab"));
+        assert_eq!(key("{\"x\": 1} "), key("{\"x\": 1.0}"));
     }
 }
 

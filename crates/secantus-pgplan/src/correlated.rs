@@ -1876,8 +1876,11 @@ fn eval(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Result<Bson> {
             // Over an array column the rows are accumulated into one more
             // dimension (`accumArrayResultArr`), as the uncorrelated
             // sublink's are (RP-730).
+            // The result's inner dimensions take the first array's lower
+            // bounds (RP-731).
             if column_types.first().is_some_and(|(t, _)| t.ends_with("[]")) {
                 crate::arrays::check_accumulable(&values)?;
+                return Ok(crate::arrays::accumulate(values));
             }
             Ok(Bson::Array(values))
         }
