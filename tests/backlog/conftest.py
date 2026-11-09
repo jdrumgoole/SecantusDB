@@ -156,6 +156,10 @@ def mongo_answer(fn: Callable[[], Any]) -> tuple:
 # -------------------------------------------------------------- servers --
 
 
+#: A `delinquentAcquisitionIntervalMillis` no ticket is held past (a day).
+NO_DELINQUENCY_MILLIS = 86_400_000
+
+
 def drain_output(proc: subprocess.Popen) -> None:
     """Keep reading a server's output once its banner is read. Nobody reads
     the pipe otherwise, and once its 64 KiB buffer fills, every thread that
@@ -167,11 +171,21 @@ def drain_output(proc: subprocess.Popen) -> None:
 
 @pytest.fixture(scope="module")
 def rust_mongo(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
-    """A pymongo client to a `secantusd-rs` of this module's own."""
+    """A pymongo client to a `secantusd-rs` of this module's own, whose
+    execution control, as `mongod_rs`'s, counts no ticket as held too long:
+    a line's `delinquencyInfo` is load's, not the operation's."""
     assert RS_BINARY.exists(), f"{RS_BINARY} is not built (./inv rust-binary-build)"
     store = tmp_path_factory.mktemp("rust-mongo")
     proc = subprocess.Popen(
-        [str(RS_BINARY), "--port", "0", "--storage-path", str(store)],
+        [
+            str(RS_BINARY),
+            "--port",
+            "0",
+            "--storage-path",
+            str(store),
+            "--setParameter",
+            f"delinquentAcquisitionIntervalMillis={NO_DELINQUENCY_MILLIS}",
+        ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -225,9 +239,9 @@ def mongod_rs() -> Iterator[Any]:
     `delinquentAcquisitionIntervalMillis` (30 ms, startup only) as
     `delinquencyInfo` on its `Slow query` line, which load decides: a
     three-document `find` printed it in the RM gate (2026-11-07), and any
-    `find` holding its ticket longer does on an idle machine. This server's
-    line prints no `delinquencyInfo` yet (RM-355), so the interval is out
-    of reach and the lines compared are the operation's own."""
+    `find` holding its ticket longer does on an idle machine. Both servers
+    run with the interval out of reach (`rust_mongo` too, since RM-355's
+    line prints it), so the lines compared are the operation's own."""
     from tests.mongod_reference import MONGOD, _host_port, _start_mongod, _stop_mongod
 
     assert MONGOD, "no mongod on PATH: the reference server is required"
@@ -236,7 +250,7 @@ def mongod_rs() -> Iterator[Any]:
             "--replSet",
             "backlog",
             "--setParameter",
-            "delinquentAcquisitionIntervalMillis=86400000",
+            f"delinquentAcquisitionIntervalMillis={NO_DELINQUENCY_MILLIS}",
         )
     )
     try:

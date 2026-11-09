@@ -586,11 +586,16 @@ impl LockManager {
             let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.heads.values().any(|h| h.holds(owner))
         };
+        // The whole acquisition is the operation's wait for execution
+        // admission (`storageExecutionMicros`), a ticket that was free at
+        // once included.
+        let started = std::time::Instant::now();
         let taken = if reacquiring {
             self.reacquire(owner, mode, holder, &ctx, &mut interrupted)
         } else {
             holder.wait_for_ticket(&ctx, &mut interrupted)
         };
+        ctx.record_acquiring(started.elapsed());
         match taken {
             Ok(ticket) => {
                 self.tickets
@@ -1278,6 +1283,12 @@ impl Drop for TicketStash {
     fn drop(&mut self) {
         self.lm.release_ticket(self.owner);
     }
+}
+
+/// The running operation's execution admissions, when a command runs on
+/// this thread.
+pub fn execution_admission() -> Option<std::sync::Arc<crate::admission::AdmissionContext>> {
+    EXEC_ADMISSION.with(|c| c.borrow().clone())
 }
 
 /// Makes `ctx` the running operation's execution admissions until dropped.

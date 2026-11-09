@@ -1290,6 +1290,17 @@ fn run_dispatch(
         }
     };
     if slow {
+        // mongod reads the operation's storage statistics for the line
+        // under the global lock in IS, when the operation took the global
+        // lock at all (RM-299). Its execution ticket is one more of the
+        // operation's admissions, and its wait part of the operation's,
+        // which the line then prints (`queues.execution`,
+        // `storageExecutionMicros`); its `locks` were read before (RM-355).
+        if secantus_commands::lock_manager::took_global() {
+            let _admitted =
+                secantus_commands::lock_manager::admission_scope(ctx.execution_admission.clone());
+            secantus_commands::lock_manager::log_lock(&shared.locks);
+        }
         let read = secantus_commands::slowop::read_attributes(request, &reply, &ctx);
         let attr = secantus_commands::slowop::attributes(
             request,
@@ -1299,12 +1310,6 @@ fn run_dispatch(
             worked,
             total,
         );
-        // mongod reads the operation's storage statistics for the line
-        // under the global lock in IS, when the operation took the global
-        // lock at all (RM-299).
-        if secantus_commands::lock_manager::took_global() {
-            secantus_commands::lock_manager::log_lock(&shared.locks);
-        }
         let attr = secantus_commands::slowop::with_interrupt_checks(request, &ctx, attr);
         let entry = LogEntry::new(
             "I",

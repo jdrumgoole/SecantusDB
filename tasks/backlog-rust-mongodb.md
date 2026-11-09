@@ -514,14 +514,10 @@ These are explicit non-goals. Don't add them without a reason.
       held the insert.
       Backlog-ID: RM-022
       Verify: none -- unreproduced 10 s stall on a bad droplet
-- [ ] **A `Slow query` line and profile entry have no execution admission
-      control's fields.** mongod 8.2.11 admits every operation through its
-      ingress and execution admission control, and its line says so:
-      `queues: {ingress: {admissions: 1}, execution: {admissions: 2}}`, and
-      in `storage.timeWaitingMicros` the `storageExecutionMicros` it waited
-      for admission -- never zero, so a `find` of documents in the cache
-      still has a `storage` section (measured 2026-10-27). This server has
-      mongod's ingress admission control since 2026-11-08
+- [ ] **Execution admission control's ticket points and reports are not
+      all mongod's.** mongod 8.2.11 admits every operation through its
+      ingress and execution admission control. This server has mongod's
+      ingress admission control since 2026-11-08
       (`secantus-commands` `admission/ingress.rs`;
       `tests/mongod_live/test_ingress_admission.py`) and its execution
       control's ticket pools since 2026-11-09 (`admission/execution.rs`, a
@@ -534,29 +530,23 @@ These are explicit non-goals. Don't add them without a reason.
       queued in them, and a ticket taken with each owner's global lock
       (`lock_manager`, mongod's `Locker::_acquireTicket`), returned between
       a transaction's statements and taken again with mongod's
-      `reacquireTicket` conflict check. `admission.rs`'s opt-in write
-      tickets are gone (`--write-tickets N` sets
-      `storageEngineConcurrentWriteTransactions`). Open:
-      - the line's `queues.execution` admissions and
-        `storage.timeWaitingMicros.storageExecutionMicros`, and
-        `delinquencyInfo` (the operation's context counts both since
-        2026-11-09; the line prints neither): the count is mongod's
-        acquisition structure, not its `locks` -- a `find` with `Global:
-        {r: 1}` has 2 admissions, with or without the profiler -- so each
-        command's acquisition points need their own probe before a count is
-        printed. Measured 2026-11-07: `execution.admissions` is 2 for `find`,
-        `getMore`, `aggregate`, `count`, `listCollections` and `dbStats`, 3
-        for an `insert`, 2 for an update statement and 4 for its `update`
-        command, and `ping`'s `execution` is `{}` with no `storage`;
-        `storageExecutionMicros` was 1-6 us whenever admissions > 0. When
-        the line prints `delinquencyInfo`, the backlog conftest's `rust_mongo`
-        needs the reference's `delinquentAcquisitionIntervalMillis`;
+      `reacquireTicket` conflict check. Since 2026-11-09 the `Slow query`
+      line prints `queues.execution` and `delinquencyInfo`, and the line
+      and profile entry `storage.timeWaitingMicros.storageExecutionMicros`
+      (the global IS the line reads its statistics under takes the
+      admission mongod's does; compared operation by operation in
+      `tests/mongod_live/test_slow_query_lines.py`). Open:
       - where this server's ticket points differ from mongod's: a yield here
         keeps its locks, so it keeps its ticket and takes no second
         admission (mongod returns both and takes them again, RM-360); an
         `awaitData` getMore returns its ticket for each 100 ms of its wait,
         where mongod's yields once per wait; `commitTransaction` and
         `abortTransaction` take no ticket (mongod's unstash takes one);
+        and an `update` or `delete` statement's line counts one admission
+        fewer, its command's line one fewer per statement, because the
+        statement's line is written with the command's locks still held
+        (RM-357's statement rounds), where mongod's statement has let its
+        own go and takes a fresh ticket to read its statistics;
       - a `currentOp` row has no `queues` (each pool's `admissions`,
         `totalTimeQueuedMicros`, `isHoldingTicket`) or, while it waits,
         `currentQueue`; `serverStatus.queues` has no
@@ -565,9 +555,9 @@ These are explicit non-goals. Don't add them without a reason.
         `<db>.$cmd` on mongod, its collection here; and mongod's first
         retryable write after startup takes a second, exempt, ingress
         admission (not traced), all measured 8.2.11 2026-11-08.
-      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08 and the ticket pools 2026-11-09; the per-command admission counts on the line are next.
+      **Decided (Joe, 2026-11-08): build mongod's execution admission control in full, the faithful option: the ingress controller, then the read and write ticket pools with `throughputProbing` (replacing `admission.rs`'s opt-in write tickets), then the per-command admission counts, so the concurrency cap is on by default as on mongod. Several PRs, in that order.** The ingress controller landed 2026-11-08, the ticket pools 2026-11-09, and the per-command admission counts on the line 2026-11-09; what is left is above.
       Backlog-ID: RM-355
-      Verify: tests/backlog/test_rm_355_364.py::test_a_line_says_what_execution_control_admitted, tests/backlog/test_rm_001_028.py::test_slow_query_line_says_where_the_time_went
+      Verify: tests/backlog/test_rm_355_364.py::test_admission_control_is_reported_where_mongod_reports_it
 - [ ] **Some writes' `locks` are not mongod's.** Since 2026-11-07 a write
       counts mongod's flow control tickets (one per global IX taken apart)
       and a retryable write's session checkout and session row, and a
@@ -598,6 +588,11 @@ These are explicit non-goals. Don't add them without a reason.
         takes a single round;
       - `collMod` and `$out` take more transition locks than this server's
         rounds (`$out`'s were measured on a standalone, RM-185);
+      - each global lock taken apart takes an execution ticket, so where
+        these locks differ the line's `queues.execution` admissions differ
+        too (RM-355; `collMod`'s line has 3 here, 4 on mongod), and an
+        `aggregate` of `$documents`, which takes no lock on mongod, has no
+        admission and no `storage` section there;
       - a statement of a transaction shows `{}` on mongod's line and the
         transaction's initial locks in its entry; an `aggregate` of
         `$documents` takes no lock on mongod, and the global IS here.

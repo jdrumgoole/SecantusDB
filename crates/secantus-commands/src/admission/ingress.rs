@@ -172,27 +172,6 @@ fn exempt_pipeline(stages: &[Bson]) -> bool {
     })
 }
 
-/// The `queues` of an operation's `Slow query` line (mongod's
-/// `TicketHolderQueueStats::toBson`): each pool's admissions and time
-/// queued, either left out at zero. `ctx` is the operation's ingress
-/// admissions, `None` for work no command admitted (an index build's
-/// thread), whose line has `ingress: {}`.
-pub fn line_queues(ctx: Option<&AdmissionContext>) -> Document {
-    let mut ingress = Document::new();
-    if let Some(ctx) = ctx {
-        if ctx.admissions() > 0 {
-            ingress.insert("admissions", ctx.admissions());
-        }
-        let queued = ctx.total_time_queued_micros();
-        if queued > 0 {
-            ingress.insert("totalTimeQueuedMicros", queued);
-        }
-    }
-    let mut out = Document::new();
-    out.insert("ingress", ingress);
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,21 +268,5 @@ mod tests {
             "aggregate",
             &agg(vec![doc! {"$facet": {"a": [{"$currentOp": {}}]}}])
         ));
-    }
-
-    #[test]
-    fn the_line_leaves_out_what_is_zero() {
-        assert_eq!(line_queues(None), doc! {"ingress": {}});
-        let ctx = AdmissionContext::default();
-        assert_eq!(line_queues(Some(&ctx)), doc! {"ingress": {}});
-        ctx.admissions
-            .store(1, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(line_queues(Some(&ctx)), doc! {"ingress": {"admissions": 1}});
-        ctx.total_time_queued_micros
-            .store(7, std::sync::atomic::Ordering::Relaxed);
-        assert_eq!(
-            line_queues(Some(&ctx)),
-            doc! {"ingress": {"admissions": 1, "totalTimeQueuedMicros": 7_i64}}
-        );
     }
 }

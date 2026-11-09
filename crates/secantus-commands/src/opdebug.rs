@@ -73,6 +73,7 @@ pub(crate) const LINE_ORDER: &[&str] = &[
     "cpuNanos",
     "remote",
     "protocol",
+    "delinquencyInfo",
     "numInterruptChecks",
     "queues",
     "workingMillis",
@@ -410,9 +411,15 @@ pub(crate) fn reorder(mut doc: Document, order: &[&str]) -> Document {
 /// no probe made mongod wait on the schema lock, and `schemaLock` follows
 /// `handleLock`'s spelling. mongod's own waits (`cacheInterruptibleMicros`,
 /// which this engine's statistics do not split from the rest of the cache
-/// wait, and `storageExecutionMicros`, its execution admission control)
-/// are not counted here (RM-355).
-pub(crate) fn storage_section(c: &OperationCounts) -> Option<Document> {
+/// wait) is not counted here. `storageExecutionMicros` is the time the
+/// operation spent acquiring its `execution` tickets, printed whenever it
+/// took one (measured 8.2.11: a `find` always has it, `ping` never; RM-355).
+pub(crate) fn storage_section(
+    c: Option<&OperationCounts>,
+    execution: Option<&crate::admission::AdmissionContext>,
+) -> Option<Document> {
+    let none = OperationCounts::default();
+    let c = c.unwrap_or(&none);
     let mut data = Document::new();
     let put = |d: &mut Document, k: &str, v: i64| {
         if v > 0 {
@@ -429,6 +436,9 @@ pub(crate) fn storage_section(c: &OperationCounts) -> Option<Document> {
     put(&mut waiting, "cacheMicros", c.cache_wait_micros);
     put(&mut waiting, "schemaLock", c.schema_lock_wait_micros);
     put(&mut waiting, "handleLock", c.handle_lock_wait_micros);
+    if let Some(execution) = execution.filter(|e| e.admissions() > 0) {
+        waiting.insert("storageExecutionMicros", execution.acquiring_micros());
+    }
     let mut out = Document::new();
     if !data.is_empty() {
         out.insert("data", data);
@@ -567,7 +577,11 @@ mod tests {
 
     #[test]
     fn a_storage_section_leaves_out_what_is_zero() {
-        assert_eq!(storage_section(&OperationCounts::default()), None);
+        assert_eq!(
+            storage_section(Some(&OperationCounts::default()), None),
+            None
+        );
+        assert_eq!(storage_section(None, None), None);
         let c = OperationCounts {
             bytes_read: 274,
             read_micros: 10,
@@ -578,7 +592,7 @@ mod tests {
         };
         // mongod 8.2.11's order, from a line that had all of these.
         assert_eq!(
-            storage_section(&c),
+            storage_section(Some(&c), None),
             Some(doc! {
                 "data": {
                     "bytesRead": 274_i64,
@@ -587,6 +601,35 @@ mod tests {
                     "timeWritingMicros": 2812_i64,
                 },
                 "timeWaitingMicros": { "cacheMicros": 2551_i64 },
+            })
+        );
+    }
+
+    #[test]
+    fn an_operation_admitted_to_execution_says_how_long_it_waited() {
+        let execution = crate::admission::AdmissionContext::default();
+        // Not admitted (`ping`): no wait, and no section.
+        assert_eq!(storage_section(None, Some(&execution)), None);
+        let holder = std::sync::Arc::new(crate::admission::TicketHolder::new(1, 1, None));
+        let execution = std::sync::Arc::new(execution);
+        let ticket = holder.try_acquire(&execution);
+        assert!(ticket.is_some());
+        // Admitted at once: a wait too short to count is still printed.
+        assert_eq!(
+            storage_section(None, Some(&execution)),
+            Some(doc! { "timeWaitingMicros": { "storageExecutionMicros": 0_i64 } })
+        );
+        execution.record_acquiring(std::time::Duration::from_micros(13));
+        let c = OperationCounts {
+            bytes_read: 274,
+            cache_wait_micros: 5,
+            ..Default::default()
+        };
+        assert_eq!(
+            storage_section(Some(&c), Some(&execution)),
+            Some(doc! {
+                "data": { "bytesRead": 274_i64 },
+                "timeWaitingMicros": { "cacheMicros": 5_i64, "storageExecutionMicros": 13_i64 },
             })
         );
     }

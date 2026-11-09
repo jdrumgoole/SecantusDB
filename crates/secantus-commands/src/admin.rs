@@ -2619,10 +2619,7 @@ pub fn create_indexes(doc: &Document, ctx: &mut CommandContext) -> HandlerResult
     // once for a request's indexes, with the global IS it takes (measured
     // 8.2.11, 2026-10-24; RM-299). An empty collection builds in the
     // command, which logs alone.
-    let build_storage = storage
-        .operation_counts()
-        .as_ref()
-        .and_then(crate::opdebug::storage_section);
+    let build_storage = crate::opdebug::storage_section(storage.operation_counts().as_ref(), None);
     std::mem::drop(build_counts);
     if any_created && scans {
         let mut attr = doc! {

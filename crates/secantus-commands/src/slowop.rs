@@ -161,7 +161,9 @@ pub(crate) fn statement_line(component: &'static str, mut attr: Document, worked
         // A statement's line has its command's admissions; an index
         // build's thread was admitted by no command.
         let admitted = (component != "STORAGE").then(|| sink.admission.as_ref());
-        attr.insert("queues", crate::admission::ingress::line_queues(admitted));
+        let execution = crate::lock_manager::execution_admission();
+        let execution = admitted.and(execution.as_deref());
+        attr.insert("queues", crate::admission::line_queues(admitted, execution));
         attr.insert("workingMillis", worked.as_millis() as i64);
         attr.insert("durationMillis", worked.as_millis() as i64);
         let attr = crate::opdebug::reorder(attr, crate::opdebug::LINE_ORDER);
@@ -409,10 +411,8 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
     if let Some(n) = ctx.cpu_nanos {
         out.insert("cpuNanos", n);
     }
-    if let Some(storage) = ctx
-        .op_counts
-        .as_ref()
-        .and_then(crate::opdebug::storage_section)
+    if let Some(storage) =
+        crate::opdebug::storage_section(ctx.op_counts.as_ref(), Some(&ctx.execution_admission))
     {
         out.insert("storage", storage);
     }
@@ -420,10 +420,13 @@ pub fn read_attributes(request: &Document, reply: &Document, ctx: &CommandContex
         out.insert("remote", remote);
     }
     out.insert("protocol", if ctx.op_query { "op_query" } else { "op_msg" });
+    if let Some(delinquency) = crate::admission::line_delinquency(&ctx.execution_admission) {
+        out.insert("delinquencyInfo", delinquency);
+    }
     // What admission control admitted it through (RM-355).
     out.insert(
         "queues",
-        crate::admission::ingress::line_queues(Some(&ctx.ingress_admission)),
+        crate::admission::line_queues(Some(&ctx.ingress_admission), Some(&ctx.execution_admission)),
     );
     out
 }

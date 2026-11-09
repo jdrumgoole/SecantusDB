@@ -8,14 +8,15 @@ is best), unless a concurrency given at startup fixes them.
 `serverStatus.queues.execution` reports the pools and the monitor. Each test
 runs the same thing on both servers and compares the answers.
 
-What execution control adds to an operation's `Slow query` line (its
-`execution` admissions, `storageExecutionMicros`, `delinquencyInfo`) is
-RM-355's remainder, left out here.
+What execution control adds to an operation's `Slow query` line: its
+`execution` admissions and `storageExecutionMicros`, compared for every
+operation by `test_slow_query_lines.py`, and `delinquencyInfo`, here.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import shutil
 import subprocess
 import tempfile
@@ -405,3 +406,80 @@ def _queue_a_writer(client: pymongo.MongoClient) -> tuple:
     session.abort_transaction()
     session.end_session()
     return (queued, sorted(map(str, drops)), inserted)
+
+
+# ------------------------------------------------- what the line prints --
+
+#: Documents enough that one scan of them holds its read ticket well past
+#: `_DELINQUENT_MILLIS` on either server.
+_SCANNED = 300_000
+
+_DELINQUENT_MILLIS = 10
+
+
+@pytest.fixture(scope="module")
+def delinquent() -> Iterator[dict[str, Any]]:
+    """Both servers counting a ticket held past 10 ms (mongod's least) as
+    delinquent, with mongod's time-based yields off, so the scan holds one
+    ticket throughout, as this server's does."""
+    arg = ("--setParameter", f"delinquentAcquisitionIntervalMillis={_DELINQUENT_MILLIS}")
+    with _rust_server(*arg) as rust, _mongod_set(*arg) as mongod:
+        was = mongod.admin.command("setParameter", 1, internalQueryExecYieldPeriodMS=86_400_000)
+        try:
+            yield {"rust": rust, "mongod": mongod}
+        finally:
+            mongod.admin.command("setParameter", 1, internalQueryExecYieldPeriodMS=was["was"])
+
+
+def _slow_query_line(client: pymongo.MongoClient, command: str) -> dict:
+    log = client.admin.command("getLog", "global")["log"]
+    for raw in reversed(log):
+        entry = json.loads(raw)
+        if (
+            entry.get("msg") == "Slow query"
+            and next(iter(entry["attr"].get("command", {})), "") == command
+        ):
+            return entry["attr"]
+    raise AssertionError(f"no Slow query line for {command}")
+
+
+def test_a_ticket_held_too_long_is_on_the_line(delinquent: dict) -> None:
+    """A `count` that scans for longer than the delinquency interval holds
+    its read ticket past it: its line prints `delinquencyInfo` -- how many
+    tickets, how long in all, the longest -- after `protocol` and before
+    `queues`, whose `execution` counts the ticket. mongod 8.2.11's profile
+    entry has no `delinquencyInfo` (measured 2026-11-09, RM-355)."""
+    got = {}
+    for name, client in delinquent.items():
+        db = client["rm355_delinquent"]
+        db.drop_collection("c")
+        db.c.insert_many([{"i": i} for i in range(_SCANNED)])
+        db.command("profile", 2, slowms=0)
+        try:
+            db.command("count", "c", query={"missing": 1})
+        finally:
+            db.command("profile", 0, slowms=100)
+        attr = _slow_query_line(client, "count")
+        entry = db.system.profile.find_one({"command.count": "c"})
+        info = attr.get("delinquencyInfo", {})
+        names = list(attr)
+        got[name] = {
+            "info": list(info),
+            "after protocol": names[names.index("protocol") + 1 :].index("delinquencyInfo")
+            if "delinquencyInfo" in names
+            else None,
+            "before queues": names.index("delinquencyInfo") < names.index("queues")
+            if "delinquencyInfo" in names
+            else None,
+            "held": info.get("totalDelinquentAcquisitions", 0) >= 1
+            and info.get("maxAcquisitionDelinquencyMillis", 0) >= _DELINQUENT_MILLIS,
+            "entry": entry is not None and "delinquencyInfo" not in entry,
+        }
+        client.drop_database(db.name)
+    same(got["rust"], got["mongod"])
+    assert got["mongod"]["info"] == [
+        "totalDelinquentAcquisitions",
+        "totalAcquisitionDelinquencyMillis",
+        "maxAcquisitionDelinquencyMillis",
+    ]
+    assert got["mongod"]["held"] and got["mongod"]["entry"]
