@@ -2410,7 +2410,7 @@ What is left, there and beside it:
       **Decided 2026-10-16 (Joe):** link the C ICU 57.1 that mongod links,
       in place of ICU4X, so `normalization: false` and the `alternate:
       "shifted"` cases match.
-      **Decision needed (2026-11-09):** how ICU 57.1 gets into the build.
+      **Decided (Joe, 2026-11-09): vendor mongo's copy, option (a)** -- commit mongod r8.2.11's `src/third_party/icu4c-57.1` sources and its trimmed `mongo_sources/icudt57l.dat` (and `icudt57b.dat`) under `vendor/icu4c-57.1/`, built from there with no network, and give the `.dat` files the same named exception to the no-generated-binaries guard (`tests/test_no_tracked_build_output.py`) that the PGO profile has. Measured when it was asked (2026-11-09): how ICU 57.1 gets into the build.
       Sized from what mongod links, `mongodb/mongo` r8.2.11
       `src/third_party/icu4c-57.1/source/`: `common/` 379 files, 7.6 MB;
       `i18n/` 423 files, 8.1 MB; `stubdata/`; and mongo's trimmed data
