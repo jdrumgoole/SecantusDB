@@ -19,6 +19,7 @@
 
 mod bounds;
 mod cache_key;
+mod change_stream;
 pub(crate) mod debug_string;
 mod deps;
 pub(crate) mod distinct;
@@ -2464,6 +2465,13 @@ fn aggregate(
     if inline {
         echo = inner.clone();
         echo.insert("$db", db.clone());
+    }
+    // A change stream reads the oplog, through the stages it expands into.
+    if pipeline
+        .first()
+        .is_some_and(|s| s.contains_key("$changeStream"))
+    {
+        return change_stream::reply(inner, &pipeline, echo, verbosity, ctx);
     }
     let own_source = pipeline.first().is_some_and(shape::own_source);
     let Some(coll) = target_coll.filter(|_| !own_source) else {

@@ -28,6 +28,17 @@ from bson.binary import UUID_SUBTYPE  # noqa: E402
 
 DEFAULT_MONGOD = "mongodb://127.0.0.1:27441"
 NOISE = ("$clusterTime", "operationTime", "opTime", "electionId", "localTime")
+#: What an `explain` says of the server and the run rather than the plan:
+#: at its top, the host and its parameters and the command as the driver
+#: sent it; anywhere in it, the start of the oplog scan (the start time's
+#: record id, per server like the time) and the timings.
+EXPLAIN_TOP = ("serverInfo", "serverParameters", "command")
+EXPLAIN_NOISE = (
+    "minRecord",
+    "optimizationTimeMillis",
+    "executionTimeMillis",
+    "executionTimeMillisEstimate",
+)
 
 
 class Sid:
@@ -781,8 +792,9 @@ def clean(value, key=None, db=""):
         if set(value) <= {"_data", "_typeBits"} and "_data" in value:
             return "TOKEN"
         out = {}
+        explained = "explainVersion" in value
         for k, v in value.items():
-            if k in NOISE:
+            if k in NOISE or k in EXPLAIN_NOISE or (explained and k in EXPLAIN_TOP):
                 continue
             if k == "id" and key == "cursor":
                 out[k] = "CURSOR" if v else 0
