@@ -4,7 +4,8 @@ A job that never starts leaves no check run, so the check runs alone can
 read green while the workflow run failed: PR #2563's Tests run created 3 of
 its 8 jobs during a GitHub Actions incident (2026-11-09), concluded
 `failure`, and was merged on "all 6 checks passed". These run the script
-against a stand-in `gh` that answers from fixed JSON through real `jq` (on PATH on macOS and the CI runners).
+against a stand-in `gh` that answers from fixed JSON through real `jq`
+(on PATH on macOS and the CI runners).
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parent.parent
 SHA = "2702bbc3" + "0" * 32
