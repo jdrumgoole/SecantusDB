@@ -195,3 +195,42 @@ fn a_transaction_counts_its_updates() {
     drop(conn);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// A transaction's statement takes what its transaction counted since the
+/// last statement did, as mongod's statement takes its recovery unit's
+/// statistics since the last call (RM-385): the share is the statement's,
+/// not added to the operation's, and the next take counts from it.
+#[test]
+fn a_statement_takes_its_share_of_a_transaction() {
+    let home = temp_home();
+    let conn = Connection::open(home.to_str().unwrap(), CONFIG).unwrap();
+    let s = conn.open_session().unwrap();
+    s.create("table:t", "key_format=q,value_format=u").unwrap();
+    let c = s.open_cursor("table:t", None).unwrap();
+    // No operation counting: nothing to take.
+    assert_eq!(s.statistics_since_last_call().unwrap(), None);
+    let scope = operation_stats_scope();
+    s.begin_transaction(None).unwrap();
+    s.discard_statistics().unwrap();
+    for i in 0..2i64 {
+        c.set_key_q(i);
+        c.set_value_u(b"v");
+        c.insert().unwrap();
+    }
+    let first = s.statistics_since_last_call().unwrap().unwrap();
+    assert_eq!(first.txn_updates, 2, "{first:?}");
+    assert!(first.txn_bytes_dirty > 0, "{first:?}");
+    c.set_key_q(0);
+    c.remove().unwrap();
+    let second = s.statistics_since_last_call().unwrap().unwrap();
+    assert_eq!(second.txn_updates, 1, "{second:?}");
+    // What was taken is not the operation's.
+    s.collect_operation_statistics().unwrap();
+    assert_eq!(scope.stats().txn_updates, 0, "{:?}", scope.stats());
+    s.rollback_transaction(None).unwrap();
+    drop(scope);
+    drop(c);
+    drop(s);
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&home);
+}

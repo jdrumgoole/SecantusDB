@@ -566,6 +566,28 @@ fn what_mongod_does_not_profile_is_not_profiled() {
     });
 }
 
+/// A view's drop answers `{ns, ok}`, with no index count, and mongod
+/// profiles it as a collection's drop (RM-384).
+#[test]
+fn dropping_a_view_is_profiled() {
+    with_wt(|c| {
+        on("dv", &doc! {"insert": "c", "documents": [{"_id": 1}]}, c);
+        on(
+            "dv",
+            &doc! {"create": "v", "viewOn": "c", "pipeline": []},
+            c,
+        );
+        on("dv", &doc! {"profile": 2}, c);
+        assert_eq!(
+            on("dv", &doc! {"drop": "v"}, c),
+            doc! {"ns": "dv.v", "ok": 1.0}
+        );
+        let profiled = stop("dv", c);
+        assert_eq!(ops(&profiled), vec![("command".into(), "drop".into())]);
+        assert_eq!(profiled[0].get_str("ns"), Ok("dv.v"));
+    });
+}
+
 #[test]
 fn system_profile_is_the_profilers_own() {
     with_wt(|c| {

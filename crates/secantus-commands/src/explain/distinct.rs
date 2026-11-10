@@ -56,7 +56,6 @@ pub(crate) fn scan_values(
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: false,
         implies: &implied,
         trial: None,
@@ -99,6 +98,7 @@ pub(crate) fn scan_values(
         upsert: false,
         returns: false,
         known: None,
+        query: None,
     };
     let mut values = Vec::new();
     for (row, value) in exec::distinct_entries(ix, *width, &env) {

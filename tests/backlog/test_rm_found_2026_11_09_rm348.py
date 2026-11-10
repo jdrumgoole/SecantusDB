@@ -35,11 +35,12 @@ def _after_delete(client: Any, read: Callable[[Any], Any]) -> int:
     return len(list(cur))
 
 
-@pytest.mark.backlog("RM-455")
+@pytest.mark.backlog_fixed("RM-455")
 def test_a_time_series_find_goes_bucket_by_bucket(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 answers a `find` of a time-series collection with an
     aggregation whose cursor stage buffers 32 buckets first: 2,303 more
-    after the delete."""
+    after the delete. This server read the collection at the command, and
+    returned 3,999, until its `find` became that aggregation too."""
 
     def read(c: Any) -> Any:
         return c.find({"v": {"$gte": 0}}).batch_size(1)

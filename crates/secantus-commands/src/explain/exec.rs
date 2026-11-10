@@ -33,6 +33,9 @@ pub(crate) struct Env<'a> {
     /// Every filter a plan runs passes exactly the documents the query
     /// matches, among those its scan returns.
     pub known: Option<&'a [bool]>,
+    /// The command's filter, which a positional projection below a sort
+    /// reads; `None` where no sort over one reports what it sorted.
+    pub query: Option<&'a Document>,
 }
 
 impl Env<'_> {
@@ -867,13 +870,18 @@ impl<'a> Run<'a> {
                 }
                 None
             }
-            Node::Sort { limit, pattern, .. } => {
+            Node::Sort {
+                limit,
+                pattern,
+                input,
+                ..
+            } => {
                 if self.buffer.is_none() {
                     let mut all = Vec::new();
                     while let Some(row) = self.inputs[0].pull(env) {
                         all.push(row);
                     }
-                    sort_stats(&mut self.extra, pattern, *limit, &all, env);
+                    sort_stats(&mut self.extra, pattern, *limit, input, &all, env);
                     if let Some(n) = limit {
                         all.truncate(*n as usize);
                     }
@@ -1060,13 +1068,26 @@ pub(crate) fn sort_stats(
     extra: &mut Document,
     pattern: &Document,
     limit: Option<i64>,
+    input: &Node,
     rows: &[usize],
     env: &Env,
 ) {
     if !crate::explain::order::plain_sort(pattern) {
         return;
     }
-    let docs: Vec<Document> = rows.iter().map(|&r| env.docs[r].clone()).collect();
+    // A projection below the sort: it sorts the projected documents.
+    let docs: Result<Vec<Document>, _> = rows
+        .iter()
+        .map(|&r| match input {
+            Node::Projection { spec, .. } => {
+                secantus_core::projection::apply_projection(&env.docs[r], spec, env.query)
+            }
+            _ => Ok(env.docs[r].clone()),
+        })
+        .collect();
+    let Ok(docs) = docs else {
+        return;
+    };
     let sizing = secantus_core::sorter::Sizing {
         source: secantus_core::sorter::SortSource::QueryLayer,
         fields: None,

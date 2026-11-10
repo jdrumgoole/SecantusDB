@@ -984,6 +984,22 @@ impl CmdStorage for StorageAdapter {
         Some(Box::new(secantus_storage::operation_scope_apart()))
     }
 
+    fn take_transaction_counts(&self) -> Option<secantus_commands::storage::OperationCounts> {
+        let e = secantus_storage::take_transaction_statistics()?;
+        Some(secantus_commands::storage::OperationCounts {
+            bytes_read: e.bytes_read,
+            bytes_written: e.bytes_written,
+            read_micros: e.read_micros,
+            write_micros: e.write_micros,
+            cache_wait_micros: e.cache_wait_micros,
+            schema_lock_wait_micros: e.schema_lock_wait_micros,
+            handle_lock_wait_micros: e.handle_lock_wait_micros,
+            txn_bytes_dirty: e.txn_bytes_dirty,
+            txn_updates: e.txn_updates,
+            ..Default::default()
+        })
+    }
+
     fn operation_counts(&self) -> Option<secantus_commands::storage::OperationCounts> {
         let c = secantus_storage::operation_counts()?;
         Some(secantus_commands::storage::OperationCounts {

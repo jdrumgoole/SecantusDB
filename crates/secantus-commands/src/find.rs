@@ -230,6 +230,35 @@ fn unknown_expr_operator_in_filter(filter: &Document) -> Option<String> {
     None
 }
 
+/// The option of a `find` mongod refuses as it converts the find to an
+/// aggregation, which it does for a view or a time-series collection
+/// (`asAggregationCommand`): 168 for the first, checked in mongod's order
+/// (measured 8.2.11, 2026-11-10). `singleBatch` passes with `limit: 1`, a
+/// `findOne`.
+fn aggregation_refusal(doc: &Document) -> Option<CommandError> {
+    let given = |f: &str| matches!(doc.get(f), Some(Bson::Boolean(true)));
+    let message = ["min", "max"]
+        .into_iter()
+        .find(|f| matches!(doc.get(*f), Some(Bson::Document(d)) if !d.is_empty()))
+        .or_else(|| ["returnKey", "showRecordId"].into_iter().find(|f| given(f)))
+        .map(|f| format!("Option {f} not supported in aggregation."))
+        .or_else(|| {
+            given("tailable").then(|| "Tailable cursors are not supported in aggregation.".into())
+        })
+        .or_else(|| {
+            ["noCursorTimeout", "allowPartialResults"]
+                .into_iter()
+                .find(|f| given(f))
+                .or_else(|| {
+                    (given("singleBatch") && doc.get("limit").and_then(as_i64) != Some(1))
+                        .then_some("singleBatch")
+                })
+                .or_else(|| given("readOnce").then_some("readOnce"))
+                .map(|f| format!("Option {f} not supported in aggregation."))
+        })?;
+    Some(CommandError::new(168, "InvalidPipelineOperator", message))
+}
+
 /// `find` — run a query and open a cursor over the results.
 /// Build the aggregate command equivalent to a `find` on a view: the find's
 /// filter / sort / skip / limit / projection become pipeline stages (in that
@@ -286,6 +315,9 @@ fn build_view_find_aggregate(doc: &Document, coll: &str, natural_hint: Option<&B
     if let Some(h) = hint {
         agg.insert("hint", h.clone());
     }
+    if let Some(a) = doc.get("allowDiskUse") {
+        agg.insert("allowDiskUse", a.clone());
+    }
     agg
 }
 
@@ -299,6 +331,14 @@ pub fn find(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         .and_then(|c| c.get_i64("id").ok())
         .filter(|id| *id != 0);
     if let (Ok(coll), Ok(storage)) = (coll_arg(doc, "find"), ctx.storage()) {
+        // A time-series collection's read was the aggregate's, which
+        // counted its index use and keeps its cursor's indexes.
+        if storage
+            .get_collection_options(&ctx.db_name, &coll)
+            .is_ok_and(|o| o.contains_key("timeseries"))
+        {
+            return Ok(reply);
+        }
         let filter = doc_field(doc, "filter");
         let collation = crate::util::effective_collation(storage, &ctx.db_name, &coll, doc)
             .ok()
@@ -472,35 +512,24 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             .unwrap_or(false)
     };
     if is_view {
-        if matches!(doc.get("tailable"), Some(Bson::Boolean(true))) {
-            return Ok(CommandError::new(
-                168,
-                "InvalidPipelineOperator",
-                "Tailable cursors are not supported in aggregation.",
-            )
-            .into_reply());
+        if let Some(refused) = aggregation_refusal(doc) {
+            return Ok(refused.into_reply());
         }
         let agg = build_view_find_aggregate(doc, &coll, natural_hint.as_ref());
         return crate::aggregate::aggregate(&agg, ctx);
     }
     let storage = ctx.storage()?;
     ctx.cursors()?;
-    // mongod answers a `find` on a time-series collection with an
-    // aggregation over its buckets, which takes none of these three.
+    // mongod answers a `find` on a time-series collection as it answers one
+    // on a view: with the aggregation it converts the find to, over the
+    // buckets, read through its cursor stage as a time-series `aggregate`
+    // is (RM-348), and counting what it examined as that does (RM-363).
     if storage
         .get_collection_options(&ctx.db_name, &coll)
         .is_ok_and(|o| o.contains_key("timeseries"))
     {
-        let refused = if matches!(doc.get("tailable"), Some(Bson::Boolean(true))) {
-            Some("Tailable cursors are not supported in aggregation.".to_string())
-        } else {
-            ["min", "max"]
-                .into_iter()
-                .find(|f| matches!(doc.get(*f), Some(Bson::Document(d)) if !d.is_empty()))
-                .map(|f| format!("Option {f} not supported in aggregation."))
-        };
-        if let Some(message) = refused {
-            return Ok(CommandError::new(168, "InvalidPipelineOperator", message).into_reply());
+        if let Some(refused) = aggregation_refusal(doc) {
+            return Ok(refused.into_reply());
         }
         // A hint naming no index is refused over the buckets
         // (`timeseries::check_hint`; the buckets are clustered, so
@@ -514,6 +543,8 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         ) {
             return Ok(e.into_reply());
         }
+        let agg = build_view_find_aggregate(doc, &coll, natural_hint.as_ref());
+        return crate::aggregate::aggregate(&agg, ctx);
     }
 
     let filter = doc_field(doc, "filter");
@@ -778,7 +809,7 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let bounded = doc.contains_key("min") || doc.contains_key("max");
     let inexact = matches!(doc.get("sort"), Some(Bson::Document(given))
         if !given.is_empty() && !crate::explain::order::plain_sort(given));
-    let docs = if bounded || inexact {
+    let mut docs = if bounded || inexact {
         storage.find_collated(
             &ctx.db_name,
             &coll,
@@ -816,10 +847,6 @@ fn find_body(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         )
     }
     .map_err(|e| crate::util::read_exec_error(e, "find", &format!("{}.{}", ctx.db_name, coll)))?;
-
-    // A time-series collection scans bucket by bucket, and returns each
-    // measurement with its time and meta fields first.
-    let mut docs = crate::ts_buckets::as_read(storage, &ctx.db_name, &coll, docs, sort.is_some())?;
 
     // A sort mongod's plan does in memory is held to its budget: spilled to
     // disk, or refused (292) under `allowDiskUse: false` (RM-315). The read
@@ -1546,7 +1573,12 @@ fn stream_find(
     if let Some(trial) = trial {
         let _active = secantus_core::collation::activate(asked.collation);
         stream
-            .buffer_trial(storage.as_ref(), trial.results, trial.ended)
+            .buffer_trial(
+                storage.as_ref(),
+                trial.results,
+                trial.ended,
+                trial.cached.then_some(&plan),
+            )
             .map_err(read_error)?;
     }
     let mut cursor = FindStream {
@@ -2315,5 +2347,53 @@ mod first_batch_byte_cap_tests {
         let (first, cursor_id) = split_into_cursor(docs, 101, "t.small", &reg, false).unwrap();
         assert_eq!(first.len(), 5);
         assert_eq!(cursor_id, 0);
+    }
+}
+
+#[cfg(test)]
+mod aggregation_refusal_tests {
+    use super::aggregation_refusal;
+    use bson::doc;
+
+    fn refused(cmd: bson::Document) -> Option<String> {
+        aggregation_refusal(&cmd).map(|e| {
+            assert_eq!(e.code, 168);
+            e.errmsg
+        })
+    }
+
+    /// mongod 8.2.11's order of checks, and what it lets through.
+    #[test]
+    fn refuses_in_mongods_order() {
+        let option = |f: &str| Some(format!("Option {f} not supported in aggregation."));
+        let tailable = Some("Tailable cursors are not supported in aggregation.".to_string());
+        assert_eq!(
+            refused(doc! {"find": "v", "tailable": true, "min": {"x": 1}}),
+            option("min")
+        );
+        assert_eq!(
+            refused(doc! {"find": "v", "tailable": true, "returnKey": true}),
+            option("returnKey")
+        );
+        assert_eq!(
+            refused(doc! {"find": "v", "tailable": true, "noCursorTimeout": true}),
+            tailable
+        );
+        assert_eq!(
+            refused(doc! {"find": "v", "singleBatch": true, "readOnce": true}),
+            option("singleBatch")
+        );
+        assert_eq!(
+            refused(doc! {"find": "v", "readOnce": true}),
+            option("readOnce")
+        );
+        assert_eq!(
+            refused(doc! {"find": "v", "singleBatch": true, "limit": 1}),
+            None
+        );
+        assert_eq!(
+            refused(doc! {"find": "v", "returnKey": false, "min": {}}),
+            None
+        );
     }
 }

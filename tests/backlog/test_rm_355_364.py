@@ -8,6 +8,7 @@ its item names with mongod 8.2's.
 
 from __future__ import annotations
 
+import datetime
 from collections.abc import Iterator
 from typing import Any
 
@@ -835,15 +836,16 @@ def test_a_rooted_or_of_tried_branches_counts_its_reads(rust_mongo: Any, mongod_
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-458")
+@pytest.mark.backlog_fixed("RM-458")
 def test_a_read_of_the_cached_plan_reports_its_cached_plan_stage(
     rust_mongo: Any, steady_mongod: Any
 ) -> None:
     """mongod 8.2.11's profile entries for a `find` that runs the active
     plan of its plan cache carry a CACHED_PLAN stage over the plan's, which
     counts what it handed out (`works` and `advanced` 2 on a first batch of
-    two, 4 after the next, measured 2026-11-09). This server's start at the
-    plan's FETCH."""
+    two, 4 after the next, measured 2026-11-09). This server's started at
+    the plan's FETCH; they now carry the CACHED_PLAN
+    (`test_a_cached_read_reports_its_cached_plan_as_it_ran`)."""
     query = {"a": {"$gte": 2}, "b": {"$gte": 3}}
 
     def setup(d: Any) -> None:
@@ -862,6 +864,68 @@ def test_a_read_of_the_cached_plan_reports_its_cached_plan_stage(
         for s, (_, entries) in got.items()
     }
     assert [e["stage"] for e in answers["mongod"]] == ["CACHED_PLAN"] * 8, answers["mongod"]
+    assert answers["rust"] == answers["mongod"]
+
+
+_CACHED_QUERY = {"a": {"$gte": 2}, "b": {"$gte": 3}}
+
+#: Reads of the plan cache's plan, besides `_CONTESTED`'s: a trial that
+#: ran to its end before a default first batch, a LIMIT filled after the
+#: trial in the first batch and in a `getMore`, a SKIP under a LIMIT, and a
+#: first batch that reads the plan to its end.
+_CACHED: dict[str, tuple[Any, Any]] = {
+    **_CONTESTED,
+    "ended_default_batch": (
+        _contested,
+        lambda d: list(d.c.find({"x": {"$gte": 2}, "y": 1})),
+    ),
+    "limit_past_trial": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).limit(150).batch_size(200)),
+    ),
+    "limit_past_trial_batches": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).limit(150).batch_size(120)),
+    ),
+    "skip_under_limit": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).skip(3).limit(20).batch_size(8)),
+    ),
+    "whole_first_batch": (
+        _contested_many,
+        lambda d: list(d.c.find(_CACHED_QUERY).batch_size(500)),
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RM-458")
+@pytest.mark.parametrize("name", list(_CACHED))
+def test_a_cached_read_reports_its_cached_plan_as_it_ran(
+    rust_mongo: Any, steady_mongod: Any, name: str
+) -> None:
+    """mongod 8.2.11 runs a contested `find` whose plan cache entry is
+    active under a CACHED_PLAN stage, which hands out its trial's results
+    one per work before it works the plan again and passes on each work
+    after; it finds a plan already at its end (a trial that ran out, a
+    LIMIT filled) without working it, so the `find`'s last work is its own
+    (measured 2026-11-10). This server's entries had no CACHED_PLAN."""
+    setup, op = _CACHED[name]
+
+    def cached(d: Any) -> None:
+        setup(d)
+        for _ in range(2):
+            op(d)
+
+    got = _both(rust_mongo, steady_mongod, op, cached)
+    answers = {
+        s: [
+            (e.get("keysExamined"), e.get("docsExamined"), _timeless(e.get("execStats")))
+            for e in entries
+        ]
+        for s, (_, entries) in got.items()
+    }
+    assert answers["mongod"], name
+    assert all(a[2]["stage"] == "CACHED_PLAN" for a in answers["mongod"]), answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 
@@ -1036,14 +1100,15 @@ def rust_mongo_async(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Any]:
             proc.kill()
 
 
-@pytest.mark.backlog("RM-379")
+@pytest.mark.backlog_fixed("RM-379")
 def test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot(
     rust_mongo_async: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for an insert carries
     `totalOplogSlotDurationMicros` (RM-361). On the asynchronous oplog
-    (`--oplog-async`) this server mints a write's entries only after the
-    write commits, so no slot is open inside it and the line has no field."""
+    (`--oplog-async`) this server minted a write's entries only after the
+    write committed, so it timed no slot and the line had no field; it now
+    times each emit, where mongod reserves, to the write's commit."""
     got = _both(rust_mongo_async, mongod_rs, lambda d: d.c.insert_one({"_id": 100}))
     answers = {
         s: ("totalOplogSlotDurationMicros" in _line(lines, "insert"))
@@ -1210,13 +1275,14 @@ def test_a_contested_read_counts_what_it_examined(rust_mongo: Any, mongod_rs: An
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-363")
+@pytest.mark.backlog_fixed("RM-363")
 def test_a_read_of_a_time_series_collection_counts_what_it_examined(
     rust_mongo: Any, mongod_rs: Any
 ) -> None:
     """mongod 8.2.11's line for a `find` of a time-series collection counts
     the buckets it examined (`keysExamined: 0, docsExamined: 0` over none,
-    measured 2026-10-27). This server reads it whole, and counts nothing."""
+    measured 2026-10-27). This server read it whole, and counted nothing,
+    until the `find` became the aggregation mongod converts it to (RM-455)."""
 
     def setup(db: Any) -> None:
         db.create_collection("ts", timeseries={"timeField": "t"})
@@ -1224,6 +1290,59 @@ def test_a_read_of_a_time_series_collection_counts_what_it_examined(
     got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find()), setup)
     answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
     assert answers["mongod"].get("docsExamined") == 0
+    assert answers["rust"] == answers["mongod"]
+
+
+def _series(db: Any) -> None:
+    """300 measurements in five series: five buckets."""
+    db.create_collection("ts", timeseries={"timeField": "t", "metaField": "m"})
+    base = datetime.datetime(2024, 1, 1)
+    db.ts.insert_many(
+        [{"t": base + datetime.timedelta(seconds=i), "m": i % 5, "v": i} for i in range(300)]
+    )
+
+
+@pytest.mark.backlog_fixed("RM-363")
+def test_a_time_series_find_counts_the_buckets_its_first_batch_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a `find` of five buckets counts all five
+    examined for the first batch, and none for the `getMore` after it, as
+    its line for the same `aggregate` does (measured 2026-11-10)."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find({"v": {"$gte": 10}})), _series)
+    answers = {s: [_counts(a) for _, a in lines] for s, (lines, _) in got.items()}
+    assert [a.get("docsExamined") for a in answers["mongod"]] == [5, 0]
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_time_series_read_made_whole_counts_what_it_examined(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a sorted `find` of five buckets counts the
+    five it examined (measured 2026-11-10). This server reads a time-series
+    collection whole under a sort, and counts nothing."""
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.ts.find().sort("v", -1).limit(3)), _series)
+    answers = {s: _counts(_line(lines, "find")) for s, (lines, _) in got.items()}
+    assert answers["mongod"].get("docsExamined") == 5
+    assert answers["rust"] == answers["mongod"]
+
+
+@pytest.mark.backlog("RM-363")
+def test_a_contested_aggregate_counts_what_it_examined(rust_mongo: Any, mongod_rs: Any) -> None:
+    """mongod 8.2.11's line for an `aggregate` two indexes could serve counts
+    what the plan it chose by trial examined (`keysExamined: 4,
+    docsExamined: 4`, measured 2026-11-10). This server reads it through its
+    store's router, and counts nothing."""
+
+    def setup(db: Any) -> None:
+        seed(db)
+        db.c.create_index("y")
+
+    pipeline = [{"$match": {"x": {"$gte": 2}, "y": 1}}]
+    got = _both(rust_mongo, mongod_rs, lambda d: list(d.c.aggregate(pipeline)), setup)
+    answers = {s: _counts(_line(lines, "aggregate")) for s, (lines, _) in got.items()}
+    assert "keysExamined" in answers["mongod"]
     assert answers["rust"] == answers["mongod"]
 
 
@@ -1368,12 +1487,14 @@ def test_a_transaction_statement_counts_its_updates(rust_mongo: Any, mongod_rs: 
     assert answers["rust"] == answers["mongod"]
 
 
-@pytest.mark.backlog("RM-385")
+@pytest.mark.backlog_fixed("RM-385")
 def test_an_update_in_a_transaction_counts_no_dirty_bytes(rust_mongo: Any, mongod_rs: Any) -> None:
-    """mongod 8.2.11's line for an `update` and a `delete` inside a
-    transaction carries no `txnBytesDirty` or `txnNumUpdates`, where an
-    insert's carries both (measured 2026-11-07); this server's counts the
-    statement's share on all three."""
+    """mongod 8.2.11's `update` and `delete` command lines inside a
+    transaction carried no `txnBytesDirty` or `txnNumUpdates`, where an
+    insert's carries both (measured 2026-11-07): the statement's own line
+    took them, as its `CurOp` takes its recovery unit's statistics since
+    the last call. This server's printed the statement's share on the
+    command line; its statement takes them now (2026-11-10)."""
 
     def op(db: Any) -> None:
         with db.client.start_session() as s, s.start_transaction():
@@ -1397,3 +1518,63 @@ def test_an_update_in_a_transaction_counts_no_dirty_bytes(rust_mongo: Any, mongo
         "delete": [],
     }
     assert answers["rust"] == answers["mongod"]
+    # Where they went: the statements' lines and the profile entries.
+    keys = ["txnBytesDirty", "txnNumUpdates"]
+    taken = {
+        s: (
+            [
+                (sorted(k for k in a.get("storage", {}).get("data", {}) if k.startswith("txn")))
+                for _, a in lines
+                if next(iter(a.get("command", {})), "") == "q"
+            ],
+            [
+                (
+                    e.get("op"),
+                    sorted(k for k in e.get("storage", {}).get("data", {}) if k.startswith("txn")),
+                )
+                for e in entries
+            ],
+        )
+        for s, (lines, entries) in got.items()
+    }
+    assert taken["mongod"] == (
+        [keys, keys],
+        [("insert", keys), ("update", keys), ("remove", keys)],
+    )
+    assert taken["rust"] == taken["mongod"]
+
+
+# ------------------------------------------------------------- RM-499 --
+
+
+@pytest.mark.backlog("RM-499")
+def test_an_insert_in_a_transaction_counts_mongods_dirty_bytes(
+    rust_mongo: Any, mongod_rs: Any
+) -> None:
+    """mongod 8.2.11's line for a transaction's insert of `{_id: 700, y: 1}`
+    into a collection indexed on `_id` and `x` counts about 305-345
+    `txnBytesDirty`; this server's about 391, 71-87 bytes more per document
+    (measured 2026-11-10), where an update and a delete of it count the same
+    on both (96 and 192). An insert's count is not exact on either server:
+    WiredTiger draws each new key's skiplist depth at random, 8 bytes a
+    level (`__wt_skip_choose_depth`, one in four goes a level deeper), so
+    the per-document mean over fifty documents is compared, within 8 bytes.
+    The draw moves that mean by about 1.3 bytes either way; the surplus is
+    ten times the tolerance."""
+    n = 50
+
+    def op(db: Any) -> None:
+        with db.client.start_session() as s, s.start_transaction():
+            db.c.insert_many([{"_id": 1000 + i, "y": i % 3} for i in range(n)], session=s)
+
+    got = _both(rust_mongo, mongod_rs, op)
+    per_doc = {
+        s: [
+            e.get("storage", {}).get("data", {}).get("txnBytesDirty", 0) / n
+            for e in entries
+            if e.get("op") == "insert"
+        ]
+        for s, (_, entries) in got.items()
+    }
+    assert len(per_doc["mongod"]) == 1 and len(per_doc["rust"]) == 1, per_doc
+    assert abs(per_doc["rust"][0] - per_doc["mongod"][0]) <= 8, per_doc

@@ -230,8 +230,9 @@ fn ends_in_out(doc: &Document) -> bool {
 fn refused_unprofiled(name: &str, reply: &Document) -> bool {
     if reply.get_f64("ok").unwrap_or(1.0) == 1.0 {
         // `drop` of a collection that does not exist answers ok, profiled
-        // nowhere (measured).
-        return name == "drop" && !reply.contains_key("nIndexesWas");
+        // nowhere (measured). A view's drop answers `{ns, ok}`, with no
+        // index count, and is profiled as a collection's (RM-384).
+        return name == "drop" && !reply.contains_key("nIndexesWas") && !reply.contains_key("ns");
     }
     let code = reply.get_i32("code").unwrap_or(0);
     let msg = reply.get_str("errmsg").unwrap_or("");
@@ -265,6 +266,13 @@ pub(crate) fn finish(
     if let Some(ns) = noted_ns {
         pending.ns = ns;
     }
+    // A read of a view that failed is filed under the collection beneath
+    // the view, once it resolved it (RM-380).
+    if !crate::util::reply_ok(reply) {
+        if let Some(ns) = crate::opdebug::beneath_view(ctx, &pending.ns) {
+            pending.ns = ns;
+        }
+    }
     let millis = pending.start.elapsed().as_millis() as i64;
     let who = Who::of(ctx);
     let mut logged = false;
@@ -288,7 +296,7 @@ pub(crate) fn finish(
             "ns": pending.ns.clone(),
             "command": abbreviated(doc),
         };
-        let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+        let ok = crate::util::reply_ok(reply);
         let exec = ctx.exec_stats.as_ref().filter(|_| ok);
         // A cursor's `getMore` names the command that opened it, and repeats
         // its plan (RM-023; measured 8.2.11, 2026-10-24).
@@ -462,7 +470,7 @@ fn outcome(
     ctx: &CommandContext,
     entry: &mut Document,
 ) {
-    let ok = reply.get_f64("ok").unwrap_or(0.0) == 1.0;
+    let ok = crate::util::reply_ok(reply);
     if ok {
         let cursor = reply.get_document("cursor").ok();
         let cursor_id = cursor.and_then(|c| match c.get("id") {
@@ -520,18 +528,17 @@ fn outcome(
                     entry.insert("usedDisk", true);
                 }
                 // A `find` of a view or a time-series collection runs as an
-                // `aggregate`, which counts no batches.
-                let coll = doc
-                    .get_str(if name == "getMore" {
-                        "collection"
-                    } else {
-                        name
-                    })
-                    .unwrap_or("");
-                let as_aggregate = matches!(
-                    crate::opdebug::collection_type(ctx, &ctx.db_name, coll),
-                    "view" | "timeseries"
-                );
+                // `aggregate`, which counts no batches; a `getMore` of its
+                // cursor counts one (measured 8.2.11, RM-380).
+                let as_aggregate = name == "find"
+                    && matches!(
+                        crate::opdebug::collection_type(
+                            ctx,
+                            &ctx.db_name,
+                            doc.get_str("find").unwrap_or("")
+                        ),
+                        "view" | "timeseries"
+                    );
                 if name != "aggregate" && !as_aggregate {
                     entry.insert("nBatches", 1_i32);
                 }
@@ -932,7 +939,6 @@ struct Statement {
 /// How a statement ran, as its line and entry report it.
 #[derive(Default)]
 struct Ran {
-    collection_type: &'static str,
     plan_summary: Option<String>,
     planning_micros: Option<i64>,
     examined: Option<(i64, i64)>,
@@ -976,7 +982,10 @@ impl Statement {
             "type": self.op,
             "isFromUserConnection": true,
             "ns": self.ns.clone(),
-            "collectionType": self.ran.collection_type,
+            // A write acquires its namespace as a collection: mongod names
+            // it `normal` whatever it is, a view or a time-series
+            // collection included (measured 8.2.11, RM-380).
+            "collectionType": "normal",
             "command": self.command.clone(),
         };
         self.counts(&mut attr);
@@ -1267,6 +1276,17 @@ impl<'a> Statements<'a> {
     fn ran(&self, open: &Open, outcome: &StatementOutcome) -> Ran {
         let since = |now: Option<i64>, then: Option<i64>| now.map(|a| a - then.unwrap_or(0));
         let now = self.storage.as_ref().and_then(|s| s.operation_counts());
+        // A transaction's statement takes what its transaction counted in
+        // the engine since the last statement did, and its command keeps
+        // none of it (RM-385).
+        let taken = self
+            .storage
+            .as_ref()
+            .and_then(|s| s.take_transaction_counts());
+        let statement = match (now, taken) {
+            (Some(n), Some(t)) => Some(n.plus_engine(&t)),
+            (n, t) => n.or(t),
+        };
         let then = open.counts;
         let exec = STATEMENT_EXEC.with(|s| s.borrow_mut().take());
         let planning = match (crate::explain::planning_spent(), open.planning) {
@@ -1286,9 +1306,6 @@ impl<'a> Statements<'a> {
         });
         Ran {
             hashes,
-            collection_type: self.storage.map_or("normal", |s| {
-                crate::opdebug::collection_type_in(s, &open.db, &open.coll)
-            }),
             plan_summary: exec.as_ref().and_then(|e| e.summary.clone()),
             planning_micros: planning,
             examined: exec.as_ref().map(|e| (e.keys_examined, e.docs_examined)),
@@ -1313,7 +1330,7 @@ impl<'a> Statements<'a> {
                 .zip(crate::opdebug::thread_cpu_nanos())
                 .map(|(a, b)| b - a),
             storage: crate::opdebug::storage_section(
-                now.as_ref(),
+                statement.as_ref(),
                 crate::lock_manager::execution_admission().as_deref(),
             ),
             remote: crate::slowop::remote(),

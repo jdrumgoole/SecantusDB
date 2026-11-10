@@ -652,16 +652,6 @@ These are explicit non-goals. Don't add them without a reason.
       '<db>.explain.dry.run' does not exist`). Found 2026-11-09 (RM-358).
       Verify: tests/backlog/test_rm_found_rm358.py::test_an_explain_of_plan_cache_stats_names_its_stage
       Backlog-ID: RM-466
-- [ ] **A projection is not where mongod's plan puts it.** mongod 8.2.11
-      projects below a blocking SORT (`SORT` over `PROJECTION_SIMPLE` or
-      `PROJECTION_COVERED`, so the SORT sorts the projected documents:
-      `totalDataSizeSorted` 318 where whole documents are 402), and the
-      projection over a SORT_MERGE whose keys hold the projected fields is
-      `PROJECTION_DEFAULT`. This server's plan projects above the SORT and
-      calls that projection `PROJECTION_COVERED`, in `explain` and in a
-      profile entry's `execStats` alike. Found 2026-11-07 (RM-359).
-      Verify: tests/backlog/test_rm_found_2026_11_07.py::test_a_projection_is_where_mongods_plan_puts_it
-      Backlog-ID: RM-373
 - [ ] **An aggregate's top-k sort counts only the keys it kept.** mongod
       8.2.11 adds every document its sort read to
       `metrics.query.sort.totalKeysSorted` for a leading `$sort` and
@@ -712,6 +702,40 @@ These are explicit non-goals. Don't add them without a reason.
       Found 2026-11-09 (RM-375).
       Verify: tests/backlog/test_rm_found_rm375.py::test_a_sort_beside_a_multikey_field_sorts_index_keys
       Backlog-ID: RM-477
+- [ ] **`returnKey` is not at the top of a sorted plan.** mongod 8.2.11
+      puts RETURN_KEY above a blocking sort and drops the projection:
+      `RETURN_KEY <- SORT <- COLLSCAN`, and `RETURN_KEY <- SORT <- FETCH <-
+      IXSCAN` where the index does not hold the sort. This server ignores
+      `returnKey` over a COLLSCAN (`PROJECTION_SIMPLE <- SORT <- COLLSCAN`)
+      and puts RETURN_KEY below the sort with no FETCH (`SORT <- RETURN_KEY
+      <- IXSCAN`). Found 2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_return_key_is_the_top_of_a_sorted_plan
+      Backlog-ID: RM-470
+- [ ] **An `$or` of index scans does not answer a covered projection.**
+      mongod 8.2.11 answers `{_id: 0, x: 1}` over an `$or` of two scans of
+      `{y: 1, x: 1}` from their keys (`SUBPLAN <- PROJECTION_DEFAULT <- OR
+      <- IXSCAN`, no FETCH). This server fetches each document
+      (`PROJECTION_SIMPLE <- FETCH <- OR`). Found 2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_an_or_of_scans_answers_a_covered_projection
+      Backlog-ID: RM-471
+- [ ] **A sort beside `showRecordId` is a `simple` sort.** mongod 8.2.11's
+      SORT under a `showRecordId` read's projection is `type: "default"`
+      (it keeps each document's RecordId); without `showRecordId` the same
+      read sorts `simple`. This server's is `simple` both ways. Found
+      2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_beside_show_record_id_is_a_default_sort
+      Backlog-ID: RM-472
+- [ ] **A SORT over a covered projection does not count what it sorted.**
+      mongod 8.2.11's `SORT <- PROJECTION_COVERED <- IXSCAN` (`type:
+      "default"`) counts 1584 bytes sorted for the twelve `{x}` members of
+      `find({y: {$gte: 0}}, {_id: 0, x: 1}).sort({x: 1})`, in `explain`
+      and in a profile entry's `execStats`: its working-set members, not
+      the projected documents. This server counts 528 in `explain` (the
+      projected documents) and 780 in the profile entry (members of their
+      index keys, as its sort of keys below a FETCH counts them since
+      RM-375). Found 2026-11-09 (RM-373).
+      Verify: tests/backlog/test_rm_found_2026_11_09_rm373.py::test_a_sort_over_a_covered_projection_counts_what_it_sorted
+      Backlog-ID: RM-473
 - [ ] **Some lines have no `numInterruptChecks`.** Since 2026-11-08 this
       server checks for interrupt where mongod 8.2 does, and counts it
       (`secantus_core::deadline::check_for_interrupt`): at dispatch, at
@@ -771,56 +795,138 @@ These are explicit non-goals. Don't add them without a reason.
       e01df2d2 (2026-11-08), each command checked against a probe of its own.
       Backlog-ID: RM-360
       Verify: tests/backlog/test_rm_355_364.py::test_every_line_counts_its_interrupt_checks
-- [ ] **On the asynchronous oplog a write's line has no
-      `totalOplogSlotDurationMicros`.** mongod 8.2.11 times each oplog slot
-      from its reservation to the commit of the write that took it (RM-361).
-      With `--oplog-async` (`SECANTUS_OPLOG_ASYNC`, a prototype; its default
-      is RM-135's decision) this server mints a write's entries only after
-      the write commits and a drainer writes them later, so no slot is open
-      inside the write and the line carries no field. Found 2026-11-07 when
-      CI's async-oplog lane failed RM-361's storage tests, which now pin the
-      synchronous oplog.
-      Backlog-ID: RM-379
-      Verify: tests/backlog/test_rm_355_364.py::test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot
-- [ ] **A `renameCollection` line names the wrong namespace.** mongod
-      8.2.1's `Slow query` line for a `renameCollection` (which runs
-      against `admin`) names the collection it renames, `ns: "<db>.c"`;
-      this server's names `admin.<db>.c` -- the command's database joined to
-      its argument, which is already a full namespace. Found while working
-      RM-361, 2026-11-07.
-      Backlog-ID: RM-378
-      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_rename_line_names_the_collection_it_renames
-- [ ] **A line names the wrong namespace or kind around a view.**
-      mongod 8.2.1's `Slow query` line for a `getMore` of a cursor over a
-      view, and for a `findAndModify` of a view (which it refuses), says
-      `collectionType: "normal"`, where this server's says `view`; its
-      line for an `explain` of a `find` of a view names `<db>.v`, `view`,
-      where this server's names `<db>.$cmd`, `normal`; and its line for a
-      read of a view that fails once it runs names the collection beneath
-      the view (`<db>.c`, `normal`), where this server's names the view.
-      (An `aggregate` of a view refused for an unknown stage wrote no line
-      on mongod and one here; not pinned.) Found while working RM-362,
-      2026-11-07.
-      Backlog-ID: RM-380
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_get_more_of_a_view_is_of_a_normal_collection, tests/backlog/test_rm_view_lines.py::test_a_find_and_modify_of_a_view_is_of_a_normal_collection, tests/backlog/test_rm_view_lines.py::test_an_explain_line_names_what_it_explains, tests/backlog/test_rm_view_lines.py::test_a_read_of_a_view_that_fails_names_its_collection
-- [ ] **A `distinct` of a view says nothing of its planning.** mongod
-      8.2.1's line for a `distinct` of a view carries `planningTimeMicros`,
-      as one of a collection does; this server's has none. Found while
-      working RM-362, 2026-11-07.
-      Backlog-ID: RM-381
-      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_says_how_long_it_planned
-- [ ] **A `dropDatabase` line names `<db>.$cmd`.** mongod 8.2.11's `Slow
-      query` line for a `dropDatabase` names the database alone (`ns:
-      "<db>"`); this server's names `<db>.$cmd`, as it does for a command
-      that runs on no collection. Found while working RM-363, 2026-11-07.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_a_drop_database_line_names_the_database
-      Backlog-ID: RM-383
-- [ ] **Dropping a view writes no profile entry.** mongod 8.2.11 profiles a
-      `drop` of a view as it profiles a `drop` of a collection (`{op:
-      "command", ns: "<db>.v", command: {drop: "v"}}`); this server writes
-      the `drop` line and no entry. Found while working RM-363, 2026-11-07.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_dropping_a_view_is_profiled
-      Backlog-ID: RM-384
+- [ ] **A line on `admin`, `local` or `config` says its collection is
+      `normal`.** mongod 8.2.1's `Slow query` line for an operation on one
+      of its internal databases -- a `ping` (`admin.$cmd`), a `find` of
+      `admin.c` -- says `collectionType: "admin"` (`"local"`, `"config"`);
+      this server's says `"normal"`. A failed `renameCollection`, whose
+      line names `admin.$cmd` since RM-378, says `"normal"` for the same
+      reason. Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_line_on_an_internal_database_names_its_kind
+      Backlog-ID: RM-478
+- [ ] **A failed `renameCollection` is profiled.** mongod 8.2.1 profiles a
+      `renameCollection` that renamed in its source's database (`ns:
+      "<db>.c"`) and one that failed nowhere: its namespace is the
+      command's own `admin.$cmd`, and `admin` profiles no command. This
+      server profiles a failed one in the source's database as well (`ns:
+      "<db>.nope"`). Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_failed_rename_is_not_profiled
+      Backlog-ID: RM-479
+- [ ] **A `dataSize` line names `<db>.<db>.c`.** mongod 8.2.1's `Slow
+      query` line for a `dataSize`, whose argument is a full namespace,
+      names `<db>.$cmd`; this server's joins the command's database to the
+      argument. Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_data_size_line_names_its_own_namespace
+      Backlog-ID: RM-480
+- [ ] **A command refused as it parses writes a `Slow query` line.**
+      mongod 8.2.1 writes no line for a command its IDL parse refuses -- a
+      mistyped or missing field (14, 40414: `renameCollection: 5`, no
+      `to`), an unknown one (40415: `find` with `bogus`), a collection name
+      that is not a string (73: `find: 5`, `count: 5`), an unknown pipeline
+      stage (40324: an `aggregate` of a collection or a view, measured
+      8.2.11 while working RM-380) -- as the operation
+      never ran; this server writes one for each, since its handlers parse
+      and run in one step (as RM-386 has it).
+      Found while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_slow_query_namespace.py::test_a_command_that_fails_to_parse_writes_no_line
+      Backlog-ID: RM-481
+- [ ] **Renaming `<db>.system.views` is refused as a view.** mongod 8.2.1
+      refuses it as a write to the namespace (20 IllegalOperation, "error
+      with source namespace: cannot write to <db>.system.views"); this
+      server answers 166 "cannot rename view: <db>.system.views". Found
+      while working RM-378, 2026-11-09.
+      Verify: tests/backlog/test_rm_rename_errors.py::test_renaming_system_views_is_a_write_to_it
+      Backlog-ID: RM-482
+- [ ] **A read of a view refused before it resolves the view resolves it
+      anyway.** mongod 8.2.11 refuses a `find` of a view whose projection
+      does not parse (`{a: {$bogusop: 1}}`), and an `explain` of a `find`
+      of a view whose filter does not, before it resolves the view: its line
+      names the view (`<db>.v`, `normal`) and has no `resolvedViews`. This
+      server resolves the view first, so its line has `resolvedViews` and
+      names the collection beneath, as a read that failed after resolving
+      does (RM-380). Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_read_refused_before_it_resolves_names_the_view
+      Backlog-ID: RM-483
+- [ ] **A time-series collection's `collMod` and `collStats` lines name the
+      collection, not its buckets.** mongod 8.2.11's name
+      `<db>.system.buckets.ts`, `collectionType: "timeseriesBuckets"`; this
+      server's name `<db>.ts`, `normal`. Found while working RM-380,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_time_series_ddl_line_names_its_buckets
+      Backlog-ID: RM-484
+- [ ] **A refused `validate` or `dropIndexes` of a view names the view.**
+      mongod 8.2.11's line for each names `<db>.$cmd`; this server's names
+      `<db>.v`. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_validate_of_a_view_names_cmd
+      Backlog-ID: RM-485
+- [ ] **An `explain` of a write is profiled.** mongod 8.2.11 writes no
+      profile entry for an `explain` of an `update` (a `delete` or
+      `findAndModify` not measured); this server writes one, named for the
+      collection. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_an_explain_of_a_write_is_not_profiled
+      Backlog-ID: RM-486
+- [ ] **An `update` or `delete` of a view writes no statement line.**
+      mongod 8.2.11 refuses the statement and writes its line (`<db>.v`,
+      `normal`, `ok: 0`, the refusal) before the command's; this server
+      writes the command's line alone. Found while working RM-380,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_write_to_a_view_has_a_statement_line
+      Backlog-ID: RM-487
+- [ ] **A refused `listIndexes` or `collStats` of a view is not profiled.**
+      mongod 8.2.11 writes an entry for each (`<db>.v`, `ok: 0`); this
+      server writes none. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_refused_list_indexes_of_a_view_is_profiled
+      Backlog-ID: RM-488
+- [ ] **A `getMore` of a `find` of a view names a write concern.** mongod
+      8.2.11's line and profile entry for it carry no `writeConcern`, as
+      one of a `find` of a collection; this server's carry the one an
+      `aggregate`'s `getMore` runs under, since it runs the `find` as an
+      `aggregate`. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_get_more_of_a_find_of_a_view_names_no_write_concern
+      Backlog-ID: RM-489
+- [ ] **A `distinct` of a view is counted as failed.** A view's `distinct`
+      answers `ok` as an int32, as mongod's does, and about 270 readers of
+      a reply's `ok` (`get_f64("ok")`) take it for a failure:
+      `serverStatus` counts it in `metrics.commands.distinct.failed`, where
+      mongod 8.2.11 does not, and the transaction, interrupt and
+      write-concern paths read it the same way. The profiler reads it with
+      `util::reply_ok` since RM-380. Found while working RM-380,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_distinct_of_a_view_is_not_counted_failed
+      Backlog-ID: RM-490
+- [ ] **`metrics.commands.<name>` has no `rejected`.** mongod 8.2.11 counts
+      `failed`, `rejected` and `total` for a command; this server counts
+      `failed` and `total`. Found while working RM-380, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_namespaces.py::test_a_command_metric_counts_rejections
+      Backlog-ID: RM-491
+- [ ] **A `distinct` of a view counts nothing it examined.** mongod 8.2.11
+      runs it as an aggregation over the collection beneath the view, and
+      its line counts what that plan examined (`keysExamined: 11,
+      docsExamined: 11, cursorExhausted: true` over an `IXSCAN { x: 1 }`),
+      as an `aggregate` of the view's does here; this server reads the
+      view's documents another way (`aggregate::collection_documents`) and
+      prints none of the three. Since RM-381 it plans that read, for the
+      `planningTimeMicros`, without running it. Found while working
+      RM-381, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_distinct_of_a_view_counts_what_it_examined
+      Backlog-ID: RM-493
+- [ ] **A `count` or `aggregate` of a view names a COLLSCAN beneath it.**
+      Over a view `{$match: {x: {$gte: 1}}}` on a collection indexed on
+      `x`, mongod 8.2.11's line for a `count_documents({})` names
+      `COUNT_SCAN { x: 1 }` (`docsExamined: 0`) and for a `$group` names
+      `IXSCAN { x: 1 }`; this server's name `COLLSCAN`, while counting 11
+      keys and 11 documents examined. Its explain of such a `count` is
+      RM-072. Found while working RM-381, 2026-11-10.
+      Verify: tests/backlog/test_rm_view_lines.py::test_a_count_and_an_aggregate_of_a_view_name_the_plan_beneath
+      Backlog-ID: RM-494
+- [ ] **A `Slow query` line takes a command's string argument for its
+      collection.** mongod 8.2.11's lines for a `validate: "c"`, a
+      `dataSize: "<db>.c"` and a `getLog` name `<db>.$cmd`; this server's
+      name `<db>.c`, `<db>.<db>.c` and `<db>.startupWarnings`
+      (`slowop::target_collection` reads any command's string value as
+      one). Found while working RM-383, 2026-11-10.
+      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection
+      Backlog-ID: RM-495
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
@@ -828,30 +934,29 @@ These are explicit non-goals. Don't add them without a reason.
       neither:
       - a read two or more plans could serve, which mongod chooses by
         trial, other than a `find`'s: an `aggregate`'s, a `count`'s, a
-        write's. Its documents come from the store's router. mongod counts
-        what the winner examined in its trial, and since RM-349 a `find`
-        streams the winner after its trial's buffer and counts as mongod's
-        does; the other readers still decline a contested plan
-        (`order::stream_plan`);
-      - a time-series collection's read and a geo, `$near` or `$text` read.
-        mongod counts the buckets its cursor stage buffered (all 15 of 300
-        measurements in the first batch of 101, 0 after); counting them
-        needs `find` to read the buckets as a time-series `aggregate` does
-        since RM-348, which is RM-455.
-      Measured 2026-10-27 and 2026-11-07.
+        `distinct`'s, a write's. Its documents come from the store's
+        router. mongod counts what the winner examined in its trial, and
+        since RM-349 a `find` streams the winner after its trial's buffer
+        and counts as mongod's does; the other readers still decline a
+        contested plan (`order::stream_plan`);
+      - a read of a time-series collection made whole: under a `$sort`, a
+        `$group` (`count_documents`), an inclusion `$project` (RM-456), a
+        filter on the meta field (RM-457), a hint or a collation. mongod
+        counts the buckets its cursor stage buffered (five of five for a
+        sorted `find`). Since RM-455 a `find` is the aggregation mongod
+        converts it to, and counts where a time-series `aggregate` streams;
+      - a geo, `$near` or `$text` read (`$geoWithin` over a `2d` index:
+        mongod 5 keys and 4 documents, this server none).
+      Measured 2026-10-27, 2026-11-07 and 2026-11-10.
       Backlog-ID: RM-363
-      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_a_time_series_collection_counts_what_it_examined
-- [ ] **A read of the plan cache's plan has no CACHED_PLAN stage.** mongod
-      8.2.11 runs the active plan of its plan cache under a CACHED_PLAN
-      stage, and its profile entries for the `find` and each `getMore`
-      carry it over the plan's stages, counting what it handed out (`works`
-      and `advanced` 2 on a first batch of two, 4 after the next); this
-      server's start at the plan's FETCH, whose counts are mongod's. A
-      `find` mongod plans by a fresh trial carries no MULTI_PLAN stage, and
-      neither does this server's. Measured 2026-11-09; found while working
-      RM-349.
-      Verify: tests/backlog/test_rm_355_364.py::test_a_read_of_the_cached_plan_reports_its_cached_plan_stage
-      Backlog-ID: RM-458
+      Verify: tests/backlog/test_rm_355_364.py::test_a_contested_aggregate_counts_what_it_examined, tests/backlog/test_rm_355_364.py::test_a_time_series_read_made_whole_counts_what_it_examined
+- [ ] **A read of a time-series collection's meta index names the index
+      as `listIndexes` shows it.** mongod 8.2.11's line for a `find({m: 1})`
+      of a time-series collection says `IXSCAN { meta: 1, control.min.t: 1,
+      control.max.t: 1 }`, the index as its buckets keep it; this server's
+      says `IXSCAN { m: 1, t: 1 }`. Found while working RM-363, 2026-11-10.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_read_of_the_meta_index_names_the_index_over_the_buckets
+      Backlog-ID: RM-496
 - [ ] **WiredTiger 11's interruptible cache wait is not on the line.**
       mongod 8.2.11's WiredTiger splits a cache wait into the share spent
       in interruptible eviction (`timeWaitingMicros.cacheInterruptibleMicros`)
@@ -864,38 +969,55 @@ These are explicit non-goals. Don't add them without a reason.
       cache). (Its other half, `txnNumUpdates`, closed 2026-11-07.)
       Backlog-ID: RM-364
       Verify: none -- no test drives mongod's eviction into an interruptible wait on demand
-- [ ] **A transaction's `update` and `delete` lines count dirty bytes.**
-      mongod 8.2.11's line for an `update` or a `delete` inside a
-      transaction carries no `txnBytesDirty` or `txnNumUpdates`, where an
-      insert's carries both; this server's counts the statement's share on
-      all three (measured 2026-11-07). Found while working RM-364.
-      Backlog-ID: RM-385
-      Verify: tests/backlog/test_rm_355_364.py::test_an_update_in_a_transaction_counts_no_dirty_bytes
+- [ ] **A transaction's insert counts more dirty bytes than mongod's.**
+      mongod 8.2.11's line for an insert of `{_id: 700, y: 1}` inside a
+      transaction, into a collection indexed on `_id` and `x`, counts
+      `txnBytesDirty` 305-345 over its 3 updates; this server's about 391.
+      Over fifty documents in one `insert` the mean is 70-71 bytes more per
+      document here, every run. An update or a delete of the same document
+      counts the same on both (96 and 192), so the surplus is in what an
+      insert links into a page: the record and its index keys, whose layout
+      here is not mongod's KeyString. (An insert's count varies by 8 bytes a
+      skiplist level on both servers: WiredTiger draws each new key's depth
+      at random.) Measured 2026-11-10. Found while working RM-385.
+      Verify: tests/backlog/test_rm_355_364.py::test_an_insert_in_a_transaction_counts_mongods_dirty_bytes
+      Backlog-ID: RM-499
 
 - [ ] **mongod's startup lines this server does not write.** Since RM-302
-  the log is mongod's structured log, and the lines this server writes --
-  `MongoDB starting`, `Waiting for connections`, `Connection accepted` /
-  `ended`, `client metadata`, `Received first command on ingress
-  connection`, every `Slow query` -- carry mongod's ids, threads and
-  attributes. At startup mongod 8.2.11 also writes about eighty more on
-  `initandlisten` (`Build Info` 23403, `Operating System` 51765, `Options
-  set by command line` 21951, then the network, WiredTiger and recovery
-  lines); this server writes `MongoDB starting` alone (measured
-  2026-10-24 and 2026-11-07). Found with RM-302.
+  the log is mongod's structured log, and since 2026-11-10 this server
+  starts it as mongod 8.2.11 does on `initandlisten`: `MongoDB starting`,
+  `Build Info` (23403), `Operating System` (51765) and `Options set by
+  command line` (21951, which carries RM-425's `parsed` until that is
+  fixed). mongod then writes about seventy more there -- the network
+  lines, `Opening WiredTiger` (22315) and the WiredTiger messages under
+  it, `WiredTiger opened` (4795906), the recovery, catalog, FCV, FTDC and
+  flow-control lines -- and ends with `mongod startup complete`
+  (8423403); this server writes none of them (measured 2026-10-24,
+  2026-11-07 and 2026-11-10). Found with RM-302.
   Backlog-ID: RM-305
-  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_build_os_and_options_lines
-- [ ] **A command that fails to parse is counted as a connection's first
-  command.** mongod 8.2.11 writes `Received first command on ingress
-  connection` (6788700) for the first command after the handshake that it
-  parses (`IngressHandshakeMetrics::onCommandReceived`, after the
-  command's IDL parse): `{find: 1}` after `hello`, refused for its
-  namespace, is passed over and the next command writes the line, timed
-  from the `hello`. This server counts every command either server knows
-  as it arrives, since its handlers parse and run in one step; the fix is
-  a parse step ahead of the run that the line can follow (measured
-  2026-11-07). Found with RM-305.
+  Verify: tests/backlog/test_rm_001_028.py::test_startup_writes_the_storage_and_startup_complete_lines
+- [ ] **`buildInfo` names the architecture as Rust does.** mongod 8.2.11 on
+  macOS arm64 gives `arm64` as `buildEnvironment.distarch` and
+  `target_arch` (and in the `Build Info` startup line); this server gives
+  Rust's `std::env::consts::ARCH`, `aarch64` (measured 2026-11-10). Found
+  while working RM-305.
+  Backlog-ID: RM-500
+  Verify: tests/backlog/test_rm_found_2026_11_10.py::test_build_info_names_the_architecture_as_mongod_does
+- [ ] **A command its handler fails to parse is counted as a connection's
+  first command.** mongod 8.2.11 writes `Received first command on ingress
+  connection` (6788700) when a command is about to run: one its IDL parse,
+  its generic arguments, its concerns, `maxTimeMS` or its authorization
+  refuses is passed over, and the next command writes the line, timed from
+  the `hello`. This server writes it at the same point of its dispatcher
+  (since 2026-11-10), so the checks the dispatcher makes are passed over;
+  but its handlers parse their own fields inside the run, so a command
+  refused there -- `{find: "c", bogus: 1}` (40415), `{insert: "c",
+  documents: 1}` (14), an unknown pipeline stage (40324), `lsid: 1` (14),
+  and the like -- still counts. The fix is a parse step for each handler
+  ahead of its run, which the line can follow (measured 2026-11-10). Found
+  with RM-305.
   Backlog-ID: RM-386
-  Verify: tests/backlog/test_rm_001_028.py::test_a_command_that_fails_to_parse_is_not_the_first_command
+  Verify: tests/backlog/test_rm_001_028.py::test_a_command_its_handler_fails_to_parse_is_not_the_first_command
 - [ ] **A `deleteMany` over pre-images is batched.** mongod 8.2.11 writes
   a multi-document delete of a collection with
   `changeStreamPreAndPostImages` as one `d` entry per document, each with
@@ -2171,16 +2293,6 @@ What is left, all on the RUST MongoDB server:
       Found 2026-11-09 working RM-311.
       Verify: tests/backlog/test_rm_found_2026_11_09.py::test_explain_lists_a_match_after_the_cursor_in_written_order
       Backlog-ID: RM-444
-- [ ] **`explain` calls a renaming projection `PROJECTION_SIMPLE`.**
-      mongod 8.2.11 explains `[{$project: {w: "$x"}}]`'s projection as
-      `PROJECTION_DEFAULT`, with or without a `$match` moved ahead of it: a
-      field computed from a path is no inclusion. This server's
-      `projection_name` (`explain/plan.rs`) calls a projection general only
-      when a field is dotted or its value a document or array, so a string
-      value is `PROJECTION_SIMPLE`. The documents are the same. Found
-      2026-11-09 working RM-311.
-      Verify: tests/backlog/test_rm_found_2026_11_09.py::test_a_renaming_projection_is_projection_default
-      Backlog-ID: RM-445
 - [ ] **A blocking sort keeps equal documents in the order it read them;
       mongod's sort does not.** Over 200 documents in runs of equal keys,
       mongod 8.2.11's `find().sort({s: 1})` and `$sort` (with a collation
@@ -2296,16 +2408,15 @@ cursor options, `getMore`, `killCursors`, the cursors of `aggregate` and the
 listing commands, tailable cursors, `count`, `distinct`). The Rust server
 differs on 5 scenarios. What is left:
 
-- [ ] **RUST MongoDB server: a `find` of a time-series collection reads
-      it whole.** mongod answers it with an aggregation over the buckets,
-      read through its cursor stage (32 buckets first, twice as many at each
-      refill) as a time-series `aggregate` is here since RM-348: over 4,000
-      measurements in 100 buckets, read one at a time and all deleted after
-      the first, mongod 8.2.11 returns 2,303 more and this server 3,999.
-      `find` reads the collection at the command (`find.rs`, `as_read`), so
-      its line also counts nothing examined (RM-363). Measured 2026-11-09.
-      Backlog-ID: RM-455
-      Verify: tests/backlog/test_rm_found_2026_11_09_rm348.py::test_a_time_series_find_goes_bucket_by_bucket
+- [ ] **RUST MongoDB server: a tailable `find` of a collection that is not
+      capped does not print its query.** mongod 8.2.11 refuses it (2) with
+      the query its planner could not plan, `error processing query:
+      ns=<db>.pTree: $and\nSort: {}\nProj: {}\n tailable cursor requested
+      on non capped collection`; this server's message is `ns=<db>.p
+      tailable cursor ...`, with no query. Found while working RM-363,
+      2026-11-10.
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm363.py::test_a_tailable_find_of_a_collection_that_is_not_capped_prints_its_query
+      Backlog-ID: RM-498
 - [ ] **RUST MongoDB server: a time-series `aggregate` that needs only
       some fields reads the collection at the command.** Behind an inclusion
       `$project` (`{$project: {v: 1}}`) mongod 8.2.11 reads the buckets one

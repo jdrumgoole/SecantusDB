@@ -407,6 +407,50 @@ one beside it.
   cancellation point looked at it, when the ErrorResponse went out.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check
+- [ ] **OPEN -- a cancel while a huge `IN` list is planned is honoured up
+  to 0.52 s late, against RP-202's 0.3 s budget (2026-11-09).**
+  `tests/backlog/test_rp202_cancel.py::test_a_cancel_while_a_huge_in_list_is_planned_over_a_table`
+  (RP-202's regression test) failed in the `backlog` step of a local
+  `gate_pg.sh --storage --fast` on the RM-379 lane (commit `5cc38549` on
+  `rm-batch` `57e33821`, debug build): `[0.7]` honoured 0.32 s late.
+  Rerun on its own at once (load average about 7), it failed 3 runs of 5:
+  0.30 s, 0.52 s and 0.34 s late. After the lane was rebuilt, on
+  `rm-batch` `49012e84` without RM-379 it passed 6 of 6, and with RM-379
+  on `01a19d63` it passed 8 of 8 (load average about 3.5). RM-379 changes
+  only the shared storage crate's asynchronous-oplog path, which the PG
+  server does not select. So the late cancels follow load or the older
+  build, and the cause has not been measured. PostgreSQL 15.19 answers at
+  about 0.015 s. Found by the MongoDB batch, and not worked from that side.
+  To work it: time each rewrite pass of the `IN` list at delay 0.7 and
+  record when each pass checks the cancel flag, under a load average near
+  7. A copy that cannot be interrupted and takes about 0.3 s under load is
+  RP-202's own signature. Again 2026-11-10 in the RM-385 lane (`[0.7]`
+  0.42 s late, load average about 12.6 from a `gate_rm.py` just before);
+  rerun alone at once it passed 15 of 15. RM-385 changes only the MongoDB
+  server's statement statistics, which the PG server does not read.
+  Verify: none -- intermittent under load; RP-202's regression test is the check, and it passed 14 of 14 runs on two rebuilt commits
+  Backlog-ID: RP-748
+- [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
+  in 6 of 547 TLS scenarios, because that reference now links OpenSSL 4.**
+  Homebrew's `postgresql@15` (15.19_1, 2026-11-07) links
+  `openssl@4/lib/libssl.4.dylib`. Since then
+  `tests/test_rust_pg_login_differential.py` (`pg_login_tls_files.py`)
+  reports `541 of 547 the same` on every local run, and again on
+  2026-11-09 in the RM-379 lane. The six are the CRL distribution-point
+  scenarios: no distribution point (good, revoked), distribution point a
+  (good, revoked), distribution point b, and revoked-first-answer. In each
+  of them the reference answers `tlsv1 alert unknown ca`, even for a good
+  certificate. The Rust PG server accepts the good certificate, or answers
+  `certificate revoked`. Neither server's code changed. RP-013's record
+  says the OpenSSL version decides how a CRL on the root is checked. CI's
+  Ubuntu reference links OpenSSL 3, which is why CI still passes. Until
+  this is settled, the local login step cannot tell a regression from this
+  difference. The fix is either a local reference PostgreSQL linked against
+  OpenSSL 3, or CRLs that the probe issues so that OpenSSL 3 and 4 agree,
+  with the decision recorded in RP-013. Found by the MongoDB batch, and not
+  worked from that side.
+  Verify: none -- the local reference's OpenSSL decides it; `tests/test_rust_pg_login_differential.py` against a PostgreSQL 15 on OpenSSL 4 is the check
+  Backlog-ID: RP-747
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
@@ -1049,7 +1093,7 @@ one beside it.
 ## Found by a CI run (2026-11-07)
 
 - [ ] **OPEN — CI: `obj_description` of a commented index answered NULL
-      once; not reproduced.** Commit `f96fc90d`, job 128491514608
+      twice; not reproduced.** Commit `f96fc90d`, job 128491514608
       (`pg-oracle (differential)`),
       `tests/test_rust_pg_corpora.py::test_corpus_answers_as_postgresql_does[sqlalchemy_catalog]`.
       The setup ran `COMMENT ON INDEX sa35_s.sa35_d_ix IS 'ix comment'`, and
@@ -1077,8 +1121,25 @@ one beside it.
       transform comment helpers, and `shobj_description`'s
       `shared_comments`. They were not on this corpus's path, and their
       first failure should be made to surface the same way.
+      **It recurred on 2026-11-09, as the NULL with no error.** RM snapshot
+      #2584, run 42717349016, job 129502313793, 23:17 UTC: the same check
+      answered NULL, 1 of 52 differ, 1 failed and 1,183 passed. Every setup
+      statement succeeded, because the test now fails a setup error first,
+      and no statement raised. The rerun of the same job on the same commit
+      passed (job 129513427390). The snapshot changed no code on this path.
+      That rules out the transient storage read. What remains: the comment
+      was written under a key the later read does not find, or the planner
+      thread that ran the check held a publication of `OBJECT_COMMENTS`
+      from before the write. Locally, 600 more runs did not reproduce it
+      (macOS arm64, a binary of tree `72006e6c`): 200 serial, and 400 as
+      four concurrent loops at load 13-25. Both occurrences are Linux CI.
+      A lead not yet checked: the autovacuum launcher builds a full
+      `PgHandler` (`autovacuum::setting`, `worker`) every second for the
+      server's whole life, a second session reading the catalog beside
+      every connection, so a fix should prove the catalog caches cannot
+      take that session's view as the connection's.
       Backlog-ID: RP-499
-      Verify: none -- seen once in CI, not reproduced; a recurrence now names its cause in the job log
+      Verify: none -- seen twice in Linux CI (2026-11-07, 2026-11-09), 600 + ~2,000 local runs never reproduced it
 
 ## Found by the 2026-10-20 audit
 

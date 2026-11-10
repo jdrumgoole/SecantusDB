@@ -85,6 +85,13 @@ the helpers (`mongo_answer`, `pg_answer`) that turn an error into a value.
   gates run on this arm64 Mac and CI's comparison on x86_64 Linux, so an
   x86-only gap is checked by CI alone: say so in the item. A regression
   test's per-platform case does the same.
+  **The reverse trap: a gap measured only here.** Before filing one, ask
+  whether the answer names or depends on the platform: an architecture or
+  OS string, a size, a layout, a path. If Linux x86_64 mongod would agree
+  with this server, the gap is this Mac's alone: `only_on("darwin", ...)`
+  and `only_on("arm64", ...)`. Otherwise CI's verify sees the open gap pass
+  and reports `FIXED?`, failing the snapshot (RM-500, `buildInfo`'s
+  `arm64` against Rust's `aarch64`, 2026-11-10).
 - Gap tests and regression tests are excluded from the default suite by
   their markers (gap tests fail by design, and both need the reference
   servers) and run through the verifier. **CI runs the RM side on every

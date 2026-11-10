@@ -513,36 +513,41 @@ fn slot_micros(scope: &secantus_storage::OperationScope) -> i64 {
     scope.counts().oplog_slot_micros
 }
 
-/// `with_db` on the SYNCHRONOUS oplog. The slot tests time the in-flight
-/// window, which only the synchronous oplog has: the asynchronous one mints
-/// a write's entries after it commits, so no slot is open inside it (RM-379).
-/// Pinned with the option, which beats the env var, so the CI lane that sets
-/// `SECANTUS_OPLOG_ASYNC=1` still checks the synchronous timing, as
+/// `with_db` on each oplog in turn, synchronous then asynchronous. The
+/// synchronous one times the in-flight window from mint to commit; the
+/// asynchronous one mints after the commit and times each emit to it
+/// instead (RM-379). Pinned with the option, which beats the env var, so
+/// the CI lane that sets `SECANTUS_OPLOG_ASYNC=1` still checks both, as
 /// `oplog_visibility.rs` does.
-fn with_sync_db(body: impl FnOnce(&Storage)) {
-    let home = temp_home();
-    let mut st = Storage::open_with_options(
-        home.to_str().unwrap(),
-        &StorageOptions {
-            oplog_async: Some(false),
-            ..StorageOptions::default()
-        },
-    )
-    .unwrap();
-    st.set_enable_oplog(false);
-    st.create_collection("app", "c").unwrap();
-    st.create_collection("app", "other").unwrap();
-    st.set_enable_oplog(true);
-    body(&st);
-    drop(st);
-    let _ = std::fs::remove_dir_all(&home);
+fn with_each_oplog(body: impl Fn(&Storage)) {
+    for oplog_async in [false, true] {
+        let home = temp_home();
+        let mut st = Storage::open_with_options(
+            home.to_str().unwrap(),
+            &StorageOptions {
+                oplog_async: Some(oplog_async),
+                // A store with unlogged data keeps the synchronous oplog.
+                data_nonlogged: oplog_async.then_some(false),
+                ..StorageOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(st.oplog_async(), oplog_async);
+        st.set_enable_oplog(false);
+        st.create_collection("app", "c").unwrap();
+        st.create_collection("app", "other").unwrap();
+        st.set_enable_oplog(true);
+        body(&st);
+        drop(st);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
 
 #[test]
 fn a_write_counts_how_long_it_held_its_oplog_slots() {
     // mongod's `totalOplogSlotDurationMicros` (RM-361): each slot is timed
     // from its reservation to the commit of the write that took it.
-    with_sync_db(|st| {
+    with_each_oplog(|st| {
         let docs: Vec<Vec<u8>> = (0..200).map(|i| enc(&doc! {"_id": i, "x": i})).collect();
         let scope = secantus_storage::operation_scope();
         st.insert("app", "c", docs, true).unwrap();
@@ -552,7 +557,7 @@ fn a_write_counts_how_long_it_held_its_oplog_slots() {
 
 #[test]
 fn a_write_that_rolls_back_or_mints_nothing_counts_no_slot() {
-    with_sync_db(|st| {
+    with_each_oplog(|st| {
         st.insert_one("app", "c", &enc(&doc! {"_id": 1})).unwrap();
         // A duplicate key rolls its write back: mongod counts nothing.
         let scope = secantus_storage::operation_scope();
@@ -570,7 +575,7 @@ fn a_write_that_rolls_back_or_mints_nothing_counts_no_slot() {
 fn a_transactions_slots_are_its_commits() {
     // mongod reserves a transaction's slots when it commits, so its
     // statements count none and `commitTransaction` counts them.
-    with_sync_db(|st| {
+    with_each_oplog(|st| {
         let mut txn = st.begin_user_transaction().unwrap();
         let statement = secantus_storage::operation_scope();
         st.with_user_transaction(&mut txn, || {
@@ -589,7 +594,7 @@ fn a_transactions_slots_are_its_commits() {
 
 #[test]
 fn an_operation_inside_another_adds_its_slots_to_it() {
-    with_sync_db(|st| {
+    with_each_oplog(|st| {
         let outer = secantus_storage::operation_scope();
         {
             let _inner = secantus_storage::operation_scope();

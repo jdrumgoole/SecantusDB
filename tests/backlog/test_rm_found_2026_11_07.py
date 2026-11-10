@@ -59,15 +59,21 @@ def _chain(client: Any, command: dict) -> list:
     return out
 
 
-@pytest.mark.backlog("RM-373")
+@pytest.mark.backlog_fixed("RM-373")
 def test_a_projection_is_where_mongods_plan_puts_it(rust_mongo: Any, mongod: Any) -> None:
     """mongod 8.2.11 projects BELOW a blocking SORT (`SORT` over
     `PROJECTION_SIMPLE` / `PROJECTION_COVERED`), and the projection of a
     SORT_MERGE whose keys hold the projected fields is `PROJECTION_DEFAULT`.
-    This server projects above the SORT, and calls the merge's projection
-    covered."""
+    This server projected above the SORT, and called the merge's projection
+    covered. (The `simple` read sorted on `y` until 2026-11-09, which the
+    `{y: 1, x: 1}` index returns in order: mongod plans no SORT for it.)"""
     commands = {
-        "simple": {"find": "c", "filter": {"z": 0}, "projection": {"y": 1}, "sort": {"y": 1}},
+        "simple": {
+            "find": "c",
+            "filter": {"z": 0},
+            "projection": {"y": 1, "z": 1},
+            "sort": {"z": 1},
+        },
         "covered": {
             "find": "c",
             "filter": {"y": {"$gte": 0}},

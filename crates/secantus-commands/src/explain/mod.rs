@@ -316,7 +316,6 @@ pub(crate) fn plans_table_scan(
         batch_size: false,
         keys_only: false,
         wanted: None,
-        pipeline: false,
         sbe: false,
         implies: &implies,
         trial: None,
@@ -638,6 +637,7 @@ fn plan_for(
         whole: &whole,
         ranked: Default::default(),
         cache: None,
+        cached_ran: Default::default(),
     };
     let q = Query {
         canonical,
@@ -653,7 +653,6 @@ fn plan_for(
         batch_size: s.batch_size,
         keys_only: false,
         wanted: None,
-        pipeline: s.pipeline,
         sbe,
         implies: &implies,
         trial: Some(&trial),
@@ -849,6 +848,7 @@ fn distinct_group(
         whole: &whole,
         ranked: Default::default(),
         cache: None,
+        cached_ran: Default::default(),
     };
     distinct_group_with(s, collation, &t.catalog, Some(&trial), |asked| {
         plan_for(asked, canonical, collation, t, ctx, false)
@@ -909,7 +909,6 @@ pub(crate) fn distinct_group_read(
             batch_size: false,
             keys_only: false,
             wanted: None,
-            pipeline: true,
             sbe: false,
             implies: &implied,
             trial: None,
@@ -1830,6 +1829,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
             upsert,
             returns,
             known: None,
+            query: Some(&s.filter),
         };
         let mut run = exec::run(&plan, &env);
         // The winner's stages are the ones the trial worked: what they

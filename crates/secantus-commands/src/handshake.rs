@@ -357,7 +357,10 @@ fn log_client_metadata(client: &Document, compressors: &[String], ctx: &CommandC
 /// the clock, which starts when the connection does; the first command of
 /// any other kind writes the line, once a connection, with the milliseconds
 /// since. A command neither server knows does not count (`{nosuchcmd: 1}`
-/// leaves the line to the next command). Called as a request arrives.
+/// leaves the line to the next command). Called as the command is about
+/// to run, so one refused before it runs -- for its fields, its namespace,
+/// its concerns, its authorization -- is passed over (RM-386); `received`
+/// is when it arrived.
 pub(crate) fn note_command(name: &str, ctx: &CommandContext, received: std::time::Instant) {
     let known = crate::lookup(name).is_some() || crate::mongod_commands::row(name).is_some();
     if !known {
@@ -1031,6 +1034,26 @@ mod tests {
             logs.tail(None)[0].attr,
             Some(doc! {"elapsedMillis": 250_i64})
         );
+    }
+
+    /// A command refused before it runs -- `{find: 1}`, for its namespace --
+    /// is passed over, and the next command writes 6788700 (mongod 8.2.11,
+    /// RM-386).
+    #[test]
+    fn a_command_refused_before_it_runs_is_not_the_first_command() {
+        let (mut ctx, logs) = logging_ctx();
+        ctx.db_name = "admin".to_string();
+        let first = |logs: &crate::logbuf::LogBuffer| {
+            ids(logs)
+                .into_iter()
+                .filter(|(id, _)| *id == 6788700)
+                .count()
+        };
+        let refused = crate::dispatch(&doc! {"find": 1, "$db": "admin"}, &mut ctx);
+        assert_eq!(refused.get_i32("code"), Ok(73), "{refused:?}");
+        assert_eq!(first(&logs), 0);
+        crate::dispatch(&doc! {"ping": 1, "$db": "admin"}, &mut ctx);
+        assert_eq!(first(&logs), 1);
     }
 
     /// The topologyVersion processId must be identical across calls — a changing
