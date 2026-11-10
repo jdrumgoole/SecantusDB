@@ -405,6 +405,21 @@ one beside it.
   shows without a check. A third the same morning: the user-code test
   at 0.33 s against 0.25 s on RM snapshot PR #2601 (job 129641495115),
   whose change (RM-385, MongoDB statement statistics) reaches no PG path.
+  **Fourth, traced (2026-11-10):** the user-code test at 0.37 s on PG
+  snapshot PR #2655 (`cd41d329`, job 130097550779). The trace shows no
+  stretch without a check on the statement's own thread. Instead the
+  statement's first parse ran 0.5 s (about 70 ms elsewhere) beside two
+  parse threads earlier statements had abandoned, and after the cancel
+  (+0.507) a privilege pre-pass that swallowed the cut-short parse
+  started a SECOND parse thread (+0.526, which took 100 ms to start);
+  the 57014 left at +0.866. Each abandoned thread parses to the end and
+  then frees its 200,000-item tree (113 to 144 ms here). Fixed in part:
+  `cancel::interruptible` now answers a pending cancel before starting
+  any work, as PostgreSQL's next CHECK_FOR_INTERRUPTS would, so no parse
+  starts after the cancel (unit test `cancel::tests::a_pending_cancel_starts_no_work`).
+  What remains is the CPU the parse threads abandoned BEFORE the cancel
+  take until they finish, since libpg_query cannot be stopped mid-parse.
+  Left open as a watch item until the lane stays green.
   Backlog-ID: RP-571
   Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check, and print the cancel trace on a miss
 - [ ] **OPEN -- `gate_pg.sh`'s login step differs from the local reference
