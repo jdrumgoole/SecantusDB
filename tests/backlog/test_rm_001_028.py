@@ -682,18 +682,33 @@ def test_client_metadata_is_logged(rust_mongo: Any) -> None:
     assert _client_metadata(rust_mongo) == want
 
 
-@pytest.mark.backlog("RM-305")
+def _startup_ids(client: Any) -> list[int]:
+    """The ids of the lines the server wrote on `initandlisten`, in order."""
+    return [
+        e["id"]
+        for e in map(json.loads, client.admin.command("getLog", "global")["log"])
+        if e["ctx"] == "initandlisten"
+    ]
+
+
+@pytest.mark.backlog_fixed("RM-305")
 def test_startup_writes_build_os_and_options_lines(rust_mongo: Any) -> None:
     """mongod 8.2.11 follows `MongoDB starting` with `Build Info` (23403),
     `Operating System` (51765) and `Options set by command line` (21951),
-    all on `initandlisten` (measured 2026-11-07 on a default mongod). This
-    server writes `MongoDB starting` alone."""
-    ids = [
-        e["id"]
-        for e in map(json.loads, rust_mongo.admin.command("getLog", "global")["log"])
-        if e["ctx"] == "initandlisten"
-    ]
-    assert ids[:4] == [4615611, 23403, 51765, 21951]
+    all on `initandlisten` (measured 2026-11-07 and 2026-11-10 on a default
+    mongod). This server wrote `MongoDB starting` alone until 2026-11-10."""
+    assert _startup_ids(rust_mongo)[:4] == [4615611, 23403, 51765, 21951]
+
+
+@pytest.mark.backlog("RM-305")
+def test_startup_writes_the_storage_and_startup_complete_lines(rust_mongo: Any) -> None:
+    """After the options, mongod 8.2.11 writes `Opening WiredTiger` (22315)
+    and `WiredTiger opened` (4795906) as it opens the store, and ends its
+    start on `initandlisten` with `mongod startup complete` (8423403),
+    among about seventy more lines (measured 2026-11-10 on a default
+    mongod). This server writes none of the three."""
+    ids = [i for i in _startup_ids(rust_mongo) if i in (22315, 4795906, 8423403)]
+    assert ids == [22315, 4795906, 8423403]
 
 
 def _op_msg(sock: socket.socket, command: dict, request_id: int) -> dict:

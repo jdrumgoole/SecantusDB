@@ -95,6 +95,52 @@ pub fn parsed_options(require_auth: bool) -> Document {
     parsed
 }
 
+/// The three lines mongod writes on `initandlisten` straight after `MongoDB
+/// starting` (measured 8.2.11, 2026-11-10): `Build Info` (23403), `Operating
+/// System` (51765) and `Options set by command line` (21951). Each comes from
+/// the same place as the command that reports it -- `buildInfo`, `hostInfo`'s
+/// `os` and `getCmdLineOpts`'s `parsed` -- as mongod's `logProcessDetails`
+/// does. `Build Info` carries `version`, `gitVersion`, `modules`,
+/// `allocator` and the non-empty `distmod` / `distarch` / `target_arch` of
+/// the build environment; `openSSLVersion` only on an OpenSSL build, which
+/// this is not.
+pub fn startup_details(require_auth: bool) -> [crate::logbuf::LogEntry; 3] {
+    use crate::logbuf::LogEntry;
+    let info = crate::handshake::build_info_document();
+    let mut build = Document::new();
+    for key in ["version", "gitVersion", "modules", "allocator"] {
+        if let Some(v) = info.get(key) {
+            build.insert(key, v.clone());
+        }
+    }
+    let mut environment = Document::new();
+    if let Ok(env) = info.get_document("buildEnvironment") {
+        for key in ["distmod", "distarch", "target_arch"] {
+            if let Ok(v) = env.get_str(key) {
+                if !v.is_empty() {
+                    environment.insert(key, v);
+                }
+            }
+        }
+    }
+    build.insert("environment", environment);
+    let host = crate::hostinfo::Host::read();
+    [
+        LogEntry::new("I", "CONTROL", 23403, "initandlisten", "Build Info")
+            .attr(doc! {"buildInfo": build}),
+        LogEntry::new("I", "CONTROL", 51765, "initandlisten", "Operating System")
+            .attr(doc! {"os": {"name": host.os_name, "version": host.os_version}}),
+        LogEntry::new(
+            "I",
+            "CONTROL",
+            21951,
+            "initandlisten",
+            "Options set by command line",
+        )
+        .attr(doc! {"options": parsed_options(require_auth)}),
+    ]
+}
+
 /// `hostInfo`: the machine's own figures, in mongod's keys, types and order
 /// (measured 8.2.11 on macOS arm64, 2026-10-15). `hostname` is the host's
 /// name and the server's port, as mongod gives it. A figure this platform
@@ -578,6 +624,47 @@ mod tests {
         let all = dispatch(&doc! {"getParameter": "*"}, &mut ctx());
         assert!(all.get("authenticationMechanisms").is_some());
         assert!(all.get("logLevel").is_some());
+    }
+
+    #[test]
+    fn startup_details_are_mongods_three_lines() {
+        let [build, os, options] = startup_details(true);
+        assert_eq!(
+            [build.id, os.id, options.id],
+            [23403, 51765, 21951],
+            "Build Info, Operating System, Options set by command line"
+        );
+        let build = build.attr.unwrap();
+        let build = build.get_document("buildInfo").unwrap();
+        let keys: Vec<&str> = build.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "version",
+                "gitVersion",
+                "modules",
+                "allocator",
+                "environment"
+            ]
+        );
+        // An empty distmod is left out, as on mongod.
+        assert!(build
+            .get_document("environment")
+            .unwrap()
+            .get("distmod")
+            .is_none());
+        let os = os.attr.unwrap();
+        let os_keys: Vec<&str> = os
+            .get_document("os")
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(os_keys, ["name", "version"]);
+        assert_eq!(
+            options.attr.unwrap().get_document("options").unwrap(),
+            &parsed_options(true)
+        );
     }
 
     #[test]
