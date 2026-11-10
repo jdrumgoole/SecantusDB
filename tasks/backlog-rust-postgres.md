@@ -3354,15 +3354,6 @@ never with `expr` as it reads the select list.
       ... order by 1` is answered).
       Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_call_in_an_order_by_key
       Backlog-ID: RP-761
-- [ ] **A window `min` / `max` under a collation picks by the text's
-      bytes.** `select min(x collate "en-x-icu") over (), max(x collate
-      "en-x-icu") over () from (values ('a'), ('B')) s(x)` is `a`, `B` on
-      PostgreSQL 15.19, as the plain aggregate is here; here the window call
-      answers `B`, `a`. The collation rewrite of `min` / `max` skips a call
-      with OVER, as the network one did before RP-754; the enum one does
-      too (unmeasured, it needs a `CREATE TYPE`).
-      Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_min_max_under_a_collation
-      Backlog-ID: RP-763
 
 ## Found while working RP-756 (2026-11-10)
 

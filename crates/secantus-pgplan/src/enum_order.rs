@@ -1803,19 +1803,38 @@ impl Rewriter<'_> {
             // `network_cmp` as the plain aggregate does: the window function
             // over the key, its ORDER BY keyed too, read back as the
             // overload's type (RP-754).
+            // Under a locale collation it picks by the collation's order
+            // (`text_larger` / `text_smaller` compare by the input's
+            // collation), and over an enum by its labels' positions, again
+            // as the plain aggregate does (RP-763).
             if let (Some("min" | "max"), [arg], Some(_)) =
                 (name.as_deref(), f.args.as_slice(), f.over.as_ref())
             {
-                if let Some(ty) = self.net_of(arg) {
+                let windowed = |this: &mut Self, key: pg_query::protobuf::Node| {
                     let mut agg = (**f).clone();
-                    agg.args = vec![Self::net_key(arg.clone())];
+                    agg.args = vec![key];
                     if let Some(w) = agg.over.as_deref_mut() {
-                        self.window(w)?;
+                        this.window(w)?;
                     }
-                    let call = pg_query::protobuf::Node {
+                    Ok::<_, Error>(pg_query::protobuf::Node {
                         node: Some(N::FuncCall(Box::new(agg))),
-                    };
+                    })
+                };
+                if let Some(ty) = self.net_of(arg) {
+                    let call = windowed(self, Self::net_key(arg.clone()))?;
                     *node = Self::net_value(call, &crate::min_max_result_type(&ty));
+                    self.changed = true;
+                    return Ok(());
+                }
+                if let Some((collation, _)) = self.coll_of(arg) {
+                    let call = windowed(self, Self::coll_keyv(arg, &collation))?;
+                    *node = Self::typed_value(Self::coll_value(call), &collation);
+                    self.changed = true;
+                    return Ok(());
+                }
+                if let Some((ty, labels)) = self.enum_of(arg) {
+                    let call = windowed(self, Self::ord(arg.clone(), &labels))?;
+                    *node = Self::label_of(call, &ty, &labels);
                     self.changed = true;
                     return Ok(());
                 }

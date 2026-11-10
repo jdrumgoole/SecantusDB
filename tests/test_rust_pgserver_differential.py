@@ -383,6 +383,12 @@ QUERIES = [
     "ORDER BY a > '9.5.0.0'::inet, a::text",
     "SELECT string_agg(a::text, ',' ORDER BY a > '9.5.0.0'::inet, a::text) "
     "FROM (VALUES ('10.0.0.1'::inet), ('9.0.0.0')) s(a)",
+    # Under a locale collation a window min / max picks in the collation's
+    # order, its frame ordered by the same collation (RP-763).
+    'SELECT min(a COLLATE "en-x-icu") OVER (), max(a COLLATE "en-x-icu") OVER () '
+    "FROM (VALUES ('a'), ('B'), ('A')) s(a)",
+    'SELECT a, max(a COLLATE "en-x-icu") OVER (ORDER BY a COLLATE "en-x-icu") '
+    "FROM (VALUES ('a'), ('B'), ('b'), ('A')) s(a) ORDER BY 1",
     "SELECT NULL::uuid",
     # Anonymous records (ROW / parenthesised list): construction, text
     # render with PG field-quoting, and three-valued comparison.

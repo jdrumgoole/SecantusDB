@@ -6,12 +6,12 @@ the HAVING and a window's ORDER BY as expressions, but read an ORDER BY key
 only as a key: a comparison inside one compared the stored text (RP-762,
 fixed). A window call in one is refused, whether written there or copied
 from the select list by a positional `ORDER BY 1`. A windowed `min` / `max`
-under a collation still picks by the stored text's order.
+under a collation picked by the stored text's order (RP-763, fixed).
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement but the enum one is VALUES-only and runs there as written; the
-enum one, which needs a `CREATE TYPE`, was measured on a private 15.19
-cluster.
+statement but the enum ones is VALUES-only and runs there as written; the
+enum ones, which need a `CREATE TYPE`, were measured on a private 15.19
+cluster (RP-763's after `_ENUM_SETUP`).
 """
 
 from __future__ import annotations
@@ -133,10 +133,49 @@ WINDOWED_COLLATED = {
 }
 
 
-@pytest.mark.backlog("RP-763")
+@pytest.mark.backlog_fixed("RP-763")
 @pytest.mark.parametrize("query", list(WINDOWED_COLLATED))
 def test_a_window_min_max_under_a_collation(query: str, rust_pg: object) -> None:
     """A windowed `min` / `max` under the `en-x-icu` collation picks `a` and
-    `B` on PostgreSQL 15.19, as the plain aggregate does here. Here the
-    window call picks by the stored text's byte order, `B` and `a`."""
+    `B` on PostgreSQL 15.19, as the plain aggregate does. The window call
+    picked by the stored text's byte order, `B` and `a`, until RP-763."""
     assert _rows(rust_pg, query) == WINDOWED_COLLATED[query]
+
+
+_ENUM_SETUP = [
+    "drop table if exists t763",
+    "drop type if exists e763",
+    "create type e763 as enum ('zeta', 'alpha', 'mid')",
+    "create table t763 (k int, e e763)",
+    "insert into t763 values (1, 'alpha'), (2, 'zeta'), (3, 'mid'), (4, null)",
+]
+
+WINDOWED_ENUM = {
+    # By label position, `zeta` < `alpha` < `mid`; by text `alpha` is least.
+    "select k, min(e) over (), max(e) over (order by k), pg_typeof(max(e) over ())::text"
+    " from t763 order by k": [
+        (1, "zeta", "alpha", "e763"),
+        (2, "zeta", "alpha", "e763"),
+        (3, "zeta", "mid", "e763"),
+        (4, "zeta", "mid", "e763"),
+    ],
+    "select k, min(e) over (order by k rows between 1 preceding and current row)"
+    " from t763 order by k": [(1, "alpha"), (2, "zeta"), (3, "zeta"), (4, "mid")],
+}
+
+
+@pytest.mark.backlog_fixed("RP-763")
+@pytest.mark.parametrize("query", list(WINDOWED_ENUM))
+def test_a_window_min_max_over_an_enum(query: str, rust_pg: object) -> None:
+    """A windowed `min` / `max` over an enum picks by the labels' sort order
+    on PostgreSQL 15.19, as the plain aggregate does, and is of the enum
+    type. The window call picked by the labels' text until RP-763."""
+    with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+        for q in _ENUM_SETUP:
+            c.execute(q)
+    try:
+        assert _rows(rust_pg, query) == WINDOWED_ENUM[query]
+    finally:
+        with psycopg.connect(_dsn(rust_pg) + " dbname=postgres", autocommit=True) as c:
+            for q in _ENUM_SETUP[:2]:
+                c.execute(q)
