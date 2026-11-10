@@ -65,6 +65,9 @@ mod index_builds;
 mod index_filters;
 pub mod names;
 mod snapshot;
+#[cfg(any(target_os = "linux", test))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod system_metrics;
 pub use generic::db_field_problem;
 pub mod failpoints;
 pub mod find;
