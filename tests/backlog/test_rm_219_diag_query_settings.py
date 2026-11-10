@@ -628,39 +628,143 @@ def test_oplog_storage_stats(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: 
     assert _oplog_storage_stats(rust_mongo) == _oplog_storage_stats(mongod_rs)
 
 
-def _admin_remainders(client: Any) -> dict:
-    db = client["rm219r"]
-    client.drop_database("rm219r")
+_MIB16 = 16 * 1024 * 1024
+
+
+def _apply_ops_past_16mb(client: Any) -> tuple:
+    db = client["rm416a"]
+    client.drop_database("rm416a")
     db.a.insert_one({"_id": 1})
+    big = {"_id": 2, "s": "x" * (_MIB16 + 1024)}
+    try:
+        r = client.admin.command("applyOps", [{"op": "i", "ns": "rm416a.a", "o": big}])
+    except pymongo.errors.OperationFailure as e:
+        return ("err", e.code)
+    stored = db.a.find_one({"_id": 2})
+    return (r["applied"], r["results"], len(bson.encode(stored)) if stored else None)
+
+
+@pytest.mark.backlog_fixed("RM-416")
+def test_apply_ops_inserts_past_16mb(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2 applied an `applyOps` insert of a document a little over
+    16 MB, as oplog application allows, and a find read it back."""
+    assert _apply_ops_past_16mb(rust_mongo) == _apply_ops_past_16mb(mongod_rs)
+
+
+def _filemd5_partial(client: Any) -> list:
+    db = client["rm416f"]
+    client.drop_database("rm416f")
     db.fs.chunks.create_index([("files_id", 1), ("n", 1)], unique=True)
-    db.fs.chunks.insert_one({"files_id": 1, "n": 0, "data": bson.Binary(b"abc")})
+    db.fs.chunks.insert_many(
+        [
+            {"files_id": 1, "n": 0, "data": bson.Binary(b"abc")},
+            {"files_id": 1, "n": 1, "data": bson.Binary(b"d" * 70)},
+            {"files_id": 1, "n": 3, "data": bson.Binary(b"zz")},
+        ]
+    )
 
-    def code(fn: Any) -> Any:
+    def answer(cmd: dict) -> Any:
         try:
-            fn()
-            return "ok"
-        except pymongo.errors.PyMongoError as e:
-            return getattr(e, "code", type(e).__name__)
+            r = db.command({"filemd5": 1, "root": "fs", **cmd})
+        except pymongo.errors.OperationFailure as e:
+            return ("err", e.code, e.details.get("errmsg"))
+        return {
+            k: (bytes(v).hex() if k == "md5state" else v)
+            for k, v in r.items()
+            if k in ("md5state", "numChunks", "md5")
+        }
 
-    big = {"_id": 2, "s": "x" * (16 * 1024 * 1024 + 1024)}
-    return {
-        "applyOps over 16 MB": code(
-            lambda: client.admin.command("applyOps", [{"op": "i", "ns": "rm219r.a", "o": big}])
-        ),
-        "dbCheck extraIndexKeysCheck": code(
-            lambda: db.command(
-                {"dbCheck": "a", "validateMode": "extraIndexKeysCheck", "secondaryIndex": "_id_"}
-            )
-        ),
-        "filemd5 partialOk": code(
-            lambda: db.command({"filemd5": 1, "root": "fs", "partialOk": True})
-        ),
-    }
+    state = db.command({"filemd5": 1, "root": "fs", "partialOk": True})["md5state"]
+    return [
+        answer({"partialOk": True}),
+        answer({"partialOk": 1, "startAt": 1}),
+        answer({"partialOk": True, "startAt": 3, "md5state": state}),
+        answer({"partialOk": True, "startAt": 9}),
+        answer({"partialOk": True, "md5state": bson.Binary(b"x" * 10)}),
+        answer({"partialOk": True, "md5state": "x"}),
+        answer({"partialOk": False, "md5state": "x"}),
+    ]
+
+
+@pytest.mark.backlog_fixed("RM-416")
+def test_filemd5_partial_ok(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2 answered `filemd5` with `partialOk` with its MD5 state
+    (`md5state`, libtomcrypt's 416-byte `hash_state`), took one back with
+    `startAt` to resume, and stopped at a missing chunk instead of failing."""
+    assert _filemd5_partial(rust_mongo) == _filemd5_partial(mongod_rs)
+
+
+def _db_check_extra_keys(client: Any) -> Any:
+    db = client["rm416d"]
+    client.drop_database("rm416d")
+    db.a.insert_many([{"_id": i, "x": i % 3} for i in range(5)])
+    db.a.create_index("x")
+    try:
+        db.command(
+            {
+                "dbCheck": "a",
+                "validateMode": "extraIndexKeysCheck",
+                "secondaryIndex": "x_1",
+                "maxDocsPerBatch": 2,
+            }
+        )
+    except pymongo.errors.OperationFailure as e:
+        return ("err", e.code)
+    # mongod runs the check in the background: wait for its stop entry.
+    oplog = client.local["oplog.rs"]
+    deadline = time.monotonic() + 10
+    while True:
+        entries = [e["o"] for e in oplog.find({"o.dbCheck": "rm416d.a"}).sort("$natural", 1)]
+        if any(o.get("type") == "stop" for o in entries) or time.monotonic() > deadline:
+            break
+        time.sleep(0.05)
+    return [
+        (
+            o.get("type"),
+            o.get("md5"),
+            o.get("batchStart"),
+            o.get("batchEnd"),
+            o.get("lastKeyChecked"),
+        )
+        for o in entries
+    ]
 
 
 @pytest.mark.backlog("RM-416")
-def test_admin_command_remainders(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
-    """mongod 8.2 applies an `applyOps` insert of a document a little over
-    16 MB, runs `dbCheck`'s `extraIndexKeysCheck` and answers `filemd5`
-    with `partialOk`."""
-    assert _admin_remainders(rust_mongo) == _admin_remainders(mongod_rs)
+def test_db_check_extra_index_keys(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2 runs `dbCheck`'s `extraIndexKeysCheck`: a batch entry per
+    run of index keys, ending on a key boundary, each carrying the MD5 of
+    the batch's KeyString-encoded keys."""
+    assert _db_check_extra_keys(rust_mongo) == _db_check_extra_keys(mongod_rs)
+
+
+def _update_entries(client: Any) -> dict:
+    db = client["rm416u"]
+    client.drop_database("rm416u")
+    db.u.insert_one({"_id": 1})
+
+    def apply(entry: dict) -> Any:
+        try:
+            r = client.admin.command("applyOps", [{"ns": "rm416u.u", **entry}])
+            return ("ok", r["results"])
+        except pymongo.errors.OperationFailure as e:
+            return (e.code, e.details.get("errmsg"), e.details.get("results"))
+
+    big = "z" * (_MIB16 + 10)
+    return {
+        "replace missing, no b": apply({"op": "u", "o": {"_id": 8, "s": "z"}, "o2": {"_id": 8}}),
+        "upsert past 16 MB": apply(
+            {"op": "u", "o": {"_id": 9, "s": big}, "o2": {"_id": 9}, "b": True}
+        ),
+        "insert replacing past 16 MB": apply({"op": "i", "o": {"_id": 1, "s": big}}),
+        "ids": sorted(d["_id"] for d in db.u.find({}, {"_id": 1})),
+    }
+
+
+@pytest.mark.backlog("RM-540")
+def test_apply_ops_update_entries(rust_mongo: Any, mongod_rs: Any) -> None:  # noqa: F811
+    """mongod 8.2.11 does not apply a `u` replacement of a missing document
+    without `b: true` (the entry is `false` in `results`, the command 8), and
+    refuses a document past 16 MB that a `u` upsert would insert (17420) or
+    an `i` entry would replace (17419)."""
+    assert _update_entries(rust_mongo) == _update_entries(mongod_rs)

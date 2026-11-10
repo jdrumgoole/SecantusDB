@@ -419,6 +419,7 @@ fn apply_entry(
                 &id,
                 o.clone(),
                 validator.as_ref(),
+                true,
             )
         }
         "u" => {
@@ -495,7 +496,15 @@ fn apply_entry(
                 }
                 return Ok(Outcome::Applied);
             }
-            write_document(storage.as_ref(), db, coll, &id, post, validator.as_ref())
+            write_document(
+                storage.as_ref(),
+                db,
+                coll,
+                &id,
+                post,
+                validator.as_ref(),
+                false,
+            )
         }
         _ => {
             let Some(id) = o.get("_id").cloned() else {
@@ -550,7 +559,9 @@ fn find_by_id(
 }
 
 /// Write `doc` as the document with `id`: a replacement when one exists, an
-/// insert when none does.
+/// insert when none does. An `i` entry's insert takes a document past the
+/// 16 MiB a client may write, as mongod's oplog application does; an `u`
+/// entry's upsert does not (17420 on mongod 8.2.11).
 fn write_document(
     storage: &dyn crate::Storage,
     db: &str,
@@ -558,6 +569,7 @@ fn write_document(
     id: &Bson,
     doc: Document,
     validator: Option<&Document>,
+    insert_entry: bool,
 ) -> Result<Outcome, CommandError> {
     if let Some(v) = validator {
         // A validator no interrupt reaches (RM-313).
@@ -574,9 +586,12 @@ fn write_document(
         return Ok(Outcome::Applied);
     }
     let bytes = crate::bsondoc::to_vec(&doc).map_err(|e| error(1, e.to_string()))?;
-    let (_, errors) = storage
-        .insert(db, coll, vec![bytes], true)
-        .map_err(crate::util::command_error)?;
+    let (_, errors) = if insert_entry {
+        storage.insert_from_oplog_application(db, coll, vec![bytes], true)
+    } else {
+        storage.insert(db, coll, vec![bytes], true)
+    }
+    .map_err(crate::util::command_error)?;
     if let Some(e) = errors.first() {
         let code = e.get_i32("code").unwrap_or(1);
         let mut err = error(code, e.get_str("errmsg").unwrap_or_default().to_string());

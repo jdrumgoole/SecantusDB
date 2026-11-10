@@ -514,6 +514,18 @@ impl CmdStorage for StorageAdapter {
         self.inner.insert(db, coll, docs, ordered).map_err(map_err)
     }
 
+    fn insert_from_oplog_application(
+        &self,
+        db: &str,
+        coll: &str,
+        docs: Vec<Vec<u8>>,
+        ordered: bool,
+    ) -> Result<(usize, Vec<Document>), StorageError> {
+        self.inner
+            .insert_from_oplog_application(db, coll, docs, ordered)
+            .map_err(map_err)
+    }
+
     fn update_matching(
         &self,
         db: &str,

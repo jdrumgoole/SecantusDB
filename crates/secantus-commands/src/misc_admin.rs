@@ -5,8 +5,8 @@
 //! has never rolled back.
 
 use bson::{doc, Bson, Document};
-use md5::{Digest, Md5};
 
+use crate::tomcrypt_md5::Md5State;
 use crate::{CommandContext, CommandError, HandlerResult};
 
 fn wrong_type(path: &str, value: &Bson, expected: &str) -> CommandError {
@@ -123,18 +123,30 @@ pub fn filemd5(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             ))
         }
     };
-    // `partialOk` answers with mongod's MD5 implementation's internal state
-    // (`md5state`), which no other implementation reproduces: refused by
-    // name rather than answered without it.
-    if doc
-        .get("partialOk")
-        .is_some_and(|v| !matches!(v, Bson::Boolean(false) | Bson::Null))
-    {
-        return Err(CommandError::new(
-            115,
-            "CommandNotSupported",
-            "filemd5 with partialOk is not supported: its md5state is mongod's own MD5 state",
-        ));
+    // `partialOk` answers the hash's state as well, and takes one back
+    // (`md5state`) with the chunk number to resume at (`startAt`), so a
+    // client can hash a file in pieces.
+    let partial_ok = doc.get("partialOk").is_some_and(crate::util::true_value);
+    let mut md5 = Md5State::new();
+    let mut start_at: i32 = 0;
+    if partial_ok {
+        if let Some(state) = doc.get("md5state") {
+            let Bson::Binary(b) = state else {
+                return Err(CommandError::new(
+                    50847,
+                    "Location50847",
+                    format!(
+                        "The element that calls binDataClean() must be type of BinData, but \
+                         type of {} found.",
+                        secantus_core::query::bson_type_name(state)
+                    ),
+                ));
+            };
+            md5 = Md5State::from_bytes(&b.bytes).ok_or_else(|| {
+                CommandError::new(16247, "Location16247", "md5 state not correct size")
+            })?;
+        }
+        start_at = doc.get("startAt").map_or(0, number_int);
     }
     let chunks = format!("{root}.chunks");
     let db = ctx.db_name.clone();
@@ -161,13 +173,13 @@ pub fn filemd5(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             "NoQueryExecutionPlans",
             format!(
                 "error processing query: ns={db}.{chunks}Tree: $and\n    files_id $eq {}\n    n \
-                 $gte 0\nSort: {{ files_id: 1, n: 1 }}\nProj: {{}}\n planner returned error :: \
+                 $gte {start_at}\nSort: {{ files_id: 1, n: 1 }}\nProj: {{}}\n planner returned error :: \
                  caused by :: No indexed plans available, and running with 'notablescan' 2",
                 crate::argtypes::render_stage_value(&files_id)
             ),
         ));
     }
-    let filter = doc! {"files_id": files_id.clone(), "n": {"$gte": 0_i32}};
+    let filter = doc! {"files_id": files_id.clone(), "n": {"$gte": start_at}};
     let sort = doc! {"files_id": 1_i32, "n": 1_i32};
     let rows = storage
         .find(&db, &chunks, &filter, Some(&sort), None)
@@ -179,17 +191,22 @@ pub fn filemd5(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
             format!("Executor error during filemd5 command :: caused by :: {why}"),
         )
     };
-    let mut md5 = Md5::new();
-    let mut count: i32 = 0;
+    let mut count = start_at;
     for raw in rows {
         let chunk = secantus_core::bsondoc::from_bytes(&raw)
             .map_err(|e| CommandError::new(1, "InternalError", e.to_string()))?;
         let n = chunk.get("n").and_then(crate::util::as_i64).unwrap_or(-1);
         if n != i64::from(count) {
+            // A skipped chunk is probably on another shard, as mongod puts it.
+            if partial_ok {
+                break;
+            }
             return Err(executor(10040, "chunks out of order".to_string()));
         }
         match chunk.get("data") {
-            Some(Bson::Binary(b)) => md5.update(&b.bytes),
+            Some(Bson::Binary(b)) => md5
+                .append(&b.bytes)
+                .map_err(|_| executor(MD5_FAILED, "MD5 operation failed".to_string()))?,
             // mongod's own spelling, "misisng" included.
             None => {
                 return Err(executor(
@@ -210,10 +227,48 @@ pub fn filemd5(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
                 ))
             }
         }
-        count += 1;
+        count = count.wrapping_add(1);
     }
-    let digest: String = md5.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    Ok(doc! {"numChunks": count, "md5": digest, "ok": 1.0})
+    let mut out = Document::new();
+    if partial_ok {
+        out.insert(
+            "md5state",
+            Bson::Binary(bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: md5.0.to_vec(),
+            }),
+        );
+    }
+    let digest = md5
+        .finish()
+        .map_err(|_| CommandError::new(MD5_FAILED, "Location12220700", "MD5 operation failed"))?;
+    out.insert("numChunks", count);
+    out.insert(
+        "md5",
+        digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>(),
+    );
+    out.insert("ok", 1.0);
+    Ok(out)
+}
+
+/// libtomcrypt failing an MD5 step, as mongod reports it.
+const MD5_FAILED: i32 = 12220700;
+
+/// mongod's `BSONElement::numberInt`: a number saturated at the int32 range
+/// (a double truncated, a decimal rounded half to even, NaN as 0), anything
+/// else 0.
+fn number_int(v: &Bson) -> i32 {
+    let clamp = |n: i64| n.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32;
+    match v {
+        Bson::Int32(n) => *n,
+        Bson::Int64(n) => clamp(*n),
+        Bson::Double(d) => *d as i32,
+        Bson::Decimal128(_) => secantus_core::decimal_to_i64_saturating(v).map_or(0, clamp),
+        _ => 0,
+    }
 }
 
 /// The reasons `setUserWriteBlockMode` takes, as mongod 8.2.11 names them.
