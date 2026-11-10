@@ -1226,17 +1226,36 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       file's framing. Found 2026-11-10 (RM-400).
       Verify: tests/backlog/test_rm_326_sort_counts.py::test_descending_and_tied_spill_storage_size
       Backlog-ID: RM-503
-- [ ] **Four window shapes still miss mongod's `$setWindowFields` budget.**
-      Over 40 small documents Linux mongod 8.2.12 runs a `range` window
-      with no lower end (`["unbounded", 4]`) under 676 bytes, where this
-      server holds the whole partition (5176); `$expMovingAvg` under 261
-      and `$locf` under 253 (here 250: their functions count nothing); a
-      removable `[-3, 3]` `$max` under 852 (here 908). Each also misses
-      partitioned. The rest of a 48-shape matrix (document and range
-      windows, `$first` / `$last`, `$shift`, the rank functions, each with
-      and without `partitionBy`) matches to the byte.
-      Verify: tests/backlog/test_rm_found_2026_11_08.py::test_window_budget_more_shapes
-      Backlog-ID: RM-404
+- [ ] **A `range` window's `"current"` bound takes in tied documents.**
+      mongod 8.2.1 reads `"current"` in a `range` window as the document
+      answered (`getEndpointsRangeBased`: offset 0), so over `n` of 1, 1,
+      2, 2, 2, 3 a `$push` of `_id` over `["unbounded", "current"]` gives
+      `[0], [0, 1], [0, 1, 2], ...`; this server bounds the window by the
+      current sort value (`range_window_bounds`), taking in every document
+      tied with it: `[0, 1], [0, 1], [0, 1, 2, 3, 4], ...`. The same for a
+      `"current"` lower bound. A wrong answer for any sort key with ties.
+      Found 2026-11-10 (RM-404).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_range_windows_current_is_the_document
+      Backlog-ID: RM-508
+- [ ] **`$integral` and the covariances count no memory in a window.**
+      mongod 8.2.1 counts what they hold: `maxFunctionMemoryUsageBytes`
+      3888 for a `["unbounded", 4]` `range` `$integral` over 40 documents,
+      568 for a `["unbounded", -1]` `$covariancePop`. This server counts
+      nothing for either (`FunctionMemory::Nothing`), so `explain` shows 0
+      and the stage runs under budgets mongod refuses (500 against 4300,
+      375 against 818). Found 2026-11-10 (RM-404).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_integral_and_covariance_count_their_memory
+      Backlog-ID: RM-509
+- [ ] **A partitioned window's `maxTotalMemoryUsageBytes` is 16 bytes off.**
+      With `partitionBy` over three partitions of 40 small documents,
+      macOS mongod 8.2.1 reports 748 for a `range [-4, 4]` `$sum` (here
+      764), 2180 for a whole-partition `$sum` (2196), 480 for a running
+      `$sum` (464) and 432 for `$expMovingAvg` (416). Both directions, one
+      partition key's size; the least budgets agree, so the moment the
+      tracker sees differs, not what the budget counts. Cause not yet
+      traced. Found 2026-11-10 (RM-404).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm404.py::test_a_partitioned_windows_total_memory
+      Backlog-ID: RM-510
 - [ ] **A document a stage changed or built is sized as if it were read.**
       mongod 8.2.1 sizes a document an `$unwind` or `$addFields` changed,
       or an expression object built, by its storage: the buffer it
