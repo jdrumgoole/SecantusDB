@@ -26822,6 +26822,102 @@ fn alias_field_rewrite(
     Ok(changed.then_some(out))
 }
 
+/// A select-list `(v).*` or `(v.*).*`, where `v` names a FROM item of this
+/// level, as the item's star `v.*` (RP-704). PostgreSQL's
+/// `transformIndirection` reads `(v)` as a column first and as the item's
+/// whole row only when no column of that name is in scope
+/// (`transformColumnRef`), and a star over a whole row expands as `v.*`
+/// does (`ExpandIndirectionStar` -> `ExpandRowReference`): the item's
+/// columns, under their own names. A column named `v` wins, so `(v).*` of
+/// an integer column stays PostgreSQL's 42809; so does a one-column
+/// function's alias, whose whole row is the function's scalar value.
+/// `None` when the select list holds none to rewrite.
+fn whole_row_star_rewrite(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<pg_query::protobuf::SelectStmt> {
+    let is_star = |n: &pg_query::protobuf::Node| matches!(n.node.as_ref(), Some(N::AStar(_)));
+    // The item a target `(q).*` / `(q.*).*` names, and whether it was the
+    // qualified star `q.*`, which is the row whatever the columns are.
+    let named = |t: &pg_query::protobuf::Node| -> Option<(String, bool, i32)> {
+        let Some(N::ResTarget(rt)) = t.node.as_ref() else {
+            return None;
+        };
+        let Some(N::AIndirection(ind)) = rt.val.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        if !matches!(ind.indirection.as_slice(), [star] if is_star(star)) {
+            return None;
+        }
+        let Some(N::ColumnRef(c)) = ind.arg.as_deref()?.node.as_ref() else {
+            return None;
+        };
+        let (q, qualified_star) = match c.fields.as_slice() {
+            [q] => (q, false),
+            [q, star] if is_star(star) => (q, true),
+            _ => return None,
+        };
+        match q.node.as_ref() {
+            Some(N::String(q)) => Some((q.sval.clone(), qualified_star, c.location)),
+            _ => None,
+        }
+    };
+    if !s.target_list.iter().any(|t| named(t).is_some()) {
+        return None;
+    }
+    let mut ctes = VISIBLE_CTES.with(|v| v.borrow().clone());
+    ctes.extend(s.with_clause.iter().flat_map(|w| w.ctes.iter().cloned()));
+    let mut columns = Vec::new();
+    for item in &s.from_clause {
+        collect_from_columns(item, lookup, &ctes, &mut columns);
+    }
+    let whole_row = |name: &str| -> bool {
+        if columns.iter().any(|c| c == name) {
+            return false;
+        }
+        let Some(item) = s
+            .from_clause
+            .iter()
+            .find_map(|item| correlated::named_item(item, name))
+        else {
+            return false;
+        };
+        match item.node.as_ref() {
+            Some(N::RangeFunction(rf)) => {
+                correlated::without_calls(|| joins::function_columns(rf, lookup, &[]))
+                    .is_some_and(|cols| cols.len() > 1)
+            }
+            _ => true,
+        }
+    };
+    let mut out = s.clone();
+    let mut changed = false;
+    for t in &mut out.target_list {
+        let Some((q, qualified_star, location)) = named(t) else {
+            continue;
+        };
+        if !qualified_star && !whole_row(&q) {
+            continue;
+        }
+        let Some(N::ResTarget(rt)) = t.node.as_mut() else {
+            continue;
+        };
+        rt.val = Some(Box::new(pg_query::protobuf::Node {
+            node: Some(N::ColumnRef(pg_query::protobuf::ColumnRef {
+                fields: vec![
+                    string_node(&q),
+                    pg_query::protobuf::Node {
+                        node: Some(N::AStar(pg_query::protobuf::AStar {})),
+                    },
+                ],
+                location,
+            })),
+        }));
+        changed = true;
+    }
+    changed.then_some(out)
+}
+
 thread_local! {
     /// The FROM subqueries `column_alias_rewrite` made of a table with a
     /// column-alias list: `(alias, subquery, table)`.
@@ -27043,6 +27139,10 @@ fn plan_select(
     cancel::check()?;
     // `(j).value` where `j` names a FROM item: the item's column.
     if let Some(rewritten) = alias_field_rewrite(s, lookup)? {
+        return plan_select(&rewritten, lookup, params);
+    }
+    // `(v).*` where `v` names a FROM item: the item's star (RP-704).
+    if let Some(rewritten) = whole_row_star_rewrite(s, lookup) {
         return plan_select(&rewritten, lookup, params);
     }
     if s.op != pg_query::protobuf::SetOperation::SetopNone as i32 {

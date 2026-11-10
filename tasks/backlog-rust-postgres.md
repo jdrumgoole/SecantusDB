@@ -3156,14 +3156,6 @@ the column written out, so none is the star's. The gap tests are in
       over an unaliased `generate_series(1, 2) f`.
       Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
       Backlog-ID: RP-702
-- [ ] **`(v).*` in a select list is 0A000.** `select (v).* from (values
-      (1)) v(a)` answers `1`, column `a`, on PostgreSQL 15.19 and over `v(a,
-      b)` both columns (`transformIndirection` expands a whole row's star
-      as `v.*`); here each is 0A000 `this field selection is not supported
-      yet`. Since RP-699 the same star inside an expression subquery is
-      answered.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_whole_row_star_in_a_select_list
-      Backlog-ID: RP-704
 - [ ] **A field of an outer item's whole row in a LATERAL subquery is
       42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
       as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k
@@ -3671,3 +3663,20 @@ statement is VALUES-only and runs there as written. The gap tests are in
       comparison with ~<~ and a subquery is not supported yet`.
       Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
       Backlog-ID: RP-851
+
+## Found while working RP-704 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement reads only `VALUES` lists.
+
+- [ ] **A star over a FROM subquery in a grouped query is 42803 with no
+      column name.** `select v.* from (values (1), (1)) v(a) group by a`
+      answers `1`, column `a`, on PostgreSQL 15.19, and so does `(v).*`
+      beside a `count(*)` grouped by `v.a`; `... group by v` is 42803
+      `column "v.a" must appear in the GROUP BY clause or be used in an
+      aggregate function` at 8. Here each is 42803 `column "" must appear
+      in the GROUP BY clause ...` with no position: `expand_star_in_grouped`
+      expands a star over a lone table only, so the star reaches the
+      grouping check unexpanded.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_a_star_over_a_from_subquery_in_a_grouped_query
+      Backlog-ID: RP-852

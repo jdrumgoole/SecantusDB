@@ -6930,3 +6930,59 @@ fn a_select_list_literal_over_a_from_item_is_typed_by_its_node() {
         );
     }
 }
+
+/// `sql`'s select list after `whole_row_star_rewrite`, deparsed; `None`
+/// when it rewrote nothing.
+fn whole_row_star(sql: &str) -> Option<String> {
+    let parsed = pg_query::parse(sql).unwrap();
+    let Some(N::SelectStmt(s)) = parsed.protobuf.stmts[0]
+        .stmt
+        .as_ref()
+        .and_then(|n| n.node.as_ref())
+    else {
+        panic!("not a SELECT: {sql}");
+    };
+    let out = whole_row_star_rewrite(s, &lookup)?;
+    let tree = pg_query::protobuf::ParseResult {
+        version: parsed.protobuf.version,
+        stmts: vec![pg_query::protobuf::RawStmt {
+            stmt: Some(Box::new(pg_query::protobuf::Node {
+                node: Some(N::SelectStmt(Box::new(out))),
+            })),
+            stmt_location: 0,
+            stmt_len: 0,
+        }],
+    };
+    Some(pg_query::deparse(&tree).unwrap())
+}
+
+#[test]
+fn a_whole_row_star_is_the_items_star() {
+    // PostgreSQL 15.19 (RP-704): `transformIndirection` reads `(v)` as the
+    // FROM item's whole row when no column is named `v`, and expands its
+    // star as `v.*` does.
+    assert_eq!(
+        whole_row_star("select 0 as k, (v).* from (values (1)) v(a)").as_deref(),
+        Some("SELECT 0 AS k, v.* FROM (VALUES (1)) v(a)")
+    );
+    assert_eq!(
+        whole_row_star("select (x).* from t x").as_deref(),
+        Some("SELECT x.* FROM t x")
+    );
+    // `(v.*).*` is the row whatever the item's columns are called.
+    assert_eq!(
+        whole_row_star("select (v.*).* from (values (1)) v(v)").as_deref(),
+        Some("SELECT v.* FROM (VALUES (1)) v(v)")
+    );
+    // A column of the name wins: `(v).*` of an integer is PostgreSQL's
+    // 42809, as is a one-column function's alias, whose whole row is its
+    // scalar value.
+    assert_eq!(whole_row_star("select (v).* from (values (1)) v(v)"), None);
+    assert_eq!(whole_row_star("select (name).* from t name"), None);
+    assert_eq!(
+        whole_row_star("select (f).* from generate_series(1, 2) f(x)"),
+        None
+    );
+    // A name no FROM item has is left to be reported as a missing column.
+    assert_eq!(whole_row_star("select (q).* from t"), None);
+}
