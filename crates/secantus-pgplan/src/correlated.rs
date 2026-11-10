@@ -1566,7 +1566,7 @@ pub(crate) fn outer_field_selections(
 /// The FROM item of one list that answers to `name`: a relation or a
 /// derived table by its alias (a relation without one by its name), an
 /// aliased JOIN by its alias alone, an unaliased one by its sides' names.
-fn named_item<'a>(
+pub(crate) fn named_item<'a>(
     item: &'a pg_query::protobuf::Node,
     name: &str,
 ) -> Option<&'a pg_query::protobuf::Node> {

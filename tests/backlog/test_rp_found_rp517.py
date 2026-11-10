@@ -8,7 +8,8 @@ explicitly as well as through a star, so they are not the star's:
 - a correlated subquery that passed an outer FROM function's column, or a
   field of an outer whole row, through unchanged answered it as text, and
   `(v).*` there was refused (RP-699, fixed);
-- a GROUP BY naming a correlated subquery target is 42803 (RP-700);
+- a GROUP BY naming a correlated subquery target was 42803 (RP-700,
+  fixed);
 - a LATERAL subquery's outer column is named by its type, and a star over
   an outer item there is 42P01 (RP-701).
 
@@ -312,11 +313,12 @@ def test_correlated_pass_through_keeps_its_type(query: str, dsn: str) -> None:
 
 
 # A GROUP BY item that is the correlated subquery itself (by position or
-# written out) groups by it, so its outer column is grouped. Here the
-# first is 42803 `subquery uses ungrouped column "v.a" from outer query`,
-# the star form 42P01 `missing FROM-clause entry for table "v"` and the
-# written-out one 42803 `column "v.a" must appear in the GROUP BY clause`,
-# each at 16.
+# written out) groups by it, so its outer column is grouped. The first was
+# 42803 `subquery uses ungrouped column "v.a" from outer query`, the star
+# form 42P01 `missing FROM-clause entry for table "v"` and the written-out
+# one 42803 `column "v.a" must appear in the GROUP BY clause`, each at 16:
+# the subquery split resolved no GROUP BY position, and the aggregate
+# planner keyed on no subquery (RP-700, fixed).
 GROUP_BY_CORRELATED_TARGET = {
     "select (select v.a) from (values (1)) v(a) group by 1": ([(1,)], ["a"]),
     "select (select v.*) from (values (1)) v(a) group by 1": ([(1,)], ["a"]),
@@ -327,7 +329,7 @@ GROUP_BY_CORRELATED_TARGET = {
 }
 
 
-@pytest.mark.backlog("RP-700")
+@pytest.mark.backlog_fixed("RP-700")
 @pytest.mark.parametrize("query", list(GROUP_BY_CORRELATED_TARGET))
 def test_group_by_a_correlated_subquery_target(query: str, dsn: str) -> None:
     assert answer(dsn, query) == GROUP_BY_CORRELATED_TARGET[query]

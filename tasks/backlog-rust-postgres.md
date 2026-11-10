@@ -355,6 +355,26 @@ one beside it.
 
 ## 5. Known bugs and edge cases to watch
 
+- [ ] **NOT REPRODUCED -- left open as a watch item. SERIALIZABLE
+  raised a false 40001 once in the GIN isolation spec (2026-11-10).**
+  `tests/backlog/test_rp_isolation.py::test_ssi_index_access_methods[predicate-gin]`
+  (RP-254's regression test) failed in a local `gate_pg.sh --fast` backlog
+  step, under a load average of about 14 on 12 cores. In permutation
+  `ra1 ro2 wo1 c1 wb2 c2`, `wb2` (`insert into gin_tbl values (array[2])`)
+  was 40001 `could not serialize access due to read/write dependencies
+  among transactions`, `Canceled on identification as a pivot, during
+  write`. PostgreSQL 15.19 inserts and commits there: `ra1`'s `p @>
+  array[1] limit 1` holds SIREAD locks only on key 1's GIN pages, so `wb2`
+  makes no conflict. Here `ra1`'s read overlapped `wb2`'s write, which
+  points at the read locking more GIN pages than PostgreSQL does, perhaps
+  rows read past the LIMIT. That was not measured. The batch's change at
+  the time, RP-843 (select-list literal typing), is not on any path this
+  spec runs, and the gate before the rebase passed it. On the same commit
+  it then passed 4 of 4 runs alone and 24 of 24 runs six at a time. On a
+  recurrence, record which GIN pages `ra1` locked (`pg_locks` of s1 before
+  `c1`) and how many rows its scan read.
+  Verify: none -- intermittent, not reproduced; RP-254's isolation test is the check
+  Backlog-ID: RP-848
 - [ ] **NOT REPRODUCED -- left open as a watch item. A `CREATE VIEW`
   went unanswered for 10 s once (2026-11-08).** `tests/backlog/test_rp_found_pgtest.py::test_view_columns_name_their_base_columns`
   (a regression test) failed in CI's `pg-oracle (backlog)` lane on
@@ -3103,16 +3123,6 @@ Measured on a private PostgreSQL 15.19 cluster with `fe(a int, b text)` and
 the column written out, so none is the star's. The gap tests are in
 `tests/backlog/test_rp_found_rp517.py`.
 
-- [ ] **A GROUP BY naming a correlated subquery target is refused.**
-      `select (select v.a) from (values (1)) v(a) group by 1`, its `(select
-      v.*)` form and `group by (select v.a)` each answer `1` on PostgreSQL
-      15.19: the grouped item is the subquery, so its outer column is
-      grouped. Here the first is 42803 `subquery uses ungrouped column "v.a"
-      from outer query`, the star form 42P01 `missing FROM-clause entry for
-      table "v"`, the written-out one 42803 `column "v.a" must appear in the
-      GROUP BY clause or be used in an aggregate function`, each at 16.
-      Verify: tests/backlog/test_rp_found_rp517.py::test_group_by_a_correlated_subquery_target
-      Backlog-ID: RP-700
 - [ ] **A LATERAL subquery's outer column is named by its type, and a star
       over an outer item there is 42P01.** `select l.* from (values (3))
       v(a), lateral (select v.a) l` names its column `a` on PostgreSQL 15.19
@@ -3136,24 +3146,6 @@ the column written out, so none is the star's. The gap tests are in
       over an unaliased `generate_series(1, 2) f`.
       Verify: tests/backlog/test_rp_found_rp699.py::test_function_whole_row_under_a_column_alias
       Backlog-ID: RP-702
-- [ ] **A correlated subquery in the WHERE of a query over a FROM function
-      is 42883 and names the internal call.** `select 1 from
-      generate_series(1, 2) f(x) where (select f.x + 1) > 0` answers two
-      rows on PostgreSQL 15.19 and `where exists (select 1 where f.x > 1)`
-      one; here each is 42883 `function \x1fcorrelated(integer, unknown,
-      ...) does not exist`, the per-row call that stands in for the
-      subquery leaking into the client's error. The same subquery in the
-      select list, or over a VALUES list, is answered.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_correlated_subquery_in_a_function_scan_where
-      Backlog-ID: RP-703
-- [ ] **`(v).*` in a select list is 0A000.** `select (v).* from (values
-      (1)) v(a)` answers `1`, column `a`, on PostgreSQL 15.19 and over `v(a,
-      b)` both columns (`transformIndirection` expands a whole row's star
-      as `v.*`); here each is 0A000 `this field selection is not supported
-      yet`. Since RP-699 the same star inside an expression subquery is
-      answered.
-      Verify: tests/backlog/test_rp_found_rp699.py::test_whole_row_star_in_a_select_list
-      Backlog-ID: RP-704
 - [ ] **A field of an outer item's whole row in a LATERAL subquery is
       42703.** `select l.* from (values (3)) v(a), lateral (select (v).a + 0
       as k) l` answers `3` on PostgreSQL 15.19 and `lateral (select 1 as k
@@ -3169,15 +3161,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 `tests/backlog/test_rp_found_rp697.py`: `rn697(k int, a int, c text)` and
 `ch697(k int, c char(3), v varchar(4))`.
 
-- [ ] **An uncorrelated `row op ANY / ALL (subquery)` with an ordering
-      operator is refused.** `select k, (k, a) < any (select 2, 3) from
-      rn697` answers per row on PostgreSQL 15.19 (each subquery row a
-      `RowCompareExpr` with the row); here it is 0A000 `a row comparison
-      with < and a subquery is not supported yet`, as is `>= all`.
-      `row_subquery_comparison` builds only `=` and `<>`; the correlated
-      form is answered since RP-697.
-      Verify: tests/backlog/test_rp_found_rp697.py::test_uncorrelated_ordered_row_any
-      Backlog-ID: RP-727
 - [ ] **A row compared with a subquery whose column has no operator with
       the row's field is not 42883.** `(a, c) = (select 1, 2)`, `c` text,
       is 42883 `operator does not exist: text = integer` at 18 on
@@ -3618,13 +3601,95 @@ its first input gave.
       hashed.
       Verify: tests/backlog/test_rp_found_rp692.py::test_an_intersect_over_a_join_puts_the_smaller_input_first
       Backlog-ID: RP-841
-- [ ] **A numeric constant selected from a FROM item is refused by
-      INSERT.** `insert into t692e select 1.0, g from generate_series(1, 2)
-      g`, the same over `(values (3)) v(g)`, and `insert into t692e (x)
-      select 1.5 from t692j` insert their rows on PostgreSQL 15.19. Here
-      each is 42804 `column "x" is of type numeric but expression is of
-      type text`, though `insert into t692e select 1.0, 1`, with no FROM,
-      is inserted: the select list's constant over a FROM item is typed
-      `text`.
-      Verify: tests/backlog/test_rp_found_rp692.py::test_a_numeric_constant_selected_from_a_from_item_is_inserted
-      Backlog-ID: RP-843
+
+## Found while working RP-703 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is a FROM function and runs there as written.
+
+- [ ] **EXPLAIN of a `generate_series` in FROM prints no alias and no
+      Filter.** `explain (costs off) select 1 from generate_series(1, 2)
+      f(x) where x > 1` is `Function Scan on generate_series f` /
+      `Filter: (x > 1)` on PostgreSQL 15.19 (`ExplainNode` names the
+      alias, `show_scan_qual` the quals the scan applies to each row), and
+      a WHERE that runs per row (`f.x + 1 > 0`, since RP-703) is a
+      `Filter:` the same way. Here each prints the bare `Function Scan on
+      generate_series`, with or without the alias and the WHERE; with
+      costs, its estimate is `rows=0 width=0` where PostgreSQL's is
+      `rows=1 width=4`.
+      Verify: tests/backlog/test_rp_found_rp703.py::test_a_series_scan_explains_its_alias_and_filter
+      Backlog-ID: RP-847
+
+## Found while working RP-727 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp727.py`.
+
+- [ ] **A row comparison of zero-length rows answers.** `select row() =
+      row()`, `row() <> row()` and `row() in (select)` are 0A000 `cannot
+      compare rows of zero length` at the operator (14) on PostgreSQL 15.19
+      (`make_row_comparison_op`); here they answer `t`, `f` and `t`. Since
+      RP-727 an ordering operator against a subquery (`row() < any
+      (select)`) is refused as PostgreSQL refuses it.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_zero_length_row_comparison_is_0a000
+      Backlog-ID: RP-849
+- [ ] **A row field that is an untyped literal is not coerced to its
+      pair's type.** `select (1, '2') = (1, 2)` and `(1, '2') < any
+      (select 1, 3)` are `t` on PostgreSQL 15.19: each pair's operator is
+      resolved as the statement is analysed, and the `unknown` literal
+      takes the other side's type. `(1, 'a') < (1, 2)` is then 22P02
+      `invalid input syntax for type integer: "a"` at 12. Here each is
+      0A000 `comparing string with int32 using ... is not supported yet`,
+      with no position: the literal is compared as a string.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_untyped_literal_in_a_row_takes_its_pairs_type
+      Backlog-ID: RP-850
+- [ ] **A row comparison with a pattern operator is refused.** `select
+      ('a', 'b') ~<~ ('a', 'c')` and `('a', 'b') ~<~ any (select 'a', 'c')`
+      are `t` on PostgreSQL 15.19: `~<~` is a btree operator (of
+      `text_pattern_ops`), so `make_row_comparison_op` builds a
+      RowCompareExpr of it as of `<`. Here the first is 42804 `collations
+      are not supported by type record` and the second 0A000 `a row
+      comparison with ~<~ and a subquery is not supported yet`.
+      Verify: tests/backlog/test_rp_found_rp727.py::test_row_comparison_with_a_pattern_operator
+      Backlog-ID: RP-851
+
+## Found while working RP-704 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement reads only `VALUES` lists.
+
+- [ ] **A star over a FROM subquery in a grouped query is 42803 with no
+      column name.** `select v.* from (values (1), (1)) v(a) group by a`
+      answers `1`, column `a`, on PostgreSQL 15.19, and so does `(v).*`
+      beside a `count(*)` grouped by `v.a`; `... group by v` is 42803
+      `column "v.a" must appear in the GROUP BY clause or be used in an
+      aggregate function` at 8. Here each is 42803 `column "" must appear
+      in the GROUP BY clause ...` with no position: `expand_star_in_grouped`
+      expands a star over a lone table only, so the star reaches the
+      grouping check unexpanded.
+      Verify: tests/backlog/test_rp_found_rp699.py::test_a_star_over_a_from_subquery_in_a_grouped_query
+      Backlog-ID: RP-852
+
+## Found while working RP-700 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written.
+
+- [ ] **An ungrouped column beside a subquery in a grouped select list is
+      42703, not 42803.** `select b, (select 1) from (values (1, 2)) v(a,
+      b) group by a` is 42803 `column "v.b" must appear in the GROUP BY
+      clause or be used in an aggregate function` at 8 on PostgreSQL 15.19,
+      and `select (select v.a), b ... group by 1` the same at 22. Here each
+      is 42703 `column "b" does not exist`, with a HINT that `v` has one:
+      `agg_hoist::split` reads `b` from the grouped FROM subquery it builds,
+      and calls `check_stray` only for a query with no GROUP BY.
+      Verify: tests/backlog/test_rp_found_rp700.py::test_an_ungrouped_column_beside_a_subquery_is_42803
+      Backlog-ID: RP-853
+- [ ] **A GROUP BY constant that is no integer is not 42601.** `select 1
+      from (values (1)) v(a) group by 1.5` is 42601 `non-integer constant
+      in GROUP BY` at 42 on PostgreSQL 15.19 (`findTargetlistEntrySQL92`),
+      and so is a string, NULL or boolean constant there. Here each is
+      0A000 `this target is not supported yet`, with no position.
+      Verify: tests/backlog/test_rp_found_rp700.py::test_a_non_integer_group_by_constant_is_42601
+      Backlog-ID: RP-854
