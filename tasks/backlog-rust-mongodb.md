@@ -905,12 +905,14 @@ These are explicit non-goals. Don't add them without a reason.
       `failed` and `total`. Found while working RM-380, 2026-11-10.
       Verify: tests/backlog/test_rm_view_namespaces.py::test_a_command_metric_counts_rejections
       Backlog-ID: RM-491
-- [ ] **A `dropDatabase` line names `<db>.$cmd`.** mongod 8.2.11's `Slow
-      query` line for a `dropDatabase` names the database alone (`ns:
-      "<db>"`); this server's names `<db>.$cmd`, as it does for a command
-      that runs on no collection. Found while working RM-363, 2026-11-07.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_a_drop_database_line_names_the_database
-      Backlog-ID: RM-383
+- [ ] **A `Slow query` line takes a command's string argument for its
+      collection.** mongod 8.2.11's lines for a `validate: "c"`, a
+      `dataSize: "<db>.c"` and a `getLog` name `<db>.$cmd`; this server's
+      name `<db>.c`, `<db>.<db>.c` and `<db>.startupWarnings`
+      (`slowop::target_collection` reads any command's string value as
+      one). Found while working RM-383, 2026-11-10.
+      Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection
+      Backlog-ID: RM-495
 - [ ] **Dropping a view writes no profile entry.** mongod 8.2.11 profiles a
       `drop` of a view as it profiles a `drop` of a collection (`{op:
       "command", ns: "<db>.v", command: {drop: "v"}}`); this server writes
