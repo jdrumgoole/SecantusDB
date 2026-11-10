@@ -25,5 +25,5 @@ across its commit, which is where mongod reserves a transaction's slots.
   PostgreSQL server also links. Only the asynchronous-oplog path changes,
   and the PostgreSQL server sets no option that selects it.
 - Fixes RM-379 (tests/backlog/test_rm_355_364.py::test_an_async_oplog_write_says_how_long_it_held_its_oplog_slot)
-- Filed RP-747: RP-202's cancel test was honoured up to 0.52 s late, against its 0.3 s budget, in this item's PG gate. It then passed 14 of 14 runs on two rebuilt commits.
-- Filed RP-748: the local login comparison differs in 6 of 547 TLS CRL scenarios, because the reference PostgreSQL 15 now links OpenSSL 4.
+- Filed RP-748: RP-202's cancel test was honoured up to 0.52 s late, against its 0.3 s budget, in this item's PG gate. It then passed 14 of 14 runs on two rebuilt commits.
+- Filed RP-747: the local login comparison differs in 6 of 547 TLS CRL scenarios, because the reference PostgreSQL 15 now links OpenSSL 4.
