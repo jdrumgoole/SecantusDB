@@ -667,6 +667,13 @@ fn listed(test_commands: bool) -> Vec<(&'static str, bool, Bson)> {
             true,
             Bson::Int64((crate::cursors::DEFAULT_IDLE_TTL_SECONDS * 1000.0) as i64),
         ),
+        // mongod's FTDC sampling, honoured by the collector (`crate::ftdc`).
+        ("diagnosticDataCollectionEnabled", true, Bson::Boolean(true)),
+        (
+            "diagnosticDataCollectionPeriodMillis",
+            true,
+            Bson::Int32(1000),
+        ),
         // Whether the logical session cache refreshes and reaps at all.
         (
             "disableLogicalSessionCacheRefresh",

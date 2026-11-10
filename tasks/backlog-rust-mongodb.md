@@ -1538,16 +1538,31 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       Carried over from RM-219 when its last commands landed, 2026-11-08.
       Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_admin_command_remainders
       Backlog-ID: RM-416
-- [ ] **FTDC is a sample in memory only.** Since 2026-11-08
-      `getDiagnosticData` answers mongod's periodic sample (RM-219). Open:
-      the sample has no `transportLayerStats` collector; nothing is written
-      to `diagnostic.data` (mongod keeps `metrics.*` files there); and
-      `getParameter` / `setParameter` do not know
-      `diagnosticDataCollectionEnabled` (true),
-      `diagnosticDataCollectionPeriodMillis` (1000) or the other
-      `diagnosticData*` parameters (72 here), so the period cannot change.
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_ftdc_parameters_and_transport_collector
+- [ ] **FTDC is a sample in memory only.** Since 2026-11-10 the sample
+      carries `transportLayerStats` and `diagnosticDataCollectionEnabled` /
+      `diagnosticDataCollectionPeriodMillis` switch it and set its period.
+      Open: nothing is written to `diagnostic.data` (mongod 8.2.11 keeps
+      `metrics.<time>-00000` files and `metrics.interim` there, and reports
+      the directory in `diagnosticDataCollectionDirectoryPath`), so the
+      other `diagnosticData*` parameters, which tune that writer, are not
+      registered (72 here). In `transportLayerStats` mongod also lists its
+      Unix domain socket (`/tmp/mongodb-<port>.sock`), which this server
+      does not listen on, and on Linux measures each TCP listener's backlog
+      depth and counts the connections it discards for a client that left;
+      macOS mongod reports 0 for both, as this server does everywhere (the
+      Linux measurement is not in the macOS binary; not probed on Linux).
+      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_samples_are_written_to_diagnostic_data
       Backlog-ID: RM-417
+- [ ] **`setParameter` takes a double just past an int's range.**
+      mongod 8.2.11 refuses `2147483647.9` and `-2147483648.5` for an int
+      parameter (`transactionLifetimeLimitSeconds`,
+      `diagnosticDataCollectionPeriodMillis`) with 2 "Failed validating
+      <name>: Out of bounds coercing to integral value", and takes
+      `2147483647.0`: it bounds the double before truncating it. This
+      server's `params::integral` truncates first, so it stores 2147483647
+      for the first. Found 2026-11-10 (RM-417).
+      Verify: tests/backlog/test_rm_found_2026_11_10_rm417.py::test_an_int_parameter_bounds_the_double_before_truncating
+      Backlog-ID: RM-541
 - [ ] **Query settings keep `queryFramework` without acting on it.** Since
       2026-11-08 `setQuerySettings` / `removeQuerySettings` / `$querySettings`
       keep mongod's settings and a read of their shape is refused (411) or
