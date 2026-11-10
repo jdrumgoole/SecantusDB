@@ -507,7 +507,14 @@ impl<'p> Scope<'p> {
                     _ => None,
                 })
                 .unwrap_or_else(|| "?column?".to_string());
-            let ty = operand_type(val, &inner).unwrap_or_default();
+            // An untyped literal or NULL is `text` to the query around
+            // this one (`resolveTargetListUnknowns`, which a FROM
+            // subquery, a CTE and a view are analysed with).
+            let ty = if is_untyped_literal(val) {
+                "text".to_string()
+            } else {
+                operand_type(val, &inner).unwrap_or_default()
+            };
             columns.push(Column::new(&name, &ty, true));
         }
         // A name the derived table has twice is ambiguous to a reference
@@ -954,17 +961,10 @@ fn operand_type_declared(n: &pg_query::protobuf::Node, scope: &Scope) -> Option<
             else {
                 return None;
             };
-            if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32
-                || sub.with_clause.is_some()
-            {
+            if sub.with_clause.is_some() {
                 return None;
             }
-            let lookup = scope.lookup?;
-            let inner = Scope::new(&sub.from_clause, &scope.ctes, lookup, Some(scope));
-            let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
-                return None;
-            };
-            operand_type(rt.val.as_deref()?, &inner)
+            first_output_type(sub, scope)?.or_else(|| Some("text".into()))
         }
         // CASE / COALESCE / GREATEST / LEAST: their branches' common type,
         // untyped literals taking it.
@@ -2862,6 +2862,45 @@ fn literal_fits(n: &pg_query::protobuf::Node, ty: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A bare string literal or NULL: of type `unknown` where it is written.
+fn is_untyped_literal(n: &pg_query::protobuf::Node) -> bool {
+    matches!(n.node.as_ref(), Some(N::AConst(c))
+        if c.isnull || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_))))
+}
+
+/// The type of a subquery's first output column, as a scalar subquery
+/// over it is typed: `Some(None)` when every arm gives an untyped literal
+/// or NULL there -- which the query around it reads as `text`, as
+/// `resolveTargetListUnknowns` resolves a subquery's own targets and a set
+/// operation its all-unknown columns -- and `None` when this cannot tell.
+/// Arms of different known types are `None` too: their common type is the
+/// planner's to judge.
+fn first_output_type(
+    sub: &pg_query::protobuf::SelectStmt,
+    scope: &Scope,
+) -> Option<Option<String>> {
+    if sub.op != pg_query::protobuf::SetOperation::SetopNone as i32 {
+        let left = first_output_type(sub.larg.as_deref()?, scope)?;
+        let right = first_output_type(sub.rarg.as_deref()?, scope)?;
+        return match (left, right) {
+            (None, t) | (t, None) => Some(t),
+            (Some(l), Some(r)) => (l == r).then_some(Some(l)),
+        };
+    }
+    if sub.with_clause.is_some() || !sub.values_lists.is_empty() {
+        return None;
+    }
+    let Some(N::ResTarget(rt)) = sub.target_list.first()?.node.as_ref() else {
+        return None;
+    };
+    let val = rt.val.as_deref()?;
+    if is_untyped_literal(val) {
+        return Some(None);
+    }
+    let inner = Scope::new(&sub.from_clause, &scope.ctes, scope.lookup?, Some(scope));
+    operand_type(val, &inner).map(Some)
 }
 
 /// The type several branches share: their known types agreeing (numbers

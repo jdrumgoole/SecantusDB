@@ -3326,21 +3326,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
 
-- [ ] **A subquery over an untyped literal is `unknown` outside it.**
-      PostgreSQL 15.19 resolves an untyped literal in a subquery's target
-      list to `text` (`resolveTargetListUnknowns`), so `select 1 =
-      (select '1')` is 42883 `operator does not exist: integer = text`,
-      `(select '2020-01-01') < now()` is 42883 too, and `case when false
-      then 1 else (select 'a') end` is 42804 `CASE types text and integer
-      cannot be matched`. Here the outer expression still coerces the
-      literal to the other side's type: `1 = (select '1')` and `(select
-      'a') = 1` are 0A000 `comparing int32 with string using = is not
-      supported yet` (`1 = (select '1')` answered true before RP-707), the
-      `< now()` answers true, and the CASE is 22P02. `(select 'a'::text) = 1`
-      is already right, and `pg_typeof((select 'a'))` is `text` since
-      RP-707.
-      Verify: tests/backlog/test_rp_found_rp707.py::test_an_untyped_literal_subquery_is_text_outside_it
-      Backlog-ID: RP-756
 - [ ] **A scalar subquery in an `IN` list is refused.** `x in ((select
       max(y) ...), 'tt')` is an ordinary list on PostgreSQL 15.19 (each
       element compared by `=`, ORed); here the statement is 0A000 `SubLink
@@ -3387,3 +3372,21 @@ never with `expr` as it reads the select list.
       too (unmeasured, it needs a `CREATE TYPE`).
       Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_min_max_under_a_collation
       Backlog-ID: RP-763
+
+## Found while working RP-756 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written.
+
+- [ ] **A FROM subquery's set operation is not typed by the operator
+      check.** `select x = 1 from (select 'a'::text union select 'b')
+      s(x)` is 42883 `operator does not exist: text = integer` at 10 on
+      PostgreSQL 15.19 (the set operation's column is its arms' common
+      type, `text` when both are untyped literals); here it is 0A000
+      `comparing string with int32 using = is not supported yet`, raised
+      at run time with no position. `optype.rs`'s `add_derived` marks a
+      set-operation FROM item incomplete, so none of its columns is
+      typed. A scalar subquery over a set operation is typed since RP-756
+      (`first_output_type`).
+      Verify: tests/backlog/test_rp_found_rp756.py::test_a_set_operation_from_subquerys_column_is_typed
+      Backlog-ID: RP-765
