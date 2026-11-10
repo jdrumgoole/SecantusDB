@@ -62,9 +62,10 @@ pub fn apply_pipeline(
         DOWNSTREAM.with(|d| all.extend(d.borrow().iter().cloned()));
         group::downstream_fields(&all)
     };
-    // The query layer's `$sort` when it spilled: what it counted, and the
-    // stage its executor's documents reach through the cursor stage (RM-326).
-    // Its sizes are those of the documents that reach that stage.
+    // The query layer's `$sort`: what it counted, and the stage its
+    // executor's documents reach through the cursor stage (RM-326), which
+    // reports it once per load, spilled or not (RM-400). Its sizes are those
+    // of the documents that reach that stage.
     let mut cursor_read: Option<memlimit::CursorRead> = None;
     let note_read = |read: &mut Option<memlimit::CursorRead>, i: usize, docs: &[Document]| {
         if let Some(mut read) = read.take_if(|read| read.at == i) {
@@ -106,7 +107,7 @@ pub fn apply_pipeline(
                 let before = memlimit::report();
                 let sorted = window_sort_budget(&docs, spec, vars, source, fields)?;
                 let sort = memlimit::report().less(&before);
-                if source == crate::sorter::SortSource::QueryLayer && sort.sort_spills > 0 {
+                if source == crate::sorter::SortSource::QueryLayer {
                     // The executor hands the stage its documents sorted.
                     let sizes = sorted.iter().map(|(_, d)| memlimit::bson_len(d)).collect();
                     memlimit::note_cursor_read(memlimit::CursorRead {
@@ -174,7 +175,7 @@ pub fn apply_pipeline(
                 }
             };
             let sort = memlimit::report().less(&before);
-            if source == Some(crate::sorter::SortSource::QueryLayer) && sort.sort_spills > 0 {
+            if source == Some(crate::sorter::SortSource::QueryLayer) {
                 // The stages after it the query layer also takes.
                 let mut at = i + 1;
                 while pipeline.get(at).is_some_and(|st| {

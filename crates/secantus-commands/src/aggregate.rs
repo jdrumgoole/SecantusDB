@@ -1064,11 +1064,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
     let total = result.len();
     let (first_batch, mut cursor_id) =
         split_docs_into_cursor_checked(result, batch_size, &ns, cursors, false, Some(&prefix))?;
-    // A query-layer sort that spilled is reported once for each buffer the
-    // cursor stage loaded from it for this batch (RM-326): in the
-    // operation's own counts, never in what `explain` says of its stages.
+    // A query-layer sort is reported once for each buffer the cursor stage
+    // loaded from it for this batch (RM-326): in the operation's own counts,
+    // never in what `explain` says of its stages. A cursor left open loads
+    // on at each `getMore` (RM-400).
     let read = secantus_core::memlimit::take_cursor_read()
         .filter(|_| !crate::explain::order::is_uncounted());
+    let mut loads = None;
     if let Some(read) = read {
         let wanted = if batch_size < 0 {
             DEFAULT_BATCH_SIZE as usize
@@ -1079,17 +1081,32 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let pulls = first_batch.len() + usize::from(first_batch.len() == total && total < wanted);
         let downstream = working_pipeline.get(read.at..).unwrap_or_default();
         if !downstream.is_empty() {
-            let loads = crate::agg_executor::cursor_loads(
-                downstream,
-                &read.sizes,
-                read.limited,
-                &read.reads,
-                pulls,
-            );
-            if let Some(more) = loads.and_then(|n| n.checked_sub(1)).filter(|n| *n > 0) {
-                secantus_core::memlimit::add_sort_counts(&read.sort, more as i64);
+            let mut stage = crate::cursors::CursorLoads {
+                sort: read.sort,
+                downstream: downstream.to_vec(),
+                sizes: read.sizes,
+                limited: read.limited,
+                reads: read.reads,
+                pulled: 0,
+                loaded: 1,
+            };
+            if let Some(more) = stage.pull(pulls).filter(|n| *n > 0) {
+                secantus_core::memlimit::add_sort_counts(&stage.sort, more);
             }
+            loads = Some(stage);
         }
+    }
+    // Every document was read for the first batch: the cursor's `getMore`s
+    // name the command that opened it and repeat its plan (RM-400).
+    if cursor_id != 0 {
+        let has_sort_stage = secantus_core::memlimit::report().has_sort_stage;
+        let plan_summary = crate::explain::summary::plan_summary(doc, ctx);
+        ctx.cursors()?.update_counts(cursor_id, |c| {
+            c.origin = Some(doc.clone());
+            c.plan_summary = plan_summary;
+            c.has_sort_stage = has_sort_stage;
+            c.loads = loads;
+        });
     }
     // `batchSize: 0` asks for the cursor and no documents, and mongod opens
     // one even over nothing -- a missing collection included.
