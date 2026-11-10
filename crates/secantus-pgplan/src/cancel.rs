@@ -58,8 +58,41 @@ pub(crate) fn pending() -> bool {
 /// list) plans for seconds; without these a cancel that missed the parse
 /// waited for all of them, and every repeat of a statement misses it,
 /// because the parse is memoised.
+#[track_caller]
 pub(crate) fn check() -> Result<()> {
-    match reason() {
+    let why = reason();
+    if trace_on() {
+        // A check that stops is always traced; one that lets the plan go on
+        // only after a gap of 20 ms or more since this thread's last check,
+        // which is the stretch a cancel could not interrupt. Every check
+        // would be tens of thousands of lines a statement.
+        type Last = Option<(std::time::Instant, &'static std::panic::Location<'static>)>;
+        thread_local! {
+            static LAST_CHECK: std::cell::Cell<Last> = const { std::cell::Cell::new(None) };
+        }
+        let at = std::panic::Location::caller();
+        let now = std::time::Instant::now();
+        let last = LAST_CHECK.with(|c| c.replace(Some((now, at))));
+        let gap = last.map(|(t, _)| now - t);
+        let long = gap.is_some_and(|g| g >= std::time::Duration::from_millis(20));
+        if why.is_some() || long {
+            let short = |l: &std::panic::Location<'_>| {
+                format!(
+                    "{}:{}",
+                    l.file().rsplit("crates/").next().unwrap_or_default(),
+                    l.line()
+                )
+            };
+            trace(format_args!(
+                "plan check {} {} ({} ms since the check at {})",
+                short(at),
+                if why.is_some() { "STOP" } else { "go" },
+                gap.map_or(0, |g| g.as_millis()),
+                last.map_or_else(|| "-".to_string(), |(_, l)| short(l))
+            ));
+        }
+    }
+    match why {
         Some(message) => Err(Error::Sqlstate("57014", message.into())),
         None => Ok(()),
     }
@@ -93,6 +126,7 @@ pub fn with_walk_checks<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// A walk's cancellation point (`with_walk_checks`).
+#[track_caller]
 pub(crate) fn walk_point() -> Result<()> {
     if !WALK_CHECKS.with(|w| w.get()) {
         return Ok(());
@@ -125,17 +159,38 @@ pub(crate) fn interruptible<T: Send + 'static>(
             .map_err(|_| Error::Sqlstate("XX000", "the parser thread panicked".into()))?;
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    trace(format_args!("parse thread spawning"));
     std::thread::Builder::new()
         .stack_size(stack)
         .spawn(move || {
-            let _ = tx.send(work());
+            trace(format_args!("parse thread started"));
+            let out = work();
+            trace(format_args!("parse thread finished"));
+            let _ = tx.send(out);
+            trace(format_args!("parse thread answered"));
         })
         .map_err(|e| Error::Sqlstate("54001", format!("stack depth limit exceeded: {e}")))?;
+    let mut last = std::time::Instant::now();
     loop {
-        match rx.recv_timeout(std::time::Duration::from_millis(5)) {
-            Ok(out) => return out,
+        let got = rx.recv_timeout(std::time::Duration::from_millis(5));
+        if trace_on() {
+            let gap = last.elapsed();
+            if gap > std::time::Duration::from_millis(50) {
+                trace(format_args!(
+                    "parse wait polled after {} ms",
+                    gap.as_millis()
+                ));
+            }
+            last = std::time::Instant::now();
+        }
+        match got {
+            Ok(out) => {
+                trace(format_args!("parse waited out"));
+                return out;
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(message) = reason() {
+                    trace(format_args!("parse abandoned on a cancel"));
                     return Err(Error::Sqlstate("57014", message.into()));
                 }
             }
@@ -147,4 +202,55 @@ pub(crate) fn interruptible<T: Send + 'static>(
             }
         }
     }
+}
+
+/// The cancel trace: with `SECANTUS_PG_CANCEL_TRACE` naming a file, every
+/// cancellation point, the parse thread, the cancel request and the 57014
+/// append a line to it -- microseconds since the Unix epoch, the thread,
+/// the event -- so a cancel honoured late shows what ran between the
+/// request and the answer. Off (one relaxed load) without the variable.
+/// The timing tests turn it on and print it when a budget is missed
+/// (RP-571, RP-748): those failures come from Linux CI and do not happen
+/// on demand.
+static TRACE: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+    std::sync::OnceLock::new();
+
+fn trace_file() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    TRACE
+        .get_or_init(|| {
+            let path = std::env::var_os("SECANTUS_PG_CANCEL_TRACE")?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()
+                .map(std::sync::Mutex::new)
+        })
+        .as_ref()
+}
+
+/// Whether the cancel trace is on.
+pub fn trace_on() -> bool {
+    trace_file().is_some()
+}
+
+/// One line of the cancel trace (`trace_on`); nothing when it is off.
+pub fn trace(event: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let Some(file) = trace_file() else {
+        return;
+    };
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or_default();
+    let thread = std::thread::current();
+    let line = format!(
+        "{micros} {}/{:?} {event}\n",
+        thread.name().unwrap_or("-"),
+        thread.id()
+    );
+    // One write per line, so lines from several threads do not interleave.
+    let mut f = file.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = f.write_all(line.as_bytes());
 }

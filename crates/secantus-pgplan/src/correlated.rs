@@ -692,7 +692,78 @@ fn parts_of(c: &pg_query::protobuf::ColumnRef) -> Option<Vec<String>> {
 }
 
 /// Replace every reference in `outer_refs` with its `$N`.
+///
+/// A set operation's arms are query levels of their own: a bare name an
+/// arm's FROM has is that arm's column, whatever the outer row also has
+/// (`(select a from t intersect select v.a)`), so it is substituted only in
+/// the arms that do not have it (RP-698). The set operation's own ORDER BY
+/// names its output columns and is left as written.
 fn substitute(
+    s: &pg_query::protobuf::SelectStmt,
+    outer_refs: &[Vec<String>],
+    first_param: usize,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> pg_query::protobuf::SelectStmt {
+    if s.larg.is_some() || s.rarg.is_some() {
+        let mut out = s.clone();
+        for arm in [out.larg.as_deref_mut(), out.rarg.as_deref_mut()]
+            .into_iter()
+            .flatten()
+        {
+            *arm = if arm.larg.is_some() || arm.rarg.is_some() {
+                substitute(arm, outer_refs, first_param, lookup, params)
+            } else {
+                // An arm's own column is kept by blanking its ref, which
+                // matches no written reference, so `$N` keeps its number.
+                let own = level_columns(arm, lookup, params);
+                let refs: Vec<Vec<String>> = outer_refs
+                    .iter()
+                    .map(|r| match (&own, r.as_slice()) {
+                        (Some(cols), [name]) if cols.contains(name) => Vec::new(),
+                        _ => r.clone(),
+                    })
+                    .collect();
+                substitute_level(arm, &refs, first_param)
+            };
+        }
+        return out;
+    }
+    substitute_level(s, outer_refs, first_param)
+}
+
+/// The column names one query level's FROM exposes, or `None` when one of
+/// its items cannot be typed here.
+fn level_columns(
+    s: &pg_query::protobuf::SelectStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+    params: &[Bson],
+) -> Option<Vec<String>> {
+    fn item(
+        n: &pg_query::protobuf::Node,
+        lookup: &dyn Fn(&str) -> Option<TableDef>,
+        params: &[Bson],
+        out: &mut Vec<String>,
+    ) -> Option<()> {
+        if let Some(N::JoinExpr(j)) = n.node.as_ref() {
+            for side in [j.larg.as_deref(), j.rarg.as_deref()].into_iter().flatten() {
+                item(side, lookup, params, out)?;
+            }
+            return Some(());
+        }
+        let (_, def) = from_item_def(n, lookup, params)?;
+        out.extend(def.columns.into_iter().map(|c| c.name));
+        Some(())
+    }
+    let mut out = Vec::new();
+    for n in &s.from_clause {
+        item(n, lookup, params, &mut out)?;
+    }
+    Some(out)
+}
+
+/// `substitute` over one query level and the levels inside it.
+fn substitute_level(
     s: &pg_query::protobuf::SelectStmt,
     outer_refs: &[Vec<String>],
     first_param: usize,
@@ -729,21 +800,47 @@ fn substitute(
 /// Whether a FROM-less subquery names a column of the outer query: it has
 /// nothing else a bare name could mean, so it is correlated.
 pub(crate) fn fromless_outer_ref(inner: &pg_query::protobuf::SelectStmt, outer: &[String]) -> bool {
-    if !inner.from_clause.is_empty() {
-        return false;
+    !fromless_outer_names(inner, outer).is_empty()
+}
+
+/// The bare names a FROM-less level reads from the outer row. A set
+/// operation is FROM-less at its top, but each arm is a level of its own:
+/// only an arm with no FROM has nothing else a bare name could mean
+/// (RP-698: `(select a from t union select 9)` read the outer `a`).
+fn fromless_outer_names(inner: &pg_query::protobuf::SelectStmt, outer: &[String]) -> Vec<String> {
+    if inner.larg.is_some() || inner.rarg.is_some() {
+        let mut names = Vec::new();
+        for arm in [inner.larg.as_deref(), inner.rarg.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            for n in fromless_outer_names(arm, outer) {
+                if !names.contains(&n) {
+                    names.push(n);
+                }
+            }
+        }
+        return names;
     }
-    let mut found = false;
+    if !inner.from_clause.is_empty() {
+        return Vec::new();
+    }
+    let mut names = Vec::new();
     let mut probe = inner.clone();
     let _ = walk_select(&mut probe, &mut |n| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = parts_of(c) {
-                found |= parts.len() == 1
-                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
+                if parts.len() == 1
+                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]))
+                    && !names.contains(&parts[0])
+                {
+                    names.push(parts[0].clone());
+                }
             }
         }
         Ok(())
     });
-    found
+    names
 }
 
 pub(crate) fn correlate(
@@ -777,14 +874,13 @@ pub(crate) fn correlate(
     // not at the subquery around it (RP-443).
     let mut locations: Vec<i32> = Vec::new();
     let mut probe = inner.clone();
+    // With no FROM of its own, a bare name can only be the outer row's
+    // (`SET v = (SELECT v + 1)`); a set operation's arms each count alone.
+    let fromless = fromless_outer_names(inner, outer);
     walk_select_scoped(&mut probe, &[], &mut |n, bound| {
         if let Some(N::ColumnRef(c)) = n.node.as_ref() {
             if let Some(parts) = parts_of(c) {
-                // With no FROM of its own, a bare name can only be the
-                // outer row's (`SET v = (SELECT v + 1)`).
-                let bare_outer = parts.len() == 1
-                    && inner.from_clause.is_empty()
-                    && (outer.contains(&parts[0]) || crate::outer_whole_row(&parts[0]));
+                let bare_outer = parts.len() == 1 && fromless.contains(&parts[0]);
                 if (bare_outer || parts.len() >= 2 && !bound.contains(&parts[parts.len() - 2]))
                     && !outer_refs.contains(&parts)
                 {
@@ -799,7 +895,7 @@ pub(crate) fn correlate(
     // that the outer query has is a correlation; anything else is a typo.
     let first = params.len() + 1;
     let (planned, body) = loop {
-        let body = substitute(inner, &outer_refs, first);
+        let body = substitute(inner, &outer_refs, first, lookup, params);
         let mut probe_params = params.to_vec();
         probe_params.extend(std::iter::repeat_n(Bson::Null, outer_refs.len()));
         // Planned only to check and type the body, never to run it: a
@@ -1623,7 +1719,7 @@ fn typed_probe(
     if types.iter().all(Option::is_none) {
         return None;
     }
-    let mut body = substitute(inner, outer_refs, first);
+    let mut body = substitute(inner, outer_refs, first, lookup, params);
     let _ = walk_select(&mut body, &mut |n| {
         let Some(N::ParamRef(p)) = n.node.as_ref() else {
             return Ok(());
@@ -2497,6 +2593,8 @@ pub struct UserFn {
     pub strict: bool,
     /// Each input parameter's `DEFAULT` as SQL, `None` where it has none.
     pub defaults: Vec<Option<String>>,
+    /// `procost`: its `COST`, 100 by default for `sql` and `plpgsql`.
+    pub cost: f64,
 }
 
 impl UserFn {

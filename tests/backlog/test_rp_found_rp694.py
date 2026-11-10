@@ -2,9 +2,10 @@
 scalar variable stored the column's value uncoerced):
 
 - an assignment whose types have only an EXPLICIT cast between them (`int`
-  from `bool`, `bool` from `int`) uses that cast, where PostgreSQL's
+  from `bool`, `bool` from `int`) used that cast, where PostgreSQL's
   PL/pgSQL coercion (`COERCION_PLPGSQL`) converts through the types' text
-  I/O and refuses `t` as an integer (RP-712);
+  I/O and refuses `t` as an integer (RP-712, fixed: such an assignment now
+  goes through the source's output function and the target's input);
 - a `FOR` over a query, or an `EXECUTE ... INTO`, whose target is a scalar
   variable or a list of them is refused 0A000 (RP-713);
 - a variable of a NOT NULL domain with no default was created NULL, where
@@ -71,10 +72,109 @@ EXPLICIT_ONLY = {
 }
 
 
-@pytest.mark.backlog("RP-712")
+@pytest.mark.backlog_fixed("RP-712")
 @pytest.mark.parametrize("query", list(EXPLICIT_ONLY))
 def test_assignment_with_only_an_explicit_cast_converts_through_text(query: str, dsn: str) -> None:
     assert _answer(dsn, query) == EXPLICIT_ONLY[query]
+
+
+def _framed(dsn: str, query: str) -> object:
+    with psycopg.connect(dsn, autocommit=True) as c:
+        try:
+            c.execute(query)
+            return ("ok",)
+        except psycopg.Error as e:
+            return (e.sqlstate, e.diag.message_primary, e.diag.context)
+
+
+_AT_ASSIGNMENT = "PL/pgSQL function inline_code_block line 1 at assignment"
+_AT_SQL = "PL/pgSQL function inline_code_block line 1 at SQL statement"
+
+
+def _assignment(text: str) -> str:
+    return f'PL/pgSQL assignment "{text}"\n{_AT_ASSIGNMENT}'
+
+
+# The conversion through text I/O, and where its error is framed. A `:=`
+# coerces inside its own query (`transformPLAssignStmt`): over a constant,
+# through immutable I/O functions (`boolout` / `int4in`, `inet_in`,
+# `bit_in`), the conversion folds while the query is planned and its error
+# carries the `PL/pgSQL assignment` frame; through a STABLE one (`date_in`,
+# `range_in`, `cash_out`), or over a variable, it runs in the executor's
+# simple-expression path, which frames nothing. An `INTO` casts outside
+# the query (`exec_move_row`): no `SQL statement` frame.
+VIA_IO = {
+    "do $$ declare x date; begin x := 5; end $$": (
+        "22007",
+        'invalid input syntax for type date: "5"',
+        _AT_ASSIGNMENT,
+    ),
+    "do $$ declare x int[]; begin x := array[true]; end $$": (
+        "22P02",
+        'invalid input syntax for type integer: "t"',
+        _assignment("x := array[true]"),
+    ),
+    "do $$ declare x bit(3); begin x := 5; end $$": (
+        "22P02",
+        '"5" is not a valid binary digit',
+        _assignment("x := 5"),
+    ),
+    "do $$ declare x inet; begin x := 5; end $$": (
+        "22P02",
+        'invalid input syntax for type inet: "5"',
+        _assignment("x := 5"),
+    ),
+    "do $$ declare x int; begin x := true; end $$": (
+        "22P02",
+        'invalid input syntax for type integer: "t"',
+        _assignment("x := true"),
+    ),
+    "do $$ declare x float8; begin x := 5::money; end $$": (
+        "22P02",
+        'invalid input syntax for type double precision: "$5.00"',
+        _AT_ASSIGNMENT,
+    ),
+    "do $$ declare x int4range; begin x := 5; end $$": (
+        "22P02",
+        'malformed range literal: "5"',
+        _AT_ASSIGNMENT,
+    ),
+    "do $$ declare x int; b bool := false; begin x := b; end $$": (
+        "22P02",
+        'invalid input syntax for type integer: "f"',
+        _AT_ASSIGNMENT,
+    ),
+    "do $$ declare x int; begin select false, 1 into x; end $$": (
+        "22P02",
+        'invalid input syntax for type integer: "f"',
+        _AT_SQL,
+    ),
+}
+
+
+@pytest.mark.backlog_fixed("RP-712")
+@pytest.mark.parametrize("query", list(VIA_IO))
+def test_conversion_through_text_is_framed_as_postgres_frames_it(query: str, dsn: str) -> None:
+    assert _framed(dsn, query) == VIA_IO[query]
+
+
+# An implicit or assignment cast is used, through text I/O never.
+ASSIGNED = {
+    "do $$ declare x int; begin x := 1.5; raise notice '%', x; end $$": ["2"],
+    "do $$ declare x int; begin x := 5::bigint; raise notice '%', x; end $$": ["5"],
+    "do $$ declare x bool; begin x := 'yes'; raise notice '%', x; end $$": ["t"],
+    "do $$ declare x int; begin x := '12'::text; raise notice '%', x; end $$": ["12"],
+    "do $$ declare x json; begin x := 5; raise notice '%', x; end $$": ["5"],
+    "do $$ declare x numeric; begin x := '5'::jsonb; raise notice '%', x; end $$": ["5"],
+    "do $$ declare x text; b bool := true; begin x := b; raise notice '%', x; end $$": ["true"],
+    "do $$ declare x int; begin x := null::bool; raise notice '%', x is null; end $$": ["t"],
+}
+
+
+@pytest.mark.backlog_fixed("RP-712")
+@pytest.mark.parametrize("query", list(ASSIGNED))
+def test_assignment_cast_is_used_where_one_exists(query: str, dsn: str) -> None:
+    assert _answer(dsn, query) == ("ok", ASSIGNED[query])
 
 
 _VARCHAR3 = ("error", "22001", "value too long for type character varying(3)")

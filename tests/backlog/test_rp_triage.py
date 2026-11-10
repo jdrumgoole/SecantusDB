@@ -8,7 +8,11 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.conftest import pg_answer
+from tests.backlog.conftest import cancel_trace_window, pg_answer
+
+# The cancel tests below print the server's cancel trace when they miss
+# their budget: their late answers come from Linux CI only (RP-571).
+CANCEL_TRACE = True
 
 
 @pytest.mark.backlog_fixed("RP-001")
@@ -22,24 +26,28 @@ def test_set_transaction_outside_a_block_warns(pg: Any) -> None:
 
 
 @pytest.mark.backlog_fixed("RP-002")
-def test_cancel_during_parse_is_honoured_at_once(pg: Any) -> None:
+def test_cancel_during_parse_is_honoured_at_once(pg: Any, rust_pg: Any) -> None:
     """PostgreSQL 15.19: a cancel sent 0.5 s into this 1.2 MB statement
     answers 57014 at 0.515 s, during the parse (it takes ~2 s to parse
     here in a debug build, and the cancel waits for it)."""
     sql = "select pg_sleep(3), 1 in (" + ",".join(str(i) for i in range(200_000)) + ")"
     delay = 0.5
     timer = threading.Timer(delay, pg.cancel)
+    wall = time.time()
     t0 = time.monotonic()
     timer.start()
     answer = pg_answer(pg, sql)
     elapsed = time.monotonic() - t0
     timer.join()
     assert answer[:2] == ("err", "57014")
-    assert elapsed - delay < 0.5, f"cancel honoured {elapsed - delay:.2f} s after it was sent"
+    assert elapsed - delay < 0.5, (
+        f"cancel honoured {elapsed - delay:.2f} s after it was sent"
+        + cancel_trace_window(rust_pg, wall, time.time())
+    )
 
 
 @pytest.mark.backlog_fixed("RP-002")
-def test_cancel_during_parse_is_honoured_with_user_code_present(pg: Any) -> None:
+def test_cancel_during_parse_is_honoured_with_user_code_present(pg: Any, rust_pg: Any) -> None:
     """As `test_cancel_during_parse_is_honoured_at_once`, with a user function
     that shadows a built-in in the database. A statement that may run user
     code is one transaction, so the lock pass parses it first: that pass
@@ -52,6 +60,7 @@ def test_cancel_during_parse_is_honoured_with_user_code_present(pg: Any) -> None
         sql = "select pg_sleep(3), 1 in (" + ",".join(str(i) for i in range(200_000)) + ")"
         delay = 0.5
         timer = threading.Timer(delay, pg.cancel)
+        wall = time.time()
         t0 = time.monotonic()
         timer.start()
         answer = pg_answer(pg, sql)
@@ -61,7 +70,10 @@ def test_cancel_during_parse_is_honoured_with_user_code_present(pg: Any) -> None
         # PostgreSQL 15.19 answers 0.015 s after the cancel. The budget is
         # tighter than the test above's so the shape fails here without the
         # fix (0.27 s on a developer machine), not only on CI.
-        assert elapsed - delay < 0.25, f"cancel honoured {elapsed - delay:.2f} s after it was sent"
+        assert elapsed - delay < 0.25, (
+            f"cancel honoured {elapsed - delay:.2f} s after it was sent"
+            + cancel_trace_window(rust_pg, wall, time.time())
+        )
     finally:
         pg.execute("drop function rp002_upper(int)")
         pg.execute("drop function upper(int)")

@@ -2,7 +2,9 @@
 `oidvector`s orders its elements as int arrays): a VALUES list's network
 column ordered by its text (RP-651, fixed by RP-610's typing of a derived
 column: its test is now a regression test), and an ORDER BY naming a window
-function whose window is ordered by a keyed type is refused (RP-652).
+function whose window is ordered by a keyed type was refused (RP-652, fixed
+by RP-754: a positional key naming a window target is no longer copied into
+the sort clause).
 
 The expected answers were measured on PostgreSQL 15.19; none needs DDL.
 """
@@ -65,7 +67,7 @@ WINDOW_TARGET_ORDER: dict[str, list[tuple[object, ...]]] = {
 }
 
 
-@pytest.mark.backlog("RP-652")
+@pytest.mark.backlog_fixed("RP-652")
 @pytest.mark.parametrize("query", list(WINDOW_TARGET_ORDER))
 def test_order_by_a_window_target_over_a_keyed_window(query: str, dsn: str) -> None:
     with psycopg.connect(dsn, autocommit=True) as c:

@@ -1051,7 +1051,11 @@ impl Rewriter<'_> {
         ))
     }
 
-    fn sort_by(&mut self, item: &mut pg_query::protobuf::Node) {
+    /// A sort key: one whose own type orders by something other than its
+    /// stored form is keyed; any other is an expression like the select
+    /// list's, its comparisons rewritten (`order by x > '9.5.0.0'::inet`
+    /// compares by `network_cmp`, not the text, RP-762).
+    fn sort_by(&mut self, item: &mut pg_query::protobuf::Node) -> Result<()> {
         if let Some(N::SortBy(sb)) = item.node.as_mut() {
             if let Some(key) = sb.node.as_deref() {
                 if let Some((_, labels)) = self.enum_of(key) {
@@ -1075,15 +1079,19 @@ impl Rewriter<'_> {
                 } else if let Some((collation, _)) = self.coll_of(key) {
                     sb.node = Some(Box::new(Self::coll_key(key, &collation)));
                     self.changed = true;
+                } else if let Some(key) = sb.node.as_deref_mut() {
+                    self.expr(key)?;
                 }
             }
         }
+        Ok(())
     }
 
-    fn window(&mut self, w: &mut pg_query::protobuf::WindowDef) {
+    fn window(&mut self, w: &mut pg_query::protobuf::WindowDef) -> Result<()> {
         for o in &mut w.order_clause {
-            self.sort_by(o);
+            self.sort_by(o)?;
         }
+        Ok(())
     }
 
     /// Rewrite an expression tree in place.
@@ -1791,6 +1799,46 @@ impl Rewriter<'_> {
         // `min(e)` / `max(e)`: the extreme POSITION, mapped back.
         if let Some(N::FuncCall(f)) = node.node.as_ref() {
             let name = func_name(f);
+            // A windowed `min` / `max` over a network value picks by
+            // `network_cmp` as the plain aggregate does: the window function
+            // over the key, its ORDER BY keyed too, read back as the
+            // overload's type (RP-754).
+            // Under a locale collation it picks by the collation's order
+            // (`text_larger` / `text_smaller` compare by the input's
+            // collation), and over an enum by its labels' positions, again
+            // as the plain aggregate does (RP-763).
+            if let (Some("min" | "max"), [arg], Some(_)) =
+                (name.as_deref(), f.args.as_slice(), f.over.as_ref())
+            {
+                let windowed = |this: &mut Self, key: pg_query::protobuf::Node| {
+                    let mut agg = (**f).clone();
+                    agg.args = vec![key];
+                    if let Some(w) = agg.over.as_deref_mut() {
+                        this.window(w)?;
+                    }
+                    Ok::<_, Error>(pg_query::protobuf::Node {
+                        node: Some(N::FuncCall(Box::new(agg))),
+                    })
+                };
+                if let Some(ty) = self.net_of(arg) {
+                    let call = windowed(self, Self::net_key(arg.clone()))?;
+                    *node = Self::net_value(call, &crate::min_max_result_type(&ty));
+                    self.changed = true;
+                    return Ok(());
+                }
+                if let Some((collation, _)) = self.coll_of(arg) {
+                    let call = windowed(self, Self::coll_keyv(arg, &collation))?;
+                    *node = Self::typed_value(Self::coll_value(call), &collation);
+                    self.changed = true;
+                    return Ok(());
+                }
+                if let Some((ty, labels)) = self.enum_of(arg) {
+                    let call = windowed(self, Self::ord(arg.clone(), &labels))?;
+                    *node = Self::label_of(call, &ty, &labels);
+                    self.changed = true;
+                    return Ok(());
+                }
+            }
             if matches!(name.as_deref(), Some("min" | "max")) && f.over.is_none() {
                 if let [arg] = f.args.as_slice() {
                     if let Some((collation, _)) = self.coll_of(arg) {
@@ -1822,7 +1870,10 @@ impl Rewriter<'_> {
                         let call = pg_query::protobuf::Node {
                             node: Some(N::FuncCall(Box::new(agg))),
                         };
-                        *node = Self::net_value(call, &ty);
+                        // Read back as the overload's type: `max(cidr)` is
+                        // `max(inet)`, its input coerced, so an `inet`
+                        // (15.19, RP-706).
+                        *node = Self::net_value(call, &crate::min_max_result_type(&ty));
                         self.changed = true;
                         return Ok(());
                     }
@@ -1914,10 +1965,10 @@ impl Rewriter<'_> {
         // Window and aggregate ORDER BYs inside the expression.
         if let Some(N::FuncCall(f)) = node.node.as_mut() {
             for o in &mut f.agg_order {
-                self.sort_by(o);
+                self.sort_by(o)?;
             }
             if let Some(w) = f.over.as_deref_mut() {
-                self.window(w);
+                self.window(w)?;
             }
         }
         // Then the children.
@@ -2155,13 +2206,23 @@ pub(crate) fn rewrite(
         };
         if let Some(t) = target {
             // An enum target is sorted by position (below); a non-enum one
-            // named like an enum column is sorted as itself.
+            // named like an enum column is sorted as itself. A window call
+            // is computed in the select list only, so a target holding one
+            // whose own value needs no key stays named by position: copied
+            // here, `(max(x) over (order by x))::text` was a second window
+            // call the sort could not run (RP-754).
+            let windowed = || {
+                crate::expr_any(
+                    &t,
+                    &|n| matches!(n.node.as_ref(), Some(N::FuncCall(f)) if f.over.is_some()),
+                )
+            };
             if r.enum_of(&t).is_some()
                 || r.net_of(&t).is_some()
                 || r.oidvec_of(&t)
                 || r.oidvec_arr_of(&t)
                 || r.coll_of(&t).is_some()
-                || !matches!(t.node.as_ref(), Some(N::ColumnRef(_)))
+                || (!matches!(t.node.as_ref(), Some(N::ColumnRef(_))) && !windowed())
             {
                 sb.node = Some(Box::new(t));
             }
@@ -2323,7 +2384,7 @@ pub(crate) fn rewrite(
         }
     }
     for item in &mut out.sort_clause {
-        r.sort_by(item);
+        r.sort_by(item)?;
     }
     // A JOIN's ON condition compares like a WHERE.
     fn join_quals(node: &mut pg_query::protobuf::Node, r: &mut Rewriter) -> Result<()> {
@@ -2382,7 +2443,7 @@ pub(crate) fn rewrite(
     }
     for w in &mut out.window_clause {
         if let Some(N::WindowDef(def)) = w.node.as_mut() {
-            r.window(def);
+            r.window(def)?;
         }
     }
     Ok(r.changed.then_some(out))

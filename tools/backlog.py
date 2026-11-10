@@ -309,7 +309,8 @@ def _owners(idents: list[str], repo: pathlib.Path, remote: str) -> dict[str, str
 def check_ids(names: Iterable[str], repo: pathlib.Path = REPO, remote: str = REMOTE) -> list[str]:
     """What is wrong with the IDs this branch adds: one line per problem.
 
-    An ID is this branch's to write when it is not on `remote`'s main and
+    An ID is this branch's to write when it is not on `remote`'s main as
+    it was when this branch left it, and
     either this branch reserved it, or another branch on `remote` already
     holds the same item under it (an item inherited from an integration
     branch such as pg-batch). Any other new ID is a number someone else
@@ -342,7 +343,13 @@ def check_ids(names: Iterable[str], repo: pathlib.Path = REPO, remote: str = REM
             if it.id in seen:
                 problems.append(f"{it.id} twice in {name}: lines {seen[it.id].line} and {it.line}")
             seen.setdefault(it.id, it)
-        main = _git(repo, "show", f"{remote}/main:tasks/{name}")
+        # New means added since this branch left main: an ID main gained
+        # AFTER the fork is someone else's item, and comparing with main's
+        # tip took it for one this branch inherited. A pg-batch lane wrote
+        # RP-747 while main already held another RP-747 (2026-11-10), and
+        # the merge of the two conflicted on the duplicate.
+        fork = _git(repo, "merge-base", f"{remote}/main", "HEAD").stdout.strip()
+        main = _git(repo, "show", f"{fork or f'{remote}/main'}:tasks/{name}")
         on_main = {it.id for it in parse(name, main.stdout)} if main.returncode == 0 else set()
         new = sorted(i for i in seen if i not in on_main)
         if not new:

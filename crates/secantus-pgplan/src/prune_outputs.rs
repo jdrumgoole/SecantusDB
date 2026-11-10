@@ -1033,6 +1033,17 @@ pub(crate) fn returns_set(name: &str) -> bool {
     .contains(name)
 }
 
+/// A set operation's leftmost leaf: the arm its output columns are named
+/// by (`transformSetOperationStmt` takes the names from the left input).
+/// A plain SELECT is its own leaf.
+pub(crate) fn leftmost_arm(s: &pg_query::protobuf::SelectStmt) -> &pg_query::protobuf::SelectStmt {
+    let mut s = s;
+    while let Some(l) = s.larg.as_deref() {
+        s = l;
+    }
+    s
+}
+
 /// PostgreSQL's `FigureColname`, for the shapes whose name is certain.
 pub fn figure_colname(n: &pg_query::protobuf::Node) -> Option<String> {
     match n.node.as_ref()? {
@@ -1065,8 +1076,8 @@ pub fn figure_colname(n: &pg_query::protobuf::Node) -> Option<String> {
                 T::ExistsSublink => Some("exists".into()),
                 T::ArraySublink => Some("array".into()),
                 T::ExprSublink => match sl.subselect.as_deref()?.node.as_ref()? {
-                    N::SelectStmt(b) if b.larg.is_none() => {
-                        match b.target_list.first()?.node.as_ref()? {
+                    N::SelectStmt(b) => {
+                        match leftmost_arm(b).target_list.first()?.node.as_ref()? {
                             N::ResTarget(rt) if !rt.name.is_empty() => Some(rt.name.clone()),
                             N::ResTarget(rt) => figure_colname(rt.val.as_deref()?),
                             _ => None,

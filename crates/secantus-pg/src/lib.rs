@@ -836,6 +836,7 @@ pub struct CancelBackend;
 #[async_trait]
 impl pgwire::api::cancel::CancelHandler for CancelBackend {
     async fn on_cancel_request(&self, request: pgwire::messages::cancel::CancelRequest) {
+        secantus_pgplan::cancel::trace(format_args!("cancel request for pid {}", request.pid));
         let entry = backend_registry()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -846,6 +847,7 @@ impl pgwire::api::cancel::CancelHandler for CancelBackend {
                 entry
                     .cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                secantus_pgplan::cancel::trace(format_args!("pid {} cancel flag set", request.pid));
             }
         }
     }
@@ -1609,6 +1611,8 @@ fn user_fn_of(d: &Document) -> secantus_pgplan::UserFn {
             .get_array("param_defaults")
             .map(|a| a.iter().map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default(),
+        // What `pg_proc.procost` shows for it (`catalog_fill`).
+        cost: d.get_f64("cost").unwrap_or(100.0),
     }
 }
 
@@ -2119,6 +2123,31 @@ impl Drop for NestedStatement<'_> {
 }
 
 impl plpgsql_fn::Host for PlHost<'_> {
+    fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
+        // Planned as a Describe plans it, over NULL parameters of the
+        // declared types, but with no subquery runner and without
+        // `describe_fields`' bookkeeping: an expression that fails to plan
+        // (`1/0` folds) answers no type here, and the evaluation that
+        // follows raises the error -- recording it as a failed Describe
+        // would abort the transaction first (25P02).
+        let declared: Vec<Option<String>> = types.iter().map(|t| Some(t.clone())).collect();
+        let params = vec![Bson::Null; types.len()];
+        let stmt = secantus_pgplan::plan_with_session_types_and_subqueries(
+            sql,
+            &|n| self.h.lookup(n),
+            &params,
+            &declared,
+            &self.h.session_timezone(),
+            None,
+        )
+        .ok()?;
+        let fields = self.h.describe_planned(stmt).ok()??;
+        let [field] = fields.as_slice() else {
+            return None;
+        };
+        secantus_pgplan::pgtypes::type_name_of_oid(i64::from(field.datatype().oid()))
+    }
+
     fn output_domains(&self, sql: &str, types: &[String]) -> Vec<Option<String>> {
         let lookup = |n: &str| self.h.lookup(n);
         secantus_pgplan::select_output_domains(sql, types, &lookup)
@@ -10158,8 +10187,9 @@ impl PgHandler {
                 .map(|d| {
                     let mut out = Document::new();
                     for (i, ((_, field), c)) in sel.columns.iter().zip(&def.columns).enumerate() {
-                        let v = resolve_cell(
+                        let v = resolve_select_cell(
                             d,
+                            i,
                             field,
                             sel.casts.get(i).and_then(|c| c.as_ref()),
                             schema[i].datatype(),
@@ -28390,6 +28420,11 @@ impl SimpleQueryHandler for PgHandler {
         // while the text was still arriving, or is being split or parsed, is
         // kept; opening it here is for a session without the hook.
         self.begin_message_cycle();
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} Query, {} bytes",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            query.len()
+        ));
         // ... and closes when the Query's answer is done, however it ends, so
         // a cancel sent while the backend is idle again targets nothing.
         struct CloseCycle<'a>(&'a PgHandler);
@@ -32916,7 +32951,16 @@ impl PgHandler {
     }
 
     /// PostgreSQL's answer to a statement interrupted by a `CancelRequest`.
+    #[track_caller]
     fn query_canceled() -> PgWireError {
+        if secantus_pgplan::cancel::trace_on() {
+            let at = std::panic::Location::caller();
+            secantus_pgplan::cancel::trace(format_args!(
+                "57014 built at {}:{}",
+                at.file(),
+                at.line()
+            ));
+        }
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),
             "57014".into(), // query_canceled
@@ -32937,7 +32981,16 @@ impl PgHandler {
     fn begin_message_cycle(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.cycle_open.swap(true, Relaxed) {
-            self.backend.cancel.store(false, Relaxed);
+            let dropped = self.backend.cancel.swap(false, Relaxed);
+            secantus_pgplan::cancel::trace(format_args!(
+                "pid {} cycle start{}",
+                self.backend_pid.load(Relaxed),
+                if dropped {
+                    ", a pending cancel dropped"
+                } else {
+                    ""
+                }
+            ));
             self.message_cycle.fetch_add(1, Relaxed);
             if self.backend_pid.load(Relaxed) != 0 {
                 self.stats().wake();
@@ -32952,6 +33005,10 @@ impl PgHandler {
     fn end_message_cycle(&self) {
         self.cycle_open
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} cycle end",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         if self.backend_pid.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return;
         }
@@ -32982,6 +33039,7 @@ impl PgHandler {
     /// has arrived since the current message cycle started. Taking the
     /// request consumes it, so a handler that catches the error is not
     /// cancelled a second time by the same request.
+    #[track_caller]
     fn check_cancel(&self) -> PgWireResult<()> {
         // A `pg_terminate_backend` aimed at a RUNNING statement ends it, and
         // the session, at the statement's next cancellation point -- the
@@ -32993,11 +33051,21 @@ impl PgHandler {
         {
             return Err(Self::admin_shutdown());
         }
-        if self
+        let cancelled = self
             .backend
             .cancel
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if secantus_pgplan::cancel::trace_on() {
+            let at = std::panic::Location::caller();
+            secantus_pgplan::cancel::trace(format_args!(
+                "pid {} check_cancel {}:{} {}",
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+                at.file(),
+                at.line(),
+                if cancelled { "TAKEN" } else { "none" }
+            ));
+        }
+        if cancelled {
             return Err(Self::query_canceled());
         }
         let expired = self
@@ -37586,6 +37654,14 @@ impl PgHandler {
                 }
                 trailing_rows = !seen.insert(ident);
                 if !trailing_rows {
+                    // The select list is computed once a row, below the
+                    // DISTINCT: the value printed is the one compared.
+                    let mut d = d;
+                    for (i, v) in values.iter().enumerate() {
+                        if sel.casts.get(i).is_some_and(Option::is_some) {
+                            d.insert(sort_input_key(i), v.clone().unwrap_or(Bson::Null));
+                        }
+                    }
                     kept.push(d);
                     kept_keys.push(values);
                 }
@@ -37648,7 +37724,7 @@ impl PgHandler {
             && !presorted
             && !(!sel.windows.is_empty() && window_order::presorted(&sel.order, &window_sorted))
         {
-            materialise_order_exprs(&mut docs, &sel.order).map_err(|e| Self::err(&e))?;
+            self.materialise_sort_input(&mut docs, sel, &def)?;
             // A LIMIT directly over the Sort bounds it (`ExecSetTupleBound`,
             // OFFSET + LIMIT), which changes where ties land; a Unique (any
             // DISTINCT) or a LockRows between them passes no bound down.
@@ -37727,7 +37803,7 @@ impl PgHandler {
                 for d in docs.iter().take(skip) {
                     for (i, (_, field)) in sel.columns.iter().enumerate() {
                         if let Some(c) = sel.casts.get(i).and_then(|c| c.as_ref()) {
-                            resolve_cell(d, field, Some(c), schema[i].datatype(), &tz)?;
+                            resolve_select_cell(d, i, field, Some(c), schema[i].datatype(), &tz)?;
                         }
                     }
                 }
@@ -37782,6 +37858,75 @@ impl PgHandler {
             self.lock_selected_rows(&t.table, &base, t.lock)?;
         }
         Ok((docs, def))
+    }
+
+    /// The rows a select's Sort reads: each row's select-list columns
+    /// that are computed below the Sort (`Select::sort_input`), then its
+    /// computed ORDER BY keys, a row at a time in scan order -- the Sort's
+    /// input target list PostgreSQL projects as it scans, so the first
+    /// row scanned raises its error first, whatever sorts first (RP-732).
+    /// The columns ride the row under `sort_input_key`; a postponed one
+    /// (volatile, or expensive under a LIMIT) is left to the projection
+    /// after the Sort.
+    fn materialise_sort_input(
+        &self,
+        docs: &mut [Document],
+        sel: &secantus_pgplan::Select,
+        def: &TableDef,
+    ) -> PgWireResult<()> {
+        let cols: Vec<usize> = (0..sel.columns.len())
+            .filter(|i| {
+                sel.sort_input.get(*i).copied().unwrap_or(false)
+                    && sel.casts.get(*i).is_some_and(Option::is_some)
+            })
+            .collect();
+        if cols.is_empty() {
+            return materialise_order_exprs(docs, &sel.order).map_err(|e| Self::err(&e));
+        }
+        let schema = self.row_schema(def, &sel.columns, &sel.casts);
+        let tz = self.session_timezone();
+        let keys: Vec<String> = cols.iter().map(|i| sort_input_key(*i)).collect();
+        let mut run = || -> PgWireResult<()> {
+            let mut values: Vec<(String, Bson)> = Vec::new();
+            for d in docs.iter_mut() {
+                values.clear();
+                for (&i, key) in cols.iter().zip(&keys) {
+                    // A DISTINCT below the Sort computed it already.
+                    if d.contains_key(key) {
+                        continue;
+                    }
+                    let v = resolve_cell(
+                        d,
+                        &sel.columns[i].1,
+                        sel.casts[i].as_ref(),
+                        schema[i].datatype(),
+                        &tz,
+                    )?;
+                    values.push((key.clone(), v.unwrap_or(Bson::Null)));
+                }
+                for k in &sel.order {
+                    if let Some(expr) = k.expr.as_ref() {
+                        let v =
+                            secantus_pgplan::sort_key_value(expr, d).map_err(|e| Self::err(&e))?;
+                        values.push((k.field.clone(), v));
+                    }
+                }
+                for (key, v) in values.drain(..) {
+                    d.insert(key, v);
+                }
+            }
+            Ok(())
+        };
+        let correlated = cols.iter().any(|i| {
+            sel.casts[*i]
+                .as_ref()
+                .is_some_and(secantus_pgplan::correlated::has_correlated)
+        });
+        if correlated {
+            self.correlated_scope(run)
+        } else {
+            run()
+        }
     }
 
     /// Does another session's open transaction hold the row of `table`
@@ -38213,8 +38358,9 @@ impl PgHandler {
                             .iter()
                             .enumerate()
                             .map(|(i, (_, field))| {
-                                resolve_cell(
+                                resolve_select_cell(
                                     d,
+                                    i,
                                     field,
                                     sel.casts.get(i).and_then(|c| c.as_ref()),
                                     schema[i].datatype(),
@@ -38614,8 +38760,9 @@ impl PgHandler {
                             .iter()
                             .enumerate()
                             .map(|(i, (_, field))| {
-                                resolve_cell(
+                                resolve_select_cell(
                                     d,
+                                    i,
                                     field,
                                     sel.casts.get(i).and_then(|c| c.as_ref()),
                                     schema[i].datatype(),
@@ -38664,9 +38811,14 @@ impl PgHandler {
                         continue;
                     };
                     let key = format!("\u{1f}correlated{i}");
+                    let computed = sort_input_key(i);
                     for d in docs.iter_mut() {
-                        let v =
-                            secantus_pgplan::apply_row_expr(expr, d).map_err(|e| Self::err(&e))?;
+                        // Computed below the Sort already (RP-732).
+                        let v = match d.get(&computed) {
+                            Some(v) => v.clone(),
+                            None => secantus_pgplan::apply_row_expr(expr, d)
+                                .map_err(|e| Self::err(&e))?,
+                        };
                         d.insert(key.clone(), v);
                     }
                     *cast = None;
@@ -38735,6 +38887,7 @@ impl PgHandler {
                 .is_some();
             armed.then(|| self.cursor_capture.clone())
         });
+        let computed: Vec<String> = (0..fields.len()).map(sort_input_key).collect();
         let rows = source.map(move |d| {
             let d = d?;
             if let Some(ids) = &ids {
@@ -38749,6 +38902,21 @@ impl PgHandler {
                 // A computed column is applied per row -- the cast
                 // chain or the scalar call the planner recorded.
                 if let Some(expr) = casts.get(i).and_then(|c| c.as_ref()) {
+                    // Computed below the Sort (RP-732) or the DISTINCT.
+                    if let Some(v) = d.get(&computed[i]) {
+                        encode_field_value(
+                            &mut enc,
+                            column_at(&schema_ref, i)?,
+                            Some(v),
+                            &row_tz,
+                            &row_ds,
+                            row_cenc,
+                        )?;
+                        if let Some(row) = captured.as_mut() {
+                            row.push(Some(v.clone()));
+                        }
+                        continue;
+                    }
                     let stop = || -> Option<&'static str> {
                         if backend.cancelled() {
                             return Some("canceling statement due to user request");
@@ -47800,6 +47968,32 @@ fn lateral_base_params(sql: &str, params: &[Bson]) -> Vec<Bson> {
         .collect()
 }
 
+/// The key a select-list column computed below the ORDER BY's Sort (or
+/// a DISTINCT) rides its row under, so the projection that sends the row
+/// does not compute it again (RP-732). Prefixed with U+001F, which no
+/// column name and no joined-row key starts with.
+fn sort_input_key(i: usize) -> String {
+    format!("\u{1f}sortinput{i}")
+}
+
+/// Output column `i` of a select's row: the value computed below its Sort
+/// when it was (`sort_input_key`), else [`resolve_cell`]'s.
+fn resolve_select_cell(
+    doc: &Document,
+    i: usize,
+    field: &str,
+    expr: Option<&secantus_pgplan::ColumnExpr>,
+    datatype: &Type,
+    tz: &secantus_pgplan::TimeZoneSetting,
+) -> PgWireResult<Option<Bson>> {
+    if expr.is_some() {
+        if let Some(v) = doc.get(sort_input_key(i)) {
+            return Ok(Some(v.clone()));
+        }
+    }
+    resolve_cell(doc, field, expr, datatype, tz)
+}
+
 fn resolve_cell(
     doc: &Document,
     field: &str,
@@ -49859,7 +50053,8 @@ thread_local! {
 }
 
 thread_local! {
-    /// What `array_agg` over arrays refused; read with the float overflow.
+    /// What `array_agg` over arrays refused, or a `min` / `max` input's
+    /// coercion to its overload's type; read with the float overflow.
     static ARRAY_AGG_ERROR: std::cell::RefCell<Option<PlanError>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -50383,6 +50578,32 @@ fn compute_basic_aggregate(item: &AggItem, rows: &[Document]) -> Bson {
             }
         }
         AggFunc::Min | AggFunc::Max => {
+            // The overload's input type, where it is another one: a `reg*`
+            // is `max(oid)` and a `cidr` `max(inet)`, so each input is
+            // coerced first and `max(regclass)` is the largest OID, not the
+            // largest name (15.19, RP-706).
+            let coerced: Vec<Bson>;
+            let values: Vec<&Bson> = match item
+                .source_type
+                .as_deref()
+                .and_then(secantus_pgplan::min_max_input_type)
+            {
+                Some(target) => {
+                    let mut out = Vec::with_capacity(values.len());
+                    for v in values {
+                        match secantus_pgplan::coerce_min_max_input(v, &target) {
+                            Ok(c) => out.push(c),
+                            Err(e) => {
+                                ARRAY_AGG_ERROR.with(|slot| *slot.borrow_mut() = Some(e));
+                                return Bson::Null;
+                            }
+                        }
+                    }
+                    coerced = out;
+                    coerced.iter().collect()
+                }
+                None => values,
+            };
             let mut best: Option<&Bson> = None;
             for v in values {
                 best = Some(match best {
@@ -53721,6 +53942,11 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.begin_message_cycle();
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} Parse, {} bytes",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            message.query.len()
+        ));
         self.apply_wire_dealloc(client.portal_store());
         let parser = <Self as ExtendedQueryHandler>::query_parser(self);
         let mut message = message;
@@ -53993,6 +54219,10 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.begin_message_cycle();
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} Execute",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         let out = self._on_execute(client, message).await;
         if out.is_err() {
             self.note_failure();

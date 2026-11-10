@@ -3,8 +3,8 @@ arrays) found:
 
 - an element array whose lower bounds are not 1 was lost when an ARRAY
   sublink or `array_agg` accumulated it (RP-731, fixed);
-- a query with ORDER BY computes its select list after the sort, so a
-  later row's error is raised first (RP-732).
+- a query with ORDER BY computed its select list after the sort, so a
+  later row's error was raised first (RP-732, fixed).
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
 statement is VALUES-only and runs there as written.
@@ -61,13 +61,41 @@ def test_accumulated_arrays_keep_their_lower_bounds(dsn: str) -> None:
     ) == [("[1:1][2:3]={{3,4}}",), ("[1:2][2:3]={{3,4},{5,6}}",)]
 
 
-@pytest.mark.backlog("RP-732")
+@pytest.mark.backlog_fixed("RP-732")
 def test_select_list_is_computed_before_the_sort(dsn: str) -> None:
-    """PostgreSQL 15.19 projects the select list below the Sort, in scan
-    order: the first row's division by zero is raised, not the second
-    row's cast error, though the second sorts first."""
+    """PostgreSQL 15.19 projects the select list below the Sort, a row at a
+    time in scan order (`make_sort_input_target`), so the first row
+    scanned raises its error, whatever sorts first. Here the select list
+    was computed after the sort, as the rows were sent: the row sorting
+    first raised its error, and a row a LIMIT dropped never raised one.
+
+    The divisions are by `k - 1`, not by a constant: PostgreSQL folds a
+    constant `1/0` while planning and raises it whatever the rows are."""
     assert _answer(
         dsn,
-        "select k, case when k = 1 then 1/0 else ('x' || k)::int end"
+        "select k, case when k = 1 then 1/(k - 1) else ('x' || k)::int end"
         " from (values (1), (2)) s(k) order by k desc",
     ) == ("22012", "division by zero")
+    assert _answer(
+        dsn, "select k, ('x' || k)::int from (values (1), (2)) s(k) order by k desc"
+    ) == ("22P02", 'invalid input syntax for type integer: "x1"')
+    # Every row is computed for the Sort, the ones a LIMIT drops too.
+    assert _answer(
+        dsn,
+        "select k, 1/(k - 1) from (values (1), (2)) s(k) order by k desc limit 1",
+    ) == ("22012", "division by zero")
+    assert _answer(
+        dsn,
+        "select k, ('x' || k)::int from (values (1), (2)) s(k) order by ('y' || k)::int",
+    ) == ("22P02", 'invalid input syntax for type integer: "x1"')
+    # A volatile column is postponed past the Sort: computed in output
+    # order, and only for the rows the LIMIT keeps.
+    assert _answer(
+        dsn,
+        "select k, 1/(k - 1 + (random() * 0)::int) from (values (1), (2)) s(k)"
+        " order by k desc limit 1",
+    ) == [(2, 1)]
+    # Over a generated series too.
+    assert _answer(
+        dsn, "select g, ('x' || g)::int from generate_series(1, 2) g order by g desc"
+    ) == ("22P02", 'invalid input syntax for type integer: "x1"')

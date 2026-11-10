@@ -238,3 +238,20 @@ def test_a_duplicate_id_in_the_file_is_refused(world):
     _add_item(world["a"], "Same number again.", "RP-002")
     problems = _check(mod, world["a"])
     assert any(p.startswith("RP-002 twice in") for p in problems), problems
+
+
+def test_an_id_main_gained_after_the_fork_is_not_this_branchs(world):
+    # The 2026-11-10 incident: lane-a left main, then main gained RP-002 (b's,
+    # reserved). Lane-a writing RP-002 on its own item compared clean against
+    # main's tip, as though it had inherited the ID, and the two RP-002s met
+    # only when pg-batch merged main.
+    mod = _backlog()
+    a, b = world["a"], world["b"]
+    _on_branch(a, "lane-a")
+    _on_branch(b, "lane-b")
+    assert _assign(mod, b) == "RP-002"
+    _git(b, "commit", "--quiet", "-am", "b's item")
+    _git(b, "push", "--quiet", "origin", "HEAD:main")
+    _add_item(a, "Written by hand.", "RP-002")
+    (problem,) = [p for p in _check(mod, a) if "RP-002" in p]
+    assert "reserved on branch lane-b, not this one (lane-a)" in problem

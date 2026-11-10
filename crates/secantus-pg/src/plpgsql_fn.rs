@@ -168,6 +168,14 @@ pub trait Host {
         let _ = (base, typmod);
         Ok(value)
     }
+    /// The type of the one column the query `sql` (over parameters of
+    /// `types`) returns, as a Describe of it answers, without running it;
+    /// `None` when it does not describe as one column. PL/pgSQL decides
+    /// an assignment's coercion from that type (`exec_cast_value`, RP-712).
+    fn expression_type(&self, sql: &str, types: &[String]) -> Option<String> {
+        let _ = (sql, types);
+        None
+    }
     /// The domain each column of the query `sql` (over parameters of
     /// `types`) is of, in order; empty when not known. A column of the
     /// domain its `INTO` variable is of moves into it with no coercion
@@ -312,6 +320,9 @@ enum Flow {
     Return(Outcome),
 }
 
+/// An expression's described type, by its bound SQL and parameter types.
+type ExpressionTypes = HashMap<(String, Vec<String>), Option<String>>;
+
 struct Interp<'a> {
     datums: Vec<Datum>,
     /// The datum of each argument, in declared order, for `$n`.
@@ -354,6 +365,11 @@ struct Interp<'a> {
     /// The levels of the blocks and labelled FOR loops being run, outermost
     /// first: what a `label.name` is looked up in.
     active: Vec<block_scope::Scope>,
+    /// The type each assigned expression is of (`SELECT <expr>` over its
+    /// parameters' types), as [`Host::expression_type`] described it:
+    /// PL/pgSQL keeps a cast per source and target type for the body's
+    /// life (`get_cast_hashentry`), so a loop's assignment describes once.
+    expression_types: std::cell::RefCell<ExpressionTypes>,
 }
 
 impl Interp<'_> {
@@ -903,6 +919,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
         cursor_options: open_cursor::cursor_options(&f),
+        expression_types: std::cell::RefCell::default(),
         label: function_label(create_sql),
         dyn_text: None,
         scopes: block_scope::scopes(&f),
@@ -1164,43 +1181,7 @@ fn expr_frame(
         return frame();
     }
     // Every operator / call / cast subexpression that folds, tried alone.
-    let folds = |expr: &N| -> bool {
-        !expr.nodes().iter().any(|(n, _, _, _)| match n {
-            pg_query::NodeRef::ParamRef(_)
-            | pg_query::NodeRef::ColumnRef(_)
-            | pg_query::NodeRef::SubLink(_) => true,
-            pg_query::NodeRef::FuncCall(f) => {
-                let name = f
-                    .funcname
-                    .last()
-                    .and_then(|n| match n.node.as_ref() {
-                        Some(N::String(s)) => Some(s.sval.as_str()),
-                        _ => None,
-                    })
-                    .unwrap_or("");
-                !secantus_pgplan::is_known_function(name)
-                    || !f.agg_order.is_empty()
-                    || f.over.is_some()
-                    || matches!(
-                        name,
-                        "random"
-                            | "now"
-                            | "nextval"
-                            | "currval"
-                            | "setval"
-                            | "clock_timestamp"
-                            | "timeofday"
-                            | "pg_sleep"
-                            | "gen_random_uuid"
-                            | "statement_timestamp"
-                            | "transaction_timestamp"
-                            | "current_setting"
-                            | "set_config"
-                    )
-            }
-            _ => false,
-        })
-    };
+    let folds = expression_folds;
     for (n, _, _, _) in &nodes {
         if !matches!(
             n,
@@ -1244,6 +1225,65 @@ fn expr_frame(
         }
     }
     None
+}
+
+/// The one target expression of the query `sql`, a `SELECT <expr>`.
+fn select_target(sql: &str) -> Option<pg_query::protobuf::node::Node> {
+    use pg_query::protobuf::node::Node as N;
+    let parsed = pg_query::parse(sql).ok()?;
+    let stmt = parsed.protobuf.stmts.into_iter().next()?.stmt?.node?;
+    let N::SelectStmt(sel) = stmt else {
+        return None;
+    };
+    let [target] = sel.target_list.as_slice() else {
+        return None;
+    };
+    let Some(N::ResTarget(rt)) = target.node.as_ref() else {
+        return None;
+    };
+    rt.val.as_ref()?.node.clone()
+}
+
+/// Does `expr` fold to a constant when its query is planned: no
+/// parameter, column or subquery, and no call PostgreSQL leaves to the
+/// executor (a volatile or stable one, an aggregate, a window call)?
+fn expression_folds(expr: &pg_query::protobuf::node::Node) -> bool {
+    use pg_query::protobuf::node::Node as N;
+    !expr.nodes().iter().any(|(n, _, _, _)| match n {
+        pg_query::NodeRef::ParamRef(_)
+        | pg_query::NodeRef::ColumnRef(_)
+        | pg_query::NodeRef::SubLink(_) => true,
+        pg_query::NodeRef::FuncCall(f) => {
+            let name = f
+                .funcname
+                .last()
+                .and_then(|n| match n.node.as_ref() {
+                    Some(N::String(s)) => Some(s.sval.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("");
+            !secantus_pgplan::is_known_function(name)
+                || !f.agg_order.is_empty()
+                || f.over.is_some()
+                || matches!(
+                    name,
+                    "random"
+                        | "now"
+                        | "nextval"
+                        | "currval"
+                        | "setval"
+                        | "clock_timestamp"
+                        | "timeofday"
+                        | "pg_sleep"
+                        | "gen_random_uuid"
+                        | "statement_timestamp"
+                        | "transaction_timestamp"
+                        | "current_setting"
+                        | "set_config"
+                )
+        }
+        _ => false,
+    })
 }
 
 /// A record as a whole, as a value of its row type.
@@ -1640,6 +1680,30 @@ impl Interp<'_> {
                 .to_string(),
             _ => text.to_string(),
         };
+        // With no implicit or assignment cast from the expression's type,
+        // the value goes through its output function and the declared
+        // type's input (`COERCION_PLPGSQL`'s `COERCEVIAIO`): evaluated as
+        // it is, then converted as a moved column is (RP-712).
+        if let Some(src) = ty.as_deref().and_then(|ty| {
+            let src = self.expression_type(&body)?;
+            secantus_pgplan::plpgsql_assigns_via_io(&src, ty).then_some(src)
+        }) {
+            let v = self.eval(e)?;
+            // An assignment statement's coercion is part of its query
+            // (`transformPLAssignStmt`), so an error in it is framed by
+            // the assignment; a declaration's default is coerced outside
+            // the query (`exec_assign_value`), with no frame.
+            // A conversion over a constant through immutable I/O
+            // functions folds while the query is planned, and its error
+            // is framed by it; any other runs in the executor's simple
+            // expression path, which frames nothing.
+            let planned = matches!(mode, 3..=5)
+                && secantus_pgplan::plpgsql_io_folds(&src, ty.as_deref().unwrap_or_default())
+                && select_target(&format!("SELECT {body}")).is_some_and(|n| expression_folds(&n));
+            return self
+                .convert_moved(no, v, &src)
+                .map_err(|err| err.with_sql_frame(|| planned.then(|| bind_frame(text, mode))?));
+        }
         let length = ty.as_deref().and_then(|ty| {
             let (sql, _, types) = self.bind(&format!("SELECT {body}")).ok()?;
             self.host.assignment_length(ty, &sql, &types)
@@ -1693,6 +1757,20 @@ impl Interp<'_> {
         }
     }
 
+    /// The type `SELECT <body>` describes as, over the body's variables
+    /// (`None` when it does not describe as one column), remembered for
+    /// the body's life.
+    fn expression_type(&self, body: &str) -> Option<String> {
+        let (sql, _, types) = self.bind(&format!("SELECT {body}")).ok()?;
+        let key = (sql, types);
+        if let Some(known) = self.expression_types.borrow().get(&key) {
+            return known.clone();
+        }
+        let ty = self.host.expression_type(&key.0, &key.1);
+        self.expression_types.borrow_mut().insert(key, ty.clone());
+        ty
+    }
+
     /// The value `exec_move_row` stores in variable `no` from a column of
     /// type `src` (a `SELECT`, `FETCH` or `EXECUTE ... INTO`, a `FOR` over
     /// a query): `exec_assign_value`'s coercion, the one a `:=` makes
@@ -1703,6 +1781,14 @@ impl Interp<'_> {
     /// assignment rule -- an overlong `varchar(3)` value is 22001, not
     /// truncated -- and a domain's constraints checked (RP-694).
     fn coerce_moved(&self, no: usize, v: Bson, src: &str) -> Result<Bson, PlError> {
+        // `exec_move_row` casts outside the query that produced the row:
+        // an error in the cast takes no `SQL statement` frame.
+        self.convert_moved(no, v, src)
+            .map_err(|e| e.with_sql_frame(|| None))
+    }
+
+    /// [`Self::coerce_moved`]'s conversion, its errors unframed.
+    fn convert_moved(&self, no: usize, v: Bson, src: &str) -> Result<Bson, PlError> {
         let Some(Datum::Var { ty, .. }) = self.datums.get(no) else {
             return Ok(v);
         };
@@ -1711,6 +1797,15 @@ impl Interp<'_> {
             .is_some_and(|(base, typmod)| typmod < 0 && base == src);
         if unmodified_same || secantus_pgplan::domains::same_domain(src, &ty) {
             return Ok(v);
+        }
+        // No implicit or assignment cast: the source's output function,
+        // then the declared type's input, as `text` (RP-712).
+        if secantus_pgplan::plpgsql_assigns_via_io(src, &ty) {
+            let text = match &v {
+                Bson::Null => Bson::Null,
+                v => Bson::String(secantus_pgplan::typeout::output_text(v, src)),
+            };
+            return self.convert_moved(no, text, "text");
         }
         let types = [src.to_string()];
         let length = self.host.assignment_length(&ty, "SELECT $1", &types);
