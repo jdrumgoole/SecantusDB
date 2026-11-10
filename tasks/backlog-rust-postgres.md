@@ -2750,25 +2750,6 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp603.py::test_oidvector_comparison_functions
       Backlog-ID: RP-612
 
-## Found while working RP-611 (2026-11-08)
-
-Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
-`tests/backlog/test_rp_found_rp611.py`.
-
-- [ ] **An ORDER BY naming a window function over a keyed window is
-      refused.** `select v::text t, row_number() over (order by v) from
-      (values ('[1,2]'::int4range), ('[0,5]')) s(v) order by 2` (or `...
-      r ... order by r`) answers on PostgreSQL 15.19; here it is `function
-      row_number() is not supported yet`. The same query without the outer
-      ORDER BY answers, as does one whose window orders by a collation. It
-      fails when the window's ORDER BY is a range, a multirange or an
-      `oidvector`, which `sort_by` keys by `__range_sortkey`. A likely
-      cause, read from the code and not proven: `rewrite` resolves an
-      ORDER BY position or alias to its target and copies any target that
-      is not a column -- the window call too -- into the sort clause.
-      Verify: tests/backlog/test_rp_found_rp611.py::test_order_by_a_window_target_over_a_keyed_window
-      Backlog-ID: RP-652
-
 ## Found while working RP-529 (2026-11-08)
 
 Measured on a private PostgreSQL 15.19 cluster with `create domain dc3 as
@@ -3321,26 +3302,6 @@ Measured on PostgreSQL 15.19 (the shared reference on port 5415).
       Verify: tests/backlog/test_rp_found_rp722.py::test_a_scalar_against_an_array_value_names_its_types
       Backlog-ID: RP-742
 
-## Found while working RP-706 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp706.py`.
-
-- [ ] **A window `min` / `max` over `inet` or `cidr` compares the values'
-      text.** `select (max(x) over ())::text, (min(x) over ())::text from
-      (values ('10.0.0.1'::inet), ('9.0.0.0'::inet), ('::1'::inet)) s(x)`
-      is `::1/128` and `9.0.0.0/32` on PostgreSQL 15.19 (`network_cmp`:
-      IPv4 first, then by address); here the minimum is `10.0.0.1/32`, the
-      smallest TEXT, and `max(cidr) over ()` picks `9.0.0.0/8` over
-      `10.0.0.1/32`. With `over (order by x)` it is 0A000 `function
-      max(inet) is not supported yet`. The plain aggregate is rewritten to
-      compare `__net_sortkey` (`enum_order.rs`, RP-610); that rewrite skips
-      a call with OVER, which the enum and collation rewrites beside it
-      also do (unmeasured for those).
-      Verify: tests/backlog/test_rp_found_rp706.py::test_a_window_min_max_over_a_network_value_uses_network_order
-      Backlog-ID: RP-754
-
 ## Found while working RP-698 (2026-11-10)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).
@@ -3383,3 +3344,43 @@ statement is VALUES-only and runs there as written.
       is not supported yet`.
       Verify: tests/backlog/test_rp_found_rp707.py::test_a_scalar_subquery_in_an_in_list
       Backlog-ID: RP-757
+
+## Found while working RP-754 (2026-11-10)
+
+Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
+statement is VALUES-only and runs there as written. The gap tests are in
+`tests/backlog/test_rp_found_rp754.py`. The type-order rewrite
+(`enum_order.rs`, `rewrite`) reads an ORDER BY key with `sort_by` only,
+never with `expr` as it reads the select list.
+
+- [ ] **A window call in an ORDER BY key is 0A000.** `select max(x::text)
+      over (order by x) from (values (1), (2)) s(x) order by max(x::text)
+      over (order by x) desc` is `2`, `1` on PostgreSQL 15.19, and the same
+      with `sum(x) over (order by x) + 1` `4`, `2`; here each is 0A000
+      `function max(text) is not supported yet` (`sum(integer)`): the key is
+      evaluated per row as a scalar call. `select max(x) over (order by x)
+      from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet)) s(x) order by 1
+      desc` is refused the same way, since the network rewrite copies a
+      positional key's target into the sort (since RP-754 a target whose
+      value needs no key stays positional, so `(max(x) over (...))::text
+      ... order by 1` is answered).
+      Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_call_in_an_order_by_key
+      Backlog-ID: RP-761
+- [ ] **An ORDER BY comparison over a network value compares the text.**
+      `select x::text from (values ('10.0.0.1'::inet), ('9.0.0.0'::inet))
+      s(x) order by x > '9.5.0.0'::inet` is `9.0.0.0/32`, `10.0.0.1/32` on
+      PostgreSQL 15.19; here `10.0.0.1/32` comes first, its comparison false
+      by the text, though the same comparison in the select list answers
+      true. Enum comparisons in an ORDER BY key are left alone the same way
+      (unmeasured).
+      Verify: tests/backlog/test_rp_found_rp754.py::test_an_order_by_comparison_over_a_network_value
+      Backlog-ID: RP-762
+- [ ] **A window `min` / `max` under a collation picks by the text's
+      bytes.** `select min(x collate "en-x-icu") over (), max(x collate
+      "en-x-icu") over () from (values ('a'), ('B')) s(x)` is `a`, `B` on
+      PostgreSQL 15.19, as the plain aggregate is here; here the window call
+      answers `B`, `a`. The collation rewrite of `min` / `max` skips a call
+      with OVER, as the network one did before RP-754; the enum one does
+      too (unmeasured, it needs a `CREATE TYPE`).
+      Verify: tests/backlog/test_rp_found_rp754.py::test_a_window_min_max_under_a_collation
+      Backlog-ID: RP-763

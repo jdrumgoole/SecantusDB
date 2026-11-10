@@ -1791,6 +1791,27 @@ impl Rewriter<'_> {
         // `min(e)` / `max(e)`: the extreme POSITION, mapped back.
         if let Some(N::FuncCall(f)) = node.node.as_ref() {
             let name = func_name(f);
+            // A windowed `min` / `max` over a network value picks by
+            // `network_cmp` as the plain aggregate does: the window function
+            // over the key, its ORDER BY keyed too, read back as the
+            // overload's type (RP-754).
+            if let (Some("min" | "max"), [arg], Some(_)) =
+                (name.as_deref(), f.args.as_slice(), f.over.as_ref())
+            {
+                if let Some(ty) = self.net_of(arg) {
+                    let mut agg = (**f).clone();
+                    agg.args = vec![Self::net_key(arg.clone())];
+                    if let Some(w) = agg.over.as_deref_mut() {
+                        self.window(w);
+                    }
+                    let call = pg_query::protobuf::Node {
+                        node: Some(N::FuncCall(Box::new(agg))),
+                    };
+                    *node = Self::net_value(call, &crate::min_max_result_type(&ty));
+                    self.changed = true;
+                    return Ok(());
+                }
+            }
             if matches!(name.as_deref(), Some("min" | "max")) && f.over.is_none() {
                 if let [arg] = f.args.as_slice() {
                     if let Some((collation, _)) = self.coll_of(arg) {
@@ -2158,13 +2179,23 @@ pub(crate) fn rewrite(
         };
         if let Some(t) = target {
             // An enum target is sorted by position (below); a non-enum one
-            // named like an enum column is sorted as itself.
+            // named like an enum column is sorted as itself. A window call
+            // is computed in the select list only, so a target holding one
+            // whose own value needs no key stays named by position: copied
+            // here, `(max(x) over (order by x))::text` was a second window
+            // call the sort could not run (RP-754).
+            let windowed = || {
+                crate::expr_any(
+                    &t,
+                    &|n| matches!(n.node.as_ref(), Some(N::FuncCall(f)) if f.over.is_some()),
+                )
+            };
             if r.enum_of(&t).is_some()
                 || r.net_of(&t).is_some()
                 || r.oidvec_of(&t)
                 || r.oidvec_arr_of(&t)
                 || r.coll_of(&t).is_some()
-                || !matches!(t.node.as_ref(), Some(N::ColumnRef(_)))
+                || (!matches!(t.node.as_ref(), Some(N::ColumnRef(_))) && !windowed())
             {
                 sb.node = Some(Box::new(t));
             }
