@@ -5721,10 +5721,10 @@ fn a_domain_column_is_cast_to_its_domain_where_an_array_shows_it() {
         assert_eq!(rewritten(sql), None, "{sql}");
     }
     let mut sub = select("SELECT a FROM fd");
-    cast_array_subquery_column(&mut sub, &lookup);
+    cast_subquery_column_to_domain(&mut sub, &lookup);
     assert_eq!(deparse(sub), "SELECT a::dc FROM fd");
     let mut two = select("SELECT a, i FROM fd");
-    cast_array_subquery_column(&mut two, &lookup);
+    cast_subquery_column_to_domain(&mut two, &lookup);
     assert_eq!(deparse(two), "SELECT a, i FROM fd");
 }
 
@@ -5836,7 +5836,7 @@ fn a_domain_column_keeps_its_domain_through_joins_withs_and_set_operations() {
         ),
     ] {
         let mut sub = select(sql);
-        cast_array_subquery_column(&mut sub, &lookup);
+        cast_subquery_column_to_domain(&mut sub, &lookup);
         assert_eq!(deparse(sub), expected, "{sql}");
     }
 }

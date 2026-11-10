@@ -23260,8 +23260,12 @@ fn resolve_one_sublink(
     // WITH items see and hide (`under_visible_ctes`). Added AFTER the
     // subquery's own resolution: they are already resolved.
     let mut inner = under_visible_ctes(&inner)?;
-    if sl.sub_link_type == SubLinkType::ArraySublink as i32 {
-        cast_array_subquery_column(&mut inner, lookup);
+    // An ARRAY or a scalar (EXPR) subquery is of its one column's type,
+    // which over a domain column is the domain (RP-569, RP-665).
+    if sl.sub_link_type == SubLinkType::ArraySublink as i32
+        || sl.sub_link_type == SubLinkType::ExprSublink as i32
+    {
+        cast_subquery_column_to_domain(&mut inner, lookup);
     }
 
     // A QUALIFIED reference to something outside the subquery has to be
@@ -23474,6 +23478,12 @@ fn resolve_one_sublink(
                     // that returned nothing is a bare NULL.
                     if ty == "record" {
                         return Ok(null);
+                    }
+                    // A NULL of the column's domain is no coercion into it:
+                    // no row is a NULL `ExecSetParamPlan` checks nothing of,
+                    // even a NOT NULL domain's (RP-665).
+                    if domains::user_domain(ty.strip_suffix("[]").unwrap_or(&ty)).is_some() {
+                        return Ok(relabel_cast(null, &ty));
                     }
                     // A NULL of the column's type at its modifier, as an
                     // EXPR sublink is typed whatever it returns (RP-666).
@@ -25195,7 +25205,7 @@ fn timezone_functions_as_views(
 /// a table's, a join's, a WITH item's or a FROM subquery's
 /// (`domain_scope`, RP-657); `None` when nothing changed. An ARRAY
 /// subquery's column is cast where the subquery is resolved
-/// (`cast_array_subquery_column`).
+/// (`cast_subquery_column_to_domain`).
 fn rewrite_domain_typeof(
     s: &pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
@@ -25249,12 +25259,14 @@ fn domain_columns_of(def: &TableDef) -> std::collections::HashMap<String, String
 }
 
 /// `ARRAY(select c ...)` over a domain column `c` is the domain's array,
-/// as `ARRAY[c]` is: the subquery's one column is cast to its domain before
-/// the subquery is planned (RP-569) -- reached through a join, a WITH or a
+/// as `ARRAY[c]` is, and a scalar `(select c ...)` is of the domain
+/// (`exprType` of an EXPR SubLink is its column's, RP-665): the subquery's
+/// one column is cast to its domain before the subquery is planned
+/// (RP-569) -- reached through a join, a WITH or a
 /// FROM subquery, or in every branch of a set operation whose branches are
 /// all of the domain (RP-657). More than one column is the 42601 the
 /// subquery reports. The cast is a relabel, which checks nothing (RP-655).
-fn cast_array_subquery_column(
+fn cast_subquery_column_to_domain(
     inner: &mut pg_query::protobuf::SelectStmt,
     lookup: &dyn Fn(&str) -> Option<TableDef>,
 ) {
@@ -30179,14 +30191,15 @@ fn static_type_uncached(node: &pg_query::protobuf::Node, value: &Bson) -> String
                             && !matches!(r.node.as_ref(), Some(N::AConst(c)) if c.isnull
                                 || matches!(c.val, Some(pg_query::protobuf::a_const::Val::Sval(_)))) =>
                     {
-                        static_type(r, &Bson::Null)
+                        domain_base(static_type(r, &Bson::Null))
                     }
                     // Typed from the `=` PostgreSQL resolves: its LEFT input
-                    // type, which an implicit cast may widen (RP-076).
+                    // type, which an implicit cast may widen (RP-076), and a
+                    // domain's is its base's operator's (RP-665).
                     (Some(l), Some(r)) => {
                         // An untyped right side reads as the left's type
                         // (RP-741).
-                        let lt = static_type(l, value);
+                        let lt = domain_base(static_type(l, value));
                         let rt = nullif_right_type(r, &Bson::Null, &lt);
                         funcsig::operator_left_input("=", &lt, &rt).unwrap_or(lt)
                     }
@@ -30761,7 +30774,18 @@ fn case_results(c: &pg_query::protobuf::CaseExpr) -> Vec<&pg_query::protobuf::No
             _ => None,
         })
         .collect();
-    out.extend(c.defresult.as_deref());
+    // No ELSE is an ELSE NULL (`transformCaseExpr`), an untyped input to
+    // the CASE's `select_common_type`, so `case when p then d end` over a
+    // domain `d` is of its base (RP-665).
+    static ELSE_NULL: std::sync::LazyLock<pg_query::protobuf::Node> =
+        std::sync::LazyLock::new(|| pg_query::protobuf::Node {
+            node: Some(N::AConst(pg_query::protobuf::AConst {
+                isnull: true,
+                location: -1,
+                val: None,
+            })),
+        });
+    out.push(c.defresult.as_deref().unwrap_or(&ELSE_NULL));
     out
 }
 
@@ -30776,9 +30800,18 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
         }
         _ => false,
     };
+    // Only inputs all of exactly one type keep it, which is the one way a
+    // domain is the result; otherwise each is resolved by its domain's base
+    // (`getBaseType`), so `coalesce(d, 0)` is the base type (RP-665).
+    let typed: Vec<String> = nodes
+        .iter()
+        .filter(|n| !untyped(n))
+        .map(|n| static_type(n, &Bson::Null))
+        .collect();
+    let same = typed.len() == nodes.len() && typed.windows(2).all(|w| w[0] == w[1]);
     let mut out: Option<String> = None;
-    for n in nodes.iter().filter(|n| !untyped(n)) {
-        let t = static_type(n, &Bson::Null);
+    for t in typed {
+        let t = if same { t } else { domain_base(t) };
         out = Some(match out {
             None => t,
             Some(cur) if cur == t => cur,
@@ -30788,6 +30821,11 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
         });
     }
     out.unwrap_or_else(|| "text".to_string())
+}
+
+/// `getBaseType`: a domain's innermost base type, any other type as it is.
+fn domain_base(t: String) -> String {
+    domains::base_type_and_typmod(&t).map_or(t, |(base, _, _)| base)
 }
 
 /// The date/time type two of them meet as: `date` widens to `timestamp`,

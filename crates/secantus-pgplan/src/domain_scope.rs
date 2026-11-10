@@ -7,7 +7,7 @@
 //! subquery, or a set operation whose branches are all of the domain
 //! (`select_common_type` keeps a type every input shares). The rewrites
 //! that cast such a column to its domain (`rewrite_domain_typeof`,
-//! `cast_array_subquery_column`) ask this scope which domain, if any, a
+//! `cast_subquery_column_to_domain`) ask this scope which domain, if any, a
 //! reference is of. A reference it cannot be sure of -- a bare name more
 //! than one FROM item may have, a FROM item whose columns it does not know
 //! -- is of no domain here, as before RP-657.

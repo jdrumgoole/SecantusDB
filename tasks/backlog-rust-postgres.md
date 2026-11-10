@@ -2450,21 +2450,24 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
       Verify: tests/backlog/test_rp_found_rp672.py::test_intersect_keeps_the_smaller_inputs_value
       Backlog-ID: RP-692
 
-## Found while working RP-655 (2026-11-08)
+## Found while working RP-665 (2026-11-10)
 
-Measured on a private PostgreSQL 15.19 cluster with `create domain d655 as
-int`, `t655(a d655, b int)` holding `(-1, -1)` and `(5, 5)`, then `alter
-domain d655 add constraint d655_pos check (value > 0) not valid`. The gap
-tests are in `tests/backlog/test_rp_found_rp655.py`.
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp665.py`: `t665(a d665, c dc665, b int)`
+over `create domain d665 as int` and `create domain dc665 as char(4)`.
 
-- [ ] **A scalar subquery over a domain column is typed by the domain's
-      base.** `select pg_typeof((select a from t655 where b < 0))` is
-      `d655` on PostgreSQL 15.19 (`exprType` of the SubLink is its column's);
-      here it is `integer`. The subquery's column is typed by the stored
-      column's base type; since RP-569 only an ARRAY subquery's column is
-      cast to its domain (`cast_array_subquery_column`).
-      Verify: tests/backlog/test_rp_found_rp655.py::test_scalar_subquery_over_a_domain_column_is_of_the_domain
-      Backlog-ID: RP-665
+- [ ] **A CASE, COALESCE, GREATEST or LEAST over domain columns alone is
+      typed by the domain's base.** `select pg_typeof(coalesce(a, a)) from
+      t665` is `d665` on PostgreSQL 15.19, and so are `case when ... then a
+      else a end`, `greatest(a, a)` and `least(a, a)`; `coalesce(c, c)` is
+      `dc665` (`select_common_type` keeps a type every input shares
+      exactly, a domain included). Here each is `integer` (`character`).
+      Since RP-665 the common type keeps a domain every input is OF -- a
+      scalar subquery over one is -- but a bare domain column reaches a
+      `pg_typeof` as its domain only directly (`rewrite_domain_typeof`),
+      so inside these it is still of its stored base type.
+      Verify: tests/backlog/test_rp_found_rp665.py::test_common_type_of_domain_columns_alone_is_the_domain
+      Backlog-ID: RP-764
 
 ## Found while working RP-656 (2026-11-08)
 
