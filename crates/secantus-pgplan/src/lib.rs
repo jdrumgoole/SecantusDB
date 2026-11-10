@@ -17816,7 +17816,7 @@ fn bpchar_compared_operands(
 /// Whether an IN list's member reads a Var of its own query: a column, or
 /// a row's column standing as a `$n` past the statement's `row_from`
 /// parameters (`contain_vars_of_level(rexpr, 0)` in `transformAExprIn`).
-fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
+pub(crate) fn in_member_has_var(item: &pg_query::protobuf::Node, row_from: usize) -> bool {
     if matches!(item.node.as_ref(), Some(N::ColumnRef(_))) {
         return true;
     }
@@ -31195,7 +31195,7 @@ fn common_type(nodes: &[&pg_query::protobuf::Node]) -> String {
 }
 
 /// `getBaseType`: a domain's innermost base type, any other type as it is.
-fn domain_base(t: String) -> String {
+pub(crate) fn domain_base(t: String) -> String {
     domains::base_type_and_typmod(&t).map_or(t, |(base, _, _)| base)
 }
 

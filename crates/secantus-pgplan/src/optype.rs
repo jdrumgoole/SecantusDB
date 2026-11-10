@@ -1782,6 +1782,40 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
                     }
                 }
             }
+            // Each untyped member is read as a type when the statement is
+            // analysed, so one that is not valid input for it fails before
+            // any row is compared, and over no rows (RP-806). More than one
+            // member with no Var is coerced to their common type with the
+            // left operand's (`transformAExprIn`); otherwise each member is
+            // an `=` of its own, where the untyped side takes the left's
+            // type. A common type this cannot tell checks nothing.
+            let row_from = crate::correlated::row_params_from();
+            let mut nonvars: Vec<&pg_query::protobuf::Node> = Vec::new();
+            for (i, item) in items.items.iter().enumerate() {
+                if i % 1024 == 1023 {
+                    crate::cancel::check()?;
+                }
+                if !crate::in_member_has_var(item, row_from) {
+                    nonvars.push(item);
+                }
+            }
+            let target = match (e.lexpr.as_deref(), nonvars.len()) {
+                (Some(lexpr), n) if n > 1 => {
+                    let mut parts = Vec::with_capacity(n + 1);
+                    parts.push(lexpr);
+                    parts.extend(nonvars.iter().copied());
+                    common_type(&parts, scope).map(crate::domain_base)
+                }
+                _ => Some(crate::domain_base(l.clone())),
+            };
+            if let Some(target) = target {
+                for (i, item) in nonvars.iter().enumerate() {
+                    if i % 1024 == 1023 {
+                        crate::cancel::check()?;
+                    }
+                    literal_fits(item, &target)?;
+                }
+            }
         }
         Some(K::AexprLike | K::AexprIlike) | Some(K::AexprOp)
             if matches!(op.as_str(), "~~" | "~~*" | "!~~" | "!~~*") =>

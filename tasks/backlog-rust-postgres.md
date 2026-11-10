@@ -3452,25 +3452,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
       Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
       Backlog-ID: RP-803
 
-## Found while working RP-792 (2026-11-10)
-
-Measured on the shared PostgreSQL 15.19 reference (port 5415) with
-FROM-less and VALUES-only statements. The gap test is in
-`tests/backlog/test_rp_found_rp792.py`.
-
-- [ ] **An IN list's untyped member that its common type cannot read is
-      no error once an earlier member matches.** `select 1 in (1, 'x')`
-      is 22P02 `invalid input syntax for type integer: "x"` on PostgreSQL
-      15.19, and so is `select x, x in (1, 'x') from (values (1)) s(x)`,
-      even `... where false`: `transformAExprIn` coerces every non-Var
-      member to the list's common type while the statement is analysed,
-      before a row is read. Here the members are compared one at a time
-      and the first match ends the list, so both answer `true`, and with
-      no rows nothing is checked. (A WHERE that lowers to a filter, and
-      `1 = any(array[1, 'x'])`, already raise it.)
-      Verify: tests/backlog/test_rp_found_rp792.py::test_an_in_lists_unreadable_member_is_an_error
-      Backlog-ID: RP-806
-
 ## Found while working RP-808 (2026-11-10)
 
 Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the

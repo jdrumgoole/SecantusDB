@@ -6393,3 +6393,61 @@ fn a_field_of_an_outer_whole_row_is_its_column() {
     assert_eq!(target_refs(&own), ["?"]);
     assert_eq!(target_refs(&bound), ["?"]);
 }
+
+/// `transformAExprIn` reads an IN list's untyped members as a type when the
+/// statement is analysed (RP-806): the common type of the left operand and
+/// the members with no Var when there are more than one of them, otherwise
+/// the left operand's. A member that type's input refuses is its 22P02 at
+/// planning, before any row is compared, even one past a member that
+/// matches; each measured on PostgreSQL 15.19.
+#[test]
+fn an_in_lists_untyped_member_is_read_as_the_lists_type_at_planning() {
+    // (statement, message, 0-based location: PostgreSQL's position less one)
+    for (sql, want, at) in [
+        (
+            "select n in (1, 'x') from t",
+            "invalid input syntax for type integer: \"x\"",
+            16,
+        ),
+        (
+            "select 1 in (1, 'x')",
+            "invalid input syntax for type integer: \"x\"",
+            16,
+        ),
+        // One member with no Var: a plain `=`, read as the left operand's
+        // type.
+        (
+            "select n in (id, 'x') from t",
+            "invalid input syntax for type integer: \"x\"",
+            17,
+        ),
+        // The common type of `int4` and `numeric` is `numeric`.
+        (
+            "select n in (1.5, 'x') from t",
+            "invalid input syntax for type numeric: \"x\"",
+            18,
+        ),
+        // NOT IN coerces the same way.
+        (
+            "select n not in (2, '1.5') from t",
+            "invalid input syntax for type integer: \"1.5\"",
+            20,
+        ),
+    ] {
+        take_error_location();
+        let err = analysed(sql).expect_err("should refuse");
+        assert_eq!(err.sqlstate(), "22P02", "for {sql}: {err}");
+        assert_eq!(err.to_string(), want, "for {sql}");
+        assert_eq!(take_error_location(), Some(at), "for {sql}");
+    }
+    // A member the type reads is no error.
+    for sql in [
+        "select n in (1, '2') from t",
+        "select n in (1, ' 2 ', null) from t",
+        "select n in (1.5, '1.5') from t",
+        "select 1::int2 in (1, '70000')",
+        "select name in ('a', 'x') from t",
+    ] {
+        assert!(analysed(sql).is_ok(), "{sql}: {:?}", analysed(sql).err());
+    }
+}
