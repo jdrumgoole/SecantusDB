@@ -4658,7 +4658,7 @@ fn apply_coll_stats(
             ),
         )
     };
-    let exists = storage.collection_exists(db, coll).unwrap_or(false);
+    let exists = crate::stats_admin::has_stats(storage, db, coll);
     // A time-series collection's statistics are its buckets': their
     // namespace, and how many there are.
     let buckets = if storage

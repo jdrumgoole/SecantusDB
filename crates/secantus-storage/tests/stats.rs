@@ -70,6 +70,24 @@ fn synthetic_oplog_rs_options() {
 }
 
 #[test]
+fn synthetic_oplog_rs_is_sized_from_its_entries() {
+    with_db(|st| {
+        // The oplog's entries are in the oplog tables, not the document
+        // tables, and are what its count and size are read from (RM-419:
+        // the size read 0).
+        st.insert_one("app", "c", &enc(&doc! {"_id": 1, "x": "hello"}))
+            .unwrap();
+        let sizes = st.collection_sizes("local", "oplog.rs").unwrap();
+        assert!(sizes.records >= 1, "{sizes:?}");
+        assert!(sizes.data_size > 0, "{sizes:?}");
+        assert_eq!(
+            st.collection_data_size("local", "oplog.rs").unwrap(),
+            sizes.data_size
+        );
+    });
+}
+
+#[test]
 fn collection_is_capped_reflects_options() {
     with_db(|st| {
         st.create_collection("app", "plain").unwrap();

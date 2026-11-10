@@ -409,6 +409,34 @@ fn coll_stats_reports_count_and_index_sizes() {
     });
 }
 
+/// The oplog has no catalog entry, but `$collStats` answers it as mongod
+/// 8.2.11 does any capped collection: its entries counted and sized, with
+/// `capped`, `max` and `maxSize` (RM-419: it was NamespaceNotFound, and
+/// `collStats` sized it 0).
+#[test]
+fn coll_stats_answers_the_oplog() {
+    with_wt(|c| {
+        seed(c, "c", vec![doc! {"_id": 1}, doc! {"_id": 2}]);
+        c.db_name = "local".into();
+        let reply = dispatch(
+            &doc! {"aggregate": "oplog.rs", "pipeline": [{"$collStats": {"storageStats": {}, "count": {}}}], "cursor": {}},
+            c,
+        );
+        let out = docs_of(&reply);
+        assert_eq!(out.len(), 1, "{reply:?}");
+        assert_eq!(out[0].get_str("ns").unwrap(), "local.oplog.rs");
+        let ss = out[0].get_document("storageStats").unwrap();
+        assert!(ss.get_i32("count").unwrap() >= 2, "{ss:?}");
+        assert!(ss.get_i32("size").unwrap() > 0, "{ss:?}");
+        assert_eq!(ss.get_bool("capped"), Ok(true));
+        assert_eq!(ss.get_i32("max"), Ok(0));
+        assert!(ss.contains_key("maxSize"), "{ss:?}");
+        let stats = dispatch(&doc! {"collStats": "oplog.rs"}, c);
+        assert_eq!(stats.get_bool("capped"), Ok(true), "{stats:?}");
+        assert_eq!(stats.get_i32("size"), ss.get_i32("size"));
+    });
+}
+
 #[test]
 fn index_stats_one_doc_per_index() {
     with_wt(|c| {
