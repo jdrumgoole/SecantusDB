@@ -3458,17 +3458,6 @@ Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
 `_SETUP` in `tests/backlog/test_rp_found_rp808.py`: `t808(i int, b bool,
 s text)`.
 
-- [ ] **An UPDATE's SET expression is not coerced to boolean when no row
-      reaches it.** `update t808 set b = (i is true) where false`, `(i
-      and true)` and `(not i)` over the `int` column are 42804 `argument
-      of IS TRUE / AND / NOT must be type boolean, not type integer` on
-      PostgreSQL 15.19 (`transformUpdateTargetList` transforms each SET
-      expression, whatever the rows). Here each is `UPDATE 0`: the SET
-      expression is only judged when a row's value is computed, so the
-      statement fails or not by the data. A SELECT's, a DELETE's WHERE and
-      an INSERT's VALUES are checked when the statement is analysed.
-      Verify: tests/backlog/test_rp_found_rp808.py::test_an_update_set_expression_is_coerced_to_boolean
-      Backlog-ID: RP-810
 - [ ] **AND / OR / NOT report a non-boolean argument at the operator.**
       `coerce_to_boolean` reports at the argument's `exprLocation`, an
       operator expression's leftmost token: `select ('x' || 'y') and

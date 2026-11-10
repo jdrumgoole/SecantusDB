@@ -2856,14 +2856,19 @@ fn check_in(node: &N, outer: &[Cte], lookup: &dyn Fn(&str) -> Option<TableDef>) 
                 .collect();
             let scope = Scope::new(&items, &ctes, lookup, None);
             let cx = Cx { lookup, ctes };
-            match u.where_clause.as_deref() {
-                Some(w) => {
-                    no_aggregate_in_where(w)?;
-                    walk(w, &scope, &cx)?;
-                    clause_is_boolean(w, &scope, "WHERE")
-                }
-                None => Ok(()),
+            if let Some(w) = u.where_clause.as_deref() {
+                no_aggregate_in_where(w)?;
+                walk(w, &scope, &cx)?;
+                clause_is_boolean(w, &scope, "WHERE")?;
             }
+            // `transformUpdateStmt` transforms the WHERE, then each SET
+            // expression (`transformUpdateTargetList`), whatever the rows:
+            // `set b = (i is true) where false` over an `int` is 42804
+            // (RP-810), where judging it per row answered `UPDATE 0`.
+            for t in &u.target_list {
+                walk(t, &scope, &cx)?;
+            }
+            Ok(())
         }
         N::DeleteStmt(d) => {
             let ctes = with_ctes(d.with_clause.as_ref(), outer, lookup, None)?;

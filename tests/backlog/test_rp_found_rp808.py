@@ -1,8 +1,8 @@
 """Gap tests of the divergences found while working RP-808 (`IS TRUE` and
 its kin over a value that is not boolean):
 
-- an UPDATE's SET expression is not coerced to boolean when no row reaches
-  it (RP-810);
+- an UPDATE's SET expression was not coerced to boolean when no row
+  reached it (RP-810, fixed);
 - a CHECK constraint's expression was not coerced to boolean (RP-811,
   fixed);
 - AND / OR / NOT report a non-boolean argument at the operator, not at the
@@ -93,7 +93,7 @@ def test_a_boolean_test_over_a_non_boolean_is_42804_at_its_argument(
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-810")
+@pytest.mark.backlog_fixed("RP-810")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -107,8 +107,9 @@ def test_an_update_set_expression_is_coerced_to_boolean(
 ) -> None:
     """`transformUpdateTargetList` transforms each SET expression, which
     coerces a test's or a connective's argument to boolean whether or not a
-    row is updated: each is 42804 on PostgreSQL 15.19. Here an UPDATE no
-    row reaches is `UPDATE 0`."""
+    row is updated: each is 42804 on PostgreSQL 15.19. Before RP-810 an
+    UPDATE no row reached was `UPDATE 0`, as its SET expressions were only
+    judged when a row's value was computed."""
     assert _answer(dsn, query) == expected
 
 
