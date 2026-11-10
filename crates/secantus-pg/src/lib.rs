@@ -39098,8 +39098,10 @@ impl PgHandler {
                     // table's order. Every first-input row inserts
                     // (`LookupTupleHashEntry` with `isnew`), so one after the
                     // last group's first can grow the table.
-                    let types: Option<Vec<String>> =
-                        schema.iter().map(|f| Self::planner_type_name(f.datatype())).collect();
+                    let types: Option<Vec<String>> = schema
+                        .iter()
+                        .map(|f| Self::planner_type_name(f.datatype()))
+                        .collect();
                     let order = plan
                         .nbuckets
                         .zip(types)
