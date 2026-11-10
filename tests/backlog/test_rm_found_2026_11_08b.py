@@ -145,6 +145,21 @@ _LISTED = {
 }
 
 
+def _or_branches_unordered(value: Any) -> Any:
+    """`value` with every `$or`'s branches in one order. mongod 8.2.11 does
+    not keep one: the moved `$match` of `an_or` listed `a` before `b` in 3
+    of 5 fresh replica sets and `b` before `a` in the other 2 (2026-11-10),
+    so a comparison of the order fails on mongod's coin, not this server's."""
+    if isinstance(value, dict):
+        out = {k: _or_branches_unordered(v) for k, v in value.items()}
+        if isinstance(out.get("$or"), list):
+            out["$or"] = sorted(out["$or"], key=repr)
+        return out
+    if isinstance(value, list):
+        return [_or_branches_unordered(v) for v in value]
+    return value
+
+
 def _collectionless_stages(client: Any, pipelines: dict, verbosity: str) -> dict:
     def stages(pipeline: list) -> list:
         reply = client.admin.command(
@@ -153,7 +168,9 @@ def _collectionless_stages(client: Any, pipelines: dict, verbosity: str) -> dict
             verbosity=verbosity,
         )
         return [
-            {k: v for k, v in s.items() if k != "executionTimeMillisEstimate"}
+            _or_branches_unordered(
+                {k: v for k, v in s.items() if k != "executionTimeMillisEstimate"}
+            )
             for s in reply["stages"]
         ]
 
