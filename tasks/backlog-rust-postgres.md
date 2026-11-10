@@ -2519,14 +2519,6 @@ Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
 dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
 `varchar(3)`.
 
-- [ ] **A variable of a table's row type has no assignable fields.**
-      `declare r t687; begin r.a := 5;` assigns the field on PostgreSQL
-      15.19 (and `r.a := -5` is the domain's 23514); here it is 42601
-      `"r.a" is not a known variable`, and `raise exception '%', r` after a
-      `select * into r` is 0A000 `a cast of int32 to t687 is not supported
-      yet` where PostgreSQL prints `(5,ab,q,"x  ")`.
-      Verify: tests/backlog/test_rp_found_rp670.py::test_row_variable_fields_are_assignable
-      Backlog-ID: RP-689
 - [ ] **OPEN -- `stop()` with an idle connection open took 3.8 s once
       under load.** `crates/secantus-pg/tests/embedded.rs::stop_does_not_wait_on_an_idle_connection`
       failed in a local `scripts/gate_pg.sh --fast` run on 2026-11-09
@@ -3566,3 +3558,32 @@ Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
       line) as an error collects them on the way out.
       Verify: tests/backlog/test_rp_found_rp751.py::test_a_notice_carries_its_context
       Backlog-ID: RP-833
+
+## Found while working RP-689 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp689.py`: `t689(a d689, v
+varchar(3), w dv689, c char(3))`, `d689` an `int` with `check (value > 0)`.
+
+- [ ] **Reading a field a record lacks is 42P01.** `do $$ declare r record;
+      begin select 1 as a into r; raise exception '%', r.nosuch; end $$` is
+      42703 `record "r" has no field "nosuch"` on PostgreSQL 15.19
+      (`exec_eval_datum` over the RECFIELD), and so is the same read of a
+      variable of a row type, assigned or not. Here the reference is left
+      in the SQL text, which reads it as a column of a FROM item `r`: 42P01
+      `missing FROM-clause entry for table "r"`. (An assignment to such a
+      field is 42703 already.)
+      Verify: tests/backlog/test_rp_found_rp689.py::test_reading_a_field_a_record_lacks_is_42703
+      Backlog-ID: RP-837
+- [ ] **A column a record variable's field shares is not ambiguous.** With
+      `declare r t689`, `(select r.a from t689 r)` is 42702 `column
+      reference "r.a" is ambiguous` on PostgreSQL 15.19
+      (`plpgsql.variable_conflict` is `error` by default, and
+      `plpgsql_pre_column_ref` / `resolve_column_ref` find both the FROM
+      item's column and the variable's field); here the variable's field is
+      substituted as a parameter, which the subquery then rejects as 42601
+      `syntax error at or near "$2"`. The interpreter reads any name a
+      variable has as the variable (the module comment of
+      `plpgsql_fn.rs` says so), a bare column name included.
+      Verify: tests/backlog/test_rp_found_rp689.py::test_a_column_a_record_field_shares_is_ambiguous
+      Backlog-ID: RP-838

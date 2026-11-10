@@ -153,19 +153,81 @@ fn column_type(
 ) -> Option<String> {
     let key = relation_key_of(schema.map(String::as_str), relation)?;
     let def = lookup(&key)?;
-    let c = def.column(column)?;
-    // A domain column is of the domain, which carries the modifier
-    // (`atttypmod` -1); an enum column of its enum.
+    Some(column_declared_type(def.column(column)?))
+}
+
+/// A column's type as a declared type's text: a domain column is of the
+/// domain, which carries the modifier (`atttypmod` -1); an enum column of
+/// its enum; any other of its type at its modifier.
+fn column_declared_type(c: &crate::Column) -> String {
     for key in ["domain_type", "enum_type"] {
         if let Ok(t) = c.extra.get_str(key) {
-            return Some(t.to_string());
+            return t.to_string();
         }
     }
-    Some(if c.typmod >= 0 {
+    if c.typmod >= 0 {
         scalar::format_type_text_public(&c.pg_type, Some(c.typmod))
     } else {
         c.pg_type.clone()
-    })
+    }
+}
+
+/// A row type as [`plpgsql_row_type`] answers it: the type's name and each
+/// field's `(name, declared type text)`, in order.
+pub type PlpgsqlRowType = (String, Vec<(String, String)>);
+
+/// A PL/pgSQL declaration's type text as a ROW type (RP-689), or `None`
+/// when it is not one. `plpgsql_build_variable` compiles a variable whose
+/// type is composite as a record of that type (`PLPGSQL_TTYPE_REC` with
+/// `rectypeid` set): a `rel%ROWTYPE` (`plpgsql_parse_wordrowtype` /
+/// `cwordrowtype`, the relation as `RangeVarGetRelid` finds it), or a type
+/// name `parse_datatype` resolves to a table's row type or a `CREATE TYPE
+/// ... AS (...)`. A built-in, domain, enum or base type of that name is
+/// found first, as the search path finds `pg_catalog` first. Answers the
+/// type's name and each field's `(name, declared type text)`, in order.
+pub fn plpgsql_row_type(
+    text: &str,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Option<PlpgsqlRowType> {
+    let text = text.trim();
+    let lower = text.to_ascii_lowercase();
+    let (head, rowtype) = match lower.strip_suffix("rowtype") {
+        Some(h) if h.trim_end().ends_with('%') => {
+            let h = h.trim_end();
+            (&text[..h.len() - 1], true)
+        }
+        _ => (text, false),
+    };
+    let words = plpgsql_percent_type_words(&format!("{head}%type"))?;
+    let (schema, name) = match words.as_slice() {
+        [name] => (None, name),
+        [schema, name] => (Some(schema.as_str()), name),
+        _ => return None,
+    };
+    // `pg_catalog` comes first on the path, so a built-in type of that name
+    // is the one found. Any other type shares the name space of the row
+    // types (`pg_type`), so a relation or composite of the name is it.
+    if !rowtype && schema.is_none() && pgtypes::BUILTIN_TYPES.iter().any(|(t, _, _)| t == name) {
+        return None;
+    }
+    if let Some(key) = relation_key_of(schema, name) {
+        if let Some(def) = lookup(&key) {
+            let fields = def
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), column_declared_type(c)))
+                .collect();
+            return Some((key, fields));
+        }
+    }
+    if rowtype {
+        return None;
+    }
+    let resolution = match schema {
+        Some(s) if s != "public" => format!("{s}.{name}"),
+        _ => name.clone(),
+    };
+    crate::user_composite_fields(&resolution).map(|fields| (resolution, fields))
 }
 
 /// `LookupTypeNameExtended`'s `%TYPE` branch, for a routine's parameter or

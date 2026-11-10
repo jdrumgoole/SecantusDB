@@ -129,7 +129,9 @@ mod funcsig;
 mod named_args;
 pub mod nodetostring;
 mod plpgsql_pct_type;
-pub use plpgsql_pct_type::{plpgsql_percent_type_outer, plpgsql_percent_type_words};
+pub use plpgsql_pct_type::{
+    plpgsql_percent_type_outer, plpgsql_percent_type_words, plpgsql_row_type, PlpgsqlRowType,
+};
 mod query_reads;
 mod schema_functions;
 mod search_cycle;
@@ -36061,6 +36063,11 @@ fn user_composite(name: &str) -> Option<(i64, CompositeFields)> {
             .get(at)
             .map(|(_, oid, fields)| (*oid, fields.clone()))
     })
+}
+
+/// A composite type's fields by name, as `user_composite` finds it.
+pub(crate) fn user_composite_fields(name: &str) -> Option<CompositeFields> {
+    user_composite(name).map(|(_, fields)| fields)
 }
 
 /// A composite type's oid by name -- the door `user_type_oid` misses because
