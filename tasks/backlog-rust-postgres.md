@@ -3424,18 +3424,28 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
       answered.
       Verify: tests/backlog/test_rp_found_rp796.py::test_collate_over_a_collated_domain_expression
       Backlog-ID: RP-802
-- [ ] **A VALUES or set-operation column whose rows carry two different
-      implicit collations sorts bytewise.** `transformValuesClause` and a
-      set operation take the column's collation by
-      `select_common_collation(..., none_ok = true)`, so `(values
-      ('a'::xu782f), ('B'::xc782f)) s(v)` has no collation on PostgreSQL
-      15.19: `collation for (v)` is NULL, and `order by v` or `max(v)` is
-      42P22 `could not determine which collation to use for string
-      comparison` (a UNION ALL of the two likewise). Here the column has
-      `"default"` and sorts bytewise (`B, a`; `max` is `a`). Comparing it
-      with a constant takes the constant's default collation and agrees.
-      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
-      Backlog-ID: RP-803
+
+## Found while working RP-803 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster (locale C.UTF-8, built
+with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`.
+Since RP-803 a VALUES or set-operation column whose rows' implicit
+collations conflict has none (`collation::INDETERMINATE`): ORDER BY and
+`max` / `min` over it are 42P22, and `collation for` it is NULL.
+
+- [ ] **A column of no collation is still grouped, made distinct and
+      compared bytewise.** Over `(values ('a'::xu782f), ('B'::xc782f))
+      s(v)`, `group by v` is 42P22 `could not determine which collation to
+      use for string hashing` on PostgreSQL 15.19 (`hashtext`'s
+      `check_collation_set`), and `select distinct v`, `count(distinct
+      v)`, `select v = v` and `select v < v` are 42P22 `... for string
+      comparison` (`texteq`, `text_lt`); here each answers, bytewise. A
+      sort by it over no rows (`... where false order by v`) is 42P22 there,
+      as `varstr_sortsupport` checks as the sort starts; here it is empty,
+      since the check rides on each row's sort key. (`where v = v` answers
+      both rows on both: the planner reduces it to `v IS NOT NULL`.)
+      Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_no_collation_is_not_hashed_or_compared
+      Backlog-ID: RP-820
 
 ## Found while working RP-808 (2026-11-10)
 

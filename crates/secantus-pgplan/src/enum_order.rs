@@ -389,10 +389,14 @@ fn derived_def(
                     col
                 })
                 .unwrap_or_else(|| Column::new(n, "text", false));
-            // An explicit `COLLATE` wins; otherwise the implicit collation
-            // the rows' casts to a collated domain agree on, and none when
-            // two differ (`select_common_collation` with `none_ok`, as
-            // `transformValuesClause` and a set operation call it) (RP-796).
+            // An explicit `COLLATE` wins; otherwise the non-default implicit
+            // collation the rows' casts to a collated domain, and the columns
+            // the legs pass through, agree on (RP-796). Two different ones
+            // leave the column with none, `INDETERMINATE`
+            // (`select_common_collation` with `none_ok`, as
+            // `transformValuesClause` and a set operation call it), and a
+            // passed-through column of none takes no part (RP-803).
+            c.extra.remove("collation");
             let collation = all
                 .iter()
                 .find_map(|r| match expr_at(r, i)?.node.as_ref() {
@@ -405,13 +409,34 @@ fn derived_def(
                 .or_else(|| {
                     let implicit: Vec<String> = all
                         .iter()
-                        .filter_map(|r| match expr_at(r, i)?.node.as_ref() {
-                            Some(N::TypeCast(tc)) => domain_cast_collation(tc),
-                            _ => None,
+                        .filter_map(|r| {
+                            let leg = r.get(i)?;
+                            if let Some(col) = &leg.column {
+                                return col.extra.get_str("collation").ok().map(str::to_string);
+                            }
+                            match leg.expr.as_ref()?.node.as_ref() {
+                                Some(N::TypeCast(tc)) => domain_cast_collation(tc),
+                                _ => None,
+                            }
                         })
+                        .filter(|n| n != "default" && n != crate::collation::INDETERMINATE)
                         .collect();
+                    let none = |r: &Vec<LegColumn>| {
+                        r.get(i)
+                            .and_then(|l| l.column.as_ref())
+                            .and_then(|c| c.extra.get_str("collation").ok())
+                            == Some(crate::collation::INDETERMINATE)
+                    };
+                    // Every leg passing a column of none through: still none.
+                    if implicit.is_empty() && !all.is_empty() && all.iter().all(none) {
+                        return Some(crate::collation::INDETERMINATE.to_string());
+                    }
                     let first = implicit.first()?;
-                    implicit.iter().all(|n| n == first).then(|| first.clone())
+                    Some(if implicit.iter().all(|n| n == first) {
+                        first.clone()
+                    } else {
+                        crate::collation::INDETERMINATE.to_string()
+                    })
                 });
             if let Some(coll) = collation {
                 c.extra.insert("collation", coll);
@@ -800,6 +825,17 @@ impl Rewriter<'_> {
         scope_column(self.scope, c)
     }
 
+    /// Is `node` a column of no collation -- a VALUES or set-operation
+    /// column whose rows' implicit collations conflict (RP-803)?
+    fn indeterminate(&self, node: &pg_query::protobuf::Node) -> bool {
+        match node.node.as_ref() {
+            Some(N::ColumnRef(c)) => self.column_of(c).is_some_and(|col| {
+                col.extra.get_str("collation") == Ok(crate::collation::INDETERMINATE)
+            }),
+            _ => false,
+        }
+    }
+
     /// The LOCALE collation (one that orders differently from bytes) a
     /// text operand carries: an explicit `COLLATE`, or its column's
     /// declared collation. `(name, explicit)`.
@@ -906,9 +942,12 @@ impl Rewriter<'_> {
                         .push((name.clone(), cc.location));
                     Some((name, true))
                 }
+                // A column of no collation takes no part (`COLLATE_NONE`)
+                // (RP-803).
                 Some(N::ColumnRef(c)) => self
                     .column_of(c)
                     .and_then(crate::collation::column_collation)
+                    .filter(|name| name != crate::collation::INDETERMINATE)
                     .map(|name| (name, false)),
                 Some(N::TypeCast(tc)) if Self::is_citext_cast(tc) => {
                     Some((crate::collation::CITEXT.to_string(), false))
@@ -974,6 +1013,62 @@ impl Rewriter<'_> {
             return Ok(Some((*first).clone()));
         }
         Ok(None)
+    }
+
+    /// `min` / `max` call `f` over `arg`, a column of no collation: `CASE
+    /// WHEN count(arg) < 2 THEN f(arg::text) ELSE __coll_key(<none>,
+    /// f(arg::text)) END`, the count with `f`'s FILTER, DISTINCT and
+    /// window, so it fails as `text_larger` does, on the first comparison.
+    /// The cast keeps the rewritten call from matching again.
+    fn indeterminate_extreme(
+        f: &pg_query::protobuf::FuncCall,
+        arg: &pg_query::protobuf::Node,
+    ) -> pg_query::protobuf::Node {
+        let call = |name: &str, a: pg_query::protobuf::Node| {
+            let mut g = f.clone();
+            g.funcname = vec![string_node(name)];
+            g.args = vec![a];
+            pg_query::protobuf::Node {
+                node: Some(N::FuncCall(Box::new(g))),
+            }
+        };
+        let extreme = call(
+            &func_name(f).unwrap_or_default(),
+            pg_query::protobuf::Node {
+                node: Some(N::TypeCast(Box::new(pg_query::protobuf::TypeCast {
+                    arg: Some(Box::new(arg.clone())),
+                    type_name: Some(type_name_node("text")),
+                    location: -1,
+                }))),
+            },
+        );
+        let fewer_than_two = pg_query::protobuf::Node {
+            node: Some(N::AExpr(Box::new(pg_query::protobuf::AExpr {
+                kind: pg_query::protobuf::AExprKind::AexprOp as i32,
+                name: vec![string_node("<")],
+                lexpr: Some(Box::new(call("count", arg.clone()))),
+                rexpr: Some(Box::new(int_const(2))),
+                location: -1,
+            }))),
+        };
+        pg_query::protobuf::Node {
+            node: Some(N::CaseExpr(Box::new(pg_query::protobuf::CaseExpr {
+                args: vec![pg_query::protobuf::Node {
+                    node: Some(N::CaseWhen(Box::new(pg_query::protobuf::CaseWhen {
+                        expr: Some(Box::new(fewer_than_two)),
+                        result: Some(Box::new(extreme.clone())),
+                        location: -1,
+                        ..Default::default()
+                    }))),
+                }],
+                defresult: Some(Box::new(Self::coll_key(
+                    &extreme,
+                    crate::collation::INDETERMINATE,
+                ))),
+                location: -1,
+                ..Default::default()
+            }))),
+        }
     }
 
     /// `__coll_key('collation', node)`, the `COLLATE` wrapper stripped.
@@ -1335,6 +1430,14 @@ impl Rewriter<'_> {
                     self.changed = true;
                 } else if self.range_of(key).is_none() && self.char_of(key) {
                     sb.node = Some(Box::new(Self::range_key(key.clone(), crate::QUOTED_CHAR)));
+                    self.changed = true;
+                } else if self.indeterminate(key) {
+                    // A sort by a column of no collation fails as it starts
+                    // (`varstr_sortsupport`'s `check_collation_set`) (RP-803).
+                    sb.node = Some(Box::new(Self::coll_key(
+                        key,
+                        crate::collation::INDETERMINATE,
+                    )));
                     self.changed = true;
                 } else if let Some((collation, _)) = self.coll_of(key) {
                     sb.node = Some(Box::new(Self::coll_key(key, &collation)));
@@ -2063,6 +2166,17 @@ impl Rewriter<'_> {
         // `min(e)` / `max(e)`: the extreme POSITION, mapped back.
         if let Some(N::FuncCall(f)) = node.node.as_ref() {
             let name = func_name(f);
+            // Over a column of no collation, `text_larger` / `text_smaller`
+            // fail when they first compare two values: an aggregate (or a
+            // window frame) of fewer than two non-NULL inputs answers
+            // (RP-803).
+            if let (Some("min" | "max"), [arg]) = (name.as_deref(), f.args.as_slice()) {
+                if self.indeterminate(arg) {
+                    *node = Self::indeterminate_extreme(f, arg);
+                    self.changed = true;
+                    return Ok(());
+                }
+            }
             // A windowed `min` / `max` over a network value picks by
             // `network_cmp` as the plain aggregate does: the window function
             // over the key, its ORDER BY keyed too, read back as the
@@ -2472,6 +2586,7 @@ pub(crate) fn rewrite(
                 || r.oidvec_of(&t)
                 || r.oidvec_arr_of(&t)
                 || r.coll_of(&t).is_some()
+                || r.indeterminate(&t)
                 || (!matches!(t.node.as_ref(), Some(N::ColumnRef(_))) && !windowed())
             {
                 sb.node = Some(Box::new(t));
@@ -2921,5 +3036,71 @@ mod tests {
         );
         assert_eq!(explicit("select ('1' collate \"C\")::int4"), None);
         assert_eq!(explicit("select 'a'::xu796"), None);
+    }
+
+    /// The collation `derived_def` gives the FROM subquery `s` of `sql`.
+    fn derived_collation(sql: &str) -> Option<String> {
+        let parsed = pg_query::parse(sql).expect("parses");
+        let stmt = parsed.protobuf.stmts[0].stmt.as_ref().expect("a statement");
+        let Some(N::SelectStmt(s)) = stmt.node.as_ref() else {
+            panic!("{sql}: not a SELECT");
+        };
+        let mut defs = Vec::new();
+        scope(&s.from_clause, &|_| None, &mut defs);
+        let (_, def) = defs.iter().find(|(n, _)| n == "s").expect("s in scope");
+        def.columns[0]
+            .extra
+            .get_str("collation")
+            .ok()
+            .map(str::to_string)
+    }
+
+    /// RP-803: a VALUES or set-operation column whose rows' non-default
+    /// implicit collations differ has none (`select_common_collation` with
+    /// `none_ok`), which a subquery passes through and a set operation's
+    /// other leg can settle; the default collation never conflicts.
+    /// Measured on PostgreSQL 15.19.
+    #[test]
+    fn conflicting_implicit_collations_leave_a_derived_column_none() {
+        domains::set_user_domains(vec![
+            domain("xu803", "text", Some("und-x-icu")),
+            domain("xc803", "text", Some("C")),
+        ]);
+        let none = Some(crate::collation::INDETERMINATE.to_string());
+        let v = "(values ('a'::xu803), ('B'::xc803)) s0(v)";
+        assert_eq!(
+            derived_collation("select * from (values ('a'::xu803), ('B'::xc803)) s(v)"),
+            none
+        );
+        assert_eq!(
+            derived_collation("select * from (select 'a'::xu803 union all select 'B'::xc803) s(v)"),
+            none
+        );
+        assert_eq!(
+            derived_collation(&format!("select * from (select v from {v}) s")),
+            none
+        );
+        assert_eq!(
+            derived_collation(&format!(
+                "select * from (select v from {v} union all select 'z'::xu803) s"
+            )),
+            Some("und-x-icu".to_string())
+        );
+        assert_eq!(
+            derived_collation(&format!(
+                "select * from (select v from {v} union all select 'z'::text) s"
+            )),
+            None
+        );
+        assert_eq!(
+            derived_collation("select * from (values ('a'::xu803), ('B'::text)) s(v)"),
+            Some("und-x-icu".to_string())
+        );
+        assert_eq!(
+            derived_collation(
+                "select * from (values ('a'::xu803 collate \"C\"), ('B'::xc803)) s(v)"
+            ),
+            Some("C".to_string())
+        );
     }
 }

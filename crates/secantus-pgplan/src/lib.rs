@@ -44172,6 +44172,11 @@ fn collation_for_call(f: &pg_query::protobuf::FuncCall, params: &[Bson]) -> Opti
 /// `pg_collation_for` of a value of the type `pg_typeof` names.
 fn collation_for_type(ty: &str) -> Result<Bson> {
     if let Some(known) = ty.strip_prefix('\u{1f}') {
+        // A column of no collation (RP-803): `pg_collation_for` of
+        // `InvalidOid` is NULL.
+        if known == crate::collation::INDETERMINATE {
+            return Ok(Bson::Null);
+        }
         return Ok(Bson::String(crate::scalar::quote_identifier(known)));
     }
     let mut base = ty.trim_end_matches("[]").to_string();

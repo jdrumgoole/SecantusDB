@@ -92,6 +92,24 @@ pub enum Resolved {
 /// comparisons, ordering, grouping and uniqueness all go through it.
 pub const CITEXT: &str = "__citext";
 
+/// The collation a derived column carries when its rows' (or legs')
+/// implicit collations conflict: PostgreSQL's `InvalidOid`, which
+/// `transformValuesClause` and a set operation leave by
+/// `select_common_collation(..., none_ok = true)` (RP-803). Such a column
+/// takes no part in choosing a comparison's collation (a `Var` of
+/// `COLLATE_NONE` strength); `collation for` it is NULL, and sorting or
+/// comparing by it is [`indeterminate`] when it runs.
+pub const INDETERMINATE: &str = "\u{1f}indeterminate";
+
+/// `check_collation_set`'s error: a string comparison reached with no
+/// collation.
+pub fn indeterminate() -> Error {
+    Error::Sqlstate(
+        "42P22",
+        "could not determine which collation to use for string comparison".into(),
+    )
+}
+
 /// The collation a column compares under: its declared one, else citext's
 /// implicit one for a `citext` (or `citext[]`) column.
 pub fn column_collation(column: &Column) -> Option<String> {
@@ -475,6 +493,9 @@ fn hex(bytes: &[u8]) -> String {
 /// `__coll_key(collation, text)`: a string whose order AND equality are the
 /// collation's. See the module header.
 pub fn sort_key(collation: &str, text: &str) -> Result<String> {
+    if collation == INDETERMINATE {
+        return Err(indeterminate());
+    }
     Ok(match resolve(collation)? {
         // Byte order: the text's own bytes, hex, keep that order.
         Resolved::Bytes => hex(text.as_bytes()),
