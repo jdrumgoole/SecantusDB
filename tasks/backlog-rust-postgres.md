@@ -373,8 +373,8 @@ one beside it.
   Backlog-ID: RP-606
   Verify: none -- intermittent, not reproduced; the regression test is the check
 - [ ] **NOT REPRODUCED -- left open as a watch item. A cancel during the
-  parse was honoured 0.65 s late once, RP-002's pre-fix signature
-  (2026-11-08).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
+  parse was honoured late on Linux CI twice, in both of RP-002's
+  regression tests (2026-11-08, 2026-11-10).** `tests/backlog/test_rp_triage.py::test_cancel_during_parse_is_honoured_with_user_code_present`
   (RP-002's regression test) failed in CI's `pg-oracle (backlog)` lane on
   snapshot PR #2480 (`e8272d38`): `cancel honoured 0.65 s after it was
   sent`, budget 0.25 s. RP-002's own record puts the unfixed bug at about
@@ -387,8 +387,26 @@ one beside it.
   write past it). Found by the MongoDB batch; not worked from that side.
   On a recurrence, capture which passes parsed the statement and when each
   checked the cancel flag.
+  **Second recurrence (2026-11-10), in the other test:**
+  `test_cancel_during_parse_is_honoured_at_once` failed in the same lane on
+  snapshot PR #2591 (`2d70153d`, job 129547189731): `cancel honoured 0.53 s
+  after it was sent`, budget 0.5 s, the 57014 at 1.03 s where PostgreSQL
+  15.19 answers at 0.515 s. The snapshot's one change was RP-741 (NULLIF's
+  operand typing in `static_type_uncached` / `const_value_node`), which no
+  parse or cancel path reaches. That statement arrives by the extended
+  protocol, so the cut-short parse is `analyse_at_parse`'s (hooked, then
+  `check_cancel`), not the lock pass's. Not reproduced on macOS: a debug
+  `secantusd-pg` (tree `52a70cbe`) over 130 runs of the same scenario,
+  30 serial and 4 x 25 concurrent at load ~14, answered 0.006 to 0.089 s
+  after the cancel (median 0.015 serial, ~0.027 concurrent). So both
+  recurrences are Linux-only so far. Unmeasured leads: the orphaned parse
+  thread (`cancel::interruptible` leaves it running on a 1 GiB stack, then
+  it builds and frees a ~200 MB tree) contending with the backend on
+  glibc's allocator; the cancel connection's own setup. Diagnosis needs a
+  timestamped trace on CI: when the cancel flag was set, when each
+  cancellation point looked at it, when the ErrorResponse went out.
   Backlog-ID: RP-571
-  Verify: none -- intermittent, not reproduced; RP-002's regression test is the check, and it passed on rerun
+  Verify: none -- intermittent, Linux CI only, not reproduced on macOS; RP-002's two regression tests are the check
 - [ ] **RUST pgserver: the planner's choices that decide row order are only
   partly modelled.** **Decided (Joe, 2026-10-16): build a cost model** --
   enough of PostgreSQL's planner to make its choices, since the order rows
