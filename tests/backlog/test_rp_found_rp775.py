@@ -3,8 +3,9 @@
 - evaluated per row, a `char(n)` operand against a `text` one resolves
   the operator wrongly in two shapes: a longer IN list's `text` member,
   and a scalar subquery's `text` value (RP-792);
-- a one-member IN list of `text` over a stored `char(n)` column compares
-  as `bpchar`, where PostgreSQL makes it a plain `=`, `text`'s (RP-793);
+- a one-member IN list of `text` over a stored `char(n)` column compared
+  as `bpchar`, where PostgreSQL makes it a plain `=`, `text`'s (RP-793,
+  fixed);
 - an ORDER BY over an unsized `bpchar` column of a VALUES list or a set
   operation counts the cells' trailing blanks (RP-794).
 
@@ -79,7 +80,7 @@ def test_a_char_operand_against_text_per_row(dsn: str, query: str, expected: obj
     assert _answer(dsn, query) == expected
 
 
-@pytest.mark.backlog("RP-793")
+@pytest.mark.backlog_fixed("RP-793")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -94,8 +95,8 @@ def test_a_one_member_text_in_list_compares_as_text(dsn: str, query: str, expect
     """`transformAExprIn` builds a `bpchar[]` comparison only for more
     than one non-Var member; one member is `f = 'uu  '::text`, which
     resolves to `texteq` over the `rtrim`med column, so nothing matches on
-    PostgreSQL 15.19. Here the member is coerced to `bpchar` and its blanks
-    dropped, so `uu` matches (and NOT IN drops it)."""
+    PostgreSQL 15.19. The member was coerced to `bpchar` and its blanks
+    dropped, so `uu` matched (and NOT IN dropped it)."""
     assert _answer(dsn, query, _SETUP) == expected
 
 

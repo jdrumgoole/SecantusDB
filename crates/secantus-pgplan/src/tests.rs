@@ -6168,9 +6168,10 @@ fn a_blank_keeping_bpchar_column_is_compared_per_row() {
 /// A constant compared with a `char(n)` column keeps its trailing blanks
 /// only when the comparison is `text`'s: against a `text` or `name` value
 /// PostgreSQL 15.19 casts the column to `text` (RP-685). An untyped, a
-/// `char(n)` or a `varchar` constant, an IN list's members (coerced to the
-/// column's type) and a BETWEEN's untyped bounds compare as `bpchar`, which
-/// drops them (RP-691).
+/// `char(n)` or a `varchar` constant, a longer IN list's members (coerced
+/// to the list's common type) and a BETWEEN's untyped bounds compare as
+/// `bpchar`, which drops them (RP-691); a one-member IN list is a plain `=`
+/// (RP-793).
 #[test]
 fn a_char_n_column_strips_a_constant_only_for_a_bpchar_comparison() {
     let def = TableDef::new(
@@ -6191,6 +6192,9 @@ fn a_char_n_column_strips_a_constant_only_for_a_bpchar_comparison() {
         "SELECT k FROM t WHERE f = 'xy  '::name",
         "SELECT k FROM t WHERE f < 'xy  '::text",
         "SELECT k FROM t WHERE f BETWEEN 'xy  '::text AND 'xz'::text",
+        // One member is a plain `=`, `text`'s (RP-793).
+        "SELECT k FROM t WHERE f IN ('xy  '::text)",
+        "SELECT k FROM t WHERE f NOT IN ('xy  '::text)",
     ] {
         assert!(
             filter(sql).contains("\"xy  \""),

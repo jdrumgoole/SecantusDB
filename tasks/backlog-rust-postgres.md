@@ -3526,17 +3526,6 @@ initdb'd cluster. The gap tests are in
       MQL filter answered wrongly were RP-775.
       Verify: tests/backlog/test_rp_found_rp775.py::test_a_char_operand_against_text_per_row
       Backlog-ID: RP-792
-- [ ] **A one-member `IN` list of `text` over a `char(n)` column compares
-      as `bpchar`.** Over a stored `char(4)` column holding `uu`, `where
-      f in ('uu  '::text)` finds nothing on PostgreSQL 15.19 (a private
-      cluster): `transformAExprIn` builds the `bpchar[]` comparison only
-      for more than one non-Var member, and one member is a plain `=`,
-      which against `text` resolves to `texteq` over the `rtrim`med
-      column. Here `lower_in` coerces every member to the column's type
-      and drops its blanks, so `uu` matches, and `not in` drops it. Its
-      comment (RP-691) states the one-member case the wrong way round.
-      Verify: tests/backlog/test_rp_found_rp775.py::test_a_one_member_text_in_list_compares_as_text
-      Backlog-ID: RP-793
 - [ ] **An ORDER BY over an unsized `bpchar` column of a VALUES list or a
       set operation counts the trailing blanks.** `select f from (values
       ('a  '::char(3)), (E'a\t')) s(f) order by f` is `a  `, `a<tab>` on

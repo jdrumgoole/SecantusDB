@@ -48607,14 +48607,25 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
         Some(N::List(l)) => &l.items,
         _ => return Err(Error::Unsupported("this IN list".into())),
     };
+    // `transformAExprIn` builds one array comparison only from more than one
+    // non-Var member: then the members take the list's common type
+    // (`select_common_type` keeps the first, `bpchar`, as `text` and
+    // `bpchar` coerce both ways), so a `char(n)` column compares each as
+    // `bpchar`, even a `text` one: `f in ('xy  '::text, 'q')` finds `'xy'`
+    // (RP-691). One member is a plain `=` (`make_op`), resolved like any
+    // comparison: against `text` it is `texteq` over the `rtrim`med column,
+    // so `f in ('xy  '::text)` finds nothing (RP-793).
+    let text_wins = items.len() == 1;
     let mut values = Vec::new();
     let mut saw_null = false;
     for item in items {
-        // An IN list's members take the column's type (`select_common_type`
-        // keeps the first, `bpchar`, as `text` and `bpchar` coerce both
-        // ways), so a `char(n)` column compares each as `bpchar`, even a
-        // `text` one: `f in ('xy  '::text)` finds `'xy'` (RP-691).
-        let v = bpchar_operand(def, &field, Some(item), const_value(item, params)?, false);
+        let v = bpchar_operand(
+            def,
+            &field,
+            Some(item),
+            const_value(item, params)?,
+            text_wins,
+        );
         let v = coerce_to_column(def, &field, reg_oid_operand(v))?;
         if v == Bson::Null {
             saw_null = true;
@@ -48678,8 +48689,9 @@ fn lower_in(e: &AExpr, def: &TableDef, params: &[Bson]) -> Result<Document> {
 /// value PostgreSQL 15.19 casts the column to `text` (`rtrim`) and compares
 /// `text`s: `f = 'xy  '::text` finds nothing and `f < 'xy '::text` finds
 /// `'xy'` (RP-685). The stored value is the column's `rtrim` already, so
-/// that constant is compared as it is. An IN list passes `false`: its
-/// members are coerced to the column's type first (RP-691).
+/// that constant is compared as it is. An IN list of more than one member
+/// passes `false`: its members are coerced to the list's common type,
+/// `bpchar`, first (RP-691); one member is a plain `=` (RP-793).
 fn bpchar_operand(
     def: &TableDef,
     field: &str,
