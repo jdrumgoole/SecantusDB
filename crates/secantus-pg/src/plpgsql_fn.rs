@@ -359,6 +359,9 @@ struct Interp<'a> {
     cursor_exprs: HashMap<usize, String>,
     /// A bound cursor's declared options (`SCROLL` / `NO SCROLL`), by datum.
     cursor_options: HashMap<usize, u64>,
+    /// A bound cursor's argument row (`c CURSOR (k int) FOR ...`), by datum:
+    /// the row of the variables its OPEN assigns (`cursor_explicit_argrow`).
+    cursor_argrows: HashMap<usize, usize>,
     /// How CONTEXT names this function: `f(integer)`, or
     /// `inline_code_block` for a DO block.
     label: String,
@@ -1051,6 +1054,7 @@ pub fn run(create_sql: &str, inv: Invocation<'_>, host: &dyn Host) -> Result<Out
         handling: None,
         cursor_exprs: open_cursor::cursor_exprs(&f),
         cursor_options: open_cursor::cursor_options(&f),
+        cursor_argrows: open_cursor::cursor_argrows(&f),
         expression_types: std::cell::RefCell::default(),
         label: function_label(create_sql),
         dyn_text: None,
@@ -1260,6 +1264,19 @@ fn bind_frame(text: &str, mode: u64) -> Option<String> {
     })
 }
 
+/// An input error on a literal of `sql` (`'x'::int`): it carries a cursor
+/// position, which `_SPI_error_callback` turns into an internal query
+/// position instead of a `SQL ...` CONTEXT frame.
+fn literal_input_error(sql: &str, err: &PlError) -> bool {
+    err.sqlstate.starts_with("22")
+        && err
+            .message
+            .strip_suffix('"')
+            .and_then(|m| m.rsplit_once(": \""))
+            .map(|(_, v)| v)
+            .is_some_and(|lit| sql.contains(&format!("'{}'", lit.replace('\'', "''"))))
+}
+
 fn expr_frame(
     text: &str,
     mode: u64,
@@ -1275,18 +1292,8 @@ fn expr_frame(
             _ => format!("SQL statement \"{text}\""),
         })
     };
-    // An input error on a literal of the text has a position: no frame.
-    if err.sqlstate.starts_with("22") {
-        if let Some(lit) = err
-            .message
-            .strip_suffix('"')
-            .and_then(|m| m.rsplit_once(": \""))
-            .map(|(_, v)| v)
-        {
-            if sql.contains(&format!("'{}'", lit.replace('\'', "''"))) {
-                return None;
-            }
-        }
+    if literal_input_error(sql, err) {
+        return None;
     }
     let parsed = pg_query::parse(sql).ok()?;
     let simple = match parsed

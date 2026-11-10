@@ -2542,21 +2542,6 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
-## Found while working RP-807 (2026-11-10)
-
-Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
-`tests/backlog/test_rp_found_rp807.py`.
-
-- [ ] **A bound cursor's arguments are not bound.** `declare r int; c
-      cursor (k int) for select k; begin open c(5); fetch c into r;` sets
-      `r` to 5 on PostgreSQL 15.19, and a cursor argument may stand
-      anywhere its query takes a value (`where a = k`). Here the OPEN is
-      42703 `column "k" does not exist`: the bound query is planned with
-      no variable `k` in scope, as the argument list is not read. A
-      cursor reading a block variable of the same name works.
-      Verify: tests/backlog/test_rp_found_rp807.py::test_bound_cursor_arguments_are_bound
-      Backlog-ID: RP-809
-
 ## Found while working RP-687 (2026-11-09)
 
 Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
@@ -3516,3 +3501,35 @@ and `create domain di811 as int`.
       is 42703 `column "xmin" does not exist`.
       Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
       Backlog-ID: RP-816
+
+## Found while working RP-809 (2026-11-10)
+
+Measured on a private PostgreSQL 15.19 cluster with the `_SETUP` in
+`tests/backlog/test_rp_found_rp809.py`: `t809(a int, v varchar(3))`.
+
+- [ ] **A FOR loop over a bound cursor is refused.** `declare t int := 0; c
+      cursor (k int) for select a from t809 where a >= k; begin for x in
+      c(1) loop t := t + x.a; end loop;` sums 3 on PostgreSQL 15.19
+      (`exec_stmt_forc`: the cursor is opened with its arguments, the loop
+      variable is a record of the cursor's row, and the portal is closed
+      when the loop ends), and `for x in c loop` over a cursor with no
+      arguments works alike. Here each is 0A000 `the statement forc in a
+      PL/pgSQL function is not supported yet`. Since RP-809 an OPEN binds
+      the arguments (`open_cursor::cursor_arguments`), which a FOR can
+      reuse.
+      Verify: tests/backlog/test_rp_found_rp809.py::test_for_over_a_bound_cursor
+      Backlog-ID: RP-817
+- [ ] **A variable declared `%TYPE` cannot be assigned.** `declare k
+      t809.v%type := 'ab'` is a `character varying` holding `ab`, and `k :=
+      'abcd'` is 22001 `value too long for type character varying(3)`, on
+      PostgreSQL 15.19; `declare a int; k a%type` is an `integer`. Here
+      every assignment to such a variable, its default included, is 3F000
+      `schema "t809" does not exist` (the `t809.v%type` text read as a
+      qualified type name) or 42601 `syntax error at or near "$1"`. Since
+      RP-573 the declaration is checked at CREATE FUNCTION and before a DO
+      block runs, but the variable's type stays the text as written
+      (libpg_query stubs `plpgsql_parse_wordtype` / `cwordtype` out), so
+      the type must be resolved here, from the column or from the variable
+      in the block scopes.
+      Verify: tests/backlog/test_rp_found_rp809.py::test_a_percent_type_variable_is_assigned
+      Backlog-ID: RP-818
