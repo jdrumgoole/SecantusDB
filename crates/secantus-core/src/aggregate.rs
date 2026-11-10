@@ -114,11 +114,11 @@ pub fn apply_pipeline(
                         sizes,
                         at: i,
                         limited: false,
+                        reads: Default::default(),
                     });
                 }
             }
-            let (out, next) =
-                window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll, false)?;
+            let (out, next) = window_fields_streamed(spec, docs, pipeline, i, vars, coll, false)?;
             docs = out;
             i += 1 + next;
             continue;
@@ -126,8 +126,7 @@ pub fn apply_pipeline(
         if name == "$_internalSetWindowFields" {
             // What `$setWindowFields` runs behind its `$sort`: no sort of
             // its own (RM-328).
-            let (out, next) =
-                window_fields_streamed(spec, docs, &pipeline[i + 1..], vars, coll, true)?;
+            let (out, next) = window_fields_streamed(spec, docs, pipeline, i, vars, coll, true)?;
             docs = out;
             i += 1 + next;
             continue;
@@ -194,12 +193,29 @@ pub fn apply_pipeline(
                     sizes: Vec::new(),
                     at,
                     limited,
+                    reads: Default::default(),
                 });
             }
             i += 1;
             continue;
         }
-        docs = apply_stage(name, spec, docs, vars, coll)?;
+        docs = if matches!(name.as_str(), "$match" | "$unwind" | "$redact")
+            && memlimit::tracks_reads(i)
+        {
+            // mongod pulls a document at a time through these: keep which
+            // input each output came from (RM-326).
+            let mut out = Vec::with_capacity(docs.len());
+            let mut reads = Vec::with_capacity(docs.len());
+            for (k, d) in docs.into_iter().enumerate() {
+                let one = apply_stage(name, spec, vec![d], vars, coll)?;
+                reads.extend(std::iter::repeat_n(k + 1, one.len()));
+                out.extend(one);
+            }
+            memlimit::note_stage_reads(i, reads);
+            out
+        } else {
+            apply_stage(name, spec, docs, vars, coll)?
+        };
         i += 1;
     }
     note_read(&mut cursor_read, pipeline.len(), &docs);
@@ -339,10 +355,17 @@ fn apply_stage(
         "$setWindowFields" => windowfields::set_window_fields_stage(spec, docs, vars),
         "$_internalSetWindowFields" => {
             let mut out = Vec::with_capacity(docs.len());
-            windowfields::internal_set_window_fields_each(spec, docs, vars, None, &mut |d| {
-                out.push(d);
-                Ok(())
-            })?;
+            windowfields::internal_set_window_fields_each(
+                spec,
+                docs,
+                vars,
+                None,
+                None,
+                &mut |d| {
+                    out.push(d);
+                    Ok(())
+                },
+            )?;
             Ok(out)
         }
         // storage-backed ($lookup/$geoNear/$out/$merge) / $sample / … -> Python.
@@ -443,16 +466,19 @@ pub fn downstream(stages: &[Bson]) -> Downstream {
 
 /// `$setWindowFields`, with the per-document stages right after it run on
 /// each output document as it is made (mongod streams them; holding every
-/// output first held every window's values at once -- RM-211). Returns the
-/// documents and how many of `rest` it ran.
+/// output first held every window's values at once -- RM-211). `at`: the
+/// stage's place in `pipeline`. Returns the documents and how many of the
+/// stages after it it ran.
 fn window_fields_streamed(
     spec: &Bson,
     docs: Vec<Document>,
-    rest: &[Bson],
+    pipeline: &[Bson],
+    at: usize,
     vars: &Document,
     coll: Option<&Collation>,
     presorted: bool,
 ) -> R<(Vec<Document>, usize)> {
+    let rest = &pipeline[at + 1..];
     let fused = rest
         .iter()
         .take_while(|s| {
@@ -471,21 +497,47 @@ fn window_fields_streamed(
     } else {
         windowfields::set_window_fields_each
     };
-    each(spec, docs, vars, fields.as_ref(), &mut |d| {
-        let mut one = vec![d];
-        for stage in &rest[..fused] {
-            let (name, spec) = stage
-                .as_document()
-                .and_then(|s| s.iter().next())
-                .ok_or(Fallback::Defer)?;
-            one = apply_stage(name, spec, one, vars, coll)?;
-            if one.is_empty() {
-                break;
+    // What each stage read for each of its outputs, when a query-layer
+    // sort that spilled feeds them (RM-326): the window's, then each fused
+    // stage's, which counts the documents it was handed.
+    let tracks = memlimit::tracks_reads(at);
+    let mut window_reads = Vec::new();
+    let mut fused_reads: Vec<(usize, Vec<usize>)> = vec![(0, Vec::new()); fused];
+    each(
+        spec,
+        docs,
+        vars,
+        fields.as_ref(),
+        tracks.then_some(&mut window_reads),
+        &mut |d| {
+            let mut one = vec![d];
+            for (f, stage) in rest[..fused].iter().enumerate() {
+                let (name, spec) = stage
+                    .as_document()
+                    .and_then(|s| s.iter().next())
+                    .ok_or(Fallback::Defer)?;
+                one = apply_stage(name, spec, one, vars, coll)?;
+                if tracks {
+                    let (seen, reads) = &mut fused_reads[f];
+                    *seen += 1;
+                    if !one.is_empty() {
+                        reads.push(*seen);
+                    }
+                }
+                if one.is_empty() {
+                    break;
+                }
             }
+            out.extend(one);
+            Ok(())
+        },
+    )?;
+    if tracks {
+        memlimit::note_stage_reads(at, window_reads);
+        for (f, (_, reads)) in fused_reads.into_iter().enumerate() {
+            memlimit::note_stage_reads(at + 1 + f, reads);
         }
-        out.extend(one);
-        Ok(())
-    })?;
+    }
     Ok((out, fused))
 }
 

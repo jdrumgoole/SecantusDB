@@ -1079,8 +1079,13 @@ pub fn aggregate(doc: &Document, ctx: &mut CommandContext) -> HandlerResult {
         let pulls = first_batch.len() + usize::from(first_batch.len() == total && total < wanted);
         let downstream = working_pipeline.get(read.at..).unwrap_or_default();
         if !downstream.is_empty() {
-            let loads =
-                crate::agg_executor::cursor_loads(downstream, &read.sizes, read.limited, pulls);
+            let loads = crate::agg_executor::cursor_loads(
+                downstream,
+                &read.sizes,
+                read.limited,
+                &read.reads,
+                pulls,
+            );
             if let Some(more) = loads.and_then(|n| n.checked_sub(1)).filter(|n| *n > 0) {
                 secantus_core::memlimit::add_sort_counts(&read.sort, more as i64);
             }

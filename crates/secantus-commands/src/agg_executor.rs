@@ -232,9 +232,12 @@ enum Reads {
 /// `stages` (the pipeline after the stages the query layer took) give
 /// `pulls` documents. `sizes`: the BSON size of each document the executor
 /// hands over, in order, before the `$skip` and `$limit` it takes from
-/// `stages`. `limited`: the executor already took a `$limit`. `None`: what
-/// the stages read depends on the documents (a `$match`, an `$unwind`, a
-/// `$setWindowFields` window), which is not followed here.
+/// `stages`. `limited`: the executor already took a `$limit`. `reads`: for
+/// a stage whose reads depend on its documents (a `$match`, an `$unwind`, a
+/// `$setWindowFields`), keyed by its place in `stages`, how many documents
+/// of its input it had read when it gave each output (one past its input
+/// when it looked for the end). `None`: such a stage whose reads were not
+/// kept.
 ///
 /// mongod 8.2.11: the `$skip`s and the least `$limit` that only stages
 /// passing each document on stand before are moved into the executor
@@ -248,6 +251,7 @@ pub(crate) fn cursor_loads(
     stages: &[Bson],
     sizes: &[usize],
     limited: bool,
+    reads_of: &std::collections::BTreeMap<usize, Vec<usize>>,
     pulls: usize,
 ) -> Option<usize> {
     let count = |stage: &Bson, name: &str| {
@@ -258,7 +262,7 @@ pub(crate) fn cursor_loads(
             .and_then(|n| usize::try_from(n).ok())
     };
     let (mut skip, mut limit) = (0usize, None::<usize>);
-    let mut left: Vec<&Bson> = Vec::new();
+    let mut left: Vec<(usize, &Bson)> = Vec::new();
     let mut moving = true;
     for (i, stage) in stages.iter().enumerate() {
         if moving {
@@ -273,7 +277,7 @@ pub(crate) fn cursor_loads(
             }
             moving = swaps_with_skip_and_limit(stage, stages.get(i + 1));
         }
-        left.push(stage);
+        left.push((i, stage));
     }
     let sizes = &sizes[..limit.map_or(sizes.len(), |l| l.min(sizes.len()))];
     let sizes = &sizes[skip.min(sizes.len())..];
@@ -283,11 +287,16 @@ pub(crate) fn cursor_loads(
         FIRST_LOAD as usize
     };
     let mut reads = Reads::Some(pulls);
-    for stage in left.into_iter().rev() {
+    for (i, stage) in left.into_iter().rev() {
         let (name, spec) = stage.as_document().and_then(|d| d.iter().next())?;
         let n = || crate::util::as_i64(spec).and_then(|n| usize::try_from(n).ok());
+        let kept = reads_of.get(&i);
         reads = match (name.as_str(), reads) {
             (_, Reads::Some(0)) => Reads::Some(0),
+            // Asked for more than it gave, a stage read to its end.
+            (_, Reads::Some(p)) if kept.is_some() => kept
+                .and_then(|r| r.get(p - 1))
+                .map_or(Reads::All, |&r| Reads::Some(r)),
             (secantus_core::sbe::ENGINE_STAGE, r) => r,
             // A `$limit` asks for no more once it has passed its count.
             ("$limit", Reads::All) => Reads::Some(n()?),
@@ -420,6 +429,7 @@ fn whole_input_window(spec: &Bson) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     fn stages(v: &[Document]) -> Vec<Document> {
         v.to_vec()
@@ -511,6 +521,7 @@ mod tests {
     /// of 1 KB behind a sort that spilled: `sortSpills` was 13 times these.
     #[test]
     fn the_cursor_stage_loads_as_mongod_does() {
+        let none = BTreeMap::new();
         let sizes = vec![1060; 300];
         let af = b(doc! { "$addFields": { "z": 1 } });
         let group = b(doc! { "$group": { "_id": "$k" } });
@@ -542,33 +553,43 @@ mod tests {
         ];
         for (stages, pulls, loads) in cases {
             assert_eq!(
-                cursor_loads(&stages, &sizes, false, pulls),
+                cursor_loads(&stages, &sizes, false, &none, pulls),
                 Some(loads),
                 "{stages:?} {pulls}"
             );
         }
         // A `$limit` the executor took before the stages.
         assert_eq!(
-            cursor_loads(std::slice::from_ref(&af), &sizes[..200], true, 101),
+            cursor_loads(std::slice::from_ref(&af), &sizes[..200], true, &none, 101),
             Some(1)
         );
         // 32 documents fill the first buffer; the end is a second load.
         assert_eq!(
-            cursor_loads(std::slice::from_ref(&window), &sizes[..32], false, 33),
+            cursor_loads(
+                std::slice::from_ref(&window),
+                &sizes[..32],
+                false,
+                &none,
+                33
+            ),
             Some(2)
         );
-        assert_eq!(cursor_loads(&[window], &sizes[..33], false, 34), Some(2));
+        assert_eq!(
+            cursor_loads(&[window], &sizes[..33], false, &none, 34),
+            Some(2)
+        );
         // A buffer stops past 4 MB, without doubling.
         let big = vec![1 << 20; 10];
         assert_eq!(
-            cursor_loads(std::slice::from_ref(&group), &big, true, 1),
+            cursor_loads(std::slice::from_ref(&group), &big, true, &none, 1),
             Some(3)
         );
-        assert_eq!(cursor_loads(&[group], &big, false, 1), Some(3));
+        assert_eq!(cursor_loads(&[group], &big, false, &none, 1), Some(3));
     }
 
     #[test]
     fn reads_that_depend_on_the_documents_are_not_followed() {
+        let none = BTreeMap::new();
         let sizes = vec![1060; 300];
         for stage in [
             doc! { "$unwind": "$s" },
@@ -578,7 +599,7 @@ mod tests {
             "partitionBy": "$k", "sortBy": { "n": 1 }, "output": { "t": { "$sum": "$n" } } } },
         ] {
             assert_eq!(
-                cursor_loads(&[b(stage.clone())], &sizes, false, 101),
+                cursor_loads(&[b(stage.clone())], &sizes, false, &none, 101),
                 None,
                 "{stage:?}"
             );
@@ -588,6 +609,50 @@ mod tests {
             b(doc! { "$match": { "k": 1 } }),
             b(doc! { "$group": { "_id": "$k" } }),
         ];
-        assert_eq!(cursor_loads(&then_group, &sizes, false, 2), Some(4));
+        assert_eq!(cursor_loads(&then_group, &sizes, false, &none, 2), Some(4));
+    }
+
+    /// mongod 8.2.11 (2026-11-10), 300 documents of 1 KB behind a sort that
+    /// spilled: the loads follow what the stages read for the batch.
+    #[test]
+    fn the_cursor_stage_loads_what_the_stages_read() {
+        let sizes = vec![1060; 300];
+        let unwind = b(doc! { "$unwind": "$a" });
+        let project = b(doc! { "$project": { "_id": 1 } });
+        // Three outputs for each three documents: none, one, then two.
+        let unwound: Vec<usize> = (0..100)
+            .flat_map(|k| [3 * k + 2, 3 * k + 3, 3 * k + 3])
+            .collect();
+        let kept = BTreeMap::from([(0, unwound)]);
+        let stages = [unwind.clone(), project.clone()];
+        for (pulls, loads) in [(31, 1), (32, 2), (96, 2), (97, 3), (300, 4), (301, 4)] {
+            assert_eq!(
+                cursor_loads(&stages, &sizes, false, &kept, pulls),
+                Some(loads),
+                "{pulls}"
+            );
+        }
+        // A `$match` keeping every third document, after an `$addFields`.
+        let af = b(doc! { "$addFields": { "z": 1 } });
+        let matched = b(doc! { "$match": { "z": 0 } });
+        let kept = BTreeMap::from([(1, (1..=100).map(|k| 3 * k).collect())]);
+        for (pulls, loads) in [(1, 1), (31, 2), (33, 3), (95, 4), (101, 4)] {
+            assert_eq!(
+                cursor_loads(&[af.clone(), matched.clone()], &sizes, false, &kept, pulls),
+                Some(loads),
+                "{pulls}"
+            );
+        }
+        // A window that reads one ahead: 33 documents for 32 outputs.
+        let window = b(doc! { "$setWindowFields": {
+        "sortBy": { "n": 1 }, "output": { "r": { "$rank": {} } } } });
+        let kept = BTreeMap::from([(0, (2..=301).collect())]);
+        for (pulls, loads) in [(31, 1), (32, 2), (95, 2), (96, 3), (300, 4)] {
+            assert_eq!(
+                cursor_loads(std::slice::from_ref(&window), &sizes, false, &kept, pulls),
+                Some(loads),
+                "{pulls}"
+            );
+        }
     }
 }

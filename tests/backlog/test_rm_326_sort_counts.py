@@ -142,10 +142,11 @@ def _depends_on_documents(client: Any) -> dict:
     )
 
 
-@pytest.mark.backlog("RM-326")
+@pytest.mark.backlog_fixed("RM-326")
 def test_sort_counts_per_load_through_stages_that_filter(rust_mongo: Any, mongod: Any) -> None:
-    """mongod 8.2.11 counts the sort per load behind an `$unwind` (39), a
-    `$rank` or a running total (39), and a partitioned window (42)."""
+    """mongod 8.2.11 counted the sort per load behind an `$unwind` (39), a
+    `$rank` or a running total (39), and a partitioned window (42): the
+    loads follow what those stages read of their input for the batch."""
     assert _depends_on_documents(rust_mongo) == _depends_on_documents(mongod)
 
 
