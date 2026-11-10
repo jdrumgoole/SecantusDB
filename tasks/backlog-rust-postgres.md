@@ -3447,23 +3447,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`
       Verify: tests/backlog/test_rp_found_rp796.py::test_a_column_of_conflicting_implicit_collations_has_none
       Backlog-ID: RP-803
 
-## Found while working RP-757 (2026-11-10)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415): every
-statement is VALUES-only and runs there as written. The gap tests are in
-`tests/backlog/test_rp_found_rp757.py`.
-
-- [ ] **A scalar subquery under `IS [NOT] TRUE` or `COLLATE` is refused.**
-      `select x from (values ('tt'::text), ('uu'), ('vv')) s(x) where (x =
-      (select 'uu')) is not true` is `tt`, `vv` on PostgreSQL 15.19, and
-      `where x = (select 'uu') collate "C"` is `uu`; here each is 0A000
-      `SubLink is not supported yet`. `resolve_sublinks_in_expr` in
-      `secantus-pgplan/src/lib.rs` descends no `BooleanTest` and no
-      `CollateClause`, so the subquery under one reaches planning
-      unresolved.
-      Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
-      Backlog-ID: RP-774
-
 ## Found while working RP-792 (2026-11-10)
 
 Measured on the shared PostgreSQL 15.19 reference (port 5415) with
@@ -3501,3 +3484,22 @@ statements are VALUES-only and create nothing. The gap tests are in
       length.
       Verify: tests/backlog/test_rp_found_rp794.py::test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks
       Backlog-ID: RP-804
+
+## Found while working RP-774 (2026-11-10)
+
+Measured on the shared PostgreSQL 15.19 reference (port 5415); the
+statements are FROM-less or VALUES-only and create nothing. The gap test
+is in `tests/backlog/test_rp_found_rp774.py`.
+
+- [ ] **`IS [NOT] TRUE / FALSE / UNKNOWN` over a value that is not
+      `boolean` is no error.** `select 1 is true` is 42804 `argument of
+      IS TRUE must be type boolean, not type integer` on PostgreSQL 15.19
+      (`transformBooleanTest` coerces the argument with
+      `coerce_to_boolean`, naming the test), and so is `'x'::text is
+      unknown` or `null::int is unknown`. Here `1 is true` and `1 is not
+      false` are `false`, `null::int is unknown` is `true`, and a WHERE
+      `x is true` over an `int` column finds no rows: a wrong answer
+      where PostgreSQL refuses the query. `IS NOT TRUE` / `IS FALSE` over
+      one is 42804 already, but blames `NOT` rather than the test.
+      Verify: tests/backlog/test_rp_found_rp774.py::test_a_boolean_test_over_a_non_boolean_is_42804
+      Backlog-ID: RP-808
