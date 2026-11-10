@@ -7,7 +7,7 @@
   as `bpchar`, where PostgreSQL makes it a plain `=`, `text`'s (RP-793,
   fixed);
 - an ORDER BY over an unsized `bpchar` column of a VALUES list or a set
-  operation counts the cells' trailing blanks (RP-794).
+  operation counted the cells' trailing blanks (RP-794, fixed).
 
 The stored-table answers were measured on a private, freshly initdb'd
 PostgreSQL 15.19 cluster with `_SETUP`; the VALUES-only ones on the shared
@@ -100,7 +100,7 @@ def test_a_one_member_text_in_list_compares_as_text(dsn: str, query: str, expect
     assert _answer(dsn, query, _SETUP) == expected
 
 
-@pytest.mark.backlog("RP-794")
+@pytest.mark.backlog_fixed("RP-794")
 @pytest.mark.parametrize(
     ("query", "expected"),
     [
@@ -116,14 +116,20 @@ def test_a_one_member_text_in_list_compares_as_text(dsn: str, query: str, expect
             "select f from (select 'a'::char(3) f union all select E'a\\t') s order by f",
             [("a  ",), ("a\t",)],
         ),
+        (
+            "select f, row_number() over (order by f)"
+            " from (values ('a  '::char(3)), (E'a\\t')) s(f) order by 2",
+            [("a  ", 1), ("a\t", 2)],
+        ),
     ],
 )
 def test_an_unsized_bpchar_column_sorts_without_its_blanks(
     dsn: str, query: str, expected: object
 ) -> None:
     """`bpcharcmp` compares the values' `bcTruelen` lengths, so `'a  '`
-    sorts as `'a'`, before `E'a\\t'`, on PostgreSQL 15.19. The column is
-    unsized (its members' modifiers differ), so its cells keep their
-    blanks here, and the sort reads them: a blank (0x20) sorts after a tab
-    (0x09)."""
+    sorts as `'a'`, before `E'a\\t'`, on PostgreSQL 15.19, in an ORDER BY
+    and a window's alike. The column is unsized (its members' modifiers
+    differ), so its cells keep their blanks, and the sort read them: a
+    blank (0x20) sorted after a tab (0x09). A `bpchar` sort key now
+    compares without them (`OrderKey::bpchar`)."""
     assert _answer(dsn, query) == expected

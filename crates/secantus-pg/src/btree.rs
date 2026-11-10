@@ -185,6 +185,10 @@ impl IndexShape {
                         .columns
                         .iter()
                         .any(|c| &c.field() == f && c.pg_type == "jsonb"),
+                    bpchar: def
+                        .columns
+                        .iter()
+                        .any(|c| &c.field() == f && c.pg_type == "bpchar"),
                     expr: None,
                 })
                 .collect(),

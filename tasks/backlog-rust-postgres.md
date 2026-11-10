@@ -3526,14 +3526,33 @@ initdb'd cluster. The gap tests are in
       MQL filter answered wrongly were RP-775.
       Verify: tests/backlog/test_rp_found_rp775.py::test_a_char_operand_against_text_per_row
       Backlog-ID: RP-792
-- [ ] **An ORDER BY over an unsized `bpchar` column of a VALUES list or a
-      set operation counts the trailing blanks.** `select f from (values
-      ('a  '::char(3)), (E'a\t')) s(f) order by f` is `a  `, `a<tab>` on
-      PostgreSQL 15.19: `bpcharcmp` compares `bcTruelen` lengths, so `'a  '`
-      sorts as `'a'`. The column is unsized (its members' modifiers
-      differ), so its cells keep their blanks (`stored_bpchar_cell` has no
-      width to pad back to), and the sort here reads them: a blank (0x20)
-      after a tab (0x09), so the order is reversed. The same over `(select
-      'a'::char(3) f union all select E'a\t') s`, and with DESC.
-      Verify: tests/backlog/test_rp_found_rp775.py::test_an_unsized_bpchar_column_sorts_without_its_blanks
-      Backlog-ID: RP-794
+
+## Found while working RP-794 (2026-11-10)
+
+Measured on the shared PostgreSQL 15.19 reference (port 5415); the
+statements are VALUES-only and create nothing. The gap tests are in
+`tests/backlog/test_rp_found_rp794.py`.
+
+- [ ] **An untyped literal resolved to `bpchar` beside a `char(n)` loses its
+      trailing blanks.** `select 'a'::char(3) union all select 'b '` is
+      `a  `, `b ` on PostgreSQL 15.19, and so is `(values ('a'::char(3)),
+      ('b ')) s(f)`: the column is `bpchar` with no modifier (the literal
+      is `unknown`, resolved to the `char(3)` member's type, and the
+      members' modifiers differ), so `octet_length` of `'b '` is 2. Here
+      it reads back `b`, 1 byte: the literal's blanks are dropped where it
+      is coerced to `bpchar`, while a member cast to `char(2)` keeps
+      them (`('b '::char(2))` agrees). A wrong value, not only a wrong
+      length.
+      Verify: tests/backlog/test_rp_found_rp794.py::test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks
+      Backlog-ID: RP-804
+- [ ] **`string_agg` over an unsized `bpchar` column keeps its blanks.**
+      `select string_agg(f, '|') from (values ('a  '::char(3)),
+      ('b'::char(2))) s(f)` is `a|b` on PostgreSQL 15.19: the argument
+      reaches `string_agg(text, text)` through the implicit `bpchar` ->
+      `text` cast (`rtrim1`), which drops the trailing blanks. Here it is
+      `a  |b `: the unsized column's cells keep their blanks and the
+      aggregate joins them uncast. `f::text` and `length(f::text)` over the
+      same column already agree, and so does a `char(3)` column of both
+      members.
+      Verify: tests/backlog/test_rp_found_rp794.py::test_string_agg_over_an_unsized_bpchar_drops_its_blanks
+      Backlog-ID: RP-805

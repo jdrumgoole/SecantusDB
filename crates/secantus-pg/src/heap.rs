@@ -1587,6 +1587,7 @@ pub(crate) fn ctid_order_key() -> secantus_pgplan::OrderKey {
         ascending: true,
         nulls: secantus_pgplan::Nulls::First,
         jsonb: false,
+        bpchar: false,
         expr: None,
     }
 }

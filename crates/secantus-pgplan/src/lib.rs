@@ -1468,6 +1468,12 @@ pub struct OrderKey {
     /// The key is `jsonb`: it orders as PostgreSQL's jsonb btree order
     /// (`json::jsonb_compare`), not as its stored text.
     pub jsonb: bool,
+    /// The key is `bpchar`: it orders as `bpcharcmp`, which compares the two
+    /// values' `bcTruelen` lengths, so trailing blanks do not count (`'a  '`
+    /// sorts as `'a'`, before `E'a\t'`). A stored `char(n)` cell is kept
+    /// trimmed already; an unsized `bpchar` column of a VALUES list or a set
+    /// operation keeps its blanks, which a raw string comparison read (RP-794).
+    pub bpchar: bool,
     /// `ORDER BY` over a COMPUTED expression (`order by n * -1`,
     /// `order by upper(a)`). The executor evaluates it per row into `field` —
     /// a synthetic name — just before sorting, so the sort itself stays the
@@ -13825,6 +13831,14 @@ fn jsonb_field(def: &TableDef, field: &str) -> bool {
         .any(|c| c.pg_type == "jsonb" && c.field() == field)
 }
 
+/// Is `field` a `bpchar` column of `def`? Its sort key then orders as
+/// `bpcharcmp`, without the trailing blanks.
+fn bpchar_field(def: &TableDef, field: &str) -> bool {
+    def.columns
+        .iter()
+        .any(|c| is_bpchar_type(&c.pg_type) && c.field() == field)
+}
+
 /// One PARTITION BY or ORDER BY key of a window.
 ///
 /// A PARTITION BY item is a bare expression rather than a `SortBy`, so the two
@@ -13867,6 +13881,7 @@ fn window_sort_key(
                     ascending,
                     nulls,
                     jsonb: column.pg_type == "jsonb",
+                    bpchar: is_bpchar_type(&column.pg_type),
                     expr: None,
                 });
             }
@@ -13897,6 +13912,7 @@ fn window_sort_key(
         ascending,
         nulls,
         jsonb: false,
+        bpchar: false,
         expr: Some(expr),
     })
 }
@@ -16641,6 +16657,7 @@ fn plan_series_select(
             ascending,
             nulls,
             jsonb: false,
+            bpchar: false,
             expr: None,
         });
     }
@@ -19333,6 +19350,7 @@ fn plan_aggregate_item(
             ascending,
             nulls,
             jsonb: false,
+            bpchar: false,
             expr: None,
         }];
         // The further ordering columns, an expression computed into a
@@ -19968,6 +19986,7 @@ fn plan_aggregate_order(
         };
         keys.push(OrderKey {
             jsonb: jsonb_field(def, &field),
+            bpchar: bpchar_field(def, &field),
             field,
             ascending,
             nulls,
@@ -27385,6 +27404,7 @@ fn plan_select_rest(
             .map(|i| order_exprs[i].clone());
         order.push(OrderKey {
             jsonb: jsonb_field(&def, &field),
+            bpchar: bpchar_field(&def, &field),
             field,
             ascending,
             nulls,
@@ -31400,6 +31420,7 @@ fn plan_select_srf(
             ascending,
             nulls,
             jsonb: false,
+            bpchar: false,
             expr: None,
         });
     }

@@ -37830,6 +37830,7 @@ impl PgHandler {
                             Nulls::First
                         },
                         jsonb: false,
+                        bpchar: false,
                         expr: None,
                     }]
                 }
@@ -51523,6 +51524,18 @@ fn compare_rows(a: &Document, b: &Document, order: &[OrderKey]) -> Ordering {
                         secantus_pgplan::json::jsonb_compare(a, b)
                             .unwrap_or_else(|| compare_values(l, r))
                     }
+                    // `bpcharcmp` compares the `bcTruelen` lengths: a cell
+                    // that kept its trailing blanks (an unsized `bpchar`
+                    // column of a VALUES list or a set operation) sorts
+                    // without them (RP-794).
+                    (_, Bson::String(a), Bson::String(b))
+                        if key.bpchar && (a.ends_with(' ') || b.ends_with(' ')) =>
+                    {
+                        compare_values(
+                            &Bson::String(a.trim_end_matches(' ').to_string()),
+                            &Bson::String(b.trim_end_matches(' ').to_string()),
+                        )
+                    }
                     _ => compare_values(l, r),
                 };
                 // A stored timestamp is a millisecond date plus its hidden
@@ -55410,6 +55423,44 @@ impl PgWireServerHandlers for HandlerFactory {
 }
 
 #[cfg(test)]
+mod bpchar_sort_tests {
+    use super::{sort_rows, Nulls, OrderKey};
+    use bson::doc;
+
+    fn key(bpchar: bool, ascending: bool) -> OrderKey {
+        OrderKey {
+            field: "f".into(),
+            ascending,
+            nulls: if ascending { Nulls::Last } else { Nulls::First },
+            jsonb: false,
+            bpchar,
+            expr: None,
+        }
+    }
+
+    fn sorted(bpchar: bool, ascending: bool) -> Vec<String> {
+        let mut rows = vec![doc! { "f": "a\t" }, doc! { "f": "a  " }, doc! { "f": "a " }];
+        sort_rows(&mut rows, &[key(bpchar, ascending)]);
+        rows.iter()
+            .map(|d| d.get_str("f").unwrap().to_string())
+            .collect()
+    }
+
+    /// `bpcharcmp` compares the `bcTruelen` lengths, so a cell that kept
+    /// its trailing blanks sorts as the trimmed value: `'a  '` before
+    /// `E'a\t'` on PostgreSQL 15.19 (RP-794). A `text` key still counts
+    /// them, a blank after a tab.
+    #[test]
+    fn a_bpchar_key_sorts_without_its_trailing_blanks() {
+        let asc = sorted(true, true);
+        assert_eq!(asc[2], "a\t");
+        assert!(asc[..2].contains(&"a  ".to_string()) && asc[..2].contains(&"a ".to_string()));
+        assert_eq!(sorted(true, false)[0], "a\t");
+        assert_eq!(sorted(false, true), ["a\t", "a ", "a  "]);
+    }
+}
+
+#[cfg(test)]
 mod join_hash_key_tests {
     use super::*;
 
@@ -56513,6 +56564,7 @@ impl PgHandler {
                 ascending: true,
                 nulls: Nulls::Last,
                 jsonb: false,
+                bpchar: false,
                 expr: None,
             })
             .collect();

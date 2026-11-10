@@ -587,6 +587,7 @@ impl PgHandler {
             ascending: true,
             nulls: Nulls::Last,
             jsonb: false,
+            bpchar: false,
             expr: None,
         });
         let mut out = crate::external_sort::RunBuilder::new(&order, None, BATCH);
