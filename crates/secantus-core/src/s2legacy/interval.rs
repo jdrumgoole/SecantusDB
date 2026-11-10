@@ -229,7 +229,7 @@ impl S1Interval {
         if self.is_empty() {
             return self;
         }
-        if 2.0f64.mul_add(radius, self.length()) >= 2.0 * PI - 1e-15 {
+        if self.length() + 2.0 * radius >= 2.0 * PI - 1e-15 {
             return S1Interval::full();
         }
         let mut result = S1Interval::new(

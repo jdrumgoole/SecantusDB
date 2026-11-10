@@ -257,7 +257,7 @@ fn a_near_hinted_elsewhere_is_refused() {
         // Hinted to its own index, it is the search's order.
         assert_eq!(
             ids(&dispatch_full(&hinted("geo".into()), c)),
-            [1, 11, 6, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
+            [6, 1, 11, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
         );
         // The same for `$geoNear`, whose hint is the aggregate's.
         let stage = |hint: Bson| {
@@ -277,7 +277,7 @@ fn a_near_hinted_elsewhere_is_refused() {
         );
         assert_eq!(
             ids(&dispatch_full(&stage("geo".into()), c)),
-            [1, 11, 6, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
+            [6, 1, 11, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
         );
     });
 }
@@ -295,11 +295,11 @@ fn near_returns_ties_in_its_searchs_order() {
         // (libstdc++'s heap) hands back 17 first, then 4 and 20 (mongod
         // 8.2.12; the macOS build's libc++ heap: 20, 4, 17). Linux answers
         // 6, 1, 11 for the first three: it measures the line 6 at distance
-        // 0, where this server's S2 arithmetic, the macOS build's, puts it
-        // 6.4e-12 m out (RM-393).
+        // 0, where the macOS build's fused arithmetic puts it 6.4e-12 m out
+        // and after the point and the polygon (RM-393).
         assert_eq!(
             find(c, near(doc! {})),
-            [1, 11, 6, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
+            [6, 1, 11, 17, 4, 20, 13, 14, 19, 2, 18, 10, 9, 3, 7, 8, 12, 5]
         );
         // The rest of the query filters what the search returns.
         let mut filter = near(doc! {});

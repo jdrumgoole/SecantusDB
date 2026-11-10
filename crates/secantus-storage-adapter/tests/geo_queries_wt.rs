@@ -222,14 +222,15 @@ fn near_needs_its_index_and_returns_nearest_first() {
         );
 
         seed(c, sphere(), Some("2dsphere"));
-        // The polygon holds the centre, and the line starts at it but is
-        // never at no distance.
+        // The polygon holds the centre and the line starts at it: all three
+        // are at distance 0, the line first (mongod 8.2.12 on Linux; the
+        // macOS build puts the line 6.4e-12 m out, RM-393).
         // Documents 4 and 20 are one point: mongod returns them in the order
         // its index scan meets them, which is not pinned here.
         let got = ids(&find(c, near(doc! { "$maxDistance": 200000 })));
-        assert_eq!(got[..3], [1, 11, 6]);
+        assert_eq!(got[..3], [6, 1, 11]);
         assert_eq!(sorted(&got[3..]), [4, 17, 20]);
-        assert_eq!(ids(&find(c, near(doc! { "$maxDistance": 0 }))), [1, 11]);
+        assert_eq!(ids(&find(c, near(doc! { "$maxDistance": 0 }))), [6, 1, 11]);
         // A legacy `$near` reads a `2d` index, and this is not one.
         assert_eq!(
             refusal(&find(c, doc! { "loc": { "$near": [0, 0] } })).0,
@@ -258,17 +259,13 @@ fn geo_near_measures_every_geometry() {
             &stage(doc! { "near": point(0.0, 0.0), "distanceField": "d", "maxDistance": 200000 }),
             c,
         );
-        assert_eq!(ids(&reply)[..3], [1, 11, 6]);
+        assert_eq!(ids(&reply)[..3], [6, 1, 11]);
         assert_eq!(sorted(&ids(&reply)[3..]), [4, 17, 20]);
         let distances: Vec<f64> = batch(&reply)
             .iter()
             .map(|d| d.get_f64("d").unwrap())
             .collect();
-        assert_eq!(distances[0], 0.0);
-        assert!(
-            (distances[2] - 6.42567661e-12).abs() < 1e-18,
-            "{distances:?}"
-        );
+        assert_eq!(distances[..3], [0.0, 0.0, 0.0]);
         assert!((distances[3] - 157_424.624).abs() < 0.001, "{distances:?}");
         // A legacy point on the sphere measures in radians.
         let reply = dispatch_full(
@@ -277,7 +274,7 @@ fn geo_near_measures_every_geometry() {
             ),
             c,
         );
-        assert_eq!(ids(&reply)[..3], [1, 11, 6]);
+        assert_eq!(ids(&reply)[..3], [6, 1, 11]);
         assert_eq!(sorted(&ids(&reply)[3..6]), [4, 17, 20]);
         assert_eq!(ids(&reply)[6..], [13, 14]);
         let reply = dispatch_full(
