@@ -3500,24 +3500,6 @@ and `create domain di811 as int`.
       Verify: tests/backlog/test_rp_found_rp811.py::test_a_system_column_in_a_check_is_42p10
       Backlog-ID: RP-816
 
-## Found while working RP-818 (2026-11-10)
-
-- [ ] **A routine's parameter or result declared `%TYPE` is not
-      resolved.** `create function f(x t.v%type) returns text` over a
-      `varchar(3)` column makes `x` a `character varying` on PostgreSQL
-      15.19 (`LookupTypeNameExtended`: the column's type, without its
-      modifier), with the NOTICE `type reference t.v%TYPE converted to
-      character varying`, and `pg_get_function_arguments` is `x character
-      varying`; `returns t.v%type` alike. Here CREATE succeeds with no
-      NOTICE, the parameter is stored as a type named `"t.v"` (a call sees
-      a `record`), the result's `pg_typeof` is `t.v`, and a LANGUAGE sql
-      routine's `%TYPE` parameter is 3F000 `schema "t" does not exist`.
-      Found while working RP-818 (2026-11-10), which resolves `%TYPE` in a
-      DECLARE (`secantus_pgplan::plpgsql_percent_type_outer` answers the
-      column's type, which CREATE FUNCTION can reuse without the modifier).
-      Verify: tests/backlog/test_rp_found_rp818.py::test_a_routines_percent_type_parameter_is_resolved
-      Backlog-ID: RP-822
-
 ## Found while working RP-823 (2026-11-10)
 
 Measured on PostgreSQL 15.19; none of the statements creates an object.
@@ -3547,3 +3529,18 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       only a BEGIN inside an explicit block should.
       Verify: tests/backlog/test_rp_found_rp823.py::test_a_begin_in_a_multi_statement_query_does_not_warn
       Backlog-ID: RP-829
+
+## Found while working RP-822 (2026-11-10)
+
+- [ ] **A DROP or ALTER FUNCTION signature's `%TYPE` names no type.**
+      `drop function f(t.v%type)` and `alter function f(t.v%type) rename
+      to g` over a `varchar(3)` column find `f(varchar)` on PostgreSQL
+      15.19 (`LookupFuncWithArgs` looks each argument type up with
+      `LookupTypeName`), with the NOTICE `type reference t.v%TYPE
+      converted to character varying`. Here the DROP is 42704 `type "t.v"
+      does not exist` and the ALTER 42883 `function f(t.v) does not
+      exist`. CREATE FUNCTION resolves one since RP-822
+      (`plpgsql_pct_type::routine_percent_type`), which a signature's
+      lookup can reuse.
+      Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
+      Backlog-ID: RP-830
