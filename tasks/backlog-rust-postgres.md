@@ -3480,14 +3480,51 @@ statement is VALUES-only and runs there as written. The gap tests are in
       unresolved.
       Verify: tests/backlog/test_rp_found_rp757.py::test_a_scalar_subquery_under_a_boolean_test_or_collate
       Backlog-ID: RP-774
-- [ ] **A `char(n)` column of a VALUES list does not compare as `bpchar` in
-      a WHERE.** Over `(values ('uu'::char(4)), ('tt'), ('vv')) s(f)`,
-      `where f in ('uu  ', 'tt')` is `tt`, `uu  ` on PostgreSQL 15.19 (the
-      list's members take the column's type, and `bpchar` ignores trailing
-      blanks); here it is `tt` alone, and the same with `'uu  '::text` or
-      `(select 'uu')` as the member. `where f = (select 'uu  ')` finds
-      nothing on 15.19 (`bpchar = text` resolves to `text`, the column
-      `rtrim`med) and `uu  ` here. The select list's `f in (...)` already
-      agrees, as does a `char(4)` table column (RP-691).
-      Verify: tests/backlog/test_rp_found_rp757.py::test_a_values_char_column_compares_as_bpchar_in_a_where
-      Backlog-ID: RP-775
+
+## Found while working RP-775 (2026-11-10)
+
+Measured on PostgreSQL 15.19: the VALUES-only statements on the shared
+reference (port 5415), the stored-table ones on a private, freshly
+initdb'd cluster. The gap tests are in
+`tests/backlog/test_rp_found_rp775.py`.
+
+- [ ] **Per row, a `char(n)` operand against a `text` one resolves the
+      operator wrongly in two shapes.** Evaluated per row -- a select
+      list, or a WHERE over a VALUES list or a set operation (RP-775 sends
+      those to the evaluator) -- over `(values ('uu'::char(4)), ('tt'),
+      ('vv')) s(f)` on PostgreSQL 15.19: `f in ('uu  '::text, 'tt')` is
+      true for `uu  ` (more than one non-Var member, so
+      `transformAExprIn` compares as the list's common type, `bpchar`),
+      and `f = (select 'uu  ')` is false for every row (the subquery's
+      column is `text`, so `texteq` over the `rtrim`med column). Here the
+      first compares the `text` member as `text` (it expands the list to
+      one `=` per member, which is right only for one member), and the
+      second as `bpchar`: the subquery's value is a parameter whose type
+      `declare_sublink_param` records while planning, and the per-row
+      evaluation no longer sees it. The same on a stored `char(n)`
+      table's select list. The WHERE forms over a VALUES list that the
+      MQL filter answered wrongly were RP-775.
+      Verify: tests/backlog/test_rp_found_rp775.py::test_a_char_operand_against_text_per_row
+      Backlog-ID: RP-792
+- [ ] **A one-member `IN` list of `text` over a `char(n)` column compares
+      as `bpchar`.** Over a stored `char(4)` column holding `uu`, `where
+      f in ('uu  '::text)` finds nothing on PostgreSQL 15.19 (a private
+      cluster): `transformAExprIn` builds the `bpchar[]` comparison only
+      for more than one non-Var member, and one member is a plain `=`,
+      which against `text` resolves to `texteq` over the `rtrim`med
+      column. Here `lower_in` coerces every member to the column's type
+      and drops its blanks, so `uu` matches, and `not in` drops it. Its
+      comment (RP-691) states the one-member case the wrong way round.
+      Verify: tests/backlog/test_rp_found_rp775.py::test_a_one_member_text_in_list_compares_as_text
+      Backlog-ID: RP-793
+- [ ] **An ORDER BY over an unsized `bpchar` column of a VALUES list or a
+      set operation counts the trailing blanks.** `select f from (values
+      ('a  '::char(3)), (E'a\t')) s(f) order by f` is `a  `, `a<tab>` on
+      PostgreSQL 15.19: `bpcharcmp` compares `bcTruelen` lengths, so `'a  '`
+      sorts as `'a'`. The column is unsized (its members' modifiers
+      differ), so its cells keep their blanks (`stored_bpchar_cell` has no
+      width to pad back to), and the sort here reads them: a blank (0x20)
+      after a tab (0x09), so the order is reversed. The same over `(select
+      'a'::char(3) f union all select E'a\t') s`, and with DESC.
+      Verify: tests/backlog/test_rp_found_rp775.py::test_an_unsized_bpchar_column_sorts_without_its_blanks
+      Backlog-ID: RP-794

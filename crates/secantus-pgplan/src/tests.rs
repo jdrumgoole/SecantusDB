@@ -6136,6 +6136,35 @@ fn any_array_bpchar_trims_follow_operator_resolution() {
     }
 }
 
+/// An unsized `bpchar` column of a materialised source keeps its cells'
+/// trailing blanks (`stored_bpchar_cell` has no width to pad back to), so a
+/// predicate over it is evaluated per row, as `bpchar`, not lowered to an
+/// MQL filter that reads the blanks (RP-775). A stored table's unsized
+/// `bpchar` cell is written trimmed, and its predicate still lowers.
+#[test]
+fn a_blank_keeping_bpchar_column_is_compared_per_row() {
+    let mut stored = TableDef::new("t", vec![Column::new("f", "bpchar", false)]);
+    stored.system_columns = secantus_pgcatalog::system_columns();
+    let lookup = |name: &str| (name == "t").then(|| stored.clone());
+    let planned = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter.is_empty(), s.residual.is_some()),
+        other => panic!("wrong statement for {sql}: {other:?}"),
+    };
+    for sql in [
+        "SELECT f FROM (VALUES ('uu'::char(4)), ('tt')) s(f) WHERE f = 'uu'",
+        "SELECT f FROM (VALUES ('uu'::char(4)), ('tt')) s(f) WHERE f IN ('uu  ', 'tt')",
+        "SELECT f FROM (SELECT 'uu'::char(4) f UNION ALL SELECT 'tt') s WHERE f <> 'uu'",
+    ] {
+        assert_eq!(planned(sql), (true, true), "per row: {sql}");
+    }
+    // A sized column of the same source is stored trimmed: still a filter.
+    assert_eq!(
+        planned("SELECT f FROM (VALUES ('uu'::char(4)), ('tt'::char(4))) s(f) WHERE f = 'uu'"),
+        (false, false)
+    );
+    assert_eq!(planned("SELECT f FROM t WHERE f = 'uu'"), (false, false));
+}
+
 /// A constant compared with a `char(n)` column keeps its trailing blanks
 /// only when the comparison is `text`'s: against a `text` or `name` value
 /// PostgreSQL 15.19 casts the column to `text` (RP-685). An untyped, a
