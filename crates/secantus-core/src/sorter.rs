@@ -11,9 +11,12 @@
 //! bisecting the knob over several document sizes, 2026-10-26). At the end
 //! it spills what is left and merges the runs, `max(knob / 64 KiB, 2)` at a
 //! time, into that many runs, each merge pass writing every record again;
-//! the last runs are merged as they are read. Equal keys keep the order of
-//! the runs, which keep the order the documents came in, so a spilled sort
-//! answers in the same order as one held in memory.
+//! the last runs are merged as they are read. Each run, and a sort that
+//! never spills, is sorted by `std::sort`, which is not stable: documents
+//! whose keys compare equal come in the C++ library's order ([`sort_held`]),
+//! so a spilled sort can answer ties in another order than one held in
+//! memory, as mongod's does. The merges keep equal keys in the order of
+//! their runs.
 //!
 //! What a document counts depends on the stage that sorts it, all measured
 //! against 8.2.11 by the same bisection:
@@ -194,6 +197,10 @@ struct Run {
     /// How many values each key holds: one is written as itself, more as
     /// an array of them.
     arity: usize,
+    /// Each record's place in the sort's input, in the order written: not
+    /// in the file, which holds what mongod's does, but kept so a caller
+    /// can carry what it keeps beside each document through the sort.
+    positions: Vec<i64>,
 }
 
 impl Drop for Run {
@@ -288,6 +295,34 @@ fn read_record(
     Ok((keys, d, pos))
 }
 
+/// `NoLimitSorter::sort`: what the sorter holds, in the order it came,
+/// sorted by `std::sort` on the keys alone -- before each spill, and once
+/// at the end when it never spilled. `std::sort` is not stable, so the
+/// order of documents whose keys compare equal is the C++ library's:
+/// libstdc++'s introsort ([`crate::stl::sort`]) on the Linux build (RM-402:
+/// the runs of up to 21 documents over seven keys a sort after `$project`
+/// spills store mongod 8.2.12's 122253 bytes only in that order). The
+/// macOS build's
+/// libc++ sort is not modelled (RM-526); there the documents keep the order
+/// they came in.
+fn sort_held(held: &mut Vec<Held>, cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering) {
+    if crate::stl::LIBCXX {
+        held.sort_by(|a, b| cmp(&a.0, &b.0));
+        return;
+    }
+    // The algorithm moves positions, so sorting them moves no document.
+    let mut order: Vec<usize> = (0..held.len()).collect();
+    crate::stl::sort(&mut order, &|a: &usize, b: &usize| {
+        cmp(&held[*a].0, &held[*b].0) == Ordering::Less
+    });
+    let mut taken: Vec<Option<Held>> = std::mem::take(held).into_iter().map(Some).collect();
+    held.extend(
+        order
+            .into_iter()
+            .map(|i| taken[i].take().expect("each position once")),
+    );
+}
+
 /// Write sorted `items` as a run, counted as one spill.
 fn write_run(items: impl Iterator<Item = Held>, sizing: &Sizing) -> R<Run> {
     let bucket_auto = sizing.source == SortSource::BucketAuto;
@@ -312,9 +347,11 @@ fn write_run(items: impl Iterator<Item = Held>, sizing: &Sizing) -> R<Run> {
         path: path.clone(),
         records: 0,
         arity: 1,
+        positions: Vec::new(),
     };
     for item in items {
         run.arity = item.0.len();
+        run.positions.push(item.2);
         write_record(&item, sizing, out.buffer()).map_err(|e| io_error(&path, e))?;
         out.added().map_err(|e| io_error(&path, e))?;
         run.records += 1;
@@ -339,35 +376,35 @@ fn write_run(items: impl Iterator<Item = Held>, sizing: &Sizing) -> R<Run> {
 }
 
 /// A run being read back.
-struct Reader {
+struct Reader<'a> {
     input: spill_file::Reader,
     path: PathBuf,
-    left: usize,
+    positions: std::slice::Iter<'a, i64>,
     arity: usize,
     source: SortSource,
 }
 
-impl Reader {
-    fn open(run: &Run, source: SortSource) -> R<Reader> {
+impl<'a> Reader<'a> {
+    fn open(run: &'a Run, source: SortSource) -> R<Reader<'a>> {
         Ok(Reader {
             input: spill_file::Reader::open(&run.path).map_err(|e| io_error(&run.path, e))?,
             path: run.path.clone(),
-            left: run.records,
+            positions: run.positions.iter(),
             arity: run.arity,
             source,
         })
     }
 
     fn next(&mut self) -> R<Option<Held>> {
-        if self.left == 0 {
+        let Some(&pos) = self.positions.next() else {
             return Ok(None);
-        }
-        self.left -= 1;
+        };
         let (arity, source) = (self.arity, self.source);
-        self.input
+        let (keys, d, _) = self
+            .input
             .record(|at| read_record(at, arity, source))
-            .map(Some)
-            .map_err(|e| io_error(&self.path, e))
+            .map_err(|e| io_error(&self.path, e))?;
+        Ok(Some((keys, d, pos)))
     }
 }
 
@@ -678,6 +715,19 @@ pub fn blocking_sort(
     sizing: &Sizing,
     limit: Option<usize>,
 ) -> R<Vec<(Vec<Bson>, Document)>> {
+    Ok(sort_items(items, cmp, sizing, limit)?
+        .into_iter()
+        .map(|(k, d, _)| (k, d))
+        .collect())
+}
+
+/// [`blocking_sort`], each item with its place in `items`.
+fn sort_items(
+    items: Vec<(Vec<Bson>, Document)>,
+    cmp: &dyn Fn(&[Bson], &[Bson]) -> Ordering,
+    sizing: &Sizing,
+    limit: Option<usize>,
+) -> R<Vec<Held>> {
     let budget = sizing.budget;
     let reserve = reserved(budget, sizing.source.file_iterator());
     let effective = budget.saturating_sub(reserve);
@@ -692,7 +742,6 @@ pub fn blocking_sort(
         .into_iter()
         .enumerate()
         .map(|(i, (k, d))| (k, d, i as i64));
-    let unheld = |held: Vec<Held>| held.into_iter().map(|(k, d, _)| (k, d)).collect();
     let n = items.len() as i64;
     let bucket_auto = sizing.source == SortSource::BucketAuto;
     // mongod 8.2.11's slot-based sort adds its bytes to the counters only
@@ -719,7 +768,7 @@ pub fn blocking_sort(
             items.sort_by(|a, b| cmp(&a.0, &b.0));
             items.truncate(k);
             record(0);
-            return Ok(unheld(items));
+            return Ok(items);
         }
         Some(k) => {
             let mut top = TopK::new(k, cmp, sizing, effective, iterators, parallel);
@@ -729,7 +778,7 @@ pub fn blocking_sort(
                 top.add(item, s)?;
             }
             record(if sbe { top.spilled } else { top.sorted });
-            return top.done().map(unheld);
+            return top.done();
         }
         None => {}
     }
@@ -746,7 +795,7 @@ pub fn blocking_sort(
         if !memlimit::disk_allowed() {
             return Err(refused(budget));
         }
-        held.sort_by(|a, b| cmp(&a.0, &b.0));
+        sort_held(held, cmp);
         runs.push(write_run(std::mem::take(held).into_iter(), sizing)?);
         if runs.len() >= iterators {
             let all = std::mem::take(runs);
@@ -768,14 +817,14 @@ pub fn blocking_sort(
     }
     record(if sbe { spilled } else { total });
     if runs.is_empty() {
-        held.sort_by(|a, b| cmp(&a.0, &b.0));
-        return Ok(unheld(held));
+        sort_held(&mut held, cmp);
+        return Ok(held);
     }
     spill(&mut held, &mut runs)?;
     let runs = merge_spills(runs, parallel, parallel, cmp, sizing, None)?;
     let mut out = Vec::with_capacity(n as usize);
-    merge_runs(&runs, sizing.source, cmp, |(k, d, _)| {
-        out.push((k, d));
+    merge_runs(&runs, sizing.source, cmp, |item| {
+        out.push(item);
         Ok(())
     })?;
     Ok(out)
@@ -820,14 +869,26 @@ pub fn count_members(sizes: &[usize], budget: usize, limit: Option<usize>) -> R<
     Ok(())
 }
 
-/// `docs` sorted by the `$sort` spec `spec` (stable), held to the budget
-/// (see [`blocking_sort`]).
+/// `docs` sorted by the `$sort` spec `spec`, held to the budget (see
+/// [`blocking_sort`], which says what order ties come in).
 pub fn sort_documents(
     docs: Vec<Document>,
     spec: &Bson,
     sizing: &Sizing,
     limit: Option<usize>,
 ) -> R<Vec<Document>> {
+    Ok(sort_documents_placed(docs, spec, sizing, limit)?.0)
+}
+
+/// [`sort_documents`], with each document's place in `docs`: what a caller
+/// keeps beside each document follows it through a sort whose ties come in
+/// the C++ library's order rather than in the order they came.
+pub fn sort_documents_placed(
+    docs: Vec<Document>,
+    spec: &Bson,
+    sizing: &Sizing,
+    limit: Option<usize>,
+) -> R<(Vec<Document>, Vec<usize>)> {
     let sort = crate::aggregate::sort_fields(spec)?;
     let mut keyed: Vec<(Vec<Bson>, Document)> = Vec::with_capacity(docs.len());
     for d in docs {
@@ -843,8 +904,11 @@ pub fn sort_documents(
         }
         Ordering::Equal
     };
-    let sorted = blocking_sort(keyed, &cmp, sizing, limit)?;
-    Ok(sorted.into_iter().map(|(_, d)| d).collect())
+    let sorted = sort_items(keyed, &cmp, sizing, limit)?;
+    Ok(sorted
+        .into_iter()
+        .map(|(_, d, pos)| (d, pos as usize))
+        .unzip())
 }
 
 #[cfg(test)]
@@ -878,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn a_spilled_sort_answers_as_one_held_in_memory() {
+    fn a_spilled_sort_answers_the_keys_one_held_in_memory_does() {
         let whole = {
             let sizing = Sizing {
                 sizes: None,
@@ -898,7 +962,18 @@ mod tests {
             budget: 50_000,
         };
         let spilled = blocking_sort(items(300, 1000), &cmp, &sizing, None).unwrap();
-        assert_eq!(ids(&spilled), ids(&whole));
+        // The same keys in the same order, and the same documents; those
+        // whose keys tie can come in another order, as mongod's do: each
+        // run is sorted by `std::sort` on its own (`sort_held`).
+        let keys =
+            |out: &[(Vec<Bson>, Document)]| out.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>();
+        assert_eq!(keys(&spilled), keys(&whole));
+        let sorted_ids = |out: &[(Vec<Bson>, Document)]| {
+            let mut ids = ids(out);
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(sorted_ids(&spilled), sorted_ids(&whole));
         let report = memlimit::report();
         assert!(report.used_disk && report.sort_spills > 1, "{report:?}");
         let _off = memlimit::allow_disk_use(false);
@@ -911,6 +986,55 @@ mod tests {
                  sorting."
             ))
         );
+    }
+
+    #[test]
+    fn ties_come_in_the_order_the_builds_std_sort_leaves_them() {
+        let sizing = Sizing {
+            sizes: None,
+            source: SortSource::Stored,
+            fields: None,
+            added: None,
+            budget: memlimit::MAX_BYTES,
+        };
+        let out = blocking_sort(items(40, 1), &cmp, &sizing, None).unwrap();
+        let expected: Vec<i32> = if crate::stl::LIBCXX {
+            // libc++'s sort is not modelled (RM-526): the order they came in.
+            let mut v: Vec<i32> = (0..40).collect();
+            v.sort_by_key(|i| (i * 7) % 5);
+            v
+        } else {
+            // libstdc++'s `std::sort` over the same 40 keys, by key alone
+            // (g++ 15.2, 2026-11-10).
+            vec![
+                10, 20, 25, 15, 30, 35, 5, 0, 33, 8, 28, 13, 3, 38, 23, 18, 31, 1, 36, 26, 21, 6,
+                16, 11, 39, 19, 4, 34, 9, 29, 14, 24, 12, 27, 32, 7, 17, 37, 2, 22,
+            ]
+        };
+        assert_eq!(ids(&out), expected);
+    }
+
+    #[test]
+    fn each_document_keeps_its_place_through_a_spilled_sort() {
+        let docs: Vec<Document> = items(300, 1000).into_iter().map(|(_, d)| d).collect();
+        let sizing = Sizing {
+            sizes: None,
+            source: SortSource::Stored,
+            fields: None,
+            added: None,
+            budget: 50_000,
+        };
+        for limit in [None, Some(50)] {
+            memlimit::reset_report();
+            let (sorted, placed) =
+                sort_documents_placed(docs.clone(), &Bson::Document(doc! {"k": 1}), &sizing, limit)
+                    .unwrap();
+            assert!(memlimit::report().sort_spills > 1, "{limit:?}");
+            assert_eq!(sorted.len(), placed.len());
+            for (d, at) in sorted.iter().zip(&placed) {
+                assert_eq!(d, &docs[*at], "{limit:?}");
+            }
+        }
     }
 
     #[test]

@@ -15,7 +15,7 @@ from typing import Any
 
 import pytest
 
-from tests.backlog.conftest import PLATFORM, mongo_answer, only_on
+from tests.backlog.conftest import mongo_answer, only_on
 
 DEFAULT = 104_857_600
 
@@ -92,24 +92,61 @@ def test_spill_file_storage_size(rust_mongo: Any, mongod: Any) -> None:
     """A sorter's spill file was this server's own; it is now mongod 8.2's:
     64 KiB chunks of `serializeForSorter` records, each snappy-compressed by
     mongod's compressor, so a sort's and `$bucketAuto`'s
-    `spilledDataStorageSize` are mongod's to the byte -- each platform's
-    mongod, whose sizes differ (the in-order sort: 130545 bytes on arm64,
-    131252 on x86_64). On x86_64 the `after $project` case is RM-402's gap."""
-    ours, theirs = _sort_storage_sizes(rust_mongo), _sort_storage_sizes(mongod)
-    if PLATFORM == "x86_64":
-        ours.pop("after $project")
-        theirs.pop("after $project")
-    assert ours == theirs
+    `spilledDataStorageSize` are mongod's to the byte, on each platform: the
+    `after $project` case's tied keys come in each build's `std::sort` order
+    (RM-402)."""
+    assert _sort_storage_sizes(rust_mongo) == _sort_storage_sizes(mongod)
 
 
-@pytest.mark.backlog("RM-402")
-def test_x86_spill_after_project_storage_size(rust_mongo: Any, mongod: Any) -> None:
-    """On x86_64 mongod 8.2 stores 122253 bytes for the 29 spills of a sort
-    after `$project`; this server stores 122288 (CI, 2026-11-07). On arm64
-    the two agree, pinned by RM-325's regression test."""
-    only_on("x86_64", why="the arm64 sizes agree (RM-325's regression test)")
+@pytest.mark.backlog_fixed("RM-402")
+def test_linux_spill_after_project_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """Linux mongod 8.2.12 stored 122253 bytes for the 29 spills of a sort
+    after `$project` and this server 122288 (CI, 2026-11-07): mongod sorts
+    each run with `std::sort`, which is not stable, and libstdc++'s leaves
+    the 21 documents of a run whose keys tie in another order than they
+    came. Each run is now sorted as libstdc++ sorts it. On macOS mongod's
+    libc++ leaves these runs as they came (RM-325's regression test)."""
+    only_on("linux", why="the sort is libstdc++'s, the Linux build's")
     ours = _sort_storage_sizes(rust_mongo)["after $project"]
     assert ours == _sort_storage_sizes(mongod)["after $project"]
+
+
+def _tied_order(client: Any) -> dict:
+    client.drop_database("rmtie")
+    c = client.rmtie.c
+    c.insert_many([{"_id": i, "k": i % 3} for i in range(40)])
+    return {
+        name: [d["_id"] for d in c.aggregate(pipeline)]
+        for name, pipeline in {
+            "after $project": [{"$project": {"k": 1}}, {"$sort": {"k": 1}}],
+            "after $addFields": [{"$addFields": {"z": 1}}, {"$sort": {"k": 1}}],
+        }.items()
+    }
+
+
+@pytest.mark.backlog_fixed("RM-402")
+def test_linux_tied_sort_order(rust_mongo: Any, mongod: Any) -> None:
+    """mongod sorts what it holds with `std::sort` whether or not it
+    spills, so 40 documents over three values of `k` come back from a
+    `$sort` after another stage in libstdc++'s order on Linux (0, 21, 18,
+    24, ...; g++ 15.2 gives the same), where this server kept the order they
+    came in."""
+    only_on("linux", why="the sort is libstdc++'s, the Linux build's")
+    assert _tied_order(rust_mongo) == _tied_order(mongod)
+
+
+@pytest.mark.backlog_fixed("RM-402")
+def test_linux_tied_spill_storage_size(rust_mongo: Any, mongod: Any) -> None:
+    """Sorts by a key many documents share store Linux mongod 8.2.12's bytes
+    once each run is sorted as libstdc++ sorts it: `{k: 1}` 51231 (this
+    server stored 51244) and `find`'s `{k: -1}` 51232 (51242), CI
+    2026-11-10. macOS is RM-526."""
+    from tests.backlog.test_rm_326_sort_counts import _spill_storage
+    from tests.backlog.test_rm_found_2026_11_10_rm395 import _tied_sort_storage
+
+    only_on("linux", why="the sort is libstdc++'s, the Linux build's")
+    assert _spill_storage(rust_mongo) == _spill_storage(mongod)
+    assert _tied_sort_storage(rust_mongo) == _tied_sort_storage(mongod)
 
 
 def _group_storage_sizes(client: Any) -> dict:

@@ -8,6 +8,10 @@
 //! algorithms do with them. libstdc++ is the library of the Linux build,
 //! which is mongod's exemplar (RM-280).
 //!
+//! mongod's external sorter sorts what it holds with `std::sort` too
+//! (`NoLimitSorter::sort`), so the order of documents whose sort keys
+//! compare equal is the library's there as well (RM-402).
+//!
 //! `less(a, b)` is the comparator the C++ code passes: a strict weak order.
 //!
 //! The heap steps move elements with swaps where libstdc++ moves them into
@@ -89,6 +93,11 @@ fn make_heap<T, F: Fn(&T, &T) -> bool>(v: &mut [T], less: &F) {
 }
 
 const THRESHOLD: usize = 16;
+
+/// Whether the mongod build this server stands in for is macOS arm64's,
+/// whose C++ library is libc++ rather than libstdc++: each platform's
+/// mongod is the reference (Joe, 2026-11-07).
+pub(crate) const LIBCXX: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
 
 fn median_to_first<T, F: Fn(&T, &T) -> bool>(
     v: &mut [T],
