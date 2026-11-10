@@ -1291,7 +1291,12 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
             e.rexpr.as_deref().and_then(|n| n.node.as_ref()),
         ) {
             if let Some(ty) = operand_type(col, scope).filter(|t| crate::user_enum(t).is_some()) {
-                for item in &items.items {
+                for (i, item) in items.items.iter().enumerate() {
+                    // A cancellation point every so often, as in the typing
+                    // loop below (RP-748).
+                    if i % 1024 == 1023 {
+                        crate::cancel::check()?;
+                    }
                     if let Some(N::AConst(c)) = item.node.as_ref() {
                         if let Some(pg_query::protobuf::a_const::Val::Sval(label)) = c.val.as_ref()
                         {
@@ -1326,7 +1331,14 @@ fn check_aexpr(e: &pg_query::protobuf::AExpr, scope: &Scope) -> Result<()> {
         ) {
             // `transformAExprIn` falls back to one `=` (`<>` for NOT IN)
             // per item, in the list's order.
-            for item in &items.items {
+            for (i, item) in items.items.iter().enumerate() {
+                // A cancellation point every so often: over a 200,000-item
+                // list this loop was the longest stretch a cancel could not
+                // reach, about 70 ms in a debug build and half a second
+                // under load, past RP-202's budget (RP-748).
+                if i % 1024 == 1023 {
+                    crate::cancel::check()?;
+                }
                 row_against_non_row(&op, l, item, e.location, scope)?;
             }
         }

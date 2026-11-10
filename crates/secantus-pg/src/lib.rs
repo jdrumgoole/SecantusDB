@@ -836,6 +836,7 @@ pub struct CancelBackend;
 #[async_trait]
 impl pgwire::api::cancel::CancelHandler for CancelBackend {
     async fn on_cancel_request(&self, request: pgwire::messages::cancel::CancelRequest) {
+        secantus_pgplan::cancel::trace(format_args!("cancel request for pid {}", request.pid));
         let entry = backend_registry()
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -846,6 +847,7 @@ impl pgwire::api::cancel::CancelHandler for CancelBackend {
                 entry
                     .cancel
                     .store(true, std::sync::atomic::Ordering::Relaxed);
+                secantus_pgplan::cancel::trace(format_args!("pid {} cancel flag set", request.pid));
             }
         }
     }
@@ -28418,6 +28420,11 @@ impl SimpleQueryHandler for PgHandler {
         // while the text was still arriving, or is being split or parsed, is
         // kept; opening it here is for a session without the hook.
         self.begin_message_cycle();
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} Query, {} bytes",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            query.len()
+        ));
         // ... and closes when the Query's answer is done, however it ends, so
         // a cancel sent while the backend is idle again targets nothing.
         struct CloseCycle<'a>(&'a PgHandler);
@@ -32944,7 +32951,16 @@ impl PgHandler {
     }
 
     /// PostgreSQL's answer to a statement interrupted by a `CancelRequest`.
+    #[track_caller]
     fn query_canceled() -> PgWireError {
+        if secantus_pgplan::cancel::trace_on() {
+            let at = std::panic::Location::caller();
+            secantus_pgplan::cancel::trace(format_args!(
+                "57014 built at {}:{}",
+                at.file(),
+                at.line()
+            ));
+        }
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".into(),
             "57014".into(), // query_canceled
@@ -32965,7 +32981,12 @@ impl PgHandler {
     fn begin_message_cycle(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         if !self.cycle_open.swap(true, Relaxed) {
-            self.backend.cancel.store(false, Relaxed);
+            let dropped = self.backend.cancel.swap(false, Relaxed);
+            secantus_pgplan::cancel::trace(format_args!(
+                "pid {} cycle start{}",
+                self.backend_pid.load(Relaxed),
+                if dropped { ", a pending cancel dropped" } else { "" }
+            ));
             self.message_cycle.fetch_add(1, Relaxed);
             if self.backend_pid.load(Relaxed) != 0 {
                 self.stats().wake();
@@ -32980,6 +33001,10 @@ impl PgHandler {
     fn end_message_cycle(&self) {
         self.cycle_open
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} cycle end",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         if self.backend_pid.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return;
         }
@@ -33010,6 +33035,7 @@ impl PgHandler {
     /// has arrived since the current message cycle started. Taking the
     /// request consumes it, so a handler that catches the error is not
     /// cancelled a second time by the same request.
+    #[track_caller]
     fn check_cancel(&self) -> PgWireResult<()> {
         // A `pg_terminate_backend` aimed at a RUNNING statement ends it, and
         // the session, at the statement's next cancellation point -- the
@@ -33021,11 +33047,21 @@ impl PgHandler {
         {
             return Err(Self::admin_shutdown());
         }
-        if self
+        let cancelled = self
             .backend
             .cancel
-            .swap(false, std::sync::atomic::Ordering::Relaxed)
-        {
+            .swap(false, std::sync::atomic::Ordering::Relaxed);
+        if secantus_pgplan::cancel::trace_on() {
+            let at = std::panic::Location::caller();
+            secantus_pgplan::cancel::trace(format_args!(
+                "pid {} check_cancel {}:{} {}",
+                self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+                at.file(),
+                at.line(),
+                if cancelled { "TAKEN" } else { "none" }
+            ));
+        }
+        if cancelled {
             return Err(Self::query_canceled());
         }
         let expired = self
@@ -53902,6 +53938,11 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.begin_message_cycle();
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} Parse, {} bytes",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed),
+            message.query.len()
+        ));
         self.apply_wire_dealloc(client.portal_store());
         let parser = <Self as ExtendedQueryHandler>::query_parser(self);
         let mut message = message;
@@ -54174,6 +54215,10 @@ impl ExtendedQueryHandler for PgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         self.begin_message_cycle();
+        secantus_pgplan::cancel::trace(format_args!(
+            "pid {} Execute",
+            self.backend_pid.load(std::sync::atomic::Ordering::Relaxed)
+        ));
         let out = self._on_execute(client, message).await;
         if out.is_err() {
             self.note_failure();
