@@ -2510,9 +2510,17 @@ impl plpgsql_fn::Host for PlHost<'_> {
             .map_err(|e| pl_error(&e))
     }
 
-    fn notice(&self, severity: &str, sqlstate: &str, message: String) {
+    fn notice(
+        &self,
+        severity: &str,
+        sqlstate: &str,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+    ) {
         let mut info = ErrorInfo::new(severity.into(), sqlstate.into(), message);
-        info.detail = None;
+        info.detail = detail;
+        info.hint = hint;
         self.h
             .pending_notices
             .lock()

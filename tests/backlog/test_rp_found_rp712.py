@@ -62,7 +62,7 @@ def test_jsonb_input_error_carries_its_json_data_context(dsn: str) -> None:
     )
 
 
-@pytest.mark.backlog("RP-751")
+@pytest.mark.backlog_fixed("RP-751")
 @pytest.mark.parametrize(
     "query",
     [

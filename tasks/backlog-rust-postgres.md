@@ -2592,12 +2592,6 @@ nothing. The gap tests are in `tests/backlog/test_rp_found_rp712.py`.
       true`) the line is missing from the stack.
       Verify: tests/backlog/test_rp_found_rp712.py::test_jsonb_input_error_carries_its_json_data_context
       Backlog-ID: RP-750
-- [ ] **A `money` variable prints its number in a RAISE.** `declare x money;
-      begin x := 5.25; raise notice '%', x;` notices `$5.25` on PostgreSQL
-      15.19 (RAISE prints a value by its type's output function, `cash_out`);
-      here it notices `5.25`, the carried numeric.
-      Verify: tests/backlog/test_rp_found_rp712.py::test_money_variable_prints_through_cash_out
-      Backlog-ID: RP-751
 - [ ] **An assignment's overlong `varchar(n)` value is 22001 with no
       assignment frame.** `declare x varchar(3); begin x := 'abcdef'::text;`
       carries CONTEXT `PL/pgSQL assignment "x := 'abcdef'::text"` above the
@@ -3583,3 +3577,20 @@ COLUMN adds.
       domain -- and `integer` here.
       Verify: tests/backlog/test_rp_found_rp799.py::test_data_type_of_a_domain_over_a_domain_is_user_defined
       Backlog-ID: RP-827
+
+## Found while working RP-751 (2026-11-10)
+
+Measured on PostgreSQL 15.19; none of it needs DDL. The gap tests are in
+`tests/backlog/test_rp_found_rp751.py`.
+
+- [ ] **A RAISE below ERROR carries no CONTEXT.** `do $$ declare x int;
+      begin raise notice 'm'; end $$` notices `m` with CONTEXT
+      `PL/pgSQL function inline_code_block line 1 at RAISE` on PostgreSQL
+      15.19 (`plpgsql_exec_error_callback` runs for every `ereport`, a
+      notice's included); here the NOTICE, WARNING or INFO has no
+      CONTEXT. An error raised there carries the frame already; a notice
+      needs the interpreter's current statement and the frames of the
+      callers above it (`SQL statement "..."`, the calling function's
+      line) as an error collects them on the way out.
+      Verify: tests/backlog/test_rp_found_rp751.py::test_a_notice_carries_its_context
+      Backlog-ID: RP-833
