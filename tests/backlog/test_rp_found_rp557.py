@@ -76,7 +76,9 @@ def test_set_op_of_a_domain_and_its_base_type(query: str, dsn: str) -> None:
 
 # `CREATE TABLE AS` copies the query's tuple descriptor (`intorel_startup`):
 # a domain column stays of the domain, with the column's own modifier -1.
-@pytest.mark.backlog("RP-661")
+# Here the columns were read back from the wire description, which sees
+# through the domain, so `a` was `character` with 7 (RP-661).
+@pytest.mark.backlog_fixed("RP-661")
 def test_create_table_as_keeps_a_domain_column(dsn: str) -> None:
     with _connect(dsn) as c:
         c.execute("create table c557 as select a, c from t557")
@@ -86,3 +88,53 @@ def test_create_table_as_keeps_a_domain_column(dsn: str) -> None:
             " order by attnum"
         ).fetchall()
     assert got == [("a", "d557", -1), ("c", "character", 7)]
+
+
+_ATTS = (
+    "select attname::text, atttypid::regtype::text, atttypmod from pg_attribute"
+    " where attrelid = '{}'::regclass and attnum > 0 order by attnum"
+)
+
+
+# Every form of CREATE TABLE AS keeps the domain: WITH NO DATA, SELECT ...
+# INTO, a WITH query; a cast to the base type does not. A domain takes no
+# modifier, so `pg_attribute.atttypmod` of ANY column of a domain is -1
+# (RP-558). Measured on PostgreSQL 15.19.
+CTAS_FORMS = {
+    "create table c557 as select a from t557 with no data": [("a", "d557", -1)],
+    "select a into c557 from t557": [("a", "d557", -1)],
+    "create table c557 as with q as (select a from t557) select * from q": [("a", "d557", -1)],
+    "create table c557 as select a::bpchar from t557": [("a", "character", -1)],
+}
+
+
+@pytest.mark.backlog_fixed("RP-661")
+@pytest.mark.parametrize("statement", list(CTAS_FORMS))
+def test_create_table_as_forms_keep_a_domain_column(statement: str, dsn: str) -> None:
+    with _connect(dsn) as c:
+        c.execute(statement)
+        got = c.execute(_ATTS.format("c557")).fetchall()
+    assert got == CTAS_FORMS[statement]
+
+
+# `intorel_receive` coerces nothing, so a value of the domain is copied
+# without its CHECKs: a row a `NOT VALID` CHECK would refuse is copied, as
+# INSERT ... SELECT copies it (RP-664). Measured on PostgreSQL 15.19.
+@pytest.mark.backlog_fixed("RP-661")
+def test_create_table_as_does_not_recheck_a_domain_value(dsn: str) -> None:
+    with _connect(dsn) as c:
+        for q in [
+            "drop table if exists tp661, cp661",
+            "drop domain if exists dp661",
+            "create domain dp661 as int",
+            "create table tp661 (a dp661, b int)",
+            "insert into tp661 values (0, 1), (5, 2)",
+            "alter domain dp661 add constraint pos check (value > 0) not valid",
+            "create table cp661 as select a, b from tp661",
+        ]:
+            c.execute(q)
+        got = c.execute("select a, b from cp661 order by b").fetchall()
+        typ = c.execute(_ATTS.format("cp661")).fetchall()
+        c.execute("drop table tp661, cp661")
+        c.execute("drop domain dp661")
+    assert (got, typ) == ([(0, 1), (5, 2)], [("a", "dp661", -1), ("b", "integer", -1)])

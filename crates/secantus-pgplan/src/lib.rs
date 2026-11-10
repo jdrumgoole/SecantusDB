@@ -1237,6 +1237,12 @@ pub enum Statement {
         /// `USING am`: one of the database's own table access methods
         /// (`heap` is `None`).
         access_method: Option<String>,
+        /// The domain each of the query's columns is of, read from the
+        /// query as written (`domain_scope::query_output_domains`); empty
+        /// when they are not known. The description sees through a domain,
+        /// but `intorel_startup` copies the tuple descriptor, which keeps
+        /// it (RP-661).
+        column_domains: Vec<Option<String>>,
     },
     /// `REFRESH MATERIALIZED VIEW name [WITH [NO] DATA]`.
     RefreshMatView {
@@ -5060,9 +5066,9 @@ fn plan_with_subqueries_parsed(
             let plan =
                 |q: &pg_query::protobuf::Node| plan_query_node(sql, q.clone(), lookup, params, run);
             return if fills {
-                plan_create_table_as_with(c, plan)
+                plan_create_table_as_with(c, lookup, plan)
             } else {
-                planning_without_running(|| plan_create_table_as_with(c, plan))
+                planning_without_running(|| plan_create_table_as_with(c, lookup, plan))
             };
         }
     }
@@ -7585,7 +7591,7 @@ fn plan_create_table_as(
     lookup: &dyn Fn(&str) -> Option<TableDef>,
     params: &[Bson],
 ) -> Result<Statement> {
-    plan_create_table_as_with(c, |q| match q.node.as_ref() {
+    plan_create_table_as_with(c, lookup, |q| match q.node.as_ref() {
         Some(N::SelectStmt(sel)) => plan_select(sel, lookup, params),
         Some(other) => Err(Error::Unsupported(disc(other))),
         None => Err(Error::Parse("CREATE TABLE AS without a query".into())),
@@ -7597,6 +7603,7 @@ fn plan_create_table_as(
 /// SELECT planner when it has not.
 fn plan_create_table_as_with(
     c: &pg_query::protobuf::CreateTableAsStmt,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
     plan_query: impl FnOnce(&pg_query::protobuf::Node) -> Result<Statement>,
 ) -> Result<Statement> {
     use pg_query::protobuf::ObjectType;
@@ -7645,6 +7652,13 @@ fn plan_create_table_as_with(
         matview_sql,
         matview_aliases,
         access_method: misc_alter::table_access_method(&into.access_method)?,
+        // From the query as written, before the planner rewrites its
+        // subqueries into constants.
+        column_domains: c
+            .query
+            .as_deref()
+            .map(|q| domain_scope::query_output_domains(q, lookup))
+            .unwrap_or_default(),
     })
 }
 
@@ -9074,6 +9088,50 @@ fn ruleutils_default(node: &pg_query::protobuf::Node) -> Option<String> {
 pub enum DefaultSpec {
     Value(Bson),
     Expr(String),
+}
+
+/// Make `column`, stored as `underlying`, a column of the domain `d`, whose
+/// innermost base and modifier are `resolved` (`getBaseTypeAndTypmod`): the
+/// stored width is the base's, the column is tagged with the domain, and
+/// the domain's DEFAULT is the column's until the column sets its own.
+fn tag_domain_column(
+    column: &mut Column,
+    d: &domains::Domain,
+    resolved: Option<&(String, i32, Vec<domains::Domain>)>,
+    underlying: &str,
+) -> Result<()> {
+    column.typmod = resolved.map_or(d.typmod, |(_, typmod, _)| *typmod);
+    column.extra.insert("domain_type", d.name.clone());
+    if let Some(sql) = &d.default_sql {
+        let raw = domains::parse_default_sql(sql)?;
+        match default_value_or_expr(&raw, underlying, &[])? {
+            DefaultSpec::Value(v) => {
+                column.default = Some(v);
+                column.set_default_sql(ruleutils_default(&raw));
+            }
+            DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
+        }
+    }
+    // Follows the domain's default until the column sets one of its own.
+    column.extra.insert("default_from_domain", true);
+    Ok(())
+}
+
+/// A column `name` of the domain `domain`, as `CREATE TABLE (name domain)`
+/// declares it; `None` when `domain` names no domain. A CREATE TABLE AS
+/// column of a domain is made this way (RP-661).
+pub fn domain_column(name: &str, domain: &str) -> Result<Option<Column>> {
+    let Some(d) = domains::user_domain(domain) else {
+        return Ok(None);
+    };
+    let resolved = domains::base_type_and_typmod(&d.name);
+    let base = resolved
+        .as_ref()
+        .map_or(d.base.clone(), |(base, _, _)| base.clone());
+    let underlying = normalize_serial(&base);
+    let mut column = Column::new(name, &underlying, false);
+    tag_domain_column(&mut column, &d, resolved.as_ref(), &underlying)?;
+    Ok(Some(column))
 }
 
 /// Fold a DEFAULT to a value when it is a constant; keep it as SQL when it is
@@ -11597,23 +11655,9 @@ fn plan_create(c: &pg_query::protobuf::CreateStmt) -> Result<Statement> {
                     column.extra.insert("collation", name);
                 }
                 if let Some(d) = &domain {
-                    column.typmod = resolved.as_ref().map_or(d.typmod, |(_, typmod, _)| *typmod);
-                    column.extra.insert("domain_type", d.name.clone());
                     // The domain's DEFAULT is the column's unless the column
                     // declares its own (below, which then overwrites it).
-                    if let Some(sql) = &d.default_sql {
-                        let raw = domains::parse_default_sql(sql)?;
-                        match default_value_or_expr(&raw, &underlying, &[])? {
-                            DefaultSpec::Value(v) => {
-                                column.default = Some(v);
-                                column.set_default_sql(ruleutils_default(&raw));
-                            }
-                            DefaultSpec::Expr(e) => column.set_default_expr(Some(e)),
-                        }
-                    }
-                    // Follows the domain's default until the column sets
-                    // one of its own.
-                    column.extra.insert("default_from_domain", true);
+                    tag_domain_column(&mut column, d, resolved.as_ref(), &underlying)?;
                 }
                 // A serial column draws its default from a sequence named
                 // `<table>_<column>_seq`, as PostgreSQL names it -- and is

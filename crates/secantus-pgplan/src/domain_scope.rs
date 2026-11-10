@@ -319,6 +319,23 @@ fn output_columns_with(
     Some(out)
 }
 
+/// The domain each column of `query`, a CREATE TABLE AS's query as
+/// written, is of, in order (RP-661): `intorel_startup` copies the query's
+/// tuple descriptor, so a column of a domain makes a column of the domain.
+/// Empty when the columns are not known (a VALUES list, a star over an
+/// item whose columns are not known).
+pub(crate) fn query_output_domains(
+    query: &Node,
+    lookup: &dyn Fn(&str) -> Option<TableDef>,
+) -> Vec<Option<String>> {
+    match query.node.as_ref() {
+        Some(N::SelectStmt(s)) => output_columns(s, lookup, &Ctes::new())
+            .map(|columns| columns.into_iter().map(|(_, d)| d).collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// The columns `*` or `q.*` stands for.
 fn star_columns(scope: &Scope, fields: &[Node]) -> Option<Columns> {
     match fields {
