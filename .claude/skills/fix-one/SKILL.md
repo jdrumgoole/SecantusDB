@@ -174,6 +174,24 @@ Python servers' tests and the parity suites CI no longer runs. A change to
 the shared storage crates also runs `scripts/gate_pg.sh --storage`, since
 the PG server links them.
 
+- **It scopes itself by the diff** from `origin/rm-batch` / `origin/main`.
+  The storage crate's two test runs (~9 min) run only when the work touches
+  `crates/secantus-storage/`, `secantus-wt`, `secantus-wiredtiger-sys`,
+  `cmake/` or `vendor/wiredtiger`. The PostgreSQL server's test files
+  (`tests/test_rust_pg*.py`, `test_pgserver_embedded.py`) leave
+  `ci-selected` unless `tools/ci_pg_needed.py` says the change can reach
+  that server (they ran whenever the lane held a `secantusd-pg`, 400-850 s
+  against ~100 s). `--full` runs both anyway. Skipped steps are recorded
+  as `skipped`, not passed.
+- **It starts with `backlog-ids`** (`tools/backlog.py check-ids`): a
+  Backlog-ID the work adds that it did not reserve fails here, not as a
+  duplicate on the snapshot PR.
+- **After a failure, rerun only the failed steps:**
+  `scripts/gate_rm.py --only mongod-live,lint` keeps the other steps on
+  record and fails unless every recorded step is green. A fix to code
+  usually needs `binary-build,server-build` in the list too, or the suites
+  run against the old build.
+
 Read every `.rc` that is not 0, and the log beside it; do not trust an exit
 code taken through a pipe or a trailing `echo`. Expected from the backlog
 step: this item gone, no `REGRESSED`, no new `FIXED?` or `BROKEN`.

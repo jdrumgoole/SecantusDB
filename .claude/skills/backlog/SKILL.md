@@ -123,7 +123,8 @@ the helpers (`mongo_answer`, `pg_answer`) that turn an error into a value.
    again. For the Rust PG backlog, CI's `pg-oracle` job also runs every
    `backlog_fixed` test in `tests/backlog/test_rust_postgres_gaps.py` and
    `tests/backlog/test_rp_*.py`, and `verify --file backlog-rust-postgres.md`,
-   on every PR: an RP item a change fixes without closing turns CI red
+   on every PR that can reach the PG server (`tools/ci_pg_needed.py`; a
+   MongoDB-only PR skips it): an RP item a change fixes without closing turns CI red
    (`FIXED?`), so close it in that PR. (A test that needs no reference server can instead move into the
    default suite; keep the ID in its docstring.)
 4. **Delete the item** in the same change, and name it in the
