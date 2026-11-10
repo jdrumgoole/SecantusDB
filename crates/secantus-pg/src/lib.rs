@@ -30461,11 +30461,24 @@ impl PgHandler {
                         Ok(())
                     });
                 }
+                // `ATExecAddColumn`: a column of a domain takes its DEFAULT,
+                // or NULL, coerced into the domain for every row already
+                // there, so a NOT NULL or CHECK the value fails refuses the
+                // ALTER (23502 / 23514); an empty table checks nothing.
+                let domain = column.extra.get_str("domain_type").ok();
+                let check = |v: &Bson| -> PgWireResult<()> {
+                    match domain {
+                        Some(d) => secantus_pgplan::domains::domain_check(d, v)
+                            .map_err(|e| PgHandler::err(&e)),
+                        None => Ok(()),
+                    }
+                };
                 if let Some(expr) = column.default_expr() {
                     let sql = format!("SELECT ({expr})::{}", column.pg_type);
                     let field = column.field();
                     return self.rewrite_rows(table, |d| {
                         let value = self.eval_constant_sql(&sql)?;
+                        check(&value)?;
                         let stored = secantus_pgplan::carry_subms(d, &field, value);
                         d.insert(field.clone(), stored);
                         Ok(())
@@ -30473,6 +30486,7 @@ impl PgHandler {
                 }
                 let value = typed_default(column)?.unwrap_or(Bson::Null);
                 self.rewrite_rows(table, |d| {
+                    check(&value)?;
                     d.insert(column.field(), value.clone());
                     Ok(())
                 })

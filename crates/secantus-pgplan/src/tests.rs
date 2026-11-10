@@ -5203,6 +5203,54 @@ fn a_domain_over_char_n_coerces_to_its_base_width() {
     domains::set_user_domains(Vec::new());
 }
 
+/// RP-799: a column ADD COLUMN adds of a domain is typed as CREATE TABLE
+/// types one -- the innermost base at its width, tagged with the domain,
+/// with the domain's DEFAULT until the column declares its own. It was
+/// typed by the domain's name and tagged with nothing.
+#[test]
+fn an_added_domain_column_is_tagged_like_a_declared_one() {
+    let domain = |name: &str, oid, base: &str, typmod, default_sql: Option<&str>| domains::Domain {
+        name: name.to_string(),
+        oid,
+        base: base.to_string(),
+        typmod,
+        not_null: false,
+        checks: Vec::new(),
+        not_valid: Vec::new(),
+        default_sql: default_sql.map(str::to_string),
+        collation: None,
+    };
+    domains::set_user_domains(vec![
+        domain("dc3", 90011, "bpchar", 7, None),
+        domain("dc3n", 90012, "dc3", -1, None),
+        domain("dd", 90013, "int4", -1, Some("42")),
+    ]);
+    let added = |sql: &str| match plan_ok(sql) {
+        Statement::AlterTable { mut actions, .. } => match actions.remove(0) {
+            AlterTableAction::AddColumn { column, .. } => column,
+            other => panic!("wrong action: {other:?}"),
+        },
+        other => panic!("wrong statement: {other:?}"),
+    };
+    let c = added("ALTER TABLE t ADD COLUMN a dc3n");
+    assert_eq!((c.pg_type.as_str(), c.typmod), ("bpchar", 7));
+    assert_eq!(c.extra.get_str("domain_type").ok(), Some("dc3n"));
+    let c = added("ALTER TABLE t ADD COLUMN d dd");
+    assert_eq!(c.pg_type, "int4");
+    assert_eq!(c.extra.get_str("domain_type").ok(), Some("dd"));
+    assert_eq!(c.default, Some(Bson::Int32(42)));
+    assert_eq!(c.extra.get_bool("default_from_domain").ok(), Some(true));
+    // The column's own DEFAULT replaces the domain's, whichever form it has.
+    let c = added("ALTER TABLE t ADD COLUMN d dd DEFAULT (random() * 10)::int4");
+    assert_eq!(c.default, None);
+    assert!(c.default_expr().is_some());
+    assert!(c.extra.get_bool("default_from_domain").is_err());
+    let c = added("ALTER TABLE t ADD COLUMN d dd DEFAULT 1");
+    assert_eq!(c.default, Some(Bson::Int32(1)));
+    assert!(c.extra.get_bool("default_from_domain").is_err());
+    domains::set_user_domains(Vec::new());
+}
+
 /// `ALTER DOMAIN ... ADD CONSTRAINT ... NOT VALID` carries the NOT VALID
 /// (`skip_validation`), which a plain ADD does not, and `VALIDATE
 /// CONSTRAINT` names the constraint (RP-555).

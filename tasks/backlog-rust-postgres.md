@@ -3392,16 +3392,6 @@ with ICU) with the `_SETUP` in `tests/backlog/test_rp_found_rp782.py`:
       answers NULL, though a user view's definition is printed.
       Verify: tests/backlog/test_rp_found_rp782.py::test_pg_get_viewdef_of_a_system_view
       Backlog-ID: RP-798
-- [ ] **An added domain column does not reach its base type's
-      aggregates.** After `alter table t add column a xc782f`,
-      `string_agg(a, ',')` is 42883 `function string_agg(xc782f, unknown)
-      does not exist` here and aggregates on PostgreSQL 15.19. A column
-      CREATE TABLE declares of a domain is stored as the base type with a
-      `domain_type` tag (`tag_domain_column`); one ADD COLUMN adds keeps the
-      domain's name as its type (`plan_added_column`), which the
-      aggregate's overload resolution does not follow to `text`.
-      Verify: tests/backlog/test_rp_found_rp782.py::test_an_added_domain_column_reaches_its_base_types_aggregates
-      Backlog-ID: RP-799
 
 ## Found while working RP-796 (2026-11-10)
 
@@ -3558,3 +3548,46 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       per transaction and checks it in the three GUCs' check hooks.
       Verify: tests/backlog/test_rp_found_rp829.py::test_a_transaction_mode_is_set_before_any_query
       Backlog-ID: RP-831
+
+## Found while working RP-799 (2026-11-10)
+
+Measured on a private, freshly initdb'd PostgreSQL 15.19 cluster with the
+`_SETUP` in `tests/backlog/test_rp_found_rp799.py`: `dx` a domain over
+`int` with `default 42`, `dx2` a domain over `dx`, `dnd` one over `int`
+`not null default 5`, and `dpos` one over `int` `check (value > 0)`. Each
+holds for a column CREATE TABLE declares and, since RP-799, for one ADD
+COLUMN adds.
+
+- [ ] **A column retyped off its domain still enforces the domain.** After
+      `create table t (a dpos)` and `alter table t alter column a type
+      int`, PostgreSQL 15.19 inserts `-1`, `information_schema.columns`
+      names no domain, and `drop domain dpos` succeeds; here the insert is
+      23514 `value for domain dpos violates check constraint "dpos_check"`,
+      `domain_name` is still `dpos`, and the DROP is 2BP01 naming the
+      column. `ALTER COLUMN TYPE` sets the stored type but leaves the
+      column's `domain_type` tag, which every write checks.
+      Verify: tests/backlog/test_rp_found_rp799.py::test_a_column_retyped_off_its_domain_drops_it
+      Backlog-ID: RP-824
+- [ ] **A domain's DEFAULT is listed as its column's default.** `create
+      table t (d dx)` has no `pg_attrdef` row on PostgreSQL 15.19, and
+      `information_schema.columns.column_default` is NULL: the domain's
+      DEFAULT is the type's (`pg_type.typdefault`), applied at INSERT by
+      `build_column_default`, not copied into the column. Here
+      `pg_get_expr(adbin, adrelid)` and `column_default` are `42`, as
+      `tag_domain_column` stores the domain's default in the column.
+      Verify: tests/backlog/test_rp_found_rp799.py::test_a_domains_default_is_not_its_columns
+      Backlog-ID: RP-825
+- [ ] **A domain over a domain does not take the inner domain's DEFAULT.**
+      A column of `dx2`, over `dx` with `default 42`, is `42` where an
+      INSERT omits it on PostgreSQL 15.19 (`getTypeDefault` reads the
+      outer domain's `typdefault`, which CREATE DOMAIN copies from its base
+      domain); here it is NULL, as only the outer domain's own DEFAULT is
+      read.
+      Verify: tests/backlog/test_rp_found_rp799.py::test_a_domain_over_a_domain_takes_its_default
+      Backlog-ID: RP-826
+- [ ] **`information_schema.columns.data_type` of a domain over a domain
+      names its base.** A column of `dx2` is `USER-DEFINED` on PostgreSQL
+      15.19 -- the view reads the domain's immediate base type, itself a
+      domain -- and `integer` here.
+      Verify: tests/backlog/test_rp_found_rp799.py::test_data_type_of_a_domain_over_a_domain_is_user_defined
+      Backlog-ID: RP-827
