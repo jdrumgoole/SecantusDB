@@ -3519,14 +3519,3 @@ statements are VALUES-only and create nothing. The gap tests are in
       length.
       Verify: tests/backlog/test_rp_found_rp794.py::test_an_untyped_literal_resolved_to_bpchar_keeps_its_blanks
       Backlog-ID: RP-804
-- [ ] **`string_agg` over an unsized `bpchar` column keeps its blanks.**
-      `select string_agg(f, '|') from (values ('a  '::char(3)),
-      ('b'::char(2))) s(f)` is `a|b` on PostgreSQL 15.19: the argument
-      reaches `string_agg(text, text)` through the implicit `bpchar` ->
-      `text` cast (`rtrim1`), which drops the trailing blanks. Here it is
-      `a  |b `: the unsized column's cells keep their blanks and the
-      aggregate joins them uncast. `f::text` and `length(f::text)` over the
-      same column already agree, and so does a `char(3)` column of both
-      members.
-      Verify: tests/backlog/test_rp_found_rp794.py::test_string_agg_over_an_unsized_bpchar_drops_its_blanks
-      Backlog-ID: RP-805
