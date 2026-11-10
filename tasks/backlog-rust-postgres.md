@@ -3520,15 +3520,6 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       `INSERT ... RETURNING`.
       Verify: tests/backlog/test_rp_found_rp823.py::test_a_query_loop_walks_a_pinned_portal
       Backlog-ID: RP-828
-- [ ] **A BEGIN inside a multi-statement simple query warns 25001.**
-      `begin; select 1; commit` and `select 1; begin; select 2; commit`,
-      each sent as one simple Query, answer with no notice on PostgreSQL
-      15.19: `BeginTransactionBlock` turns the implicit block
-      (`TBLOCK_IMPLICIT_INPROGRESS`) into a real one. Here each sends the
-      WARNING 25001 `there is already a transaction in progress`, which
-      only a BEGIN inside an explicit block should.
-      Verify: tests/backlog/test_rp_found_rp823.py::test_a_begin_in_a_multi_statement_query_does_not_warn
-      Backlog-ID: RP-829
 
 ## Found while working RP-822 (2026-11-10)
 
@@ -3544,3 +3535,26 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       lookup can reuse.
       Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
       Backlog-ID: RP-830
+
+## Found while working RP-829 (2026-11-10)
+
+Measured on PostgreSQL 15.19; none of the statements creates an object.
+
+- [ ] **A transaction's isolation, read-write and deferrable modes can be
+      changed after it ran a query.** On PostgreSQL 15.19 `begin; select 1;
+      set transaction isolation level serializable` is 25001 `SET
+      TRANSACTION ISOLATION LEVEL must be called before any query`
+      (`check_XactIsoLevel` once `FirstSnapshotSet`, for a level other than
+      the current one), and so is the same change through `set
+      transaction_isolation = ...`, `set_config(...)`, a BEGIN's modes
+      after a query in a multi-statement query's implicit block (`select
+      1; begin isolation level serializable`) or in a block. `begin read
+      only; select 1; set transaction read write` is 25001 `transaction
+      read-write mode must be set before any query`, and `set transaction
+      [not] deferrable` after a query is 25001 `SET TRANSACTION [NOT]
+      DEFERRABLE must be called before any query`. Here each is accepted
+      and the GUC moves, though the transaction's snapshot was taken under
+      the old mode. The faithful fix keeps PostgreSQL's `FirstSnapshotSet`
+      per transaction and checks it in the three GUCs' check hooks.
+      Verify: tests/backlog/test_rp_found_rp829.py::test_a_transaction_mode_is_set_before_any_query
+      Backlog-ID: RP-831
