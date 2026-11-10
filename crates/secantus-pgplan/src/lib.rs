@@ -18835,8 +18835,12 @@ fn plan_aggregate_item(
             }
         }
     }
-    // A FILTER no MQL filter can express -- one holding a subquery, or the
-    // per-row call a correlated one became -- is evaluated per row (below).
+    // A FILTER no MQL filter can express -- one holding a subquery, the
+    // per-row call a correlated one became, or one the lowering refuses as
+    // `Unsupported` (an array column's null test or comparison, RP-739 /
+    // RP-733) -- is evaluated per row (below), as a WHERE's residual is
+    // (`lower_where_or_residual`). An undefined column or a bad type stays
+    // the error it is.
     let mut sublink_filter = None;
     let filter = match f.agg_filter.as_deref() {
         None => None,
@@ -18851,6 +18855,10 @@ fn plan_aggregate_item(
         Some(node) => match lower_where(node, def, params) {
             Ok(d) => Some(d),
             Err(_) if correlated::has_correlated_call(node) => {
+                sublink_filter = Some(node);
+                None
+            }
+            Err(Error::Unsupported(_)) => {
                 sublink_filter = Some(node);
                 None
             }
@@ -18921,6 +18929,13 @@ fn plan_aggregate_item(
         item.filter = Some(bson::doc! { field.clone(): true });
         item.filter_field = Some(field);
         item.filter_expr = expr;
+        // `count(*)` takes no argument to resolve: the per-row FILTER is
+        // all it reads (`count(*) filter (where b is null)`, RP-739).
+        if name == "count" && f.agg_star {
+            item.func = AggFunc::CountStar;
+            item.order = plan_aggregate_order(&f.agg_order, def, params)?;
+            return Ok(item);
+        }
     }
     if f.agg_within_group {
         // `percentile_cont(0.5) WITHIN GROUP (ORDER BY v)`: the ordered
@@ -43523,6 +43538,7 @@ fn lower_where_plain(
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             composite_null_test_is_per_row(def, &field)?;
+            array_compare_is_per_row(def, &field)?;
             // A SQL NULL is either an explicit null or an absent field here,
             // and MQL's `null` / `$ne: null` match exactly that pair.
             match NullTestType::try_from(t.nulltesttype) {
@@ -46789,6 +46805,7 @@ fn lower_negated(
         Some(N::NullTest(t)) => {
             let field = column_field(t.arg.as_deref(), def)?;
             composite_null_test_is_per_row(def, &field)?;
+            array_compare_is_per_row(def, &field)?;
             match NullTestType::try_from(t.nulltesttype) {
                 Ok(NullTestType::IsNull) => Ok(doc! { field: { "$ne": Bson::Null } }),
                 Ok(NullTestType::IsNotNull) => Ok(doc! { field: Bson::Null }),
@@ -46984,6 +47001,11 @@ fn type_is_rowtype(t: &str) -> bool {
 /// '{x,y}'` found `{{x,y},{z,w}}`, a NULL element sorted first, and an
 /// array whose lower bound is not 1 (held as a tagged document) fell in no
 /// range at all (RP-733). Evaluated per row it compares as `array_cmp`.
+///
+/// `IS [NOT] NULL` over an array column too: the MQL `{a: null}` also
+/// matches an array holding a NULL element (`{NULL,1}`), which PostgreSQL's
+/// `ExecEvalNullTest` finds NOT NULL -- only the datum itself is tested,
+/// never its elements (RP-739).
 fn array_compare_is_per_row(def: &TableDef, field: &str) -> Result<()> {
     if ARRAY_COMPARE_AS_FILTER.with(std::cell::Cell::get) {
         return Ok(());

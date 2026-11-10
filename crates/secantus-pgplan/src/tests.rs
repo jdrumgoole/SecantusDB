@@ -4990,6 +4990,83 @@ fn array_column_against_a_constant_is_per_row() {
     }
 }
 
+/// RP-739: `IS [NOT] NULL` over an array column is evaluated per row: the
+/// MQL `{b: null}` also matches an array holding a NULL element
+/// (`{NULL,1}`), which PostgreSQL 15.19 finds NOT NULL. A scalar column's
+/// null test stays a filter.
+#[test]
+fn null_test_over_an_array_column_is_per_row() {
+    let def = || {
+        TableDef::new(
+            "ta",
+            vec![
+                Column::new("k", "int4", true),
+                Column::new("c", "int4", false),
+                Column::new("b", "int4[]", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "ta").then(def);
+    let lowered = |sql: &str| match plan(sql, &lookup).expect("should plan") {
+        Statement::Select(s) => (s.filter, s.residual.is_some()),
+        other => panic!("wrong statement: {other:?}"),
+    };
+    for sql in [
+        "select k from ta where b is null",
+        "select k from ta where b is not null",
+        "select k from ta where b isnull",
+        "select k from ta where b notnull",
+        "select k from ta where not (b is null)",
+        "select k from ta where not (b is not null)",
+        "select k from ta where b is null and k > 0",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(residual, "{sql} should be evaluated per row: {filter:?}");
+    }
+    for sql in [
+        "select k from ta where c is null",
+        "select k from ta where not (c is null)",
+    ] {
+        let (filter, residual) = lowered(sql);
+        assert!(!residual, "{sql} stays a filter: {filter:?}");
+    }
+}
+
+/// RP-739: an aggregate's FILTER the MQL filter cannot express -- an array
+/// column's null test or comparison -- is evaluated per row, `count(*)`'s
+/// included, rather than refused as 0A000.
+#[test]
+fn aggregate_filter_over_an_array_column_is_per_row() {
+    let def = || {
+        TableDef::new(
+            "ta",
+            vec![
+                Column::new("k", "int4", true),
+                Column::new("b", "int4[]", false),
+            ],
+        )
+    };
+    let lookup = |name: &str| (name == "ta").then(def);
+    for sql in [
+        "select count(*) filter (where b is null) from ta",
+        "select count(*) filter (where b = '{1,2}') from ta",
+        "select array_agg(k) filter (where b is not null) from ta",
+        "select sum(k) filter (where b >= '{1,2}') from ta group by k",
+    ] {
+        if let Err(e) = plan(sql, &lookup) {
+            panic!("{sql} should plan: {e:?}");
+        }
+    }
+    // An undefined column in a FILTER stays its own error.
+    assert!(matches!(
+        plan(
+            "select count(*) filter (where nope is null) from ta",
+            &lookup
+        ),
+        Err(Error::UndefinedColumn(_))
+    ));
+}
+
 /// RP-734: an untyped literal beside an array is read as that array type
 /// -- beside one whose lower bound is not 1 too, where it was left a string
 /// and the comparison was 42883 -- its element type from the first element

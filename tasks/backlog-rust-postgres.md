@@ -3288,33 +3288,6 @@ statement is VALUES-only and runs there as written. The gap tests are in
       Verify: tests/backlog/test_rp_found_rp732.py::test_a_cast_over_a_case_of_literals_reports_no_position
       Backlog-ID: RP-746
 
-## Found while working RP-733 (2026-11-09)
-
-Measured on PostgreSQL 15.19 (the shared reference on port 5415) with the
-`_SHAPES` in `tests/backlog/test_rp_found_rp722.py`: `x733(k int, a text[],
-b int[])`, `b` holding `'{}'`, `'{NULL,1}'`, `'{1,2}'`, `'{{1,2},{3,4}}'`,
-`'[2:3]={1,2}'`, NULL and `'{NULL}'`.
-
-- [ ] **`IS NULL` over an array column matches an array holding a NULL
-      element.** `select k from x733 where b is null` is only the row whose
-      `b` is NULL on PostgreSQL 15.19; here it is also `{NULL,1}` and
-      `{NULL}`, and `IS NOT NULL` (`NOT (b IS NULL)`, `ISNULL` the same)
-      drops them. The null test lowers to the MQL `{b: null}`, which also
-      matches an array with a NULL element; `IS NOT DISTINCT FROM NULL` is
-      right since RP-733 took it per row.
-      A first fix (`d4e56836`, 2026-11-09) sent the null test down RP-733's
-      per-row path and was reverted. The aggregate FILTER lowering
-      (`lower_where` for `agg_filter`, which takes the per-row path only
-      for a sublink or a correlated call) returned the refusal, so
-      `select array_agg(a) filter (where a is not null) from bc_arr where id
-      < 3` became 0A000 "an array column compared with a constant" where
-      PostgreSQL answers `{{1,2}}`. `test_rust_pg_builtin_coverage.py` failed
-      on snapshot PR #2586. The fix must evaluate a FILTER that the filter
-      cannot express per row too, which an array comparison inside a
-      FILTER probably needs since RP-733 as well (unmeasured).
-      Verify: tests/backlog/test_rp_found_rp722.py::test_a_null_test_over_an_array_column_reads_the_array
-      Backlog-ID: RP-739
-
 ## Found while working RP-740 (2026-11-09)
 
 Measured on PostgreSQL 15.19 (the shared reference on port 5415).
