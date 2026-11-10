@@ -54,7 +54,7 @@ def test_get_diagnostic_data_samples_mongods_collectors(
     """A set member's sample is `start`, `replSetGetStatus`, the three
     `$collStats` collectors, `serverStatus` and `end`, each collector stamped
     with its own `start` and `end` -- on each OS, as its mongod samples: on
-    Linux mongod adds `systemMetrics`, which is RM-424's gap."""
+    Linux mongod adds `systemMetrics`, which RM-424's test compares."""
     ours, theirs = _sample_shape(rust_mongo), _sample_shape(mongod_rs)
     if OS == "linux":
         for shape in (ours, theirs):
@@ -63,7 +63,7 @@ def test_get_diagnostic_data_samples_mongods_collectors(
     assert ours == theirs
 
 
-@pytest.mark.backlog("RM-424")
+@pytest.mark.backlog_fixed("RM-424")
 def test_linux_diagnostic_data_samples_system_metrics(
     rust_mongo: Any,
     mongod_rs: Any,  # noqa: F811
@@ -71,7 +71,8 @@ def test_linux_diagnostic_data_samples_system_metrics(
     """On Linux mongod 8.2's diagnostic sample carries a `systemMetrics`
     collector (the machine's CPU, memory and disk counters from `/proc`),
     stamped with its own `start` and `end`, just before `end` (CI,
-    2026-11-08). This server's has none. macOS mongod has no such collector."""
+    2026-11-08). This server's had none; it now reads the same `/proc`
+    files. macOS mongod has no such collector."""
     only_on("linux", why="macOS mongod samples no systemMetrics")
 
     def system_metrics(client: Any) -> tuple:

@@ -11,7 +11,9 @@
 //! - a replica-set member: `replSetGetStatus`, the `$collStats`
 //!   `storageStats` of `local.oplog.rs`, `config.transactions` and
 //!   `config.image_collection`, then `serverStatus`;
-//! - a standalone: `serverStatus` alone.
+//! - a standalone: `serverStatus` alone;
+//! - on Linux, either one then `systemMetrics`, the machine's `/proc`
+//!   counters (`system_metrics`).
 //!
 //! A collector that fails keeps its error in the sample (`ok: 0`, `errmsg`,
 //! `code`, `codeName`), as mongod's does before its set is initiated.
@@ -138,6 +140,14 @@ fn sample(ctx: &mut CommandContext) -> Document {
     let start = DateTime::now();
     let status = crate::admin::server_status(&server_status_request(), ctx);
     out.insert("serverStatus", stamped(start, status));
+    // Linux mongod's machine counters from `/proc` (RM-424); macOS mongod
+    // has no such collector.
+    #[cfg(target_os = "linux")]
+    {
+        let start = DateTime::now();
+        let metrics = crate::system_metrics::collect();
+        out.insert("systemMetrics", stamped(start, Ok(metrics)));
+    }
     out.insert("end", DateTime::now());
     out
 }
@@ -165,7 +175,12 @@ mod tests {
         let mut ctx = CommandContext::new(0);
         let s = sample(&mut ctx);
         let keys: Vec<&str> = s.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["start", "serverStatus", "end"]);
+        let expected: &[&str] = if cfg!(target_os = "linux") {
+            &["start", "serverStatus", "systemMetrics", "end"]
+        } else {
+            &["start", "serverStatus", "end"]
+        };
+        assert_eq!(keys, expected);
         let status = s.get_document("serverStatus").unwrap();
         assert_eq!(status.keys().next().map(String::as_str), Some("start"));
         assert_eq!(status.keys().last().map(String::as_str), Some("end"));

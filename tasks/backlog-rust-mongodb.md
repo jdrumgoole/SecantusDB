@@ -1364,17 +1364,6 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       RM-395.
       Verify: tests/backlog/test_rm_found_2026_11_10_rm395.py::test_tied_sort_spill_storage_size
       Backlog-ID: RM-526
-- [ ] **On Linux the diagnostic sample has no `systemMetrics`.** mongod
-      8.2 on Linux adds a `systemMetrics` collector to each FTDC sample
-      (`getDiagnosticData`): the machine's CPU, memory, network and disk
-      counters read from `/proc`, stamped `start`/`end`, just before `end`.
-      macOS mongod has no such collector, which is why RM-219 (built on a
-      Mac) matched there and failed on CI's Linux. Each platform's mongod is
-      the reference (Joe, 2026-11-07), so on Linux this server should sample
-      the same counters. Checked on Linux only, by CI. Found 2026-11-08,
-      snapshot PR #2465.
-      Backlog-ID: RM-424
-      Verify: tests/backlog/test_rm_219_diag_query_settings.py::test_linux_diagnostic_data_samples_system_metrics
 - [ ] **On x86_64 a sort after `$project` stores 35 bytes more spill than
       mongod.** mongod 8.2's spill sizes differ by platform (the in-order
       sort stores 130545 bytes on arm64 and 131252 on x86_64), and each
