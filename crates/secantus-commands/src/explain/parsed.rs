@@ -361,6 +361,12 @@ fn equality(branch: &Document) -> Option<(String, Bson)> {
     })
 }
 
+/// Whether an `$or` branch is one mongod's `$or` optimisation would gather
+/// into an `$in`: an equality, or a regex.
+pub(crate) fn is_or_equality(branch: &Document) -> bool {
+    equality(branch).is_some()
+}
+
 /// The `$or` branches with each path's equalities, where it has two or
 /// more, folded into one `$in` in the place of the first.
 fn group_equalities(branches: Vec<Document>, sorted_in: bool) -> Vec<Document> {

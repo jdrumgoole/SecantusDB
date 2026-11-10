@@ -74,11 +74,146 @@ fn as_sort(stage: &Bson) -> Option<&Document> {
 }
 
 fn as_match(stage: &Bson) -> Option<&Document> {
+    let d = stage.as_document().filter(|d| d.len() == 1)?;
+    d.get_document("$match")
+        .or_else(|_| d.get_document(PUSHED_MATCH))
+        .ok()
+}
+
+/// A `$match` mongod moved ahead of a `$replaceRoot` and rewrote, which
+/// `explain` lists as it stands -- its clauses in the order the rewrite left
+/// them, not sorted again -- and which runs as the `$match` it is.
+pub(crate) const PUSHED_MATCH: &str = "$_secantusPushedMatch";
+
+/// Whether a stage is a [`PUSHED_MATCH`].
+fn is_pushed(stage: &Bson) -> bool {
     stage
         .as_document()
-        .filter(|d| d.len() == 1)?
-        .get_document("$match")
-        .ok()
+        .is_some_and(|d| d.contains_key(PUSHED_MATCH))
+}
+
+/// The field a `$replaceRoot` / `$replaceWith` makes the document, when its
+/// new root is a plain field path (`"$x.y"`; not `$$ROOT`, not a computed
+/// document).
+fn new_root_path(stage: &Bson) -> Option<&str> {
+    let d = stage.as_document().filter(|d| d.len() == 1)?;
+    let root = match (d.get_document("$replaceRoot"), d.get("$replaceWith")) {
+        (Ok(spec), _) => spec.get_str("newRoot").ok()?,
+        (_, Some(Bson::String(root))) => root.as_str(),
+        _ => return None,
+    };
+    root.strip_prefix('$')
+        .filter(|p| !p.is_empty() && !p.starts_with('$'))
+}
+
+/// A stage that turns each document into one other (mongod's
+/// `DocumentSourceSingleDocumentTransformation`), which a `$skip` behind it
+/// moves ahead of.
+fn transforms_one_by_one(stage: &Bson) -> bool {
+    stage
+        .as_document()
+        .filter(|d| d.len() == 1)
+        .and_then(|d| d.keys().next())
+        .is_some_and(|k| {
+            matches!(
+                k.as_str(),
+                "$project" | "$addFields" | "$set" | "$unset" | "$replaceRoot" | "$replaceWith"
+            )
+        })
+}
+
+fn is_skip(stage: &Bson) -> bool {
+    stage
+        .as_document()
+        .is_some_and(|d| d.len() == 1 && d.contains_key("$skip"))
+}
+
+/// Whether mongod renames a parsed filter onto the field a `$replaceRoot`
+/// reads (measured 8.2.11): not one that is only `$alwaysTrue` or
+/// `$alwaysFalse`, nor one that holds an `$expr`, an `$elemMatch` or a
+/// clause that is not on a path.
+fn renameable(parsed: &Document) -> bool {
+    fn clause(key: &str, value: &Bson) -> bool {
+        match key {
+            "$and" | "$or" | "$nor" => value.as_array().is_some_and(|cs| {
+                cs.iter().all(|c| {
+                    c.as_document()
+                        .is_some_and(|d| d.iter().all(|(k, v)| clause(k, v)))
+                })
+            }),
+            "$alwaysTrue" | "$alwaysFalse" => true,
+            k if k.starts_with('$') => false,
+            _ => !holds_elem_match(value),
+        }
+    }
+    fn holds_elem_match(value: &Bson) -> bool {
+        match value {
+            Bson::Document(d) => d
+                .iter()
+                .any(|(k, v)| k == "$elemMatch" || (k == "$not" && holds_elem_match(v))),
+            _ => false,
+        }
+    }
+    let lone_constant = parsed.len() == 1
+        && (parsed.contains_key("$alwaysTrue") || parsed.contains_key("$alwaysFalse"));
+    !lone_constant && parsed.iter().all(|(k, v)| clause(k, v))
+}
+
+/// `filter` with each path under `root`.
+fn under_root(filter: &Document, root: &str) -> Document {
+    filter
+        .iter()
+        .map(|(k, v)| match (k.as_str(), v) {
+            ("$and" | "$or" | "$nor", Bson::Array(cs)) => (
+                k.clone(),
+                Bson::Array(
+                    cs.iter()
+                        .map(|c| match c {
+                            Bson::Document(d) => Bson::Document(under_root(d, root)),
+                            other => other.clone(),
+                        })
+                        .collect(),
+                ),
+            ),
+            (k, _) if k.starts_with('$') => (k.to_string(), v.clone()),
+            (k, _) => (format!("{root}.{k}"), v.clone()),
+        })
+        .collect()
+}
+
+/// A `$match` behind a `$replaceRoot` whose new root is the field `root`,
+/// as mongod 8.2 moves it ahead (`ReplaceRootTransformation`, measured
+/// 8.2.11): the filter, parsed, reads its paths under `root`, in an `$or`
+/// with the tests that let through what the `$replaceRoot` then refuses (an
+/// array, or not a document) so that the error still comes. The `$or` takes
+/// in the branches of a renamed `$or`, and its equalities and regexes go
+/// last (mongod's `$or` optimisation keeps them for an `$in`). An empty
+/// filter moves as it is; `None`: it stays behind. `pushed`: the filter is
+/// one an earlier `$replaceRoot` already rewrote.
+fn through_replace_root(filter: &Document, pushed: bool, root: &str) -> Option<Document> {
+    let filter = if pushed {
+        filter.clone()
+    } else {
+        super::parsed::parsed_query(filter)
+    };
+    if filter.is_empty() {
+        return Some(filter);
+    }
+    if !pushed && !renameable(&filter) {
+        return None;
+    }
+    let renamed = under_root(&filter, root);
+    let mut branches: Vec<Document> = match renamed.get_array("$or") {
+        Ok(cs) if renamed.len() == 1 => cs.iter().filter_map(Bson::as_document).cloned().collect(),
+        _ => vec![renamed],
+    };
+    branches.push(doc! { root: { "$type": [4] } });
+    branches.push(doc! { root: { "$not": { "$type": [3] } } });
+    let (equalities, mut out): (Vec<Document>, Vec<Document>) = branches
+        .into_iter()
+        .partition(super::parsed::is_or_equality);
+    out.extend(equalities);
+    Some(doc! { "$or": out.into_iter().map(Bson::Document).collect::<Vec<_>>() })
 }
 
 /// What a stage a `$match` can move ahead of does to the fields.
@@ -461,6 +596,20 @@ fn through_projection(
 /// `{z: 1}` behind the stage), and one behind a `$group` moves ahead of it
 /// onto the fields its key renames (RM-311).
 pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
+    hoist(pipeline, false)
+}
+
+/// The stages after a pipeline's own source (`$documents`, which is a
+/// `$replaceRoot` from `_tempDocumentsField` by then, `$queryStats`, ...)
+/// as mongod reorders them: as [`hoist_matches`] does, and besides, a
+/// `$match` moves ahead of a `$replaceRoot` of a field path, rewritten
+/// ([`through_replace_root`]), and a `$skip` ahead of a stage that
+/// transforms each document into one (measured 8.2.11, RM-414).
+pub(crate) fn hoist_after_source(pipeline: &[Bson]) -> Vec<Bson> {
+    hoist(pipeline, true)
+}
+
+fn hoist(pipeline: &[Bson], after_source: bool) -> Vec<Bson> {
     let mut out = pipeline.to_vec();
     // A `$skip` / `$limit` is a wall a `$match` never crosses, but mongod
     // still moves one behind it ahead of the stages after it (8.2.11:
@@ -478,6 +627,7 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
             || projects(s).is_some()
             || groups(s).is_some()
             || as_sort(s).is_some()
+            || (after_source && transforms_one_by_one(s))
     };
     'again: loop {
         for at in 1..out.len() {
@@ -501,9 +651,24 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
                     continue 'again;
                 }
             }
+            if after_source && is_skip(&out[at]) && transforms_one_by_one(&out[at - 1]) {
+                out.swap(at - 1, at);
+                continue 'again;
+            }
             let Some(m) = as_match(&out[at]) else {
                 continue;
             };
+            let pushed = is_pushed(&out[at]);
+            if let Some(root) = new_root_path(&out[at - 1]).filter(|_| after_source) {
+                let Some(moved) = through_replace_root(m, pushed, root) else {
+                    continue;
+                };
+                out[at] = out[at - 1].clone();
+                out[at - 1] = Bson::Document(doc! { PUSHED_MATCH: moved });
+                continue 'again;
+            }
+            // A rewritten `$match` stays one as it moves on.
+            let key = if pushed { PUSHED_MATCH } else { "$match" };
             // A `$match` behind a `$sort` goes ahead of it (measured 8.2.11:
             // `[{$project: {x: 1}}, {$sort: {x: 1}}, {$match: {x: 1}}]`
             // reads `{x: 1}`).
@@ -554,12 +719,12 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
                     // Every clause moved: one filter, as the `$match` wrote
                     // it (a rename that names a field twice stays a
                     // conjunction).
-                    doc! { "$match": if kept.is_empty() { conjoin(moved) } else { joined(moved) } },
+                    doc! { key: if kept.is_empty() { conjoin(moved) } else { joined(moved) } },
                 ),
                 out[at - 1].clone(),
             ];
             if !kept.is_empty() {
-                replaced.push(Bson::Document(doc! { "$match": joined(kept) }));
+                replaced.push(Bson::Document(doc! { key: joined(kept) }));
             }
             out.splice(at - 1..=at, replaced);
             continue 'again;
@@ -569,6 +734,11 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
     // The `$match`es at the front, as one.
     let lead = out.iter().take_while(|s| as_match(s).is_some()).count();
     if lead > 1 {
+        let key = if out[..lead].iter().any(is_pushed) {
+            PUSHED_MATCH
+        } else {
+            "$match"
+        };
         let parts: Vec<Document> = out[..lead]
             .iter()
             .filter_map(as_match)
@@ -580,7 +750,7 @@ pub(crate) fn hoist_matches(pipeline: &[Bson]) -> Vec<Bson> {
             1 => parts.into_iter().next().unwrap_or_default(),
             _ => doc! { "$and": parts.into_iter().map(Bson::Document).collect::<Vec<_>>() },
         };
-        out.splice(..lead, [Bson::Document(doc! { "$match": joined })]);
+        out.splice(..lead, [Bson::Document(doc! { key: joined })]);
     }
     out
 }
@@ -598,4 +768,92 @@ pub(crate) fn unwind_paths(unwind: &Bson) -> Option<Vec<String>> {
     let mut out = vec![path.strip_prefix('$')?.to_string()];
     out.extend(index.map(str::to_string));
     Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hoist_after_source, hoist_matches, PUSHED_MATCH};
+    use bson::{doc, Bson};
+
+    fn root() -> Bson {
+        doc! { "$replaceRoot": { "newRoot": "$_tempDocumentsField" } }.into()
+    }
+
+    fn guarded(clauses: Vec<Bson>) -> Bson {
+        doc! { PUSHED_MATCH: { "$or": clauses } }.into()
+    }
+
+    /// The order mongod 8.2.11 lists (RM-414): the renamed filter, the two
+    /// tests, and equalities last.
+    #[test]
+    fn a_match_moves_ahead_of_a_replace_root_renamed() {
+        let t4 = Bson::from(doc! { "_tempDocumentsField": { "$type": [4] } });
+        let n3 = Bson::from(doc! { "_tempDocumentsField": { "$not": { "$type": [3] } } });
+        let eq =
+            |f: &str, v: i32| Bson::from(doc! { format!("_tempDocumentsField.{f}"): { "$eq": v } });
+        assert_eq!(
+            hoist_after_source(&[root(), doc! { "$match": { "a": 1 } }.into()]),
+            vec![guarded(vec![t4.clone(), n3.clone(), eq("a", 1)]), root()]
+        );
+        assert_eq!(
+            hoist_after_source(&[root(), doc! { "$match": { "a": { "$gte": 1 } } }.into()]),
+            vec![
+                guarded(vec![
+                    doc! { "_tempDocumentsField.a": { "$gte": 1 } }.into(),
+                    t4.clone(),
+                    n3.clone(),
+                ]),
+                root()
+            ]
+        );
+        // Two `$match`es each move, then join.
+        assert_eq!(
+            hoist_after_source(&[
+                root(),
+                doc! { "$match": { "a": 1 } }.into(),
+                doc! { "$match": { "b": 2 } }.into(),
+            ]),
+            vec![
+                doc! { PUSHED_MATCH: { "$and": [
+                    { "$or": [t4.clone(), n3.clone(), eq("a", 1)] },
+                    { "$or": [t4, n3, eq("b", 2)] },
+                ] } }
+                .into(),
+                root()
+            ]
+        );
+    }
+
+    #[test]
+    fn what_stays_behind_a_replace_root() {
+        for filter in [
+            doc! { "$expr": { "$eq": ["$a", 1] } },
+            doc! { "a": { "$elemMatch": { "$gt": 1 } } },
+            doc! { "$alwaysFalse": 1 },
+        ] {
+            let pipeline = vec![root(), doc! { "$match": filter.clone() }.into()];
+            assert_eq!(hoist_after_source(&pipeline), pipeline, "{filter}");
+        }
+        // A new root that is not a field path takes no `$match`.
+        let pipeline = vec![
+            doc! { "$replaceRoot": { "newRoot": { "z": "$a" } } }.into(),
+            doc! { "$match": { "z": 1 } }.into(),
+        ];
+        assert_eq!(hoist_after_source(&pipeline), pipeline);
+    }
+
+    #[test]
+    fn a_skip_moves_ahead_of_a_transform_but_not_a_match() {
+        let skip = Bson::from(doc! { "$skip": 1 });
+        let project = Bson::from(doc! { "$project": { "a": 1 } });
+        assert_eq!(
+            hoist_after_source(&[root(), project.clone(), skip.clone()]),
+            vec![skip.clone(), root(), project.clone()]
+        );
+        // Over a collection the pipeline keeps its order.
+        assert_eq!(
+            hoist_matches(&[root(), project.clone(), skip.clone()]),
+            vec![root(), project, skip]
+        );
+    }
 }

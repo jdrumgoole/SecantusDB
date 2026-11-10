@@ -1451,17 +1451,51 @@ live. Not filed here: `$rankFusion` / `$score` / `$scoreFusion` (RM-198),
       to an array". Found 2026-11-10 (RM-413).
       Verify: tests/backlog/test_rm_found_2026_11_10_lookup.py::test_documents_of_a_non_array_is_an_executor_error
       Backlog-ID: RM-531
-- [ ] **A collectionless aggregate's explain is not mongod's.** For
-      `{aggregate: 1, pipeline: [{$documents: [...]}, {$match: ...}]}` at
-      `executionStats` mongod 8.2.11 gives each stage its `nReturned` and
-      `executionTimeMillisEstimate`, a `$queue: []`, and the `$match` moved
-      ahead of the `$replaceRoot` and rewritten over `_tempDocumentsField`.
-      This server gives the stages with no counts, `$queue: [{}]`, and the
-      `$match` last as written; `$listSampledQueries`, `$listLocalSessions`
-      (whose spec mongod also expands) and `$queryStats` lack the counts too.
-      Found 2026-11-08 (RM-215).
-      Verify: tests/backlog/test_rm_found_2026_11_08b.py::test_a_collectionless_explain_counts_each_stage
-      Backlog-ID: RM-414
+- [ ] **A `$match` behind a `$replaceRoot` stays behind it over a
+      collection.** mongod 8.2.11 moves a `$match` behind
+      `{$replaceRoot: {newRoot: "$x"}}` (or `$replaceWith: "$x"`) ahead of
+      it, renamed onto `x` in an `$or` with `{x: {$type: [4]}}` and
+      `{x: {$not: {$type: [3]}}}` (which let through what the
+      `$replaceRoot` then refuses), and the collection's query takes it; it
+      also moves a `$skip` ahead of a `$project` / `$addFields` /
+      `$replaceRoot`. This server leaves both where they were written and
+      reads the whole collection. The rewrite runs for a collectionless
+      pipeline since RM-414 (`hoist::hoist_after_source`); over a collection
+      it would change the plan, so it is not applied there. Found
+      2026-11-10 (RM-414).
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_match_moves_ahead_of_a_replace_root_into_the_query
+      Backlog-ID: RM-536
+- [ ] **A pipeline `$match` lists its clauses sorted.** mongod 8.2.11 lists
+      a `$match` stage's clauses in the order they were written
+      (`{d: {$gt: 0}, c: 1}` as `$and: [d, c]`; an `$expr`'s
+      `$_internalExprEq` ahead of the `$expr`; a `$match` moved ahead of a
+      `$replaceRoot` keeps its own order inside the `$or`); only a query's
+      `parsedQuery` is sorted. This server lists each with
+      `parsed::parsed_query`, which sorts (`canonical_match` and `tidy` sort
+      too). Found 2026-11-10 (RM-414).
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_a_pipeline_match_lists_its_clauses_as_written
+      Backlog-ID: RM-537
+- [ ] **Explain lists stages mongod's optimizer rewrites as written.**
+      mongod 8.2.11 drops a `$replaceWith: "$$ROOT"`, folds a `$limit` into
+      the `$sort` before it (`{$sort: {sortKey, limit: 1}}`, no `$limit`
+      stage), moves a `$match` on a field an `$addFields` / `$set` renames
+      (`{b: "$a"}`) ahead of it onto `a`, and lists `$sampleRate: 0.5` as
+      `$expr: {$lt: [{$rand: {}}, {$const: 0.5}]}`. This server lists
+      each stage as written. Found 2026-11-10 (RM-414).
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_the_pipeline_rewrites_mongod_lists
+      Backlog-ID: RM-538
+- [ ] **Explain's stages lack some of mongod's statistics.** At
+      `executionStats` mongod 8.2.11 gives the stages inside a `$facet` and
+      a `$unionWith` their own `nReturned` (and lists the `$unionWith`'s
+      `$documents` as the `$queue` / `$project` / `$unwind` /
+      `$replaceRoot` it runs), a `$lookup` its `totalDocsExamined`,
+      `totalKeysExamined`, `collectionScans` and `indexesUsed`, the `$group`
+      a `$count` makes its `maxAccumulatorMemoryUsageBytes` and
+      `totalOutputDataSizeBytes`, and a `$sort` after `$documents` a
+      `totalDataSizeSortedBytesEstimate` of 245 for one document where this
+      server says 117. Found 2026-11-10 (RM-414).
+      Verify: tests/backlog/test_rm_found_2026_11_10_explain_rewrites.py::test_each_stage_reports_what_mongod_does
+      Backlog-ID: RM-539
 - [ ] **The operation rows `currentOp` lists lack mongod's detail.** Since
       2026-10-20 a registry of running operations stands behind
       `currentOp`, `$currentOp` (with `idleCursors`) and `killOp`, which

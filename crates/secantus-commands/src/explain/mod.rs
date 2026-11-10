@@ -1468,44 +1468,52 @@ fn spill_fields(stage: &mut Document, spilled: &secantus_core::memlimit::SpillRe
 /// argument checks, so nothing in the real collection can fail the run.
 const DRY: &str = "explain.dry.run";
 
-/// How many documents come out of `pipeline` over `coll`.
+/// How many documents come out of `pipeline` over `target` (the
+/// `aggregate` argument: a collection's name, or `1`).
 fn count_through(
     ctx: &mut CommandContext,
-    coll: &str,
+    target: &Bson,
     pipeline: &[Document],
     options: &Document,
 ) -> i64 {
-    count_and_spills(ctx, coll, pipeline, options).0
+    count_and_spills(ctx, target, pipeline, options).0
 }
 
 /// [`count_through`], and what the run spilled (RM-315).
 fn count_and_spills(
     ctx: &mut CommandContext,
-    coll: &str,
+    target: &Bson,
     pipeline: &[Document],
     options: &Document,
 ) -> (i64, secantus_core::memlimit::SpillReport) {
     let (n, report) =
-        secantus_core::memlimit::captured(|| count_inline(ctx, coll, pipeline, options));
+        secantus_core::memlimit::captured(|| count_inline(ctx, target, pipeline, options));
     (n, report)
 }
 
 fn count_inline(
     ctx: &mut CommandContext,
-    coll: &str,
+    target: &Bson,
     pipeline: &[Document],
     options: &Document,
 ) -> i64 {
-    // The window's `$sort` runs as the `$sort` it is.
+    // The window's `$sort` runs as the `$sort` it is, and a `$match` moved
+    // ahead of a `$replaceRoot` as the `$match` it is.
     let stages: Vec<Bson> = pipeline
         .iter()
-        .map(|stage| match stage.get(shape::WINDOW_SORT) {
-            Some(sort) => Bson::Document(doc! { "$sort": sort.clone() }),
-            None => Bson::Document(stage.clone()),
+        .map(|stage| {
+            match (
+                stage.get(shape::WINDOW_SORT),
+                stage.get(hoist::PUSHED_MATCH),
+            ) {
+                (Some(sort), _) => Bson::Document(doc! { "$sort": sort.clone() }),
+                (_, Some(filter)) => Bson::Document(doc! { "$match": filter.clone() }),
+                _ => Bson::Document(stage.clone()),
+            }
         })
         .collect();
     let mut cmd = doc! {
-        "aggregate": coll,
+        "aggregate": target.clone(),
         "pipeline": stages,
         "cursor": { "batchSize": i32::MAX },
     };
@@ -1546,6 +1554,7 @@ fn streams(stage: &Document) -> bool {
         stage.keys().next().map(String::as_str),
         Some(
             "$match"
+                | hoist::PUSHED_MATCH
                 | "$unwind"
                 | "$project"
                 | "$addFields"
@@ -1553,6 +1562,7 @@ fn streams(stage: &Document) -> bool {
                 | "$unset"
                 | "$replaceRoot"
                 | "$replaceWith"
+                | "$skip"
         )
     )
 }
@@ -1560,12 +1570,12 @@ fn streams(stage: &Document) -> bool {
 /// mongod's per-stage counts in front of a `$limit` (measured 8.2.11): a
 /// stage that streams hands over only what the stage after it pulled, so
 /// `[$match, $unwind: "$t", $limit: 3]` returns 2 documents from the
-/// cursor and 3 from the `$unwind`. Rewrites `counts` (the stages after the
-/// cursor) and returns what the cursor handed over, when it streams into
-/// the limit.
+/// cursor and 3 from the `$unwind`; a `$skip` of n reads n more than it
+/// hands over (RM-414). Rewrites `counts` (the stages after the cursor) and
+/// returns what the cursor handed over, when it streams into the limit.
 fn pulled_counts(
     ctx: &mut CommandContext,
-    coll: &str,
+    target: &Bson,
     pipeline: &[Document],
     taken: usize,
     options: &Document,
@@ -1582,7 +1592,7 @@ fn pulled_counts(
         .map_or(0, |b| b + 1);
     let full_before = |ctx: &mut CommandContext, j: usize, counts: &[i64]| -> i64 {
         if j == 0 {
-            count_through(ctx, coll, &pipeline[..taken], options)
+            count_through(ctx, target, &pipeline[..taken], options)
         } else {
             counts[j - 1]
         }
@@ -1596,6 +1606,10 @@ fn pulled_counts(
             continue;
         }
         counts[j] = demand;
+        if let Some(n) = rest[j].get("$skip").and_then(as_i64) {
+            demand = (demand + n.max(0)).min(before);
+            continue;
+        }
         let wanted = demand;
         // The fewest documents stage `j` reads to hand over `wanted`.
         let (mut lo, mut hi) = (0_i64, before);
@@ -1607,7 +1621,7 @@ fn pulled_counts(
             let got = if mid == 0 {
                 0
             } else {
-                count_through(ctx, coll, &probe, options)
+                count_through(ctx, target, &probe, options)
             };
             if got >= wanted {
                 hi = mid;
@@ -1639,6 +1653,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let db = ctx.db_name.clone();
     let ns = format!("{db}.{}", s.coll);
     let wanted = verbosity != Verbosity::QueryPlanner;
+    let source = Bson::String(s.coll.clone());
     // What each stage after the cursor returns: the pipeline run that far.
     let taken = r.pipeline.len() - s.rest.len();
     // What each stage after the cursor spilled: the run through it less the
@@ -1668,7 +1683,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
                         prefix.push(doc! { "$project": keep });
                     }
                 }
-                let (n, report) = count_and_spills(ctx, &s.coll, &prefix, &s.options);
+                let (n, report) = count_and_spills(ctx, &source, &prefix, &s.options);
                 stage_spills.push(report.less(&before));
                 before = report;
                 n
@@ -1682,7 +1697,7 @@ fn reply_for(r: &Request, verbosity: Verbosity, ctx: &mut CommandContext) -> Han
     let cursor_pulled = if wanted {
         pulled_counts(
             ctx,
-            &s.coll,
+            &source,
             &r.pipeline,
             taken,
             &s.options,
@@ -2489,18 +2504,8 @@ fn aggregate(
     }
     let own_source = pipeline.first().is_some_and(shape::own_source);
     let Some(coll) = target_coll.filter(|_| !own_source) else {
-        // No collection is read through a query: the stages, as mongod lists them.
-        let stages: Vec<Bson> = pipeline
-            .iter()
-            .flat_map(|s| shape::listed_stage(s, &db))
-            .map(Bson::Document)
-            .collect();
-        let mut reply = doc! { "explainVersion": "1", "stages": stages };
-        reply.insert("serverInfo", server_info(ctx));
-        reply.insert("serverParameters", server_parameters());
-        reply.insert("command", echo);
-        reply.insert("ok", 1.0);
-        return Ok(reply);
+        let target = inner.get("aggregate").cloned().unwrap_or(Bson::Int32(1));
+        return own_source_reply(&target, &pipeline, echo, verbosity, ctx);
     };
     let mut s = shape::find(&coll, &doc! { "find": coll.clone() })?;
     s.hint = inner.get("hint").cloned();
@@ -2534,6 +2539,174 @@ fn aggregate(
         }
     };
     reply_for(&request, verbosity, ctx)
+}
+
+/// The field `$documents` unwinds its documents from (mongod's
+/// `_tempDocumentsField`).
+const DOCUMENTS_FIELD: &str = "_tempDocumentsField";
+
+/// The reply for a pipeline that makes its own documents rather than read a
+/// collection through a query (`$documents`, `$queryStats`,
+/// `$listLocalSessions`, ...): its stages as mongod reorders and lists them,
+/// and above `queryPlanner` what each returned (measured 8.2.11, RM-414).
+/// `$documents` is the stages mongod runs it as -- a `$queue` of one empty
+/// document, which the run has taken by the time it is listed, a
+/// `$project` of the documents, an `$unwind` of them and a `$replaceRoot`
+/// that a `$match` behind it moves ahead of.
+fn own_source_reply(
+    target: &Bson,
+    pipeline: &[Document],
+    echo: Document,
+    verbosity: Verbosity,
+    ctx: &mut CommandContext,
+) -> HandlerResult {
+    let db = ctx.db_name.clone();
+    let wanted = verbosity != Verbosity::QueryPlanner;
+    let (head, run_head, after) = match pipeline.split_first() {
+        None => (Vec::new(), Vec::new(), Vec::new()),
+        Some((source, rest)) => {
+            let staged: Vec<Bson> = rest.iter().cloned().map(Bson::Document).collect();
+            let mut after = shape::desugared(&staged);
+            let mut head = shape::listed_stage(source, &db);
+            let run_head = match source.get("$documents") {
+                Some(docs) => {
+                    // The `$replaceRoot` is one of the stages after it.
+                    head.truncate(3);
+                    after.insert(
+                        0,
+                        Bson::Document(doc! {
+                            "$replaceRoot": { "newRoot": format!("${DOCUMENTS_FIELD}") }
+                        }),
+                    );
+                    vec![
+                        doc! { "$documents": [{}] },
+                        doc! { "$addFields": { DOCUMENTS_FIELD: docs.clone() } },
+                        doc! { "$unwind": { "path": format!("${DOCUMENTS_FIELD}") } },
+                    ]
+                }
+                None => vec![source.clone()],
+            };
+            if source.contains_key("$listLocalSessions") {
+                let caller = crate::session::authenticated(ctx);
+                for stage in &mut head {
+                    if let Some(Bson::Document(spec)) = stage.get("$listLocalSessions") {
+                        let listed = listed_local_sessions(spec, &caller);
+                        stage.insert("$listLocalSessions", listed);
+                    }
+                }
+            }
+            let after: Vec<Document> = hoist::hoist_after_source(&after)
+                .into_iter()
+                .filter_map(|b| match b {
+                    Bson::Document(d) => Some(d),
+                    _ => None,
+                })
+                .collect();
+            (head, run_head, after)
+        }
+    };
+    // What each stage returns: the pipeline run through it, the first under
+    // what a `$limit` downstream pulls ([`pulled_counts`]).
+    let mut run = run_head.clone();
+    run.extend(after.iter().cloned());
+    let mut counts: Vec<i64> = Vec::new();
+    let mut spills: Vec<secantus_core::memlimit::SpillReport> = Vec::new();
+    let mut first = None;
+    if wanted && !run.is_empty() {
+        let options = Document::new();
+        let mut before = secantus_core::memlimit::SpillReport::default();
+        for i in 1..run.len() {
+            let (n, report) = count_and_spills(ctx, target, &run[..=i], &options);
+            spills.push(report.less(&before));
+            before = report;
+            counts.push(n);
+        }
+        first = Some(
+            match pulled_counts(ctx, target, &run, 1, &options, &mut counts) {
+                Some(n) => n,
+                None => count_through(ctx, target, &run[..1], &options),
+            },
+        );
+    }
+    let counted = |stage: &mut Document, n: i64| {
+        stage.insert("nReturned", Bson::Int64(n));
+        stage.insert("executionTimeMillisEstimate", Bson::Int64(0));
+    };
+    let mut stages: Vec<Bson> = Vec::new();
+    let documents = run_head.len() == 3;
+    for (i, mut listed) in head.into_iter().enumerate() {
+        if wanted {
+            if listed.contains_key("$queue") {
+                // The run has taken the one document it queued.
+                listed.insert("$queue", Bson::Array(Vec::new()));
+            }
+            // `$documents`' `$project` and `$unwind` are runs of their own.
+            let n = match (documents, i) {
+                (true, 1 | 2) => counts.get(i - 1).copied(),
+                _ => first,
+            };
+            if let Some(n) = n {
+                counted(&mut listed, n);
+            }
+        }
+        stages.push(Bson::Document(listed));
+    }
+    let offset = run_head.len().saturating_sub(1);
+    for (i, stage) in after.iter().enumerate() {
+        for mut listed in shape::listed_stage(stage, &db) {
+            if let Some(spilled) = spills.get(offset + i) {
+                spill_fields(&mut listed, spilled);
+            }
+            if let Some(n) = counts.get(offset + i) {
+                counted(&mut listed, *n);
+            }
+            stages.push(Bson::Document(listed));
+        }
+    }
+    let mut reply = doc! { "explainVersion": "1", "stages": stages };
+    reply.insert("serverInfo", server_info(ctx));
+    reply.insert("serverParameters", server_parameters());
+    reply.insert("command", echo);
+    reply.insert("ok", 1.0);
+    Ok(reply)
+}
+
+/// A `$listLocalSessions` spec as mongod lists it back (measured 8.2.11):
+/// `allUsers` always, and unless it is true the `users` whose sessions it
+/// lists -- the caller's own when none were named (the empty user without
+/// authentication).
+fn listed_local_sessions(spec: &Document, caller: &[(String, String)]) -> Document {
+    let all = spec.get("allUsers").is_some_and(crate::util::truthy);
+    if all {
+        return doc! { "allUsers": true };
+    }
+    let named: Vec<Bson> = spec
+        .get_array("users")
+        .map(|users| {
+            users
+                .iter()
+                .filter_map(Bson::as_document)
+                .map(|u| {
+                    doc! {
+                        "db": u.get("db").cloned().unwrap_or_else(|| "".into()),
+                        "user": u.get("user").cloned().unwrap_or_else(|| "".into()),
+                    }
+                    .into()
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let users = if !named.is_empty() {
+        named
+    } else if caller.is_empty() {
+        vec![doc! { "db": "", "user": "" }.into()]
+    } else {
+        caller
+            .iter()
+            .map(|(db, user)| doc! { "db": db.clone(), "user": user.clone() }.into())
+            .collect()
+    };
+    doc! { "allUsers": false, "users": users }
 }
 
 #[cfg(test)]
