@@ -295,6 +295,9 @@ impl PgHandler {
     pub(crate) fn ssi_end(&self, committed: bool) {
         self.ssi_registered
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        // `AtEOXact_Snapshot`: the next transaction has taken no snapshot.
+        self.first_snapshot_set
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         SSI_CAPTURE.with(|c| c.set(false));
         let pid = self.ssi_pid();
         self.ssi(|s| s.release(pid, committed, false));

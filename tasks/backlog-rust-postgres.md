@@ -2538,7 +2538,11 @@ dv687, c char(3))`, `d687` an `int` with `check (value > 0)` and `dv687` a
       for the whole test, reopen included). Not diagnosed: whether the time
       is the shutdown watch telling the connection to finish, the drain, or
       the closing checkpoint under disk contention; the next step is the
-      three phases' durations from a slow run.
+      three phases' durations from a slow run. Seen a second time on
+      2026-11-10 (RP-831's `--fast` gate, again the run after a rebase):
+      `4.21637575s`, with the load average at 15-17 and a second lane's
+      gate running; the test alone then passed six times running at load
+      8-10.
       Backlog-ID: RP-690
       Verify: none -- seen once, under load; a timing that does not fail on demand
 
@@ -3519,29 +3523,6 @@ Measured on PostgreSQL 15.19; none of the statements creates an object.
       lookup can reuse.
       Verify: tests/backlog/test_rp_found_rp822.py::test_a_signatures_percent_type_is_resolved
       Backlog-ID: RP-830
-
-## Found while working RP-829 (2026-11-10)
-
-Measured on PostgreSQL 15.19; none of the statements creates an object.
-
-- [ ] **A transaction's isolation, read-write and deferrable modes can be
-      changed after it ran a query.** On PostgreSQL 15.19 `begin; select 1;
-      set transaction isolation level serializable` is 25001 `SET
-      TRANSACTION ISOLATION LEVEL must be called before any query`
-      (`check_XactIsoLevel` once `FirstSnapshotSet`, for a level other than
-      the current one), and so is the same change through `set
-      transaction_isolation = ...`, `set_config(...)`, a BEGIN's modes
-      after a query in a multi-statement query's implicit block (`select
-      1; begin isolation level serializable`) or in a block. `begin read
-      only; select 1; set transaction read write` is 25001 `transaction
-      read-write mode must be set before any query`, and `set transaction
-      [not] deferrable` after a query is 25001 `SET TRANSACTION [NOT]
-      DEFERRABLE must be called before any query`. Here each is accepted
-      and the GUC moves, though the transaction's snapshot was taken under
-      the old mode. The faithful fix keeps PostgreSQL's `FirstSnapshotSet`
-      per transaction and checks it in the three GUCs' check hooks.
-      Verify: tests/backlog/test_rp_found_rp829.py::test_a_transaction_mode_is_set_before_any_query
-      Backlog-ID: RP-831
 
 ## Found while working RP-799 (2026-11-10)
 
