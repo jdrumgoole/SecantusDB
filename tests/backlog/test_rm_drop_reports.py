@@ -102,11 +102,12 @@ def _view_drop_entries(client: Any, is_mongod: bool) -> list:
     return [e for e in entries if e[2] != "profile"]
 
 
-@pytest.mark.backlog("RM-384")
+@pytest.mark.backlog_fixed("RM-384")
 def test_dropping_a_view_is_profiled(rust_mongo: Any, mongod_rs: Any) -> None:
     """mongod 8.2.11 profiles a `drop` of a view as it profiles a `drop` of
-    a collection (`{op: "command", ns: "<db>.v"}`); this server writes the
-    view's `drop` line and no profile entry."""
+    a collection (`{op: "command", ns: "<db>.v"}`); this server wrote the
+    view's `drop` line and no profile entry, taking its `{ns, ok}` reply,
+    which has no index count, for a drop of nothing."""
     answers = {
         "rust": _view_drop_entries(rust_mongo, False),
         "mongod": _view_drop_entries(mongod_rs, True),

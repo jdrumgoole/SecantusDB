@@ -230,8 +230,9 @@ fn ends_in_out(doc: &Document) -> bool {
 fn refused_unprofiled(name: &str, reply: &Document) -> bool {
     if reply.get_f64("ok").unwrap_or(1.0) == 1.0 {
         // `drop` of a collection that does not exist answers ok, profiled
-        // nowhere (measured).
-        return name == "drop" && !reply.contains_key("nIndexesWas");
+        // nowhere (measured). A view's drop answers `{ns, ok}`, with no
+        // index count, and is profiled as a collection's (RM-384).
+        return name == "drop" && !reply.contains_key("nIndexesWas") && !reply.contains_key("ns");
     }
     let code = reply.get_i32("code").unwrap_or(0);
     let msg = reply.get_str("errmsg").unwrap_or("");

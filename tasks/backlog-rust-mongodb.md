@@ -927,12 +927,6 @@ These are explicit non-goals. Don't add them without a reason.
       one). Found while working RM-383, 2026-11-10.
       Verify: tests/backlog/test_rm_drop_reports.py::test_a_command_s_string_argument_is_not_its_collection
       Backlog-ID: RM-495
-- [ ] **Dropping a view writes no profile entry.** mongod 8.2.11 profiles a
-      `drop` of a view as it profiles a `drop` of a collection (`{op:
-      "command", ns: "<db>.v", command: {drop: "v"}}`); this server writes
-      the `drop` line and no entry. Found while working RM-363, 2026-11-07.
-      Verify: tests/backlog/test_rm_drop_reports.py::test_dropping_a_view_is_profiled
-      Backlog-ID: RM-384
 - [ ] **Operations this server runs another way than mongod's plan say
       less.** Since RM-023 a read or a write's read that a stream runs as
       mongod's plan counts its keys and documents examined, and since
